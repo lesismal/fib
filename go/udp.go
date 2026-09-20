@@ -3,6 +3,7 @@
 package fib
 
 import (
+	"errors"
 	"net"
 	"net/netip"
 	"sync/atomic"
@@ -258,6 +259,10 @@ func (e *Engine) LocalUDPAddr() (*net.UDPAddr, error) {
 	}
 	return addrs[0], nil
 }
+
+// errUDPRead is what Read reports on a UDP connection, whose datagrams the
+// event loop reads and delivers whole.
+var errUDPRead = errors.New("fib: a UDP connection is read through OnData")
 
 // IsUDP reports whether the connection exchanges datagrams.
 func (c *Connection) IsUDP() bool { return c.udp != nil }

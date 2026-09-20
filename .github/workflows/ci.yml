@@ -142,7 +142,7 @@ jobs:
           FIB_REQUIRE_CURL: '1'
         run: |
           go test -race -count=1 -timeout 10m -v \
-            -run 'TestHTTP1Conformance|TestSendFile|TestSendableFileOf|TestResponseWriter|TestStreamRequestBody|TestChunkedDecoder|TestHoldReads' \
+            -run 'TestHTTP1Conformance|TestSendFile|TestSendableFileOf|TestResponseWriter|TestStreamRequestBody|TestChunkedDecoder|TestHoldReads|TestServerRead|TestServerIdle|TestServerTimeout|TestServerWithoutTimeouts|TestReadDeadline|TestWriteDeadline|TestZeroDeadline|TestConnectionAddresses' \
             . ./http/ 2>&1 | tee "$RUNNER_TEMP/conformance.log"
           status=${PIPESTATUS[0]}
           if [ "$status" -ne 0 ]; then

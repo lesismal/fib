@@ -34,7 +34,7 @@ type PacketConn interface {
 	// Send sends one datagram. The connection does not use it again.
 	Send(datagram []byte) error
 	// Close releases the path once the connection is over.
-	Close()
+	Close() error
 }
 
 // Handler is told what happens on a connection. Its methods are called one
@@ -1066,7 +1066,7 @@ func (c *Conn) terminateLocked(err error) {
 	c.buffered = nil
 	c.events = append(c.events, func() {
 		c.tls.Close()
-		c.pc.Close()
+		_ = c.pc.Close()
 		c.handler.OnClose(c, err)
 	})
 }

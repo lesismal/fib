@@ -53,6 +53,7 @@ func (h *ServerHandler) upgradeH2C(c *fib.Connection, parser *Parser, request *s
 		return
 	}
 	rest := parser.TakeBuffered()
+	h.releaseTimeouts(c, parser)
 	c.SetAttachment(sc)
 	// The 101 is the implicit acknowledgement of the client's settings.
 	_ = c.Send([]byte(h2cSwitchingProtocols))

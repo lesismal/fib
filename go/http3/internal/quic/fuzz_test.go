@@ -127,7 +127,7 @@ func fuzzConn(t *testing.T) *Conn {
 type fuzzPacketConn struct{}
 
 func (fuzzPacketConn) Send([]byte) error { return nil }
-func (fuzzPacketConn) Close()            {}
+func (fuzzPacketConn) Close() error      { return nil }
 
 type fuzzHandler struct{}
 

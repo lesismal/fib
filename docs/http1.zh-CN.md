@@ -17,6 +17,7 @@ HTTP/2、HTTP/3 各有单独的文档：[`http2.zh-CN.md`](http2.zh-CN.md)、
 | 响应 body | `Content-Length`、chunked（含 trailer）、HTTP/1.0 流式响应以关闭连接结束 | `Content-Length`、chunked（含 trailer，`Response.Trailer`）、以关闭连接结束 |
 | 流式 | 响应：`Context` 实现了 `http.ResponseWriter`、`http.Flusher`、`io.ReaderFrom`，`Write` + `Flush` 边生成边发送。请求：超过 `StreamRequestBodyThreshold` 时 `Request.Body` 是 `*BodyStream` | body 完整缓存后再回调 |
 | 文件 | `Connection.SendFile` / `Context.ReadFrom`：Linux、macOS 用 `sendfile(2)`，Windows 分块读取；`http.ServeFile`、`http.ServeContent`、`http.FileServer` 可以直接通过 `Context` 使用（Range、多段 Range、条件请求） | — |
+| 超时 | `ReadHeaderTimeout`、`ReadTimeout`、`IdleTimeout`，回退规则与 `net/http.Server` 相同 | 每个请求的 `Timeout` |
 | 1xx 中间响应 | `WriteInterim` 或 `WriteHeader(1xx)`，自动 `100 Continue` | 自动跳过 |
 | 无 body 的响应 | HEAD（保留 GET 的长度）；204、1xx 不带 `Content-Length`；304 只带 handler 自己给的 `Content-Length` | HEAD、204、304 不读 body |
 | 校验 | HTTP/1.1 缺少或重复 `Host`、HTTP/1.0 带 `Transfer-Encoding`、报文格式错误时返回 400；chunked 以外的 transfer coding 返回 501；无法满足的 `Expect` 返回 417；超限返回 413/431 | 格式错误的响应、未知 transfer coding、body 不完整都会让请求失败 |
@@ -35,6 +36,31 @@ handler 用 `Write`/`WriteHeader` 而不是 `WriteResponse` 写响应时，服�
 
 `Flush` 发送响应头和缓存的数据，并立即交给 socket；不调用时，engine 会把一轮读取中
 产生的输出合并，等 handler 返回后一次写出（见 `Connection.Flush`）。
+
+### 读超时
+
+`Config.ReadHeaderTimeout`、`Config.ReadTimeout`、`Config.IdleTimeout` 就是
+`net/http.Server` 的那三个，回退规则也一样：`ReadHeaderTimeout` 为 0 时用
+`ReadTimeout`，`IdleTimeout` 同理，全为 0 表示不限（默认）。超时的连接会被关闭，
+`OnClose` 收到 `os.ErrDeadlineExceeded`。
+
+用哪一个取决于连接在等什么：
+
+| 在等 | 受限于 | 从什么时候算 |
+| --- | --- | --- |
+| 第一个请求，或 keep-alive 连接上的下一个请求 | `IdleTimeout` | 上一个响应之后，或连接建立时 |
+| header 收完 | `ReadHeaderTimeout` | 该请求的第一个字节 |
+| body 收完（流式与否都一样） | `ReadTimeout` | 该请求的第一个字节 |
+| 不在等——请求已经收全 | 不限 | — |
+
+最后一行是和 `net/http` 的区别：`net/http` 把读 deadline 设在整个请求期间，handler
+只有在读的时候才会察觉；这里 deadline 是直接关连接的，所以请求收全之后就会撤掉——
+比 `ReadTimeout` 慢的 handler 仍然能把响应写完，`ReadTimeout` 约束的是请求到达的时间
+而不是处理它花的时间。流式 body 在 handler 运行期间仍在到达，所以它确实受
+`ReadTimeout` 约束，这正是慢上传占不住连接的原因。
+
+通过 preface 或 `h2c` 升级变成 HTTP/2 的连接会被解除这些超时：HTTP/2 有自己的连接
+状态，HTTP/1 解析器设下的 deadline 之后没人会去刷新它。
 
 ### 流式请求 body
 
@@ -99,12 +125,9 @@ handler 把 128MB 的上传拷进 `io.Discard`：整体缓存时堆内存峰值�
   501，这样的响应会失败。
 - **除 h2c 和 WebSocket（在 `websocket` package 中）外不处理 `Upgrade`**；`CONNECT`
   请求会交给 handler，但无法建立隧道。
-- **服务端没有空闲、读头、读 body 超时**：慢客户端可以一直占着连接，见待优化项。
 
 ## 待优化
 
-- 服务端超时：读头、读 body、空闲超时，对应 `net/http.Server` 的
-  `ReadHeaderTimeout`、`ReadTimeout`、`IdleTimeout`。
 - HTTP/2 和 HTTP/3 的流式请求 body（目前仍然整体缓存），客户端流式读取响应 body。
 - 让 handler 能等待已排队的输出排空，使流式生成大 body 时内存不再增长。
 - TLS 上按 socket 排空进度读取并加密文件；Linux 上用 kTLS 实现真正的 HTTPS 零拷贝。
@@ -122,6 +145,11 @@ handler 把 128MB 的上传拷进 `io.Discard`：整体缓存时堆内存峰值�
 - **fib 客户端**对 Go `net/http` 服务端（`httptest`）和原始服务端（HTTP/1.0 keep-alive
   和以关闭连接结束的响应、格式错误的响应）。
 - **fib 客户端对 fib 服务端**，包括 HTTP/1.0 和 sendfile。
+- **读超时**（`go/http/timeout_test.go`）：header 和 body 收到一半就不来了、流式 body
+  收到一半就不来了、比 `ReadTimeout` 慢的 handler 仍然能回复、空闲连接被关闭、每个请求
+  都会刷新空闲超时、一个字节都不发的连接、没配超时的服务端、变成 HTTP/2 的连接被解除
+  超时，以及超时传到 `OnClose`。`go/netconn_test.go` 检查 `Connection` 自己的 deadline
+  和其余 `net.Conn` 方法。
 - **流式请求 body**（`go/http/body_test.go`）：handler 在 body 结束前就运行、小于阈值的
   body 仍然整体缓存、一块一块发来的带 trailer 的 chunked 上传、handler 落后时暂停读、
   没读完的 body 的丢弃与关闭、惰性与被拒绝的 100-continue、`MaxStreamedBodyBytes`、
@@ -137,5 +165,5 @@ handler 把 128MB 的上传拷进 `io.Discard`：整体缓存时堆内存峰值�
 
 ```sh
 cd go
-go test -race -run 'TestHTTP1Conformance|TestSendFile|TestSendableFileOf|TestResponseWriter|TestStreamRequestBody|TestChunkedDecoder|TestHoldReads' -v . ./http/
+go test -race -run 'TestHTTP1Conformance|TestSendFile|TestSendableFileOf|TestResponseWriter|TestStreamRequestBody|TestChunkedDecoder|TestHoldReads|TestServerRead|TestServerIdle|TestServerTimeout|TestServerWithoutTimeouts|TestReadDeadline|TestWriteDeadline|TestZeroDeadline|TestConnectionAddresses' -v . ./http/
 ```

@@ -14,6 +14,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	fib "github.com/lesismal/fib/go"
 )
@@ -58,6 +59,19 @@ type Config struct {
 	// server is willing to hold in memory. Zero, the default, leaves a
 	// streamed body unbounded.
 	MaxStreamedBodyBytes int64
+	// ReadHeaderTimeout bounds how long a request's header may take to
+	// arrive, measured from the first byte of the request. Zero means
+	// ReadTimeout, as net/http.Server resolves it; both zero means no limit.
+	// A request that outstays it has its connection closed.
+	ReadHeaderTimeout time.Duration
+	// ReadTimeout bounds how long a whole request, header and body, may take
+	// to arrive, measured from its first byte. It bounds a streamed body for
+	// as long as it is still arriving, and stops once the request has all
+	// arrived, so a handler is never cut off by it. Zero means no limit.
+	ReadTimeout time.Duration
+	// IdleTimeout bounds how long a kept-alive connection may sit between
+	// requests. Zero means ReadTimeout; both zero means no limit.
+	IdleTimeout time.Duration
 	// StreamRequestBodyBuffer is how many bytes of a streamed body may wait
 	// unread before the connection stops reading its socket, so that a
 	// handler slower than its client is paid for by TCP flow control rather
@@ -114,9 +128,15 @@ type Parser struct {
 	// requests keep their order.
 	stream *BodyStream
 	busy   bool
-	// spent marks a connection that is ending, whose remaining bytes belong
-	// to a message nobody will answer.
+	// spent marks a connection that is ending, or that has become HTTP/2,
+	// whose remaining bytes this parser will not answer.
 	spent bool
+	// headerComplete records that the request being parsed has its header and
+	// is waiting for its body, which is what tells ReadHeaderTimeout from
+	// ReadTimeout. requestStart is when that request's first byte arrived,
+	// which both are measured from.
+	headerComplete bool
+	requestStart   time.Time
 	// live is stream, or the last one, reachable without mu so that a close
 	// on the event-loop goroutine can fail a body whose reader is waiting.
 	live atomic.Pointer[BodyStream]
@@ -154,6 +174,7 @@ func (p *Parser) Reset() {
 	p.headerScan = 0
 	p.continued, p.wantContinue = false, false
 	p.stream, p.busy, p.spent = nil, false, false
+	p.headerComplete, p.requestStart = false, time.Time{}
 	p.live.Store(nil)
 }
 
@@ -240,7 +261,44 @@ func (p *Parser) FeedOne(data []byte) (*stdhttp.Request, bool, error) {
 		req.Body = io.NopCloser(bytes.NewReader(body))
 	}
 	p.consume(frame.end)
+	p.requestEnded()
 	return req, true, nil
+}
+
+// requestEnded marks the request that was arriving as arrived, so the next one
+// is timed from its own first byte.
+func (p *Parser) requestEnded() {
+	p.headerComplete, p.requestStart = false, time.Time{}
+}
+
+// waitState is what the connection is waiting for, which says which of the
+// read timeouts bounds it.
+type waitState uint8
+
+const (
+	// waitIdle is a connection between requests, waitHeader one whose
+	// request has begun without its header being complete, waitBody one
+	// whose body is still arriving, and waitServing one whose request has
+	// all arrived and whose handler is running.
+	waitIdle waitState = iota
+	waitHeader
+	waitBody
+	waitServing
+)
+
+func (p *Parser) waitState() waitState {
+	switch {
+	case p.stream != nil:
+		return waitBody
+	case p.busy:
+		return waitServing
+	case len(p.buffer) == 0:
+		return waitIdle
+	case p.headerComplete:
+		return waitBody
+	default:
+		return waitHeader
+	}
 }
 
 // pumpBody hands a streamed body the bytes it is owed, from what the parser
@@ -272,6 +330,7 @@ func (p *Parser) bodyEnded(done bool, err error) (bool, error) {
 	stream := p.stream
 	p.stream = nil
 	p.live.Store(nil)
+	p.requestEnded()
 	if err != nil {
 		stream.fail(err)
 		return false, err
@@ -330,6 +389,9 @@ func (p *Parser) frameLength() (frameInfo, bool, error) {
 		return frameInfo{}, false, fmt.Errorf("%w: %v", ErrMalformed, err)
 	}
 	_ = req.Body.Close()
+	// The header is in; from here the request is waiting for its body, which
+	// ReadTimeout rather than ReadHeaderTimeout bounds.
+	p.headerComplete = true
 	if !req.ProtoAtLeast(1, 1) && hasHeaderField(p.buffer[:headerEnd], "transfer-encoding") {
 		// HTTP/1.0 has no transfer codings, so a body framed by one cannot
 		// be trusted to end where either side thinks (RFC 9112 section 6.1).

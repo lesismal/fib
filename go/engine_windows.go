@@ -148,6 +148,8 @@ func (l *udpListener) sockname() (syscall.Sockaddr, error) { return syscall.Gets
 
 func (c *Connection) peerSockaddr() (syscall.Sockaddr, error) { return syscall.Getpeername(c.socket()) }
 
+func (c *Connection) sockname() (syscall.Sockaddr, error) { return syscall.Getsockname(c.socket()) }
+
 // sysSendDatagram sends one datagram without waiting. Callers hold c.mu.
 func (c *Connection) sysSendDatagram(data []byte) error {
 	var bufs [1]syscall.WSABuf

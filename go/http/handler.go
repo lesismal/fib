@@ -11,6 +11,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 
 	fib "github.com/lesismal/fib/go"
 	fibtls "github.com/lesismal/fib/go/tls"
@@ -207,6 +208,9 @@ var _ stdhttp.Pusher = (*Context)(nil)
 type ServerHandler struct {
 	handler Handler
 	config  Config
+	// timed records that at least one read timeout is set, so a server
+	// without any does no clock or timer work per read round.
+	timed bool
 }
 
 func NewHandler(handler Handler) *ServerHandler {
@@ -219,11 +223,77 @@ func NewHandlerWithConfig(config Config, handler Handler) *ServerHandler {
 			_ = c.Respond(stdhttp.StatusNotFound, "text/plain; charset=utf-8", []byte("404 page not found\n"))
 		})
 	}
-	return &ServerHandler{handler: handler, config: config}
+	return &ServerHandler{
+		handler: handler,
+		config:  config,
+		timed:   config.ReadHeaderTimeout > 0 || config.ReadTimeout > 0 || config.IdleTimeout > 0,
+	}
+}
+
+// headerTimeout bounds a header's arrival, and idleTimeout a kept-alive
+// connection between requests. Both fall back to ReadTimeout when they are
+// not set, as net/http.Server resolves them.
+func (h *ServerHandler) headerTimeout() time.Duration {
+	if h.config.ReadHeaderTimeout > 0 {
+		return h.config.ReadHeaderTimeout
+	}
+	return h.config.ReadTimeout
+}
+
+func (h *ServerHandler) idleTimeout() time.Duration {
+	if h.config.IdleTimeout > 0 {
+		return h.config.IdleTimeout
+	}
+	return h.config.ReadTimeout
+}
+
+// armRead sets the read deadline that matches what the connection is waiting
+// for. A connection whose request has all arrived is left without one, so a
+// handler is never cut off by the timeout that bounded its request's arrival,
+// and a connection this parser has finished with — one that is closing, or
+// that has become HTTP/2 — is left alone entirely. Callers hold parser.mu.
+func (h *ServerHandler) armRead(c *fib.Connection, parser *Parser) {
+	if !h.timed || parser.spent {
+		return
+	}
+	var at time.Time
+	switch state := parser.waitState(); state {
+	case waitIdle:
+		if d := h.idleTimeout(); d > 0 {
+			at = time.Now().Add(d)
+		}
+	case waitHeader, waitBody:
+		if parser.requestStart.IsZero() {
+			parser.requestStart = time.Now()
+		}
+		d := h.config.ReadTimeout
+		if state == waitHeader {
+			d = h.headerTimeout()
+		}
+		if d > 0 {
+			at = parser.requestStart.Add(d)
+		}
+	}
+	_ = c.SetReadDeadline(at)
+}
+
+// releaseTimeouts hands the connection over to another protocol: this parser
+// stops timing it, and the deadline it had goes with it.
+func (h *ServerHandler) releaseTimeouts(c *fib.Connection, parser *Parser) {
+	parser.spent = true
+	if h.timed {
+		_ = c.SetReadDeadline(time.Time{})
+	}
 }
 
 func (h *ServerHandler) OnOpen(c *fib.Connection) {
-	c.SetAttachment(h.newParser(c))
+	parser := h.newParser(c)
+	c.SetAttachment(parser)
+	// A connection that opens and then says nothing is idle, and bounded like
+	// any other idle connection.
+	parser.mu.Lock()
+	h.armRead(c, parser)
+	parser.mu.Unlock()
 }
 
 // newParser starts a connection's parser, recording the peer's address so
@@ -261,10 +331,13 @@ func (h *ServerHandler) drive(c *fib.Connection, parser *Parser, data []byte) {
 	parser.mu.Lock()
 	defer parser.mu.Unlock()
 	if parser.spent {
-		// The connection is ending; what is still arriving belongs to a
-		// message nobody is going to answer.
+		// The connection is ending, or has become HTTP/2; what is still
+		// arriving belongs to a message this parser will not answer.
 		return
 	}
+	// Whatever this round leaves the connection waiting for decides which
+	// timeout bounds it.
+	defer h.armRead(c, parser)
 	if !parser.sniffed {
 		if h.config.DisableHTTP2 {
 			parser.sniffed = true
@@ -318,6 +391,12 @@ func (h *ServerHandler) drive(c *fib.Connection, parser *Parser, data []byte) {
 			parser.busy = true
 			go h.serveStreamed(c, parser, context, parser.stream)
 			continue
+		}
+		if h.timed {
+			// The request has all arrived, so nothing is waiting on the peer
+			// any more: the handler's time is its own, and the deadline for
+			// whatever comes next is set when this round ends.
+			_ = c.SetReadDeadline(time.Time{})
 		}
 		serveRequest(h.handler, context)
 		if request.Close || context.closing {
@@ -481,6 +560,7 @@ func (h *ServerHandler) sniff(c *fib.Connection, parser *Parser, data []byte) []
 func (h *ServerHandler) startH2(c *fib.Connection, parser *Parser, state *stdtls.ConnectionState) {
 	sc := newH2ServerConn(h, c, parser.remoteAddr)
 	sc.tlsState = state
+	h.releaseTimeouts(c, parser)
 	c.SetAttachment(sc)
 	sc.start()
 	sc.feed(parser.TakeBuffered())

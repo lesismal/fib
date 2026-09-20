@@ -64,6 +64,13 @@ type Connection struct {
 	// dialing is set while an outbound connect is still in progress, and
 	// cleared when it completes or fails. Event-loop ownership.
 	dialing *dialRequest
+	// readDeadline and writeDeadline close the connection when they pass.
+	// Guarded by mu.
+	readDeadline  deadline
+	writeDeadline deadline
+	// closeReason is why the connection closed, which Read and Write report
+	// to a caller that comes back to it afterwards. Guarded by mu.
+	closeReason error
 	// layer, when set, carries every send, as TLS does to encrypt it.
 	layer Layer
 	// udp is set for a UDP connection, which exchanges datagrams.
@@ -88,8 +95,14 @@ func (c *Connection) SetAttachment(value any) {
 	c.attachment.Store(&connectionAttachment{value: value})
 }
 
-func (c *Connection) Close() {
+// Close ends the connection, dropping whatever has been queued for sending
+// but not yet handed to the kernel; CloseAfterSend waits for that instead. The
+// close itself is carried out by the event loop, so there is no error to
+// report and Close always returns nil, including for a connection that is
+// already closing. It satisfies net.Conn and io.Closer.
+func (c *Connection) Close() error {
 	c.closeWithError(nil)
+	return nil
 }
 
 // CloseAfterSend closes the connection after all data already accepted by Send

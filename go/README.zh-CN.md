@@ -134,6 +134,40 @@ if err := server.Run(); err != nil { panic(err) }
 config.Addrs = []string{"127.0.0.1:9000", "127.0.0.1:9001"}
 ```
 
+### net.Conn 与 deadline
+
+`*fib.Connection` 实现了 `net.Conn`，可以直接交给只需要拿地址、写数据、设超时、关连接
+的代码。其中两个方法和阻塞 socket 的行为不同，务必注意：
+
+- **`Read` 不阻塞**：读到什么返回什么，socket 里没有数据时返回 `fib.ErrWouldBlock`。
+  数据正常是通过 `OnData` 回调交付的，`Read` 是给那种想在 `OnData` 里自己把剩下的报文
+  从 socket 上读完的 handler 用的，不要把它交给 `bufio.Reader` 之类期待阻塞语义的代码。
+- **deadline 不是让调用失败，而是关连接**：`Read`、`Write` 都不会等待，所以 deadline
+  到了就关闭连接，`OnClose` 收到 `os.ErrDeadlineExceeded`。
+
+```go
+Data: func(c *fib.Connection, data []byte) {
+    // 滚动超时：每次听到对端说话就往后推
+    _ = c.SetReadDeadline(time.Now().Add(30 * time.Second))
+    ...
+},
+Close: func(c *fib.Connection, err error) {
+    if errors.Is(err, os.ErrDeadlineExceeded) { /* 对端超时 */ }
+},
+```
+
+- `SetReadDeadline(t)`：到 t 就关连接，不管这期间对端发过什么——需要滚动超时就在每次
+  收到数据时重新设置。`SetWriteDeadline(t)`：到 t 时如果 `Send` 收下的数据还没全部交给
+  内核才关连接，已经发完的连接不受影响。`SetDeadline(t)` 同时设置两者，零值 `time.Time{}`
+  取消，已经过去的时间立即关连接。可以在任意 goroutine 调用。
+- 重复设置同一个时间点不会重建定时器，所以每轮读都重申一次同样的 deadline 没有额外开销。
+- `Close()` 现在返回 `error`（恒为 nil，关闭由事件循环执行，没有可报告的错误），
+  `Write` 走 `Send`（拷贝并排队，不等对端），另外补上了 `LocalAddr()`。
+- 关闭之后 `Read`/`Write` 返回连接关闭的原因（超时是 `os.ErrDeadlineExceeded`，
+  其余是 `net.ErrClosed`），而不只是「已关闭」。
+- UDP 连接没有 `Read`：数据报由事件循环读走并整包交给 `OnData`。非原生（portable）
+  后端也没有 `Read`：那边由连接自己的读 goroutine 占着 socket，别处再读会把数据读走。
+
 ### HoldReads 读背压
 
 写方向有 `WriteHighWatermark`/`MaxPendingBytes` 两级水位自动暂停读；读方向由应用自己
@@ -375,6 +409,28 @@ func(c *fibhttp.Context, r *http.Request) {
 `Transfer-Encoding` 时返回 400；204 和 1xx 响应不带 `Content-Length`；自动添加 `Date`。
 完整的 HTTP/1.x 支持情况、限制和一致性测试见
 [`docs/http1.zh-CN.md`](../docs/http1.zh-CN.md)。
+
+### 读超时
+
+`Config.ReadHeaderTimeout`、`Config.ReadTimeout`、`Config.IdleTimeout` 就是
+`net/http.Server` 的那三个，回退规则也一样（前两者为 0 时用 `ReadTimeout`），
+全为 0 表示不限，默认不限：
+
+```go
+config := fibhttp.DefaultConfig()
+config.ReadHeaderTimeout = 10 * time.Second
+config.ReadTimeout       = 60 * time.Second
+config.IdleTimeout       = 120 * time.Second
+handler := fibhttp.NewHandlerWithConfig(config, myHandler)
+```
+
+- 连接在等第一个/下一个请求时受 `IdleTimeout` 约束；在等 header 收完时受
+  `ReadHeaderTimeout` 约束；在等 body 收完（流式与否都一样）时受 `ReadTimeout` 约束，
+  都从该请求的第一个字节算起。超时的连接被关闭，`OnClose` 收到 `os.ErrDeadlineExceeded`。
+- **请求收全之后 deadline 会被撤掉**：比 `ReadTimeout` 慢的 handler 仍然能把响应写完。
+  `ReadTimeout` 约束的是请求到达的时间，不是处理它的时间。流式 body 在 handler 运行期间
+  仍在到达，所以它确实受 `ReadTimeout` 约束——慢上传占不住连接靠的就是这个。
+- 变成 HTTP/2 的连接（preface 或 h2c 升级）会被解除这些超时，交给 HTTP/2 自己管。
 
 ### 流式请求 body（大 body 边收边处理）
 

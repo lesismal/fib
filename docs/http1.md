@@ -18,6 +18,7 @@ usage, see the [HTTP section of the Go README](../go/README.zh-CN.md#http-子-pa
 | Response bodies | `Content-Length`, chunked with trailers, close-delimited for HTTP/1.0 streams | `Content-Length`, chunked with trailers (`Response.Trailer`), close-delimited |
 | Streaming | Responses: `Context` is an `http.ResponseWriter`, `http.Flusher` and `io.ReaderFrom`, so `Write` + `Flush` stream the body as it is produced. Requests: `Request.Body` is a `*BodyStream` past `StreamRequestBodyThreshold` | Bodies are buffered whole before the callback |
 | Files | `Connection.SendFile` / `Context.ReadFrom`: `sendfile(2)` on Linux and macOS, chunked reads on Windows; `http.ServeFile`, `http.ServeContent` and `http.FileServer` work through `Context` (Range, multipart ranges, conditional requests) | — |
+| Timeouts | `ReadHeaderTimeout`, `ReadTimeout` and `IdleTimeout`, as `net/http.Server` resolves them | Per-request `Timeout` |
 | Interim responses | 1xx through `WriteInterim` or `WriteHeader(1xx)`, automatic `100 Continue` | 1xx skipped |
 | Bodiless responses | HEAD (length of the GET kept), 204 and 1xx without `Content-Length`, 304 only with the handler's own `Content-Length` | HEAD, 204, 304 read no body |
 | Validation | 400 for a missing or repeated `Host` in HTTP/1.1, for `Transfer-Encoding` in HTTP/1.0 and for malformed messages; 501 for transfer codings other than chunked; 417 for unknown expectations; 413/431 for limits | Malformed responses, unknown transfer codings and short bodies fail the request |
@@ -39,6 +40,35 @@ server picks the framing:
 `Flush` sends the header and whatever is held back and hands it to the socket
 at once; without it the engine batches a read round's output until the
 handler returns (see `Connection.Flush`).
+
+### Read timeouts
+
+`Config.ReadHeaderTimeout`, `Config.ReadTimeout` and `Config.IdleTimeout` are
+`net/http.Server`'s, resolved the same way: `ReadHeaderTimeout` falls back to
+`ReadTimeout`, so does `IdleTimeout`, and zero everywhere means no limit,
+which is the default. A connection that outstays one is closed, and its
+`OnClose` is given `os.ErrDeadlineExceeded`.
+
+Which one applies is decided by what the connection is waiting for:
+
+| Waiting for | Bounded by | Measured from |
+| --- | --- | --- |
+| Its first request, or the next one on a kept-alive connection | `IdleTimeout` | the response before it, or the connection opening |
+| A header to finish | `ReadHeaderTimeout` | the request's first byte |
+| A body to finish, streamed or not | `ReadTimeout` | the request's first byte |
+| Nothing — the request has all arrived | nothing | — |
+
+The last row is the difference from `net/http`, where the read deadline is set
+for the whole of a request and a handler notices it only when it reads.
+Here a deadline closes the connection, so it is dropped once the request has
+all arrived: a handler slower than `ReadTimeout` still gets to answer, and
+`ReadTimeout` bounds the arrival of a request rather than the work done for
+it. A streamed body is still arriving while its handler runs, so `ReadTimeout`
+does bound that, which is what keeps a slow upload from holding a connection.
+
+A connection that becomes HTTP/2, by the preface or through an `h2c` upgrade,
+is released from these: HTTP/2 is served by its own connection state, and
+nothing would refresh a deadline the HTTP/1 parser had set.
 
 ### Streaming request bodies
 
@@ -128,13 +158,9 @@ instead, which costs less than the extra system calls.
 - **No `Upgrade` handling other than h2c and WebSocket** (the latter in the
   `websocket` package); `CONNECT` requests reach the handler but cannot become
   tunnels.
-- **No idle, header or body read timeouts on the server.** A slow client can
-  hold a connection open; see the planned improvements.
 
 ## Planned improvements
 
-- Server-side timeouts: read-header, body and idle, like `net/http.Server`'s
-  `ReadHeaderTimeout`, `ReadTimeout` and `IdleTimeout`.
 - Streaming request bodies for HTTP/2 and HTTP/3, which still buffer them
   whole, and streaming response bodies for the client.
 - A way for a handler to wait for its queued output to drain, so that
@@ -157,6 +183,13 @@ are not fib:
 - **fib client** against Go's `net/http` server (`httptest`) and raw servers
   (HTTP/1.0 keep-alive and close-delimited responses, malformed responses).
 - **fib client against fib server**, including HTTP/1.0 and sendfile.
+- **read timeouts** (`go/http/timeout_test.go`): a header and a body that stop
+  arriving, a streamed body that stops arriving, a handler slower than
+  `ReadTimeout` still answering, an idle connection closed and an idle timeout
+  refreshed by each request, a connection that never speaks, a server without
+  timeouts, a connection that becomes HTTP/2 being released from them, and the
+  timeout reaching `OnClose`. `go/netconn_test.go` checks
+  `Connection`'s own deadlines and its other `net.Conn` methods.
 - **streaming request bodies** (`go/http/body_test.go`): the handler running
   before the body ends, bodies under the threshold staying buffered, chunked
   uploads with trailers fed a chunk at a time, reads held while the handler is
@@ -176,5 +209,5 @@ curl fail the job instead of skipping those cases. To run it locally:
 
 ```sh
 cd go
-go test -race -run 'TestHTTP1Conformance|TestSendFile|TestSendableFileOf|TestResponseWriter|TestStreamRequestBody|TestChunkedDecoder|TestHoldReads' -v . ./http/
+go test -race -run 'TestHTTP1Conformance|TestSendFile|TestSendableFileOf|TestResponseWriter|TestStreamRequestBody|TestChunkedDecoder|TestHoldReads|TestServerRead|TestServerIdle|TestServerTimeout|TestServerWithoutTimeouts|TestReadDeadline|TestWriteDeadline|TestZeroDeadline|TestConnectionAddresses' -v . ./http/
 ```

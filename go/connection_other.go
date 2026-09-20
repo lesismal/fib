@@ -53,7 +53,13 @@ func (c *Connection) RemoteAddr() net.Addr { return c.conn.RemoteAddr() }
 
 func (c *Connection) FD() int { return int(c.fd.Load()) }
 
-func (c *Connection) Close() { c.closeWithError(nil) }
+// Close ends the connection. The close is carried out asynchronously, so
+// there is no error to report and Close always returns nil, including for a
+// connection that is already closing. It satisfies net.Conn and io.Closer.
+func (c *Connection) Close() error {
+	c.closeWithError(nil)
+	return nil
+}
 
 func (c *Connection) Attachment() any {
 	if value := c.attachment.Load(); value != nil {

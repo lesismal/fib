@@ -548,6 +548,11 @@ func (e *Engine) closeConnection(c *Connection, closeErr error, callback bool) {
 	}
 	c.closed = true
 	c.closing = true
+	// Record why, so a Read or Write that comes back to the connection is
+	// told what happened rather than only that it is closed, and drop the
+	// deadline timers, which have nothing left to close.
+	c.closeReason = closeErr
+	c.stopDeadlinesLocked()
 	// Buffers the kernel is still sending from cannot go back to the pool: the
 	// next connection to take one would overwrite bytes still on their way out.
 	// They are left to the garbage collector instead.

@@ -44,10 +44,11 @@ func (p *pipeEnd) Send(d []byte) error {
 	return nil
 }
 
-func (p *pipeEnd) Close() {
+func (p *pipeEnd) Close() error {
 	p.mu.Lock()
 	p.closed = true
 	p.mu.Unlock()
+	return nil
 }
 
 func newPipe() (a, b *pipeEnd) {
