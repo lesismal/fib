@@ -21,6 +21,11 @@ func FuzzParser(f *testing.F) {
 		config := DefaultConfig()
 		config.MaxHeaderBytes = 1 << 16
 		config.MaxBodyBytes = 1 << 16
+		// A low threshold makes most bodies in the corpus stream, so the
+		// incremental decoder sees the same arbitrary bytes the whole-body
+		// path does.
+		config.StreamRequestBodyThreshold = 8
+		config.MaxStreamedBodyBytes = 1 << 16
 		parser := NewParser(config)
 		for _, chunk := range [][]byte{data[:cut], data[cut:]} {
 			requests, err := parser.Feed(chunk)
@@ -30,6 +35,16 @@ func FuzzParser(f *testing.F) {
 			for _, request := range requests {
 				if request.Method == "" || request.URL == nil {
 					t.Fatalf("parsed a request without a method or URL: %+v", request)
+				}
+				if _, streamed := request.Body.(*BodyStream); streamed {
+					// Reading a streamed body would wait for a connection
+					// this parser does not have; feed it what has arrived
+					// instead, as the server handler does. One call takes
+					// everything the framing accounts for.
+					if _, err := parser.pumpBody(nil); err != nil {
+						return
+					}
+					continue
 				}
 				if request.Body != nil {
 					if _, err := io.Copy(io.Discard, request.Body); err != nil {

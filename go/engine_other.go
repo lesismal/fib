@@ -283,6 +283,9 @@ func (e *Engine) readConnection(c *Connection) {
 		buf = make([]byte, maxDatagramSize)
 	}
 	for {
+		if !c.udp && !c.awaitReadable() {
+			return
+		}
 		n, err := c.conn.Read(buf)
 		if n > 0 && !c.enqueueData(buf[:n]) {
 			return

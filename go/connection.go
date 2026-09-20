@@ -47,6 +47,10 @@ type Connection struct {
 	closed        bool
 	readPaused    bool
 	budgetPaused  bool
+	// readHeld is an application-driven pause, set through HoldReads by a
+	// handler that has more input buffered than it has consumed. It is read
+	// without the mutex by the read loop, which checks it between reads.
+	readHeld atomic.Bool
 	// readStalled records that a read round stopped with bytes possibly
 	// still in the socket, because the write backlog filled up first. Those
 	// bytes raise no further edge on their own, so the event loop owes the
@@ -256,6 +260,11 @@ func (c *Connection) pauseDecision(readPaused bool) (pause, byBudget bool) {
 		// Datagrams are never queued for sending, so there is nothing to wait
 		// for, and a flood is bounded by the receive queue instead.
 		return false, false
+	}
+	if c.readHeld.Load() {
+		// The application asked for the socket to be left alone; only it can
+		// say when reads resume.
+		return true, false
 	}
 	e := c.engine
 	if e.maxPendingBytes > 0 && e.pendingTotal.Load() >= e.maxPendingBytes {
@@ -604,10 +613,45 @@ func (c *Connection) Flush() error {
 	return c.uncork()
 }
 
-// overWriteWatermark reports whether queued output has reached the budget that
-// bounds how much this connection, or the server as a whole, buffers in
-// userspace.
-func (c *Connection) overWriteWatermark() bool {
+// stallRead ends a read round with bytes possibly still in the socket and asks
+// the event loop to settle what happens to them: it either pauses reads, so
+// that resuming them later redelivers what is left, or, when whatever stopped
+// the round is already over, hands the read straight back. Without the stall
+// mark those bytes would wait for an edge that only the peer sending more can
+// raise.
+func (c *Connection) stallRead() {
+	c.mu.Lock()
+	c.readStalled = true
+	c.mu.Unlock()
+	c.engine.request(command{kind: commandRefresh, connection: c})
+}
+
+// HoldReads stops or resumes reading from this connection's socket. It is the
+// read-side counterpart of the write watermarks: a handler that buffers input
+// it has not passed on yet — a streaming HTTP request body whose handler has
+// not consumed it — holds reads while its buffer is full, so that the peer is
+// slowed by TCP flow control rather than by memory growing here. Releasing the
+// hold redelivers whatever the socket already had, without the peer having to
+// send anything more.
+//
+// It may be called from any goroutine, including from inside OnData, where the
+// current read round stops before its next read. Holds do not nest: the last
+// call wins, and a hold left set on a closed connection is harmless. It does
+// nothing on a UDP connection, whose datagrams the event loop has already read.
+func (c *Connection) HoldReads(hold bool) {
+	if c.udp != nil || c.readHeld.Swap(hold) == hold {
+		return
+	}
+	c.engine.request(command{kind: commandRefresh, connection: c})
+}
+
+// ReadsHeld reports whether HoldReads is currently holding reads back.
+func (c *Connection) ReadsHeld() bool { return c.readHeld.Load() }
+
+// readShouldStop reports whether this round should stop reading: either queued
+// output has reached the budget that bounds how much this connection, or the
+// server as a whole, buffers in userspace, or the application is holding reads.
+func (c *Connection) readShouldStop() bool {
 	pause, _ := c.pauseDecision(false)
 	return pause
 }
@@ -617,32 +661,34 @@ func (c *Connection) readLoop() error {
 	buf := buffer.data
 	defer c.engine.readBufferPool.Put(buffer)
 	for {
+		if c.readHeld.Load() {
+			// The application is holding reads until it has worked through
+			// what it already has. Leave the rest in the socket, where TCP
+			// flow control slows the peer down instead of this side growing:
+			// releasing the hold refreshes the connection, and re-arming
+			// reads redelivers whatever was left behind.
+			c.stallRead()
+			return nil
+		}
 		n, err := c.sysRead(buf)
 		if n > 0 {
 			c.handler.OnData(c, buf[:n])
-			if c.overWriteWatermark() {
-				// The replies queued so far already fill the write budget.
-				// Hand them to the socket before reading on rather than
-				// stopping outright: stopping would leave readable bytes
-				// behind an edge that does not fire again until the peer sends
-				// more, and it is the flush, not the queue depth, that says
-				// whether the peer is actually keeping up.
+			if c.readShouldStop() {
+				// Either the replies queued so far already fill the write
+				// budget or the handler is holding reads. Hand what is queued
+				// to the socket before stopping rather than stopping outright:
+				// stopping would leave readable bytes behind an edge that does
+				// not fire again until the peer sends more, and it is the
+				// flush, not the queue depth, that says whether the peer is
+				// actually keeping up.
 				if flushErr := c.uncork(); flushErr != nil {
 					return flushErr
 				}
-				if c.overWriteWatermark() {
-					// The peer is behind. Stop reading and let the event loop
-					// decide what happens to the bytes left behind: it pauses
-					// reads, and re-arming them later redelivers what is left,
-					// or, if the backlog has drained by the time it looks,
-					// hands the read straight back. Without the stall mark a
-					// backlog that drains before the loop gets there leaves
-					// nothing to re-arm, and the bytes sit unread until the
-					// peer happens to send more.
-					c.mu.Lock()
-					c.readStalled = true
-					c.mu.Unlock()
-					c.engine.request(command{kind: commandRefresh, connection: c})
+				if c.readShouldStop() {
+					// The peer is behind, or the handler still has more than
+					// it can take. Stop reading and let the event loop settle
+					// the bytes left behind.
+					c.stallRead()
 					return nil
 				}
 				c.mu.Lock()

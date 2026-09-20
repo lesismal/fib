@@ -13,6 +13,9 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
+
+	fib "github.com/lesismal/fib/go"
 )
 
 var (
@@ -31,12 +34,35 @@ var requestReaderPool = sync.Pool{New: func() any {
 
 const maxRetainedBuffer = 64 << 10
 
+var crlf = []byte("\r\n")
+
+// DefaultStreamRequestBodyBuffer is Config.StreamRequestBodyBuffer's default.
+const DefaultStreamRequestBodyBuffer = 256 << 10
+
 type Config struct {
 	// MaxHeaderBytes bounds a request's header: its bytes in HTTP/1, and in
 	// HTTP/2 both its encoded block and its decoded size as RFC 9113
 	// counts it.
 	MaxHeaderBytes int
 	MaxBodyBytes   int64
+	// StreamRequestBodyThreshold, when positive, hands a request to the
+	// handler before its whole body has arrived: a body whose Content-Length
+	// is larger than this, or a chunked body that has already sent more than
+	// this, arrives as a *BodyStream in Request.Body, which reads the rest as
+	// the connection delivers it. Such a handler runs on its own goroutine,
+	// since reading the body blocks. Zero, the default, buffers every body
+	// whole and runs every handler on the connection's worker.
+	StreamRequestBodyThreshold int64
+	// MaxStreamedBodyBytes bounds a streamed body, which MaxBodyBytes does
+	// not: the point of streaming is to accept an upload larger than the
+	// server is willing to hold in memory. Zero, the default, leaves a
+	// streamed body unbounded.
+	MaxStreamedBodyBytes int64
+	// StreamRequestBodyBuffer is how many bytes of a streamed body may wait
+	// unread before the connection stops reading its socket, so that a
+	// handler slower than its client is paid for by TCP flow control rather
+	// than by memory here. Zero means DefaultStreamRequestBodyBuffer.
+	StreamRequestBodyBuffer int
 	// DisableHTTP2 serves HTTP/1 only. Otherwise a connection that opens with
 	// the HTTP/2 preface, over TLS after ALPN chose "h2" or in cleartext with
 	// prior knowledge, is served as HTTP/2.
@@ -61,8 +87,10 @@ type Parser struct {
 	config     Config
 	buffer     []byte
 	headerScan int
-	// remoteAddr is the peer's address, which the server handler fills in
-	// once per connection for every request's RemoteAddr.
+	// conn is the connection being parsed, which a streamed body reads from
+	// and holds back; the server handler fills it in. remoteAddr is the
+	// peer's address, which every request carries as its RemoteAddr.
+	conn       *fib.Connection
 	remoteAddr string
 	// sniffed records that the server handler has seen enough of the
 	// connection to know it is not HTTP/2.
@@ -76,13 +104,32 @@ type Parser struct {
 	// not; continued records that it was asked for the request in progress.
 	wantContinue bool
 	continued    bool
+	// mu serializes everything the server handler does with the parser. It is
+	// held while a request is served, so that the connection's worker and the
+	// goroutine serving a streamed request never parse at once.
+	mu sync.Mutex
+	// stream is the streamed body being fed from buffer, and busy records
+	// that the handler of a streamed request has not returned: nothing that
+	// follows it on the connection is parsed until it has, so pipelined
+	// requests keep their order.
+	stream *BodyStream
+	busy   bool
+	// spent marks a connection that is ending, whose remaining bytes belong
+	// to a message nobody will answer.
+	spent bool
+	// live is stream, or the last one, reachable without mu so that a close
+	// on the event-loop goroutine can fail a body whose reader is waiting.
+	live atomic.Pointer[BodyStream]
 }
 
 type frameInfo struct {
 	end       int
 	headerEnd int
 	chunked   bool
-	request   *stdhttp.Request
+	// stream marks a body too big to wait for: the request is complete at
+	// headerEnd and the body that follows is delivered as it arrives.
+	stream  bool
+	request *stdhttp.Request
 }
 
 func NewParser(config Config) *Parser {
@@ -106,6 +153,8 @@ func (p *Parser) Reset() {
 	}
 	p.headerScan = 0
 	p.continued, p.wantContinue = false, false
+	p.stream, p.busy, p.spent = nil, false, false
+	p.live.Store(nil)
 }
 
 // Feed may return zero, one, or several pipelined requests.
@@ -130,7 +179,17 @@ func (p *Parser) Feed(data []byte) ([]*stdhttp.Request, error) {
 // FeedOne parses at most one request. Any bytes following that request remain
 // buffered and can be retrieved with TakeBuffered. This is useful for protocol
 // upgrades whose first frame may arrive in the same TCP read as the request.
+//
+// A request whose body streams (see Config.StreamRequestBodyThreshold) is
+// returned as soon as its header has arrived, with the rest of the body still
+// to come in Request.Body. Until that body ends, the bytes that follow are the
+// body rather than another request, so FeedOne buffers them and returns
+// nothing; only the server handler, which feeds the body, goes on from there.
 func (p *Parser) FeedOne(data []byte) (*stdhttp.Request, bool, error) {
+	if p.stream != nil {
+		p.buffer = append(p.buffer, data...)
+		return nil, false, nil
+	}
 	p.buffer = append(p.buffer, data...)
 	frame, complete, err := p.frameLength()
 	if err != nil {
@@ -142,6 +201,21 @@ func (p *Parser) FeedOne(data []byte) (*stdhttp.Request, bool, error) {
 		return nil, false, nil
 	}
 	req := frame.request
+	if frame.stream {
+		// The header is complete and the body is not; the bytes that follow
+		// it in the buffer are the start of the body, which pumpBody hands to
+		// the reader.
+		p.consume(frame.headerEnd)
+		var decoder *chunkedDecoder
+		if frame.chunked {
+			decoder = &chunkedDecoder{maxTrailer: p.config.MaxHeaderBytes}
+		}
+		wantContinue := req.ProtoAtLeast(1, 1) && strings.EqualFold(req.Header.Get("Expect"), "100-continue")
+		p.stream = newBodyStream(p.conn, req, p.config, decoder, wantContinue)
+		p.live.Store(p.stream)
+		req.Body = p.stream
+		return req, true, nil
+	}
 	if frame.chunked {
 		// net/http owns the chunk decoder; only chunked requests need this
 		// second parse. Content-Length requests reuse the header parse below.
@@ -167,6 +241,42 @@ func (p *Parser) FeedOne(data []byte) (*stdhttp.Request, bool, error) {
 	}
 	p.consume(frame.end)
 	return req, true, nil
+}
+
+// pumpBody hands a streamed body the bytes it is owed, from what the parser
+// has buffered and from data, and reports whether the body ended there. What
+// the body took leaves the buffer, so that whatever follows it on the
+// connection is parsed as the next request; when the buffer is empty the body
+// takes its bytes straight from data, so an upload is copied once rather than
+// twice.
+func (p *Parser) pumpBody(data []byte) (bool, error) {
+	stream := p.stream
+	if len(p.buffer) == 0 {
+		used, done, err := stream.absorb(data)
+		p.buffer = append(p.buffer, data[used:]...)
+		return p.bodyEnded(done, err)
+	}
+	p.buffer = append(p.buffer, data...)
+	used, done, err := stream.absorb(p.buffer)
+	if used > 0 {
+		p.consume(used)
+	}
+	return p.bodyEnded(done, err)
+}
+
+// bodyEnded retires a streamed body that has arrived whole, or failed.
+func (p *Parser) bodyEnded(done bool, err error) (bool, error) {
+	if err == nil && !done {
+		return false, nil
+	}
+	stream := p.stream
+	p.stream = nil
+	p.live.Store(nil)
+	if err != nil {
+		stream.fail(err)
+		return false, err
+	}
+	return true, nil
 }
 
 // TakeBuffered returns and clears bytes read beyond the last parsed request.
@@ -236,6 +346,13 @@ func (p *Parser) frameLength() (frameInfo, bool, error) {
 			// (RFC 9112 section 6.3).
 			req.Close = true
 		}
+		if threshold := p.config.StreamRequestBodyThreshold; threshold > 0 &&
+			int64(len(p.buffer)-headerEnd) > threshold {
+			// More has been sent than this server is willing to hold, and a
+			// chunked body never says how much more is coming. Hand the
+			// request over and decode the rest as it arrives.
+			return frameInfo{end: headerEnd, headerEnd: headerEnd, chunked: true, stream: true, request: req}, true, nil
+		}
 		end, complete, err := chunkedEnd(p.buffer, headerEnd, p.config.MaxHeaderBytes, p.config.MaxBodyBytes)
 		if err == nil && !complete {
 			p.expectContinue(req)
@@ -250,6 +367,12 @@ func (p *Parser) frameLength() (frameInfo, bool, error) {
 	}
 	if req.ContentLength < 0 {
 		return frameInfo{end: headerEnd, headerEnd: headerEnd, request: req}, true, nil
+	}
+	if threshold := p.config.StreamRequestBodyThreshold; threshold > 0 && req.ContentLength > threshold {
+		if limit := p.config.MaxStreamedBodyBytes; limit > 0 && req.ContentLength > limit {
+			return frameInfo{}, false, ErrBodyTooLarge
+		}
+		return frameInfo{end: headerEnd, headerEnd: headerEnd, stream: true, request: req}, true, nil
 	}
 	if req.ContentLength > p.config.MaxBodyBytes {
 		return frameInfo{}, false, ErrBodyTooLarge

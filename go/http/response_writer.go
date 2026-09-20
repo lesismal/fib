@@ -285,8 +285,6 @@ func (s sendableFile) advance() {
 	}
 }
 
-var crlf = []byte("\r\n")
-
 // isHTTP1 reports whether the response goes straight onto an HTTP/1
 // connection, rather than onto a stream of a multiplexed one.
 func (c *Context) isHTTP1() bool { return c.stream == nil && c.external == nil }
@@ -473,18 +471,6 @@ func hasPrefixedTrailers(header stdhttp.Header) bool {
 		if strings.HasPrefix(key, stdhttp.TrailerPrefix) {
 			return true
 		}
-	}
-	return false
-}
-
-// forbiddenTrailer reports fields a trailer may not carry, since they frame,
-// route or authenticate the message (RFC 9110 section 6.5.1).
-func forbiddenTrailer(name string) bool {
-	switch stdhttp.CanonicalHeaderKey(name) {
-	case "Content-Length", "Transfer-Encoding", "Trailer", "Host", "Content-Type", "Content-Encoding",
-		"Content-Range", "Cache-Control", "Expect", "Max-Forwards", "Pragma", "Range", "Te",
-		"Authorization", "Set-Cookie", "Connection", "Keep-Alive", "Upgrade":
-		return true
 	}
 	return false
 }

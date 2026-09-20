@@ -30,9 +30,13 @@ type Connection struct {
 	mu                                 sync.Mutex
 	events                             []portableEvent
 	scheduled, closing, closeDelivered bool
-	writeMu                            sync.Mutex
-	attachment                         atomic.Pointer[connectionAttachment]
-	layer                              Layer
+	// readHeld is an application-driven read pause, set through HoldReads.
+	// readWake is what the reader goroutine parks on while it is set.
+	readHeld   bool
+	readWake   *sync.Cond
+	writeMu    sync.Mutex
+	attachment atomic.Pointer[connectionAttachment]
+	layer      Layer
 	// udp marks a connection that exchanges datagrams: a peer of a UDP
 	// listener, whose conn is a udpPeerConn, or a dialed UDP socket.
 	udp bool
@@ -73,6 +77,10 @@ func (c *Connection) closeWithError(err error) {
 		return
 	}
 	c.closing = true
+	if c.readWake != nil {
+		// A reader parked on a hold has to see the close.
+		c.readWake.Broadcast()
+	}
 	c.events = append(c.events, portableEvent{closing: true, closeErr: err})
 	submit := !c.scheduled
 	c.scheduled = true
@@ -81,6 +89,45 @@ func (c *Connection) closeWithError(err error) {
 	if submit && !c.engine.submit(c) {
 		c.engine.finishConnection(c, err)
 	}
+}
+
+// HoldReads stops or resumes reading from this connection. See the native
+// backends' HoldReads: here the connection's reader goroutine parks while the
+// hold is set, which leaves the peer's bytes in the socket.
+func (c *Connection) HoldReads(hold bool) {
+	if c.udp {
+		return
+	}
+	c.mu.Lock()
+	if c.readHeld != hold {
+		c.readHeld = hold
+		if c.readWake == nil {
+			c.readWake = sync.NewCond(&c.mu)
+		}
+		c.readWake.Broadcast()
+	}
+	c.mu.Unlock()
+}
+
+// ReadsHeld reports whether HoldReads is currently holding reads back.
+func (c *Connection) ReadsHeld() bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.readHeld
+}
+
+// awaitReadable parks the reader goroutine while reads are held, and reports
+// whether reading should go on.
+func (c *Connection) awaitReadable() bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	for c.readHeld && !c.closing {
+		if c.readWake == nil {
+			c.readWake = sync.NewCond(&c.mu)
+		}
+		c.readWake.Wait()
+	}
+	return !c.closing
 }
 
 func (c *Connection) Send(data []byte) error {

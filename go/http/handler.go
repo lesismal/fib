@@ -80,6 +80,14 @@ func NewStreamContext(conn *fib.Connection, req *stdhttp.Request, stream Stream)
 	return &Context{Conn: conn, Request: req, external: stream}
 }
 
+// RequestBody is the request's body when it is still arriving, or nil when
+// the whole body was read before the handler ran. Reading Request.Body needs
+// no such test: it is an io.ReadCloser either way.
+func (c *Context) RequestBody() *BodyStream {
+	stream, _ := c.Request.Body.(*BodyStream)
+	return stream
+}
+
 func (c *Context) Respond(status int, contentType string, body []byte) error {
 	header := make(stdhttp.Header)
 	if contentType != "" {
@@ -162,7 +170,9 @@ func (c *Context) Push(target string, opts *stdhttp.PushOptions) error {
 // does not know interim responses, gets http.ErrNotSupported.
 //
 // A request that expects 100-continue gets its 100 Continue without asking:
-// the body is read whole before the handler runs.
+// the body is read whole before the handler runs. A streamed body is the
+// exception — it asks for it on its first read — so a handler that refuses
+// such a request answers it without the upload ever starting.
 func (c *Context) WriteInterim(status int, header stdhttp.Header) error {
 	if status < 100 || status > 199 || status == stdhttp.StatusSwitchingProtocols {
 		return fmt.Errorf("http: invalid interim status code %d", status)
@@ -220,6 +230,7 @@ func (h *ServerHandler) OnOpen(c *fib.Connection) {
 // that each request carries it in RemoteAddr as net/http's do.
 func (h *ServerHandler) newParser(c *fib.Connection) *Parser {
 	parser := NewParser(h.config)
+	parser.conn = c
 	if addr := c.RemoteAddr(); addr != nil {
 		parser.remoteAddr = addr.String()
 	}
@@ -238,6 +249,22 @@ func (h *ServerHandler) OnData(c *fib.Connection, data []byte) {
 		parser = h.newParser(c)
 		c.SetAttachment(parser)
 	}
+	h.drive(c, parser, data)
+}
+
+// drive turns whatever the connection has into requests and serves them. It
+// runs on the connection's worker for data that has just been read, and on the
+// goroutine of a streamed request once its handler returns, so it holds the
+// parser's lock throughout: a connection is never parsed by two goroutines at
+// once, and a request pipelined behind a streamed one waits its turn.
+func (h *ServerHandler) drive(c *fib.Connection, parser *Parser, data []byte) {
+	parser.mu.Lock()
+	defer parser.mu.Unlock()
+	if parser.spent {
+		// The connection is ending; what is still arriving belongs to a
+		// message nobody is going to answer.
+		return
+	}
 	if !parser.sniffed {
 		if h.config.DisableHTTP2 {
 			parser.sniffed = true
@@ -249,6 +276,24 @@ func (h *ServerHandler) OnData(c *fib.Connection, data []byte) {
 	// and leave what follows it to the new protocol.
 	var err error
 	for ; ; data = nil {
+		if parser.stream != nil {
+			// A streamed body owns the connection until its last byte: the
+			// bytes arriving now are the body, not the next request.
+			var done bool
+			if done, err = parser.pumpBody(data); err != nil {
+				h.failStream(c, parser, err)
+				return
+			} else if !done {
+				return
+			}
+			continue
+		}
+		if parser.busy {
+			// The handler of a streamed request has not returned. Keep what
+			// arrives; its return drives the connection on from here.
+			parser.buffer = append(parser.buffer, data...)
+			return
+		}
 		var request *stdhttp.Request
 		var complete bool
 		request, complete, err = parser.FeedOne(data)
@@ -261,13 +306,22 @@ func (h *ServerHandler) OnData(c *fib.Connection, data []byte) {
 			err = requestError(status)
 			break
 		}
-		if settings, ok := h.h2cUpgrade(c, request); ok {
+		if settings, ok := h.h2cUpgrade(c, request); ok && parser.stream == nil {
 			h.upgradeH2C(c, parser, request, settings)
 			return
 		}
 		context := &Context{Conn: c, Request: request}
+		if parser.stream != nil {
+			// The body has not all arrived. Serve the request on its own
+			// goroutine, since reading the body blocks, and go on feeding
+			// that body from here.
+			parser.busy = true
+			go h.serveStreamed(c, parser, context, parser.stream)
+			continue
+		}
 		serveRequest(h.handler, context)
 		if request.Close || context.closing {
+			parser.spent = true
 			return
 		}
 		if len(parser.buffer) == 0 {
@@ -277,31 +331,93 @@ func (h *ServerHandler) OnData(c *fib.Connection, data []byte) {
 	if parser.wantContinue {
 		// The request waits for permission to send its body; the body is
 		// read whole before the handler runs, so permission is given at once.
+		// A streamed body asks for it on its first read instead.
 		parser.wantContinue = false
 		_ = c.Send([]byte("HTTP/1.1 100 Continue\r\n\r\n"))
 	}
 	if err != nil {
-		status := stdhttp.StatusBadRequest
-		var statusErr requestError
-		switch {
-		case errors.As(err, &statusErr):
-			status = int(statusErr)
-		case errors.Is(err, ErrHeaderTooLarge):
-			status = stdhttp.StatusRequestHeaderFieldsTooLarge
-		case errors.Is(err, ErrBodyTooLarge):
-			status = stdhttp.StatusRequestEntityTooLarge
-		case errors.Is(err, ErrUnsupportedTransferEncoding):
-			status = stdhttp.StatusNotImplemented
-		}
-		request := &stdhttp.Request{ProtoMajor: 1, ProtoMinor: 1, Header: make(stdhttp.Header)}
-		context := &Context{Conn: c, Request: request}
-		_ = context.WriteResponse(Response{
-			StatusCode: status,
-			Header:     stdhttp.Header{"Content-Type": {"text/plain; charset=utf-8"}},
-			Body:       []byte(stdhttp.StatusText(status) + "\n"),
-			Close:      true,
-		})
+		parser.spent = true
+		h.refuse(c, err)
 	}
+}
+
+// serveStreamed runs the handler of a request whose body is still arriving,
+// and drives the connection on once it returns.
+func (h *ServerHandler) serveStreamed(c *fib.Connection, parser *Parser, context *Context, stream *BodyStream) {
+	recovered := runStreamed(h.handler, context)
+	// Whatever the handler left of the body has to come off the connection
+	// before the next request on it can be parsed, and abandon says when
+	// there is too much of it left to be worth reading and dropping. It runs
+	// before whatever else decides the connection's fate, so that a body the
+	// handler walked away from is always retired.
+	tooMuchLeft := stream.abandon()
+	closing := recovered != nil || tooMuchLeft || context.closing || context.Request.Close
+	parser.mu.Lock()
+	parser.busy = false
+	if closing {
+		parser.spent = true
+		parser.stream = nil
+		parser.live.Store(nil)
+	}
+	parser.mu.Unlock()
+	switch {
+	case recovered != nil:
+		c.CloseWithError(fmt.Errorf("handler panic: %v", recovered))
+	case closing:
+		c.CloseAfterSend()
+	default:
+		_ = c.Flush()
+		h.drive(c, parser, nil)
+	}
+}
+
+// runStreamed serves one request and returns what its handler panicked with,
+// if anything. A panic on this goroutine would take the process with it, where
+// one on a worker reaches the task pool that isolates it, so it is caught here
+// and ends the connection the same way a worker's does.
+func runStreamed(handler Handler, context *Context) (recovered any) {
+	defer func() { recovered = recover() }()
+	serveRequest(handler, context)
+	return nil
+}
+
+// failStream ends a connection whose streamed body could not be framed or grew
+// past what the server accepts. The handler has the request already, so the
+// failure reaches it through the body rather than as a status.
+func (h *ServerHandler) failStream(c *fib.Connection, parser *Parser, err error) {
+	parser.spent = true
+	if errors.Is(err, ErrMalformed) || errors.Is(err, ErrHeaderTooLarge) || errors.Is(err, ErrBodyTooLarge) {
+		// The handler may still be writing a response to a request it was
+		// given; let what it has sent go out before the connection ends.
+		c.CloseAfterSend()
+		return
+	}
+	c.CloseWithError(err)
+}
+
+// refuse answers a request the server could not parse or would not serve, and
+// ends the connection.
+func (h *ServerHandler) refuse(c *fib.Connection, err error) {
+	status := stdhttp.StatusBadRequest
+	var statusErr requestError
+	switch {
+	case errors.As(err, &statusErr):
+		status = int(statusErr)
+	case errors.Is(err, ErrHeaderTooLarge):
+		status = stdhttp.StatusRequestHeaderFieldsTooLarge
+	case errors.Is(err, ErrBodyTooLarge):
+		status = stdhttp.StatusRequestEntityTooLarge
+	case errors.Is(err, ErrUnsupportedTransferEncoding):
+		status = stdhttp.StatusNotImplemented
+	}
+	request := &stdhttp.Request{ProtoMajor: 1, ProtoMinor: 1, Header: make(stdhttp.Header)}
+	context := &Context{Conn: c, Request: request}
+	_ = context.WriteResponse(Response{
+		StatusCode: status,
+		Header:     stdhttp.Header{"Content-Type": {"text/plain; charset=utf-8"}},
+		Body:       []byte(stdhttp.StatusText(status) + "\n"),
+		Close:      true,
+	})
 }
 
 // serveRequest runs the handler for the request context carries, and then ends the
@@ -383,9 +499,18 @@ func (h *ServerHandler) tlsState(c *fib.Connection, parser *Parser) *stdtls.Conn
 }
 
 func (h *ServerHandler) OnPriorityData(*fib.Connection, []byte) {}
-func (h *ServerHandler) OnClose(c *fib.Connection, _ error) {
-	if sc, ok := c.Attachment().(*h2ServerConn); ok {
-		sc.shutdown()
+func (h *ServerHandler) OnClose(c *fib.Connection, err error) {
+	switch state := c.Attachment().(type) {
+	case *h2ServerConn:
+		state.shutdown()
+	case *Parser:
+		if stream := state.live.Load(); stream != nil {
+			// A handler waiting on the rest of a body has to hear that the
+			// rest will never come, rather than take a truncated upload for a
+			// complete one. The parser's own lock is not taken: this runs on
+			// the event-loop goroutine, which a handler must never block.
+			stream.fail(err)
+		}
 	}
 	c.SetAttachment(nil)
 }
