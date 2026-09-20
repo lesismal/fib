@@ -530,8 +530,9 @@ QUIC 层的实现要点：
 
 - 包保护支持 TLS 1.3 的三种套件：AES-128-GCM、AES-256-GCM 和
   ChaCha20-Poly1305（标准库没有导出 ChaCha20-Poly1305，本库按 RFC 8439 自行实现，
-  并用 RFC 9001 附录的测试向量校验）；支持对端发起的密钥更新（key update）；
-  客户端支持 Retry。不支持 0-RTT。
+  并用 RFC 9001 附录的测试向量校验）；密钥更新（key update）双向支持：一把密钥保护的
+  包数达到 RFC 9001 §6.6 的上限时主动发起，也响应对端发起的更新，解密失败次数超过
+  完整性上限时关闭连接；客户端支持 Retry。不支持 0-RTT。
 - 丢包检测与拥塞控制按 RFC 9002 实现：ACK 阈值和时间阈值判定丢包、PTO 探测、
   NewReno 拥塞控制；服务端在验证客户端地址前遵守 3 倍放大限制。发出的数据报固定为
   1200 字节（所有 IPv6 路径都能承载的大小），因此不需要 PMTU 探测。
@@ -542,11 +543,13 @@ QUIC 层的实现要点：
 - 已与 quic-go 做双向互通测试（包括 5% 随机丢包下的 20MB 双向传输），客户端也验证过
   Cloudflare、Google、nginx、Facebook、Varnish、quiche 的线上 HTTP/3 服务。
 
-#### 限制与待优化
+#### 一致性与限制
 
-HTTP/3 当前的限制（按对端地址区分连接、不支持迁移、固定 1200 字节数据报、关闭时没有
-closing/draining 期等）、有意未实现的功能及原因（0-RTT、QPACK 动态表、server push 等），
-以及待优化项（主动 key update 与安全加固、pacing、PMTU 探测、拥塞控制、批量收发等）见
+HTTP/3 的一致性测试（与 quic-go 客户端、服务端的双向互通，以及用手写帧构造的协议错误
+用例，CI 中在三个平台运行；quic-go 放在 `go/http3/interop` 这个独立 module 里，fib 本身
+不增加依赖）、当前的限制（按对端地址区分连接、不支持迁移、固定 1200 字节数据报、关闭时
+没有 closing/draining 期等）、有意未实现的功能及原因（0-RTT、QPACK 动态表、server push
+等），以及待优化项（安全加固、pacing、PMTU 探测、拥塞控制、批量收发等）见
 [`docs/http3.zh-CN.md`](../docs/http3.zh-CN.md)。
 
 ### 异步 HTTP/3 client
@@ -566,6 +569,7 @@ resp, err := client.Go(req).Wait()
   MAX_STREAMS 限制，超出的请求排队，等服务端放开 stream 后自动发送。
 - 收到 GOAWAY 时，服务端未处理的请求和排队中的请求自动在新连接上发送；被服务端以
   H3_REQUEST_REJECTED 重置的请求同样重发一次。
+- 支持发送请求 trailer（`req.Trailer`，名字会在 `Trailer` 头里声明）和接收响应 trailer。
 - `Timeout`、请求的 context 取消只重置对应 stream（H3_REQUEST_CANCELLED），不影响
   同连接上的其他请求；`HandshakeTimeout`、`MaxIdleTimeout`、`IdleConnTimeout` 分别
   限制握手、QUIC 空闲超时和连接复用的空闲时间；`MaxResponseHeaderBytes`、

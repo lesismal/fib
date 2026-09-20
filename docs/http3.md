@@ -17,10 +17,13 @@ from scratch. The TLS 1.3 handshake is the standard library's
 
 | Area | Content |
 | --- | --- |
-| QUIC | Version 1; Initial, Handshake and 1-RTT packet number spaces; AES-128-GCM, AES-256-GCM and ChaCha20-Poly1305 packet and header protection; answering peer-initiated key updates; Retry on the client; Version Negotiation; stateless reset; RFC 9002 loss detection, PTO and NewReno congestion control; the server's 3x amplification limit; connection- and stream-level flow control in both directions; MAX_STREAMS; idle timeout and optional keep-alive |
-| Server | Shares one `Handler` and `Context` with HTTP/1 and HTTP/2; 1xx interim responses, automatic 100 Continue, request and response trailers, graceful `Response.Close` via GOAWAY, 413/431, malformed requests reset with H3_MESSAGE_ERROR, protocol errors closing the connection with RFC 9114 codes, `Request.TLS`, an `AltSvc` helper |
-| Client | Asynchronous `Do`/`Go`; one multiplexed connection per host:port; honors MAX_STREAMS and queues the rest; cancellation resets only its own stream; requests the server marks as unprocessed (GOAWAY, H3_REQUEST_REJECTED) are retried on a new connection; response trailers |
+| QUIC | Version 1; Initial, Handshake and 1-RTT packet number spaces; AES-128-GCM, AES-256-GCM and ChaCha20-Poly1305 packet and header protection; key updates in both directions (started here when a key reaches its AEAD limit, and answered when the peer starts one) and a limit on decryption failures; Retry on the client; Version Negotiation; stateless reset; RFC 9002 loss detection, PTO and NewReno congestion control; the server's 3x amplification limit; connection- and stream-level flow control in both directions; MAX_STREAMS; idle timeout and optional keep-alive |
+| Server | Shares one `Handler` and `Context` with HTTP/1 and HTTP/2; 1xx interim responses, automatic 100 Continue, request and response trailers, graceful `Response.Close` via GOAWAY, 413/431/417, malformed requests (including an `:authority` and `Host` that disagree) reset with H3_MESSAGE_ERROR, protocol errors closing the connection with RFC 9114 and RFC 9204 codes, `Request.TLS`, an `AltSvc` helper |
+| Client | Asynchronous `Do`/`Go`; one multiplexed connection per host:port; honors MAX_STREAMS and queues the rest; cancellation resets only its own stream; requests the server marks as unprocessed (GOAWAY, H3_REQUEST_REJECTED) are retried on a new connection; request and response trailers; a peer that breaks the protocol ends the connection with its error code |
+| Conformance | Both directions against quic-go, and protocol errors written frame by frame, all run in CI |
 | Interop | quic-go client and server, both directions, including 5% packet loss; the client against the live services of Cloudflare, Google, nginx, Facebook (mvfst), Varnish and quiche |
+
+All of it is covered by tests that run in CI; see [Conformance tests](#conformance-tests).
 
 ## Current limitations
 
@@ -97,9 +100,11 @@ exposed through `http3.Config` or `http3.ClientConfig`:
   CONNECTION_CLOSE for packets that arrive later. Receiving CONNECTION_CLOSE
   also releases at once, with no draining period. If the close is lost, the peer
   ends only on a stateless reset or idle timeout.
-- **Key updates**: peer-initiated updates are answered, but this side never
-  initiates one, and the AEAD usage limits of RFC 9001 §6.6 (about 2^23 packets
-  for AES-GCM) and the decryption failure limit are not tracked.
+- **Key updates**: this side starts one once a key has protected as many
+  packets as RFC 9001 §6.6 allows (about 2^23 for AES-GCM), and answers the
+  peer's; past the integrity limit on failed decryptions the connection ends
+  with AEAD_LIMIT_REACHED. What it does not do is rotate keys on a timer or
+  on request.
 - **Stateless reset**: the reset key is random per `ServerHandler` and not
   configurable. After a server restart the key changes, so clients cannot
   recognize resets for connections from before it. Only clients recognize
@@ -111,8 +116,6 @@ exposed through `http3.Config` or `http3.ClientConfig`:
   for (`EAGAIN`) is dropped and treated as lost.
 - **The peer's `SETTINGS_MAX_FIELD_SECTION_SIZE`** is parsed but not checked
   when sending.
-- **Request trailers**: the client cannot send request trailers (both sides
-  can receive trailers, and the server sends response trailers).
 - **Priorities**: the `priority` header and PRIORITY_UPDATE frames are ignored;
   streams with data to send take turns.
 - **ECN**: ECN marks are neither set nor reported. ACK_ECN frames are parsed,
@@ -151,10 +154,6 @@ In order of priority.
 
 ### 1. Correctness and hardening (high)
 
-- **Initiate key updates and track the AEAD limits**: a long, busy connection
-  whose peer never updates its keys could in theory pass the confidentiality
-  limit. Initiate a key update near the limit, count decryption failures, and
-  close the connection past their limit.
 - **Control frame and reset floods**: there is no rate limit on PING, MAX_*
   frames, or streams opened and reset over and over (as in HTTP/2 Rapid Reset).
 - **Handshake cost**: the server neither sends Retry nor limits concurrent
@@ -207,16 +206,37 @@ In order of priority.
 
 ### 5. Test coverage (low)
 
-These paths are covered only by unit tests or test vectors, not end to end:
+The conformance suite is done; see [Conformance tests](#conformance-tests).
+What is still not covered end to end:
 
-- ChaCha20-Poly1305 negotiated in a real handshake (the test machine has AES
-  hardware, so handshakes always pick AES-GCM).
-- Receiving a peer-initiated key update.
-- Client handling of Retry; a quic-go server with source address validation
-  could exercise it.
-- Session resumption.
-- Running on Linux and Windows: only macOS has been run locally; the rest is
-  left to CI.
+- ChaCha20-Poly1305 negotiated in a real handshake: the development machine
+  and the CI runners have AES hardware, so handshakes always pick AES-GCM, and
+  only RFC 9001's test vectors cover that path.
+- Session resumption (`TLSConfig.ClientSessionCache`).
+- Fuzzing the frame parser and the QPACK decoder, and the concurrency problems
+  only load testing shows.
 - Consider joining the
   [QUIC Interop Runner](https://github.com/quic-interop/quic-interop-runner) for
-  continuous interop testing against other implementations.
+  continuous interop testing against quiche, ngtcp2, mvfst and the rest.
+
+## Conformance tests
+
+The suite is `go/http3/http3_conformance_test.go` (its tests start with
+`TestHTTP3Conformance`) and `go/http3/protocol_test.go` (protocol errors
+written frame by frame). The `HTTP/3 conformance` CI job runs them on Linux,
+macOS and Windows.
+
+The standard library has no HTTP/3, so the peer for the interop cases is
+quic-go — but it lives in `go/http3/interop`, a **module of its own**: fib's
+`go.mod` gains no dependency and `go build ./...` does not see it. The tests
+build it as a program and drive it as a subprocess, a line of JSON at a time.
+When it cannot be built, for want of network access for instance, those cases
+skip; CI sets `FIB_REQUIRE_H3_INTEROP=1`, which turns a skip into a failure.
+
+| Peer | What it checks |
+| --- | --- |
+| quic-go's HTTP/3 client, against the fib server | GET/POST/PUT/HEAD, request and response headers, several cookies and Set-Cookies, 4 MiB uploads and downloads checked by hash, 50 concurrent requests on one connection, 204, response trailers, request trailers, 103 Early Hints, 100-continue, 417, 413, 431, status codes |
+| quic-go's HTTP/3 server, against the fib client | The same ground from the other side, and: the connection still serves after a timeout, a request in flight finishes when the server retires the connection with GOAWAY, a server that validates the address with Retry, and a certificate the client does not trust |
+| The suite's own hand-written HTTP/3 client (no dependency), against the fib server | What a sound implementation never sends: DATA before HEADERS, a control stream that does not start with SETTINGS, a second control stream, a request missing a pseudo-header, a reference to the QPACK dynamic table, CANCEL_PUSH, a lowered MAX_PUSH_ID, a raised GOAWAY, a QPACK insertion, an `:authority` and `Host` that disagree, and neither of them |
+| The suite's own hand-written HTTP/3 server (no dependency), against the fib client | How the client polices its peer: MAX_PUSH_ID from a server, CANCEL_PUSH, GOAWAY naming another kind of stream, a raised GOAWAY, a QPACK insertion, and a response that refers to the dynamic table |
+| Two QUIC connections over an in-memory path | Handshake, transfers under 5% and 20% loss, stream limits, resets, application close, idle timeout, keep-alive, stateless reset, key updates (with the AEAD limits lowered) and the decryption failure limit |

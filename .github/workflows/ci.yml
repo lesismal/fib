@@ -191,6 +191,50 @@ jobs:
         # HTTP/2 header compression, checked against RFC 7541's own vectors.
         run: go test -race -count=1 ./internal/hpack/
 
+  # HTTP/3 conformance: the fib server against a quic-go client, the fib
+  # client against a quic-go server, and both against raw QUIC peers for the
+  # frames a well-behaved implementation never sends. The quic-go peer is a
+  # module of its own under go/http3/interop, built as a program the tests
+  # run, so the fib module itself gains no dependency.
+  http3-conformance:
+    name: HTTP/3 conformance (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v6
+        with:
+          go-version: stable
+          cache-dependency-path: |
+            go/go.mod
+            go/http3/interop/go.sum
+      - name: Build the interop peer
+        working-directory: go/http3/interop
+        run: |
+          go vet ./...
+          go build ./...
+      - name: Conformance tests
+        working-directory: go
+        shell: bash
+        env:
+          # Fail rather than skip if the peer cannot be built.
+          FIB_REQUIRE_H3_INTEROP: '1'
+        run: |
+          go test -race -count=1 -timeout 10m -v ./http3/... 2>&1 | tee "$RUNNER_TEMP/h3conformance.log"
+          status=${PIPESTATUS[0]}
+          if [ "$status" -ne 0 ]; then
+            summary=$(grep -E -B2 -A20 -- '--- FAIL|^panic:|^FAIL' "$RUNNER_TEMP/h3conformance.log" | head -c 60000)
+            summary=${summary//'%'/'%25'}
+            summary=${summary//$'\r'/'%0D'}
+            summary=${summary//$'\n'/'%0A'}
+            echo "::error title=HTTP/3 conformance failed::$summary"
+          fi
+          exit "$status"
+
   cross-build:
     name: Cross build
     runs-on: ubuntu-latest

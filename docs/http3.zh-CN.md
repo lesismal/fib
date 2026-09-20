@@ -15,10 +15,13 @@
 
 | 方向 | 内容 |
 | --- | --- |
-| QUIC | version 1；Initial、Handshake、1-RTT 三个包号空间；AES-128-GCM、AES-256-GCM、ChaCha20-Poly1305 包保护与头部保护；响应对端发起的 key update；客户端处理 Retry；Version Negotiation；stateless reset；RFC 9002 丢包检测、PTO 与 NewReno 拥塞控制；服务端 3 倍放大限制；连接级与 stream 级双向流控；MAX_STREAMS；空闲超时与可选 keep-alive |
-| 服务端 | 与 HTTP/1、HTTP/2 共用同一个 `Handler` 和 `Context`；1xx 中间响应、自动 100 Continue、请求与响应 trailer、`Response.Close` 通过 GOAWAY 优雅关闭、413/431、非法请求以 H3_MESSAGE_ERROR 重置、协议错误按 RFC 9114 错误码关闭连接、`Request.TLS`、`AltSvc` 辅助函数 |
-| 客户端 | 异步 `Do`/`Go`；每个 host:port 一条连接、多路复用；遵守 MAX_STREAMS 并排队；取消只重置单个 stream；GOAWAY 与 H3_REQUEST_REJECTED 的请求自动在新连接上重发；响应 trailer |
+| QUIC | version 1；Initial、Handshake、1-RTT 三个包号空间；AES-128-GCM、AES-256-GCM、ChaCha20-Poly1305 包保护与头部保护；双向 key update（本端按 AEAD 使用上限主动发起，也响应对端发起）与解密失败次数上限；客户端处理 Retry；Version Negotiation；stateless reset；RFC 9002 丢包检测、PTO 与 NewReno 拥塞控制；服务端 3 倍放大限制；连接级与 stream 级双向流控；MAX_STREAMS；空闲超时与可选 keep-alive |
+| 服务端 | 与 HTTP/1、HTTP/2 共用同一个 `Handler` 和 `Context`；1xx 中间响应、自动 100 Continue、请求与响应 trailer、`Response.Close` 通过 GOAWAY 优雅关闭、413/431/417、非法请求（含 `:authority` 与 `Host` 不一致）以 H3_MESSAGE_ERROR 重置、协议错误按 RFC 9114 / RFC 9204 错误码关闭连接、`Request.TLS`、`AltSvc` 辅助函数 |
+| 客户端 | 异步 `Do`/`Go`；每个 host:port 一条连接、多路复用；遵守 MAX_STREAMS 并排队；取消只重置单个 stream；GOAWAY 与 H3_REQUEST_REJECTED 的请求自动在新连接上重发；请求与响应 trailer；对端违反协议时按错误码关闭连接 |
+| 一致性 | 与 quic-go 客户端、服务端双向互通，以及用手写帧构造的协议错误用例，都在 CI 中运行 |
 | 互通验证 | quic-go 客户端与服务端（双向，含 5% 丢包）；客户端访问 Cloudflare、Google、nginx、Facebook（mvfst）、Varnish、quiche 的线上服务 |
+
+以上内容都有测试覆盖并在 CI 中运行，见下面的[一致性测试](#一致性测试)。
 
 ## 当前限制
 
@@ -85,8 +88,9 @@
   closing 期，也不会对之后到达的包重发 CONNECTION_CLOSE；收到对端的 CONNECTION_CLOSE
   时同样立即释放，没有 draining 期。如果关闭包丢失，对端要等 stateless reset 或空闲
   超时才会结束。
-- **密钥更新**：只响应对端发起的 key update，本端从不发起，也不统计 RFC 9001 §6.6 规定
-  的 AEAD 使用上限（AES-GCM 约 2^23 个包）和解密失败次数上限。
+- **密钥更新**：本端在一把密钥保护的包数达到 RFC 9001 §6.6 的上限（AES-GCM 约 2^23 个
+  包）时主动发起 key update，也响应对端发起的更新；解密失败次数超过完整性上限时以
+  AEAD_LIMIT_REACHED 关闭连接。不做的是按时间或按需要更换密钥。
 - **Stateless reset**：reset key 由每个 `ServerHandler` 随机生成，不能配置。服务端重启后
   key 变了，客户端认不出服务端对重启前的连接发出的 reset。只有客户端会识别 stateless reset。
 - **BLOCKED 类帧**：受流控限制时不发送 DATA_BLOCKED、STREAM_DATA_BLOCKED、
@@ -95,8 +99,6 @@
   持续拥塞（persistent congestion）判定。发送缓冲区满（`EAGAIN`）时数据报直接丢弃，
   按丢包处理。
 - **对端的 `SETTINGS_MAX_FIELD_SECTION_SIZE`**：能解析，但发送时不检查。
-- **请求 trailer**：客户端无法发送请求 trailer（两端都能接收 trailer，服务端可以发送
-  响应 trailer）。
 - **优先级**：`priority` 头和 PRIORITY_UPDATE 帧都被忽略，待发送的 stream 轮流发送。
 - **ECN**：不设置也不上报 ECN 标记。ACK_ECN 帧能解析，但其中的计数被忽略。
 
@@ -129,9 +131,6 @@
 
 ### 1. 正确性与安全加固（高）
 
-- **主动发起 key update，并统计 AEAD 使用上限**：长时间高负载的连接在对端也不更新
-  密钥时，理论上可能超过保密上限。应当在接近上限时主动发起 key update，同时统计解密
-  失败次数，超过上限时关闭连接。
 - **控制帧与 reset 洪泛**：没有对 PING、MAX_* 等帧，以及 stream 的反复打开和重置做速率
   限制（类似 HTTP/2 的 Rapid Reset）。
 - **握手资源消耗**：服务端不发 Retry，也不限制同时进行的握手数量，伪造源地址的 Initial
@@ -174,12 +173,30 @@
 
 ### 5. 测试覆盖（低）
 
-以下路径目前只有单元测试或测试向量覆盖，还没有端到端验证：
+一致性测试已完成，见[一致性测试](#一致性测试)。还没有端到端验证的是：
 
-- ChaCha20-Poly1305 在真实握手中被协商的情况（测试机有 AES 硬件，握手总是选 AES-GCM）。
-- 对端发起 key update 的接收路径。
-- 客户端处理 Retry：可以用配置了源地址验证的 quic-go 服务端来测。
-- 会话恢复。
-- Linux、Windows 上的实际运行：本地只在 macOS 上跑过，依赖 CI。
+- ChaCha20-Poly1305 在真实握手中被协商的情况：测试机和 CI 机器都有 AES 硬件，握手总是
+  选 AES-GCM，这条路径只有 RFC 9001 的测试向量覆盖。
+- 会话恢复（`TLSConfig.ClientSessionCache`）。
+- 帧解析和 QPACK 解码的 fuzz 测试，以及压测才能暴露的并发问题。
 - 可以考虑接入 [QUIC Interop Runner](https://github.com/quic-interop/quic-interop-runner)，
-  持续与其他实现做互通测试。
+  与更多实现（quiche、ngtcp2、mvfst 等）持续做互通测试。
+
+## 一致性测试
+
+测试集在 `go/http3/http3_conformance_test.go`（测试名以 `TestHTTP3Conformance` 开头）
+和 `go/http3/protocol_test.go`（手写帧构造的协议错误），CI 的 `HTTP/3 conformance`
+job 在 Linux、macOS、Windows 上运行。
+
+标准库没有 HTTP/3 实现，所以正向互通的对端用 quic-go，但它放在 `go/http3/interop`
+这个**独立的 module** 里：fib 的 `go.mod` 不引入任何依赖，`go build ./...` 也看不到它。
+测试把它编译成一个程序并以子进程方式驱动，两边用 JSON 逐行通信。构建不了（例如没有
+网络）时这些用例会跳过，CI 里设了 `FIB_REQUIRE_H3_INTEROP=1`，跳过即失败。
+
+| 对端 | 验证内容 |
+| --- | --- |
+| quic-go 的 HTTP/3 客户端（对 fib 服务端） | GET/POST/PUT/HEAD、请求与响应头、多个 Cookie 与 Set-Cookie、4 MiB 上传与下载（按哈希校验）、单连接 50 个并发请求、204、响应 trailer、请求 trailer、103 Early Hints、100-continue、417、413、431、各种状态码 |
+| quic-go 的 HTTP/3 服务端（对 fib 客户端） | 同样的矩阵反过来验证，另加：超时后连接仍可用、服务端优雅关闭（GOAWAY）时在途请求正常完成、服务端用 Retry 验证源地址、证书不受信任时拒绝连接 |
+| 测试内置的手写 HTTP/3 客户端（零依赖，对 fib 服务端） | 正常实现不会发的东西：HEADERS 之前的 DATA、不以 SETTINGS 开头的控制流、第二条控制流、缺少伪头部的请求、引用 QPACK 动态表、CANCEL_PUSH、调低的 MAX_PUSH_ID、抬高的 GOAWAY、QPACK 插入指令、`:authority` 与 `Host` 不一致、两者都缺失 |
+| 测试内置的手写 HTTP/3 服务端（零依赖，对 fib 客户端） | 客户端的协议纠错：服务端发来的 MAX_PUSH_ID、CANCEL_PUSH、GOAWAY 指向非请求流、抬高的 GOAWAY、QPACK 插入指令、引用动态表的响应 |
+| 内存管道上的 QUIC 两端 | 握手、5% 与 20% 丢包下的传输、stream 数限制、reset、应用关闭、空闲超时、keep-alive、stateless reset、密钥更新（调低 AEAD 上限触发）、解密失败上限 |
