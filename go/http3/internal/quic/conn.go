@@ -85,8 +85,8 @@ type Config struct {
 
 func (config Config) withDefaults() Config {
 	if tc := config.TLSConfig; tc != nil && tc.MinVersion < tls.VersionTLS13 {
-		// QUIC is TLS 1.3 only, and older versions of crypto/tls insist
-		// that the config say so.
+		// QUIC is TLS 1.3 only, whatever a config carried over from a TCP
+		// server allows (RFC 9001 section 4.2).
 		tc = tc.Clone()
 		tc.MinVersion = tls.VersionTLS13
 		config.TLSConfig = tc
