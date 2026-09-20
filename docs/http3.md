@@ -213,8 +213,10 @@ What is still not covered end to end:
   and the CI runners have AES hardware, so handshakes always pick AES-GCM, and
   only RFC 9001's test vectors cover that path.
 - Session resumption (`TLSConfig.ClientSessionCache`).
-- Fuzzing the frame parser and the QPACK decoder, and the concurrency problems
-  only load testing shows.
+- The concurrency problems only load testing shows. Frame parsing, building
+  requests, QPACK decoding, QUIC packet headers, transport parameters and
+  frame handling all have fuzz targets, which the `Fuzz the parsers` CI job
+  runs for 20 seconds each.
 - Consider joining the
   [QUIC Interop Runner](https://github.com/quic-interop/quic-interop-runner) for
   continuous interop testing against quiche, ngtcp2, mvfst and the rest.
@@ -240,3 +242,4 @@ skip; CI sets `FIB_REQUIRE_H3_INTEROP=1`, which turns a skip into a failure.
 | The suite's own hand-written HTTP/3 client (no dependency), against the fib server | What a sound implementation never sends: DATA before HEADERS, a control stream that does not start with SETTINGS, a second control stream, a request missing a pseudo-header, a reference to the QPACK dynamic table, CANCEL_PUSH, a lowered MAX_PUSH_ID, a raised GOAWAY, a QPACK insertion, an `:authority` and `Host` that disagree, and neither of them |
 | The suite's own hand-written HTTP/3 server (no dependency), against the fib client | How the client polices its peer: MAX_PUSH_ID from a server, CANCEL_PUSH, GOAWAY naming another kind of stream, a raised GOAWAY, a QPACK insertion, and a response that refers to the dynamic table |
 | Two QUIC connections over an in-memory path | Handshake, transfers under 5% and 20% loss, stream limits, resets, application close, idle timeout, keep-alive, stateless reset, key updates (with the AEAD limits lowered) and the decryption failure limit |
+| Fuzzing (`go test -fuzz`) | The parsers that take untrusted bytes: the HTTP/3 frame parser, building requests from fields, QPACK decoding and its round trip, QUIC packet headers, transport parameters and 1-RTT frame handling |

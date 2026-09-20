@@ -173,9 +173,12 @@ still lacks:
 
 ### 2. Conformance testing
 
-Done: see [Conformance testing](#conformance-testing). What is still missing
-is a fuzzer over the frame and HPACK decoders, and a load-oriented check (for
-example h2load) to catch what only shows up under concurrency.
+Done: see [Conformance testing](#conformance-testing). Parsing HTTP/1
+requests, reading HTTP/2 frames and coding HPACK all have fuzz targets
+(`go/http/fuzz_test.go` and `go/internal/hpack/fuzz_test.go`), which the
+`Fuzz the parsers` CI job runs for 20 seconds each. What is still missing is a
+load-oriented check (h2load, for example) to catch what only shows up under
+concurrency.
 
 ### 3. Streaming bodies and the handler model (medium)
 

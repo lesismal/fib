@@ -178,7 +178,8 @@
 - ChaCha20-Poly1305 在真实握手中被协商的情况：测试机和 CI 机器都有 AES 硬件，握手总是
   选 AES-GCM，这条路径只有 RFC 9001 的测试向量覆盖。
 - 会话恢复（`TLSConfig.ClientSessionCache`）。
-- 帧解析和 QPACK 解码的 fuzz 测试，以及压测才能暴露的并发问题。
+- 压测才能暴露的并发问题。帧解析、请求构造、QPACK 解码、QUIC 包头、传输参数和帧处理
+  都有 fuzz 目标，CI 的 `Fuzz the parsers` job 每个目标跑 20 秒。
 - 可以考虑接入 [QUIC Interop Runner](https://github.com/quic-interop/quic-interop-runner)，
   与更多实现（quiche、ngtcp2、mvfst 等）持续做互通测试。
 
@@ -200,3 +201,4 @@ job 在 Linux、macOS、Windows 上运行。
 | 测试内置的手写 HTTP/3 客户端（零依赖，对 fib 服务端） | 正常实现不会发的东西：HEADERS 之前的 DATA、不以 SETTINGS 开头的控制流、第二条控制流、缺少伪头部的请求、引用 QPACK 动态表、CANCEL_PUSH、调低的 MAX_PUSH_ID、抬高的 GOAWAY、QPACK 插入指令、`:authority` 与 `Host` 不一致、两者都缺失 |
 | 测试内置的手写 HTTP/3 服务端（零依赖，对 fib 客户端） | 客户端的协议纠错：服务端发来的 MAX_PUSH_ID、CANCEL_PUSH、GOAWAY 指向非请求流、抬高的 GOAWAY、QPACK 插入指令、引用动态表的响应 |
 | 内存管道上的 QUIC 两端 | 握手、5% 与 20% 丢包下的传输、stream 数限制、reset、应用关闭、空闲超时、keep-alive、stateless reset、密钥更新（调低 AEAD 上限触发）、解密失败上限 |
+| fuzz（`go test -fuzz`） | 面向不可信输入的解析：HTTP/3 帧解析器、从字段构造请求、QPACK 解码与编解码往返、QUIC 包头、传输参数、1-RTT 帧处理 |

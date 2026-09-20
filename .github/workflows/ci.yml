@@ -235,6 +235,54 @@ jobs:
           fi
           exit "$status"
 
+  # The parsers all take bytes from the network, so each gets a short fuzz
+  # run: HTTP/1 requests, HTTP/2 frames and HPACK, HTTP/3 frames, requests
+  # and QPACK, and QUIC packet headers, transport parameters and frames.
+  # Anything that fails is uploaded as a seed for the corpus.
+  fuzz:
+    name: Fuzz the parsers
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    defaults:
+      run:
+        working-directory: go
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v6
+        with:
+          go-version: stable
+          cache-dependency-path: go/go.mod
+      - name: Fuzz
+        shell: bash
+        run: |
+          set -e
+          for entry in \
+            ./http:FuzzParser \
+            ./http:FuzzH2Frame \
+            ./internal/hpack:FuzzDecode \
+            ./internal/hpack:FuzzRoundTrip \
+            ./internal/hpack:FuzzHuffman \
+            ./http3:FuzzFrameParser \
+            ./http3:FuzzNewRequest \
+            ./http3/internal/qpack:FuzzDecode \
+            ./http3/internal/qpack:FuzzRoundTrip \
+            ./http3/internal/quic:FuzzParseHeader \
+            ./http3/internal/quic:FuzzParseParams \
+            ./http3/internal/quic:FuzzFrames; do
+            package=${entry%%:*}
+            target=${entry##*:}
+            echo "::group::$package $target"
+            go test -run "^$target$" -fuzz "^$target$" -fuzztime 20s "$package"
+            echo "::endgroup::"
+          done
+      - name: Upload the inputs that failed
+        if: failure()
+        uses: actions/upload-artifact@v5
+        with:
+          name: fuzz-failures
+          path: go/**/testdata/fuzz/**
+          if-no-files-found: ignore
+
   cross-build:
     name: Cross build
     runs-on: ubuntu-latest
