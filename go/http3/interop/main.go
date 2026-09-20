@@ -367,7 +367,7 @@ func serveHTTP(w http.ResponseWriter, r *http.Request) {
 	if v := query.Get("trailer"); v != "" {
 		for _, pair := range strings.Split(v, ",") {
 			if name, value, ok := strings.Cut(pair, ":"); ok {
-				w.Header().Set(http.CanonicalHeaderKey(name), value)
+				w.Header().Set(name, value)
 			}
 		}
 	}

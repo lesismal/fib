@@ -52,6 +52,21 @@ jobs:
             GOOS=$goos "$(go env GOPATH)/bin/staticcheck" ./...
             echo "::endgroup::"
           done
+      # The HTTP/3 conformance peer is a module of its own, so the checks
+      # above, which are module-aware, do not reach it.
+      - name: Lint the interop peer
+        working-directory: go/http3/interop
+        run: |
+          go vet ./...
+          "$(go env GOPATH)/bin/staticcheck" ./...
+      - name: go mod tidy
+        shell: bash
+        run: |
+          for module in . http3/interop; do
+            echo "::group::$module"
+            (cd "$module" && go mod tidy -diff)
+            echo "::endgroup::"
+          done
 
   test:
     name: Test (${{ matrix.os }}, Go ${{ matrix.go }})
@@ -282,6 +297,30 @@ jobs:
           name: fuzz-failures
           path: go/**/testdata/fuzz/**
           if-no-files-found: ignore
+
+  # Known vulnerabilities in the standard library the module builds against,
+  # and in the conformance peer's dependencies.
+  vulncheck:
+    name: Vulnerability scan
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v6
+        with:
+          go-version: stable
+          cache-dependency-path: go/go.mod
+      - name: Install govulncheck
+        run: go install golang.org/x/vuln/cmd/govulncheck@latest
+      - name: Scan
+        shell: bash
+        run: |
+          set -e
+          for module in go go/http3/interop; do
+            echo "::group::$module"
+            (cd "$module" && "$(go env GOPATH)/bin/govulncheck" ./...)
+            echo "::endgroup::"
+          done
 
   cross-build:
     name: Cross build
