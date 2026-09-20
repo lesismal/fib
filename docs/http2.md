@@ -47,17 +47,26 @@ Behaviour to be aware of when using it.
 - A `CONNECT` request is parsed and handed to the handler, but no tunnel can be
   established (there is no bidirectional streaming channel).
 
-### Handlers run synchronously on the connection's worker
+### Handlers run on a pool of their own
 
-- A connection's frames are processed in order, and a handler is called
-  synchronously on the worker reading the connection once a request is
-  complete. A handler that blocks holds up the other streams on the same
-  connection (application-level head-of-line blocking).
-- For slow work, start a goroutine in the handler and call
-  `Respond`/`WriteResponse` from it; responses on different streams do not
-  block each other.
-- `Push` runs the handler of the pushed request synchronously and returns only
-  when it does, so a slow pushed handler delays the parent response.
+- A connection's frames are processed in order, and a request that is complete
+  goes to the handler pool that `Config.StreamPool` describes, so the requests
+  one client has open on a connection are served concurrently and a handler
+  that blocks holds up only itself. The pool is shared by every server asking
+  for the same sizing and is sized by `fib.DefaultStreamPoolSizing`, which is
+  deliberately wider than the engine's own pool.
+- `StreamPool.MaxConcurrentHandlers` bounds how many of one connection's
+  requests are served at once. The last of the N runs on the goroutine reading
+  the connection, which reads nothing further until it returns, so the limit is
+  paid for by the peer's flow control rather than by a queue of requests on the
+  server. 1, like `StreamPool.Disable`, serves every request on the reader, one
+  at a time, which is how the server behaved before the pool existed
+  (application-level head-of-line blocking).
+- `StreamPool.TaskPool` runs the handlers on a pool the caller owns — the
+  engine's own, or one shared with other work — instead.
+- `Push` runs the handler of the pushed request synchronously, on the goroutine
+  that called it, and returns only when it does, so a slow pushed handler
+  delays the parent response.
 
 ### No direct writes to the connection
 
@@ -122,7 +131,7 @@ These are constants today and cannot be configured:
 | Feature | Reason |
 | --- | --- |
 | Receiving server push in the client | Chrome and Firefox have removed push, and Go's `net/http` client never supported it. The client sends `ENABLE_PUSH=0`; the server's push support remains for clients that still want it. For preloading, 103 Early Hints (`Context.WriteInterim`) is the recommended replacement. |
-| RFC 9218 extensible priorities (`priority` header, PRIORITY_UPDATE) | With bodies buffered whole and handlers run synchronously, scheduling has little to gain. The RFC 7540 priority tree is deprecated by RFC 9113 and is not implemented either. |
+| RFC 9218 extensible priorities (`priority` header, PRIORITY_UPDATE) | With bodies buffered whole, scheduling has little to gain. The RFC 7540 priority tree is deprecated by RFC 9113 and is not implemented either. |
 | Extended CONNECT (RFC 8441, WebSocket over HTTP/2) | Needs bidirectional streaming streams, which need streaming bodies first; WebSocket uses the HTTP/1.1 Upgrade. |
 | `Upgrade: h2c` initiated by the client | RFC 9113 deprecates this upgrade; cleartext HTTP/2 uses prior knowledge (`UnencryptedHTTP2`). The server still accepts the upgrade for compatibility with curl and others. |
 | `Upgrade: h2c` over TLS | The RFCs allow switching protocols over TLS only through ALPN. |

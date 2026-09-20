@@ -59,7 +59,7 @@ Behavior users need to be aware of.
   (Linux, macOS, Windows); on the portable backend (e.g. FreeBSD) the package is
   empty.
 
-### Whole bodies, synchronous handlers
+### Whole bodies
 
 - A request body is read into memory in full before the handler runs, and a
   response is given at once as `Response.Body []byte`; the client likewise
@@ -70,9 +70,14 @@ Behavior users need to be aware of.
 - Memory bounds: a server connection can hold up to about
   `MaxConcurrentStreams × MaxBodyBytes` (100 × 16MB by default); a single
   client response is bounded by `MaxResponseBodyBytes`.
-- Handler calls on one connection are serialized; a handler that blocks delays
-  the other requests on its connection. Do slow work on a goroutine and respond
-  asynchronously.
+- A request that is complete goes to the handler pool that `Config.StreamPool`
+  describes — the same pool the HTTP/2 server uses — so the requests one client
+  has open on a connection are served concurrently and a handler that blocks
+  holds up only itself. `StreamPool.MaxConcurrentHandlers` bounds how many of
+  one connection's requests run at once, the last of them on the goroutine
+  reading the connection, which then reads nothing further until it returns;
+  1, like `StreamPool.Disable`, serializes the handler calls of a connection
+  again, as they were before the pool existed.
 - Do not write with `Context.Conn.Send`: `Conn` is the UDP connection, and all
   output must go through `Context`.
 
@@ -145,7 +150,7 @@ exposed through `http3.Config` or `http3.ClientConfig`:
 | Server-sent Retry / NEW_TOKEN | Address validation relies on the handshake and the 3x amplification limit, which spares issuing and checking tokens. The client handles a Retry from a server but ignores NEW_TOKEN. |
 | QUIC v2 (RFC 9369) and other versions | Version 1 is enough in practice. The client fails on Version Negotiation. |
 | DATAGRAM (RFC 9221), Extended CONNECT (RFC 9220), WebTransport | They need APIs for streaming or unreliable datagrams, which the current handler model lacks. A DATAGRAM frame from the peer is an unknown frame and closes the connection with FRAME_ENCODING_ERROR. |
-| RFC 9218 extensible priorities | With whole bodies and synchronous handlers, scheduling gains little. |
+| RFC 9218 extensible priorities | With whole bodies, scheduling gains little. |
 | ECN | Needs reading and writing the IP header's ECN bits in the engine's UDP layer; the gain is mostly in congestion control. |
 
 ## Planned improvements

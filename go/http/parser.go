@@ -90,6 +90,14 @@ type Config struct {
 	// MaxConcurrentStreams is how many requests an HTTP/2 client may have
 	// open on one connection. Zero means DefaultMaxConcurrentStreams.
 	MaxConcurrentStreams uint32
+	// StreamPool runs HTTP/2 request handlers on a pool of their own, so
+	// that the requests a client has open on one connection are served
+	// concurrently rather than one after another on the goroutine that
+	// reads it. Its zero value is the default, which does that on a shared
+	// pool with no per-connection limit; see StreamPoolConfig. It has no
+	// effect on HTTP/1, where a connection carries one request at a time
+	// anyway.
+	StreamPool StreamPoolConfig
 }
 
 func DefaultConfig() Config {

@@ -108,6 +108,9 @@ type h2ServerConn struct {
 	// tlsState is the connection's TLS state, handed to every request, or
 	// nil in cleartext.
 	tlsState *stdtls.ConnectionState
+	// gate counts the requests of this connection running on the handler's
+	// stream pool, which is how the per-connection limit is kept.
+	gate StreamGate
 }
 
 // h2ServerStream is one request and its response.
@@ -787,8 +790,18 @@ func (sc *h2ServerConn) finishRequest(st *h2ServerStream) error {
 		req.Body = io.NopCloser(bytes.NewReader(st.body))
 	}
 	st.body = nil
-	serveRequest(sc.handler.handler, &Context{Conn: sc.conn, Request: req, stream: st})
+	sc.serve(&Context{Conn: sc.conn, Request: req, stream: st})
 	return nil
+}
+
+// serve runs the handler for a request that has been framed, on the stream
+// pool or, when this connection is at its limit, here: this goroutine is the
+// one reading the connection, so serving a request here is what stops the
+// next one from being framed until this is answered.
+func (sc *h2ServerConn) serve(context *Context) {
+	sc.handler.streams.Run(&sc.gate, sc.conn, func() {
+		serveRequest(sc.handler.handler, context)
+	})
 }
 
 // reject answers a stream with an error status before its request is

@@ -61,6 +61,14 @@ type Config struct {
 	// Keep it below the engine's UDPIdleTimeout, or the engine closes a
 	// quiet peer first.
 	MaxIdleTimeout time.Duration
+	// StreamPool runs request handlers on a pool of their own, so that the
+	// requests a client has open on one QUIC connection are served
+	// concurrently rather than one after another on the goroutine that
+	// reads its datagrams. Its zero value is the default, which does that
+	// on a pool shared with every other server asking for the same sizing,
+	// HTTP/2 servers included, and sets no per-connection limit; see
+	// http.StreamPoolConfig.
+	StreamPool fibhttp.StreamPoolConfig
 }
 
 // DefaultConfig returns the defaults, which are what zero values in a Config
@@ -107,6 +115,9 @@ type ServerHandler struct {
 	config   Config
 	quic     quic.Config
 	resetKey quic.ResetKey
+	// streams runs request handlers away from the goroutine that reads
+	// their connection, or is nil when they run on it.
+	streams *fibhttp.StreamPool
 }
 
 // NewHandler serves handler over HTTP/3 with the default limits.
@@ -136,7 +147,8 @@ func NewHandlerWithConfig(config Config, handler fibhttp.Handler) *ServerHandler
 			_ = c.Respond(stdhttp.StatusNotFound, "text/plain; charset=utf-8", []byte("404 page not found\n"))
 		})
 	}
-	h := &ServerHandler{handler: handler, config: config, resetKey: quic.NewResetKey()}
+	h := &ServerHandler{handler: handler, config: config, resetKey: quic.NewResetKey(),
+		streams: fibhttp.NewStreamPool(config.StreamPool)}
 	h.quic = quic.Config{
 		TLSConfig:          ConfigureTLS(config.TLSConfig),
 		MaxIdleTimeout:     config.MaxIdleTimeout,
@@ -216,6 +228,10 @@ type serverConn struct {
 	tlsState   *tls.ConnectionState
 	control    *quic.Stream
 	peer       peerStreams
+
+	// gate counts the requests of this connection running on the handler's
+	// stream pool, which is how the per-connection limit is kept.
+	gate fibhttp.StreamGate
 
 	mu sync.Mutex
 	// streams are the requests not yet answered.
@@ -491,10 +507,16 @@ func (rs *requestStream) finish() {
 		req.Body = io.NopCloser(bytes.NewReader(rs.body))
 	}
 	rs.body = nil
-	c := fibhttp.NewStreamContext(rs.sc.conn, req, rs)
+	sc := rs.sc
+	c := fibhttp.NewStreamContext(sc.conn, req, rs)
 	// Serve rather than the handler directly, so that a handler which retains
-	// the request, or reads its body through OnBody, works here too.
-	fibhttp.Serve(rs.sc.h.handler, c)
+	// the request, or reads its body through OnBody, works here too. The pool
+	// runs it away from this goroutine, which reads the connection, unless
+	// the connection is at its concurrency limit: then it runs here, and
+	// nothing more is read from the connection until it has been answered.
+	sc.h.streams.Run(&sc.gate, sc.conn, func() {
+		fibhttp.Serve(sc.h.handler, c)
+	})
 }
 
 // abort gives up on a malformed or incomplete request.

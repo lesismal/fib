@@ -82,6 +82,21 @@ const (
 	eventsPerWorker = 10
 	minMaxEvents    = 10000
 	maxMaxEvents    = 100000
+
+	// streamPoolFactor is how much larger the pool a multiplexed protocol
+	// runs its request handlers on is than the engine's own.
+	//
+	// The two pools do different work. An engine worker holds its connection
+	// for one round: it reads the socket, hands what came in to the protocol,
+	// and gives the round back, so the work is bounded by the syscalls it
+	// makes. A handler runs the application, which may wait on a database, a
+	// file or another server for as long as that takes, and one multiplexed
+	// connection can have hundreds of requests open at once where a TCP
+	// connection has one round. Sizing the handler pool like the engine's
+	// would make it the bottleneck it exists to remove, so it is sized well
+	// above it; under ModeAdaptive, which both take by default, a ceiling
+	// costs nothing until the load climbs to it.
+	streamPoolFactor = 4
 )
 
 // DefaultPoolSizing reports the sizing mode is tuned for, which is what
@@ -97,6 +112,20 @@ func DefaultPoolSizing(mode taskpool.Mode) PoolSizing {
 	if workerCount < minWorkers {
 		workerCount = minWorkers
 	}
+	return poolSizing(workerCount)
+}
+
+// DefaultStreamPoolSizing reports the sizing of the pool that a multiplexed
+// protocol runs its request handlers on, which HTTP/2 and HTTP/3 take when
+// their configuration leaves it at zero. It is deliberately larger than what
+// DefaultPoolSizing reports for the engine that feeds it; see
+// streamPoolFactor.
+func DefaultStreamPoolSizing(mode taskpool.Mode) PoolSizing {
+	return poolSizing(DefaultPoolSizing(mode).WorkerCount * streamPoolFactor)
+}
+
+// poolSizing pairs a worker count with the queue that goes with it.
+func poolSizing(workerCount int) PoolSizing {
 	maxEvents := workerCount * eventsPerWorker
 	if maxEvents < minMaxEvents {
 		maxEvents = minMaxEvents

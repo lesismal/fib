@@ -38,14 +38,19 @@
   （默认 250 × 16MB）；客户端单个响应受 `MaxResponseBodyBytes` 限制。
 - `CONNECT` 请求能被解析并交给 handler，但无法建立隧道（没有双向流式通道）。
 
-### handler 在连接的 worker 上同步执行
+### handler 在独立的协程池上执行
 
-- 一个连接的帧按顺序处理，请求完整后在读取它的 worker 上同步调用 handler。handler
-  同步阻塞时，同一连接上其他 stream 的请求也要等待（应用层的队头阻塞）。
-- 耗时操作应在 handler 中启动 goroutine 后异步调用 `Respond`/`WriteResponse`，
-  不同 stream 的响应互不阻塞。
-- `Push` 会同步执行被推送请求的 handler，在它返回后才返回；被推送的 handler 慢，
-  父请求的响应也会随之推迟。
+- 一个连接的帧按顺序处理，请求完整后交给 `Config.StreamPool` 描述的 handler 协程池，
+  因此同一连接上客户端并发发起的多个请求是并发处理的，阻塞的 handler 只拖累它自己。
+  该协程池由所有相同配置的 server 共享，默认大小取 `fib.DefaultStreamPoolSizing`，
+  刻意比 engine 自身的协程池更大。
+- `StreamPool.MaxConcurrentHandlers` 限制单个连接同时处理的请求数 N：第 N 个请求在读取
+  该连接的协程上执行，在它返回前该连接不再读取新数据，因此这个上限由对端的流控承担，
+  而不是在服务端排队。N 为 1 时（与 `StreamPool.Disable` 相同）每个请求都在读取协程上
+  逐个执行，也就是引入协程池之前的行为（应用层的队头阻塞）。
+- `StreamPool.TaskPool` 可以改用调用方自己的协程池（engine 自身的，或与其他任务共享的）。
+- `Push` 仍然在调用它的协程上同步执行被推送请求的 handler，在它返回后才返回；被推送的
+  handler 慢，父请求的响应也会随之推迟。
 
 ### 不能向连接直接写字节
 
@@ -96,7 +101,7 @@
 | 功能 | 原因 |
 | --- | --- |
 | 客户端接收 server push | Chrome、Firefox 已移除 push，Go 的 `net/http` 客户端也从未支持。客户端在 SETTINGS 中声明 `ENABLE_PUSH=0`，服务端 push 能力保留给仍然需要它的客户端。预加载推荐用 103 Early Hints（`Context.WriteInterim`）。 |
-| RFC 9218 可扩展优先级（`priority` 头、PRIORITY_UPDATE） | 在当前“body 整体缓存、handler 同步执行”的模型下，调度收益有限；RFC 7540 的优先级树已被 RFC 9113 废弃，同样不实现。 |
+| RFC 9218 可扩展优先级（`priority` 头、PRIORITY_UPDATE） | 在当前“body 整体缓存”的模型下，调度收益有限；RFC 7540 的优先级树已被 RFC 9113 废弃，同样不实现。 |
 | Extended CONNECT（RFC 8441，WebSocket over HTTP/2） | 依赖双向流式 stream，需要先支持流式 body；WebSocket 目前走 HTTP/1.1 Upgrade。 |
 | 客户端发起 `Upgrade: h2c` | RFC 9113 已废弃这种升级方式；需要明文 HTTP/2 的场景使用 prior knowledge（`UnencryptedHTTP2`）。服务端仍然接受升级，以兼容 curl 等客户端。 |
 | TLS 连接上的 `Upgrade: h2c` | RFC 规定 TLS 上只能通过 ALPN 切换协议。 |

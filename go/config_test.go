@@ -57,6 +57,24 @@ func TestDefaultConfigPoolSizing(t *testing.T) {
 	}
 }
 
+// The pool a multiplexed protocol runs its handlers on is fed by the engine's
+// own, and a handler waits on the application where an engine worker only
+// waits on the kernel, so it has to be the wider of the two.
+func TestDefaultStreamPoolSizingExceedsTheEnginePool(t *testing.T) {
+	for _, mode := range []taskpool.Mode{taskpool.ModeCond, taskpool.ModeElastic, taskpool.ModeAdaptive} {
+		engine := DefaultPoolSizing(mode)
+		streams := DefaultStreamPoolSizing(mode)
+		if streams.WorkerCount <= engine.WorkerCount {
+			t.Fatalf("%v: stream pool WorkerCount = %d, want more than the engine's %d",
+				mode, streams.WorkerCount, engine.WorkerCount)
+		}
+		if streams.MaxEvents < streams.WorkerCount && streams.MaxEvents != maxMaxEvents {
+			t.Fatalf("%v: stream pool MaxEvents = %d, want at least WorkerCount %d",
+				mode, streams.MaxEvents, streams.WorkerCount)
+		}
+	}
+}
+
 // A worker count means a population of goroutines under one mode and a ceiling
 // under the other, so the modes cannot share one default.
 func TestDefaultPoolSizingDiffersByMode(t *testing.T) {

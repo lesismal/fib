@@ -564,6 +564,23 @@ server, err := fib.Bind(config, fibtls.NewServer(tlsConfig, fibhttp.NewHandler(h
   帧。HTTP/2 连接上不要直接调用 `Context.Conn.Send`。
 - 多路复用：一个连接上的多个 stream 并发进行，handler 可以在其他 goroutine 中稍后
   回复（异步响应），不同 stream 的响应互不阻塞。
+- handler 协程池：请求收齐后不在读取该连接的协程上执行，而是交给一个独立的协程池，
+  因此同一连接上并发到达的请求是并发处理的，阻塞的 handler 只拖累它自己。协程池由
+  `Config.StreamPool` 配置（`http.StreamPoolConfig`），默认由配置相同的所有 server
+  共享，容量取 `fib.DefaultStreamPoolSizing`，比 Engine 自身的协程池更大——Engine 的
+  worker 只等内核，handler 还要等应用自己的 I/O：
+
+  ```go
+  httpConfig := fibhttp.DefaultConfig()
+  httpConfig.StreamPool.MaxConcurrentHandlers = 8 // 单连接最多并发 8 个请求，0 表示不限
+  server, err := fib.Bind(config, fibhttp.NewHandlerWithConfig(httpConfig, handler))
+  ```
+
+  `MaxConcurrentHandlers` 为 N（>0）时限制单个连接同时处理的请求数：第 N 个请求在读取
+  该连接的协程上执行，在它返回前这个连接不再读取新数据，于是这个上限由对端的流控承担，
+  服务端不需要排队。N 为 1（或 `StreamPool.Disable`）就是逐个执行的旧行为；
+  `StreamPool.MaxWorkers`/`MinWorkers`/`QueueSize` 调整池容量，`StreamPool.TaskPool`
+  则改用调用方自己的协程池（例如 Engine 自身的那个）。
 - `Response.Close` 在 HTTP/2 上优雅关闭连接：发送 GOAWAY(NO_ERROR)，不再接受新
   stream，已在处理的 stream 完成后再关闭连接。
 - 流控：遵守对端的连接级与 stream 级窗口，窗口不足的响应 body 暂存，等 WINDOW_UPDATE
@@ -621,7 +638,7 @@ _ = c.Respond(http.StatusOK, "text/html", page)
 #### 一致性与限制
 
 HTTP/2 的一致性测试（h2spec 145 项全部通过，另有与 `net/http`、curl 的互通测试和原始
-帧测试，CI 中运行）、当前的限制（body 整体缓存、handler 同步执行、固定的窗口参数等）、
+帧测试，CI 中运行）、当前的限制（body 整体缓存、固定的窗口参数等）、
 有意未实现的功能及原因、以及待优化项见
 [`docs/http2.zh-CN.md`](../docs/http2.zh-CN.md)。
 
@@ -707,6 +724,10 @@ server, err := fib.Bind(config, http3.NewHandler(tlsConfig, handler))
   HTTP/3 的 push 需要客户端先发 MAX_PUSH_ID，浏览器都不这样做。
 - `Response.Close` 在 HTTP/3 上优雅关闭：发送 GOAWAY，不再接受新请求，已在处理的请求
   的响应全部送达后再关闭连接。
+- handler 协程池：与 HTTP/2 一样，请求收齐后交给独立的协程池（默认与 HTTP/2 server
+  共用同一个），同一连接上的请求并发处理；用 `Config.StreamPool` 配置，
+  `StreamPool.MaxConcurrentHandlers` 限制单个连接的并发处理数，其中最后一个在读取该
+  连接的协程上执行，在它返回前这个连接不再读取数据报。
 - 请求 body 超过 `MaxBodyBytes` 返回 413，header 超过 `MaxHeaderBytes` 返回 431；
   非法请求（缺少伪头部、大写字段名、连接相关字段等）用 H3_MESSAGE_ERROR 重置该
   stream，协议错误（控制流不以 SETTINGS 开头、DATA 出现在 HEADERS 之前、引用动态表等）

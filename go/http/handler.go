@@ -237,6 +237,9 @@ type ServerHandler struct {
 	// timed records that at least one read timeout is set, so a server
 	// without any does no clock or timer work per read round.
 	timed bool
+	// streams runs the handlers of HTTP/2 requests away from the goroutine
+	// that reads their connection, or is nil when they run on it.
+	streams *StreamPool
 }
 
 func NewHandler(handler Handler) *ServerHandler {
@@ -249,11 +252,15 @@ func NewHandlerWithConfig(config Config, handler Handler) *ServerHandler {
 			_ = c.Respond(stdhttp.StatusNotFound, "text/plain; charset=utf-8", []byte("404 page not found\n"))
 		})
 	}
-	return &ServerHandler{
+	h := &ServerHandler{
 		handler: handler,
 		config:  config,
 		timed:   config.ReadHeaderTimeout > 0 || config.ReadTimeout > 0 || config.IdleTimeout > 0,
 	}
+	if !config.DisableHTTP2 {
+		h.streams = NewStreamPool(config.StreamPool)
+	}
+	return h
 }
 
 // headerTimeout bounds a header's arrival, and idleTimeout a kept-alive

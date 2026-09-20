@@ -52,7 +52,7 @@
 - 与 `http` package 相同，`http3` 只在 Linux、macOS、Windows 三个原生后端上编译，兼容
   后端（如 FreeBSD）上这个 package 为空。
 
-### 消息体整体缓存，handler 同步执行
+### 消息体整体缓存
 
 - 请求 body 在 handler 运行前完整读入内存，响应通过 `Response.Body []byte` 一次性给出；
   客户端同样把响应 body 完整缓存后再回调，因此不支持 SSE、流式上传下载等场景。
@@ -60,8 +60,11 @@
   写出的响应会先缓存，handler 返回后整体发送；只有 HTTP/1 是流式的。
 - 内存上限：服务端单连接最坏约为 `MaxConcurrentStreams × MaxBodyBytes`（默认
   100 × 16MB），客户端单个响应受 `MaxResponseBodyBytes` 限制。
-- 同一连接上的 handler 调用是串行的，同步阻塞的 handler 会推迟同一连接上其他请求的处理。
-  耗时操作应在 goroutine 中异步回复。
+- 请求完整后交给 `Config.StreamPool` 描述的 handler 协程池（与 HTTP/2 server 共用同一个
+  协程池），因此同一连接上客户端并发发起的多个请求是并发处理的，阻塞的 handler 只拖累它
+  自己。`StreamPool.MaxConcurrentHandlers` 限制单个连接同时处理的请求数 N，其中第 N 个在
+  读取该连接的协程上执行，在它返回前该连接不再读取新数据；N 为 1 时（与
+  `StreamPool.Disable` 相同）又回到引入协程池之前的串行处理。
 - 不要调用 `Context.Conn.Send` 直接写数据：`Conn` 是 UDP 连接，所有输出都必须经过
   `Context`。
 
@@ -122,7 +125,7 @@
 | 服务端发送 Retry / NEW_TOKEN | 地址验证只靠握手本身和 3 倍放大限制，省去令牌的签发与校验。客户端能处理服务端发来的 Retry，但会忽略 NEW_TOKEN。 |
 | QUIC v2（RFC 9369）等其他版本 | 部署上 version 1 已足够。客户端收到 Version Negotiation 时直接失败。 |
 | DATAGRAM（RFC 9221）、Extended CONNECT（RFC 9220）、WebTransport | 依赖流式 stream 或不可靠数据报的 API，当前 handler 模型不支持。对端发来的 DATAGRAM 帧会被当作未知帧，连接以 FRAME_ENCODING_ERROR 关闭。 |
-| RFC 9218 可扩展优先级 | 在“body 整体缓存、handler 同步执行”的模型下，调度收益有限。 |
+| RFC 9218 可扩展优先级 | 在“body 整体缓存”的模型下，调度收益有限。 |
 | ECN | 需要在 Engine 的 UDP 层读写 IP 头的 ECN 位，收益主要体现在拥塞控制上。 |
 
 ## 待优化项
