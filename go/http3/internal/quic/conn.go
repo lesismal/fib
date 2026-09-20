@@ -180,13 +180,27 @@ type Conn struct {
 	local              transportParams
 	peerParams         *transportParams
 
-	// 1-RTT key updates: keyPhase is the current phase, prevRx the keys of
-	// the one before for packets that arrive late, and phaseStart the first
-	// packet number of the current phase.
-	keyPhase   bool
+	// 1-RTT key updates (RFC 9001 section 6). txGen and rxGen count the
+	// updates each direction has made; the Key Phase bit is the low bit of
+	// the sender's. prevRx are the keys of the phase before, for packets
+	// that arrive late, and phaseStart the first packet number of the
+	// current receiving phase.
+	txGen      uint64
+	rxGen      uint64
 	prevRx     *keys
 	nextRx     *keys
 	phaseStart uint64
+	// txPhaseFirstPN is the first packet number sent in the current
+	// sending phase, txPhaseAcked whether one of them has been
+	// acknowledged, and txPhasePackets how many have been sent: an update
+	// may only follow an acknowledgement, and has to come before the
+	// AEAD's confidentiality limit.
+	txPhaseFirstPN uint64
+	txPhaseAcked   bool
+	txPhasePackets uint64
+	// decryptFailures counts packets that failed authentication, which the
+	// AEAD's integrity limit bounds.
+	decryptFailures uint64
 
 	rtt          rttStats
 	cc           newReno
@@ -244,6 +258,29 @@ type Conn struct {
 }
 
 func (c *Conn) now() time.Time { return time.Now() }
+
+// updateTxKeys moves the sending side to the next key phase.
+func (c *Conn) updateTxKeys(s *pnSpace) {
+	s.tx = s.tx.next()
+	c.txGen++
+	c.txPhaseFirstPN = s.nextPN
+	c.txPhaseAcked = false
+	c.txPhasePackets = 0
+}
+
+// maybeUpdateKeys starts a key update once this side has sent as many
+// packets as one key may protect (RFC 9001 section 6.6). An update needs a
+// confirmed handshake, and an acknowledgement of the phase in use, so that
+// two updates cannot overtake each other (RFC 9001 section 6.5).
+func (c *Conn) maybeUpdateKeys() {
+	s := &c.spaces[spaceApp]
+	if !c.handshakeConfirmed || s.tx == nil || c.txGen != c.rxGen || !c.txPhaseAcked {
+		return
+	}
+	if c.txPhasePackets >= confidentialityLimit(s.tx.suite) {
+		c.updateTxKeys(s)
+	}
+}
 
 func randomCID() []byte {
 	b := make([]byte, cidLen)
@@ -678,7 +715,7 @@ func (c *Conn) handlePacket(pkt []byte, h header, now time.Time) bool {
 	var phase bool
 	if space == spaceApp {
 		phase = pkt[0]&0x04 != 0
-		if phase != c.keyPhase {
+		if phase != (c.rxGen&1 == 1) {
 			if c.prevRx != nil && pn < c.phaseStart {
 				k = c.prevRx
 			} else {
@@ -699,6 +736,15 @@ func (c *Conn) handlePacket(pkt []byte, h header, now time.Time) bool {
 		payload, err = k.open(pkt, hdrEnd, pn)
 	}
 	if err != nil {
+		if space == spaceApp {
+			// Too many forgeries against one key would weaken it, so the
+			// connection ends well before the AEAD's integrity limit
+			// (RFC 9001 section 6.6).
+			if c.decryptFailures++; c.decryptFailures >= integrityLimit(s.rx.suite) {
+				c.closeLocked(transportErr(errAEADLimitReached, "too many packets failed authentication"))
+				return true
+			}
+		}
 		return false
 	}
 	if updating {
@@ -709,9 +755,12 @@ func (c *Conn) handlePacket(pkt []byte, h header, now time.Time) bool {
 		c.prevRx = s.rx
 		s.rx = c.nextRx
 		c.nextRx = nil
-		s.tx = s.tx.next()
-		c.keyPhase = phase
+		c.rxGen++
 		c.phaseStart = pn
+		if c.txGen < c.rxGen {
+			// The peer started this update, so this side follows it.
+			c.updateTxKeys(s)
+		}
 	}
 	reserved := byte(0x18)
 	if pkt[0]&0x80 != 0 {

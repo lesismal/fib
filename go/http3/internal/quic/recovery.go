@@ -140,6 +140,9 @@ func (c *Conn) onPacketSent(space int, p *sentPacket) {
 	if p.inFlight {
 		c.cc.bytesInFlight += uint64(p.size)
 	}
+	if space == spaceApp {
+		c.txPhasePackets++
+	}
 	if space == spaceHandshake && c.isClient && !c.spaces[spaceInitial].discarded {
 		// A client stops using Initial packets once it sends a Handshake
 		// one (RFC 9001 section 4.9.1).
@@ -201,6 +204,10 @@ func (c *Conn) onAckReceived(space int, ranges []pnRange, ackDelay time.Duration
 		for i := range p.frames {
 			c.frameAcked(space, &p.frames[i])
 		}
+	}
+	if space == spaceApp && largest >= c.txPhaseFirstPN {
+		// A key update may follow an acknowledged packet of this phase.
+		c.txPhaseAcked = true
 	}
 	if space == spaceApp && c.isClient && !c.handshakeConfirmed {
 		// An acknowledged 1-RTT packet confirms the handshake as well as

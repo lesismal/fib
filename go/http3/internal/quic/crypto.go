@@ -10,6 +10,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"hash"
+	"sync/atomic"
 )
 
 // Packet protection (RFC 9001 section 5): each packet number space has a key
@@ -144,6 +145,32 @@ func (k *keys) nonce(pn uint64) []byte {
 		n[11-i] ^= byte(pn >> (8 * i))
 	}
 	return n[:]
+}
+
+// The AEAD limits of RFC 9001 section 6.6: how many packets one key may
+// protect, and how many forgeries it may survive. Tests lower them through
+// testAEADLimits, which connections of other tests may be reading.
+var testAEADLimits struct{ confidentiality, integrity atomic.Uint64 }
+
+func confidentialityLimit(suite uint16) uint64 {
+	if n := testAEADLimits.confidentiality.Load(); n > 0 {
+		return n
+	}
+	if suite == tls.TLS_CHACHA20_POLY1305_SHA256 {
+		// Effectively no limit; a connection idles out long before.
+		return 1 << 62
+	}
+	return 1 << 23
+}
+
+func integrityLimit(suite uint16) uint64 {
+	if n := testAEADLimits.integrity.Load(); n > 0 {
+		return n
+	}
+	if suite == tls.TLS_CHACHA20_POLY1305_SHA256 {
+		return 1 << 36
+	}
+	return 1 << 52
 }
 
 // initialKeys derives the Initial keys both sides compute from the

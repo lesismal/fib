@@ -40,7 +40,7 @@ func (c *Conn) sealPlan(out []byte, p *packetPlan) []byte {
 	s := &c.spaces[p.space]
 	if p.space == spaceApp {
 		first := byte(0x40) | byte(p.pnLen-1)
-		if c.keyPhase {
+		if c.txGen&1 == 1 {
 			first |= 0x04
 		}
 		out = append(out, first)
@@ -79,6 +79,7 @@ func (c *Conn) sealPlan(out []byte, p *packetPlan) []byte {
 // flushLocked sends whatever there is to send and the limits allow, then
 // sets the timer for what comes next.
 func (c *Conn) flushLocked(now time.Time) {
+	c.maybeUpdateKeys()
 	for !c.closed {
 		d := c.buildDatagram(now)
 		if d == nil {

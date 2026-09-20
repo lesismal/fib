@@ -441,3 +441,64 @@ func TestPathChallengeFlood(t *testing.T) {
 		t.Fatalf("%d responses queued", queued)
 	}
 }
+
+// TestKeyUpdate lowers the AEAD confidentiality limit so that a short
+// exchange passes it: the side that reaches it updates its keys, the peer
+// follows, and the data keeps flowing.
+func TestKeyUpdate(t *testing.T) {
+	testAEADLimits.confidentiality.Store(4)
+	t.Cleanup(func() { testAEADLimits.confidentiality.Store(0) })
+	p := newTestPair(t, 0, nil)
+	p.serverH.onData = func(s *Stream, data []byte, fin bool) { _ = s.Write(data, fin) }
+	for i := 0; i < 20; i++ {
+		s, err := p.client.OpenStream()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := s.Write([]byte("round"), true); err != nil {
+			t.Fatal(err)
+		}
+		waitFinished(t, p.clientH, s.ID())
+		if got := p.clientH.received(s.ID()); string(got) != "round" {
+			t.Fatalf("echo %q", got)
+		}
+	}
+	// Both directions have updated their keys several times. One side may
+	// be a phase ahead, having just started an update the other has not
+	// answered yet, but no further than that.
+	for _, c := range []*Conn{p.client, p.server} {
+		c.mu.Lock()
+		txGen, rxGen := c.txGen, c.rxGen
+		c.mu.Unlock()
+		if txGen == 0 || rxGen == 0 || txGen > rxGen+1 || rxGen > txGen+1 {
+			t.Fatalf("client=%v: tx generation %d, rx generation %d", c.isClient, txGen, rxGen)
+		}
+	}
+}
+
+// TestIntegrityLimit ends a connection whose keys have been attacked with
+// more forgeries than the AEAD allows (RFC 9001 section 6.6).
+func TestIntegrityLimit(t *testing.T) {
+	testAEADLimits.integrity.Store(3)
+	t.Cleanup(func() { testAEADLimits.integrity.Store(0) })
+	p := newTestPair(t, 0, nil)
+	// Short header packets for the client's connection ID that no key opens.
+	forged := make([]byte, 64)
+	p.client.mu.Lock()
+	copy(forged[1:], p.client.scid)
+	p.client.mu.Unlock()
+	forged[0] = 0x40
+	for i := 0; i < 5; i++ {
+		forged[len(forged)-1] = byte(i)
+		_ = p.serverEnd.Send(forged)
+	}
+	select {
+	case err := <-p.clientH.closed:
+		var te *TransportError
+		if !errors.As(err, &te) || te.Code != errAEADLimitReached {
+			t.Fatalf("closed with %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("connection survived the forgeries")
+	}
+}
