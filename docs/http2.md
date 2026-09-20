@@ -17,7 +17,11 @@ internal hpack package. It is written from scratch and does not depend on
 | --- | --- |
 | Server | TLS + ALPN (h2), cleartext with prior knowledge (h2c), HTTP/1.1 `Upgrade: h2c`; multiplexing, flow control in both directions, HPACK (Huffman and dynamic table), CONTINUATION, trailers, server push, 1xx interim responses, automatic 100 Continue, graceful GOAWAY on `Response.Close`, `Request.TLS` |
 | Client | h2 over https through ALPN, cleartext prior knowledge with `UnencryptedHTTP2`; multiplexing on one connection, honouring the server's `MAX_CONCURRENT_STREAMS`, cancellation that resets only its own stream, automatic retry after GOAWAY / REFUSED_STREAM |
+| Conformance | h2spec: 145 of 145 cases, over h2c and TLS |
 | Interop | Go `net/http` client and server (TLS and h2c); curl (nghttp2) over h2, h2c and Upgrade |
+
+The suite that checks all of this runs in CI; see
+[Conformance testing](#conformance-testing) below.
 
 ## Current limitations
 
@@ -80,8 +84,6 @@ These are constants today and cannot be configured:
   weighting.
 - **The peer's `SETTINGS_MAX_HEADER_LIST_SIZE`**: this side advertises its own
   limit but does not check the peer's when sending.
-- **Request trailers**: the client cannot send request trailers (both sides
-  can receive trailers, and the server sends response trailers).
 - **TCP RST on graceful close**: after GOAWAY the connection closes once every
   stream has finished, but it does not half-close and drain what the peer is
   still sending first; if unread data is left in the socket, the kernel sends a
@@ -112,6 +114,8 @@ These are constants today and cannot be configured:
   sent along with the header (which the protocol allows).
 - Cleartext HTTP/2 is prior knowledge only; the client does not upgrade from
   HTTP/1.1 with `Upgrade: h2c`.
+- A request with `Expect: 100-continue` does not wait for the 100 (see above),
+  so a server that would refuse the body still receives it.
 
 ## Intentionally not implemented
 
@@ -124,6 +128,26 @@ These are constants today and cannot be configured:
 | `Upgrade: h2c` over TLS | The RFCs allow switching protocols over TLS only through ALPN. |
 | 1xx interim responses to HTTP/1.0 requests | HTTP/1.0 clients do not understand 1xx; `WriteInterim` returns `http.ErrNotSupported`. |
 | Pushing from a pushed request | The protocol only allows PUSH_PROMISE on client-initiated streams. |
+
+## Conformance testing
+
+`go/http/http2_conformance_test.go` holds the suite, every test named
+`TestHTTP2Conformance…`, and CI runs it on Linux, macOS and Windows in the
+`HTTP/2 conformance` job. The peers are the standard library and tools the
+runners already have or install as tools, so the module itself gains no
+dependency:
+
+| Peer | What it checks |
+| --- | --- |
+| [h2spec](https://github.com/summerwind/h2spec) v2.2.1, installed with `go install` as staticcheck is | The server against RFC 9113 and RFC 7541 case by case: framing, stream states, flow control, HPACK and error codes. 145 of 145 cases pass over h2c and over TLS |
+| `net/http`'s HTTP/2 client and server | Methods, bodies past the flow-control windows, HEAD, bodiless statuses, trailers both ways, 1xx, 100-continue, multiplexing 50 requests on one connection |
+| curl (nghttp2) | The three ways a client starts HTTP/2: prior knowledge, `Upgrade: h2c`, and ALPN over TLS |
+| A raw frame server in the test | What the client does that no ordinary server would show: its preface and settings, REFUSED_STREAM and GOAWAY retries, RST_STREAM, flow control against a small window (the raw server rejects a single byte past what it granted), the server's concurrency limit, CONTINUATION, PING, trailers, and a server that pushes although push is disabled |
+| A raw frame client in the test | Stream states, server push, h2c upgrade, graceful GOAWAY, and the HTTP/2-only mode |
+
+h2spec is run against a server with `Config.HTTP2Only` set, since it speaks
+nothing but HTTP/2: a sniffing server would answer its deliberately invalid
+preface with an HTTP/1 response, which h2spec cannot read.
 
 ## Planned improvements
 
@@ -147,12 +171,11 @@ still lacks:
 - **Slow connections**: with no header-read timeout or idle timeout (see
   above), many half-open connections can tie up resources.
 
-### 2. Conformance testing (high)
+### 2. Conformance testing
 
-- Add [h2spec](https://github.com/summerwind/h2spec) to CI, as Autobahn is for
-  WebSocket, to verify RFC 9113 / RFC 7541 conformance continuously.
-- Today's verification relies on interop tests against Go `net/http` and curl
-  plus hand-written raw-frame tests, which cannot cover every error path.
+Done: see [Conformance testing](#conformance-testing). What is still missing
+is a fuzzer over the frame and HPACK decoders, and a load-oriented check (for
+example h2load) to catch what only shows up under concurrency.
 
 ### 3. Streaming bodies and the handler model (medium)
 

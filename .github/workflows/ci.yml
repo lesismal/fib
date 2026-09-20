@@ -139,6 +139,58 @@ jobs:
           fi
           exit "$status"
 
+  # HTTP/2 conformance: the fib server against net/http's client, h2spec and
+  # curl, and the fib client against net/http's server and a raw frame server.
+  # h2spec is installed as a tool, like staticcheck, so the module itself
+  # gains no dependency.
+  http2-conformance:
+    name: HTTP/2 conformance (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    defaults:
+      run:
+        working-directory: go
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v6
+        with:
+          go-version: stable
+          cache-dependency-path: go/go.mod
+      - name: Install h2spec
+        run: go install github.com/summerwind/h2spec/cmd/h2spec@v2.2.1
+      - name: Versions
+        shell: bash
+        run: |
+          curl --version
+          "$(go env GOPATH)/bin/h2spec" --version || true
+      - name: Conformance tests
+        shell: bash
+        env:
+          # Fail rather than skip if either peer is missing.
+          FIB_REQUIRE_CURL: '1'
+          FIB_REQUIRE_H2SPEC: '1'
+        run: |
+          PATH="$(go env GOPATH)/bin:$PATH"
+          go test -race -count=1 -timeout 10m -v \
+            -run 'TestHTTP2Conformance|TestH2|TestClientHTTP2|TestClientDisableHTTP2|TestClientUnencryptedHTTP2|TestPushOnHTTP1|TestInterim|TestRequestTLS|TestConfigureTLS' \
+            ./http/ 2>&1 | tee "$RUNNER_TEMP/h2conformance.log"
+          status=${PIPESTATUS[0]}
+          if [ "$status" -ne 0 ]; then
+            summary=$(grep -E -B2 -A20 -- '--- FAIL|^panic:|^FAIL' "$RUNNER_TEMP/h2conformance.log" | head -c 60000)
+            summary=${summary//'%'/'%25'}
+            summary=${summary//$'\r'/'%0D'}
+            summary=${summary//$'\n'/'%0A'}
+            echo "::error title=HTTP/2 conformance failed::$summary"
+          fi
+          exit "$status"
+      - name: HPACK tests
+        # HTTP/2 header compression, checked against RFC 7541's own vectors.
+        run: go test -race -count=1 ./internal/hpack/
+
   cross-build:
     name: Cross build
     runs-on: ubuntu-latest

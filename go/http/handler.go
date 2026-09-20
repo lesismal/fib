@@ -338,22 +338,36 @@ func checkRequest(request *stdhttp.Request) int {
 // sniff tells HTTP/2 from HTTP/1 by whether the connection opens with the
 // HTTP/2 preface. It returns the bytes to parse as HTTP/1, or nil when they
 // are HTTP/2 or too few to tell yet.
+//
+// A connection whose ALPN chose "h2", and any connection at all when
+// Config.HTTP2Only is set, is HTTP/2 whatever it sends: what does not start
+// with the preface is a connection error rather than an HTTP/1 request.
 func (h *ServerHandler) sniff(c *fib.Connection, parser *Parser, data []byte) []byte {
 	parser.buffer = append(parser.buffer, data...)
+	state := h.tlsState(c, parser)
+	if h.config.HTTP2Only || state != nil && state.NegotiatedProtocol == "h2" {
+		h.startH2(c, parser, state)
+		return nil
+	}
 	n := min(len(parser.buffer), len(h2Preface))
 	if string(parser.buffer[:n]) == h2Preface[:n] {
 		if n < len(h2Preface) {
 			return nil
 		}
-		sc := newH2ServerConn(h, c, parser.remoteAddr)
-		sc.tlsState = h.tlsState(c, parser)
-		c.SetAttachment(sc)
-		sc.start()
-		sc.feed(parser.TakeBuffered())
+		h.startH2(c, parser, state)
 		return nil
 	}
 	parser.sniffed = true
 	return parser.TakeBuffered()
+}
+
+// startH2 hands the connection, and whatever it has sent so far, to HTTP/2.
+func (h *ServerHandler) startH2(c *fib.Connection, parser *Parser, state *stdtls.ConnectionState) {
+	sc := newH2ServerConn(h, c, parser.remoteAddr)
+	sc.tlsState = state
+	c.SetAttachment(sc)
+	sc.start()
+	sc.feed(parser.TakeBuffered())
 }
 
 // tlsState is the connection's TLS state, looked up once the handshake has

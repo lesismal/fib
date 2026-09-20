@@ -9,6 +9,7 @@ import (
 	"io"
 	stdhttp "net/http"
 	"net/textproto"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -68,6 +69,9 @@ type h2ClientStream struct {
 	sendWindow int64
 	pending    []byte
 	localDone  bool
+	// trailer holds the request's trailer fields, as name and value pairs,
+	// which go out in a HEADERS frame once the body has.
+	trailer []string
 }
 
 // startH2 turns the connection over to HTTP/2 before it carries anything,
@@ -121,7 +125,7 @@ func (hc *h2ClientConn) send(r *clientRequest) {
 		hc.client.enqueue(hc.cc.host.target, r, true)
 		return
 	}
-	fields, err := h2RequestFields(r, hc.cc.host.target.secure)
+	fields, trailer, err := h2RequestFields(r, hc.cc.host.target.secure)
 	if err != nil {
 		hc.mu.Unlock()
 		r.detach()
@@ -139,21 +143,27 @@ func (hc *h2ClientConn) send(r *clientRequest) {
 		name := fields[i]
 		block = hc.enc.AppendField(block, name, fields[i+1], name == "authorization" || name == "cookie")
 	}
-	out := h2AppendHeaderBlock(nil, id, block, len(r.body) == 0, hc.peerMaxFrame)
-	if len(r.body) == 0 {
-		st.localDone = true
-	} else {
+	st.trailer = trailer
+	// The stream ends with the body, or with the trailers when there are any.
+	out := h2AppendHeaderBlock(nil, id, block, len(r.body) == 0 && len(trailer) == 0, hc.peerMaxFrame)
+	switch {
+	case len(r.body) > 0:
 		st.pending = r.body
 		out = hc.flushStreamLocked(out, st)
+	case len(trailer) > 0:
+		out = hc.appendTrailerLocked(out, st)
+	default:
+		st.localDone = true
 	}
 	hc.sendLocked(out)
 	hc.mu.Unlock()
 }
 
-// h2RequestFields lists a request's header fields, pseudo-headers first, as
-// name and value pairs. Everything is checked before anything is encoded,
-// since encoding changes the table the server tracks.
-func h2RequestFields(r *clientRequest, secure bool) ([]string, error) {
+// h2RequestFields lists a request's header fields, pseudo-headers first, and
+// its trailer fields, both as name and value pairs. Everything is checked
+// before anything is encoded, since encoding changes the table the server
+// tracks.
+func h2RequestFields(r *clientRequest, secure bool) (fields, trailer []string, err error) {
 	req := r.req
 	host := req.Host
 	if host == "" {
@@ -163,7 +173,7 @@ func h2RequestFields(r *clientRequest, secure bool) ([]string, error) {
 	if method == "" {
 		method = stdhttp.MethodGet
 	}
-	fields := []string{":method", method}
+	fields = []string{":method", method}
 	if method != stdhttp.MethodConnect {
 		scheme := "http"
 		if secure {
@@ -176,16 +186,17 @@ func h2RequestFields(r *clientRequest, secure bool) ([]string, error) {
 	userAgent := false
 	for key, values := range req.Header {
 		name := strings.ToLower(key)
-		if h2ConnectionHeaders[name] || name == "host" || name == "content-length" || name == "te" {
+		if h2ConnectionHeaders[name] || name == "host" || name == "content-length" || name == "te" ||
+			name == "trailer" {
 			continue
 		}
 		if !h2ValidHeaderName(name) {
-			return nil, errors.New("http: invalid request header name " + strconv.Quote(key))
+			return nil, nil, errors.New("http: invalid request header name " + strconv.Quote(key))
 		}
 		userAgent = userAgent || name == "user-agent"
 		for _, value := range values {
 			if !validHeaderValue(value) {
-				return nil, errors.New("http: invalid request header value for " + key)
+				return nil, nil, errors.New("http: invalid request header value for " + key)
 			}
 			fields = append(fields, name, value)
 		}
@@ -199,7 +210,27 @@ func h2RequestFields(r *clientRequest, secure bool) ([]string, error) {
 	case method == stdhttp.MethodPost || method == stdhttp.MethodPut || method == stdhttp.MethodPatch:
 		fields = append(fields, "content-length", "0")
 	}
-	return fields, nil
+	var declared []string
+	for key, values := range req.Trailer {
+		name := strings.ToLower(key)
+		if !h2ValidHeaderName(name) || strings.HasPrefix(name, ":") || h2ConnectionHeaders[name] {
+			return nil, nil, errors.New("http: invalid request trailer name " + strconv.Quote(key))
+		}
+		declared = append(declared, name)
+		for _, value := range values {
+			if !validHeaderValue(value) {
+				return nil, nil, errors.New("http: invalid request trailer value for " + key)
+			}
+			trailer = append(trailer, name, value)
+		}
+	}
+	if len(declared) > 0 {
+		// Servers keep only the trailers a request announced, so the names
+		// go out ahead of the body in a Trailer field of this side's making.
+		slices.Sort(declared)
+		fields = append(fields, "trailer", strings.Join(declared, ","))
+	}
+	return fields, trailer, nil
 }
 
 // cancel abandons r's stream, which the request's timeout or context has
@@ -764,15 +795,32 @@ func (hc *h2ClientConn) flushStreamLocked(out []byte, st *h2ClientStream) []byte
 		chunk := st.pending[:n]
 		st.pending = st.pending[n:]
 		var flags uint8
-		if len(st.pending) == 0 {
-			flags = h2FlagEndStream
+		last := len(st.pending) == 0
+		if last {
 			st.pending = nil
-			st.localDone = true
+			if len(st.trailer) == 0 {
+				flags = h2FlagEndStream
+				st.localDone = true
+			}
 		}
 		out = h2AppendFrameHeader(out, h2FrameData, flags, st.id, len(chunk))
 		out = append(out, chunk...)
 		hc.sendWindow -= n
 		st.sendWindow -= n
+		if last && len(st.trailer) > 0 {
+			return hc.appendTrailerLocked(out, st)
+		}
 	}
 	return out
+}
+
+// appendTrailerLocked ends the request with its trailers.
+func (hc *h2ClientConn) appendTrailerLocked(out []byte, st *h2ClientStream) []byte {
+	block := hc.enc.Begin(nil)
+	for i := 0; i < len(st.trailer); i += 2 {
+		block = hc.enc.AppendField(block, st.trailer[i], st.trailer[i+1], false)
+	}
+	st.trailer = nil
+	st.localDone = true
+	return h2AppendHeaderBlock(out, st.id, block, true, hc.peerMaxFrame)
 }

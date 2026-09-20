@@ -295,6 +295,10 @@ func (sc *h2ServerConn) handleFrame(f *h2Frame) error {
 		if len(f.payload) != 5 {
 			return &H2StreamError{StreamID: f.streamID, Code: H2FrameSizeError}
 		}
+		if binary.BigEndian.Uint32(f.payload)&0x7fffffff == f.streamID {
+			return &H2StreamError{StreamID: f.streamID, Code: H2ProtocolError}
+		}
+		// Priority itself is ignored (RFC 9113 deprecates it).
 		return nil
 	case h2FrameRSTStream:
 		return sc.handleRSTStream(f)
@@ -471,12 +475,6 @@ func (sc *h2ServerConn) handleData(f *h2Frame) error {
 	}
 	sc.recvWindow -= length
 	sc.recvUnacked += length
-	if f.streamID%2 == 0 {
-		return h2ConnErr(H2ProtocolError, "DATA on server stream %d", f.streamID)
-	}
-	if f.streamID > sc.maxClientID {
-		return h2ConnErr(H2ProtocolError, "DATA on idle stream %d", f.streamID)
-	}
 	var out []byte
 	if sc.recvUnacked >= h2ConnWindow/2 {
 		out = h2AppendWindowUpdate(out, 0, uint32(sc.recvUnacked))
@@ -484,16 +482,19 @@ func (sc *h2ServerConn) handleData(f *h2Frame) error {
 		sc.recvUnacked = 0
 	}
 	sc.mu.Lock()
+	idle := sc.idleLocked(f.streamID)
 	st := sc.streams[f.streamID]
 	remoteDone := st != nil && st.remoteDone
 	sc.sendLocked(out)
 	sc.mu.Unlock()
-	if st == nil {
-		// A stream this side has already reset or finished: what was in
-		// flight is dropped, and only counts against the connection window.
-		return nil
+	if idle {
+		// Nothing has opened this stream: DATA on it is a connection error
+		// (RFC 9113 section 5.1).
+		return h2ConnErr(H2ProtocolError, "DATA on idle stream %d", f.streamID)
 	}
-	if remoteDone {
+	// A stream that is closed, or half-closed by the client, takes no more
+	// data; what was in flight still counts against the connection window.
+	if st == nil || remoteDone {
 		return &H2StreamError{StreamID: f.streamID, Code: H2StreamClosed}
 	}
 	if length > st.recvWindow {
@@ -595,8 +596,10 @@ func (sc *h2ServerConn) handleHeaderBlock(id uint32, block []byte, endStream boo
 		return sc.handleTrailers(st, fields, endStream, tooLarge)
 	}
 	if id <= sc.maxClientID {
-		// Trailers of a stream already reset or answered: nothing to do.
-		return nil
+		// A stream this side has finished with, or one the client skipped,
+		// which RFC 9113 section 5.1.1 also counts as closed. Either way the
+		// client may not open it now.
+		return h2ConnErr(H2ProtocolError, "HEADERS on closed stream %d", id)
 	}
 	sc.maxClientID = id
 

@@ -41,6 +41,12 @@ type Config struct {
 	// the HTTP/2 preface, over TLS after ALPN chose "h2" or in cleartext with
 	// prior knowledge, is served as HTTP/2.
 	DisableHTTP2 bool
+	// HTTP2Only serves HTTP/2 only: every connection is HTTP/2 whatever it
+	// sends, and one that does not start with the HTTP/2 preface is ended
+	// with GOAWAY rather than answered in HTTP/1. A connection whose ALPN
+	// chose "h2" is treated this way in any case. It has no effect when
+	// DisableHTTP2 is set.
+	HTTP2Only bool
 	// MaxConcurrentStreams is how many requests an HTTP/2 client may have
 	// open on one connection. Zero means DefaultMaxConcurrentStreams.
 	MaxConcurrentStreams uint32

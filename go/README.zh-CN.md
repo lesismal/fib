@@ -385,7 +385,9 @@ server, err := fib.Bind(config, fibtls.NewServer(tlsConfig, fibhttp.NewHandler(h
   RST_STREAM 拒绝，协议错误用 GOAWAY 关闭连接）。
 - `Config.MaxConcurrentStreams` 限制单连接并发 stream 数（默认 250，超出的 stream 被
   REFUSED_STREAM 拒绝）；`MaxHeaderBytes`、`MaxBodyBytes` 同样作用于 HTTP/2，超限时
-  返回 431/413。`Config.DisableHTTP2` 关闭 HTTP/2，只服务 HTTP/1。
+  返回 431/413。`Config.DisableHTTP2` 关闭 HTTP/2，只服务 HTTP/1；`Config.HTTP2Only`
+  相反，只服务 HTTP/2：连接不以 HTTP/2 preface 开头时用 GOAWAY 结束，而不是按 HTTP/1
+  回复。ALPN 协商出 `h2` 的 TLS 连接一定按 HTTP/2 处理，不再嗅探。
 - 通过 TLS 到达的请求（HTTP/1 和 HTTP/2）都会设置 `Request.TLS`，可以读取 ALPN 结果、
   对端证书等。
 
@@ -428,10 +430,11 @@ _ = c.Respond(http.StatusOK, "text/html", page)
 - 带 `Expect: 100-continue` 的请求会自动收到 100 Continue（HTTP/1.1 与 HTTP/2），
   因为 body 总是在 handler 运行前完整读取，客户端不必等待超时才发送 body。
 
-#### 限制与待优化
+#### 一致性与限制
 
-HTTP/2 当前的限制（body 整体缓存、handler 同步执行、固定的窗口参数等）、有意未实现的
-功能及原因、以及待优化项（安全加固、h2spec 一致性测试、流式 body、性能等）见
+HTTP/2 的一致性测试（h2spec 145 项全部通过，另有与 `net/http`、curl 的互通测试和原始
+帧测试，CI 中运行）、当前的限制（body 整体缓存、handler 同步执行、固定的窗口参数等）、
+有意未实现的功能及原因、以及待优化项见
 [`docs/http2.zh-CN.md`](../docs/http2.zh-CN.md)。
 
 ### 异步 HTTP client
@@ -461,7 +464,9 @@ resp, err := client.Go(req).Wait() // Future：Wait 阻塞，Done() 可用于 se
   `ClientConfig.DisableHTTP2` 强制 HTTP/1.1；`ClientConfig.UnencryptedHTTP2` 让 http://
   以 prior knowledge 方式直接使用明文 HTTP/2（h2c）。HTTP/2 上超时或取消只会用
   RST_STREAM 结束对应 stream，不影响同连接上的其他请求；收到 GOAWAY 或
-  REFUSED_STREAM 时，服务端未处理的请求会自动在新连接上重发。
+  REFUSED_STREAM 时，服务端未处理的请求会自动在新连接上重发。设置了 `Request.Trailer`
+  的请求，trailer 会在 body 之后用单独的 HEADERS 帧发送（HTTP/1 上则是 chunked 的
+  trailer）。
 - 每个 host:port 维护连接池：keep-alive 复用，`MaxConnsPerHost` 限制同时打开或正在
   建立的连接数，超出的请求排队；`MaxIdleConnsPerHost`、`IdleConnTimeout` 控制空闲
   连接的保留。HTTP/1.1 连接同时只跑一个请求，不做 pipelining。

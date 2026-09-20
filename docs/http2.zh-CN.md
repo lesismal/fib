@@ -15,7 +15,10 @@
 | --- | --- |
 | 服务端 | TLS + ALPN（h2）、明文 prior knowledge（h2c）、HTTP/1.1 `Upgrade: h2c`；多路复用、双向流控、HPACK（含 Huffman、动态表）、CONTINUATION、trailer、server push、1xx 中间响应、自动 100 Continue、`Response.Close` 优雅 GOAWAY、`Request.TLS` |
 | 客户端 | https 经 ALPN 协商 h2、`UnencryptedHTTP2` 明文 prior knowledge；单连接多路复用、遵守服务端 `MAX_CONCURRENT_STREAMS`、取消只重置单个 stream、GOAWAY / REFUSED_STREAM 自动重发 |
+| 一致性 | h2spec：145 项全部通过，h2c 与 TLS 两种方式 |
 | 互通验证 | Go `net/http` 客户端与服务端（TLS 与 h2c）、curl（nghttp2）的 h2 / h2c / Upgrade |
+
+以上内容都有测试覆盖并在 CI 中运行，见下面的[一致性测试](#一致性测试)。
 
 ## 当前限制
 
@@ -67,8 +70,6 @@
   同时有待发送数据时，发送顺序由内部 map 的遍历顺序决定，没有公平性或权重保证。
 - **对端的 `SETTINGS_MAX_HEADER_LIST_SIZE`**：本端会声明自己的上限，但发送时不检查
   对端声明的上限。
-- **请求 trailer**：客户端无法发送请求 trailer（两端都能接收 trailer，服务端可以发送
-  响应 trailer）。
 - **优雅关闭时的 TCP RST**：GOAWAY 后连接在所有 stream 完成时关闭，但不会先半关闭、
   排空对端仍在发送的数据；如果此时 socket 中还有未读数据，内核会发送 RST。
 - **引擎停止**：`Engine.Stop`/`Close` 不会给 HTTP/2 连接发送 GOAWAY，连接被直接关闭，
@@ -87,6 +88,8 @@
   幂等的请求，以及被 GOAWAY / REFUSED_STREAM 明确标为未处理的请求会重发。
 - 带 `Expect: 100-continue` 的请求不会等待 100，body 和请求头一起发送（协议允许）。
 - 明文 HTTP/2 只支持 prior knowledge，不支持从 HTTP/1.1 `Upgrade: h2c` 升级。
+- 带 `Expect: 100-continue` 的请求不等 100 就发送 body（见上），所以服务端即使想拒绝
+  body 也仍然会收到。
 
 ## 有意没有实现的功能
 
@@ -99,6 +102,23 @@
 | TLS 连接上的 `Upgrade: h2c` | RFC 规定 TLS 上只能通过 ALPN 切换协议。 |
 | HTTP/1.0 请求的 1xx 中间响应 | HTTP/1.0 客户端不认识 1xx，`WriteInterim` 返回 `http.ErrNotSupported`。 |
 | 在被推送的请求上再次 push | 协议规定 PUSH_PROMISE 只能在客户端发起的 stream 上发送。 |
+
+## 一致性测试
+
+测试集在 `go/http/http2_conformance_test.go`，测试名统一以 `TestHTTP2Conformance`
+开头，CI 的 `HTTP/2 conformance` job 在 Linux、macOS、Windows 上运行。对端全部使用
+标准库或 CI 上安装的工具，fib 本身不因此增加任何第三方依赖：
+
+| 对端 | 验证内容 |
+| --- | --- |
+| [h2spec](https://github.com/summerwind/h2spec) v2.2.1（和 staticcheck 一样用 `go install` 安装） | 逐条验证服务端是否符合 RFC 9113、RFC 7541：帧格式、stream 状态、流控、HPACK、错误码。h2c 与 TLS 两种方式下 145 项全部通过 |
+| `net/http` 的 HTTP/2 客户端与服务端 | 各种方法、超过流控窗口的 body、HEAD、无 body 的状态码、双向 trailer、1xx、100-continue、单连接并发 50 个请求 |
+| curl（nghttp2） | 客户端进入 HTTP/2 的三种方式：prior knowledge、`Upgrade: h2c`、TLS ALPN |
+| 测试内置的原始帧服务端 | 普通服务端不会暴露的客户端行为：preface 与 settings 内容、REFUSED_STREAM 与 GOAWAY 重发、RST_STREAM、小窗口下的流控（服务端对超出授权哪怕 1 字节都会报错）、服务端并发上限、CONTINUATION、PING、trailer，以及服务端在 push 被禁用时仍然 push |
+| 测试内置的原始帧客户端 | stream 状态、server push、h2c 升级、优雅 GOAWAY、HTTP/2-only 模式 |
+
+h2spec 只会说 HTTP/2，所以跑它时服务端要设置 `Config.HTTP2Only`：否则协议嗅探的
+服务端会把它故意发送的非法 preface 当作 HTTP/1 请求回复，h2spec 读不懂这个回复。
 
 ## 待优化项
 
@@ -117,12 +137,10 @@
   CONTINUATION 帧的数量，以及零长度帧的数量。
 - **慢速连接**：没有 header 读取超时、空闲超时（见上文），可被大量半开连接占用资源。
 
-### 2. 协议一致性测试（高）
+### 2. 协议一致性测试
 
-- 在 CI 中加入 [h2spec](https://github.com/summerwind/h2spec)，像 WebSocket 的
-  Autobahn 测试一样持续验证 RFC 9113 / RFC 7541 的一致性。
-- 目前的验证依赖 Go `net/http`、curl 互通测试以及自写的原始帧测试，覆盖不到所有
-  错误路径。
+已完成，见[一致性测试](#一致性测试)。还缺的是对帧解析和 HPACK 解码的 fuzz 测试，
+以及压测（例如 h2load）才能暴露的并发问题。
 
 ### 3. 流式 body 与 handler 模型（中）
 
@@ -150,4 +168,4 @@
 - 服务端：可配置的空闲超时和 PING 保活；`Engine` 停止时对 HTTP/2 连接发送 GOAWAY
   并等待在途 stream 完成（优雅停机）；GOAWAY 后半关闭并排空输入，避免 RST。
 - 客户端：可选的 PING 健康检查、按负载选择连接、SETTINGS 确认超时检测。
-- 支持发送请求 trailer。
+- 客户端可选地等待 100-continue 再发送 body。
