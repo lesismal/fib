@@ -41,6 +41,73 @@ server picks the framing:
 at once; without it the engine batches a read round's output until the
 handler returns (see `Connection.Flush`).
 
+### Holding a response open, and body callbacks
+
+A response is held open by a reference count. Serving a request takes one
+hold, which the handler's return gives back, so a handler that answers and
+returns needs none of this: the response is ended and handed to the connection
+for it. A handler that answers later takes another hold with
+`Context.Retain()` and gives it back with `Context.Release()`; the response is
+written when the last hold goes, wherever that happens.
+
+On an HTTP/1 connection a retained request holds the ones pipelined behind it,
+which are parsed and served once it is released, so responses keep their
+order. On HTTP/2 and HTTP/3 a stream holds up nothing else.
+
+`Context.OnBody` takes the request body as a callback instead of through
+`Request.Body`, the way a websocket handler's `OnFrame` is given a message
+frame by frame:
+
+```go
+func(c *fibhttp.Context, r *http.Request) {
+	f, _ := os.Create("upload.bin")
+	c.Retain()
+	c.OnBody(func(data []byte, fin bool, err error) {
+		if err != nil {         // the connection went, or the body failed
+			f.Close()
+			os.Remove("upload.bin")
+			c.Release()
+			return
+		}
+		f.Write(data)
+		if fin {
+			f.Close()
+			c.Respond(200, "text/plain", []byte("stored"))
+			c.Release()
+		}
+	})
+}
+```
+
+- `fin` marks the last call, and `err` a body that will not be finished, which
+  is also a last call and comes exactly once. `data` is only valid for the
+  duration of the call.
+- The callbacks run on the connection's worker, one at a time and in order, so
+  a body of any size is taken without a goroutine of the handler's own and
+  without being buffered. What paces the peer is the callback itself.
+- A body arrives in pieces only when it streams, which
+  `StreamRequestBodyThreshold` decides; one that was read whole before the
+  handler ran arrives in a single call with `fin` set.
+- `Request.Body` is not readable once `OnBody` has taken it over, and a
+  handler that uses `OnBody` without retaining answers when it returns and has
+  the rest of the body discarded — which is how to refuse an upload without
+  reading it.
+
+### When a request ends before its response does
+
+A connection that closes, a read timeout, or a body that cannot be finished
+ends a request the handler may still be working on. The request is cancelled:
+nothing more is written, every hold left on it is void, and the handler is
+told once, through `OnBody`'s `err` and through `Context.OnCancel`. Both run
+on a goroutine rather than on the event loop, so a handler's cleanup cannot
+hold the server up. `Context.Err()` reports the same reason to a handler that
+would rather ask than be told.
+
+From there everything is idempotent: `Retain`, `Release` and `Finish` on a
+request that has ended do nothing, so cleanup code may call them without
+checking, and writing to it fails with the reason rather than corrupting the
+connection.
+
 ### Read timeouts
 
 `Config.ReadHeaderTimeout`, `Config.ReadTimeout` and `Config.IdleTimeout` are
@@ -183,6 +250,15 @@ are not fib:
 - **fib client** against Go's `net/http` server (`httptest`) and raw servers
   (HTTP/1.0 keep-alive and close-delimited responses, malformed responses).
 - **fib client against fib server**, including HTTP/1.0 and sendfile.
+- **retained responses and body callbacks** (`go/http/retain_test.go`):
+  answering from another goroutine, a retained request holding the pipelined
+  ones behind it, nested holds, `OnBody` on a buffered and on a streamed body,
+  a release from inside a body callback, chunked with trailers, answering
+  without retaining, a client that walks away mid-upload reaching `OnBody` and
+  `OnCancel` exactly once, a read timeout reaching `OnCancel`, an oversized
+  body, holds taken after the response was written, the same handler over
+  HTTP/2, and a stress test running all of it at once and checking that
+  nothing is left behind.
 - **read timeouts** (`go/http/timeout_test.go`): a header and a body that stop
   arriving, a streamed body that stops arriving, a handler slower than
   `ReadTimeout` still answering, an idle connection closed and an idle timeout
@@ -209,5 +285,5 @@ curl fail the job instead of skipping those cases. To run it locally:
 
 ```sh
 cd go
-go test -race -run 'TestHTTP1Conformance|TestSendFile|TestSendableFileOf|TestResponseWriter|TestStreamRequestBody|TestChunkedDecoder|TestHoldReads|TestServerRead|TestServerIdle|TestServerTimeout|TestServerWithoutTimeouts|TestReadDeadline|TestWriteDeadline|TestZeroDeadline|TestConnectionAddresses' -v . ./http/
+go test -race -run 'TestHTTP1Conformance|TestSendFile|TestSendableFileOf|TestResponseWriter|TestStreamRequestBody|TestChunkedDecoder|TestHoldReads|TestServerRead|TestServerIdle|TestServerTimeout|TestServerWithoutTimeouts|TestReadDeadline|TestWriteDeadline|TestZeroDeadline|TestConnectionAddresses|TestRetain|TestOnBody|TestOnCancel' -v . ./http/
 ```

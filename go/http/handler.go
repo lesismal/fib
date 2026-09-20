@@ -11,6 +11,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	fib "github.com/lesismal/fib/go"
@@ -60,6 +61,31 @@ type Context struct {
 	stream *h2ServerStream
 	// external is the stream of a protocol served outside this package.
 	external Stream
+
+	// mu guards the response's lifetime: refs counts the holds on it (see
+	// Retain), state says whether it has been written or cancelled, err why
+	// it was cancelled, and resume whether whoever finishes it owes the
+	// connection the step that lets it carry on. delivering counts the body
+	// callbacks running on the connection's worker, which cannot take that
+	// step themselves.
+	mu         sync.Mutex
+	refs       int
+	state      uint8
+	err        error
+	resume     bool
+	delivering int
+	// body is OnBody's callback and bodyDone that it has had its last call.
+	// cancel is OnCancel's. deliverMu keeps body callbacks one at a time.
+	body      BodyFunc
+	bodyDone  bool
+	cancel    func(error)
+	deliverMu sync.Mutex
+	// server and parser are the HTTP/1 connection this request arrived on,
+	// which a release away from the worker needs to carry on with. They are
+	// nil for HTTP/2, HTTP/3 and anything else multiplexed, where a response
+	// holds up nothing else.
+	server *ServerHandler
+	parser *Parser
 }
 
 // Stream answers a request that arrived over a protocol served outside this
@@ -352,11 +378,23 @@ func (h *ServerHandler) drive(c *fib.Connection, parser *Parser, data []byte) {
 		if parser.stream != nil {
 			// A streamed body owns the connection until its last byte: the
 			// bytes arriving now are the body, not the next request.
-			var done bool
-			if done, err = parser.pumpBody(data); err != nil {
+			var done, resumed bool
+			done, err = parser.pumpBody(data)
+			if context := parser.liveContext.Load(); context != nil && context.claimResume() {
+				// A body callback answered and released the request from
+				// inside this round. It could not carry the connection on
+				// while this goroutine held the parser, so that is done here.
+				if h.endRequestLocked(context) {
+					c.CloseAfterSend()
+					return
+				}
+				resumed = true
+			}
+			if err != nil {
 				h.failStream(c, parser, err)
 				return
-			} else if !done {
+			}
+			if !done && !resumed {
 				return
 			}
 			continue
@@ -383,12 +421,16 @@ func (h *ServerHandler) drive(c *fib.Connection, parser *Parser, data []byte) {
 			h.upgradeH2C(c, parser, request, settings)
 			return
 		}
-		context := &Context{Conn: c, Request: request}
+		context := &Context{Conn: c, Request: request, server: h, parser: parser}
+		// Nothing behind this request is served until its response is
+		// written, so that pipelined responses keep their order, and the
+		// connection knows which request to cancel if it closes first.
+		parser.busy = true
+		parser.liveContext.Store(context)
 		if parser.stream != nil {
 			// The body has not all arrived. Serve the request on its own
 			// goroutine, since reading the body blocks, and go on feeding
 			// that body from here.
-			parser.busy = true
 			go h.serveStreamed(c, parser, context, parser.stream)
 			continue
 		}
@@ -399,6 +441,12 @@ func (h *ServerHandler) drive(c *fib.Connection, parser *Parser, data []byte) {
 			_ = c.SetReadDeadline(time.Time{})
 		}
 		serveRequest(h.handler, context)
+		if !context.settle() {
+			// The handler kept the response open; the release that closes it
+			// carries the connection on from there.
+			return
+		}
+		parser.busy = false
 		if request.Close || context.closing {
 			parser.spent = true
 			return
@@ -421,33 +469,64 @@ func (h *ServerHandler) drive(c *fib.Connection, parser *Parser, data []byte) {
 }
 
 // serveStreamed runs the handler of a request whose body is still arriving,
-// and drives the connection on once it returns.
+// and drives the connection on once the response is written.
 func (h *ServerHandler) serveStreamed(c *fib.Connection, parser *Parser, context *Context, stream *BodyStream) {
-	recovered := runStreamed(h.handler, context)
+	if recovered := runStreamed(h.handler, context); recovered != nil {
+		err := fmt.Errorf("handler panic: %v", recovered)
+		context.cancelWith(err)
+		parser.mu.Lock()
+		parser.busy, parser.spent, parser.stream = false, true, nil
+		parser.live.Store(nil)
+		parser.mu.Unlock()
+		_ = stream.abandon()
+		c.CloseWithError(err)
+		return
+	}
+	_ = c.Flush()
+	if !context.settle() {
+		// The handler kept the response open; the release that closes it
+		// carries the connection on from there.
+		return
+	}
+	h.finishRequest(context)
+}
+
+// endRequestLocked settles the connection once a request's response has been
+// written: whatever the handler left of the body is retired, and the answer
+// is whether the connection has to close rather than serve anything more.
+// Callers hold parser.mu.
+func (h *ServerHandler) endRequestLocked(context *Context) bool {
+	parser := context.parser
+	parser.busy = false
 	// Whatever the handler left of the body has to come off the connection
 	// before the next request on it can be parsed, and abandon says when
-	// there is too much of it left to be worth reading and dropping. It runs
-	// before whatever else decides the connection's fate, so that a body the
-	// handler walked away from is always retired.
-	tooMuchLeft := stream.abandon()
-	closing := recovered != nil || tooMuchLeft || context.closing || context.Request.Close
-	parser.mu.Lock()
-	parser.busy = false
+	// there is too much of it left to be worth reading and dropping.
+	tooMuchLeft := false
+	if stream := context.RequestBody(); stream != nil {
+		tooMuchLeft = stream.abandon()
+	}
+	closing := tooMuchLeft || context.closing || context.Request.Close
 	if closing {
 		parser.spent = true
 		parser.stream = nil
 		parser.live.Store(nil)
 	}
+	return closing
+}
+
+// finishRequest carries the connection on after a response written away from
+// its worker: the streamed request's own goroutine, or whichever goroutine
+// released the last hold on a retained one.
+func (h *ServerHandler) finishRequest(context *Context) {
+	c, parser := context.Conn, context.parser
+	parser.mu.Lock()
+	closing := h.endRequestLocked(context)
 	parser.mu.Unlock()
-	switch {
-	case recovered != nil:
-		c.CloseWithError(fmt.Errorf("handler panic: %v", recovered))
-	case closing:
+	if closing {
 		c.CloseAfterSend()
-	default:
-		_ = c.Flush()
-		h.drive(c, parser, nil)
+		return
 	}
+	h.drive(c, parser, nil)
 }
 
 // runStreamed serves one request and returns what its handler panicked with,
@@ -499,12 +578,26 @@ func (h *ServerHandler) refuse(c *fib.Connection, err error) {
 	})
 }
 
-// serveRequest runs the handler for the request context carries, and then ends the
-// response the handler wrote through the ResponseWriter methods, if it began
-// one, as net/http does when a handler returns.
+// Serve runs handler for the request context carries and, once it returns,
+// writes the response back: the response the handler began through the
+// ResponseWriter methods is ended, as net/http ends one when a handler
+// returns, and handed to the connection. A handler that retained the request
+// keeps it open instead, and the release that gives back its last hold writes
+// it back the same way.
+//
+// The HTTP/1 and HTTP/2 servers here dispatch through it. A protocol served
+// outside this package, as HTTP/3 is by package http3, calls it in place of
+// calling the handler itself, so that Retain, Release and OnBody work there
+// too.
+func Serve(handler Handler, context *Context) { serveRequest(handler, context) }
+
+// serveRequest runs the handler for the request context carries, and gives
+// back the hold that serving it took, which writes the response unless the
+// handler retained it.
 func serveRequest(handler Handler, context *Context) {
+	context.begin()
 	handler.ServeHTTP(context, context.Request)
-	_ = context.Finish()
+	context.release(false)
 }
 
 // requestError is a request the server refuses with its status.
@@ -584,12 +677,23 @@ func (h *ServerHandler) OnClose(c *fib.Connection, err error) {
 	case *h2ServerConn:
 		state.shutdown()
 	case *Parser:
-		if stream := state.live.Load(); stream != nil {
-			// A handler waiting on the rest of a body has to hear that the
-			// rest will never come, rather than take a truncated upload for a
-			// complete one. The parser's own lock is not taken: this runs on
-			// the event-loop goroutine, which a handler must never block.
-			stream.fail(err)
+		// A handler waiting on the rest of a body has to hear that the rest
+		// will never come, rather than take a truncated upload for a complete
+		// one, and one still working on a request it retained has to hear
+		// that there is nothing left to answer. Both are reported from a
+		// goroutine, since this runs on the event loop, which a handler's
+		// cleanup must never hold up; the parser's own lock is not taken
+		// there either, for the same reason.
+		stream, context := state.live.Load(), state.liveContext.Load()
+		if stream != nil || context != nil {
+			go func() {
+				if stream != nil {
+					stream.fail(err)
+				}
+				if context != nil {
+					context.cancelWith(err)
+				}
+			}()
 		}
 	}
 	c.SetAttachment(nil)

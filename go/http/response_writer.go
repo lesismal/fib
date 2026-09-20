@@ -372,7 +372,8 @@ func appendChunk(out, p []byte) []byte {
 
 // Finish ends a response written through Write: it sends the header if it
 // has not gone yet, what body is held back, and the trailers. The server
-// calls it when the handler returns, as net/http ends a response then, so a
+// calls it when the last hold on the response goes, which for a handler that
+// retained nothing is its own return, as net/http ends a response then, so a
 // handler only calls it to end the response sooner. A response that was never
 // begun is left alone, since the handler may answer it later with
 // WriteResponse.

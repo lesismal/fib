@@ -492,8 +492,9 @@ func (rs *requestStream) finish() {
 	}
 	rs.body = nil
 	c := fibhttp.NewStreamContext(rs.sc.conn, req, rs)
-	rs.sc.h.handler.ServeHTTP(c, req)
-	_ = c.Finish()
+	// Serve rather than the handler directly, so that a handler which retains
+	// the request, or reads its body through OnBody, works here too.
+	fibhttp.Serve(rs.sc.h.handler, c)
 }
 
 // abort gives up on a malformed or incomplete request.

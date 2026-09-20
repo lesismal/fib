@@ -410,6 +410,66 @@ func(c *fibhttp.Context, r *http.Request) {
 完整的 HTTP/1.x 支持情况、限制和一致性测试见
 [`docs/http1.zh-CN.md`](../docs/http1.zh-CN.md)。
 
+### 异步响应与 body 回调（Retain / Release / OnBody）
+
+响应由引用计数持有：处理一个请求先占一个引用，handler 返回时还回去。所以「回复完就返回」
+的 handler 什么都不用改——**外层负责结束响应并回写**。要稍后再回复就多占一个引用：
+
+```go
+func(c *fibhttp.Context, r *http.Request) {
+    c.Retain()                     // handler 返回后不自动回写
+    go func() {
+        result := doSomethingSlow()
+        _ = c.Respond(200, "application/json", result)
+        c.Release()                // 引用归零 → 结束响应并交给连接
+    }()
+}
+```
+
+- `Retain` / `Release` 成对；释放次数多于 `Retain` 会提前结束响应（因为 handler 自己的
+  那一个引用也是一次释放）。`Retained()` 查当前是否被持有。
+- HTTP/1 上被持有的请求会挡住排在它后面的流水线请求，等释放之后才继续解析处理，**响应
+  顺序不变**。HTTP/2、HTTP/3 上 stream 之间互不影响。
+- 没有任何超时约束持有时长，handler 不释放就会一直占着连接，直到对端断开或读超时。
+
+`OnBody` 用回调接收 body，和 websocket 的 `OnFrame` 按帧交付是一个路子，回调带 `fin`：
+
+```go
+func(c *fibhttp.Context, r *http.Request) {
+    f, _ := os.Create("upload.bin")
+    c.Retain()
+    c.OnBody(func(data []byte, fin bool, err error) {
+        if err != nil {                 // 连接断了 / body 出错
+            f.Close(); os.Remove("upload.bin"); c.Release()
+            return
+        }
+        f.Write(data)                   // 边收边写，不缓存整个 body
+        if fin {
+            f.Close()
+            _ = c.Respond(200, "text/plain", []byte("stored"))
+            c.Release()
+        }
+    })
+}
+```
+
+- 回调在**连接的 worker 上**执行，一次一个、保持顺序：任意大的 body 都不需要 handler
+  自己的 goroutine，也不会被缓存下来，给对端限速的就是回调本身。
+- `fin` 是最后一次回调；`err != nil` 表示 body 不会有后续了，同样是最后一次、且只来一次。
+  `data` 只在回调期间有效，要保留先复制。
+- body 只有在流式交付时才会分多次到达（看 `StreamRequestBodyThreshold`）；handler 运行前
+  就收全的 body 会在一次 `fin` 为 true 的回调里全部给出。
+- `OnBody` 接管之后 `Request.Body` 不能再读。只用 `OnBody` 不 `Retain` 的 handler 返回时
+  就回复、剩下的 body 被丢弃——「不读 body 直接拒绝上传」就这么写。
+
+**异常情况**：连接断开、读超时、body 收不完，都会让请求被取消——不再写出任何东西，剩余
+引用全部作废，handler 只被告知一次：`OnBody` 的 `err`，以及 `Context.OnCancel(func(error))`
+（给只 `Retain`、不用 `OnBody` 的异步 handler）。两者都在单独 goroutine 上执行而不是事件
+循环上，拖不住服务端。`Context.Err()` 可以主动查。之后一切幂等：已经结束的请求上再调
+`Retain`、`Release`、`Finish` 都是空操作，往上面写会返回那个原因而不会把连接写坏。
+
+`Context.Flush()` 语义不变，仍然是 `http.Flusher`：把暂存的 body 立即发出去，响应不结束。
+
 ### 读超时
 
 `Config.ReadHeaderTimeout`、`Config.ReadTimeout`、`Config.IdleTimeout` 就是

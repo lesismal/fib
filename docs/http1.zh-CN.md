@@ -37,6 +37,60 @@ handler 用 `Write`/`WriteHeader` 而不是 `WriteResponse` 写响应时，服�
 `Flush` 发送响应头和缓存的数据，并立即交给 socket；不调用时，engine 会把一轮读取中
 产生的输出合并，等 handler 返回后一次写出（见 `Connection.Flush`）。
 
+### 保持响应不结束，以及 body 回调
+
+响应由引用计数持有。处理一个请求先占一个引用，handler 返回时还回去——所以「回复完就
+返回」的 handler 什么都不用做：外层替它结束响应并交给连接。要稍后再回复的 handler 用
+`Context.Retain()` 多占一个、用 `Context.Release()` 还回去，最后一个引用释放时（不管在
+哪个 goroutine）响应才被写回。
+
+HTTP/1 连接上，被持有的请求会挡住排在它后面的流水线请求，等它释放之后才解析和处理，
+所以响应顺序不变。HTTP/2 和 HTTP/3 上一个 stream 不挡别的 stream。
+
+`Context.OnBody` 用回调的方式接收请求 body，而不是从 `Request.Body` 读——和 websocket
+handler 的 `OnFrame` 按帧拿到消息是一个路子：
+
+```go
+func(c *fibhttp.Context, r *http.Request) {
+	f, _ := os.Create("upload.bin")
+	c.Retain()
+	c.OnBody(func(data []byte, fin bool, err error) {
+		if err != nil {         // 连接断了，或者 body 出错了
+			f.Close()
+			os.Remove("upload.bin")
+			c.Release()
+			return
+		}
+		f.Write(data)
+		if fin {
+			f.Close()
+			c.Respond(200, "text/plain", []byte("stored"))
+			c.Release()
+		}
+	})
+}
+```
+
+- `fin` 标记最后一次回调；`err` 表示这个 body 不会有后续了，同样是最后一次回调，且只来
+  一次。`data` 只在回调期间有效，需要保留先复制。
+- 回调在连接的 worker 上执行，一次一个、保持顺序，所以任意大的 body 都能处理，既不需要
+  handler 自己的 goroutine，也不会被缓存下来。给对端限速的就是回调本身。
+- body 只有在流式交付时才会分多次到达（由 `StreamRequestBodyThreshold` 决定）；handler
+  运行前就收全的 body 会在一次 `fin` 为 true 的回调里全部给出。
+- `OnBody` 接管之后 `Request.Body` 不能再读。只用 `OnBody` 而不 `Retain` 的 handler 在
+  返回时就回复、剩下的 body 被丢弃——这正是「不读 body 直接拒绝上传」的写法。
+
+### 请求在响应之前就结束了
+
+连接断开、读超时、body 收不完，都会让一个 handler 可能还在处理的请求提前结束。这时请求
+被取消：不会再写出任何东西，它上面剩余的引用全部作废，handler 只会被告知一次——通过
+`OnBody` 的 `err`，以及 `Context.OnCancel`。两者都在单独的 goroutine 上执行而不是事件
+循环上，所以 handler 的清理逻辑拖不住服务端。想主动查的话 `Context.Err()` 给出同样的
+原因。
+
+从这里开始一切都是幂等的：已经结束的请求上再调 `Retain`、`Release`、`Finish` 都是空操作，
+清理代码可以放心调用而不必先判断；往上面写数据会返回那个原因，而不会把连接写坏。
+
 ### 读超时
 
 `Config.ReadHeaderTimeout`、`Config.ReadTimeout`、`Config.IdleTimeout` 就是
@@ -145,6 +199,11 @@ handler 把 128MB 的上传拷进 `io.Discard`：整体缓存时堆内存峰值�
 - **fib 客户端**对 Go `net/http` 服务端（`httptest`）和原始服务端（HTTP/1.0 keep-alive
   和以关闭连接结束的响应、格式错误的响应）。
 - **fib 客户端对 fib 服务端**，包括 HTTP/1.0 和 sendfile。
+- **持有响应与 body 回调**（`go/http/retain_test.go`）：在别的 goroutine 里回复、被持有
+  的请求挡住后面的流水线请求、嵌套持有、`OnBody` 对缓存 body 和流式 body、在 body 回调
+  里释放、带 trailer 的 chunked、不 Retain 直接回复、客户端上传到一半跑掉时 `OnBody` 和
+  `OnCancel` 各只收到一次、读超时触发 `OnCancel`、body 超限、响应写完之后再 Retain、同一
+  个 handler 跑在 HTTP/2 上，以及把以上全部并发跑一遍并检查没有残留的压力测试。
 - **读超时**（`go/http/timeout_test.go`）：header 和 body 收到一半就不来了、流式 body
   收到一半就不来了、比 `ReadTimeout` 慢的 handler 仍然能回复、空闲连接被关闭、每个请求
   都会刷新空闲超时、一个字节都不发的连接、没配超时的服务端、变成 HTTP/2 的连接被解除
@@ -165,5 +224,5 @@ handler 把 128MB 的上传拷进 `io.Discard`：整体缓存时堆内存峰值�
 
 ```sh
 cd go
-go test -race -run 'TestHTTP1Conformance|TestSendFile|TestSendableFileOf|TestResponseWriter|TestStreamRequestBody|TestChunkedDecoder|TestHoldReads|TestServerRead|TestServerIdle|TestServerTimeout|TestServerWithoutTimeouts|TestReadDeadline|TestWriteDeadline|TestZeroDeadline|TestConnectionAddresses' -v . ./http/
+go test -race -run 'TestHTTP1Conformance|TestSendFile|TestSendableFileOf|TestResponseWriter|TestStreamRequestBody|TestChunkedDecoder|TestHoldReads|TestServerRead|TestServerIdle|TestServerTimeout|TestServerWithoutTimeouts|TestReadDeadline|TestWriteDeadline|TestZeroDeadline|TestConnectionAddresses|TestRetain|TestOnBody|TestOnCancel' -v . ./http/
 ```

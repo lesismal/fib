@@ -140,6 +140,9 @@ type Parser struct {
 	// live is stream, or the last one, reachable without mu so that a close
 	// on the event-loop goroutine can fail a body whose reader is waiting.
 	live atomic.Pointer[BodyStream]
+	// serverState is what only a server keeps, which is built only on the
+	// platforms that have one.
+	serverState
 }
 
 type frameInfo struct {
@@ -176,6 +179,7 @@ func (p *Parser) Reset() {
 	p.stream, p.busy, p.spent = nil, false, false
 	p.headerComplete, p.requestStart = false, time.Time{}
 	p.live.Store(nil)
+	p.resetServerState()
 }
 
 // Feed may return zero, one, or several pipelined requests.

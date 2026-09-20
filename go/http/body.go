@@ -24,6 +24,16 @@ var ErrBodyAbandoned = errors.New("http: request body no longer being read")
 // work the client, not the server, should pay for.
 const discardAfterHandler = 256 << 10
 
+// BodyFunc receives a request's body as it arrives, piece by piece; see
+// Context.OnBody. fin marks the last call, and err a body that will not be
+// finished, which is also a last call. data is only valid for the duration of
+// the call.
+type BodyFunc func(data []byte, fin bool, err error)
+
+// emptyBody is a Body with nothing in it, for a request whose body has been
+// handed to a callback instead.
+func emptyBody() io.ReadCloser { return stdhttp.NoBody }
+
 // BodyStream is the Body of a request whose handler ran before the whole body
 // had arrived; see Config.StreamRequestBodyThreshold. It is an
 // io.ReadCloser, so anything that reads a net/http request body — io.Copy,
@@ -82,6 +92,52 @@ type BodyStream struct {
 	// scratch is the buffer the chunked decoder decodes into, kept between
 	// reads so that a chunked upload does not allocate one per read.
 	scratch []byte
+	// sink, when set, is given the body as it arrives instead of it being
+	// buffered for a reader; Context.OnBody installs it. sinkBusy is set
+	// while it is being handed what had already arrived, so that the
+	// connection's worker waits rather than delivering out of order.
+	sink     BodyFunc
+	sinkBusy bool
+}
+
+// setSink hands the body to fn as it arrives rather than buffering it for
+// Read, starting with whatever has already been taken off the connection.
+// Nothing is held back once a sink has it, so any hold on the connection's
+// reads goes with the buffer: what paces the peer from here is fn itself.
+func (s *BodyStream) setSink(fn BodyFunc) {
+	s.mu.Lock()
+	s.awaitSinkLocked()
+	if s.abandoned {
+		s.mu.Unlock()
+		return
+	}
+	s.sink, s.sinkBusy = fn, true
+	pending := s.buf[s.read:]
+	s.buf, s.read = nil, 0
+	s.releaseLocked()
+	ended, err := s.ended, s.err
+	s.wake.Broadcast()
+	s.mu.Unlock()
+
+	last := ended || err != nil
+	if len(pending) > 0 {
+		fn(pending, last && err == nil, nil)
+	}
+	if last && (len(pending) == 0 || err != nil) {
+		fn(nil, true, err)
+	}
+	s.mu.Lock()
+	s.sinkBusy = false
+	s.wake.Broadcast()
+	s.mu.Unlock()
+}
+
+// awaitSinkLocked waits for a handover to finish, so that nothing the
+// connection delivers overtakes what the body had already taken in.
+func (s *BodyStream) awaitSinkLocked() {
+	for s.sinkBusy {
+		s.wake.Wait()
+	}
 }
 
 func newBodyStream(conn *fib.Connection, request *stdhttp.Request, config Config, decoder *chunkedDecoder, wantContinue bool) *BodyStream {
@@ -121,6 +177,9 @@ func (s *BodyStream) Read(p []byte) (int, error) {
 			return n, nil
 		}
 		switch {
+		case s.sink != nil:
+			s.mu.Unlock()
+			return 0, ErrBodyAbandoned
 		case s.ended:
 			s.mu.Unlock()
 			return 0, io.EOF
@@ -215,6 +274,15 @@ func (s *BodyStream) dropLocked() {
 // when they pile up faster than the reader takes them.
 func (s *BodyStream) push(data []byte) {
 	s.mu.Lock()
+	s.awaitSinkLocked()
+	if sink := s.sink; sink != nil {
+		abandoned := s.abandoned
+		s.mu.Unlock()
+		if !abandoned {
+			sink(data, false, nil)
+		}
+		return
+	}
 	defer s.mu.Unlock()
 	if s.abandoned {
 		return
@@ -233,6 +301,7 @@ func (s *BodyStream) push(data []byte) {
 // finish marks the body complete and publishes its trailer.
 func (s *BodyStream) finish(trailer stdhttp.Header) {
 	s.mu.Lock()
+	s.awaitSinkLocked()
 	s.ended = true
 	if trailer != nil {
 		s.trailer = trailer
@@ -240,9 +309,16 @@ func (s *BodyStream) finish(trailer stdhttp.Header) {
 			s.request.Trailer = trailer
 		}
 	}
+	sink := s.sink
+	if s.abandoned {
+		sink = nil
+	}
 	s.releaseLocked()
 	s.wake.Broadcast()
 	s.mu.Unlock()
+	if sink != nil {
+		sink(nil, true, nil)
+	}
 }
 
 // fail ends the body short, with the reason the rest will never arrive. A
@@ -253,12 +329,21 @@ func (s *BodyStream) fail(err error) {
 		err = io.ErrUnexpectedEOF
 	}
 	s.mu.Lock()
-	if s.err == nil && !s.ended {
+	s.awaitSinkLocked()
+	report := s.err == nil && !s.ended
+	if report {
 		s.err = err
+	}
+	sink := s.sink
+	if s.abandoned {
+		sink = nil
 	}
 	s.releaseLocked()
 	s.wake.Broadcast()
 	s.mu.Unlock()
+	if report && sink != nil {
+		sink(nil, true, err)
+	}
 }
 
 // releaseLocked ends any hold this body has on the connection's reads. The
