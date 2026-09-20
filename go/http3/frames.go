@@ -58,8 +58,10 @@ const (
 	ErrCodeMessageError         ErrorCode = 0x10e
 	ErrCodeConnectError         ErrorCode = 0x10f
 	ErrCodeVersionFallback      ErrorCode = 0x110
-	// ErrCodeQPACKDecompressionFailed is QPACK's (RFC 9204 section 6).
+	// The QPACK error codes (RFC 9204 section 6).
 	ErrCodeQPACKDecompressionFailed ErrorCode = 0x200
+	ErrCodeQPACKEncoderStreamError  ErrorCode = 0x201
+	ErrCodeQPACKDecoderStreamError  ErrorCode = 0x202
 )
 
 var errorNames = map[ErrorCode]string{
@@ -81,6 +83,8 @@ var errorNames = map[ErrorCode]string{
 	ErrCodeConnectError:             "H3_CONNECT_ERROR",
 	ErrCodeVersionFallback:          "H3_VERSION_FALLBACK",
 	ErrCodeQPACKDecompressionFailed: "QPACK_DECOMPRESSION_FAILED",
+	ErrCodeQPACKEncoderStreamError:  "QPACK_ENCODER_STREAM_ERROR",
+	ErrCodeQPACKDecoderStreamError:  "QPACK_DECODER_STREAM_ERROR",
 }
 
 func (c ErrorCode) String() string {

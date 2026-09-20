@@ -12,6 +12,7 @@ import (
 	"net"
 	stdhttp "net/http"
 	"os"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -152,12 +153,12 @@ func (c *Client) Do(req *stdhttp.Request, callback func(*stdhttp.Response, error
 		req.Body = io.NopCloser(bytes.NewReader(body))
 	}
 	r := &clientRequest{req: req, body: body, callback: callback}
-	fields, err := requestFields(req, len(body))
+	fields, trailer, err := requestFields(req, len(body))
 	if err != nil {
 		callback(nil, err)
 		return
 	}
-	r.fields = fields
+	r.fields, r.trailer = fields, trailer
 	r.mu.Lock()
 	if c.config.Timeout > 0 {
 		r.timer = time.AfterFunc(c.config.Timeout, func() { r.abort(errRequestTimeout) })
@@ -249,6 +250,7 @@ func (c *Client) enqueue(r *clientRequest) {
 	if dial {
 		cc = &clientConn{client: c, key: key, addr: addr, serverName: serverName,
 			streams: make(map[uint64]*clientStream)}
+		cc.peer.isClient = true
 		cc.peer.onGoAway = cc.handleGoAway
 		c.conns[key] = cc
 	}
@@ -274,9 +276,11 @@ func (c *Client) forget(cc *clientConn) {
 
 // clientRequest is one request from Do until its callback.
 type clientRequest struct {
-	req      *stdhttp.Request
-	body     []byte
-	fields   []qpack.HeaderField
+	req    *stdhttp.Request
+	body   []byte
+	fields []qpack.HeaderField
+	// trailer is the trailer section that ends the request, if it has one.
+	trailer  []qpack.HeaderField
 	callback func(*stdhttp.Response, error)
 
 	mu          sync.Mutex
@@ -350,9 +354,9 @@ func (r *clientRequest) retry(c *Client, err error) {
 	c.enqueue(r)
 }
 
-// requestFields lists a request's fields, pseudo-headers first, checking
-// them all before any is encoded.
-func requestFields(req *stdhttp.Request, bodyLen int) ([]qpack.HeaderField, error) {
+// requestFields lists a request's fields, pseudo-headers first, and its
+// trailer fields, checking them all before any is encoded.
+func requestFields(req *stdhttp.Request, bodyLen int) (fields, trailer []qpack.HeaderField, err error) {
 	host := req.Host
 	if host == "" {
 		host = req.URL.Host
@@ -362,9 +366,9 @@ func requestFields(req *stdhttp.Request, bodyLen int) ([]qpack.HeaderField, erro
 		method = stdhttp.MethodGet
 	}
 	if !validMethod(method) {
-		return nil, errors.New("http3: invalid method " + strconv.Quote(method))
+		return nil, nil, errors.New("http3: invalid method " + strconv.Quote(method))
 	}
-	fields := []qpack.HeaderField{{Name: ":method", Value: method}}
+	fields = []qpack.HeaderField{{Name: ":method", Value: method}}
 	if method == stdhttp.MethodConnect {
 		fields = append(fields, qpack.HeaderField{Name: ":authority", Value: host})
 	} else {
@@ -380,12 +384,12 @@ func requestFields(req *stdhttp.Request, bodyLen int) ([]qpack.HeaderField, erro
 			continue
 		}
 		if !validName(name) {
-			return nil, errors.New("http3: invalid request header name " + strconv.Quote(key))
+			return nil, nil, errors.New("http3: invalid request header name " + strconv.Quote(key))
 		}
 		userAgent = userAgent || name == "user-agent"
 		for _, value := range values {
 			if !sendableValue(value) {
-				return nil, errors.New("http3: invalid request header value for " + key)
+				return nil, nil, errors.New("http3: invalid request header value for " + key)
 			}
 			fields = append(fields, qpack.HeaderField{Name: name, Value: value})
 		}
@@ -399,7 +403,27 @@ func requestFields(req *stdhttp.Request, bodyLen int) ([]qpack.HeaderField, erro
 	case method == stdhttp.MethodPost || method == stdhttp.MethodPut || method == stdhttp.MethodPatch:
 		fields = append(fields, qpack.HeaderField{Name: "content-length", Value: "0"})
 	}
-	return fields, nil
+	var declared []string
+	for key, values := range req.Trailer {
+		name := strings.ToLower(key)
+		if !validName(name) || strings.HasPrefix(name, ":") || connectionHeaders[name] {
+			return nil, nil, errors.New("http3: invalid request trailer name " + strconv.Quote(key))
+		}
+		declared = append(declared, name)
+		for _, value := range values {
+			if !sendableValue(value) {
+				return nil, nil, errors.New("http3: invalid request trailer value for " + key)
+			}
+			trailer = append(trailer, qpack.HeaderField{Name: name, Value: value})
+		}
+	}
+	if len(declared) > 0 {
+		// Servers keep only the trailers a request announced, so the names
+		// go out ahead of the body in a Trailer field of this side's making.
+		slices.Sort(declared)
+		fields = append(fields, qpack.HeaderField{Name: "trailer", Value: strings.Join(declared, ",")})
+	}
+	return fields, trailer, nil
 }
 
 func validMethod(method string) bool {
@@ -736,6 +760,13 @@ func (st *clientStream) send() {
 		out = appendFrameHeader(out, frameData, len(r.body))
 		out = append(out, r.body...)
 	}
+	if len(r.trailer) > 0 {
+		trailer := append([]byte(nil), qpack.Prefix...)
+		for _, f := range r.trailer {
+			trailer = qpack.AppendField(trailer, f.Name, f.Value, sensitive(f.Name))
+		}
+		out = appendHeadersFrame(out, trailer)
+	}
 	if err := st.s.Write(out, true); err != nil {
 		st.fail(err)
 	}
@@ -747,7 +778,10 @@ func (st *clientStream) feed(data []byte, fin bool) {
 	}
 	if err := st.parser.feed(data, st.onData, st.onFrame); err != nil {
 		var ce *connError
-		if errors.As(err, &ce) {
+		// A field section that does not decode leaves the peer's encoder
+		// and this side's decoder out of step, so it ends the connection
+		// rather than the request (RFC 9204 section 2.2).
+		if errors.As(err, &ce) || errors.Is(err, qpack.ErrDecompression) {
 			closeWith(st.s.Conn(), err)
 			return
 		}

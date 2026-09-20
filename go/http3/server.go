@@ -179,6 +179,8 @@ func (h *ServerHandler) OnData(c *fib.Connection, data []byte) {
 	if addr := c.RemoteAddr(); addr != nil {
 		sc.remoteAddr = addr.String()
 	}
+	// A client's GOAWAY names a push ID; nothing here promises pushes, so
+	// only the checks the control stream makes matter.
 	sc.peer.onGoAway = func(uint64) error { return nil }
 	if tc := h.quic.TLSConfig; tc == nil || len(tc.Certificates) == 0 && tc.GetCertificate == nil && tc.GetConfigForClient == nil {
 		c.Close()
@@ -461,6 +463,12 @@ func (rs *requestStream) onFrame(typ uint64, payload []byte) error {
 			return nil
 		}
 		rs.declared = n
+	}
+	if expect, ok := req.Header["Expect"]; ok &&
+		(len(expect) != 1 || !strings.EqualFold(strings.TrimSpace(expect[0]), "100-continue")) {
+		// An expectation this server cannot meet (RFC 9110 section 10.1.1).
+		rs.reject(stdhttp.StatusExpectationFailed)
+		return nil
 	}
 	if strings.EqualFold(req.Header.Get("Expect"), "100-continue") {
 		// The body is read whole before the handler runs, so there is no

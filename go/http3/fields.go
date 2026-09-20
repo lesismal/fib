@@ -183,9 +183,22 @@ func newRequest(fields []qpack.HeaderField) (*stdhttp.Request, error) {
 		req.URL = u
 		req.RequestURI = path
 	}
+	// A request for a scheme with a mandatory authority has to name it,
+	// once, either way and with one value (RFC 9114 section 4.3.1).
+	hosts := header["Host"]
+	if len(hosts) > 1 {
+		return nil, errors.New("multiple Host fields")
+	}
+	host := header.Get("Host")
+	switch {
+	case authority != "" && host != "" && !strings.EqualFold(authority, host):
+		return nil, errors.New(":authority and Host disagree")
+	case authority == "" && host == "" && (scheme == "http" || scheme == "https"):
+		return nil, errors.New("neither :authority nor Host")
+	}
 	req.Host = authority
 	if req.Host == "" {
-		req.Host = header.Get("Host")
+		req.Host = host
 	}
 	header.Del("Host")
 	return req, nil
