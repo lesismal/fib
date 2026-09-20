@@ -241,3 +241,29 @@ func BenchmarkDecompressMessage(b *testing.B) {
 		}
 	}
 }
+
+// TestParserPerFrameCompressedMessageArrivesWhole covers the one message a
+// per-frame parser cannot hand out frame by frame: the frames of a compressed
+// message are pieces of one DEFLATE stream, so it is reassembled, inflated and
+// emitted as a single event with Fin set.
+func TestParserPerFrameCompressedMessageArrivesWhole(t *testing.T) {
+	payload := compressiblePayload(4096)
+	data := compressed(t, payload)
+	parser := deflateParser(1 << 20)
+	parser.SetPerFrame(true)
+	third := len(data) / 3
+	stream := deflateFrame(Binary, false, true, data[:third])
+	stream = append(stream, clientFrame(Continuation, false, data[third:2*third])...)
+	stream = append(stream, clientFrame(Continuation, true, data[2*third:])...)
+	stream = append(stream, clientFrame(Binary, true, []byte("plain"))...)
+	events, err := parser.Feed(stream)
+	if err != nil || len(events) != 2 {
+		t.Fatalf("events = %d, err = %v", len(events), err)
+	}
+	if !events[0].Fin || !bytes.Equal(events[0].Payload, payload) {
+		t.Fatalf("compressed message: fin=%v, %d bytes, want %d", events[0].Fin, len(events[0].Payload), len(payload))
+	}
+	if !events[1].Fin || string(events[1].Payload) != "plain" {
+		t.Fatalf("message after it = %q, fin=%v", events[1].Payload, events[1].Fin)
+	}
+}

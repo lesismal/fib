@@ -51,6 +51,10 @@ var frameBuffers = sync.Pool{New: func() any { return new(frameBuffer) }}
 type Event struct {
 	Opcode  Opcode
 	Payload []byte
+	// Fin reports that this is the last frame of its message. It is true for
+	// every event but those of a parser that delivers frames as they arrive,
+	// which SetPerFrame turns on, where a message may take several.
+	Fin bool
 }
 
 type fragmentedMessage struct {
@@ -69,6 +73,11 @@ type Parser struct {
 	owned        *frameBuffer
 	borrowedTail []byte
 	fragment     *fragmentedMessage
+	// perFrame emits every frame of a data message as it completes instead of
+	// reassembling the message, and frameMessage is the state of the message
+	// being received, which then holds no payload of its own.
+	perFrame     bool
+	frameMessage fragmentedMessage
 	// text validates the UTF-8 of the text message being received, and
 	// textChecked counts the payload bytes of the frame at the head of buffer
 	// that it has already seen while that frame was incomplete.
@@ -101,20 +110,22 @@ func NewServerFrameParser(maxMessageBytes int64) *Parser {
 	return p
 }
 
+// SetPerFrame chooses whether a fragmented data message is emitted frame by
+// frame, each event carrying Fin, or held until it can be emitted whole. Per
+// frame nothing accumulates between frames, so a peer may stream a message far
+// larger than maxMessageBytes, which then bounds one frame rather than the
+// message. A compressed message is the exception: its frames cannot be
+// inflated one by one, so it is reassembled either way and emitted whole with
+// Fin set.
+func (p *Parser) SetPerFrame(on bool) { p.perFrame = on }
+
 func (p *Parser) Reset() {
 	if p.borrowedBuffer || cap(p.buffer) > maxRetainedFrameBuffer {
 		p.buffer = nil
 	} else {
 		p.buffer = p.buffer[:0]
 	}
-	if p.fragment != nil {
-		p.fragment.opcode = 0
-		if cap(p.fragment.data) > maxRetainedFrameBuffer {
-			p.fragment = nil
-		} else {
-			p.fragment.data = p.fragment.data[:0]
-		}
-	}
+	p.fragment = nil
 	p.text.reset()
 	p.textChecked = 0
 	p.window = nil
@@ -130,7 +141,8 @@ func (p *Parser) Reset() {
 
 // Feed parses frames and returns complete messages and control frames. A
 // parser from NewParser reads a client's masked frames; see
-// NewServerFrameParser for the other direction. Fragmented data messages are reassembled before being returned.
+// NewServerFrameParser for the other direction. Fragmented data messages are
+// reassembled before being returned, unless SetPerFrame says otherwise.
 func (p *Parser) Feed(data []byte) ([]Event, error) {
 	var events []Event
 	for {
@@ -448,7 +460,7 @@ func (p *Parser) next(borrowPayload bool) (Event, bool, bool, error) {
 			}
 		}
 		p.finishFrame(frameEnd, borrowPayload)
-		return Event{Opcode: opcode, Payload: payload}, true, true, nil
+		return Event{Opcode: opcode, Payload: payload, Fin: true}, true, true, nil
 	}
 	if opcode == Text || opcode == Binary {
 		if fin && compressed {
@@ -460,7 +472,7 @@ func (p *Parser) next(borrowPayload bool) (Event, bool, bool, error) {
 				return Event{}, false, false, ErrInvalidPayload
 			}
 			p.finishFrame(frameEnd, borrowPayload)
-			return Event{Opcode: opcode, Payload: payload}, true, true, nil
+			return Event{Opcode: opcode, Payload: payload, Fin: true}, true, true, nil
 		}
 		if fin {
 			if text {
@@ -474,10 +486,18 @@ func (p *Parser) next(borrowPayload bool) (Event, bool, bool, error) {
 				p.text.reset()
 			}
 			p.finishFrame(frameEnd, borrowPayload)
-			return Event{Opcode: opcode, Payload: payload}, true, true, nil
+			return Event{Opcode: opcode, Payload: payload, Fin: true}, true, true, nil
 		}
 		if text && !p.text.write(payload[checked:]) {
 			return Event{}, false, false, ErrInvalidPayload
+		}
+		if p.perFrame && !compressed {
+			// The frame goes out as it is and nothing is kept but the opcode
+			// the continuations belong to.
+			p.frameMessage = fragmentedMessage{opcode: opcode}
+			p.fragment = &p.frameMessage
+			p.finishFrame(frameEnd, borrowPayload)
+			return Event{Opcode: opcode, Payload: payload}, true, true, nil
 		}
 		p.fragment = &fragmentedMessage{opcode: opcode, compressed: compressed, data: append([]byte(nil), payload...)}
 		p.consume(frameEnd)
@@ -486,12 +506,21 @@ func (p *Parser) next(borrowPayload bool) (Event, bool, bool, error) {
 	if text && (!p.text.write(payload[checked:]) || (fin && !p.text.complete())) {
 		return Event{}, false, false, ErrInvalidPayload
 	}
+	if p.perFrame && !p.fragment.compressed {
+		event := Event{Opcode: p.fragment.opcode, Payload: payload, Fin: fin}
+		if fin {
+			p.text.reset()
+			p.fragment = nil
+		}
+		p.finishFrame(frameEnd, borrowPayload)
+		return event, true, true, nil
+	}
 	p.fragment.data = append(p.fragment.data, payload...)
 	p.consume(frameEnd)
 	if !fin {
 		return Event{}, false, true, nil
 	}
-	event := Event{Opcode: p.fragment.opcode, Payload: p.fragment.data}
+	event := Event{Opcode: p.fragment.opcode, Payload: p.fragment.data, Fin: true}
 	if p.fragment.compressed {
 		var err error
 		if event.Payload, err = p.inflate(event.Payload, borrowPayload); err != nil {

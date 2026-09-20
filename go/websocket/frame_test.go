@@ -244,3 +244,128 @@ func TestPooledBufferNotSharedWhileFrameIsPartial(t *testing.T) {
 	}
 	held.ReleaseBorrowed()
 }
+
+// TestParserPerFrameDeliversEachFrame covers a parser that hands out the
+// frames of a fragmented message as they complete: each carries the message's
+// own opcode rather than Continuation, only the last has Fin, and a control
+// frame between them is unaffected.
+func TestParserPerFrameDeliversEachFrame(t *testing.T) {
+	parser := NewParser(1024)
+	parser.SetPerFrame(true)
+	stream := append(clientFrame(Text, false, []byte("hel")), clientFrame(Ping, true, []byte("?"))...)
+	stream = append(stream, clientFrame(Continuation, false, []byte("lo "))...)
+	stream = append(stream, clientFrame(Continuation, true, []byte("world"))...)
+	stream = append(stream, clientFrame(Binary, true, []byte("whole"))...)
+	events, err := parser.Feed(stream)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []Event{
+		{Opcode: Text, Payload: []byte("hel")},
+		{Opcode: Ping, Payload: []byte("?"), Fin: true},
+		{Opcode: Text, Payload: []byte("lo ")},
+		{Opcode: Text, Payload: []byte("world"), Fin: true},
+		{Opcode: Binary, Payload: []byte("whole"), Fin: true},
+	}
+	if len(events) != len(want) {
+		t.Fatalf("events = %#v, want %d", events, len(want))
+	}
+	for i, event := range events {
+		if event.Opcode != want[i].Opcode || event.Fin != want[i].Fin ||
+			!bytes.Equal(event.Payload, want[i].Payload) {
+			t.Fatalf("event %d = {opcode %d, %q, fin %v}, want {opcode %d, %q, fin %v}",
+				i, event.Opcode, event.Payload, event.Fin, want[i].Opcode, want[i].Payload, want[i].Fin)
+		}
+	}
+	if parser.fragment != nil {
+		t.Fatal("a completed message left state behind")
+	}
+}
+
+// TestParserPerFrameStreamsPastMaxMessageBytes is the point of per-frame
+// delivery: nothing accumulates, so a message far larger than the limit goes
+// through while the limit still bounds one frame. Reassembling the same
+// message fails, which is what a handler taking whole messages wants.
+func TestParserPerFrameStreamsPastMaxMessageBytes(t *testing.T) {
+	const (
+		frameSize = 512
+		frames    = 64
+	)
+	payload := bytes.Repeat([]byte{'x'}, frameSize)
+	wire := make([][]byte, frames)
+	for i := range wire {
+		opcode := Continuation
+		if i == 0 {
+			opcode = Binary
+		}
+		wire[i] = clientFrame(opcode, i == frames-1, payload)
+	}
+
+	parser := NewParser(frameSize)
+	parser.SetPerFrame(true)
+	received := 0
+	for i, frame := range wire {
+		event, complete, err := parser.FeedOneBorrowed(frame)
+		if err != nil || !complete {
+			t.Fatalf("frame %d: complete=%v err=%v", i, complete, err)
+		}
+		if event.Opcode != Binary || event.Fin != (i == frames-1) || !bytes.Equal(event.Payload, payload) {
+			t.Fatalf("frame %d = {opcode %d, %d bytes, fin %v}", i, event.Opcode, len(event.Payload), event.Fin)
+		}
+		received += len(event.Payload)
+		parser.ReleaseBorrowed()
+	}
+	if received != frames*frameSize {
+		t.Fatalf("received %d bytes, want %d", received, frames*frameSize)
+	}
+	if parser.fragment != nil || len(parser.buffer) != 0 {
+		t.Fatalf("parser held %d bytes of a streamed message", len(parser.buffer))
+	}
+
+	whole := NewParser(frameSize)
+	var err error
+	for _, frame := range wire {
+		if _, _, err = whole.FeedOneBorrowed(frame); err != nil {
+			break
+		}
+		whole.ReleaseBorrowed()
+	}
+	if !errors.Is(err, ErrMessageTooBig) {
+		t.Fatalf("reassembling the same message: error = %v, want %v", err, ErrMessageTooBig)
+	}
+}
+
+// TestParserPerFrameValidatesTextAcrossFrames checks that handing out frames
+// as they arrive does not give up on UTF-8: a rune may be split across two
+// frames, but the message as a whole still has to be valid text.
+func TestParserPerFrameValidatesTextAcrossFrames(t *testing.T) {
+	tests := []struct {
+		name   string
+		frames [][]byte
+		want   error
+	}{
+		{"rune split across frames", [][]byte{{0xce}, {0xba}}, nil},
+		{"invalid continuation byte", [][]byte{{0xce}, {0xff}}, ErrInvalidPayload},
+		{"message ends mid-rune", [][]byte{{0xce}, {}}, ErrInvalidPayload},
+	}
+	for _, test := range tests {
+		parser := NewParser(1024)
+		parser.SetPerFrame(true)
+		var stream []byte
+		for i, payload := range test.frames {
+			opcode := Continuation
+			if i == 0 {
+				opcode = Text
+			}
+			stream = append(stream, clientFrame(opcode, i == len(test.frames)-1, payload)...)
+		}
+		events, err := parser.Feed(stream)
+		if !errors.Is(err, test.want) {
+			t.Errorf("%s: error = %v, want %v", test.name, err, test.want)
+			continue
+		}
+		if err == nil && (len(events) != len(test.frames) || !events[len(events)-1].Fin) {
+			t.Errorf("%s: events = %#v", test.name, events)
+		}
+	}
+}

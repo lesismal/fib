@@ -371,3 +371,61 @@ func TestReadsPauseForPeerThatNeverReadsAndResumeWhenItDoes(t *testing.T) {
 		t.Fatalf("server read nothing more after the peer drained %d bytes of replies; the pause never lifted", paused)
 	}
 }
+
+// TestServerDeliversFramesToFrameHandler drives a server whose handler takes
+// frames: every frame of a fragmented message reaches Frame as it arrives,
+// carrying the message's opcode and its fin, and Message is not called at all.
+func TestServerDeliversFramesToFrameHandler(t *testing.T) {
+	handler := NewHandler(HandlerFuncs{
+		Message: func(*Connection, Opcode, []byte) {
+			t.Error("Message ran for a handler that takes frames")
+		},
+		Frame: func(c *Connection, opcode Opcode, fin bool, payload []byte) {
+			reply := make([]byte, 0, len(payload)+1)
+			if fin {
+				reply = append(reply, '1')
+			} else {
+				reply = append(reply, '0')
+			}
+			if err := c.WriteMessage(opcode, append(reply, payload...)); err != nil {
+				t.Error(err)
+			}
+		},
+	})
+	config := fib.DefaultConfig()
+	config.Addr = "127.0.0.1:0"
+	server, err := fib.Bind(config, handler)
+	if err != nil {
+		t.Fatal(err)
+	}
+	addr, err := server.LocalAddr()
+	if err != nil {
+		t.Fatal(err)
+	}
+	runDone := make(chan error, 1)
+	go func() { runDone <- server.Run() }()
+	defer func() {
+		server.Stop()
+		<-runDone
+		_ = server.Close()
+	}()
+
+	conn, reader := dialUpgraded(t, addr.String())
+	defer conn.Close()
+	frames := clientFrame(Text, false, []byte("hel"))
+	frames = append(frames, clientFrame(Continuation, false, []byte("lo "))...)
+	frames = append(frames, clientFrame(Continuation, true, []byte("world"))...)
+	frames = append(frames, clientFrame(Text, true, []byte("!"))...)
+	if _, err = conn.Write(frames); err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{"0hel", "0lo ", "1world", "1!"} {
+		opcode, payload, err := readServerFrame(reader)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if opcode != Text || string(payload) != want {
+			t.Fatalf("frame = opcode %d %q, want Text %q", opcode, payload, want)
+		}
+	}
+}

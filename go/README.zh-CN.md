@@ -579,8 +579,8 @@ resp, err := client.Go(req).Wait()
 ## WebSocket 子 package
 
 `websocket` package 实现 RFC 6455 Upgrade 握手、增量帧解析、
-分片消息重组、客户端掩码校验、Ping/Pong、Close 握手、子协议协商、消息大小限制和
-permessage-deflate 压缩（RFC 7692）：
+分片消息重组（也可以按帧接收）、客户端掩码校验、Ping/Pong、Close 握手、子协议协商、
+消息大小限制和 permessage-deflate 压缩（RFC 7692）：
 
 ```go
 handler := websocket.NewHandler(websocket.HandlerFuncs{
@@ -621,6 +621,33 @@ handler := websocket.HandlerFuncs{
 cd go
 go run ./examples/websocket/nontls/server   # 另开终端：go run ./examples/websocket/nontls/client
 ```
+
+### 按帧接收（避免大消息占用大内存）
+
+`OnMessage` 收到的是重组后的完整消息，分片消息要先在内存里拼起来，大 body 就意味着
+大内存开销。`HandlerFuncs` 设置 `Frame` 字段（自己实现 Handler 时额外实现
+`FrameHandler` 接口的 `OnFrame`）后，消息按帧交付，不再重组：
+
+```go
+handler := websocket.HandlerFuncs{
+    // 设置 Frame 后 Text/Binary 不再回调 Message
+    Frame: func(c *websocket.Connection, opcode websocket.Opcode, fin bool, data []byte) {
+        _, _ = file.Write(data) // 边收边处理，连接不持有整条消息
+        if fin {
+            _ = file.Close()
+        }
+    },
+}
+```
+
+- 每帧回调都带消息自己的 opcode（Text/Binary，不会是 Continuation）和 fin，最后一帧
+  fin 为 true；未分片的消息就是一次 fin 为 true 的回调。
+- 帧之间不缓存任何 payload，所以对端可以发送远大于 `MaxMessageBytes` 的消息，此时
+  `MaxMessageBytes` 限制的是单帧大小而不是整条消息。
+- Text 的 UTF-8 仍然增量校验：一个字符可以跨帧，但整条消息必须合法，否则以 1007 关闭。
+- 压缩消息是例外：一条压缩消息的各帧是同一个 DEFLATE 流的片段，无法逐帧解压，仍然
+  重组、解压后作为一次 fin 为 true 的 `OnFrame` 交付。
+- server 和 client（`Dialer`）两端都支持；payload 同样只在回调期间有效，需要保留先复制。
 
 ### permessage-deflate 压缩
 

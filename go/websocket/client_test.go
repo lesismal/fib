@@ -485,3 +485,57 @@ func TestClientConcurrentDialsWithHeaders(t *testing.T) {
 		t.Fatalf("server saw origins %v", origins)
 	}
 }
+
+// serverFrame builds one unmasked frame the way a server sends it, including
+// the continuations MarshalFrame does not build. The payload is short enough
+// for a one-byte length.
+func serverFrame(opcode Opcode, fin bool, payload []byte) []byte {
+	first := byte(opcode)
+	if fin {
+		first |= 0x80
+	}
+	if len(payload) > 125 {
+		panic("serverFrame: payload too long")
+	}
+	return append([]byte{first, byte(len(payload))}, payload...)
+}
+
+// TestClientDeliversFramesToFrameHandler is the client side of per-frame
+// delivery: a server that fragments a message reaches the handler's Frame one
+// frame at a time, and Message is not called.
+func TestClientDeliversFramesToFrameHandler(t *testing.T) {
+	url := rawServer(t, func(conn net.Conn, reader *bufio.Reader, req *stdhttp.Request) {
+		frames := serverFrame(Text, false, []byte("hel"))
+		frames = append(frames, serverFrame(Continuation, false, []byte("lo "))...)
+		frames = append(frames, serverFrame(Continuation, true, []byte("world"))...)
+		_, _ = io.WriteString(conn, upgradeResponse(req)+string(frames))
+		_, _ = io.Copy(io.Discard, reader)
+	})
+	received := make(chan Event, 8)
+	handler := HandlerFuncs{
+		Message: func(*Connection, Opcode, []byte) {
+			t.Error("Message ran for a handler that takes frames")
+		},
+		Frame: func(_ *Connection, opcode Opcode, fin bool, payload []byte) {
+			received <- Event{Opcode: opcode, Payload: append([]byte(nil), payload...), Fin: fin}
+		},
+	}
+	if _, _, err := NewDialer(startClientEngine(t), DefaultDialerConfig()).Go(url, nil, handler).Wait(); err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []Event{
+		{Opcode: Text, Payload: []byte("hel")},
+		{Opcode: Text, Payload: []byte("lo ")},
+		{Opcode: Text, Payload: []byte("world"), Fin: true},
+	} {
+		select {
+		case got := <-received:
+			if got.Opcode != want.Opcode || got.Fin != want.Fin || !bytes.Equal(got.Payload, want.Payload) {
+				t.Fatalf("frame = {opcode %d, %q, fin %v}, want {opcode %d, %q, fin %v}",
+					got.Opcode, got.Payload, got.Fin, want.Opcode, want.Payload, want.Fin)
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatalf("timed out waiting for %q", want.Payload)
+		}
+	}
+}

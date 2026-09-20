@@ -45,7 +45,8 @@ type DialerConfig struct {
 	// Subprotocols are offered to the server in order of preference. The
 	// server's choice, if it makes one, is Connection.Subprotocol.
 	Subprotocols []string
-	// MaxMessageBytes bounds one message from the server, reassembled.
+	// MaxMessageBytes bounds one message from the server, reassembled, or one
+	// frame of it when the handler implements FrameHandler.
 	MaxMessageBytes int64
 	// MaxHandshakeBytes bounds the server's handshake response header.
 	MaxHandshakeBytes int
@@ -117,7 +118,8 @@ func (d *Dialer) Dial(rawURL string, header stdhttp.Header, handler Handler,
 		done(nil, nil, err)
 		return
 	}
-	cc := &clientConn{dialer: d, handler: handler, done: done, req: req, request: buf.Bytes()}
+	cc := &clientConn{dialer: d, handler: handler, frames: frameHandler(handler), done: done,
+		req: req, request: buf.Bytes()}
 	websocketAccept(cc.accept[:], []byte(key))
 	cc.mu.Lock()
 	if d.config.HandshakeTimeout > 0 {
@@ -240,6 +242,7 @@ func (d *Dialer) handshakeRequest(rawURL string, header stdhttp.Header) (
 type clientConn struct {
 	dialer  *Dialer
 	handler Handler
+	frames  FrameHandler
 	done    func(*Connection, *stdhttp.Response, error)
 	req     *stdhttp.Request
 	request []byte
@@ -314,7 +317,7 @@ func (cc *clientConn) OnPriorityData(*fib.Connection, []byte) {}
 
 func (cc *clientConn) OnData(conn *fib.Connection, data []byte) {
 	if cc.upgraded.Load() {
-		serveFrames(cc.handler, &cc.ws, &cc.parser, data)
+		serveFrames(cc.handler, cc.frames, &cc.ws, &cc.parser, data)
 		return
 	}
 	if cc.settled.Load() {
@@ -352,12 +355,12 @@ func (cc *clientConn) OnData(conn *fib.Connection, data []byte) {
 	cc.ws = Connection{conn: conn, subprotocol: subprotocol, client: true, compress: compress,
 		windowBits: deflate.windowBits}
 	cc.parser = Parser{maxMessageBytes: cc.dialer.config.MaxMessageBytes, fromServer: true, deflate: compress,
-		contextTakeover: compress && deflate.peerContextTakeover}
+		contextTakeover: compress && deflate.peerContextTakeover, perFrame: cc.frames != nil}
 	cc.upgraded.Store(true)
 	cc.handler.OnOpen(&cc.ws, cc.req)
 	cc.done(&cc.ws, resp, nil)
 	if len(remainder) != 0 {
-		serveFrames(cc.handler, &cc.ws, &cc.parser, remainder)
+		serveFrames(cc.handler, cc.frames, &cc.ws, &cc.parser, remainder)
 	}
 }
 

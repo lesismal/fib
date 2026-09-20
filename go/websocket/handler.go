@@ -22,6 +22,8 @@ import (
 const websocketGUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
 
 type Config struct {
+	// MaxMessageBytes bounds one message, reassembled, or one frame of it
+	// when the handler implements FrameHandler.
 	MaxMessageBytes int64
 	Subprotocols    []string
 	CheckOrigin     func(*stdhttp.Request) bool
@@ -42,6 +44,24 @@ type Handler interface {
 	// before returning if it must be retained.
 	OnMessage(*Connection, Opcode, []byte)
 	OnClose(*Connection, uint16, string, error)
+}
+
+// FrameHandler is implemented by a Handler that takes a data message one
+// frame at a time instead of waiting for the whole of it. OnMessage is then
+// never called for Text or Binary: every frame of such a message reaches
+// OnFrame instead, carrying the message's own opcode, never Continuation, and
+// fin on the last frame of the message.
+//
+// Nothing is held between frames, so a peer may stream a message far larger
+// than Config.MaxMessageBytes, which then bounds a single frame rather than
+// the message, and a handler that only forwards or writes what arrives needs
+// no buffer of its own. A message that arrives compressed is the exception:
+// its frames cannot be inflated one by one, so it is reassembled and reaches
+// OnFrame whole, with fin set.
+//
+// The payload is valid only for the duration of the callback.
+type FrameHandler interface {
+	OnFrame(c *Connection, opcode Opcode, fin bool, payload []byte)
 }
 
 // PingHandler is implemented by a Handler that handles pings itself. OnPing
@@ -71,6 +91,9 @@ type HandlerFuncs struct {
 	Open    func(*Connection, *stdhttp.Request)
 	Message func(*Connection, Opcode, []byte)
 	Close   func(*Connection, uint16, string, error)
+	// Frame, when set, receives a data message frame by frame and Message is
+	// not called for Text or Binary. See FrameHandler.
+	Frame func(c *Connection, opcode Opcode, fin bool, payload []byte)
 	// Ping replaces the default reply to a ping: it has to call
 	// Connection.Pong itself for a pong to be sent.
 	Ping func(*Connection, []byte)
@@ -92,6 +115,11 @@ func (h HandlerFuncs) OnClose(c *Connection, code uint16, reason string, err err
 		h.Close(c, code, reason, err)
 	}
 }
+func (h HandlerFuncs) OnFrame(c *Connection, opcode Opcode, fin bool, payload []byte) {
+	if h.Frame != nil {
+		h.Frame(c, opcode, fin, payload)
+	}
+}
 func (h HandlerFuncs) OnPing(c *Connection, payload []byte) {
 	if h.Ping != nil {
 		h.Ping(c, payload)
@@ -103,6 +131,27 @@ func (h HandlerFuncs) OnPong(c *Connection, payload []byte) {
 	if h.Pong != nil {
 		h.Pong(c, payload)
 	}
+}
+
+// frameHandler reports how handler takes the frames of a data message, and nil
+// when it wants whole messages. A HandlerFuncs implements OnFrame whether or
+// not its Frame is set, so it is asked for the field instead.
+func frameHandler(handler Handler) FrameHandler {
+	switch typed := handler.(type) {
+	case HandlerFuncs:
+		if typed.Frame == nil {
+			return nil
+		}
+		return typed
+	case *HandlerFuncs:
+		if typed == nil || typed.Frame == nil {
+			return nil
+		}
+		return typed
+	case FrameHandler:
+		return typed
+	}
+	return nil
 }
 
 // Connection is a WebSocket connection. Its write methods are safe to call
@@ -241,6 +290,7 @@ type connectionState struct {
 type ServerHandler struct {
 	config           Config
 	handler          Handler
+	frames           FrameHandler
 	needsRequest     bool
 	handshakeParsers sync.Pool
 }
@@ -274,7 +324,8 @@ func NewHandlerWithConfig(config Config, handler Handler) *ServerHandler {
 			needsRequest = true
 		}
 	}
-	h := &ServerHandler{config: config, handler: handler, needsRequest: needsRequest}
+	h := &ServerHandler{config: config, handler: handler, frames: frameHandler(handler),
+		needsRequest: needsRequest}
 	h.handshakeParsers.New = func() any {
 		return &handshakeParser{maxHeaderBytes: config.HTTP.MaxHeaderBytes}
 	}
@@ -362,6 +413,7 @@ func (h *ServerHandler) upgrade(c *fib.Connection, state *connectionState, reque
 	state.wsParser.maxMessageBytes = h.config.MaxMessageBytes
 	state.wsParser.deflate = compress
 	state.wsParser.contextTakeover = compress && result.deflate.peerContextTakeover
+	state.wsParser.perFrame = h.frames != nil
 	state.upgraded = true
 	if state.handshake != nil && remainder == nil {
 		remainder = state.handshake.TakeBuffered()
@@ -379,15 +431,15 @@ func (h *ServerHandler) upgrade(c *fib.Connection, state *connectionState, reque
 }
 
 func (h *ServerHandler) handleFrames(state *connectionState, data []byte) {
-	serveFrames(h.handler, &state.websocket, &state.wsParser, data)
+	serveFrames(h.handler, h.frames, &state.websocket, &state.wsParser, data)
 }
 
 // serveFrames feeds bytes from the peer through parser and acts on every frame
-// they complete: messages go to handler, pings are answered or handed to a
-// PingHandler, pongs go to a PongHandler, and a close is echoed. Both ends of
-// a connection run it; they differ only in the parser's direction and in
-// whether ws masks what it sends.
-func serveFrames(handler Handler, ws *Connection, parser *Parser, data []byte) {
+// they complete: messages go to handler, or their frames to frames when it is
+// not nil, pings are answered or handed to a PingHandler, pongs go to a
+// PongHandler, and a close is echoed. Both ends of a connection run it; they
+// differ only in the parser's direction and in whether ws masks what it sends.
+func serveFrames(handler Handler, frames FrameHandler, ws *Connection, parser *Parser, data []byte) {
 	defer parser.ReleaseBorrowed()
 	for {
 		event, complete, err := parser.FeedOneBorrowed(data)
@@ -401,7 +453,11 @@ func serveFrames(handler Handler, ws *Connection, parser *Parser, data []byte) {
 		}
 		switch event.Opcode {
 		case Text, Binary:
-			handler.OnMessage(ws, event.Opcode, event.Payload)
+			if frames != nil {
+				frames.OnFrame(ws, event.Opcode, event.Fin, event.Payload)
+			} else {
+				handler.OnMessage(ws, event.Opcode, event.Payload)
+			}
 		case Ping:
 			if pinged, ok := handler.(PingHandler); ok {
 				pinged.OnPing(ws, event.Payload)
