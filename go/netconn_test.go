@@ -152,24 +152,32 @@ func TestWriteDeadlineIgnoresADrainedConnection(t *testing.T) {
 	watcher.quiet(t, 500*time.Millisecond)
 }
 
+// backlogOnceSettled reports how much output a connection is still holding,
+// once the count has stopped moving. A reply is queued before the round that
+// sent it hands it to the socket, so the count taken straight after a Send
+// says what was offered rather than what the kernel would not take.
+func backlogOnceSettled(t *testing.T, c *Connection) int64 {
+	t.Helper()
+	last := int64(-1)
+	for stop := time.Now().Add(10 * time.Second); time.Now().Before(stop); {
+		time.Sleep(200 * time.Millisecond)
+		queued := c.pendingBytes.Load()
+		if queued == last {
+			return queued
+		}
+		last = queued
+	}
+	t.Fatal("the connection's backlog never settled")
+	return 0
+}
+
 func TestWriteDeadlineClosesAStalledConnection(t *testing.T) {
 	payload := bytes.Repeat([]byte("x"), 16<<20)
-	// The reply and the send buffer it was queued against, for the test to
-	// watch and to report when the kernel turns out to have taken it.
-	type reply struct {
-		conn   *Connection
-		buffer int
-	}
-	sent := make(chan reply, 1)
+	replied := make(chan *Connection, 1)
 	watcher := newCloseWatcher(func(c *Connection, _ []byte) {
-		// A send buffer of its own lets the kernel take the reply off this
-		// side, and a deadline is only about output this side still owes, so
-		// ask for no buffer at all.
-		buffer := shrinkSendBuffer(c.FD())
-		_ = c.SetWriteDeadline(time.Now().Add(time.Second))
 		_ = c.Send(payload)
 		select {
-		case sent <- reply{c, buffer}:
+		case replied <- c:
 		default:
 		}
 	})
@@ -193,51 +201,40 @@ func TestWriteDeadlineClosesAStalledConnection(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	// Never read, so the reply cannot drain.
+	// Never read, so nothing the server sends can drain.
 	if _, err = conn.Write([]byte("go")); err != nil {
 		t.Fatal(err)
 	}
-	var stalled reply
+	var stalled *Connection
 	select {
-	case stalled = <-sent:
+	case stalled = <-replied:
 	case <-time.After(5 * time.Second):
 		t.Fatal("the reply was never sent")
 	}
-	closedByDeadline := func(err error) {
-		t.Helper()
-		if !errors.Is(err, os.ErrDeadlineExceeded) {
-			t.Fatalf("OnClose error = %v, want os.ErrDeadlineExceeded", err)
+	// A write deadline is only about output the connection still owes, so
+	// there has to be some before one is armed. The first reply can leave
+	// none: Windows accepts one send of any size while its own send backlog
+	// is below the socket's send buffer, so the kernel takes all sixteen
+	// megabytes however little of it the peer has room for. It does that once
+	// — the backlog stands above the buffer afterwards, and a peer that never
+	// reads does not bring it back down — so send again until the engine is
+	// left holding something.
+	queued := backlogOnceSettled(t, stalled)
+	for attempt := 0; queued == 0; attempt++ {
+		if attempt == 2 {
+			t.Fatal("every reply went into the kernel; a write deadline would have nothing to be about")
 		}
+		if err = stalled.Send(payload); err != nil {
+			t.Fatalf("Send: %v", err)
+		}
+		queued = backlogOnceSettled(t, stalled)
 	}
-	// Two things can end the wait. The deadline closing the connection is the
-	// one this test is about; the counter emptying without it means the kernel
-	// took the whole reply however small a buffer it was given — which is what
-	// Windows does, and slowly enough that it cannot be ruled out up front —
-	// and then the deadline has nothing to be about and the test nothing to
-	// check.
-	for stop := time.Now().Add(5 * time.Second); time.Now().Before(stop); time.Sleep(10 * time.Millisecond) {
-		select {
-		case err := <-watcher.closed:
-			closedByDeadline(err)
-			return
-		default:
-		}
-		if stalled.conn.pendingBytes.Load() != 0 {
-			continue
-		}
-		// A close empties the counter as well, and does so before it reaches
-		// OnClose, so give the close its moment before taking an empty
-		// counter for the kernel's doing.
-		select {
-		case err := <-watcher.closed:
-			closedByDeadline(err)
-			return
-		case <-time.After(time.Second):
-			t.Skipf("the kernel took the whole %d-byte reply with a send buffer of %d bytes; "+
-				"the write deadline has nothing to be about", len(payload), stalled.buffer)
-		}
+	if err = stalled.SetWriteDeadline(time.Now().Add(500 * time.Millisecond)); err != nil {
+		t.Fatal(err)
 	}
-	t.Fatal("the connection did not close")
+	if err = watcher.await(t, 5*time.Second); !errors.Is(err, os.ErrDeadlineExceeded) {
+		t.Fatalf("OnClose error = %v, want os.ErrDeadlineExceeded", err)
+	}
 }
 
 func TestReadTakesBytesOffTheSocket(t *testing.T) {
