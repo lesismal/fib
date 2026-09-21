@@ -13,12 +13,17 @@ import (
 )
 
 // shrinkSendBuffer asks for the smallest send buffer the kernel will give this
-// socket, so that a reply the peer is not reading stays queued in the engine
-// instead of disappearing into the kernel. Linux clamps zero to a minimum of
-// its own; macOS refuses it and keeps the buffer it has, which is small enough
-// to leave a large reply queued anyway.
-func shrinkSendBuffer(fd int) error {
-	return syscall.SetsockoptInt(fd, syscall.SOL_SOCKET, syscall.SO_SNDBUF, 0)
+// socket and reports the size it settled on, so that a reply the peer is not
+// reading stays queued in the engine instead of disappearing into the kernel.
+// Linux clamps zero to a minimum of its own; macOS refuses it and keeps the
+// buffer it has, which is small enough to leave a large reply queued anyway.
+func shrinkSendBuffer(fd int) int {
+	_ = syscall.SetsockoptInt(fd, syscall.SOL_SOCKET, syscall.SO_SNDBUF, 0)
+	size, err := syscall.GetsockoptInt(fd, syscall.SOL_SOCKET, syscall.SO_SNDBUF)
+	if err != nil {
+		return -1
+	}
+	return size
 }
 
 // Descriptors are recycled by the kernel, and the connection table is indexed
