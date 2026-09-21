@@ -836,7 +836,10 @@ func TestHTTP1ConformanceServerWithCurl(t *testing.T) {
 	})
 	t.Run("keep-alive", func(t *testing.T) {
 		_, stderr := runCurl(t, curl, "--verbose", "--output", os.DevNull, "--output", os.DevNull, base+"/echo", base+"/echo")
-		if !strings.Contains(strings.ToLower(stderr), "existing connection") {
+		// curl says "Re-using existing connection" up to 8.20 and "Reusing
+		// existing http: connection" after it; what both agree on is that the
+		// second request used the connection the first one left open.
+		if !strings.Contains(strings.ToLower(stderr), "using existing") {
 			t.Fatalf("second request did not reuse the connection:\n%s", stderr)
 		}
 	})

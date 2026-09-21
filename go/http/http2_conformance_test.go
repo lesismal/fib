@@ -76,7 +76,7 @@ func rawH2Server(t *testing.T, settings []([2]uint32), serve func(s *h2RawServer
 				return
 			}
 			go func() {
-				defer c.Close()
+				defer endRawConn(c)
 				_ = c.SetDeadline(time.Now().Add(20 * time.Second))
 				s := &h2RawServer{t: t, c: c, enc: hpack.NewEncoder(), dec: hpack.NewDecoder(hpack.DefaultTableSize),
 					initialWindow: h2DefaultWindow, connWindow: h2DefaultWindow}
@@ -92,6 +92,27 @@ func rawH2Server(t *testing.T, settings []([2]uint32), serve func(s *h2RawServer
 		}
 	}()
 	return ln.Addr().String()
+}
+
+// endRawConn ends a raw server's connection without resetting it. Closing a
+// socket that still holds bytes the peer sent is abortive, and a reset throws
+// away what the peer has received but not yet read — here, the response this
+// server has just written. A client leaves such bytes behind on any healthy
+// connection: its settings acknowledgement and its window updates, which this
+// server reads only as far as the request it was waiting for. So the send side
+// goes first, which is the client's cue to close, and the rest is read off
+// until it does.
+func endRawConn(c net.Conn) {
+	defer c.Close()
+	tcp, ok := c.(*net.TCPConn)
+	if !ok {
+		return
+	}
+	if err := tcp.CloseWrite(); err != nil {
+		return
+	}
+	_ = tcp.SetReadDeadline(time.Now().Add(2 * time.Second))
+	_, _ = io.Copy(io.Discard, tcp)
 }
 
 func (s *h2RawServer) readPreface() {

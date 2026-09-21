@@ -154,9 +154,20 @@ func TestWriteDeadlineIgnoresADrainedConnection(t *testing.T) {
 
 func TestWriteDeadlineClosesAStalledConnection(t *testing.T) {
 	payload := bytes.Repeat([]byte("x"), 16<<20)
+	// One send of any size is accepted whole while the kernel's own backlog is
+	// below its send buffer — which is what Windows does — and a reply the
+	// kernel took whole leaves nothing queued for the deadline to be about.
+	// Send more chunks than one flush can hand over in a single call instead:
+	// the first batch goes the same way, and the rest queues behind a peer
+	// that is not reading, on every platform.
+	chunk := len(payload) / (2 * maxWritevItems)
 	watcher := newCloseWatcher(func(c *Connection, _ []byte) {
 		_ = c.SetWriteDeadline(time.Now().Add(200 * time.Millisecond))
-		_ = c.Send(payload)
+		for offset := 0; offset+chunk <= len(payload); offset += chunk {
+			if err := c.SendOwned(payload[offset : offset+chunk]); err != nil {
+				return
+			}
+		}
 	})
 	config := DefaultConfig()
 	// Keep the backlog off the watermarks, so the connection is closed by its
