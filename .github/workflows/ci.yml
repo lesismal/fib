@@ -110,6 +110,15 @@ jobs:
             echo "::error title=go test failed::$summary"
           fi
           exit "$status"
+      # An annotation is capped at a few kilobytes, which one failing test can
+      # fill, so the whole log is kept for the failures behind it.
+      - name: Upload the test log
+        if: failure()
+        uses: actions/upload-artifact@v5
+        with:
+          name: test-log-${{ matrix.os }}-${{ matrix.go }}
+          path: ${{ runner.temp }}/test.log
+          if-no-files-found: ignore
 
   # HTTP/1.0 and HTTP/1.1 conformance: the fib server against net/http's
   # client, raw sockets and curl, the fib client against net/http's server and
@@ -141,18 +150,30 @@ jobs:
           # Fail rather than skip the curl cases if curl is missing.
           FIB_REQUIRE_CURL: '1'
         run: |
+          # The job's own shell stops on the first failure, which would take
+          # the summary below with it, so failures are reported by hand.
+          set +e
           go test -race -count=1 -timeout 10m -v \
             -run 'TestHTTP1Conformance|TestSendFile|TestSendableFileOf|TestResponseWriter|TestStreamRequestBody|TestChunkedDecoder|TestHoldReads|TestServerRead|TestServerIdle|TestServerTimeout|TestServerWithoutTimeouts|TestReadDeadline|TestWriteDeadline|TestZeroDeadline|TestConnectionAddresses|TestRetain|TestOnBody|TestOnCancel' \
             . ./http/ 2>&1 | tee "$RUNNER_TEMP/conformance.log"
           status=${PIPESTATUS[0]}
           if [ "$status" -ne 0 ]; then
-            summary=$(grep -E -B2 -A20 -- '--- FAIL|^panic:|^FAIL' "$RUNNER_TEMP/conformance.log" | head -c 60000)
+            summary=$(grep -E -B2 -A20 -- '--- FAIL|^panic:|^FAIL|fatal error:' "$RUNNER_TEMP/conformance.log" | head -c 60000)
             summary=${summary//'%'/'%25'}
             summary=${summary//$'\r'/'%0D'}
             summary=${summary//$'\n'/'%0A'}
             echo "::error title=HTTP/1.x conformance failed::$summary"
           fi
           exit "$status"
+      # An annotation is capped at a few kilobytes, which one failing test can
+      # fill, so the whole log is kept for the failures behind it.
+      - name: Upload the test log
+        if: failure()
+        uses: actions/upload-artifact@v5
+        with:
+          name: http1-conformance-log-${{ matrix.os }}
+          path: ${{ runner.temp }}/conformance.log
+          if-no-files-found: ignore
 
   # HTTP/2 conformance: the fib server against net/http's client, h2spec and
   # curl, and the fib client against net/http's server and a raw frame server.
@@ -189,19 +210,29 @@ jobs:
           FIB_REQUIRE_CURL: '1'
           FIB_REQUIRE_H2SPEC: '1'
         run: |
+          set +e
           PATH="$(go env GOPATH)/bin:$PATH"
           go test -race -count=1 -timeout 10m -v \
             -run 'TestHTTP2Conformance|TestH2|TestClientHTTP2|TestClientDisableHTTP2|TestClientUnencryptedHTTP2|TestPushOnHTTP1|TestInterim|TestRequestTLS|TestConfigureTLS' \
             ./http/ 2>&1 | tee "$RUNNER_TEMP/h2conformance.log"
           status=${PIPESTATUS[0]}
           if [ "$status" -ne 0 ]; then
-            summary=$(grep -E -B2 -A20 -- '--- FAIL|^panic:|^FAIL' "$RUNNER_TEMP/h2conformance.log" | head -c 60000)
+            summary=$(grep -E -B2 -A20 -- '--- FAIL|^panic:|^FAIL|fatal error:' "$RUNNER_TEMP/h2conformance.log" | head -c 60000)
             summary=${summary//'%'/'%25'}
             summary=${summary//$'\r'/'%0D'}
             summary=${summary//$'\n'/'%0A'}
             echo "::error title=HTTP/2 conformance failed::$summary"
           fi
           exit "$status"
+      # An annotation is capped at a few kilobytes, which one failing test can
+      # fill, so the whole log is kept for the failures behind it.
+      - name: Upload the test log
+        if: failure()
+        uses: actions/upload-artifact@v5
+        with:
+          name: http2-conformance-log-${{ matrix.os }}
+          path: ${{ runner.temp }}/h2conformance.log
+          if-no-files-found: ignore
       - name: HPACK tests
         # HTTP/2 header compression, checked against RFC 7541's own vectors.
         run: go test -race -count=1 ./internal/hpack/
@@ -255,10 +286,12 @@ jobs:
             if [ "$name" = "h2" ]; then
               h2spec_args+=(-t -k)
             fi
-            "$h2spec" "${h2spec_args[@]}" > "$reports/$name.log" 2>&1
-            local status=$?
-            kill "$pid" 2>/dev/null
-            wait "$pid" 2>/dev/null
+            # h2spec exits non-zero on a reported failure, which is what
+            # this job is for, so it must not stop the shell.
+            local status=0
+            "$h2spec" "${h2spec_args[@]}" > "$reports/$name.log" 2>&1 || status=$?
+            kill "$pid" 2>/dev/null || true
+            wait "$pid" 2>/dev/null || true
 
             echo "::group::h2spec ($name)"
             cat "$reports/$name.log"
@@ -337,16 +370,26 @@ jobs:
           # Fail rather than skip if the peer cannot be built.
           FIB_REQUIRE_H3_INTEROP: '1'
         run: |
+          set +e
           go test -race -count=1 -timeout 10m -v ./http3/... 2>&1 | tee "$RUNNER_TEMP/h3conformance.log"
           status=${PIPESTATUS[0]}
           if [ "$status" -ne 0 ]; then
-            summary=$(grep -E -B2 -A20 -- '--- FAIL|^panic:|^FAIL' "$RUNNER_TEMP/h3conformance.log" | head -c 60000)
+            summary=$(grep -E -B2 -A20 -- '--- FAIL|^panic:|^FAIL|fatal error:' "$RUNNER_TEMP/h3conformance.log" | head -c 60000)
             summary=${summary//'%'/'%25'}
             summary=${summary//$'\r'/'%0D'}
             summary=${summary//$'\n'/'%0A'}
             echo "::error title=HTTP/3 conformance failed::$summary"
           fi
           exit "$status"
+      # An annotation is capped at a few kilobytes, which one failing test can
+      # fill, so the whole log is kept for the failures behind it.
+      - name: Upload the test log
+        if: failure()
+        uses: actions/upload-artifact@v5
+        with:
+          name: http3-conformance-log-${{ matrix.os }}
+          path: ${{ runner.temp }}/h3conformance.log
+          if-no-files-found: ignore
 
   # The parsers all take bytes from the network, so each gets a short fuzz
   # run: HTTP/1 requests, HTTP/2 frames and HPACK, HTTP/3 frames, requests
