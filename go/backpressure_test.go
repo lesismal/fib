@@ -408,9 +408,20 @@ func TestPingPongUnderWatermarkNeverPausesReads(t *testing.T) {
 					stats.ReadsPausedByWatermark, stats.ReadsPausedByBudget, rounds, header+message, watermark)
 			}
 			// Nothing may be left owing either, or the counter would creep up
-			// across rounds and trip the watermark on a later one.
-			if stats.PendingBytes != 0 {
-				t.Fatalf("pending = %d bytes after %d drained rounds, want 0", stats.PendingBytes, rounds)
+			// across rounds and trip the watermark on a later one. A reply is
+			// discounted just after the write that hands it to the socket, so
+			// the client can be reading the last one while the server has yet
+			// to run those few instructions: wait for the counter to settle
+			// instead of reading it the moment the last byte lands. A leak
+			// never settles, so this still catches one.
+			deadline := time.Now().Add(5 * time.Second)
+			pending := server.Stats().PendingBytes
+			for pending != 0 && time.Now().Before(deadline) {
+				time.Sleep(time.Millisecond)
+				pending = server.Stats().PendingBytes
+			}
+			if pending != 0 {
+				t.Fatalf("pending = %d bytes after %d drained rounds, want 0", pending, rounds)
 			}
 		})
 	}
