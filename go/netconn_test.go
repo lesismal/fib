@@ -154,19 +154,19 @@ func TestWriteDeadlineIgnoresADrainedConnection(t *testing.T) {
 
 func TestWriteDeadlineClosesAStalledConnection(t *testing.T) {
 	payload := bytes.Repeat([]byte("x"), 16<<20)
-	// One send of any size is accepted whole while the kernel's own backlog is
-	// below its send buffer — which is what Windows does — and a reply the
-	// kernel took whole leaves nothing queued for the deadline to be about.
-	// Send more chunks than one flush can hand over in a single call instead:
-	// the first batch goes the same way, and the rest queues behind a peer
-	// that is not reading, on every platform.
-	chunk := len(payload) / (2 * maxWritevItems)
+	sending := make(chan *Connection, 1)
 	watcher := newCloseWatcher(func(c *Connection, _ []byte) {
-		_ = c.SetWriteDeadline(time.Now().Add(200 * time.Millisecond))
-		for offset := 0; offset+chunk <= len(payload); offset += chunk {
-			if err := c.SendOwned(payload[offset : offset+chunk]); err != nil {
-				return
-			}
+		// A send buffer of its own would take the reply off this side and
+		// leave the deadline nothing to be about: every kernel takes at least
+		// a bufferful, and Windows takes one send of any size while its
+		// backlog is below that buffer. Ask for no buffer at all, so what the
+		// peer will not read stays queued here.
+		_ = shrinkSendBuffer(c.FD())
+		_ = c.SetWriteDeadline(time.Now().Add(time.Second))
+		_ = c.Send(payload)
+		select {
+		case sending <- c:
+		default:
 		}
 	})
 	config := DefaultConfig()
@@ -185,7 +185,7 @@ func TestWriteDeadlineClosesAStalledConnection(t *testing.T) {
 		// a receive window that auto-tunes as far as the payload — which is
 		// what Windows does — would take the whole reply into the kernel even
 		// though nothing here ever reads it, and then the write deadline would
-		// have nothing to be about.
+		// have nothing to be about either.
 		if err = tcp.SetReadBuffer(16 << 10); err != nil {
 			t.Fatal(err)
 		}
@@ -193,6 +193,18 @@ func TestWriteDeadlineClosesAStalledConnection(t *testing.T) {
 	// Never read, so the reply cannot drain.
 	if _, err = conn.Write([]byte("go")); err != nil {
 		t.Fatal(err)
+	}
+	var sender *Connection
+	select {
+	case sender = <-sending:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the reply was never sent")
+	}
+	// The round's output reaches the socket when the round ends, so let the
+	// flush have the socket before asking what it would not take.
+	time.Sleep(300 * time.Millisecond)
+	if sender.pendingBytes.Load() == 0 {
+		t.Skip("the kernel accepted the whole reply; the write deadline has nothing to be about")
 	}
 	if err := watcher.await(t, 5*time.Second); !errors.Is(err, os.ErrDeadlineExceeded) {
 		t.Fatalf("OnClose error = %v, want os.ErrDeadlineExceeded", err)
