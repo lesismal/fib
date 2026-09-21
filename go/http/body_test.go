@@ -17,6 +17,9 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	fib "github.com/lesismal/fib/go"
+	"github.com/lesismal/fib/go/taskpool"
 )
 
 // streamingConfig is a server that hands over any body past 1KB.
@@ -30,6 +33,37 @@ func streamingConfig() Config {
 func serveStreamingServer(t *testing.T, config Config, handler HandlerFunc) string {
 	t.Helper()
 	return serve(t, NewHandlerWithConfig(config, handler))
+}
+
+// serveOnPinnedPool runs a server whose rounds go to a pool of a fixed size,
+// for a test that counts goroutines: the built-in pool grows with how many
+// connections happen to be busy at once, which is not a cost of the requests
+// themselves and differs from one machine to the next. ModeCond starts all of
+// its workers with the pool, so they are already there when the count is
+// taken and none is added later.
+func serveOnPinnedPool(t *testing.T, config Config, handler HandlerFunc) string {
+	t.Helper()
+	pool := taskpool.NewWithMode(taskpool.ModeCond, 8, 1024)
+	engine := fib.DefaultConfig()
+	engine.Addr = "127.0.0.1:0"
+	engine.SetTaskPool(pool)
+	server, err := fib.Bind(engine, NewHandlerWithConfig(config, handler))
+	if err != nil {
+		t.Fatal(err)
+	}
+	addr, err := server.LocalAddr()
+	if err != nil {
+		t.Fatal(err)
+	}
+	runDone := make(chan error, 1)
+	go func() { runDone <- server.Run() }()
+	t.Cleanup(func() {
+		server.Stop()
+		<-runDone
+		_ = server.Close()
+		pool.Stop()
+	})
+	return addr.String()
 }
 
 // bodyOf is the body a streamed request carries, or nil when the request was
@@ -635,7 +669,9 @@ func TestStreamRequestBodyRunsOnTheConnectionWorker(t *testing.T) {
 	config := streamingConfig()
 	config.StreamRequestBodyBuffer = 16 << 10
 	waiting := make(chan struct{}, uploads)
-	addr := serveStreamingServer(t, config, func(c *Context, r *stdhttp.Request) {
+	// The pool is pinned: what this test counts is goroutines the uploads
+	// themselves cost, not the workers the engine's own pool adds under load.
+	addr := serveOnPinnedPool(t, config, func(c *Context, r *stdhttp.Request) {
 		var total int64
 		buf := make([]byte, 4096)
 		for {
@@ -688,10 +724,13 @@ func TestStreamRequestBodyRunsOnTheConnectionWorker(t *testing.T) {
 		}
 	}
 	// Every upload is now held open with its body unfinished. A goroutine per
-	// upload would show here.
+	// upload would show here; the few the runtime and the sockets come with
+	// are what the allowance is for.
+	const allowance = 8
 	grew := runtime.NumGoroutine() - before
-	if grew >= uploads/2 {
-		t.Fatalf("%d uploads in flight grew the process by %d goroutines", uploads, grew)
+	if grew > allowance {
+		t.Fatalf("%d uploads in flight grew the process by %d goroutines, allowing %d",
+			uploads, grew, allowance)
 	}
 
 	rest := bytes.Repeat([]byte("s"), size-(2<<10))

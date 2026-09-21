@@ -169,6 +169,16 @@ func TestWriteDeadlineClosesAStalledConnection(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer conn.Close()
+	if tcp, ok := conn.(*net.TCPConn); ok {
+		// Pin this side's receive buffer before anything is sent. Left alone,
+		// a receive window that auto-tunes as far as the payload — which is
+		// what Windows does — would take the whole reply into the kernel even
+		// though nothing here ever reads it, and then the write deadline would
+		// have nothing to be about.
+		if err = tcp.SetReadBuffer(16 << 10); err != nil {
+			t.Fatal(err)
+		}
+	}
 	// Never read, so the reply cannot drain.
 	if _, err = conn.Write([]byte("go")); err != nil {
 		t.Fatal(err)
