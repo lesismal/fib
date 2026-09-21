@@ -12,6 +12,7 @@ import (
 	"net"
 	stdhttp "net/http"
 	"os"
+	"runtime"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -38,6 +39,63 @@ func bodyOf(r *stdhttp.Request) *BodyStream {
 	return stream
 }
 
+// collectBody is the shape a handler takes under a body that never waits: it
+// reads what has arrived, and when Read reports ErrWouldBlock it retains the
+// request and takes the rest through OnBody. answer runs once, with what the
+// body came to and the error that ended it, if any.
+func collectBody(answer func(c *Context, total int64, digest []byte, err error)) HandlerFunc {
+	return func(c *Context, r *stdhttp.Request) {
+		digest := sha256.New()
+		var total int64
+		buf := make([]byte, 4096)
+		for {
+			n, err := r.Body.Read(buf)
+			if n > 0 {
+				digest.Write(buf[:n])
+				total += int64(n)
+			}
+			switch {
+			case err == nil:
+				continue
+			case errors.Is(err, io.EOF):
+				answer(c, total, digest.Sum(nil), nil)
+				return
+			case errors.Is(err, ErrWouldBlock):
+				c.Retain()
+				c.OnBody(func(data []byte, fin bool, err error) {
+					digest.Write(data)
+					total += int64(len(data))
+					if err != nil || fin {
+						answer(c, total, digest.Sum(nil), err)
+						c.Release()
+					}
+				})
+				return
+			default:
+				answer(c, total, digest.Sum(nil), err)
+				return
+			}
+		}
+	}
+}
+
+// sizeAndDigest answers with what collectBody gathered.
+func sizeAndDigest(c *Context, total int64, digest []byte, err error) {
+	if err != nil {
+		_ = c.Respond(stdhttp.StatusBadRequest, "text/plain", []byte(err.Error()))
+		return
+	}
+	_ = c.Respond(stdhttp.StatusOK, "text/plain", fmt.Appendf(nil, "%d %x", total, digest))
+}
+
+func wantSizeAndDigest(payload []byte) string {
+	return fmt.Sprintf("%d %x", len(payload), sha256.Sum256(payload))
+}
+
+// TestStreamRequestBodyReachesHandlerBeforeTheBodyEnds also checks the
+// handover: what the handler read before ErrWouldBlock and what OnBody
+// delivered after it have to add up to the whole body, with nothing dropped
+// between the two.
 func TestStreamRequestBodyReachesHandlerBeforeTheBodyEnds(t *testing.T) {
 	const size = 1 << 20
 	started := make(chan int64, 1)
@@ -49,12 +107,7 @@ func TestStreamRequestBodyReachesHandlerBeforeTheBodyEnds(t *testing.T) {
 			return
 		}
 		started <- stream.Consumed()
-		digest := sha256.New()
-		n, err := io.Copy(digest, r.Body)
-		if err != nil {
-			t.Errorf("reading the body: %v", err)
-		}
-		_ = c.Respond(stdhttp.StatusOK, "text/plain", fmt.Appendf(nil, "%d %x", n, digest.Sum(nil)))
+		collectBody(sizeAndDigest)(c, r)
 	})
 
 	payload := bytes.Repeat([]byte("fib streaming body "), size/19)
@@ -74,13 +127,79 @@ func TestStreamRequestBodyReachesHandlerBeforeTheBodyEnds(t *testing.T) {
 	if _, err := conn.Write(payload); err != nil {
 		t.Fatal(err)
 	}
-	digest := sha256.Sum256(payload)
-	_, body := conn.response(stdhttp.MethodPost)
-	if want := fmt.Sprintf("%d %x", len(payload), digest); body != want {
-		t.Fatalf("body = %q, want %q", body, want)
+	if _, body := conn.response(stdhttp.MethodPost); body != wantSizeAndDigest(payload) {
+		t.Fatalf("body = %q, want %q", body, wantSizeAndDigest(payload))
 	}
 }
 
+// TestStreamRequestBodyReadReportsWouldBlockAndEOF checks the answers a
+// handler steers by: nothing here yet, and the body already taken over.
+func TestStreamRequestBodyReadReportsWouldBlock(t *testing.T) {
+	errs := make(chan error, 2)
+	addr := serveStreamingServer(t, streamingConfig(), func(c *Context, r *stdhttp.Request) {
+		buf := make([]byte, 64<<10)
+		_, err := r.Body.Read(buf)
+		errs <- err
+		c.Retain()
+		c.OnBody(func(data []byte, fin bool, err error) {
+			if !fin && err == nil {
+				return
+			}
+			// Once a callback has the body, reading it reports as much.
+			_, readErr := r.Body.Read(buf)
+			errs <- readErr
+			_ = c.Respond(stdhttp.StatusOK, "text/plain", []byte("done"))
+			c.Release()
+		})
+	})
+	conn := dialRaw(t, addr)
+	conn.send("POST /x HTTP/1.1\r\nHost: test\r\nContent-Length: 4096\r\n\r\n")
+	time.Sleep(50 * time.Millisecond)
+	if _, err := conn.Write(bytes.Repeat([]byte("q"), 4096)); err != nil {
+		t.Fatal(err)
+	}
+	if _, body := conn.response(stdhttp.MethodPost); body != "done" {
+		t.Fatalf("body = %q", body)
+	}
+	if err := <-errs; !errors.Is(err, ErrWouldBlock) {
+		t.Fatalf("first read = %v, want ErrWouldBlock", err)
+	}
+	if err := <-errs; !errors.Is(err, ErrBodyAbandoned) {
+		t.Fatalf("read after OnBody took the body = %v, want ErrBodyAbandoned", err)
+	}
+}
+
+// TestStreamRequestBodyReadsToEOFWithoutOnBody covers the body that is all
+// there by the time the handler runs: it reads to io.EOF and answers, with no
+// callback and nothing retained.
+func TestStreamRequestBodyReadsToEOFWithoutOnBody(t *testing.T) {
+	addr := serveStreamingServer(t, streamingConfig(), func(c *Context, r *stdhttp.Request) {
+		digest := sha256.New()
+		var total int64
+		buf := make([]byte, 4096)
+		for {
+			n, err := r.Body.Read(buf)
+			digest.Write(buf[:n])
+			total += int64(n)
+			if errors.Is(err, io.EOF) {
+				sizeAndDigest(c, total, digest.Sum(nil), nil)
+				return
+			}
+			if err != nil {
+				t.Errorf("read = %v, want the whole body to be here", err)
+				collectBody(sizeAndDigest)(c, r)
+				return
+			}
+		}
+	})
+	payload := bytes.Repeat([]byte("p"), 8<<10)
+	conn := dialRaw(t, addr)
+	// Header and body in one write, so the body is there when the handler is.
+	conn.send(fmt.Sprintf("POST /x HTTP/1.1\r\nHost: test\r\nContent-Length: %d\r\n\r\n%s", len(payload), payload))
+	if _, body := conn.response(stdhttp.MethodPost); body != wantSizeAndDigest(payload) {
+		t.Fatalf("body = %q, want %q", body, wantSizeAndDigest(payload))
+	}
+}
 func TestStreamRequestBodyKeepsBodiesUnderTheThresholdBuffered(t *testing.T) {
 	kinds := make(chan string, 1)
 	addr := serveStreamingServer(t, streamingConfig(), func(c *Context, r *stdhttp.Request) {
@@ -104,16 +223,16 @@ func TestStreamRequestBodyKeepsBodiesUnderTheThresholdBuffered(t *testing.T) {
 
 func TestStreamRequestBodyChunkedWithTrailer(t *testing.T) {
 	addr := serveStreamingServer(t, streamingConfig(), func(c *Context, r *stdhttp.Request) {
-		stream := bodyOf(r)
-		if stream == nil {
+		if bodyOf(r) == nil {
 			t.Errorf("body is %T, want a *BodyStream", r.Body)
 		}
-		body, err := io.ReadAll(r.Body)
-		if err != nil {
-			t.Errorf("reading the body: %v", err)
-		}
-		_ = c.Respond(stdhttp.StatusOK, "text/plain",
-			fmt.Appendf(nil, "%d %s", len(body), r.Trailer.Get("X-Checksum")))
+		collectBody(func(c *Context, total int64, _ []byte, err error) {
+			if err != nil {
+				t.Errorf("reading the body: %v", err)
+			}
+			_ = c.Respond(stdhttp.StatusOK, "text/plain",
+				fmt.Appendf(nil, "%d %s", total, r.Trailer.Get("X-Checksum")))
+		})(c, r)
 	})
 
 	conn := dialRaw(t, addr)
@@ -133,26 +252,47 @@ func TestStreamRequestBodyChunkedWithTrailer(t *testing.T) {
 	}
 }
 
+// TestStreamRequestBodyHoldsReadsWhileTheHandlerIsBehind checks the
+// backpressure a handler that retains the body without taking it still gets:
+// what has arrived is buffered up to the watermark, and past it the
+// connection stops reading.
 func TestStreamRequestBodyHoldsReadsWhileTheHandlerIsBehind(t *testing.T) {
 	const size = 1 << 20
 	config := streamingConfig()
 	config.StreamRequestBodyBuffer = 16 << 10
 	held := make(chan bool, 1)
 	addr := serveStreamingServer(t, config, func(c *Context, r *stdhttp.Request) {
-		// Let the buffer fill before reading a byte.
-		deadline := time.Now().Add(5 * time.Second)
-		for !c.Conn.ReadsHeld() && time.Now().Before(deadline) {
-			time.Sleep(5 * time.Millisecond)
-		}
-		held <- c.Conn.ReadsHeld()
-		n, err := io.Copy(io.Discard, r.Body)
-		if err != nil {
-			t.Errorf("reading the body: %v", err)
-		}
-		if c.Conn.ReadsHeld() {
-			t.Error("reads still held once the body had been read")
-		}
-		_ = c.Respond(stdhttp.StatusOK, "text/plain", fmt.Appendf(nil, "%d", n))
+		c.Retain()
+		go func() {
+			// Let the buffer fill before reading a byte.
+			deadline := time.Now().Add(5 * time.Second)
+			for !c.Conn.ReadsHeld() && time.Now().Before(deadline) {
+				time.Sleep(5 * time.Millisecond)
+			}
+			held <- c.Conn.ReadsHeld()
+			var total int64
+			buf := make([]byte, 4096)
+			for {
+				n, err := r.Body.Read(buf)
+				total += int64(n)
+				if errors.Is(err, io.EOF) {
+					break
+				}
+				if errors.Is(err, ErrWouldBlock) {
+					time.Sleep(time.Millisecond)
+					continue
+				}
+				if err != nil {
+					t.Errorf("reading the body: %v", err)
+					break
+				}
+			}
+			if c.Conn.ReadsHeld() {
+				t.Error("reads still held once the body had been read")
+			}
+			_ = c.Respond(stdhttp.StatusOK, "text/plain", fmt.Appendf(nil, "%d", total))
+			c.Release()
+		}()
 	})
 
 	payload := bytes.Repeat([]byte("x"), size)
@@ -170,7 +310,6 @@ func TestStreamRequestBodyHoldsReadsWhileTheHandlerIsBehind(t *testing.T) {
 		t.Fatalf("body = %q, want %d", body, size)
 	}
 }
-
 func TestStreamRequestBodyKeepsAliveAfterAShortDiscard(t *testing.T) {
 	addr := serveStreamingServer(t, streamingConfig(), func(c *Context, r *stdhttp.Request) {
 		// Answer without reading the body at all.
@@ -213,12 +352,17 @@ func TestStreamRequestBodyClosesAfterALongDiscard(t *testing.T) {
 func TestStreamRequestBodyExpectContinueWaitsForTheFirstRead(t *testing.T) {
 	read := make(chan struct{})
 	addr := serveStreamingServer(t, streamingConfig(), func(c *Context, r *stdhttp.Request) {
-		<-read
-		n, err := io.Copy(io.Discard, r.Body)
-		if err != nil {
-			t.Errorf("reading the body: %v", err)
-		}
-		_ = c.Respond(stdhttp.StatusOK, "text/plain", fmt.Appendf(nil, "%d", n))
+		c.Retain()
+		go func() {
+			<-read
+			collectBody(func(c *Context, total int64, _ []byte, err error) {
+				if err != nil {
+					t.Errorf("reading the body: %v", err)
+				}
+				_ = c.Respond(stdhttp.StatusOK, "text/plain", fmt.Appendf(nil, "%d", total))
+			})(c, r)
+			c.Release()
+		}()
 	})
 	payload := bytes.Repeat([]byte("q"), 4<<10)
 	conn := dialRaw(t, addr)
@@ -242,6 +386,33 @@ func TestStreamRequestBodyExpectContinueWaitsForTheFirstRead(t *testing.T) {
 	}
 }
 
+// TestStreamRequestBodyExpectContinueGrantedByOnBody checks that asking for
+// the body as a callback is asking for it too.
+func TestStreamRequestBodyExpectContinueGrantedByOnBody(t *testing.T) {
+	addr := serveStreamingServer(t, streamingConfig(), func(c *Context, r *stdhttp.Request) {
+		var total int64
+		c.Retain()
+		c.OnBody(func(data []byte, fin bool, err error) {
+			total += int64(len(data))
+			if err != nil || fin {
+				_ = c.Respond(stdhttp.StatusOK, "text/plain", fmt.Appendf(nil, "%d", total))
+				c.Release()
+			}
+		})
+	})
+	payload := bytes.Repeat([]byte("e"), 4<<10)
+	conn := dialRaw(t, addr)
+	conn.send(fmt.Sprintf("POST /expect HTTP/1.1\r\nHost: test\r\nExpect: 100-continue\r\nContent-Length: %d\r\n\r\n", len(payload)))
+	if head := conn.head(); !strings.HasPrefix(head, "HTTP/1.1 100 Continue") {
+		t.Fatalf("interim response = %q", head)
+	}
+	if _, err := conn.Write(payload); err != nil {
+		t.Fatal(err)
+	}
+	if _, body := conn.response(stdhttp.MethodPost); body != fmt.Sprintf("%d", len(payload)) {
+		t.Fatalf("body = %q, want %d", body, len(payload))
+	}
+}
 func TestStreamRequestBodyRefusedExpectationSendsNoContinue(t *testing.T) {
 	addr := serveStreamingServer(t, streamingConfig(), func(c *Context, r *stdhttp.Request) {
 		_ = c.Respond(stdhttp.StatusForbidden, "text/plain", []byte("no"))
@@ -261,10 +432,9 @@ func TestStreamRequestBodyLimitFailsTheRead(t *testing.T) {
 	config := streamingConfig()
 	config.MaxStreamedBodyBytes = 64 << 10
 	failed := make(chan error, 1)
-	addr := serveStreamingServer(t, config, func(c *Context, r *stdhttp.Request) {
-		_, err := io.Copy(io.Discard, r.Body)
+	addr := serveStreamingServer(t, config, collectBody(func(c *Context, _ int64, _ []byte, err error) {
 		failed <- err
-	})
+	}))
 	conn := dialRaw(t, addr)
 	conn.send("POST /big HTTP/1.1\r\nHost: test\r\nTransfer-Encoding: chunked\r\n\r\n")
 	chunk := bytes.Repeat([]byte("w"), 8<<10)
@@ -282,13 +452,11 @@ func TestStreamRequestBodyLimitFailsTheRead(t *testing.T) {
 		t.Fatal("the body grew past MaxStreamedBodyBytes without failing")
 	}
 }
-
 func TestStreamRequestBodyTruncatedUploadFailsTheRead(t *testing.T) {
 	failed := make(chan error, 1)
-	addr := serveStreamingServer(t, streamingConfig(), func(c *Context, r *stdhttp.Request) {
-		_, err := io.Copy(io.Discard, r.Body)
+	addr := serveStreamingServer(t, streamingConfig(), collectBody(func(c *Context, _ int64, _ []byte, err error) {
 		failed <- err
-	})
+	}))
 	conn, err := net.DialTimeout("tcp", addr, 5*time.Second)
 	if err != nil {
 		t.Fatal(err)
@@ -306,13 +474,17 @@ func TestStreamRequestBodyTruncatedUploadFailsTheRead(t *testing.T) {
 		t.Fatal("the read never failed after the client went away")
 	}
 }
-
 func TestStreamRequestBodyPipelinesBehindTheStreamedRequest(t *testing.T) {
 	var order atomic.Int64
 	addr := serveStreamingServer(t, streamingConfig(), func(c *Context, r *stdhttp.Request) {
-		n, _ := io.Copy(io.Discard, r.Body)
-		_ = c.Respond(stdhttp.StatusOK, "text/plain",
-			fmt.Appendf(nil, "%d %s %d", order.Add(1), r.URL.Path, n))
+		path := r.URL.Path
+		collectBody(func(c *Context, total int64, _ []byte, err error) {
+			if err != nil {
+				t.Errorf("reading the body: %v", err)
+			}
+			_ = c.Respond(stdhttp.StatusOK, "text/plain",
+				fmt.Appendf(nil, "%d %s %d", order.Add(1), path, total))
+		})(c, r)
 	})
 	payload := bytes.Repeat([]byte("p"), 4<<10)
 	conn := dialRaw(t, addr)
@@ -321,7 +493,7 @@ func TestStreamRequestBodyPipelinesBehindTheStreamedRequest(t *testing.T) {
 		t.Fatal(err)
 	}
 	// The second request arrives in the same breath as the end of the first
-	// body, so it may only be served once the first handler has returned.
+	// body, so it may only be served once the first handler has answered.
 	conn.send("GET /second HTTP/1.1\r\nHost: test\r\n\r\n")
 	for _, want := range []string{
 		fmt.Sprintf("1 /first %d", len(payload)),
@@ -341,13 +513,12 @@ func TestStreamRequestBodyAcceptsMoreThanMaxBodyBytes(t *testing.T) {
 	config.MaxBodyBytes = 1 << 20
 	config.StreamRequestBodyBuffer = 64 << 10
 	const size = 32 << 20
-	addr := serveStreamingServer(t, config, func(c *Context, r *stdhttp.Request) {
-		n, err := io.Copy(io.Discard, r.Body)
+	addr := serveStreamingServer(t, config, collectBody(func(c *Context, total int64, _ []byte, err error) {
 		if err != nil {
 			t.Errorf("reading the body: %v", err)
 		}
-		_ = c.Respond(stdhttp.StatusOK, "text/plain", fmt.Appendf(nil, "%d", n))
-	})
+		_ = c.Respond(stdhttp.StatusOK, "text/plain", fmt.Appendf(nil, "%d", total))
+	}))
 	conn := dialRaw(t, addr)
 	conn.send(fmt.Sprintf("POST /huge HTTP/1.1\r\nHost: test\r\nContent-Length: %d\r\n\r\n", size))
 	chunk := bytes.Repeat([]byte("m"), 64<<10)
@@ -360,10 +531,6 @@ func TestStreamRequestBodyAcceptsMoreThanMaxBodyBytes(t *testing.T) {
 		t.Fatalf("body = %q, want %d", body, size)
 	}
 }
-
-// TestStreamRequestBodyHandlerPanicEndsTheConnection checks that a panic on
-// the goroutine serving a streamed request is contained the way the task pool
-// contains one on a worker, rather than taking the process with it.
 func TestStreamRequestBodyHandlerPanicEndsTheConnection(t *testing.T) {
 	addr := serveStreamingServer(t, streamingConfig(), func(c *Context, r *stdhttp.Request) {
 		panic("handler gave up")
@@ -431,15 +598,7 @@ func TestChunkedDecoderRejectsBadFraming(t *testing.T) {
 // TestStreamRequestBodyWithNetHTTPClient uploads through Go's own client, so
 // the framing is not this package's on both ends.
 func TestStreamRequestBodyWithNetHTTPClient(t *testing.T) {
-	config := streamingConfig()
-	addr := serveStreamingServer(t, config, func(c *Context, r *stdhttp.Request) {
-		digest := sha256.New()
-		n, err := io.Copy(digest, r.Body)
-		if err != nil {
-			t.Errorf("reading the body: %v", err)
-		}
-		_ = c.Respond(stdhttp.StatusOK, "text/plain", fmt.Appendf(nil, "%d %x", n, digest.Sum(nil)))
-	})
+	addr := serveStreamingServer(t, streamingConfig(), collectBody(sizeAndDigest))
 	client, _ := stdClient(t)
 	payload := bytes.Repeat([]byte("net/http streams too "), 50000)
 	for _, chunked := range []bool{false, true} {
@@ -460,10 +619,96 @@ func TestStreamRequestBodyWithNetHTTPClient(t *testing.T) {
 			if resp.StatusCode != stdhttp.StatusOK {
 				t.Fatalf("status = %d", resp.StatusCode)
 			}
-			want := fmt.Sprintf("%d %x", len(payload), sha256.Sum256(payload))
-			if got != want {
-				t.Fatalf("body = %q, want %q", got, want)
+			if got != wantSizeAndDigest(payload) {
+				t.Fatalf("body = %q, want %q", got, wantSizeAndDigest(payload))
 			}
 		})
+	}
+}
+
+// TestStreamRequestBodyRunsOnTheConnectionWorker checks the invariant that
+// reading without waiting buys: many uploads held open at once, each with its
+// handler waiting on the rest of its body, and not a goroutine between them.
+// A body that had to be waited on would need one apiece.
+func TestStreamRequestBodyRunsOnTheConnectionWorker(t *testing.T) {
+	const uploads = 64
+	config := streamingConfig()
+	config.StreamRequestBodyBuffer = 16 << 10
+	waiting := make(chan struct{}, uploads)
+	addr := serveStreamingServer(t, config, func(c *Context, r *stdhttp.Request) {
+		var total int64
+		buf := make([]byte, 4096)
+		for {
+			n, err := r.Body.Read(buf)
+			total += int64(n)
+			if !errors.Is(err, ErrWouldBlock) {
+				if err != nil && !errors.Is(err, io.EOF) {
+					t.Errorf("reading the body: %v", err)
+				}
+				continue
+			}
+			// The rest has not arrived; wait for it without a goroutine.
+			c.Retain()
+			waiting <- struct{}{}
+			c.OnBody(func(data []byte, fin bool, err error) {
+				total += int64(len(data))
+				if err != nil || fin {
+					_ = c.Respond(stdhttp.StatusOK, "text/plain", fmt.Appendf(nil, "%d", total))
+					c.Release()
+				}
+			})
+			return
+		}
+	})
+
+	const size = 256 << 10
+	before := runtime.NumGoroutine()
+	conns := make([]net.Conn, 0, uploads)
+	for i := 0; i < uploads; i++ {
+		conn, err := net.DialTimeout("tcp", addr, 5*time.Second)
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { conn.Close() })
+		_ = conn.SetDeadline(time.Now().Add(20 * time.Second))
+		if _, err = fmt.Fprintf(conn, "POST /u HTTP/1.1\r\nHost: t\r\nContent-Length: %d\r\n\r\n", size); err != nil {
+			t.Fatal(err)
+		}
+		// Enough to reach the handler, not enough to finish the body.
+		if _, err = conn.Write(bytes.Repeat([]byte("s"), 2<<10)); err != nil {
+			t.Fatal(err)
+		}
+		conns = append(conns, conn)
+	}
+	for i := 0; i < uploads; i++ {
+		select {
+		case <-waiting:
+		case <-time.After(10 * time.Second):
+			t.Fatalf("only %d of %d uploads reached their handler", i, uploads)
+		}
+	}
+	// Every upload is now held open with its body unfinished. A goroutine per
+	// upload would show here.
+	grew := runtime.NumGoroutine() - before
+	if grew >= uploads/2 {
+		t.Fatalf("%d uploads in flight grew the process by %d goroutines", uploads, grew)
+	}
+
+	rest := bytes.Repeat([]byte("s"), size-(2<<10))
+	for _, conn := range conns {
+		if _, err := conn.Write(rest); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, conn := range conns {
+		resp, err := stdhttp.ReadResponse(bufio.NewReader(conn), &stdhttp.Request{Method: stdhttp.MethodPost})
+		if err != nil {
+			t.Fatal(err)
+		}
+		body, _ := io.ReadAll(resp.Body)
+		_ = resp.Body.Close()
+		if string(body) != fmt.Sprintf("%d", size) {
+			t.Fatalf("body = %q, want %d", body, size)
+		}
 	}
 }

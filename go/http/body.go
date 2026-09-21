@@ -15,8 +15,13 @@ import (
 )
 
 // ErrBodyAbandoned is what a streamed body reports to a reader that comes back
-// to it after Close, or after the handler it belongs to has returned.
+// to it after Close, after OnBody took the body over, or after the handler it
+// belongs to has returned.
 var ErrBodyAbandoned = errors.New("http: request body no longer being read")
+
+// ErrWouldBlock is what reading a streamed body reports when none of it has
+// arrived yet. It is the engine's own, so a handler may test either for it.
+var ErrWouldBlock = fib.ErrWouldBlock
 
 // discardAfterHandler bounds what the server will still take off a connection
 // to keep it alive when the handler returned without reading the whole body.
@@ -35,21 +40,27 @@ type BodyFunc func(data []byte, fin bool, err error)
 func emptyBody() io.ReadCloser { return stdhttp.NoBody }
 
 // BodyStream is the Body of a request whose handler ran before the whole body
-// had arrived; see Config.StreamRequestBodyThreshold. It is an
-// io.ReadCloser, so anything that reads a net/http request body — io.Copy,
-// multipart.Reader, json.Decoder — reads it the same way.
+// had arrived; see Config.StreamRequestBodyThreshold.
 //
-// Read blocks until the connection delivers more body bytes, so the handler
-// of a streamed request runs on its own goroutine rather than on the
-// connection's worker. What has arrived and not been read is buffered, and
-// once that buffer reaches Config.StreamRequestBodyBuffer the connection
-// stops reading its socket until the handler catches up, which slows the
-// client down through TCP flow control rather than growing memory here.
+// It never waits. The handler of a streamed request runs on the connection's
+// worker like any other, and a worker that waited for the peer would be
+// waiting on itself, so Read takes what has arrived and reports
+// ErrWouldBlock for the rest. io.EOF means the whole body has been read, and
+// any other error that the rest of it will never arrive — a connection that
+// closed mid-body, a body past MaxStreamedBodyBytes, broken framing — so a
+// truncated upload is never mistaken for a complete one.
 //
-// Read returns io.EOF at the end of the body. A connection that fails or
-// closes mid-body fails the Read instead, so a truncated upload is never
-// mistaken for a complete one. Reading after the handler has returned, or
-// after Close, returns ErrBodyAbandoned.
+// A handler that meets ErrWouldBlock and wants the rest retains the request
+// and asks for the rest through Context.OnBody, which delivers it as it
+// arrives; see Context.Retain. Until it does, what has arrived and not been
+// read is buffered, and once that buffer reaches
+// Config.StreamRequestBodyBuffer the connection stops reading its socket,
+// which slows the client down through TCP flow control rather than growing
+// memory here.
+//
+// Reading after Close, after OnBody has taken the body over, or after the
+// handler has returned without retaining the request, returns
+// ErrBodyAbandoned.
 type BodyStream struct {
 	conn *fib.Connection
 	mu   sync.Mutex
@@ -105,6 +116,9 @@ type BodyStream struct {
 // Nothing is held back once a sink has it, so any hold on the connection's
 // reads goes with the buffer: what paces the peer from here is fn itself.
 func (s *BodyStream) setSink(fn BodyFunc) {
+	// Asking for the body as a callback is asking for it, so a client waiting
+	// for permission to send it is given that here as a read would.
+	s.grantContinue()
 	s.mu.Lock()
 	s.awaitSinkLocked()
 	if s.abandoned {
@@ -161,38 +175,31 @@ func newBodyStream(conn *fib.Connection, request *stdhttp.Request, config Config
 	return s
 }
 
-// Read implements io.Reader.
+// Read takes what of the body has arrived, and never waits for the rest: it
+// reports ErrWouldBlock when none of it has, io.EOF when all of it has been
+// read, and the reason the body ended short when it did. See BodyStream.
 func (s *BodyStream) Read(p []byte) (int, error) {
 	if len(p) == 0 {
 		return 0, nil
 	}
 	s.grantContinue()
 	s.mu.Lock()
-	for {
-		if s.read < len(s.buf) {
-			n := copy(p, s.buf[s.read:])
-			s.read += n
-			s.compactLocked()
-			s.mu.Unlock()
-			return n, nil
-		}
-		switch {
-		case s.sink != nil:
-			s.mu.Unlock()
-			return 0, ErrBodyAbandoned
-		case s.ended:
-			s.mu.Unlock()
-			return 0, io.EOF
-		case s.err != nil:
-			err := s.err
-			s.mu.Unlock()
-			return 0, err
-		case s.abandoned:
-			s.mu.Unlock()
-			return 0, ErrBodyAbandoned
-		}
-		s.wake.Wait()
+	defer s.mu.Unlock()
+	if s.read < len(s.buf) {
+		n := copy(p, s.buf[s.read:])
+		s.read += n
+		s.compactLocked()
+		return n, nil
 	}
+	switch {
+	case s.sink != nil || s.abandoned:
+		return 0, ErrBodyAbandoned
+	case s.ended:
+		return 0, io.EOF
+	case s.err != nil:
+		return 0, s.err
+	}
+	return 0, ErrWouldBlock
 }
 
 // Close gives up the rest of the body. The connection consumes and drops what
@@ -234,8 +241,9 @@ func (s *BodyStream) Complete() bool {
 	return s.ended
 }
 
-// grantContinue sends the 100 Continue a body waits for, once, on the first
-// read of it.
+// grantContinue sends the 100 Continue a body waits for, once, when the
+// handler first asks for the body, by reading it or by taking it as a
+// callback.
 func (s *BodyStream) grantContinue() {
 	s.mu.Lock()
 	send := s.wantContinue && !s.continueSent && !s.ended && s.err == nil

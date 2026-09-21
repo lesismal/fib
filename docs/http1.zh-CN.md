@@ -15,7 +15,7 @@ HTTP/2、HTTP/3 各有单独的文档：[`http2.zh-CN.md`](http2.zh-CN.md)、
 | 连接 | keep-alive（HTTP/1.1 默认开启，HTTP/1.0 需 `Connection: keep-alive`）、任一方的 `Connection: close`、pipelining（按请求顺序回复） | 每个 host:port 一个 keep-alive 连接池；HTTP/1.0 连接只有在请求要求 keep-alive 且服务端同意时才复用 |
 | 请求 body | `Content-Length`、chunked（含 chunk 扩展和 trailer，`Request.Trailer`）；默认整体缓存，超过 `StreamRequestBodyThreshold` 的 body 边收边交给 handler | `Content-Length`；`ContentLength` 为 -1 时用 chunked，可带 `req.Trailer` |
 | 响应 body | `Content-Length`、chunked（含 trailer）、HTTP/1.0 流式响应以关闭连接结束 | `Content-Length`、chunked（含 trailer，`Response.Trailer`）、以关闭连接结束 |
-| 流式 | 响应：`Context` 实现了 `http.ResponseWriter`、`http.Flusher`、`io.ReaderFrom`，`Write` + `Flush` 边生成边发送。请求：超过 `StreamRequestBodyThreshold` 时 `Request.Body` 是 `*BodyStream` | body 完整缓存后再回调 |
+| 流式 | 响应：`Context` 实现了 `http.ResponseWriter`、`http.Flusher`、`io.ReaderFrom`，`Write` + `Flush` 边生成边发送。请求：超过 `StreamRequestBodyThreshold` 时 `Request.Body` 是 `*BodyStream`，读取不阻塞，也可以用 `Context.OnBody` 接管 | body 完整缓存后再回调 |
 | 文件 | `Connection.SendFile` / `Context.ReadFrom`：Linux、macOS 用 `sendfile(2)`，Windows 分块读取；`http.ServeFile`、`http.ServeContent`、`http.FileServer` 可以直接通过 `Context` 使用（Range、多段 Range、条件请求） | — |
 | 超时 | `ReadHeaderTimeout`、`ReadTimeout`、`IdleTimeout`，回退规则与 `net/http.Server` 相同 | 每个请求的 `Timeout` |
 | 1xx 中间响应 | `WriteInterim` 或 `WriteHeader(1xx)`，自动 `100 Continue` | 自动跳过 |
@@ -120,13 +120,41 @@ func(c *fibhttp.Context, r *http.Request) {
 
 `Config.StreamRequestBodyThreshold` 大于 0 时，body 不必收齐就会调用 handler：
 `Content-Length` 超过它的 body，以及已经发来超过这么多字节的 chunked body，以
-`*BodyStream` 的形式出现在 `Request.Body` 里。它是普通的 `io.ReadCloser`，`io.Copy`、
-`multipart.Reader`、`json.Decoder` 和读 `net/http` 的 body 一样读它；
-`Context.RequestBody()` 返回它，body 已经收全时返回 nil。小于阈值的 body 行为不变：
-整体缓存、handler 在连接的 worker 上执行。
+`*BodyStream` 的形式出现在 `Request.Body` 里。`Context.RequestBody()` 返回它，body
+已经收全时返回 nil。小于阈值的 body 行为不变：整体缓存，其余一切照旧。
 
-- **handler 跑在自己的 goroutine 上**：读 body 会阻塞，所以不能占用 worker。是每个流式
-  请求一个 goroutine，不是每个连接一个。
+**读取不阻塞。** handler 和别的 handler 一样跑在连接的 worker 上，而 worker 去等对端
+就是在等自己，所以 `Read` 只给出已经到达的部分：
+
+| Read 返回 | 含义 |
+| --- | --- |
+| `n > 0` | 这些字节已经到了 |
+| `io.EOF` | 整个 body 已经读完 |
+| `ErrWouldBlock` | 现在一个字节都没有，后续还会来 |
+| `ErrBodyAbandoned` | body 已经被别的东西接管：`Close`、`OnBody`，或者 handler 没有 Retain 就返回了 |
+| 其它错误 | 后续不会再来了——连接断了、超过 `MaxStreamedBodyBytes`、帧格式错误 |
+
+`ErrWouldBlock` 就是 `fib.ErrWouldBlock`，和 `Connection.Read` 用的是同一个，判断哪个
+都行。body 有可能在 handler 运行时就已经全在了（和 header 在同一次读里到达），这种情况
+下 handler 一路读到 `io.EOF`、直接回复即可。
+
+遇到 `ErrWouldBlock` 又想要后续的 handler，就 Retain 住请求、用 `Context.OnBody` 接管
+剩下的部分，见[保持响应不结束](#保持响应不结束以及-body-回调)。交接不会丢字节：`OnBody`
+拿到的正好从上一次 `Read` 停下的地方开始。
+
+```go
+func(c *fibhttp.Context, r *http.Request) {
+	n, err := r.Body.Read(buf)          // 先拿已经到的
+	switch {
+	case errors.Is(err, io.EOF):        // 就这么多，全了
+		answer(c)
+	case errors.Is(err, fibhttp.ErrWouldBlock):
+		c.Retain()                      // 后面还有
+		c.OnBody(func(data []byte, fin bool, err error) { ... })
+	}
+}
+```
+
 - **背压**：已到达但还没被读走的 body 最多缓存 `Config.StreamRequestBodyBuffer`
   （默认 256KB），超过后连接通过 `Connection.HoldReads` 停止读 socket，读走一半之后
   恢复。上传快过 handler 处理速度时，被减速的是对端而不是这一侧的内存——这是写方向
@@ -135,19 +163,19 @@ func(c *fibhttp.Context, r *http.Request) {
   上传），改由 `MaxStreamedBodyBytes` 约束，为 0 表示不限。超限时 `Read` 返回
   `ErrBodyTooLarge` 并关闭连接；`Content-Length` 一开始就超限的请求在 handler 之前就用
   413 拒绝。
-- **pipelining**：排在流式请求后面的请求要等它的 handler 返回之后才解析，响应顺序不变。
+- **pipelining**：排在流式请求后面的请求要等它的响应写完之后才解析，响应顺序不变。
 - **handler 没读完的 body** 会被读掉丢弃，最多 256KB，连接继续复用；超过这个量（或者
   长度未知的 chunked body）则在响应发完后关闭连接，与 `net/http` 一致。
-- **`Expect: 100-continue` 变成惰性的**：第一次读 body 时才发 100 Continue，handler 可以
-  在上传开始之前用 413、403 拒绝请求。这样回复而不读 body 时连接会关闭，因为客户端还在
-  等这个许可。
+- **`Expect: 100-continue` 变成惰性的**：handler 第一次要 body 时（读它，或者用 `OnBody`
+  接管它）才发 100 Continue，所以可以在上传开始之前就用 413、403 拒绝请求。回复了却不要
+  body 时连接会关闭，因为客户端还在等这个许可。
 - **连接中途断开**时 `Read` 返回 `io.ErrUnexpectedEOF` 而不是 `io.EOF`，截断的上传不会被
   当成完整的。handler 返回之后或 `Close` 之后再读返回 `ErrBodyAbandoned`。
 - HTTP/2 和 HTTP/3 的请求 body 仍然整体缓存。
 
-handler 把 128MB 的上传拷进 `io.Discard`：整体缓存时堆内存峰值约 491MB（body 本身、
-它增长所在的解析缓冲区，以及拷贝留下的垃圾），流式时约 3MB
-（`StreamRequestBodyBuffer` 为默认的 256KB）。
+handler 收下 128MB 的上传并计数：整体缓存时堆内存峰值约 470MB（body 本身、它增长所在
+的解析缓冲区，以及沿途留下的垃圾），流式时约 4MB（`StreamRequestBodyBuffer` 为默认的
+256KB）。
 
 ### 零拷贝发送文件
 
@@ -167,8 +195,11 @@ handler 把 128MB 的上传拷进 `io.Discard`：整体缓存时堆内存峰值�
   [流式请求 body](#流式请求-body)。
 - **客户端响应 body 整体缓存**：受 `MaxResponseBodyBytes` 限制，客户端没有流式下载。
 - **客户端不做 pipelining**：一个 HTTP/1 连接同时只有一个请求。
-- **流式响应在 handler 中写出**：与 `net/http` 一样，handler 返回时响应结束；需要之后
-  在其他 goroutine 中回复的 handler 应使用 `WriteResponse`，不要先用 `Write` 开始响应。
+- **响应在最后一个引用释放时结束**：什么都不 Retain 的 handler 就是它自己返回的时候，
+  与 `net/http` 一致。要稍后回复、或者要在其他 goroutine 里接着写的 handler 先
+  `Retain`，见[保持响应不结束](#保持响应不结束以及-body-回调)。
+- **读取同样不阻塞**：handler 跑在连接自己的 worker 上，所以流式 body 的读取返回
+  `ErrWouldBlock` 而不是等对端；剩下的部分用 `OnBody` 接管。
 - **写入不阻塞**：handler 写得比对端读得快时，差额排队在内存中（连接的读取会暂停，但
   handler 本身不会被阻塞）。`SendFile` 发送的文件例外：它只随 socket 的排空读取。
 - **TLS 无法使用 sendfile**：TLS 连接上 `SendFile` 在返回前读出并加密整段文件，整段
@@ -209,6 +240,9 @@ handler 把 128MB 的上传拷进 `io.Discard`：整体缓存时堆内存峰值�
   都会刷新空闲超时、一个字节都不发的连接、没配超时的服务端、变成 HTTP/2 的连接被解除
   超时，以及超时传到 `OnClose`。`go/netconn_test.go` 检查 `Connection` 自己的 deadline
   和其余 `net.Conn` 方法。
+- **流式请求 body 的非阻塞读取**：`Read` 返回 `ErrWouldBlock` 后交给 `OnBody` 不丢字节、
+  body 已经全在时一路读到 `io.EOF`、读和 `OnBody` 都能触发 100-continue，以及 64 个上传
+  同时挂起而不多出一条 goroutine。
 - **流式请求 body**（`go/http/body_test.go`）：handler 在 body 结束前就运行、小于阈值的
   body 仍然整体缓存、一块一块发来的带 trailer 的 chunked 上传、handler 落后时暂停读、
   没读完的 body 的丢弃与关闭、惰性与被拒绝的 100-continue、`MaxStreamedBodyBytes`、

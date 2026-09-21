@@ -355,11 +355,13 @@ func (h *ServerHandler) OnData(c *fib.Connection, data []byte) {
 	h.drive(c, parser, data)
 }
 
-// drive turns whatever the connection has into requests and serves them. It
-// runs on the connection's worker for data that has just been read, and on the
-// goroutine of a streamed request once its handler returns, so it holds the
-// parser's lock throughout: a connection is never parsed by two goroutines at
-// once, and a request pipelined behind a streamed one waits its turn.
+// drive turns whatever the connection has into requests and serves them,
+// handlers and all: nothing a handler does here waits on the peer, so the
+// connection's worker carries a request from its first byte to its response
+// without another goroutine. It also runs on whichever goroutine released the
+// last hold on a retained request, and holds the parser's lock throughout, so
+// a connection is never parsed by two goroutines at once and a request
+// pipelined behind a retained one waits its turn.
 func (h *ServerHandler) drive(c *fib.Connection, parser *Parser, data []byte) {
 	parser.mu.Lock()
 	defer parser.mu.Unlock()
@@ -407,8 +409,9 @@ func (h *ServerHandler) drive(c *fib.Connection, parser *Parser, data []byte) {
 			continue
 		}
 		if parser.busy {
-			// The handler of a streamed request has not returned. Keep what
-			// arrives; its return drives the connection on from here.
+			// A request is still being answered: one whose handler retained
+			// it. Keep what arrives; the release that writes its response
+			// drives the connection on from here.
 			parser.buffer = append(parser.buffer, data...)
 			return
 		}
@@ -434,33 +437,46 @@ func (h *ServerHandler) drive(c *fib.Connection, parser *Parser, data []byte) {
 		// connection knows which request to cancel if it closes first.
 		parser.busy = true
 		parser.liveContext.Store(context)
+		var bodyErr error
 		if parser.stream != nil {
-			// The body has not all arrived. Serve the request on its own
-			// goroutine, since reading the body blocks, and go on feeding
-			// that body from here.
-			go h.serveStreamed(c, parser, context, parser.stream)
-			continue
+			// Hand the body what has already arrived before the handler runs,
+			// so that its first read is of everything the connection has and
+			// a body that came in with its header reads straight to io.EOF.
+			_, bodyErr = parser.pumpBody(nil)
 		}
-		if h.timed {
+		if h.timed && parser.stream == nil {
 			// The request has all arrived, so nothing is waiting on the peer
 			// any more: the handler's time is its own, and the deadline for
-			// whatever comes next is set when this round ends.
+			// whatever comes next is set when this round ends. A request
+			// whose body is still coming keeps the deadline that bounds it.
 			_ = c.SetReadDeadline(time.Time{})
 		}
+		// The handler runs here, on the connection's worker, whether or not
+		// its body has all arrived: reading a streamed body never waits, so
+		// there is nothing for a goroutine of its own to wait on.
 		serveRequest(h.handler, context)
+		if bodyErr != nil {
+			// The body was refused or misframed before the handler even saw
+			// it, which its own read told it; the connection cannot go on.
+			h.failStream(c, parser, bodyErr)
+			return
+		}
 		if !context.settle() {
-			// The handler kept the response open; the release that closes it
-			// carries the connection on from there.
+			// The handler kept the response open. If its body is still
+			// arriving, feeding it is this loop's job; otherwise the release
+			// that writes the response carries the connection on.
+			if parser.stream == nil {
+				return
+			}
+			continue
+		}
+		if h.endRequestLocked(context) {
+			c.CloseAfterSend()
 			return
 		}
-		parser.busy = false
-		if request.Close || context.closing {
-			parser.spent = true
-			return
-		}
-		if len(parser.buffer) == 0 {
-			break
-		}
+		// A body the handler did not take is discarded by the loop, which
+		// goes back to parsing once it has run out.
+		continue
 	}
 	if parser.wantContinue {
 		// The request waits for permission to send its body; the body is
@@ -473,29 +489,6 @@ func (h *ServerHandler) drive(c *fib.Connection, parser *Parser, data []byte) {
 		parser.spent = true
 		h.refuse(c, err)
 	}
-}
-
-// serveStreamed runs the handler of a request whose body is still arriving,
-// and drives the connection on once the response is written.
-func (h *ServerHandler) serveStreamed(c *fib.Connection, parser *Parser, context *Context, stream *BodyStream) {
-	if recovered := runStreamed(h.handler, context); recovered != nil {
-		err := fmt.Errorf("handler panic: %v", recovered)
-		context.cancelWith(err)
-		parser.mu.Lock()
-		parser.busy, parser.spent, parser.stream = false, true, nil
-		parser.live.Store(nil)
-		parser.mu.Unlock()
-		_ = stream.abandon()
-		c.CloseWithError(err)
-		return
-	}
-	_ = c.Flush()
-	if !context.settle() {
-		// The handler kept the response open; the release that closes it
-		// carries the connection on from there.
-		return
-	}
-	h.finishRequest(context)
 }
 
 // endRequestLocked settles the connection once a request's response has been
@@ -534,16 +527,6 @@ func (h *ServerHandler) finishRequest(context *Context) {
 		return
 	}
 	h.drive(c, parser, nil)
-}
-
-// runStreamed serves one request and returns what its handler panicked with,
-// if anything. A panic on this goroutine would take the process with it, where
-// one on a worker reaches the task pool that isolates it, so it is caught here
-// and ends the connection the same way a worker's does.
-func runStreamed(handler Handler, context *Context) (recovered any) {
-	defer func() { recovered = recover() }()
-	serveRequest(handler, context)
-	return nil
 }
 
 // failStream ends a connection whose streamed body could not be framed or grew

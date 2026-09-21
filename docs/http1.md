@@ -16,7 +16,7 @@ usage, see the [HTTP section of the Go README](../go/README.zh-CN.md#http-子-pa
 | Connections | Keep-alive (HTTP/1.1 by default, HTTP/1.0 with `Connection: keep-alive`), `Connection: close` from either side, pipelining (responses in request order) | Keep-alive pool per host:port; an HTTP/1.0 connection is reused only if the request asked for keep-alive and the server agreed |
 | Request bodies | `Content-Length`, chunked with extensions and trailers (`Request.Trailer`); buffered whole, or streamed to the handler as they arrive past `StreamRequestBodyThreshold` | `Content-Length`; chunked with `req.Trailer` when `ContentLength` is -1 |
 | Response bodies | `Content-Length`, chunked with trailers, close-delimited for HTTP/1.0 streams | `Content-Length`, chunked with trailers (`Response.Trailer`), close-delimited |
-| Streaming | Responses: `Context` is an `http.ResponseWriter`, `http.Flusher` and `io.ReaderFrom`, so `Write` + `Flush` stream the body as it is produced. Requests: `Request.Body` is a `*BodyStream` past `StreamRequestBodyThreshold` | Bodies are buffered whole before the callback |
+| Streaming | Responses: `Context` is an `http.ResponseWriter`, `http.Flusher` and `io.ReaderFrom`, so `Write` + `Flush` stream the body as it is produced. Requests: past `StreamRequestBodyThreshold` `Request.Body` is a `*BodyStream`, read without waiting or taken through `Context.OnBody` | Bodies are buffered whole before the callback |
 | Files | `Connection.SendFile` / `Context.ReadFrom`: `sendfile(2)` on Linux and macOS, chunked reads on Windows; `http.ServeFile`, `http.ServeContent` and `http.FileServer` work through `Context` (Range, multipart ranges, conditional requests) | — |
 | Timeouts | `ReadHeaderTimeout`, `ReadTimeout` and `IdleTimeout`, as `net/http.Server` resolves them | Per-request `Timeout` |
 | Interim responses | 1xx through `WriteInterim` or `WriteHeader(1xx)`, automatic `100 Continue` | 1xx skipped |
@@ -142,14 +142,46 @@ nothing would refresh a deadline the HTTP/1 parser had set.
 `Config.StreamRequestBodyThreshold`, when positive, hands a request to the
 handler before its whole body has arrived: a body whose `Content-Length` is
 larger than it, or a chunked body that has already sent more than it, arrives
-as a `*BodyStream` in `Request.Body` — an `io.ReadCloser`, so `io.Copy`,
-`multipart.Reader` and `json.Decoder` read it as they read any net/http body.
-`Context.RequestBody()` returns it, or nil for a body that was read whole.
-A body under the threshold is unaffected: buffered whole, handler on the
-connection's worker, nothing else changed.
+as a `*BodyStream` in `Request.Body`. `Context.RequestBody()` returns it, or
+nil for a body that was read whole. A body under the threshold is unaffected:
+buffered whole, nothing else changed.
 
-- **The handler runs on its own goroutine**, since reading the body blocks;
-  one per request whose body streams, not one per connection.
+**Reading it never waits.** The handler runs on the connection's worker like
+any other, and a worker that waited for the peer would be waiting on itself,
+so `Read` answers with what has arrived:
+
+| Read returns | Means |
+| --- | --- |
+| `n > 0` | that much of the body was here |
+| `io.EOF` | the whole body has been read |
+| `ErrWouldBlock` | none of it is here yet; the rest is still coming |
+| `ErrBodyAbandoned` | something else has the body: `Close`, `OnBody`, or the handler returned without retaining the request |
+| anything else | the rest will never arrive — the connection closed, the body outgrew `MaxStreamedBodyBytes`, its framing broke |
+
+`ErrWouldBlock` is `fib.ErrWouldBlock`, the same one a `Connection`'s own
+`Read` reports, so a handler may test for either. The whole body may be there
+already, when it arrived in the same read as its header, in which case the
+handler reads through to `io.EOF` and answers without any of what follows.
+
+A handler that meets `ErrWouldBlock` and wants the rest retains the request
+and takes the rest through `Context.OnBody`, which delivers it as it arrives;
+see [Holding a response open](#holding-a-response-open-and-body-callbacks).
+Nothing is lost across the handover: what `OnBody` is given begins where the
+last `Read` stopped.
+
+```go
+func(c *fibhttp.Context, r *http.Request) {
+	n, err := r.Body.Read(buf)          // whatever is here
+	switch {
+	case errors.Is(err, io.EOF):        // that was all of it
+		answer(c)
+	case errors.Is(err, fibhttp.ErrWouldBlock):
+		c.Retain()                      // the rest is still coming
+		c.OnBody(func(data []byte, fin bool, err error) { ... })
+	}
+}
+```
+
 - **Backpressure.** Body bytes that have arrived and not been read are
   buffered up to `Config.StreamRequestBodyBuffer` (256KB by default), past
   which the connection stops reading its socket through
@@ -163,25 +195,26 @@ connection's worker, nothing else changed.
   `ErrBodyTooLarge` and ends the connection; a declared `Content-Length` past
   it is refused with 413 before the handler runs.
 - **Pipelining.** A request behind a streamed one is parsed only once that
-  handler has returned, so responses keep their order.
+  request's response has been written, so responses keep their order.
 - **A body the handler did not read** is taken off the connection and dropped,
   up to 256KB, so the connection stays usable; more than that (or a chunked
   body, whose length is not known) ends the connection after the response, as
   `net/http` does.
-- **`Expect: 100-continue` becomes lazy**: the 100 Continue goes out on the
-  first read of the body, so a handler can refuse the request with 413 or 403
-  before the upload starts. A handler that answers such a request without
-  reading it ends the connection, since the client is still owed permission.
+- **`Expect: 100-continue` becomes lazy**: the 100 Continue goes out when the
+  handler first asks for the body, by reading it or by taking it with
+  `OnBody`, so a handler can refuse the request with 413 or 403 before the
+  upload starts. A handler that answers such a request without asking for its
+  body ends the connection, since the client is still owed permission.
 - **A connection that fails or closes mid-body** fails the `Read` with
   `io.ErrUnexpectedEOF` rather than reporting `io.EOF`, so a truncated upload
   is never taken for a complete one. Reading after the handler has returned,
   or after `Close`, returns `ErrBodyAbandoned`.
 - HTTP/2 and HTTP/3 still buffer request bodies whole.
 
-A 128MB upload into a handler that copies it to `io.Discard` peaks at around
-491MB of heap buffered — the body, the parser buffer it grew in, and what the
-copy left behind — and around 3MB streamed, with
-`StreamRequestBodyBuffer` at its 256KB default.
+A 128MB upload into a handler that counts it peaks at around 470MB of heap
+buffered — the body, the parser buffer it grew in, and what was left behind on
+the way — and around 4MB streamed, with `StreamRequestBodyBuffer` at its 256KB
+default.
 
 ### Zero-copy file sending
 
@@ -208,10 +241,14 @@ instead, which costs less than the extra system calls.
   `MaxResponseBodyBytes`; the client has no streaming download.
 - **The client does not pipeline**: one request per HTTP/1 connection at a
   time.
-- **Streaming responses are written from the handler.** The response is ended
-  when the handler returns, as in `net/http`; a handler that wants to answer
-  later from another goroutine must use `WriteResponse` and not start the
-  response with `Write` first.
+- **A response is ended when the last hold on it goes**, which for a handler
+  that retained nothing is its own return, as in `net/http`. A handler that
+  wants to answer later, or to go on writing from another goroutine, retains
+  the request first; see
+  [Holding a response open](#holding-a-response-open-and-body-callbacks).
+- **Reads do not block either.** A streamed body reports `ErrWouldBlock`
+  rather than waiting for the peer, since the handler runs on the connection's
+  own worker; the rest of it is taken through `OnBody`.
 - **Writes do not block.** A handler that writes faster than the peer reads
   queues the difference in memory (reads on the connection pause, but the
   handler is not held back). Files sent with `SendFile` are the exception:
@@ -259,6 +296,11 @@ are not fib:
   body, holds taken after the response was written, the same handler over
   HTTP/2, and a stress test running all of it at once and checking that
   nothing is left behind.
+- **streaming request bodies** also cover reading without waiting: a read
+  that reports `ErrWouldBlock` and hands over to `OnBody` losing nothing, a
+  body that is all there reading through to `io.EOF`, `Expect: 100-continue`
+  granted by a read and by `OnBody`, and 64 uploads held open at once without
+  a goroutine between them.
 - **read timeouts** (`go/http/timeout_test.go`): a header and a body that stop
   arriving, a streamed body that stops arriving, a handler slower than
   `ReadTimeout` still answering, an idle connection closed and an idle timeout

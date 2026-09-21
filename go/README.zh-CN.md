@@ -508,39 +508,68 @@ config.StreamRequestBodyBuffer = 512 << 10  // 未被读走的 body 攒到这么
 handler := fibhttp.NewHandlerWithConfig(config, fibhttp.HandlerFunc(
     func(c *fibhttp.Context, r *http.Request) {
         f, _ := os.Create("upload.bin")
-        defer f.Close()
-        n, err := io.Copy(f, r.Body) // 边收边写盘，内存里只有一个缓冲区
-        if err != nil {
-            _ = c.Respond(http.StatusBadRequest, "text/plain", []byte(err.Error()))
-            return
+        buf := make([]byte, 32*1024)
+        for {
+            n, err := r.Body.Read(buf) // 只拿已经到的，不阻塞
+            f.Write(buf[:n])
+            if errors.Is(err, io.EOF) { // body 读完了
+                f.Close()
+                _ = c.Respond(http.StatusOK, "text/plain", []byte("ok"))
+                return
+            }
+            if errors.Is(err, fibhttp.ErrWouldBlock) { // 后面还有，异步接着收
+                c.Retain()
+                c.OnBody(func(data []byte, fin bool, err error) {
+                    if err != nil {
+                        f.Close(); os.Remove("upload.bin"); c.Release()
+                        return
+                    }
+                    f.Write(data)
+                    if fin {
+                        f.Close()
+                        _ = c.Respond(http.StatusOK, "text/plain", []byte("ok"))
+                        c.Release()
+                    }
+                })
+                return
+            }
+            if err != nil { // 连接断了 / 超限 / 帧错误
+                f.Close(); os.Remove("upload.bin")
+                _ = c.Respond(http.StatusBadRequest, "text/plain", []byte(err.Error()))
+                return
+            }
         }
-        _ = c.Respond(http.StatusOK, "text/plain", fmt.Appendf(nil, "%d bytes\n", n))
     },
 ))
 ```
 
-- `Request.Body` 就是普通的 `io.ReadCloser`，`io.Copy`、`multipart.Reader`、
-  `json.Decoder` 都能直接用；`Content-Length` 和 chunked（含 trailer，读完后在
-  `Request.Trailer` 里）都支持。想知道是不是流式的，用
-  `r.Body.(*fibhttp.BodyStream)` 或 `Context.RequestBody()`（返回 nil 表示 body 已经
-  收全了）。
-- 小于阈值的 body 行为完全不变：仍然收齐后交付，handler 仍然在连接的 worker 上执行，
-  没有额外开销。只有流式请求的 handler 会跑在自己的 goroutine 上——读 body 会阻塞，
-  不能占着 worker。
+- **读取不阻塞，也不额外开 goroutine**：handler 和别的 handler 一样跑在连接的 worker
+  上，worker 去等对端就是在等自己。`Read` 的返回值就是状态机：`n > 0` 是已经到的字节，
+  `io.EOF` 是整个 body 读完了，`ErrWouldBlock`（就是 `fib.ErrWouldBlock`）是现在一个
+  字节都没有、后续还会来，`ErrBodyAbandoned` 是 body 已被 `Close`/`OnBody` 接管或
+  handler 没 Retain 就返回了，其它错误表示后续不会再来（连接断、超限、帧错误）。
+- 遇到 `ErrWouldBlock` 就 `Retain` + `OnBody` 异步接管剩下的部分。**交接不丢字节**：
+  `OnBody` 拿到的正好从上一次 `Read` 停下的地方开始。body 也可能在 handler 运行时就全
+  到了（和 header 在同一次读里），那就一路读到 `io.EOF` 直接回复。
+- `Content-Length` 和 chunked（含 trailer，读完后在 `Request.Trailer` 里）都支持。想知道
+  是不是流式的，用 `r.Body.(*fibhttp.BodyStream)` 或 `Context.RequestBody()`（返回 nil
+  表示 body 已经收全了）。
+- 小于阈值的 body 行为完全不变：收齐后交付，`io.ReadAll`、`json.Decoder` 照常用。
 - 背压：还没被读走的 body 攒到 `StreamRequestBodyBuffer`（默认 256KB）就调用
   `Connection.HoldReads(true)` 停止读 socket，读掉一半之后恢复。上传快过 handler 处理
   速度时，减速的是对端，而不是这一侧的内存。
-- 同一连接上排在后面的流水线请求要等这个 handler 返回之后才会被解析，响应顺序不变。
+- 同一连接上排在后面的流水线请求要等这个请求的响应写完之后才会被解析，响应顺序不变。
 - handler 没读完就返回时：剩余不超过 256KB 就读掉丢弃、连接继续复用；更多（或者
   chunked 这种长度未知的）则响应发完后关闭连接，和 `net/http` 的做法一致。
-- `Expect: 100-continue` 变成惰性的：第一次读 body 时才发 100 Continue，所以 handler
-  可以在客户端还没开始上传时就用 413/403 拒绝掉，之后连接关闭。
+- `Expect: 100-continue` 变成惰性的：handler 第一次要 body 时（读它，或者用 `OnBody`
+  接管它）才发 100 Continue，所以可以在客户端还没开始上传时就用 413/403 拒绝掉，之后
+  连接关闭。
 - 连接中途断开时 `Read` 返回 `io.ErrUnexpectedEOF` 而不是 `io.EOF`，截断的上传不会被
   当成完整的；超过 `MaxStreamedBodyBytes` 时返回 `ErrBodyTooLarge`。
 - 目前只有 HTTP/1.x 支持，HTTP/2 和 HTTP/3 的 body 仍然收齐后交付。
 
-handler 把 128MB 的上传拷进 `io.Discard`：整体缓存时堆内存峰值约 491MB，流式时约
-3MB（`StreamRequestBodyBuffer` 为默认的 256KB）。
+handler 收下 128MB 的上传并计数：整体缓存时堆内存峰值约 470MB，流式时约 4MB
+（`StreamRequestBodyBuffer` 为默认的 256KB）。
 
 ### HTTP/2
 
