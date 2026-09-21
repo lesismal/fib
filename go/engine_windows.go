@@ -138,6 +138,12 @@ type connPlatform struct {
 	// failure is the error a failed zero-byte read reported, which socketError
 	// hands on when the worker asks why the connection broke.
 	failure error
+	// closingSocket holds a detached connection's socket until the operations
+	// it had posted have completed: closing one while an operation is still
+	// posted resets the connection instead of ending it, and a reset throws
+	// away whatever the transport had left to deliver. Zero means none, which
+	// a socket handle never is. Event-loop ownership.
+	closingSocket syscall.Handle
 }
 
 func (c *Connection) socket() syscall.Handle { return syscall.Handle(c.handle.Load()) }
@@ -642,10 +648,24 @@ func (e *Engine) completeWrite(c *Connection, n int, err error) *Connection {
 	return e.noteEvent(c, evOut)
 }
 
-// forget drops a closed connection once the kernel holds nothing of it.
+// forget drops a closed connection once the kernel holds nothing of it, and
+// closes the socket detach left behind: with nothing posted on it any more,
+// that close is graceful and what the transport still holds goes out.
 func (e *Engine) forget(c *Connection) {
-	if c.outstanding.Load() == 0 {
-		delete(e.conns, c)
+	if c.outstanding.Load() != 0 {
+		return
+	}
+	e.closeSocketNow(c)
+	delete(e.conns, c)
+}
+
+// closeSocketNow closes a detached connection's socket, whether or not its
+// operations have all completed. Every close goes through here, so a socket
+// cannot be closed twice.
+func (e *Engine) closeSocketNow(c *Connection) {
+	if h := c.closingSocket; h != 0 {
+		c.closingSocket = 0
+		_ = syscall.Closesocket(h)
 	}
 }
 
@@ -671,16 +691,29 @@ func (e *Engine) setReadPaused(c *Connection, paused bool) error {
 	return err
 }
 
-// detach closes a connection's socket, which cancels whatever it has posted.
-// The cancelled operations still complete through the port, and the connection
-// stays in conns until the last of them has.
+// detach ends a connection's socket. Closing it outright would be abortive
+// while an operation is still posted on it, and this backend keeps a zero-byte
+// read posted on every open connection, so the peer would be sent a reset that
+// throws away the bytes the transport had yet to deliver — a reply the socket
+// accepted whole and has barely started sending. The send side is shut down
+// instead, which puts the FIN behind those bytes, and the posted operations are
+// cancelled so their completions arrive now rather than whenever the peer next
+// says something. forget closes the socket once the last of them has, by which
+// time nothing is posted and the close is the graceful one.
 func (e *Engine) detach(c *Connection) {
 	if c.udp != nil && c.udp.listener != nil {
 		e.detachPeer(c)
 		return
 	}
 	if h := syscall.Handle(c.handle.Swap(uintptr(syscall.InvalidHandle))); h != syscall.InvalidHandle {
-		_ = syscall.Closesocket(h)
+		c.closingSocket = h
+		if c.udp == nil {
+			// A datagram socket has no stream to end.
+			_ = syscall.Shutdown(h, syscall.SHUT_WR)
+		}
+		if c.outstanding.Load() > 0 {
+			_ = syscall.CancelIoEx(h, nil)
+		}
 	}
 	e.forget(c)
 }
@@ -713,6 +746,12 @@ func (e *Engine) Close() error {
 		}
 		e.removeUnixPaths()
 		e.drainPort()
+		// A connection whose completions never arrived still holds its
+		// socket, and the port is about to go with the engine, so nothing
+		// would ever close it. It goes now, orderly close or not.
+		for c := range e.conns {
+			e.closeSocketNow(c)
+		}
 		if err := syscall.CloseHandle(e.port); err != nil && closeErr == nil {
 			closeErr = err
 		}
