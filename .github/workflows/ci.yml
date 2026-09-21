@@ -206,6 +206,104 @@ jobs:
         # HTTP/2 header compression, checked against RFC 7541's own vectors.
         run: go test -race -count=1 ./internal/hpack/
 
+  # A standalone h2spec report. http2-conformance above already runs h2spec
+  # inside go test and fails on any case it reports, but only keeps its last
+  # summary line; this job runs the same tool directly against
+  # examples/http2only's server, over h2c and h2, and keeps h2spec's own
+  # case-by-case log and JUnit report as an artifact together with a
+  # pass/fail summary and conclusion in the job itself.
+  h2spec-report:
+    name: HTTP/2 conformance report (h2spec)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v6
+        with:
+          go-version: stable
+          cache-dependency-path: go/go.mod
+      - name: Install h2spec
+        run: go install github.com/summerwind/h2spec/cmd/h2spec@v2.2.1
+      - name: Versions
+        run: '"$(go env GOPATH)/bin/h2spec" --version'
+      - name: Build the HTTP/2-only example server
+        working-directory: go
+        run: go build -o "$RUNNER_TEMP/h2only-server" ./examples/http2only/server
+      - name: Run h2spec against h2c and h2, and report the result
+        shell: bash
+        run: |
+          h2spec="$(go env GOPATH)/bin/h2spec"
+          reports="$RUNNER_TEMP/h2spec-reports"
+          mkdir -p "$reports"
+          overall=0
+
+          # Starts the example server in mode $1 on port $2 with the extra
+          # server flags in $3+, runs h2spec's full default suite against it,
+          # and appends "$1|tests|passed|skipped|failed|result" to
+          # summary.txt for the table below.
+          run_mode() {
+            local name="$1" port="$2"
+            shift 2
+            "$RUNNER_TEMP/h2only-server" -addr "127.0.0.1:$port" "$@" \
+              > "$reports/$name-server.log" 2>&1 &
+            local pid=$!
+            for _ in $(seq 50); do
+              nc -z 127.0.0.1 "$port" && break
+              sleep 0.2
+            done
+            local h2spec_args=(-h 127.0.0.1 -p "$port" --timeout 5 -v -j "$reports/$name-junit.xml")
+            if [ "$name" = "h2" ]; then
+              h2spec_args+=(-t -k)
+            fi
+            "$h2spec" "${h2spec_args[@]}" > "$reports/$name.log" 2>&1
+            local status=$?
+            kill "$pid" 2>/dev/null
+            wait "$pid" 2>/dev/null
+
+            echo "::group::h2spec ($name)"
+            cat "$reports/$name.log"
+            echo "::endgroup::"
+
+            local summary counts result
+            summary=$(tail -n 1 "$reports/$name.log")
+            counts=$(grep -Eo '[0-9]+' <<<"$summary" | tr '\n' '|')
+            result=success
+            if [ "$status" -ne 0 ] || ! grep -q '0 failed' <<<"$summary"; then
+              result=failure
+              overall=1
+            fi
+            echo "$name|$counts$result" >> "$reports/summary.txt"
+          }
+
+          run_mode h2c 18080
+          run_mode h2 18443 -tls -cert-out "$reports/cert.pem"
+
+          {
+            echo '### h2spec HTTP/2 conformance report'
+            echo
+            echo '| Mode | Tests | Passed | Skipped | Failed | Result |'
+            echo '|------|------:|-------:|--------:|-------:|:------:|'
+            while IFS='|' read -r name tests passed skipped failed result; do
+              icon=$([ "$result" = success ] && echo ✅ || echo ❌)
+              echo "| $name | ${tests:-?} | ${passed:-?} | ${skipped:-?} | ${failed:-?} | $icon $result |"
+            done < "$reports/summary.txt"
+            echo
+            if [ "$overall" -eq 0 ]; then
+              echo '**Conclusion: all h2spec conformance cases passed.**'
+            else
+              echo '**Conclusion: h2spec reported failures — see the logs above and the h2spec-report artifact.**'
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          exit "$overall"
+      - name: Upload h2spec report
+        if: always()
+        uses: actions/upload-artifact@v5
+        with:
+          name: h2spec-report
+          path: ${{ runner.temp }}/h2spec-reports
+          if-no-files-found: error
+
   # HTTP/3 conformance: the fib server against a quic-go client, the fib
   # client against a quic-go server, and both against raw QUIC peers for the
   # frames a well-behaved implementation never sends. The quic-go peer is a
