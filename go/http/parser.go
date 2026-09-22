@@ -30,9 +30,38 @@ var (
 	ErrUnsupportedTransferEncoding = fmt.Errorf("%w: unsupported transfer encoding", ErrMalformed)
 )
 
+// requestReader is the pair every request is parsed through: a bytes.Reader
+// over the buffered bytes, and the bufio.Reader net/http reads it with. They
+// are pooled together because the bufio.Reader keeps a pointer to the other,
+// so a bytes.Reader in a local variable escapes to the heap on every request,
+// and pointing the bufio.Reader back at something harmless at the end needs a
+// reader to point it at. Pooled as a pair, parsing a request borrows both and
+// allocates neither.
+type requestReader struct {
+	source bytes.Reader
+	buf    *bufio.Reader
+}
+
 var requestReaderPool = sync.Pool{New: func() any {
-	return bufio.NewReaderSize(bytes.NewReader(nil), 1024)
+	r := new(requestReader)
+	r.buf = bufio.NewReaderSize(&r.source, 1024)
+	return r
 }}
+
+func acquireRequestReader(data []byte) *requestReader {
+	r := requestReaderPool.Get().(*requestReader)
+	r.source.Reset(data)
+	r.buf.Reset(&r.source)
+	return r
+}
+
+// releaseRequestReader hands the pair back, with neither of them left holding
+// the request's bytes.
+func releaseRequestReader(r *requestReader) {
+	r.source.Reset(nil)
+	r.buf.Reset(&r.source)
+	requestReaderPool.Put(r)
+}
 
 const maxRetainedBuffer = 64 << 10
 
@@ -252,14 +281,19 @@ func (p *Parser) FeedOne(data []byte) (*stdhttp.Request, bool, error) {
 	if frame.chunked {
 		// net/http owns the chunk decoder; only chunked requests need this
 		// second parse. Content-Length requests reuse the header parse below.
-		req, err = readRequest(p.buffer[:frame.end], true)
+		var reader *requestReader
+		req, reader, err = readRequest(p.buffer[:frame.end], true)
 		if err != nil {
+			if reader != nil {
+				releaseRequestReader(reader)
+			}
 			p.discard()
 			return nil, false, fmt.Errorf("%w: %v", ErrMalformed, err)
 		}
 		req.Close = req.Close || frame.request.Close
 		body, readErr := io.ReadAll(io.LimitReader(req.Body, p.config.MaxBodyBytes+1))
 		_ = req.Body.Close()
+		releaseRequestReader(reader)
 		if readErr != nil || int64(len(body)) > p.config.MaxBodyBytes {
 			p.discard()
 			if int64(len(body)) > p.config.MaxBodyBytes {
@@ -401,7 +435,7 @@ func (p *Parser) frameLength() (frameInfo, bool, error) {
 	if headerEnd > p.config.MaxHeaderBytes {
 		return frameInfo{}, false, ErrHeaderTooLarge
 	}
-	req, err := readRequest(p.buffer[:headerEnd], false)
+	req, _, err := readRequest(p.buffer[:headerEnd], false)
 	if err != nil {
 		if strings.Contains(err.Error(), "unsupported transfer encoding") {
 			// net/http refuses transfer codings other than chunked, without
@@ -478,23 +512,23 @@ func (p *Parser) expectContinue(req *stdhttp.Request) {
 	}
 }
 
-func readRequest(data []byte, keepBody bool) (*stdhttp.Request, error) {
+// readRequest parses the request at the front of data. With keepBody set, the
+// request's Body reads the rest of data through the reader that comes back
+// with it, which the caller releases once it has finished with the body;
+// otherwise the body is detached here and the reader goes straight back.
+func readRequest(data []byte, keepBody bool) (*stdhttp.Request, *requestReader, error) {
+	reader := acquireRequestReader(data)
+	req, err := stdhttp.ReadRequest(reader.buf)
 	if keepBody {
-		return stdhttp.ReadRequest(bufio.NewReaderSize(bytes.NewReader(data), 1024))
+		return req, reader, err
 	}
-	var source bytes.Reader
-	source.Reset(data)
-	reader := requestReaderPool.Get().(*bufio.Reader)
-	reader.Reset(&source)
-	req, err := stdhttp.ReadRequest(reader)
-	if req != nil && !keepBody {
+	if req != nil {
 		// Detach the request from the pooled reader. FeedOne installs the real
 		// Content-Length body after the complete frame has arrived.
 		req.Body = stdhttp.NoBody
 	}
-	reader.Reset(bytes.NewReader(nil))
-	requestReaderPool.Put(reader)
-	return req, err
+	releaseRequestReader(reader)
+	return req, nil, err
 }
 
 func chunkedEnd(data []byte, offset, maxTrailer int, maxBody int64) (int, bool, error) {

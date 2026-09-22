@@ -671,26 +671,34 @@ func MarshalFrame(opcode Opcode, payload []byte) ([]byte, error) {
 	return frame, nil
 }
 
-func frameHeader(opcode Opcode, payloadLen int) ([10]byte, int, error) {
-	var header [10]byte
+// maxFrameHeader is the longest header a frame can carry: the two bytes every
+// frame has, an eight-byte length, and the four-byte mask a client adds.
+const maxFrameHeader = 14
+
+// frameHeader writes a frame's header into the front of dst, which must hold
+// maxFrameHeader bytes, and returns its length. It fills a buffer the caller
+// owns rather than returning an array, so that a header on its way to the
+// connection can come from somewhere that does not have to be allocated for
+// each frame.
+func frameHeader(dst []byte, opcode Opcode, payloadLen int) (int, error) {
 	if opcode != Text && opcode != Binary && opcode != Close && opcode != Ping && opcode != Pong {
-		return header, 0, ErrProtocol
+		return 0, ErrProtocol
 	}
 	if opcode >= 0x8 && payloadLen > 125 {
-		return header, 0, ErrProtocol
+		return 0, ErrProtocol
 	}
-	header[0] = 0x80 | byte(opcode)
+	dst[0] = 0x80 | byte(opcode)
 	switch {
 	case payloadLen < 126:
-		header[1] = byte(payloadLen)
-		return header, 2, nil
+		dst[1] = byte(payloadLen)
+		return 2, nil
 	case payloadLen <= 65535:
-		header[1] = 126
-		binary.BigEndian.PutUint16(header[2:4], uint16(payloadLen))
-		return header, 4, nil
+		dst[1] = 126
+		binary.BigEndian.PutUint16(dst[2:4], uint16(payloadLen))
+		return 4, nil
 	default:
-		header[1] = 127
-		binary.BigEndian.PutUint64(header[2:10], uint64(payloadLen))
-		return header, 10, nil
+		dst[1] = 127
+		binary.BigEndian.PutUint64(dst[2:10], uint64(payloadLen))
+		return 10, nil
 	}
 }

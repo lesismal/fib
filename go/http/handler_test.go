@@ -76,9 +76,9 @@ func TestMarshalHeadResponse(t *testing.T) {
 	if response.ContentLength != 5 {
 		t.Fatalf("Content-Length = %d", response.ContentLength)
 	}
-	body, _ := io.ReadAll(response.Body)
-	if len(body) != 0 {
-		t.Fatalf("HEAD body = %q", body)
+	read, _ := io.ReadAll(response.Body)
+	if len(read) != 0 {
+		t.Fatalf("HEAD body = %q", read)
 	}
 }
 

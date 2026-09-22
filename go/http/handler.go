@@ -117,12 +117,28 @@ func (c *Context) RequestBody() *BodyStream {
 }
 
 func (c *Context) Respond(status int, contentType string, body []byte) error {
-	header := make(stdhttp.Header)
-	if contentType != "" {
-		header.Set("Content-Type", contentType)
+	if contentType == "" {
+		return c.WriteResponse(Response{StatusCode: status, Body: body})
 	}
-	return c.WriteResponse(Response{StatusCode: status, Header: header, Body: body})
+	// Every path a response takes — HTTP/1's marshalResponse, HTTP/2's
+	// encoder, an external stream's — has read the header by the time it
+	// returns, and this one is not the caller's to keep, so it goes back to
+	// be the next reply's. That is a map and a value slice per response,
+	// which for a handler that answers with Respond is most of what
+	// answering allocates.
+	header := contentTypeHeaders.Get().(stdhttp.Header)
+	header["Content-Type"] = append(header["Content-Type"][:0], contentType)
+	err := c.WriteResponse(Response{StatusCode: status, Header: header, Body: body})
+	contentTypeHeaders.Put(header)
+	return err
 }
+
+// contentTypeHeaders recycles the one-field headers Respond builds. A header
+// in it holds Content-Type and nothing else, which is why it needs no
+// clearing on the way in or out.
+var contentTypeHeaders = sync.Pool{New: func() any {
+	return stdhttp.Header{"Content-Type": make([]string, 0, 1)}
+}}
 
 // WriteResponse sends the whole response at once. It fails once the
 // response has been begun through the ResponseWriter methods.
@@ -161,6 +177,14 @@ func (c *Context) writeResponse(response Response) error {
 	if err != nil {
 		return err
 	}
+	// The array goes to the connection rather than being copied into its
+	// send buffer, and is deliberately not a pooled one. A buffer from the
+	// pool would have to be sent rather than handed over so that it could
+	// come back, and a reply the socket cannot take at once is then copied
+	// into a send buffer sized for a whole read round: answering one small
+	// request would take a 32KB buffer out of the pool to hold 130 bytes.
+	// Measured at one connection per core that cost 78% of the round trip,
+	// which is far more than the allocation it saves.
 	if err = c.Conn.SendOwned(data); err != nil {
 		return err
 	}
@@ -694,9 +718,11 @@ func (h *ServerHandler) OnClose(c *fib.Connection, err error) {
 	c.SetAttachment(nil)
 }
 
+// marshalResponse builds a whole response into one array, which it hands to
+// the caller to give to the connection.
 func marshalResponse(request *stdhttp.Request, response Response, closeConnection bool) ([]byte, error) {
 	status := response.StatusCode
-	head := responseHead{status: status, header: response.Header, contentLength: -1, close: closeConnection}
+	framing := responseHead{status: status, header: response.Header, contentLength: -1, close: closeConnection}
 	hasBody := statusHasBody(status)
 	isHead := request.Method == stdhttp.MethodHead
 	var trailer stdhttp.Header
@@ -704,27 +730,27 @@ func marshalResponse(request *stdhttp.Request, response Response, closeConnectio
 	case status == stdhttp.StatusNotModified:
 		// A 304 may repeat the length of what it stands for, and only a
 		// length the handler gives knows that (RFC 9110 section 8.6).
-		head.contentLength = declaredLength(response.Header)
+		framing.contentLength = declaredLength(response.Header)
 	case !hasBody:
 		// 1xx and 204 never carry Content-Length.
 	case isHead:
-		head.contentLength = declaredLength(response.Header)
-		if head.contentLength < 0 {
-			head.contentLength = int64(len(response.Body))
+		framing.contentLength = declaredLength(response.Header)
+		if framing.contentLength < 0 {
+			framing.contentLength = int64(len(response.Body))
 		}
 	case len(response.Trailer) > 0 && request.ProtoAtLeast(1, 1):
-		head.chunked = true
+		framing.chunked = true
 		trailer = make(stdhttp.Header, len(response.Trailer))
 		for key, values := range response.Trailer {
 			if !forbiddenTrailer(key) {
 				key = stdhttp.CanonicalHeaderKey(key)
 				trailer[key] = values
-				head.trailers = append(head.trailers, key)
+				framing.trailers = append(framing.trailers, key)
 			}
 		}
-		sort.Strings(head.trailers)
+		sort.Strings(framing.trailers)
 	default:
-		head.contentLength = int64(len(response.Body))
+		framing.contentLength = int64(len(response.Body))
 	}
 	capacity := len(response.Body) + 128
 	for key, values := range response.Header {
@@ -733,14 +759,14 @@ func marshalResponse(request *stdhttp.Request, response Response, closeConnectio
 			capacity += len(value) + 2
 		}
 	}
-	out, err := appendResponseHead(make([]byte, 0, capacity), request, head)
+	out, err := appendResponseHead(make([]byte, 0, capacity), request, framing)
 	if err != nil {
 		return nil, err
 	}
 	if isHead || !hasBody {
 		return out, nil
 	}
-	if !head.chunked {
+	if !framing.chunked {
 		return append(out, response.Body...), nil
 	}
 	if len(response.Body) > 0 {

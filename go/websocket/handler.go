@@ -16,6 +16,7 @@ import (
 	"unicode/utf8"
 
 	fib "github.com/lesismal/fib/go"
+	"github.com/lesismal/fib/go/bufferpool"
 	epollhttp "github.com/lesismal/fib/go/http"
 )
 
@@ -238,21 +239,43 @@ func (c *Connection) writeFrame(opcode Opcode, payload []byte) error {
 	return c.sendFrame(opcode, payload, false)
 }
 
-// sendFrame frames payload for the peer. A server's frames go out as they are.
-// A client has to mask every frame with a key the server cannot predict (RFC
-// 6455 section 5.3), and masking rewrites the payload, which is the caller's
-// buffer and not this connection's to scramble, so a client frame is built in a
-// buffer of its own. compressed sets RSV1, which marks a compressed message.
+// sendFrame frames payload for the peer. A server's frames go out as they are,
+// with the header beside the payload rather than copied in front of it. A
+// client has to mask every frame instead (RFC 6455 section 5.3), which
+// sendMaskedFrame does. compressed sets RSV1, which marks a compressed
+// message.
 func (c *Connection) sendFrame(opcode Opcode, payload []byte, compressed bool) error {
-	header, headerLen, err := frameHeader(opcode, len(payload))
+	if c.client {
+		return c.sendMaskedFrame(opcode, payload, compressed)
+	}
+	// The header goes to the connection beside the payload, and the compiler
+	// cannot see that the connection copies it, so an array on the stack here
+	// would be moved to the heap and every frame sent would allocate one. A
+	// pooled buffer is the same header without that.
+	header := bufferpool.Get(maxFrameHeader)
+	defer bufferpool.Put(header)
+	headerLen, err := frameHeader(header, opcode, len(payload))
 	if err != nil {
 		return err
 	}
 	if compressed {
 		header[0] |= 0x40
 	}
-	if !c.client {
-		return c.conn.SendParts(header[:headerLen], payload)
+	return c.conn.SendParts(header[:headerLen], payload)
+}
+
+// sendMaskedFrame is sendFrame for a client, which has to mask every frame
+// with a key the server cannot predict. Masking rewrites the payload, which is
+// the caller's buffer and not this connection's to scramble, so the frame is
+// built whole in a buffer of its own and the header never leaves this frame.
+func (c *Connection) sendMaskedFrame(opcode Opcode, payload []byte, compressed bool) error {
+	var header [maxFrameHeader]byte
+	headerLen, err := frameHeader(header[:], opcode, len(payload))
+	if err != nil {
+		return err
+	}
+	if compressed {
+		header[0] |= 0x40
 	}
 	frame := make([]byte, headerLen+4+len(payload))
 	copy(frame, header[:headerLen])
