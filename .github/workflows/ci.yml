@@ -95,7 +95,7 @@ jobs:
           go test -race -count=1 -timeout 10m -v ./... > "$RUNNER_TEMP/test.log" 2>&1
           status=$?
           grep -v -E '^(=== (RUN|PAUSE|CONT)|\s*--- PASS)' "$RUNNER_TEMP/test.log"
-          skipped=$(grep -E -A1 -- '--- SKIP' "$RUNNER_TEMP/test.log")
+          skipped=$(grep -a -E -A1 -- '--- SKIP' "$RUNNER_TEMP/test.log")
           if [ -n "$skipped" ]; then
             skipped=${skipped//$'\n'/'%0A'}
             echo "::notice title=skipped tests::$skipped"
@@ -103,7 +103,7 @@ jobs:
           if [ "$status" -ne 0 ]; then
             # Surface the failures as an annotation so they are readable
             # without opening the full log.
-            summary=$(grep -E -B2 -A20 -- '--- FAIL|^panic:|^FAIL|fatal error:' "$RUNNER_TEMP/test.log" | head -c 60000)
+            summary=$(grep -a -E -B2 -A20 -- '--- FAIL|^panic:|^FAIL|fatal error:' "$RUNNER_TEMP/test.log" | head -c 60000)
             summary=${summary//'%'/'%25'}
             summary=${summary//$'\r'/'%0D'}
             summary=${summary//$'\n'/'%0A'}
@@ -158,7 +158,7 @@ jobs:
             . ./http/ 2>&1 | tee "$RUNNER_TEMP/conformance.log"
           status=${PIPESTATUS[0]}
           if [ "$status" -ne 0 ]; then
-            summary=$(grep -E -B2 -A20 -- '--- FAIL|^panic:|^FAIL|fatal error:' "$RUNNER_TEMP/conformance.log" | head -c 60000)
+            summary=$(grep -a -E -B2 -A20 -- '--- FAIL|^panic:|^FAIL|fatal error:' "$RUNNER_TEMP/conformance.log" | head -c 60000)
             summary=${summary//'%'/'%25'}
             summary=${summary//$'\r'/'%0D'}
             summary=${summary//$'\n'/'%0A'}
@@ -217,7 +217,7 @@ jobs:
             ./http/ 2>&1 | tee "$RUNNER_TEMP/h2conformance.log"
           status=${PIPESTATUS[0]}
           if [ "$status" -ne 0 ]; then
-            summary=$(grep -E -B2 -A20 -- '--- FAIL|^panic:|^FAIL|fatal error:' "$RUNNER_TEMP/h2conformance.log" | head -c 60000)
+            summary=$(grep -a -E -B2 -A20 -- '--- FAIL|^panic:|^FAIL|fatal error:' "$RUNNER_TEMP/h2conformance.log" | head -c 60000)
             summary=${summary//'%'/'%25'}
             summary=${summary//$'\r'/'%0D'}
             summary=${summary//$'\n'/'%0A'}
@@ -374,7 +374,7 @@ jobs:
           go test -race -count=1 -timeout 10m -v ./http3/... 2>&1 | tee "$RUNNER_TEMP/h3conformance.log"
           status=${PIPESTATUS[0]}
           if [ "$status" -ne 0 ]; then
-            summary=$(grep -E -B2 -A20 -- '--- FAIL|^panic:|^FAIL|fatal error:' "$RUNNER_TEMP/h3conformance.log" | head -c 60000)
+            summary=$(grep -a -E -B2 -A20 -- '--- FAIL|^panic:|^FAIL|fatal error:' "$RUNNER_TEMP/h3conformance.log" | head -c 60000)
             summary=${summary//'%'/'%25'}
             summary=${summary//$'\r'/'%0D'}
             summary=${summary//$'\n'/'%0A'}
