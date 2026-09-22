@@ -10,6 +10,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/lesismal/fib/go/bufferpool"
 )
 
 type portableEvent struct {
@@ -17,8 +19,6 @@ type portableEvent struct {
 	closeErr error
 	closing  bool
 }
-
-type readBuffer struct{ data []byte }
 
 type connectionAttachment struct{ value any }
 
@@ -185,9 +185,10 @@ func (c *Connection) SendParts(first, second []byte) error {
 	if l := c.layer; l != nil {
 		return l.Send(first, second)
 	}
-	data := make([]byte, len(first)+len(second))
-	n := copy(data, first)
-	copy(data[n:], second)
+	// A send on this backend has reached the socket by the time it returns,
+	// so the joined copy is done with as soon as Send is.
+	data := bufferpool.Join(nil, first, second)
+	defer bufferpool.Put(data)
 	return c.Send(data)
 }
 

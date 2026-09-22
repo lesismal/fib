@@ -15,6 +15,7 @@ import (
 	"time"
 
 	fib "github.com/lesismal/fib/go"
+	"github.com/lesismal/fib/go/bufferpool"
 	fibtls "github.com/lesismal/fib/go/tls"
 )
 
@@ -646,7 +647,11 @@ func (h *ServerHandler) startH2(c *fib.Connection, parser *Parser, state *stdtls
 	h.releaseTimeouts(c, parser)
 	c.SetAttachment(sc)
 	sc.start()
-	sc.feed(parser.TakeBuffered())
+	// feed copies what it is given into the connection's own buffer, so the
+	// parser's goes back to the pool rather than to the collector.
+	buffered := parser.TakeBuffered()
+	sc.feed(buffered)
+	bufferpool.Put(buffered)
 }
 
 // tlsState is the connection's TLS state, looked up once the handshake has

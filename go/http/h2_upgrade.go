@@ -8,6 +8,7 @@ import (
 	"strings"
 
 	fib "github.com/lesismal/fib/go"
+	"github.com/lesismal/fib/go/bufferpool"
 )
 
 // The HTTP/1.1 Upgrade to h2c (RFC 7540 section 3.2): a cleartext client that
@@ -82,6 +83,7 @@ func (h *ServerHandler) upgradeH2C(c *fib.Connection, parser *Parser, request *s
 	if len(rest) > 0 {
 		sc.feed(rest)
 	}
+	bufferpool.Put(rest)
 }
 
 // headerHasToken reports whether a comma-separated header lists token,

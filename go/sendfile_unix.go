@@ -5,6 +5,8 @@ package fib
 import (
 	"io"
 	"syscall"
+
+	"github.com/lesismal/fib/go/bufferpool"
 )
 
 // maxSendFileCall bounds one sendfile call, below the 2GB Linux takes at most.
@@ -56,6 +58,10 @@ func (s *fileSegment) close() {
 		_ = syscall.Close(s.fd)
 		s.fd = -1
 	}
+	// A copy through this segment is a synchronous write, so nothing is
+	// reading the staging buffer by the time the segment ends.
+	bufferpool.Put(s.copyBuf)
+	s.copyBuf = nil
 }
 
 // sysSendFileLocked sends what it can of the file item at the head of the
@@ -90,7 +96,7 @@ func (c *Connection) sysSendFileLocked(item *sendItem) (n, attempted int, fromFi
 			return 0, attempted, true, io.ErrUnexpectedEOF
 		case err == syscall.EINVAL || err == syscall.ENOTSUP || err == syscall.EOPNOTSUPP || err == syscall.ENOTSOCK:
 			// This kind of socket or file cannot be spliced; copy it.
-			s.copyBuf = make([]byte, sendFileChunk)
+			s.copyBuf = bufferpool.Get(sendFileChunk)
 		default:
 			return n, attempted, true, err
 		}

@@ -5,8 +5,9 @@ package websocket
 import (
 	"encoding/binary"
 	"errors"
-	"sync"
 	"unicode/utf8"
+
+	"github.com/lesismal/fib/go/bufferpool"
 )
 
 type Opcode byte
@@ -39,15 +40,6 @@ var (
 
 const maxRetainedFrameBuffer = 64 << 10
 
-type frameBuffer struct{ data []byte }
-
-// frameBuffers recycles the arrays a parser adopts a partial frame into. A
-// connection needs one only while a frame is split across reads, so pooling
-// them lets a connection that is between messages hold none at all instead of
-// keeping its own for as long as it stays open. At high connection counts
-// those retained arrays were the largest thing on the heap.
-var frameBuffers = sync.Pool{New: func() any { return new(frameBuffer) }}
-
 type Event struct {
 	Opcode  Opcode
 	Payload []byte
@@ -70,7 +62,7 @@ type Parser struct {
 	// reject a frame masked the other way (RFC 6455 section 5.1).
 	fromServer   bool
 	buffer       []byte
-	owned        *frameBuffer
+	owned        []byte
 	borrowedTail []byte
 	fragment     *fragmentedMessage
 	// perFrame emits every frame of a data message as it completes instead of
@@ -92,7 +84,7 @@ type Parser struct {
 	contextTakeover bool
 	window          []byte
 	// inflated holds the last message FeedOneBorrowed decompressed.
-	inflated *frameBuffer
+	inflated []byte
 }
 
 func NewParser(maxMessageBytes int64) *Parser {
@@ -120,7 +112,7 @@ func NewServerFrameParser(maxMessageBytes int64) *Parser {
 func (p *Parser) SetPerFrame(on bool) { p.perFrame = on }
 
 func (p *Parser) Reset() {
-	if p.borrowedBuffer || cap(p.buffer) > maxRetainedFrameBuffer {
+	if p.borrowedBuffer {
 		p.buffer = nil
 	} else {
 		p.buffer = p.buffer[:0]
@@ -190,17 +182,12 @@ func (p *Parser) ReleaseBorrowed() {
 }
 
 // releaseOwned returns the adopted array to the pool. The caller must have
-// established that no partial frame still lives in it. An array that outgrew
-// the retention limit is dropped instead, so one large message cannot leave
-// every pooled array permanently inflated.
+// established that no partial frame still lives in it. An array one large
+// message grew goes back as well: it returns to the class its capacity
+// belongs to, so it can never be handed to a connection that asked for an
+// ordinary one.
 func (p *Parser) releaseOwned() {
-	if p.owned == nil {
-		return
-	}
-	if cap(p.owned.data) <= maxRetainedFrameBuffer {
-		p.owned.data = p.owned.data[:0]
-		frameBuffers.Put(p.owned)
-	}
+	bufferpool.Put(p.owned)
 	p.owned = nil
 }
 
@@ -221,14 +208,20 @@ func (p *Parser) feedOne(data []byte, borrowPayload bool) (Event, bool, error) {
 		p.buffer, p.borrowedTail = appendCurrentFrame(p.buffer, data)
 		p.keepOwned()
 	} else {
-		p.buffer = append(p.buffer, data...)
+		if p.borrowedBuffer && len(data) != 0 {
+			// The partial frame still lives in the read buffer, which is not
+			// this parser's to append to: the bytes past it belong to whoever
+			// lent it. Copy it out first.
+			p.adopt()
+		}
+		p.buffer = bufferpool.Append(p.buffer, data)
 		p.keepOwned()
 	}
 	for {
 		event, emit, complete, err := p.next(borrowPayload)
 		if err != nil {
 			p.buffer = nil
-			p.owned = nil
+			p.releaseOwned()
 			p.borrowedBuffer = false
 			p.borrowedTail = nil
 			p.fragment = nil
@@ -262,10 +255,10 @@ func (p *Parser) feedOne(data []byte, borrowPayload bool) (Event, bool, error) {
 // reuse it. An emptied or borrowed buffer must not displace a larger array that
 // is still worth keeping, so the retained one only ever grows.
 func (p *Parser) keepOwned() {
-	if p.borrowedBuffer || p.owned == nil || cap(p.buffer) < cap(p.owned.data) {
+	if p.borrowedBuffer || cap(p.buffer) < cap(p.owned) {
 		return
 	}
-	p.owned.data = p.buffer
+	p.owned = p.buffer
 }
 
 // adopt copies the borrowed tail into the parser's own array so the read
@@ -286,32 +279,33 @@ func (p *Parser) adopt() {
 			capacity = frameEnd
 		}
 	}
-	if p.owned == nil {
-		p.owned = frameBuffers.Get().(*frameBuffer)
+	if cap(p.owned) < capacity {
+		bufferpool.Put(p.owned)
+		p.owned = bufferpool.Get(capacity)
 	}
-	if cap(p.owned.data) < capacity {
-		p.owned.data = make([]byte, 0, capacity)
-	}
-	p.owned.data = append(p.owned.data[:0], p.buffer...)
-	p.buffer = p.owned.data
+	p.owned = append(p.owned[:0], p.buffer...)
+	p.buffer = p.owned
 	p.borrowedBuffer = false
 }
 
+// appendCurrentFrame grows buffer, which the parser owns, through the pool
+// with as much of data as the frame being received still needs, and returns
+// what is left of data for the frame after it.
 func appendCurrentFrame(buffer, data []byte) ([]byte, []byte) {
 	for {
 		frameEnd, known := frameSize(buffer)
 		if known {
 			need := frameEnd - len(buffer)
 			if need <= 0 || need >= len(data) {
-				return append(buffer, data...), nil
+				return bufferpool.Append(buffer, data), nil
 			}
-			return append(buffer, data[:need]...), data[need:]
+			return bufferpool.Append(buffer, data[:need]), data[need:]
 		}
 		need := frameHeaderSize(buffer) - len(buffer)
 		if need <= 0 || need >= len(data) {
-			return append(buffer, data...), nil
+			return bufferpool.Append(buffer, data), nil
 		}
-		buffer = append(buffer, data[:need]...)
+		buffer = bufferpool.Append(buffer, data[:need])
 		data = data[need:]
 	}
 }
@@ -542,10 +536,7 @@ func (p *Parser) next(borrowPayload bool) (Event, bool, bool, error) {
 func (p *Parser) inflate(compressed []byte, borrowed bool) ([]byte, error) {
 	var dst []byte
 	if borrowed {
-		if p.inflated == nil {
-			p.inflated = frameBuffers.Get().(*frameBuffer)
-		}
-		dst = p.inflated.data[:0]
+		dst = p.inflated[:0]
 	}
 	var window []byte
 	if p.contextTakeover {
@@ -556,7 +547,7 @@ func (p *Parser) inflate(compressed []byte, borrowed bool) ([]byte, error) {
 		return nil, err
 	}
 	if borrowed {
-		p.inflated.data = message
+		p.inflated = message
 	}
 	if p.contextTakeover {
 		p.window = keepWindow(p.window, message)
@@ -565,13 +556,7 @@ func (p *Parser) inflate(compressed []byte, borrowed bool) ([]byte, error) {
 }
 
 func (p *Parser) releaseInflated() {
-	if p.inflated == nil {
-		return
-	}
-	if cap(p.inflated.data) <= maxRetainedFrameBuffer {
-		p.inflated.data = p.inflated.data[:0]
-		frameBuffers.Put(p.inflated)
-	}
+	bufferpool.Put(p.inflated)
 	p.inflated = nil
 }
 
@@ -631,7 +616,11 @@ func (p *Parser) consume(n int) {
 			// The retained array is kept: the next partial frame reuses it.
 			p.buffer = nil
 		case cap(p.buffer) > maxRetainedFrameBuffer:
-			p.buffer, p.owned = nil, nil
+			// One message grew this parser's array past what is worth keeping
+			// attached to a connection. The pool keeps it in the class it
+			// belongs to instead.
+			p.releaseOwned()
+			p.buffer = nil
 		default:
 			p.buffer = p.buffer[:0]
 		}

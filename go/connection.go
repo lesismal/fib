@@ -8,16 +8,14 @@ import (
 	"sync"
 	"sync/atomic"
 	"syscall"
+
+	"github.com/lesismal/fib/go/bufferpool"
 )
 
-type readBuffer struct{ data []byte }
-
-type sendBuffer struct{ data []byte }
-
-// sendItem is one queued chunk. buf is the pooled buffer backing data, or nil
-// when the caller handed over an array the connection does not own. Returning
-// buf to the pool as soon as the item drains is what keeps a backpressured
-// connection from allocating a fresh array per reply.
+// sendItem is one queued chunk. pooled says data came from the buffer pool,
+// rather than being an array the caller handed over and the connection does
+// not own. Returning a pooled array as soon as the item drains is what keeps a
+// backpressured connection from allocating a fresh one per reply.
 //
 // file, when set, makes the item a stretch of a file, which SendFile queued.
 // Where the file goes to the socket by sendfile, data stays nil; otherwise data
@@ -25,7 +23,7 @@ type sendBuffer struct{ data []byte }
 type sendItem struct {
 	data   []byte
 	offset int
-	buf    *sendBuffer
+	pooled bool
 	file   *fileSegment
 }
 
@@ -163,13 +161,11 @@ func (c *Connection) resetQueueLocked() {
 	c.rewindQueueLocked()
 }
 
-// releaseItemLocked returns a drained item's buffer to the server pool. An
-// outsized buffer is dropped instead so that one large message does not leave
-// every pooled buffer permanently inflated. A file item closes its descriptor.
-// Callers hold c.mu.
+// releaseItemLocked returns a drained item's buffer to the pool. A file item
+// closes its descriptor. Callers hold c.mu.
 func (c *Connection) releaseItemLocked(item *sendItem) {
-	if item.buf != nil {
-		c.engine.releaseSendBuffer(item.buf)
+	if item.pooled {
+		c.engine.releaseSendBuffer(item.data)
 	}
 	if item.file != nil {
 		item.file.close()
@@ -221,15 +217,15 @@ func (c *Connection) queueLocked(first, second []byte) {
 		// Merging is only safe while the socket has taken nothing from the
 		// item: appending may move the array, and re-pointing an item a write
 		// has already consumed part of would disturb that write. It also has
-		// to fit: growing past the pooled capacity would both reallocate and
-		// produce a buffer too large to hand back, so a round's replies would
-		// allocate their way up the size classes and throw the result away.
-		// Starting a new item instead keeps every buffer poolable, and writev
-		// still hands the whole round to the socket in one call.
-		if tail.buf != nil && tail.offset == 0 &&
-			len(tail.buf.data)+len(first)+len(second) <= cap(tail.buf.data) {
-			tail.buf.data = append(append(tail.buf.data, first...), second...)
-			tail.data = tail.buf.data
+		// to fit: growing past the buffer's capacity would move the round's
+		// replies up a size class each time a message is added to them, so
+		// each round would leave behind a chain of ever larger buffers nothing
+		// that round asks for again. Starting a new item instead keeps every
+		// buffer at the size a round is served from, and writev still hands
+		// the whole round to the socket in one call.
+		if tail.pooled && tail.offset == 0 &&
+			len(tail.data)+len(first)+len(second) <= cap(tail.data) {
+			tail.data = append(append(tail.data, first...), second...)
 			return
 		}
 	}
@@ -237,9 +233,11 @@ func (c *Connection) queueLocked(first, second []byte) {
 		// Nothing is queued any more, so the item slice can start over.
 		c.rewindQueueLocked()
 	}
-	buf := c.engine.acquireSendBuffer()
-	buf.data = append(append(buf.data[:0], first...), second...)
-	c.sends = append(c.sends, sendItem{data: buf.data, buf: buf})
+	// A chunk larger than the pooled size grows through the pool as well, so
+	// that even an outsized message comes from a class rather than from a
+	// fresh allocation append would have had to make.
+	data := bufferpool.Join(c.engine.acquireSendBuffer(), first, second)
+	c.sends = append(c.sends, sendItem{data: data, pooled: true})
 }
 
 // queueOwnedLocked queues data the caller handed over. The connection does not
@@ -670,9 +668,8 @@ func (c *Connection) readShouldStop() bool {
 }
 
 func (c *Connection) readLoop() error {
-	buffer := c.engine.readBufferPool.Get().(*readBuffer)
-	buf := buffer.data
-	defer c.engine.readBufferPool.Put(buffer)
+	buf := bufferpool.Get(c.engine.readBufferSize)
+	defer bufferpool.Put(buf)
 	for {
 		if c.readHeld.Load() {
 			// The application is holding reads until it has worked through

@@ -10,6 +10,8 @@ import (
 	"syscall"
 	"testing"
 	"time"
+
+	"github.com/lesismal/fib/go/bufferpool"
 )
 
 // startEchoServer brings up a server on a loopback port and returns its address
@@ -182,15 +184,12 @@ func TestQueuedChunksPackIntoPooledBuffers(t *testing.T) {
 	queued := 0
 	for i := range c.sends {
 		item := &c.sends[i]
-		if item.buf == nil {
+		if !item.pooled {
 			t.Fatalf("item %d has no pooled buffer to return", i)
 		}
-		if len(item.data) > cap(item.buf.data) {
-			t.Fatalf("item %d holds %d bytes in a buffer of %d", i, len(item.data), cap(item.buf.data))
-		}
-		if i < len(c.sends)-1 && len(item.data)+len(chunk) <= cap(item.buf.data) {
+		if i < len(c.sends)-1 && len(item.data)+len(chunk) <= cap(item.data) {
 			t.Fatalf("item %d holds %d of %d bytes; another chunk still fit",
-				i, len(item.data), cap(item.buf.data))
+				i, len(item.data), cap(item.data))
 		}
 		queued += len(item.data)
 	}
@@ -220,25 +219,25 @@ func TestQueuedChunksPackIntoPooledBuffers(t *testing.T) {
 func TestPooledSendBuffersHoldAFullRound(t *testing.T) {
 	server := newOfflineServer(t)
 	buf := server.acquireSendBuffer()
-	if cap(buf.data) < server.retainedSendBuffer {
+	if cap(buf) < server.sendBufferSize {
 		t.Fatalf("pooled buffer holds %d bytes, want a full round of %d",
-			cap(buf.data), server.retainedSendBuffer)
+			cap(buf), server.sendBufferSize)
 	}
-	if len(buf.data) != 0 {
-		t.Fatalf("pooled buffer came back holding %d bytes", len(buf.data))
+	if len(buf) != 0 {
+		t.Fatalf("pooled buffer came back holding %d bytes", len(buf))
 	}
 
 	// A chunk larger than a round still lands in one item, so a big message is
 	// never split across buffers.
 	c := newOfflineConnection(server)
-	big := bytes.Repeat([]byte{'y'}, server.retainedSendBuffer*2)
+	big := bytes.Repeat([]byte{'y'}, server.sendBufferSize*2)
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.queueLocked(big, nil)
 	if len(c.sends) != 1 {
 		t.Fatalf("one large chunk produced %d items, want 1", len(c.sends))
 	}
-	if got := cap(c.sends[0].buf.data); got < len(big) {
+	if got := cap(c.sends[0].data); got < len(big) {
 		t.Fatalf("large chunk took a buffer of %d, want at least %d", got, len(big))
 	}
 }
@@ -252,23 +251,18 @@ func TestDrainedItemReturnsBufferToPool(t *testing.T) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.queueLocked(bytes.Repeat([]byte{'z'}, 1024), nil)
-	buf := c.sends[0].buf
-	if buf == nil {
+	if !c.sends[0].pooled {
 		t.Fatal("queued item has no pooled buffer")
 	}
 	c.releaseItemLocked(&c.sends[0])
-	if c.sends[0].buf != nil || c.sends[0].data != nil {
+	if c.sends[0].pooled || c.sends[0].data != nil {
 		t.Fatal("released item still references its buffer")
 	}
 	// The pool is a sync.Pool, which may drop entries at any GC, so the only
-	// guarantee worth asserting is that what comes back is reusable and that
-	// the released buffer was reset rather than left holding its old contents.
-	if len(buf.data) != 0 {
-		t.Fatalf("released buffer still holds %d bytes", len(buf.data))
-	}
-	got := server.sendBufferPool.Get().(*sendBuffer)
-	if len(got.data) != 0 {
-		t.Fatalf("pooled buffer came back holding %d bytes", len(got.data))
+	// guarantee worth asserting is that what comes back is still a buffer a
+	// whole round fits in.
+	if got := server.acquireSendBuffer(); len(got) != 0 || cap(got) < server.sendBufferSize {
+		t.Fatalf("pooled buffer came back holding %d of %d bytes", len(got), cap(got))
 	}
 }
 
@@ -286,24 +280,26 @@ func newOfflineServer(t *testing.T) *Engine {
 	return server
 }
 
-// An outsized buffer must not be retained, or one large message would leave
-// every pooled buffer permanently inflated.
-func TestOutsizedSendBufferIsDropped(t *testing.T) {
+// An outsized buffer goes back to the pool like any other, but to the class
+// its capacity belongs to: a round's replies must never be handed a buffer one
+// large message inflated, or every connection would hold that much.
+func TestOutsizedSendBufferGoesBackToItsOwnClass(t *testing.T) {
 	server := newOfflineServer(t)
 	c := newOfflineConnection(server)
-	oversized := &sendBuffer{data: make([]byte, 0, server.retainedSendBuffer*2)}
-	item := sendItem{data: oversized.data, buf: oversized}
+	oversized := bufferpool.Get(server.sendBufferSize * 2)[:0]
+	item := sendItem{data: oversized, pooled: true}
 	c.mu.Lock()
 	c.releaseItemLocked(&item)
 	c.mu.Unlock()
-	if item.buf != nil {
+	if item.pooled || item.data != nil {
 		t.Fatal("released item still references its buffer")
 	}
-	// The pool must not be holding the oversized array: a fresh Get should come
-	// back with a buffer of the ordinary size.
-	got := server.sendBufferPool.Get().(*sendBuffer)
-	if cap(got.data) > server.retainedSendBuffer {
-		t.Fatalf("pool returned a buffer of cap %d, want at most %d", cap(got.data), server.retainedSendBuffer)
+	// A round's buffer comes from the class a round asks for, whatever the
+	// oversized one was returned to.
+	for range 8 {
+		if got := server.acquireSendBuffer(); cap(got) != server.sendBufferSize {
+			t.Fatalf("a round was given a buffer of cap %d, want %d", cap(got), server.sendBufferSize)
+		}
 	}
 }
 

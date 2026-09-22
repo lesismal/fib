@@ -9,6 +9,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/lesismal/fib/go/bufferpool"
 )
 
 type Engine struct {
@@ -25,7 +27,7 @@ type Engine struct {
 	mu             sync.Mutex
 	connections    map[*Connection]struct{}
 	readers        sync.WaitGroup
-	readBufferPool sync.Pool
+	readBufferSize int
 	// udpListeners are the engine's UDP sockets, when Config.Network names
 	// UDP, and udpIdleTimeout closes their silent peers.
 	udpListeners   []*udpListener
@@ -90,7 +92,7 @@ func newEngine(config Config, handler Handler, addrs []string) (*Engine, error) 
 	e := &Engine{listeners: listeners, handler: handler, taskPool: pool, releaseTaskPool: releasePool,
 		connections: make(map[*Connection]struct{}), stopped: make(chan struct{}),
 		udpListeners: udpListeners, udpIdleTimeout: udpIdleTimeout(config.UDPIdleTimeout)}
-	e.readBufferPool.New = func() any { return &readBuffer{data: make([]byte, config.ReadBufferSize)} }
+	e.readBufferSize = config.ReadBufferSize
 	e.startUDPSweeper()
 	return e, nil
 }
@@ -275,13 +277,13 @@ func (e *Engine) DialWithHandler(network, addr string, timeout time.Duration, ha
 }
 func (e *Engine) readConnection(c *Connection) {
 	defer e.readers.Done()
-	buffer := e.readBufferPool.Get().(*readBuffer)
-	buf := buffer.data
-	defer e.readBufferPool.Put(buffer)
+	size := e.readBufferSize
 	if c.udp {
 		// A datagram larger than the buffer would be truncated.
-		buf = make([]byte, maxDatagramSize)
+		size = maxDatagramSize
 	}
+	buf := bufferpool.Get(size)
+	defer bufferpool.Put(buf)
 	for {
 		if !c.udp && !c.awaitReadable() {
 			return

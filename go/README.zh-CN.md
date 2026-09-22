@@ -10,8 +10,8 @@
 - 每个 connection 有 FIFO 事件队列；同一 connection 串行执行，不同 connection 动态负载均衡。
 - ET 读写均排空到 `EAGAIN`；仅发送队列非空时关注 `EPOLLOUT`。
 - 每轮事件处理先 flush 发送队列，再读 OOB，再读普通数据；发送队列仍有数据时跳过读取，并把可读状态保留到下一轮，待可写事件清空队列后再读，既限制用户态缓冲又不会漏读。
-- 读 buffer 由 Engine 级 `sync.Pool` 复用，大小通过 `Config.ReadBufferSize`
-  设置，默认 16 KiB。
+- 读 buffer 由 `bufferpool` 子 package 按字节对齐的尺寸档复用（见下），大小通过
+  `Config.ReadBufferSize` 设置，默认 16 KiB。
 - `Config.TaskPoolMode` 可选 `taskpool.ModeCond`（基于 `sync.Cond` 的有界环形
   队列，按 worker 数分片）、`taskpool.ModeElastic`（nbio 风格的弹性
   fork/dispatcher）或 `taskpool.ModeAdaptive`（见下，所有后端的默认值，
@@ -944,6 +944,44 @@ conn, resp, err := dialer.Go(url, header, handler).Wait() // Future 形式
   带掩码的服务端帧按协议错误以 1002 关闭。与握手响应同一次读到的首帧也会正常交付。
 - done 可能在任意 goroutine 上执行：握手成功在读取它的 worker 上，超时在定时器
   goroutine 上，连接失败在单独的 goroutine 上，URL 非法时在调用方 goroutine 上。
+
+## bufferpool 子 package
+
+`bufferpool` package 按 2 的幂尺寸档复用 `[]byte`，是 fib 及其各子 package 里所有
+可复用 buffer 的统一来源：
+
+```go
+import "github.com/lesismal/fib/go/bufferpool"
+
+buf := bufferpool.Get(n)          // len 为 n，cap 为 bufferpool.Align(n)
+defer bufferpool.Put(buf)
+
+buf = bufferpool.Append(buf, data)          // 不够时从更大的档取一块，旧的还回去
+out := bufferpool.Join(nil, first, second)  // 一次取够，把几段拼成一块
+```
+
+- **为什么对齐到 2 的幂。** 一是只有对齐才谈得上复用：按请求大小裁出来的 buffer 各不相同，
+  按档取整之后同一档里的任何一块都能服务这一档的任何请求，一档只需留住同时在用的那几块。
+  二是底层分配没有浪费：Go 的分配器本来就要把对象向上取整到它自己的 size class，请求
+  4200 字节会拿到 4864 字节的对象；而 64 字节往上的每个 2 的幂都正好是一个 size class，
+  超过 32 KiB 之后分配按页走，2 的幂也正好是 8 KiB 页的整数倍。档位索引也因此只是一条
+  `bits.Len`，不需要查找。
+- **档位范围。** 最小 64 字节（`MinSize`），更小的对象 Go 的 tiny allocator 本来就比两次
+  原子操作快；最大 64 MiB（`MaxSize`），更大的直接分配、`Put` 时直接丢弃，为一次罕见的请求
+  长期留住那么大一块并不划算。
+- **Get/Put 不分配内存。** `sync.Pool` 存的是 `any`，slice header 放不进去，只能通过指针，
+  否则每次 `Put` 都要为这个 24 字节的 header 分配一次。`bufferpool` 把这些 header 本身也
+  放进一个池子里循环使用：单协程下比让 header 逃逸多花约 2ns，但所有核同时取 buffer 时
+  （也就是 server 的实际情形）一次往返是 7.1ns 对 10.5ns，因为真正产生竞争的正是那次分配。
+- **一个全局池，不是每处一个。** 连接的读 buffer、由它拼出来的回包、一条 TLS 记录用的都是
+  同一批 buffer 在各档之间流动；分成多个池只会让每个池各自留一份闲置 buffer。
+- **`Get` 返回的内容是上一个使用者留下的**，和任何复用 buffer 一样，先写后读。
+- **`Put` 之后不能再用这块 buffer**（包括它的任何子 slice）。小于 `MinSize` 或大于
+  `MaxSize` 的会被直接丢弃，所以来路不明的 buffer 也可以直接交给 `Put`。
+
+fib 内部用它的地方：连接的读 buffer 与发送队列缓冲、`SendFile` 的中转 buffer、UDP
+拼包、TLS 的收包缓冲与记录拼接、WebSocket 跨读分帧时接管的数组、HTTP/1 与 HTTP/2 的
+收包缓冲和 CONTINUATION 块、HTTP/3 的响应帧组装。
 
 ## Examples
 

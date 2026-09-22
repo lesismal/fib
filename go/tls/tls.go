@@ -19,6 +19,7 @@ import (
 	"time"
 
 	fib "github.com/lesismal/fib/go"
+	"github.com/lesismal/fib/go/bufferpool"
 )
 
 // DefaultHandshakeTimeout bounds a handshake when Handler leaves
@@ -28,10 +29,6 @@ const DefaultHandshakeTimeout = 10 * time.Second
 // readBufferSize holds the largest record crypto/tls will hand back from one
 // Read, so a drain never splits a record's plaintext across two calls.
 const readBufferSize = 16 << 10
-
-type readBuffer struct{ data []byte }
-
-var readBufferPool = sync.Pool{New: func() any { return &readBuffer{data: make([]byte, readBufferSize)} }}
 
 // errWouldBlock is what the transport tells crypto/tls when a read would
 // have to wait for bytes the socket has not delivered yet. crypto/tls treats a
@@ -186,7 +183,6 @@ type layer struct {
 	failed         bool
 	pending        [][]byte
 	closeAfterSend bool
-	joined         []byte
 }
 
 func (t *layer) handshake(handler fib.Handler, timeout time.Duration) {
@@ -201,8 +197,12 @@ func (t *layer) handshake(handler fib.Handler, timeout time.Duration) {
 	t.wmu.Lock()
 	pending, closeAfterSend := t.pending, t.closeAfterSend
 	t.pending = nil
-	for i := 0; err == nil && i < len(pending); i++ {
-		_, err = t.conn.Write(pending[i])
+	for i, held := range pending {
+		if err == nil {
+			_, err = t.conn.Write(held)
+		}
+		bufferpool.Put(held)
+		pending[i] = nil
 	}
 	if err != nil {
 		t.failed = true
@@ -242,7 +242,7 @@ func (t *layer) feed(handler fib.Handler, data []byte) {
 		t.mu.Unlock()
 		return
 	}
-	t.in = append(t.in, data...)
+	t.in = bufferpool.Append(t.in, data)
 	if t.handshaking {
 		t.cond.Signal()
 		t.mu.Unlock()
@@ -257,12 +257,12 @@ func (t *layer) feed(handler fib.Handler, data []byte) {
 func (t *layer) drain(handler fib.Handler) {
 	t.readMu.Lock()
 	defer t.readMu.Unlock()
-	buffer := readBufferPool.Get().(*readBuffer)
-	defer readBufferPool.Put(buffer)
+	buf := bufferpool.Get(readBufferSize)
+	defer bufferpool.Put(buf)
 	for {
-		n, err := t.conn.Read(buffer.data)
+		n, err := t.conn.Read(buf)
 		if n > 0 {
-			handler.OnData(t.c, buffer.data[:n])
+			handler.OnData(t.c, buf[:n])
 		}
 		if err == nil {
 			continue
@@ -280,6 +280,7 @@ func (t *layer) drain(handler fib.Handler) {
 func (t *layer) shutdown() {
 	t.mu.Lock()
 	t.closed = true
+	bufferpool.Put(t.in)
 	t.in = nil
 	t.cond.Broadcast()
 	t.mu.Unlock()
@@ -296,21 +297,22 @@ func (t *layer) Send(first, second []byte) error {
 		return syscall.EPIPE
 	}
 	if !t.ready {
-		data := make([]byte, 0, len(first)+len(second))
-		t.pending = append(t.pending, append(append(data, first...), second...))
+		t.pending = append(t.pending, bufferpool.Join(nil, first, second))
 		return nil
 	}
 	data := first
 	if len(second) > 0 {
 		// One record for both parts: a frame header sent as a record of its
-		// own would cost more in record overhead than it carries.
-		t.joined = append(append(t.joined[:0], first...), second...)
-		data = t.joined
+		// own would cost more in record overhead than it carries. The joined
+		// copy comes from the pool rather than from a buffer kept per
+		// connection: crypto/tls has encrypted it by the time Write returns,
+		// and at high connection counts a retained buffer apiece costs far
+		// more than taking one for the length of a call.
+		joined := bufferpool.Join(nil, first, second)
+		defer bufferpool.Put(joined)
+		data = joined
 	}
 	_, err := t.conn.Write(data)
-	if cap(t.joined) > readBufferSize {
-		t.joined = nil
-	}
 	return err
 }
 
@@ -359,12 +361,19 @@ func (t *layer) Read(p []byte) (int, error) {
 	n := copy(p, t.in)
 	if n == len(t.in) {
 		if cap(t.in) > 4*readBufferSize {
+			// A burst grew this connection's buffer past what is worth
+			// keeping attached to it. The pool keeps it instead, in the class
+			// it belongs to, for whoever needs one that size next.
+			bufferpool.Put(t.in)
 			t.in = nil
 		} else {
 			t.in = t.in[:0]
 		}
 	} else {
-		t.in = t.in[n:]
+		// Moving the rest down rather than reslicing past what was read keeps
+		// the buffer starting at its array, so what goes back to the pool is
+		// the whole of it.
+		t.in = t.in[:copy(t.in, t.in[n:])]
 	}
 	return n, nil
 }

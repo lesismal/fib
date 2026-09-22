@@ -17,6 +17,7 @@ import (
 	"time"
 
 	fib "github.com/lesismal/fib/go"
+	"github.com/lesismal/fib/go/bufferpool"
 )
 
 var (
@@ -177,11 +178,10 @@ func NewParser(config Config) *Parser {
 // Reset clears buffered state so the parser can be reused for another
 // connection with the same configuration.
 func (p *Parser) Reset() {
-	if cap(p.buffer) > maxRetainedBuffer {
-		p.buffer = nil
-	} else {
-		p.buffer = p.buffer[:0]
-	}
+	// The parser is about to serve another connection, so its buffer belongs
+	// back in the pool rather than attached to it through the wait in between.
+	bufferpool.Put(p.buffer)
+	p.buffer = nil
 	p.headerScan = 0
 	p.continued, p.wantContinue = false, false
 	p.stream, p.busy, p.spent = nil, false, false
@@ -220,13 +220,13 @@ func (p *Parser) Feed(data []byte) ([]*stdhttp.Request, error) {
 // nothing; only the server handler, which feeds the body, goes on from there.
 func (p *Parser) FeedOne(data []byte) (*stdhttp.Request, bool, error) {
 	if p.stream != nil {
-		p.buffer = append(p.buffer, data...)
+		p.buffer = bufferpool.Append(p.buffer, data)
 		return nil, false, nil
 	}
-	p.buffer = append(p.buffer, data...)
+	p.buffer = bufferpool.Append(p.buffer, data)
 	frame, complete, err := p.frameLength()
 	if err != nil {
-		p.buffer = nil
+		p.discard()
 		p.headerScan = 0
 		return nil, false, err
 	}
@@ -254,14 +254,14 @@ func (p *Parser) FeedOne(data []byte) (*stdhttp.Request, bool, error) {
 		// second parse. Content-Length requests reuse the header parse below.
 		req, err = readRequest(p.buffer[:frame.end], true)
 		if err != nil {
-			p.buffer = nil
+			p.discard()
 			return nil, false, fmt.Errorf("%w: %v", ErrMalformed, err)
 		}
 		req.Close = req.Close || frame.request.Close
 		body, readErr := io.ReadAll(io.LimitReader(req.Body, p.config.MaxBodyBytes+1))
 		_ = req.Body.Close()
 		if readErr != nil || int64(len(body)) > p.config.MaxBodyBytes {
-			p.buffer = nil
+			p.discard()
 			if int64(len(body)) > p.config.MaxBodyBytes {
 				return nil, false, ErrBodyTooLarge
 			}
@@ -326,7 +326,7 @@ func (p *Parser) pumpBody(data []byte) (bool, error) {
 		p.buffer = append(p.buffer, data[used:]...)
 		return p.bodyEnded(done, err)
 	}
-	p.buffer = append(p.buffer, data...)
+	p.buffer = bufferpool.Append(p.buffer, data)
 	used, done, err := stream.absorb(p.buffer)
 	if used > 0 {
 		p.consume(used)
@@ -359,10 +359,20 @@ func (p *Parser) TakeBuffered() []byte {
 	return data
 }
 
+// discard drops what is buffered, returning the array to the pool. The caller
+// must have established that nothing parsed out of it is still referring to it.
+func (p *Parser) discard() {
+	bufferpool.Put(p.buffer)
+	p.buffer = nil
+}
+
 func (p *Parser) consume(n int) {
 	if n == len(p.buffer) {
 		if cap(p.buffer) > maxRetainedBuffer {
-			p.buffer = nil
+			// A large request grew the buffer past what is worth keeping for
+			// the next one on this connection; the pool keeps it instead, in
+			// the class it belongs to.
+			p.discard()
 		} else {
 			p.buffer = p.buffer[:0]
 		}

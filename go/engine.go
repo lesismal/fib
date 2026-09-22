@@ -11,6 +11,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/lesismal/fib/go/bufferpool"
 	"github.com/lesismal/fib/go/taskpool"
 )
 
@@ -80,7 +81,7 @@ type Engine struct {
 	writeLowWatermark  int
 	maxPendingBytes    int64
 	budgetResumeBytes  int64
-	retainedSendBuffer int
+	sendBufferSize     int
 	handler            Handler
 	stopping           atomic.Bool
 	pendingTotal       atomic.Int64
@@ -109,8 +110,7 @@ type Engine struct {
 	taskPool        TaskPool
 	releaseTaskPool func()
 	taskWG          sync.WaitGroup
-	readBufferPool  sync.Pool
-	sendBufferPool  sync.Pool
+	readBufferSize  int
 	closeOnce       sync.Once
 	// udpListeners are the engine's UDP sockets, when Config.Network names
 	// UDP. udpIdleTimeout closes their silent peers, and udpSweepDone stops
@@ -149,26 +149,27 @@ func (e *Engine) datagramBuffer() []byte {
 	return e.datagramBuf
 }
 
-// acquireSendBuffer returns a pooled outbound buffer.
+// acquireSendBuffer returns an empty outbound buffer from the shared pool,
+// with room for a whole round's replies.
 //
-// One size for every buffer is deliberate. Sizing buffers to the backlog was
-// measured twice and helped neither: a 4KB class left 736MB of buffers about a
-// third full, and stepping down to 1KB classes made it worse still at 1181MB,
-// because several pools each retain their own idle buffers. Resident peak did
-// not move for any of them, so the bound that matters is MaxPendingBytes, not
-// the shape of the buffers underneath it.
-func (e *Engine) acquireSendBuffer() *sendBuffer {
-	return e.sendBufferPool.Get().(*sendBuffer)
+// One size for every buffer is deliberate, even though the pool has classes
+// for every other size. Asking for a buffer shaped to the backlog was measured
+// twice and helped neither: a 4KB class left 736MB of buffers about a third
+// full, and stepping down to 1KB classes made it worse still at 1181MB,
+// because each class retains idle buffers of its own. Resident peak did not
+// move for any of them, so the bound that matters is MaxPendingBytes, not the
+// shape of the buffers underneath it.
+func (e *Engine) acquireSendBuffer() []byte {
+	return bufferpool.Get(e.sendBufferSize)[:0]
 }
 
-// releaseSendBuffer hands a buffer back. One larger than the retention limit is
-// dropped, so that a single big message cannot leave every pooled buffer
-// permanently inflated.
-func (e *Engine) releaseSendBuffer(b *sendBuffer) {
-	if cap(b.data) <= e.retainedSendBuffer {
-		b.data = b.data[:0]
-		e.sendBufferPool.Put(b)
-	}
+// releaseSendBuffer hands a buffer back. A buffer a single large message grew
+// past the size it was taken at goes back too, since it returns to the class
+// its capacity belongs to rather than to the one a round's replies are served
+// from: an outsized buffer is then reused only by another message that size,
+// and cannot leave the ordinary buffers inflated the way one shared pool would.
+func (e *Engine) releaseSendBuffer(data []byte) {
+	bufferpool.Put(data)
 }
 
 // Bind creates an engine that listens on config.Addr, or on every address in
@@ -218,33 +219,26 @@ func newEngine(config Config, handler Handler, addrs []string) (*Engine, error) 
 		writeLowWatermark: config.WriteBufferHighWatermark / 4,
 		maxPendingBytes:   config.MaxPendingBytes,
 		budgetResumeBytes: config.MaxPendingBytes / 4,
-		// Retention is sized to one read round's replies, not to the write
-		// watermark. The watermark bounds the bytes a connection may have
-		// pending; it does not bound the capacity of the buffer holding them,
-		// and a buffer that grew to the watermark during a burst would
-		// otherwise be pooled at that size and handed to the next connection.
-		// At high connection counts that capacity, not the pending bytes, is
-		// what the process actually pays for: retaining at the watermark held
-		// 908MB of buffers against 256MB of pending data.
+		// An outbound buffer is sized to one read round's replies, not to the
+		// write watermark. The watermark bounds the bytes a connection may
+		// have pending; it does not bound the capacity of the buffer holding
+		// them, and a buffer taken at the watermark would be pooled at that
+		// size and handed on to the next connection. At high connection
+		// counts that capacity, not the pending bytes, is what the process
+		// actually pays for: buffers at the watermark held 908MB against
+		// 256MB of pending data.
 		//
 		// The allowance is twice the round size because replies carry framing
-		// on top of the bytes that arrived. Retaining at exactly the round size
-		// would drop the buffer every round and allocate a new one next round.
-		retainedSendBuffer: 2 * config.ReadBufferSize,
-		udpIdleTimeout:     udpIdleTimeout(config.UDPIdleTimeout),
-		handler:            handler}
-	e.readBufferPool.New = func() any { return &readBuffer{data: make([]byte, config.ReadBufferSize)} }
-	// Pooled outbound buffers start at the size a full round's replies actually
-	// reach, which is the bytes that arrived plus the framing put back on top
-	// of them, not the read buffer size alone. Starting any smaller costs a
-	// reallocation per round on every connection, and starting from empty costs
-	// one per doubling: empty cost 49.5GB of allocation across a 15-second rate
-	// test, and an exact-fit 16KB still cost 12.4GB. Matching the retention
-	// limit means a buffer that has grown is still handed back to the pool
-	// rather than dropped.
-	e.sendBufferPool.New = func() any {
-		return &sendBuffer{data: make([]byte, 0, e.retainedSendBuffer)}
-	}
+		// on top of the bytes that arrived, and buffers are taken at it rather
+		// than empty: starting smaller costs a reallocation per round on every
+		// connection, and starting from empty costs one per doubling. Empty
+		// cost 49.5GB of allocation across a 15-second rate test, and an
+		// exact-fit 16KB still cost 12.4GB. Aligning it to a pool class means
+		// the buffer a round is given is exactly the class it comes from.
+		sendBufferSize: bufferpool.Align(2 * config.ReadBufferSize),
+		udpIdleTimeout: udpIdleTimeout(config.UDPIdleTimeout),
+		handler:        handler}
+	e.readBufferSize = config.ReadBufferSize
 	e.taskPool, e.releaseTaskPool = acquireTaskPool(config)
 	if err := e.open(config, addrs); err != nil {
 		e.releaseTaskPool()

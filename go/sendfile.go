@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"io"
 	"syscall"
+
+	"github.com/lesismal/fib/go/bufferpool"
 )
 
 // File is what SendFile sends from: an *os.File, or any type that wraps one
@@ -36,7 +38,10 @@ func checkSendFileRange(offset, count int64) error {
 // range, leaves the peer short of bytes it was promised, so the connection is
 // closed; one that fails before anything was sent leaves it as it was.
 func sendFileCopy(c *Connection, f File, offset, count int64, send func([]byte) error) error {
-	buf := make([]byte, min(count, sendFileChunk))
+	// send copies, so the staging buffer is the pool's again as soon as the
+	// range has gone out.
+	buf := bufferpool.Get(int(min(count, sendFileChunk)))
+	defer bufferpool.Put(buf)
 	sent := false
 	for count > 0 {
 		n, err := f.ReadAt(buf[:min(count, int64(len(buf)))], offset)

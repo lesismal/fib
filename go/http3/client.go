@@ -19,6 +19,7 @@ import (
 	"time"
 
 	fib "github.com/lesismal/fib/go"
+	"github.com/lesismal/fib/go/bufferpool"
 	"github.com/lesismal/fib/go/http3/internal/qpack"
 	"github.com/lesismal/fib/go/http3/internal/quic"
 )
@@ -750,26 +751,31 @@ type clientStream struct {
 // end of the stream.
 func (st *clientStream) send() {
 	r := st.r
-	block := append([]byte(nil), qpack.Prefix...)
+	// The stream copies what it is written, so every buffer built here goes
+	// back to the pool once the frames are on it.
+	block := bufferpool.Append(nil, qpack.Prefix)
 	for _, f := range r.fields {
 		block = qpack.AppendField(block, f.Name, f.Value, sensitive(f.Name))
 	}
-	out := make([]byte, 0, len(block)+len(r.body)+16)
+	out := bufferpool.Get(len(block) + len(r.body) + 16)[:0]
 	out = appendHeadersFrame(out, block)
+	bufferpool.Put(block)
 	if len(r.body) > 0 {
 		out = appendFrameHeader(out, frameData, len(r.body))
 		out = append(out, r.body...)
 	}
 	if len(r.trailer) > 0 {
-		trailer := append([]byte(nil), qpack.Prefix...)
+		trailer := bufferpool.Append(nil, qpack.Prefix)
 		for _, f := range r.trailer {
 			trailer = qpack.AppendField(trailer, f.Name, f.Value, sensitive(f.Name))
 		}
 		out = appendHeadersFrame(out, trailer)
+		bufferpool.Put(trailer)
 	}
 	if err := st.s.Write(out, true); err != nil {
 		st.fail(err)
 	}
+	bufferpool.Put(out)
 }
 
 func (st *clientStream) feed(data []byte, fin bool) {

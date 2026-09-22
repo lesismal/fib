@@ -14,6 +14,7 @@ import (
 	"strings"
 	"sync"
 
+	"github.com/lesismal/fib/go/bufferpool"
 	"github.com/lesismal/fib/go/internal/hpack"
 )
 
@@ -305,7 +306,7 @@ func (hc *h2ClientConn) closeIfDoneLocked() {
 }
 
 func (hc *h2ClientConn) feed(data []byte) {
-	hc.in = append(hc.in, data...)
+	hc.in = bufferpool.Append(hc.in, data)
 	offset := 0
 	for {
 		f, n, err := h2ReadFrame(hc.in[offset:], h2DefaultMaxFrameSize)
@@ -324,6 +325,7 @@ func (hc *h2ClientConn) feed(data []byte) {
 				connErr = h2ConnErr(H2InternalError, "%v", err)
 			}
 			hc.fail(connErr)
+			bufferpool.Put(hc.in)
 			hc.in = nil
 			return
 		}
@@ -333,6 +335,7 @@ func (hc *h2ClientConn) feed(data []byte) {
 	}
 	if offset == len(hc.in) {
 		if cap(hc.in) > maxRetainedBuffer {
+			bufferpool.Put(hc.in)
 			hc.in = nil
 		} else {
 			hc.in = hc.in[:0]
@@ -371,7 +374,7 @@ func (hc *h2ClientConn) handleFrame(f *h2Frame) error {
 				return h2ConnErr(H2EnhanceYourCalm, "header block too large")
 			}
 			hc.contStream, hc.contEndStream = f.streamID, f.has(h2FlagEndStream)
-			hc.contBlock = append(hc.contBlock[:0], block...)
+			hc.contBlock = bufferpool.Append(hc.contBlock[:0], block)
 			return nil
 		}
 		return hc.handleHeaderBlock(f.streamID, block, f.has(h2FlagEndStream))
@@ -379,7 +382,7 @@ func (hc *h2ClientConn) handleFrame(f *h2Frame) error {
 		if hc.contStream == 0 {
 			return h2ConnErr(H2ProtocolError, "unexpected CONTINUATION")
 		}
-		hc.contBlock = append(hc.contBlock, f.payload...)
+		hc.contBlock = bufferpool.Append(hc.contBlock, f.payload)
 		if len(hc.contBlock) > hc.client.config.MaxResponseHeaderBytes {
 			return h2ConnErr(H2EnhanceYourCalm, "header block too large")
 		}
@@ -390,6 +393,7 @@ func (hc *h2ClientConn) handleFrame(f *h2Frame) error {
 		hc.contStream = 0
 		err := hc.handleHeaderBlock(id, hc.contBlock, hc.contEndStream)
 		if cap(hc.contBlock) > maxRetainedBuffer {
+			bufferpool.Put(hc.contBlock)
 			hc.contBlock = nil
 		}
 		return err

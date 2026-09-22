@@ -19,6 +19,7 @@ import (
 	"time"
 
 	fib "github.com/lesismal/fib/go"
+	"github.com/lesismal/fib/go/bufferpool"
 	"github.com/lesismal/fib/go/internal/hpack"
 )
 
@@ -197,7 +198,7 @@ func (sc *h2ServerConn) sendLocked(out []byte) {
 // feed takes bytes from the connection, preface included, and handles every
 // complete frame among them.
 func (sc *h2ServerConn) feed(data []byte) {
-	sc.in = append(sc.in, data...)
+	sc.in = bufferpool.Append(sc.in, data)
 	offset := 0
 	if !sc.gotPreface {
 		if len(sc.in) < len(h2Preface) {
@@ -219,6 +220,7 @@ func (sc *h2ServerConn) feed(data []byte) {
 		if err != nil {
 			sc.handleError(err)
 			if sc.isClosed() {
+				bufferpool.Put(sc.in)
 				sc.in = nil
 				return
 			}
@@ -230,6 +232,9 @@ func (sc *h2ServerConn) feed(data []byte) {
 	}
 	if offset == len(sc.in) {
 		if cap(sc.in) > maxRetainedBuffer {
+			// A burst grew the buffer past what is worth keeping attached to
+			// this connection; the pool keeps it in its own class instead.
+			bufferpool.Put(sc.in)
 			sc.in = nil
 		} else {
 			sc.in = sc.in[:0]
@@ -553,7 +558,7 @@ func (sc *h2ServerConn) handleHeaders(f *h2Frame) error {
 		}
 		sc.contStream = f.streamID
 		sc.contEndStream = f.has(h2FlagEndStream)
-		sc.contBlock = append(sc.contBlock[:0], block...)
+		sc.contBlock = bufferpool.Append(sc.contBlock[:0], block)
 		return nil
 	}
 	return sc.handleHeaderBlock(f.streamID, block, f.has(h2FlagEndStream))
@@ -563,7 +568,7 @@ func (sc *h2ServerConn) handleContinuation(f *h2Frame) error {
 	if sc.contStream == 0 {
 		return h2ConnErr(H2ProtocolError, "unexpected CONTINUATION")
 	}
-	sc.contBlock = append(sc.contBlock, f.payload...)
+	sc.contBlock = bufferpool.Append(sc.contBlock, f.payload)
 	if len(sc.contBlock) > sc.handler.config.MaxHeaderBytes {
 		return h2ConnErr(H2EnhanceYourCalm, "header block too large")
 	}
@@ -574,6 +579,7 @@ func (sc *h2ServerConn) handleContinuation(f *h2Frame) error {
 	sc.contStream = 0
 	err := sc.handleHeaderBlock(id, block, sc.contEndStream)
 	if cap(sc.contBlock) > maxRetainedBuffer {
+		bufferpool.Put(sc.contBlock)
 		sc.contBlock = nil
 	}
 	return err

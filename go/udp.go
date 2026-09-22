@@ -9,6 +9,8 @@ import (
 	"sync/atomic"
 	"syscall"
 	"time"
+
+	"github.com/lesismal/fib/go/bufferpool"
 )
 
 // UDP rides on the same connections, handlers and workers as TCP. What is
@@ -162,7 +164,11 @@ func (c *Connection) sendDatagramParts(first, second []byte) error {
 	if len(first) == 0 {
 		return c.sendDatagram(second)
 	}
-	return c.sendDatagram(append(append(make([]byte, 0, len(first)+len(second)), first...), second...))
+	// sendDatagram hands the bytes to the socket before it returns, so the
+	// joined copy goes straight back to the pool.
+	data := bufferpool.Join(nil, first, second)
+	defer bufferpool.Put(data)
+	return c.sendDatagram(data)
 }
 
 // detachPeer drops a closed peer from its listener's table. The socket is the

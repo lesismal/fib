@@ -35,6 +35,7 @@ import (
 	"time"
 
 	fib "github.com/lesismal/fib/go"
+	"github.com/lesismal/fib/go/bufferpool"
 	fibhttp "github.com/lesismal/fib/go/http"
 	"github.com/lesismal/fib/go/http3/internal/qpack"
 	"github.com/lesismal/fib/go/http3/internal/quic"
@@ -587,7 +588,10 @@ func (rs *requestStream) WriteResponse(req *stdhttp.Request, response fibhttp.Re
 	rs.responded = true
 	rs.mu.Unlock()
 
-	block := append([]byte(nil), qpack.Prefix...)
+	// The stream copies what it is written, so every buffer built here goes
+	// back to the pool once the frames are on it.
+	block := bufferpool.Append(nil, qpack.Prefix)
+	defer func() { bufferpool.Put(block) }()
 	block = qpack.AppendField(block, ":status", strconv.Itoa(status), false)
 	statusBody := status != stdhttp.StatusNoContent && status != stdhttp.StatusNotModified
 	if statusBody {
@@ -598,14 +602,15 @@ func (rs *requestStream) WriteResponse(req *stdhttp.Request, response fibhttp.Re
 	if !bodyAllowed(req, status) {
 		body = nil
 	}
-	out := make([]byte, 0, len(block)+len(body)+16)
+	out := bufferpool.Get(len(block) + len(body) + 16)[:0]
+	defer func() { bufferpool.Put(out) }()
 	out = appendHeadersFrame(out, block)
 	if len(body) > 0 {
 		out = appendFrameHeader(out, frameData, len(body))
 		out = append(out, body...)
 	}
 	if bodyAllowed(req, status) && len(response.Trailer) > 0 {
-		trailer := append([]byte(nil), qpack.Prefix...)
+		trailer := bufferpool.Append(nil, qpack.Prefix)
 		for key, values := range response.Trailer {
 			name := strings.ToLower(key)
 			if !validTrailer(name, values) {
@@ -618,6 +623,7 @@ func (rs *requestStream) WriteResponse(req *stdhttp.Request, response fibhttp.Re
 		if len(trailer) > len(qpack.Prefix) {
 			out = appendHeadersFrame(out, trailer)
 		}
+		bufferpool.Put(trailer)
 	}
 	err := rs.s.Write(out, true)
 	if !rs.remoteDone {

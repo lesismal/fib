@@ -8,6 +8,8 @@ import (
 	"io"
 	stdhttp "net/http"
 	"strings"
+
+	"github.com/lesismal/fib/go/bufferpool"
 )
 
 var (
@@ -45,11 +47,8 @@ type responseParser struct {
 }
 
 func (p *responseParser) reset() {
-	if cap(p.buffer) > maxRetainedBuffer {
-		p.buffer = nil
-	} else {
-		p.buffer = p.buffer[:0]
-	}
+	bufferpool.Put(p.buffer)
+	p.buffer = nil
 	p.headerScan = 0
 	p.head = nil
 	p.headerEnd = 0
@@ -62,7 +61,7 @@ func (p *responseParser) buffered() bool { return len(p.buffer) > 0 }
 // once it is complete. Interim 1xx responses are skipped: they are not the
 // answer, and the final response follows them on the same connection.
 func (p *responseParser) feed(data []byte, req *stdhttp.Request) (*stdhttp.Response, error) {
-	p.buffer = append(p.buffer, data...)
+	p.buffer = bufferpool.Append(p.buffer, data)
 	for {
 		if p.head == nil {
 			done, err := p.parseHead(req)
@@ -203,6 +202,9 @@ func (p *responseParser) complete(end int, body []byte) *stdhttp.Response {
 func (p *responseParser) consume(n int) {
 	if n == len(p.buffer) {
 		if cap(p.buffer) > maxRetainedBuffer {
+			// One large response is not a reason for this connection to hold
+			// the buffer it needed; the pool keeps it in its own class.
+			bufferpool.Put(p.buffer)
 			p.buffer = nil
 		} else {
 			p.buffer = p.buffer[:0]
