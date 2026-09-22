@@ -7,6 +7,7 @@ import (
 	"strconv"
 	"sync"
 	"testing"
+	"time"
 	"unsafe"
 )
 
@@ -67,11 +68,25 @@ func TestOversizedBuffersAreServedButNotPooled(t *testing.T) {
 	if len(buf) != size || cap(buf) != size {
 		t.Fatalf("Get(%d) has len %d cap %d, want both %d", size, len(buf), cap(buf), size)
 	}
+	address := unsafe.SliceData(buf)
 	Put(buf)
+	// A class holds addresses and works the length out from the class, so an
+	// oversized buffer kept by one could not be told apart from an ordinary
+	// one afterwards. What has to hold is that Put turned it away.
 	for i := range classes {
-		if handle, _ := classes[i].Get().(*[]byte); handle != nil && cap(*handle) > MaxSize {
-			t.Fatalf("class %d kept a buffer of capacity %d", i, cap(*handle))
+		if p, _ := classes[i].pool.Get().(*byte); p != nil {
+			if p == address {
+				t.Fatalf("class %d pooled a buffer larger than MaxSize", i)
+			}
+			classes[i].pool.Put(p)
 		}
+		classes[i].mu.Lock()
+		for _, held := range classes[i].free {
+			if held == address {
+				t.Fatalf("class %d reserved a buffer larger than MaxSize", i)
+			}
+		}
+		classes[i].mu.Unlock()
 	}
 }
 
@@ -274,3 +289,111 @@ func BenchmarkJoinParts(b *testing.B) {
 var sink []byte
 
 func sizeName(size int) string { return strconv.Itoa(size) + "B" }
+
+// collect runs a collection and waits for the cleanup that counts it, since a
+// cleanup runs on its own goroutine once the collection has swept the tick.
+func collect(t *testing.T) {
+	t.Helper()
+	before := gcEpoch.Load()
+	deadline := time.Now().Add(5 * time.Second)
+	for gcEpoch.Load() == before {
+		runtime.GC()
+		if time.Now().After(deadline) {
+			t.Fatal("no collection was ever counted: the pool cannot tell its sync.Pool has been emptied")
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
+// A collection empties every sync.Pool, so without a reserve behind them the
+// whole working set is made again afterwards. This is the measurement the
+// reserve exists for: once it has settled, a collection costs nothing.
+func TestTheWorkingSetSurvivesACollection(t *testing.T) {
+	const (
+		size    = 16 << 10
+		working = 256
+	)
+	// Start from a clean pool: the classes are shared, and what the tests
+	// before this one left reserved is budget this one cannot have.
+	SetRetainedBytes(0)
+	SetRetainedBytes(DefaultRetainedBytes)
+	held := make([][]byte, working)
+	remade := func() uint64 {
+		var before, after runtime.MemStats
+		runtime.ReadMemStats(&before)
+		for i := range held {
+			held[i] = Get(size)
+		}
+		runtime.ReadMemStats(&after)
+		for _, buf := range held {
+			Put(buf)
+		}
+		return after.Mallocs - before.Mallocs
+	}
+	// The target is learned from what a class has had to make, and a reserve
+	// is filled by the returns that follow a collection, so it takes a round
+	// or two of both to settle.
+	var last uint64
+	for range 8 {
+		collect(t)
+		last = remade()
+		if last <= working/8 {
+			return
+		}
+	}
+	t.Fatalf("a collection still costs %d of a working set of %d", last, working)
+}
+
+// The reserve is bounded, and the bound is what the caller says it is.
+func TestRetentionStaysWithinItsBudget(t *testing.T) {
+	t.Cleanup(func() { SetRetainedBytes(DefaultRetainedBytes) })
+	const size = 64 << 10
+	SetRetainedBytes(8 * size)
+	held := make([][]byte, 512)
+	for range 4 {
+		collect(t)
+		for i := range held {
+			held[i] = Get(size)
+		}
+		for _, buf := range held {
+			Put(buf)
+		}
+		if got := RetainedBytes(); got > 8*size {
+			t.Fatalf("retention reached %d bytes, want at most %d", got, 8*size)
+		}
+	}
+
+	// Lowering the budget gives back what is already reserved, which is what
+	// makes it a way to release the pool's memory rather than only a limit on
+	// what it takes next.
+	SetRetainedBytes(0)
+	if got := RetainedBytes(); got != 0 {
+		t.Fatalf("retention is %d bytes after being set to zero", got)
+	}
+	for i := range classes {
+		classes[i].mu.Lock()
+		free := len(classes[i].free)
+		classes[i].mu.Unlock()
+		if free != 0 {
+			t.Fatalf("class %d still holds %d buffers", i, free)
+		}
+	}
+}
+
+// With the reserves off the pool is the sync.Pool alone, which still has to
+// hand out buffers of the right shape.
+func TestTheReservesCanBeTurnedOff(t *testing.T) {
+	t.Cleanup(func() { SetRetainedBytes(DefaultRetainedBytes) })
+	SetRetainedBytes(0)
+	collect(t)
+	for range 64 {
+		buf := Get(1500)
+		if len(buf) != 1500 || cap(buf) != 2048 {
+			t.Fatalf("Get(1500) has len %d cap %d", len(buf), cap(buf))
+		}
+		Put(buf)
+	}
+	if got := RetainedBytes(); got != 0 {
+		t.Fatalf("retention grew to %d bytes with the reserves off", got)
+	}
+}

@@ -26,20 +26,46 @@
 // moving between classes, and a second pool would only mean each of them
 // retaining idle buffers the others could have used.
 //
+// # What it costs the collector
+//
+// Nothing is allocated to keep a buffer. A class holds the address of each of
+// its buffers and works the length out from the class, so recycling adds no
+// object of its own to the heap, and buffers hold no pointers, so the
+// collector never scans one.
+//
+// What is left is that a sync.Pool is emptied at every collection, and what it
+// empties is the program's working set: measured here, a thousand idle 16 KiB
+// buffers cost 16.8MB of fresh allocation after each collection, which is
+// itself part of what brings on the next one. So each class keeps a reserve
+// behind its pool, in an ordinary slice the collector leaves alone, and the
+// pool falls back to it when a collection has just emptied the pool.
+//
+// A reserve is refilled in a burst once a collection has been noticed — the
+// package has the collector count them for it — rather than a little on every
+// return. That is what keeps it off the ordinary path: a return between
+// collections reads one counter and goes to the sync.Pool, and the reserve's
+// lock is taken only for the burst that follows a collection, which is as many
+// operations as the reserve holds buffers and saves that many allocations. A
+// reserve grows only towards what its class has actually had to make, gives
+// back what a burst could not fill, and stops at what SetRetainedBytes allows.
+//
 // The bytes in a buffer Get returns are whatever the last user left there.
 // Callers write before they read, as they would with any recycled buffer.
 package bufferpool
 
 import (
 	"math/bits"
+	"runtime"
 	"sync"
+	"sync/atomic"
+	"unsafe"
 )
 
 const (
 	// minShift puts the smallest class at 64 bytes, which is a cache line on
 	// every platform this runs on. Below that the pool costs more than the
 	// allocation it saves: Go allocates tiny objects from a per-P tiny
-	// allocator that is already faster than two atomic pool operations.
+	// allocator that is already faster than an atomic pool operation.
 	minShift = 6
 	// maxShift puts the largest class at 64 MiB. A buffer past it is left to
 	// the collector rather than pooled, since retaining one that big for a
@@ -56,24 +82,151 @@ const (
 	numClasses = maxShift - minShift + 1
 )
 
-// classes holds one pool per size class. Each entry stores *[]byte rather than
-// []byte: sync.Pool stores an any, and a slice header does not fit in one, so
-// storing slices directly would copy each to the heap on the way in.
-var classes [numClasses]sync.Pool
+// class is one size class: a sync.Pool for the traffic, and behind it a
+// reserve holding what a collection would otherwise take away.
+type class struct {
+	// pool is the fast path. The runtime shards it per P, so an ordinary take
+	// and return costs no lock. It holds each buffer's address rather than
+	// the buffer: a sync.Pool stores an any, a slice header does not fit in
+	// one and would be copied to the heap on the way in, while a pointer fits
+	// exactly — and every buffer in a class is the same length, so the
+	// address is all there is to keep.
+	pool sync.Pool
 
-// headers recycles the *[]byte handles themselves, which is what keeps a
-// Get/Put round trip free of allocation entirely. Taking a handle out of a
-// class pool leaves it empty and reusable, and the next Put needs one; without
-// this they would be allocated and collected at exactly the rate buffers are
-// recycled, which is the cost the pool exists to avoid. A pointer does fit in
-// an any, so moving handles through a pool of their own allocates nothing.
+	// mu guards free, the reserve. held mirrors len(free) so that a return
+	// can see the reserve is full without taking the lock.
+	mu   sync.Mutex
+	free []*byte
+	held atomic.Int64
+	// size is this class's capacity, kept here so that a class can price its
+	// own target against the budget.
+	size int64
+	// target is how many buffers this class is entitled to keep. It rises by
+	// one each time a request had to be served by making a buffer and falls
+	// back to what a burst managed to keep when it could not fill it, so it
+	// settles at what the program keeps in flight, and stops at what is left
+	// of the retention budget.
+	target atomic.Int64
+	// refill is how many more returns may go to the reserve instead of the
+	// pool. It is set to target when a collection is first noticed and then
+	// spent, which is what confines refilling to a burst after a collection.
+	refill atomic.Int64
+	// epoch is the collection this class last began refilling for.
+	epoch atomic.Uint64
+	// pad keeps one class's counters off the cache line of the next one: the
+	// class a server reads into and the class it replies from are neighbours
+	// here, and they are busiest at the same moment.
+	_ [64]byte
+}
+
+var classes [numClasses]class
+
+// gcEpoch counts collections, so that a class can tell its pool has been
+// emptied. Reading it is one atomic load of a line every core already has,
+// which is what keeps refilling off the ordinary path.
+var gcEpoch atomic.Uint64
+
+// collectionTick is the object whose collection is the signal. It is well
+// clear of the 16 bytes below which the runtime packs several objects into one
+// tiny block: a tick in such a block is freed only once everything sharing it
+// is, so a small one silently never ticks at all.
+type collectionTick struct{ _ [32]byte }
+
+// watchCollections arranges for gcEpoch to count collections: the tick it
+// allocates is unreachable the moment this returns, so its cleanup runs once
+// the next collection has swept it, and sets up the one after.
+func watchCollections() {
+	runtime.AddCleanup(new(collectionTick), func(struct{}) {
+		gcEpoch.Add(1)
+		watchCollections()
+	}, struct{}{})
+}
+
+// DefaultRetainedBytes is how much the reserves may hold between them until
+// SetRetainedBytes says otherwise. It bounds what the pool keeps while nothing
+// is asking for it, which is the price of not making the working set again
+// after every collection.
+const DefaultRetainedBytes = 32 << 20
+
+// budget is the ceiling SetRetainedBytes sets, and committed is what the
+// classes' targets add up to, which is what the reserves may grow to hold.
+var (
+	budget    atomic.Int64
+	committed atomic.Int64
+)
+
+func init() {
+	for i := range classes {
+		classes[i].size = int64(classSize(i))
+	}
+	budget.Store(DefaultRetainedBytes)
+	watchCollections()
+}
+
+// SetRetainedBytes bounds how much the pool may keep across collections, in
+// bytes. Zero turns the reserves off and leaves the sync.Pool in front of
+// them, so that buffers are recycled while they are in use and made again
+// after each collection. Lowering it gives back what is already reserved,
+// largest class first, so SetRetainedBytes(0) releases the pool's memory.
 //
-// It pays for itself where it matters. On one goroutine the extra pool
-// operation costs about 2ns against letting each handle escape to the heap;
-// with every core taking buffers at once, which is what a server does, the
-// round trip measured 7.1ns against 10.5ns, because the allocation the handle
-// would need is what contends.
-var headers sync.Pool
+// A reserve only grows towards what its class has had to make, so a program
+// that needs less than the budget keeps less than it.
+func SetRetainedBytes(bytes int) {
+	if bytes < 0 {
+		bytes = 0
+	}
+	budget.Store(int64(bytes))
+	if committed.Load() > int64(bytes) {
+		trim()
+	}
+}
+
+// RetainedBytes reports what the reserves are currently entitled to hold.
+func RetainedBytes() int { return int(committed.Load()) }
+
+// reserveMore lets this class keep one more buffer, if the budget has room for
+// one. It is called where a request had to be served by making a buffer, which
+// is the evidence that the class holds less than the program keeps in flight.
+func (c *class) reserveMore() {
+	if committed.Add(c.size) > budget.Load() {
+		committed.Add(-c.size)
+		return
+	}
+	c.target.Add(1)
+}
+
+// aim moves this class's target, giving the difference back to the budget or
+// taking it, so that committed always says what the classes may hold.
+func (c *class) aim(target int64) {
+	committed.Add((target - c.target.Swap(target)) * c.size)
+}
+
+// trim gives back what the classes hold above the budget, largest class first,
+// since a buffer there is worth many of a small one.
+func trim() {
+	for i := numClasses - 1; i >= 0; i-- {
+		c := &classes[i]
+		for committed.Load() > budget.Load() {
+			target := c.target.Load()
+			if target == 0 {
+				break
+			}
+			c.target.Store(target - 1)
+			committed.Add(-c.size)
+		}
+		if c.held.Load() <= c.target.Load() {
+			continue
+		}
+		c.mu.Lock()
+		for int64(len(c.free)) > c.target.Load() {
+			last := len(c.free) - 1
+			c.free[last] = nil
+			c.free = c.free[:last]
+		}
+		c.held.Store(int64(len(c.free)))
+		c.mu.Unlock()
+	}
+}
 
 // Align returns the capacity a buffer of size bytes is given: size rounded up
 // to a power of two, and at least MinSize. A size larger than MaxSize is
@@ -120,16 +273,35 @@ func Get(size int) []byte {
 		return make([]byte, size)
 	}
 	i := classUp(size)
-	handle, _ := classes[i].Get().(*[]byte)
-	if handle == nil {
-		return make([]byte, size, classSize(i))
+	c := &classes[i]
+	if p, _ := c.pool.Get().(*byte); p != nil {
+		return unsafe.Slice(p, classSize(i))[:size]
 	}
-	buf := *handle
-	// Emptying the handle before parking it is what lets it be reused without
-	// keeping the buffer alive through it.
-	*handle = nil
-	headers.Put(handle)
-	return buf[:size]
+	// An empty pool is what every collection leaves behind. The reserve is
+	// what the collection could not take.
+	if c.held.Load() > 0 {
+		if p := c.take(); p != nil {
+			return unsafe.Slice(p, classSize(i))[:size]
+		}
+	}
+	c.reserveMore()
+	return make([]byte, size, classSize(i))
+}
+
+// take removes a buffer from the reserve, or reports that there was none.
+func (c *class) take() *byte {
+	c.mu.Lock()
+	last := len(c.free) - 1
+	if last < 0 {
+		c.mu.Unlock()
+		return nil
+	}
+	p := c.free[last]
+	c.free[last] = nil
+	c.free = c.free[:last]
+	c.held.Store(int64(last))
+	c.mu.Unlock()
+	return p
 }
 
 // Put returns buf to the pool. The caller must not use buf, or any slice of
@@ -142,16 +314,62 @@ func Put(buf []byte) {
 		return
 	}
 	i := classDown(capacity)
-	handle, _ := headers.Get().(*[]byte)
-	if handle == nil {
-		handle = new([]byte)
-	}
+	c := &classes[i]
 	// Trimmed to the class size, so that every buffer in a class is exactly
 	// that size and what Get hands out is always Align of what was asked for,
 	// whatever shape the buffer had before it came here.
 	size := classSize(i)
-	*handle = buf[:size:size]
-	classes[i].Put(handle)
+	p := unsafe.SliceData(buf[:size:size])
+	if gcEpoch.Load() != c.epoch.Load() {
+		c.beginRefill()
+	}
+	if c.refill.Load() > 0 && c.keep(p) {
+		return
+	}
+	c.pool.Put(p)
+}
+
+// beginRefill starts this class's burst of returns into the reserve, once per
+// collection. The swap settles which caller noticed it first.
+//
+// A burst that still had allowance left when the next collection came around
+// ran out of returns before it filled the reserve, which says the class no
+// longer keeps that many buffers in flight. Its target drops to what the burst
+// did manage to keep, and the difference goes back to the budget for a class
+// that can use it. That is what stops a target raised by one busy stretch from
+// holding memory for the rest of the program's life.
+func (c *class) beginRefill() {
+	epoch := gcEpoch.Load()
+	if c.epoch.Swap(epoch) == epoch {
+		return
+	}
+	if c.refill.Load() > 0 {
+		c.aim(c.held.Load())
+	}
+	c.refill.Store(c.target.Load())
+}
+
+// keep puts a buffer in the reserve and reports whether it took it. The burst
+// is spent whether or not a return finds room, so a class the program no
+// longer keeps that many of in flight stops taking the lock instead of
+// reaching for a target it cannot fill.
+func (c *class) keep(p *byte) bool {
+	if c.refill.Add(-1) < 0 {
+		c.refill.Store(0)
+		return false
+	}
+	if c.held.Load() >= c.target.Load() {
+		return false
+	}
+	c.mu.Lock()
+	if int64(len(c.free)) >= c.target.Load() {
+		c.mu.Unlock()
+		return false
+	}
+	c.free = append(c.free, p)
+	c.held.Store(int64(len(c.free)))
+	c.mu.Unlock()
+	return true
 }
 
 // Grow returns a buffer holding buf's bytes with room for capacity of them in

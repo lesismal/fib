@@ -966,13 +966,25 @@ out := bufferpool.Join(nil, first, second)  // 一次取够，把几段拼成一
   4200 字节会拿到 4864 字节的对象；而 64 字节往上的每个 2 的幂都正好是一个 size class，
   超过 32 KiB 之后分配按页走，2 的幂也正好是 8 KiB 页的整数倍。档位索引也因此只是一条
   `bits.Len`，不需要查找。
-- **档位范围。** 最小 64 字节（`MinSize`），更小的对象 Go 的 tiny allocator 本来就比两次
-  原子操作快；最大 64 MiB（`MaxSize`），更大的直接分配、`Put` 时直接丢弃，为一次罕见的请求
+- **档位范围。** 最小 64 字节（`MinSize`），更小的对象 Go 的 tiny allocator 本来就比一次
+  池操作快；最大 64 MiB（`MaxSize`），更大的直接分配、`Put` 时直接丢弃，为一次罕见的请求
   长期留住那么大一块并不划算。
-- **Get/Put 不分配内存。** `sync.Pool` 存的是 `any`，slice header 放不进去，只能通过指针，
-  否则每次 `Put` 都要为这个 24 字节的 header 分配一次。`bufferpool` 把这些 header 本身也
-  放进一个池子里循环使用：单协程下比让 header 逃逸多花约 2ns，但所有核同时取 buffer 时
-  （也就是 server 的实际情形）一次往返是 7.1ns 对 10.5ns，因为真正产生竞争的正是那次分配。
+- **Get/Put 不分配任何内存。** `sync.Pool` 存的是 `any`，slice header 放不进去，
+  用 `*[]byte` 则每个 buffer 都要多一个 24 字节的堆对象。同一档里所有 buffer 长度相同，
+  所以只存首地址（指针本身就能放进 `any`，不产生装箱分配），长度由档位算出来：
+  堆上不会因为复用多出任何对象，而 `[]byte` 不含指针，GC 也从不扫描它们。
+  一次 Get+Put 是 7.4ns，0 次分配。
+- **working set 不会被每次 GC 清掉。** `sync.Pool` 每轮 GC 都会被清空，被清掉的正是程序的
+  working set：实测 1024 块闲置的 16KiB buffer，每次 GC 之后要重新分配 16.8MB，而这些分配
+  本身又会把下一次 GC 提前。所以每档在 `sync.Pool` 后面还有一层 reserve，用普通 slice 持有，
+  GC 不会动它。reserve 只在「刚发生过一次 GC」之后集中补一批（GC 次数由 runtime 的 cleanup
+  机制统计），平时的归还只读一个计数器就走 `sync.Pool`，锁只在这一批补充里用到：这一批的次数
+  等于 reserve 里的 buffer 数，省下的正是同样数量的分配。
+- **reserve 的大小是学出来的，并且有上限。** 某一档每被迫 `make` 一次，它的 target 就加一，
+  所以 target 收敛到程序真正同时在用的数量；某一轮补充没用完（说明这一档不再需要那么多）就
+  回落到实际留住的数量，把额度还给别的档。总量由 `SetRetainedBytes` 限定，默认
+  `DefaultRetainedBytes`（32 MiB）；`SetRetainedBytes(0)` 会立刻把已经留住的内存全部释放，
+  可以用来应对内存压力。`RetainedBytes()` 返回当前的额度。
 - **一个全局池，不是每处一个。** 连接的读 buffer、由它拼出来的回包、一条 TLS 记录用的都是
   同一批 buffer 在各档之间流动；分成多个池只会让每个池各自留一份闲置 buffer。
 - **`Get` 返回的内容是上一个使用者留下的**，和任何复用 buffer 一样，先写后读。
