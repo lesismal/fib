@@ -16,6 +16,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	fib "github.com/lesismal/fib/go"
 	"github.com/lesismal/fib/go/internal/hpack"
@@ -37,6 +38,10 @@ const (
 	// DefaultMaxConcurrentStreams is how many requests a client may have open
 	// on one connection when Config leaves MaxConcurrentStreams at zero.
 	DefaultMaxConcurrentStreams = 250
+	// h2PeerGoAwayGrace is how long a connection whose peer has gone away is
+	// kept once its last stream has finished, so that frames the peer sent
+	// before it heard back are still answered.
+	h2PeerGoAwayGrace = time.Second
 )
 
 var errH2StreamClosed = errors.New("http2: stream closed")
@@ -95,6 +100,10 @@ type h2ServerConn struct {
 	goAway        bool
 	peerGoingAway bool
 	closed        bool
+	// closeScheduled says the connection is already waiting out
+	// h2PeerGoAwayGrace, so that each stream that ends after it does not
+	// start the wait again.
+	closeScheduled bool
 	// lastStreamID is the highest client stream accepted, which GOAWAY
 	// reports as the last one this side will process.
 	lastStreamID uint32
@@ -839,7 +848,26 @@ func (sc *h2ServerConn) closeIfDone() {
 }
 
 func (sc *h2ServerConn) closeFinishedLocked() {
-	if sc.closed || !sc.goAway && !sc.peerGoingAway || len(sc.streams) > 0 {
+	if sc.closed || sc.closeScheduled || !sc.goAway && !sc.peerGoingAway || len(sc.streams) > 0 {
+		return
+	}
+	if !sc.goAway {
+		// The peer is the one going away, and it says so before it closes:
+		// frames it sent in the same breath — a PING, a window update, a
+		// reset for a stream already finished — are still owed an answer.
+		// Closing on the spot would meet them with a reset instead, since a
+		// socket closed while bytes it was sent sit unread is reset rather
+		// than finished, and the peer would lose the answers it did get
+		// along with the ones it did not. So the connection answers for a
+		// moment longer. The peer normally closes within it, which ends the
+		// connection here too and leaves the wait with nothing to do.
+		sc.closeScheduled = true
+		time.AfterFunc(h2PeerGoAwayGrace, func() {
+			sc.mu.Lock()
+			sc.closed = true
+			sc.mu.Unlock()
+			sc.conn.CloseAfterSend()
+		})
 		return
 	}
 	sc.closed = true

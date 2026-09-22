@@ -445,6 +445,23 @@ func TestHTTP2ConformanceServerWithNetHTTP(t *testing.T) {
 	}
 }
 
+// A GOAWAY from the client says that the client is closing the connection,
+// not that the server should close it under the frames the client sent in the
+// same breath. Answering those is what tells the client the connection ended
+// in order: a socket closed while bytes it was sent sit unread is reset, and a
+// reset costs the client the answers it did get along with the ones it did
+// not. This is h2spec's generic 3.8 and 7.1, which follow their GOAWAY with a
+// PING and expect it acknowledged or the connection cleanly closed.
+func TestHTTP2ConformanceServerAnswersFramesAfterAClientGoAway(t *testing.T) {
+	tc := dialH2(t, serveH2(t, false, DefaultConfig()))
+	tc.write(h2AppendGoAway(nil, 0, H2NoError, ""))
+	ping := h2AppendFrameHeader(nil, h2FramePing, 0, 0, 8)
+	tc.write(append(ping, "h2spec  "...))
+	if f := tc.readUntil(h2FramePing); !f.has(h2FlagAck) {
+		t.Fatal("the PING behind the client's GOAWAY was not acknowledged")
+	}
+}
+
 // TestHTTP2ConformanceServerStreamStates checks the stream-state rules of RFC
 // 9113 section 5.1 with frames net/http's client would never send.
 func TestHTTP2ConformanceServerStreamStates(t *testing.T) {
