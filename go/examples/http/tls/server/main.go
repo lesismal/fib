@@ -14,6 +14,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"log"
 	stdhttp "net/http"
 
 	fib "github.com/lesismal/fib/go"
@@ -49,7 +50,11 @@ func echo() fibhttp.HandlerFunc {
 		body, _ := io.ReadAll(r.Body)
 		reply := fmt.Sprintf("%s %s %s %s", r.Proto, r.Method, r.URL.Path, body)
 		if err := c.Respond(stdhttp.StatusOK, "text/plain; charset=utf-8", []byte(reply)); err != nil {
-			c.Conn.Close()
+			// The request went away before its answer did — an HTTP/2 client
+			// resetting one stream, or a peer that hung up. The connection
+			// carries the others, so it is left alone; one the engine cannot
+			// use any more it closes itself.
+			log.Printf("respond: %v", err)
 		}
 	}
 }
