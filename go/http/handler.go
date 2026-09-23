@@ -64,23 +64,15 @@ type Context struct {
 	// external is the stream of a protocol served outside this package.
 	external Stream
 
-	// mu guards the response's lifetime: refs counts the holds on it (see
-	// Retain), state says whether it has been written or cancelled, err why
-	// it was cancelled, and resume whether whoever finishes it owes the
-	// connection the step that lets it carry on. delivering counts the body
-	// callbacks running on the connection's worker, which cannot take that
-	// step themselves.
-	mu sync.Mutex
-	// gen counts the requests a recycled Context has served, so that what
-	// was meant for one of them can tell it from the next; see recycle.
+	// word is the response's and the Context's lifetime: the holds on each,
+	// whether the response has been written or cancelled, and the generation
+	// a recycled Context is serving; see ctxHolds. mu guards what hands a
+	// callback between goroutines, and err, why the response was cancelled.
 	// pooled records that the Context came from contextPool.
-	gen        atomic.Uint64
-	pooled     bool
-	refs       int
-	state      uint8
-	err        error
-	resume     bool
-	delivering int
+	word   atomic.Uint64
+	mu     sync.Mutex
+	pooled bool
+	err    error
 	// body is OnBody's callback and bodyDone that it has had its last call.
 	// cancel is OnCancel's. deliverMu keeps body callbacks one at a time.
 	body      BodyFunc
@@ -495,6 +487,7 @@ func (h *ServerHandler) drive(c *fib.Connection, parser *Parser, data []byte) {
 		// Nothing behind this request is served until its response is
 		// written, so that pipelined responses keep their order, and the
 		// connection knows which request to cancel if it closes first.
+		context.begin(true)
 		parser.busy = true
 		parser.liveContext.Store(context)
 		var bodyErr error
@@ -565,18 +558,16 @@ func (h *ServerHandler) endRequestLocked(context *Context) bool {
 	if stream := context.RequestBody(); stream != nil {
 		tooMuchLeft = stream.abandon()
 	}
-	if context.whole != nil {
-		// The response is finished, and with it the handler's use of the
-		// body, whose buffer is the next request's.
-		context.whole.release()
-	}
 	closing := tooMuchLeft || context.closing || context.Request.Close
 	if closing {
 		parser.spent = true
 		parser.stream = nil
 		parser.live.Store(nil)
 	}
-	h.recycle(context)
+	// The connection is done with the request. Its body and whatever the
+	// Reuse options recycle go back once the handler is done with them too,
+	// which may be already or may be at a Release still to come.
+	context.drop(ctxConn)
 	return closing
 }
 
@@ -602,9 +593,10 @@ func (h *ServerHandler) newContext(block *requestBlock) *Context {
 }
 
 // recycle gives back what serving a request took from the reuse pools; see
-// Config.ReuseRequests. It runs once the response is finished and the
-// connection has done with the request, which is the last the server touches
-// of either, and the caller does not touch context afterwards.
+// Config.ReuseRequests. It runs once nothing but the server can reach the
+// Context any more — the handler has returned and released every Retain, and
+// the connection has done with the request — and nothing touches context
+// afterwards.
 func (h *ServerHandler) recycle(context *Context) {
 	if context.streamed {
 		// A streamed body can still be finishing after the response has
@@ -695,9 +687,9 @@ func Serve(handler Handler, context *Context) { serveRequest(handler, context) }
 // back the hold that serving it took, which writes the response unless the
 // handler retained it.
 func serveRequest(handler Handler, context *Context) {
-	context.begin()
+	context.begin(false)
 	handler.ServeHTTP(context, context.Request)
-	context.release(false)
+	context.returned()
 }
 
 // requestError is a request the server refuses with its status.
@@ -795,7 +787,7 @@ func (h *ServerHandler) OnClose(c *fib.Connection, err error) {
 			// time the cancellation reaches it, and the generation is how
 			// it tells. It is read while the Context is still this
 			// connection's, which the second load confirms.
-			gen = context.gen.Load()
+			gen = context.generation()
 			if state.liveContext.Load() != context {
 				context = nil
 			}

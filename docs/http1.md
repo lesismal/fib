@@ -147,9 +147,10 @@ nil for a body that was read whole. A body under the threshold is unaffected:
 buffered whole, nothing else changed.
 
 A body read whole sits in a pooled buffer, which the server takes back once
-the response is finished: when the handler returns, or when the last hold on a
-retained request is released. That is the point at which `net/http` closes a
-request's body too. Reading it afterwards returns `ErrBodyReleased`; a handler
+the handler is done with the request: it has returned and released every
+`Retain` it took, even one outlasting the connection. For a handler that
+retains nothing that is its return, which is the point at which `net/http`
+closes a request's body too. Reading it afterwards returns `ErrBodyReleased`; a handler
 that needs the bytes later keeps a copy of them, as `io.ReadAll` makes.
 
 **Reading it never waits.** The handler runs on the connection's worker like
@@ -234,10 +235,11 @@ from 1.77-1.81M to 1.99M responses a second with all four on, the most the
 client asks for, at less CPU.
 
 What they ask of a handler is fasthttp's rule for its `RequestCtx`: a
-recycled object is the handler's only until the response is finished, which
-is when the handler returns, or when the `Release` that ends a retained
-request is made. After that the next request, on this connection or another,
-is given it, so a handler that keeps one longer, or hands it to a goroutine
+recycled object is the handler's until it is done with the request: it has
+returned and released every `Retain` it took. A request retained past its
+response, or past its connection going (as `OnCancel` reports), stays its own
+until the last `Release`, however long that takes. After that the next
+request, on this connection or another, is given it, so a handler that keeps one longer, or hands it to a goroutine
 that outlives the response, reads or writes another request's. Keep a copy
 of what is needed instead, as `http.Request.Clone` and `http.Header.Clone`
 make. A `Context` waiting for its next request reads as finished, so a stray

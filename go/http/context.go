@@ -27,51 +27,123 @@ type blockServerState struct {
 
 func (b *requestBlock) recycleServerState() { b.context.recycle() }
 
+// A Context's lifetime is one atomic word, which the ordinary path through a
+// request — begin, the handler's return, settle, and any Retain and Release —
+// moves on with a compare-and-swap rather than under a lock. mu is left
+// guarding what hands a callback from one goroutine to another: err, body,
+// bodyDone and cancel.
+//
+// Two counts live in it, since a response and the objects it is written from
+// do not end together. The response is held open by the handler's share and
+// by every Retain not yet released, and is written when the last of them goes,
+// as Retain describes. The Context, and the request and body it serves, stay
+// the handler's for as long as anyone may still be using them: until the
+// handler has returned, every Retain has been released — including one taken
+// before the connection went and released after, when the response is long
+// past — the connection has done with the request, and a cancellation or a
+// response in the middle of being written has finished. Only then does the
+// body's buffer go back, and do the Reuse options recycle anything.
+const (
+	// ctxHolds counts the Retains not yet released.
+	ctxHolds uint64 = 1<<16 - 1
+	// ctxServed marks a handler that has not returned yet, and ctxShare its
+	// hold on the response, which its return gives back unless a Release too
+	// many gave it back first.
+	ctxServed uint64 = 1 << 16
+	ctxShare  uint64 = 1 << 17
+	// ctxConn marks a request the connection has not finished with yet.
+	ctxConn uint64 = 1 << 18
+	// ctxCancelling and ctxFinishing mark a cancellation and the writing of a
+	// finished response that are still going on, on whichever goroutine is
+	// doing them.
+	ctxCancelling uint64 = 1 << 19
+	ctxFinishing  uint64 = 1 << 20
+	// ctxResume marks the connection's duty to carry on, left by settle for
+	// whoever finishes the response, and ctxDelivering a body callback
+	// running on the connection's worker, which cannot take that duty itself.
+	ctxResume     uint64 = 1 << 21
+	ctxDelivering uint64 = 1 << 22
+	// The state takes two bits, and the generation the rest.
+	ctxStateShift        = 23
+	ctxStateMask  uint64 = 3 << ctxStateShift
+	ctxGenShift          = 25
+
+	// ctxAlive is what keeps the Context the request's.
+	ctxAlive = ctxHolds | ctxServed | ctxConn | ctxCancelling | ctxFinishing
+)
+
+// The states a response is in: ctxOpen is still being written, ctxDone has
+// been, and ctxCancelled is one whose connection went first. A fresh Context,
+// whose word is zero, is open.
+const (
+	ctxOpen uint64 = iota
+	ctxDone
+	ctxCancelled
+)
+
+func ctxState(w uint64) uint64 { return w & ctxStateMask >> ctxStateShift }
+
+func withState(w, state uint64) uint64 { return w&^ctxStateMask | state<<ctxStateShift }
+
+// generation is the one the Context is serving, which a Context recycled
+// since has moved past; see recycle.
+func (c *Context) generation() uint64 { return c.word.Load() >> ctxGenShift }
+
+// drop clears bits from the word, and ends the Context if nothing is left
+// keeping it.
+func (c *Context) drop(bits uint64) {
+	for {
+		w := c.word.Load()
+		next := w &^ bits
+		if c.word.CompareAndSwap(w, next) {
+			if w&ctxAlive != 0 && next&ctxAlive == 0 {
+				c.ended()
+			}
+			return
+		}
+	}
+}
+
+// ended runs once nothing can reach the Context any more but the server: the
+// body's buffer goes back, and whatever the Reuse options recycle goes too.
+func (c *Context) ended() {
+	if c.whole != nil {
+		c.whole.release()
+	}
+	if c.server != nil {
+		c.server.recycle(c)
+	}
+}
+
 // contextPool recycles Contexts on their own, for a server that recycles its
 // Contexts but not its requests; see Config.ReuseContexts.
 var contextPool = sync.Pool{New: func() any { return &Context{pooled: true} }}
 
-// recycle clears the Context for another request. The generation moves on
-// under mu, so that a cancellation meant for the request it served, which
-// OnClose makes from a goroutine of its own, finds it serving another and
-// leaves it alone. Every field but mu, gen and pooled is reset, which
+// recycle clears the Context for another request. Its generation moves on,
+// so that a cancellation meant for the request it served, which OnClose makes
+// from a goroutine of its own, finds it serving another and leaves it alone.
+// Every field but mu, deliverMu, word and pooled is reset, which
 // TestContextRecycleResetsEveryField holds it to.
 //
 // A recycled Context waiting for its next request reads as finished, so that
-// a handler that wrongly holds on to it past its response finds that Retain,
+// a handler that wrongly holds on to it past its end finds that Retain,
 // Release and the rest do nothing, as they do on any finished response,
 // rather than acting on a Context with no connection; reopen hands it out.
 func (c *Context) recycle() {
-	c.mu.Lock()
-	c.gen.Add(1)
+	gen := c.generation() + 1
+	c.word.Store(withState(gen<<ctxGenShift, ctxDone))
 	c.Conn, c.Request = nil, nil
 	c.wrote, c.closing, c.streamed = true, false, false
 	c.w, c.stream, c.external = nil, nil, nil
-	c.refs, c.state, c.err, c.resume, c.delivering = 0, ctxDone, nil, false, 0
-	c.body, c.bodyDone, c.cancel = nil, false, nil
+	c.err, c.body, c.bodyDone, c.cancel = nil, nil, false, nil
 	c.server, c.parser, c.whole, c.block = nil, nil, nil, nil
-	c.mu.Unlock()
 }
 
 // reopen readies a recycled Context for the request it is about to serve.
 func (c *Context) reopen() {
-	c.mu.Lock()
-	c.state, c.wrote = ctxOpen, false
-	c.mu.Unlock()
+	c.word.Store(c.generation() << ctxGenShift)
+	c.wrote = false
 }
-
-// A Context's response is held open by a reference count. Serving a request
-// takes one hold, which the handler's return gives back, so a handler that
-// answers and returns needs none of this. A handler that answers later takes
-// another with Retain and gives it back with Release, and the response is
-// written when the last hold goes.
-const (
-	// ctxOpen is a response still being written, ctxDone one that has been,
-	// and ctxCancelled one whose connection went first.
-	ctxOpen uint8 = iota
-	ctxDone
-	ctxCancelled
-)
 
 // Retain keeps the response open past the handler's return, so that the
 // request can be answered later, from another goroutine or from the body
@@ -86,12 +158,21 @@ const (
 //
 // Retaining a request whose response is already written, or whose connection
 // has already gone, does nothing.
+//
+// A handler may hold at most 65535 Retains on one request at a time.
 func (c *Context) Retain() {
-	c.mu.Lock()
-	if c.state == ctxOpen {
-		c.refs++
+	for {
+		w := c.word.Load()
+		if ctxState(w) != ctxOpen {
+			return
+		}
+		if w&ctxHolds == ctxHolds {
+			panic("http: too many Retains on one request")
+		}
+		if c.word.CompareAndSwap(w, w+1) {
+			return
+		}
 	}
-	c.mu.Unlock()
 }
 
 // Release gives back one hold taken by Retain. The last one to go finishes
@@ -101,15 +182,20 @@ func (c *Context) Retain() {
 // Releasing more often than retaining ends the response early: the hold that
 // serving the request took is given back by the handler's return, so a
 // release that is not undoing a Retain is undoing that one. Releasing a
-// response that is already written, or one whose connection has gone, does
-// nothing, so a Release on a failed request is safe and can be repeated.
-func (c *Context) Release() { c.release(true) }
+// response that is already written, or one whose connection has gone, writes
+// nothing, so a Release on a failed request is safe and can be repeated. It
+// still counts, though: a request whose connection went is the handler's
+// until it has released every Retain it took, and no longer.
+func (c *Context) Release() { c.giveBack(false) }
 
 // Retained reports whether the response is still being held open.
 func (c *Context) Retained() bool {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	return c.state == ctxOpen && c.refs > 1
+	w := c.word.Load()
+	holds := w & ctxHolds
+	if w&ctxShare != 0 {
+		holds++
+	}
+	return ctxState(w) == ctxOpen && holds > 1
 }
 
 // Err is why the request ended before its response did — the connection
@@ -131,20 +217,24 @@ func (c *Context) Err() error {
 //
 // fn runs once, on a goroutine of its own rather than on the event loop, and
 // never after the response has been written. It still has to Release what it
-// retained, which is then only the bookkeeping: nothing more is written.
+// retained. Nothing more is written then, but the request, its body and the
+// Context stay the handler's until it has, and are recycled or given back
+// only after its last Release.
 // Registering it on a request that has already ended runs it at once.
 func (c *Context) OnCancel(fn func(error)) {
 	if fn == nil {
 		return
 	}
 	c.mu.Lock()
-	if c.state == ctxCancelled {
+	// cancelWith moves the state on under mu, so what is read here is either
+	// before it, and fn is left for it to run, or after it, with err set.
+	switch ctxState(c.word.Load()) {
+	case ctxCancelled:
 		err := c.err
 		c.mu.Unlock()
 		fn(err)
 		return
-	}
-	if c.state == ctxDone {
+	case ctxDone:
 		c.mu.Unlock()
 		return
 	}
@@ -225,49 +315,105 @@ func (c *Context) OnBody(fn BodyFunc) {
 }
 
 // begin takes the hold that serving a request stands on, which the handler's
-// return gives back.
-func (c *Context) begin() {
-	c.mu.Lock()
-	if c.state == ctxOpen && c.refs == 0 {
-		c.refs = 1
+// return gives back. conn says the connection has the request too, until
+// endRequestLocked is done with it.
+func (c *Context) begin(conn bool) {
+	add := ctxServed | ctxShare
+	if conn {
+		add |= ctxConn
 	}
-	c.mu.Unlock()
+	for {
+		w := c.word.Load()
+		if ctxState(w) != ctxOpen || w&ctxServed != 0 {
+			return
+		}
+		if c.word.CompareAndSwap(w, w|add) {
+			return
+		}
+	}
 }
 
-// release gives back one hold and, when it was the last, writes the response.
-// flush asks for it to reach the socket at once, which a release away from
-// the connection's read round wants; one inside a round is written with the
-// rest of the round's output when it ends.
-func (c *Context) release(flush bool) {
-	c.mu.Lock()
-	if c.state != ctxOpen || c.refs <= 0 {
-		c.mu.Unlock()
+// returned is the handler's return, which gives back the hold serving the
+// request took.
+func (c *Context) returned() { c.giveBack(true) }
+
+// giveBack gives back the handler's hold, when returning is set, or one taken
+// by Retain, and when that was the last hold on an open response, writes it.
+func (c *Context) giveBack(returning bool) {
+	for {
+		w := c.word.Load()
+		next := w
+		if returning {
+			next &^= ctxServed
+		}
+		if ctxState(w) != ctxOpen {
+			// Nothing more is written, but the hold still counts for how long
+			// the request is the handler's.
+			if !returning {
+				if w&ctxHolds == 0 {
+					return
+				}
+				next--
+			}
+			if c.word.CompareAndSwap(w, next) {
+				if w&ctxAlive != 0 && next&ctxAlive == 0 {
+					c.ended()
+				}
+				return
+			}
+			continue
+		}
+		switch {
+		case returning:
+			next &^= ctxShare
+		case w&ctxHolds != 0:
+			next--
+		case w&ctxShare != 0:
+			// A Release too many takes the handler's share.
+			next &^= ctxShare
+		default:
+			return
+		}
+		if next&(ctxHolds|ctxShare) != 0 || w&(ctxHolds|ctxShare) == 0 {
+			// Still held open, or the handler returning from a response a
+			// Release too many has finished already.
+			if c.word.CompareAndSwap(w, next) {
+				if w&ctxAlive != 0 && next&ctxAlive == 0 {
+					c.ended()
+				}
+				return
+			}
+			continue
+		}
+		// The last hold on the response. A release from inside a body callback
+		// cannot carry the connection on: the worker delivering that callback
+		// holds the parser, and it picks the duty up itself once the callback
+		// returns.
+		resume := w&ctxResume != 0 && w&ctxDelivering == 0
+		next = withState(next, ctxDone) | ctxFinishing
+		if resume {
+			next &^= ctxResume
+		}
+		if !c.word.CompareAndSwap(w, next) {
+			continue
+		}
+		if next&ctxResume == 0 {
+			// While the duty is still owed the connection has to keep its
+			// pointer to this request, since that is how the worker finds it
+			// to take it.
+			c.forget()
+		}
+		_ = c.Finish()
+		if !returning {
+			// Away from the connection's read round, nothing else will send
+			// what was just written.
+			_ = c.Conn.Flush()
+		}
+		if resume {
+			c.server.finishRequest(c)
+		}
+		c.drop(ctxFinishing)
 		return
-	}
-	c.refs--
-	if c.refs > 0 {
-		c.mu.Unlock()
-		return
-	}
-	c.state = ctxDone
-	// A release from inside a body callback cannot carry the connection on:
-	// the worker delivering that callback holds the parser, and it picks the
-	// duty up itself once the callback returns.
-	resume := c.resume && c.delivering == 0
-	c.resume = c.resume && !resume
-	owed := c.resume
-	c.mu.Unlock()
-	if !owed {
-		// While the duty is still owed the connection has to keep its pointer
-		// to this request, since that is how the worker finds it to take it.
-		c.forget()
-	}
-	_ = c.Finish()
-	if flush {
-		_ = c.Conn.Flush()
-	}
-	if resume {
-		c.server.finishRequest(c)
 	}
 }
 
@@ -275,34 +421,36 @@ func (c *Context) release(flush bool) {
 // whether the response is finished, and otherwise leaves whoever finishes it
 // the duty of letting the connection carry on.
 func (c *Context) settle() bool {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	if c.state != ctxOpen {
-		return true
+	for {
+		w := c.word.Load()
+		if ctxState(w) != ctxOpen {
+			return true
+		}
+		if c.server == nil || c.parser == nil || c.word.CompareAndSwap(w, w|ctxResume) {
+			return false
+		}
 	}
-	if c.server != nil && c.parser != nil {
-		c.resume = true
-	}
-	return false
 }
 
 // claimResume takes the duty a release could not, and reports that it did, so
 // that the connection is carried on exactly once.
 func (c *Context) claimResume() bool {
-	c.mu.Lock()
-	if c.state == ctxOpen || !c.resume {
-		c.mu.Unlock()
-		return false
+	for {
+		w := c.word.Load()
+		if ctxState(w) == ctxOpen || w&ctxResume == 0 {
+			return false
+		}
+		if c.word.CompareAndSwap(w, w&^ctxResume) {
+			c.forget()
+			return true
+		}
 	}
-	c.resume = false
-	c.mu.Unlock()
-	c.forget()
-	return true
 }
 
 // cancelWith ends a request whose connection went before its response did.
-// Nothing more is written, every hold left on it is void, and the handler
-// hears about it through OnBody and OnCancel. It runs once.
+// Nothing more is written, the response's holds are void, and the handler
+// hears about it through OnBody and OnCancel; the request stays the handler's
+// until it has released what it retained. It runs once.
 //
 // gen is the generation the request was served in, which a Context recycled
 // since has moved past; see recycle.
@@ -311,13 +459,23 @@ func (c *Context) cancelWith(err error, gen uint64) {
 		err = net.ErrClosed
 	}
 	c.mu.Lock()
-	if c.state != ctxOpen || c.gen.Load() != gen {
-		c.mu.Unlock()
-		return
+	var owed bool
+	for {
+		w := c.word.Load()
+		if ctxState(w) != ctxOpen || w>>ctxGenShift != gen {
+			c.mu.Unlock()
+			return
+		}
+		next := withState(w&^(ctxShare|ctxResume), ctxCancelled) | ctxCancelling
+		if c.word.CompareAndSwap(w, next) {
+			// A connection owed the duty to carry on is not coming back for
+			// the request; one that was not owed it yet still is, from the
+			// worker the handler is running on.
+			owed = w&ctxResume != 0
+			break
+		}
 	}
-	c.state, c.err, c.refs = ctxCancelled, err, 0
-	// There is no connection left to carry on with.
-	c.resume = false
+	c.err = err
 	onCancel := c.cancel
 	c.cancel = nil
 	c.mu.Unlock()
@@ -326,6 +484,11 @@ func (c *Context) cancelWith(err error, gen uint64) {
 	if onCancel != nil {
 		onCancel(err)
 	}
+	done := ctxCancelling
+	if owed {
+		done |= ctxConn
+	}
+	c.drop(done)
 }
 
 // forget drops the connection's pointer to this request, so that a close
@@ -355,10 +518,22 @@ func (c *Context) deliverBody(data []byte, fin bool, err error) {
 	if fin || err != nil {
 		c.bodyDone = true
 	}
-	c.delivering++
 	c.mu.Unlock()
+	// deliverMu keeps the callbacks one at a time, so one bit counts them.
+	c.setDelivering(true)
 	fn(data, fin, err)
-	c.mu.Lock()
-	c.delivering--
-	c.mu.Unlock()
+	c.setDelivering(false)
+}
+
+func (c *Context) setDelivering(on bool) {
+	for {
+		w := c.word.Load()
+		next := w &^ ctxDelivering
+		if on {
+			next |= ctxDelivering
+		}
+		if c.word.CompareAndSwap(w, next) {
+			return
+		}
+	}
 }

@@ -123,8 +123,9 @@ func(c *fibhttp.Context, r *http.Request) {
 `*BodyStream` 的形式出现在 `Request.Body` 里。`Context.RequestBody()` 返回它，body
 已经收全时返回 nil。小于阈值的 body 行为不变：整体缓存，其余一切照旧。
 
-整体缓存的 body 放在池化缓冲里，响应结束时由 server 收回：handler 返回时，或者被
-Retain 的请求最后一次 Release 时。`net/http` 也是在这个时刻关闭请求 body 的。之后再读
+整体缓存的 body 放在池化缓冲里，handler 用完这个请求后由 server 收回：handler 已经
+返回，并且释放了每一个 `Retain`（即使 Retain 持续到连接断开之后）。对不做 Retain 的
+handler 来说就是它返回的时刻，`net/http` 也是在这个时刻关闭请求 body 的。之后再读
 会返回 `ErrBodyReleased`；handler 如果之后还要用这些字节，应自己保留一份副本（比如
 `io.ReadAll` 得到的结果）。
 
@@ -190,9 +191,10 @@ handler 收下 128MB 的上传并计数：整体缓存时堆内存峰值约 470M
 server 的瓶颈：go-http-benchmark 的流水线测试里，3 核 1 万连接从每秒 177–181 万响应
 提升到 199 万（即客户端请求的上限），CPU 还更少。
 
-对 handler 的要求与 fasthttp 对 `RequestCtx` 的要求相同：被复用的对象只在响应结束之前
-属于 handler，也就是 handler 返回时，或者被 Retain 的请求调用最后一次 `Release` 时。
-之后它会交给下一个请求——可能在这条连接上，也可能在别的连接上。所以 handler 如果持有得
+对 handler 的要求与 fasthttp 对 `RequestCtx` 的要求相同：被复用的对象在 handler 用完
+这个请求之前都属于它，即 handler 已经返回，并且释放了它取得的每一个 `Retain`。被 Retain
+的请求即使响应早已发出、甚至连接已经断开（`OnCancel` 会通知），也要到最后一次 `Release`
+才失效，不论这需要多久。之后它会交给下一个请求——可能在这条连接上，也可能在别的连接上。所以 handler 如果持有得
 更久，或者交给一个活得比响应更久的 goroutine，读写的就是别的请求的数据。需要的内容请
 自己保留副本，比如用 `http.Request.Clone`、`http.Header.Clone`。等待下一个请求的
 `Context` 处于已结束状态，误调用的 `Retain`、`Release`、`Respond` 不会产生任何作用。

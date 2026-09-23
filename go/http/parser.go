@@ -136,9 +136,10 @@ type Config struct {
 	// request, and at a high rate collecting them is what holds it back.
 	//
 	// The price is that a recycled object is only the handler's until the
-	// response is finished — when the handler returns, or when the Release
-	// that ends a retained request is made — after which the next request,
-	// on this connection or another, is given it. A handler that keeps one
+	// request is done with: the handler has returned and has released every
+	// Retain it took — a request retained past its response, or past its
+	// connection going, stays its own until the last Release — after which
+	// the next request, on this connection or another, is given it. A handler that keeps one
 	// longer, or hands it to a goroutine that outlives the response, reads
 	// or writes another request's: keep a copy of what is needed instead,
 	// as http.Request.Clone and http.Header.Clone make. That is fasthttp's
