@@ -29,11 +29,24 @@ func BenchmarkServerKeepAlivePOST(b *testing.B) {
 		"Content-Length: 12\r\n\r\nhello, world"))
 }
 
+// BenchmarkServerKeepAliveReuse is BenchmarkServerKeepAlivePOST with the
+// server recycling everything Config.ReuseRequests and its siblings let it.
+func BenchmarkServerKeepAliveReuse(b *testing.B) {
+	config := DefaultConfig()
+	setReuseAll(&config)
+	benchmarkServerWith(b, config, []byte("POST /hello HTTP/1.1\r\nHost: localhost\r\nContent-Type: text/plain\r\n"+
+		"Content-Length: 12\r\n\r\nhello, world"))
+}
+
 func benchmarkServer(b *testing.B, request []byte) {
+	benchmarkServerWith(b, DefaultConfig(), request)
+}
+
+func benchmarkServerWith(b *testing.B, config Config, request []byte) {
 	const connections = 8
 	reply := []byte("hello")
 
-	server, addr := startBenchServer(b, HandlerFunc(func(c *Context, r *stdhttp.Request) {
+	server, addr := startBenchServer(b, config, HandlerFunc(func(c *Context, r *stdhttp.Request) {
 		_ = c.Respond(stdhttp.StatusOK, "text/plain", reply)
 	}))
 	defer server()
@@ -80,11 +93,11 @@ func benchmarkServer(b *testing.B, request []byte) {
 	b.StopTimer()
 }
 
-func startBenchServer(b *testing.B, handler Handler) (stop func(), addr string) {
+func startBenchServer(b *testing.B, httpConfig Config, handler Handler) (stop func(), addr string) {
 	b.Helper()
 	config := fib.DefaultConfig()
 	config.Addr = "127.0.0.1:0"
-	server, err := fib.Bind(config, NewHandler(handler))
+	server, err := fib.Bind(config, NewHandlerWithConfig(httpConfig, handler))
 	if err != nil {
 		b.Fatal(err)
 	}

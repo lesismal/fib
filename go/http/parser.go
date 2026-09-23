@@ -128,6 +128,34 @@ type Config struct {
 	// effect on HTTP/1, where a connection carries one request at a time
 	// anyway.
 	StreamPool StreamPoolConfig
+	// ReuseRequests, ReuseHeaders, ReuseURLs and ReuseContexts recycle the
+	// objects an HTTP/1 request is served with once its response is finished,
+	// rather than leaving each request's to the collector: the
+	// *http.Request, its Header, its URL, and the *Context it is answered
+	// through. A busy server makes a request's worth of them for every
+	// request, and at a high rate collecting them is what holds it back.
+	//
+	// The price is that a recycled object is only the handler's until the
+	// response is finished — when the handler returns, or when the Release
+	// that ends a retained request is made — after which the next request,
+	// on this connection or another, is given it. A handler that keeps one
+	// longer, or hands it to a goroutine that outlives the response, reads
+	// or writes another request's: keep a copy of what is needed instead,
+	// as http.Request.Clone and http.Header.Clone make. That is fasthttp's
+	// rule for its RequestCtx, and the reason these are off by default.
+	//
+	// A request whose body streams (see StreamRequestBodyThreshold), and one
+	// net/http parsed because it is outside the shape parsed here, keep
+	// their Request, Header and URL whatever these say.
+	ReuseRequests bool
+	ReuseHeaders  bool
+	ReuseURLs     bool
+	ReuseContexts bool
+}
+
+// reuse is which of a request's objects the parser takes from the pools.
+func (c *Config) reuse() reuseOptions {
+	return reuseOptions{requests: c.ReuseRequests, headers: c.ReuseHeaders, urls: c.ReuseURLs}
 }
 
 func DefaultConfig() Config {
@@ -536,7 +564,7 @@ func (p *Parser) frameLength() (frameInfo, bool, error) {
 	if headerEnd > p.config.MaxHeaderBytes {
 		return frameInfo{}, false, ErrHeaderTooLarge
 	}
-	req, block, err := parseRequestHead(p.buffer[:headerEnd])
+	req, block, err := parseRequestHead(p.buffer[:headerEnd], p.config.reuse())
 	if err != nil {
 		if strings.Contains(err.Error(), "unsupported transfer encoding") {
 			// net/http refuses transfer codings other than chunked, without

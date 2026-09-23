@@ -25,6 +25,9 @@ import (
 // serve runs an engine serving handler and returns its address.
 func serve(t *testing.T, handler fib.Handler) string {
 	t.Helper()
+	if server, ok := handler.(*ServerHandler); ok && testReuse {
+		setReuseAll(&server.config)
+	}
 	config := fib.DefaultConfig()
 	config.Addr = "127.0.0.1:0"
 	server, err := fib.Bind(config, handler)

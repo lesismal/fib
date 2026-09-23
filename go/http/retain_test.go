@@ -399,6 +399,9 @@ func TestOnBodyReportsAnOversizedBody(t *testing.T) {
 // TestRetainAfterTheResponseIsWrittenDoesNothing checks the idempotency of the
 // count against a handler that gets its own bookkeeping wrong.
 func TestRetainAfterTheResponseIsWrittenDoesNothing(t *testing.T) {
+	if testReuse {
+		t.Skip("a recycled Context is not the handler's once its response is written")
+	}
 	addr := serveStreamingServer(t, DefaultConfig(), func(c *Context, r *stdhttp.Request) {
 		_ = c.Respond(stdhttp.StatusOK, "text/plain", []byte(r.URL.Path))
 		go func() {

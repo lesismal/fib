@@ -112,8 +112,17 @@ func FuzzParseRequestHead(f *testing.F) {
 // net/http.ReadRequest does, and reports whether the simple parser took it on.
 func compareRequestHead(t *testing.T, head []byte) bool {
 	t.Helper()
+	simple, _ := compareRequestHeadWith(t, head, reuseOptions{})
+	return simple
+}
+
+// compareRequestHeadWith is compareRequestHead for a parser that recycles
+// what reuse says, and returns the block the request was parsed into, if any,
+// for the caller to recycle.
+func compareRequestHeadWith(t *testing.T, head []byte, reuse reuseOptions) (bool, *requestBlock) {
+	t.Helper()
 	want, wantErr := stdhttp.ReadRequest(bufio.NewReader(bytes.NewReader(head)))
-	got, _, gotErr := parseRequestHead(head)
+	got, block, gotErr := parseRequestHead(head, reuse)
 	if (wantErr == nil) != (gotErr == nil) {
 		t.Fatalf("%q: error %v, net/http's %v", head, gotErr, wantErr)
 	}
@@ -121,9 +130,9 @@ func compareRequestHead(t *testing.T, head []byte) bool {
 		if gotErr.Error() != wantErr.Error() {
 			t.Fatalf("%q: error %q, net/http's %q", head, gotErr, wantErr)
 		}
-		return false
+		return false, nil
 	}
-	simple := parseSimpleRequestHead(head) != nil
+	simple := block != nil
 	checks := []struct {
 		name      string
 		got, want any
@@ -149,7 +158,30 @@ func compareRequestHead(t *testing.T, head []byte) bool {
 	if got.Body != stdhttp.NoBody {
 		t.Fatalf("%q: body %T, want http.NoBody", head, got.Body)
 	}
-	return simple
+	return simple, block
+}
+
+// TestParseRequestHeadRecycled parses the corpus again and again with every
+// combination of what may be recycled, giving each request back before the
+// next is parsed, so that each is parsed into what the last one left: none
+// of it may show through.
+func TestParseRequestHeadRecycled(t *testing.T) {
+	for mask := 0; mask < 8; mask++ {
+		reuse := reuseOptions{requests: mask&1 != 0, headers: mask&2 != 0, urls: mask&4 != 0}
+		for round := 0; round < 3; round++ {
+			for _, raw := range requestHeadCorpus {
+				if _, block := compareRequestHeadWith(t, []byte(raw), reuse); block != nil {
+					if block.pooled != reuse.requests {
+						t.Fatalf("%+v: block pooled = %v", reuse, block.pooled)
+					}
+					if (block.headerFromPool != nil) != reuse.headers {
+						t.Fatalf("%+v: header pooled = %v", reuse, block.headerFromPool != nil)
+					}
+					block.recycle()
+				}
+			}
+		}
+	}
 }
 
 func BenchmarkParseRequestHead(b *testing.B) {
@@ -160,7 +192,7 @@ func BenchmarkParseRequestHead(b *testing.B) {
 		fn   func([]byte) (*stdhttp.Request, error)
 	}{
 		{"simple", func(head []byte) (*stdhttp.Request, error) {
-			req, _, err := parseRequestHead(head)
+			req, _, err := parseRequestHead(head, reuseOptions{})
 			return req, err
 		}},
 		{"nethttp", func(head []byte) (*stdhttp.Request, error) {

@@ -1,0 +1,109 @@
+//go:build linux || darwin || windows
+
+package http
+
+import (
+	"bytes"
+	"fmt"
+	"io"
+	stdhttp "net/http"
+	"reflect"
+	"sort"
+	"strings"
+	"sync"
+	"testing"
+	"time"
+)
+
+// TestContextRecycleResetsEveryField keeps recycle in step with Context: a
+// field added to Context has to be reset there, and then listed here.
+func TestContextRecycleResetsEveryField(t *testing.T) {
+	kept := map[string]bool{"mu": true, "gen": true, "pooled": true, "deliverMu": true}
+	reset := []string{
+		"Conn", "Request", "wrote", "closing", "w", "stream", "external", "refs", "state", "err",
+		"resume", "delivering", "body", "bodyDone", "cancel", "server", "parser", "whole", "block",
+		"streamed",
+	}
+	var fields []string
+	typ := reflect.TypeFor[Context]()
+	for i := 0; i < typ.NumField(); i++ {
+		if name := typ.Field(i).Name; !kept[name] {
+			fields = append(fields, name)
+		}
+	}
+	sort.Strings(fields)
+	sort.Strings(reset)
+	if !reflect.DeepEqual(fields, reset) {
+		t.Fatalf("Context has fields %v; recycle resets %v", fields, reset)
+	}
+}
+
+// TestServerReuseKeepsRequestsApart serves pipelined requests, some of them
+// retained and answered from another goroutine, with each combination of
+// what the server recycles, and checks that every handler sees its own
+// request and nothing of the one its objects served before.
+func TestServerReuseKeepsRequestsApart(t *testing.T) {
+	for mask := 1; mask < 16; mask++ {
+		config := DefaultConfig()
+		config.ReuseRequests, config.ReuseHeaders = mask&1 != 0, mask&2 != 0
+		config.ReuseURLs, config.ReuseContexts = mask&4 != 0, mask&8 != 0
+		t.Run(fmt.Sprintf("%04b", mask), func(t *testing.T) {
+			testServerReuse(t, config)
+		})
+	}
+}
+
+func testServerReuse(t *testing.T, config Config) {
+	var retained sync.WaitGroup
+	t.Cleanup(retained.Wait)
+	addr := serve(t, NewHandlerWithConfig(config, HandlerFunc(func(c *Context, r *stdhttp.Request) {
+		n := strings.TrimPrefix(r.URL.Path, "/r")
+		body, _ := io.ReadAll(r.Body)
+		var problems []string
+		if got := r.Header.Get("X-N"); got != n {
+			problems = append(problems, "X-N "+got)
+		}
+		if _, ok := r.Header["X-Odd"]; ok != (len(n)%2 == 1) {
+			problems = append(problems, "X-Odd")
+		}
+		if got := r.URL.Query().Get("n"); got != n {
+			problems = append(problems, "query "+got)
+		}
+		if want := strings.Repeat(n, len(body)/max(len(n), 1)); string(body) != want {
+			problems = append(problems, "body")
+		}
+		reply := []byte(r.URL.Path + " " + strings.Join(problems, ","))
+		if len(n)%3 != 0 {
+			_ = c.Respond(stdhttp.StatusOK, "text/plain", reply)
+			return
+		}
+		c.Retain()
+		retained.Add(1)
+		go func() {
+			defer retained.Done()
+			time.Sleep(time.Millisecond)
+			_ = c.Respond(stdhttp.StatusOK, "text/plain", reply)
+			c.Release()
+		}()
+	})))
+	conn := dialRaw(t, addr)
+	var stream bytes.Buffer
+	const requests = 200
+	for i := 0; i < requests; i++ {
+		n := fmt.Sprint(i * 7919 % 100003)
+		odd := ""
+		if len(n)%2 == 1 {
+			odd = "X-Odd: 1\r\n"
+		}
+		body := strings.Repeat(n, i%5)
+		fmt.Fprintf(&stream, "POST /r%s?n=%s HTTP/1.1\r\nHost: x\r\nX-N: %s\r\n%sContent-Length: %d\r\n\r\n%s",
+			n, n, n, odd, len(body), body)
+	}
+	go func() { _, _ = conn.Write(stream.Bytes()) }()
+	for i := 0; i < requests; i++ {
+		n := fmt.Sprint(i * 7919 % 100003)
+		if _, body := conn.response("POST"); body != "/r"+n+" " {
+			t.Fatalf("request %d: %q", i, body)
+		}
+	}
+}

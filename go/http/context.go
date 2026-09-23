@@ -5,6 +5,7 @@ package http
 import (
 	"io"
 	"net"
+	"sync"
 	"sync/atomic"
 )
 
@@ -22,6 +23,41 @@ func (p *Parser) resetServerState() { p.liveContext.Store(nil) }
 // with: the Context it is answered through.
 type blockServerState struct {
 	context Context
+}
+
+func (b *requestBlock) recycleServerState() { b.context.recycle() }
+
+// contextPool recycles Contexts on their own, for a server that recycles its
+// Contexts but not its requests; see Config.ReuseContexts.
+var contextPool = sync.Pool{New: func() any { return &Context{pooled: true} }}
+
+// recycle clears the Context for another request. The generation moves on
+// under mu, so that a cancellation meant for the request it served, which
+// OnClose makes from a goroutine of its own, finds it serving another and
+// leaves it alone. Every field but mu, gen and pooled is reset, which
+// TestContextRecycleResetsEveryField holds it to.
+//
+// A recycled Context waiting for its next request reads as finished, so that
+// a handler that wrongly holds on to it past its response finds that Retain,
+// Release and the rest do nothing, as they do on any finished response,
+// rather than acting on a Context with no connection; reopen hands it out.
+func (c *Context) recycle() {
+	c.mu.Lock()
+	c.gen.Add(1)
+	c.Conn, c.Request = nil, nil
+	c.wrote, c.closing, c.streamed = true, false, false
+	c.w, c.stream, c.external = nil, nil, nil
+	c.refs, c.state, c.err, c.resume, c.delivering = 0, ctxDone, nil, false, 0
+	c.body, c.bodyDone, c.cancel = nil, false, nil
+	c.server, c.parser, c.whole, c.block = nil, nil, nil, nil
+	c.mu.Unlock()
+}
+
+// reopen readies a recycled Context for the request it is about to serve.
+func (c *Context) reopen() {
+	c.mu.Lock()
+	c.state, c.wrote = ctxOpen, false
+	c.mu.Unlock()
 }
 
 // A Context's response is held open by a reference count. Serving a request
@@ -267,12 +303,15 @@ func (c *Context) claimResume() bool {
 // cancelWith ends a request whose connection went before its response did.
 // Nothing more is written, every hold left on it is void, and the handler
 // hears about it through OnBody and OnCancel. It runs once.
-func (c *Context) cancelWith(err error) {
+//
+// gen is the generation the request was served in, which a Context recycled
+// since has moved past; see recycle.
+func (c *Context) cancelWith(err error, gen uint64) {
 	if err == nil {
 		err = net.ErrClosed
 	}
 	c.mu.Lock()
-	if c.state != ctxOpen {
+	if c.state != ctxOpen || c.gen.Load() != gen {
 		c.mu.Unlock()
 		return
 	}

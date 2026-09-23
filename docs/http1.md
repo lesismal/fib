@@ -222,6 +222,32 @@ buffered — the body, the parser buffer it grew in, and what was left behind on
 the way — and around 4MB streamed, with `StreamRequestBodyBuffer` at its 256KB
 default.
 
+### Recycling request objects
+
+`Config.ReuseRequests`, `ReuseHeaders`, `ReuseURLs` and `ReuseContexts`,
+each off by default, recycle the `*http.Request`, its `Header`, its `URL` and
+the `*Context` of an HTTP/1 request once its response is finished, instead
+of leaving a request's worth of them to the collector for every request. At
+a high request rate collecting them is what holds a server back: in
+go-http-benchmark's pipelined test, 10,000 connections on three cores went
+from 1.77-1.81M to 1.99M responses a second with all four on, the most the
+client asks for, at less CPU.
+
+What they ask of a handler is fasthttp's rule for its `RequestCtx`: a
+recycled object is the handler's only until the response is finished, which
+is when the handler returns, or when the `Release` that ends a retained
+request is made. After that the next request, on this connection or another,
+is given it, so a handler that keeps one longer, or hands it to a goroutine
+that outlives the response, reads or writes another request's. Keep a copy
+of what is needed instead, as `http.Request.Clone` and `http.Header.Clone`
+make. A `Context` waiting for its next request reads as finished, so a stray
+`Retain`, `Release` or `Respond` on one does nothing.
+
+Each option recycles its own object, so a handler that keeps only, say, the
+`Context` can recycle the rest. A request whose body streams, and one outside
+the shape the server parses itself (which `net/http` parses instead), keep
+their `Request`, `Header` and `URL` whatever the options say.
+
 ### Zero-copy file sending
 
 `Connection.SendFile(f, offset, count)` queues a file range in order with the

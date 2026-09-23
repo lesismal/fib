@@ -12,6 +12,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	fib "github.com/lesismal/fib/go"
@@ -69,7 +70,12 @@ type Context struct {
 	// connection the step that lets it carry on. delivering counts the body
 	// callbacks running on the connection's worker, which cannot take that
 	// step themselves.
-	mu         sync.Mutex
+	mu sync.Mutex
+	// gen counts the requests a recycled Context has served, so that what
+	// was meant for one of them can tell it from the next; see recycle.
+	// pooled records that the Context came from contextPool.
+	gen        atomic.Uint64
+	pooled     bool
 	refs       int
 	state      uint8
 	err        error
@@ -88,8 +94,12 @@ type Context struct {
 	server *ServerHandler
 	parser *Parser
 	// whole is the request's body when it arrived whole, whose buffer goes
-	// back to the pool once the response is finished.
-	whole *wholeBody
+	// back to the pool once the response is finished. block is where the
+	// request was allocated, when the simple parser took it, and streamed
+	// records that its body was still arriving when the handler ran.
+	whole    *wholeBody
+	block    *requestBlock
+	streamed bool
 }
 
 // Stream answers a request that arrived over a protocol served outside this
@@ -473,15 +483,15 @@ func (h *ServerHandler) drive(c *fib.Connection, parser *Parser, data []byte) {
 			h.upgradeH2C(c, parser, request, settings)
 			return
 		}
-		var context *Context
-		if block := parser.block; block != nil && &block.request == request {
-			context = &block.context
-		} else {
-			context = new(Context)
+		block := parser.block
+		if block != nil && &block.request != request {
+			block = nil
 		}
 		parser.block = nil
+		context := h.newContext(block)
 		context.Conn, context.Request, context.server, context.parser = c, request, h, parser
 		context.whole, _ = request.Body.(*wholeBody)
+		context.block, context.streamed = block, parser.stream != nil
 		// Nothing behind this request is served until its response is
 		// written, so that pipelined responses keep their order, and the
 		// connection knows which request to cancel if it closes first.
@@ -566,7 +576,52 @@ func (h *ServerHandler) endRequestLocked(context *Context) bool {
 		parser.stream = nil
 		parser.live.Store(nil)
 	}
+	h.recycle(context)
 	return closing
+}
+
+// newContext returns the Context a request is served through: the one in
+// the request's block when the two are recycled together or not at all, one
+// from contextPool when only Contexts are recycled, and a fresh one when only
+// requests are, since a handler may then keep the Context past the request.
+func (h *ServerHandler) newContext(block *requestBlock) *Context {
+	reuse := h.config.ReuseContexts
+	var context *Context
+	switch {
+	case block != nil && block.pooled == reuse:
+		context = &block.context
+	case reuse:
+		context = contextPool.Get().(*Context)
+	default:
+		return new(Context)
+	}
+	if reuse {
+		context.reopen()
+	}
+	return context
+}
+
+// recycle gives back what serving a request took from the reuse pools; see
+// Config.ReuseRequests. It runs once the response is finished and the
+// connection has done with the request, which is the last the server touches
+// of either, and the caller does not touch context afterwards.
+func (h *ServerHandler) recycle(context *Context) {
+	if context.streamed {
+		// A streamed body can still be finishing after the response has
+		// gone, and it writes the request's trailer and calls back into the
+		// Context when it does. Such a request and its Context are left to
+		// the collector.
+		return
+	}
+	if block := context.block; block != nil {
+		// The block takes with it the Context it holds, when that is the
+		// one the request was served through.
+		block.recycle()
+	}
+	if context.pooled {
+		context.recycle()
+		contextPool.Put(context)
+	}
 }
 
 // finishRequest carries the connection on after a response written away from
@@ -734,13 +789,24 @@ func (h *ServerHandler) OnClose(c *fib.Connection, err error) {
 		// cleanup must never hold up; the parser's own lock is not taken
 		// there either, for the same reason.
 		stream, context := state.live.Load(), state.liveContext.Load()
+		var gen uint64
+		if context != nil {
+			// A recycled Context may be serving another request by the
+			// time the cancellation reaches it, and the generation is how
+			// it tells. It is read while the Context is still this
+			// connection's, which the second load confirms.
+			gen = context.gen.Load()
+			if state.liveContext.Load() != context {
+				context = nil
+			}
+		}
 		if stream != nil || context != nil {
 			go func() {
 				if stream != nil {
 					stream.fail(err)
 				}
 				if context != nil {
-					context.cancelWith(err)
+					context.cancelWith(err, gen)
 				}
 			}()
 		}

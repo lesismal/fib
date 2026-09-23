@@ -182,6 +182,25 @@ handler 收下 128MB 的上传并计数：整体缓存时堆内存峰值约 470M
 的解析缓冲区，以及沿途留下的垃圾），流式时约 4MB（`StreamRequestBodyBuffer` 为默认的
 256KB）。
 
+### 复用请求对象
+
+`Config.ReuseRequests`、`ReuseHeaders`、`ReuseURLs`、`ReuseContexts` 默认都关闭。
+打开后，HTTP/1 请求的 `*http.Request`、它的 `Header`、`URL` 以及 `*Context` 会在响应
+结束后回收复用，而不是每个请求都留一整套对象给 GC。请求速率很高时，回收这些对象正是
+server 的瓶颈：go-http-benchmark 的流水线测试里，3 核 1 万连接从每秒 177–181 万响应
+提升到 199 万（即客户端请求的上限），CPU 还更少。
+
+对 handler 的要求与 fasthttp 对 `RequestCtx` 的要求相同：被复用的对象只在响应结束之前
+属于 handler，也就是 handler 返回时，或者被 Retain 的请求调用最后一次 `Release` 时。
+之后它会交给下一个请求——可能在这条连接上，也可能在别的连接上。所以 handler 如果持有得
+更久，或者交给一个活得比响应更久的 goroutine，读写的就是别的请求的数据。需要的内容请
+自己保留副本，比如用 `http.Request.Clone`、`http.Header.Clone`。等待下一个请求的
+`Context` 处于已结束状态，误调用的 `Retain`、`Release`、`Respond` 不会产生任何作用。
+
+每个选项只管自己那个对象，所以比如只持有 `Context` 的 handler 可以复用其余对象。流式
+body 的请求，以及不在 server 自行解析范围内、改由 `net/http` 解析的请求，无论选项如何
+都不复用 `Request`、`Header`、`URL`。
+
 ### 零拷贝发送文件
 
 `Connection.SendFile(f, offset, count)` 把文件的一段排进发送队列，与连接上其他发送保持

@@ -10,3 +10,5 @@ func (p *Parser) resetServerState() {}
 
 // blockServerState is empty here too, for the same reason.
 type blockServerState struct{}
+
+func (b *requestBlock) recycleServerState() {}

@@ -5,6 +5,7 @@ import (
 	stdhttp "net/http"
 	"net/url"
 	"strings"
+	"sync"
 )
 
 // parseRequestHead parses the request line and header that head holds, up to
@@ -22,8 +23,8 @@ import (
 //
 // A request the simple parser takes comes with the block it was allocated in,
 // which has room for the rest of what serving it takes.
-func parseRequestHead(head []byte) (*stdhttp.Request, *requestBlock, error) {
-	if block := parseSimpleRequestHead(head); block != nil {
+func parseRequestHead(head []byte, reuse reuseOptions) (*stdhttp.Request, *requestBlock, error) {
+	if block := parseSimpleRequestHead(head, reuse); block != nil {
 		return &block.request, block, nil
 	}
 	req, _, err := readRequest(head, false)
@@ -42,9 +43,70 @@ type requestBlock struct {
 	values [4]string
 	// body is the request's body when it arrived whole.
 	body wholeBody
+	// pooled records that the block came from blockPool, and headerFromPool
+	// and urlFromPool are the request's Header and URL when they came from
+	// pools of their own; see Config.ReuseRequests.
+	pooled         bool
+	headerFromPool *pooledHeader
+	urlFromPool    *url.URL
 	// blockServerState is what only a server serves the request with, which
 	// is built only on the platforms that have one.
 	blockServerState
+}
+
+// reuseOptions is which of a request's objects are recycled; see
+// Config.ReuseRequests.
+type reuseOptions struct{ requests, headers, urls bool }
+
+// The pools the Reuse options recycle through. An object a request does not
+// share a lifetime with — a URL that is recycled on a request that is not, or
+// the other way round — cannot live in the request's block, and has a pool or
+// an allocation of its own.
+var (
+	blockPool  = sync.Pool{New: func() any { return &requestBlock{pooled: true} }}
+	headerPool = sync.Pool{New: func() any { return &pooledHeader{header: make(stdhttp.Header)} }}
+	urlPool    = sync.Pool{New: func() any { return new(url.URL) }}
+)
+
+// pooledHeader is a recycled Header, with room for its values.
+type pooledHeader struct {
+	header stdhttp.Header
+	values [8]string
+}
+
+// newRequestBlock takes the block a request is parsed into.
+func newRequestBlock(reuse reuseOptions) *requestBlock {
+	if reuse.requests {
+		return blockPool.Get().(*requestBlock)
+	}
+	return new(requestBlock)
+}
+
+// recycle gives back what the request took from the pools, once its response
+// is finished and the server has done with it, and reports whether the block
+// itself went back, which takes with it whatever it holds.
+func (b *requestBlock) recycle() bool {
+	if h := b.headerFromPool; h != nil {
+		b.headerFromPool = nil
+		clear(h.header)
+		clear(h.values[:])
+		headerPool.Put(h)
+	}
+	if u := b.urlFromPool; u != nil {
+		b.urlFromPool = nil
+		*u = url.URL{}
+		urlPool.Put(u)
+	}
+	if !b.pooled {
+		return false
+	}
+	b.request = stdhttp.Request{}
+	b.url = url.URL{}
+	b.values = [len(b.values)]string{}
+	b.body = wholeBody{}
+	b.recycleServerState()
+	blockPool.Put(b)
+	return true
 }
 
 // maxSimpleHeaderFields bounds the header parseSimpleRequestHead takes on,
@@ -54,7 +116,7 @@ const maxSimpleHeaderFields = 64
 
 // parseSimpleRequestHead parses head if it is in the shape parseRequestHead
 // describes, and returns nil otherwise.
-func parseSimpleRequestHead(head []byte) *requestBlock {
+func parseSimpleRequestHead(head []byte, reuse reuseOptions) *requestBlock {
 	lineEnd := bytes.IndexByte(head, '\n')
 	if lineEnd < 1 || head[lineEnd-1] != '\r' {
 		return nil
@@ -90,13 +152,24 @@ func parseSimpleRequestHead(head []byte) *requestBlock {
 		return nil
 	}
 
-	block := new(requestBlock)
+	block := newRequestBlock(reuse)
 	req := &block.request
 	// One string for everything the request keeps of head: its target and
 	// every field's key and value are slices of it.
 	text := string(head)
 	target := text[targetStart:targetEnd]
 	u := &block.url
+	switch {
+	case reuse.urls == reuse.requests:
+		// The URL lives, and is recycled or not, with the block.
+	case reuse.urls:
+		u = urlPool.Get().(*url.URL)
+		block.urlFromPool = u
+	default:
+		// The block is recycled and the URL is not, so a handler may keep
+		// it past the request the block goes on to hold.
+		u = new(url.URL)
+	}
 	// As url.ParseRequestURI splits a request target: a lone trailing '?'
 	// forces an empty query, and otherwise the query starts at the first.
 	if strings.HasSuffix(target, "?") && strings.Count(target, "?") == 1 {
@@ -107,8 +180,20 @@ func parseSimpleRequestHead(head []byte) *requestBlock {
 
 	// A map this small is allocated on its first insert whatever it is
 	// sized for, so there is no count to take first.
-	header := make(stdhttp.Header)
+	var header stdhttp.Header
 	values := block.values[:]
+	switch {
+	case reuse.headers:
+		pooled := headerPool.Get().(*pooledHeader)
+		block.headerFromPool = pooled
+		header, values = pooled.header, pooled.values[:]
+	case reuse.requests:
+		// A header that is not recycled cannot keep its values in a block
+		// that is, since a handler may keep the header past the request.
+		header, values = make(stdhttp.Header), nil
+	default:
+		header = make(stdhttp.Header)
+	}
 	// The fields net/http gives a meaning are noticed on the way past, so
 	// that the map is not searched for each of them afterwards.
 	var sawHost, sawLength, sawConnection, sawPragma bool
