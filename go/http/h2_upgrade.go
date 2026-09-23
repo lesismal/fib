@@ -90,7 +90,7 @@ func (h *ServerHandler) upgradeH2C(c *fib.Connection, parser *Parser, request *s
 // ignoring case.
 func headerHasToken(header stdhttp.Header, key, token string) bool {
 	for _, value := range header[key] {
-		for _, item := range strings.Split(value, ",") {
+		for item := range strings.SplitSeq(value, ",") {
 			if strings.EqualFold(strings.TrimSpace(item), token) {
 				return true
 			}

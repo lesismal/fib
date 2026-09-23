@@ -14,6 +14,7 @@ import (
 	"time"
 
 	fib "github.com/lesismal/fib/go"
+	"github.com/lesismal/fib/go/bufferpool"
 )
 
 // ErrResponseWritten is what writing to a response returns once the response
@@ -139,8 +140,14 @@ func (c *Context) Write(p []byte) (int, error) {
 	if c.Request.Method == stdhttp.MethodHead || len(p) == 0 {
 		return len(p), nil
 	}
-	if !c.isHTTP1() || !w.committed && len(w.buf)+len(p) <= writerBufferSize {
+	if !c.isHTTP1() {
 		w.buf = append(w.buf, p...)
+		return len(p), nil
+	}
+	if !w.committed && len(w.buf)+len(p) <= writerBufferSize {
+		// Held back in a pooled buffer, which commit gives back once the
+		// header has gone out with it.
+		w.buf = bufferpool.Append(w.buf, p)
 		return len(p), nil
 	}
 	if !w.committed {
@@ -324,9 +331,13 @@ func (c *Context) commit(final bool) error {
 		// HTTP/1.0 has no chunks: the body runs until the connection closes.
 		head.close = true
 	}
-	out := make([]byte, 0, 256+len(w.buf))
-	out, err := appendResponseHead(out, req, head)
+	// The header and whatever body was held back go out together, built in a
+	// pooled buffer that Send copies from, since the round's send buffer is
+	// where they end up either way.
+	pooled := bufferpool.Get(headCapacity(w.sent) + len(w.buf) + 32)
+	out, err := appendResponseHead(pooled[:0], req, head)
 	if err != nil {
+		bufferpool.Put(pooled)
 		return err
 	}
 	w.committed = true
@@ -340,8 +351,11 @@ func (c *Context) commit(final bool) error {
 			out = append(out, w.buf...)
 		}
 	}
+	bufferpool.Put(w.buf)
 	w.buf = nil
-	if err := c.Conn.SendOwned(out); err != nil {
+	err = c.Conn.Send(out)
+	bufferpool.Put(out)
+	if err != nil {
 		return err
 	}
 	if final {
@@ -360,7 +374,10 @@ func (c *Context) sendBody(p []byte) error {
 	if !c.w.chunked {
 		return c.Conn.Send(p)
 	}
-	return c.Conn.SendOwned(appendChunk(make([]byte, 0, len(p)+20), p))
+	out := appendChunk(bufferpool.Get(len(p) + 20)[:0], p)
+	err := c.Conn.Send(out)
+	bufferpool.Put(out)
+	return err
 }
 
 func appendChunk(out, p []byte) []byte {
@@ -487,6 +504,9 @@ type responseHead struct {
 	chunked       bool
 	trailers      []string
 	close         bool
+	// contentType, when it is not empty, is a Content-Type field header
+	// does not hold.
+	contentType string
 }
 
 // appendResponseHead appends the status line and header of an HTTP/1
@@ -538,6 +558,17 @@ func appendResponseHead(out []byte, req *stdhttp.Request, head responseHead) ([]
 		out = append(out, connection...)
 		out = append(out, crlf...)
 	}
+	if head.contentType != "" {
+		if !validHeaderValue(head.contentType) {
+			return nil, errors.New("http: invalid response header value")
+		}
+		out = append(out, "Content-Type: "...)
+		out = append(out, head.contentType...)
+		out = append(out, crlf...)
+	}
+	if len(head.header) == 0 {
+		return append(out, crlf...), nil
+	}
 	out, err := appendHeaderLines(out, head.header, func(key string) bool {
 		switch {
 		case strings.EqualFold(key, "Content-Length"), strings.EqualFold(key, "Transfer-Encoding"),
@@ -555,26 +586,68 @@ func appendResponseHead(out []byte, req *stdhttp.Request, head responseHead) ([]
 }
 
 // cachedDate is the Date header value for one second, formatted once.
-type cachedDate struct {
-	second int64
-	value  []byte
+type cachedDate struct{ value []byte }
+
+func newCachedDate(now time.Time) *cachedDate {
+	return &cachedDate{value: now.UTC().AppendFormat(nil, stdhttp.TimeFormat)}
 }
 
-var dateCache atomic.Pointer[cachedDate]
+// The Date every response carries comes from a clock of its own: a goroutine
+// that wakes at each second boundary and formats the new second into
+// dateClock, so that a response reads the value rather than the time. Reading
+// the time for every response cost more than the rest of its head together.
+//
+// The clock runs only while responses are being written. dateUsed records
+// that one was written since the clock last ticked, and a clock that ticks
+// twice without one stops, clearing dateClock; the next response starts it
+// again, and until it has, formats the time it reads itself.
+var (
+	dateClock   atomic.Pointer[cachedDate]
+	dateRunning atomic.Bool
+	dateUsed    atomic.Bool
+)
 
 // appendDate appends a Date header for now, which RFC 9110 section 6.6.1 asks
 // an origin server with a clock to send.
 func appendDate(out []byte) []byte {
-	now := time.Now()
-	second := now.Unix()
-	date := dateCache.Load()
-	if date == nil || date.second != second {
-		date = &cachedDate{second: second, value: now.UTC().AppendFormat(nil, stdhttp.TimeFormat)}
-		dateCache.Store(date)
+	date := dateClock.Load()
+	if date == nil {
+		date = startDateClock()
+	}
+	// A store only when the flag changes, since every response on every
+	// core passes here and the line it sits on is shared.
+	if !dateUsed.Load() {
+		dateUsed.Store(true)
 	}
 	out = append(out, "Date: "...)
 	out = append(out, date.value...)
 	return append(out, crlf...)
+}
+
+// startDateClock starts the clock if it is not running, and returns the date
+// for now.
+func startDateClock() *cachedDate {
+	date := newCachedDate(time.Now())
+	if dateRunning.CompareAndSwap(false, true) {
+		dateClock.Store(date)
+		go runDateClock()
+	}
+	return date
+}
+
+func runDateClock() {
+	for idle := 0; idle < 2; {
+		now := time.Now()
+		time.Sleep(time.Second - time.Duration(now.Nanosecond()))
+		if dateUsed.Swap(false) {
+			idle = 0
+		} else {
+			idle++
+		}
+		dateClock.Store(newCachedDate(time.Now()))
+	}
+	dateClock.Store(nil)
+	dateRunning.Store(false)
 }
 
 var (

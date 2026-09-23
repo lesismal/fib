@@ -123,6 +123,11 @@ func(c *fibhttp.Context, r *http.Request) {
 `*BodyStream` 的形式出现在 `Request.Body` 里。`Context.RequestBody()` 返回它，body
 已经收全时返回 nil。小于阈值的 body 行为不变：整体缓存，其余一切照旧。
 
+整体缓存的 body 放在池化缓冲里，响应结束时由 server 收回：handler 返回时，或者被
+Retain 的请求最后一次 Release 时。`net/http` 也是在这个时刻关闭请求 body 的。之后再读
+会返回 `ErrBodyReleased`；handler 如果之后还要用这些字节，应自己保留一份副本（比如
+`io.ReadAll` 得到的结果）。
+
 **读取不阻塞。** handler 和别的 handler 一样跑在连接的 worker 上，而 worker 去等对端
 就是在等自己，所以 `Read` 只给出已经到达的部分：
 

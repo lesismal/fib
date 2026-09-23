@@ -87,6 +87,9 @@ type Context struct {
 	// holds up nothing else.
 	server *ServerHandler
 	parser *Parser
+	// whole is the request's body when it arrived whole, whose buffer goes
+	// back to the pool once the response is finished.
+	whole *wholeBody
 }
 
 // Stream answers a request that arrived over a protocol served outside this
@@ -119,6 +122,14 @@ func (c *Context) RequestBody() *BodyStream {
 func (c *Context) Respond(status int, contentType string, body []byte) error {
 	if contentType == "" {
 		return c.WriteResponse(Response{StatusCode: status, Body: body})
+	}
+	if c.isHTTP1() {
+		// HTTP/1 writes the one field straight into the response's head,
+		// without a header map to build and walk.
+		if c.w != nil && c.w.status != 0 {
+			return ErrResponseWritten
+		}
+		return c.writeHTTP1(Response{StatusCode: status, Body: body}, contentType)
 	}
 	// Every path a response takes — HTTP/1's marshalResponse, HTTP/2's
 	// encoder, an external stream's — has read the header by the time it
@@ -172,20 +183,21 @@ func (c *Context) writeResponse(response Response) error {
 		c.wrote = true
 		return nil
 	}
-	closeConnection := response.Close || c.Request.Close || headerHasToken(response.Header, "Connection", "close")
-	data, err := marshalResponse(c.Request, response, closeConnection)
-	if err != nil {
-		return err
+	return c.writeHTTP1(response, "")
+}
+
+// writeHTTP1 is writeResponse for HTTP/1. contentType, when it is not empty,
+// is sent as a Content-Type field besides those of response.Header, which
+// then has none of its own.
+func (c *Context) writeHTTP1(response Response, contentType string) error {
+	if c.wrote {
+		return ErrResponseWritten
 	}
-	// The array goes to the connection rather than being copied into its
-	// send buffer, and is deliberately not a pooled one. A buffer from the
-	// pool would have to be sent rather than handed over so that it could
-	// come back, and a reply the socket cannot take at once is then copied
-	// into a send buffer sized for a whole read round: answering one small
-	// request would take a 32KB buffer out of the pool to hold 130 bytes.
-	// Measured at one connection per core that cost 78% of the round trip,
-	// which is far more than the allocation it saves.
-	if err = c.Conn.SendOwned(data); err != nil {
+	if response.StatusCode == 0 {
+		response.StatusCode = stdhttp.StatusOK
+	}
+	closeConnection := response.Close || c.Request.Close || headerHasToken(response.Header, "Connection", "close")
+	if err := c.sendResponse(response, contentType, closeConnection); err != nil {
 		return err
 	}
 	c.wrote = true
@@ -398,6 +410,11 @@ func (h *ServerHandler) drive(c *fib.Connection, parser *Parser, data []byte) {
 	// Whatever this round leaves the connection waiting for decides which
 	// timeout bounds it.
 	defer h.armRead(c, parser)
+	// The requests are parsed straight out of data, which is the
+	// connection's until the round ends; whatever is left of it is copied
+	// before then. Deferred after armRead so that it runs first, and the
+	// timeout is chosen by what the parser really holds.
+	defer parser.own()
 	if !parser.sniffed {
 		if h.config.DisableHTTP2 {
 			parser.sniffed = true
@@ -437,12 +454,12 @@ func (h *ServerHandler) drive(c *fib.Connection, parser *Parser, data []byte) {
 			// A request is still being answered: one whose handler retained
 			// it. Keep what arrives; the release that writes its response
 			// drives the connection on from here.
-			parser.buffer = append(parser.buffer, data...)
+			parser.appendBuffer(data)
 			return
 		}
 		var request *stdhttp.Request
 		var complete bool
-		request, complete, err = parser.FeedOne(data)
+		request, complete, err = parser.feedBorrowed(data)
 		if err != nil || !complete {
 			break
 		}
@@ -456,7 +473,15 @@ func (h *ServerHandler) drive(c *fib.Connection, parser *Parser, data []byte) {
 			h.upgradeH2C(c, parser, request, settings)
 			return
 		}
-		context := &Context{Conn: c, Request: request, server: h, parser: parser}
+		var context *Context
+		if block := parser.block; block != nil && &block.request == request {
+			context = &block.context
+		} else {
+			context = new(Context)
+		}
+		parser.block = nil
+		context.Conn, context.Request, context.server, context.parser = c, request, h, parser
+		context.whole, _ = request.Body.(*wholeBody)
 		// Nothing behind this request is served until its response is
 		// written, so that pipelined responses keep their order, and the
 		// connection knows which request to cancel if it closes first.
@@ -529,6 +554,11 @@ func (h *ServerHandler) endRequestLocked(context *Context) bool {
 	tooMuchLeft := false
 	if stream := context.RequestBody(); stream != nil {
 		tooMuchLeft = stream.abandon()
+	}
+	if context.whole != nil {
+		// The response is finished, and with it the handler's use of the
+		// body, whose buffer is the next request's.
+		context.whole.release()
 	}
 	closing := tooMuchLeft || context.closing || context.Request.Close
 	if closing {
@@ -646,7 +676,7 @@ func checkRequest(request *stdhttp.Request) int {
 // Config.HTTP2Only is set, is HTTP/2 whatever it sends: what does not start
 // with the preface is a connection error rather than an HTTP/1 request.
 func (h *ServerHandler) sniff(c *fib.Connection, parser *Parser, data []byte) []byte {
-	parser.buffer = append(parser.buffer, data...)
+	parser.appendBuffer(data)
 	state := h.tlsState(c, parser)
 	if h.config.HTTP2Only || state != nil && state.NegotiatedProtocol == "h2" {
 		h.startH2(c, parser, state)
@@ -718,14 +748,90 @@ func (h *ServerHandler) OnClose(c *fib.Connection, err error) {
 	c.SetAttachment(nil)
 }
 
+// sendResponse writes a whole HTTP/1 response to the connection.
+//
+// The head is built in a pooled buffer and goes to the connection with the
+// body through SendParts, which copies only what the socket does not take at
+// once. A response written from inside a read round, which is where nearly
+// every one is written, is corked, so both parts are copied into the round's
+// send buffer behind the responses before it and reach the socket with them
+// in one write: answering a request allocates nothing for its response, and
+// the round's replies share one buffer that goes back to the pool once they
+// are sent, rather than each holding an array of its own until then.
+//
+// A chunked response, which carries trailers, is rare enough to be built
+// whole instead.
+func (c *Context) sendResponse(response Response, contentType string, closeConnection bool) error {
+	framing, body, trailer := responseFraming(c.Request, response, closeConnection)
+	framing.contentType = contentType
+	if framing.chunked {
+		data, err := marshalChunked(c.Request, framing, body, trailer)
+		if err != nil {
+			return err
+		}
+		return c.Conn.SendOwned(data)
+	}
+	pooled := bufferpool.Get(headCapacity(response.Header) + len(contentType))
+	head, err := appendResponseHead(pooled[:0], c.Request, framing)
+	if err == nil {
+		err = c.Conn.SendParts(head, body)
+		pooled = head
+	}
+	bufferpool.Put(pooled)
+	return err
+}
+
 // marshalResponse builds a whole response into one array, which it hands to
 // the caller to give to the connection.
 func marshalResponse(request *stdhttp.Request, response Response, closeConnection bool) ([]byte, error) {
+	framing, body, trailer := responseFraming(request, response, closeConnection)
+	if framing.chunked {
+		return marshalChunked(request, framing, body, trailer)
+	}
+	out, err := appendResponseHead(make([]byte, 0, len(body)+headCapacity(response.Header)), request, framing)
+	if err != nil {
+		return nil, err
+	}
+	return append(out, body...), nil
+}
+
+// headCapacity is room enough for the head of a response with header in
+// nearly every case: its fields, and the status line, Date and framing
+// fields the server adds.
+func headCapacity(header stdhttp.Header) int {
+	capacity := 128
+	for key, values := range header {
+		capacity += len(key) + 4
+		for _, value := range values {
+			capacity += len(value) + 2
+		}
+	}
+	return capacity
+}
+
+// marshalChunked builds a chunked response, which ends with trailer.
+func marshalChunked(request *stdhttp.Request, framing responseHead, body []byte, trailer stdhttp.Header) ([]byte, error) {
+	out, err := appendResponseHead(make([]byte, 0, len(body)+headCapacity(framing.header)+32), request, framing)
+	if err != nil {
+		return nil, err
+	}
+	if len(body) > 0 {
+		out = appendChunk(out, body)
+	}
+	out = append(out, "0\r\n"...)
+	if out, err = appendHeaderLines(out, trailer, nil); err != nil {
+		return nil, err
+	}
+	return append(out, crlf...), nil
+}
+
+// responseFraming works out how an HTTP/1 response to request is framed,
+// which part of its body is sent, and for a chunked one, its trailer.
+func responseFraming(request *stdhttp.Request, response Response, closeConnection bool) (framing responseHead, body []byte, trailer stdhttp.Header) {
 	status := response.StatusCode
-	framing := responseHead{status: status, header: response.Header, contentLength: -1, close: closeConnection}
+	framing = responseHead{status: status, header: response.Header, contentLength: -1, close: closeConnection}
 	hasBody := statusHasBody(status)
 	isHead := request.Method == stdhttp.MethodHead
-	var trailer stdhttp.Header
 	switch {
 	case status == stdhttp.StatusNotModified:
 		// A 304 may repeat the length of what it stands for, and only a
@@ -752,31 +858,10 @@ func marshalResponse(request *stdhttp.Request, response Response, closeConnectio
 	default:
 		framing.contentLength = int64(len(response.Body))
 	}
-	capacity := len(response.Body) + 128
-	for key, values := range response.Header {
-		capacity += len(key) + 4
-		for _, value := range values {
-			capacity += len(value) + 2
-		}
-	}
-	out, err := appendResponseHead(make([]byte, 0, capacity), request, framing)
-	if err != nil {
-		return nil, err
-	}
 	if isHead || !hasBody {
-		return out, nil
+		return framing, nil, trailer
 	}
-	if !framing.chunked {
-		return append(out, response.Body...), nil
-	}
-	if len(response.Body) > 0 {
-		out = appendChunk(out, response.Body)
-	}
-	out = append(out, "0\r\n"...)
-	if out, err = appendHeaderLines(out, trailer, nil); err != nil {
-		return nil, err
-	}
-	return append(out, crlf...), nil
+	return framing, response.Body, trailer
 }
 
 // declaredLength is the Content-Length header holds, or -1.
@@ -792,7 +877,9 @@ func declaredLength(header stdhttp.Header) int64 {
 // appendHeaderLines appends header as HTTP/1 lines in key order, leaving out
 // the keys skip reports.
 func appendHeaderLines(out []byte, header stdhttp.Header, skip func(string) bool) ([]byte, error) {
-	keys := make([]string, 0, len(header))
+	// Room on the stack for the keys of any ordinary header.
+	var stack [16]string
+	keys := stack[:0]
 	for key := range header {
 		if skip == nil || !skip(key) {
 			keys = append(keys, key)

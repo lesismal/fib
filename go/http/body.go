@@ -12,6 +12,7 @@ import (
 	"sync"
 
 	fib "github.com/lesismal/fib/go"
+	"github.com/lesismal/fib/go/bufferpool"
 )
 
 // ErrBodyAbandoned is what a streamed body reports to a reader that comes back
@@ -582,4 +583,80 @@ func (d *chunkedDecoder) decode(dst, src []byte) (out []byte, used int, trailer 
 			return dst, used + at + 4, rest[:at+4], true, nil
 		}
 	}
+}
+
+// ErrBodyReleased is what the body of a request that arrived whole reports
+// to a reader that comes back to it after the response was finished, by
+// which point the server has taken its buffer back.
+var ErrBodyReleased = errors.New("http: read of a request body after its response was finished")
+
+// wholeBody is the Body of a request that arrived whole before its handler
+// ran. Its bytes are in a pooled buffer, which goes back to the pool once the
+// response is finished, as net/http closes a request's body once its handler
+// is done: a handler reads the body while it answers the request, or, if it
+// retained the request, until it releases it, and a read after that reports
+// ErrBodyReleased. Close does nothing, so a handler that closes the body may
+// still read it until then.
+type wholeBody struct {
+	data []byte
+	read int
+	// pooled says data came from the pool, and released that it has gone
+	// back there.
+	pooled   bool
+	released bool
+}
+
+// fill copies data into a pooled buffer for the body to read.
+func (b *wholeBody) fill(data []byte) {
+	b.data = bufferpool.Get(len(data))
+	copy(b.data, data)
+	b.pooled = true
+}
+
+func (b *wholeBody) Read(p []byte) (int, error) {
+	if b.released {
+		return 0, ErrBodyReleased
+	}
+	if b.read >= len(b.data) {
+		return 0, io.EOF
+	}
+	n := copy(p, b.data[b.read:])
+	b.read += n
+	return n, nil
+}
+
+// WriteTo hands what is left of the body to w in one write, which is what
+// io.Copy and io.ReadAll's callers would otherwise do a piece at a time.
+func (b *wholeBody) WriteTo(w io.Writer) (int64, error) {
+	if b.released {
+		return 0, ErrBodyReleased
+	}
+	if b.read >= len(b.data) {
+		return 0, nil
+	}
+	n, err := w.Write(b.data[b.read:])
+	b.read += n
+	return int64(n), err
+}
+
+// Len is how much of the body has not been read yet.
+func (b *wholeBody) Len() int {
+	if b.released {
+		return 0
+	}
+	return len(b.data) - b.read
+}
+
+func (b *wholeBody) Close() error { return nil }
+
+// release takes the buffer back once the response is finished.
+func (b *wholeBody) release() {
+	if b.released {
+		return
+	}
+	b.released = true
+	if b.pooled {
+		bufferpool.Put(b.data)
+	}
+	b.data = nil
 }

@@ -18,6 +18,12 @@ type serverState struct {
 
 func (p *Parser) resetServerState() { p.liveContext.Store(nil) }
 
+// blockServerState is the part of a requestBlock a server serves the request
+// with: the Context it is answered through.
+type blockServerState struct {
+	context Context
+}
+
 // A Context's response is held open by a reference count. Serving a request
 // takes one hold, which the handler's return gives back, so a handler that
 // answers and returns needs none of this. A handler that answers later takes
@@ -166,10 +172,17 @@ func (c *Context) OnBody(fn BodyFunc) {
 		stream.setSink(c.deliverBody)
 		return
 	}
-	// The body was read whole before the handler ran, so it is all here.
+	// The body was read whole before the handler ran, so it is all here. The
+	// callback may keep none of it past its call, so a body still in the
+	// server's buffer is handed over from there rather than copied out.
 	var data []byte
-	if c.Request.Body != nil {
+	if whole, ok := c.Request.Body.(*wholeBody); ok && !whole.released {
+		data = whole.data[whole.read:]
+		whole.read = len(whole.data)
+	} else if c.Request.Body != nil {
 		data, _ = io.ReadAll(c.Request.Body)
+	}
+	if c.Request.Body != nil {
 		c.Request.Body = emptyBody()
 	}
 	c.deliverBody(data, true, nil)

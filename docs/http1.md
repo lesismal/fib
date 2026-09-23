@@ -146,6 +146,12 @@ as a `*BodyStream` in `Request.Body`. `Context.RequestBody()` returns it, or
 nil for a body that was read whole. A body under the threshold is unaffected:
 buffered whole, nothing else changed.
 
+A body read whole sits in a pooled buffer, which the server takes back once
+the response is finished: when the handler returns, or when the last hold on a
+retained request is released. That is the point at which `net/http` closes a
+request's body too. Reading it afterwards returns `ErrBodyReleased`; a handler
+that needs the bytes later keeps a copy of them, as `io.ReadAll` makes.
+
 **Reading it never waits.** The handler runs on the connection's worker like
 any other, and a worker that waited for the peer would be waiting on itself,
 so `Read` answers with what has arrived:

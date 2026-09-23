@@ -7,3 +7,6 @@ package http
 type serverState struct{}
 
 func (p *Parser) resetServerState() {}
+
+// blockServerState is empty here too, for the same reason.
+type blockServerState struct{}

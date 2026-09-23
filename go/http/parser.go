@@ -136,8 +136,28 @@ func DefaultConfig() Config {
 
 // Parser incrementally turns arbitrary TCP chunks into complete HTTP requests.
 type Parser struct {
-	config     Config
-	buffer     []byte
+	config Config
+	// buffer is what has arrived and not been parsed yet. It is a window on
+	// base, the pooled array the parser received it into: consuming a request
+	// moves the window's start rather than copying what follows it to the
+	// front, so that a read carrying many pipelined requests is copied once
+	// rather than once per request. When borrowed is set, buffer is instead a
+	// window on the bytes the connection is delivering, which are only valid
+	// until the read round ends; own copies what is left of them before then.
+	// An empty buffer holds no array at all, so that an idle connection keeps
+	// none.
+	buffer []byte
+	// block is where the request FeedOne returned last was allocated, when
+	// the simple parser took it, for the server handler to take the rest of
+	// what serving it needs from.
+	block *requestBlock
+	// base is always the whole array, len and cap alike.
+	base     []byte
+	borrowed bool
+	// awaiting is the frame of a request whose header has been parsed and
+	// whose body is still arriving, so that the header is parsed once rather
+	// than again on every read until the body is complete.
+	awaiting   frameInfo
 	headerScan int
 	// conn is the connection being parsed, which a streamed body reads from
 	// and holds back; the server handler fills it in. remoteAddr is the
@@ -191,6 +211,8 @@ type frameInfo struct {
 	// headerEnd and the body that follows is delivered as it arrives.
 	stream  bool
 	request *stdhttp.Request
+	// block is where request was allocated, when the simple parser took it.
+	block *requestBlock
 }
 
 func NewParser(config Config) *Parser {
@@ -209,8 +231,7 @@ func NewParser(config Config) *Parser {
 func (p *Parser) Reset() {
 	// The parser is about to serve another connection, so its buffer belongs
 	// back in the pool rather than attached to it through the wait in between.
-	bufferpool.Put(p.buffer)
-	p.buffer = nil
+	p.discard()
 	p.headerScan = 0
 	p.continued, p.wantContinue = false, false
 	p.stream, p.busy, p.spent = nil, false, false
@@ -248,11 +269,29 @@ func (p *Parser) Feed(data []byte) ([]*stdhttp.Request, error) {
 // body rather than another request, so FeedOne buffers them and returns
 // nothing; only the server handler, which feeds the body, goes on from there.
 func (p *Parser) FeedOne(data []byte) (*stdhttp.Request, bool, error) {
+	p.appendBuffer(data)
+	return p.feedOne()
+}
+
+// feedBorrowed is FeedOne for the server handler, which parses the bytes a
+// read round delivers where they are rather than copying them into the
+// parser's own buffer first: only what is left of them once the round's
+// requests are parsed is copied, by own, which the caller runs before the
+// round ends.
+func (p *Parser) feedBorrowed(data []byte) (*stdhttp.Request, bool, error) {
+	if len(p.buffer) == 0 && len(data) > 0 {
+		p.discard()
+		p.buffer, p.borrowed = data, true
+	} else {
+		p.appendBuffer(data)
+	}
+	return p.feedOne()
+}
+
+func (p *Parser) feedOne() (*stdhttp.Request, bool, error) {
 	if p.stream != nil {
-		p.buffer = bufferpool.Append(p.buffer, data)
 		return nil, false, nil
 	}
-	p.buffer = bufferpool.Append(p.buffer, data)
 	frame, complete, err := p.frameLength()
 	if err != nil {
 		p.discard()
@@ -276,6 +315,7 @@ func (p *Parser) FeedOne(data []byte) (*stdhttp.Request, bool, error) {
 		p.stream = newBodyStream(p.conn, req, p.config, decoder, wantContinue)
 		p.live.Store(p.stream)
 		req.Body = p.stream
+		p.block = frame.block
 		return req, true, nil
 	}
 	if frame.chunked {
@@ -301,13 +341,20 @@ func (p *Parser) FeedOne(data []byte) (*stdhttp.Request, bool, error) {
 			}
 			return nil, false, fmt.Errorf("%w: %v", ErrMalformed, readErr)
 		}
-		req.Body = io.NopCloser(bytes.NewReader(body))
+		req.Body = &wholeBody{data: body}
 	} else if req.ContentLength > 0 {
-		body := append([]byte(nil), p.buffer[frame.headerEnd:frame.end]...)
-		req.Body = io.NopCloser(bytes.NewReader(body))
+		var body *wholeBody
+		if frame.block != nil {
+			body = &frame.block.body
+		} else {
+			body = new(wholeBody)
+		}
+		body.fill(p.buffer[frame.headerEnd:frame.end])
+		req.Body = body
 	}
 	p.consume(frame.end)
 	p.requestEnded()
+	p.block = frame.block
 	return req, true, nil
 }
 
@@ -357,10 +404,10 @@ func (p *Parser) pumpBody(data []byte) (bool, error) {
 	stream := p.stream
 	if len(p.buffer) == 0 {
 		used, done, err := stream.absorb(data)
-		p.buffer = append(p.buffer, data[used:]...)
+		p.appendBuffer(data[used:])
 		return p.bodyEnded(done, err)
 	}
-	p.buffer = bufferpool.Append(p.buffer, data)
+	p.appendBuffer(data)
 	used, done, err := stream.absorb(p.buffer)
 	if used > 0 {
 		p.consume(used)
@@ -385,40 +432,94 @@ func (p *Parser) bodyEnded(done bool, err error) (bool, error) {
 }
 
 // TakeBuffered returns and clears bytes read beyond the last parsed request.
+// The array it returns starts with them, so that the caller may hand it back
+// to the buffer pool once it is done with them.
 func (p *Parser) TakeBuffered() []byte {
+	p.own()
 	data := p.buffer
-	p.buffer = nil
+	if len(data) > 0 && cap(data) != cap(p.base) {
+		// The window has moved up its array; bring it back to the front.
+		data = p.base[:copy(p.base, data)]
+	}
+	p.buffer, p.base = nil, nil
+	p.awaiting = frameInfo{}
 	p.headerScan = 0
 	p.continued, p.wantContinue = false, false
 	return data
 }
 
+// appendBuffer adds data behind what is buffered, in the parser's own array.
+// Room that consuming left at the front of the array is reused before a
+// larger one is taken from the pool.
+func (p *Parser) appendBuffer(data []byte) {
+	if len(data) == 0 {
+		return
+	}
+	p.own()
+	n := len(p.buffer)
+	need := n + len(data)
+	if need <= cap(p.buffer) {
+		p.buffer = append(p.buffer, data...)
+		return
+	}
+	if need <= cap(p.base) {
+		p.buffer = append(p.base[:copy(p.base, p.buffer)], data...)
+		return
+	}
+	grown := bufferpool.Get(need)
+	grown = grown[:cap(grown)]
+	copy(grown, p.buffer)
+	bufferpool.Put(p.base)
+	p.base = grown
+	p.buffer = append(grown[:n], data...)
+}
+
+// own ends a borrow: what is left of the bytes the round delivered is copied
+// into an array of the parser's own, sized to them, since the round's buffer
+// goes back to the connection once it ends.
+func (p *Parser) own() {
+	if !p.borrowed {
+		return
+	}
+	left := p.buffer
+	p.buffer, p.borrowed = nil, false
+	if len(left) > 0 {
+		p.base = bufferpool.Get(len(left))
+		p.base = p.base[:cap(p.base)]
+		p.buffer = p.base[:copy(p.base, left)]
+	}
+}
+
 // discard drops what is buffered, returning the array to the pool. The caller
 // must have established that nothing parsed out of it is still referring to it.
 func (p *Parser) discard() {
-	bufferpool.Put(p.buffer)
-	p.buffer = nil
+	if !p.borrowed {
+		bufferpool.Put(p.base)
+	}
+	p.buffer, p.base, p.borrowed = nil, nil, false
+	p.awaiting = frameInfo{}
 }
 
 func (p *Parser) consume(n int) {
 	if n == len(p.buffer) {
-		if cap(p.buffer) > maxRetainedBuffer {
-			// A large request grew the buffer past what is worth keeping for
-			// the next one on this connection; the pool keeps it instead, in
-			// the class it belongs to.
-			p.discard()
-		} else {
-			p.buffer = p.buffer[:0]
-		}
+		// Nothing is left, so the array goes back to the pool rather than
+		// staying with a connection that may say nothing more for a while.
+		p.discard()
 	} else {
-		copy(p.buffer, p.buffer[n:])
-		p.buffer = p.buffer[:len(p.buffer)-n]
+		p.buffer = p.buffer[n:]
 	}
 	p.headerScan = 0
 	p.continued = false
 }
 
 func (p *Parser) frameLength() (frameInfo, bool, error) {
+	if frame := p.awaiting; frame.request != nil {
+		if frame.end > len(p.buffer) {
+			return frameInfo{}, false, nil
+		}
+		p.awaiting = frameInfo{}
+		return frame, true, nil
+	}
 	headerAt := bytes.Index(p.buffer[p.headerScan:], []byte("\r\n\r\n"))
 	if headerAt < 0 {
 		if len(p.buffer) > p.config.MaxHeaderBytes {
@@ -435,7 +536,7 @@ func (p *Parser) frameLength() (frameInfo, bool, error) {
 	if headerEnd > p.config.MaxHeaderBytes {
 		return frameInfo{}, false, ErrHeaderTooLarge
 	}
-	req, _, err := readRequest(p.buffer[:headerEnd], false)
+	req, block, err := parseRequestHead(p.buffer[:headerEnd])
 	if err != nil {
 		if strings.Contains(err.Error(), "unsupported transfer encoding") {
 			// net/http refuses transfer codings other than chunked, without
@@ -484,23 +585,25 @@ func (p *Parser) frameLength() (frameInfo, bool, error) {
 		return frameInfo{end: end, headerEnd: headerEnd, chunked: true, request: req}, true, nil
 	}
 	if req.ContentLength < 0 {
-		return frameInfo{end: headerEnd, headerEnd: headerEnd, request: req}, true, nil
+		return frameInfo{end: headerEnd, headerEnd: headerEnd, request: req, block: block}, true, nil
 	}
 	if threshold := p.config.StreamRequestBodyThreshold; threshold > 0 && req.ContentLength > threshold {
 		if limit := p.config.MaxStreamedBodyBytes; limit > 0 && req.ContentLength > limit {
 			return frameInfo{}, false, ErrBodyTooLarge
 		}
-		return frameInfo{end: headerEnd, headerEnd: headerEnd, stream: true, request: req}, true, nil
+		return frameInfo{end: headerEnd, headerEnd: headerEnd, stream: true, request: req, block: block}, true, nil
 	}
 	if req.ContentLength > p.config.MaxBodyBytes {
 		return frameInfo{}, false, ErrBodyTooLarge
 	}
 	end64 := int64(headerEnd) + req.ContentLength
+	frame := frameInfo{end: int(end64), headerEnd: headerEnd, request: req, block: block}
 	if end64 > int64(len(p.buffer)) {
 		p.expectContinue(req)
+		p.awaiting = frame
 		return frameInfo{}, false, nil
 	}
-	return frameInfo{end: int(end64), headerEnd: headerEnd, request: req}, true, nil
+	return frame, true, nil
 }
 
 // expectContinue notes a request, complete but for its body, that waits for
