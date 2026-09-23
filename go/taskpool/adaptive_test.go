@@ -1,6 +1,7 @@
 package taskpool
 
 import (
+	"math/rand/v2"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -249,5 +250,74 @@ func TestAdaptiveEachTaskRunsOnceWhileResizing(t *testing.T) {
 	}
 	if got := tp.Workers(); got != 0 {
 		t.Fatalf("Workers() = %d after Stop", got)
+	}
+}
+
+// Submissions of every shape race resizes and a shrink interval short enough
+// to retire workers between them, on queues small enough to fill. Every task
+// must run, none may be left queued behind parked workers, and Stop must
+// return.
+func TestAdaptiveNeverStrandsATask(t *testing.T) {
+	deadline := time.Now().Add(2 * time.Second)
+	for iter := 0; time.Now().Before(deadline); iter++ {
+		rng := rand.New(rand.NewPCG(uint64(iter), 1))
+		ceiling := 1 + rng.IntN(40)
+		tp := NewAdaptive(AdaptiveConfig{MinWorkers: rng.IntN(ceiling + 1), MaxWorkers: ceiling,
+			QueueSize: 1 + rng.IntN(8), ShrinkInterval: time.Millisecond})
+		var ran, want atomic.Int64
+		stopResizing := make(chan struct{})
+		resized := make(chan struct{})
+		go func() {
+			defer close(resized)
+			for i := 0; ; i++ {
+				select {
+				case <-stopResizing:
+					return
+				default:
+				}
+				m := 1 + i%40
+				tp.Resize(i%(m+1), m)
+				time.Sleep(time.Duration(i%200) * time.Microsecond)
+			}
+		}()
+		var producers sync.WaitGroup
+		for g := 0; g < 4; g++ {
+			producers.Add(1)
+			go func(seed uint64) {
+				defer producers.Done()
+				rng := rand.New(rand.NewPCG(seed, 2))
+				for i := 0; i < 200; i++ {
+					block := rng.IntN(10) == 0
+					run := func() {
+						if block {
+							time.Sleep(20 * time.Microsecond)
+						}
+						ran.Add(1)
+					}
+					if rng.IntN(2) == 0 {
+						want.Add(1)
+						tp.Go(run)
+					} else {
+						tasks := make([]Task, 1+rng.IntN(6))
+						for j := range tasks {
+							tasks[j] = taskFunc(run)
+						}
+						want.Add(int64(len(tasks)))
+						tp.GoTasks(tasks)
+					}
+				}
+			}(uint64(iter*4 + g))
+		}
+		producers.Wait()
+		close(stopResizing)
+		<-resized
+		waitFor(t, "every task to run", func() bool { return ran.Load() == want.Load() })
+		stopped := make(chan struct{})
+		go func() { tp.Stop(); close(stopped) }()
+		select {
+		case <-stopped:
+		case <-time.After(5 * time.Second):
+			t.Fatalf("iteration %d: Stop did not return", iter)
+		}
 	}
 }

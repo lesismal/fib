@@ -17,10 +17,10 @@ const (
 	// idle ones linger briefly, and retires them after that. The worker count
 	// is a ceiling rather than a population.
 	ModeElastic
-	// ModeAdaptive parks its workers on a condition variable as ModeCond does,
-	// but grows the population when tasks arrive with no idle worker to take
-	// them and retires workers that stay idle, between a floor and a ceiling
-	// that Resize can move while the pool runs. See NewAdaptive.
+	// ModeAdaptive keeps parked workers as ModeCond does, but grows the
+	// population when tasks arrive to find every worker busy and retires
+	// workers that stay idle, between a floor and a ceiling that Resize can
+	// move while the pool runs. See NewAdaptive.
 	ModeAdaptive
 )
 
@@ -83,14 +83,14 @@ type TaskPool struct {
 }
 
 // New creates a ModeAdaptive pool that grows to maxConcurrent workers under
-// load and retires down to ten workers per P when idle.
+// load and retires down to twenty workers per P when idle.
 func New(maxConcurrent, queueSize int) *TaskPool {
 	return NewWithMode(ModeAdaptive, maxConcurrent, queueSize)
 }
 
 // NewWithMode creates a pool of the given mode. For ModeAdaptive,
-// maxConcurrent is the ceiling and the floor is ten workers per P; NewAdaptive
-// sets both.
+// maxConcurrent is the ceiling and the floor is twenty workers per P;
+// NewAdaptive sets both.
 func NewWithMode(mode Mode, maxConcurrent, queueSize int) *TaskPool {
 	if maxConcurrent <= 0 {
 		panic("taskpool: maxConcurrent must be greater than zero")

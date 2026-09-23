@@ -59,7 +59,7 @@ type PoolSizing struct {
 // elasticMinWorkersPerCPU workers per core, where a fixed floor would hand a
 // two-core machine 5000 workers per core.
 //
-// ModeAdaptive parks its workers the way ModeCond does but grows and shrinks
+// ModeAdaptive keeps parked workers the way ModeCond does but grows and shrinks
 // the population with the load, so its count is a ceiling as under
 // ModeElastic, and it takes the same default. The floor it retires down to is
 // Config.MinWorkerCount.

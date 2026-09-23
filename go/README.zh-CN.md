@@ -16,21 +16,32 @@
   队列，按 worker 数分片）、`taskpool.ModeElastic`（nbio 风格的弹性
   fork/dispatcher）或 `taskpool.ModeAdaptive`（见下，所有后端的默认值，
   `taskpool.New` 也默认使用它）。
-- `taskpool.ModeAdaptive` 同样基于 `sync.Cond`、同样分片，worker 空闲时挂在条件
-  变量上，但常驻数量随负载在下限和上限之间变化：
-  - 扩容：任务入队时没有空闲 worker 可以接手，就新起一个 worker，直到上限。
-    已被唤醒、还没开始跑的 worker 不算空闲，所以一批连发的任务不会都指望同一个
-    worker。
+- `taskpool.ModeAdaptive` 同样分片，但常驻数量随负载在下限和上限之间变化，调度方式
+  也不同：
+  - 唤醒：每个空闲 worker 有自己的唤醒通道，按后进先出压在空闲栈上，被唤醒的总是
+    最近停下、栈和缓存都还热的那个。唤醒的对象是"队列"而不是"某个任务"：到达队列的
+    worker 会一直取任务直到取空。每个分片最多保持 2 个"已唤醒、尚未到达队列"的
+    worker；worker 取走一个任务后如果还剩下比正在赶来的更多的任务，就再叫醒下一个。
+    于是任务阻塞时 worker 逐跳扇出，任务很短时已经在跑的 worker 就能消化，不必为
+    一批 n 个任务付出 n 次唤醒（ModeCond 的做法，在繁忙服务器上这部分调度开销占了
+    池的大部分 CPU）。
+  - 扩容：只有当所有 worker 都在忙、且没有正在赶来的 worker 时才新起一个，直到上限。
+    已被唤醒、还没开始跑的 worker 算作"正在赶来"，所以一批连发的任务按实际忙起来的
+    worker 数扩容，而不是一个任务一个。
+  - 取任务不加锁：队列是一个生产者（持分片锁提交）、多个消费者（worker 用 CAS 取）
+    的有界环形队列，繁忙分片里的 worker 不会互相排队抢锁；锁只保护提交、空闲栈和
+    队列满时的等待。
   - 缩容：后台每隔 `ShrinkInterval`（默认 1 秒）看一次上个周期里**最少**有几个
-    worker 空闲，这些 worker 整个周期都没用上，退掉其中一半，但不低于下限。按一半
+    worker 空闲，这些 worker 整个周期都没用上（就是空闲栈底部那些），从栈底退掉其中
+    一半，但不低于下限。按一半
     退是为了突发过后分几个周期逐步回落，而不是把下一次突发要用的 worker 一次退光。
   - 运行中可以用 `TaskPool.Resize(min, max)` 调整上下限：调高下限立即补足 worker；
     调低上限时，空闲 worker 立即退出，忙碌的在手头任务完成后退出。
     `TaskPool.Workers()` 返回当前 worker 数（其他 Mode 调 `Resize` 返回 false）。
   - 直接使用：`taskpool.NewAdaptive(taskpool.AdaptiveConfig{MinWorkers: 16,
     MaxWorkers: 4096, QueueSize: 10000})`；`NewWithMode(ModeAdaptive, max, queue)`
-    的下限默认为每个 P 十个 worker。在 fib 里，`WorkerCount` 是上限，
-    `Config.MinWorkerCount` 是下限（0 表示每个 P 十个）。
+    的下限默认为每个 P 二十个 worker。在 fib 里，`WorkerCount` 是上限，
+    `Config.MinWorkerCount` 是下限（0 表示每个 P 二十个）。
 - 池容量按 Mode 分别给默认值，因为 `WorkerCount` 在不同 Mode 下含义不同
   （ModeAdaptive 与 ModeElastic 一样是上限，默认值也相同）：
   ModeCond 会预先创建这么多协程并让它们挂在条件变量上，这个数就是实际存在的
