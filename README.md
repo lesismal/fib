@@ -1,73 +1,110 @@
-# Fast In Balance
+# fib — Fast In Balance
+
+[![CI](https://github.com/lesismal/fib/actions/workflows/ci.yml/badge.svg)](https://github.com/lesismal/fib/actions/workflows/ci.yml)
 
 [English](README.md) | [简体中文](README.zh-CN.md)
 
-A Linux C11 networking library built around one edge-triggered epoll event loop and a logical worker pool. Connections are the scheduling unit: each connection owns an ordered event queue, while any idle worker may execute it without a fixed connection-to-thread binding.
+An event-driven networking library for Go, with a matching C11 implementation. A single
+edge-triggered event loop collects I/O readiness, and each connection is scheduled as one
+task onto a pool of workers: events on a connection run in order, and any idle worker can
+run any connection, so load balances across real work rather than fd counts.
 
-[![Complete architecture and execution flows](docs/assets/architecture-full.en.png)](docs/architecture.html)
+## Features
 
-_Click the complete diagram to open the interactive, bilingual architecture document._
+- **Native backends**: epoll on Linux, kqueue on macOS, IOCP on Windows, and a portable fallback elsewhere
+- **Connection-level scheduling**: per-connection FIFO, no worker affinity, adaptive worker pool
+- **Backpressure**: a per-connection write watermark plus a server-wide pending-bytes budget
+- **Zero-copy paths**: `sendfile`, batched `writev`, pooled buffers
+- **Protocols**: TCP, UDP, Unix sockets, TLS, HTTP/1.x, HTTP/2 (h2 and h2c), HTTP/3 over QUIC, WebSocket
+- **Asynchronous clients**: non-blocking dial, and HTTP/1.x, HTTP/2 and HTTP/3 clients
+- **Middleware**: compress, cors, csrf, etag, limiter, logger, pprof, recover, requestid, responsetime
 
-## Design
-
-- The listening fd is registered with `epoll_event.data.ptr == NULL`. Once accepted, each fd is wrapped in an `epoll_connection`, and subsequent events carry a direct pointer to that object.
-- Every connection owns a mutex, a FIFO event queue, and a pending-send queue.
-- Accepted connections register `EPOLLIN`, `EPOLLPRI`, `EPOLLERR`, `EPOLLHUP`, and `EPOLLRDHUP` in ET mode. The event loop owns event collection, every `epoll_ctl` operation, and final fd closure.
-- A connection is submitted to the worker pool only when its first queued event changes it from idle to scheduled. One worker drains all events for that connection in FIFO order.
-- Connections have no worker affinity. Each scheduling round may be handled by any idle worker, balancing actual task load instead of only fd counts.
-- A single connection is never executed by multiple workers concurrently. The connection mutex and `scheduled` state preserve ordering without fixed thread binding.
-- ET reads continue until `EAGAIN`. Writes continue until the send queue is empty or the socket returns `EAGAIN`; `EPOLLOUT` is enabled only while buffered output remains.
-- When no output is pending, `epoll_connection_send` first attempts a direct send. Queued output can be flushed with either `write` or configurable `writev` batching (`use_writev`).
-- If an unexecuted read event already exists in a connection queue, another read event is coalesced. A read currently being executed does not count as queued, preventing an edge from being lost around the final `recv(...)=EAGAIN` boundary.
-- Workers return write-interest updates and close requests to the event loop through a command queue and `eventfd`. Reference counting protects connection lifetime across threads.
-
-## Build and run
+## Quick start
 
 ```sh
-make
-./c/echo_server 9000
+go get github.com/lesismal/fib/go
 ```
 
-From another terminal:
+```go
+package main
+
+import (
+	stdhttp "net/http"
+
+	fib "github.com/lesismal/fib/go"
+	fibhttp "github.com/lesismal/fib/go/http"
+	"github.com/lesismal/fib/go/middleware"
+	"github.com/lesismal/fib/go/middleware/logger"
+	"github.com/lesismal/fib/go/middleware/recover"
+)
+
+func main() {
+	app := fibhttp.HandlerFunc(func(c *fibhttp.Context, r *stdhttp.Request) {
+		_ = c.Respond(stdhttp.StatusOK, "text/plain; charset=utf-8", []byte("hello\n"))
+	})
+
+	config := fib.DefaultConfig()
+	config.Addr = "127.0.0.1:8080"
+	engine, err := fib.Bind(config, fibhttp.NewHandler(middleware.Chain(app, recover.New(), logger.New())))
+	if err != nil {
+		panic(err)
+	}
+	defer engine.Close()
+	if err := engine.Run(); err != nil {
+		panic(err)
+	}
+}
+```
+
+The same `Handler` serves HTTP/1.x and HTTP/2 on one port. For HTTP/3, see `examples/http3`.
+
+## Packages
+
+| Package | Description |
+| --- | --- |
+| [`fib`](go) | Event loop, connections, TCP / UDP / Unix sockets, `SendFile`, async dial |
+| [`taskpool`](go/taskpool) | Bounded worker pools: adaptive, cond and elastic modes |
+| [`bufferpool`](go/bufferpool) | Aligned, size-classed buffer pool |
+| [`tls`](go/tls) | TLS layered on a connection, transparent to the protocols above it |
+| [`http`](go/http) | HTTP/1.x and HTTP/2 server and client |
+| [`http3`](go/http3) | HTTP/3, QUIC and QPACK server and client |
+| [`websocket`](go/websocket) | RFC 6455 server and client, with permessage-deflate |
+| [`middleware`](go/middleware) | HTTP middleware chain and the common middleware |
+
+## Examples
 
 ```sh
-printf 'hello\n' | nc 127.0.0.1 9000
+cd go
+go run ./examples/tcp/nontls/server
+go run ./examples/http/nontls/server
+go run ./examples/websocket/nontls/server
+go run ./examples/http3/tls/server
 ```
 
-Run the concurrent integration test:
+Each server has a matching `client` beside it.
+
+## Documentation
+
+- [Go guide](go/README.zh-CN.md) (Chinese): configuration, API and every sub-package
+- [HTTP/1.x](docs/http1.md), [HTTP/2](docs/http2.md), [HTTP/3](docs/http3.md): what is supported, the limitations, and the conformance tests
+- [Architecture](docs/architecture.html): an interactive, bilingual diagram of read scheduling, write backpressure, load balancing and connection teardown
+
+## C implementation
+
+The original Linux C11 library, which the Go version follows, lives in [`c/`](c). Its API is in
+[`c/include/epoll_server.h`](c/include/epoll_server.h).
 
 ```sh
-make test
+make                      # build
+./c/echo_server 9000      # try it: printf 'hello\n' | nc 127.0.0.1 9000
+make test                 # concurrent integration test
 ```
 
-## Go implementation
-
-The matching Go implementation lives in [`go/`](go/README.zh-CN.md). It includes
-the public API, TCP, UDP, TLS, HTTP (HTTP/1.1, HTTP/2 and HTTP/3 over QUIC) and WebSocket echo server and client
-examples, and concurrent backpressure tests for
-both the regular `write` and batched `writev` paths. It has native backends on
-Linux (epoll), macOS (kqueue) and Windows (IOCP); other systems use a portable
-backend that preserves connection-level FIFO scheduling:
+## Build and test
 
 ```sh
-make go
-make go-test
+make go         # go build ./...
+make go-test    # go test ./...
 ```
 
-HTTP/1.0 and HTTP/1.1 support (streaming responses, trailers, zero-copy
-`sendfile` for files), its limitations and its conformance tests are documented
-in [`docs/http1.md`](docs/http1.md). The HTTP/2 implementation's current
-limitations, intentionally omitted features and planned improvements are
-documented in [`docs/http2.md`](docs/http2.md); those of HTTP/3 (and the QUIC
-and QPACK under it) in [`docs/http3.md`](docs/http3.md).
-
-The public API is in [`c/include/epoll_server.h`](c/include/epoll_server.h). Regular
-input invokes `on_data`; out-of-band input raised by `EPOLLPRI` and read with
-`MSG_OOB` invokes `on_priority_data`. Both run on the logical worker currently
-executing that connection; they may parse the protocol and call
-`epoll_connection_send`. The send function copies its input, so the caller may
-immediately reuse the original buffer.
-
-## Architecture document
-
-Open [`docs/architecture.html`](docs/architecture.html) for the bilingual relationship diagram and the read scheduling, write backpressure, dynamic load balancing, and close/reclamation flows. English is selected by default.
+Go 1.27 or later.

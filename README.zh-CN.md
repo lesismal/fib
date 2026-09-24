@@ -1,69 +1,109 @@
-# 单 Event Loop epoll 网络库
+# fib — Fast In Balance
+
+[![CI](https://github.com/lesismal/fib/actions/workflows/ci.yml/badge.svg)](https://github.com/lesismal/fib/actions/workflows/ci.yml)
 
 [English](README.md) | [简体中文](README.zh-CN.md)
 
-一个 Linux C11 网络库，采用单个 edge-triggered epoll event loop 和逻辑线程池。connection 是调度单位：每个 connection 自己维护有序事件队列，同时可以由任意空闲 worker 执行，不与固定线程绑定。
+事件驱动的 Go 网络库，附带同架构的 C11 实现。单个 edge-triggered 事件循环收集 I/O
+就绪事件，每个 connection 作为一个任务调度到 worker 池：同一 connection 的事件按顺序
+执行，任意空闲 worker 都能执行任意 connection，负载按实际任务量均衡，而不是按 fd 数量。
 
-[![完整架构与执行流程图](docs/assets/architecture-full.zh-CN.png)](docs/architecture.html)
+## 特性
 
-_点击完整架构与流程图可打开支持中英文切换的交互架构文档。_
+- **原生后端**：Linux 用 epoll，macOS 用 kqueue，Windows 用 IOCP，其他系统使用兼容后端
+- **connection 级调度**：每个 connection 内 FIFO，不绑定 worker，worker 池自适应伸缩
+- **背压**：单连接写水位线，加上整个 server 共享的待发送字节预算
+- **零拷贝路径**：`sendfile`、批量 `writev`、池化 buffer
+- **协议**：TCP、UDP、Unix socket、TLS、HTTP/1.x、HTTP/2（h2 与 h2c）、基于 QUIC 的 HTTP/3、WebSocket
+- **异步 client**：非阻塞 Dial，以及 HTTP/1.x、HTTP/2、HTTP/3 client
+- **中间件**：compress、cors、csrf、etag、limiter、logger、pprof、recover、requestid、responsetime
 
-## 设计
-
-- 监听 fd 注册时 `epoll_event.data.ptr == NULL`；连接建立后创建 `epoll_connection`，后续事件的 `data.ptr` 直接指向该结构。
-- 每个连接拥有 mutex、FIFO 事件队列和待发送数据队列。
-- accept 后的连接以 ET 模式注册 `EPOLLIN`、`EPOLLPRI`、`EPOLLERR`、`EPOLLHUP` 和 `EPOLLRDHUP`；event loop 负责事件收集、全部 `epoll_ctl` 操作和最终 fd 关闭。
-- 首个事件使 connection 从空闲变为已调度时，才把 connection 投递到线程池。一个 worker 按 FIFO 顺序排空该 connection 的全部事件。
-- connection 与 worker 没有亲和性。每轮可由任意空闲 worker 执行，平衡的是实际任务量，而不只是 fd 数量。
-- 同一个 connection 不会同时被多个 worker 执行。connection mutex 和 `scheduled` 状态在不绑定固定线程的情况下保证事件顺序。
-- ET 读循环持续到 `EAGAIN`；写循环持续到队列清空或 `EAGAIN`。仅在存在待发送数据时注册 `EPOLLOUT`，清空后移除。
-- 没有待发送数据时，`epoll_connection_send` 会先尝试直接发送；排队数据可配置使用普通 `write` 或 `writev` 批量发送（`use_writev`）。
-- 若连接队列中已有尚未执行的读事件，新读事件会被合并。正在执行的读事件不算“尚未执行”，避免在最后一次 `recv(...)=EAGAIN` 的边界丢失新 edge。
-- worker 通过 command queue 和 `eventfd` 将写关注更新和关闭请求送回 event loop；引用计数保护跨线程 connection 生命周期。
-
-## 构建和运行
+## 快速上手
 
 ```sh
-make
-./c/echo_server 9000
+go get github.com/lesismal/fib/go
 ```
 
-另一个终端可执行：
+```go
+package main
+
+import (
+	stdhttp "net/http"
+
+	fib "github.com/lesismal/fib/go"
+	fibhttp "github.com/lesismal/fib/go/http"
+	"github.com/lesismal/fib/go/middleware"
+	"github.com/lesismal/fib/go/middleware/logger"
+	"github.com/lesismal/fib/go/middleware/recover"
+)
+
+func main() {
+	app := fibhttp.HandlerFunc(func(c *fibhttp.Context, r *stdhttp.Request) {
+		_ = c.Respond(stdhttp.StatusOK, "text/plain; charset=utf-8", []byte("hello\n"))
+	})
+
+	config := fib.DefaultConfig()
+	config.Addr = "127.0.0.1:8080"
+	engine, err := fib.Bind(config, fibhttp.NewHandler(middleware.Chain(app, recover.New(), logger.New())))
+	if err != nil {
+		panic(err)
+	}
+	defer engine.Close()
+	if err := engine.Run(); err != nil {
+		panic(err)
+	}
+}
+```
+
+同一个 `Handler` 在同一端口上同时服务 HTTP/1.x 和 HTTP/2；HTTP/3 见 `examples/http3`。
+
+## 子 package
+
+| Package | 说明 |
+| --- | --- |
+| [`fib`](go) | 事件循环、connection、TCP / UDP / Unix socket、`SendFile`、异步 Dial |
+| [`taskpool`](go/taskpool) | 有界 worker 池：adaptive、cond、elastic 三种模式 |
+| [`bufferpool`](go/bufferpool) | 按尺寸档对齐的 buffer 池 |
+| [`tls`](go/tls) | 叠加在 connection 上的 TLS，上层协议无需改动 |
+| [`http`](go/http) | HTTP/1.x 与 HTTP/2 的 server 和 client |
+| [`http3`](go/http3) | HTTP/3、QUIC、QPACK 的 server 和 client |
+| [`websocket`](go/websocket) | RFC 6455 server 和 client，支持 permessage-deflate |
+| [`middleware`](go/middleware) | HTTP 中间件链与常用中间件 |
+
+## 示例
 
 ```sh
-printf 'hello\n' | nc 127.0.0.1 9000
+cd go
+go run ./examples/tcp/nontls/server
+go run ./examples/http/nontls/server
+go run ./examples/websocket/nontls/server
+go run ./examples/http3/tls/server
 ```
 
-运行并发集成测试：
+每个 server 旁边都有对应的 `client`。
+
+## 文档
+
+- [Go 使用指南](go/README.zh-CN.md)：配置、API 和各子 package 的用法
+- [HTTP/1.x](docs/http1.zh-CN.md)、[HTTP/2](docs/http2.zh-CN.md)、[HTTP/3](docs/http3.zh-CN.md)：支持范围、限制和一致性测试
+- [架构文档](docs/architecture.html)：中英文可切换的交互式架构图，涵盖读取调度、写背压、负载均衡和连接关闭回收流程
+
+## C 实现
+
+Go 版所沿用架构的原始 Linux C11 实现位于 [`c/`](c)，接口见
+[`c/include/epoll_server.h`](c/include/epoll_server.h)。
 
 ```sh
-make test
+make                      # 构建
+./c/echo_server 9000      # 试一下：printf 'hello\n' | nc 127.0.0.1 9000
+make test                 # 并发集成测试
 ```
 
-## Go 实现
-
-同架构的 Go 版本位于 [`go/`](go/README.zh-CN.md)，包含公共 API、TCP/UDP、
-TLS、HTTP（HTTP/1.1、HTTP/2 与基于 QUIC 的 HTTP/3）和 WebSocket 的 echo server/client 示例，以及覆盖普通 `write` 和
-`writev` 两种路径的并发背压测试。Linux（epoll）、
-macOS（kqueue）和 Windows（IOCP）使用原生后端，其他系统使用保持 connection 级
-FIFO 调度语义的兼容后端：
+## 构建与测试
 
 ```sh
-make go
-make go-test
+make go         # go build ./...
+make go-test    # go test ./...
 ```
 
-HTTP/1.0、HTTP/1.1 的支持情况（流式响应、trailer、文件的 sendfile 零拷贝发送）、限制和
-一致性测试整理在 [`docs/http1.zh-CN.md`](docs/http1.zh-CN.md)。
-HTTP/2 实现当前的限制、有意未实现的功能和待优化项整理在
-[`docs/http2.zh-CN.md`](docs/http2.zh-CN.md)；HTTP/3（及其下的 QUIC、QPACK）的整理在
-[`docs/http3.zh-CN.md`](docs/http3.zh-CN.md)。
-
-公共接口位于 [`c/include/epoll_server.h`](c/include/epoll_server.h)。普通数据调用
-`on_data`，由 `EPOLLPRI` 触发并通过 `MSG_OOB` 读取的带外数据单独调用
-`on_priority_data`。两者都在当前执行该 connection 的逻辑 worker 上调用，可解析协议并调用
-`epoll_connection_send`；发送函数会复制传入数据，因此回调返回后原缓冲区可立即复用。
-
-## 架构文档
-
-打开 [`docs/architecture.html`](docs/architecture.html) 可查看支持中英文切换的系统关系图，以及读取调度、写背压、动态负载均衡和关闭回收流程。页面默认显示英文。
+需要 Go 1.27 或更高版本。
