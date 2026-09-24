@@ -113,6 +113,52 @@ func TestUDPPeersAreSeparateConnections(t *testing.T) {
 	}
 }
 
+// A peer over IPv6 is told apart by its address and port as an IPv4 one is,
+// and its replies go back to the address its datagrams came from.
+func TestUDPPeersOverIPv6(t *testing.T) {
+	config := DefaultConfig()
+	config.Network = "udp6"
+	config.Addr = "[::1]:0"
+	server, err := Bind(config, HandlerFuncs{Data: func(c *Connection, b []byte) {
+		_ = c.Send(append([]byte(c.RemoteAddr().String()+" "), b...))
+	}})
+	if err != nil {
+		t.Skipf("no IPv6 loopback: %v", err)
+	}
+	addr, err := server.LocalUDPAddr()
+	if err != nil {
+		t.Fatal(err)
+	}
+	runDone := make(chan error, 1)
+	go func() { runDone <- server.Run() }()
+	defer func() {
+		server.Stop()
+		if err := <-runDone; err != nil {
+			t.Error(err)
+		}
+		_ = server.Close()
+	}()
+	for i := 0; i < 3; i++ {
+		conn, err := net.DialUDP("udp6", nil, addr)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer conn.Close()
+		_ = conn.SetDeadline(time.Now().Add(5 * time.Second))
+		if _, err := conn.Write([]byte("ping")); err != nil {
+			t.Fatal(err)
+		}
+		buf := make([]byte, 128)
+		n, err := conn.Read(buf)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if want := conn.LocalAddr().String() + " ping"; string(buf[:n]) != want {
+			t.Fatalf("reply %q, want %q", buf[:n], want)
+		}
+	}
+}
+
 // A peer that goes quiet is closed after the idle timeout, and one that sends
 // again afterwards gets a fresh connection.
 func TestUDPIdlePeerTimesOut(t *testing.T) {

@@ -303,10 +303,8 @@ func (e *Engine) completeRecvFrom(l *udpListener, n int, err error) *Connection 
 	}
 	var ready *Connection
 	if err == nil {
-		if sa, saErr := l.from.Sockaddr(); saErr == nil {
-			if c := e.udpPeer(l, sa); c != nil {
-				ready = e.deliverDatagram(c, l.buf[:n])
-			}
+		if c := e.udpPeer(l, &l.from); c != nil {
+			ready = e.deliverDatagram(c, l.buf[:n])
 		}
 	}
 	// A failed receive loses only its own datagram. If no receive can be

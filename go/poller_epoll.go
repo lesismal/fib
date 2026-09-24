@@ -94,12 +94,12 @@ func (e *Engine) Run() error {
 				e.drainCommands()
 			case udpKind:
 				if l := e.udpListenerAt(int(uint32(token))); l != nil {
-					ready = e.readUDPListener(l, ready)
+					ready = e.readUDPListener(l, -1, ready)
 				}
 			default:
 				if c := e.connectionFor(token); c != nil {
 					if c.udp != nil {
-						ready = e.readUDPConnection(c, ready)
+						ready = e.readUDPConnection(c, -1, ready)
 						continue
 					}
 					if c.dialing != nil {

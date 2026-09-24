@@ -9,6 +9,7 @@ import (
 	"sync/atomic"
 	"syscall"
 	"time"
+	"unsafe"
 
 	"github.com/lesismal/fib/go/bufferpool"
 )
@@ -63,15 +64,32 @@ type udpListener struct {
 	peers map[netip.AddrPort]*Connection
 }
 
-// sockaddrKey turns a peer's socket address into its table key.
-func sockaddrKey(sa syscall.Sockaddr) (netip.AddrPort, bool) {
-	switch a := sa.(type) {
-	case *syscall.SockaddrInet4:
-		return netip.AddrPortFrom(netip.AddrFrom4(a.Addr), uint16(a.Port)), true
-	case *syscall.SockaddrInet6:
-		return netip.AddrPortFrom(netip.AddrFrom16(a.Addr), uint16(a.Port)), true
+// rawSockaddrKey reads the table key of the peer a receive left its address
+// in, and the scope of an IPv6 one, which the key leaves out. It reads the
+// raw address where the kernel wrote it rather than through a
+// syscall.Sockaddr, which would be an allocation for every datagram when only
+// a new peer needs one.
+func rawSockaddrKey(rsa *syscall.RawSockaddrAny) (key netip.AddrPort, zone uint32, ok bool) {
+	switch rsa.Addr.Family {
+	case syscall.AF_INET:
+		pp := (*syscall.RawSockaddrInet4)(unsafe.Pointer(rsa))
+		port := (*[2]byte)(unsafe.Pointer(&pp.Port))
+		return netip.AddrPortFrom(netip.AddrFrom4(pp.Addr), uint16(port[0])<<8|uint16(port[1])), 0, true
+	case syscall.AF_INET6:
+		pp := (*syscall.RawSockaddrInet6)(unsafe.Pointer(rsa))
+		port := (*[2]byte)(unsafe.Pointer(&pp.Port))
+		return netip.AddrPortFrom(netip.AddrFrom16(pp.Addr), uint16(port[0])<<8|uint16(port[1])), pp.Scope_id, true
 	}
-	return netip.AddrPort{}, false
+	return netip.AddrPort{}, 0, false
+}
+
+// keySockaddr is the socket address a peer's replies are sent to: the
+// address its key was read from.
+func keySockaddr(key netip.AddrPort, zone uint32) syscall.Sockaddr {
+	if addr := key.Addr(); addr.Is4() {
+		return &syscall.SockaddrInet4{Port: int(key.Port()), Addr: addr.As4()}
+	}
+	return &syscall.SockaddrInet6{Port: int(key.Port()), ZoneId: zone, Addr: key.Addr().As16()}
 }
 
 func sockaddrToUDPAddr(sa syscall.Sockaddr) *net.UDPAddr {
@@ -82,11 +100,11 @@ func sockaddrToUDPAddr(sa syscall.Sockaddr) *net.UDPAddr {
 	return &net.UDPAddr{IP: addr.IP, Port: addr.Port, Zone: addr.Zone}
 }
 
-// udpPeer returns the connection for the peer at sa, opening one if this is
-// the first datagram from it. It returns nil once the engine is stopping.
-// Callers run on the event loop.
-func (e *Engine) udpPeer(l *udpListener, sa syscall.Sockaddr) *Connection {
-	key, ok := sockaddrKey(sa)
+// udpPeer returns the connection for the peer whose address a receive left
+// in from, opening one if this is the first datagram from it. It returns nil
+// once the engine is stopping. Callers run on the event loop.
+func (e *Engine) udpPeer(l *udpListener, from *syscall.RawSockaddrAny) *Connection {
+	key, zone, ok := rawSockaddrKey(from)
 	if !ok {
 		return nil
 	}
@@ -96,6 +114,7 @@ func (e *Engine) udpPeer(l *udpListener, sa syscall.Sockaddr) *Connection {
 	if e.stopping.Load() {
 		return nil
 	}
+	sa := keySockaddr(key, zone)
 	c := &Connection{engine: e, handler: e.handler,
 		udp: &udpState{listener: l, sa: sa, key: key, raddr: sockaddrToUDPAddr(sa)}}
 	c.initUDPPeer()
@@ -106,7 +125,9 @@ func (e *Engine) udpPeer(l *udpListener, sa syscall.Sockaddr) *Connection {
 }
 
 // deliverDatagram queues a copy of one datagram on its connection and reports
-// the connection if that made it runnable. Callers run on the event loop.
+// the connection if that made it runnable. The copy is a buffer from package
+// bufferpool, which a handler done with it may give back. Callers run on the
+// event loop.
 func (e *Engine) deliverDatagram(c *Connection, data []byte) *Connection {
 	u := c.udp
 	c.mu.Lock()
@@ -118,7 +139,9 @@ func (e *Engine) deliverDatagram(c *Connection, data []byte) *Connection {
 		u.queue = u.queue[:0]
 		u.head = 0
 	}
-	u.queue = append(u.queue, append([]byte(nil), data...))
+	datagram := bufferpool.Get(len(data))
+	copy(datagram, data)
+	u.queue = append(u.queue, datagram)
 	c.mu.Unlock()
 	u.lastActive.Store(time.Now().UnixNano())
 	return e.noteEvent(c, evIn)

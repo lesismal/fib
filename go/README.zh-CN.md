@@ -308,7 +308,8 @@ addr, _ := server.LocalUDPAddr()
 - Handler 如果实现了 `fib.DatagramsHandler`，worker 运行时连接已经排队的数据报会按到达
   顺序一次性交给 `OnDatagrams`，不再逐个调用 `OnData`；需要回应所收数据的协议（比如
   回 ACK）可以对整批数据一起回应，少发数据报。每个数据报归 handler 所有，装它们的切片
-  在 `OnDatagrams` 返回后不能再持有。
+  在 `OnDatagrams` 返回后不能再持有。数据报取自 `bufferpool`，handler 用完且不再引用时
+  可以用 `bufferpool.Put` 归还，供后面的数据报复用；不归还的和普通切片一样由 GC 回收。
 - UDP socket 由 event loop 自己读取（level-triggered，每轮每个 socket 最多读
   256 个数据报），按对端地址分发到各连接的队列，再由 worker 依次调用 `OnData`；
   每条连接最多排队 1024 个数据报，超出的直接丢弃，和内核接收缓冲满时一样。

@@ -63,7 +63,12 @@ type connPlatform struct {
 // and a peer sends through its listener's.
 type udpPlatform struct{}
 
-type udpListenerPlatform struct{ fd int }
+// udpListenerPlatform is a UDP socket and where a receive leaves the
+// sender's address, which only the event loop reads into.
+type udpListenerPlatform struct {
+	fd   int
+	from syscall.RawSockaddrAny
+}
 
 // FD returns the connection's descriptor, or -1 once it is closed. A UDP peer
 // has no descriptor of its own and always reports -1.
@@ -150,33 +155,43 @@ func (e *Engine) udpListenerAt(fd int) *udpListener {
 // readUDPListener reads the datagrams waiting on a UDP listener and queues
 // each on its peer's connection, opening connections for new peers. The socket
 // is level-triggered, so it reads at most one round's share and leaves the
-// rest to the next round. Callers run on the event loop.
-func (e *Engine) readUDPListener(l *udpListener, ready []*Connection) []*Connection {
+// rest to the next round.
+//
+// avail is how many bytes of datagrams the poller reported waiting, or -1
+// where it does not say. Reading stops once that many have been read, rather
+// than at a read that finds nothing, which on a socket that has one datagram
+// for each round, as a busy server's many sockets do, is a system call for
+// nothing per datagram. What arrived since is the next round's. Callers run
+// on the event loop.
+func (e *Engine) readUDPListener(l *udpListener, avail int, ready []*Connection) []*Connection {
 	buf := e.datagramBuffer()
 	for i := 0; i < maxDatagramsPerRound; i++ {
-		n, from, err := syscall.Recvfrom(l.fd, buf, 0)
+		n, err := recvfrom(l.fd, buf, &l.from)
 		if err == syscall.EINTR {
 			continue
 		}
 		if err != nil {
 			return ready
 		}
-		c := e.udpPeer(l, from)
-		if c == nil {
-			continue
+		if c := e.udpPeer(l, &l.from); c != nil {
+			if r := e.deliverDatagram(c, buf[:n]); r != nil {
+				ready = append(ready, r)
+			}
 		}
-		if r := e.deliverDatagram(c, buf[:n]); r != nil {
-			ready = append(ready, r)
+		if avail >= 0 {
+			if avail -= n; avail <= 0 {
+				return ready
+			}
 		}
 	}
 	return ready
 }
 
 // readUDPConnection reads a dialed UDP connection's datagrams, as
-// readUDPListener does for a listener's. An error, such as the refusal a
-// connected socket reports when nothing listens at the peer's port, closes the
-// connection. Callers run on the event loop.
-func (e *Engine) readUDPConnection(c *Connection, ready []*Connection) []*Connection {
+// readUDPListener does for a listener's, avail included. An error, such as
+// the refusal a connected socket reports when nothing listens at the peer's
+// port, closes the connection. Callers run on the event loop.
+func (e *Engine) readUDPConnection(c *Connection, avail int, ready []*Connection) []*Connection {
 	buf := e.datagramBuffer()
 	for i := 0; i < maxDatagramsPerRound; i++ {
 		n, err := syscall.Read(c.FD(), buf)
@@ -191,6 +206,11 @@ func (e *Engine) readUDPConnection(c *Connection, ready []*Connection) []*Connec
 		}
 		if r := e.deliverDatagram(c, buf[:n]); r != nil {
 			ready = append(ready, r)
+		}
+		if avail >= 0 {
+			if avail -= n; avail <= 0 {
+				return ready
+			}
 		}
 	}
 	return ready

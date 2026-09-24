@@ -20,7 +20,10 @@ type Handler interface {
 //
 // Each datagram belongs to the handler, as a UDP connection's OnData data
 // does; the slice holding them does not, and must not be kept once
-// OnDatagrams returns.
+// OnDatagrams returns. A datagram is a buffer from package bufferpool, so a
+// handler that is done with one, with nothing left referring to it, may give
+// it back with bufferpool.Put for the next one to be read into; one it keeps
+// or drops is collected like any other slice.
 type DatagramsHandler interface {
 	Handler
 	OnDatagrams(c *Connection, datagrams [][]byte)

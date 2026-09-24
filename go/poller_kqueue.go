@@ -94,7 +94,9 @@ func (e *Engine) Run() error {
 					if l := e.udpListenerAt(fd); l != nil {
 						// Reading opens and closes no descriptor, so it
 						// need not wait for the batch to end.
-						ready = e.readUDPListener(l, ready)
+						// A socket's read event counts the bytes of
+						// datagrams waiting on it.
+						ready = e.readUDPListener(l, int(ev.Data), ready)
 					} else if e.isListener(fd) {
 						e.acceptable = append(e.acceptable, fd)
 					}
@@ -102,7 +104,7 @@ func (e *Engine) Run() error {
 				continue
 			}
 			if c.udp != nil {
-				ready = e.readUDPConnection(c, ready)
+				ready = e.readUDPConnection(c, int(ev.Data), ready)
 				continue
 			}
 			if c.dialing != nil {
