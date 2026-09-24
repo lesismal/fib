@@ -29,9 +29,13 @@ const (
 	// minInitialDatagram is how large a datagram carrying a client's
 	// Initial packet has to be (RFC 9000 section 14.1).
 	minInitialDatagram = 1200
-	// maxDatagram is the largest datagram sent. It is the size every IPv6
-	// path carries, which spares path MTU discovery.
+	// maxDatagram is the largest datagram sent until the handshake is over,
+	// and after it unless Config.MaxDatagramSize allows more. It is the size
+	// every IPv6 path carries, which spares path MTU discovery.
 	maxDatagram = 1200
+	// maxDatagramLimit is the most Config.MaxDatagramSize may allow: what an
+	// Ethernet MTU of 1500 bytes leaves for UDP over IPv6.
+	maxDatagramLimit = 1452
 	// aeadOverhead is the tag every supported AEAD appends.
 	aeadOverhead = 16
 	// statelessResetTokenLen is the length of a stateless reset token.

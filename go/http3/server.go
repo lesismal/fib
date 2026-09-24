@@ -62,6 +62,11 @@ type Config struct {
 	// Keep it below the engine's UDPIdleTimeout, or the engine closes a
 	// quiet peer first.
 	MaxIdleTimeout time.Duration
+	// MaxDatagramSize is the largest UDP payload the server sends once a
+	// connection's handshake is over, if the client allows it. Zero means
+	// 1200 bytes, which every path carries; a network known to carry more
+	// saves packets with more, up to 1452.
+	MaxDatagramSize int
 	// StreamPool runs request handlers on a pool of their own, so that the
 	// requests a client has open on one QUIC connection are served
 	// concurrently rather than one after another on the goroutine that
@@ -158,6 +163,7 @@ func NewHandlerWithConfig(config Config, handler fibhttp.Handler) *ServerHandler
 		// extensions it may try.
 		MaxIncomingUniStreams: 16,
 		ResetKey:              &h.resetKey,
+		MaxDatagramSize:       config.MaxDatagramSize,
 	}
 	return h
 }
@@ -207,6 +213,20 @@ func (h *ServerHandler) OnData(c *fib.Connection, data []byte) {
 	c.SetAttachment(qc)
 }
 
+// OnDatagrams hands a burst of datagrams to their peer's connection, which
+// answers them together. A burst that starts a connection starts it with its
+// first datagram, as OnData does.
+func (h *ServerHandler) OnDatagrams(c *fib.Connection, datagrams [][]byte) {
+	for len(datagrams) > 0 {
+		if qc, ok := c.Attachment().(*quic.Conn); ok {
+			qc.HandleDatagrams(datagrams)
+			return
+		}
+		h.OnData(c, datagrams[0])
+		datagrams = datagrams[1:]
+	}
+}
+
 // OnClose ends the peer's connection with its path.
 func (h *ServerHandler) OnClose(c *fib.Connection, err error) {
 	if qc, ok := c.Attachment().(*quic.Conn); ok {
@@ -218,7 +238,7 @@ func (h *ServerHandler) OnClose(c *fib.Connection, err error) {
 	c.SetAttachment(nil)
 }
 
-var _ fib.Handler = (*ServerHandler)(nil)
+var _ fib.DatagramsHandler = (*ServerHandler)(nil)
 
 // serverConn is one client's HTTP/3 connection.
 type serverConn struct {
@@ -419,6 +439,13 @@ func (rs *requestStream) onData(chunk []byte) error {
 	}
 	if int64(len(rs.body)+len(chunk)) > rs.sc.h.config.MaxBodyBytes {
 		rs.reject(stdhttp.StatusRequestEntityTooLarge)
+		return nil
+	}
+	if rs.body == nil && rs.parser.direct {
+		// QUIC hands a stream's data over for keeps, so a body that
+		// arrives in one piece is kept where it arrived. Capping it means
+		// a second piece is appended to a copy, not over what follows.
+		rs.body = chunk[:len(chunk):len(chunk)]
 		return nil
 	}
 	rs.body = append(rs.body, chunk...)

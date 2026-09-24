@@ -169,18 +169,28 @@ func parseSettings(payload []byte) (uint64, error) {
 // frameParser splits a stream into frames. DATA payloads are handed on as
 // they arrive; every other frame is collected whole first.
 type frameParser struct {
+	// buf holds the start of a frame that has not arrived whole.
 	buf []byte
 	// dataLeft is how much of the current DATA frame is still to come.
 	dataLeft uint64
 	// maxFrame bounds a frame other than DATA.
 	maxFrame uint64
+	// direct says, while feed runs, that what it hands on is a slice of
+	// the data it was given rather than of buf.
+	direct bool
 }
 
 // feed parses what data completes. onData receives DATA payload pieces and
-// onFrame every other frame, neither of which may keep what it is given.
+// onFrame every other frame, neither of which may keep what it is given,
+// unless direct says it is a slice of data and data is the caller's to give.
+// Only the start of a frame that data leaves unfinished is copied.
 func (p *frameParser) feed(data []byte, onData func([]byte) error, onFrame func(typ uint64, payload []byte) error) error {
-	p.buf = append(p.buf, data...)
-	buf := p.buf
+	buf := data
+	p.direct = len(p.buf) == 0
+	if !p.direct {
+		p.buf = append(p.buf, data...)
+		buf = p.buf
+	}
 	var err error
 	for err == nil {
 		if p.dataLeft > 0 {
@@ -217,6 +227,7 @@ func (p *frameParser) feed(data []byte, onData func([]byte) error, onFrame func(
 		buf = buf[n1+n2+int(length):]
 		err = onFrame(typ, payload)
 	}
+	p.direct = false
 	p.buf = append(p.buf[:0], buf...)
 	if cap(p.buf) > 64<<10 && len(p.buf) < 1<<10 {
 		p.buf = append([]byte(nil), p.buf...)

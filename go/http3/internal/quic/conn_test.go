@@ -7,6 +7,7 @@ import (
 	"errors"
 	mrand "math/rand/v2"
 	"net"
+	"slices"
 	"sync"
 	"testing"
 	"time"
@@ -501,5 +502,128 @@ func TestIntegrityLimit(t *testing.T) {
 		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("connection survived the forgeries")
+	}
+}
+
+// watchSends records the size of every datagram end sends from now on.
+func watchSends(end *pipeEnd) func() []int {
+	var mu sync.Mutex
+	var sizes []int
+	end.mu.Lock()
+	end.drop = func(d []byte) bool {
+		mu.Lock()
+		sizes = append(sizes, len(d))
+		mu.Unlock()
+		return false
+	}
+	end.mu.Unlock()
+	return func() []int {
+		mu.Lock()
+		defer mu.Unlock()
+		return append([]int(nil), sizes...)
+	}
+}
+
+func TestMaxDatagramSize(t *testing.T) {
+	p := newTestPair(t, 0, func(_, server *Config) { server.MaxDatagramSize = 1350 })
+	payload := make([]byte, 64<<10)
+	p.serverH.onData = func(s *Stream, data []byte, fin bool) {
+		if fin {
+			_ = s.Write(payload, true)
+		}
+	}
+	serverSizes := watchSends(p.serverEnd)
+	clientSizes := watchSends(p.clientEnd)
+	s, err := p.client.OpenStream()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Write(payload, true); err != nil {
+		t.Fatal(err)
+	}
+	waitFinished(t, p.clientH, s.ID())
+	largest := func(sizes []int) int { return slices.Max(append(sizes, 0)) }
+	if got := largest(serverSizes()); got != 1350 {
+		t.Errorf("server's largest datagram is %d bytes, want 1350", got)
+	}
+	if got := largest(clientSizes()); got != maxDatagram {
+		t.Errorf("client's largest datagram is %d bytes, want the default %d", got, maxDatagram)
+	}
+}
+
+// TestWriteDuringSlowHandlerCall writes from another goroutine while a
+// handler call blocks: the write is sent without waiting for the call to
+// return, as are acknowledgements and loss recovery.
+func TestWriteDuringSlowHandlerCall(t *testing.T) {
+	p := newTestPair(t, 0, nil)
+	release := make(chan struct{})
+	defer close(release)
+	p.serverH.onData = func(s *Stream, data []byte, fin bool) {
+		if !fin {
+			return
+		}
+		go func() {
+			// Once the acknowledgement of the request is out, so that the
+			// write is all there is to send.
+			time.Sleep(100 * time.Millisecond)
+			_ = s.Write([]byte("early"), true)
+		}()
+		<-release
+	}
+	s, err := p.client.OpenStream()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Write([]byte("request"), true); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case id := <-p.clientH.finished:
+		if id != s.ID() || string(p.clientH.received(id)) != "early" {
+			t.Fatalf("stream %d finished with %q", id, p.clientH.received(id))
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("the write waited for the handler call to return")
+	}
+}
+
+// TestWritesDuringHandlerCallShareDatagrams writes many small pieces while
+// the handler is told of a request: they leave together, not a datagram each.
+func TestWritesDuringHandlerCallShareDatagrams(t *testing.T) {
+	p := newTestPair(t, 0, nil)
+	const pieces = 20
+	p.serverH.onData = func(s *Stream, data []byte, fin bool) {
+		if !fin {
+			return
+		}
+		for i := 0; i < pieces; i++ {
+			_ = s.Write([]byte("0123456789012345678901234567890123456789"), i == pieces-1)
+		}
+	}
+	// A first request lets the end of the handshake go by, so that only the
+	// answer to the second one is counted.
+	first, err := p.client.OpenStream()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := first.Write([]byte("request"), true); err != nil {
+		t.Fatal(err)
+	}
+	waitFinished(t, p.clientH, first.ID())
+	time.Sleep(50 * time.Millisecond)
+	serverSizes := watchSends(p.serverEnd)
+	s, err := p.client.OpenStream()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Write([]byte("request"), true); err != nil {
+		t.Fatal(err)
+	}
+	waitFinished(t, p.clientH, s.ID())
+	if got := len(p.clientH.received(s.ID())); got != pieces*40 {
+		t.Fatalf("received %d bytes, want %d", got, pieces*40)
+	}
+	if n := len(serverSizes()); n > 2 {
+		t.Fatalf("%d writes left in %d datagrams, want them together: %v", pieces, n, serverSizes())
 	}
 }

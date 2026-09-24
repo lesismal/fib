@@ -83,7 +83,10 @@ func FuzzFrames(f *testing.F) {
 		}
 		// Whatever state the frames left, building a packet from it is
 		// still allowed to run.
-		c.flushLocked(time.Now())
+		c.mu.Lock()
+		c.wantFlush = true
+		c.mu.Unlock()
+		c.dispatch()
 	})
 }
 

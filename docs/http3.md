@@ -50,9 +50,14 @@ Behavior users need to be aware of.
   `Config.UDPIdleTimeout` (default 60s), or the engine closes a quiet peer first.
 - The engine queues at most 1024 unprocessed datagrams per UDP connection; more
   are dropped and QUIC treats them as lost.
-- The QUIC layer relies on the engine handing every UDP datagram to `OnData` as
-  a copy of its own: it keeps those slices, without copying, while it reorders
-  data and waits for keys.
+- The QUIC layer relies on the engine handing every UDP datagram to it as a
+  copy of its own: it keeps those slices, without copying, while it reorders
+  data and waits for keys, and keeps a request body that arrived in one piece
+  where it arrived.
+- The server takes a connection's datagrams in bursts, as a
+  `fib.DatagramsHandler`: whatever has piled up by the time the connection's
+  worker runs is processed together, and the acknowledgement and the
+  responses written meanwhile leave in as few packets as they fit in.
 - `Engine.Stop`/`Close` sends neither CONNECTION_CLOSE nor GOAWAY; connections
   are dropped and clients find out only when they time out.
 - Like the `http` package, `http3` builds only on the three native backends
@@ -88,7 +93,7 @@ exposed through `http3.Config` or `http3.ClientConfig`:
 
 | Parameter | Value |
 | --- | --- |
-| Datagram size | Fixed at 1200 bytes, no PMTU discovery |
+| Datagram size | 1200 bytes, no PMTU discovery; a server can raise it up to 1452 with `Config.MaxDatagramSize` on a network known to carry that |
 | Per-stream receive window | 1MB, replenished when half is consumed |
 | Connection receive window | 16MB, replenished when half is consumed |
 | Unidirectional streams the peer may open | 16 |
@@ -176,17 +181,17 @@ In order of priority.
   loopback; under loss, throughput is bound mainly by this and by NewReno.
 - **PMTU discovery (DPLPMTUD, RFC 8899)**: Ethernet paths usually carry about
   1450-byte datagrams, which would cut per-packet header and AEAD overhead.
+  Until then, `Config.MaxDatagramSize` sets a larger size by hand.
 - **Congestion control**: add CUBIC or BBR, app-limited detection and persistent
   congestion.
 - **Batched I/O**: GSO/GRO and `sendmmsg`/`recvmmsg`, which need the engine's
   UDP layer.
-- **Fewer copies and allocations**: sending copies once in `Write` and again
-  when packets are built; receiving copies in the engine, in the HTTP/3 frame
-  parser and when appending the body. Each datagram and packet makes several
-  small allocations; buffers could come from a `sync.Pool`.
+- **Fewer copies and allocations**: sending copies once in `Write`, into a
+  pooled buffer, and again when packets are built; receiving copies in the
+  engine, and in the HTTP/3 frame parser only a frame split across pieces.
+  Every sent packet still allocates the record loss recovery keeps of it.
 - **Data structures**: sent packets live in a slice, so ACK processing and loss
-  detection scan linearly; every flush resets a `time.Timer`; datagram send
-  syscalls happen under the connection lock.
+  detection scan linearly; every round of sending resets a `time.Timer`.
 - **ACK frequency**: implement the ACK_FREQUENCY extension to send fewer ACKs
   under heavy traffic.
 - **ChaCha20-Poly1305** is pure Go and slower than assembly. Machines with AES

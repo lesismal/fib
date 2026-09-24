@@ -3,6 +3,8 @@ package quic
 import (
 	"encoding/binary"
 	"time"
+
+	"github.com/lesismal/fib/go/bufferpool"
 )
 
 // packetPlan is a packet whose frames are chosen but which is not yet
@@ -76,34 +78,69 @@ func (c *Conn) sealPlan(out []byte, p *packetPlan) []byte {
 	return out[:start+len(sealed)]
 }
 
-// flushLocked sends whatever there is to send and the limits allow, then
-// sets the timer for what comes next.
-func (c *Conn) flushLocked(now time.Time) {
+// sendBufferSize is the memory a round of sending builds its datagrams in:
+// room for a burst of full packets, and one of the buffer pool's classes.
+const sendBufferSize = 32 << 10
+
+// maxRoundDatagrams bounds the datagrams a round of sending sends.
+const maxRoundDatagrams = 64
+
+// sendRoundLocked builds what there is to send and the limits allow, as much
+// of it as a round's buffer holds, sets the timer for what comes next, and
+// sends the datagrams with the lock released. It leaves wantFlush set when it
+// stopped for want of room rather than of something to send. Callers are the
+// sending goroutine (see flush) and hold c.mu, which they hold again when it
+// returns.
+func (c *Conn) sendRoundLocked() {
+	buf := bufferpool.Get(sendBufferSize)[:0]
+	// Each space builds its packet's payload in a slot of its own, since the
+	// packets of a datagram are all chosen before any of them is sealed.
+	scratch := bufferpool.Get(numSpaces * maxDatagramLimit)
+	var datagrams [maxRoundDatagrams][]byte
+	n := 0
+	now := c.now()
 	c.maybeUpdateKeys()
 	for !c.closed {
-		d := c.buildDatagram(now)
-		if d == nil {
+		if n == len(datagrams) || cap(buf)-len(buf) < c.maxDatagram {
+			c.wantFlush = true
 			break
 		}
-		c.bytesSent += uint64(len(d))
-		_ = c.pc.Send(d)
+		start := len(buf)
+		buf = c.appendDatagram(buf, scratch, now)
+		if len(buf) == start {
+			break
+		}
+		c.bytesSent += uint64(len(buf) - start)
+		datagrams[n] = buf[start:]
+		n++
 	}
-	if c.closed {
-		return
+	bufferpool.Put(scratch)
+	c.flushDeadline = time.Time{}
+	if !c.closed {
+		c.setLossDetectionTimer(now)
+		c.armTimerLocked(now)
 	}
-	c.setLossDetectionTimer(now)
-	c.armTimerLocked(now)
+	if n > 0 {
+		c.mu.Unlock()
+		for _, d := range datagrams[:n] {
+			_ = c.pc.Send(d)
+		}
+		c.mu.Lock()
+	}
+	bufferpool.Put(buf)
 }
 
-// buildDatagram fills one datagram with a packet from each space that has
-// something to send, or returns nil when none has.
-func (c *Conn) buildDatagram(now time.Time) []byte {
-	limit := maxDatagram
+// appendDatagram appends one datagram to out, with a packet from each space
+// that has something to send, and returns out as it was when none has. out
+// has room for c.maxDatagram more bytes, and scratch for numSpaces payloads of
+// maxDatagramLimit bytes.
+func (c *Conn) appendDatagram(out, scratch []byte, now time.Time) []byte {
+	limit := c.maxDatagram
 	if !c.isClient && !c.addressValidated {
 		// Until the client's address is proven, a server sends at most
 		// three times what it received (RFC 9000 section 8.1).
-		if c.bytesSent+maxDatagram > 3*c.bytesRecv {
-			return nil
+		if c.bytesSent+uint64(limit) > 3*c.bytesRecv {
+			return out
 		}
 	}
 	congestionOK := c.cc.canSend()
@@ -114,7 +151,8 @@ func (c *Conn) buildDatagram(now time.Time) []byte {
 		if s.tx == nil || s.discarded {
 			continue
 		}
-		plan, ok := c.buildPacket(space, limit-size, congestionOK || s.probes > 0, now)
+		slot := scratch[space*maxDatagramLimit : space*maxDatagramLimit : (space+1)*maxDatagramLimit]
+		plan, ok := c.buildPacket(space, limit-size, congestionOK || s.probes > 0, now, slot)
 		if !ok {
 			continue
 		}
@@ -123,7 +161,7 @@ func (c *Conn) buildDatagram(now time.Time) []byte {
 		size += c.packetSize(&plan)
 	}
 	if n == 0 {
-		return nil
+		return out
 	}
 	pad := false
 	for i := 0; i < n; i++ {
@@ -139,7 +177,6 @@ func (c *Conn) buildDatagram(now time.Time) []byte {
 		last.padded = true
 		size = minInitialDatagram
 	}
-	out := make([]byte, 0, size)
 	for i := 0; i < n; i++ {
 		out = c.sealPlan(out, &plans[i])
 	}
@@ -154,9 +191,10 @@ func (c *Conn) buildDatagram(now time.Time) []byte {
 }
 
 // buildPacket chooses the frames for a packet in space of at most room
-// bytes. mayElicit says whether congestion control allows ack-eliciting
-// frames; without them, only an acknowledgement that is due goes out.
-func (c *Conn) buildPacket(space, room int, mayElicit bool, now time.Time) (packetPlan, bool) {
+// bytes, building its payload in scratch, which has room for all of it.
+// mayElicit says whether congestion control allows ack-eliciting frames;
+// without them, only an acknowledgement that is due goes out.
+func (c *Conn) buildPacket(space, room int, mayElicit bool, now time.Time, scratch []byte) (packetPlan, bool) {
 	s := &c.spaces[space]
 	pn := s.nextPN
 	pl := pnLen(pn, s.largestAcked)
@@ -165,7 +203,7 @@ func (c *Conn) buildPacket(space, room int, mayElicit bool, now time.Time) (pack
 		return packetPlan{}, false
 	}
 	sp := &sentPacket{pn: pn}
-	payload := make([]byte, 0, max)
+	payload := scratch[:0]
 	ackDue := s.ackPending && (s.ackNow || !s.ackDeadline.IsZero() && !now.Before(s.ackDeadline))
 	withAck := false
 	if s.ackPending && len(s.recv) > 0 {

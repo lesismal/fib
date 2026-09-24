@@ -1,6 +1,10 @@
 package quic
 
-import "sort"
+import (
+	"sort"
+
+	"github.com/lesismal/fib/go/bufferpool"
+)
 
 // span is the byte range [off, end) of a stream.
 type span struct{ off, end uint64 }
@@ -31,9 +35,13 @@ func addSpan(spans []span, s span) []span {
 // has been given to send, until the peer acknowledges it.
 type sendBuffer struct {
 	// buf holds the bytes from offset base on; everything before base has
-	// been acknowledged.
+	// been acknowledged. It is a window of mem, an array from the buffer
+	// pool, which goes back to it once everything written is acknowledged:
+	// what is sent is copied into packets as they are built, so nothing
+	// else holds on to it.
 	base uint64
 	buf  []byte
+	mem  []byte
 	// next is the offset of the first byte never sent.
 	next uint64
 	// lost are sent ranges to send again, and acked the acknowledged ones
@@ -44,7 +52,15 @@ type sendBuffer struct {
 
 func (b *sendBuffer) end() uint64 { return b.base + uint64(len(b.buf)) }
 
-func (b *sendBuffer) write(p []byte) { b.buf = append(b.buf, p...) }
+func (b *sendBuffer) write(p []byte) {
+	if len(b.buf)+len(p) > cap(b.buf) {
+		grown := bufferpool.Get(len(b.buf) + len(p))[:len(b.buf)]
+		copy(grown, b.buf)
+		bufferpool.Put(b.mem)
+		b.mem, b.buf = grown, grown
+	}
+	b.buf = append(b.buf, p...)
+}
 
 // hasLost reports whether some sent data needs sending again.
 func (b *sendBuffer) hasLost() bool {
@@ -95,7 +111,8 @@ func (b *sendBuffer) onAck(off, n uint64) {
 	b.base = newBase
 	if len(b.buf) == 0 {
 		// Let the array go rather than grow it from its tail forever.
-		b.buf = nil
+		bufferpool.Put(b.mem)
+		b.mem, b.buf = nil, nil
 	}
 }
 

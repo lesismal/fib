@@ -524,6 +524,15 @@ func (p clientPath) OnData(_ *fib.Connection, data []byte) {
 	}
 }
 
+func (p clientPath) OnDatagrams(_ *fib.Connection, datagrams [][]byte) {
+	p.cc.mu.Lock()
+	qc := p.cc.qc
+	p.cc.mu.Unlock()
+	if qc != nil {
+		qc.HandleDatagrams(datagrams)
+	}
+}
+
 func (p clientPath) OnClose(_ *fib.Connection, err error) {
 	p.cc.mu.Lock()
 	qc := p.cc.qc

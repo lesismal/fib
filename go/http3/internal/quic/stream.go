@@ -68,7 +68,7 @@ func (s *Stream) Write(p []byte, fin bool) error {
 	c.mu.Lock()
 	err := s.writeLocked(p, fin)
 	if err == nil {
-		c.flushLocked(c.now())
+		c.wantFlush = true
 	}
 	c.mu.Unlock()
 	c.dispatch()
@@ -100,7 +100,7 @@ func (s *Stream) Reset(code uint64) {
 	c.mu.Lock()
 	if !c.closed {
 		s.resetLocked(code)
-		c.flushLocked(c.now())
+		c.wantFlush = true
 	}
 	c.mu.Unlock()
 	c.dispatch()
@@ -127,7 +127,7 @@ func (s *Stream) StopSending(code uint64) {
 	c.mu.Lock()
 	if !c.closed {
 		s.stopSendingLocked(code)
-		c.flushLocked(c.now())
+		c.wantFlush = true
 	}
 	c.mu.Unlock()
 	c.dispatch()

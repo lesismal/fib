@@ -31,7 +31,8 @@ const (
 
 // PacketConn sends a connection's datagrams to its peer.
 type PacketConn interface {
-	// Send sends one datagram. The connection does not use it again.
+	// Send sends one datagram. It must not keep the datagram once it
+	// returns: the connection reuses the memory for the next one.
 	Send(datagram []byte) error
 	// Close releases the path once the connection is over.
 	Close() error
@@ -81,6 +82,11 @@ type Config struct {
 	ConnReceiveWindow   uint64
 	// ResetKey, on a server, lets its peers recognize stateless resets.
 	ResetKey *ResetKey
+	// MaxDatagramSize is the largest datagram sent once the handshake is
+	// over, if the peer's max_udp_payload_size allows it. Default 1200, the
+	// size every path carries; more saves packets, and the syscalls that
+	// send them, on a path known to carry them. At most 1452.
+	MaxDatagramSize int
 }
 
 func (config Config) withDefaults() Config {
@@ -109,6 +115,7 @@ func (config Config) withDefaults() Config {
 	if config.ConnReceiveWindow == 0 {
 		config.ConnReceiveWindow = 16 << 20
 	}
+	config.MaxDatagramSize = min(max(config.MaxDatagramSize, maxDatagram), maxDatagramLimit)
 	return config
 }
 
@@ -177,8 +184,11 @@ type Conn struct {
 	addressValidated   bool
 	bytesRecv          uint64
 	bytesSent          uint64
-	local              transportParams
-	peerParams         *transportParams
+	// maxDatagram is the largest datagram this side sends: maxDatagram
+	// until the handshake is over, then what the config and the peer allow.
+	maxDatagram int
+	local       transportParams
+	peerParams  *transportParams
 
 	// 1-RTT key updates (RFC 9001 section 6). txGen and rxGen count the
 	// updates each direction has made; the Key Phase bit is the low bit of
@@ -250,6 +260,14 @@ type Conn struct {
 
 	events      []func()
 	dispatching bool
+	// sending says a goroutine is sending, which only one does at a time;
+	// wantFlush that there may be something to send, which the sending one
+	// sends too before it stops. flushDeadline bounds how long what was
+	// written while the handler was being called may wait for its calls to
+	// end (see flush).
+	sending       bool
+	wantFlush     bool
+	flushDeadline time.Time
 	// buffered are packets that arrived before their keys.
 	buffered [][]byte
 
@@ -308,6 +326,7 @@ func newConn(pc PacketConn, remote net.Addr, config Config, handler Handler, isC
 		recvMaxData:  config.ConnReceiveWindow,
 		maxBidi:      config.MaxIncomingStreams,
 		maxUni:       config.MaxIncomingUniStreams,
+		maxDatagram:  maxDatagram,
 	}
 	for i := range c.spaces {
 		c.spaces[i].largestAcked = -1
@@ -346,9 +365,9 @@ func Dial(pc PacketConn, remote net.Addr, config Config, handler Handler) (*Conn
 		c.tls.Close()
 		return nil, err
 	}
-	now := c.now()
-	c.flushLocked(now)
+	c.wantFlush = true
 	c.mu.Unlock()
+	c.dispatch()
 	return c, nil
 }
 
@@ -391,12 +410,34 @@ func (c *Conn) ConnectionState() tls.ConnectionState {
 }
 
 // HandleDatagram processes a datagram from the peer.
+//
+// What it has to send in reply - acknowledgements, and whatever the handler
+// writes while it is told about the datagram - goes out once the handler
+// calls are done, in as few packets as it fits in.
 func (c *Conn) HandleDatagram(datagram []byte) {
 	c.mu.Lock()
 	if !c.closed {
+		c.handleDatagramLocked(datagram, c.now())
+		c.wantFlush = true
+	}
+	c.mu.Unlock()
+	c.dispatch()
+}
+
+// HandleDatagrams processes datagrams that arrived together, and answers
+// them together: one acknowledgement for all of them, and what the handler
+// writes for them packed into the same packets.
+func (c *Conn) HandleDatagrams(datagrams [][]byte) {
+	c.mu.Lock()
+	if !c.closed {
 		now := c.now()
-		c.handleDatagramLocked(datagram, now)
-		c.flushLocked(now)
+		for _, d := range datagrams {
+			if c.closed {
+				break
+			}
+			c.handleDatagramLocked(d, now)
+		}
+		c.wantFlush = true
 	}
 	c.mu.Unlock()
 	c.dispatch()
@@ -578,11 +619,13 @@ func (c *Conn) queueStream(s *Stream) {
 }
 
 // dispatch runs queued handler calls, one goroutine at a time, so that the
-// handler sees a connection's events in order and never concurrently.
+// handler sees a connection's events in order and never concurrently; then
+// it sends what there is to send.
 func (c *Conn) dispatch() {
 	c.mu.Lock()
 	if c.dispatching {
 		c.mu.Unlock()
+		c.flush()
 		return
 	}
 	c.dispatching = true
@@ -597,6 +640,51 @@ func (c *Conn) dispatch() {
 	}
 	c.dispatching = false
 	c.mu.Unlock()
+	c.flush()
+}
+
+// flushHold bounds how long a write made while the handler is being called
+// waits for the calls to end before it is sent anyway.
+const flushHold = time.Millisecond
+
+// flush sends what there is to send, on one goroutine at a time, so that
+// packets leave in the order they are numbered. A goroutine that finds
+// another one sending leaves its data to it, which sends it too before it
+// stops: that is what packs the writes of goroutines that answer requests
+// concurrently into full packets. Packets are built with the lock held but
+// sent without it, so that nobody waits on the syscalls.
+//
+// While the handler is being called, what is written waits for the calls to
+// end, so that the answers to a burst of requests leave together with the
+// acknowledgement of the burst; a handler that takes longer than flushHold
+// has it sent without waiting for it.
+func (c *Conn) flush() {
+	c.mu.Lock()
+	if c.dispatching && c.wantFlush && !c.closed && c.flushDeadline.IsZero() {
+		now := c.now()
+		c.flushDeadline = now.Add(flushHold)
+		c.armTimerLocked(now)
+	}
+	if c.dispatching || c.sending {
+		c.mu.Unlock()
+		return
+	}
+	c.sendLocked()
+	c.mu.Unlock()
+}
+
+// sendLocked sends until there is nothing left to send, unless another
+// goroutine is sending already. Callers hold c.mu.
+func (c *Conn) sendLocked() {
+	if c.sending {
+		return
+	}
+	c.sending = true
+	for c.wantFlush && !c.closed {
+		c.wantFlush = false
+		c.sendRoundLocked()
+	}
+	c.sending = false
 }
 
 func (c *Conn) handleDatagramLocked(d []byte, now time.Time) {
@@ -930,6 +1018,7 @@ func (c *Conn) onHandshakeComplete() error {
 		return transportErr(errTransportParameter, "no transport parameters")
 	}
 	c.handshakeComplete = true
+	c.maxDatagram = int(min(uint64(c.config.MaxDatagramSize), c.peerParams.maxUDPPayloadSize))
 	if !c.isClient {
 		c.handshakeDonePending = true
 		c.confirmHandshake()
@@ -1087,6 +1176,7 @@ func (c *Conn) armTimerLocked(now time.Time) {
 		earliest(c.created.Add(c.config.HandshakeTimeout))
 	}
 	earliest(c.lossDeadline)
+	earliest(c.flushDeadline)
 	if s := &c.spaces[spaceApp]; s.ackPending && !s.ackNow {
 		earliest(s.ackDeadline)
 	}
@@ -1136,7 +1226,10 @@ func (c *Conn) onTimer() {
 		if c.config.KeepAlivePeriod > 0 && c.handshakeComplete && !now.Before(c.keepAliveAt()) {
 			c.pingPending = true
 		}
-		c.flushLocked(now)
+		// The timer sends whether or not the handler is being called: loss
+		// recovery does not wait for a handler that takes its time.
+		c.wantFlush = true
+		c.sendLocked()
 	}
 	c.mu.Unlock()
 	c.dispatch()
