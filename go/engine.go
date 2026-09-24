@@ -118,9 +118,6 @@ type Engine struct {
 	udpListeners   []*udpListener
 	udpIdleTimeout time.Duration
 	udpSweepDone   chan struct{}
-	// datagramBuf receives every datagram the loop reads. Event-loop
-	// ownership.
-	datagramBuf []byte
 	// unixPaths are the socket files the engine's Unix listeners created,
 	// which it removes when it closes, as net.UnixListener does.
 	unixPaths []string
@@ -139,14 +136,6 @@ func (e *Engine) noteUnixPath(network, path string) {
 	if isUnixNetwork(network) && !isAbstractUnixPath(path) {
 		e.unixPaths = append(e.unixPaths, path)
 	}
-}
-
-// datagramBuffer returns the loop's receive buffer for datagrams.
-func (e *Engine) datagramBuffer() []byte {
-	if e.datagramBuf == nil {
-		e.datagramBuf = make([]byte, maxDatagramSize)
-	}
-	return e.datagramBuf
 }
 
 // acquireSendBuffer returns an empty outbound buffer from the shared pool,

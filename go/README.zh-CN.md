@@ -311,10 +311,12 @@ addr, _ := server.LocalUDPAddr()
   在 `OnDatagrams` 返回后不能再持有。数据报取自 `bufferpool`，handler 用完且不再引用时
   可以用 `bufferpool.Put` 归还，供后面的数据报复用；不归还的和普通切片一样由 GC 回收。
 - UDP socket 由 event loop 自己读取（level-triggered，每轮每个 socket 最多读
-  256 个数据报），按对端地址分发到各连接的队列，再由 worker 依次调用 `OnData`；
+  256 个数据报；Linux 上用 `recvmmsg`、macOS 上用 `recvmsg_x` 一次读一批，最多 32 个，
+  一批没读满就说明 socket 已空），按对端地址分发到各连接的队列，再由 worker 依次调用 `OnData`；
   每条连接最多排队 1024 个数据报，超出的直接丢弃，和内核接收缓冲满时一样。
 - 发送直接写 socket，从不排队：socket 没有空间时这个数据报被丢弃，`Send` 返回错误，
-  连接保持打开。因此 UDP 连接不参与写水位和背压。
+  连接保持打开。因此 UDP 连接不参与写水位和背压。`SendBatch` 按顺序发送多个数据报，
+  Linux 上用 `sendmmsg`、macOS 上用 `sendmsg_x`，一次系统调用发出一批。
 - Windows 上监听 socket 用 overlapped `WSARecvFrom`、拨号 socket 用带缓冲区的
   overlapped `WSARecv` 接收，并关闭 `SIO_UDP_CONNRESET`，以免某个对端的 ICMP
   端口不可达导致整个监听 socket 的接收失败。兼容后端用 `net.ListenUDP` 实现同样的语义。

@@ -126,9 +126,11 @@ func (e *Engine) udpPeer(l *udpListener, from *syscall.RawSockaddrAny) *Connecti
 
 // deliverDatagram queues a copy of one datagram on its connection and reports
 // the connection if that made it runnable. The copy is a buffer from package
-// bufferpool, which a handler done with it may give back. Callers run on the
-// event loop.
-func (e *Engine) deliverDatagram(c *Connection, data []byte) *Connection {
+// bufferpool, which a handler done with it may give back. now, in Unix
+// nanoseconds, is when the datagram was read, which a read shares between
+// the datagrams it took rather than ask the clock for each. Callers run on
+// the event loop.
+func (e *Engine) deliverDatagram(c *Connection, data []byte, now int64) *Connection {
 	u := c.udp
 	c.mu.Lock()
 	if c.closing || c.closed || len(u.queue)-u.head >= maxQueuedDatagrams {
@@ -143,7 +145,7 @@ func (e *Engine) deliverDatagram(c *Connection, data []byte) *Connection {
 	copy(datagram, data)
 	u.queue = append(u.queue, datagram)
 	c.mu.Unlock()
-	u.lastActive.Store(time.Now().UnixNano())
+	u.lastActive.Store(now)
 	return e.noteEvent(c, evIn)
 }
 
@@ -198,6 +200,39 @@ func (c *Connection) sendDatagram(data []byte) error {
 		return syscall.EPIPE
 	}
 	err := c.sysSendDatagram(data)
+	if err == nil {
+		c.udp.lastActive.Store(time.Now().UnixNano())
+	}
+	return err
+}
+
+// SendBatch sends each of datagrams as a datagram of its own, in order, as
+// that many Sends would, but on Linux and macOS with one system call for as
+// many of them as it can: sendmmsg, or sendmsg_x. A datagram the socket has
+// no room for is dropped, with those after it, and SendBatch reports why;
+// those before it were sent. On a connection that is not UDP it Sends each
+// in turn.
+func (c *Connection) SendBatch(datagrams [][]byte) error {
+	batch := c.udp != nil
+	for _, d := range datagrams {
+		// Send sends nothing for an empty datagram, where a batch would
+		// send an empty one.
+		batch = batch && len(d) > 0
+	}
+	if !batch {
+		for _, d := range datagrams {
+			if err := c.Send(d); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.closing || c.closed || c.closeAfterSend {
+		return syscall.EPIPE
+	}
+	err := c.sysSendDatagrams(datagrams)
 	if err == nil {
 		c.udp.lastActive.Store(time.Now().UnixNano())
 	}

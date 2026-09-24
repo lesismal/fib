@@ -7,6 +7,7 @@ import (
 	"net/netip"
 	"sync/atomic"
 	"syscall"
+	"time"
 )
 
 const (
@@ -37,6 +38,8 @@ const (
 // to its connection. backend is the epoll or kqueue instance itself.
 type enginePlatform struct {
 	backend
+	// udpBatch is what the loop reads UDP datagrams into.
+	udpBatch       *udpBatch
 	listenFDs      []int
 	nextGeneration atomic.Uint64
 	// connections is a paged table indexed by file descriptor: a descriptor is
@@ -63,12 +66,7 @@ type connPlatform struct {
 // and a peer sends through its listener's.
 type udpPlatform struct{}
 
-// udpListenerPlatform is a UDP socket and where a receive leaves the
-// sender's address, which only the event loop reads into.
-type udpListenerPlatform struct {
-	fd   int
-	from syscall.RawSockaddrAny
-}
+type udpListenerPlatform struct{ fd int }
 
 // FD returns the connection's descriptor, or -1 once it is closed. A UDP peer
 // has no descriptor of its own and always reports -1.
@@ -95,6 +93,26 @@ func (c *Connection) sysSendDatagram(data []byte) error {
 			return err
 		}
 	}
+}
+
+// sysSendDatagrams sends datagrams, none of them empty, in batches. Callers
+// hold c.mu.
+func (c *Connection) sysSendDatagrams(datagrams [][]byte) error {
+	fd, to := c.FD(), syscall.Sockaddr(nil)
+	if l := c.udp.listener; l != nil {
+		fd, to = l.fd, c.udp.sa
+	}
+	for len(datagrams) > 0 {
+		n, err := sendBatch(fd, to, datagrams)
+		if err == syscall.EINTR {
+			continue
+		}
+		if err != nil {
+			return err
+		}
+		datagrams = datagrams[n:]
+	}
+	return nil
 }
 
 func (e *Engine) open(config Config, addrs []string) error {
@@ -157,44 +175,82 @@ func (e *Engine) udpListenerAt(fd int) *udpListener {
 // is level-triggered, so it reads at most one round's share and leaves the
 // rest to the next round.
 //
-// avail is how many bytes of datagrams the poller reported waiting, or -1
-// where it does not say. Reading stops once that many have been read, rather
-// than at a read that finds nothing, which on a socket that has one datagram
-// for each round, as a busy server's many sockets do, is a system call for
-// nothing per datagram. What arrived since is the next round's. Callers run
-// on the event loop.
+// It reads in batches, and stops at a batch that comes back short, which
+// says the socket is empty, rather than at a read that finds nothing. avail
+// is how many bytes of datagrams the poller reported waiting, or -1 where it
+// does not say. Where it says, the round reads the first datagram with an
+// ordinary receive, since most rounds find just the one and a batch of one
+// costs more, batches only when the count says several are left after it
+// (see nextRead), and stops once it has had that many bytes. What arrived
+// since is the next round's.
+// Callers run on the event loop.
 func (e *Engine) readUDPListener(l *udpListener, avail int, ready []*Connection) []*Connection {
-	buf := e.datagramBuffer()
-	for i := 0; i < maxDatagramsPerRound; i++ {
-		n, err := recvfrom(l.fd, buf, &l.from)
+	b := e.datagramBatch()
+	counted := avail >= 0
+	last := 0
+	for read := 0; read < maxDatagramsPerRound; {
+		want, one := nextRead(read, avail, last)
+		n, empty, err := b.recv(l.fd, want, one)
 		if err == syscall.EINTR {
 			continue
 		}
 		if err != nil {
 			return ready
 		}
-		if c := e.udpPeer(l, &l.from); c != nil {
-			if r := e.deliverDatagram(c, buf[:n]); r != nil {
-				ready = append(ready, r)
+		now := time.Now().UnixNano()
+		for i := 0; i < n; i++ {
+			data := b.datagram(i)
+			avail -= len(data)
+			if c := e.udpPeer(l, &b.names[i]); c != nil {
+				if r := e.deliverDatagram(c, data, now); r != nil {
+					ready = append(ready, r)
+				}
 			}
 		}
-		if avail >= 0 {
-			if avail -= n; avail <= 0 {
-				return ready
-			}
+		read += n
+		last = len(b.datagram(n - 1))
+		if empty || counted && avail <= 0 {
+			return ready
 		}
 	}
 	return ready
 }
 
+// minCountedBatch is the fewest datagrams a round the poller counts reads
+// with a batch: a batched receive costs more than an ordinary one, about a
+// quarter more on macOS, and pays for itself only when it takes several.
+const minCountedBatch = 4
+
+// nextRead is how many datagrams a round's next receive asks for, and
+// whether it is an ordinary receive of one rather than a batch: read is how
+// many the round has had, left how many bytes of datagrams the poller counted
+// as still waiting, or -1 where it does not count, and last the size of the
+// last one read, from which left gives how many there are.
+func nextRead(read, left, last int) (int, bool) {
+	want := min(udpBatchSize, maxDatagramsPerRound-read)
+	switch {
+	case left < 0:
+		return want, false
+	case read == 0 || last <= 0:
+		return 1, true
+	}
+	if more := (left + last - 1) / last; more >= minCountedBatch {
+		return min(want, more), false
+	}
+	return 1, true
+}
+
 // readUDPConnection reads a dialed UDP connection's datagrams, as
-// readUDPListener does for a listener's, avail included. An error, such as
-// the refusal a connected socket reports when nothing listens at the peer's
-// port, closes the connection. Callers run on the event loop.
+// readUDPListener does for a listener's. An error, such as the refusal a
+// connected socket reports when nothing listens at the peer's port, closes the
+// connection. Callers run on the event loop.
 func (e *Engine) readUDPConnection(c *Connection, avail int, ready []*Connection) []*Connection {
-	buf := e.datagramBuffer()
-	for i := 0; i < maxDatagramsPerRound; i++ {
-		n, err := syscall.Read(c.FD(), buf)
+	b := e.datagramBatch()
+	counted := avail >= 0
+	last := 0
+	for read := 0; read < maxDatagramsPerRound; {
+		want, one := nextRead(read, avail, last)
+		n, empty, err := b.recv(c.FD(), want, one)
 		if err == syscall.EINTR {
 			continue
 		}
@@ -204,16 +260,29 @@ func (e *Engine) readUDPConnection(c *Connection, avail int, ready []*Connection
 			}
 			return ready
 		}
-		if r := e.deliverDatagram(c, buf[:n]); r != nil {
-			ready = append(ready, r)
-		}
-		if avail >= 0 {
-			if avail -= n; avail <= 0 {
-				return ready
+		now := time.Now().UnixNano()
+		for i := 0; i < n; i++ {
+			data := b.datagram(i)
+			avail -= len(data)
+			if r := e.deliverDatagram(c, data, now); r != nil {
+				ready = append(ready, r)
 			}
+		}
+		read += n
+		last = len(b.datagram(n - 1))
+		if empty || counted && avail <= 0 {
+			return ready
 		}
 	}
 	return ready
+}
+
+// datagramBatch returns the loop's batch to read datagrams into.
+func (e *Engine) datagramBatch() *udpBatch {
+	if e.udpBatch == nil {
+		e.udpBatch = newUDPBatch()
+	}
+	return e.udpBatch
 }
 
 // connectionAt returns the connection currently holding a descriptor.

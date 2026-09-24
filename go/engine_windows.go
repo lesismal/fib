@@ -156,6 +156,17 @@ func (c *Connection) peerSockaddr() (syscall.Sockaddr, error) { return syscall.G
 
 func (c *Connection) sockname() (syscall.Sockaddr, error) { return syscall.Getsockname(c.socket()) }
 
+// sysSendDatagrams sends datagrams one at a time, Windows having no batched
+// send that sendmmsg would be. Callers hold c.mu.
+func (c *Connection) sysSendDatagrams(datagrams [][]byte) error {
+	for _, d := range datagrams {
+		if err := c.sysSendDatagram(d); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 // sysSendDatagram sends one datagram without waiting. Callers hold c.mu.
 func (c *Connection) sysSendDatagram(data []byte) error {
 	var bufs [1]syscall.WSABuf
@@ -304,7 +315,7 @@ func (e *Engine) completeRecvFrom(l *udpListener, n int, err error) *Connection 
 	var ready *Connection
 	if err == nil {
 		if c := e.udpPeer(l, &l.from); c != nil {
-			ready = e.deliverDatagram(c, l.buf[:n])
+			ready = e.deliverDatagram(c, l.buf[:n], time.Now().UnixNano())
 		}
 	}
 	// A failed receive loses only its own datagram. If no receive can be
@@ -333,7 +344,7 @@ func (e *Engine) completeDatagramRead(c *Connection, n int, err error) *Connecti
 	}
 	var ready *Connection
 	if err == nil {
-		ready = e.deliverDatagram(c, c.udp.buf[:n])
+		ready = e.deliverDatagram(c, c.udp.buf[:n], time.Now().UnixNano())
 	}
 	c.mu.Lock()
 	armErr := c.armDatagramReadLocked()
