@@ -54,6 +54,10 @@ type responseWriter struct {
 	closeAfter bool
 	trailers   []string
 	finished   bool
+	// hooks are what OnHeader, OnResponse and OnFinish registered, which
+	// live here rather than in Context so that a Context, which HTTP/3
+	// allocates with each request, costs no more for a feature few use.
+	hooks *responseHooks
 }
 
 // Header returns the header of the response written through Write, as
@@ -106,6 +110,12 @@ func (c *Context) WriteHeader(status int) {
 	if w.sent == nil {
 		w.sent = make(stdhttp.Header)
 	}
+	if w.hooks != nil && !w.hooks.whole {
+		// The header is settled from here on, so this is the last moment the
+		// hooks can change it. A response held whole runs them when it is
+		// sent instead, with its body.
+		w.hooks.beforeHeader(status, w.sent)
+	}
 	if values := w.sent["Content-Length"]; len(values) == 1 {
 		if n, err := strconv.ParseInt(strings.TrimSpace(values[0]), 10, 64); err == nil && n >= 0 {
 			w.declared = n
@@ -140,7 +150,7 @@ func (c *Context) Write(p []byte) (int, error) {
 	if c.Request.Method == stdhttp.MethodHead || len(p) == 0 {
 		return len(p), nil
 	}
-	if !c.isHTTP1() {
+	if c.holdsWhole() {
 		w.buf = append(w.buf, p...)
 		return len(p), nil
 	}
@@ -171,7 +181,8 @@ func (c *Context) WriteString(s string) (int, error) { return c.Write([]byte(s))
 func (c *Context) Flush() { _ = c.FlushError() }
 
 // FlushError is Flush reporting what went wrong, which is what
-// http.ResponseController looks for.
+// http.ResponseController looks for. A response an OnResponse hook needs
+// whole is held as on HTTP/2, so Flush does nothing for it either.
 func (c *Context) FlushError() error {
 	if c.wrote {
 		return ErrResponseWritten
@@ -180,7 +191,7 @@ func (c *Context) FlushError() error {
 	if w.status == 0 {
 		c.WriteHeader(stdhttp.StatusOK)
 	}
-	if w.finished || !c.isHTTP1() {
+	if w.finished || c.holdsWhole() {
 		return nil
 	}
 	if !w.committed {
@@ -202,7 +213,7 @@ func (c *Context) ReadFrom(src io.Reader) (int64, error) {
 	}
 	w := c.writer()
 	file, ok := sendableFileOf(src)
-	if !ok || !c.isHTTP1() || c.Request.Method == stdhttp.MethodHead || w.finished ||
+	if !ok || c.holdsWhole() || c.Request.Method == stdhttp.MethodHead || w.finished ||
 		w.status != 0 && !statusHasBody(w.status) || file.size < minSendFileSize ||
 		w.declared >= 0 && w.written+file.size > w.declared {
 		return io.Copy(writerOnly{c}, src)
@@ -290,6 +301,14 @@ func (s sendableFile) advance() {
 	if s.limited != nil {
 		s.limited.N -= s.size
 	}
+}
+
+// holdsWhole reports whether a response written through the ResponseWriter
+// methods is held until the handler is done and then sent at once: always on
+// HTTP/2 and HTTP/3, and on HTTP/1 when an OnResponse hook needs its body
+// whole.
+func (c *Context) holdsWhole() bool {
+	return !c.isHTTP1() || c.w != nil && c.w.hooks != nil && c.w.hooks.whole
 }
 
 // isHTTP1 reports whether the response goes straight onto an HTTP/1
@@ -400,7 +419,7 @@ func (c *Context) Finish() error {
 		return nil
 	}
 	w.finished = true
-	if !c.isHTTP1() {
+	if c.holdsWhole() {
 		w.sniff()
 		response := Response{StatusCode: w.status, Header: w.sent, Body: w.buf, Trailer: w.trailer()}
 		switch {
@@ -433,6 +452,13 @@ func (c *Context) Finish() error {
 		}
 	}
 	c.wrote = true
+	if w.hooks != nil {
+		size := w.written
+		if c.Request.Method == stdhttp.MethodHead || !statusHasBody(w.status) {
+			size = 0
+		}
+		w.hooks.finished(w.status, w.sent, size)
+	}
 	if w.closeAfter || w.declared >= 0 && w.written < w.declared && c.Request.Method != stdhttp.MethodHead &&
 		statusHasBody(w.status) {
 		// A body shorter than its Content-Length leaves the client waiting

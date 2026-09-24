@@ -181,7 +181,7 @@ func (c *Context) Respond(status int, contentType string, body []byte) error {
 	if contentType == "" {
 		return c.WriteResponse(Response{StatusCode: status, Body: body})
 	}
-	if c.isHTTP1() {
+	if c.isHTTP1() && c.hooked() == nil {
 		// HTTP/1 writes the one field straight into the response's head,
 		// without a header map to build and walk.
 		if c.w != nil && c.w.status != 0 {
@@ -215,6 +215,11 @@ func (c *Context) WriteResponse(response Response) error {
 	if c.w != nil && c.w.status != 0 {
 		return ErrResponseWritten
 	}
+	if c.hooked() != nil && response.Header != nil && !c.wrote {
+		// The hooks may change the header, which is the caller's and may be
+		// shared with other responses.
+		response.Header = response.Header.Clone()
+	}
 	return c.writeResponse(response)
 }
 
@@ -225,23 +230,33 @@ func (c *Context) writeResponse(response Response) error {
 	if response.StatusCode == 0 {
 		response.StatusCode = stdhttp.StatusOK
 	}
-	if c.external != nil {
-		if err := c.external.WriteResponse(c.Request, response); err != nil {
-			return err
-		}
-		c.wrote = true
-		return nil
+	hooks := c.hooked()
+	if hooks != nil {
+		hooks.before(&response)
 	}
-	if c.stream != nil {
+	var err error
+	switch {
+	case c.external != nil:
+		if err = c.external.WriteResponse(c.Request, response); err == nil {
+			c.wrote = true
+		}
+	case c.stream != nil:
 		// HTTP/2 multiplexes the connection, so Close retires it gracefully
 		// with GOAWAY rather than cutting the other streams short.
-		if err := c.stream.respond(c.Request, response); err != nil {
-			return err
+		if err = c.stream.respond(c.Request, response); err == nil {
+			c.wrote = true
 		}
-		c.wrote = true
-		return nil
+	default:
+		err = c.writeHTTP1(response, "")
 	}
-	return c.writeHTTP1(response, "")
+	if err == nil && hooks != nil {
+		size := int64(len(response.Body))
+		if c.Request.Method == stdhttp.MethodHead || !statusHasBody(response.StatusCode) {
+			size = 0
+		}
+		hooks.finished(response.StatusCode, response.Header, size)
+	}
+	return err
 }
 
 // writeHTTP1 is writeResponse for HTTP/1. contentType, when it is not empty,
