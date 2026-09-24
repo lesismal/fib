@@ -741,6 +741,41 @@ resp, err := client.Go(req).Wait() // Future：Wait 阻塞，Done() 可用于 se
 - 先 `client.Close()` 再关闭 Engine：`Close` 让排队中的请求以 `ErrClientClosed` 失败，
   已发出的请求照常完成；直接关闭 Engine 不会通知 client，已发出的请求只能等超时。
 
+### 中间件（middleware）
+
+`middleware` package 用 `Chain` 把中间件套在 handler 外面，第一个在最外层（最先看到
+请求、最后看到响应）。各子 package 用 `New(可选 Config)` 构造，HTTP/1、HTTP/2、HTTP/3
+通用：
+
+```go
+handler := middleware.Chain(app,
+    recover.New(),      // panic 转成 500，连接和同连接上的其他请求不受影响
+    requestid.New(),    // X-Request-ID：沿用客户端的，否则生成 UUID
+    logger.New(),       // 每个响应写一行，格式用 ${status}、${latency} 等标签
+    responsetime.New(), // X-Response-Time
+    limiter.New(limiter.Config{Max: 100, Expiration: time.Minute}), // 按 IP 限流，超出返回 429
+    cors.New(cors.Config{AllowOrigins: []string{"https://app.example.com"}}),
+    csrf.New(),         // double-submit cookie + net/http 的 CrossOriginProtection
+    pprof.New(),        // /debug/pprof/，profile 在单独的 goroutine 里采集
+    compress.New(),     // gzip / deflate
+    etag.New(),         // ETag 与 If-None-Match → 304
+)
+server, err := fib.Bind(config, fibhttp.NewHandler(handler))
+```
+
+每个 Config 都有 `Next`，返回 true 时跳过该中间件。中间件通过 `Context` 的三个钩子改写
+响应，所以 handler 无论用 `Respond`、`WriteResponse` 还是 ResponseWriter 方法写响应都适用：
+
+- `OnHeader(fn)`：响应头定下来之前调用，拿到最终状态码，可以修改 header，不影响流式发送。
+- `OnResponse(fn)`：发送前拿到完整响应（状态码、header、body、trailer）并可替换。
+  注册后 ResponseWriter 方法写的响应会整体缓存到 handler 结束再发（和 HTTP/2 一样），
+  HTTP/1 上 `Flush` 不再立即发送，文件也不走 sendfile；compress 和 etag 用的就是它，
+  对 SSE 之类的流式响应请用 `Next` 跳过。
+- `OnFinish(fn)`：响应交给连接之后调用，带状态码、header 和 body 长度。
+
+钩子按注册的逆序执行（和 defer 一样），外层中间件看到的是内层处理完的结果。compress 要放在
+etag 外面，这样 ETag 按原始 body 计算，压缩后再改成弱 ETag。
+
 ## HTTP/3 子 package
 
 `http3` package 在 Engine 的 UDP socket 上提供 HTTP/3（RFC 9114），其下的 QUIC
