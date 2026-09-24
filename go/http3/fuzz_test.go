@@ -3,6 +3,7 @@
 package http3
 
 import (
+	"net/textproto"
 	"net/url"
 	"reflect"
 	"testing"
@@ -106,4 +107,16 @@ func headerFields(method, scheme, authority, path, name, value string) []qpack.H
 		fields = append(fields, qpack.HeaderField{Name: name, Value: value})
 	}
 	return fields
+}
+
+// canonicalKey makes of a lowercase name what textproto does.
+func TestCanonicalKey(t *testing.T) {
+	for name := range canonicalKeys {
+		if got, want := canonicalKey(name), textproto.CanonicalMIMEHeaderKey(name); got != want {
+			t.Fatalf("%q: %q, textproto makes %q", name, got, want)
+		}
+	}
+	if got := canonicalKey("x-unknown-field"); got != "X-Unknown-Field" {
+		t.Fatalf("x-unknown-field: %q", got)
+	}
 }

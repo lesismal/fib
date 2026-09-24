@@ -40,7 +40,10 @@ type sentFrame struct {
 }
 
 type sentPacket struct {
-	pn           uint64
+	pn uint64
+	// ackOf is one more than the largest packet number the packet's ACK
+	// frame acknowledged, or zero if it carried none.
+	ackOf        uint64
 	time         time.Time
 	size         int
 	ackEliciting bool
@@ -48,8 +51,14 @@ type sentPacket struct {
 	frames       []sentFrame
 }
 
-// maxFreeSent bounds the sent packets a connection keeps for reuse.
-const maxFreeSent = 64
+// maxFreeSent bounds the sent packets a connection keeps for reuse, and
+// maxFreeFrames the frames one of them keeps room for: records a connection
+// has in flight at once come back and go out again, and what is kept past
+// that is memory for every connection.
+const (
+	maxFreeSent   = 16
+	maxFreeFrames = 16
+)
 
 // newSentPacket returns a record for the packet numbered pn, reusing one
 // that was acknowledged or declared lost when there is one: every packet
@@ -73,8 +82,13 @@ func (c *Conn) releaseSent(p *sentPacket) {
 	if len(c.freeSent) >= maxFreeSent {
 		return
 	}
-	clear(p.frames)
-	*p = sentPacket{frames: p.frames[:0]}
+	frames := p.frames[:0]
+	if cap(frames) > maxFreeFrames {
+		frames = nil
+	} else {
+		clear(p.frames)
+	}
+	*p = sentPacket{frames: frames}
 	c.freeSent = append(c.freeSent, p)
 }
 
@@ -240,6 +254,13 @@ func (c *Conn) onAckReceived(space int, ranges []pnRange, ackDelay time.Duration
 		}
 		for i := range p.frames {
 			c.frameAcked(space, &p.frames[i])
+		}
+		if p.ackOf > s.ackFloor+1 {
+			// The peer has the ACK frame, so what it acknowledged need not
+			// be again: every ACK would otherwise carry every range still
+			// kept, which a peer that skips packet numbers keeps many of.
+			s.ackFloor = p.ackOf - 1
+			s.recv.forget(s.ackFloor)
 		}
 	}
 	if space == spaceApp && largest >= c.txPhaseFirstPN {

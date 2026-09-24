@@ -411,6 +411,9 @@ type requestStream struct {
 	mu        sync.Mutex
 	responded bool
 	closed    bool
+	// expected is set while the connection expects the response, and holds
+	// what it has to send for it; see quic.Conn.ExpectWrite.
+	expected bool
 
 	// block is the request, its URL and the Context it is answered through,
 	// allocated with the stream, and values holds its header's values.
@@ -419,8 +422,10 @@ type requestStream struct {
 }
 
 // requestValues is how many of a request's header values its stream has
-// room for, which is more than an ordinary request's regular fields.
-const requestValues = 6
+// room for, which is more than an ordinary request's regular fields. It is
+// also what keeps a requestStream at 896 bytes, one of the allocator's size
+// classes; one more value would put it in the class of 1024.
+const requestValues = 5
 
 func (rs *requestStream) feed(data []byte, fin bool) {
 	if rs.done {
@@ -562,6 +567,13 @@ func (rs *requestStream) finish() {
 	sc := rs.sc
 	rs.block.Context(sc.conn, rs, rs.body)
 	rs.body = nil
+	// The response comes from another goroutine, soon: the connection holds
+	// what it has to send, the acknowledgement of the request included, to
+	// send it with the response, and with the rest of the burst's.
+	rs.mu.Lock()
+	rs.expected = true
+	rs.mu.Unlock()
+	sc.qc.ExpectWrite()
 	// Served through fibhttp rather than by calling the handler, so that a
 	// handler which retains the request, or reads its body through OnBody,
 	// works here too. The pool runs it away from this goroutine, which reads
@@ -620,6 +632,8 @@ func (rs *requestStream) peerReset() {
 // frame, then the end of the stream. QUIC flow and congestion control pace
 // the body.
 func (rs *requestStream) WriteResponse(req *stdhttp.Request, response fibhttp.Response) error {
+	// After the response is written, so that what was held leaves with it.
+	defer rs.writeDone()
 	status := response.StatusCode
 	if status < 200 || status > 999 {
 		return fmt.Errorf("http3: invalid status code %d", status)
@@ -639,8 +653,8 @@ func (rs *requestStream) WriteResponse(req *stdhttp.Request, response fibhttp.Re
 	rs.responded = true
 	rs.mu.Unlock()
 
-	// The stream copies what it is written, so every buffer built here goes
-	// back to the pool once the frames are on it.
+	// The field sections go back to the pool once the frames are built from
+	// them; the frames' own buffer the stream takes over.
 	block := bufferpool.Append(nil, qpack.Prefix)
 	defer func() { bufferpool.Put(block) }()
 	// The numbers are formatted on the stack: AppendField keeps nothing of
@@ -656,8 +670,9 @@ func (rs *requestStream) WriteResponse(req *stdhttp.Request, response fibhttp.Re
 	if !bodyAllowed(req, status) {
 		body = nil
 	}
+	// The stream takes out over, as the buffer it sends from until the
+	// client has acknowledged it.
 	out := bufferpool.Get(len(block) + len(body) + 16)[:0]
-	defer func() { bufferpool.Put(out) }()
 	out = appendHeadersFrame(out, block)
 	if len(body) > 0 {
 		out = appendFrameHeader(out, frameData, len(body))
@@ -679,7 +694,7 @@ func (rs *requestStream) WriteResponse(req *stdhttp.Request, response fibhttp.Re
 		}
 		bufferpool.Put(trailer)
 	}
-	err := rs.s.Write(out, true)
+	err := rs.s.WriteOwned(out, true)
 	if !rs.remoteDone {
 		// Answered before the request finished arriving: the rest of it is
 		// not wanted (RFC 9114 section 4.1).
@@ -697,6 +712,18 @@ func (rs *requestStream) WriteResponse(req *stdhttp.Request, response fibhttp.Re
 		return errStreamClosed
 	}
 	return nil
+}
+
+// writeDone tells the connection, once, that the response finish told it to
+// expect has been written.
+func (rs *requestStream) writeDone() {
+	rs.mu.Lock()
+	expected := rs.expected
+	rs.expected = false
+	rs.mu.Unlock()
+	if expected {
+		rs.sc.qc.WriteDone()
+	}
 }
 
 // WriteInterim sends an informational 1xx response ahead of the final one.

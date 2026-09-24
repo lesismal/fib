@@ -9,6 +9,7 @@ import (
 	"net"
 	"slices"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -117,6 +118,9 @@ type testPair struct {
 	serverMu             sync.Mutex
 	// stray gets what reaches the server while it has no connection.
 	stray func(d []byte)
+	// bursts has the server take what has piled up for it with one
+	// HandleDatagrams, as a fib server does, rather than a datagram a call.
+	bursts atomic.Bool
 }
 
 func (p *testPair) close() {
@@ -161,7 +165,22 @@ func newTestPair(t *testing.T, loss float64, configure func(client, server *Conf
 				}
 				s := p.server
 				p.serverMu.Unlock()
-				s.HandleDatagram(d)
+				if !p.bursts.Load() {
+					s.HandleDatagram(d)
+					continue
+				}
+				// A flight of datagrams is all there once the path has
+				// been quiet for a while.
+				burst := [][]byte{d}
+				for more := true; more; {
+					select {
+					case d := <-p.serverEnd.queue:
+						burst = append(burst, d)
+					case <-time.After(2 * time.Millisecond):
+						more = false
+					}
+				}
+				s.HandleDatagrams(burst)
 			case <-p.done:
 				return
 			}
@@ -626,4 +645,164 @@ func TestWritesDuringHandlerCallShareDatagrams(t *testing.T) {
 	if n := len(serverSizes()); n > 2 {
 		t.Fatalf("%d writes left in %d datagrams, want them together: %v", pieces, n, serverSizes())
 	}
+}
+
+// Once the peer has acknowledged an ACK frame, the ranges it covered are no
+// longer sent, so a connection whose peer's packet numbers have gaps, lost
+// or skipped, keeps sending acknowledgements of a few ranges rather than of
+// every range ever kept (RFC 9000 section 13.2.4).
+func TestAckRangesForgotten(t *testing.T) {
+	p := newTestPair(t, 0, nil)
+	p.serverH.onData = func(s *Stream, data []byte, fin bool) { _ = s.Write(data, fin) }
+	// The client's packets go missing now and then, which leaves gaps in
+	// what the server has received.
+	p.clientEnd.mu.Lock()
+	p.clientEnd.loss = 0.1
+	p.clientEnd.mu.Unlock()
+	payload := make([]byte, 256<<10)
+	_, _ = rand.Read(payload)
+	s, err := p.client.OpenStream()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Write(payload, true); err != nil {
+		t.Fatal(err)
+	}
+	waitFinished(t, p.clientH, s.ID())
+	p.server.mu.Lock()
+	ranges := len(p.server.spaces[spaceApp].recv)
+	p.server.mu.Unlock()
+	if ranges >= maxAckRanges/2 {
+		t.Fatalf("the server still acknowledges %d ranges", ranges)
+	}
+}
+
+// A request whose answer comes from another goroutine, with the connection
+// told to expect it, is acknowledged in the answer rather than in a packet of
+// its own ahead of it, even when the request took packets enough to want an
+// acknowledgement at once; one whose answer is late is acknowledged anyway.
+func TestExpectedWriteCarriesTheAck(t *testing.T) {
+	for _, delay := range []time.Duration{0, 20 * time.Millisecond} {
+		t.Run(delay.String(), func(t *testing.T) {
+			p := newTestPair(t, 0, nil)
+			time.Sleep(50 * time.Millisecond) // the handshake's last packets
+			p.bursts.Store(true)
+			sends := watchSends(p.serverEnd)
+			p.serverH.onData = func(s *Stream, data []byte, fin bool) {
+				if !fin {
+					return
+				}
+				s.Conn().ExpectWrite()
+				go func() {
+					time.Sleep(delay)
+					_ = s.Write(bytes.Repeat([]byte("a"), 500), true)
+					s.Conn().WriteDone()
+				}()
+			}
+			s, err := p.client.OpenStream()
+			if err != nil {
+				t.Fatal(err)
+			}
+			// Three packets of request, which want an acknowledgement at once.
+			if err := s.Write(make([]byte, 3000), true); err != nil {
+				t.Fatal(err)
+			}
+			waitFinished(t, p.clientH, s.ID())
+			sent := sends()
+			small := 0
+			for _, n := range sent {
+				if n < 100 {
+					small++
+				}
+			}
+			if late := delay > flushHold; late != (small > 0) {
+				t.Fatalf("answered after %v: the server sent %v", delay, sent)
+			}
+		})
+	}
+}
+
+// Answers to a burst of requests written on goroutines of their own, with
+// the connection told to expect them, leave packed together rather than in a
+// packet each.
+func TestExpectedWritesArePacked(t *testing.T) {
+	p := newTestPair(t, 0, func(_, server *Config) { server.MaxDatagramSize = 1350 })
+	time.Sleep(50 * time.Millisecond)
+	p.bursts.Store(true)
+	const requests = 4
+	var mu sync.Mutex
+	var streams []*Stream
+	p.serverH.onData = func(s *Stream, data []byte, fin bool) {
+		if !fin {
+			return
+		}
+		s.Conn().ExpectWrite()
+		mu.Lock()
+		streams = append(streams, s)
+		ready := len(streams) == requests
+		mu.Unlock()
+		if !ready {
+			return
+		}
+		// Every request of the burst has arrived: each is answered on a
+		// goroutine of its own.
+		for _, s := range streams {
+			go func() {
+				_ = s.Write(bytes.Repeat([]byte("a"), 600), true)
+				s.Conn().WriteDone()
+			}()
+		}
+	}
+	sends := watchSends(p.serverEnd)
+	var ids []uint64
+	for i := 0; i < requests; i++ {
+		s, err := p.client.OpenStream()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := s.Write([]byte("request"), true); err != nil {
+			t.Fatal(err)
+		}
+		ids = append(ids, s.ID())
+	}
+	for _, id := range ids {
+		waitFinished(t, p.clientH, id)
+	}
+	if sent := sends(); len(sent) > requests/2 {
+		t.Fatalf("%d answers of 600 bytes left in %v", requests, sent)
+	}
+}
+
+// A write expected but not made, as by a handler that keeps its request,
+// holds the connection's other writes back once, for flushHold, and not after.
+func TestExpectedWriteThatDoesNotCome(t *testing.T) {
+	p := newTestPair(t, 0, nil)
+	time.Sleep(50 * time.Millisecond)
+	sends := watchSends(p.clientEnd)
+	p.client.ExpectWrite()
+	s, err := p.client.OpenStream()
+	if err != nil {
+		t.Fatal(err)
+	}
+	start := time.Now()
+	if err := s.Write([]byte("x"), true); err != nil {
+		t.Fatal(err)
+	}
+	for len(sends()) == 0 {
+		if time.Since(start) > time.Second {
+			t.Fatal("the write never left")
+		}
+		time.Sleep(100 * time.Microsecond)
+	}
+	if waited := time.Since(start); waited < flushHold/2 {
+		t.Fatalf("the write left after %v, without waiting for the one expected", waited)
+	}
+	p.client.mu.Lock()
+	awaited := p.client.awaited
+	p.client.mu.Unlock()
+	if awaited != 0 {
+		t.Fatalf("%d writes still expected once they have held the rest back", awaited)
+	}
+	// Its WriteDone, when it comes at last, is harmless.
+	p.client.WriteDone()
 }

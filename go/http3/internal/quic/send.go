@@ -92,16 +92,18 @@ const maxRoundDatagrams = 64
 // sending goroutine (see flush) and hold c.mu, which they hold again when it
 // returns.
 func (c *Conn) sendRoundLocked() {
-	buf := bufferpool.Get(sendBufferSize)[:0]
-	// Each space builds its packet's payload in a slot of its own, since the
+	// One buffer for the round: datagrams from its start, and at its end a
+	// slot for each space to build its packet's payload in, since the
 	// packets of a datagram are all chosen before any of them is sealed.
-	scratch := bufferpool.Get(numSpaces * maxDatagramLimit)
-	var datagrams [maxRoundDatagrams][]byte
+	mem := bufferpool.Get(sendBufferSize)
+	scratch := mem[sendBufferSize-numSpaces*maxDatagramLimit:]
+	buf := mem[: 0 : sendBufferSize-numSpaces*maxDatagramLimit]
+	lens := &c.roundLens
 	n := 0
 	now := c.now()
 	c.maybeUpdateKeys()
 	for !c.closed {
-		if n == len(datagrams) || cap(buf)-len(buf) < c.maxDatagram {
+		if n == len(lens) || cap(buf)-len(buf) < c.maxDatagram {
 			c.wantFlush = true
 			break
 		}
@@ -111,10 +113,9 @@ func (c *Conn) sendRoundLocked() {
 			break
 		}
 		c.bytesSent += uint64(len(buf) - start)
-		datagrams[n] = buf[start:]
+		lens[n] = uint16(len(buf) - start)
 		n++
 	}
-	bufferpool.Put(scratch)
 	c.flushDeadline = time.Time{}
 	if !c.closed {
 		c.setLossDetectionTimer(now)
@@ -122,12 +123,28 @@ func (c *Conn) sendRoundLocked() {
 	}
 	if n > 0 {
 		c.mu.Unlock()
-		for _, d := range datagrams[:n] {
-			_ = c.pc.Send(d)
-		}
+		c.sendDatagrams(buf, lens[:n])
 		c.mu.Lock()
 	}
-	bufferpool.Put(buf)
+	bufferpool.Put(mem)
+}
+
+// sendDatagrams sends the datagrams laid one after another in buf, with one
+// call when the path takes several at once. Callers are the sending goroutine,
+// without c.mu.
+func (c *Conn) sendDatagrams(buf []byte, lens []uint16) {
+	if b, ok := c.pc.(BatchSender); ok && len(lens) > 1 {
+		var datagrams [maxRoundDatagrams][]byte
+		for i, n := range lens {
+			datagrams[i], buf = buf[:n], buf[n:]
+		}
+		_ = b.SendBatch(datagrams[:len(lens)])
+		return
+	}
+	for _, n := range lens {
+		_ = c.pc.Send(buf[:n])
+		buf = buf[n:]
+	}
 }
 
 // appendDatagram appends one datagram to out, with a packet from each space
@@ -202,14 +219,20 @@ func (c *Conn) buildPacket(space, room int, mayElicit bool, now time.Time, scrat
 	if max < 16 {
 		return packetPlan{}, false
 	}
+	ackDue := s.ackPending && (s.ackNow || !s.ackDeadline.IsZero() && !now.Before(s.ackDeadline))
+	if !ackDue && s.probes == 0 && (!mayElicit || !c.framesWaiting(space)) {
+		// An acknowledgement that is not due goes out only with something
+		// else, and there is nothing else: building it would be for nothing.
+		return packetPlan{}, false
+	}
 	sp := c.newSentPacket(pn)
 	payload := scratch[:0]
-	ackDue := s.ackPending && (s.ackNow || !s.ackDeadline.IsZero() && !now.Before(s.ackDeadline))
 	withAck := false
 	if s.ackPending && len(s.recv) > 0 {
 		if ack := c.appendAck(payload, s, now); len(ack) <= max/2 {
 			payload = ack
 			withAck = true
+			sp.ackOf = s.recv.largest() + 1
 		}
 	}
 	if mayElicit {
@@ -240,6 +263,18 @@ func (c *Conn) buildPacket(space, room int, mayElicit bool, now time.Time, scrat
 	}
 	s.nextPN++
 	return packetPlan{space: space, pn: pn, pnLen: pl, payload: payload, sp: sp, padded: padded}, true
+}
+
+// framesWaiting reports whether a space may have ack-eliciting frames to
+// send, which appendFrames finds out for sure: false means it has none.
+func (c *Conn) framesWaiting(space int) bool {
+	cs := &c.spaces[space].cryptoSend
+	if cs.next < cs.end() || cs.hasLost() {
+		return true
+	}
+	return space == spaceApp && (len(c.sendQueue) > 0 || c.handshakeDonePending || c.maxDataPending ||
+		c.maxStreamsBidiPending || c.maxStreamsUniPending || len(c.pathResponses) > 0 ||
+		len(c.retireCIDs) > 0 || c.pingPending)
 }
 
 // appendFrames adds a space's ack-eliciting frames, up to max bytes of

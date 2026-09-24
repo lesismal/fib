@@ -1,5 +1,7 @@
 package quic
 
+import "github.com/lesismal/fib/go/bufferpool"
+
 // Stream is one QUIC stream. Its sending side is written with Write and
 // ended with Close or Reset; what arrives on its receiving side goes to the
 // connection handler's OnStreamData, in order.
@@ -63,10 +65,18 @@ func (s *Stream) Bidirectional() bool { return isBidi(s.id) }
 // Write queues p to be sent, and with fin set ends the sending side after
 // it. The stream keeps a copy, so p may be reused at once. Data is sent as
 // flow and congestion control allow, which Write does not wait for.
-func (s *Stream) Write(p []byte, fin bool) error {
+func (s *Stream) Write(p []byte, fin bool) error { return s.write(p, fin, false) }
+
+// WriteOwned is Write for p that is a buffer from package bufferpool, which
+// the stream takes over, whether or not the write succeeds, rather than copy:
+// the caller must not use p afterwards. A stream with nothing waiting to be
+// sent keeps p as it is until it has been acknowledged.
+func (s *Stream) WriteOwned(p []byte, fin bool) error { return s.write(p, fin, true) }
+
+func (s *Stream) write(p []byte, fin, owned bool) error {
 	c := s.conn
 	c.mu.Lock()
-	err := s.writeLocked(p, fin)
+	err := s.writeLocked(p, fin, owned)
 	if err == nil {
 		c.wantFlush = true
 	}
@@ -75,14 +85,19 @@ func (s *Stream) Write(p []byte, fin bool) error {
 	return err
 }
 
-func (s *Stream) writeLocked(p []byte, fin bool) error {
+func (s *Stream) writeLocked(p []byte, fin, owned bool) error {
 	switch {
-	case s.conn.closed:
-		return ErrClosed
-	case !s.hasSend || s.finQueued || s.reset:
+	case s.conn.closed, !s.hasSend || s.finQueued || s.reset:
+		if owned {
+			bufferpool.Put(p)
+		}
 		return ErrClosed
 	}
-	s.send.write(p)
+	if owned {
+		s.send.adopt(p)
+	} else {
+		s.send.write(p)
+	}
 	if fin {
 		s.finQueued = true
 		s.finalSize = s.send.end()

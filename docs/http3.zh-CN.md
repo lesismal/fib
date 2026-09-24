@@ -52,6 +52,11 @@
   读完 body，之后再读会得到 `http.ErrBodyReleased`。
 - 服务端以 `fib.DatagramsHandler` 的方式成批接收一条连接的数据报：连接的 worker 运行时
   已经排队的数据报一起处理，ACK 和这期间写出的响应尽量装进更少的包里一起发出。
+- 交给 handler 池的请求会告诉它的连接即将有响应写出（`quic.Conn.ExpectWrite`）：池里各个
+  goroutine 写出的响应等这一批其余的响应（最多 1 毫秒），再和这批请求的 ACK 一起尽量装进
+  更少的包里发出，与 handler 在连接上直接应答时一样。
+- ACK 不再重复确认对端已经看到被确认过的范围（RFC 9000 第 13.2.4 节），所以对跳过包号的
+  对端（quiche 就会这样做），ACK 帧只带少数几个范围，而不是保留的全部范围。
 - `Engine.Stop`/`Close` 不会给 HTTP/3 连接发送 CONNECTION_CLOSE 或 GOAWAY，连接被直接
   丢弃，客户端要等空闲超时才会发现。
 - 与 `http` package 相同，`http3` 只在 Linux、macOS、Windows 三个原生后端上编译，兼容
@@ -154,7 +159,9 @@
 - **PMTU 探测（DPLPMTUD，RFC 8899）**：以太网上通常可以用到约 1450 字节的数据报，每个
   包的头部和 AEAD 标签开销会降低。在此之前可以用 `Config.MaxDatagramSize` 手动调大。
 - **拥塞控制**：增加 CUBIC 或 BBR，判断应用受限，实现持续拥塞判定。
-- **批量收发**：使用 GSO/GRO、`sendmmsg`/`recvmmsg`，需要 Engine 的 UDP 层配合。
+- **批量收发**：Engine 在 Linux 上用 `recvmmsg`、macOS 上用 `recvmsg_x` 批量读取；一轮
+  发送多于一个数据报时用 `sendmmsg` 或 `sendmsg_x` 一次发出（`fib.Connection.SendBatch`）。
+  GSO/GRO（把发给同一对端的一批数据报作为一个缓冲区交给内核）尚未实现。
 - **减少复制与分配**：发送时 `Write` 复制一次（复制进缓冲池里的缓冲区）、组包时再复制
   一次；接收时 Engine 复制一次（复制进缓冲池里的缓冲区），HTTP/3 帧解析器只复制跨片段的帧
   和请求 body。每个请求仍要分配它的 QUIC stream、header map，以及一块装着 request、URL、

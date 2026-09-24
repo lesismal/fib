@@ -63,6 +63,19 @@ func (b *sendBuffer) write(p []byte) {
 	b.buf = append(b.buf, p...)
 }
 
+// adopt appends p, a buffer from the pool that the send buffer takes over:
+// kept as the buffer itself when nothing else is waiting in it, which saves
+// the copy, and copied and given back otherwise.
+func (b *sendBuffer) adopt(p []byte) {
+	if len(b.buf) > 0 || len(p) == 0 {
+		b.write(p)
+		bufferpool.Put(p)
+		return
+	}
+	bufferpool.Put(b.mem)
+	b.mem, b.buf = p, p
+}
+
 // hasLost reports whether some sent data needs sending again.
 func (b *sendBuffer) hasLost() bool {
 	for len(b.lost) > 0 && b.lost[0].end <= b.base {
@@ -254,3 +267,14 @@ func (s *rangeSet) add(pn uint64) bool {
 }
 
 func (s rangeSet) largest() uint64 { return s[len(s)-1].hi }
+
+// forget drops the ranges wholly below pn, but never the last one, which
+// packet numbers are decoded against.
+func (s *rangeSet) forget(pn uint64) {
+	r := *s
+	i := 0
+	for i < len(r)-1 && r[i].hi < pn {
+		i++
+	}
+	*s = r[i:]
+}

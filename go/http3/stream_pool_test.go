@@ -7,6 +7,7 @@ import (
 	"sync"
 	"testing"
 	"time"
+	"unsafe"
 
 	fibhttp "github.com/lesismal/fib/go/http"
 )
@@ -117,5 +118,18 @@ func TestStreamPoolConcurrency(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// A request's stream is allocated with everything serving it takes, and kept
+// until the client has acknowledged its response, so its size is memory per
+// request in flight: it stays within the allocator's 896-byte size class,
+// which one field more would take it out of into the class of 1024.
+func TestRequestStreamSize(t *testing.T) {
+	if unsafe.Sizeof(uintptr(0)) != 8 {
+		t.Skip("sized for 64-bit platforms")
+	}
+	if size := unsafe.Sizeof(requestStream{}); size > 896 {
+		t.Fatalf("a requestStream takes %d bytes, past the 896-byte size class", size)
 	}
 }

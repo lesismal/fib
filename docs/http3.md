@@ -61,7 +61,15 @@ Behavior users need to be aware of.
 - The server takes a connection's datagrams in bursts, as a
   `fib.DatagramsHandler`: whatever has piled up by the time the connection's
   worker runs is processed together, and the acknowledgement and the
-  responses written meanwhile leave in as few packets as they fit in.
+  responses written meanwhile leave in as few packets as they fit in. A
+  request handed to the handler pool tells its connection to expect its
+  response (`quic.Conn.ExpectWrite`), so that answers written on the pool's
+  goroutines wait for the rest of the burst's, a millisecond at most, and
+  leave packed together with its acknowledgement, as they would from a
+  handler answering inline.
+- Acknowledgements stop covering what the peer has seen acknowledged (RFC
+  9000 section 13.2.4), so a peer that skips packet numbers, as quiche does,
+  gets ACK frames of a few ranges rather than of every range kept.
 - `Engine.Stop`/`Close` sends neither CONNECTION_CLOSE nor GOAWAY; connections
   are dropped and clients find out only when they time out.
 - Like the `http` package, `http3` builds only on the three native backends
@@ -188,8 +196,10 @@ In order of priority.
   Until then, `Config.MaxDatagramSize` sets a larger size by hand.
 - **Congestion control**: add CUBIC or BBR, app-limited detection and persistent
   congestion.
-- **Batched I/O**: GSO/GRO and `sendmmsg`/`recvmmsg`, which need the engine's
-  UDP layer.
+- **Batched I/O**: the engine reads with `recvmmsg` on Linux and `recvmsg_x`
+  on macOS, and a round of sending with more than one datagram leaves with
+  `sendmmsg` or `sendmsg_x` (`fib.Connection.SendBatch`). GSO/GRO, which
+  would hand the kernel a burst to one peer as one buffer, are still to do.
 - **Fewer copies and allocations**: sending copies once in `Write`, into a
   pooled buffer, and again when packets are built; receiving copies in the
   engine, into a pooled buffer, and in the HTTP/3 frame parser only a frame

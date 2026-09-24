@@ -118,6 +118,25 @@ var lowerKeys = func() map[string]string {
 	return keys
 }()
 
+// canonicalKeys maps the lowercase names of lowerKeys back to their keys,
+// which is what textproto.CanonicalMIMEHeaderKey makes of them, for the
+// fields of a request to be looked up rather than rebuilt.
+var canonicalKeys = func() map[string]string {
+	keys := make(map[string]string, len(lowerKeys))
+	for key, name := range lowerKeys {
+		keys[name] = key
+	}
+	return keys
+}()
+
+// canonicalKey is textproto.CanonicalMIMEHeaderKey of a lowercase field name.
+func canonicalKey(name string) string {
+	if key, ok := canonicalKeys[name]; ok {
+		return key
+	}
+	return textproto.CanonicalMIMEHeaderKey(name)
+}
+
 // lowerKey is a header key in lower case, as HTTP/3 sends it, without the
 // allocation strings.ToLower makes of a canonical key for the keys messages
 // nearly always carry.
@@ -179,7 +198,7 @@ func newRequest(fields []qpack.HeaderField, block *fibhttp.StreamRequest, values
 			cookies = append(cookies, f.Value)
 			continue
 		}
-		key := textproto.CanonicalMIMEHeaderKey(f.Name)
+		key := canonicalKey(f.Name)
 		if existing, ok := header[key]; ok || len(values) == 0 {
 			header[key] = append(existing, f.Value)
 			continue

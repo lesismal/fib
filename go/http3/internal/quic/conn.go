@@ -29,6 +29,13 @@ const (
 	numSpaces
 )
 
+// BatchSender is a PacketConn that sends several datagrams with one call,
+// which a connection uses for a round of sending that has more than one. It
+// must not keep them once it returns.
+type BatchSender interface {
+	SendBatch(datagrams [][]byte) error
+}
+
 // PacketConn sends a connection's datagrams to its peer.
 type PacketConn interface {
 	// Send sends one datagram. It must not keep the datagram once it
@@ -141,8 +148,12 @@ type pnSpace struct {
 	lastAckElicitingSent time.Time
 	probes               int
 
-	// Receiving: what to acknowledge, and whether and when to.
+	// Receiving: what to acknowledge, and whether and when to. ackFloor is
+	// the packet number below which nothing needs acknowledging any more:
+	// the peer has acknowledged an ACK frame that covered it (RFC 9000
+	// section 13.2.4).
 	recv             rangeSet
+	ackFloor         uint64
 	largestRecvTime  time.Time
 	ackPending       bool
 	ackNow           bool
@@ -280,8 +291,14 @@ type Conn struct {
 	sending       bool
 	wantFlush     bool
 	flushDeadline time.Time
+	// awaited counts the writes ExpectWrite said are on their way.
+	awaited int
 	// buffered are packets that arrived before their keys.
 	buffered [][]byte
+	// roundLens are the lengths of the datagrams a round of sending sends,
+	// one after another in its buffer, which only the sending goroutine uses
+	// (see flush).
+	roundLens [maxRoundDatagrams]uint16
 
 	// freeSent are sent packet records to reuse, and ackedScratch and
 	// lostScratch the arrays acknowledgement and loss detection list theirs
@@ -682,6 +699,37 @@ func (c *Conn) dispatch() {
 	c.flush()
 }
 
+// ExpectWrite tells the connection that a write is on its way from another
+// goroutine: the response to a request its handler has handed on, say.
+// Until as many WriteDone, what there is to send waits for the writes still
+// expected, flushHold at most, as what is written while the handler is being
+// called waits for the calls to end (see flush): a burst of requests
+// answered on other goroutines is then answered in one burst, the answers
+// packed into as few packets as they fit in and the acknowledgement of the
+// requests among them, rather than a packet an answer and one more for the
+// acknowledgement. A connection with one request at a time sends its answer
+// as soon as it is written. Every ExpectWrite needs a WriteDone.
+func (c *Conn) ExpectWrite() {
+	c.mu.Lock()
+	c.awaited++
+	c.mu.Unlock()
+}
+
+// WriteDone ends an ExpectWrite, once its write has been made or will not be.
+// A write expected for longer than flushHold has already stopped holding
+// anything back.
+func (c *Conn) WriteDone() {
+	c.mu.Lock()
+	if c.awaited > 0 {
+		c.awaited--
+	}
+	last := c.awaited == 0 && c.wantFlush
+	c.mu.Unlock()
+	if last {
+		c.dispatch()
+	}
+}
+
 // flushHold bounds how long a write made while the handler is being called
 // waits for the calls to end before it is sent anyway.
 const flushHold = time.Millisecond
@@ -693,18 +741,20 @@ const flushHold = time.Millisecond
 // concurrently into full packets. Packets are built with the lock held but
 // sent without it, so that nobody waits on the syscalls.
 //
-// While the handler is being called, what is written waits for the calls to
-// end, so that the answers to a burst of requests leave together with the
-// acknowledgement of the burst; a handler that takes longer than flushHold
-// has it sent without waiting for it.
+// While the handler is being called, or writes ExpectWrite announced are
+// still to come, what is written waits for them, so that the answers to a
+// burst of requests leave together with the acknowledgement of the burst; a
+// handler that takes longer than flushHold has it sent without waiting for
+// it.
 func (c *Conn) flush() {
 	c.mu.Lock()
-	if c.dispatching && c.wantFlush && !c.closed && c.flushDeadline.IsZero() {
+	held := c.dispatching || c.awaited > 0
+	if held && c.wantFlush && !c.closed && c.flushDeadline.IsZero() {
 		now := c.now()
 		c.flushDeadline = now.Add(flushHold)
 		c.armTimerLocked(now)
 	}
-	if c.dispatching || c.sending {
+	if held || c.sending {
 		c.mu.Unlock()
 		return
 	}
@@ -898,7 +948,8 @@ func (c *Conn) handlePacket(pkt []byte, h header, now time.Time) bool {
 		c.closeLocked(transportErr(errProtocolViolation, "reserved header bits set"))
 		return true
 	}
-	if !s.recv.add(pn) {
+	if pn < s.ackFloor || !s.recv.add(pn) {
+		// A packet already seen, or too old to tell, which may be one.
 		return true
 	}
 	if c.isClient && !c.heardPeer && h.typ != packet1RTT {
@@ -1262,6 +1313,12 @@ func (c *Conn) onTimer() {
 		}
 		if c.config.KeepAlivePeriod > 0 && c.handshakeComplete && !now.Before(c.keepAliveAt()) {
 			c.pingPending = true
+		}
+		if !c.flushDeadline.IsZero() && !now.Before(c.flushDeadline) {
+			// Writes expected that have held the rest back for flushHold are
+			// not coming soon, a handler that keeps its request, say: they no
+			// longer hold anything back.
+			c.awaited = 0
 		}
 		// The timer sends whether or not the handler is being called: loss
 		// recovery does not wait for a handler that takes its time.
