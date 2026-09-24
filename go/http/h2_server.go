@@ -3,12 +3,10 @@
 package http
 
 import (
-	"bytes"
 	stdtls "crypto/tls"
 	"encoding/binary"
 	"errors"
 	"fmt"
-	"io"
 	"math"
 	stdhttp "net/http"
 	"net/textproto"
@@ -77,6 +75,8 @@ type h2ServerConn struct {
 	gotPreface  bool
 	gotSettings bool
 	dec         *hpack.Decoder
+	// fields is where each header block is decoded, kept for the next one.
+	fields []hpack.HeaderField
 	// contStream is the stream whose header block is still arriving in
 	// CONTINUATION frames, or zero; contBlock holds what arrived so far.
 	contStream    uint32
@@ -121,6 +121,14 @@ type h2ServerConn struct {
 	// gate counts the requests of this connection running on the handler's
 	// stream pool, which is how the per-connection limit is kept.
 	gate StreamGate
+	// headerBlock is where response header blocks are encoded before they
+	// are framed, kept for the next one. lengthValue caches the last
+	// content-length sent as a string, lengthOf the length it is of: a
+	// server's responses are often the same size, and the encoder needs the
+	// value as a string it may keep in its table. All guarded by mu.
+	headerBlock []byte
+	lengthOf    int64
+	lengthValue string
 }
 
 // h2ServerStream is one request and its response.
@@ -146,7 +154,18 @@ type h2ServerStream struct {
 	reset      bool
 	sendWindow int64
 	pending    []byte
+
+	// block is the request, its URL and the Context it is answered through,
+	// allocated with the stream, and values holds its header's values.
+	block  StreamRequest
+	values [h2RequestValues]string
 }
+
+// h2RequestValues is how many of a request's header values its stream has
+// room for, which is about what a browser's request carries. It is also what
+// fills an h2ServerStream to 1016 bytes on a 64-bit platform, just inside
+// the allocator's size class of 1024; one more would put it in the next.
+const h2RequestValues = 11
 
 func newH2ServerConn(h *ServerHandler, c *fib.Connection, remoteAddr string) *h2ServerConn {
 	maxStreams := h.config.MaxConcurrentStreams
@@ -193,6 +212,16 @@ func (sc *h2ServerConn) sendLocked(out []byte) {
 	if len(out) > 0 && !sc.closed {
 		_ = sc.conn.SendOwned(out)
 	}
+}
+
+// sendPooledLocked sends out, a buffer from the pool, unless the connection
+// has ended, and gives it back. The connection copies what the socket does
+// not take at once, so a response that goes straight out is never copied.
+func (sc *h2ServerConn) sendPooledLocked(out []byte) {
+	if len(out) > 0 && !sc.closed {
+		_ = sc.conn.Send(out)
+	}
+	bufferpool.Put(out)
 }
 
 // feed takes bytes from the connection, preface included, and handles every
@@ -523,7 +552,7 @@ func (sc *h2ServerConn) handleData(f *h2Frame) error {
 		sc.reject(st, stdhttp.StatusRequestEntityTooLarge)
 		return nil
 	}
-	st.body = append(st.body, f.payload...)
+	st.body = bufferpool.Append(st.body, f.payload)
 	if f.has(h2FlagEndStream) {
 		return sc.finishRequest(st)
 	}
@@ -588,7 +617,15 @@ func (sc *h2ServerConn) handleContinuation(f *h2Frame) error {
 // handleHeaderBlock decodes a complete header block: a new request, or the
 // trailers of one whose body has arrived.
 func (sc *h2ServerConn) handleHeaderBlock(id uint32, block []byte, endStream bool) error {
-	var fields []hpack.HeaderField
+	fields := sc.fields[:0]
+	defer func() {
+		// Nothing keeps the fields past this block: the request copied out
+		// what it needs.
+		clear(fields)
+		if cap(fields) <= 4*h2RequestValues {
+			sc.fields = fields[:0]
+		}
+	}()
 	listSize := 0
 	tooLarge := false
 	// The block is always decoded, whatever becomes of the stream, so that the
@@ -639,7 +676,7 @@ func (sc *h2ServerConn) handleHeaderBlock(id uint32, block []byte, endStream boo
 		sc.reject(st, stdhttp.StatusRequestHeaderFieldsTooLarge)
 		return nil
 	}
-	req, err := sc.newRequest(fields)
+	req, err := sc.newRequest(fields, st)
 	if err != nil {
 		return &H2StreamError{StreamID: id, Code: H2ProtocolError}
 	}
@@ -693,11 +730,14 @@ func (sc *h2ServerConn) handleTrailers(st *h2ServerStream, fields []hpack.Header
 }
 
 // newRequest builds a request from a stream's header fields, rejecting what
-// RFC 9113 section 8.3 calls malformed.
-func (sc *h2ServerConn) newRequest(fields []hpack.HeaderField) (*stdhttp.Request, error) {
+// RFC 9113 section 8.3 calls malformed. The request and its URL are the
+// stream's, and the header's values, as far as they go, are slices of the
+// stream's values.
+func (sc *h2ServerConn) newRequest(fields []hpack.HeaderField, st *h2ServerStream) (*stdhttp.Request, error) {
 	var method, scheme, authority, path string
 	var seen [4]bool
 	header := make(stdhttp.Header, len(fields))
+	values := st.values[:]
 	var cookies []string
 	regular := false
 	for _, f := range fields {
@@ -735,8 +775,16 @@ func (sc *h2ServerConn) newRequest(fields []hpack.HeaderField) (*stdhttp.Request
 			cookies = append(cookies, f.Value)
 			continue
 		}
-		key := textproto.CanonicalMIMEHeaderKey(f.Name)
-		header[key] = append(header[key], f.Value)
+		key := h2CanonicalKey(f.Name)
+		if existing, ok := header[key]; ok || len(values) == 0 {
+			header[key] = append(existing, f.Value)
+			continue
+		}
+		// Capped, so that a handler appending to it gets a copy rather than
+		// writing over the next key's value.
+		header[key] = values[:1:1]
+		values[0] = f.Value
+		values = values[1:]
 	}
 	if len(cookies) > 0 {
 		// HTTP/2 lets cookies arrive as separate fields; HTTP/1 handlers
@@ -746,7 +794,8 @@ func (sc *h2ServerConn) newRequest(fields []hpack.HeaderField) (*stdhttp.Request
 	if method == "" {
 		return nil, errors.New("missing :method")
 	}
-	req := &stdhttp.Request{
+	req := &st.block.Request
+	*req = stdhttp.Request{
 		Method:     method,
 		Proto:      "HTTP/2.0",
 		ProtoMajor: 2,
@@ -755,26 +804,25 @@ func (sc *h2ServerConn) newRequest(fields []hpack.HeaderField) (*stdhttp.Request
 		TLS:        sc.tlsState,
 		Body:       stdhttp.NoBody,
 	}
+	u := &st.block.URL
 	if method == stdhttp.MethodConnect {
 		if scheme != "" || path != "" || authority == "" {
 			return nil, errors.New("malformed CONNECT")
 		}
-		req.URL = &url.URL{Host: authority}
+		*u = url.URL{Host: authority}
 		req.RequestURI = authority
 	} else {
 		if scheme == "" || path == "" {
 			return nil, errors.New("missing :scheme or :path")
 		}
-		u, err := url.ParseRequestURI(path)
 		if path == "*" {
-			u, err = &url.URL{Path: "*"}, nil
-		}
-		if err != nil {
+			*u = url.URL{Path: "*"}
+		} else if err := ParseRequestTarget(u, path); err != nil {
 			return nil, err
 		}
-		req.URL = u
 		req.RequestURI = path
 	}
+	req.URL = u
 	req.Host = authority
 	if req.Host == "" {
 		req.Host = header.Get("Host")
@@ -799,13 +847,12 @@ func (sc *h2ServerConn) finishRequest(st *h2ServerStream) error {
 	if done || st.req == nil {
 		return nil
 	}
-	req := st.req
-	req.ContentLength = int64(len(st.body))
-	if len(st.body) > 0 {
-		req.Body = io.NopCloser(bytes.NewReader(st.body))
-	}
+	// The body goes to the Context, which gives its buffer back to the pool
+	// once the response is finished, as HTTP/1 and HTTP/3 do theirs.
+	st.req.ContentLength = int64(len(st.body))
+	st.block.bind(sc.conn, st.body).stream = st
 	st.body = nil
-	sc.serve(&Context{Conn: sc.conn, Request: req, stream: st})
+	sc.handler.streams.Serve(&sc.gate, sc.conn, sc.handler.handler, &st.block)
 	return nil
 }
 
@@ -822,6 +869,7 @@ func (sc *h2ServerConn) serve(context *Context) {
 // reject answers a stream with an error status before its request is
 // complete, and stops reading it.
 func (sc *h2ServerConn) reject(st *h2ServerStream, status int) {
+	bufferpool.Put(st.body)
 	st.body = nil
 	req := st.req
 	if req == nil {
@@ -908,17 +956,25 @@ func (st *h2ServerStream) respond(req *stdhttp.Request, response Response) error
 	}
 	st.responded = true
 
-	block := sc.enc.Begin(nil)
-	block = sc.enc.AppendField(block, ":status", strconv.Itoa(status), false)
+	block := sc.enc.Begin(sc.headerBlock[:0])
+	block = sc.enc.AppendField(block, ":status", h2Status(status), false)
 	if bodyAllowed {
-		block = sc.enc.AppendField(block, "content-length", strconv.FormatInt(responseLength(req, response), 10), false)
+		block = sc.enc.AppendField(block, "content-length", sc.lengthLocked(responseLength(req, response)), false)
 	}
 	block = sc.appendHeaderLocked(block, response.Header)
 	if bodyAllowed && req.Method != stdhttp.MethodHead {
 		st.trailer = h2Trailer(response.Trailer)
 	}
-	out := make([]byte, 0, len(block)+2*h2FrameHeaderLen+len(body))
+	// Framed in one buffer from the pool: the header block, and as much of
+	// the body as the windows let go now, each behind its frame headers.
+	sendable := max(min(int64(len(body)), sc.sendWindow, st.sendWindow), 0)
+	size := len(block) + h2FrameHeaderLen*(1+len(block)/sc.peerMaxFrame)
+	if sendable > 0 {
+		size += int(sendable) + h2FrameHeaderLen*(1+int(sendable)/sc.peerMaxFrame)
+	}
+	out := bufferpool.Get(size)[:0]
 	out = h2AppendHeaderBlock(out, st.id, block, len(body) == 0 && st.trailer == nil, sc.peerMaxFrame)
+	sc.keepHeaderBlockLocked(block)
 	if len(body) == 0 {
 		out = sc.endStreamLocked(out, st)
 	} else {
@@ -932,17 +988,63 @@ func (st *h2ServerStream) respond(req *stdhttp.Request, response Response) error
 		sc.goAway = true
 		out = h2AppendGoAway(out, sc.lastStreamID, H2NoError, "")
 	}
-	sc.sendLocked(out)
+	sc.sendPooledLocked(out)
 	sc.finishStreamLocked(st)
 	sc.closeFinishedLocked()
 	return nil
+}
+
+// keepHeaderBlockLocked keeps block, which has been framed and is no longer
+// needed, for the next header block to be encoded into, unless a large one
+// grew it past what is worth keeping.
+func (sc *h2ServerConn) keepHeaderBlockLocked(block []byte) {
+	if cap(block) <= maxRetainedBuffer {
+		sc.headerBlock = block[:0]
+	} else {
+		sc.headerBlock = nil
+	}
+}
+
+// lengthLocked is n as the content-length value the encoder is given, the
+// same string as last time when the length is too.
+func (sc *h2ServerConn) lengthLocked(n int64) string {
+	if sc.lengthValue == "" || sc.lengthOf != n {
+		sc.lengthOf, sc.lengthValue = n, strconv.FormatInt(n, 10)
+	}
+	return sc.lengthValue
+}
+
+// h2Status is status as the :status value, without formatting the ones
+// nearly every response carries.
+func h2Status(status int) string {
+	switch status {
+	case stdhttp.StatusOK:
+		return "200"
+	case stdhttp.StatusNoContent:
+		return "204"
+	case stdhttp.StatusPartialContent:
+		return "206"
+	case stdhttp.StatusMovedPermanently:
+		return "301"
+	case stdhttp.StatusFound:
+		return "302"
+	case stdhttp.StatusNotModified:
+		return "304"
+	case stdhttp.StatusBadRequest:
+		return "400"
+	case stdhttp.StatusNotFound:
+		return "404"
+	case stdhttp.StatusInternalServerError:
+		return "500"
+	}
+	return strconv.Itoa(status)
 }
 
 // h2CheckHeader checks the fields of a response or pushed request before
 // any is encoded, since encoding changes the table the client tracks.
 func h2CheckHeader(header stdhttp.Header) error {
 	for key, values := range header {
-		if key == "" || textproto.CanonicalMIMEHeaderKey(key) == "" || !h2ValidHeaderName(strings.ToLower(key)) {
+		if key == "" || textproto.CanonicalMIMEHeaderKey(key) == "" || !h2ValidHeaderName(h2LowerKey(key)) {
 			return errors.New("http: invalid header name " + strconv.Quote(key))
 		}
 		for _, value := range values {
@@ -958,7 +1060,7 @@ func h2CheckHeader(header stdhttp.Header) error {
 // not carry and the Content-Length this side sets itself.
 func (sc *h2ServerConn) appendHeaderLocked(block []byte, header stdhttp.Header) []byte {
 	for key, values := range header {
-		name := strings.ToLower(key)
+		name := h2LowerKey(key)
 		if h2ConnectionHeaders[name] || name == "content-length" {
 			continue
 		}

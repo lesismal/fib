@@ -139,8 +139,17 @@ type StreamRequest struct {
 // the body of a request the HTTP/1 server read whole does; a read after that
 // reports ErrBodyReleased.
 func (r *StreamRequest) Context(conn *fib.Connection, stream Stream, body []byte) *Context {
+	c := r.bind(conn, body)
+	c.external = stream
+	return c
+}
+
+// bind readies the Context for Request, which arrived on conn with body, as
+// Context does, leaving the caller to say what answers it: an external
+// stream, or this package's own HTTP/2 stream.
+func (r *StreamRequest) bind(conn *fib.Connection, body []byte) *Context {
 	c := &r.context
-	c.Conn, c.Request, c.external = conn, &r.Request, stream
+	c.Conn, c.Request = conn, &r.Request
 	if len(body) == 0 {
 		bufferpool.Put(body)
 		return c
@@ -232,7 +241,12 @@ func (c *Context) writeResponse(response Response) error {
 	}
 	hooks := c.hooked()
 	if hooks != nil {
-		hooks.before(&response)
+		// The hooks are handed a copy, so that a response nothing hooks
+		// stays off the heap: taking its own address would move it there.
+		hooked := new(Response)
+		*hooked = response
+		hooks.before(hooked)
+		response = *hooked
 	}
 	var err error
 	switch {

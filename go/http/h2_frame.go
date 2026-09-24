@@ -3,6 +3,8 @@ package http
 import (
 	"encoding/binary"
 	"fmt"
+	"net/textproto"
+	"strings"
 )
 
 // HTTP/2 framing (RFC 9113 section 4 and 6), shared by the server and the
@@ -275,6 +277,57 @@ var h2ConnectionHeaders = map[string]bool{
 	"proxy-connection":  true,
 	"transfer-encoding": true,
 	"upgrade":           true,
+}
+
+// h2LowerKeys are the lowercase names of the header keys messages nearly
+// always carry, which h2LowerKey looks up rather than builds.
+var h2LowerKeys = func() map[string]string {
+	keys := make(map[string]string)
+	for _, key := range []string{
+		"Accept", "Accept-Charset", "Accept-Encoding", "Accept-Language", "Accept-Ranges",
+		"Access-Control-Allow-Headers", "Access-Control-Allow-Methods", "Access-Control-Allow-Origin",
+		"Age", "Allow", "Authorization", "Cache-Control", "Content-Disposition", "Content-Encoding",
+		"Content-Language", "Content-Length", "Content-Location", "Content-Range", "Content-Type",
+		"Cookie", "Date", "Etag", "Expect", "Expires", "Forwarded", "Host", "If-Match",
+		"If-Modified-Since", "If-None-Match", "If-Range", "If-Unmodified-Since", "Last-Modified",
+		"Link", "Location", "Origin", "Pragma", "Range", "Referer", "Retry-After", "Server",
+		"Set-Cookie", "Strict-Transport-Security", "Te", "Trailer", "User-Agent", "Vary", "Via",
+		"Www-Authenticate", "X-Content-Type-Options", "X-Forwarded-For", "X-Forwarded-Host",
+		"X-Forwarded-Proto", "X-Frame-Options", "X-Real-Ip", "X-Request-Id",
+	} {
+		keys[key] = strings.ToLower(key)
+	}
+	return keys
+}()
+
+// h2CanonicalKeys maps the lowercase names of h2LowerKeys back to their keys,
+// which is what textproto.CanonicalMIMEHeaderKey makes of them.
+var h2CanonicalKeys = func() map[string]string {
+	keys := make(map[string]string, len(h2LowerKeys))
+	for key, name := range h2LowerKeys {
+		keys[name] = key
+	}
+	return keys
+}()
+
+// h2LowerKey is a header key in lower case, as HTTP/2 sends it, without the
+// allocation strings.ToLower makes of a canonical key for the keys messages
+// nearly always carry.
+func h2LowerKey(key string) string {
+	if name, ok := h2LowerKeys[key]; ok {
+		return name
+	}
+	return strings.ToLower(key)
+}
+
+// h2CanonicalKey is textproto.CanonicalMIMEHeaderKey of a lowercase field
+// name, looked up rather than rebuilt for the names requests nearly always
+// carry.
+func h2CanonicalKey(name string) string {
+	if key, ok := h2CanonicalKeys[name]; ok {
+		return key
+	}
+	return textproto.CanonicalMIMEHeaderKey(name)
 }
 
 // h2ValidHeaderName reports whether name is a valid lowercase field name.
