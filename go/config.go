@@ -83,8 +83,11 @@ const (
 	minMaxEvents    = 10000
 	maxMaxEvents    = 100000
 
-	// streamPoolFactor is how much larger the pool a multiplexed protocol
-	// runs its request handlers on is than the engine's own.
+	// streamPoolFactor is how much wider the pool HTTP/2 and HTTP/3 run
+	// their request handlers on is than the widest engine pool in the
+	// process. It is one pool, shared by every HTTP/2 and HTTP/3 server, and
+	// never one an engine runs on; see package internal/streampool for the
+	// deadlock sharing an engine's pool would invite.
 	//
 	// The two pools do different work. An engine worker holds its connection
 	// for one round: it reads the socket, hands what came in to the protocol,
@@ -93,10 +96,10 @@ const (
 	// file or another server for as long as that takes, and one multiplexed
 	// connection can have hundreds of requests open at once where a TCP
 	// connection has one round. Sizing the handler pool like the engine's
-	// would make it the bottleneck it exists to remove, so it is sized well
-	// above it; under ModeAdaptive, which both take by default, a ceiling
-	// costs nothing until the load climbs to it.
-	streamPoolFactor = 4
+	// would make it the bottleneck it exists to remove, so it is sized above
+	// it; under ModeAdaptive, which it takes, a ceiling costs nothing until
+	// the load climbs to it.
+	streamPoolFactor = 2
 )
 
 // DefaultPoolSizing reports the sizing mode is tuned for, which is what
@@ -115,11 +118,11 @@ func DefaultPoolSizing(mode taskpool.Mode) PoolSizing {
 	return poolSizing(workerCount)
 }
 
-// DefaultStreamPoolSizing reports the sizing of the pool that a multiplexed
-// protocol runs its request handlers on, which HTTP/2 and HTTP/3 take when
-// their configuration leaves it at zero. It is deliberately larger than what
-// DefaultPoolSizing reports for the engine that feeds it; see
-// streamPoolFactor.
+// DefaultStreamPoolSizing reports the sizing of the pool HTTP/2 and HTTP/3
+// run their request handlers on while no engine is running: twice what
+// DefaultPoolSizing reports for the engine. Once engines run, the pool's
+// ceiling is twice the widest of their pools instead, whatever their mode;
+// see streamPoolFactor.
 func DefaultStreamPoolSizing(mode taskpool.Mode) PoolSizing {
 	return poolSizing(DefaultPoolSizing(mode).WorkerCount * streamPoolFactor)
 }

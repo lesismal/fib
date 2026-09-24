@@ -2,6 +2,7 @@ package taskpool
 
 import (
 	"math/rand/v2"
+	"runtime"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -44,6 +45,20 @@ func waitFor(t *testing.T, what string, cond func() bool) {
 			t.Fatalf("timed out waiting for %s", what)
 		}
 		time.Sleep(time.Millisecond)
+	}
+}
+
+// A pool NewWithMode builds keeps ten workers per CPU core resident, or its
+// ceiling when that is lower.
+func TestAdaptiveDefaultFloorIsTenPerCPU(t *testing.T) {
+	floor := 10 * runtime.NumCPU()
+	tp := NewWithMode(ModeAdaptive, floor+1, 16)
+	defer tp.Stop()
+	if got := tp.Workers(); got != floor {
+		t.Fatalf("Workers() = %d right after NewWithMode, want %d", got, floor)
+	}
+	if got := DefaultMinWorkers(floor - 1); got != floor-1 {
+		t.Fatalf("DefaultMinWorkers(%d) = %d, want the ceiling itself", floor-1, got)
 	}
 }
 

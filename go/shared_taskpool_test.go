@@ -3,6 +3,7 @@ package fib
 import (
 	"testing"
 
+	"github.com/lesismal/fib/go/internal/streampool"
 	"github.com/lesismal/fib/go/taskpool"
 )
 
@@ -44,5 +45,31 @@ func TestAdaptiveTaskPoolHonoursMinWorkerCount(t *testing.T) {
 	defer releaseOther()
 	if other == pool {
 		t.Fatal("pools with different floors were shared")
+	}
+}
+
+// The pool HTTP/2 and HTTP/3 serve handlers on is never an engine's, and its
+// ceiling follows the widest engine pool running, at twice it, falling back once that engine's pool is released.
+func TestStreamPoolStaysWiderThanEnginePools(t *testing.T) {
+	sizing := DefaultStreamPoolSizing(taskpool.ModeAdaptive)
+	streams := streampool.Get(sizing.WorkerCount, sizing.MaxEvents)
+	// Wider than any engine another test may have left running, so that it
+	// is this one that decides the ceiling.
+	workers := 1 << 24
+	for _, shared := range []bool{true, false} {
+		config := Config{WorkerCount: workers, MaxEvents: 64,
+			TaskPoolMode: taskpool.ModeAdaptive, SharedTaskPool: shared}
+		pool, release := acquireTaskPool(config)
+		if pool == TaskPool(streams) {
+			t.Fatalf("shared=%v: the engine was given the stream pool", shared)
+		}
+		if got, want := streampool.Ceiling(), 2*workers; got != want {
+			t.Fatalf("shared=%v: stream pool ceiling = %d, want %d", shared, got, want)
+		}
+		release()
+		release()
+		if got := streampool.Ceiling(); got >= 2*workers {
+			t.Fatalf("shared=%v: stream pool ceiling = %d after the engine released its pool", shared, got)
+		}
 	}
 }

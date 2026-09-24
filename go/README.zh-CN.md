@@ -40,8 +40,8 @@
     `TaskPool.Workers()` 返回当前 worker 数（其他 Mode 调 `Resize` 返回 false）。
   - 直接使用：`taskpool.NewAdaptive(taskpool.AdaptiveConfig{MinWorkers: 16,
     MaxWorkers: 4096, QueueSize: 10000})`；`NewWithMode(ModeAdaptive, max, queue)`
-    的下限默认为每个 P 二十个 worker。在 fib 里，`WorkerCount` 是上限，
-    `Config.MinWorkerCount` 是下限（0 表示每个 P 二十个）。
+    的下限默认为每个 CPU 核心十个 worker（`taskpool.DefaultMinWorkers`）。在 fib 里，
+    `WorkerCount` 是上限，`Config.MinWorkerCount` 是下限（0 表示每个 CPU 核心十个）。
 - 池容量按 Mode 分别给默认值，因为 `WorkerCount` 在不同 Mode 下含义不同
   （ModeAdaptive 与 ModeElastic 一样是上限，默认值也相同）：
   ModeCond 会预先创建这么多协程并让它们挂在条件变量上，这个数就是实际存在的
@@ -613,9 +613,12 @@ server, err := fib.Bind(config, fibtls.NewServer(tlsConfig, fibhttp.NewHandler(h
   回复（异步响应），不同 stream 的响应互不阻塞。
 - handler 协程池：请求收齐后不在读取该连接的协程上执行，而是交给一个独立的协程池，
   因此同一连接上并发到达的请求是并发处理的，阻塞的 handler 只拖累它自己。协程池由
-  `Config.StreamPool` 配置（`http.StreamPoolConfig`），默认由配置相同的所有 server
-  共享，容量取 `fib.DefaultStreamPoolSizing`，比 Engine 自身的协程池更大——Engine 的
-  worker 只等内核，handler 还要等应用自己的 I/O：
+  `Config.StreamPool` 配置（`http.StreamPoolConfig`）。整个进程只有一个 handler 协程池，
+  由所有 HTTP/2 与 HTTP/3 server 共用，且永远不是 Engine 的协程池：Engine 的 worker
+  解析出请求后要往这个池提交，若两者是同一个池，队列满时所有 worker 都可能卡在提交上，
+  没有人再取任务，连 event loop 也会卡住。它的上限是当前运行的最大 Engine 协程池的
+  2 倍（没有 Engine 时取 `fib.DefaultStreamPoolSizing`），下限为每个 CPU 核心十个
+  worker——Engine 的 worker 只等内核，handler 还要等应用自己的 I/O：
 
   ```go
   httpConfig := fibhttp.DefaultConfig()
@@ -625,9 +628,7 @@ server, err := fib.Bind(config, fibtls.NewServer(tlsConfig, fibhttp.NewHandler(h
 
   `MaxConcurrentHandlers` 为 N（>0）时限制单个连接同时处理的请求数：第 N 个请求在读取
   该连接的协程上执行，在它返回前这个连接不再读取新数据，于是这个上限由对端的流控承担，
-  服务端不需要排队。N 为 1（或 `StreamPool.Disable`）就是逐个执行的旧行为；
-  `StreamPool.MaxWorkers`/`MinWorkers`/`QueueSize` 调整池容量，`StreamPool.TaskPool`
-  则改用调用方自己的协程池（例如 Engine 自身的那个）。
+  服务端不需要排队。N 为 1（或 `StreamPool.Disable`）就是逐个执行的旧行为。
 - `Response.Close` 在 HTTP/2 上优雅关闭连接：发送 GOAWAY(NO_ERROR)，不再接受新
   stream，已在处理的 stream 完成后再关闭连接。
 - 流控：遵守对端的连接级与 stream 级窗口，窗口不足的响应 body 暂存，等 WINDOW_UPDATE
@@ -806,8 +807,8 @@ server, err := fib.Bind(config, http3.NewHandler(tlsConfig, handler))
   HTTP/3 的 push 需要客户端先发 MAX_PUSH_ID，浏览器都不这样做。
 - `Response.Close` 在 HTTP/3 上优雅关闭：发送 GOAWAY，不再接受新请求，已在处理的请求
   的响应全部送达后再关闭连接。
-- handler 协程池：与 HTTP/2 一样，请求收齐后交给独立的协程池（默认与 HTTP/2 server
-  共用同一个），同一连接上的请求并发处理；用 `Config.StreamPool` 配置，
+- handler 协程池：与 HTTP/2 一样，请求收齐后交给独立的协程池（与 HTTP/2 server
+  共用同一个，不与 Engine 的协程池共用），同一连接上的请求并发处理；用 `Config.StreamPool` 配置，
   `StreamPool.MaxConcurrentHandlers` 限制单个连接的并发处理数，其中最后一个在读取该
   连接的协程上执行，在它返回前这个连接不再读取数据报。
 - 请求 body 超过 `MaxBodyBytes` 返回 413，header 超过 `MaxHeaderBytes` 返回 431；

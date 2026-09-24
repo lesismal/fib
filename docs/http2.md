@@ -52,9 +52,13 @@ Behaviour to be aware of when using it.
 - A connection's frames are processed in order, and a request that is complete
   goes to the handler pool that `Config.StreamPool` describes, so the requests
   one client has open on a connection are served concurrently and a handler
-  that blocks holds up only itself. The pool is shared by every server asking
-  for the same sizing and is sized by `fib.DefaultStreamPoolSizing`, which is
-  deliberately wider than the engine's own pool.
+  that blocks holds up only itself. There is one such pool in the process,
+  shared by every HTTP/2 and HTTP/3 server and never by an engine: an engine
+  worker submits each request it frames, and were the queue it submits to its
+  own, every worker could end up waiting for room that none is left to make.
+  Its ceiling is twice the widest engine pool running, or
+  `fib.DefaultStreamPoolSizing` while none is, and it keeps ten workers per CPU
+  core resident.
 - `StreamPool.MaxConcurrentHandlers` bounds how many of one connection's
   requests are served at once. The last of the N runs on the goroutine reading
   the connection, which reads nothing further until it returns, so the limit is
@@ -62,8 +66,6 @@ Behaviour to be aware of when using it.
   server. 1, like `StreamPool.Disable`, serves every request on the reader, one
   at a time, which is how the server behaved before the pool existed
   (application-level head-of-line blocking).
-- `StreamPool.TaskPool` runs the handlers on a pool the caller owns — the
-  engine's own, or one shared with other work — instead.
 - `Push` runs the handler of the pushed request synchronously, on the goroutine
   that called it, and returns only when it does, so a slow pushed handler
   delays the parent response.

@@ -61,10 +61,15 @@ func validateAdaptiveRange(minWorkers, maxWorkers int) {
 	}
 }
 
-// defaultMinWorkers is the resident floor NewWithMode gives an adaptive pool:
-// twenty workers per P, so that every core has warm workers to run on.
-func defaultMinWorkers(maxWorkers int) int {
-	return min(maxWorkers, 20*runtime.GOMAXPROCS(0))
+// MinWorkersPerCPU is how many workers per CPU core an adaptive pool keeps
+// resident by default, so that every core has warm workers to run on.
+const MinWorkersPerCPU = 10
+
+// DefaultMinWorkers is the resident floor NewWithMode gives an adaptive pool
+// whose ceiling is maxWorkers: MinWorkersPerCPU workers per CPU core, or the
+// ceiling itself when that is lower.
+func DefaultMinWorkers(maxWorkers int) int {
+	return min(maxWorkers, MinWorkersPerCPU*runtime.NumCPU())
 }
 
 // adaptiveBackend spreads an adaptive pool over shards, for the same reason

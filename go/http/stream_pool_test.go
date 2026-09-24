@@ -10,8 +10,6 @@ import (
 	"sync"
 	"testing"
 	"time"
-
-	"github.com/lesismal/fib/go/taskpool"
 )
 
 // concurrencyProbe holds every request it is given until the test releases
@@ -147,18 +145,14 @@ func TestH2StreamPoolHandlerPanic(t *testing.T) {
 	}
 }
 
-// TestStreamPoolShared checks that servers asking for the same sizing get
-// one pool between them, since a pool is never stopped and one per server
-// would leave every server's workers behind it.
+// TestStreamPoolShared checks that every server gets the one pool, since a
+// pool is never stopped and one per server would leave every server's
+// workers behind it, and that HTTP/2 and HTTP/3 are served by the same one.
 func TestStreamPoolShared(t *testing.T) {
 	first := NewStreamPool(StreamPoolConfig{})
-	second := NewStreamPool(StreamPoolConfig{})
+	second := NewStreamPool(StreamPoolConfig{MaxConcurrentHandlers: 8})
 	if first == nil || second == nil || first.pool != second.pool {
-		t.Fatalf("two default pools: %v, %v", first, second)
-	}
-	other := NewStreamPool(StreamPoolConfig{MaxWorkers: 17})
-	if other.pool == first.pool {
-		t.Fatal("a different sizing shares the default pool")
+		t.Fatalf("two servers' pools: %v, %v", first, second)
 	}
 	if pool := NewStreamPool(StreamPoolConfig{Disable: true}); pool != nil {
 		t.Fatal("a disabled pool was built")
@@ -166,20 +160,4 @@ func TestStreamPoolShared(t *testing.T) {
 	if pool := NewStreamPool(StreamPoolConfig{MaxConcurrentHandlers: 1}); pool != nil {
 		t.Fatal("a pool was built for handlers that run on the reader")
 	}
-	own := &inlinePool{}
-	if pool := NewStreamPool(StreamPoolConfig{TaskPool: own}); pool.pool != own {
-		t.Fatal("the supplied pool was not used")
-	}
-}
-
-// inlinePool is a TaskPool that runs what it is given where it is given it.
-type inlinePool struct{}
-
-func (inlinePool) GoTask(task taskpool.Task) bool { task.RunTask(); return true }
-
-func (inlinePool) GoTasks(tasks []taskpool.Task) int {
-	for _, task := range tasks {
-		task.RunTask()
-	}
-	return len(tasks)
 }

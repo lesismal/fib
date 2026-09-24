@@ -3,6 +3,7 @@ package fib
 import (
 	"sync"
 
+	"github.com/lesismal/fib/go/internal/streampool"
 	"github.com/lesismal/fib/go/taskpool"
 )
 
@@ -42,9 +43,15 @@ func acquireTaskPool(config Config) (TaskPool, func()) {
 	if key.mode == taskpool.ModeAdaptive {
 		key.minWorkers = config.MinWorkerCount
 	}
+	// The pool HTTP/2 and HTTP/3 run their handlers on has to stay wider than
+	// every engine pool that feeds it; see streamPoolFactor.
+	releaseStreams := streampool.Require(key.workers * streamPoolFactor)
 	if !config.SharedTaskPool {
 		pool := newTaskPool(key)
-		return pool, pool.Stop
+		return pool, func() {
+			pool.Stop()
+			releaseStreams()
+		}
 	}
 	sharedTaskPools.Lock()
 	entry := sharedTaskPools.entries[key]
@@ -67,6 +74,7 @@ func acquireTaskPool(config Config) (TaskPool, func()) {
 			if last {
 				entry.pool.Stop()
 			}
+			releaseStreams()
 		})
 	}
 }

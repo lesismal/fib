@@ -42,13 +42,14 @@
 
 - 一个连接的帧按顺序处理，请求完整后交给 `Config.StreamPool` 描述的 handler 协程池，
   因此同一连接上客户端并发发起的多个请求是并发处理的，阻塞的 handler 只拖累它自己。
-  该协程池由所有相同配置的 server 共享，默认大小取 `fib.DefaultStreamPoolSizing`，
-  刻意比 engine 自身的协程池更大。
+  整个进程只有这一个 handler 协程池，所有 HTTP/2 与 HTTP/3 server 共用，且永远不与
+  engine 的协程池共用（共用会在队列满时让 engine 的 worker 全部卡在提交上而死锁）。它的
+  上限是当前运行的最大 engine 协程池的 2 倍，没有 engine 时取
+  `fib.DefaultStreamPoolSizing`；空闲时保留每个 CPU 核心十个 worker。
 - `StreamPool.MaxConcurrentHandlers` 限制单个连接同时处理的请求数 N：第 N 个请求在读取
   该连接的协程上执行，在它返回前该连接不再读取新数据，因此这个上限由对端的流控承担，
   而不是在服务端排队。N 为 1 时（与 `StreamPool.Disable` 相同）每个请求都在读取协程上
   逐个执行，也就是引入协程池之前的行为（应用层的队头阻塞）。
-- `StreamPool.TaskPool` 可以改用调用方自己的协程池（engine 自身的，或与其他任务共享的）。
 - `Push` 仍然在调用它的协程上同步执行被推送请求的 handler，在它返回后才返回；被推送的
   handler 慢，父请求的响应也会随之推迟。
 

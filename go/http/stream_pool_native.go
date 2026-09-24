@@ -4,10 +4,10 @@ package http
 
 import (
 	"fmt"
-	"sync"
 	"sync/atomic"
 
 	fib "github.com/lesismal/fib/go"
+	"github.com/lesismal/fib/go/internal/streampool"
 	"github.com/lesismal/fib/go/taskpool"
 )
 
@@ -19,7 +19,7 @@ import (
 // what NewStreamPool returns for a configuration that asks for no pool, so
 // a server never has to test for one.
 type StreamPool struct {
-	pool fib.TaskPool
+	pool *taskpool.TaskPool
 	// limit is StreamPoolConfig.MaxConcurrentHandlers.
 	limit int
 }
@@ -30,11 +30,9 @@ func NewStreamPool(config StreamPoolConfig) *StreamPool {
 	if config.Disable || config.MaxConcurrentHandlers == 1 {
 		return nil
 	}
-	pool := config.TaskPool
-	if pool == nil {
-		pool = sharedStreamPool(config)
-	}
-	return &StreamPool{pool: pool, limit: config.MaxConcurrentHandlers}
+	sizing := fib.DefaultStreamPoolSizing(taskpool.ModeAdaptive)
+	return &StreamPool{pool: streampool.Get(sizing.WorkerCount, sizing.MaxEvents),
+		limit: config.MaxConcurrentHandlers}
 }
 
 // StreamGate is one connection's share of a StreamPool: it counts the
@@ -142,54 +140,4 @@ func (t *streamTask) run() {
 		return
 	}
 	serveRequest(t.handler, t.context)
-}
-
-// streamPoolKey is the sizing that decides which shared pool a server gets.
-type streamPoolKey struct {
-	minWorkers, maxWorkers, queueSize int
-}
-
-var sharedStreamPools = struct {
-	sync.Mutex
-	pools map[streamPoolKey]*taskpool.TaskPool
-}{pools: make(map[streamPoolKey]*taskpool.TaskPool)}
-
-// sharedStreamPool is the pool every server asking for config's sizing
-// shares, built on the first ask. See StreamPoolConfig.MaxWorkers for why it
-// is shared and why it is never stopped.
-func sharedStreamPool(config StreamPoolConfig) *taskpool.TaskPool {
-	key := streamPoolKey{
-		minWorkers: config.MinWorkers,
-		maxWorkers: config.MaxWorkers,
-		queueSize:  config.QueueSize,
-	}
-	if key.maxWorkers <= 0 || key.queueSize <= 0 {
-		sizing := fib.DefaultStreamPoolSizing(taskpool.ModeAdaptive)
-		if key.maxWorkers <= 0 {
-			key.maxWorkers = sizing.WorkerCount
-		}
-		if key.queueSize <= 0 {
-			key.queueSize = sizing.MaxEvents
-		}
-	}
-	if key.minWorkers < 0 {
-		key.minWorkers = 0
-	}
-	key.minWorkers = min(key.minWorkers, key.maxWorkers)
-
-	sharedStreamPools.Lock()
-	defer sharedStreamPools.Unlock()
-	pool := sharedStreamPools.pools[key]
-	if pool == nil {
-		if key.minWorkers > 0 {
-			pool = taskpool.NewAdaptive(taskpool.AdaptiveConfig{
-				MinWorkers: key.minWorkers, MaxWorkers: key.maxWorkers, QueueSize: key.queueSize,
-			})
-		} else {
-			// The pool's own floor, which NewAdaptive would read as none.
-			pool = taskpool.NewWithMode(taskpool.ModeAdaptive, key.maxWorkers, key.queueSize)
-		}
-		sharedStreamPools.pools[key] = pool
-	}
-	return pool
 }
