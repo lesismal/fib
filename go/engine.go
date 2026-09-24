@@ -7,6 +7,7 @@ import (
 	"io"
 	"net"
 	"os"
+	"runtime"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -299,6 +300,17 @@ func (e *Engine) runReady(ready []*Connection, tasks []taskpool.Task) ([]*Connec
 			}
 		} else {
 			tasks = e.submitReady(ready, tasks[:0])
+			// The workers just woken wait on this goroutine's P, and the loop
+			// is about to wait for events in a system call that keeps the P
+			// out of use: while there is other work, the runtime hands it on
+			// only after the call has lasted a while, and the loop then waits
+			// for a P of its own behind whatever is runnable. Yielding first
+			// runs the workers here straight away. Measured on Linux with 4
+			// Ps serving HTTP/2 echoes over 10k connections, it raised
+			// throughput by 10% to 25%, depending on the client, from a loop
+			// that had spent 40% of its time runnable and waiting for a P
+			// after each wait.
+			runtime.Gosched()
 		}
 		clear(ready)
 		ready = ready[:0]
