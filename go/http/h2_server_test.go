@@ -527,3 +527,52 @@ func TestConfigureTLS(t *testing.T) {
 		t.Fatalf("NextProtos %v", config.NextProtos)
 	}
 }
+
+// TestH2ServerHeadLengthMatchesHTTP1 checks that HEAD reports over HTTP/2 the
+// length HTTP/1.1 reports, however the handler answers it.
+func TestH2ServerHeadLengthMatchesHTTP1(t *testing.T) {
+	serverConfig, clientConfig, err := tlstest.Configs()
+	if err != nil {
+		t.Fatal(err)
+	}
+	modTime := time.Unix(1700000000, 0)
+	addr := serve(t, fibtls.NewServer(ConfigureTLS(serverConfig), NewHandler(HandlerFunc(func(c *Context, r *stdhttp.Request) {
+		switch r.URL.Path {
+		case "/write":
+			_, _ = c.Write(make([]byte, 1234))
+		case "/declared":
+			c.Header().Set("Content-Length", "5678")
+			c.WriteHeader(stdhttp.StatusOK)
+		case "/respond":
+			_ = c.WriteResponse(Response{StatusCode: stdhttp.StatusOK, Body: make([]byte, 42)})
+		case "/respond-declared":
+			_ = c.WriteResponse(Response{StatusCode: stdhttp.StatusOK, Header: stdhttp.Header{"Content-Length": {"9000"}}})
+		case "/serve-content":
+			stdhttp.ServeContent(c, r, "f.bin", modTime, bytes.NewReader(make([]byte, 4321)))
+		}
+	}))))
+	h1 := &stdhttp.Client{Timeout: 10 * time.Second, Transport: &stdhttp.Transport{
+		TLSClientConfig: clientConfig, TLSNextProto: map[string]func(string, *stdtls.Conn) stdhttp.RoundTripper{},
+	}}
+	h2 := &stdhttp.Client{Timeout: 10 * time.Second, Transport: &stdhttp.Transport{TLSClientConfig: clientConfig, ForceAttemptHTTP2: true}}
+	defer h1.CloseIdleConnections()
+	defer h2.CloseIdleConnections()
+
+	for _, tt := range []struct {
+		path string
+		want int64
+	}{{"/write", 1234}, {"/declared", 5678}, {"/respond", 42}, {"/respond-declared", 9000}, {"/serve-content", 4321}} {
+		for _, client := range []*stdhttp.Client{h1, h2} {
+			resp, err := client.Head("https://" + addr + tt.path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			body, _ := io.ReadAll(resp.Body)
+			resp.Body.Close()
+			if resp.ContentLength != tt.want || resp.Header.Get("Content-Length") != strconv.FormatInt(tt.want, 10) || len(body) != 0 {
+				t.Errorf("%s %s: Content-Length %d (%q), body %d bytes, want %d",
+					resp.Proto, tt.path, resp.ContentLength, resp.Header.Get("Content-Length"), len(body), tt.want)
+			}
+		}
+	}
+}

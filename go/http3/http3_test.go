@@ -214,6 +214,37 @@ func TestHeadAndNoContent(t *testing.T) {
 	}
 }
 
+// TestHeadLengthMatchesHTTP1 checks that HEAD reports the length HTTP/1.1
+// reports, however the handler answers it.
+func TestHeadLengthMatchesHTTP1(t *testing.T) {
+	url := startServer(t, Config{}, func(c *fibhttp.Context, r *stdhttp.Request) {
+		switch r.URL.Path {
+		case "/write":
+			_, _ = c.Write(make([]byte, 1234))
+		case "/declared":
+			c.Header().Set("Content-Length", "5678")
+			c.WriteHeader(stdhttp.StatusOK)
+		case "/respond-declared":
+			_ = c.WriteResponse(fibhttp.Response{StatusCode: stdhttp.StatusOK, Header: stdhttp.Header{"Content-Length": {"9000"}}})
+		case "/serve-content":
+			stdhttp.ServeContent(c, r, "f.bin", time.Unix(1700000000, 0), bytes.NewReader(make([]byte, 4321)))
+		}
+	})
+	client := newClient(t, nil)
+	for _, tt := range []struct {
+		path string
+		want int64
+	}{{"/write", 1234}, {"/declared", 5678}, {"/respond-declared", 9000}, {"/serve-content", 4321}} {
+		resp, err := client.Go(mustRequest(t, stdhttp.MethodHead, url+tt.path, nil)).Wait()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := readBody(t, resp); got != "" || resp.ContentLength != tt.want {
+			t.Errorf("%s: body %q, length %d, want %d", tt.path, got, resp.ContentLength, tt.want)
+		}
+	}
+}
+
 func TestInterimResponse(t *testing.T) {
 	url := startServer(t, Config{}, func(c *fibhttp.Context, r *stdhttp.Request) {
 		if err := c.WriteInterim(stdhttp.StatusEarlyHints, stdhttp.Header{"Link": {"</style.css>; rel=preload"}}); err != nil {

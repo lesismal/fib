@@ -911,7 +911,7 @@ func (st *h2ServerStream) respond(req *stdhttp.Request, response Response) error
 	block := sc.enc.Begin(nil)
 	block = sc.enc.AppendField(block, ":status", strconv.Itoa(status), false)
 	if bodyAllowed {
-		block = sc.enc.AppendField(block, "content-length", strconv.Itoa(len(response.Body)), false)
+		block = sc.enc.AppendField(block, "content-length", strconv.FormatInt(responseLength(req, response), 10), false)
 	}
 	block = sc.appendHeaderLocked(block, response.Header)
 	if bodyAllowed && req.Method != stdhttp.MethodHead {

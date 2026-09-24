@@ -403,7 +403,14 @@ func (c *Context) Finish() error {
 	if !c.isHTTP1() {
 		w.sniff()
 		response := Response{StatusCode: w.status, Header: w.sent, Body: w.buf, Trailer: w.trailer()}
-		if w.declared >= 0 {
+		switch {
+		case c.Request.Method == stdhttp.MethodHead:
+			// None of the body is held back, so the length the stream
+			// reports is the one declared, or else what was written.
+			if w.declared < 0 && w.written > 0 {
+				response.Header.Set("Content-Length", strconv.FormatInt(w.written, 10))
+			}
+		case w.declared >= 0:
 			// The stream's own framing reports the length.
 			delete(response.Header, "Content-Length")
 		}

@@ -334,6 +334,20 @@ func bodyAllowed(req *stdhttp.Request, status int) bool {
 		status != stdhttp.StatusNotModified && status >= 200
 }
 
+// responseLength is the content-length reported for response to req: the
+// length of its body, except that a response to HEAD, which sends no body,
+// reports the one its header declares when it declares one, as HTTP/1 does.
+func responseLength(req *stdhttp.Request, response fibhttp.Response) int64 {
+	if req.Method == stdhttp.MethodHead {
+		if values := response.Header["Content-Length"]; len(values) == 1 {
+			if n, err := strconv.ParseInt(strings.TrimSpace(values[0]), 10, 64); err == nil && n >= 0 {
+				return n
+			}
+		}
+	}
+	return int64(len(response.Body))
+}
+
 // decodeFields decodes a field section.
 // decodeFields decodes a field section onto dst, remembering its strings in
 // d for the connection's next one.

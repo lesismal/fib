@@ -663,7 +663,7 @@ func (rs *requestStream) WriteResponse(req *stdhttp.Request, response fibhttp.Re
 	block = qpack.AppendField(block, ":status", string(strconv.AppendInt(digits[:0], int64(status), 10)), false)
 	statusBody := status != stdhttp.StatusNoContent && status != stdhttp.StatusNotModified
 	if statusBody {
-		block = qpack.AppendField(block, "content-length", string(strconv.AppendInt(digits[:0], int64(len(response.Body)), 10)), false)
+		block = qpack.AppendField(block, "content-length", string(strconv.AppendInt(digits[:0], responseLength(req, response), 10)), false)
 	}
 	block = appendHeader(block, response.Header, func(name string) bool { return name == "content-length" })
 	body := response.Body

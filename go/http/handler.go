@@ -978,6 +978,19 @@ func responseFraming(request *stdhttp.Request, response Response, closeConnectio
 	return framing, response.Body, trailer
 }
 
+// responseLength is the Content-Length a stream reports for response to
+// req: the length of its body, except that a response to HEAD, which sends
+// no body, reports the one its header declares when it declares one, as
+// HTTP/1 does.
+func responseLength(req *stdhttp.Request, response Response) int64 {
+	if req.Method == stdhttp.MethodHead {
+		if n := declaredLength(response.Header); n >= 0 {
+			return n
+		}
+	}
+	return int64(len(response.Body))
+}
+
 // declaredLength is the Content-Length header holds, or -1.
 func declaredLength(header stdhttp.Header) int64 {
 	if values := header["Content-Length"]; len(values) == 1 {
