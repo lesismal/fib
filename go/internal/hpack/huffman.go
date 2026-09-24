@@ -32,7 +32,15 @@ func buildHuffmanTree() {
 // huffmanDecode decodes s. Padding must be at most seven bits, all ones, the
 // start of EOS (RFC 7541 section 5.2); EOS itself never decodes.
 func huffmanDecode(s []byte, maxLen int) (string, error) {
-	out := make([]byte, 0, len(s)*8/5)
+	out, err := huffmanDecodeAppend(make([]byte, 0, len(s)*8/5), s, maxLen)
+	if err != nil {
+		return "", err
+	}
+	return string(out), nil
+}
+
+// huffmanDecodeAppend decodes s onto out, as huffmanDecode does.
+func huffmanDecodeAppend(out, s []byte, maxLen int) ([]byte, error) {
 	node := 0
 	// depth counts the bits since the last symbol, and ones whether they
 	// were all ones, which decides whether they are valid padding.
@@ -43,7 +51,7 @@ func huffmanDecode(s []byte, maxLen int) (string, error) {
 			next := huffmanTree[node].children[bit]
 			if next == 0 {
 				// Only the path of 30 ones, EOS, runs off the tree.
-				return "", ErrInvalidHuffman
+				return nil, ErrInvalidHuffman
 			}
 			node = int(next)
 			depth++
@@ -51,16 +59,16 @@ func huffmanDecode(s []byte, maxLen int) (string, error) {
 			if huffmanTree[node].children[0] == 0 {
 				out = append(out, huffmanTree[node].sym)
 				if maxLen > 0 && len(out) > maxLen {
-					return "", ErrStringTooLong
+					return nil, ErrStringTooLong
 				}
 				node, depth, ones = 0, 0, true
 			}
 		}
 	}
 	if depth > 7 || !ones {
-		return "", ErrInvalidHuffman
+		return nil, ErrInvalidHuffman
 	}
-	return string(out), nil
+	return out, nil
 }
 
 // huffmanLen is the length of s once Huffman coded.

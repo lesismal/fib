@@ -98,7 +98,23 @@ type Decoder struct {
 	// MaxStringLength bounds one name or value. Zero means no bound beyond
 	// the block's own length.
 	MaxStringLength int
+	// recent holds short literal strings decoded lately, so that a literal
+	// a peer sends on every block without indexing it — a :path, an
+	// :authority, a content-length — becomes a string once rather than once
+	// per block. huffman is where Huffman-coded strings are decoded before
+	// they are looked up there.
+	recent     [recentStrings]string
+	nextRecent int
+	huffman    []byte
 }
+
+// recentStrings is how many literals a Decoder remembers, and
+// maxRecentString the longest it remembers, which together bound what a
+// connection keeps to a few hundred bytes.
+const (
+	recentStrings   = 8
+	maxRecentString = 64
+)
 
 // NewDecoder returns a decoder for a peer allowed a dynamic table of up to
 // maxTableSize bytes.
@@ -209,14 +225,42 @@ func (d *Decoder) readString(block []byte) (string, []byte, error) {
 	}
 	raw := rest[:length]
 	rest = rest[length:]
-	if !huffman {
-		if d.MaxStringLength > 0 && len(raw) > d.MaxStringLength {
-			return "", nil, ErrStringTooLong
+	if huffman {
+		d.huffman, err = huffmanDecodeAppend(d.huffman[:0], raw, d.MaxStringLength)
+		if err != nil {
+			return "", nil, err
 		}
-		return string(raw), rest, nil
+		raw = d.huffman
+		if cap(raw) > maxRecentString*4 {
+			// Kept for the next string only while it stays small.
+			d.huffman = nil
+		}
+	} else if d.MaxStringLength > 0 && len(raw) > d.MaxStringLength {
+		return "", nil, ErrStringTooLong
 	}
-	s, err := huffmanDecode(raw, d.MaxStringLength)
-	return s, rest, err
+	return d.intern(raw), rest, nil
+}
+
+// intern returns raw as a string: for a short one, the string it returned
+// before for the same bytes if it still has it. The strings are replaced in
+// turn, so the few literals a peer repeats stay while one-off values pass
+// through.
+func (d *Decoder) intern(raw []byte) string {
+	if len(raw) == 0 {
+		return ""
+	}
+	if len(raw) > maxRecentString {
+		return string(raw)
+	}
+	for _, s := range d.recent {
+		if len(s) == len(raw) && s == string(raw) {
+			return s
+		}
+	}
+	s := string(raw)
+	d.recent[d.nextRecent] = s
+	d.nextRecent = (d.nextRecent + 1) % recentStrings
+	return s
 }
 
 // readInt reads an integer with an n-bit prefix (RFC 7541 section 5.1).

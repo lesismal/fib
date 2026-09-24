@@ -151,3 +151,67 @@ func TestDecodeRejects(t *testing.T) {
 		}
 	}
 }
+
+// literalBlock encodes fields as literals without indexing whose names are in
+// the static table, the way a peer that replays one encoded request does,
+// Huffman coding the values when huffman is set.
+func literalBlock(huffman bool, fields ...HeaderField) []byte {
+	var block []byte
+	for _, f := range fields {
+		block = appendInt(block, 0x00, 4, uint64(staticNameIndex[f.Name]))
+		if huffman {
+			block = appendInt(block, 0x80, 7, uint64(huffmanLen(f.Value)))
+			block = huffmanAppend(block, f.Value)
+		} else {
+			block = appendInt(block, 0x00, 7, uint64(len(f.Value)))
+			block = append(block, f.Value...)
+		}
+	}
+	return block
+}
+
+// TestDecodeInternsRepeatedLiterals checks that a literal a peer sends on
+// every block without indexing it is only made a string once, and that the
+// strings handed out stay what they were.
+func TestDecodeInternsRepeatedLiterals(t *testing.T) {
+	want := []HeaderField{{":authority", "127.0.0.1:21001"}, {":path", "/echo"}, {"content-length", "1024"}}
+	for _, huffman := range []bool{false, true} {
+		d := NewDecoder(DefaultTableSize)
+		block := literalBlock(huffman, want...)
+		first := decodeAll(t, d, block)
+		if !reflect.DeepEqual(first, want) {
+			t.Fatalf("huffman=%v: got %v, want %v", huffman, first, want)
+		}
+		fields := make([]HeaderField, 0, len(want))
+		allocs := testing.AllocsPerRun(100, func() {
+			fields = fields[:0]
+			_ = d.Decode(block, func(f HeaderField) error {
+				fields = append(fields, f)
+				return nil
+			})
+		})
+		if allocs != 0 {
+			t.Fatalf("huffman=%v: a block seen before took %v allocations", huffman, allocs)
+		}
+		if !reflect.DeepEqual(fields, want) {
+			t.Fatalf("huffman=%v: got %v, want %v", huffman, fields, want)
+		}
+
+		// Other values of the same length, decoded through the same scratch
+		// buffer, leave the strings already handed out alone.
+		other := decodeAll(t, d, literalBlock(huffman,
+			HeaderField{":authority", "10.20.30.40:9999"}, HeaderField{":path", "/ohce"}, HeaderField{"content-length", "4201"}))
+		if other[1].Value != "/ohce" || other[2].Value != "4201" {
+			t.Fatalf("huffman=%v: got %v", huffman, other)
+		}
+		if !reflect.DeepEqual(first, want) {
+			t.Fatalf("huffman=%v: strings decoded earlier changed to %v", huffman, first)
+		}
+
+		// Past what is remembered, a literal is still decoded whole.
+		long := HeaderField{":path", "/" + strings.Repeat("x", 2*maxRecentString)}
+		if got := decodeAll(t, d, literalBlock(huffman, long)); !reflect.DeepEqual(got, []HeaderField{long}) {
+			t.Fatalf("huffman=%v: long literal decoded as %v", huffman, got)
+		}
+	}
+}
