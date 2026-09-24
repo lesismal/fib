@@ -341,7 +341,9 @@ func (s *Stream) onStreamFrame(off uint64, data []byte, fin bool) error {
 		}
 		return nil
 	}
-	s.recv.push(off, data)
+	if chunk := s.recv.take(off, data); chunk != nil {
+		s.deliver(chunk, false)
+	}
 	for {
 		chunk := s.recv.pop()
 		if chunk == nil {
@@ -363,7 +365,7 @@ func (s *Stream) onStreamFrame(off uint64, data []byte, fin bool) error {
 func (s *Stream) deliver(data []byte, fin bool) {
 	c := s.conn
 	c.consumed(s, s.recv.offset)
-	c.events = append(c.events, func() { c.handler.OnStreamData(s, data, fin) })
+	c.events = append(c.events, event{kind: evStreamData, stream: s, data: data, fin: fin})
 }
 
 // consumed records that the stream has been read up to offset, and gives
@@ -408,7 +410,7 @@ func (s *Stream) onResetStream(code, finalSize uint64) error {
 	s.maxDataPending = false
 	s.recv = recvBuffer{offset: s.recv.offset}
 	if !s.stopSent {
-		c.events = append(c.events, func() { c.handler.OnStreamReset(s, code) })
+		c.events = append(c.events, event{kind: evStreamReset, stream: s, code: code})
 	}
 	c.maybeFinish(s)
 	return nil
@@ -420,7 +422,7 @@ func (s *Stream) onStopSending(code uint64) {
 		return
 	}
 	s.resetLocked(code)
-	c.events = append(c.events, func() { c.handler.OnStopSending(s, code) })
+	c.events = append(c.events, event{kind: evStopSending, stream: s, code: code})
 }
 
 // recvFinished reports whether the receiving side needs nothing more.

@@ -55,6 +55,47 @@ var Prefix = []byte{0, 0}
 // stops with ErrTooLarge once the fields' size, counted as RFC 9114 section
 // 4.2.2 does, would pass maxSize, if maxSize is positive.
 func Decode(block []byte, maxSize int, emit func(HeaderField) error) error {
+	var d *Decoder
+	return d.decode(block, maxSize, emit, nil)
+}
+
+// Decoder decodes the field sections of one connection. A connection's
+// requests repeat most of their fields — the authority, the paths, the
+// client's own fields — so it remembers the strings it decoded last, and a
+// field line it has seen before costs neither decoding nor an allocation. A
+// Decoder is used by one goroutine at a time. The zero value is ready, and
+// a nil *Decoder decodes as Decode does, remembering nothing.
+type Decoder struct {
+	recent [recentStrings]recentString
+	next   int
+}
+
+// recentString is a string as a field line encoded it, with a prefix of n
+// bits, and what it decoded to. The same bytes read with another prefix are
+// another string.
+type recentString struct {
+	encoded, decoded string
+	n                uint8
+}
+
+const (
+	// recentStrings is how many strings a Decoder remembers, which is more
+	// than an ordinary request has that the static table does not cover.
+	recentStrings = 8
+	// maxRecentString bounds the encoded length of a string worth
+	// remembering: long ones are rarely the same twice.
+	maxRecentString = 128
+)
+
+// AppendFields decodes a field section as Decode does, appending its fields
+// to dst.
+func (d *Decoder) AppendFields(dst []HeaderField, block []byte, maxSize int) ([]HeaderField, error) {
+	err := d.decode(block, maxSize, nil, &dst)
+	return dst, err
+}
+
+// decode decodes a field section into emit, or onto dst when emit is nil.
+func (d *Decoder) decode(block []byte, maxSize int, emit func(HeaderField) error, dst *[]HeaderField) error {
 	ric, rest, err := readInt(block, 8)
 	if err != nil {
 		return err
@@ -97,15 +138,15 @@ func Decode(block []byte, maxSize int, emit func(HeaderField) error) error {
 				return ErrDecompression
 			}
 			f.Name = staticTable[i].Name
-			if f.Value, rest, err = readString(rest, 7, maxSize); err != nil {
+			if f.Value, rest, err = d.readString(rest, 7, maxSize); err != nil {
 				return err
 			}
 		case b&0xe0 == 0x20:
 			// Literal field line with a literal name.
-			if f.Name, rest, err = readString(rest, 3, maxSize); err != nil {
+			if f.Name, rest, err = d.readString(rest, 3, maxSize); err != nil {
 				return err
 			}
-			if f.Value, rest, err = readString(rest, 7, maxSize); err != nil {
+			if f.Value, rest, err = d.readString(rest, 7, maxSize); err != nil {
 				return err
 			}
 		default:
@@ -116,7 +157,9 @@ func Decode(block []byte, maxSize int, emit func(HeaderField) error) error {
 		if maxSize > 0 && size > maxSize {
 			return ErrTooLarge
 		}
-		if err := emit(f); err != nil {
+		if emit == nil {
+			*dst = append(*dst, f)
+		} else if err := emit(f); err != nil {
 			return err
 		}
 	}
@@ -159,6 +202,37 @@ func appendInt(dst []byte, first byte, n uint8, v uint64) []byte {
 		v >>= 7
 	}
 	return append(dst, byte(v))
+}
+
+// readString reads a string whose length has an n-bit prefix, with the
+// Huffman flag in the bit just above it, and remembers it for the next field
+// line that encodes it the same way.
+func (d *Decoder) readString(b []byte, n uint8, maxLen int) (string, []byte, error) {
+	if d == nil {
+		return readString(b, n, maxLen)
+	}
+	// A remembered string is taken only where readString would have taken
+	// it, raw length limit and all.
+	if length, after, err := readInt(b, n); err == nil && length <= uint64(len(after)) && (maxLen <= 0 || length <= uint64(maxLen)) {
+		if end := len(b) - len(after) + int(length); end <= maxRecentString {
+			encoded := b[:end]
+			for i := range d.recent {
+				r := &d.recent[i]
+				if r.n == n && r.encoded == string(encoded) && (maxLen <= 0 || len(r.decoded) <= maxLen) {
+					return r.decoded, b[end:], nil
+				}
+			}
+		}
+	}
+	s, rest, err := readString(b, n, maxLen)
+	if err != nil {
+		return s, rest, err
+	}
+	if encoded := b[:len(b)-len(rest)]; len(encoded) <= maxRecentString {
+		d.recent[d.next] = recentString{encoded: string(encoded), decoded: s, n: n}
+		d.next = (d.next + 1) % recentStrings
+	}
+	return s, rest, nil
 }
 
 // readString reads a string whose length has an n-bit prefix, with the

@@ -240,7 +240,7 @@ func (c *Conn) handleFrames(space int, payload []byte, now time.Time) (bool, err
 			}
 			if max > *limit {
 				*limit = max
-				c.events = append(c.events, func() { c.handler.OnStreamsAvailable(c) })
+				c.events = append(c.events, event{kind: evStreamsAvailable})
 			}
 		case typ == frameDataBlocked:
 			r.varint()
@@ -302,7 +302,9 @@ func (c *Conn) handleAckFrame(space int, r *reader, ecn bool, now time.Time) err
 	if r.bad || first > largest || count > 1<<16 {
 		return transportErr(errFrameEncoding, "malformed ACK")
 	}
-	ranges := make([]pnRange, 0, min(count+1, 64))
+	// Most acknowledgements have a range or two, which fit on the stack.
+	var few [4]pnRange
+	ranges := few[:0]
 	ranges = append(ranges, pnRange{largest - first, largest})
 	smallest := largest - first
 	for i := uint64(0); i < count; i++ {

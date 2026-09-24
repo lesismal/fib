@@ -1,6 +1,7 @@
 package quic
 
 import (
+	"bytes"
 	"sort"
 
 	"github.com/lesismal/fib/go/bufferpool"
@@ -98,12 +99,19 @@ func (b *sendBuffer) popNew(n uint64) (uint64, []byte) {
 // onAck records that [off, off+n) arrived, and lets go of what now needs no
 // keeping.
 func (b *sendBuffer) onAck(off, n uint64) {
-	b.acked = addSpan(b.acked, span{off, off + n})
-	if len(b.acked) == 0 || b.acked[0].off > b.base {
-		return
+	var newBase uint64
+	if len(b.acked) == 0 && off <= b.base {
+		// Acknowledged in order, which is how nearly everything is: the
+		// range moves the base on without being recorded.
+		newBase = off + n
+	} else {
+		b.acked = addSpan(b.acked, span{off, off + n})
+		if len(b.acked) == 0 || b.acked[0].off > b.base {
+			return
+		}
+		newBase = b.acked[0].end
+		b.acked = b.acked[1:]
 	}
-	newBase := b.acked[0].end
-	b.acked = b.acked[1:]
 	if newBase <= b.base {
 		return
 	}
@@ -145,8 +153,27 @@ type recvBuffer struct {
 	buffered int
 }
 
-// push stores a frame's data, less what has been delivered already; pop
-// then hands it on in order.
+// take hands on a frame's data at once, less what has been delivered already,
+// when it continues the stream where delivery left off and nothing waits
+// ahead of it, which is how nearly every frame arrives. Otherwise it stores
+// the data for pop and returns nil.
+func (r *recvBuffer) take(off uint64, data []byte) []byte {
+	if len(r.segments) > 0 || off > r.offset {
+		r.push(off, data)
+		return nil
+	}
+	end := off + uint64(len(data))
+	if end <= r.offset {
+		return nil
+	}
+	data = data[r.offset-off:]
+	r.offset = end
+	return data
+}
+
+// push stores a copy of a frame's data, less what has been delivered
+// already, since it outlives the datagram it arrived in; pop then hands it
+// on in order.
 func (r *recvBuffer) push(off uint64, data []byte) {
 	end := off + uint64(len(data))
 	if end <= r.offset || len(data) == 0 {
@@ -159,7 +186,7 @@ func (r *recvBuffer) push(off uint64, data []byte) {
 	i := sort.Search(len(r.segments), func(i int) bool { return r.segments[i].off > off })
 	r.segments = append(r.segments, segment{})
 	copy(r.segments[i+1:], r.segments[i:])
-	r.segments[i] = segment{off: off, data: data}
+	r.segments[i] = segment{off: off, data: bytes.Clone(data)}
 	r.buffered += len(data)
 }
 

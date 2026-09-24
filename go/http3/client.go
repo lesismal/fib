@@ -443,6 +443,9 @@ type clientConn struct {
 	addr       string
 	serverName string
 	peer       peerStreams
+	// decoder decodes the connection's field sections. Only the goroutine
+	// QUIC calls the connection's handler on uses it.
+	decoder qpack.Decoder
 
 	mu       sync.Mutex
 	fc       *fib.Connection
@@ -479,6 +482,9 @@ func (cc *clientConn) dial() {
 			// Servers may not open request streams; one is the least QUIC
 			// allows advertising that means it.
 			MaxIncomingStreams: 1,
+			// fib hands each datagram over as a buffer of its own from the
+			// pool, which QUIC gives back once it has done with it.
+			RecycleDatagrams: true,
 		}
 		cc.mu.Lock()
 		cc.fc = fc
@@ -848,7 +854,7 @@ func (st *clientStream) onFrame(typ uint64, payload []byte) error {
 	if st.trailers {
 		return connErr(ErrCodeFrameUnexpected, "HEADERS after trailers")
 	}
-	fields, err := decodeFields(payload, st.cc.client.config.MaxResponseHeaderBytes)
+	fields, err := decodeFields(&st.cc.decoder, nil, payload, st.cc.client.config.MaxResponseHeaderBytes)
 	if errors.Is(err, qpack.ErrTooLarge) {
 		st.fail(errHeaderTooLarge)
 		return nil

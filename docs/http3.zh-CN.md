@@ -45,8 +45,11 @@
   （默认 60 秒），否则 Engine 会先把静默的对端关掉。
 - Engine 为每个 UDP 连接最多排队 1024 个待处理的数据报，超出的会被丢弃，由 QUIC 按丢包
   处理。
-- QUIC 层依赖 Engine 把每个 UDP 数据报复制一份交给它这一行为：乱序重组和等待密钥时，
-  QUIC 层会直接持有这些切片；一次到齐的请求 body 也直接留在原处，不再复制。
+- Engine 把每个 UDP 数据报放进一个取自 `bufferpool` 的独立缓冲区交给 QUIC 层，QUIC 层在
+  由它引起的 handler 回调都执行完后把缓冲区归还。需要比数据报活得更久的内容会被复制：
+  乱序到达、前面还有空缺的数据，等待密钥的包，以及请求 body——body 汇集到一个单独的池化
+  缓冲区里，响应结束后归还，与 HTTP/1 相同：handler 既没有 Retain 请求、也没有在响应前
+  读完 body，之后再读会得到 `http.ErrBodyReleased`。
 - 服务端以 `fib.DatagramsHandler` 的方式成批接收一条连接的数据报：连接的 worker 运行时
   已经排队的数据报一起处理，ACK 和这期间写出的响应尽量装进更少的包里一起发出。
 - `Engine.Stop`/`Close` 不会给 HTTP/3 连接发送 CONNECTION_CLOSE 或 GOAWAY，连接被直接
@@ -153,8 +156,9 @@
 - **拥塞控制**：增加 CUBIC 或 BBR，判断应用受限，实现持续拥塞判定。
 - **批量收发**：使用 GSO/GRO、`sendmmsg`/`recvmmsg`，需要 Engine 的 UDP 层配合。
 - **减少复制与分配**：发送时 `Write` 复制一次（复制进缓冲池里的缓冲区）、组包时再复制
-  一次；接收时 Engine 复制一次，HTTP/3 帧解析器只复制跨片段的帧。每个发出的包仍要为丢包
-  恢复分配一条记录。
+  一次；接收时 Engine 复制一次（复制进缓冲池里的缓冲区），HTTP/3 帧解析器只复制跨片段的帧
+  和请求 body。每个请求仍要分配它的 QUIC stream、header map，以及一块装着 request、URL、
+  `Context` 等服务它所需其余对象的内存。
 - **数据结构**：已发送的包存在切片里，ACK 处理和丢包检测都是线性扫描；每轮发送都会重置
   一次 `time.Timer`。
 - **ACK 频率**：大流量时可以实现 ACK_FREQUENCY 扩展，减少 ACK 数量。

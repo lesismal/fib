@@ -170,13 +170,7 @@ func parseSimpleRequestHead(head []byte, reuse reuseOptions) *requestBlock {
 		// it past the request the block goes on to hold.
 		u = new(url.URL)
 	}
-	// As url.ParseRequestURI splits a request target: a lone trailing '?'
-	// forces an empty query, and otherwise the query starts at the first.
-	if strings.HasSuffix(target, "?") && strings.Count(target, "?") == 1 {
-		u.Path, u.ForceQuery = target[:len(target)-1], true
-	} else {
-		u.Path, u.RawQuery, _ = strings.Cut(target, "?")
-	}
+	splitTarget(u, target)
 
 	// A map this small is allocated on its first insert whatever it is
 	// sized for, so there is no count to take first.
@@ -299,16 +293,28 @@ func simpleMethod(b []byte) string {
 	return ""
 }
 
+// splitTarget fills in u from a target simpleTarget approved, as
+// url.ParseRequestURI splits one: a lone trailing '?' forces an empty query,
+// and otherwise the query starts at the first.
+func splitTarget(u *url.URL, target string) {
+	if strings.HasSuffix(target, "?") && strings.Count(target, "?") == 1 {
+		u.Path, u.ForceQuery = target[:len(target)-1], true
+	} else {
+		u.Path, u.RawQuery, _ = strings.Cut(target, "?")
+	}
+}
+
 // simpleTarget reports whether a request target is an origin-form path that
 // url.ParseRequestURI takes as it is: a path of characters it would not
 // escape, so that Path is the path and RawPath is empty, with an optional
 // query of any printable characters, which it keeps raw.
-func simpleTarget(target []byte) bool {
+func simpleTarget[T string | []byte](target T) bool {
 	if target[0] != '/' {
 		return false
 	}
 	inQuery := false
-	for _, c := range target {
+	for i := 0; i < len(target); i++ {
+		c := target[i]
 		if inQuery {
 			if c <= ' ' || c == 0x7f {
 				return false

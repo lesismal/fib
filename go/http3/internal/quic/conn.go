@@ -46,7 +46,9 @@ type Handler interface {
 	OnHandshake(c *Conn)
 	// OnStreamData delivers a stream's data in order, with fin set on the
 	// last call. The first call for a stream the peer opened is how the
-	// stream becomes known. data belongs to the handler.
+	// stream becomes known. data belongs to the handler, unless
+	// Config.RecycleDatagrams is set: then it is valid only until the call
+	// returns, and what the handler keeps it copies.
 	OnStreamData(s *Stream, data []byte, fin bool)
 	// OnStreamReset runs when the peer abandons its sending side.
 	OnStreamReset(s *Stream, code uint64)
@@ -87,6 +89,13 @@ type Config struct {
 	// size every path carries; more saves packets, and the syscalls that
 	// send them, on a path known to carry them. At most 1452.
 	MaxDatagramSize int
+	// RecycleDatagrams says that the datagrams HandleDatagram and
+	// HandleDatagrams are given are buffers from package bufferpool that the
+	// connection takes over, and gives back once it has done with them. What
+	// it has to keep past that, such as data that arrived ahead of what comes
+	// before it, it copies; and OnStreamData's data is then valid only for
+	// the call.
+	RecycleDatagrams bool
 }
 
 func (config Config) withDefaults() Config {
@@ -258,7 +267,10 @@ type Conn struct {
 	// closeWhenDone is the close CloseWhenDone asked for.
 	closeWhenDone *ApplicationError
 
-	events      []func()
+	// events are the handler calls waiting for dispatch, and spareEvents
+	// the array the last batch of them was run from, kept for the next.
+	events      []event
+	spareEvents []event
 	dispatching bool
 	// sending says a goroutine is sending, which only one does at a time;
 	// wantFlush that there may be something to send, which the sending one
@@ -270,6 +282,13 @@ type Conn struct {
 	flushDeadline time.Time
 	// buffered are packets that arrived before their keys.
 	buffered [][]byte
+
+	// freeSent are sent packet records to reuse, and ackedScratch and
+	// lostScratch the arrays acknowledgement and loss detection list theirs
+	// in; see newSentPacket.
+	freeSent     []*sentPacket
+	ackedScratch []*sentPacket
+	lostScratch  []*sentPacket
 
 	// Context is for the application, which the connection never touches.
 	Context any
@@ -420,6 +439,7 @@ func (c *Conn) HandleDatagram(datagram []byte) {
 		c.handleDatagramLocked(datagram, c.now())
 		c.wantFlush = true
 	}
+	c.recycleLocked(datagram)
 	c.mu.Unlock()
 	c.dispatch()
 }
@@ -439,8 +459,21 @@ func (c *Conn) HandleDatagrams(datagrams [][]byte) {
 		}
 		c.wantFlush = true
 	}
+	for _, d := range datagrams {
+		c.recycleLocked(d)
+	}
 	c.mu.Unlock()
 	c.dispatch()
+}
+
+// recycleLocked gives a datagram back to the pool, with
+// Config.RecycleDatagrams, once the handler calls it led to have run: they
+// are queued ahead of it, and may be dispatched by another goroutine after
+// this one has returned. Callers hold c.mu.
+func (c *Conn) recycleLocked(datagram []byte) {
+	if c.config.RecycleDatagrams {
+		c.events = append(c.events, event{kind: evRecycle, data: datagram})
+	}
 }
 
 // Abort ends the connection without telling the peer, as when the path
@@ -630,13 +663,19 @@ func (c *Conn) dispatch() {
 	}
 	c.dispatching = true
 	for len(c.events) > 0 {
+		// What is queued while the batch runs goes on the spare array, so
+		// the batch is this goroutine's alone.
 		events := c.events
-		c.events = nil
+		c.events, c.spareEvents = c.spareEvents[:0], nil
 		c.mu.Unlock()
-		for _, f := range events {
-			f()
+		for i := range events {
+			c.run(&events[i])
 		}
+		clear(events)
 		c.mu.Lock()
+		if c.spareEvents == nil {
+			c.spareEvents = events[:0]
+		}
 	}
 	c.dispatching = false
 	c.mu.Unlock()
@@ -785,7 +824,8 @@ func (c *Conn) handlePacket(pkt []byte, h header, now time.Time) bool {
 	}
 	if s.rx == nil {
 		if space != spaceInitial && len(c.buffered) < maxBufferedPackets {
-			c.buffered = append(c.buffered, pkt)
+			// A copy, since it outlives the datagram it arrived in.
+			c.buffered = append(c.buffered, bytes.Clone(pkt))
 		}
 		return false
 	}
@@ -906,14 +946,15 @@ func (c *Conn) handleCrypto(space int, off uint64, data []byte) error {
 	if off+uint64(len(data)) > s.cryptoRecv.offset+maxCryptoBuffer {
 		return transportErr(errCryptoBufferExceeds, "too much out-of-order handshake data")
 	}
-	s.cryptoRecv.push(off, data)
 	level := [...]tls.QUICEncryptionLevel{
 		tls.QUICEncryptionLevelInitial,
 		tls.QUICEncryptionLevelHandshake,
 		tls.QUICEncryptionLevelApplication,
 	}[space]
-	for {
-		chunk := s.cryptoRecv.pop()
+	for chunk := s.cryptoRecv.take(off, data); ; chunk = nil {
+		if chunk == nil {
+			chunk = s.cryptoRecv.pop()
+		}
 		if chunk == nil {
 			return nil
 		}
@@ -1028,7 +1069,7 @@ func (c *Conn) onHandshakeComplete() error {
 			}
 		}
 	}
-	c.events = append(c.events, func() { c.handler.OnHandshake(c) })
+	c.events = append(c.events, event{kind: evHandshake})
 	return nil
 }
 
@@ -1153,11 +1194,7 @@ func (c *Conn) terminateLocked(err error) {
 	c.streams = nil
 	c.sendQueue = nil
 	c.buffered = nil
-	c.events = append(c.events, func() {
-		c.tls.Close()
-		_ = c.pc.Close()
-		c.handler.OnClose(c, err)
-	})
+	c.events = append(c.events, event{kind: evClose, err: err})
 }
 
 // armTimerLocked sets the connection's one timer for the earliest thing

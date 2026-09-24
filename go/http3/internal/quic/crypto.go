@@ -29,12 +29,18 @@ type headerProtector interface {
 	mask(sample []byte) [5]byte
 }
 
-type aesHeaderProtector struct{ block cipher.Block }
+// aesHeaderProtector encrypts the sample into out, which is its own rather
+// than the stack's because the block cipher is an interface the compiler
+// cannot see into, so a stack array would have to move to the heap on every
+// packet. The connection's lock keeps its packets from sharing out.
+type aesHeaderProtector struct {
+	block cipher.Block
+	out   [16]byte
+}
 
-func (h aesHeaderProtector) mask(sample []byte) (m [5]byte) {
-	var out [16]byte
-	h.block.Encrypt(out[:], sample[:16])
-	copy(m[:], out[:])
+func (h *aesHeaderProtector) mask(sample []byte) (m [5]byte) {
+	h.block.Encrypt(h.out[:], sample[:16])
+	copy(m[:], h.out[:])
 	return m
 }
 
@@ -56,6 +62,10 @@ type keys struct {
 	aead   cipher.AEAD
 	iv     [12]byte
 	hp     headerProtector
+	// nonceBuf is where nonce builds a packet's nonce, for the AEAD, an
+	// interface, would otherwise move one to the heap per packet. The
+	// connection's lock keeps its packets from sharing it.
+	nonceBuf [12]byte
 }
 
 func suiteHash(suite uint16) func() hash.Hash {
@@ -120,7 +130,7 @@ func newKeys(suite uint16, secret []byte) (*keys, error) {
 		if err != nil {
 			return nil, err
 		}
-		k.hp = aesHeaderProtector{block: block}
+		k.hp = &aesHeaderProtector{block: block}
 	}
 	return k, nil
 }
@@ -140,7 +150,8 @@ func (k *keys) next() *keys {
 }
 
 func (k *keys) nonce(pn uint64) []byte {
-	n := k.iv
+	n := &k.nonceBuf
+	*n = k.iv
 	for i := 0; i < 8; i++ {
 		n[11-i] ^= byte(pn >> (8 * i))
 	}

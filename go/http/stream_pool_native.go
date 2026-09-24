@@ -59,36 +59,63 @@ func (g *StreamGate) Running() int { return int(g.running.Load()) }
 // written outside the read round that would otherwise carry it to the
 // socket; a request run here is left to the caller's own round.
 func (p *StreamPool) Run(gate *StreamGate, conn *fib.Connection, fn func()) {
-	if p == nil {
+	if !p.admit(gate) {
 		fn()
 		return
 	}
-	if p.limit > 0 {
-		for {
-			running := gate.running.Load()
-			if running+1 >= int64(p.limit) {
-				fn()
-				return
-			}
-			if gate.running.CompareAndSwap(running, running+1) {
-				break
-			}
-		}
-	} else {
-		gate.running.Add(1)
+	p.submit(&streamTask{gate: gate, conn: conn, fn: fn})
+}
+
+// Serve serves the request r holds with handler, as Run does a function that
+// calls Serve with r's Context, but without allocating: what the pool keeps
+// of the request while it waits for a worker is in r. Get the Context from
+// r.Context first.
+func (p *StreamPool) Serve(gate *StreamGate, conn *fib.Connection, handler Handler, r *StreamRequest) {
+	if !p.admit(gate) {
+		Serve(handler, &r.context)
+		return
 	}
-	task := &streamTask{gate: gate, conn: conn, fn: fn}
+	r.task = streamTask{gate: gate, conn: conn, handler: handler, context: &r.context}
+	p.submit(&r.task)
+}
+
+// admit reports whether a request of the connection gate counts for goes to
+// the pool, counting it if so, or has to be served by the caller: when there
+// is no pool, or the connection is at its limit.
+func (p *StreamPool) admit(gate *StreamGate) bool {
+	if p == nil {
+		return false
+	}
+	if p.limit <= 0 {
+		gate.running.Add(1)
+		return true
+	}
+	for {
+		running := gate.running.Load()
+		if running+1 >= int64(p.limit) {
+			return false
+		}
+		if gate.running.CompareAndSwap(running, running+1) {
+			return true
+		}
+	}
+}
+
+// submit hands an admitted request to the pool.
+func (p *StreamPool) submit(task *streamTask) {
 	if !p.pool.GoTask(task) {
 		// The pool has stopped taking work; the request is served here.
 		task.run()
 	}
 }
 
-// streamTask is one request on the pool.
+// streamTask is one request on the pool: fn, or handler serving context.
 type streamTask struct {
-	gate *StreamGate
-	conn *fib.Connection
-	fn   func()
+	gate    *StreamGate
+	conn    *fib.Connection
+	fn      func()
+	handler Handler
+	context *Context
 }
 
 func (t *streamTask) RunTask() { t.run() }
@@ -110,7 +137,11 @@ func (t *streamTask) run() {
 			_ = t.conn.Flush()
 		}
 	}()
-	t.fn()
+	if t.fn != nil {
+		t.fn()
+		return
+	}
+	serveRequest(t.handler, t.context)
 }
 
 // streamPoolKey is the sizing that decides which shared pool a server gets.

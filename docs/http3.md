@@ -50,10 +50,14 @@ Behavior users need to be aware of.
   `Config.UDPIdleTimeout` (default 60s), or the engine closes a quiet peer first.
 - The engine queues at most 1024 unprocessed datagrams per UDP connection; more
   are dropped and QUIC treats them as lost.
-- The QUIC layer relies on the engine handing every UDP datagram to it as a
-  copy of its own: it keeps those slices, without copying, while it reorders
-  data and waits for keys, and keeps a request body that arrived in one piece
-  where it arrived.
+- The engine hands every UDP datagram over in a buffer of its own from
+  `bufferpool`, and the QUIC layer gives it back once the handler calls it led
+  to have run. What has to outlive it is copied: data that arrived ahead of a
+  gap, a packet waiting for its keys, and the request body, which is gathered
+  in a pooled buffer of its own. That buffer goes back once the response is
+  finished, as on HTTP/1: a handler that reads the body after that, having
+  neither retained the request nor read it before responding, gets
+  `http.ErrBodyReleased`.
 - The server takes a connection's datagrams in bursts, as a
   `fib.DatagramsHandler`: whatever has piled up by the time the connection's
   worker runs is processed together, and the acknowledgement and the
@@ -188,8 +192,10 @@ In order of priority.
   UDP layer.
 - **Fewer copies and allocations**: sending copies once in `Write`, into a
   pooled buffer, and again when packets are built; receiving copies in the
-  engine, and in the HTTP/3 frame parser only a frame split across pieces.
-  Every sent packet still allocates the record loss recovery keeps of it.
+  engine, into a pooled buffer, and in the HTTP/3 frame parser only a frame
+  split across pieces and the request body. A request still allocates its
+  QUIC stream, its header map and one block holding its request, URL,
+  `Context` and the rest of what serving it takes.
 - **Data structures**: sent packets live in a slice, so ACK processing and loss
   detection scan linearly; every round of sending resets a `time.Timer`.
 - **ACK frequency**: implement the ACK_FREQUENCY extension to send fewer ACKs

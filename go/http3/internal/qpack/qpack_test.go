@@ -84,3 +84,47 @@ func TestDecodeErrors(t *testing.T) {
 		t.Fatalf("size limit: got %v", err)
 	}
 }
+
+// A Decoder decodes what Decode does, and a section it has seen before costs
+// it no allocation.
+func TestDecoderRemembersStrings(t *testing.T) {
+	block := encode([]HeaderField{
+		{":method", "POST"},
+		{":path", "/echo"},
+		{":authority", "127.0.0.1:28001"},
+		{"content-length", "1024"},
+		{"user-agent", "benchmark/1.0"},
+		{"x-custom", "value"},
+		{"x-long", strings.Repeat("ab", 300)}, // too long to remember
+	})
+	want, err := decode(t, block, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var d Decoder
+	var fields []HeaderField
+	for i := 0; i < 3; i++ {
+		if fields, err = d.AppendFields(fields[:0], block, 0); err != nil {
+			t.Fatal(err)
+		}
+		if len(fields) != len(want) {
+			t.Fatalf("decoded %d fields, want %d", len(fields), len(want))
+		}
+		for j := range want {
+			if fields[j] != want[j] {
+				t.Fatalf("field %d is %q, want %q", j, fields[j], want[j])
+			}
+		}
+	}
+	short := encode(want[:6])
+	allocs := testing.AllocsPerRun(100, func() {
+		fields, _ = d.AppendFields(fields[:0], short, 0)
+	})
+	if allocs != 0 {
+		t.Fatalf("a section seen before took %v allocations", allocs)
+	}
+	// A limit the remembered string is past still fails the field.
+	if _, err := d.AppendFields(nil, short, 10); !errors.Is(err, ErrTooLarge) {
+		t.Fatalf("got %v, want ErrTooLarge", err)
+	}
+}

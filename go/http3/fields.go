@@ -11,6 +11,7 @@ import (
 	"strconv"
 	"strings"
 
+	fibhttp "github.com/lesismal/fib/go/http"
 	"github.com/lesismal/fib/go/http3/internal/qpack"
 )
 
@@ -71,7 +72,7 @@ func sensitive(name string) bool {
 // is encoded.
 func checkHeader(header stdhttp.Header) error {
 	for key, values := range header {
-		if key == "" || textproto.CanonicalMIMEHeaderKey(key) == "" || !validName(strings.ToLower(key)) {
+		if key == "" || textproto.CanonicalMIMEHeaderKey(key) == "" || !validName(lowerKey(key)) {
 			return errors.New("http3: invalid header name " + strconv.Quote(key))
 		}
 		for _, value := range values {
@@ -87,7 +88,7 @@ func checkHeader(header stdhttp.Header) error {
 // carry and what skip names.
 func appendHeader(block []byte, header stdhttp.Header, skip func(string) bool) []byte {
 	for key, values := range header {
-		name := strings.ToLower(key)
+		name := lowerKey(key)
 		if connectionHeaders[name] || skip != nil && skip(name) {
 			continue
 		}
@@ -98,6 +99,35 @@ func appendHeader(block []byte, header stdhttp.Header, skip func(string) bool) [
 	return block
 }
 
+// lowerKeys are the lowercase names of the header keys messages nearly always
+// carry, which lowerKey looks up rather than builds.
+var lowerKeys = func() map[string]string {
+	keys := make(map[string]string)
+	for _, key := range []string{
+		"Accept", "Accept-Encoding", "Accept-Language", "Accept-Ranges",
+		"Access-Control-Allow-Headers", "Access-Control-Allow-Methods", "Access-Control-Allow-Origin",
+		"Age", "Allow", "Authorization", "Cache-Control", "Content-Disposition", "Content-Encoding",
+		"Content-Language", "Content-Length", "Content-Location", "Content-Range", "Content-Type",
+		"Cookie", "Date", "Etag", "Expires", "Last-Modified", "Link", "Location", "Origin",
+		"Referer", "Retry-After", "Server", "Set-Cookie", "Strict-Transport-Security",
+		"Trailer", "User-Agent", "Vary", "Via", "Www-Authenticate", "X-Content-Type-Options",
+		"X-Forwarded-For", "X-Frame-Options", "X-Request-Id",
+	} {
+		keys[key] = strings.ToLower(key)
+	}
+	return keys
+}()
+
+// lowerKey is a header key in lower case, as HTTP/3 sends it, without the
+// allocation strings.ToLower makes of a canonical key for the keys messages
+// nearly always carry.
+func lowerKey(key string) string {
+	if name, ok := lowerKeys[key]; ok {
+		return name
+	}
+	return strings.ToLower(key)
+}
+
 // appendHeadersFrame appends a HEADERS frame holding block.
 func appendHeadersFrame(b, block []byte) []byte {
 	b = appendFrameHeader(b, frameHeaders, len(block))
@@ -105,8 +135,10 @@ func appendHeadersFrame(b, block []byte) []byte {
 }
 
 // newRequest builds a request from its fields, rejecting what RFC 9114
-// section 4.3.1 calls malformed.
-func newRequest(fields []qpack.HeaderField) (*stdhttp.Request, error) {
+// section 4.3.1 calls malformed. The request and its URL are block's, and
+// the header's values, as far as they go, are slices of values; block may be
+// nil, for a request of its own.
+func newRequest(fields []qpack.HeaderField, block *fibhttp.StreamRequest, values []string) (*stdhttp.Request, error) {
 	var method, scheme, authority, path string
 	var seen [4]bool
 	header := make(stdhttp.Header, len(fields))
@@ -148,7 +180,15 @@ func newRequest(fields []qpack.HeaderField) (*stdhttp.Request, error) {
 			continue
 		}
 		key := textproto.CanonicalMIMEHeaderKey(f.Name)
-		header[key] = append(header[key], f.Value)
+		if existing, ok := header[key]; ok || len(values) == 0 {
+			header[key] = append(existing, f.Value)
+			continue
+		}
+		// Capped, so that a handler appending to it gets a copy rather
+		// than writing over the next key's value.
+		header[key] = values[:1:1]
+		values[0] = f.Value
+		values = values[1:]
 	}
 	if len(cookies) > 0 {
 		header["Cookie"] = []string{strings.Join(cookies, "; ")}
@@ -156,33 +196,36 @@ func newRequest(fields []qpack.HeaderField) (*stdhttp.Request, error) {
 	if method == "" {
 		return nil, errors.New("missing :method")
 	}
-	req := &stdhttp.Request{
+	if block == nil {
+		block = new(fibhttp.StreamRequest)
+	}
+	req := &block.Request
+	*req = stdhttp.Request{
 		Method:     method,
 		Proto:      "HTTP/3.0",
 		ProtoMajor: 3,
 		Header:     header,
 		Body:       stdhttp.NoBody,
 	}
+	u := &block.URL
 	if method == stdhttp.MethodConnect {
 		if scheme != "" || path != "" || authority == "" {
 			return nil, errors.New("malformed CONNECT")
 		}
-		req.URL = &url.URL{Host: authority}
+		*u = url.URL{Host: authority}
 		req.RequestURI = authority
 	} else {
 		if scheme == "" || path == "" {
 			return nil, errors.New("missing :scheme or :path")
 		}
-		u, err := url.ParseRequestURI(path)
 		if path == "*" {
-			u, err = &url.URL{Path: "*"}, nil
-		}
-		if err != nil {
+			*u = url.URL{Path: "*"}
+		} else if err := fibhttp.ParseRequestTarget(u, path); err != nil {
 			return nil, err
 		}
-		req.URL = u
 		req.RequestURI = path
 	}
+	req.URL = u
 	// A request for a scheme with a mandatory authority has to name it,
 	// once, either way and with one value (RFC 9114 section 4.3.1).
 	hosts := header["Host"]
@@ -273,13 +316,10 @@ func bodyAllowed(req *stdhttp.Request, status int) bool {
 }
 
 // decodeFields decodes a field section.
-func decodeFields(block []byte, maxSize int) ([]qpack.HeaderField, error) {
-	var fields []qpack.HeaderField
-	err := qpack.Decode(block, maxSize, func(f qpack.HeaderField) error {
-		fields = append(fields, f)
-		return nil
-	})
-	return fields, err
+// decodeFields decodes a field section onto dst, remembering its strings in
+// d for the connection's next one.
+func decodeFields(d *qpack.Decoder, dst []qpack.HeaderField, block []byte, maxSize int) ([]qpack.HeaderField, error) {
+	return d.AppendFields(dst, block, maxSize)
 }
 
 // validTrailer reports whether a response may send name, in lower case, as

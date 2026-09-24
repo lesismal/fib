@@ -202,7 +202,7 @@ func (c *Conn) buildPacket(space, room int, mayElicit bool, now time.Time, scrat
 	if max < 16 {
 		return packetPlan{}, false
 	}
-	sp := &sentPacket{pn: pn}
+	sp := c.newSentPacket(pn)
 	payload := scratch[:0]
 	ackDue := s.ackPending && (s.ackNow || !s.ackDeadline.IsZero() && !now.Before(s.ackDeadline))
 	withAck := false
@@ -220,6 +220,7 @@ func (c *Conn) buildPacket(space, room int, mayElicit bool, now time.Time, scrat
 		sp.ackEliciting = true
 	}
 	if !sp.ackEliciting && !(withAck && ackDue) {
+		c.releaseSent(sp)
 		return packetPlan{}, false
 	}
 	if withAck {

@@ -3,8 +3,11 @@
 package http3
 
 import (
+	"net/url"
+	"reflect"
 	"testing"
 
+	fibhttp "github.com/lesismal/fib/go/http"
 	"github.com/lesismal/fib/go/http3/internal/qpack"
 )
 
@@ -44,7 +47,7 @@ func FuzzNewRequest(f *testing.F) {
 	f.Add("POST", "https", "localhost", "/p", "te", "trailers")
 	f.Fuzz(func(t *testing.T, method, scheme, authority, path, name, value string) {
 		fields := headerFields(method, scheme, authority, path, name, value)
-		req, err := newRequest(fields)
+		req, err := newRequest(fields, nil, nil)
 		if err != nil {
 			return
 		}
@@ -61,6 +64,28 @@ func FuzzNewRequest(f *testing.F) {
 		}
 		if _, ok := req.Header["Host"]; ok {
 			t.Fatal("a Host field left in the header")
+		}
+		if req.Method != "CONNECT" && path != "*" {
+			// The request target is taken as net/url takes it.
+			want, err := url.ParseRequestURI(path)
+			if err != nil {
+				t.Fatalf("%q was taken, but net/url refuses it: %v", path, err)
+			}
+			if !reflect.DeepEqual(req.URL, want) {
+				t.Fatalf("%q parsed as %#v, net/url makes %#v of it", path, *req.URL, *want)
+			}
+		}
+		// The same request built in a block, with room for its values, is
+		// the same request.
+		var block fibhttp.StreamRequest
+		var values [2]string
+		inBlock, err := newRequest(fields, &block, values[:])
+		if err != nil {
+			t.Fatalf("refused in a block: %v", err)
+		}
+		if inBlock.Method != req.Method || !reflect.DeepEqual(inBlock.URL, req.URL) || inBlock.Host != req.Host ||
+			!reflect.DeepEqual(inBlock.Header, req.Header) {
+			t.Fatalf("built in a block as %+v, on its own as %+v", inBlock, req)
 		}
 	})
 }

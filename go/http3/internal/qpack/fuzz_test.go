@@ -17,12 +17,33 @@ func FuzzDecode(f *testing.F) {
 	f.Add([]byte{0x01, 0x00, 0x80})
 	f.Fuzz(func(t *testing.T, block []byte) {
 		var size int
+		var plain []HeaderField
 		err := Decode(block, 1<<16, func(field HeaderField) error {
 			size += len(field.Name) + len(field.Value)
+			plain = append(plain, field)
 			return nil
 		})
 		if err == nil && size > 1<<16 {
 			t.Fatalf("decoded %d bytes of fields past the limit", size)
+		}
+		// A Decoder, remembering strings or not, decodes the same.
+		var d Decoder
+		for i := 0; i < 2; i++ {
+			fields, derr := d.AppendFields(nil, block, 1<<16)
+			if (derr == nil) != (err == nil) {
+				t.Fatalf("Decoder: %v, Decode: %v", derr, err)
+			}
+			if err != nil {
+				continue
+			}
+			if len(fields) != len(plain) {
+				t.Fatalf("Decoder got %d fields, Decode %d", len(fields), len(plain))
+			}
+			for j := range plain {
+				if fields[j] != plain[j] {
+					t.Fatalf("field %d: Decoder got %q, Decode %q", j, fields[j], plain[j])
+				}
+			}
 		}
 	})
 }

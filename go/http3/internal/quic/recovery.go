@@ -48,6 +48,36 @@ type sentPacket struct {
 	frames       []sentFrame
 }
 
+// maxFreeSent bounds the sent packets a connection keeps for reuse.
+const maxFreeSent = 64
+
+// newSentPacket returns a record for the packet numbered pn, reusing one
+// that was acknowledged or declared lost when there is one: every packet
+// sent needs one, and most of them are done with an RTT later. Callers hold
+// c.mu.
+func (c *Conn) newSentPacket(pn uint64) *sentPacket {
+	n := len(c.freeSent)
+	if n == 0 {
+		return &sentPacket{pn: pn}
+	}
+	p := c.freeSent[n-1]
+	c.freeSent[n-1] = nil
+	c.freeSent = c.freeSent[:n-1]
+	p.pn = pn
+	return p
+}
+
+// releaseSent takes back a record nothing refers to any more. Callers hold
+// c.mu.
+func (c *Conn) releaseSent(p *sentPacket) {
+	if len(c.freeSent) >= maxFreeSent {
+		return
+	}
+	clear(p.frames)
+	*p = sentPacket{frames: p.frames[:0]}
+	c.freeSent = append(c.freeSent, p)
+}
+
 type rttStats struct {
 	latest, smoothed, rttvar, min time.Duration
 	hasSample                     bool
@@ -160,7 +190,7 @@ func (c *Conn) onAckReceived(space int, ranges []pnRange, ackDelay time.Duration
 	if int64(largest) > s.largestAcked {
 		s.largestAcked = int64(largest)
 	}
-	var acked []*sentPacket
+	acked := c.ackedScratch[:0]
 	kept := s.sent[:0]
 	ri := len(ranges) - 1
 	for _, p := range s.sent {
@@ -180,6 +210,13 @@ func (c *Conn) onAckReceived(space int, ranges []pnRange, ackDelay time.Duration
 	if len(acked) == 0 {
 		return nil
 	}
+	defer func() {
+		for _, p := range acked {
+			c.releaseSent(p)
+		}
+		clear(acked)
+		c.ackedScratch = acked[:0]
+	}()
 	newest := acked[len(acked)-1]
 	eliciting := false
 	for _, p := range acked {
@@ -230,7 +267,7 @@ func (c *Conn) detectLost(space int, now time.Time) {
 	}
 	lossDelay := max(9*max(c.rtt.latest, c.rtt.smoothed)/8, timerGranularity)
 	lostSendTime := now.Add(-lossDelay)
-	var lost []*sentPacket
+	lost := c.lostScratch[:0]
 	kept := s.sent[:0]
 	for _, p := range s.sent {
 		if p.pn > uint64(s.largestAcked) {
@@ -253,6 +290,13 @@ func (c *Conn) detectLost(space int, now time.Time) {
 	if len(lost) == 0 {
 		return
 	}
+	defer func() {
+		for _, p := range lost {
+			c.releaseSent(p)
+		}
+		clear(lost)
+		c.lostScratch = lost[:0]
+	}()
 	var latest time.Time
 	for _, p := range lost {
 		if p.ackEliciting {

@@ -22,11 +22,9 @@
 package http3
 
 import (
-	"bytes"
 	"crypto/tls"
 	"errors"
 	"fmt"
-	"io"
 	"net"
 	stdhttp "net/http"
 	"strconv"
@@ -164,6 +162,9 @@ func NewHandlerWithConfig(config Config, handler fibhttp.Handler) *ServerHandler
 		MaxIncomingUniStreams: 16,
 		ResetKey:              &h.resetKey,
 		MaxDatagramSize:       config.MaxDatagramSize,
+		// fib hands each datagram over as a buffer of its own from the
+		// pool, which QUIC gives back once it has done with it.
+		RecycleDatagrams: true,
 	}
 	return h
 }
@@ -172,9 +173,8 @@ func (h *ServerHandler) OnOpen(*fib.Connection)                 {}
 func (h *ServerHandler) OnPriorityData(*fib.Connection, []byte) {}
 
 // OnData hands a datagram to its peer's connection, starting one if it is a
-// client's first. The engine hands each UDP datagram over as a copy of its
-// own, which QUIC keeps without copying again while it waits for what comes
-// before it.
+// client's first. The engine hands each UDP datagram over as a buffer of its
+// own from the pool, which QUIC gives back once it has done with it.
 func (h *ServerHandler) OnData(c *fib.Connection, data []byte) {
 	if qc, ok := c.Attachment().(*quic.Conn); ok {
 		qc.HandleDatagram(data)
@@ -253,6 +253,12 @@ type serverConn struct {
 	// gate counts the requests of this connection running on the handler's
 	// stream pool, which is how the per-connection limit is kept.
 	gate fibhttp.StreamGate
+
+	// decoder decodes the connection's field sections into fields, whose
+	// array the next one reuses. Only the goroutine QUIC calls the
+	// connection's handler on uses them.
+	decoder qpack.Decoder
+	fields  []qpack.HeaderField
 
 	mu sync.Mutex
 	// streams are the requests not yet answered.
@@ -405,7 +411,16 @@ type requestStream struct {
 	mu        sync.Mutex
 	responded bool
 	closed    bool
+
+	// block is the request, its URL and the Context it is answered through,
+	// allocated with the stream, and values holds its header's values.
+	block  fibhttp.StreamRequest
+	values [requestValues]string
 }
+
+// requestValues is how many of a request's header values its stream has
+// room for, which is more than an ordinary request's regular fields.
+const requestValues = 6
 
 func (rs *requestStream) feed(data []byte, fin bool) {
 	if rs.done {
@@ -441,15 +456,21 @@ func (rs *requestStream) onData(chunk []byte) error {
 		rs.reject(stdhttp.StatusRequestEntityTooLarge)
 		return nil
 	}
-	if rs.body == nil && rs.parser.direct {
-		// QUIC hands a stream's data over for keeps, so a body that
-		// arrives in one piece is kept where it arrived. Capping it means
-		// a second piece is appended to a copy, not over what follows.
-		rs.body = chunk[:len(chunk):len(chunk)]
-		return nil
+	if rs.body == nil && rs.declared > 0 {
+		// The datagram the body arrives in goes back to the pool once QUIC
+		// has done with it, so the body is gathered in a pooled buffer of
+		// its own, sized once when its length is known, which the Context
+		// gives back once the response is finished.
+		rs.body = bufferpool.Get(int(rs.declared))[:0]
 	}
-	rs.body = append(rs.body, chunk...)
+	rs.body = bufferpool.Append(rs.body, chunk)
 	return nil
+}
+
+// dropBody gives back a body that will not be served.
+func (rs *requestStream) dropBody() {
+	bufferpool.Put(rs.body)
+	rs.body = nil
 }
 
 func (rs *requestStream) onFrame(typ uint64, payload []byte) error {
@@ -469,7 +490,14 @@ func (rs *requestStream) onFrame(typ uint64, payload []byte) error {
 	if rs.trailers {
 		return connErr(ErrCodeFrameUnexpected, "HEADERS after trailers")
 	}
-	fields, err := decodeFields(payload, rs.sc.h.config.MaxHeaderBytes)
+	sc := rs.sc
+	fields, err := decodeFields(&sc.decoder, sc.fields[:0], payload, sc.h.config.MaxHeaderBytes)
+	// What was decoded is copied out before the next section is, so the
+	// array can take that one.
+	defer func() {
+		clear(fields)
+		sc.fields = fields[:0]
+	}()
 	if errors.Is(err, qpack.ErrTooLarge) {
 		rs.reject(stdhttp.StatusRequestHeaderFieldsTooLarge)
 		return nil
@@ -487,7 +515,7 @@ func (rs *requestStream) onFrame(typ uint64, payload []byte) error {
 		rs.trailers = true
 		return nil
 	}
-	req, err := newRequest(fields)
+	req, err := newRequest(fields, &rs.block, rs.values[:])
 	if err != nil {
 		rs.abort(ErrCodeMessageError)
 		return nil
@@ -531,26 +559,22 @@ func (rs *requestStream) finish() {
 	rs.done = true
 	req := rs.req
 	req.ContentLength = int64(len(rs.body))
-	if len(rs.body) > 0 {
-		req.Body = io.NopCloser(bytes.NewReader(rs.body))
-	}
-	rs.body = nil
 	sc := rs.sc
-	c := fibhttp.NewStreamContext(sc.conn, req, rs)
-	// Serve rather than the handler directly, so that a handler which retains
-	// the request, or reads its body through OnBody, works here too. The pool
-	// runs it away from this goroutine, which reads the connection, unless
-	// the connection is at its concurrency limit: then it runs here, and
-	// nothing more is read from the connection until it has been answered.
-	sc.h.streams.Run(&sc.gate, sc.conn, func() {
-		fibhttp.Serve(sc.h.handler, c)
-	})
+	rs.block.Context(sc.conn, rs, rs.body)
+	rs.body = nil
+	// Served through fibhttp rather than by calling the handler, so that a
+	// handler which retains the request, or reads its body through OnBody,
+	// works here too. The pool runs it away from this goroutine, which reads
+	// the connection, unless the connection is at its concurrency limit: then
+	// it runs here, and nothing more is read from the connection until it has
+	// been answered.
+	sc.h.streams.Serve(&sc.gate, sc.conn, sc.h.handler, &rs.block)
 }
 
 // abort gives up on a malformed or incomplete request.
 func (rs *requestStream) abort(code ErrorCode) {
 	rs.done = true
-	rs.body = nil
+	rs.dropBody()
 	rs.mu.Lock()
 	rs.closed = true
 	rs.mu.Unlock()
@@ -564,7 +588,7 @@ func (rs *requestStream) abort(code ErrorCode) {
 // whole, and stops reading it.
 func (rs *requestStream) reject(status int) {
 	rs.done = true
-	rs.body = nil
+	rs.dropBody()
 	req := rs.req
 	if req == nil {
 		req = &stdhttp.Request{Method: stdhttp.MethodGet, ProtoMajor: 3, Header: make(stdhttp.Header)}
@@ -579,7 +603,7 @@ func (rs *requestStream) reject(status int) {
 // peerReset is the client abandoning the request.
 func (rs *requestStream) peerReset() {
 	rs.done = true
-	rs.body = nil
+	rs.dropBody()
 	rs.mu.Lock()
 	wasOpen := !rs.closed && !rs.responded
 	rs.closed = true
@@ -619,10 +643,13 @@ func (rs *requestStream) WriteResponse(req *stdhttp.Request, response fibhttp.Re
 	// back to the pool once the frames are on it.
 	block := bufferpool.Append(nil, qpack.Prefix)
 	defer func() { bufferpool.Put(block) }()
-	block = qpack.AppendField(block, ":status", strconv.Itoa(status), false)
+	// The numbers are formatted on the stack: AppendField keeps nothing of
+	// what it is given, so the strings made of them need no allocation.
+	var digits [20]byte
+	block = qpack.AppendField(block, ":status", string(strconv.AppendInt(digits[:0], int64(status), 10)), false)
 	statusBody := status != stdhttp.StatusNoContent && status != stdhttp.StatusNotModified
 	if statusBody {
-		block = qpack.AppendField(block, "content-length", strconv.Itoa(len(response.Body)), false)
+		block = qpack.AppendField(block, "content-length", string(strconv.AppendInt(digits[:0], int64(len(response.Body)), 10)), false)
 	}
 	block = appendHeader(block, response.Header, func(name string) bool { return name == "content-length" })
 	body := response.Body

@@ -8,6 +8,7 @@ import (
 	"fmt"
 	stdhttp "net/http"
 	"net/textproto"
+	"net/url"
 	"sort"
 	"strconv"
 	"strings"
@@ -111,6 +112,61 @@ type Stream interface {
 // which arrived on conn and is answered through stream.
 func NewStreamContext(conn *fib.Connection, req *stdhttp.Request, stream Stream) *Context {
 	return &Context{Conn: conn, Request: req, external: stream}
+}
+
+// StreamRequest is what serving one request that arrived over a protocol
+// served outside this package takes from this package — the request, its
+// URL, the Context that answers it, its body and its place on a StreamPool —
+// for that protocol to allocate together with what it keeps of its own for
+// the request, rather than each on its own. Nothing in it is reused: like a
+// request and its Context, all of it lives for as long as anything refers to
+// any of it. The zero value is ready to use, for one request.
+type StreamRequest struct {
+	Request stdhttp.Request
+	URL     url.URL
+	context Context
+	body    wholeBody
+	task    streamTask
+}
+
+// Context returns the Context through which a handler answers Request,
+// which arrived on conn and is answered through stream, as NewStreamContext
+// does. body is the request's body, which arrived whole before the handler
+// runs: a buffer from package bufferpool, which the Context takes over as the
+// request's Body and ContentLength. The handler reads it as it would any
+// body, and the buffer goes back to the pool once the response is finished —
+// the handler's return, or the last Release of a request it retained — as
+// the body of a request the HTTP/1 server read whole does; a read after that
+// reports ErrBodyReleased.
+func (r *StreamRequest) Context(conn *fib.Connection, stream Stream, body []byte) *Context {
+	c := &r.context
+	c.Conn, c.Request, c.external = conn, &r.Request, stream
+	if len(body) == 0 {
+		bufferpool.Put(body)
+		return c
+	}
+	r.body = wholeBody{data: body, pooled: true}
+	r.Request.Body, r.Request.ContentLength = &r.body, int64(len(body))
+	c.whole = &r.body
+	return c
+}
+
+// ParseRequestTarget parses an origin-form request target into u, as
+// url.ParseRequestURI does, but without allocating for the plain path and
+// query nearly every request has: those are slices of target. It is for
+// protocols served outside this package, as HTTP/3 is by package http3.
+func ParseRequestTarget(u *url.URL, target string) error {
+	if target == "" || !simpleTarget(target) {
+		parsed, err := url.ParseRequestURI(target)
+		if err != nil {
+			return err
+		}
+		*u = *parsed
+		return nil
+	}
+	*u = url.URL{}
+	splitTarget(u, target)
+	return nil
 }
 
 // RequestBody is the request's body when it is still arriving, or nil when
