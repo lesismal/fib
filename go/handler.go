@@ -9,6 +9,23 @@ type Handler interface {
 	OnClose(*Connection, error)
 }
 
+// DatagramsHandler is a Handler that takes a UDP connection's datagrams in
+// bursts. When a Handler implements it, the datagrams that have arrived for
+// a connection by the time its worker runs go to OnDatagrams together, in
+// the order they arrived, instead of to OnData one at a time. A protocol
+// that answers what it receives - with acknowledgements, say - can then
+// answer the whole burst at once, in fewer datagrams than it would one
+// arrival at a time. The portable backend, on platforms other than Linux,
+// macOS and Windows, keeps calling OnData.
+//
+// Each datagram belongs to the handler, as a UDP connection's OnData data
+// does; the slice holding them does not, and must not be kept once
+// OnDatagrams returns.
+type DatagramsHandler interface {
+	Handler
+	OnDatagrams(c *Connection, datagrams [][]byte)
+}
+
 // HandlerFuncs allows callers to implement only the callbacks they need.
 type HandlerFuncs struct {
 	Open         func(*Connection)

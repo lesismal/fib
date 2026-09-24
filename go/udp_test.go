@@ -6,6 +6,7 @@ import (
 	"bytes"
 	"errors"
 	"net"
+	"slices"
 	"sync"
 	"testing"
 	"time"
@@ -184,4 +185,90 @@ func TestDialUDP(t *testing.T) {
 		}
 	}
 	c.Close()
+}
+
+// burstHandler is a DatagramsHandler that records the bursts it is given.
+// The first burst waits on gate, so that what arrives meanwhile piles up.
+type burstHandler struct {
+	HandlerFuncs
+	gate   chan struct{}
+	mu     sync.Mutex
+	bursts [][]string
+}
+
+func (h *burstHandler) OnDatagrams(_ *Connection, datagrams [][]byte) {
+	burst := make([]string, len(datagrams))
+	for i, d := range datagrams {
+		burst[i] = string(d)
+	}
+	h.mu.Lock()
+	first := len(h.bursts) == 0
+	h.bursts = append(h.bursts, burst)
+	h.mu.Unlock()
+	if first {
+		<-h.gate
+	}
+}
+
+func (h *burstHandler) received() [][]string {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return append([][]string(nil), h.bursts...)
+}
+
+// A DatagramsHandler gets what piled up for a connection in one call, in
+// the order it arrived, and OnData gets nothing.
+func TestUDPDatagramsHandlerTakesBursts(t *testing.T) {
+	h := &burstHandler{gate: make(chan struct{})}
+	h.Data = func(*Connection, []byte) { t.Error("OnData called for a DatagramsHandler") }
+	_, addr := startUDPServer(t, DefaultConfig(), h)
+	conn, err := net.DialUDP("udp", nil, addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	waitFor := func(what string, done func([][]string) bool) {
+		t.Helper()
+		deadline := time.Now().Add(10 * time.Second)
+		for !done(h.received()) {
+			if time.Now().After(deadline) {
+				t.Fatalf("timed out waiting for %s; got %v", what, h.received())
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+	}
+	if _, err := conn.Write([]byte("0")); err != nil {
+		t.Fatal(err)
+	}
+	waitFor("the first burst", func(b [][]string) bool { return len(b) == 1 })
+	want := []string{"0"}
+	for i := 1; i <= 5; i++ {
+		d := string(rune('0' + i))
+		want = append(want, d)
+		if _, err := conn.Write([]byte(d)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// Give the loop time to queue them all before the first burst returns.
+	time.Sleep(100 * time.Millisecond)
+	close(h.gate)
+	count := func(b [][]string) int {
+		n := 0
+		for _, burst := range b {
+			n += len(burst)
+		}
+		return n
+	}
+	waitFor("every datagram", func(b [][]string) bool { return count(b) == len(want) })
+	bursts := h.received()
+	var got []string
+	for _, burst := range bursts {
+		got = append(got, burst...)
+	}
+	if !slices.Equal(got, want) {
+		t.Fatalf("datagrams arrived as %v, want %v in order", bursts, want)
+	}
+	if len(bursts) != 2 {
+		t.Fatalf("datagrams arrived in bursts %v, want the five that piled up in one", bursts)
+	}
 }

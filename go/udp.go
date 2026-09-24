@@ -46,9 +46,11 @@ type udpState struct {
 	key   netip.AddrPort
 	raddr *net.UDPAddr
 	// queue holds datagrams the loop has read and the handler has not seen
-	// yet, from head on. Guarded by the connection's mu.
+	// yet, from head on. Guarded by the connection's mu. spare is the array
+	// the queue last handed to a DatagramsHandler, kept for the next swap.
 	queue [][]byte
 	head  int
+	spare [][]byte
 	// lastActive is when the peer last sent or was sent a datagram, in
 	// nanoseconds, for the idle timeout.
 	lastActive atomic.Int64
@@ -122,9 +124,32 @@ func (e *Engine) deliverDatagram(c *Connection, data []byte) *Connection {
 	return e.noteEvent(c, evIn)
 }
 
-// drainDatagrams hands every queued datagram to the handler, one per OnData.
+// drainDatagrams hands every queued datagram to the handler, one per OnData,
+// or all of them at once to a DatagramsHandler.
 func (c *Connection) drainDatagrams() {
 	u := c.udp
+	if h, ok := c.handler.(DatagramsHandler); ok {
+		for {
+			c.mu.Lock()
+			if u.head == len(u.queue) || c.closing || c.closed {
+				c.mu.Unlock()
+				return
+			}
+			queue := u.queue
+			batch := queue[u.head:]
+			// The loop queues what arrives meanwhile on the spare array, so
+			// the batch is the handler's alone while it runs.
+			u.queue, u.head, u.spare = u.spare[:0], 0, nil
+			c.mu.Unlock()
+			h.OnDatagrams(c, batch)
+			clear(queue)
+			c.mu.Lock()
+			if u.spare == nil {
+				u.spare = queue[:0]
+			}
+			c.mu.Unlock()
+		}
+	}
 	for {
 		c.mu.Lock()
 		if u.head == len(u.queue) || c.closing || c.closed {

@@ -305,6 +305,10 @@ addr, _ := server.LocalUDPAddr()
   收到 `ErrUDPIdleTimeout`。拨号出去的 UDP 连接不做超时。
 - 数据报边界保持不变：每次 `OnData` 恰好是一个数据报，每次 `Send`/`SendParts`
   恰好发送一个数据报。
+- Handler 如果实现了 `fib.DatagramsHandler`，worker 运行时连接已经排队的数据报会按到达
+  顺序一次性交给 `OnDatagrams`，不再逐个调用 `OnData`；需要回应所收数据的协议（比如
+  回 ACK）可以对整批数据一起回应，少发数据报。每个数据报归 handler 所有，装它们的切片
+  在 `OnDatagrams` 返回后不能再持有。
 - UDP socket 由 event loop 自己读取（level-triggered，每轮每个 socket 最多读
   256 个数据报），按对端地址分发到各连接的队列，再由 worker 依次调用 `OnData`；
   每条连接最多排队 1024 个数据报，超出的直接丢弃，和内核接收缓冲满时一样。
