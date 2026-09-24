@@ -395,13 +395,15 @@ func (e *Engine) notify() {
 // noteEvent folds readiness into the connection and reports whether it needs
 // to be scheduled. Actual submission happens once per round in Run.
 func (e *Engine) noteEvent(c *Connection, events uint32) *Connection {
-	c.mu.Lock()
-	if c.closing || c.closed {
-		c.mu.Unlock()
-		return nil
-	}
 	events &= evAll
 	if events == 0 {
+		// Nothing to fold in, such as kqueue's except filter firing with
+		// every read; the lock, which a worker may be holding across a
+		// write, is not worth waiting for.
+		return nil
+	}
+	c.mu.Lock()
+	if c.closing || c.closed {
 		c.mu.Unlock()
 		return nil
 	}

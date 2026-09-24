@@ -161,7 +161,16 @@ func kqueueEvents(ev *syscall.Kevent_t) uint32 {
 	case syscall.EVFILT_WRITE:
 		events = evOut
 	case evfiltExcept:
-		events = evPri
+		// XNU evaluates the except filter with the read filter's code, which
+		// falls through to the ordinary readable test when no urgent data is
+		// marked, so it fires with every read event. Only NOTE_OOB in fflags
+		// says there is urgent data; without the check each read round would
+		// also pay for an MSG_OOB receive that fails. On EOF, fflags is the
+		// socket error instead, which the read filter reports as well.
+		if ev.Flags&syscall.EV_EOF == 0 && ev.Fflags&noteOOB != 0 {
+			events = evPri
+		}
+		return events
 	}
 	if ev.Flags&syscall.EV_EOF != 0 && ev.Fflags != 0 {
 		// On EOF, fflags carries the socket error, if there was one.
@@ -193,7 +202,7 @@ func (e *Engine) registerConnection(fd int, _ uint64) error {
 	if sa, err := syscall.Getsockname(fd); err == nil {
 		if _, unix := sa.(*syscall.SockaddrUnix); unix {
 			// A Unix socket has no urgent data, yet EVFILT_EXCEPT still fires
-			// on it, which would cost a failing MSG_OOB receive per round.
+			// on it, which would only add an event to every read.
 			n--
 		}
 	}
