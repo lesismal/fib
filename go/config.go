@@ -8,6 +8,9 @@ import (
 	"github.com/lesismal/fib/go/taskpool"
 )
 
+// DefaultName is the Name an engine takes when its Config sets none.
+const DefaultName = "fib"
+
 // TaskPool runs the rounds the event loop schedules. *taskpool.TaskPool
 // implements it; set Config.TaskPool to supply a different one.
 //
@@ -84,10 +87,11 @@ const (
 	maxMaxEvents    = 100000
 
 	// streamPoolFactor is how much wider the pool HTTP/2 and HTTP/3 run
-	// their request handlers on is than the widest engine pool in the
-	// process. It is one pool, shared by every HTTP/2 and HTTP/3 server, and
-	// never one an engine runs on; see package internal/streampool for the
-	// deadlock sharing an engine's pool would invite.
+	// their request handlers on is than the widest engine pool of the same
+	// Name. There is one such pool for each Name, shared by every HTTP/2 and
+	// HTTP/3 server whose connections come from engines of that Name, and it
+	// is never one an engine runs on; see package internal/streampool for
+	// the deadlock sharing an engine's pool would invite.
 	//
 	// The two pools do different work. An engine worker holds its connection
 	// for one round: it reads the socket, hands what came in to the protocol,

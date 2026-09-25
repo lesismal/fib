@@ -57,7 +57,11 @@ type backend interface {
 	attrs() []any
 }
 
+// executor runs a pool's tasks, and knows which pool it runs them for so
+// that what it logs says so.
 type executor struct {
+	name    string
+	id      uint64
 	mu      sync.RWMutex
 	handler func(any, []byte)
 }
@@ -76,7 +80,10 @@ func (e *executor) call(task Task) {
 			e.mu.RUnlock()
 			if handler != nil {
 				handler(recovered, debug.Stack())
+				return
 			}
+			slog.Error("taskpool: task panicked", "pool", e.name, "id", e.id,
+				"panic", fmt.Sprint(recovered), "stack", string(debug.Stack()))
 		}
 	}()
 	task.RunTask()
@@ -88,15 +95,16 @@ type TaskPool struct {
 }
 
 // New creates a ModeAdaptive pool that grows to maxConcurrent workers under
-// load and retires down to ten workers per CPU core when idle.
-func New(maxConcurrent, queueSize int) *TaskPool {
-	return NewWithMode(ModeAdaptive, maxConcurrent, queueSize)
+// load and retires down to ten workers per CPU core when idle. name labels
+// the pool in what it logs.
+func New(name string, maxConcurrent, queueSize int) *TaskPool {
+	return NewWithMode(name, ModeAdaptive, maxConcurrent, queueSize)
 }
 
-// NewWithMode creates a pool of the given mode. For ModeAdaptive,
-// maxConcurrent is the ceiling and the floor is DefaultMinWorkers of it;
-// NewAdaptive sets both.
-func NewWithMode(mode Mode, maxConcurrent, queueSize int) *TaskPool {
+// NewWithMode creates a pool of the given mode, labelled name in what it
+// logs. For ModeAdaptive, maxConcurrent is the ceiling and the floor is
+// DefaultMinWorkers of it; NewAdaptive sets both.
+func NewWithMode(name string, mode Mode, maxConcurrent, queueSize int) *TaskPool {
 	if maxConcurrent <= 0 {
 		panic("taskpool: maxConcurrent must be greater than zero")
 	}
@@ -106,16 +114,16 @@ func NewWithMode(mode Mode, maxConcurrent, queueSize int) *TaskPool {
 	params := []any{"maxConcurrent", maxConcurrent, "queueSize", queueSize}
 	switch mode {
 	case ModeElastic:
-		return start(mode, params, func(executor *executor) backend {
+		return start(name, mode, params, func(executor *executor) backend {
 			return newElasticPool(executor, maxConcurrent, queueSize)
 		})
 	case ModeCond:
-		return start(mode, params, func(executor *executor) backend {
+		return start(name, mode, params, func(executor *executor) backend {
 			return newCondBackend(executor, maxConcurrent, queueSize)
 		})
 	case ModeAdaptive:
 		return NewAdaptive(AdaptiveConfig{
-			MinWorkers: DefaultMinWorkers(maxConcurrent), MaxWorkers: maxConcurrent, QueueSize: queueSize,
+			Name: name, MinWorkers: DefaultMinWorkers(maxConcurrent), MaxWorkers: maxConcurrent, QueueSize: queueSize,
 		})
 	default:
 		panic("taskpool: invalid mode")
@@ -123,21 +131,27 @@ func NewWithMode(mode Mode, maxConcurrent, queueSize int) *TaskPool {
 }
 
 // poolIDs numbers the pools built, so that the lines one pool logs can be
-// told from another's.
+// told from another's even when the two share a name.
 var poolIDs atomic.Uint64
 
 // start builds a pool's backend. It logs the parameters the pool was created
 // with before building it, and what the pool runs once it has started: the
 // shards, workers and queue those parameters resolved to.
-func start(mode Mode, params []any, build func(*executor) backend) *TaskPool {
-	id := poolIDs.Add(1)
-	slog.Info("taskpool: created", append([]any{"id", id, "mode", mode.String()}, params...)...)
-	executor := &executor{}
+func start(name string, mode Mode, params []any, build func(*executor) backend) *TaskPool {
+	executor := &executor{name: name, id: poolIDs.Add(1)}
+	label := []any{"pool", name, "id", executor.id, "mode", mode.String()}
+	slog.Info("taskpool: created", append(label, params...)...)
 	pool := &TaskPool{executor: executor, backend: build(executor)}
-	slog.Info("taskpool: started", append([]any{"id", id, "mode", mode.String()}, pool.backend.attrs()...)...)
+	slog.Info("taskpool: started", append(label[:len(label):len(label)], pool.backend.attrs()...)...)
 	return pool
 }
 
+// Name reports the name the pool was created with.
+func (tp *TaskPool) Name() string { return tp.executor.name }
+
+// SetPanicHandler sets what a task that panics is reported to, with the
+// value it panicked with and its stack. Without one, the pool logs the panic
+// under its name; the pool goes on running either way.
 func (tp *TaskPool) SetPanicHandler(handler func(any, []byte)) {
 	tp.executor.setPanicHandler(handler)
 }

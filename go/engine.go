@@ -75,6 +75,7 @@ type commandBatch struct{ items []command }
 // an I/O completion port on Windows, each embedded here as enginePlatform.
 type Engine struct {
 	enginePlatform
+	name               string
 	maxEvents          int
 	useWritev          bool
 	inlineHandlers     bool
@@ -200,7 +201,7 @@ func newEngine(config Config, handler Handler, addrs []string) (*Engine, error) 
 		handler = HandlerFuncs{}
 	}
 
-	e := &Engine{maxEvents: config.MaxEvents,
+	e := &Engine{name: engineName(config), maxEvents: config.MaxEvents,
 		useWritev: config.UseWritev, inlineHandlers: config.InlineHandlers,
 		writeHighWatermark: config.WriteBufferHighWatermark,
 		// Resume at a quarter of the budget rather than at the budget itself,

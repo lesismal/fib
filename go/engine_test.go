@@ -572,7 +572,7 @@ func (p *countingPool) GoTasks(tasks []taskpool.Task) int {
 // pool's settings irrelevant, and survive the engine: the caller owns it and
 // may be sharing it.
 func TestCustomTaskPoolRunsConnectionsAndOutlivesEngine(t *testing.T) {
-	pool := &countingPool{TaskPool: taskpool.NewWithMode(taskpool.ModeCond, 4, 64)}
+	pool := &countingPool{TaskPool: taskpool.NewWithMode("test", taskpool.ModeCond, 4, 64)}
 	defer pool.Stop()
 	config := DefaultConfig()
 	config.Addr = "127.0.0.1:0"

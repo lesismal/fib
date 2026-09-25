@@ -9,6 +9,12 @@ import (
 )
 
 type Config struct {
+	// Name labels the engine in what it logs, and names the task pools its
+	// connections run on: "<Name>-workers" for the engine's own and
+	// "<Name>-streams" for the HTTP/2 and HTTP/3 handlers. Engines of the
+	// same name share both pools; see SharedTaskPool. Empty means
+	// DefaultName.
+	Name string
 	// Network and Addr name the listener the way net.Listen does: Network is
 	// "tcp", "tcp4" or "tcp6", and Addr is a "host:port" such as ":9000",
 	// "127.0.0.1:9000" or "[::1]:9000". An empty Network means "tcp", and an
@@ -34,6 +40,9 @@ type Config struct {
 	// to, with WorkerCount as the ceiling it grows to. Zero means ten workers
 	// per CPU core. The other modes ignore it.
 	MinWorkerCount int
+	// SharedTaskPool has the engines of one Name run on one task pool. The
+	// first of them builds it from its own settings, and those that follow
+	// run on it as it is, whatever theirs say.
 	SharedTaskPool bool
 	// TaskPool, when set, runs the engine's connections instead of a pool the
 	// engine builds from the fields above. See SetTaskPool.
@@ -48,5 +57,5 @@ type Config struct {
 
 func DefaultConfig() Config {
 	sizing := DefaultPoolSizing(taskpool.ModeAdaptive)
-	return Config{Network: "tcp", Addr: ":9000", Backlog: 128, WorkerCount: sizing.WorkerCount, MaxEvents: sizing.MaxEvents, ReadBufferSize: 16 * 1024, WriteBufferHighWatermark: 4 * 1024, UseWritev: true, TaskPoolMode: taskpool.ModeAdaptive, SharedTaskPool: true}
+	return Config{Name: DefaultName, Network: "tcp", Addr: ":9000", Backlog: 128, WorkerCount: sizing.WorkerCount, MaxEvents: sizing.MaxEvents, ReadBufferSize: 16 * 1024, WriteBufferHighWatermark: 4 * 1024, UseWritev: true, TaskPoolMode: taskpool.ModeAdaptive, SharedTaskPool: true}
 }

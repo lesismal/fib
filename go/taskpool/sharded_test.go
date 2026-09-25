@@ -36,7 +36,7 @@ func TestShardedPoolRespectsTotalWorkerLimit(t *testing.T) {
 	if shardCount(shardedWorkers) < 2 {
 		t.Skip("GOMAXPROCS too low to shard")
 	}
-	tp := NewWithMode(ModeCond, shardedWorkers, shardedWorkers*4)
+	tp := NewWithMode("test", ModeCond, shardedWorkers, shardedWorkers*4)
 	defer tp.Stop()
 	if _, ok := tp.backend.(*shardedPool); !ok {
 		t.Fatalf("backend = %T, want a sharded pool", tp.backend)
@@ -95,7 +95,7 @@ func TestShardedPoolRunsEveryTaskOnce(t *testing.T) {
 	}
 	// A queue far smaller than the work forces the queue-full wait path on
 	// individual shards while other shards are still draining.
-	tp := NewWithMode(ModeCond, shardedWorkers, shardedWorkers)
+	tp := NewWithMode("test", ModeCond, shardedWorkers, shardedWorkers)
 	var counts [2000]atomic.Int64
 	tasks := make([]Task, len(counts))
 	for i := range tasks {

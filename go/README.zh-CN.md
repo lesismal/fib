@@ -38,8 +38,8 @@
   - 运行中可以用 `TaskPool.Resize(min, max)` 调整上下限：调高下限立即补足 worker；
     调低上限时，空闲 worker 立即退出，忙碌的在手头任务完成后退出。
     `TaskPool.Workers()` 返回当前 worker 数（其他 Mode 调 `Resize` 返回 false）。
-  - 直接使用：`taskpool.NewAdaptive(taskpool.AdaptiveConfig{MinWorkers: 16,
-    MaxWorkers: 4096, QueueSize: 10000})`；`NewWithMode(ModeAdaptive, max, queue)`
+  - 直接使用：`taskpool.NewAdaptive(taskpool.AdaptiveConfig{Name: "jobs", MinWorkers: 16,
+    MaxWorkers: 4096, QueueSize: 10000})`；`NewWithMode(name, ModeAdaptive, max, queue)`
     的下限默认为每个 CPU 核心十个 worker（`taskpool.DefaultMinWorkers`）。在 fib 里，
     `WorkerCount` 是上限，`Config.MinWorkerCount` 是下限（0 表示每个 CPU 核心十个）。
 - 池容量按 Mode 分别给默认值，因为 `WorkerCount` 在不同 Mode 下含义不同
@@ -70,9 +70,18 @@
   缓冲区是空的，队列里也会短暂地存在这一轮的全部回包；一轮最多读
   `ReadBufferSize` 字节。严格一问一答、单条 1KiB、水位线 8KiB 这种配置有 8 倍
   余量，不会触发背压（`TestPingPongUnderWatermarkNeverPausesReads` 固定了这一点）。
-- `SharedTaskPool` 默认开启；同一进程内配置相同的多个 Engine 共享 worker
-  和任务队列，避免多监听端口重复创建大量 goroutine 与队列。需要完全隔离时
-  可显式设为 `false`。
+- `Config.Name` 是 Engine 的名字（`Engine.Name()`），未设置时为 `fib.DefaultName`
+  即 `"fib"`。它出现在 Engine 启动（`Run`）时打印的日志里，也决定了协程池的名字：
+  Engine 自己的协程池叫 `<Name>-workers`，HTTP/2 与 HTTP/3 的 handler 协程池叫
+  `<Name>-streams`。
+- `SharedTaskPool` 默认开启；同一进程内**同名**的多个 Engine 共享 worker 和任务队列，
+  避免多监听端口重复创建大量 goroutine 与队列。共享只看名字、不看配置：第一个 Engine
+  按自己的配置创建协程池，之后的同名 Engine 直接使用它，其余配置不生效。需要隔离时
+  可以给 Engine 起不同的名字，或把 `SharedTaskPool` 设为 `false`（仍用同名的
+  `<Name>-streams`）。
+- 协程池会打印日志（`log/slog`，可用 `slog.SetDefault` 调整输出）：创建时打印传入的
+  参数，启动后打印实际运行的分片数、worker 数和队列容量等，都带上协程池名字；任务
+  panic 且没有设置 `SetPanicHandler` 时，以 ERROR 级别打印协程池名字、panic 值与调用栈。
 - `config.SetTaskPool(pool)` 让 Engine 使用外部提供的任务池（实现 `fib.TaskPool`
   接口，`*taskpool.TaskPool` 本身即满足）。设置后 `TaskPoolMode`、
   `WorkerCount`、`SharedTaskPool` 和池容量配置都不再生效；Engine 关闭时不会
@@ -613,10 +622,11 @@ server, err := fib.Bind(config, fibtls.NewServer(tlsConfig, fibhttp.NewHandler(h
   回复（异步响应），不同 stream 的响应互不阻塞。
 - handler 协程池：请求收齐后不在读取该连接的协程上执行，而是交给一个独立的协程池，
   因此同一连接上并发到达的请求是并发处理的，阻塞的 handler 只拖累它自己。协程池由
-  `Config.StreamPool` 配置（`http.StreamPoolConfig`）。整个进程只有一个 handler 协程池，
-  由所有 HTTP/2 与 HTTP/3 server 共用，且永远不是 Engine 的协程池：Engine 的 worker
+  `Config.StreamPool` 配置（`http.StreamPoolConfig`）。每个 Engine 名字有一个 handler
+  协程池，名为 `<Name>-streams`（默认 `fib-streams`），由连接来自该名字 Engine 的所有
+  HTTP/2 与 HTTP/3 server 共用，同名的最后一个 Engine 关闭后停止，且永远不是 Engine 的协程池：Engine 的 worker
   解析出请求后要往这个池提交，若两者是同一个池，队列满时所有 worker 都可能卡在提交上，
-  没有人再取任务，连 event loop 也会卡住。它的上限是当前运行的最大 Engine 协程池的
+  没有人再取任务，连 event loop 也会卡住。它的上限是当前运行的同名 Engine 中最大协程池的
   2 倍（没有 Engine 时取 `fib.DefaultStreamPoolSizing`），下限为每个 CPU 核心十个
   worker——Engine 的 worker 只等内核，handler 还要等应用自己的 I/O：
 
@@ -808,7 +818,7 @@ server, err := fib.Bind(config, http3.NewHandler(tlsConfig, handler))
 - `Response.Close` 在 HTTP/3 上优雅关闭：发送 GOAWAY，不再接受新请求，已在处理的请求
   的响应全部送达后再关闭连接。
 - handler 协程池：与 HTTP/2 一样，请求收齐后交给独立的协程池（与 HTTP/2 server
-  共用同一个，不与 Engine 的协程池共用），同一连接上的请求并发处理；用 `Config.StreamPool` 配置，
+  共用同名 Engine 的 `<Name>-streams`，不与 Engine 的协程池共用），同一连接上的请求并发处理；用 `Config.StreamPool` 配置，
   `StreamPool.MaxConcurrentHandlers` 限制单个连接的并发处理数，其中最后一个在读取该
   连接的协程上执行，在它返回前这个连接不再读取数据报。
 - 请求 body 超过 `MaxBodyBytes` 返回 413，header 超过 `MaxHeaderBytes` 返回 431；

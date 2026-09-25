@@ -1,6 +1,9 @@
 package taskpool
 
 import (
+	"bytes"
+	"log/slog"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -9,7 +12,7 @@ import (
 
 func TestConcurrencyBoundAndDrain(t *testing.T) {
 	const limit = 4
-	tp := New(limit, 32)
+	tp := New("test", limit, 32)
 	release := make(chan struct{})
 	var running atomic.Int64
 	var peak atomic.Int64
@@ -39,7 +42,7 @@ func TestConcurrencyBoundAndDrain(t *testing.T) {
 }
 
 func TestStopWaitsAndRecoversPanics(t *testing.T) {
-	tp := New(2, 2)
+	tp := New("test", 2, 2)
 	started := make(chan struct{})
 	finish := make(chan struct{})
 	var panicSeen atomic.Bool
@@ -62,7 +65,7 @@ func TestStopWaitsAndRecoversPanics(t *testing.T) {
 }
 
 func TestEachTaskRunsOnce(t *testing.T) {
-	tp := New(8, 64)
+	tp := New("test", 8, 64)
 	var counts [100]atomic.Int64
 	var submitted sync.WaitGroup
 	for i := range counts {
@@ -88,7 +91,7 @@ func TestGoTasksRunsBatchesOnce(t *testing.T) {
 		t.Run(mode.String(), func(t *testing.T) {
 			// A queue smaller than the batch forces submitBatch through its
 			// queue-full wait path.
-			tp := NewWithMode(mode, 4, 2)
+			tp := NewWithMode("test", mode, 4, 2)
 			var counts [100]atomic.Int64
 			tasks := make([]Task, len(counts))
 			for i := range tasks {
@@ -114,7 +117,7 @@ func TestGoTasksRunsBatchesOnce(t *testing.T) {
 func TestAllModesExecuteAndStop(t *testing.T) {
 	for _, mode := range []Mode{ModeElastic, ModeCond, ModeAdaptive} {
 		t.Run(mode.String(), func(t *testing.T) {
-			tp := NewWithMode(mode, 4, 16)
+			tp := NewWithMode("test", mode, 4, 16)
 			var count atomic.Int64
 			for i := 0; i < 100; i++ {
 				if !tp.Go(func() { count.Add(1) }) {
@@ -129,5 +132,48 @@ func TestAllModesExecuteAndStop(t *testing.T) {
 				t.Fatal("task accepted after Stop")
 			}
 		})
+	}
+}
+
+// syncBuffer is a bytes.Buffer the pool's goroutines can log to.
+type syncBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *syncBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *syncBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
+}
+
+// A pool logs under its name when it is created and started, and when a task
+// panics with no panic handler set.
+func TestLogsCarryThePoolName(t *testing.T) {
+	var out syncBuffer
+	previous := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&out, nil)))
+	defer slog.SetDefault(previous)
+	for _, mode := range []Mode{ModeCond, ModeElastic, ModeAdaptive} {
+		out.buf.Reset()
+		tp := NewWithMode("named-"+mode.String(), mode, 2, 4)
+		if got := tp.Name(); got != "named-"+mode.String() {
+			t.Fatalf("Name() = %q", got)
+		}
+		tp.Go(func() { panic("boom") })
+		tp.Stop()
+		logged := out.String()
+		for _, msg := range []string{"taskpool: created", "taskpool: started", "taskpool: task panicked"} {
+			want := "msg=\"" + msg + "\" pool=named-" + mode.String()
+			if !strings.Contains(logged, want) {
+				t.Fatalf("%v: no %q in the log:\n%s", mode, want, logged)
+			}
+		}
 	}
 }

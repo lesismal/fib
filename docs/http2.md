@@ -52,13 +52,16 @@ Behaviour to be aware of when using it.
 - A connection's frames are processed in order, and a request that is complete
   goes to the handler pool that `Config.StreamPool` describes, so the requests
   one client has open on a connection are served concurrently and a handler
-  that blocks holds up only itself. There is one such pool in the process,
-  shared by every HTTP/2 and HTTP/3 server and never by an engine: an engine
-  worker submits each request it frames, and were the queue it submits to its
-  own, every worker could end up waiting for room that none is left to make.
-  Its ceiling is twice the widest engine pool running, or
-  `fib.DefaultStreamPoolSizing` while none is, and it keeps ten workers per CPU
-  core resident.
+  that blocks holds up only itself. There is one such pool for each engine
+  `Config.Name`, called `<Name>-streams` (`fib-streams` by default), shared by
+  every HTTP/2 and HTTP/3 server whose connections come from engines of that
+  name and never by an engine: an engine worker submits each request it
+  frames, and were the queue it submits to its own, every worker could end up
+  waiting for room that none is left to make. Its ceiling is twice the widest
+  engine pool of that name running, or `fib.DefaultStreamPoolSizing` while
+  none is, and it keeps ten workers per CPU core resident. It stops once the
+  last engine of its name closes, without waiting for handlers still
+  running.
 - `StreamPool.MaxConcurrentHandlers` bounds how many of one connection's
   requests are served at once. The last of the N runs on the goroutine reading
   the connection, which reads nothing further until it returns, so the limit is

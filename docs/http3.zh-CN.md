@@ -76,8 +76,8 @@
   写出的响应会先缓存，handler 返回后整体发送；只有 HTTP/1 是流式的。
 - 内存上限：服务端单连接最坏约为 `MaxConcurrentStreams × MaxBodyBytes`（默认
   100 × 16MB），客户端单个响应受 `MaxResponseBodyBytes` 限制。
-- 请求完整后交给 `Config.StreamPool` 描述的 handler 协程池（与 HTTP/2 server 共用同一个
-  协程池，不与 engine 的协程池共用），因此同一连接上客户端并发发起的多个请求是并发处理的，阻塞的 handler 只拖累它
+- 请求完整后交给 `Config.StreamPool` 描述的 handler 协程池（与 HTTP/2 server 共用同名
+  engine 的 `<Name>-streams` 协程池，不与 engine 的协程池共用），因此同一连接上客户端并发发起的多个请求是并发处理的，阻塞的 handler 只拖累它
   自己。`StreamPool.MaxConcurrentHandlers` 限制单个连接同时处理的请求数 N，其中第 N 个在
   读取该连接的协程上执行，在它返回前该连接不再读取新数据；N 为 1 时（与
   `StreamPool.Disable` 相同）又回到引入协程池之前的串行处理。

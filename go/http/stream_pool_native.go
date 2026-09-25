@@ -15,11 +15,18 @@ import (
 // the goroutines that read its connections. Each connection keeps a
 // StreamGate of its own and passes it to Run for every request.
 //
+// The handlers run on the stream pool of the engine the connection came
+// from, one for each engine name, so a server whose connections come from
+// engines of different names runs each one's handlers on that name's pool.
+//
 // A nil *StreamPool runs every request on the calling goroutine, which is
 // what NewStreamPool returns for a configuration that asks for no pool, so
 // a server never has to test for one.
 type StreamPool struct {
-	pool *taskpool.TaskPool
+	// fallback and queueSize size an engine name's pool when it is built
+	// before any engine of that name asks for a ceiling.
+	fallback  int
+	queueSize int
 	// limit is StreamPoolConfig.MaxConcurrentHandlers.
 	limit int
 }
@@ -31,8 +38,22 @@ func NewStreamPool(config StreamPoolConfig) *StreamPool {
 		return nil
 	}
 	sizing := fib.DefaultStreamPoolSizing(taskpool.ModeAdaptive)
-	return &StreamPool{pool: streampool.Get(sizing.WorkerCount, sizing.MaxEvents),
+	return &StreamPool{fallback: sizing.WorkerCount, queueSize: sizing.MaxEvents,
 		limit: config.MaxConcurrentHandlers}
+}
+
+// poolFor returns the pool conn's requests run on, looking it up the first
+// time the connection asks and keeping it on gate after that. A request with
+// no connection runs on the pool of DefaultName.
+func (p *StreamPool) poolFor(gate *StreamGate, conn *fib.Connection) *taskpool.TaskPool {
+	if gate.pool == nil {
+		engine := fib.DefaultName
+		if conn != nil {
+			engine = conn.Engine().Name()
+		}
+		gate.pool = streampool.Get(engine, p.fallback, p.queueSize)
+	}
+	return gate.pool
 }
 
 // StreamGate is one connection's share of a StreamPool: it counts the
@@ -41,6 +62,9 @@ func NewStreamPool(config StreamPoolConfig) *StreamPool {
 // value, and passes it to every Run.
 type StreamGate struct {
 	running atomic.Int64
+	// pool is the pool the connection's requests run on, once the first of
+	// them has looked it up. Only the connection's reader touches it.
+	pool *taskpool.TaskPool
 }
 
 // Running is how many of the connection's requests the pool is running now.
@@ -61,7 +85,7 @@ func (p *StreamPool) Run(gate *StreamGate, conn *fib.Connection, fn func()) {
 		fn()
 		return
 	}
-	p.submit(&streamTask{gate: gate, conn: conn, fn: fn})
+	p.submit(p.poolFor(gate, conn), &streamTask{gate: gate, conn: conn, fn: fn})
 }
 
 // Serve serves the request r holds with handler, as Run does a function that
@@ -74,7 +98,7 @@ func (p *StreamPool) Serve(gate *StreamGate, conn *fib.Connection, handler Handl
 		return
 	}
 	r.task = streamTask{gate: gate, conn: conn, handler: handler, context: &r.context}
-	p.submit(&r.task)
+	p.submit(p.poolFor(gate, conn), &r.task)
 }
 
 // StreamBatch holds requests of one connection that Queue has admitted to a
@@ -87,6 +111,8 @@ func (p *StreamPool) Serve(gate *StreamGate, conn *fib.Connection, handler Handl
 // one batch, by value, used only by the goroutine that reads it.
 type StreamBatch struct {
 	tasks []taskpool.Task
+	// pool is where the queued tasks go, which Queue sets from the gate.
+	pool *taskpool.TaskPool
 }
 
 // Queue is Serve for a request that goes to the pool with the others queued
@@ -100,6 +126,7 @@ func (p *StreamPool) Queue(b *StreamBatch, gate *StreamGate, conn *fib.Connectio
 		return
 	}
 	r.task = streamTask{gate: gate, conn: conn, handler: handler, context: &r.context}
+	b.pool = p.poolFor(gate, conn)
 	b.tasks = append(b.tasks, &r.task)
 }
 
@@ -108,7 +135,7 @@ func (p *StreamPool) Submit(b *StreamBatch) {
 	if len(b.tasks) == 0 {
 		return
 	}
-	n := p.pool.GoTasks(b.tasks)
+	n := b.pool.GoTasks(b.tasks)
 	for _, task := range b.tasks[n:] {
 		// The pool has stopped taking work; the request is served here.
 		task.(*streamTask).run()
@@ -139,9 +166,9 @@ func (p *StreamPool) admit(gate *StreamGate) bool {
 	}
 }
 
-// submit hands an admitted request to the pool.
-func (p *StreamPool) submit(task *streamTask) {
-	if !p.pool.GoTask(task) {
+// submit hands an admitted request to pool.
+func (p *StreamPool) submit(pool *taskpool.TaskPool, task *streamTask) {
+	if !pool.GoTask(task) {
 		// The pool has stopped taking work; the request is served here.
 		task.run()
 	}

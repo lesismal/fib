@@ -43,7 +43,7 @@ func serveStreamingServer(t *testing.T, config Config, handler HandlerFunc) stri
 // taken and none is added later.
 func serveOnPinnedPool(t *testing.T, config Config, handler HandlerFunc) string {
 	t.Helper()
-	pool := taskpool.NewWithMode(taskpool.ModeCond, 8, 1024)
+	pool := taskpool.NewWithMode("test", taskpool.ModeCond, 8, 1024)
 	engine := fib.DefaultConfig()
 	engine.Addr = "127.0.0.1:0"
 	engine.SetTaskPool(pool)

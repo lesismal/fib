@@ -22,7 +22,7 @@ func (t *benchmarkTask) RunTask() { t.done <- struct{}{} }
 func BenchmarkGoTask(b *testing.B) {
 	for _, mode := range benchmarkModes {
 		b.Run(mode.String(), func(b *testing.B) {
-			tp := NewWithMode(mode, 1, 1)
+			tp := NewWithMode("test", mode, 1, 1)
 			defer tp.Stop()
 			task := &benchmarkTask{done: make(chan struct{}, 1)}
 			b.ReportAllocs()
@@ -72,7 +72,7 @@ func newBenchPool(mode Mode) *TaskPool {
 	if mode == ModeCond {
 		sizing = 100 * runtime.GOMAXPROCS(0)
 	}
-	return NewWithMode(mode, sizing, 100000)
+	return NewWithMode("test", mode, sizing, 100000)
 }
 
 // BenchmarkLoopBatch submits the way an engine's event loops do: a few

@@ -15,6 +15,8 @@ const defaultShrinkInterval = time.Second
 
 // AdaptiveConfig sizes a ModeAdaptive pool.
 type AdaptiveConfig struct {
+	// Name labels the pool in what it logs.
+	Name string
 	// MinWorkers is the resident floor: the pool starts this many workers and
 	// never retires below it. Zero lets the pool retire every worker while it
 	// is idle, and start them again when work arrives.
@@ -52,7 +54,7 @@ func NewAdaptive(config AdaptiveConfig) *TaskPool {
 		"minWorkers", config.MinWorkers, "maxWorkers", config.MaxWorkers,
 		"queueSize", config.QueueSize, "shrinkInterval", config.ShrinkInterval,
 	}
-	return start(ModeAdaptive, params, func(executor *executor) backend {
+	return start(config.Name, ModeAdaptive, params, func(executor *executor) backend {
 		return newAdaptiveBackend(executor, config)
 	})
 }

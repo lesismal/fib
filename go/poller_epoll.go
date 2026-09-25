@@ -70,6 +70,7 @@ func (e *Engine) closeBackend() error {
 }
 
 func (e *Engine) Run() error {
+	e.logRun()
 	batch := e.maxEvents
 	if batch > maxWaitBatch {
 		batch = maxWaitBatch

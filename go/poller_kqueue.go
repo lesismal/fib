@@ -65,6 +65,7 @@ func (e *Engine) openBackend() error {
 func (e *Engine) closeBackend() error { return syscall.Close(e.kq) }
 
 func (e *Engine) Run() error {
+	e.logRun()
 	batch := e.maxEvents
 	if batch > maxWaitBatch {
 		batch = maxWaitBatch

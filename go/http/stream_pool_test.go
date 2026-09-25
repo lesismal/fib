@@ -145,14 +145,22 @@ func TestH2StreamPoolHandlerPanic(t *testing.T) {
 	}
 }
 
-// TestStreamPoolShared checks that every server gets the one pool, since a
-// pool is never stopped and one per server would leave every server's
-// workers behind it, and that HTTP/2 and HTTP/3 are served by the same one.
+// TestStreamPoolShared checks that every server runs the requests of one
+// engine name on one pool, rather than on one per server, and that HTTP/2
+// and HTTP/3 are served by the same one.
 func TestStreamPoolShared(t *testing.T) {
 	first := NewStreamPool(StreamPoolConfig{})
 	second := NewStreamPool(StreamPoolConfig{MaxConcurrentHandlers: 8})
-	if first == nil || second == nil || first.pool != second.pool {
+	if first == nil || second == nil {
 		t.Fatalf("two servers' pools: %v, %v", first, second)
+	}
+	var firstGate, secondGate StreamGate
+	pool := first.poolFor(&firstGate, nil)
+	if pool != second.poolFor(&secondGate, nil) {
+		t.Fatal("two servers ran one engine name's requests on different pools")
+	}
+	if got := pool.Name(); got != "fib-streams" {
+		t.Fatalf("Name() = %q, want fib-streams", got)
 	}
 	if pool := NewStreamPool(StreamPoolConfig{Disable: true}); pool != nil {
 		t.Fatal("a disabled pool was built")

@@ -14,6 +14,7 @@ import (
 )
 
 type Engine struct {
+	name            string
 	listeners       []net.Listener
 	handler         Handler
 	taskPool        TaskPool
@@ -89,7 +90,7 @@ func newEngine(config Config, handler Handler, addrs []string) (*Engine, error) 
 		listeners = append(listeners, listener)
 	}
 	pool, releasePool := acquireTaskPool(config)
-	e := &Engine{listeners: listeners, handler: handler, taskPool: pool, releaseTaskPool: releasePool,
+	e := &Engine{name: engineName(config), listeners: listeners, handler: handler, taskPool: pool, releaseTaskPool: releasePool,
 		connections: make(map[*Connection]struct{}), stopped: make(chan struct{}),
 		udpListeners: udpListeners, udpIdleTimeout: udpIdleTimeout(config.UDPIdleTimeout)}
 	e.readBufferSize = config.ReadBufferSize
@@ -161,6 +162,7 @@ func (e *Engine) LocalAddrs() ([]*net.TCPAddr, error) {
 // Run serves every listener until the server is stopped. It returns the first
 // error any of them reported.
 func (e *Engine) Run() error {
+	e.logRun()
 	if len(e.listeners) == 0 && len(e.udpListeners) == 0 {
 		// A client engine's connections are served by their own readers, so
 		// Run only has to last as long as the engine does.

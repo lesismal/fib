@@ -69,8 +69,9 @@ type Config struct {
 	// requests a client has open on one QUIC connection are served
 	// concurrently rather than one after another on the goroutine that
 	// reads its datagrams. Its zero value is the default, which does that
-	// on a pool shared with every other server asking for the same sizing,
-	// HTTP/2 servers included, and sets no per-connection limit; see
+	// on the stream pool of the engine the connection came from, shared
+	// with every other server whose connections come from engines of that
+	// name, HTTP/2 servers included, and sets no per-connection limit; see
 	// http.StreamPoolConfig.
 	StreamPool fibhttp.StreamPoolConfig
 }

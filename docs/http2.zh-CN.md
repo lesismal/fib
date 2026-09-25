@@ -42,10 +42,12 @@
 
 - 一个连接的帧按顺序处理，请求完整后交给 `Config.StreamPool` 描述的 handler 协程池，
   因此同一连接上客户端并发发起的多个请求是并发处理的，阻塞的 handler 只拖累它自己。
-  整个进程只有这一个 handler 协程池，所有 HTTP/2 与 HTTP/3 server 共用，且永远不与
-  engine 的协程池共用（共用会在队列满时让 engine 的 worker 全部卡在提交上而死锁）。它的
-  上限是当前运行的最大 engine 协程池的 2 倍，没有 engine 时取
-  `fib.DefaultStreamPoolSizing`；空闲时保留每个 CPU 核心十个 worker。
+  每个 engine 名字（`Config.Name`）有一个这样的 handler 协程池，名为 `<Name>-streams`
+  （默认 `fib-streams`），由连接来自该名字 engine 的所有 HTTP/2 与 HTTP/3 server 共用，且
+  永远不与 engine 的协程池共用（共用会在队列满时让 engine 的 worker 全部卡在提交上而死锁）。
+  它的上限是当前运行的同名 engine 中最大协程池的 2 倍，没有 engine 时取
+  `fib.DefaultStreamPoolSizing`；空闲时保留每个 CPU 核心十个 worker。该名字的最后一个
+  engine 关闭后它随之停止，不等待仍在运行的 handler。
 - `StreamPool.MaxConcurrentHandlers` 限制单个连接同时处理的请求数 N：第 N 个请求在读取
   该连接的协程上执行，在它返回前该连接不再读取新数据，因此这个上限由对端的流控承担，
   而不是在服务端排队。N 为 1 时（与 `StreamPool.Disable` 相同）每个请求都在读取协程上

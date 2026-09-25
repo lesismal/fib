@@ -7,60 +7,69 @@ import (
 	"github.com/lesismal/fib/go/taskpool"
 )
 
-type taskPoolKey struct {
-	mode       taskpool.Mode
-	minWorkers int
-	workers    int
-	queueSize  int
+// engineName is the name config gives its engine.
+func engineName(config Config) string {
+	if config.Name == "" {
+		return DefaultName
+	}
+	return config.Name
 }
 
-// newTaskPool builds the pool a key describes.
-func newTaskPool(key taskPoolKey) *taskpool.TaskPool {
-	if key.mode == taskpool.ModeAdaptive && key.minWorkers > 0 {
+// taskPoolName is the name of the pool an engine named engine builds for its
+// connections.
+func taskPoolName(engine string) string { return engine + "-workers" }
+
+// newTaskPool builds the pool config describes.
+func newTaskPool(config Config) *taskpool.TaskPool {
+	name := taskPoolName(engineName(config))
+	if config.TaskPoolMode == taskpool.ModeAdaptive && config.MinWorkerCount > 0 {
 		return taskpool.NewAdaptive(taskpool.AdaptiveConfig{
-			MinWorkers: key.minWorkers, MaxWorkers: key.workers, QueueSize: key.queueSize,
+			Name: name, MinWorkers: config.MinWorkerCount, MaxWorkers: config.WorkerCount, QueueSize: config.MaxEvents,
 		})
 	}
-	return taskpool.NewWithMode(key.mode, key.workers, key.queueSize)
+	return taskpool.NewWithMode(name, config.TaskPoolMode, config.WorkerCount, config.MaxEvents)
 }
 
 type sharedTaskPoolEntry struct {
 	pool *taskpool.TaskPool
-	refs int
+	// workers is the WorkerCount the pool was built with, which the engines
+	// sharing it run on whatever theirs say.
+	workers int
+	refs    int
 }
 
+// sharedTaskPools holds the pools engines share, by the pool's name.
 var sharedTaskPools = struct {
 	sync.Mutex
-	entries map[taskPoolKey]*sharedTaskPoolEntry
-}{entries: make(map[taskPoolKey]*sharedTaskPoolEntry)}
+	entries map[string]*sharedTaskPoolEntry
+}{entries: make(map[string]*sharedTaskPoolEntry)}
 
 func acquireTaskPool(config Config) (TaskPool, func()) {
 	if config.TaskPool != nil {
 		// The caller owns a pool it supplied, so releasing it is a no-op.
 		return config.TaskPool, func() {}
 	}
-	key := taskPoolKey{mode: config.TaskPoolMode, workers: config.WorkerCount, queueSize: config.MaxEvents}
-	if key.mode == taskpool.ModeAdaptive {
-		key.minWorkers = config.MinWorkerCount
-	}
-	// The pool HTTP/2 and HTTP/3 run their handlers on has to stay wider than
-	// every engine pool that feeds it; see streamPoolFactor.
-	releaseStreams := streampool.Require(key.workers * streamPoolFactor)
+	engine := engineName(config)
 	if !config.SharedTaskPool {
-		pool := newTaskPool(key)
+		// The pool HTTP/2 and HTTP/3 run their handlers on has to stay wider
+		// than every engine pool that feeds it; see streamPoolFactor.
+		releaseStreams := streampool.Require(engine, config.WorkerCount*streamPoolFactor)
+		pool := newTaskPool(config)
 		return pool, func() {
 			pool.Stop()
 			releaseStreams()
 		}
 	}
+	name := taskPoolName(engine)
 	sharedTaskPools.Lock()
-	entry := sharedTaskPools.entries[key]
+	entry := sharedTaskPools.entries[name]
 	if entry == nil {
-		entry = &sharedTaskPoolEntry{pool: newTaskPool(key)}
-		sharedTaskPools.entries[key] = entry
+		entry = &sharedTaskPoolEntry{pool: newTaskPool(config), workers: config.WorkerCount}
+		sharedTaskPools.entries[name] = entry
 	}
 	entry.refs++
 	sharedTaskPools.Unlock()
+	releaseStreams := streampool.Require(engine, entry.workers*streamPoolFactor)
 	var once sync.Once
 	return entry.pool, func() {
 		once.Do(func() {
@@ -68,7 +77,7 @@ func acquireTaskPool(config Config) (TaskPool, func()) {
 			entry.refs--
 			last := entry.refs == 0
 			if last {
-				delete(sharedTaskPools.entries, key)
+				delete(sharedTaskPools.entries, name)
 			}
 			sharedTaskPools.Unlock()
 			if last {

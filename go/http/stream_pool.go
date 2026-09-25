@@ -19,13 +19,16 @@ package http
 // there at once. Its zero value is the default: every request goes to the
 // pool, with no limit of its own on how much of a connection runs at once.
 //
-// There is one stream pool in the process, shared by every HTTP/2 and HTTP/3
-// server, and it is never the pool of an engine: an engine worker that framed
-// a request and found an engine's own queue full of handlers would wait for
+// There is one stream pool for each engine name, "<Name>-streams", shared by
+// every HTTP/2 and HTTP/3 server whose connections come from engines of that
+// name, and it is never the pool of an engine: an engine worker that framed a
+// request and found an engine's own queue full of handlers would wait for
 // room that only another engine worker, just as stuck, could make. Its
-// ceiling is twice the widest engine pool running, or twice what
-// fib.DefaultPoolSizing reports while none is, and its resident floor ten
-// workers per CPU core; neither is configured per server.
+// ceiling is twice the widest engine pool of that name running, or twice
+// what fib.DefaultPoolSizing reports while none is, and its resident floor
+// ten workers per CPU core; neither is configured per server. It stops once
+// the last engine of its name has closed, without waiting for the handlers
+// still running, and a request that comes after is served by its reader.
 type StreamPoolConfig struct {
 	// Disable serves every request on the goroutine that reads its
 	// connection, one at a time, the way the HTTP/1 server does. It is

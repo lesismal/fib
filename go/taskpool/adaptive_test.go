@@ -52,7 +52,7 @@ func waitFor(t *testing.T, what string, cond func() bool) {
 // ceiling when that is lower.
 func TestAdaptiveDefaultFloorIsTenPerCPU(t *testing.T) {
 	floor := 10 * runtime.NumCPU()
-	tp := NewWithMode(ModeAdaptive, floor+1, 16)
+	tp := NewWithMode("test", ModeAdaptive, floor+1, 16)
 	defer tp.Stop()
 	if got := tp.Workers(); got != floor {
 		t.Fatalf("Workers() = %d right after NewWithMode, want %d", got, floor)
@@ -63,7 +63,7 @@ func TestAdaptiveDefaultFloorIsTenPerCPU(t *testing.T) {
 }
 
 func TestAdaptiveStartsAtFloor(t *testing.T) {
-	tp := NewAdaptive(AdaptiveConfig{MinWorkers: 5, MaxWorkers: 64, QueueSize: 64})
+	tp := NewAdaptive(AdaptiveConfig{Name: "test", MinWorkers: 5, MaxWorkers: 64, QueueSize: 64})
 	defer tp.Stop()
 	if got := tp.Workers(); got != 5 {
 		t.Fatalf("Workers() = %d right after NewAdaptive, want the floor of 5", got)
@@ -75,7 +75,7 @@ func TestAdaptiveStartsAtFloor(t *testing.T) {
 // never past it.
 func TestAdaptiveGrowsToCeilingAndNoFurther(t *testing.T) {
 	const ceiling = 16
-	tp := NewAdaptive(AdaptiveConfig{MinWorkers: 1, MaxWorkers: ceiling, QueueSize: 64})
+	tp := NewAdaptive(AdaptiveConfig{Name: "test", MinWorkers: 1, MaxWorkers: ceiling, QueueSize: 64})
 	defer tp.Stop()
 	b := newBlocker()
 	defer b.open()
@@ -99,7 +99,7 @@ func TestAdaptiveGrowsToCeilingAndNoFurther(t *testing.T) {
 // pool is back at its floor, and never below it.
 func TestAdaptiveShrinksBackToFloor(t *testing.T) {
 	const floor, ceiling = 2, 32
-	tp := NewAdaptive(AdaptiveConfig{MinWorkers: floor, MaxWorkers: ceiling, QueueSize: 64,
+	tp := NewAdaptive(AdaptiveConfig{Name: "test", MinWorkers: floor, MaxWorkers: ceiling, QueueSize: 64,
 		ShrinkInterval: 10 * time.Millisecond})
 	defer tp.Stop()
 	b := newBlocker()
@@ -120,7 +120,7 @@ func TestAdaptiveShrinksBackToFloor(t *testing.T) {
 // A floor of zero lets an idle pool retire every worker, and work arriving
 // afterwards starts them again.
 func TestAdaptiveZeroFloorRestartsWorkers(t *testing.T) {
-	tp := NewAdaptive(AdaptiveConfig{MinWorkers: 0, MaxWorkers: 4, QueueSize: 16,
+	tp := NewAdaptive(AdaptiveConfig{Name: "test", MinWorkers: 0, MaxWorkers: 4, QueueSize: 16,
 		ShrinkInterval: 10 * time.Millisecond})
 	defer tp.Stop()
 	var ran atomic.Int64
@@ -139,7 +139,7 @@ func TestAdaptiveZeroFloorRestartsWorkers(t *testing.T) {
 }
 
 func TestAdaptiveResize(t *testing.T) {
-	tp := NewAdaptive(AdaptiveConfig{MinWorkers: 1, MaxWorkers: 8, QueueSize: 64,
+	tp := NewAdaptive(AdaptiveConfig{Name: "test", MinWorkers: 1, MaxWorkers: 8, QueueSize: 64,
 		ShrinkInterval: 10 * time.Millisecond})
 	defer tp.Stop()
 
@@ -181,7 +181,7 @@ func TestAdaptiveResize(t *testing.T) {
 
 func TestResizeRefusedByOtherModes(t *testing.T) {
 	for _, mode := range []Mode{ModeCond, ModeElastic} {
-		tp := NewWithMode(mode, 4, 4)
+		tp := NewWithMode("test", mode, 4, 4)
 		if tp.Resize(1, 8) {
 			t.Errorf("%v pool accepted Resize", mode)
 		}
@@ -197,7 +197,7 @@ func TestAdaptiveRejectsBadRange(t *testing.T) {
 					t.Errorf("range %v accepted", r)
 				}
 			}()
-			NewAdaptive(AdaptiveConfig{MinWorkers: r[0], MaxWorkers: r[1], QueueSize: 4}).Stop()
+			NewAdaptive(AdaptiveConfig{Name: "test", MinWorkers: r[0], MaxWorkers: r[1], QueueSize: 4}).Stop()
 		}()
 	}
 }
@@ -205,7 +205,7 @@ func TestAdaptiveRejectsBadRange(t *testing.T) {
 // Growth and retirement race submissions constantly under a short interval.
 // Every task must still run exactly once, and Stop must drain them.
 func TestAdaptiveEachTaskRunsOnceWhileResizing(t *testing.T) {
-	tp := NewAdaptive(AdaptiveConfig{MinWorkers: 0, MaxWorkers: 64, QueueSize: 32,
+	tp := NewAdaptive(AdaptiveConfig{Name: "test", MinWorkers: 0, MaxWorkers: 64, QueueSize: 32,
 		ShrinkInterval: time.Millisecond})
 	const producers, perProducer = 8, 2000
 	var counts [producers * perProducer]atomic.Int64
@@ -277,7 +277,7 @@ func TestAdaptiveNeverStrandsATask(t *testing.T) {
 	for iter := 0; time.Now().Before(deadline); iter++ {
 		rng := rand.New(rand.NewPCG(uint64(iter), 1))
 		ceiling := 1 + rng.IntN(40)
-		tp := NewAdaptive(AdaptiveConfig{MinWorkers: rng.IntN(ceiling + 1), MaxWorkers: ceiling,
+		tp := NewAdaptive(AdaptiveConfig{Name: "test", MinWorkers: rng.IntN(ceiling + 1), MaxWorkers: ceiling,
 			QueueSize: 1 + rng.IntN(8), ShrinkInterval: time.Millisecond})
 		var ran, want atomic.Int64
 		stopResizing := make(chan struct{})

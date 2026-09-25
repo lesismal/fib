@@ -484,6 +484,7 @@ func (e *Engine) LocalAddrs() ([]*net.TCPAddr, error) {
 }
 
 func (e *Engine) Run() error {
+	e.logRun()
 	batch := e.maxEvents
 	if batch > maxWaitBatch {
 		batch = maxWaitBatch
