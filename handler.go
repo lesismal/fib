@@ -1,7 +1,9 @@
 package fib
 
-// Handler callbacks run on a logical worker, except OnOpen and OnClose which
-// run on the event-loop goroutine. Data is only valid for the duration of OnData.
+// Handler callbacks run on a logical worker, except OnOpen, which runs on the
+// event-loop goroutine. OnClose runs in the connection's last round, where its
+// OnData ran, after every OnData before it; that is the event loop where the
+// engine runs rounds there. Data is only valid for the duration of OnData.
 type Handler interface {
 	OnOpen(*Connection)
 	OnData(*Connection, []byte)

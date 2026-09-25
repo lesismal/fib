@@ -111,7 +111,8 @@ func testServerReuse(t *testing.T, config Config) {
 // server closes before the handler returns, as a timeout would, and keeps
 // using it from another goroutine while other requests churn through the
 // pools. Everything it was served with has to stay its own until it releases
-// the request.
+// the request. The cancellation the close brings reaches it only once the
+// handler has returned, since OnClose follows the round the handler runs in.
 func TestReuseWaitsForTheLastRelease(t *testing.T) {
 	config := DefaultConfig()
 	setReuseAll(&config)
@@ -135,7 +136,6 @@ func TestReuseWaitsForTheLastRelease(t *testing.T) {
 			c.Release()
 		}()
 		c.Conn.Close()
-		<-cancelled
 	})))
 	held := dialRaw(t, addr)
 	held.send("POST /held?q=held HTTP/1.1\r\nHost: x\r\nX-Id: held\r\nContent-Length: 9\r\n\r\nheld-body")

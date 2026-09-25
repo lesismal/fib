@@ -57,7 +57,11 @@ type Connection struct {
 	// readDeferred records that a round left a read undone because output
 	// was still queued, and ended. Whatever empties the queue owes the
 	// connection that read.
-	readDeferred   bool
+	readDeferred bool
+	// closePending records that the loop has closed the connection and left
+	// OnClose, and the release of the descriptor, to its last round; see
+	// Engine.closeConnection. Guarded by mu.
+	closePending   bool
 	flushing       bool
 	corked         bool
 	closeAfterSend bool
@@ -77,7 +81,25 @@ type Connection struct {
 	layer Layer
 	// udp is set for a UDP connection, which exchanges datagrams.
 	udp *udpState
+	// onWorkers says the connection's rounds run on a pool of workers even
+	// where the engine runs rounds on its loops; see SetRunOnWorkers.
+	onWorkers atomic.Bool
 }
+
+// SetRunOnWorkers has the connection's rounds, its reads and the OnData and
+// OnClose they call, run on a pool of workers even where the engine runs its
+// rounds on its event loops, as it does under Config.IOPollers, a
+// taskpool.ModeInline pool or Config.InlineHandlers. A protocol whose handlers
+// run inside OnData and may take a while, as HTTP/1's do, sets it in OnOpen,
+// so that one slow handler does not hold up every connection on its loop.
+// That pool is the one the engine would have run on without those settings,
+// built the first time a connection asks for it. Where the engine already
+// runs rounds on workers it changes nothing. It takes effect from the next
+// round, and may be called from any goroutine.
+func (c *Connection) SetRunOnWorkers(on bool) { c.onWorkers.Store(on) }
+
+// RunsOnWorkers reports what SetRunOnWorkers last set.
+func (c *Connection) RunsOnWorkers() bool { return c.onWorkers.Load() }
 
 // Attachment returns application state associated with the connection.
 func (c *Connection) Attachment() any {
@@ -321,7 +343,7 @@ func (c *Connection) subPending(n int64) {
 		n += pending
 	}
 	if n > 0 {
-		c.engine.pendingTotal.Add(-n)
+		c.engine.releaseBudget(n)
 	}
 }
 
@@ -494,8 +516,16 @@ func (c *Connection) process() {
 			// true and this connection could never be submitted again.
 			c.mu.Lock()
 			c.scheduled = false
+			closing := c.closePending
+			c.closePending = false
 			c.mu.Unlock()
-			c.closeWithError(fmt.Errorf("handler panic: %v", recovered))
+			if closing {
+				// The connection was already closed, and this round was to
+				// finish the close.
+				c.finishClose()
+			} else {
+				c.closeWithError(fmt.Errorf("handler panic: %v", recovered))
+			}
 			panic(recovered)
 		}
 	}()
@@ -520,7 +550,12 @@ func (c *Connection) process() {
 			// nothing to wait for, and the read runs now.
 			c.readDeferred = deferred != 0
 			c.scheduled = false
+			closing := c.closePending
+			c.closePending = false
 			c.mu.Unlock()
+			if closing {
+				c.finishClose()
+			}
 			return
 		}
 		events := c.pendingEvents
@@ -576,6 +611,22 @@ func (c *Connection) process() {
 			c.closeWithError(closeErr)
 		}
 	}
+}
+
+// finishClose ends a closed connection's last round: OnClose runs here,
+// after everything the connection delivered before it, and the loop is then
+// asked to release the descriptor, which it does itself once it has stopped.
+func (c *Connection) finishClose() {
+	e := c.engine
+	defer func() {
+		if !e.request(command{kind: commandDetach, connection: c}) {
+			e.detach(c)
+		}
+	}()
+	c.mu.Lock()
+	err := c.closeReason
+	c.mu.Unlock()
+	c.handler.OnClose(c, err)
 }
 
 // hasQueuedOutput reports whether bytes accepted by Send are still waiting for

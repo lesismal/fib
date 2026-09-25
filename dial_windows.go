@@ -7,6 +7,14 @@ import (
 	"syscall"
 )
 
+// dialLoop picks the loop a dial is to run on, which without pollers is
+// always the engine's own.
+func (e *Engine) dialLoop(*dialRequest) *Engine { return e }
+
+// closeDialSocket closes a socket opened for a dial ahead of its loop, which
+// never happens here.
+func closeDialSocket(fd int) { _ = syscall.Closesocket(syscall.Handle(fd)) }
+
 // connectSocket opens a socket and starts an overlapped ConnectEx on it, whose
 // completion reports the connect's outcome. ConnectEx always completes through
 // the port, even when it finishes at once, so connected is always false here.

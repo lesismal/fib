@@ -47,6 +47,11 @@ type Config struct {
 	// TaskPool, when set, runs the engine's connections instead of a pool the
 	// engine builds from the fields above. See SetTaskPool.
 	TaskPool TaskPool
+	// IOPollers and IOPollerCount split a Linux or macOS engine across
+	// several event loops. This backend has one goroutine per connection
+	// already, so both are ignored here.
+	IOPollers     bool
+	IOPollerCount int
 	// UDPIdleTimeout closes a silent UDP peer's connection. Zero means
 	// DefaultUDPIdleTimeout and a negative value keeps peers until closed.
 	UDPIdleTimeout time.Duration

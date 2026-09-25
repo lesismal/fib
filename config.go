@@ -186,6 +186,18 @@ func (c *Config) validateTaskPool() error {
 	return nil
 }
 
+// pollerCount reports how many loops config has an engine hand its
+// connections to, or zero when it keeps them on its own loop.
+func pollerCount(config Config) int {
+	if !config.IOPollers || !pollersSupported {
+		return 0
+	}
+	if config.IOPollerCount > 0 {
+		return config.IOPollerCount
+	}
+	return runtime.NumCPU()
+}
+
 // SetPoolSizing pins the pool sizing to the caller's own numbers, which a later
 // SetTaskPoolMode then keeps. A value that is not positive leaves that field at
 // what it already held.

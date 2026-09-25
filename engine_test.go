@@ -626,3 +626,57 @@ func TestCustomTaskPoolRunsConnectionsAndOutlivesEngine(t *testing.T) {
 	}
 	<-done
 }
+
+// A close the loop carries out while a round is still running on a worker is
+// ordered after that round, as an event would be: OnClose waits for the
+// OnData in progress to return, and the descriptor stays the connection's
+// until then, so the round never reads one that has been closed or handed on.
+func TestOnCloseFollowsTheRunningRound(t *testing.T) {
+	entered := make(chan *Connection, 1)
+	release := make(chan struct{})
+	var dataDone atomic.Bool
+	closed := make(chan bool, 1)
+	_, addr := startEchoServer(t, DefaultConfig(), HandlerFuncs{
+		Data: func(c *Connection, _ []byte) {
+			entered <- c
+			<-release
+			dataDone.Store(true)
+		},
+		Close: func(*Connection, error) { closed <- dataDone.Load() },
+	})
+	conn, err := net.DialTimeout("tcp", addr, 5*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	if _, err := conn.Write([]byte("x")); err != nil {
+		t.Fatal(err)
+	}
+	c := <-entered
+	fd := c.FD()
+	c.Close()
+	select {
+	case <-closed:
+		close(release)
+		t.Fatal("OnClose ran while OnData was still running")
+	case <-time.After(100 * time.Millisecond):
+	}
+	if c.FD() != fd {
+		close(release)
+		t.Fatalf("descriptor went from %d to %d under a running round", fd, c.FD())
+	}
+	close(release)
+	select {
+	case afterData := <-closed:
+		if !afterData {
+			t.Fatal("OnClose ran before OnData returned")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("OnClose never ran")
+	}
+	for deadline := time.Now().Add(5 * time.Second); c.FD() >= 0; time.Sleep(time.Millisecond) {
+		if time.Now().After(deadline) {
+			t.Fatal("the descriptor was never released")
+		}
+	}
+}

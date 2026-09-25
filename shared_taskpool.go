@@ -19,6 +19,11 @@ func engineName(config Config) string {
 // connections.
 func taskPoolName(engine string) string { return engine + "-workers" }
 
+// inlinePoolName is the name of the inline pool an engine named engine runs
+// its connections on instead, told apart from its pool of workers, which it
+// may build as well; see acquireWorkerPool.
+func inlinePoolName(engine string) string { return engine + "-inline" }
+
 // newTaskPool builds the pool config describes.
 func newTaskPool(config Config) *taskpool.TaskPool {
 	name := taskPoolName(engineName(config))
@@ -28,6 +33,20 @@ func newTaskPool(config Config) *taskpool.TaskPool {
 		})
 	}
 	return taskpool.NewWithMode(name, config.TaskPoolMode, config.WorkerCount, config.MaxEvents)
+}
+
+// acquireWorkerPool builds the pool of workers an engine whose own pool is
+// inline runs the connections that ask for workers on; see
+// Connection.SetRunOnWorkers. It is the pool config would give the engine
+// without pollers, shared by name as that one would be, and when config asks
+// for an inline pool outright it is a ModeAdaptive one.
+func acquireWorkerPool(config Config) (TaskPool, func()) {
+	config.IOPollers = false
+	config.TaskPool = nil
+	if config.TaskPoolMode == taskpool.ModeInline {
+		config.TaskPoolMode = taskpool.ModeAdaptive
+	}
+	return acquireTaskPool(config)
 }
 
 type sharedTaskPoolEntry struct {
@@ -50,6 +69,22 @@ func acquireTaskPool(config Config) (TaskPool, func()) {
 		return config.TaskPool, func() {}
 	}
 	engine := engineName(config)
+	if pollerCount(config) > 0 {
+		// Every loop of the engine runs its own connections' rounds; see
+		// Config.IOPollers.
+		config.TaskPoolMode = taskpool.ModeInline
+	}
+	if config.TaskPoolMode == taskpool.ModeInline {
+		// There is nothing in an inline pool to share, so every engine has
+		// its own. The HTTP/2 and HTTP/3 pool is sized as it would be
+		// without it.
+		releaseStreams := streampool.Require(engine, config.WorkerCount*streamPoolFactor)
+		pool := taskpool.NewInline(inlinePoolName(engine))
+		return pool, func() {
+			pool.Stop()
+			releaseStreams()
+		}
+	}
 	if !config.SharedTaskPool {
 		// The pool HTTP/2 and HTTP/3 run their handlers on has to stay wider
 		// than every engine pool that feeds it; see streamPoolFactor.

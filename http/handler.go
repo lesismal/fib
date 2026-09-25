@@ -444,6 +444,11 @@ func (h *ServerHandler) releaseTimeouts(c *fib.Connection, parser *Parser) {
 }
 
 func (h *ServerHandler) OnOpen(c *fib.Connection) {
+	// An HTTP/1 handler runs inside the connection's round, from its first
+	// byte read to its response, so the round belongs on a worker even where
+	// the engine runs rounds on its loops. A connection that turns out to be
+	// HTTP/2 goes back to the engine's own pool; see startH2.
+	c.SetRunOnWorkers(!h.config.HTTP2Only)
 	parser := h.newParser(c)
 	c.SetAttachment(parser)
 	// A connection that opens and then says nothing is idle, and bounded like
@@ -473,6 +478,7 @@ func (h *ServerHandler) OnData(c *fib.Connection, data []byte) {
 	case *Parser:
 		parser = state
 	default:
+		c.SetRunOnWorkers(!h.config.HTTP2Only)
 		parser = h.newParser(c)
 		c.SetAttachment(parser)
 	}
@@ -830,6 +836,10 @@ func (h *ServerHandler) sniff(c *fib.Connection, parser *Parser, data []byte) []
 func (h *ServerHandler) startH2(c *fib.Connection, parser *Parser, state *stdtls.ConnectionState) {
 	sc := newH2ServerConn(h, c, parser.remoteAddr)
 	sc.tlsState = state
+	// HTTP/2 only reads and parses in the connection's round, and runs its
+	// handlers on the stream pool, so the round goes back to the engine's
+	// own pool.
+	c.SetRunOnWorkers(false)
 	h.releaseTimeouts(c, parser)
 	c.SetAttachment(sc)
 	sc.start()
@@ -862,9 +872,10 @@ func (h *ServerHandler) OnClose(c *fib.Connection, err error) {
 		// will never come, rather than take a truncated upload for a complete
 		// one, and one still working on a request it retained has to hear
 		// that there is nothing left to answer. Both are reported from a
-		// goroutine, since this runs on the event loop, which a handler's
-		// cleanup must never hold up; the parser's own lock is not taken
-		// there either, for the same reason.
+		// goroutine, since this runs in the connection's last round, which
+		// may be on the event loop, and a handler's cleanup must never hold
+		// that up; the parser's own lock is not taken there either, for the
+		// same reason.
 		stream, context := state.live.Load(), state.liveContext.Load()
 		var gen uint64
 		if context != nil {

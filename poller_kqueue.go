@@ -64,8 +64,8 @@ func (e *Engine) openBackend() error {
 
 func (e *Engine) closeBackend() error { return syscall.Close(e.kq) }
 
-func (e *Engine) Run() error {
-	e.logRun()
+// runLoop runs the engine's event loop until Stop.
+func (e *Engine) runLoop() error {
 	batch := e.maxEvents
 	if batch > maxWaitBatch {
 		batch = maxWaitBatch

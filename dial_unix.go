@@ -7,6 +7,40 @@ import (
 	"syscall"
 )
 
+// dialLoop picks the loop a dial is to run on. With pollers, that is the one
+// its descriptor picks, as for an accepted connection, so the socket is
+// opened here, on whatever goroutine asked for the dial, rather than on the
+// loop. A dial that cannot open one runs on the engine's own loop, which
+// only has to report why.
+func (e *Engine) dialLoop(d *dialRequest) *Engine {
+	if len(e.pollers) == 0 || d.err != nil || d.hasSocket {
+		return e
+	}
+	fd, err := d.openSocket()
+	if err != nil {
+		d.err = err
+		return e
+	}
+	d.socket, d.hasSocket = fd, true
+	return e.pollers[fd%len(e.pollers)]
+}
+
+// openSocket returns the socket opened for d ahead of time, if there is one,
+// and otherwise opens one of the kind d's network needs. The caller owns it.
+func (d *dialRequest) openSocket() (int, error) {
+	if d.hasSocket {
+		d.hasSocket = false
+		return d.socket, nil
+	}
+	if isUDPNetwork(d.network) {
+		return newDatagramSocket(d.family)
+	}
+	return newSocket(d.family)
+}
+
+// closeDialSocket closes a socket opened for a dial that never connected it.
+func closeDialSocket(fd int) { _ = syscall.Close(fd) }
+
 // connectSocket opens a non-blocking socket, starts connecting it and
 // registers it with the backend, where the connect's outcome arrives as the
 // socket's first events. connected reports a connect the kernel finished on the
@@ -15,7 +49,7 @@ func (e *Engine) connectSocket(d *dialRequest) (c *Connection, connected bool, e
 	if isUDPNetwork(d.network) {
 		return e.connectDatagram(d)
 	}
-	fd, err := newSocket(d.family)
+	fd, err := d.openSocket()
 	if err != nil {
 		return nil, false, err
 	}
@@ -52,7 +86,7 @@ func (e *Engine) connectSocket(d *dialRequest) (c *Connection, connected bool, e
 // connectDatagram opens a UDP socket connected to the dialed peer. Connecting
 // a UDP socket only records the peer, so it is done on the spot.
 func (e *Engine) connectDatagram(d *dialRequest) (c *Connection, connected bool, err error) {
-	fd, err := newDatagramSocket(d.family)
+	fd, err := d.openSocket()
 	if err != nil {
 		return nil, false, err
 	}

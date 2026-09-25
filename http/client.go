@@ -802,7 +802,14 @@ func (cc *clientConn) discard() {
 	cc.conn.Close()
 }
 
-func (cc *clientConn) OnOpen(conn *fib.Connection) { cc.conn = conn }
+// OnOpen has an HTTP/1 connection's rounds, which run the callbacks its
+// responses reach, run on a worker even where the engine runs rounds on its
+// loops, as the server's do. One that speaks HTTP/2 goes back to the
+// engine's own pool; see startH2.
+func (cc *clientConn) OnOpen(conn *fib.Connection) {
+	cc.conn = conn
+	conn.SetRunOnWorkers(true)
+}
 
 func (cc *clientConn) OnPriorityData(*fib.Connection, []byte) {}
 
@@ -909,6 +916,7 @@ func (cc *clientConn) OnClose(_ *fib.Connection, err error) {
 	if err == nil || err == io.EOF {
 		err = io.ErrUnexpectedEOF
 	}
-	// OnClose runs on the event loop, which the callback must not hold up.
+	// OnClose runs in the connection's last round, which may be on the event
+	// loop, and the callback must not hold that up.
 	go r.finish(nil, err)
 }

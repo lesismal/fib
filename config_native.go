@@ -96,6 +96,49 @@ type Config struct {
 	// I/O, take contended locks, or run unbounded work want the worker pool,
 	// which exists precisely so that one slow connection cannot stall the rest.
 	InlineHandlers bool
+	// IOPollers splits the engine across several event loops. The engine's
+	// own loop is left to accept connections and serve its UDP sockets, and
+	// every connection it accepts is handed to one of IOPollerCount further
+	// loops, the one its descriptor picks modulo their number, which then
+	// serves that connection for the rest of its life. Connections the
+	// engine dials, over TCP, UDP or a Unix socket, go to those loops the
+	// same way. A UDP listener's peers share its one socket, so they stay on
+	// the engine's own loop.
+	//
+	// Spreading the connections spreads the loop's own work, the waits,
+	// registrations and wake-ups, over several cores, and each loop then runs
+	// its connections' rounds itself: the engine's task pool is a
+	// taskpool.ModeInline one, which recovers a panicking handler the way a
+	// worker does. As with InlineHandlers, a handler that blocks stalls every
+	// connection on its loop. A connection whose handlers may take a while
+	// asks for workers instead, with Connection.SetRunOnWorkers, and runs on
+	// the pool TaskPoolMode, WorkerCount and SharedTaskPool describe, built
+	// the first time one does: the http package has every HTTP/1 connection
+	// do so, while an HTTP/2 or HTTP/3 one reads on the engine's own pool and
+	// runs its requests on the stream pool, which is unaffected and still
+	// sized from WorkerCount. A pool supplied through SetTaskPool is kept.
+	//
+	// Without it, the engine serves listeners and connections alike on its
+	// one loop.
+	//
+	// Only the Linux and macOS backends have pollers; on Windows the engine
+	// keeps its single loop and its task pool, as if this were unset.
+	IOPollers bool
+	// IOPollerCount is how many loops IOPollers creates. Zero or less means
+	// one per CPU, runtime.NumCPU.
+	//
+	// One per CPU suits connections whose rounds run on their loops. Where
+	// they run on workers instead, as every HTTP/1 connection's do (see
+	// Connection.SetRunOnWorkers), a loop only waits for events and hands
+	// them on, which one loop keeps up with, and each further loop competes
+	// with the workers for the same Ps: after every round a loop yields to
+	// the workers it woke and then waits behind them for a P, so each loop's
+	// rounds gather fewer connections, and requests wait longer to be read.
+	// An HTTP/1 echo over 10k connections on three CPUs measured 583k
+	// requests/s without pollers, 584k with one poller, and 569k with three,
+	// whose 99th percentile latency rose from 25ms to 37ms. Set it low, one
+	// or a few, for such a load.
+	IOPollerCount int
 	// UDPIdleTimeout closes a UDP peer's connection once the peer has neither
 	// sent nor been sent a datagram for this long, since UDP has no close of
 	// its own to end it. OnClose receives ErrUDPIdleTimeout. Zero means

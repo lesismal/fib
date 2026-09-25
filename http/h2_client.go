@@ -95,6 +95,7 @@ func (cc *clientConn) startH2() {
 	}
 	cc.maxStreams = h2InitialMaxStreams
 	cc.h2 = hc
+	cc.conn.SetRunOnWorkers(false)
 	out := append([]byte(nil), h2Preface...)
 	out = h2AppendSettings(out,
 		[2]uint32{uint32(h2SettingEnablePush), 0},
@@ -277,7 +278,8 @@ func (hc *h2ClientConn) shutdown(err error) {
 			hc.client.enqueue(hc.cc.host.target, r, true)
 			continue
 		}
-		// OnClose runs on the event loop, which the callback must not hold up.
+		// OnClose runs in the connection's last round, which may be on the
+		// event loop, and the callback must not hold that up.
 		go r.finish(nil, err)
 	}
 }

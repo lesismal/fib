@@ -13,7 +13,13 @@ import (
 	"github.com/lesismal/fib/bufferpool"
 )
 
+// pollersSupported says Config.IOPollers applies, which it does not to a
+// backend that already serves each connection on a goroutine of its own.
+const pollersSupported = false
+
 type Engine struct {
+	// pollers is always empty here; see pollersSupported.
+	pollers         []*Engine
 	name            string
 	listeners       []net.Listener
 	handler         Handler
@@ -34,6 +40,9 @@ type Engine struct {
 	udpListeners   []*udpListener
 	udpIdleTimeout time.Duration
 }
+
+// root is the engine the application created, which here is always e.
+func (e *Engine) root() *Engine { return e }
 
 // Bind creates an engine that listens on config.Addr, or on every address in
 // config.Addrs, and serves the connections it accepts with handler.

@@ -3,7 +3,8 @@
 这是 [`c/`](../c) 目录下 C11 实现的 Go 移植版，保留相同的核心架构：
 
 - 单个 edge-triggered event loop（Linux 上是 epoll，macOS 上是 kqueue，Windows 上是 IOCP）
-  独占所有事件注册和 fd 关闭操作。
+  独占所有事件注册和 fd 关闭操作。Linux 和 macOS 上开启 `IOPollers` 时连接分到多个 event loop
+  上（见下）。
 - connection 是本地 `taskpool.TaskPool` 的任务单位。TaskPool 使用常驻、有界
   worker，避免短事件触发大量 goroutine 创建和栈扩容；connection 不与某个
   worker 固定绑定。
@@ -15,7 +16,9 @@
 - `Config.TaskPoolMode` 可选 `taskpool.ModeCond`（基于 `sync.Cond` 的有界环形
   队列，按 worker 数分片）、`taskpool.ModeElastic`（nbio 风格的弹性
   fork/dispatcher）或 `taskpool.ModeAdaptive`（见下，所有后端的默认值，
-  `taskpool.New` 也默认使用它）。
+  `taskpool.New` 也默认使用它）。`taskpool.ModeInline`（`taskpool.NewInline`）
+  不起 worker，也没有队列，直接在提交任务的 goroutine 上带 recover 执行，开启
+  `IOPollers` 时 Engine 自己的池就是这种（见下）。
 - `taskpool.ModeAdaptive` 同样分片，但常驻数量随负载在下限和上限之间变化，调度方式
   也不同：
   - 唤醒：每个空闲 worker 有自己的唤醒通道，按后进先出压在空闲栈上，被唤醒的总是
@@ -1118,3 +1121,57 @@ runtime.GOMAXPROCS(2 * runtime.NumCPU())
 代价是 handler 会阻塞它所在的整个 server —— 在它返回之前，事件循环无法收事件、无法 accept、
 也无法服务这个 server 上的其他连接。只有在所有 handler 都很短且不会阻塞时才开启；会做 I/O、
 抢锁或执行不定长工作的 handler 应该继续走工作协程池，这个池存在的意义正是让一条慢连接不拖住其他连接。
+
+## IOPollers
+
+`Config.IOPollers` 把一个 Engine 拆到多个事件循环上（仅 Linux 的 epoll 和 macOS 的 kqueue；
+Windows 上忽略这个配置，保持单个循环和原来的 task pool）：
+
+- Engine 自己的循环只负责 accept 和它的 UDP socket；每条 accept 到的连接按 `fd % pollerCount`
+  交给其中一个 poller，此后由那个 poller 负责它的事件注册、读写和关闭。poller 数量由
+  `Config.IOPollerCount` 指定，不大于 0 时取 `runtime.NumCPU()`；默认不创建 poller，
+  listener 和连接都在同一个 event loop 上。
+  每 CPU 一个 poller 适合连接的每一轮都在 poller 上执行（Inline）的负载；如果连接的处理都交给
+  worker（比如 HTTP/1，见下），`IOPollerCount` 应该设小（1 个或几个）。这时 poller 只负责等事件、
+  交给 worker，一个就够用，多出来的 poller 会和 worker 抢同样的 P：每一轮结束后 poller 都要
+  让出 P 给刚唤醒的 worker，再排在它们后面等 P，于是每轮收集到的连接更少、请求被读到得更晚。
+  实测 3 个 CPU、1 万连接的 HTTP/1 echo：不开 IOPollers 583k 请求/s，1 个 poller 584k，3 个
+  poller 569k，p99 从 25ms 升到 37ms。
+- `Dial` / `DialWithHandler` 发起的连接（TCP、UDP、Unix socket）也同样按 fd 取模分到 poller 上。
+  UDP server 的各个 peer 共用监听的那一个 socket，所以留在 Engine 自己的循环上。
+- 开启后 Engine 自己的 task pool 固定为 `taskpool.ModeInline`（名为 `<Name>-inline`）：
+  每个 poller 在自己的 goroutine 上直接执行它那些连接的这一轮处理，handler panic 会被
+  recover 并关闭该连接。和 `InlineHandlers` 一样，阻塞的 handler 会卡住同一个 poller 上的
+  所有连接。通过 `SetTaskPool` 传入的池不受影响。
+- handler 可能耗时的连接调用 `Connection.SetRunOnWorkers(true)`，它的每一轮（读、`OnData`、
+  `OnClose`）就改在 worker 池上执行。这个池就是 `TaskPoolMode`、`WorkerCount`、
+  `SharedTaskPool` 描述的那个（`<Name>-workers`），第一条要求它的连接出现时才创建。
+  Engine 本来就在 worker 上执行时这个设置不起作用；`InlineHandlers` 和 `ModeInline`
+  下同样有效。
+- http 子 package 的 HTTP/1 连接（服务端和客户端）一律 `SetRunOnWorkers(true)`，读、解析、
+  handler 都在 worker 上完成；识别出 HTTP/2（preface、ALPN `h2`、h2c upgrade）后改回
+  `false`，由 Engine 自己的池（不论是否 Inline）读和解析，请求交给共享的 stream pool
+  执行。HTTP/3 同样在 Engine 自己的池上读和解析，请求走 stream pool。stream pool 仍按
+  `WorkerCount` 计算大小。
+- WebSocket 连接不调用 `SetRunOnWorkers`，跟随 Engine 的配置：开启 IOPollers 时消息在 poller
+  上用 Inline 池处理，否则用 worker 池。所以开启 IOPollers 时 WebSocket 的消息回调同样不能阻塞。
+- `MaxPendingBytes` 仍是整个 Engine（含所有 poller）的总预算；一个 poller 上的连接把预算
+  释放到恢复线以下时，会唤醒其他因预算暂停了连接的 poller。`Stats()` 汇总所有 poller 的计数，
+  `Connection.Engine()` 返回的仍是用户创建的那个 Engine。
+
+```go
+config := fib.DefaultConfig()
+config.IOPollers = true
+config.IOPollerCount = 0 // runtime.NumCPU() 个
+```
+
+## OnClose 的顺序
+
+事件循环关闭一条连接时（`Close`、deadline、UDP 空闲超时、读写出错等），连接立即停止收发，
+发送队列和预算立即释放，但 `OnClose` 和 fd 的释放像 `noteEvent` 一样折进这条连接、排在它的
+一轮里：如果它的一轮正在执行或已在排队，`OnClose` 等那一轮的 `OnData` 返回之后才执行，fd 也
+在那之后才由事件循环关闭。所以 `OnClose` 总在之前的 `OnData` 之后，一轮还在 worker 上跑时
+它读写的 fd 也不会被关闭或被别的连接复用。
+
+相应地，在 `OnData`（例如 HTTP/1 handler）里关闭自己的连接后再等待 `OnClose` 带来的通知
+（如 `Context.OnCancel`）会死锁：那个通知要等这一轮返回才会到。

@@ -355,6 +355,11 @@ func NewHandlerWithConfig(config Config, handler Handler) *ServerHandler {
 	return h
 }
 
+// OnOpen leaves the connection on whichever pool the engine's configuration
+// gives it, inline or not: unlike the http package's HTTP/1 connections, a
+// WebSocket connection does not ask for workers (see
+// fib.Connection.SetRunOnWorkers), so under Config.IOPollers its messages are
+// handled on its poller and a handler that blocks holds that poller up.
 func (h *ServerHandler) OnOpen(c *fib.Connection) {
 	c.SetAttachment(&connectionState{})
 }

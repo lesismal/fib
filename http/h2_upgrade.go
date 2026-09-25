@@ -55,6 +55,8 @@ func (h *ServerHandler) upgradeH2C(c *fib.Connection, parser *Parser, request *s
 	}
 	rest := parser.TakeBuffered()
 	h.releaseTimeouts(c, parser)
+	// The connection is HTTP/2 from here on; see startH2.
+	c.SetRunOnWorkers(false)
 	c.SetAttachment(sc)
 	// The 101 is the implicit acknowledgement of the client's settings.
 	_ = c.Send([]byte(h2cSwitchingProtocols))

@@ -10,6 +10,10 @@ import (
 	"time"
 )
 
+// pollersSupported says Config.IOPollers applies: the readiness backends
+// can run one loop per poller.
+const pollersSupported = true
+
 const (
 	// A token's low half is always a descriptor and its high half says what
 	// that descriptor is: one of the server's listeners, the wake-up eventfd,
@@ -377,6 +381,34 @@ func (e *Engine) LocalAddrs() ([]*net.TCPAddr, error) {
 	return addrs, nil
 }
 
+// Run serves the engine until Stop. With pollers, it runs each of them on a
+// goroutine of its own while this one accepts, and returns once they have all
+// returned; a poller that fails stops the rest.
+func (e *Engine) Run() error {
+	e.logRun()
+	if len(e.pollers) == 0 {
+		return e.runLoop()
+	}
+	errs := make(chan error, len(e.pollers))
+	for _, p := range e.pollers {
+		go func(p *Engine) {
+			err := p.runLoop()
+			if err != nil {
+				e.Stop()
+			}
+			errs <- err
+		}(p)
+	}
+	err := e.runLoop()
+	e.Stop()
+	for range e.pollers {
+		if pollerErr := <-errs; err == nil {
+			err = pollerErr
+		}
+	}
+	return err
+}
+
 func (e *Engine) acceptConnections(listenFD int) {
 	for {
 		fd, err := acceptSocket(listenFD)
@@ -386,24 +418,54 @@ func (e *Engine) acceptConnections(listenFD int) {
 		if err != nil {
 			return
 		}
-		// The token pairs the descriptor with a generation: the descriptor
-		// indexes the table, and the generation makes an event left over from a
-		// previous owner of the same descriptor resolve to nothing.
-		token := uint64(uint32(fd)) | e.nextGeneration.Add(1)<<32
-		c := &Connection{engine: e, handler: e.handler}
-		c.token = token
-		c.fd.Store(int32(fd))
-		// Write interest is registered up front and never modified again. The
-		// descriptor is edge-triggered, so an always-armed write interest only
-		// fires when the socket goes from full back to writable, which spares
-		// the loop a registration change per backpressured message.
-		if err := e.registerConnection(fd, token); err != nil {
-			syscall.Close(fd)
+		if len(e.pollers) == 0 {
+			e.admit(&Connection{engine: e, handler: e.handler}, fd)
 			continue
 		}
-		e.trackConnection(fd, c)
-		c.handler.OnOpen(c)
+		// The poller registers the descriptor itself, since its table and
+		// its backend are its loop's alone.
+		p := e.pollers[fd%len(e.pollers)]
+		c := &Connection{engine: p, handler: e.handler}
+		c.fd.Store(int32(fd))
+		if !p.request(command{kind: commandAccept, connection: c}) {
+			syscall.Close(fd)
+		}
 	}
+}
+
+// admitAccepted admits a connection the engine's own loop accepted and
+// handed to this poller. One that arrives after the poller stopped is closed
+// instead, since nothing would ever serve it. Callers run on the event loop.
+func (e *Engine) admitAccepted(c *Connection) {
+	fd := c.FD()
+	if e.stopping.Load() {
+		c.fd.Store(-1)
+		syscall.Close(fd)
+		return
+	}
+	e.admit(c, fd)
+}
+
+// admit registers an accepted descriptor with the loop and opens its
+// connection. Callers run on the event loop.
+func (e *Engine) admit(c *Connection, fd int) {
+	// The token pairs the descriptor with a generation: the descriptor
+	// indexes the table, and the generation makes an event left over from a
+	// previous owner of the same descriptor resolve to nothing.
+	token := uint64(uint32(fd)) | e.nextGeneration.Add(1)<<32
+	c.token = token
+	c.fd.Store(int32(fd))
+	// Write interest is registered up front and never modified again. The
+	// descriptor is edge-triggered, so an always-armed write interest only
+	// fires when the socket goes from full back to writable, which spares
+	// the loop a registration change per backpressured message.
+	if err := e.registerConnection(fd, token); err != nil {
+		c.fd.Store(-1)
+		syscall.Close(fd)
+		return
+	}
+	e.trackConnection(fd, c)
+	c.handler.OnOpen(c)
 }
 
 // detach releases a closed connection's descriptor and its table slot.
@@ -431,8 +493,16 @@ func (e *Engine) Close() error {
 	e.closeOnce.Do(func() {
 		e.Stop()
 		e.stopUDPSweeper()
+		// The pollers' connections are the engine's, so they close first,
+		// while the task pool they run on is still there.
+		for _, p := range e.pollers {
+			if err := p.Close(); err != nil && closeErr == nil {
+				closeErr = err
+			}
+		}
 		e.taskWG.Wait()
 		e.releaseTaskPool()
+		e.releaseWorkerPool()
 		e.closeCommands()
 		for _, entries := range e.connections {
 			for _, c := range entries {

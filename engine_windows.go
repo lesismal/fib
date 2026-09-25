@@ -28,6 +28,15 @@ import (
 // hands the queued bytes to an overlapped WSASend, and its completion plays the
 // part of the write edge: it says the bytes left, and the worker carries on
 // with whatever was queued behind them.
+// pollersSupported says Config.IOPollers applies. A completion port is
+// already fed by the kernel rather than by a loop that waits on readiness,
+// so the engine keeps its one loop and ignores the setting.
+const pollersSupported = false
+
+// admitAccepted admits a connection a parent engine accepted for this
+// poller. Without pollers nothing ever queues one.
+func (e *Engine) admitAccepted(*Connection) {}
+
 const (
 	// acceptsPerListener is how many AcceptEx calls each listener keeps
 	// outstanding. Connections beyond them wait in the listen backlog, so this
@@ -742,6 +751,7 @@ func (e *Engine) Close() error {
 		e.stopUDPSweeper()
 		e.taskWG.Wait()
 		e.releaseTaskPool()
+		e.releaseWorkerPool()
 		e.closeCommands()
 		for c := range e.conns {
 			e.closeConnection(c, nil, false)

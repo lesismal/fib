@@ -60,6 +60,12 @@ const (
 	commandDial
 	commandDialTimeout
 	commandUDPSweep
+	// commandAccept hands a poller a connection the engine's own loop
+	// accepted; see Config.IOPollers.
+	commandAccept
+	// commandDetach releases the descriptor of a connection whose last
+	// round has run its OnClose; see closeConnection.
+	commandDetach
 )
 
 type command struct {
@@ -73,8 +79,20 @@ type commandBatch struct{ items []command }
 // Engine owns the listeners, the event loop, its command queue, and the worker
 // pool. The loop itself is platform code: epoll on Linux, kqueue on macOS and
 // an I/O completion port on Windows, each embedded here as enginePlatform.
+//
+// With Config.IOPollers, the engine also owns the pollers its connections are
+// served on. Each poller is an Engine of its own with no listeners, whose
+// loop, command queue and descriptor table serve only the connections handed
+// to it, while the settings, the handler, the task pool and the server-wide
+// budget are the parent's.
 type Engine struct {
 	enginePlatform
+	// parent is the engine a poller serves connections for, and nil for an
+	// engine the application created.
+	parent *Engine
+	// pollers are the loops the engine hands its connections to; see
+	// Config.IOPollers. Empty when the engine serves them itself.
+	pollers            []*Engine
 	name               string
 	maxEvents          int
 	useWritev          bool
@@ -86,7 +104,9 @@ type Engine struct {
 	sendBufferSize     int
 	handler            Handler
 	stopping           atomic.Bool
-	pendingTotal       atomic.Int64
+	// pendingTotal is the outbound total MaxPendingBytes bounds, which an
+	// engine's pollers share with it.
+	pendingTotal *atomic.Int64
 	// Backpressure counters, reported by Stats. They move only when a
 	// connection's read interest actually changes, which is rare by design.
 	readsPausedByWatermark atomic.Uint64
@@ -106,14 +126,29 @@ type Engine struct {
 	// budgetResume is the spare list resumeBudgetPaused swaps in while it walks
 	// the current one. Event-loop ownership.
 	budgetResume []*Connection
-	// redeliver holds stalled connections whose read the loop is handing back
-	// directly, to be scheduled at the end of the round. Event-loop ownership.
+	// budgetWaiting says budgetPaused is not empty, for whichever goroutine
+	// drains the budget, which with pollers may belong to another loop and
+	// has to wake this one; see releaseBudget.
+	budgetWaiting atomic.Bool
+	// redeliver holds connections the loop itself made runnable, to be
+	// scheduled at the end of the round: stalled ones whose read it hands
+	// back, and closed ones whose last round is to run OnClose. Event-loop
+	// ownership.
 	redeliver       []*Connection
 	taskPool        TaskPool
 	releaseTaskPool func()
-	taskWG          sync.WaitGroup
-	readBufferSize  int
-	closeOnce       sync.Once
+	// inlineTasks says taskPool runs tasks on the loop that submits them.
+	inlineTasks bool
+	// workers is the pool of workers connections that ask for one run on
+	// while the engine's own rounds run on its loops; see workerPool. The
+	// application's engine keeps it for its pollers too.
+	workers workerPool
+	// offload collects a round's connections bound for workers. Event-loop
+	// ownership.
+	offload        []*Connection
+	taskWG         sync.WaitGroup
+	readBufferSize int
+	closeOnce      sync.Once
 	// udpListeners are the engine's UDP sockets, when Config.Network names
 	// UDP. udpIdleTimeout closes their silent peers, and udpSweepDone stops
 	// the ticker that checks for them.
@@ -228,15 +263,110 @@ func newEngine(config Config, handler Handler, addrs []string) (*Engine, error) 
 		// the buffer a round is given is exactly the class it comes from.
 		sendBufferSize: bufferpool.Align(2 * config.ReadBufferSize),
 		udpIdleTimeout: udpIdleTimeout(config.UDPIdleTimeout),
+		pendingTotal:   new(atomic.Int64),
 		handler:        handler}
 	e.readBufferSize = config.ReadBufferSize
+	e.workers.config = config
 	e.taskPool, e.releaseTaskPool = acquireTaskPool(config)
+	if pool, ok := e.taskPool.(*taskpool.TaskPool); ok {
+		e.inlineTasks = pool.Mode() == taskpool.ModeInline
+	}
 	if err := e.open(config, addrs); err != nil {
 		e.releaseTaskPool()
 		return nil, err
 	}
+	if err := e.openPollers(config); err != nil {
+		_ = e.Close()
+		return nil, err
+	}
 	e.startUDPSweeper()
 	return e, nil
+}
+
+// openPollers creates the loops Config.IOPollers asks for. A poller is
+// created as an engine without listeners and shares everything else with
+// this one.
+func (e *Engine) openPollers(config Config) error {
+	n := pollerCount(config)
+	for i := 0; i < n; i++ {
+		p := &Engine{parent: e, name: e.name, maxEvents: e.maxEvents, useWritev: e.useWritev,
+			inlineHandlers: e.inlineHandlers, writeHighWatermark: e.writeHighWatermark,
+			writeLowWatermark: e.writeLowWatermark, maxPendingBytes: e.maxPendingBytes,
+			budgetResumeBytes: e.budgetResumeBytes, sendBufferSize: e.sendBufferSize,
+			udpIdleTimeout: e.udpIdleTimeout, pendingTotal: e.pendingTotal, handler: e.handler,
+			taskPool: e.taskPool, releaseTaskPool: func() {}, inlineTasks: e.inlineTasks,
+			readBufferSize: e.readBufferSize}
+		if err := p.open(config, nil); err != nil {
+			return err
+		}
+		e.pollers = append(e.pollers, p)
+	}
+	return nil
+}
+
+// workerPool is an engine's pool of workers for connections that ask for one
+// while the engine runs rounds on its loops. It is built the first time one
+// asks, since an engine that serves nothing that does has no use for it.
+type workerPool struct {
+	// config is what the pool is built from.
+	config Config
+	// ready holds the pool once it is built, for the loops to read without
+	// the lock.
+	ready   atomic.Pointer[builtWorkerPool]
+	mu      sync.Mutex
+	release func()
+	// closed turns building away once the engine has released the pool.
+	closed bool
+}
+
+type builtWorkerPool struct{ pool TaskPool }
+
+// workerPool returns the pool the rounds of connections that asked for
+// workers run on, or nil once the engine has closed. It is the engine's own
+// pool unless that one runs rounds on the loops.
+func (e *Engine) workerPool() TaskPool {
+	if !e.inlineTasks && !e.inlineHandlers {
+		return e.taskPool
+	}
+	w := &e.root().workers
+	if built := w.ready.Load(); built != nil {
+		return built.pool
+	}
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if built := w.ready.Load(); built != nil || w.closed {
+		if built == nil {
+			return nil
+		}
+		return built.pool
+	}
+	pool, release := acquireWorkerPool(w.config)
+	w.release = release
+	w.ready.Store(&builtWorkerPool{pool: pool})
+	return pool
+}
+
+// releaseWorkerPool lets go of the pool of workers, if one was built, and
+// turns away building one after it.
+func (e *Engine) releaseWorkerPool() {
+	w := &e.workers
+	w.mu.Lock()
+	w.closed = true
+	release := w.release
+	w.release = nil
+	w.mu.Unlock()
+	if release != nil {
+		release()
+	}
+}
+
+// root is the engine the application created: this one, or the one this
+// poller serves.
+func (e *Engine) root() *Engine {
+	if e.parent != nil {
+		return e.parent
+	}
+	return e
 }
 
 // errNoListener is what LocalAddr reports for an engine made by NewEngine.
@@ -275,13 +405,20 @@ type Stats struct {
 	PendingBytes int64
 }
 
+// Stats covers the engine's pollers too, since they serve its connections.
 func (e *Engine) Stats() Stats {
-	return Stats{
+	s := Stats{
 		ReadsPausedByWatermark: e.readsPausedByWatermark.Load(),
 		ReadsPausedByBudget:    e.readsPausedByBudget.Load(),
 		ReadsResumed:           e.readsResumed.Load(),
 		PendingBytes:           e.pendingTotal.Load(),
 	}
+	for _, p := range e.pollers {
+		s.ReadsPausedByWatermark += p.readsPausedByWatermark.Load()
+		s.ReadsPausedByBudget += p.readsPausedByBudget.Load()
+		s.ReadsResumed += p.readsResumed.Load()
+	}
+	return s
 }
 
 // runReady ends one round of the loop: it hands the connections the round made
@@ -295,12 +432,23 @@ func (e *Engine) runReady(ready []*Connection, tasks []taskpool.Task) ([]*Connec
 	clear(e.redeliver)
 	e.redeliver = e.redeliver[:0]
 	if len(ready) > 0 {
+		all := len(ready)
+		// yield says workers were just woken, rather than every round run
+		// here.
+		yield := false
+		if e.inlineHandlers || e.inlineTasks {
+			// Connections that asked for workers leave the loop even so.
+			ready, tasks, yield = e.submitToWorkers(ready, tasks)
+		}
 		if e.inlineHandlers {
 			for _, c := range ready {
 				c.process()
 			}
-		} else {
-			tasks = e.submitReady(ready, tasks[:0])
+		} else if len(ready) > 0 {
+			tasks = e.submitReady(e.taskPool, ready, tasks[:0])
+			yield = yield || !e.inlineTasks
+		}
+		if yield {
 			// The workers just woken wait on this goroutine's P, and the loop
 			// is about to wait for events in a system call that keeps the P
 			// out of use: while there is other work, the runtime hands it on
@@ -313,10 +461,32 @@ func (e *Engine) runReady(ready []*Connection, tasks []taskpool.Task) ([]*Connec
 			// after each wait.
 			runtime.Gosched()
 		}
+		ready = ready[:all]
 		clear(ready)
 		ready = ready[:0]
 	}
 	return ready, tasks
+}
+
+// submitToWorkers hands the connections of a round that asked for workers to
+// the pool of them, and reports the rest, which the loop runs, compacted at
+// the front of ready, and whether there were any to hand over.
+func (e *Engine) submitToWorkers(ready []*Connection, tasks []taskpool.Task) ([]*Connection, []taskpool.Task, bool) {
+	kept := ready[:0]
+	for _, c := range ready {
+		if c.onWorkers.Load() {
+			e.offload = append(e.offload, c)
+		} else {
+			kept = append(kept, c)
+		}
+	}
+	if len(e.offload) == 0 {
+		return kept, tasks, false
+	}
+	tasks = e.submitReady(e.workerPool(), e.offload, tasks[:0])
+	clear(e.offload)
+	e.offload = e.offload[:0]
+	return kept, tasks, true
 }
 
 // resumeBudgetPaused re-arms reads on connections the server-wide budget held
@@ -343,28 +513,72 @@ func (e *Engine) resumeBudgetPaused() {
 	}
 	clear(waiting)
 	e.budgetResume = waiting
+	e.budgetWaiting.Store(len(e.budgetPaused) > 0)
 }
 
-// submitReady hands one round's newly runnable connections to the task pool in
-// a single batch instead of one lock-and-wake cycle per connection.
-func (e *Engine) submitReady(ready []*Connection, tasks []taskpool.Task) []taskpool.Task {
+// releaseBudget returns n bytes to the server-wide budget. Draining it below
+// the level paused connections resume at wakes every loop holding some, since
+// the loop whose connection drained it need not be theirs, and a loop whose
+// connections are all paused has nothing else to wake it.
+//
+// A loop that parks a connection sets budgetWaiting before the same round
+// checks the budget in resumeBudgetPaused, so a drain lands either before
+// that check, which then sees it, or after the flag, which this then sees.
+func (e *Engine) releaseBudget(n int64) {
+	total := e.pendingTotal.Add(-n)
+	if e.maxPendingBytes <= 0 || total > e.budgetResumeBytes || total+n <= e.budgetResumeBytes {
+		return
+	}
+	root := e.root()
+	if root.budgetWaiting.Load() {
+		root.notify()
+	}
+	for _, p := range root.pollers {
+		if p.budgetWaiting.Load() {
+			p.notify()
+		}
+	}
+}
+
+// submitReady hands one round's newly runnable connections to pool in a
+// single batch instead of one lock-and-wake cycle per connection. A nil pool,
+// which is a pool of workers asked for after the engine closed, takes none.
+func (e *Engine) submitReady(pool TaskPool, ready []*Connection, tasks []taskpool.Task) []taskpool.Task {
 	for _, c := range ready {
 		tasks = append(tasks, c)
 	}
 	e.taskWG.Add(len(tasks))
-	accepted := e.taskPool.GoTasks(tasks)
+	accepted := 0
+	if pool != nil {
+		accepted = pool.GoTasks(tasks)
+	}
 	for _, c := range ready[accepted:] {
 		e.taskWG.Done()
 		c.mu.Lock()
 		c.scheduled = false
+		closing := c.closePending
+		c.closePending = false
 		c.mu.Unlock()
-		c.Close()
+		if closing {
+			// The round that was to finish the close will not run, so the
+			// close is finished here instead.
+			c.finishClose()
+		} else {
+			c.Close()
+		}
 	}
 	clear(tasks)
 	return tasks
 }
 
-func (e *Engine) Stop() { e.stopping.Store(true); e.notify() }
+// Stop makes Run return, once it has stopped the engine's pollers too.
+func (e *Engine) Stop() {
+	e.stopping.Store(true)
+	e.notify()
+	for _, p := range e.pollers {
+		p.Stop()
+	}
+}
 
 // request queues a command for the event loop. It reports false, and queues
 // nothing, once Close has drained the queue for the last time.
@@ -394,6 +608,19 @@ func (e *Engine) closeCommands() {
 	e.commandsClosed = true
 	e.commandMu.Unlock()
 	e.drainCommands()
+	// No loop or worker is left to run the rounds the loop still owes, and
+	// closes above all must not lose their OnClose. The closed connections'
+	// last rounds run here; the rest are closed with the engine.
+	for _, c := range e.redeliver {
+		c.mu.Lock()
+		closing := c.closePending
+		c.mu.Unlock()
+		if closing {
+			c.process()
+		}
+	}
+	clear(e.redeliver)
+	e.redeliver = e.redeliver[:0]
 }
 
 // notify wakes the event loop, coalescing requests that arrive before it has
@@ -464,6 +691,10 @@ func (e *Engine) drainCommands() {
 			e.expireDial(cmd.connection, cmd.dial)
 		case commandUDPSweep:
 			e.sweepUDP()
+		case commandAccept:
+			e.admitAccepted(cmd.connection)
+		case commandDetach:
+			e.detach(cmd.connection)
 		default:
 			e.refreshConnection(cmd.connection)
 		}
@@ -509,6 +740,7 @@ func (e *Engine) refreshConnection(c *Connection) {
 		// nothing of its own left to flush, so no later event of its own would
 		// re-evaluate it. The loop resumes it when the budget recovers.
 		e.budgetPaused = append(e.budgetPaused, c)
+		e.budgetWaiting.Store(true)
 	}
 	if changed {
 		switch {
@@ -529,6 +761,18 @@ func (e *Engine) refreshConnection(c *Connection) {
 	}
 }
 
+// closeConnection closes a connection from the loop. The connection stops at
+// once: nothing more is read or sent, and its queue and its share of the
+// budget are let go. What remains is ordered with its rounds the way an event
+// is, as noteEvent orders readiness: the close is folded into the connection
+// and a round scheduled for it, unless one already is, and that round runs
+// OnClose after whatever it or the round before it was delivering, then has
+// the loop release the descriptor. A round still running on a worker thus
+// never has OnClose run beside it, nor its descriptor closed, and possibly
+// handed to another connection, under it.
+//
+// Without callback, which is how Close ends what is left once no round can
+// run any more, the descriptor is released on the spot and nothing is told.
 func (e *Engine) closeConnection(c *Connection, closeErr error, callback bool) {
 	if c.dialing != nil {
 		// The dialer has not been handed the connection yet, so it is the one
@@ -542,6 +786,11 @@ func (e *Engine) closeConnection(c *Connection, closeErr error, callback bool) {
 	c.mu.Lock()
 	if c.closed {
 		c.mu.Unlock()
+		if !callback {
+			// A close still waiting for its last round, which will now never
+			// run.
+			e.detach(c)
+		}
 		return
 	}
 	c.closed = true
@@ -566,12 +815,19 @@ func (e *Engine) closeConnection(c *Connection, closeErr error, callback bool) {
 	// that abandons its queue, so a closed connection cannot hold the budget
 	// against the ones still running.
 	if pending := c.pendingBytes.Swap(0); pending > 0 {
-		e.pendingTotal.Add(-pending)
+		e.releaseBudget(pending)
 	}
+	if !callback {
+		c.mu.Unlock()
+		e.detach(c)
+		return
+	}
+	c.closePending = true
+	schedule := !c.scheduled
+	c.scheduled = true
 	c.mu.Unlock()
-	e.detach(c)
-	if callback {
-		c.handler.OnClose(c, closeErr)
+	if schedule {
+		e.redeliver = append(e.redeliver, c)
 	}
 }
 

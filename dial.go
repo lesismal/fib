@@ -26,6 +26,12 @@ type dialRequest struct {
 	sa     syscall.Sockaddr
 	raddr  *net.TCPAddr
 	err    error
+	// socket is a descriptor opened for the dial before it reached a loop,
+	// when hasSocket says there is one: an engine with pollers opens it to
+	// learn which poller the dial belongs to. The loop connects it in place
+	// of opening one of its own.
+	socket    int
+	hasSocket bool
 	// timer fires the dial timeout. Event-loop ownership.
 	timer *time.Timer
 }
@@ -103,16 +109,22 @@ func isLiteralAddr(addr string) bool {
 	return net.ParseIP(host) != nil
 }
 
-// requestDial hands a dial to the event loop. An engine that has already closed
-// will never run it, so the dial fails here instead.
+// requestDial hands a dial to the event loop that is to serve it: one of the
+// engine's pollers, if it has them, or its own. An engine that has already
+// closed will never run it, so the dial fails here instead.
 func (e *Engine) requestDial(d *dialRequest) {
-	if !e.request(command{kind: commandDial, dial: d}) {
+	if !e.dialLoop(d).request(command{kind: commandDial, dial: d}) {
 		d.fail(net.ErrClosed)
 	}
 }
 
-// fail reports a dial that never produced a connection.
+// fail reports a dial that never produced a connection, closing the socket
+// opened for it if no loop took it over.
 func (d *dialRequest) fail(err error) {
+	if d.hasSocket {
+		d.hasSocket = false
+		closeDialSocket(d.socket)
+	}
 	if d.done != nil {
 		d.done(nil, d.opError(err))
 	}

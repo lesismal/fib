@@ -10,8 +10,9 @@ import (
 // empty.
 func (e *Engine) Name() string { return e.name }
 
-// Engine reports the engine the connection belongs to.
-func (c *Connection) Engine() *Engine { return c.engine }
+// Engine reports the engine the connection belongs to: the one that
+// accepted or dialed it, even when one of its pollers serves it.
+func (c *Connection) Engine() *Engine { return c.engine.root() }
 
 // logRun logs that the engine has started serving, under its name, with the
 // addresses it listens on and the task pool its connections run on.
@@ -30,5 +31,6 @@ func (e *Engine) logRun() {
 	if named, ok := e.taskPool.(interface{ Name() string }); ok {
 		pool = named.Name()
 	}
-	slog.Info("fib: engine started", "engine", e.name, "listen", listening, "taskPool", pool)
+	slog.Info("fib: engine started", "engine", e.name, "listen", listening, "taskPool", pool,
+		"pollers", len(e.pollers))
 }
