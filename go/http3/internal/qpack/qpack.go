@@ -26,17 +26,21 @@ var (
 
 // AppendField appends one field line; a section starts with Prefix.
 func AppendField(dst []byte, name, value string, neverIndex bool) []byte {
-	if i, ok := staticPairIndex[HeaderField{name, value}]; ok && !neverIndex {
-		// Indexed field line, static table.
-		return appendInt(dst, 0xc0, 6, uint64(i))
-	}
-	if i, ok := staticNameIndex[name]; ok {
+	if entries := staticNameIndex[name]; len(entries) > 0 {
+		if !neverIndex {
+			for _, i := range entries {
+				if staticTable[i].Value == value {
+					// Indexed field line, static table.
+					return appendInt(dst, 0xc0, 6, uint64(i))
+				}
+			}
+		}
 		// Literal field line with a static name reference.
 		first := byte(0x50)
 		if neverIndex {
 			first |= 0x20
 		}
-		dst = appendInt(dst, first, 4, uint64(i))
+		dst = appendInt(dst, first, 4, uint64(entries[0]))
 		return appendString(dst, 0, 7, value)
 	}
 	// Literal field line with a literal name.
@@ -278,16 +282,14 @@ func appendString(dst []byte, first byte, n uint8, s string) []byte {
 	return append(dst, s...)
 }
 
-var (
-	staticPairIndex = make(map[HeaderField]int, len(staticTable))
-	staticNameIndex = make(map[string]int, len(staticTable))
-)
+// staticNameIndex maps a name to the static table's entries with it, in
+// order: one lookup finds both the entry a field can be indexed as, among a
+// few values, and the first one, which a literal refers to for its name.
+var staticNameIndex = make(map[string][]uint8, len(staticTable))
 
 func init() {
-	for i := len(staticTable) - 1; i >= 0; i-- {
-		f := staticTable[i]
-		staticPairIndex[f] = i
-		staticNameIndex[f.Name] = i
+	for i, f := range staticTable {
+		staticNameIndex[f.Name] = append(staticNameIndex[f.Name], uint8(i))
 	}
 }
 

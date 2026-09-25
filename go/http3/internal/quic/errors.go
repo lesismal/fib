@@ -24,6 +24,9 @@ const (
 	errKeyUpdate           = 0x0e
 	errAEADLimitReached    = 0x0f
 	errCryptoBase          = 0x100
+	// alertUnexpectedMessage is TLS's unexpected_message alert, which a
+	// CRYPTO error carries above errCryptoBase.
+	alertUnexpectedMessage = 10
 )
 
 var (

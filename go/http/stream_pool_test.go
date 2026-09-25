@@ -161,3 +161,73 @@ func TestStreamPoolShared(t *testing.T) {
 		t.Fatal("a pool was built for handlers that run on the reader")
 	}
 }
+
+// recordingStream is a Stream that records the responses written to it.
+type recordingStream struct {
+	mu    sync.Mutex
+	paths []string
+	done  chan struct{}
+}
+
+func (s *recordingStream) WriteResponse(req *stdhttp.Request, _ Response) error {
+	s.mu.Lock()
+	s.paths = append(s.paths, req.URL.Path)
+	s.mu.Unlock()
+	s.done <- struct{}{}
+	return nil
+}
+func (s *recordingStream) WriteInterim(int, stdhttp.Header) error { return nil }
+func (s *recordingStream) Push(*stdhttp.Request, string, *stdhttp.PushOptions) error {
+	return stdhttp.ErrNotSupported
+}
+
+// TestStreamPoolQueue checks that requests queued on a batch wait for Submit,
+// and that one the connection's limit keeps off the pool is served where it
+// is queued, after what was queued ahead of it has gone to the pool.
+func TestStreamPoolQueue(t *testing.T) {
+	pool := NewStreamPool(StreamPoolConfig{MaxConcurrentHandlers: 3})
+	stream := &recordingStream{done: make(chan struct{}, 8)}
+	release := make(chan struct{})
+	handler := HandlerFunc(func(c *Context, r *stdhttp.Request) {
+		if r.URL.Path != "/inline" {
+			<-release
+		}
+		_ = c.Respond(stdhttp.StatusOK, "text/plain", nil)
+	})
+	request := func(path string) *StreamRequest {
+		r := new(StreamRequest)
+		r.URL.Path = path
+		r.Request.URL = &r.URL
+		r.Request.Method = stdhttp.MethodGet
+		r.Request.Header = stdhttp.Header{}
+		r.Context(nil, stream, nil)
+		return r
+	}
+	var gate StreamGate
+	var batch StreamBatch
+	pool.Queue(&batch, &gate, nil, handler, request("/a"))
+	pool.Queue(&batch, &gate, nil, handler, request("/b"))
+	if gate.Running() != 2 || len(batch.tasks) != 2 {
+		t.Fatalf("%d running and %d queued, want both queued and counted", gate.Running(), len(batch.tasks))
+	}
+	select {
+	case <-stream.done:
+		t.Fatal("a queued request was served before Submit")
+	case <-time.After(20 * time.Millisecond):
+	}
+	// The third is at the limit: it is served here, and only once the two
+	// ahead of it are on the pool.
+	pool.Queue(&batch, &gate, nil, handler, request("/inline"))
+	if len(batch.tasks) != 0 {
+		t.Fatalf("%d requests left queued behind one served in place", len(batch.tasks))
+	}
+	<-stream.done
+	close(release)
+	<-stream.done
+	<-stream.done
+	stream.mu.Lock()
+	defer stream.mu.Unlock()
+	if len(stream.paths) != 3 || stream.paths[0] != "/inline" {
+		t.Fatalf("served %v", stream.paths)
+	}
+}

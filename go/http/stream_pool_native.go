@@ -77,6 +77,46 @@ func (p *StreamPool) Serve(gate *StreamGate, conn *fib.Connection, handler Handl
 	p.submit(&r.task)
 }
 
+// StreamBatch holds requests of one connection that Queue has admitted to a
+// StreamPool, until Submit hands them to its workers together. A burst of
+// requests handed over as one batch lands on one shard of the pool, in
+// order, and is taken off it by the same few workers, so its responses are
+// written close together, which a protocol that packs them into packets
+// makes use of; handed over one at a time, they go to shards whose queues
+// differ, and finish as far apart as those queues are. A connection keeps
+// one batch, by value, used only by the goroutine that reads it.
+type StreamBatch struct {
+	tasks []taskpool.Task
+}
+
+// Queue is Serve for a request that goes to the pool with the others queued
+// on b, once Submit is called. A request the connection's limit keeps off the
+// pool is served at once, as Serve serves it, after those queued ahead of it
+// are submitted.
+func (p *StreamPool) Queue(b *StreamBatch, gate *StreamGate, conn *fib.Connection, handler Handler, r *StreamRequest) {
+	if !p.admit(gate) {
+		p.Submit(b)
+		Serve(handler, &r.context)
+		return
+	}
+	r.task = streamTask{gate: gate, conn: conn, handler: handler, context: &r.context}
+	b.tasks = append(b.tasks, &r.task)
+}
+
+// Submit hands the requests queued on b to the pool, in order.
+func (p *StreamPool) Submit(b *StreamBatch) {
+	if len(b.tasks) == 0 {
+		return
+	}
+	n := p.pool.GoTasks(b.tasks)
+	for _, task := range b.tasks[n:] {
+		// The pool has stopped taking work; the request is served here.
+		task.(*streamTask).run()
+	}
+	clear(b.tasks)
+	b.tasks = b.tasks[:0]
+}
+
 // admit reports whether a request of the connection gate counts for goes to
 // the pool, counting it if so, or has to be served by the caller: when there
 // is no pool, or the connection is at its limit.

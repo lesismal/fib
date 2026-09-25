@@ -2,6 +2,7 @@ package quic
 
 import (
 	"encoding/binary"
+	"sync"
 	"time"
 
 	"github.com/lesismal/fib/go/bufferpool"
@@ -129,16 +130,24 @@ func (c *Conn) sendRoundLocked() {
 	bufferpool.Put(mem)
 }
 
+// roundDatagrams are the slices a batched send lists a round's datagrams in:
+// an array on the stack would be moved to the heap for every batch, since a
+// BatchSender is an interface, and one kept by each connection would be as
+// large as the rest of an idle connection.
+var roundDatagrams = sync.Pool{New: func() any { return new([maxRoundDatagrams][]byte) }}
+
 // sendDatagrams sends the datagrams laid one after another in buf, with one
 // call when the path takes several at once. Callers are the sending goroutine,
 // without c.mu.
 func (c *Conn) sendDatagrams(buf []byte, lens []uint16) {
 	if b, ok := c.pc.(BatchSender); ok && len(lens) > 1 {
-		var datagrams [maxRoundDatagrams][]byte
+		datagrams := roundDatagrams.Get().(*[maxRoundDatagrams][]byte)
 		for i, n := range lens {
 			datagrams[i], buf = buf[:n], buf[n:]
 		}
 		_ = b.SendBatch(datagrams[:len(lens)])
+		clear(datagrams[:len(lens)])
+		roundDatagrams.Put(datagrams)
 		return
 	}
 	for _, n := range lens {

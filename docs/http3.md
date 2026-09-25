@@ -66,7 +66,16 @@ Behavior users need to be aware of.
   response (`quic.Conn.ExpectWrite`), so that answers written on the pool's
   goroutines wait for the rest of the burst's, a millisecond at most, and
   leave packed together with its acknowledgement, as they would from a
-  handler answering inline.
+  handler answering inline. The requests a burst completes go to the pool
+  together, in one batch, so that they land on one of its shards and are
+  answered close together rather than as far apart as the shards' queues
+  are. The millisecond is counted from when there is something to send: an
+  acknowledgement that is not yet due waits for its own deadline instead.
+- A request's state — its `requestStream`, the `http.Request`, its header
+  and its Context — is let go once its response is written and the handler
+  has returned, rather than kept until the client has acknowledged the
+  response, and a server lets its TLS connection go once the handshake is
+  over, keeping the `tls.ConnectionState` it reports.
 - Acknowledgements stop covering what the peer has seen acknowledged (RFC
   9000 section 13.2.4), so a peer that skips packet numbers, as quiche does,
   gets ACK frames of a few ranges rather than of every range kept.

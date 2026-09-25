@@ -49,6 +49,10 @@ type Stream struct {
 
 	queued bool
 	done   bool
+	// released is set once the application is done with the stream, and
+	// its handler calls stop (see WriteFinal). Only the goroutine making
+	// them uses it.
+	released bool
 }
 
 // ID is the stream's ID.
@@ -72,6 +76,31 @@ func (s *Stream) Write(p []byte, fin bool) error { return s.write(p, fin, false)
 // the caller must not use p afterwards. A stream with nothing waiting to be
 // sent keeps p as it is until it has been acknowledged.
 func (s *Stream) WriteOwned(p []byte, fin bool) error { return s.write(p, fin, true) }
+
+// WriteFinal is WriteOwned for the last of what the stream sends, which ends
+// its sending side, and it tells the connection that the application is done
+// with the stream: the handler is called for it no more, and its Context is
+// dropped, so that what the Context refers to need not live as long as the
+// stream, which is until the peer has acknowledged all it was sent. That
+// takes effect in order with the handler's calls. With expected set it
+// is the write an ExpectWrite announced, which it ends as WriteDone would:
+// what the write adds and what was held for it then leave together, rather
+// than the write first holding them back for a write that is its own.
+func (s *Stream) WriteFinal(p []byte, expected bool) error {
+	c := s.conn
+	c.mu.Lock()
+	err := s.writeLocked(p, true, true)
+	if err == nil {
+		c.wantFlush = true
+	}
+	c.events = append(c.events, event{kind: evRelease, stream: s})
+	if expected && c.awaited > 0 {
+		c.awaited--
+	}
+	c.mu.Unlock()
+	c.dispatch()
+	return err
+}
 
 func (s *Stream) write(p []byte, fin, owned bool) error {
 	c := s.conn

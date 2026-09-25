@@ -128,3 +128,31 @@ func TestDecoderRemembersStrings(t *testing.T) {
 		t.Fatalf("got %v, want ErrTooLarge", err)
 	}
 }
+
+// A field in the static table is sent as its index, the first one it has,
+// and a field whose name alone is there refers to the first entry with that
+// name; one marked never to be indexed only ever refers to the name.
+func TestAppendFieldStaticTable(t *testing.T) {
+	for i, f := range staticTable {
+		first, firstName := -1, -1
+		for j, g := range staticTable {
+			if first < 0 && g == f {
+				first = j
+			}
+			if firstName < 0 && g.Name == f.Name {
+				firstName = j
+			}
+		}
+		if got, want := AppendField(nil, f.Name, f.Value, false), appendInt(nil, 0xc0, 6, uint64(first)); !bytes.Equal(got, want) {
+			t.Fatalf("entry %d %v: % x, want % x", i, f, got, want)
+		}
+		want := appendString(appendInt(nil, 0x70, 4, uint64(firstName)), 0, 7, f.Value)
+		if got := AppendField(nil, f.Name, f.Value, true); !bytes.Equal(got, want) {
+			t.Fatalf("entry %d %v never indexed: % x, want % x", i, f, got, want)
+		}
+		want = appendString(appendInt(nil, 0x50, 4, uint64(firstName)), 0, 7, "x-other")
+		if got := AppendField(nil, f.Name, "x-other", false); !bytes.Equal(got, want) {
+			t.Fatalf("entry %d %v with another value: % x, want % x", i, f, got, want)
+		}
+	}
+}

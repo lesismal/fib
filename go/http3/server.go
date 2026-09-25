@@ -238,7 +238,10 @@ func (h *ServerHandler) OnClose(c *fib.Connection, err error) {
 	c.SetAttachment(nil)
 }
 
-var _ fib.DatagramsHandler = (*ServerHandler)(nil)
+var (
+	_ fib.DatagramsHandler  = (*ServerHandler)(nil)
+	_ quic.CallsDoneHandler = (*serverConn)(nil)
+)
 
 // serverConn is one client's HTTP/3 connection.
 type serverConn struct {
@@ -251,8 +254,11 @@ type serverConn struct {
 	peer       peerStreams
 
 	// gate counts the requests of this connection running on the handler's
-	// stream pool, which is how the per-connection limit is kept.
-	gate fibhttp.StreamGate
+	// stream pool, which is how the per-connection limit is kept, and batch
+	// holds those of a run of QUIC's calls until the run ends, which hands
+	// them to the pool together (see OnCallsDone).
+	gate  fibhttp.StreamGate
+	batch fibhttp.StreamBatch
 
 	// decoder decodes the connection's field sections into fields, whose
 	// array the next one reuses. Only the goroutine QUIC calls the
@@ -341,6 +347,10 @@ func (sc *serverConn) OnStopSending(s *quic.Stream, _ uint64) {
 }
 
 func (sc *serverConn) OnStreamsAvailable(*quic.Conn) {}
+
+// OnCallsDone hands the requests that arrived whole during the run of calls
+// to the stream pool, together.
+func (sc *serverConn) OnCallsDone(*quic.Conn) { sc.h.streams.Submit(&sc.batch) }
 
 func (sc *serverConn) OnClose(*quic.Conn, error) {
 	sc.mu.Lock()
@@ -579,8 +589,9 @@ func (rs *requestStream) finish() {
 	// works here too. The pool runs it away from this goroutine, which reads
 	// the connection, unless the connection is at its concurrency limit: then
 	// it runs here, and nothing more is read from the connection until it has
-	// been answered.
-	sc.h.streams.Serve(&sc.gate, sc.conn, sc.h.handler, &rs.block)
+	// been answered. The requests that arrived together go to the pool
+	// together, once QUIC has told of them all.
+	sc.h.streams.Queue(&sc.batch, &sc.gate, sc.conn, sc.h.handler, &rs.block)
 }
 
 // abort gives up on a malformed or incomplete request.
@@ -651,6 +662,9 @@ func (rs *requestStream) WriteResponse(req *stdhttp.Request, response fibhttp.Re
 		return errStreamClosed
 	}
 	rs.responded = true
+	// The write the connection was told to expect ends that as it is made.
+	expected := rs.expected
+	rs.expected = false
 	rs.mu.Unlock()
 
 	// The field sections go back to the pool once the frames are built from
@@ -694,7 +708,11 @@ func (rs *requestStream) WriteResponse(req *stdhttp.Request, response fibhttp.Re
 		}
 		bufferpool.Put(trailer)
 	}
-	err := rs.s.WriteOwned(out, true)
+	// The response is all this stream sends, and a request whose response
+	// is written wants nothing more of what arrives for it, so QUIC is told
+	// to forget the request as it takes the response rather than once the
+	// client has acknowledged it.
+	err := rs.s.WriteFinal(out, expected)
 	if !rs.remoteDone {
 		// Answered before the request finished arriving: the rest of it is
 		// not wanted (RFC 9114 section 4.1).

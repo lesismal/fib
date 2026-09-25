@@ -15,6 +15,10 @@ const (
 	// evRecycle is no call: it gives a datagram back to the pool once the
 	// calls queued ahead of it, which may refer to it, have run.
 	evRecycle
+	// evRelease is no call either: it drops a stream's Context, on the
+	// goroutine that makes the calls, once the application is done with it
+	// (see Stream.WriteFinal).
+	evRelease
 )
 
 // event is a handler call waiting for dispatch. It is a value rather than a
@@ -26,11 +30,13 @@ type event struct {
 	// data is OnStreamData's, or the datagram evRecycle gives back.
 	data []byte
 	code uint64
-	err  error
 }
 
 // run makes the call an event is. Callers hold no lock.
 func (c *Conn) run(e *event) {
+	if e.stream != nil && e.stream.released {
+		return
+	}
 	switch e.kind {
 	case evStreamData:
 		c.handler.OnStreamData(e.stream, e.data, e.fin)
@@ -43,10 +49,19 @@ func (c *Conn) run(e *event) {
 	case evHandshake:
 		c.handler.OnHandshake(c)
 	case evClose:
-		c.tls.Close()
+		c.mu.Lock()
+		t := c.tls
+		c.mu.Unlock()
+		if t != nil {
+			t.Close()
+		}
 		_ = c.pc.Close()
-		c.handler.OnClose(c, e.err)
+		// closeErr is set once, before evClose is queued.
+		c.handler.OnClose(c, c.closeErr)
 	case evRecycle:
 		bufferpool.Put(e.data)
+	case evRelease:
+		e.stream.Context = nil
+		e.stream.released = true
 	}
 }

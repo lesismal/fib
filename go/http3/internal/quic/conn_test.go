@@ -13,6 +13,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/lesismal/fib/go/bufferpool"
 	"github.com/lesismal/fib/go/internal/tlstest"
 )
 
@@ -805,4 +806,166 @@ func TestExpectedWriteThatDoesNotCome(t *testing.T) {
 	}
 	// Its WriteDone, when it comes at last, is harmless.
 	p.client.WriteDone()
+}
+
+// serverConn waits for the server's side of the pair to be there.
+func (p *testPair) serverConn(t *testing.T) *Conn {
+	t.Helper()
+	for deadline := time.Now().Add(5 * time.Second); time.Now().Before(deadline); time.Sleep(time.Millisecond) {
+		p.serverMu.Lock()
+		s := p.server
+		p.serverMu.Unlock()
+		if s != nil {
+			return s
+		}
+	}
+	t.Fatal("no server connection")
+	return nil
+}
+
+// A server lets its TLS connection go once the handshake is over, keeping
+// the state it reports, and a client that sends it handshake data after that
+// is told it was not expected.
+func TestServerLetsTLSGo(t *testing.T) {
+	p := newTestPair(t, 0, nil)
+	time.Sleep(50 * time.Millisecond) // the handshake's last packets
+	server := p.serverConn(t)
+	server.mu.Lock()
+	released := server.tls == nil
+	server.mu.Unlock()
+	if !released {
+		t.Fatal("the server kept its TLS connection past the handshake")
+	}
+	if state := server.ConnectionState(); !state.HandshakeComplete || state.NegotiatedProtocol != "test" {
+		t.Fatalf("the server reports %+v", state)
+	}
+	p.client.mu.Lock()
+	p.client.spaces[spaceApp].cryptoSend.write([]byte{0x04, 0, 0, 0})
+	p.client.wantFlush = true
+	p.client.mu.Unlock()
+	p.client.flush()
+	select {
+	case err := <-p.serverH.closed:
+		var te *TransportError
+		if !errors.As(err, &te) || te.Code != errCryptoBase+alertUnexpectedMessage {
+			t.Fatalf("the server closed with %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("the server took handshake data after the handshake")
+	}
+}
+
+// A stream's final write ends the handler's calls for it and drops its
+// Context, though the stream lives on until its data is acknowledged.
+func TestWriteFinalReleasesStream(t *testing.T) {
+	p := newTestPair(t, 0, nil)
+	calls := make(chan *Stream, 16)
+	p.serverH.onData = func(s *Stream, data []byte, fin bool) {
+		calls <- s
+		if s.Context == nil {
+			s.Context = "request"
+			_ = s.WriteFinal(bufferpool.Append(nil, []byte("answer")), false)
+		}
+	}
+	s, err := p.client.OpenStream()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Write([]byte("first"), false); err != nil {
+		t.Fatal(err)
+	}
+	server := <-calls
+	waitFinished(t, p.clientH, s.ID())
+	if got := string(p.clientH.received(s.ID())); got != "answer" {
+		t.Fatalf("the client read %q", got)
+	}
+	// What arrives after the final write reaches no handler.
+	if err := s.Write([]byte("second"), true); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-calls:
+		t.Fatal("the handler was called for a stream it was done with")
+	case <-time.After(100 * time.Millisecond):
+	}
+	server.conn.mu.Lock()
+	context, released := server.Context, server.released
+	server.conn.mu.Unlock()
+	if context != nil || !released {
+		t.Fatalf("the stream kept its Context %v", context)
+	}
+}
+
+// A connection that expects a write holds back what it has to send, but with
+// nothing to send other than an acknowledgement that is not yet due it holds
+// nothing: it sets no hold for the timer to end, and leaves the
+// acknowledgement to its own deadline.
+func TestHoldWaitsForSomethingToSend(t *testing.T) {
+	p := newTestPair(t, 0, nil)
+	time.Sleep(50 * time.Millisecond)
+	type held struct {
+		deadline, ackDeadline, timerAt time.Time
+		ackNow                         bool
+	}
+	seen := make(chan held, 1)
+	release := make(chan struct{})
+	p.serverH.onData = func(s *Stream, data []byte, fin bool) {
+		if !fin {
+			return
+		}
+		c := s.Conn()
+		c.ExpectWrite()
+		go func() {
+			// Once the handler call is over and the connection has
+			// flushed, it waits for this write.
+			time.Sleep(10 * time.Millisecond)
+			c.mu.Lock()
+			app := &c.spaces[spaceApp]
+			seen <- held{c.flushDeadline, app.ackDeadline, c.timerAt, app.ackNow}
+			c.mu.Unlock()
+			<-release
+			_ = s.WriteFinal(bufferpool.Append(nil, []byte("answer")), true)
+		}()
+	}
+	s, err := p.client.OpenStream()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Write([]byte("request"), true); err != nil {
+		t.Fatal(err)
+	}
+	h := <-seen
+	close(release)
+	waitFinished(t, p.clientH, s.ID())
+	if h.ackNow {
+		t.Skip("the request wanted an acknowledgement at once")
+	}
+	if !h.deadline.IsZero() {
+		t.Fatal("a hold was set with nothing to hold back")
+	}
+	if h.ackDeadline.IsZero() || h.timerAt.IsZero() || h.timerAt.After(h.ackDeadline) {
+		t.Fatalf("the timer is set for %v, after the acknowledgement's deadline %v", h.timerAt, h.ackDeadline)
+	}
+}
+
+// batchSink is a BatchSender that keeps nothing.
+type batchSink struct{ batches int }
+
+func (b *batchSink) Send([]byte) error          { return nil }
+func (b *batchSink) SendBatch(d [][]byte) error { b.batches++; return nil }
+func (b *batchSink) Close() error               { return nil }
+
+// A round of several datagrams is handed to a BatchSender without
+// allocating the list of them.
+func TestSendDatagramsAllocs(t *testing.T) {
+	sink := &batchSink{}
+	c := &Conn{pc: sink}
+	buf := make([]byte, 3000)
+	lens := []uint16{1000, 1000, 1000}
+	if allocs := testing.AllocsPerRun(100, func() { c.sendDatagrams(buf, lens) }); allocs != 0 {
+		t.Fatalf("a batched round allocated %v times", allocs)
+	}
+	if sink.batches == 0 {
+		t.Fatal("the round was not sent as a batch")
+	}
 }

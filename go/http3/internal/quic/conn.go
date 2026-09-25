@@ -68,6 +68,15 @@ type Handler interface {
 	OnClose(c *Conn, err error)
 }
 
+// CallsDoneHandler is a Handler that is also told when a run of its calls
+// ends: the calls queued by the datagrams that arrived together, say. It is
+// called like the others, one at a time and with no lock held, and before
+// what the calls wrote is sent, so that what a handler put off until the end
+// of the run goes with it.
+type CallsDoneHandler interface {
+	OnCallsDone(c *Conn)
+}
+
 // Config sets up a connection. Zero values take the defaults.
 type Config struct {
 	// TLSConfig is required. Its NextProtos are the ALPN offer, which QUIC
@@ -183,6 +192,9 @@ type Conn struct {
 	config   Config
 	isClient bool
 	tls      *tls.QUICConn
+	// tlsState is the TLS state, kept once a server has let tls go (see
+	// releaseTLS).
+	tlsState *tls.ConnectionState
 
 	// Connection IDs: scid is this side's, dcid the peer's in use, and odcid
 	// the one the client first sent to.
@@ -238,6 +250,8 @@ type Conn struct {
 	lossDeadline time.Time
 
 	timer *time.Timer
+	// timerAt is what the timer is set for, or zero once it has fired.
+	timerAt time.Time
 
 	// Flow control: what the peer allows this side to send, and what this
 	// side allows the peer.
@@ -442,7 +456,13 @@ func (c *Conn) RemoteAddr() net.Addr { return c.remote }
 
 // ConnectionState is the TLS state of the connection.
 func (c *Conn) ConnectionState() tls.ConnectionState {
-	return c.tls.ConnectionState()
+	c.mu.Lock()
+	t, state := c.tls, c.tlsState
+	c.mu.Unlock()
+	if state != nil {
+		return *state
+	}
+	return t.ConnectionState()
 }
 
 // HandleDatagram processes a datagram from the peer.
@@ -453,7 +473,9 @@ func (c *Conn) ConnectionState() tls.ConnectionState {
 func (c *Conn) HandleDatagram(datagram []byte) {
 	c.mu.Lock()
 	if !c.closed {
-		c.handleDatagramLocked(datagram, c.now())
+		now := c.now()
+		c.handleDatagramLocked(datagram, now)
+		c.armAckLocked(now)
 		c.wantFlush = true
 	}
 	c.recycleLocked(datagram)
@@ -474,6 +496,7 @@ func (c *Conn) HandleDatagrams(datagrams [][]byte) {
 			}
 			c.handleDatagramLocked(d, now)
 		}
+		c.armAckLocked(now)
 		c.wantFlush = true
 	}
 	for _, d := range datagrams {
@@ -481,6 +504,19 @@ func (c *Conn) HandleDatagrams(datagrams [][]byte) {
 	}
 	c.mu.Unlock()
 	c.dispatch()
+}
+
+// armAckLocked makes sure that the timer fires by the time an
+// acknowledgement the datagrams just processed call for is due. It is
+// usually sent before then, with what the handler writes in reply, but the
+// handler may not write, or may take longer than the peer allows the
+// acknowledgement to wait. Callers hold c.mu.
+func (c *Conn) armAckLocked(now time.Time) {
+	s := &c.spaces[spaceApp]
+	if s.ackPending && !s.ackNow && !s.ackDeadline.IsZero() && !c.closed &&
+		(c.timerAt.IsZero() || s.ackDeadline.Before(c.timerAt)) {
+		c.armTimerLocked(now)
+	}
 }
 
 // recycleLocked gives a datagram back to the pool, with
@@ -688,6 +724,9 @@ func (c *Conn) dispatch() {
 		for i := range events {
 			c.run(&events[i])
 		}
+		if h, ok := c.handler.(CallsDoneHandler); ok {
+			h.OnCallsDone(c)
+		}
 		clear(events)
 		c.mu.Lock()
 		if c.spareEvents == nil {
@@ -748,11 +787,16 @@ const flushHold = time.Millisecond
 // it.
 func (c *Conn) flush() {
 	c.mu.Lock()
-	held := c.dispatching || c.awaited > 0
+	held := c.heldLocked()
 	if held && c.wantFlush && !c.closed && c.flushDeadline.IsZero() {
-		now := c.now()
-		c.flushDeadline = now.Add(flushHold)
-		c.armTimerLocked(now)
+		// Nothing to hold back but an acknowledgement that is not due is
+		// nothing to hold: the acknowledgement has a deadline of its own,
+		// which the timer keeps (see armAckLocked).
+		if c.sendableLocked() {
+			now := c.now()
+			c.flushDeadline = now.Add(flushHold)
+			c.armTimerLocked(now)
+		}
 	}
 	if held || c.sending {
 		c.mu.Unlock()
@@ -760,6 +804,26 @@ func (c *Conn) flush() {
 	}
 	c.sendLocked()
 	c.mu.Unlock()
+}
+
+// heldLocked reports whether what there is to send waits for the handler
+// calls, or the writes expected, to end (see flush). Callers hold c.mu.
+func (c *Conn) heldLocked() bool { return c.dispatching || c.awaited > 0 }
+
+// sendableLocked reports whether a round of sending would find something to
+// send now, other than an acknowledgement that is not yet due, which the
+// timer sends once it is. Callers hold c.mu.
+func (c *Conn) sendableLocked() bool {
+	for space := range c.spaces {
+		s := &c.spaces[space]
+		if s.tx == nil || s.discarded {
+			continue
+		}
+		if s.probes > 0 || s.ackPending && s.ackNow || c.framesWaiting(space) {
+			return true
+		}
+	}
+	return false
 }
 
 // sendLocked sends until there is nothing left to send, unless another
@@ -993,6 +1057,26 @@ func (c *Conn) handlePacket(pkt []byte, h header, now time.Time) bool {
 
 // handleCrypto takes in handshake data and hands what is in order to TLS.
 func (c *Conn) handleCrypto(space int, off uint64, data []byte) error {
+	err := c.feedCrypto(space, off, data)
+	if err == nil && !c.isClient && c.handshakeComplete && c.tls != nil {
+		c.releaseTLS()
+	}
+	return err
+}
+
+// releaseTLS lets a server's TLS connection go once the handshake is over,
+// its session ticket written: a client sends nothing more for TLS to read,
+// and what TLS keeps of the handshake would otherwise live, and weigh, as
+// long as the connection does. The state ConnectionState reports is kept.
+// Callers hold c.mu.
+func (c *Conn) releaseTLS() {
+	state := c.tls.ConnectionState()
+	c.tlsState = &state
+	c.tls.Close()
+	c.tls = nil
+}
+
+func (c *Conn) feedCrypto(space int, off uint64, data []byte) error {
 	s := &c.spaces[space]
 	if off+uint64(len(data)) > s.cryptoRecv.offset+maxCryptoBuffer {
 		return transportErr(errCryptoBufferExceeds, "too much out-of-order handshake data")
@@ -1008,6 +1092,11 @@ func (c *Conn) handleCrypto(space int, off uint64, data []byte) error {
 		}
 		if chunk == nil {
 			return nil
+		}
+		if c.tls == nil {
+			// The handshake is over, and a client has no more to say to a
+			// server's TLS (RFC 9001 section 4.1.3).
+			return &TransportError{Code: errCryptoBase + alertUnexpectedMessage, Reason: "handshake data after the handshake"}
 		}
 		if err := c.tls.HandleData(level, chunk); err != nil {
 			return tlsError(err)
@@ -1245,7 +1334,7 @@ func (c *Conn) terminateLocked(err error) {
 	c.streams = nil
 	c.sendQueue = nil
 	c.buffered = nil
-	c.events = append(c.events, event{kind: evClose, err: err})
+	c.events = append(c.events, event{kind: evClose})
 }
 
 // armTimerLocked sets the connection's one timer for the earliest thing
@@ -1271,6 +1360,10 @@ func (c *Conn) armTimerLocked(now time.Time) {
 	if c.config.KeepAlivePeriod > 0 && c.handshakeComplete {
 		earliest(c.keepAliveAt())
 	}
+	if c.timer != nil && deadline.Equal(c.timerAt) {
+		return
+	}
+	c.timerAt = deadline
 	d := max(deadline.Sub(now), 0)
 	if c.timer == nil {
 		c.timer = time.AfterFunc(d, c.onTimer)
@@ -1301,6 +1394,7 @@ func (c *Conn) onTimer() {
 		c.mu.Unlock()
 		return
 	}
+	c.timerAt = time.Time{}
 	now := c.now()
 	switch {
 	case !c.handshakeComplete && !now.Before(c.created.Add(c.config.HandshakeTimeout)):
