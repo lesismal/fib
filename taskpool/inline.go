@@ -7,7 +7,7 @@ import "sync/atomic"
 // way the other modes' workers do. A submission returns once its tasks have
 // run, so a task that blocks holds up its submitter.
 func NewInline(name string) *TaskPool {
-	return start(name, ModeInline, nil, func(executor *executor) backend {
+	return start(name, ModeInline, func(executor *executor) backend {
 		return &inlineBackend{executor: executor}
 	})
 }

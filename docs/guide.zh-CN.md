@@ -84,8 +84,7 @@
   `<Name>-streams`）。
 - 状态日志默认关闭（`log/slog`，可用 `slog.SetDefault` 调整输出）。`config.LogStatus = true`
   时 Engine 启动后打印名字、监听地址、协程池和 poller 数；`taskpool.SetLogStatus(true)`
-  之后创建的协程池在创建时打印传入的参数，启动后打印实际运行的分片数、worker 数和
-  队列容量等，都带上协程池名字。任务 panic 且没有设置 `SetPanicHandler` 时，无论开关
+  之后创建的协程池在启动后打印协程池名字，以及实际运行的分片数、worker 数和队列容量等。任务 panic 且没有设置 `SetPanicHandler` 时，无论开关
   如何，都以 ERROR 级别打印协程池名字、panic 值与调用栈。
 - `config.SetTaskPool(pool)` 让 Engine 使用外部提供的任务池（实现 `fib.TaskPool`
   接口，`*taskpool.TaskPool` 本身即满足）。设置后 `TaskPoolMode`、

@@ -49,11 +49,7 @@ func NewAdaptive(config AdaptiveConfig) *TaskPool {
 	if config.QueueSize < 0 {
 		panic("taskpool: queueSize must not be negative")
 	}
-	params := []any{
-		"minWorkers", config.MinWorkers, "maxWorkers", config.MaxWorkers,
-		"queueSize", config.QueueSize, "shrinkInterval", config.ShrinkInterval,
-	}
-	return start(config.Name, ModeAdaptive, params, func(executor *executor) backend {
+	return start(config.Name, ModeAdaptive, func(executor *executor) backend {
 		return newAdaptiveBackend(executor, config)
 	})
 }

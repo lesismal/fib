@@ -125,14 +125,13 @@ func NewWithMode(name string, mode Mode, maxConcurrent, queueSize int) *TaskPool
 	if queueSize < 0 {
 		panic("taskpool: queueSize must not be negative")
 	}
-	params := []any{"maxConcurrent", maxConcurrent, "queueSize", queueSize}
 	switch mode {
 	case ModeElastic:
-		return start(name, mode, params, func(executor *executor) backend {
+		return start(name, mode, func(executor *executor) backend {
 			return newElasticPool(executor, maxConcurrent, queueSize)
 		})
 	case ModeCond:
-		return start(name, mode, params, func(executor *executor) backend {
+		return start(name, mode, func(executor *executor) backend {
 			return newCondBackend(executor, maxConcurrent, queueSize)
 		})
 	case ModeAdaptive:
@@ -144,12 +143,12 @@ func NewWithMode(name string, mode Mode, maxConcurrent, queueSize int) *TaskPool
 	}
 }
 
-// logStatus switches the lines pools log when they are created and started.
+// logStatus switches the line a pool logs once it has started.
 var logStatus atomic.Bool
 
-// SetLogStatus switches whether the pools created from now on log their
-// parameters when they are created and what they run once started. It is off
-// by default. A task that panics with no panic handler is logged either way.
+// SetLogStatus switches whether the pools created from now on log, under
+// their name, what they run once started. It is off by default. A task that
+// panics with no panic handler is logged either way.
 func SetLogStatus(on bool) { logStatus.Store(on) }
 
 // poolIDs numbers the pools built, so that the lines one pool logs can be
@@ -157,19 +156,14 @@ func SetLogStatus(on bool) { logStatus.Store(on) }
 var poolIDs atomic.Uint64
 
 // start builds a pool's backend. When SetLogStatus has switched it on, it logs
-// the parameters the pool was created with before building it, and what the
-// pool runs once it has started: the shards, workers and queue those
-// parameters resolved to.
-func start(name string, mode Mode, params []any, build func(*executor) backend) *TaskPool {
+// under the pool's name what the pool runs once it has started: the shards,
+// workers and queue its parameters resolved to.
+func start(name string, mode Mode, build func(*executor) backend) *TaskPool {
 	executor := &executor{name: name, id: poolIDs.Add(1)}
-	logging := logStatus.Load()
-	label := []any{"pool", name, "id", executor.id, "mode", mode.String()}
-	if logging {
-		slog.Info("taskpool: created", append(label, params...)...)
-	}
 	pool := &TaskPool{executor: executor, backend: build(executor), mode: mode}
-	if logging {
-		slog.Info("taskpool: started", append(label[:len(label):len(label)], pool.backend.attrs()...)...)
+	if logStatus.Load() {
+		label := []any{"pool", name, "id", executor.id, "mode", mode.String()}
+		slog.Info("taskpool: started", append(label, pool.backend.attrs()...)...)
 	}
 	return pool
 }
