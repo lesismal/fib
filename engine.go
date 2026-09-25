@@ -826,6 +826,13 @@ func (e *Engine) closeConnection(c *Connection, closeErr error, callback bool) {
 	schedule := !c.scheduled
 	c.scheduled = true
 	c.mu.Unlock()
+	if c.udp != nil && c.udp.listener != nil {
+		// A listener's peer has no descriptor of its own to be reused under
+		// a round, so it leaves the peer table now: the peer's next datagram
+		// opens a fresh connection rather than being dropped on this one
+		// while its OnClose is still to run.
+		e.detachPeer(c)
+	}
 	if schedule {
 		e.redeliver = append(e.redeliver, c)
 	}
