@@ -21,7 +21,7 @@
 ## 快速上手
 
 ```sh
-go get github.com/lesismal/fib/go
+go get github.com/lesismal/fib
 ```
 
 ```go
@@ -30,11 +30,11 @@ package main
 import (
 	stdhttp "net/http"
 
-	fib "github.com/lesismal/fib/go"
-	fibhttp "github.com/lesismal/fib/go/http"
-	"github.com/lesismal/fib/go/middleware"
-	"github.com/lesismal/fib/go/middleware/logger"
-	"github.com/lesismal/fib/go/middleware/recover"
+	fib "github.com/lesismal/fib"
+	fibhttp "github.com/lesismal/fib/http"
+	"github.com/lesismal/fib/middleware"
+	"github.com/lesismal/fib/middleware/logger"
+	"github.com/lesismal/fib/middleware/recover"
 )
 
 func main() {
@@ -61,19 +61,18 @@ func main() {
 
 | Package | 说明 |
 | --- | --- |
-| [`fib`](go) | 事件循环、connection、TCP / UDP / Unix socket、`SendFile`、异步 Dial |
-| [`taskpool`](go/taskpool) | 有界 worker 池：adaptive、cond、elastic 三种模式 |
-| [`bufferpool`](go/bufferpool) | 按尺寸档对齐的 buffer 池 |
-| [`tls`](go/tls) | 叠加在 connection 上的 TLS，上层协议无需改动 |
-| [`http`](go/http) | HTTP/1.x 与 HTTP/2 的 server 和 client |
-| [`http3`](go/http3) | HTTP/3、QUIC、QPACK 的 server 和 client |
-| [`websocket`](go/websocket) | RFC 6455 server 和 client，支持 permessage-deflate |
-| [`middleware`](go/middleware) | HTTP 中间件链与常用中间件 |
+| [`fib`](.) | 事件循环、connection、TCP / UDP / Unix socket、`SendFile`、异步 Dial |
+| [`taskpool`](taskpool) | 有界 worker 池：adaptive、cond、elastic 三种模式 |
+| [`bufferpool`](bufferpool) | 按尺寸档对齐的 buffer 池 |
+| [`tls`](tls) | 叠加在 connection 上的 TLS，上层协议无需改动 |
+| [`http`](http) | HTTP/1.x 与 HTTP/2 的 server 和 client |
+| [`http3`](http3) | HTTP/3、QUIC、QPACK 的 server 和 client |
+| [`websocket`](websocket) | RFC 6455 server 和 client，支持 permessage-deflate |
+| [`middleware`](middleware) | HTTP 中间件链与常用中间件 |
 
 ## 示例
 
 ```sh
-cd go
 go run ./examples/tcp/nontls/server
 go run ./examples/http/nontls/server
 go run ./examples/websocket/nontls/server
@@ -84,7 +83,7 @@ go run ./examples/http3/tls/server
 
 ## 文档
 
-- [Go 使用指南](go/README.zh-CN.md)：配置、API 和各子 package 的用法
+- [Go 使用指南](docs/guide.zh-CN.md)：配置、API 和各子 package 的用法
 - [HTTP/1.x](docs/http1.zh-CN.md)、[HTTP/2](docs/http2.zh-CN.md)、[HTTP/3](docs/http3.zh-CN.md)：支持范围、限制和一致性测试
 - [架构文档](docs/architecture.html)：中英文可切换的交互式架构图，涵盖读取调度、写背压、负载均衡和连接关闭回收流程
 

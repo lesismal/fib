@@ -1,0 +1,61 @@
+//go:build !linux && !darwin && !windows
+
+package fib
+
+import (
+	"time"
+
+	"github.com/lesismal/fib/taskpool"
+)
+
+type Config struct {
+	// Name labels the engine in what it logs, and names the task pools its
+	// connections run on: "<Name>-workers" for the engine's own and
+	// "<Name>-streams" for the HTTP/2 and HTTP/3 handlers. Engines of the
+	// same name share both pools; see SharedTaskPool. Empty means
+	// DefaultName.
+	Name string
+	// Network and Addr name the listener the way net.Listen does: Network is
+	// "tcp", "tcp4" or "tcp6", and Addr is a "host:port" such as ":9000",
+	// "127.0.0.1:9000" or "[::1]:9000". An empty Network means "tcp", and an
+	// empty Addr means ":0". "unix" listens on a Unix socket at the path Addr.
+	// "udp", "udp4" and "udp6" bind UDP sockets, whose peers each become a
+	// connection, as on the native backends.
+	Network string
+	Addr    string
+	// Addrs, when it is not empty, is the complete set of addresses to listen
+	// on and Addr is ignored; they all share Network. One server spanning
+	// several addresses shares its connection table, task pool and buffer pool
+	// across all of them.
+	Addrs                           []string
+	Backlog, WorkerCount, MaxEvents int
+	ReadBufferSize                  int
+	WriteBufferHighWatermark        int
+	UseWritev                       bool
+	// TaskPoolMode picks the scheduler the workers run under. Prefer
+	// SetTaskPoolMode over assigning it, so that WorkerCount and MaxEvents
+	// follow the mode rather than staying at numbers tuned for the other one.
+	TaskPoolMode taskpool.Mode
+	// MinWorkerCount is the resident floor a ModeAdaptive pool retires down
+	// to, with WorkerCount as the ceiling it grows to. Zero means ten workers
+	// per CPU core. The other modes ignore it.
+	MinWorkerCount int
+	// SharedTaskPool has the engines of one Name run on one task pool. The
+	// first of them builds it from its own settings, and those that follow
+	// run on it as it is, whatever theirs say.
+	SharedTaskPool bool
+	// TaskPool, when set, runs the engine's connections instead of a pool the
+	// engine builds from the fields above. See SetTaskPool.
+	TaskPool TaskPool
+	// UDPIdleTimeout closes a silent UDP peer's connection. Zero means
+	// DefaultUDPIdleTimeout and a negative value keeps peers until closed.
+	UDPIdleTimeout time.Duration
+	// customPoolSizing records that SetPoolSizing pinned the sizing, so that a
+	// later SetTaskPoolMode does not overwrite it.
+	customPoolSizing bool
+}
+
+func DefaultConfig() Config {
+	sizing := DefaultPoolSizing(taskpool.ModeAdaptive)
+	return Config{Name: DefaultName, Network: "tcp", Addr: ":9000", Backlog: 128, WorkerCount: sizing.WorkerCount, MaxEvents: sizing.MaxEvents, ReadBufferSize: 16 * 1024, WriteBufferHighWatermark: 4 * 1024, UseWritev: true, TaskPoolMode: taskpool.ModeAdaptive, SharedTaskPool: true}
+}

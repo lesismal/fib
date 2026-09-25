@@ -1,0 +1,240 @@
+//go:build darwin
+
+package fib
+
+import (
+	"syscall"
+
+	"github.com/lesismal/fib/taskpool"
+)
+
+// wakeIdent names the EVFILT_USER event other goroutines trigger to wake the
+// loop. User events live in their own namespace, so it cannot collide with a
+// descriptor.
+const wakeIdent = 0
+
+// EVFILT_EXCEPT with NOTE_OOB reports urgent data, which the read filter does
+// not. The syscall package does not export either; the values are from
+// <sys/event.h>.
+const (
+	evfiltExcept = -15
+	noteOOB      = 0x2
+)
+
+// backend is a kqueue instance. Every descriptor is registered with EV_CLEAR,
+// which gives kqueue the same edge-triggered behaviour the epoll backend gets
+// from EPOLLET.
+type backend struct {
+	kq int
+	// acceptable collects the listeners that became readable during one wait.
+	// Event-loop ownership.
+	acceptable []int
+}
+
+func (e *Engine) openBackend() error {
+	syscall.ForkLock.RLock()
+	kq, err := syscall.Kqueue()
+	if err == nil {
+		syscall.CloseOnExec(kq)
+	}
+	syscall.ForkLock.RUnlock()
+	if err != nil {
+		return err
+	}
+	changes := make([]syscall.Kevent_t, 0, len(e.listenFDs)+1)
+	for _, fd := range e.listenFDs {
+		changes = append(changes, syscall.Kevent_t{Ident: uint64(fd), Filter: syscall.EVFILT_READ,
+			Flags: syscall.EV_ADD | syscall.EV_CLEAR})
+	}
+	// UDP sockets are level-triggered, so the loop can stop reading one after
+	// its share of a round and still hear about the rest.
+	for _, l := range e.udpListeners {
+		changes = append(changes, syscall.Kevent_t{Ident: uint64(l.fd), Filter: syscall.EVFILT_READ,
+			Flags: syscall.EV_ADD})
+	}
+	changes = append(changes, syscall.Kevent_t{Ident: wakeIdent, Filter: syscall.EVFILT_USER,
+		Flags: syscall.EV_ADD | syscall.EV_CLEAR})
+	if _, err = syscall.Kevent(kq, changes, nil, nil); err != nil {
+		syscall.Close(kq)
+		return err
+	}
+	e.kq = kq
+	return nil
+}
+
+func (e *Engine) closeBackend() error { return syscall.Close(e.kq) }
+
+func (e *Engine) Run() error {
+	e.logRun()
+	batch := e.maxEvents
+	if batch > maxWaitBatch {
+		batch = maxWaitBatch
+	}
+	events := make([]syscall.Kevent_t, batch)
+	var ready []*Connection
+	var tasks []taskpool.Task
+	for !e.stopping.Load() {
+		n, err := syscall.Kevent(e.kq, nil, events, nil)
+		if err == syscall.EINTR {
+			continue
+		}
+		if err != nil {
+			return err
+		}
+		woken := false
+		for i := 0; i < n; i++ {
+			ev := &events[i]
+			if ev.Filter == syscall.EVFILT_USER {
+				woken = true
+				continue
+			}
+			fd := int(ev.Ident)
+			c := e.connectionAt(fd)
+			if c == nil {
+				if ev.Filter == syscall.EVFILT_READ {
+					if l := e.udpListenerAt(fd); l != nil {
+						// Reading opens and closes no descriptor, so it
+						// need not wait for the batch to end.
+						// A socket's read event counts the bytes of
+						// datagrams waiting on it.
+						ready = e.readUDPListener(l, int(ev.Data), ready)
+					} else if e.isListener(fd) {
+						e.acceptable = append(e.acceptable, fd)
+					}
+				}
+				continue
+			}
+			if c.udp != nil {
+				ready = e.readUDPConnection(c, int(ev.Data), ready)
+				continue
+			}
+			if c.dialing != nil {
+				// A connect that failed reports its error in fflags, next to
+				// the EOF that ends it.
+				var reported error
+				if ev.Flags&syscall.EV_EOF != 0 && ev.Fflags != 0 {
+					reported = syscall.Errno(ev.Fflags)
+				}
+				c = e.finishDial(c, kqueueEvents(ev), reported)
+			} else {
+				c = e.noteEvent(c, kqueueEvents(ev))
+			}
+			if c != nil {
+				ready = append(ready, c)
+			}
+		}
+		// A kevent names only a descriptor, with no generation to tell one
+		// owner of it from the next, so nothing may close or accept a
+		// descriptor while events that name it are still being read. A failed
+		// dial is the one exception, and a safe one: it clears its table slot
+		// as it closes, and nothing can take the descriptor back until the
+		// accepts and commands below, so its remaining events resolve to
+		// nothing. Closes
+		// and accepts therefore wait until the whole batch has been folded
+		// into connections. Closing a descriptor removes its pending events
+		// from the kqueue, so the next wait cannot see a stale one either.
+		if woken {
+			e.drainCommands()
+		}
+		for _, fd := range e.acceptable {
+			e.acceptConnections(fd)
+		}
+		e.acceptable = e.acceptable[:0]
+		ready, tasks = e.runReady(ready, tasks)
+	}
+	e.drainCommands()
+	return nil
+}
+
+// kqueueEvents translates one kevent into the readiness bits a connection
+// accumulates.
+func kqueueEvents(ev *syscall.Kevent_t) uint32 {
+	var events uint32
+	switch ev.Filter {
+	case syscall.EVFILT_READ:
+		events = evIn
+		if ev.Flags&syscall.EV_EOF != 0 {
+			// The peer has finished sending. Whatever it sent first is still
+			// readable, which is what the read-side half-close means under
+			// epoll too.
+			events |= evRdHup
+		}
+	case syscall.EVFILT_WRITE:
+		events = evOut
+	case evfiltExcept:
+		// XNU evaluates the except filter with the read filter's code, which
+		// falls through to the ordinary readable test when no urgent data is
+		// marked, so it fires with every read event. Only NOTE_OOB in fflags
+		// says there is urgent data; without the check each read round would
+		// also pay for an MSG_OOB receive that fails. On EOF, fflags is the
+		// socket error instead, which the read filter reports as well.
+		if ev.Flags&syscall.EV_EOF == 0 && ev.Fflags&noteOOB != 0 {
+			events = evPri
+		}
+		return events
+	}
+	if ev.Flags&syscall.EV_EOF != 0 && ev.Fflags != 0 {
+		// On EOF, fflags carries the socket error, if there was one.
+		events |= evErr
+	}
+	return events
+}
+
+func (e *Engine) wake() {
+	changes := [1]syscall.Kevent_t{{Ident: wakeIdent, Filter: syscall.EVFILT_USER, Fflags: syscall.NOTE_TRIGGER}}
+	for {
+		if _, err := syscall.Kevent(e.kq, changes[:], nil, nil); err != syscall.EINTR {
+			return
+		}
+	}
+}
+
+// ackWake does nothing: the user event is registered with EV_CLEAR, so
+// delivering it has already reset it.
+func (e *Engine) ackWake() {}
+
+func (e *Engine) registerConnection(fd int, _ uint64) error {
+	changes := [3]syscall.Kevent_t{
+		{Ident: uint64(fd), Filter: syscall.EVFILT_READ, Flags: syscall.EV_ADD | syscall.EV_CLEAR},
+		{Ident: uint64(fd), Filter: syscall.EVFILT_WRITE, Flags: syscall.EV_ADD | syscall.EV_CLEAR},
+		{Ident: uint64(fd), Filter: evfiltExcept, Flags: syscall.EV_ADD | syscall.EV_CLEAR, Fflags: noteOOB},
+	}
+	n := len(changes)
+	if sa, err := syscall.Getsockname(fd); err == nil {
+		if _, unix := sa.(*syscall.SockaddrUnix); unix {
+			// A Unix socket has no urgent data, yet EVFILT_EXCEPT still fires
+			// on it, which would only add an event to every read.
+			n--
+		}
+	}
+	_, err := syscall.Kevent(e.kq, changes[:n], nil, nil)
+	return err
+}
+
+// registerDatagram registers a dialed UDP socket for reads alone, since sends
+// never wait, and level-triggered like a UDP listener.
+func (e *Engine) registerDatagram(fd int, _ uint64) error {
+	change := [1]syscall.Kevent_t{{Ident: uint64(fd), Filter: syscall.EVFILT_READ, Flags: syscall.EV_ADD}}
+	_, err := syscall.Kevent(e.kq, change[:], nil, nil)
+	return err
+}
+
+// unregister does nothing: closing a descriptor removes its kevents.
+func (e *Engine) unregister(int) {}
+
+// setReadPaused removes the read filter to pause reads and adds it back to
+// resume them. Adding a filter evaluates it straight away, so bytes that were
+// already waiting in the socket raise an event without the peer sending more,
+// which is the redelivery the paused read relies on.
+func (e *Engine) setReadPaused(c *Connection, paused bool) error {
+	change := [1]syscall.Kevent_t{{Ident: uint64(c.FD()), Filter: syscall.EVFILT_READ,
+		Flags: syscall.EV_ADD | syscall.EV_CLEAR}}
+	if paused {
+		change[0].Flags = syscall.EV_DELETE
+	}
+	_, err := syscall.Kevent(e.kq, change[:], nil, nil)
+	if paused && err == syscall.ENOENT {
+		err = nil
+	}
+	return err
+}

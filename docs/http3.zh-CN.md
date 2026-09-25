@@ -4,11 +4,11 @@
 
 本文记录 Go 版 `http3` package 的边界：当前行为上的限制、出于设计考虑有意没有实现的
 功能，以及后续可以优化的方向。功能用法见
-[Go README 的 HTTP/3 章节](../go/README.zh-CN.md#http3-子-package)。
+[Go 使用指南的 HTTP/3 章节](guide.zh-CN.md#http3-子-package)。
 
-实现位于 [`go/http3`](../go/http3)，QUIC 传输层在
-[`go/http3/internal/quic`](../go/http3/internal/quic)，QPACK 在
-[`go/http3/internal/qpack`](../go/http3/internal/qpack)。三者全部自行实现，TLS 1.3 握手
+实现位于 [`http3`](../http3)，QUIC 传输层在
+[`http3/internal/quic`](../http3/internal/quic)，QPACK 在
+[`http3/internal/qpack`](../http3/internal/qpack)。三者全部自行实现，TLS 1.3 握手
 使用标准库的 `crypto/tls.QUICConn`，不依赖 quic-go 或 `golang.org/x/net`。
 
 ## 已支持的范围（概览）
@@ -207,11 +207,11 @@
 
 ## 一致性测试
 
-测试集在 `go/http3/http3_conformance_test.go`（测试名以 `TestHTTP3Conformance` 开头）
-和 `go/http3/protocol_test.go`（手写帧构造的协议错误），CI 的 `HTTP/3 conformance`
+测试集在 `http3/http3_conformance_test.go`（测试名以 `TestHTTP3Conformance` 开头）
+和 `http3/protocol_test.go`（手写帧构造的协议错误），CI 的 `HTTP/3 conformance`
 job 在 Linux、macOS、Windows 上运行。
 
-标准库没有 HTTP/3 实现，所以正向互通的对端用 quic-go，但它放在 `go/http3/interop`
+标准库没有 HTTP/3 实现，所以正向互通的对端用 quic-go，但它放在 `http3/interop`
 这个**独立的 module** 里：fib 的 `go.mod` 不引入任何依赖，`go build ./...` 也看不到它。
 测试把它编译成一个程序并以子进程方式驱动，两边用 JSON 逐行通信。构建不了（例如没有
 网络）时这些用例会跳过，CI 里设了 `FIB_REQUIRE_H3_INTEROP=1`，跳过即失败。

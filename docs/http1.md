@@ -4,7 +4,7 @@
 
 This document records what the Go `http` package supports of HTTP/1.0 and
 HTTP/1.1 (RFC 9110, RFC 9112), where it stops, and how that is tested. For
-usage, see the [HTTP section of the Go README](../go/README.zh-CN.md#http-子-package)
+usage, see the [HTTP section of the Go guide](guide.zh-CN.md#http-子-package)
 (Chinese). HTTP/2 and HTTP/3 have their own documents:
 [`http2.md`](http2.md), [`http3.md`](http3.md).
 
@@ -309,7 +309,7 @@ instead, which costs less than the extra system calls.
 
 ## Conformance tests
 
-`go/http/http1_conformance_test.go` (every test is named
+`http/http1_conformance_test.go` (every test is named
 `TestHTTP1Conformance…`) checks the fib server and client against peers that
 are not fib:
 
@@ -321,7 +321,7 @@ are not fib:
 - **fib client** against Go's `net/http` server (`httptest`) and raw servers
   (HTTP/1.0 keep-alive and close-delimited responses, malformed responses).
 - **fib client against fib server**, including HTTP/1.0 and sendfile.
-- **retained responses and body callbacks** (`go/http/retain_test.go`):
+- **retained responses and body callbacks** (`http/retain_test.go`):
   answering from another goroutine, a retained request holding the pipelined
   ones behind it, nested holds, `OnBody` on a buffered and on a streamed body,
   a release from inside a body callback, chunked with trailers, answering
@@ -335,22 +335,22 @@ are not fib:
   body that is all there reading through to `io.EOF`, `Expect: 100-continue`
   granted by a read and by `OnBody`, and 64 uploads held open at once without
   a goroutine between them.
-- **read timeouts** (`go/http/timeout_test.go`): a header and a body that stop
+- **read timeouts** (`http/timeout_test.go`): a header and a body that stop
   arriving, a streamed body that stops arriving, a handler slower than
   `ReadTimeout` still answering, an idle connection closed and an idle timeout
   refreshed by each request, a connection that never speaks, a server without
   timeouts, a connection that becomes HTTP/2 being released from them, and the
-  timeout reaching `OnClose`. `go/netconn_test.go` checks
+  timeout reaching `OnClose`. `netconn_test.go` checks
   `Connection`'s own deadlines and its other `net.Conn` methods.
-- **streaming request bodies** (`go/http/body_test.go`): the handler running
+- **streaming request bodies** (`http/body_test.go`): the handler running
   before the body ends, bodies under the threshold staying buffered, chunked
   uploads with trailers fed a chunk at a time, reads held while the handler is
   behind, discard and close after an unread body, lazy and refused
   100-continue, `MaxStreamedBodyBytes`, a truncated upload, pipelining behind a
   streamed request, a panicking handler, uploads from `net/http`'s own client,
   and the incremental chunked decoder fed one byte at a time.
-  `go/hold_reads_test.go` checks `Connection.HoldReads` itself.
-- `go/sendfile_test.go` checks `Connection.SendFile` over TCP and Unix
+  `hold_reads_test.go` checks `Connection.HoldReads` itself.
+- `sendfile_test.go` checks `Connection.SendFile` over TCP and Unix
   sockets, from the handler and from other goroutines, with a slow reader, and
   a file shorter than its range.
 
@@ -360,6 +360,5 @@ on Linux, macOS and Windows with `FIB_REQUIRE_CURL=1`, which makes a missing
 curl fail the job instead of skipping those cases. To run it locally:
 
 ```sh
-cd go
 go test -race -run 'TestHTTP1Conformance|TestSendFile|TestSendableFileOf|TestResponseWriter|TestStreamRequestBody|TestChunkedDecoder|TestHoldReads|TestServerRead|TestServerIdle|TestServerTimeout|TestServerWithoutTimeouts|TestReadDeadline|TestWriteDeadline|TestZeroDeadline|TestConnectionAddresses|TestRetain|TestOnBody|TestOnCancel' -v . ./http/
 ```

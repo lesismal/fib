@@ -22,7 +22,7 @@ run any connection, so load balances across real work rather than fd counts.
 ## Quick start
 
 ```sh
-go get github.com/lesismal/fib/go
+go get github.com/lesismal/fib
 ```
 
 ```go
@@ -31,11 +31,11 @@ package main
 import (
 	stdhttp "net/http"
 
-	fib "github.com/lesismal/fib/go"
-	fibhttp "github.com/lesismal/fib/go/http"
-	"github.com/lesismal/fib/go/middleware"
-	"github.com/lesismal/fib/go/middleware/logger"
-	"github.com/lesismal/fib/go/middleware/recover"
+	fib "github.com/lesismal/fib"
+	fibhttp "github.com/lesismal/fib/http"
+	"github.com/lesismal/fib/middleware"
+	"github.com/lesismal/fib/middleware/logger"
+	"github.com/lesismal/fib/middleware/recover"
 )
 
 func main() {
@@ -62,19 +62,18 @@ The same `Handler` serves HTTP/1.x and HTTP/2 on one port. For HTTP/3, see `exam
 
 | Package | Description |
 | --- | --- |
-| [`fib`](go) | Event loop, connections, TCP / UDP / Unix sockets, `SendFile`, async dial |
-| [`taskpool`](go/taskpool) | Bounded worker pools: adaptive, cond and elastic modes |
-| [`bufferpool`](go/bufferpool) | Aligned, size-classed buffer pool |
-| [`tls`](go/tls) | TLS layered on a connection, transparent to the protocols above it |
-| [`http`](go/http) | HTTP/1.x and HTTP/2 server and client |
-| [`http3`](go/http3) | HTTP/3, QUIC and QPACK server and client |
-| [`websocket`](go/websocket) | RFC 6455 server and client, with permessage-deflate |
-| [`middleware`](go/middleware) | HTTP middleware chain and the common middleware |
+| [`fib`](.) | Event loop, connections, TCP / UDP / Unix sockets, `SendFile`, async dial |
+| [`taskpool`](taskpool) | Bounded worker pools: adaptive, cond and elastic modes |
+| [`bufferpool`](bufferpool) | Aligned, size-classed buffer pool |
+| [`tls`](tls) | TLS layered on a connection, transparent to the protocols above it |
+| [`http`](http) | HTTP/1.x and HTTP/2 server and client |
+| [`http3`](http3) | HTTP/3, QUIC and QPACK server and client |
+| [`websocket`](websocket) | RFC 6455 server and client, with permessage-deflate |
+| [`middleware`](middleware) | HTTP middleware chain and the common middleware |
 
 ## Examples
 
 ```sh
-cd go
 go run ./examples/tcp/nontls/server
 go run ./examples/http/nontls/server
 go run ./examples/websocket/nontls/server
@@ -85,7 +84,7 @@ Each server has a matching `client` beside it.
 
 ## Documentation
 
-- [Go guide](go/README.zh-CN.md) (Chinese): configuration, API and every sub-package
+- [Go guide](docs/guide.zh-CN.md) (Chinese): configuration, API and every sub-package
 - [HTTP/1.x](docs/http1.md), [HTTP/2](docs/http2.md), [HTTP/3](docs/http3.md): what is supported, the limitations, and the conformance tests
 - [Architecture](docs/architecture.html): an interactive, bilingual diagram of read scheduling, write backpressure, load balancing and connection teardown
 

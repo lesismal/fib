@@ -5,11 +5,11 @@
 This document records the boundaries of the Go `http3` package: how it
 currently behaves in ways users need to know about, what was deliberately left
 out, and where it can be improved. For usage, see the
-[HTTP/3 section of the Go README](../go/README.zh-CN.md#http3-子-package) (Chinese).
+[HTTP/3 section of the Go guide](guide.zh-CN.md#http3-子-package) (Chinese).
 
-The implementation lives in [`go/http3`](../go/http3), with the QUIC transport
-in [`go/http3/internal/quic`](../go/http3/internal/quic) and QPACK in
-[`go/http3/internal/qpack`](../go/http3/internal/qpack). All three are written
+The implementation lives in [`http3`](../http3), with the QUIC transport
+in [`http3/internal/quic`](../http3/internal/quic) and QPACK in
+[`http3/internal/qpack`](../http3/internal/qpack). All three are written
 from scratch. The TLS 1.3 handshake is the standard library's
 `crypto/tls.QUICConn`; there is no dependency on quic-go or `golang.org/x/net`.
 
@@ -259,13 +259,13 @@ What is still not covered end to end:
 
 ## Conformance tests
 
-The suite is `go/http3/http3_conformance_test.go` (its tests start with
-`TestHTTP3Conformance`) and `go/http3/protocol_test.go` (protocol errors
+The suite is `http3/http3_conformance_test.go` (its tests start with
+`TestHTTP3Conformance`) and `http3/protocol_test.go` (protocol errors
 written frame by frame). The `HTTP/3 conformance` CI job runs them on Linux,
 macOS and Windows.
 
 The standard library has no HTTP/3, so the peer for the interop cases is
-quic-go — but it lives in `go/http3/interop`, a **module of its own**: fib's
+quic-go — but it lives in `http3/interop`, a **module of its own**: fib's
 `go.mod` gains no dependency and `go build ./...` does not see it. The tests
 build it as a program and drive it as a subprocess, a line of JSON at a time.
 When it cannot be built, for want of network access for instance, those cases

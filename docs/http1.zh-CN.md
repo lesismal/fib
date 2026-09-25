@@ -3,7 +3,7 @@
 [English](http1.md) | [简体中文](http1.zh-CN.md)
 
 本文整理 Go `http` package 对 HTTP/1.0 和 HTTP/1.1（RFC 9110、RFC 9112）的支持情况、
-边界以及测试方式。用法见 [Go README 的 HTTP 章节](../go/README.zh-CN.md#http-子-package)。
+边界以及测试方式。用法见 [Go 使用指南的 HTTP 章节](guide.zh-CN.md#http-子-package)。
 HTTP/2、HTTP/3 各有单独的文档：[`http2.zh-CN.md`](http2.zh-CN.md)、
 [`http3.zh-CN.md`](http3.zh-CN.md)。
 
@@ -246,7 +246,7 @@ body 的请求，以及不在 server 自行解析范围内、改由 `net/http` �
 
 ## 一致性测试
 
-`go/http/http1_conformance_test.go`（所有测试都以 `TestHTTP1Conformance` 开头）用非 fib
+`http/http1_conformance_test.go`（所有测试都以 `TestHTTP1Conformance` 开头）用非 fib
 的对端检查 fib 的服务端和客户端：
 
 - **fib 服务端**对 Go `net/http` 客户端、原始 TCP 连接（用来发送 `net/http` 不会发出的
@@ -256,26 +256,26 @@ body 的请求，以及不在 server 自行解析范围内、改由 `net/http` �
 - **fib 客户端**对 Go `net/http` 服务端（`httptest`）和原始服务端（HTTP/1.0 keep-alive
   和以关闭连接结束的响应、格式错误的响应）。
 - **fib 客户端对 fib 服务端**，包括 HTTP/1.0 和 sendfile。
-- **持有响应与 body 回调**（`go/http/retain_test.go`）：在别的 goroutine 里回复、被持有
+- **持有响应与 body 回调**（`http/retain_test.go`）：在别的 goroutine 里回复、被持有
   的请求挡住后面的流水线请求、嵌套持有、`OnBody` 对缓存 body 和流式 body、在 body 回调
   里释放、带 trailer 的 chunked、不 Retain 直接回复、客户端上传到一半跑掉时 `OnBody` 和
   `OnCancel` 各只收到一次、读超时触发 `OnCancel`、body 超限、响应写完之后再 Retain、同一
   个 handler 跑在 HTTP/2 上，以及把以上全部并发跑一遍并检查没有残留的压力测试。
-- **读超时**（`go/http/timeout_test.go`）：header 和 body 收到一半就不来了、流式 body
+- **读超时**（`http/timeout_test.go`）：header 和 body 收到一半就不来了、流式 body
   收到一半就不来了、比 `ReadTimeout` 慢的 handler 仍然能回复、空闲连接被关闭、每个请求
   都会刷新空闲超时、一个字节都不发的连接、没配超时的服务端、变成 HTTP/2 的连接被解除
-  超时，以及超时传到 `OnClose`。`go/netconn_test.go` 检查 `Connection` 自己的 deadline
+  超时，以及超时传到 `OnClose`。`netconn_test.go` 检查 `Connection` 自己的 deadline
   和其余 `net.Conn` 方法。
 - **流式请求 body 的非阻塞读取**：`Read` 返回 `ErrWouldBlock` 后交给 `OnBody` 不丢字节、
   body 已经全在时一路读到 `io.EOF`、读和 `OnBody` 都能触发 100-continue，以及 64 个上传
   同时挂起而不多出一条 goroutine。
-- **流式请求 body**（`go/http/body_test.go`）：handler 在 body 结束前就运行、小于阈值的
+- **流式请求 body**（`http/body_test.go`）：handler 在 body 结束前就运行、小于阈值的
   body 仍然整体缓存、一块一块发来的带 trailer 的 chunked 上传、handler 落后时暂停读、
   没读完的 body 的丢弃与关闭、惰性与被拒绝的 100-continue、`MaxStreamedBodyBytes`、
   截断的上传、流式请求之后的 pipelining、handler panic、用 `net/http` 客户端上传，以及
-  逐字节喂给增量 chunked 解码器。`go/hold_reads_test.go` 单独检查
+  逐字节喂给增量 chunked 解码器。`hold_reads_test.go` 单独检查
   `Connection.HoldReads`。
-- `go/sendfile_test.go` 在 TCP 和 Unix socket 上检查 `Connection.SendFile`：在 handler
+- `sendfile_test.go` 在 TCP 和 Unix socket 上检查 `Connection.SendFile`：在 handler
   中和其他 goroutine 中调用、对端读得慢、文件比声明的范围短。
 
 对端只有标准库和 curl 可执行文件，Go module 不增加任何依赖。CI 中单独的
@@ -283,6 +283,5 @@ body 的请求，以及不在 server 自行解析范围内、改由 `net/http` �
 `FIB_REQUIRE_CURL=1`：缺少 curl 时直接失败而不是跳过 curl 用例。本地运行：
 
 ```sh
-cd go
 go test -race -run 'TestHTTP1Conformance|TestSendFile|TestSendableFileOf|TestResponseWriter|TestStreamRequestBody|TestChunkedDecoder|TestHoldReads|TestServerRead|TestServerIdle|TestServerTimeout|TestServerWithoutTimeouts|TestReadDeadline|TestWriteDeadline|TestZeroDeadline|TestConnectionAddresses|TestRetain|TestOnBody|TestOnCancel' -v . ./http/
 ```

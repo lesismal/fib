@@ -1,0 +1,70 @@
+//go:build linux || darwin || windows
+
+// Command server is an HTTP echo server: it answers each request with its
+// method, path and body. With -dir it also serves that directory's files
+// under /files/, through net/http's FileServer, which gets Range and
+// conditional requests from net/http and sends each file by sendfile(2).
+//
+//	go run ./examples/http/nontls/server -dir .
+//	curl -O http://127.0.0.1:8080/files/go.mod
+package main
+
+import (
+	"flag"
+	"fmt"
+	"io"
+	"log"
+	stdhttp "net/http"
+	"strings"
+
+	fib "github.com/lesismal/fib"
+	"github.com/lesismal/fib/examples/internal/example"
+	fibhttp "github.com/lesismal/fib/http"
+)
+
+func main() {
+	addr := flag.String("addr", "127.0.0.1:8080", "listen address")
+	dir := flag.String("dir", "", "directory to serve under /files/")
+	flag.Parse()
+
+	handler := echo()
+	if *dir != "" {
+		handler = withFiles(*dir, handler)
+	}
+	config := fib.DefaultConfig()
+	config.Addr = *addr
+	engine, err := fib.Bind(config, fibhttp.NewHandler(handler))
+	if err != nil {
+		example.Fatal(err)
+	}
+	example.Serve(engine, fmt.Sprintf("HTTP echo server listening on http://%s", *addr))
+}
+
+func echo() fibhttp.HandlerFunc {
+	return func(c *fibhttp.Context, r *stdhttp.Request) {
+		// The body has already been read off the connection whole, so
+		// reading it here never waits on the network.
+		body, _ := io.ReadAll(r.Body)
+		reply := fmt.Sprintf("%s %s %s", r.Method, r.URL.Path, body)
+		if err := c.Respond(stdhttp.StatusOK, "text/plain; charset=utf-8", []byte(reply)); err != nil {
+			// The request went away before its answer did — an HTTP/2 client
+			// resetting one stream, or a peer that hung up. The connection
+			// carries the others, so it is left alone; one the engine cannot
+			// use any more it closes itself.
+			log.Printf("respond: %v", err)
+		}
+	}
+}
+
+// withFiles serves dir under /files/ and leaves every other path to next.
+// Context is an http.ResponseWriter, so net/http's handlers answer through it.
+func withFiles(dir string, next fibhttp.HandlerFunc) fibhttp.HandlerFunc {
+	files := stdhttp.StripPrefix("/files/", stdhttp.FileServer(stdhttp.Dir(dir)))
+	return func(c *fibhttp.Context, r *stdhttp.Request) {
+		if strings.HasPrefix(r.URL.Path, "/files/") {
+			files.ServeHTTP(c, r)
+			return
+		}
+		next(c, r)
+	}
+}

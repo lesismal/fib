@@ -5,9 +5,9 @@
 This document records the boundaries of the HTTP/2 implementation in the Go
 `http` package: how it currently behaves in ways users need to know about,
 what was deliberately left out, and where it can be improved. For usage, see
-the [HTTP/2 section of the Go README](../go/README.zh-CN.md#http2) (Chinese).
+the [HTTP/2 section of the Go guide](guide.zh-CN.md#http2) (Chinese).
 
-The implementation lives in [`go/http`](../go/http) (`h2_*.go`) and an
+The implementation lives in [`http`](../http) (`h2_*.go`) and an
 internal hpack package. It is written from scratch and does not depend on
 `golang.org/x/net`.
 
@@ -145,7 +145,7 @@ These are constants today and cannot be configured:
 
 ## Conformance testing
 
-`go/http/http2_conformance_test.go` holds the suite, every test named
+`http/http2_conformance_test.go` holds the suite, every test named
 `TestHTTP2Conformance…`, and CI runs it on Linux, macOS and Windows in the
 `HTTP/2 conformance` job. The peers are the standard library and tools the
 runners already have or install as tools, so the module itself gains no
@@ -189,7 +189,7 @@ still lacks:
 
 Done: see [Conformance testing](#conformance-testing). Parsing HTTP/1
 requests, reading HTTP/2 frames and coding HPACK all have fuzz targets
-(`go/http/fuzz_test.go` and `go/internal/hpack/fuzz_test.go`), which the
+(`http/fuzz_test.go` and `internal/hpack/fuzz_test.go`), which the
 `Fuzz the parsers` CI job runs for 20 seconds each. What is still missing is a
 load-oriented check (h2load, for example) to catch what only shows up under
 concurrency.

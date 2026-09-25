@@ -18,15 +18,12 @@ jobs:
   lint:
     name: Lint (gofmt / vet / staticcheck)
     runs-on: ubuntu-latest
-    defaults:
-      run:
-        working-directory: go
     steps:
       - uses: actions/checkout@v5
       - uses: actions/setup-go@v6
         with:
           go-version: stable
-          cache-dependency-path: go/go.mod
+          cache-dependency-path: go.mod
       - name: gofmt
         run: |
           unformatted=$(gofmt -l .)
@@ -55,7 +52,7 @@ jobs:
       # The HTTP/3 conformance peer is a module of its own, so the checks
       # above, which are module-aware, do not reach it.
       - name: Lint the interop peer
-        working-directory: go/http3/interop
+        working-directory: http3/interop
         run: |
           go vet ./...
           "$(go env GOPATH)/bin/staticcheck" ./...
@@ -77,15 +74,12 @@ jobs:
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
         go: ['1.27.x', stable]
-    defaults:
-      run:
-        working-directory: go
     steps:
       - uses: actions/checkout@v5
       - uses: actions/setup-go@v6
         with:
           go-version: ${{ matrix.go }}
-          cache-dependency-path: go/go.mod
+          cache-dependency-path: go.mod
       - name: Build
         run: go build ./...
       - name: Test
@@ -132,15 +126,12 @@ jobs:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
-    defaults:
-      run:
-        working-directory: go
     steps:
       - uses: actions/checkout@v5
       - uses: actions/setup-go@v6
         with:
           go-version: stable
-          cache-dependency-path: go/go.mod
+          cache-dependency-path: go.mod
       - name: curl version
         shell: bash
         run: curl --version
@@ -187,15 +178,12 @@ jobs:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
-    defaults:
-      run:
-        working-directory: go
     steps:
       - uses: actions/checkout@v5
       - uses: actions/setup-go@v6
         with:
           go-version: stable
-          cache-dependency-path: go/go.mod
+          cache-dependency-path: go.mod
       - name: Install h2spec
         run: go install github.com/summerwind/h2spec/cmd/h2spec@v2.2.1
       - name: Versions
@@ -252,13 +240,12 @@ jobs:
       - uses: actions/setup-go@v6
         with:
           go-version: stable
-          cache-dependency-path: go/go.mod
+          cache-dependency-path: go.mod
       - name: Install h2spec
         run: go install github.com/summerwind/h2spec/cmd/h2spec@v2.2.1
       - name: Versions
         run: '"$(go env GOPATH)/bin/h2spec" --version'
       - name: Build the HTTP/2-only example server
-        working-directory: go
         run: go build -o "$RUNNER_TEMP/h2only-server" ./examples/http2only/server
       - name: Run h2spec against h2c and h2, and report the result
         shell: bash
@@ -340,7 +327,7 @@ jobs:
   # HTTP/3 conformance: the fib server against a quic-go client, the fib
   # client against a quic-go server, and both against raw QUIC peers for the
   # frames a well-behaved implementation never sends. The quic-go peer is a
-  # module of its own under go/http3/interop, built as a program the tests
+  # module of its own under http3/interop, built as a program the tests
   # run, so the fib module itself gains no dependency.
   http3-conformance:
     name: HTTP/3 conformance (${{ matrix.os }})
@@ -356,15 +343,14 @@ jobs:
         with:
           go-version: stable
           cache-dependency-path: |
-            go/go.mod
-            go/http3/interop/go.sum
+            go.mod
+            http3/interop/go.sum
       - name: Build the interop peer
-        working-directory: go/http3/interop
+        working-directory: http3/interop
         run: |
           go vet ./...
           go build ./...
       - name: Conformance tests
-        working-directory: go
         shell: bash
         env:
           # Fail rather than skip if the peer cannot be built.
@@ -399,15 +385,12 @@ jobs:
     name: Fuzz the parsers
     runs-on: ubuntu-latest
     timeout-minutes: 20
-    defaults:
-      run:
-        working-directory: go
     steps:
       - uses: actions/checkout@v5
       - uses: actions/setup-go@v6
         with:
           go-version: stable
-          cache-dependency-path: go/go.mod
+          cache-dependency-path: go.mod
       - name: Fuzz
         shell: bash
         run: |
@@ -436,7 +419,7 @@ jobs:
         uses: actions/upload-artifact@v5
         with:
           name: fuzz-failures
-          path: go/**/testdata/fuzz/**
+          path: "**/testdata/fuzz/**"
           if-no-files-found: ignore
 
   # Known vulnerabilities in the standard library the module builds against,
@@ -450,14 +433,14 @@ jobs:
       - uses: actions/setup-go@v6
         with:
           go-version: stable
-          cache-dependency-path: go/go.mod
+          cache-dependency-path: go.mod
       - name: Install govulncheck
         run: go install golang.org/x/vuln/cmd/govulncheck@latest
       - name: Scan
         shell: bash
         run: |
           set -e
-          for module in go go/http3/interop; do
+          for module in . http3/interop; do
             echo "::group::$module"
             (cd "$module" && "$(go env GOPATH)/bin/govulncheck" ./...)
             echo "::endgroup::"
@@ -471,9 +454,8 @@ jobs:
       - uses: actions/setup-go@v6
         with:
           go-version: stable
-          cache-dependency-path: go/go.mod
+          cache-dependency-path: go.mod
       - name: Build all targets
-        working-directory: go
         run: |
           # freebsd exercises the portable fallback engine.
           for target in \
@@ -508,9 +490,8 @@ jobs:
       - uses: actions/setup-go@v6
         with:
           go-version: stable
-          cache-dependency-path: go/go.mod
+          cache-dependency-path: go.mod
       - name: Build echo server
-        working-directory: go
         run: go build -o "$RUNNER_TEMP/websocket_server" ./examples/websocket/nontls/server
       - name: Start echo server
         run: |

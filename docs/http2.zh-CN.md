@@ -4,9 +4,9 @@
 
 本文记录 Go 版 `http` package 中 HTTP/2 实现的边界：当前行为上的限制、出于设计考虑
 有意没有实现的功能，以及后续可以优化的方向。功能用法见
-[Go README 的 HTTP/2 章节](../go/README.zh-CN.md#http2)。
+[Go 使用指南的 HTTP/2 章节](guide.zh-CN.md#http2)。
 
-实现位于 [`go/http`](../go/http)（`h2_*.go`）以及内部的 hpack package，全部自行实现，
+实现位于 [`http`](../http)（`h2_*.go`）以及内部的 hpack package，全部自行实现，
 不依赖 `golang.org/x/net`。
 
 ## 已支持的范围（概览）
@@ -113,7 +113,7 @@
 
 ## 一致性测试
 
-测试集在 `go/http/http2_conformance_test.go`，测试名统一以 `TestHTTP2Conformance`
+测试集在 `http/http2_conformance_test.go`，测试名统一以 `TestHTTP2Conformance`
 开头，CI 的 `HTTP/2 conformance` job 在 Linux、macOS、Windows 上运行。对端全部使用
 标准库或 CI 上安装的工具，fib 本身不因此增加任何第三方依赖：
 
@@ -148,7 +148,7 @@ h2spec 只会说 HTTP/2，所以跑它时服务端要设置 `Config.HTTP2Only`�
 ### 2. 协议一致性测试
 
 已完成，见[一致性测试](#一致性测试)。HTTP/1 请求解析、HTTP/2 帧读取和 HPACK
-编解码都有 fuzz 目标（`go/http/fuzz_test.go`、`go/internal/hpack/fuzz_test.go`），
+编解码都有 fuzz 目标（`http/fuzz_test.go`、`internal/hpack/fuzz_test.go`），
 CI 的 `Fuzz the parsers` job 每个目标跑 20 秒。还缺的是压测（例如 h2load）才能暴露的
 并发问题。
 
