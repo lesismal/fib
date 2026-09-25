@@ -27,7 +27,7 @@ func inlinePoolName(engine string) string { return engine + "-inline" }
 // newTaskPool builds the pool config describes.
 func newTaskPool(config Config) *taskpool.TaskPool {
 	name := taskPoolName(engineName(config))
-	if config.TaskPoolMode == taskpool.ModeAdaptive && config.MinWorkerCount > 0 {
+	if config.TaskPoolMode == taskpool.ModeAdaptive {
 		return taskpool.NewAdaptive(taskpool.AdaptiveConfig{
 			Name: name, MinWorkers: config.MinWorkerCount, MaxWorkers: config.WorkerCount, QueueSize: config.MaxEvents,
 		})

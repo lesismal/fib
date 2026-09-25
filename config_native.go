@@ -69,8 +69,9 @@ type Config struct {
 	// follow the mode rather than staying at numbers tuned for the other one.
 	TaskPoolMode taskpool.Mode
 	// MinWorkerCount is the resident floor a ModeAdaptive pool retires down
-	// to, with WorkerCount as the ceiling it grows to. Zero means ten workers
-	// per CPU core. The other modes ignore it.
+	// to, with WorkerCount as the ceiling it grows to. Zero, the default,
+	// lets an idle pool retire every worker and start them again when work
+	// arrives. The other modes ignore it.
 	MinWorkerCount int
 	// SharedTaskPool has the engines of one Name run on one task pool. The
 	// first of them builds it from its own settings, and those that follow

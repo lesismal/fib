@@ -43,8 +43,8 @@
     `TaskPool.Workers()` 返回当前 worker 数（其他 Mode 调 `Resize` 返回 false）。
   - 直接使用：`taskpool.NewAdaptive(taskpool.AdaptiveConfig{Name: "jobs", MinWorkers: 16,
     MaxWorkers: 4096, QueueSize: 10000})`；`NewWithMode(name, ModeAdaptive, max, queue)`
-    的下限默认为每个 CPU 核心十个 worker（`taskpool.DefaultMinWorkers`）。在 fib 里，
-    `WorkerCount` 是上限，`Config.MinWorkerCount` 是下限（0 表示每个 CPU 核心十个）。
+    的下限为 0。下限为 0 时，空闲的池会把 worker 全部退掉，有任务来时再启动。在 fib 里，
+    `WorkerCount` 是上限，`Config.MinWorkerCount` 是下限（默认 0）。
 - 池容量按 Mode 分别给默认值，因为 `WorkerCount` 在不同 Mode 下含义不同
   （ModeAdaptive 与 ModeElastic 一样是上限，默认值也相同）：
   ModeCond 会预先创建这么多协程并让它们挂在条件变量上，这个数就是实际存在的
@@ -628,8 +628,8 @@ server, err := fib.Bind(config, fibtls.NewServer(tlsConfig, fibhttp.NewHandler(h
   HTTP/2 与 HTTP/3 server 共用，同名的最后一个 Engine 关闭后停止，且永远不是 Engine 的协程池：Engine 的 worker
   解析出请求后要往这个池提交，若两者是同一个池，队列满时所有 worker 都可能卡在提交上，
   没有人再取任务，连 event loop 也会卡住。它的上限是当前运行的同名 Engine 中最大协程池的
-  2 倍（没有 Engine 时取 `fib.DefaultStreamPoolSizing`），下限为每个 CPU 核心十个
-  worker——Engine 的 worker 只等内核，handler 还要等应用自己的 I/O：
+  2 倍（没有 Engine 时取 `fib.DefaultStreamPoolSizing`），下限为 0，空闲时不保留 worker。
+  上限取 2 倍是因为 Engine 的 worker 只等内核，handler 还要等应用自己的 I/O：
 
   ```go
   httpConfig := fibhttp.DefaultConfig()

@@ -106,16 +106,15 @@ type TaskPool struct {
 }
 
 // New creates a ModeAdaptive pool that grows to maxConcurrent workers under
-// load and retires down to ten workers per CPU core when idle. name labels
-// the pool in what it logs.
+// load and retires every one of them when idle. name labels the pool in what
+// it logs.
 func New(name string, maxConcurrent, queueSize int) *TaskPool {
 	return NewWithMode(name, ModeAdaptive, maxConcurrent, queueSize)
 }
 
 // NewWithMode creates a pool of the given mode, labelled name in what it
 // logs. For ModeAdaptive, maxConcurrent is the ceiling and the floor is
-// DefaultMinWorkers of it; NewAdaptive sets both. ModeInline ignores both
-// sizes.
+// zero; NewAdaptive sets both. ModeInline ignores both sizes.
 func NewWithMode(name string, mode Mode, maxConcurrent, queueSize int) *TaskPool {
 	if mode == ModeInline {
 		return NewInline(name)
@@ -138,7 +137,7 @@ func NewWithMode(name string, mode Mode, maxConcurrent, queueSize int) *TaskPool
 		})
 	case ModeAdaptive:
 		return NewAdaptive(AdaptiveConfig{
-			Name: name, MinWorkers: DefaultMinWorkers(maxConcurrent), MaxWorkers: maxConcurrent, QueueSize: queueSize,
+			Name: name, MaxWorkers: maxConcurrent, QueueSize: queueSize,
 		})
 	default:
 		panic("taskpool: invalid mode")

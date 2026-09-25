@@ -25,8 +25,8 @@ package http
 // request and found an engine's own queue full of handlers would wait for
 // room that only another engine worker, just as stuck, could make. Its
 // ceiling is twice the widest engine pool of that name running, or twice
-// what fib.DefaultPoolSizing reports while none is, and its resident floor
-// ten workers per CPU core; neither is configured per server. It stops once
+// what fib.DefaultPoolSizing reports while none is, and its floor zero, so an
+// idle pool keeps no worker; neither is configured per server. It stops once
 // the last engine of its name has closed, without waiting for the handlers
 // still running, and a request that comes after is served by its reader.
 type StreamPoolConfig struct {

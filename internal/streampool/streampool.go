@@ -97,7 +97,6 @@ func Get(engine string, fallback, queueSize int) *taskpool.TaskPool {
 		s.ceiling = s.ceilingLocked()
 		s.pool = taskpool.NewAdaptive(taskpool.AdaptiveConfig{
 			Name:       Name(engine),
-			MinWorkers: taskpool.DefaultMinWorkers(s.ceiling),
 			MaxWorkers: s.ceiling,
 			QueueSize:  queueSize,
 		})
@@ -116,15 +115,15 @@ func Ceiling(engine string) int {
 	return 0
 }
 
-// resizeLocked moves a built pool's ceiling, and its floor with it, to what
-// the engines now ask for.
+// resizeLocked moves a built pool's ceiling to what the engines now ask for.
+// Its floor stays at zero.
 func (s *sharedPool) resizeLocked() {
 	ceiling := s.ceilingLocked()
 	if s.pool == nil || ceiling == s.ceiling || ceiling <= 0 {
 		return
 	}
 	s.ceiling = ceiling
-	s.pool.Resize(taskpool.DefaultMinWorkers(ceiling), ceiling)
+	s.pool.Resize(0, ceiling)
 }
 
 // ceilingLocked is the largest ceiling an engine asks for, or the fallback

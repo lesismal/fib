@@ -1,7 +1,6 @@
 package taskpool
 
 import (
-	"runtime"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -66,17 +65,6 @@ func validateAdaptiveRange(minWorkers, maxWorkers int) {
 	if minWorkers < 0 || minWorkers > maxWorkers {
 		panic("taskpool: minWorkers must be between zero and maxWorkers")
 	}
-}
-
-// MinWorkersPerCPU is how many workers per CPU core an adaptive pool keeps
-// resident by default, so that every core has warm workers to run on.
-const MinWorkersPerCPU = 10
-
-// DefaultMinWorkers is the resident floor NewWithMode gives an adaptive pool
-// whose ceiling is maxWorkers: MinWorkersPerCPU workers per CPU core, or the
-// ceiling itself when that is lower.
-func DefaultMinWorkers(maxWorkers int) int {
-	return min(maxWorkers, MinWorkersPerCPU*runtime.NumCPU())
 }
 
 // adaptiveBackend spreads an adaptive pool over shards, for the same reason

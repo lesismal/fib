@@ -46,7 +46,7 @@
   （默认 `fib-streams`），由连接来自该名字 engine 的所有 HTTP/2 与 HTTP/3 server 共用，且
   永远不与 engine 的协程池共用（共用会在队列满时让 engine 的 worker 全部卡在提交上而死锁）。
   它的上限是当前运行的同名 engine 中最大协程池的 2 倍，没有 engine 时取
-  `fib.DefaultStreamPoolSizing`；空闲时保留每个 CPU 核心十个 worker。该名字的最后一个
+  `fib.DefaultStreamPoolSizing`；下限为 0，空闲时不保留 worker。该名字的最后一个
   engine 关闭后它随之停止，不等待仍在运行的 handler。
 - `StreamPool.MaxConcurrentHandlers` 限制单个连接同时处理的请求数 N：第 N 个请求在读取
   该连接的协程上执行，在它返回前该连接不再读取新数据，因此这个上限由对端的流控承担，

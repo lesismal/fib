@@ -59,7 +59,7 @@ Behaviour to be aware of when using it.
   frames, and were the queue it submits to its own, every worker could end up
   waiting for room that none is left to make. Its ceiling is twice the widest
   engine pool of that name running, or `fib.DefaultStreamPoolSizing` while
-  none is, and it keeps ten workers per CPU core resident. It stops once the
+  none is, and its floor is zero, so an idle one keeps no worker. It stops once the
   last engine of its name closes, without waiting for handlers still
   running.
 - `StreamPool.MaxConcurrentHandlers` bounds how many of one connection's
