@@ -204,3 +204,87 @@ func newOfflineConnection(e *Engine) *Connection {
 	c.fd.Store(-1)
 	return c
 }
+
+// A round that finds output queued leaves its read for later, and a write edge
+// is not always coming to pick it up: another goroutine's Flush, between two
+// writes with the lock let go, keeps the round from flushing for itself, and
+// then writes everything without the socket ever filling. Here that Flush is
+// held at that point while the peer's next bytes arrive; the drain that
+// follows has to hand the read back.
+func TestReadDeferredBehindAnotherGoroutinesFlush(t *testing.T) {
+	sentB := make(chan struct{})
+	parked := make(chan *Connection, 1)
+	handler := HandlerFuncs{
+		Data: func(c *Connection, data []byte) {
+			switch string(data) {
+			case "a":
+				c.mu.Lock()
+				c.flushing = true
+				c.mu.Unlock()
+				// Output the peer does not wait for, queued behind the flush.
+				_ = c.Send([]byte("x"))
+				<-sentB
+				if !waitFor(func() bool {
+					c.mu.Lock()
+					defer c.mu.Unlock()
+					return c.pendingEvents&evIn != 0
+				}) {
+					t.Error("the event loop never noted the next read")
+				}
+				parked <- c
+			case "b":
+				_ = c.Send([]byte("r"))
+			}
+		},
+	}
+	_, addr := startEchoServer(t, DefaultConfig(), handler)
+	conn, err := net.DialTimeout("tcp", addr, 5*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	_ = conn.SetDeadline(time.Now().Add(5 * time.Second))
+	if _, err = conn.Write([]byte("a")); err != nil {
+		t.Fatal(err)
+	}
+	// Let the round deliver "a" alone before "b" follows.
+	time.Sleep(50 * time.Millisecond)
+	if _, err = conn.Write([]byte("b")); err != nil {
+		t.Fatal(err)
+	}
+	close(sentB)
+	c := <-parked
+	if !waitFor(func() bool {
+		c.mu.Lock()
+		defer c.mu.Unlock()
+		return !c.scheduled
+	}) {
+		t.Fatal("the round never ended")
+	}
+	// The Flush takes the lock again and writes "x" whole.
+	c.mu.Lock()
+	c.flushing = false
+	c.mu.Unlock()
+	if err = c.flushOutput(); err != nil {
+		t.Fatal(err)
+	}
+	var got []byte
+	buf := make([]byte, 16)
+	for !bytes.Contains(got, []byte("r")) {
+		n, err := conn.Read(buf)
+		if err != nil {
+			t.Fatalf("got %q, then %v: the read left for the drain was never done", got, err)
+		}
+		got = append(got, buf[:n]...)
+	}
+}
+
+// waitFor polls done for up to five seconds and reports whether it came true.
+func waitFor(done func() bool) bool {
+	for deadline := time.Now().Add(5 * time.Second); !done(); time.Sleep(time.Millisecond) {
+		if time.Now().After(deadline) {
+			return false
+		}
+	}
+	return true
+}

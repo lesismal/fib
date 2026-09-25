@@ -53,7 +53,11 @@ type Connection struct {
 	// still in the socket, because the write backlog filled up first. Those
 	// bytes raise no further edge on their own, so the event loop owes the
 	// connection either a paused-then-resumed read or a direct redelivery.
-	readStalled    bool
+	readStalled bool
+	// readDeferred records that a round left a read undone because output
+	// was still queued, and ended. Whatever empties the queue owes the
+	// connection that read.
+	readDeferred   bool
 	flushing       bool
 	corked         bool
 	closeAfterSend bool
@@ -505,10 +509,16 @@ func (c *Connection) process() {
 	for {
 		c.mu.Lock()
 		c.pendingEvents |= deferred
-		if c.pendingEvents == deferred {
-			// Only the deferred readiness remains. Stop here instead of spinning:
-			// the next write edge resubmits the connection, flushOutput runs
-			// first, and drainInput follows once the queue is empty.
+		if c.pendingEvents == deferred && (deferred == 0 || c.sendHead != len(c.sends)) {
+			// Only the deferred readiness remains. Stop here instead of spinning,
+			// and leave the read to whoever empties the queue. That need not be
+			// a write edge: a Flush from another goroutine that took the cork
+			// off this round's output writes it all without the socket ever
+			// filling, and then no write edge comes. So the read is recorded
+			// here, under the lock the queue drains under, and the drain hands
+			// it back. A queue that drained since the read was deferred leaves
+			// nothing to wait for, and the read runs now.
+			c.readDeferred = deferred != 0
 			c.scheduled = false
 			c.mu.Unlock()
 			return
@@ -585,6 +595,7 @@ func (c *Connection) drainInput() error {
 	c.mu.Lock()
 	c.corked = true
 	c.readStalled = false
+	c.readDeferred = false
 	c.mu.Unlock()
 	err := c.readLoop()
 	if flushErr := c.uncork(); err == nil {
@@ -768,6 +779,13 @@ func (c *Connection) flushOutput() error {
 			c.flushing = false
 			closeAfterSend := c.closeAfterSend
 			refresh := c.pauseStateChangedLocked()
+			if c.readDeferred {
+				// A round left its read to this drain; see process. The
+				// event loop hands it back as it does a stalled one.
+				c.readDeferred = false
+				c.readStalled = true
+				refresh = true
+			}
 			c.mu.Unlock()
 			if closeAfterSend {
 				c.closeWithError(nil)

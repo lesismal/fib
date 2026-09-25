@@ -641,9 +641,15 @@ func (e *Engine) completeWrite(c *Connection, n int, err error) *Connection {
 		c.consumeLocked(n)
 	}
 	closeAfterSend := false
+	events := uint32(evOut)
 	if c.sendHead == len(c.sends) {
 		c.resetQueueLocked()
 		closeAfterSend = c.closeAfterSend
+		if c.readDeferred {
+			// A round left its read to this drain; see process.
+			c.readDeferred = false
+			events |= evIn
+		}
 	}
 	refresh := c.pauseStateChangedLocked()
 	c.mu.Unlock()
@@ -654,7 +660,7 @@ func (e *Engine) completeWrite(c *Connection, n int, err error) *Connection {
 	if refresh {
 		e.refreshConnection(c)
 	}
-	return e.noteEvent(c, evOut)
+	return e.noteEvent(c, events)
 }
 
 // forget drops a closed connection once the kernel holds nothing of it, and
