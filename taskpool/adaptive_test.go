@@ -332,5 +332,120 @@ func TestAdaptiveNeverStrandsATask(t *testing.T) {
 		case <-time.After(5 * time.Second):
 			t.Fatalf("iteration %d: Stop did not return", iter)
 		}
+		if budget := &tp.backend.(*adaptiveBackend).budget; budget.extra.Load() != 0 || budget.firsts.Load() != 0 {
+			t.Fatalf("iteration %d: the budget still counts %d first and %d further workers after Stop",
+				iter, budget.firsts.Load(), budget.extra.Load())
+		}
+	}
+}
+
+// shardedAdaptive builds an adaptive pool of two shards or more, skipping the
+// test where GOMAXPROCS is too low to shard it.
+func shardedAdaptive(t *testing.T, config AdaptiveConfig) (*TaskPool, *adaptiveBackend) {
+	t.Helper()
+	config.Name = "test"
+	tp := NewAdaptive(config)
+	b := tp.backend.(*adaptiveBackend)
+	if len(b.shards) < 2 {
+		tp.Stop()
+		t.Skip("GOMAXPROCS too low to shard")
+	}
+	return tp, b
+}
+
+// A batch lands on one shard. Its tasks run on the workers parked on the
+// other shards once the ceiling will not start more, rather than queueing
+// behind the shard's own.
+func TestAdaptiveShardAdoptsParkedWorkers(t *testing.T) {
+	tp, b := shardedAdaptive(t, AdaptiveConfig{MinWorkers: 16, MaxWorkers: 16, QueueSize: 64})
+	defer tp.Stop()
+	// A worker is adopted once it has parked; the floor starts them at once,
+	// but they park in their own time.
+	waitFor(t, "the floor's workers to park", func() bool {
+		parked := int32(0)
+		for _, p := range b.shards {
+			parked += p.idleCount.Load()
+		}
+		return parked == 16
+	})
+	blocker := newBlocker()
+	defer blocker.open()
+	tasks := make([]Task, 12)
+	for i := range tasks {
+		tasks[i] = taskFunc(blocker.task())
+	}
+	tp.GoTasks(tasks)
+	waitFor(t, "every task of the batch to run", func() bool { return blocker.running.Load() == 12 })
+	if got := tp.Workers(); got > 16 {
+		t.Fatalf("Workers() = %d, over the ceiling of 16", got)
+	}
+	if excess := b.budget.excess(); excess > 0 {
+		t.Fatalf("%d workers over the ceiling", excess)
+	}
+	blocker.open()
+	blocker.done.Wait()
+}
+
+// One shard grows past its share of the ceiling when the others need none of
+// it, and the shards together still stay within it.
+func TestAdaptiveShardsShareTheCeiling(t *testing.T) {
+	tp, _ := shardedAdaptive(t, AdaptiveConfig{MaxWorkers: 16, QueueSize: 64})
+	defer tp.Stop()
+	blocker := newBlocker()
+	defer blocker.open()
+	tasks := make([]Task, 12)
+	for i := range tasks {
+		tasks[i] = taskFunc(blocker.task())
+	}
+	tp.GoTasks(tasks)
+	waitFor(t, "a shard to grow past its share", func() bool { return blocker.running.Load() == 12 })
+	for i := 0; i < 40; i++ {
+		tp.Go(blocker.task())
+	}
+	time.Sleep(50 * time.Millisecond)
+	if got := tp.Workers(); got > 16 {
+		t.Fatalf("Workers() = %d, over the ceiling of 16", got)
+	}
+	blocker.open()
+	blocker.done.Wait()
+	if peak := blocker.peak.Load(); peak > 16 {
+		t.Fatalf("%d tasks ran at once, over the ceiling of 16", peak)
+	}
+}
+
+// A submission whose turn falls on a shard with no parked worker goes to a
+// shard that has one.
+func TestAdaptivePickPrefersAnIdleShard(t *testing.T) {
+	tp, b := shardedAdaptive(t, AdaptiveConfig{MinWorkers: 16, MaxWorkers: 16, QueueSize: 64})
+	defer tp.Stop()
+	waitFor(t, "the floor's workers to park", func() bool {
+		parked := int32(0)
+		for _, p := range b.shards {
+			parked += p.idleCount.Load()
+		}
+		return parked == 16
+	})
+	// Hold shard 0's parked workers aside, as if every one of them were busy,
+	// with a task queued behind them.
+	busy := b.shards[0]
+	busy.mu.Lock()
+	var held []*adaptiveWorker
+	for w := busy.popIdleLocked(); w != nil; w = busy.popIdleLocked() {
+		held = append(held, w)
+	}
+	busy.pending.Add(1)
+	busy.ring.push(taskFunc(func() {}))
+	busy.mu.Unlock()
+	defer func() {
+		// Send them back to their queue, to run the task and park again.
+		for _, w := range held {
+			busy.waking.Add(1)
+			w.wake <- busy
+		}
+	}()
+	for i := 0; i < 100; i++ {
+		if b.pick() == busy {
+			t.Fatal("a submission was sent to a shard with work queued and no parked worker")
+		}
 	}
 }
