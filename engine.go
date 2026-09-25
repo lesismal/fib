@@ -94,6 +94,7 @@ type Engine struct {
 	// Config.IOPollers. Empty when the engine serves them itself.
 	pollers            []*Engine
 	name               string
+	logStatus          bool
 	maxEvents          int
 	useWritev          bool
 	inlineHandlers     bool
@@ -236,7 +237,7 @@ func newEngine(config Config, handler Handler, addrs []string) (*Engine, error) 
 		handler = HandlerFuncs{}
 	}
 
-	e := &Engine{name: engineName(config), maxEvents: config.MaxEvents,
+	e := &Engine{name: engineName(config), logStatus: config.LogStatus, maxEvents: config.MaxEvents,
 		useWritev: config.UseWritev, inlineHandlers: config.InlineHandlers,
 		writeHighWatermark: config.WriteBufferHighWatermark,
 		// Resume at a quarter of the budget rather than at the budget itself,
@@ -289,7 +290,7 @@ func newEngine(config Config, handler Handler, addrs []string) (*Engine, error) 
 func (e *Engine) openPollers(config Config) error {
 	n := pollerCount(config)
 	for i := 0; i < n; i++ {
-		p := &Engine{parent: e, name: e.name, maxEvents: e.maxEvents, useWritev: e.useWritev,
+		p := &Engine{parent: e, name: e.name, logStatus: e.logStatus, maxEvents: e.maxEvents, useWritev: e.useWritev,
 			inlineHandlers: e.inlineHandlers, writeHighWatermark: e.writeHighWatermark,
 			writeLowWatermark: e.writeLowWatermark, maxPendingBytes: e.maxPendingBytes,
 			budgetResumeBytes: e.budgetResumeBytes, sendBufferSize: e.sendBufferSize,

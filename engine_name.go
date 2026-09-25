@@ -15,8 +15,12 @@ func (e *Engine) Name() string { return e.name }
 func (c *Connection) Engine() *Engine { return c.engine.root() }
 
 // logRun logs that the engine has started serving, under its name, with the
-// addresses it listens on and the task pool its connections run on.
+// addresses it listens on and the task pool its connections run on, when
+// Config.LogStatus asks for it.
 func (e *Engine) logRun() {
+	if !e.logStatus {
+		return
+	}
 	listening := "none"
 	if addrs, err := e.ListenAddrs(); err != nil {
 		listening = err.Error()

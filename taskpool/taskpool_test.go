@@ -153,13 +153,16 @@ func (b *syncBuffer) String() string {
 	return b.buf.String()
 }
 
-// A pool logs under its name when it is created and started, and when a task
-// panics with no panic handler set.
+// A pool logs under its name when it is created and started, once
+// SetLogStatus has switched that on, and when a task panics with no panic
+// handler set.
 func TestLogsCarryThePoolName(t *testing.T) {
 	var out syncBuffer
 	previous := slog.Default()
 	slog.SetDefault(slog.New(slog.NewTextHandler(&out, nil)))
 	defer slog.SetDefault(previous)
+	SetLogStatus(true)
+	defer SetLogStatus(false)
 	for _, mode := range []Mode{ModeCond, ModeElastic, ModeAdaptive} {
 		out.buf.Reset()
 		tp := NewWithMode("named-"+mode.String(), mode, 2, 4)
@@ -175,5 +178,26 @@ func TestLogsCarryThePoolName(t *testing.T) {
 				t.Fatalf("%v: no %q in the log:\n%s", mode, want, logged)
 			}
 		}
+	}
+}
+
+// By default a pool logs nothing when it is created and started, but still
+// logs a task that panics with no panic handler set.
+func TestStatusLogsAreOffByDefault(t *testing.T) {
+	var out syncBuffer
+	previous := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&out, nil)))
+	defer slog.SetDefault(previous)
+	tp := NewWithMode("quiet", ModeCond, 2, 4)
+	tp.Go(func() { panic("boom") })
+	tp.Stop()
+	logged := out.String()
+	for _, msg := range []string{"taskpool: created", "taskpool: started"} {
+		if strings.Contains(logged, msg) {
+			t.Fatalf("%q logged by default:\n%s", msg, logged)
+		}
+	}
+	if !strings.Contains(logged, "taskpool: task panicked") {
+		t.Fatalf("no panic in the log:\n%s", logged)
 	}
 }

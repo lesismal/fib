@@ -82,9 +82,11 @@
   按自己的配置创建协程池，之后的同名 Engine 直接使用它，其余配置不生效。需要隔离时
   可以给 Engine 起不同的名字，或把 `SharedTaskPool` 设为 `false`（仍用同名的
   `<Name>-streams`）。
-- 协程池会打印日志（`log/slog`，可用 `slog.SetDefault` 调整输出）：创建时打印传入的
-  参数，启动后打印实际运行的分片数、worker 数和队列容量等，都带上协程池名字；任务
-  panic 且没有设置 `SetPanicHandler` 时，以 ERROR 级别打印协程池名字、panic 值与调用栈。
+- 状态日志默认关闭（`log/slog`，可用 `slog.SetDefault` 调整输出）。`config.LogStatus = true`
+  时 Engine 启动后打印名字、监听地址、协程池和 poller 数；`taskpool.SetLogStatus(true)`
+  之后创建的协程池在创建时打印传入的参数，启动后打印实际运行的分片数、worker 数和
+  队列容量等，都带上协程池名字。任务 panic 且没有设置 `SetPanicHandler` 时，无论开关
+  如何，都以 ERROR 级别打印协程池名字、panic 值与调用栈。
 - `config.SetTaskPool(pool)` 让 Engine 使用外部提供的任务池（实现 `fib.TaskPool`
   接口，`*taskpool.TaskPool` 本身即满足）。设置后 `TaskPoolMode`、
   `WorkerCount`、`SharedTaskPool` 和池容量配置都不再生效；Engine 关闭时不会

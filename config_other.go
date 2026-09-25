@@ -15,6 +15,11 @@ type Config struct {
 	// same name share both pools; see SharedTaskPool. Empty means
 	// DefaultName.
 	Name string
+	// LogStatus has the engine log a line when it starts serving, with its
+	// name, the addresses it listens on, its task pool and its pollers. It is
+	// off by default. The task pools' own lines are switched separately, with
+	// taskpool.SetLogStatus.
+	LogStatus bool
 	// Network and Addr name the listener the way net.Listen does: Network is
 	// "tcp", "tcp4" or "tcp6", and Addr is a "host:port" such as ":9000",
 	// "127.0.0.1:9000" or "[::1]:9000". An empty Network means "tcp", and an

@@ -144,19 +144,33 @@ func NewWithMode(name string, mode Mode, maxConcurrent, queueSize int) *TaskPool
 	}
 }
 
+// logStatus switches the lines pools log when they are created and started.
+var logStatus atomic.Bool
+
+// SetLogStatus switches whether the pools created from now on log their
+// parameters when they are created and what they run once started. It is off
+// by default. A task that panics with no panic handler is logged either way.
+func SetLogStatus(on bool) { logStatus.Store(on) }
+
 // poolIDs numbers the pools built, so that the lines one pool logs can be
 // told from another's even when the two share a name.
 var poolIDs atomic.Uint64
 
-// start builds a pool's backend. It logs the parameters the pool was created
-// with before building it, and what the pool runs once it has started: the
-// shards, workers and queue those parameters resolved to.
+// start builds a pool's backend. When SetLogStatus has switched it on, it logs
+// the parameters the pool was created with before building it, and what the
+// pool runs once it has started: the shards, workers and queue those
+// parameters resolved to.
 func start(name string, mode Mode, params []any, build func(*executor) backend) *TaskPool {
 	executor := &executor{name: name, id: poolIDs.Add(1)}
+	logging := logStatus.Load()
 	label := []any{"pool", name, "id", executor.id, "mode", mode.String()}
-	slog.Info("taskpool: created", append(label, params...)...)
+	if logging {
+		slog.Info("taskpool: created", append(label, params...)...)
+	}
 	pool := &TaskPool{executor: executor, backend: build(executor), mode: mode}
-	slog.Info("taskpool: started", append(label[:len(label):len(label)], pool.backend.attrs()...)...)
+	if logging {
+		slog.Info("taskpool: started", append(label[:len(label):len(label)], pool.backend.attrs()...)...)
+	}
 	return pool
 }
 

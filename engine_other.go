@@ -21,6 +21,7 @@ type Engine struct {
 	// pollers is always empty here; see pollersSupported.
 	pollers         []*Engine
 	name            string
+	logStatus       bool
 	listeners       []net.Listener
 	handler         Handler
 	taskPool        TaskPool
@@ -99,7 +100,7 @@ func newEngine(config Config, handler Handler, addrs []string) (*Engine, error) 
 		listeners = append(listeners, listener)
 	}
 	pool, releasePool := acquireTaskPool(config)
-	e := &Engine{name: engineName(config), listeners: listeners, handler: handler, taskPool: pool, releaseTaskPool: releasePool,
+	e := &Engine{name: engineName(config), logStatus: config.LogStatus, listeners: listeners, handler: handler, taskPool: pool, releaseTaskPool: releasePool,
 		connections: make(map[*Connection]struct{}), stopped: make(chan struct{}),
 		udpListeners: udpListeners, udpIdleTimeout: udpIdleTimeout(config.UDPIdleTimeout)}
 	e.readBufferSize = config.ReadBufferSize
