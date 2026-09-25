@@ -149,6 +149,10 @@ func (p *condPool) stop() {
 
 func (p *condPool) workerCount() int { return p.workerTotal }
 
+func (p *condPool) attrs() []any {
+	return []any{"shards", 1, "workers", p.workerTotal, "queueSize", len(p.queue)}
+}
+
 func (p *condPool) worker() {
 	defer p.workers.Done()
 	for {

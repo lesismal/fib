@@ -3,8 +3,10 @@ package taskpool
 
 import (
 	"fmt"
+	"log/slog"
 	"runtime/debug"
 	"sync"
+	"sync/atomic"
 )
 
 type Mode uint8
@@ -50,6 +52,9 @@ type backend interface {
 	submitBatch([]Task) int
 	stop()
 	workerCount() int
+	// attrs describes what the backend runs once built, as slog key-value
+	// pairs.
+	attrs() []any
 }
 
 type executor struct {
@@ -98,20 +103,38 @@ func NewWithMode(mode Mode, maxConcurrent, queueSize int) *TaskPool {
 	if queueSize < 0 {
 		panic("taskpool: queueSize must not be negative")
 	}
-	executor := &executor{}
-	pool := &TaskPool{executor: executor}
+	params := []any{"maxConcurrent", maxConcurrent, "queueSize", queueSize}
 	switch mode {
 	case ModeElastic:
-		pool.backend = newElasticPool(executor, maxConcurrent, queueSize)
+		return start(mode, params, func(executor *executor) backend {
+			return newElasticPool(executor, maxConcurrent, queueSize)
+		})
 	case ModeCond:
-		pool.backend = newCondBackend(executor, maxConcurrent, queueSize)
+		return start(mode, params, func(executor *executor) backend {
+			return newCondBackend(executor, maxConcurrent, queueSize)
+		})
 	case ModeAdaptive:
-		pool.backend = newAdaptiveBackend(executor, AdaptiveConfig{
+		return NewAdaptive(AdaptiveConfig{
 			MinWorkers: DefaultMinWorkers(maxConcurrent), MaxWorkers: maxConcurrent, QueueSize: queueSize,
 		})
 	default:
 		panic("taskpool: invalid mode")
 	}
+}
+
+// poolIDs numbers the pools built, so that the lines one pool logs can be
+// told from another's.
+var poolIDs atomic.Uint64
+
+// start builds a pool's backend. It logs the parameters the pool was created
+// with before building it, and what the pool runs once it has started: the
+// shards, workers and queue those parameters resolved to.
+func start(mode Mode, params []any, build func(*executor) backend) *TaskPool {
+	id := poolIDs.Add(1)
+	slog.Info("taskpool: created", append([]any{"id", id, "mode", mode.String()}, params...)...)
+	executor := &executor{}
+	pool := &TaskPool{executor: executor, backend: build(executor)}
+	slog.Info("taskpool: started", append([]any{"id", id, "mode", mode.String()}, pool.backend.attrs()...)...)
 	return pool
 }
 

@@ -48,8 +48,13 @@ func NewAdaptive(config AdaptiveConfig) *TaskPool {
 	if config.QueueSize < 0 {
 		panic("taskpool: queueSize must not be negative")
 	}
-	executor := &executor{}
-	return &TaskPool{executor: executor, backend: newAdaptiveBackend(executor, config)}
+	params := []any{
+		"minWorkers", config.MinWorkers, "maxWorkers", config.MaxWorkers,
+		"queueSize", config.QueueSize, "shrinkInterval", config.ShrinkInterval,
+	}
+	return start(ModeAdaptive, params, func(executor *executor) backend {
+		return newAdaptiveBackend(executor, config)
+	})
 }
 
 func validateAdaptiveRange(minWorkers, maxWorkers int) {
@@ -76,6 +81,7 @@ func DefaultMinWorkers(maxWorkers int) int {
 // ModeCond is sharded, and runs the one goroutine that shrinks all of them.
 type adaptiveBackend struct {
 	shards      []*adaptivePool
+	interval    time.Duration
 	next        atomic.Uint32
 	workerWG    sync.WaitGroup
 	stopJanitor chan struct{}
@@ -94,7 +100,7 @@ func newAdaptiveBackend(executor *executor, config AdaptiveConfig) *adaptiveBack
 		// Every shard needs a slot to queue into.
 		queueSize = shards
 	}
-	b := &adaptiveBackend{stopJanitor: make(chan struct{}), janitorDone: make(chan struct{})}
+	b := &adaptiveBackend{interval: interval, stopJanitor: make(chan struct{}), janitorDone: make(chan struct{})}
 	for i := 0; i < shards; i++ {
 		p := newAdaptivePool(executor, &b.workerWG, share(queueSize, shards, i))
 		b.shards = append(b.shards, p)
@@ -139,6 +145,21 @@ func (b *adaptiveBackend) workerCount() int {
 		total += p.workerCount()
 	}
 	return total
+}
+
+func (b *adaptiveBackend) attrs() []any {
+	minWorkers, maxWorkers, queueSize := 0, 0, 0
+	for _, p := range b.shards {
+		p.mu.Lock()
+		minWorkers += p.minWorkers
+		p.mu.Unlock()
+		maxWorkers += int(p.maxWorkers.Load())
+		queueSize += int(p.ring.limit)
+	}
+	return []any{
+		"shards", len(b.shards), "workers", b.workerCount(), "minWorkers", minWorkers,
+		"maxWorkers", maxWorkers, "queueSize", queueSize, "shrinkInterval", b.interval,
+	}
 }
 
 // resize splits a new floor and ceiling over the shards. The shard count was

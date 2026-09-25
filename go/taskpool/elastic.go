@@ -92,6 +92,15 @@ func (p *elasticPool) stop() {
 
 func (p *elasticPool) workerCount() int { return int(p.active.Load()) }
 
+// attrs reports maxWorkers as maxConcurrent: the dispatcher holds the last
+// execution slot, which p.maxWorkers leaves out.
+func (p *elasticPool) attrs() []any {
+	return []any{
+		"workers", p.workerCount(), "maxWorkers", p.maxWorkers + 1,
+		"queueSize", cap(p.tasks), "idleLinger", idleLinger,
+	}
+}
+
 func (p *elasticPool) fork(first Task) bool {
 	for {
 		active := p.active.Load()

@@ -23,7 +23,7 @@ const workersPerShard = 8
 // balance comes from there being far more batches than shards rather than from
 // splitting any single one.
 type shardedPool struct {
-	shards []backend
+	shards []*condPool
 	next   atomic.Uint32
 }
 
@@ -41,6 +41,14 @@ func (p *shardedPool) workerCount() int {
 		total += shard.workerCount()
 	}
 	return total
+}
+
+func (p *shardedPool) attrs() []any {
+	queueSize := 0
+	for _, shard := range p.shards {
+		queueSize += len(shard.queue)
+	}
+	return []any{"shards", len(p.shards), "workers", p.workerCount(), "queueSize", queueSize}
 }
 
 func (p *shardedPool) stop() {
@@ -71,7 +79,7 @@ func newCondBackend(executor *executor, workerCount, queueSize int) backend {
 	if shards <= 1 {
 		return newCondPool(executor, workerCount, queueSize)
 	}
-	pool := &shardedPool{shards: make([]backend, 0, shards)}
+	pool := &shardedPool{shards: make([]*condPool, 0, shards)}
 	for i := 0; i < shards; i++ {
 		// Spread the remainder over the leading shards so the worker total is
 		// exactly what the caller asked for.
