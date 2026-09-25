@@ -24,6 +24,12 @@ const (
 	// workers that stay idle, between a floor and a ceiling that Resize can
 	// move while the pool runs. See NewAdaptive.
 	ModeAdaptive
+	// ModeInline runs each task on the goroutine that submits it, under the
+	// same panic recovery as the other modes, and has no workers or queue of
+	// its own. It suits a submitter that is itself one of many goroutines
+	// spreading the load, such as one event loop among several, where handing
+	// the task to another goroutine would only add a wake-up. See NewInline.
+	ModeInline
 )
 
 func (m Mode) String() string {
@@ -34,12 +40,16 @@ func (m Mode) String() string {
 		return "cond"
 	case ModeAdaptive:
 		return "adaptive"
+	case ModeInline:
+		return "inline"
 	default:
 		return fmt.Sprintf("Mode(%d)", m)
 	}
 }
 
-func (m Mode) Valid() bool { return m == ModeElastic || m == ModeCond || m == ModeAdaptive }
+func (m Mode) Valid() bool {
+	return m == ModeElastic || m == ModeCond || m == ModeAdaptive || m == ModeInline
+}
 
 type Task interface{ RunTask() }
 
@@ -92,6 +102,7 @@ func (e *executor) call(task Task) {
 type TaskPool struct {
 	executor *executor
 	backend  backend
+	mode     Mode
 }
 
 // New creates a ModeAdaptive pool that grows to maxConcurrent workers under
@@ -103,8 +114,12 @@ func New(name string, maxConcurrent, queueSize int) *TaskPool {
 
 // NewWithMode creates a pool of the given mode, labelled name in what it
 // logs. For ModeAdaptive, maxConcurrent is the ceiling and the floor is
-// DefaultMinWorkers of it; NewAdaptive sets both.
+// DefaultMinWorkers of it; NewAdaptive sets both. ModeInline ignores both
+// sizes.
 func NewWithMode(name string, mode Mode, maxConcurrent, queueSize int) *TaskPool {
+	if mode == ModeInline {
+		return NewInline(name)
+	}
 	if maxConcurrent <= 0 {
 		panic("taskpool: maxConcurrent must be greater than zero")
 	}
@@ -141,13 +156,16 @@ func start(name string, mode Mode, params []any, build func(*executor) backend) 
 	executor := &executor{name: name, id: poolIDs.Add(1)}
 	label := []any{"pool", name, "id", executor.id, "mode", mode.String()}
 	slog.Info("taskpool: created", append(label, params...)...)
-	pool := &TaskPool{executor: executor, backend: build(executor)}
+	pool := &TaskPool{executor: executor, backend: build(executor), mode: mode}
 	slog.Info("taskpool: started", append(label[:len(label):len(label)], pool.backend.attrs()...)...)
 	return pool
 }
 
 // Name reports the name the pool was created with.
 func (tp *TaskPool) Name() string { return tp.executor.name }
+
+// Mode reports the mode the pool was created with.
+func (tp *TaskPool) Mode() Mode { return tp.mode }
 
 // SetPanicHandler sets what a task that panics is reported to, with the
 // value it panicked with and its stack. Without one, the pool logs the panic
@@ -185,8 +203,8 @@ func (tp *TaskPool) Call(f func()) { tp.executor.call(taskFunc(f)) }
 func (tp *TaskPool) Stop() { tp.backend.stop() }
 
 // Workers reports how many workers the pool is running: the fixed count under
-// ModeCond, the forked workers under ModeElastic, and the current population
-// under ModeAdaptive.
+// ModeCond, the forked workers under ModeElastic, the current population
+// under ModeAdaptive, and none under ModeInline.
 func (tp *TaskPool) Workers() int { return tp.backend.workerCount() }
 
 // Resize moves a ModeAdaptive pool's floor and ceiling while it runs. Raising
