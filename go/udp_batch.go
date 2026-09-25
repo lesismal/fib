@@ -3,6 +3,7 @@
 package fib
 
 import (
+	"sync"
 	"sync/atomic"
 	"syscall"
 )
@@ -68,6 +69,18 @@ func (b *udpBatch) recv(fd, n int, one bool) (int, bool, error) {
 // batchRefused reports whether err is a kernel refusing the batched calls
 // themselves, rather than failing one.
 func batchRefused(err error) bool { return err == syscall.ENOSYS || err == syscall.EOPNOTSUPP }
+
+// sendScratch is the memory a batched send describes its datagrams to the
+// kernel in. The kernel is handed its address as a number, which escape
+// analysis cannot follow, so a stack copy of it would be moved to the heap
+// on every send; one from the pool is not.
+type sendScratch struct {
+	name syscall.RawSockaddrAny
+	hdrs [udpBatchSize]batchHeader
+	iovs [udpBatchSize]syscall.Iovec
+}
+
+var sendScratches = sync.Pool{New: func() any { return new(sendScratch) }}
 
 // singleSends is set once the kernel has refused a batched send, after which
 // datagrams are sent one at a time.

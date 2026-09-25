@@ -50,21 +50,23 @@ const sysSendmsgX = 481
 // sendBatchSys sends datagrams with sendmsg_x, every one of them to to, or
 // on a connected socket when to is nil.
 func sendBatchSys(fd int, to syscall.Sockaddr, datagrams [][]byte) (int, error) {
-	var name syscall.RawSockaddrAny
-	namelen := rawSockaddr(to, &name)
-	var hdrs [udpBatchSize]batchHeader
-	var iovs [udpBatchSize]syscall.Iovec
+	s := sendScratches.Get().(*sendScratch)
+	namelen := rawSockaddr(to, &s.name)
 	for i, d := range datagrams {
-		iovs[i].Base = &d[0]
-		iovs[i].SetLen(len(d))
-		h := &hdrs[i]
+		s.iovs[i].Base = &d[0]
+		s.iovs[i].SetLen(len(d))
+		h := &s.hdrs[i]
+		h.name, h.namelen = nil, 0
 		if namelen > 0 {
-			h.name, h.namelen = (*byte)(unsafe.Pointer(&name)), namelen
+			h.name, h.namelen = (*byte)(unsafe.Pointer(&s.name)), namelen
 		}
-		h.iov, h.iovlen, h.datalen = &iovs[i], 1, uintptr(len(d))
+		h.iov, h.iovlen, h.datalen = &s.iovs[i], 1, uintptr(len(d))
 	}
 	got, _, errno := syscall.Syscall6(sysSendmsgX, uintptr(fd),
-		uintptr(unsafe.Pointer(&hdrs[0])), uintptr(len(datagrams)), 0, 0, 0)
+		uintptr(unsafe.Pointer(&s.hdrs[0])), uintptr(len(datagrams)), 0, 0, 0)
+	// The datagrams are the caller's again: nothing kept may point at them.
+	clear(s.iovs[:len(datagrams)])
+	sendScratches.Put(s)
 	if errno != 0 {
 		return 0, errno
 	}
