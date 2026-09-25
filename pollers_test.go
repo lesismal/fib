@@ -422,3 +422,26 @@ func TestRunOnWorkersUnderPollers(t *testing.T) {
 		t.Fatalf("engine's own pool is %q", name)
 	}
 }
+
+// The default configuration creates no pollers and runs connections on a
+// pool of workers, not an inline one: IOPollers and ModeInline are opt-in.
+func TestDefaultConfigHasNoPollersAndWorkerPool(t *testing.T) {
+	config := DefaultConfig()
+	if config.IOPollers || config.TaskPoolMode == taskpool.ModeInline {
+		t.Fatalf("DefaultConfig has IOPollers=%v, TaskPoolMode=%v", config.IOPollers, config.TaskPoolMode)
+	}
+	config.Name = "default-config"
+	config.Addr = "127.0.0.1:0"
+	server, err := Bind(config, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer server.Close()
+	if len(server.pollers) != 0 {
+		t.Fatalf("default engine has %d pollers, want none", len(server.pollers))
+	}
+	pool, ok := server.taskPool.(*taskpool.TaskPool)
+	if !ok || pool.Mode() == taskpool.ModeInline || server.inlineTasks {
+		t.Fatalf("default engine runs on %v, want a pool of workers", server.taskPool)
+	}
+}
