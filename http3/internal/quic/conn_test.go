@@ -210,6 +210,18 @@ func newTestPair(t *testing.T, loss float64, configure func(client, server *Conf
 	case <-time.After(10 * time.Second):
 		t.Fatal("handshake timed out")
 	}
+	// The client's handshake is complete before its Finished is sent, so
+	// the server may not have it yet: a close from the client now would
+	// reach a server that can still read Handshake packets, and it would
+	// get the transport close that stands in for an application close
+	// there (RFC 9000 section 10.2.3) rather than the application's own.
+	select {
+	case <-p.serverH.handshake:
+	case err := <-p.serverH.closed:
+		t.Fatalf("server closed during handshake: %v", err)
+	case <-time.After(10 * time.Second):
+		t.Fatal("server handshake timed out")
+	}
 	return p
 }
 
