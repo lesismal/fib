@@ -225,6 +225,20 @@ func (b *adaptiveBackend) adopt(p *adaptivePool) *adaptiveWorker {
 	return nil
 }
 
+// rescue sends a worker to each shard other than except that has tasks
+// queued and none on the way to them. Such a shard asked for a worker while
+// the budget was spent and got none, and its tasks wait for one of its own
+// busy workers to finish, which for tasks that block may be never. So
+// whoever gives budget back, a worker retiring over the ceiling or a shrink,
+// passes it on to the shards that ran short of it.
+func (b *adaptiveBackend) rescue(except *adaptivePool) {
+	for _, p := range b.shards {
+		if p != except && p.ring.len() > 0 && p.waking.Load() == 0 {
+			p.kick()
+		}
+	}
+}
+
 // workerBudget is the ceiling an adaptive pool's shards share. A shard with
 // no worker may always start one, so that a task that lands on it always has
 // a worker to run it; a shard's further workers draw on the budget, which is
@@ -255,6 +269,11 @@ func (b *workerBudget) take() bool {
 	}
 }
 
+// room reports whether take would draw a worker now.
+func (b *workerBudget) room() bool {
+	return b.extra.Load() < b.ceiling.Load()-b.firsts.Load()
+}
+
 // excess is how many workers the pool runs over its ceiling.
 func (b *workerBudget) excess() int32 {
 	return b.extra.Load() + b.firsts.Load() - b.ceiling.Load()
@@ -270,6 +289,9 @@ func (b *adaptiveBackend) janitor(interval time.Duration) {
 			for _, p := range b.shards {
 				p.shrink()
 			}
+			// Shrinking gave budget back, and a shard may have been left
+			// waiting for it; see rescue.
+			b.rescue(nil)
 		case <-b.stopJanitor:
 			return
 		}
@@ -374,20 +396,37 @@ func (p *adaptivePool) backlog() int { return p.ring.len() - int(p.idleCount.Loa
 
 // addWorker counts a new worker in, drawing on the budget unless it is the
 // shard's first. It reports false, counting nothing, when the budget is spent.
+//
+// What it draws it keeps across a lost race for the count, which another
+// worker joining or leaving the shard causes, rather than handing it back
+// and taking it again: the budget is shared, and a shard that looked at it in
+// between would find it spent although it was not, and leave its queued
+// tasks with no worker coming for them.
 func (p *adaptivePool) addWorker() bool {
+	taken := false
 	for {
 		workers := p.workers.Load()
-		if workers > 0 && !p.budget.take() {
-			return false
+		if workers == 0 {
+			if taken {
+				// The shard lost its last worker meanwhile, so this one is
+				// its first and not on the budget.
+				p.budget.extra.Add(-1)
+				taken = false
+			}
+			if p.workers.CompareAndSwap(0, 1) {
+				p.budget.firsts.Add(1)
+				return true
+			}
+			continue
+		}
+		if !taken {
+			if !p.budget.take() {
+				return false
+			}
+			taken = true
 		}
 		if p.workers.CompareAndSwap(workers, workers+1) {
-			if workers == 0 {
-				p.budget.firsts.Add(1)
-			}
 			return true
-		}
-		if workers > 0 {
-			p.budget.extra.Add(-1)
 		}
 	}
 }
@@ -517,8 +556,11 @@ func (p *adaptivePool) kick() {
 		}
 		p.waking.Add(-1)
 		// A worker that parked since the idle stack was looked at may have
-		// seen this reservation and left the queue to it.
-		if p.idleCount.Load() == 0 {
+		// seen this reservation and left the queue to it, and budget given
+		// back since it was looked at may have been left to it too: rescue
+		// passes budget on only to a shard with nothing on the way, which
+		// this reservation made this one look not to be.
+		if p.idleCount.Load() == 0 && !p.budget.room() {
 			return
 		}
 	}
@@ -627,8 +669,9 @@ func (p *adaptivePool) worker(self *adaptiveWorker) {
 		for {
 			if p.retireOverCeiling() {
 				// Leave even with work queued, passing it on to a worker
-				// that stays.
+				// that stays, and the budget on to a shard that ran short.
 				p.kick()
+				p.backend.rescue(p)
 				return
 			}
 			task, ok := p.ring.pop()
@@ -653,11 +696,13 @@ func (p *adaptivePool) worker(self *adaptiveWorker) {
 		if p.retireOverCeiling() {
 			// A resize that ran while this worker was busy could not retire
 			// it. A task queued since the queue was found empty may have
-			// been left to it, so it is passed on.
+			// been left to it, so it is passed on, and the budget it gives
+			// back on to a shard that ran short.
 			var w wakeups
 			p.kickLocked(&w)
 			p.mu.Unlock()
 			w.run(p)
+			p.backend.rescue(p)
 			return
 		}
 		p.idle = append(p.idle, self)
