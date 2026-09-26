@@ -25,6 +25,7 @@ import (
 // streamingConfig is a server that hands over any body past 1KB.
 func streamingConfig() Config {
 	config := DefaultConfig()
+	config.StreamRequestBody = true
 	config.StreamRequestBodyThreshold = 1 << 10
 	return config
 }
@@ -77,9 +78,9 @@ func bodyOf(r *stdhttp.Request) *BodyStream {
 }
 
 // collectBody is the shape a handler takes under a body that never waits: it
-// reads what has arrived, and when Read reports ErrWouldBlock it retains the
-// request and takes the rest through OnBody. answer runs once, with what the
-// body came to and the error that ended it, if any.
+// reads what has arrived, and when Read reports ErrWouldBlock it takes the
+// rest through OnBody, which keeps the request open. answer runs once, with
+// what the body came to and the error that ended it, if any.
 func collectBody(answer func(c *Context, total int64, digest []byte, err error)) HandlerFunc {
 	return func(c *Context, r *stdhttp.Request) {
 		digest := sha256.New()
@@ -98,13 +99,11 @@ func collectBody(answer func(c *Context, total int64, digest []byte, err error))
 				answer(c, total, digest.Sum(nil), nil)
 				return
 			case errors.Is(err, ErrWouldBlock):
-				c.Retain()
 				c.OnBody(func(data []byte, fin bool, err error) {
 					digest.Write(data)
 					total += int64(len(data))
 					if err != nil || fin {
 						answer(c, total, digest.Sum(nil), err)
-						c.Release()
 					}
 				})
 				return
@@ -177,7 +176,6 @@ func TestStreamRequestBodyReadReportsWouldBlock(t *testing.T) {
 		buf := make([]byte, 64<<10)
 		_, err := r.Body.Read(buf)
 		errs <- err
-		c.Retain()
 		c.OnBody(func(data []byte, fin bool, err error) {
 			if !fin && err == nil {
 				return
@@ -186,7 +184,6 @@ func TestStreamRequestBodyReadReportsWouldBlock(t *testing.T) {
 			_, readErr := r.Body.Read(buf)
 			errs <- readErr
 			_ = c.Respond(stdhttp.StatusOK, "text/plain", []byte("done"))
-			c.Release()
 		})
 	})
 	conn := dialRaw(t, addr)
@@ -434,12 +431,10 @@ func TestStreamRequestBodyExpectContinueWaitsForTheFirstRead(t *testing.T) {
 func TestStreamRequestBodyExpectContinueGrantedByOnBody(t *testing.T) {
 	addr := serveStreamingServer(t, streamingConfig(), func(c *Context, r *stdhttp.Request) {
 		var total int64
-		c.Retain()
 		c.OnBody(func(data []byte, fin bool, err error) {
 			total += int64(len(data))
 			if err != nil || fin {
 				_ = c.Respond(stdhttp.StatusOK, "text/plain", fmt.Appendf(nil, "%d", total))
-				c.Release()
 			}
 		})
 	})
@@ -693,13 +688,11 @@ func TestStreamRequestBodyRunsOnTheConnectionWorker(t *testing.T) {
 				continue
 			}
 			// The rest has not arrived; wait for it without a goroutine.
-			c.Retain()
 			waiting <- struct{}{}
 			c.OnBody(func(data []byte, fin bool, err error) {
 				total += int64(len(data))
 				if err != nil || fin {
 					_ = c.Respond(stdhttp.StatusOK, "text/plain", fmt.Appendf(nil, "%d", total))
-					c.Release()
 				}
 			})
 			return
@@ -758,5 +751,76 @@ func TestStreamRequestBodyRunsOnTheConnectionWorker(t *testing.T) {
 		if string(body) != fmt.Sprintf("%d", size) {
 			t.Fatalf("body = %q, want %d", body, size)
 		}
+	}
+}
+
+// TestStreamRequestBodyOffWaitsForTheWholeBody checks the default: however
+// large a body and however slowly it arrives, the handler runs only once all
+// of it has, and reads every byte of it straight from Request.Body. A
+// threshold without StreamRequestBody changes nothing.
+func TestStreamRequestBodyOffWaitsForTheWholeBody(t *testing.T) {
+	config := DefaultConfig()
+	config.StreamRequestBodyThreshold = 1 << 10
+	called := make(chan bool, 1)
+	addr := serveStreamingServer(t, config, func(c *Context, r *stdhttp.Request) {
+		called <- c.RequestBody() == nil && c.BodyComplete()
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Errorf("reading the body: %v", err)
+		}
+		_ = c.Respond(stdhttp.StatusOK, "text/plain", fmt.Appendf(nil, "%d", len(body)))
+	})
+	payload := bytes.Repeat([]byte("w"), 64<<10)
+	conn := dialRaw(t, addr)
+	conn.send(fmt.Sprintf("POST /whole HTTP/1.1\r\nHost: test\r\nContent-Length: %d\r\n\r\n", len(payload)))
+	if _, err := conn.Write(payload[:len(payload)/2]); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-called:
+		t.Fatal("the handler ran before its body had arrived")
+	case <-time.After(100 * time.Millisecond):
+	}
+	if _, err := conn.Write(payload[len(payload)/2:]); err != nil {
+		t.Fatal(err)
+	}
+	if _, body := conn.response(stdhttp.MethodPost); body != fmt.Sprint(len(payload)) {
+		t.Fatalf("body = %q, want %d", body, len(payload))
+	}
+	if whole := <-called; !whole {
+		t.Fatal("the handler was given a streamed body with StreamRequestBody off")
+	}
+}
+
+// TestStreamRequestBodyWithoutThresholdStreamsEveryBody checks that with
+// StreamRequestBody on and no threshold the handler runs as soon as the
+// header is in, before any of even a small body has arrived.
+func TestStreamRequestBodyWithoutThresholdStreamsEveryBody(t *testing.T) {
+	config := DefaultConfig()
+	config.StreamRequestBody = true
+	streamed := make(chan bool, 1)
+	addr := serveStreamingServer(t, config, func(c *Context, r *stdhttp.Request) {
+		streamed <- c.RequestBody() != nil && !c.BodyComplete()
+		var got []byte
+		c.OnBody(func(data []byte, fin bool, err error) {
+			got = append(got, data...)
+			if fin && err == nil {
+				_ = c.Respond(stdhttp.StatusOK, "text/plain", got)
+			}
+		})
+	})
+	conn := dialRaw(t, addr)
+	conn.send("POST /small HTTP/1.1\r\nHost: test\r\nContent-Length: 5\r\n\r\n")
+	select {
+	case ok := <-streamed:
+		if !ok {
+			t.Fatal("the handler was given the body as complete before it was sent")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("the handler did not run once the header was in")
+	}
+	conn.send("hello")
+	if _, body := conn.response(stdhttp.MethodPost); body != "hello" {
+		t.Fatalf("body = %q, want %q", body, "hello")
 	}
 }

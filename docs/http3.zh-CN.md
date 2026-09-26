@@ -70,8 +70,15 @@
 
 ### 消息体整体缓存
 
-- 请求 body 在 handler 运行前完整读入内存，响应通过 `Response.Body []byte` 一次性给出；
-  客户端同样把响应 body 完整缓存后再回调，因此不支持 SSE、流式上传下载等场景。
+- 请求 body 默认在 handler 运行前完整读入内存。设置 `Config.StreamRequestBody` 后，body
+  一开始到达就调用 handler——带 `content-length` 且超过 `StreamRequestBodyThreshold` 的在
+  HEADERS 到达时，不带 `content-length` 的在收到超过阈值的数据时——handler 从
+  `Request.Body`（不阻塞的 `*http.BodyStream`）读，或用 `Context.OnBody` 接收，和 HTTP/1、
+  HTTP/2 一样。这时 QUIC 只在 handler 消费了 body 之后才补充 stream 的接收窗口，快速上传
+  的客户端最多领先一个窗口（1MB）。流式 body 的上限是 `MaxStreamedBodyBytes` 而不是
+  `MaxBodyBytes`；`Expect: 100-continue` 要等 handler 第一次要 body 时才回复 100。
+- 响应通过 `Response.Body []byte` 一次性给出；客户端同样把响应 body 完整缓存后再回调，
+  因此不支持 SSE、流式下载等场景。
   `Context` 的 `http.ResponseWriter` 方法可以使用（含 trailer），但与 HTTP/2 一样，
   写出的响应会先缓存，handler 返回后整体发送；只有 HTTP/1 是流式的。
 - 内存上限：服务端单连接最坏约为 `MaxConcurrentStreams × MaxBodyBytes`（默认
@@ -182,8 +189,8 @@
 
 ### 3. 流式 body 与 handler 模型（中）
 
-- 与 HTTP/1、HTTP/2 相同：提供流式的请求 body 读取和响应写出，同时让接收窗口的补充
-  与实际消费挂钩，形成端到端背压。这也是实现 Extended CONNECT、WebTransport 的前提。
+- 与 HTTP/2 相同：提供流式的响应写出。流式请求 body 已经实现，接收窗口随 handler 的
+  消费补充。双向流式是实现 Extended CONNECT、WebTransport 的前提。
 
 ### 4. 可配置性（低）
 
@@ -221,6 +228,7 @@ job 在 Linux、macOS、Windows 上运行。
 | quic-go 的 HTTP/3 客户端（对 fib 服务端） | GET/POST/PUT/HEAD、请求与响应头、多个 Cookie 与 Set-Cookie、4 MiB 上传与下载（按哈希校验）、单连接 50 个并发请求、204、响应 trailer、请求 trailer、103 Early Hints、100-continue、417、413、431、各种状态码 |
 | quic-go 的 HTTP/3 服务端（对 fib 客户端） | 同样的矩阵反过来验证，另加：超时后连接仍可用、服务端优雅关闭（GOAWAY）时在途请求正常完成、服务端用 Retry 验证源地址、证书不受信任时拒绝连接 |
 | 测试内置的手写 HTTP/3 客户端（零依赖，对 fib 服务端） | 正常实现不会发的东西：HEADERS 之前的 DATA、不以 SETTINGS 开头的控制流、第二条控制流、缺少伪头部的请求、引用 QPACK 动态表、CANCEL_PUSH、调低的 MAX_PUSH_ID、抬高的 GOAWAY、QPACK 插入指令、`:authority` 与 `Host` 不一致、两者都缺失 |
+| body 矩阵的手写 QUIC 客户端（`http3/body_matrix_test.go`，对 fib 服务端） | 请求 body 的各种到达方式：无 body、带 content-length、不带长度的 DATA、带 trailer、`Expect: 100-continue`，小和大，stream 一次写完或分片间隔写，handler 直接读、用 OnBody、按 `BodyComplete` 二选一、或在别的 goroutine 里接收，服务端整体缓存、全部流式、超过阈值才流式；另有 body 发到一半 reset、body 上限、stream 窗口对慢 handler 的限速，以及 OnBody 在 handler 返回前不交付 body |
 | 测试内置的手写 HTTP/3 服务端（零依赖，对 fib 客户端） | 客户端的协议纠错：服务端发来的 MAX_PUSH_ID、CANCEL_PUSH、GOAWAY 指向非请求流、抬高的 GOAWAY、QPACK 插入指令、引用动态表的响应 |
 | 内存管道上的 QUIC 两端 | 握手、5% 与 20% 丢包下的传输、stream 数限制、reset、应用关闭、空闲超时、keep-alive、stateless reset、密钥更新（调低 AEAD 上限触发）、解密失败上限 |
 | fuzz（`go test -fuzz`） | 面向不可信输入的解析：HTTP/3 帧解析器、从字段构造请求、QPACK 解码与编解码往返、QUIC 包头、传输参数、1-RTT 帧处理 |

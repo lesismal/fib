@@ -92,12 +92,10 @@ func TestOnBodyDeliversABufferedBodyWhole(t *testing.T) {
 	}
 	calls := make(chan call, 4)
 	addr := serveStreamingServer(t, DefaultConfig(), func(c *Context, r *stdhttp.Request) {
-		c.Retain()
 		c.OnBody(func(data []byte, fin bool, err error) {
 			calls <- call{string(data), fin}
 			if err != nil || fin {
 				_ = c.Respond(stdhttp.StatusOK, "text/plain", []byte("got it"))
-				c.Release()
 			}
 		})
 	})
@@ -129,10 +127,8 @@ func TestOnBodyDeliversAStreamedBodyInPieces(t *testing.T) {
 		digest := sha256.New()
 		var total int64
 		var parts int
-		c.Retain()
 		c.OnBody(func(data []byte, fin bool, err error) {
 			if err != nil {
-				c.Release()
 				return
 			}
 			digest.Write(data)
@@ -144,7 +140,6 @@ func TestOnBodyDeliversAStreamedBodyInPieces(t *testing.T) {
 				pieces <- parts
 				_ = c.Respond(stdhttp.StatusOK, "text/plain",
 					fmt.Appendf(nil, "%d %x", total, digest.Sum(nil)))
-				c.Release()
 			}
 		})
 	})
@@ -163,11 +158,12 @@ func TestOnBodyDeliversAStreamedBodyInPieces(t *testing.T) {
 	}
 }
 
-// TestOnBodyReleasesFromInsideTheCallback exercises the handover a release
-// inside a body callback needs: the callback runs on the connection's worker,
-// which holds the parser, so carrying the connection on falls to the worker
-// once the callback returns. A pipelined request behind it proves it happened.
-func TestOnBodyReleasesFromInsideTheCallback(t *testing.T) {
+// TestOnBodyReleasesAfterTheLastCallback exercises the handover the release
+// after a body's last callback needs: the callback runs on the connection's
+// worker, which holds the parser, so carrying the connection on falls to the
+// worker once the callback returns. A pipelined request behind it proves it
+// happened.
+func TestOnBodyReleasesAfterTheLastCallback(t *testing.T) {
 	var order atomic.Int64
 	addr := serveStreamingServer(t, streamingConfig(), func(c *Context, r *stdhttp.Request) {
 		if r.URL.Path != "/upload" {
@@ -175,17 +171,14 @@ func TestOnBodyReleasesFromInsideTheCallback(t *testing.T) {
 			return
 		}
 		var total int64
-		c.Retain()
 		c.OnBody(func(data []byte, fin bool, err error) {
 			if err != nil {
-				c.Release()
 				return
 			}
 			total += int64(len(data))
 			if fin {
 				_ = c.Respond(stdhttp.StatusOK, "text/plain",
 					fmt.Appendf(nil, "%d /upload %d", order.Add(1), total))
-				c.Release()
 			}
 		})
 	})
@@ -206,17 +199,14 @@ func TestOnBodyReleasesFromInsideTheCallback(t *testing.T) {
 func TestOnBodyChunkedWithTrailer(t *testing.T) {
 	addr := serveStreamingServer(t, streamingConfig(), func(c *Context, r *stdhttp.Request) {
 		var got []byte
-		c.Retain()
 		c.OnBody(func(data []byte, fin bool, err error) {
 			if err != nil {
-				c.Release()
 				return
 			}
 			got = append(got, data...)
 			if fin {
 				_ = c.Respond(stdhttp.StatusOK, "text/plain",
 					fmt.Appendf(nil, "%d %s", len(got), r.Trailer.Get("X-Checksum")))
-				c.Release()
 			}
 		})
 	})
@@ -235,12 +225,20 @@ func TestOnBodyChunkedWithTrailer(t *testing.T) {
 	}
 }
 
-// TestOnBodyWithoutRetainAnswersAndDropsTheRest is the early-refusal case: the
-// handler answers straight away and the rest of the upload is discarded.
-func TestOnBodyWithoutRetainAnswersAndDropsTheRest(t *testing.T) {
+// TestOnBodyThenCloseAnswersAndDropsTheRest is the early-refusal case: the
+// handler took the body, answers straight away, and closes the body, which
+// ends the callback with ErrBodyAbandoned and lets the response go; the rest
+// of the upload is discarded.
+func TestOnBodyThenCloseAnswersAndDropsTheRest(t *testing.T) {
+	ended := make(chan error, 2)
 	addr := serveStreamingServer(t, streamingConfig(), func(c *Context, r *stdhttp.Request) {
-		c.OnBody(func(data []byte, fin bool, err error) {})
+		c.OnBody(func(data []byte, fin bool, err error) {
+			if fin || err != nil {
+				ended <- err
+			}
+		})
 		_ = c.Respond(stdhttp.StatusRequestEntityTooLarge, "text/plain", []byte("no thanks"))
+		_ = r.Body.Close()
 	})
 	conn := dialRaw(t, addr)
 	conn.send(fmt.Sprintf("POST /big HTTP/1.1\r\nHost: test\r\nContent-Length: %d\r\n\r\n", 64<<20))
@@ -251,11 +249,133 @@ func TestOnBodyWithoutRetainAnswersAndDropsTheRest(t *testing.T) {
 	if resp.StatusCode != stdhttp.StatusRequestEntityTooLarge || body != "no thanks" {
 		t.Fatalf("response = %d %q", resp.StatusCode, body)
 	}
+	if err := <-ended; !errors.Is(err, ErrBodyAbandoned) {
+		t.Fatalf("callback ended with %v, want ErrBodyAbandoned", err)
+	}
+}
+
+// TestOnBodyDoesNotCallBack checks that OnBody only registers its callback:
+// a body that has all arrived is handed over once the handler returns, on
+// the goroutine that ran it, and the response is written after that call
+// without the handler retaining or releasing anything.
+func TestOnBodyDoesNotCallBack(t *testing.T) {
+	type outcome struct {
+		complete, early, inHandler bool
+		data                       string
+	}
+	got := make(chan outcome, 1)
+	addr := serveStreamingServer(t, DefaultConfig(), func(c *Context, r *stdhttp.Request) {
+		var returned, called atomic.Bool
+		o := outcome{complete: c.BodyComplete()}
+		c.OnBody(func(data []byte, fin bool, err error) {
+			called.Store(true)
+			o.inHandler = !returned.Load()
+			o.data = string(data)
+			if fin {
+				got <- o
+				_ = c.Respond(stdhttp.StatusOK, "text/plain", []byte("done"))
+			}
+		})
+		o.early = called.Load()
+		returned.Store(true)
+	})
+	conn := dialRaw(t, addr)
+	conn.send("POST /small HTTP/1.1\r\nHost: test\r\nContent-Length: 5\r\n\r\nhello")
+	if _, body := conn.response(stdhttp.MethodPost); body != "done" {
+		t.Fatalf("body = %q", body)
+	}
+	o := <-got
+	switch {
+	case !o.complete:
+		t.Fatal("BodyComplete reported a body that arrived whole as incomplete")
+	case o.early, o.inHandler:
+		t.Fatal("OnBody called the callback before the handler returned")
+	case o.data != "hello":
+		t.Fatalf("callback got %q, want %q", o.data, "hello")
+	}
+}
+
+// TestBodyCompleteOnAStreamedBody checks BodyComplete on a body still
+// arriving, and a handler that takes such a body through OnBody and answers
+// from its last call with no Retain or Release of its own, with a pipelined
+// request behind it served once it has.
+func TestBodyCompleteOnAStreamedBody(t *testing.T) {
+	incomplete := make(chan bool, 2)
+	addr := serveStreamingServer(t, streamingConfig(), func(c *Context, r *stdhttp.Request) {
+		if r.URL.Path != "/upload" {
+			_ = c.Respond(stdhttp.StatusOK, "text/plain", []byte(r.URL.Path))
+			return
+		}
+		incomplete <- !c.BodyComplete()
+		var total int
+		c.OnBody(func(data []byte, fin bool, err error) {
+			total += len(data)
+			if fin && err == nil {
+				_ = c.Respond(stdhttp.StatusOK, "text/plain", fmt.Appendf(nil, "%d", total))
+			}
+		})
+	})
+	payload := bytes.Repeat([]byte("p"), 256<<10)
+	conn := dialRaw(t, addr)
+	conn.send(fmt.Sprintf("POST /upload HTTP/1.1\r\nHost: test\r\nContent-Length: %d\r\n\r\n", len(payload)))
+	if !<-incomplete {
+		t.Fatal("BodyComplete reported a body that had not been sent as complete")
+	}
+	if _, err := conn.Write(payload); err != nil {
+		t.Fatal(err)
+	}
+	conn.send("GET /after HTTP/1.1\r\nHost: test\r\n\r\n")
+	for _, want := range []string{fmt.Sprint(len(payload)), "/after"} {
+		if _, body := conn.response(stdhttp.MethodPost); body != want {
+			t.Fatalf("body = %q, want %q", body, want)
+		}
+	}
+}
+
+// TestOnBodyAfterTheHandlerReturned covers OnBody called from another
+// goroutine once the handler has returned: what has arrived is handed over
+// on a goroutine of the server's, and the response goes once the last call
+// has, with the handler's own Retain already released.
+func TestOnBodyAfterTheHandlerReturned(t *testing.T) {
+	for _, streamed := range []bool{false, true} {
+		t.Run(fmt.Sprintf("streamed=%v", streamed), func(t *testing.T) {
+			config := DefaultConfig()
+			if streamed {
+				config = streamingConfig()
+			}
+			addr := serveStreamingServer(t, config, func(c *Context, r *stdhttp.Request) {
+				c.Retain()
+				go func() {
+					time.Sleep(20 * time.Millisecond)
+					var got []byte
+					c.OnBody(func(data []byte, fin bool, err error) {
+						got = append(got, data...)
+						if fin && err == nil {
+							_ = c.Respond(stdhttp.StatusOK, "text/plain", got)
+						}
+					})
+					c.Release()
+				}()
+			})
+			conn := dialRaw(t, addr)
+			body := strings.Repeat("later ", 2<<10)
+			conn.send(fmt.Sprintf("POST /late HTTP/1.1\r\nHost: test\r\nContent-Length: %d\r\n\r\n%s", len(body), body))
+			conn.send("GET /next HTTP/1.1\r\nHost: test\r\n\r\n")
+			if _, got := conn.response(stdhttp.MethodPost); got != body {
+				t.Fatalf("body is %d bytes, want %d", len(got), len(body))
+			}
+			if _, got := conn.response(stdhttp.MethodGet); got != "" {
+				t.Fatalf("the request behind it got %q, want an empty body", got)
+			}
+		})
+	}
 }
 
 // TestOnBodyReportsAClosedConnection is the consistency requirement: a client
 // that goes away mid-upload must reach the callback as an error, exactly once,
-// and the held request must not be left behind.
+// and the held request must not be left behind. The handler retains the
+// request itself as well, as one written before OnBody retained it did, and
+// balances that with a Release of its own.
 func TestOnBodyReportsAClosedConnection(t *testing.T) {
 	type outcome struct {
 		err   error
@@ -370,11 +490,9 @@ func TestOnBodyReportsAnOversizedBody(t *testing.T) {
 	config.MaxStreamedBodyBytes = 64 << 10
 	failed := make(chan error, 1)
 	addr := serveStreamingServer(t, config, func(c *Context, r *stdhttp.Request) {
-		c.Retain()
 		c.OnBody(func(data []byte, fin bool, err error) {
 			if err != nil || fin {
 				failed <- err
-				c.Release()
 			}
 		})
 	})

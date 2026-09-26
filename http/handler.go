@@ -58,6 +58,11 @@ type Context struct {
 	// closing records that the response ends the HTTP/1 connection, so that
 	// no request pipelined behind it is served.
 	closing bool
+	// pooled records that the Context came from contextPool, and streamed
+	// that its request's body was still arriving when the handler ran. The
+	// flags sit together so that they share a word.
+	pooled   bool
+	streamed bool
 	// w is the response being written through the ResponseWriter methods.
 	w *responseWriter
 	// stream is the HTTP/2 stream the request arrived on, or nil for HTTP/1.
@@ -69,15 +74,18 @@ type Context struct {
 	// whether the response has been written or cancelled, and the generation
 	// a recycled Context is serving; see ctxHolds. mu guards what hands a
 	// callback between goroutines, and err, why the response was cancelled.
-	// pooled records that the Context came from contextPool.
-	word   atomic.Uint64
-	mu     sync.Mutex
-	pooled bool
-	err    error
-	// body is OnBody's callback and bodyDone that it has had its last call.
-	// cancel is OnCancel's. deliverMu keeps body callbacks one at a time.
+	word atomic.Uint64
+	mu   sync.Mutex
+	err  error
+	// body is OnBody's callback, bodyDone that it has had its last call, and
+	// bodyHeld that OnBody holds the response open until then. handover is
+	// the body OnBody was asked for while the handler ran, owed once it
+	// returns; see later. cancel is OnCancel's. deliverMu keeps body
+	// callbacks one at a time.
 	body      BodyFunc
+	handover  func(worker bool)
 	bodyDone  bool
+	bodyHeld  bool
 	cancel    func(error)
 	deliverMu sync.Mutex
 	// server and parser are the HTTP/1 connection this request arrived on,
@@ -88,11 +96,9 @@ type Context struct {
 	parser *Parser
 	// whole is the request's body when it arrived whole, whose buffer goes
 	// back to the pool once the response is finished. block is where the
-	// request was allocated, when the simple parser took it, and streamed
-	// records that its body was still arriving when the handler ran.
-	whole    *wholeBody
-	block    *requestBlock
-	streamed bool
+	// request was allocated, when the simple parser took it.
+	whole *wholeBody
+	block *requestBlock
 }
 
 // Stream answers a request that arrived over a protocol served outside this
@@ -774,12 +780,14 @@ func (h *ServerHandler) refuse(c *fib.Connection, err error) {
 // too.
 func Serve(handler Handler, context *Context) { serveRequest(handler, context) }
 
-// serveRequest runs the handler for the request context carries, and gives
-// back the hold that serving it took, which writes the response unless the
-// handler retained it.
+// serveRequest runs the handler for the request context carries, hands over
+// the body it asked for through OnBody, and gives back the hold that serving
+// it took, which writes the response unless the handler, or OnBody, retained
+// it.
 func serveRequest(handler Handler, context *Context) {
 	context.begin(false)
 	handler.ServeHTTP(context, context.Request)
+	context.handled()
 	context.returned()
 }
 
@@ -891,7 +899,7 @@ func (h *ServerHandler) OnClose(c *fib.Connection, err error) {
 		if stream != nil || context != nil {
 			go func() {
 				if stream != nil {
-					stream.fail(err)
+					stream.fail(err, false)
 				}
 				if context != nil {
 					context.cancelWith(err, gen)

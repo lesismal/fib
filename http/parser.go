@@ -76,13 +76,25 @@ type Config struct {
 	// counts it.
 	MaxHeaderBytes int
 	MaxBodyBytes   int64
-	// StreamRequestBodyThreshold, when positive, hands a request to the
-	// handler before its whole body has arrived: a body whose Content-Length
-	// is larger than this, or a chunked body that has already sent more than
-	// this, arrives as a *BodyStream in Request.Body, which reads the rest as
-	// the connection delivers it. Such a handler runs on its own goroutine,
-	// since reading the body blocks. Zero, the default, buffers every body
-	// whole and runs every handler on the connection's worker.
+	// StreamRequestBody hands a request to its handler as soon as its body
+	// has begun, on HTTP/1 and HTTP/2 alike: once its header has arrived,
+	// for a body with a Content-Length, and once some of it has, for a
+	// chunked one or an HTTP/2 one without a content-length. The body
+	// arrives as a *BodyStream in Request.Body, which reads what the
+	// connection has delivered without waiting for the rest, and which
+	// Context.OnBody takes as it arrives; Context.BodyComplete tells the two
+	// cases apart. HTTP/1 paces the client by holding the connection's reads
+	// (see StreamRequestBodyBuffer); HTTP/2, which cannot stop reading for
+	// one stream, by giving the stream's flow-control window back only as
+	// the handler consumes the body. Off, the default, a handler runs only
+	// once its request has arrived whole, body and all, so that Request.Body
+	// holds every byte of it. Package http3 has the same option for HTTP/3.
+	StreamRequestBody bool
+	// StreamRequestBodyThreshold keeps the smaller bodies buffered whole when
+	// StreamRequestBody is set: only a body whose Content-Length is larger
+	// than this, or one without a length of which more than this has
+	// arrived, streams. Zero streams every body. It has no effect without
+	// StreamRequestBody.
 	StreamRequestBodyThreshold int64
 	// MaxStreamedBodyBytes bounds a streamed body, which MaxBodyBytes does
 	// not: the point of streaming is to accept an upload larger than the
@@ -102,10 +114,11 @@ type Config struct {
 	// IdleTimeout bounds how long a kept-alive connection may sit between
 	// requests. Zero means ReadTimeout; both zero means no limit.
 	IdleTimeout time.Duration
-	// StreamRequestBodyBuffer is how many bytes of a streamed body may wait
-	// unread before the connection stops reading its socket, so that a
+	// StreamRequestBodyBuffer is how many bytes of a streamed HTTP/1 body may
+	// wait unread before the connection stops reading its socket, so that a
 	// handler slower than its client is paid for by TCP flow control rather
-	// than by memory here. Zero means DefaultStreamRequestBodyBuffer.
+	// than by memory here. Zero means DefaultStreamRequestBodyBuffer. An
+	// HTTP/2 body is bounded by its stream's window instead.
 	StreamRequestBodyBuffer int
 	// DisableHTTP2 serves HTTP/1 only. Otherwise a connection that opens with
 	// the HTTP/2 preface, over TLS after ALPN chose "h2" or in cleartext with
@@ -145,7 +158,7 @@ type Config struct {
 	// as http.Request.Clone and http.Header.Clone make. That is fasthttp's
 	// rule for its RequestCtx, and the reason these are off by default.
 	//
-	// A request whose body streams (see StreamRequestBodyThreshold), and one
+	// A request whose body streams (see StreamRequestBody), and one
 	// net/http parsed because it is outside the shape parsed here, keep
 	// their Request, Header and URL whatever these say.
 	ReuseRequests bool
@@ -292,7 +305,7 @@ func (p *Parser) Feed(data []byte) ([]*stdhttp.Request, error) {
 // buffered and can be retrieved with TakeBuffered. This is useful for protocol
 // upgrades whose first frame may arrive in the same TCP read as the request.
 //
-// A request whose body streams (see Config.StreamRequestBodyThreshold) is
+// A request whose body streams (see Config.StreamRequestBody) is
 // returned as soon as its header has arrived, with the rest of the body still
 // to come in Request.Body. Until that body ends, the bytes that follow are the
 // body rather than another request, so FeedOne buffers them and returns
@@ -460,7 +473,7 @@ func (p *Parser) bodyEnded(done bool, err error) (bool, error) {
 	p.live.Store(nil)
 	p.requestEnded()
 	if err != nil {
-		stream.fail(err)
+		stream.fail(err, true)
 		return false, err
 	}
 	return true, nil
@@ -600,8 +613,7 @@ func (p *Parser) frameLength() (frameInfo, bool, error) {
 			// (RFC 9112 section 6.3).
 			req.Close = true
 		}
-		if threshold := p.config.StreamRequestBodyThreshold; threshold > 0 &&
-			int64(len(p.buffer)-headerEnd) > threshold {
+		if p.config.StreamRequestBody && int64(len(p.buffer)-headerEnd) > p.config.StreamRequestBodyThreshold {
 			// More has been sent than this server is willing to hold, and a
 			// chunked body never says how much more is coming. Hand the
 			// request over and decode the rest as it arrives.
@@ -622,7 +634,7 @@ func (p *Parser) frameLength() (frameInfo, bool, error) {
 	if req.ContentLength < 0 {
 		return frameInfo{end: headerEnd, headerEnd: headerEnd, request: req, block: block}, true, nil
 	}
-	if threshold := p.config.StreamRequestBodyThreshold; threshold > 0 && req.ContentLength > threshold {
+	if p.config.StreamRequestBody && req.ContentLength > p.config.StreamRequestBodyThreshold {
 		if limit := p.config.MaxStreamedBodyBytes; limit > 0 && req.ContentLength > limit {
 			return frameInfo{}, false, ErrBodyTooLarge
 		}

@@ -13,9 +13,9 @@ HTTP/2、HTTP/3 各有单独的文档：[`http2.zh-CN.md`](http2.zh-CN.md)、
 | --- | --- | --- |
 | 版本 | 接受 HTTP/1.0 和 HTTP/1.1 请求，按请求的版本回复 | 发送 HTTP/1.1；请求的 `ProtoMinor` 为 0 时发送 HTTP/1.0 |
 | 连接 | keep-alive（HTTP/1.1 默认开启，HTTP/1.0 需 `Connection: keep-alive`）、任一方的 `Connection: close`、pipelining（按请求顺序回复） | 每个 host:port 一个 keep-alive 连接池；HTTP/1.0 连接只有在请求要求 keep-alive 且服务端同意时才复用 |
-| 请求 body | `Content-Length`、chunked（含 chunk 扩展和 trailer，`Request.Trailer`）；默认整体缓存，超过 `StreamRequestBodyThreshold` 的 body 边收边交给 handler | `Content-Length`；`ContentLength` 为 -1 时用 chunked，可带 `req.Trailer` |
+| 请求 body | `Content-Length`、chunked（含 chunk 扩展和 trailer，`Request.Trailer`）；默认整体缓存，开启 `StreamRequestBody` 后边收边交给 handler | `Content-Length`；`ContentLength` 为 -1 时用 chunked，可带 `req.Trailer` |
 | 响应 body | `Content-Length`、chunked（含 trailer）、HTTP/1.0 流式响应以关闭连接结束 | `Content-Length`、chunked（含 trailer，`Response.Trailer`）、以关闭连接结束 |
-| 流式 | 响应：`Context` 实现了 `http.ResponseWriter`、`http.Flusher`、`io.ReaderFrom`，`Write` + `Flush` 边生成边发送。请求：超过 `StreamRequestBodyThreshold` 时 `Request.Body` 是 `*BodyStream`，读取不阻塞，也可以用 `Context.OnBody` 接管 | body 完整缓存后再回调 |
+| 流式 | 响应：`Context` 实现了 `http.ResponseWriter`、`http.Flusher`、`io.ReaderFrom`，`Write` + `Flush` 边生成边发送。请求：开启 `StreamRequestBody` 后 `Request.Body` 是 `*BodyStream`，读取不阻塞，也可以用 `Context.OnBody` 接管 | body 完整缓存后再回调 |
 | 文件 | `Connection.SendFile` / `Context.ReadFrom`：Linux、macOS 用 `sendfile(2)`，Windows 分块读取；`http.ServeFile`、`http.ServeContent`、`http.FileServer` 可以直接通过 `Context` 使用（Range、多段 Range、条件请求） | — |
 | 超时 | `ReadHeaderTimeout`、`ReadTimeout`、`IdleTimeout`，回退规则与 `net/http.Server` 相同 | 每个请求的 `Timeout` |
 | 1xx 中间响应 | `WriteInterim` 或 `WriteHeader(1xx)`，自动 `100 Continue` | 自动跳过 |
@@ -48,37 +48,41 @@ HTTP/1 连接上，被持有的请求会挡住排在它后面的流水线请求�
 所以响应顺序不变。HTTP/2 和 HTTP/3 上一个 stream 不挡别的 stream。
 
 `Context.OnBody` 用回调的方式接收请求 body，而不是从 `Request.Body` 读——和 websocket
-handler 的 `OnFrame` 按帧拿到消息是一个路子：
+handler 的 `OnFrame` 按帧拿到消息是一个路子。`Context.BodyComplete()` 判断 body 是否
+已经全部到达：body 已完整时可以直接从 `Request.Body` 读，只有还在路上时才用回调接收：
 
 ```go
 func(c *fibhttp.Context, r *http.Request) {
 	f, _ := os.Create("upload.bin")
-	c.Retain()
 	c.OnBody(func(data []byte, fin bool, err error) {
 		if err != nil {         // 连接断了，或者 body 出错了
 			f.Close()
 			os.Remove("upload.bin")
-			c.Release()
 			return
 		}
 		f.Write(data)
 		if fin {
 			f.Close()
 			c.Respond(200, "text/plain", []byte("stored"))
-			c.Release()
 		}
 	})
 }
 ```
 
+- `OnBody` 不阻塞，也从不在自身内部调用回调：它只登记回调然后返回。已经到达的 body
+  （`BodyComplete` 为 true 时就是全部）在 handler 返回之后、在运行 handler 的那个
+  goroutine 上交给回调；handler 返回之后才调用 `OnBody` 的，则在单独的 goroutine 上交付。
+- `OnBody` 会自动 `Retain` 请求，回调的最后一次调用返回之后，框架自动 `Release`，回调在
+  `fin` 时写的响应随即发出，handler 里不需要 `Retain`/`Release`。要在别处回复的 handler，
+  在回调里自己再 `Retain` 一次，回复后 `Release`。
 - `fin` 标记最后一次回调；`err` 表示这个 body 不会有后续了，同样是最后一次回调，且只来
   一次。`data` 只在回调期间有效，需要保留先复制。
-- 回调在连接的 worker 上执行，一次一个、保持顺序，所以任意大的 body 都能处理，既不需要
-  handler 自己的 goroutine，也不会被缓存下来。给对端限速的就是回调本身。
-- body 只有在流式交付时才会分多次到达（由 `StreamRequestBodyThreshold` 决定）；handler
+- 回调一次一个、保持顺序，交接之后的回调在连接的 worker 上执行，所以任意大的 body 都能
+  处理，既不需要 handler 自己的 goroutine，也不会被缓存下来。给对端限速的就是回调本身。
+- body 只有在流式交付时才会分多次到达（由 `StreamRequestBody` 决定）；handler
   运行前就收全的 body 会在一次 `fin` 为 true 的回调里全部给出。
-- `OnBody` 接管之后 `Request.Body` 不能再读。只用 `OnBody` 而不 `Retain` 的 handler 在
-  返回时就回复、剩下的 body 被丢弃——这正是「不读 body 直接拒绝上传」的写法。
+- `OnBody` 接管之后 `Request.Body` 不能再读。关闭它会让回调以 `ErrBodyAbandoned` 结束、
+  剩下的 body 被丢弃；想不读 body 直接拒绝上传的 handler，直接回复、不调用 `OnBody`。
 
 ### 请求在响应之前就结束了
 
@@ -118,10 +122,23 @@ func(c *fibhttp.Context, r *http.Request) {
 
 ### 流式请求 body
 
-`Config.StreamRequestBodyThreshold` 大于 0 时，body 不必收齐就会调用 handler：
-`Content-Length` 超过它的 body，以及已经发来超过这么多字节的 chunked body，以
+`Config.StreamRequestBody` 默认关闭：请求完整收齐（包括 body）之后才调用 handler，
+`Request.Body` 里就是完整的 body。开启后，body 一开始到达就调用 handler——带
+`Content-Length` 的在 header 收齐时，chunked 的在收到一部分 body 时——body 以
 `*BodyStream` 的形式出现在 `Request.Body` 里。`Context.RequestBody()` 返回它，body
-已经收全时返回 nil。小于阈值的 body 行为不变：整体缓存，其余一切照旧。
+已经收全时返回 nil；`Context.BodyComplete()` 判断 body 是否已经全部到达。同一个开关
+也让 HTTP/2 的 body 流式交付，只是由流控而不是暂停读来限速（见
+[`http2.zh-CN.md`](http2.zh-CN.md)）；HTTP/3 在 `http3.Config` 里有同样的开关。
+
+`Config.StreamRequestBodyThreshold` 在开启流式时让较小的 body 仍然整体缓存：只有
+`Content-Length` 超过它的 body，以及已经发来超过这么多字节的 chunked body 才流式交付。
+为 0 时所有 body 都流式交付；不开 `StreamRequestBody` 时它不起作用。
+
+```go
+config := fibhttp.DefaultConfig()
+config.StreamRequestBody = true            // body 边收边交给 handler
+config.StreamRequestBodyThreshold = 1 << 20 // 不超过 1MB 的仍然整体缓存
+```
 
 整体缓存的 body 放在池化缓冲里，handler 用完这个请求后由 server 收回：handler 已经
 返回，并且释放了每一个 `Retain`（即使 Retain 持续到连接断开之后）。对不做 Retain 的
@@ -137,15 +154,15 @@ handler 来说就是它返回的时刻，`net/http` 也是在这个时刻关闭�
 | `n > 0` | 这些字节已经到了 |
 | `io.EOF` | 整个 body 已经读完 |
 | `ErrWouldBlock` | 现在一个字节都没有，后续还会来 |
-| `ErrBodyAbandoned` | body 已经被别的东西接管：`Close`、`OnBody`，或者 handler 没有 Retain 就返回了 |
+| `ErrBodyAbandoned` | body 已经被别的东西接管：`Close`、`OnBody`，或者 handler 既没有 Retain 也没有调用 `OnBody` 就返回了 |
 | 其它错误 | 后续不会再来了——连接断了、超过 `MaxStreamedBodyBytes`、帧格式错误 |
 
 `ErrWouldBlock` 就是 `fib.ErrWouldBlock`，和 `Connection.Read` 用的是同一个，判断哪个
 都行。body 有可能在 handler 运行时就已经全在了（和 header 在同一次读里到达），这种情况
 下 handler 一路读到 `io.EOF`、直接回复即可。
 
-遇到 `ErrWouldBlock` 又想要后续的 handler，就 Retain 住请求、用 `Context.OnBody` 接管
-剩下的部分，见[保持响应不结束](#保持响应不结束以及-body-回调)。交接不会丢字节：`OnBody`
+遇到 `ErrWouldBlock` 又想要后续的 handler，就用 `Context.OnBody` 接管剩下的部分（它会
+自动保持请求不结束），见[保持响应不结束](#保持响应不结束以及-body-回调)。交接不会丢字节：`OnBody`
 拿到的正好从上一次 `Read` 停下的地方开始。
 
 ```go
@@ -154,8 +171,7 @@ func(c *fibhttp.Context, r *http.Request) {
 	switch {
 	case errors.Is(err, io.EOF):        // 就这么多，全了
 		answer(c)
-	case errors.Is(err, fibhttp.ErrWouldBlock):
-		c.Retain()                      // 后面还有
+	case errors.Is(err, fibhttp.ErrWouldBlock): // 后面还有
 		c.OnBody(func(data []byte, fin bool, err error) { ... })
 	}
 }
@@ -217,7 +233,7 @@ body 的请求，以及不在 server 自行解析范围内、改由 `net/http` �
 ## 当前限制
 
 - **请求 body 默认整体缓存**：body 收完后才调用 handler，受 `MaxBodyBytes` 限制。设置
-  `Config.StreamRequestBodyThreshold` 后超过阈值的 body 不再受此限制，见
+  `Config.StreamRequestBody` 后不再受此限制，见
   [流式请求 body](#流式请求-body)。
 - **客户端响应 body 整体缓存**：受 `MaxResponseBodyBytes` 限制，客户端没有流式下载。
 - **客户端不做 pipelining**：一个 HTTP/1 连接同时只有一个请求。
@@ -257,8 +273,9 @@ body 的请求，以及不在 server 自行解析范围内、改由 `net/http` �
   和以关闭连接结束的响应、格式错误的响应）。
 - **fib 客户端对 fib 服务端**，包括 HTTP/1.0 和 sendfile。
 - **持有响应与 body 回调**（`http/retain_test.go`）：在别的 goroutine 里回复、被持有
-  的请求挡住后面的流水线请求、嵌套持有、`OnBody` 对缓存 body 和流式 body、在 body 回调
-  里释放、带 trailer 的 chunked、不 Retain 直接回复、客户端上传到一半跑掉时 `OnBody` 和
+  的请求挡住后面的流水线请求、嵌套持有、`OnBody` 对缓存 body 和流式 body、`OnBody` 只登记
+  不回调、`BodyComplete`、handler 返回后才调用 `OnBody`、最后一次 body 回调之后自动释放、
+  带 trailer 的 chunked、提前回复并关闭 body、客户端上传到一半跑掉时 `OnBody` 和
   `OnCancel` 各只收到一次、读超时触发 `OnCancel`、body 超限、响应写完之后再 Retain、同一
   个 handler 跑在 HTTP/2 上，以及把以上全部并发跑一遍并检查没有残留的压力测试。
 - **读超时**（`http/timeout_test.go`）：header 和 body 收到一半就不来了、流式 body
@@ -275,6 +292,16 @@ body 的请求，以及不在 server 自行解析范围内、改由 `net/http` �
   截断的上传、流式请求之后的 pipelining、handler panic、用 `net/http` 客户端上传，以及
   逐字节喂给增量 chunked 解码器。`hold_reads_test.go` 单独检查
   `Connection.HoldReads`。
+- **body 矩阵**（`http/body_matrix_test.go`，HTTP/3 在 `http3/body_matrix_test.go`）：
+  协议（HTTP/1.1、HTTP/2 各自明文和 TLS；HTTP/3）× body 格式（无 body、带长度、chunked
+  或 HTTP/2/3 不带长度的 DATA、带 trailer、`Expect: 100-continue`）× 大小（一次读得完、
+  要读多次）× 发送方式（一次写完，或分片并间隔发送，切点落在 chunk 行中间、帧中间）×
+  handler 接收方式（直接读、OnBody、按 `BodyComplete` 二选一、handler 返回后在别的
+  goroutine 调 OnBody）× 服务端配置（整体缓存、全部流式、超过阈值才流式）的全部组合，
+  每个连接上后面再跟一个请求。每个组合都检查每个字节、trailer、是否流式、缓存的 body
+  是否完整、回调没有在 OnBody 内部或 handler 返回前执行、最后一次回调恰好一次、以及从
+  回调里写的响应确实发出。另外还有：各协议上 body 发到一半被切断、body 上限落在哪、
+  HTTP/2 和 HTTP/3 上流控窗口对慢 handler 的限速。
 - `sendfile_test.go` 在 TCP 和 Unix socket 上检查 `Connection.SendFile`：在 handler
   中和其他 goroutine 中调用、对端读得慢、文件比声明的范围短。
 
@@ -283,5 +310,5 @@ body 的请求，以及不在 server 自行解析范围内、改由 `net/http` �
 `FIB_REQUIRE_CURL=1`：缺少 curl 时直接失败而不是跳过 curl 用例。本地运行：
 
 ```sh
-go test -race -run 'TestHTTP1Conformance|TestSendFile|TestSendableFileOf|TestResponseWriter|TestStreamRequestBody|TestChunkedDecoder|TestHoldReads|TestServerRead|TestServerIdle|TestServerTimeout|TestServerWithoutTimeouts|TestReadDeadline|TestWriteDeadline|TestZeroDeadline|TestConnectionAddresses|TestRetain|TestOnBody|TestOnCancel' -v . ./http/
+go test -race -run 'TestHTTP1Conformance|TestSendFile|TestSendableFileOf|TestResponseWriter|TestStreamRequestBody|TestChunkedDecoder|TestHoldReads|TestServerRead|TestServerIdle|TestServerTimeout|TestServerWithoutTimeouts|TestReadDeadline|TestWriteDeadline|TestZeroDeadline|TestConnectionAddresses|TestRetain|TestOnBody|TestBodyComplete|TestBodyMatrix|TestOnCancel' -v . ./http/ ./http3/
 ```

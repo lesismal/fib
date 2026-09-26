@@ -36,12 +36,17 @@ const discardAfterHandler = 256 << 10
 // the call.
 type BodyFunc func(data []byte, fin bool, err error)
 
+// sinkFunc is what a BodyStream hands its body to once OnBody has taken it
+// over: a BodyFunc, told as well whether it is being called on the
+// connection's worker, which holds the parser while it delivers.
+type sinkFunc func(data []byte, fin bool, err error, worker bool)
+
 // emptyBody is a Body with nothing in it, for a request whose body has been
 // handed to a callback instead.
 func emptyBody() io.ReadCloser { return stdhttp.NoBody }
 
 // BodyStream is the Body of a request whose handler ran before the whole body
-// had arrived; see Config.StreamRequestBodyThreshold.
+// had arrived; see Config.StreamRequestBody.
 //
 // It never waits. The handler of a streamed request runs on the connection's
 // worker like any other, and a worker that waited for the peer would be
@@ -51,9 +56,10 @@ func emptyBody() io.ReadCloser { return stdhttp.NoBody }
 // closed mid-body, a body past MaxStreamedBodyBytes, broken framing — so a
 // truncated upload is never mistaken for a complete one.
 //
-// A handler that meets ErrWouldBlock and wants the rest retains the request
-// and asks for the rest through Context.OnBody, which delivers it as it
-// arrives; see Context.Retain. Until it does, what has arrived and not been
+// A handler that meets ErrWouldBlock and wants the rest — or that finds
+// Context.BodyComplete false before reading at all — asks for the rest
+// through Context.OnBody, which keeps the request open and delivers the body
+// as it arrives. Until it does, what has arrived and not been
 // read is buffered, and once that buffer reaches
 // Config.StreamRequestBodyBuffer the connection stops reading its socket,
 // which slows the client down through TCP flow control rather than growing
@@ -65,7 +71,6 @@ func emptyBody() io.ReadCloser { return stdhttp.NoBody }
 type BodyStream struct {
 	conn *fib.Connection
 	mu   sync.Mutex
-	wake sync.Cond
 	// buf holds body bytes that have arrived and not been read, from read
 	// onwards. Bytes before read have been handed out already.
 	buf  []byte
@@ -106,52 +111,102 @@ type BodyStream struct {
 	scratch []byte
 	// sink, when set, is given the body as it arrives instead of it being
 	// buffered for a reader; Context.OnBody installs it. sinkBusy is set
-	// while it is being handed what had already arrived, so that the
-	// connection's worker waits rather than delivering out of order.
-	sink     BodyFunc
-	sinkBusy bool
+	// while one goroutine is handing the sink what has arrived, and nothing
+	// waits for it: whatever arrives meanwhile is buffered, and that
+	// goroutine hands it on before it lets go. delivered records the sink's
+	// last call.
+	sink      sinkFunc
+	sinkBusy  bool
+	delivered bool
+	// sendContinue sends the 100 Continue the body waits for, on a protocol
+	// other than HTTP/1, which conn sends it on. credit is told of every
+	// byte of the body the handler has taken, by reading it or through
+	// OnBody, and of every byte thrown away unread, so that a multiplexed
+	// protocol gives its peer room for more only as the body is consumed;
+	// see BodyFeed. HTTP/1 holds the connection's reads instead.
+	sendContinue func()
+	credit       func(n int)
 }
 
 // setSink hands the body to fn as it arrives rather than buffering it for
-// Read, starting with whatever has already been taken off the connection.
-// Nothing is held back once a sink has it, so any hold on the connection's
-// reads goes with the buffer: what paces the peer from here is fn itself.
-func (s *BodyStream) setSink(fn BodyFunc) {
+// Read. It never calls fn itself: it reports whether fn is owed something
+// already — body taken off the connection and not yet read, or the body's
+// end — in which case the caller has to hand it over with drain, and nothing
+// else will until it has. reserve asks for that whether or not anything is
+// owed yet, for a handler still running: on a multiplexed connection the body
+// goes on arriving on another goroutine meanwhile, and has to wait for the
+// handler to return rather than reach fn under its feet.
+func (s *BodyStream) setSink(fn sinkFunc, reserve bool) bool {
 	// Asking for the body as a callback is asking for it, so a client waiting
 	// for permission to send it is given that here as a read would.
 	s.grantContinue()
 	s.mu.Lock()
-	s.awaitSinkLocked()
-	if s.abandoned {
-		s.mu.Unlock()
-		return
+	defer s.mu.Unlock()
+	s.sink = fn
+	if s.sinkBusy || !reserve && !s.owedLocked() {
+		// Either another goroutine is handing the body on and picks the new
+		// sink up from here, or there is nothing to hand on until the
+		// connection delivers more.
+		return false
 	}
-	s.sink, s.sinkBusy = fn, true
-	pending := s.buf[s.read:]
-	s.buf, s.read = nil, 0
-	s.releaseLocked()
-	ended, err := s.ended, s.err
-	s.wake.Broadcast()
-	s.mu.Unlock()
-
-	last := ended || err != nil
-	if len(pending) > 0 {
-		fn(pending, last && err == nil, nil)
-	}
-	if last && (len(pending) == 0 || err != nil) {
-		fn(nil, true, err)
-	}
-	s.mu.Lock()
-	s.sinkBusy = false
-	s.wake.Broadcast()
-	s.mu.Unlock()
+	s.sinkBusy = true
+	return true
 }
 
-// awaitSinkLocked waits for a handover to finish, so that nothing the
-// connection delivers overtakes what the body had already taken in.
-func (s *BodyStream) awaitSinkLocked() {
-	for s.sinkBusy {
-		s.wake.Wait()
+// owedLocked reports whether the sink has something to be given: body not
+// yet handed on, or its last call.
+func (s *BodyStream) owedLocked() bool {
+	if s.delivered {
+		return false
+	}
+	return s.read < len(s.buf) || s.ended || s.err != nil || s.abandoned
+}
+
+// drain hands the sink whatever it is owed, until nothing is left, and then
+// lets another goroutine deliver again. The caller has set sinkBusy. worker
+// says drain runs on the connection's worker, holding its parser.
+//
+// Nothing is held back while the sink has the body, so the buffered bytes and
+// any hold on the connection's reads go to it together: what paces the peer
+// from here is the sink itself.
+func (s *BodyStream) drain(worker bool) {
+	for {
+		s.mu.Lock()
+		sink := s.sink
+		if sink == nil || !s.owedLocked() {
+			s.sinkBusy = false
+			s.mu.Unlock()
+			return
+		}
+		pending := s.buf[s.read:]
+		s.buf, s.read = nil, 0
+		s.releaseLocked()
+		var fin bool
+		var err error
+		switch {
+		case len(pending) > 0:
+			// The body's end goes with its last bytes, but an error is
+			// reported on a call of its own once the bytes before it are in.
+			fin = s.ended && s.err == nil
+		case s.abandoned && !s.ended && s.err == nil:
+			fin, err = true, ErrBodyAbandoned
+		default:
+			fin, err = true, s.err
+		}
+		s.delivered = fin
+		s.mu.Unlock()
+
+		sink(pending, fin, err, worker)
+		s.credited(len(pending))
+
+		if len(pending) > 0 {
+			s.mu.Lock()
+			if s.buf == nil && !s.abandoned {
+				// The buffer is the stream's again, for what arrives next.
+				s.buf = pending[:0]
+			}
+			s.mu.Unlock()
+		}
 	}
 }
 
@@ -172,7 +227,6 @@ func newBodyStream(conn *fib.Connection, request *stdhttp.Request, config Config
 	if decoder == nil {
 		s.remaining = request.ContentLength
 	}
-	s.wake.L = &s.mu
 	return s
 }
 
@@ -185,15 +239,22 @@ func (s *BodyStream) Read(p []byte) (int, error) {
 	}
 	s.grantContinue()
 	s.mu.Lock()
-	defer s.mu.Unlock()
+	if s.sink != nil {
+		// What is buffered is the sink's now.
+		s.mu.Unlock()
+		return 0, ErrBodyAbandoned
+	}
 	if s.read < len(s.buf) {
 		n := copy(p, s.buf[s.read:])
 		s.read += n
 		s.compactLocked()
+		s.mu.Unlock()
+		s.credited(n)
 		return n, nil
 	}
+	defer s.mu.Unlock()
 	switch {
-	case s.sink != nil || s.abandoned:
+	case s.abandoned:
 		return 0, ErrBodyAbandoned
 	case s.ended:
 		return 0, io.EOF
@@ -206,17 +267,38 @@ func (s *BodyStream) Read(p []byte) (int, error) {
 // Close gives up the rest of the body. The connection consumes and drops what
 // is still on its way, so that a request whose body the handler did not want
 // does not leave the next request on the connection misframed; past
-// discardAfterHandler unread bytes the connection closes instead.
+// discardAfterHandler unread bytes the connection closes instead. A body that
+// OnBody has taken over ends there too, with ErrBodyAbandoned.
 func (s *BodyStream) Close() error {
 	s.mu.Lock()
+	dropped := 0
 	if !s.abandoned {
 		s.abandoned = true
-		s.dropLocked()
+		dropped = s.dropLocked()
 		s.releaseLocked()
-		s.wake.Broadcast()
 	}
-	s.mu.Unlock()
+	s.deliverLocked(false)
+	s.credited(dropped)
 	return nil
+}
+
+// credited passes n bytes the handler is done with on to credit.
+func (s *BodyStream) credited(n int) {
+	if n > 0 && s.credit != nil {
+		s.credit(n)
+	}
+}
+
+// deliverLocked unlocks the stream and, when the sink is owed something and
+// no goroutine is handing it on already, hands it on from this one.
+func (s *BodyStream) deliverLocked(worker bool) {
+	if s.sink == nil || s.sinkBusy || !s.owedLocked() {
+		s.mu.Unlock()
+		return
+	}
+	s.sinkBusy = true
+	s.mu.Unlock()
+	s.drain(worker)
 }
 
 // Trailer is the trailer section of a chunked body, or nil. It is complete
@@ -250,7 +332,11 @@ func (s *BodyStream) grantContinue() {
 	send := s.wantContinue && !s.continueSent && !s.ended && s.err == nil
 	s.continueSent = s.continueSent || send
 	s.mu.Unlock()
-	if send && s.conn != nil {
+	switch {
+	case !send:
+	case s.sendContinue != nil:
+		s.sendContinue()
+	case s.conn != nil:
 		_ = s.conn.Send([]byte("HTTP/1.1 100 Continue\r\n\r\n"))
 		_ = s.conn.Flush()
 	}
@@ -274,43 +360,51 @@ func (s *BodyStream) compactLocked() {
 	}
 }
 
-// dropLocked throws away what the reader will not take.
-func (s *BodyStream) dropLocked() {
+// dropLocked throws away what the reader will not take, and reports how much
+// that was.
+func (s *BodyStream) dropLocked() int {
+	n := len(s.buf) - s.read
 	s.buf, s.read = nil, 0
+	return n
 }
 
 // push hands decoded body bytes to the reader, holding the connection's reads
 // when they pile up faster than the reader takes them.
 func (s *BodyStream) push(data []byte) {
 	s.mu.Lock()
-	s.awaitSinkLocked()
-	if sink := s.sink; sink != nil {
-		abandoned := s.abandoned
+	if s.abandoned || s.err != nil || s.ended {
+		// Nobody will take it: the body was given up or has already ended.
 		s.mu.Unlock()
-		if !abandoned {
-			sink(data, false, nil)
-		}
+		s.credited(len(data))
 		return
 	}
-	defer s.mu.Unlock()
-	if s.abandoned {
+	if sink := s.sink; sink != nil && !s.sinkBusy && s.read == len(s.buf) {
+		// Nothing is waiting ahead of data, so it goes to the sink straight
+		// from the connection's buffer.
+		s.sinkBusy = true
+		s.mu.Unlock()
+		sink(data, false, nil, true)
+		s.credited(len(data))
+		s.drain(true)
 		return
 	}
 	if s.read > 0 && s.read == len(s.buf) {
 		s.buf, s.read = s.buf[:0], 0
 	}
+	// A sink that is busy on another goroutine takes this once it is done
+	// with what it has; until then it is buffered, and bounded, as it is for
+	// a reader.
 	s.buf = append(s.buf, data...)
-	s.wake.Broadcast()
 	if !s.held && len(s.buf)-s.read >= s.highWater {
 		s.held = true
 		s.holdReads(true)
 	}
+	s.deliverLocked(true)
 }
 
 // finish marks the body complete and publishes its trailer.
 func (s *BodyStream) finish(trailer stdhttp.Header) {
 	s.mu.Lock()
-	s.awaitSinkLocked()
 	s.ended = true
 	if trailer != nil {
 		s.trailer = trailer
@@ -318,41 +412,24 @@ func (s *BodyStream) finish(trailer stdhttp.Header) {
 			s.request.Trailer = trailer
 		}
 	}
-	sink := s.sink
-	if s.abandoned {
-		sink = nil
-	}
 	s.releaseLocked()
-	s.wake.Broadcast()
-	s.mu.Unlock()
-	if sink != nil {
-		sink(nil, true, nil)
-	}
+	s.deliverLocked(true)
 }
 
 // fail ends the body short, with the reason the rest will never arrive. A
 // peer that simply closed reports io.EOF, which becomes io.ErrUnexpectedEOF
 // here: the body is not over, so a reader must not take the close for its end.
-func (s *BodyStream) fail(err error) {
+// worker says fail runs on the connection's worker, holding its parser.
+func (s *BodyStream) fail(err error, worker bool) {
 	if err == nil || errors.Is(err, io.EOF) {
 		err = io.ErrUnexpectedEOF
 	}
 	s.mu.Lock()
-	s.awaitSinkLocked()
-	report := s.err == nil && !s.ended
-	if report {
+	if s.err == nil && !s.ended {
 		s.err = err
 	}
-	sink := s.sink
-	if s.abandoned {
-		sink = nil
-	}
 	s.releaseLocked()
-	s.wake.Broadcast()
-	s.mu.Unlock()
-	if report && sink != nil {
-		sink(nil, true, err)
-	}
+	s.deliverLocked(worker)
 }
 
 // releaseLocked ends any hold this body has on the connection's reads. The
@@ -377,20 +454,22 @@ func (s *BodyStream) holdReads(hold bool) {
 // reading. It reports whether the connection has to close: either the client
 // is still waiting for the 100 Continue that now will never come, or what is
 // left of the body is more than the server is willing to read and throw away.
-func (s *BodyStream) abandon() bool {
+func (s *BodyStream) abandon() (closing bool) {
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	s.abandoned = true
-	s.dropLocked()
+	dropped := s.dropLocked()
 	s.releaseLocked()
-	s.wake.Broadcast()
-	if s.ended || s.err != nil {
-		return false
+	defer s.credited(dropped)
+	switch {
+	case s.ended || s.err != nil:
+	case s.wantContinue && !s.continueSent:
+		closing = true
+	default:
+		closing = s.remaining < 0 || s.remaining > discardAfterHandler
 	}
-	if s.wantContinue && !s.continueSent {
-		return true
-	}
-	return s.remaining < 0 || s.remaining > discardAfterHandler
+	// A sink still waiting for the rest hears that it is not coming.
+	s.deliverLocked(true)
+	return closing
 }
 
 // absorb takes as much of src as the body's framing accounts for, hands the

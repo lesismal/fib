@@ -120,6 +120,11 @@ func (e *StreamError) Error() string {
 // errStreamClosed is what writing to a stream that is gone gets.
 var errStreamClosed = errors.New("http3: stream closed")
 
+// errRequestReset is what a streamed body reports when the client resets its
+// request stream, or stops reading the response, before the body has all
+// arrived.
+var errRequestReset = errors.New("http3: request stream reset by the client")
+
 func appendFrameHeader(b []byte, typ uint64, length int) []byte {
 	b = quic.AppendVarint(b, typ)
 	return quic.AppendVarint(b, uint64(length))

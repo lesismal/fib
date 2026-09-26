@@ -50,9 +50,28 @@ type Config struct {
 	// MaxHeaderBytes bounds a request's header section, decoded and counted
 	// as RFC 9114 section 4.2.2 does; the server also tells clients so.
 	MaxHeaderBytes int
-	// MaxBodyBytes bounds a request body, which is read whole before the
-	// handler runs.
+	// MaxBodyBytes bounds a request body that is read whole before its
+	// handler runs, which is every body unless StreamRequestBody is set.
 	MaxBodyBytes int64
+	// StreamRequestBody hands a request to its handler as soon as its body
+	// has begun, as http.Config.StreamRequestBody does for HTTP/1 and
+	// HTTP/2: once its header has arrived, for a body with a
+	// content-length, and once some of it has, for one without. The body
+	// arrives as an *http.BodyStream in Request.Body, which reads what has
+	// arrived without waiting for the rest, and which Context.OnBody takes
+	// as it arrives; Context.BodyComplete tells the two cases apart. The
+	// client is paced by QUIC's flow control, which gives it room for more
+	// only as the handler consumes what it has. Off, the default, a handler
+	// runs only once its request has arrived whole.
+	StreamRequestBody bool
+	// StreamRequestBodyThreshold keeps the smaller bodies read whole when
+	// StreamRequestBody is set: only a body whose content-length is larger
+	// than this, or one without a content-length of which more than this has
+	// arrived, streams. Zero streams every body.
+	StreamRequestBodyThreshold int64
+	// MaxStreamedBodyBytes bounds a streamed body, which MaxBodyBytes does
+	// not; zero leaves it unbounded.
+	MaxStreamedBodyBytes int64
 	// MaxConcurrentStreams is how many requests a client may have open on
 	// one connection.
 	MaxConcurrentStreams uint64
@@ -326,8 +345,15 @@ func (sc *serverConn) newRequestStream(s *quic.Stream) *requestStream {
 	}
 	sc.nextID = max(sc.nextID, id+4)
 	sc.mu.Unlock()
-	return &requestStream{sc: sc, s: s, declared: -1,
+	rs := &requestStream{sc: sc, s: s, declared: -1,
 		parser: frameParser{maxFrame: uint64(sc.h.config.MaxHeaderBytes)}}
+	if sc.h.config.StreamRequestBody {
+		// The stream's flow control is given back by the request from here,
+		// so that a body that streams paces the client; see streamedBody.
+		rs.streamed = &streamedBody{}
+		s.HoldCredit()
+	}
+	return rs
 }
 
 func (sc *serverConn) OnStreamReset(s *quic.Stream, _ uint64) {
@@ -362,6 +388,7 @@ func (sc *serverConn) OnClose(*quic.Conn, error) {
 		rs.mu.Lock()
 		rs.closed = true
 		rs.mu.Unlock()
+		rs.failBody(net.ErrClosed)
 	}
 }
 
@@ -414,12 +441,17 @@ type requestStream struct {
 	declared int64
 	trailers bool
 	// done is set once the request needs no more reading: it has gone to
-	// the handler or been refused.
+	// the handler whole, its streamed body has ended, or it has been
+	// refused.
 	done bool
+	// streamed is what the request keeps when the server streams bodies, or
+	// nil when it does not.
+	streamed *streamedBody
+
+	mu sync.Mutex
 	// remoteDone is set when the whole request has arrived.
 	remoteDone bool
 
-	mu        sync.Mutex
 	responded bool
 	closed    bool
 	// expected is set while the connection expects the response, and holds
@@ -434,28 +466,90 @@ type requestStream struct {
 
 // requestValues is how many of a request's header values its stream has
 // room for, which is more than an ordinary request's regular fields. It is
-// also what keeps a requestStream at 896 bytes, one of the allocator's size
-// classes; one more value would put it in the class of 1024.
-const requestValues = 5
+// also what keeps a requestStream within 896 bytes, one of the allocator's
+// size classes; one more value would put it in the class of 1024.
+const requestValues = 4
+
+// streamedBody is what a request stream keeps when the server streams bodies;
+// see Config.StreamRequestBody. The stream then gives back its flow control
+// itself: what is not body at once, a body read whole as it arrives, and a
+// body that streams as the handler consumes it.
+type streamedBody struct {
+	// feed is where the body is written once it streams to the handler, and
+	// trailer the trailer that arrived after it, for when it ends.
+	feed    *fibhttp.BodyFeed
+	trailer stdhttp.Header
+	// fed says the stream has been delivered data before: its first
+	// delivery counts as consumed already, since QUIC gave it back before
+	// the request could hold it. fedBody is how much of a delivery went to
+	// the feed, and is given back only once the handler has consumed it.
+	fed     bool
+	fedBody int
+	// skip is how much of what the handler will consume was given back when
+	// it arrived, before the body streamed. The handler's goroutines consume
+	// it, hence the lock.
+	mu   sync.Mutex
+	skip int64
+}
+
+// addSkip records n bytes of the body that were given back as they arrived.
+func (b *streamedBody) addSkip(n int) {
+	b.mu.Lock()
+	b.skip += int64(n)
+	b.mu.Unlock()
+}
+
+// credit gives s back the room n bytes the handler consumed took, less what
+// was given back already.
+func (b *streamedBody) credit(s *quic.Stream, n int) {
+	b.mu.Lock()
+	skip := min(int64(n), b.skip)
+	b.skip -= skip
+	b.mu.Unlock()
+	s.Credit(n - int(skip))
+}
 
 func (rs *requestStream) feed(data []byte, fin bool) {
 	if rs.done {
 		return
 	}
+	b := rs.streamed
+	if b != nil {
+		b.fedBody = 0
+	}
 	if err := rs.parser.feed(data, rs.onData, rs.onFrame); err != nil {
 		rs.sc.fail(err)
 		return
 	}
+	if b != nil {
+		// What of this delivery went to the handler's body is given back
+		// once the handler has consumed it; the rest now.
+		if b.fed {
+			rs.s.Credit(len(data) - b.fedBody)
+		} else {
+			b.fed = true
+			b.addSkip(b.fedBody)
+		}
+	}
 	if !fin || rs.done {
 		return
 	}
+	rs.mu.Lock()
 	rs.remoteDone = true
+	rs.mu.Unlock()
 	if rs.parser.midFrame() {
 		rs.sc.fail(connErr(ErrCodeFrameError, "request stream ended inside a frame"))
 		return
 	}
 	if rs.req == nil {
 		rs.abort(ErrCodeRequestIncomplete)
+		return
+	}
+	if b != nil && b.feed != nil {
+		rs.done = true
+		if err := b.feed.End(b.trailer); err != nil {
+			rs.abort(ErrCodeMessageError)
+		}
 		return
 	}
 	rs.finish()
@@ -467,6 +561,27 @@ func (rs *requestStream) onData(chunk []byte) error {
 	}
 	if rs.req == nil || rs.trailers {
 		return connErr(ErrCodeFrameUnexpected, "DATA before HEADERS or after trailers")
+	}
+	if b := rs.streamed; b != nil {
+		if b.feed != nil {
+			b.fedBody += len(chunk)
+			if err := b.feed.Write(chunk); errors.Is(err, fibhttp.ErrMalformed) {
+				// Longer than its content-length. A body past
+				// MaxStreamedBodyBytes instead fails with the handler told,
+				// which may still answer it; what more arrives is dropped.
+				rs.abort(ErrCodeMessageError)
+			}
+			return nil
+		}
+		if config := &rs.sc.h.config; rs.declared < 0 && int64(len(rs.body)+len(chunk)) > config.StreamRequestBodyThreshold {
+			// A body of no declared length streams once more than the
+			// threshold of it has arrived. What arrived before was given
+			// back as it came, this chunk included.
+			buffered := bufferpool.Append(rs.body, chunk)
+			rs.body = nil
+			rs.startStream(buffered)
+			return nil
+		}
 	}
 	if int64(len(rs.body)+len(chunk)) > rs.sc.h.config.MaxBodyBytes {
 		rs.reject(stdhttp.StatusRequestEntityTooLarge)
@@ -527,8 +642,14 @@ func (rs *requestStream) onFrame(typ uint64, payload []byte) error {
 			rs.abort(ErrCodeMessageError)
 			return nil
 		}
-		rs.req.Trailer = trailer
 		rs.trailers = true
+		if b := rs.streamed; b != nil && b.feed != nil {
+			// The handler has the request already; the trailer becomes its
+			// Trailer when the body ends.
+			b.trailer = trailer
+			return nil
+		}
+		rs.req.Trailer = trailer
 		return nil
 	}
 	req, err := newRequest(fields, &rs.block, rs.values[:])
@@ -546,7 +667,9 @@ func (rs *requestStream) onFrame(typ uint64, payload []byte) error {
 			rs.abort(ErrCodeMessageError)
 			return nil
 		}
-		if n > rs.sc.h.config.MaxBodyBytes {
+		config := &rs.sc.h.config
+		streams := rs.streamed != nil && n > config.StreamRequestBodyThreshold
+		if !streams && n > config.MaxBodyBytes || streams && config.MaxStreamedBodyBytes > 0 && n > config.MaxStreamedBodyBytes {
 			rs.reject(stdhttp.StatusRequestEntityTooLarge)
 			return nil
 		}
@@ -558,12 +681,50 @@ func (rs *requestStream) onFrame(typ uint64, payload []byte) error {
 		rs.reject(stdhttp.StatusExpectationFailed)
 		return nil
 	}
+	if rs.streamed != nil && rs.declared > rs.sc.h.config.StreamRequestBodyThreshold {
+		// The body streams to the handler, which runs now.
+		rs.startStream(nil)
+		return nil
+	}
 	if strings.EqualFold(req.Header.Get("Expect"), "100-continue") {
 		// The body is read whole before the handler runs, so there is no
 		// reason to keep the client waiting for permission to send it.
 		_ = rs.WriteInterim(stdhttp.StatusContinue, nil)
 	}
 	return nil
+}
+
+// startStream runs the handler for a request whose body is still arriving,
+// which streams to it through a BodyFeed. buffered is what of the body has
+// arrived already, a buffer from the pool, whose room was given back as it
+// came.
+func (rs *requestStream) startStream(buffered []byte) {
+	sc, b := rs.sc, rs.streamed
+	var sendContinue func()
+	if len(buffered) == 0 && strings.EqualFold(rs.req.Header.Get("Expect"), "100-continue") {
+		// Asked for once the handler asks for the body, so that one which
+		// refuses the request answers it before the upload starts.
+		sendContinue = func() { _ = rs.WriteInterim(stdhttp.StatusContinue, nil) }
+	}
+	_, b.feed = rs.block.StreamContext(sc.conn, rs, fibhttp.BodyFeedConfig{
+		Declared: rs.declared,
+		Limit:    sc.h.config.MaxStreamedBodyBytes,
+		Continue: sendContinue,
+		Credit:   func(n int) { b.credit(rs.s, n) },
+	})
+	b.addSkip(len(buffered))
+	_ = b.feed.Write(buffered)
+	bufferpool.Put(buffered)
+	sc.h.streams.Queue(&sc.batch, &sc.gate, sc.conn, sc.h.handler, &rs.block)
+}
+
+// failBody tells the handler of a body still streaming that the rest of it
+// will not arrive, from a goroutine of its own: its callback may answer the
+// request, which may be what is failing it.
+func (rs *requestStream) failBody(err error) {
+	if b := rs.streamed; b != nil && b.feed != nil {
+		go b.feed.Fail(err)
+	}
 }
 
 // finish runs the handler for a request that has arrived whole.
@@ -599,6 +760,7 @@ func (rs *requestStream) finish() {
 func (rs *requestStream) abort(code ErrorCode) {
 	rs.done = true
 	rs.dropBody()
+	rs.failBody(fmt.Errorf("http3: request stream aborted: %v", code))
 	rs.mu.Lock()
 	rs.closed = true
 	rs.mu.Unlock()
@@ -628,6 +790,7 @@ func (rs *requestStream) reject(status int) {
 func (rs *requestStream) peerReset() {
 	rs.done = true
 	rs.dropBody()
+	rs.failBody(errRequestReset)
 	rs.mu.Lock()
 	wasOpen := !rs.closed && !rs.responded
 	rs.closed = true
@@ -714,10 +877,15 @@ func (rs *requestStream) WriteResponse(req *stdhttp.Request, response fibhttp.Re
 	// to forget the request as it takes the response rather than once the
 	// client has acknowledged it.
 	err := rs.s.WriteFinal(out, expected)
-	if !rs.remoteDone {
+	rs.mu.Lock()
+	remoteDone := rs.remoteDone
+	rs.mu.Unlock()
+	if !remoteDone {
 		// Answered before the request finished arriving: the rest of it is
-		// not wanted (RFC 9114 section 4.1).
+		// not wanted (RFC 9114 section 4.1), and a handler still taking it
+		// hears that it is not coming.
 		rs.s.StopSending(uint64(ErrCodeNoError))
+		rs.failBody(fibhttp.ErrBodyAbandoned)
 	}
 	if response.Close {
 		// One request cannot close a connection that others share, so

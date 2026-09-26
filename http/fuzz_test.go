@@ -24,6 +24,7 @@ func FuzzParser(f *testing.F) {
 		// A low threshold makes most bodies in the corpus stream, so the
 		// incremental decoder sees the same arbitrary bytes the whole-body
 		// path does.
+		config.StreamRequestBody = true
 		config.StreamRequestBodyThreshold = 8
 		config.MaxStreamedBodyBytes = 1 << 16
 		parser := NewParser(config)

@@ -27,10 +27,22 @@ The suite that checks all of this runs in CI; see
 
 Behaviour to be aware of when using it.
 
-### Bodies are buffered whole; no streaming
+### Request bodies stream on request; responses are sent whole
 
-- A request body is read completely into memory before the handler runs, and a
-  response is given all at once as `Response.Body []byte`. The client likewise
+- A request body is read completely into memory before the handler runs,
+  unless `Config.StreamRequestBody` is set: then the handler runs as soon as
+  the body has begun — at the HEADERS for a body with a `content-length` past
+  `StreamRequestBodyThreshold`, and once more than the threshold of it has
+  arrived for one without — and takes the body from `Request.Body`, a
+  `*BodyStream` read without waiting, or through `Context.OnBody`, exactly as
+  on HTTP/1 (see [`http1.md`](http1.md#streaming-request-bodies)). The stream's
+  receive window is then given back only as the handler consumes the body, so
+  a client uploading faster than the handler takes it is paced by HTTP/2 flow
+  control, one window (1MB) at most ahead, while the connection's other
+  streams carry on. `MaxStreamedBodyBytes` bounds such a body in place of
+  `MaxBodyBytes`, and `Expect: 100-continue` is answered only once the handler
+  asks for the body.
+- A response is given all at once as `Response.Body []byte`. The client
   buffers the whole response body before its callback.
 - A handler may write its response through `Context`'s `http.ResponseWriter`
   methods (`Header`/`WriteHeader`/`Write`/`Flush`), trailers included, and
@@ -38,11 +50,12 @@ Behaviour to be aware of when using it.
   streams, chunked, with files sent by sendfile (see [`http1.md`](http1.md));
   on HTTP/2 the response is held until the handler returns and then sent
   whole, and `Flush` does nothing.
-- Server-sent events, streamed long-polling output, gRPC streaming and
-  processing large uploads as they arrive are therefore not possible over
-  HTTP/2.
+- Server-sent events, streamed long-polling output and gRPC streaming are
+  therefore not possible over HTTP/2; large uploads can be processed as they
+  arrive with `StreamRequestBody`.
 - Memory bound: on the server, one connection can hold up to about
-  `MaxConcurrentStreams × MaxBodyBytes` (250 × 16MB by default); on the client,
+  `MaxConcurrentStreams × MaxBodyBytes` (250 × 16MB by default) of bodies read
+  whole, and a window (1MB) per streamed body; on the client,
   one response is bounded by `MaxResponseBodyBytes`.
 - A `CONNECT` request is parsed and handed to the handler, but no tunnel can be
   established (there is no bidirectional streaming channel).
@@ -197,10 +210,10 @@ concurrency.
 ### 3. Streaming bodies and the handler model (medium)
 
 - Make the `http.ResponseWriter` methods `Context` already has stream on
-  HTTP/2 as they do on HTTP/1, and offer streaming request-body reads, for SSE,
-  gRPC and large transfers. Window updates could then follow actual
-  consumption, giving real end-to-end backpressure instead of today's
-  replenish-on-receipt.
+  HTTP/2 as they do on HTTP/1, for SSE, gRPC and large downloads. Streamed
+  request bodies are done, with window updates that follow the handler's
+  consumption; a body read whole still has its window replenished on
+  receipt.
 
 ### 4. Performance (medium)
 

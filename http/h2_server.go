@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"net"
 	stdhttp "net/http"
 	"net/textproto"
 	"net/url"
@@ -30,8 +31,9 @@ import (
 const (
 	// h2StreamWindow is the receive window each stream is granted, and
 	// h2ConnWindow the one the whole connection is, by servers and clients
-	// alike. Bodies are buffered whole, so these only pace the peer; the
-	// body limits bound what is kept.
+	// alike. A body buffered whole is bounded by the body limits, and the
+	// windows only pace the peer; a streamed body is bounded by its stream's
+	// window, which is given back only as the handler consumes the body.
 	h2StreamWindow = 1 << 20
 	h2ConnWindow   = 1 << 24
 	// DefaultMaxConcurrentStreams is how many requests a client may have open
@@ -44,6 +46,10 @@ const (
 )
 
 var errH2StreamClosed = errors.New("http2: stream closed")
+
+// errH2RequestReset is what a streamed body reports when the client resets its
+// stream before the body has all arrived.
+var errH2RequestReset = errors.New("http2: request stream reset by the client")
 
 // ConfigureTLS returns a copy of config whose ALPN offers HTTP/2 ahead of
 // HTTP/1.1, which is what makes TLS clients choose HTTP/2. A server serves
@@ -139,11 +145,19 @@ type h2ServerStream struct {
 	// pushed marks a stream this side promised, which carries a response
 	// only; the request it answers came in PUSH_PROMISE.
 	pushed bool
-	// The reader alone touches body, declared and the receive window.
+	// The reader alone touches body, declared and feed, and, until the body
+	// streams, the receive window.
 	body        []byte
 	declared    int64
 	recvWindow  int64
 	recvUnacked int64
+	// feed is where a body that streams to its handler is written; see
+	// Config.StreamRequestBody. The receive window of such a stream is then
+	// guarded by the connection's mu, since it is given back as the handler
+	// consumes the body, from the handler's goroutine. creditSkip is how much
+	// of what the handler consumes was given back when it arrived.
+	feed       *BodyFeed
+	creditSkip int64
 	// The rest is guarded by the connection's mu.
 	remoteDone bool
 	responded  bool
@@ -165,7 +179,7 @@ type h2ServerStream struct {
 // room for, which is about what a browser's request carries. It is also what
 // fills an h2ServerStream to 1016 bytes on a 64-bit platform, just inside
 // the allocator's size class of 1024; one more would put it in the next.
-const h2RequestValues = 11
+const h2RequestValues = 10
 
 func newH2ServerConn(h *ServerHandler, c *fib.Connection, remoteAddr string) *h2ServerConn {
 	maxStreams := h.config.MaxConcurrentStreams
@@ -304,6 +318,7 @@ func (sc *h2ServerConn) fail(err *H2ConnError) {
 	sc.sendLocked(h2AppendGoAway(nil, sc.lastStreamID, err.Code, err.Reason))
 	sc.closed = true
 	sc.goAway = true
+	sc.failBodiesLocked(err)
 	clear(sc.streams)
 	sc.mu.Unlock()
 	sc.conn.CloseAfterSend()
@@ -313,6 +328,7 @@ func (sc *h2ServerConn) fail(err *H2ConnError) {
 func (sc *h2ServerConn) shutdown() {
 	sc.mu.Lock()
 	sc.closed = true
+	sc.failBodiesLocked(net.ErrClosed)
 	clear(sc.streams)
 	sc.mu.Unlock()
 }
@@ -504,6 +520,7 @@ func (sc *h2ServerConn) handleRSTStream(f *h2Frame) error {
 		return h2ConnErr(H2ProtocolError, "RST_STREAM on idle stream %d", f.streamID)
 	}
 	if st := sc.streams[f.streamID]; st != nil {
+		sc.failBodyLocked(st, errH2RequestReset)
 		sc.forgetLocked(st)
 	}
 	sc.mu.Unlock()
@@ -543,11 +560,26 @@ func (sc *h2ServerConn) handleData(f *h2Frame) error {
 	if st == nil || remoteDone {
 		return &H2StreamError{StreamID: f.streamID, Code: H2StreamClosed}
 	}
+	if st.feed != nil {
+		return sc.handleStreamedData(st, f)
+	}
 	if length > st.recvWindow {
 		return &H2StreamError{StreamID: f.streamID, Code: H2FlowControlError}
 	}
 	st.recvWindow -= length
 	st.recvUnacked += length
+	if config := &sc.handler.config; config.StreamRequestBody && st.declared < 0 && st.req != nil &&
+		int64(len(st.body))+int64(len(f.payload)) > config.StreamRequestBodyThreshold {
+		// A body of no declared length streams once more than the threshold
+		// of it has arrived, as a chunked HTTP/1 body does.
+		buffered := bufferpool.Append(st.body, f.payload)
+		st.body = nil
+		sc.streamRequest(st, buffered)
+		if f.has(h2FlagEndStream) {
+			return sc.endStreamed(st, nil)
+		}
+		return nil
+	}
 	if int64(len(st.body))+int64(len(f.payload)) > sc.handler.config.MaxBodyBytes {
 		sc.reject(st, stdhttp.StatusRequestEntityTooLarge)
 		return nil
@@ -686,7 +718,9 @@ func (sc *h2ServerConn) handleHeaderBlock(id uint32, block []byte, endStream boo
 		if err != nil || n < 0 {
 			return &H2StreamError{StreamID: id, Code: H2ProtocolError}
 		}
-		if n > sc.handler.config.MaxBodyBytes {
+		config := &sc.handler.config
+		streams := config.StreamRequestBody && !endStream && n > config.StreamRequestBodyThreshold
+		if !streams && n > config.MaxBodyBytes || streams && config.MaxStreamedBodyBytes > 0 && n > config.MaxStreamedBodyBytes {
 			sc.reject(st, stdhttp.StatusRequestEntityTooLarge)
 			return nil
 		}
@@ -694,6 +728,11 @@ func (sc *h2ServerConn) handleHeaderBlock(id uint32, block []byte, endStream boo
 	}
 	if endStream {
 		return sc.finishRequest(st)
+	}
+	if config := &sc.handler.config; config.StreamRequestBody && st.declared > config.StreamRequestBodyThreshold {
+		// The body streams to the handler, which runs now.
+		sc.streamRequest(st, nil)
+		return nil
 	}
 	if strings.EqualFold(req.Header.Get("Expect"), "100-continue") {
 		// The body is read whole before the handler runs, so there is no
@@ -724,6 +763,9 @@ func (sc *h2ServerConn) handleTrailers(st *h2ServerStream, fields []hpack.Header
 		}
 		key := textproto.CanonicalMIMEHeaderKey(f.Name)
 		trailer[key] = append(trailer[key], f.Value)
+	}
+	if st.feed != nil {
+		return sc.endStreamed(st, trailer)
 	}
 	st.req.Trailer = trailer
 	return sc.finishRequest(st)
@@ -856,6 +898,114 @@ func (sc *h2ServerConn) finishRequest(st *h2ServerStream) error {
 	return nil
 }
 
+// streamRequest runs the handler for a request whose body is still arriving,
+// which streams to it through a BodyFeed. buffered is what of the body has
+// arrived already, a buffer from the pool.
+//
+// From here the stream's receive window is given back as the handler
+// consumes the body rather than as it arrives, which is what paces the
+// client: a connection carrying other streams cannot stop reading for this
+// one. What had arrived before is given back now, and not again when the
+// handler consumes it.
+func (sc *h2ServerConn) streamRequest(st *h2ServerStream, buffered []byte) {
+	config := &sc.handler.config
+	var sendContinue func()
+	if len(buffered) == 0 && strings.EqualFold(st.req.Header.Get("Expect"), "100-continue") {
+		sendContinue = func() { _ = st.writeInterim(stdhttp.StatusContinue, nil) }
+	}
+	c := st.block.bind(sc.conn, nil)
+	c.stream = st
+	sc.mu.Lock()
+	if st.recvUnacked > 0 {
+		sc.sendLocked(h2AppendWindowUpdate(nil, st.id, uint32(st.recvUnacked)))
+		st.recvWindow += st.recvUnacked
+		st.recvUnacked = 0
+	}
+	st.creditSkip = int64(len(buffered))
+	st.feed = st.block.streamBody(c, BodyFeedConfig{
+		Declared: st.declared,
+		Limit:    config.MaxStreamedBodyBytes,
+		Continue: sendContinue,
+		Credit:   func(n int) { sc.creditBody(st, n) },
+	})
+	sc.mu.Unlock()
+	_ = st.feed.Write(buffered)
+	bufferpool.Put(buffered)
+	sc.handler.streams.Serve(&sc.gate, sc.conn, sc.handler.handler, &st.block)
+}
+
+// handleStreamedData hands a DATA frame to the handler of a body that
+// streams. Its padding is given back at once; its data once the handler has
+// consumed it.
+func (sc *h2ServerConn) handleStreamedData(st *h2ServerStream, f *h2Frame) error {
+	length := int64(f.length)
+	sc.mu.Lock()
+	if length > st.recvWindow {
+		sc.mu.Unlock()
+		return &H2StreamError{StreamID: f.streamID, Code: H2FlowControlError}
+	}
+	st.recvWindow -= length
+	st.recvUnacked += length - int64(len(f.payload))
+	sc.mu.Unlock()
+	if err := st.feed.Write(f.payload); errors.Is(err, ErrMalformed) {
+		// Longer than its content-length (RFC 9113 section 8.1.1). A body
+		// past MaxStreamedBodyBytes instead fails with the handler told,
+		// which may still answer it; what more arrives is thrown away.
+		return &H2StreamError{StreamID: f.streamID, Code: H2ProtocolError}
+	}
+	if f.has(h2FlagEndStream) {
+		return sc.endStreamed(st, nil)
+	}
+	return nil
+}
+
+// endStreamed ends a body that streams, with its trailer, if any.
+func (sc *h2ServerConn) endStreamed(st *h2ServerStream, trailer stdhttp.Header) error {
+	sc.mu.Lock()
+	st.remoteDone = true
+	if st.localDone {
+		sc.forgetLocked(st)
+	}
+	sc.mu.Unlock()
+	if err := st.feed.End(trailer); err != nil {
+		return &H2StreamError{StreamID: st.id, Code: H2ProtocolError}
+	}
+	sc.closeIfDone()
+	return nil
+}
+
+// creditBody gives the client back the window n bytes of a streamed body
+// took, once the handler has consumed them, half a window at a time.
+func (sc *h2ServerConn) creditBody(st *h2ServerStream, n int) {
+	sc.mu.Lock()
+	defer sc.mu.Unlock()
+	skip := min(int64(n), st.creditSkip)
+	st.creditSkip -= skip
+	st.recvUnacked += int64(n) - skip
+	if st.remoteDone || sc.closed || sc.streams[st.id] != st || st.recvUnacked < h2StreamWindow/2 {
+		return
+	}
+	sc.sendLocked(h2AppendWindowUpdate(nil, st.id, uint32(st.recvUnacked)))
+	st.recvWindow += st.recvUnacked
+	st.recvUnacked = 0
+}
+
+// failBodyLocked tells the handler of a body still streaming that the rest of
+// it will not arrive, from a goroutine of its own: its callback may answer
+// the request, which takes the lock held here.
+func (sc *h2ServerConn) failBodyLocked(st *h2ServerStream, err error) {
+	if feed := st.feed; feed != nil && !st.remoteDone {
+		go feed.Fail(err)
+	}
+}
+
+// failBodiesLocked fails every body still streaming on the connection.
+func (sc *h2ServerConn) failBodiesLocked(err error) {
+	for _, st := range sc.streams {
+		sc.failBodyLocked(st, err)
+	}
+}
+
 // serve runs the handler for a request that has been framed, on the stream
 // pool or, when this connection is at its limit, here: this goroutine is the
 // one reading the connection, so serving a request here is what stops the
@@ -886,6 +1036,7 @@ func (sc *h2ServerConn) reject(st *h2ServerStream, status int) {
 func (sc *h2ServerConn) resetStream(id uint32, code H2ErrorCode) {
 	sc.mu.Lock()
 	if st := sc.streams[id]; st != nil {
+		sc.failBodyLocked(st, &H2StreamError{StreamID: id, Code: code})
 		sc.forgetLocked(st)
 	}
 	sc.sendLocked(h2AppendRSTStream(nil, id, code))
@@ -1115,6 +1266,7 @@ func (sc *h2ServerConn) finishStreamLocked(st *h2ServerStream) {
 	if !st.remoteDone {
 		st.reset = true
 		sc.sendLocked(h2AppendRSTStream(nil, st.id, H2NoError))
+		sc.failBodyLocked(st, ErrBodyAbandoned)
 	}
 	sc.forgetLocked(st)
 	sc.closeFinishedLocked()

@@ -509,35 +509,41 @@ func(c *fibhttp.Context, r *http.Request) {
   顺序不变**。HTTP/2、HTTP/3 上 stream 之间互不影响。
 - 没有任何超时约束持有时长，handler 不释放就会一直占着连接，直到对端断开或读超时。
 
-`OnBody` 用回调接收 body，和 websocket 的 `OnFrame` 按帧交付是一个路子，回调带 `fin`：
+`OnBody` 用回调接收 body，和 websocket 的 `OnFrame` 按帧交付是一个路子，回调带 `fin`。
+`BodyComplete()` 判断 body 是否已经全部到达，完整的 body 可以直接从 `Request.Body` 读，
+还在路上的才用 `OnBody` 异步接收：
 
 ```go
 func(c *fibhttp.Context, r *http.Request) {
     f, _ := os.Create("upload.bin")
-    c.Retain()
-    c.OnBody(func(data []byte, fin bool, err error) {
+    c.OnBody(func(data []byte, fin bool, err error) { // 自动 Retain
         if err != nil {                 // 连接断了 / body 出错
-            f.Close(); os.Remove("upload.bin"); c.Release()
+            f.Close(); os.Remove("upload.bin")
             return
         }
         f.Write(data)                   // 边收边写，不缓存整个 body
         if fin {
             f.Close()
             _ = c.Respond(200, "text/plain", []byte("stored"))
-            c.Release()
         }
-    })
+    }) // 最后一次回调返回后框架自动 Release，响应随即写回
 }
 ```
 
-- 回调在**连接的 worker 上**执行，一次一个、保持顺序：任意大的 body 都不需要 handler
-  自己的 goroutine，也不会被缓存下来，给对端限速的就是回调本身。
+- **`OnBody` 不阻塞**：它只登记回调就返回，从不在自身内部调用回调。已经到达的部分
+  （`BodyComplete()` 为 true 时就是整个 body）在 handler 返回之后、在运行 handler 的
+  goroutine 上交给回调；handler 返回后才调用 `OnBody` 的，则在单独的 goroutine 上交付。
+- **自动 Retain / Release**：`OnBody` 自动占一个引用，最后一次回调（`fin` 或 `err`）返回
+  之后框架自动释放，回调里写的响应随即回写，handler 不用自己 `Retain`/`Release`。要在别处
+  （别的 goroutine）回复的，在回调里自己再 `Retain` 一次、回复后 `Release`。
+- 交接之后的回调在**连接的 worker 上**执行，一次一个、保持顺序：任意大的 body 都不需要
+  handler 自己的 goroutine，也不会被缓存下来，给对端限速的就是回调本身。
 - `fin` 是最后一次回调；`err != nil` 表示 body 不会有后续了，同样是最后一次、且只来一次。
   `data` 只在回调期间有效，要保留先复制。
-- body 只有在流式交付时才会分多次到达（看 `StreamRequestBodyThreshold`）；handler 运行前
+- body 只有在流式交付时才会分多次到达（看 `StreamRequestBody`）；handler 运行前
   就收全的 body 会在一次 `fin` 为 true 的回调里全部给出。
-- `OnBody` 接管之后 `Request.Body` 不能再读。只用 `OnBody` 不 `Retain` 的 handler 返回时
-  就回复、剩下的 body 被丢弃——「不读 body 直接拒绝上传」就这么写。
+- `OnBody` 接管之后 `Request.Body` 不能再读，关闭它会让回调以 `ErrBodyAbandoned` 结束、
+  剩下的 body 被丢弃。「不读 body 直接拒绝上传」就直接回复、不调用 `OnBody`。
 
 **异常情况**：连接断开、读超时、body 收不完，都会让请求被取消——不再写出任何东西，剩余
 引用全部作废，handler 只被告知一次：`OnBody` 的 `err`，以及 `Context.OnCancel(func(error))`
@@ -572,13 +578,15 @@ handler := fibhttp.NewHandlerWithConfig(config, myHandler)
 ### 流式请求 body（大 body 边收边处理）
 
 默认情况下请求的 body 收齐之后 handler 才会被调用，上传一个 1GB 的文件就意味着先在
-内存里放下 1GB。`Config.StreamRequestBodyThreshold` 大于 0 之后，超过这个大小的 body
-不再等待：header 解析完就调用 handler，`Request.Body` 是一个 `*fibhttp.BodyStream`，
+内存里放下 1GB。开启 `Config.StreamRequestBody`（默认关闭）之后，body 不再等待收齐：
+header 解析完就调用 handler（`StreamRequestBodyThreshold` 可以让不超过它的 body 仍然
+整体缓存，0 表示所有 body 都流式交付），`Request.Body` 是一个 `*fibhttp.BodyStream`，
 边收边读：
 
 ```go
 config := fibhttp.DefaultConfig()
-config.StreamRequestBodyThreshold = 1 << 20 // 超过 1MB 的 body 流式交付
+config.StreamRequestBody = true             // 开启流式请求 body
+config.StreamRequestBodyThreshold = 1 << 20 // 只有超过 1MB 的 body 流式交付
 config.MaxStreamedBodyBytes = 4 << 30       // 流式 body 的上限，0 表示不限
 config.StreamRequestBodyBuffer = 512 << 10  // 未被读走的 body 攒到这么多就停止读 socket
 
@@ -595,17 +603,15 @@ handler := fibhttp.NewHandlerWithConfig(config, fibhttp.HandlerFunc(
                 return
             }
             if errors.Is(err, fibhttp.ErrWouldBlock) { // 后面还有，异步接着收
-                c.Retain()
                 c.OnBody(func(data []byte, fin bool, err error) {
                     if err != nil {
-                        f.Close(); os.Remove("upload.bin"); c.Release()
+                        f.Close(); os.Remove("upload.bin")
                         return
                     }
                     f.Write(data)
                     if fin {
                         f.Close()
                         _ = c.Respond(http.StatusOK, "text/plain", []byte("ok"))
-                        c.Release()
                     }
                 })
                 return
@@ -624,8 +630,9 @@ handler := fibhttp.NewHandlerWithConfig(config, fibhttp.HandlerFunc(
   上，worker 去等对端就是在等自己。`Read` 的返回值就是状态机：`n > 0` 是已经到的字节，
   `io.EOF` 是整个 body 读完了，`ErrWouldBlock`（就是 `fib.ErrWouldBlock`）是现在一个
   字节都没有、后续还会来，`ErrBodyAbandoned` 是 body 已被 `Close`/`OnBody` 接管或
-  handler 没 Retain 就返回了，其它错误表示后续不会再来（连接断、超限、帧错误）。
-- 遇到 `ErrWouldBlock` 就 `Retain` + `OnBody` 异步接管剩下的部分。**交接不丢字节**：
+  handler 既没 Retain 也没调 `OnBody` 就返回了，其它错误表示后续不会再来（连接断、超限、帧错误）。
+- 遇到 `ErrWouldBlock`（或者一开始 `BodyComplete()` 就是 false）就用 `OnBody` 异步接管
+  剩下的部分，它自动保持请求不结束。**交接不丢字节**：
   `OnBody` 拿到的正好从上一次 `Read` 停下的地方开始。body 也可能在 handler 运行时就全
   到了（和 header 在同一次读里），那就一路读到 `io.EOF` 直接回复。
 - `Content-Length` 和 chunked（含 trailer，读完后在 `Request.Trailer` 里）都支持。想知道
@@ -635,6 +642,10 @@ handler := fibhttp.NewHandlerWithConfig(config, fibhttp.HandlerFunc(
 - 背压：还没被读走的 body 攒到 `StreamRequestBodyBuffer`（默认 256KB）就调用
   `Connection.HoldReads(true)` 停止读 socket，读掉一半之后恢复。上传快过 handler 处理
   速度时，减速的是对端，而不是这一侧的内存。
+- HTTP/2 和 HTTP/3 同样支持（HTTP/2 用同一个 `Config.StreamRequestBody`，HTTP/3 在
+  `http3.Config` 里有同名开关），handler 的写法完全一样。多路复用的连接不能为一个请求
+  停止读，所以背压改由流控实现：stream 的接收窗口只在 handler 消费了 body 之后才补充，
+  客户端最多领先一个窗口（1MB），同一连接上的其它请求不受影响。
 - 同一连接上排在后面的流水线请求要等这个请求的响应写完之后才会被解析，响应顺序不变。
 - handler 没读完就返回时：剩余不超过 256KB 就读掉丢弃、连接继续复用；更多（或者
   chunked 这种长度未知的）则响应发完后关闭连接，和 `net/http` 的做法一致。

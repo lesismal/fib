@@ -63,10 +63,15 @@ const (
 	// running on the connection's worker, which cannot take that duty itself.
 	ctxResume     uint64 = 1 << 21
 	ctxDelivering uint64 = 1 << 22
+	// ctxHandled marks a handler that has returned, once the body it asked
+	// for while it ran has been handed over, and ctxHandover a handover owed
+	// then; see later.
+	ctxHandled  uint64 = 1 << 23
+	ctxHandover uint64 = 1 << 24
 	// The state takes two bits, and the generation the rest.
-	ctxStateShift        = 23
+	ctxStateShift        = 25
 	ctxStateMask  uint64 = 3 << ctxStateShift
-	ctxGenShift          = 25
+	ctxGenShift          = 27
 
 	// ctxAlive is what keeps the Context the request's.
 	ctxAlive = ctxHolds | ctxServed | ctxConn | ctxCancelling | ctxFinishing
@@ -136,6 +141,7 @@ func (c *Context) recycle() {
 	c.wrote, c.closing, c.streamed = true, false, false
 	c.w, c.stream, c.external = nil, nil, nil
 	c.err, c.body, c.bodyDone, c.cancel = nil, nil, false, nil
+	c.bodyHeld, c.handover = false, nil
 	c.server, c.parser, c.whole, c.block = nil, nil, nil, nil
 }
 
@@ -160,17 +166,20 @@ func (c *Context) reopen() {
 // has already gone, does nothing.
 //
 // A handler may hold at most 65535 Retains on one request at a time.
-func (c *Context) Retain() {
+func (c *Context) Retain() { c.retain() }
+
+// retain is Retain, reporting whether it took a hold.
+func (c *Context) retain() bool {
 	for {
 		w := c.word.Load()
 		if ctxState(w) != ctxOpen {
-			return
+			return false
 		}
 		if w&ctxHolds == ctxHolds {
 			panic("http: too many Retains on one request")
 		}
 		if c.word.CompareAndSwap(w, w+1) {
-			return
+			return true
 		}
 	}
 }
@@ -212,7 +221,7 @@ func (c *Context) Err() error {
 // OnCancel registers fn to run if the request ends before its response does:
 // the connection closing under it, a read timeout, or a body that failed. It
 // is for a handler that retained the request and is working on it elsewhere,
-// so it can stop and give back what it holds; a handler that reads the body
+// so it can stop and give back what it holds; a handler that takes the body
 // through OnBody hears the same thing there and needs no second callback.
 //
 // fn runs once, on a goroutine of its own rather than on the event loop, and
@@ -242,41 +251,58 @@ func (c *Context) OnCancel(fn func(error)) {
 	c.mu.Unlock()
 }
 
+// BodyComplete reports whether the whole request body has arrived: always
+// for a body read whole before the handler ran, and for a streamed one once
+// its last byte has been taken off the connection; see
+// Config.StreamRequestBody. A handler that finds it complete can
+// read Request.Body to the end without meeting ErrWouldBlock, and one that
+// does not can take the body through OnBody as it arrives.
+func (c *Context) BodyComplete() bool {
+	if stream := c.RequestBody(); stream != nil {
+		return stream.Complete()
+	}
+	return true
+}
+
 // OnBody delivers the request body to fn as it arrives, rather than through
 // Request.Body, the way a websocket handler's OnFrame is given a message
 // frame by frame. fin marks the last call, and err a body that will not be
-// finished — the connection went, it outgrew MaxStreamedBodyBytes, or its
-// framing was broken — which is also a last call. data is only valid for the
-// duration of the call.
+// finished — the connection went, it outgrew MaxStreamedBodyBytes, its
+// framing was broken, or the body was closed — which is also a last call.
+// data is only valid for the duration of the call.
 //
-// A body arrives in pieces only when it streams, which
-// Config.StreamRequestBodyThreshold decides; a body that was read whole
-// before the handler ran arrives in one call with fin set. Either way fn runs
-// on the connection's worker, one call at a time and in order, so a handler
-// can take a body of any size without a goroutine and without it being
-// buffered: what holds the connection back is fn itself.
+// OnBody never calls fn itself and never waits: it registers fn and returns.
+// What of the body has already arrived — all of it, when BodyComplete says
+// so — is handed to fn once the handler returns, on the goroutine that ran
+// it, or, when OnBody is called after the handler has returned, on a
+// goroutine of its own. The rest follows on the connection's worker as it
+// arrives. The calls are one at a time and in order, so a handler can take a
+// body of any size without a goroutine and without it being buffered: what
+// holds the connection back is fn itself.
 //
-// A handler that means to answer once the body has arrived retains the
-// request first and releases it from fn:
+// OnBody retains the request, and the server releases it once fn has
+// returned from its last call. A handler that answers from fn therefore
+// needs neither Retain nor Release; it answers when fin arrives, and the
+// response is written after that call:
 //
-//	c.Retain()
 //	c.OnBody(func(data []byte, fin bool, err error) {
 //		if err != nil {
 //			file.Close()
-//			c.Release()
 //			return
 //		}
 //		file.Write(data)
 //		if fin {
 //			c.Respond(200, "text/plain", []byte("stored"))
-//			c.Release()
 //		}
 //	})
 //
+// A handler that answers elsewhere, after the body has arrived, takes a
+// Retain of its own in fn and releases it when it has answered.
+//
 // Request.Body is not readable once OnBody has taken it over. Calling OnBody
-// twice replaces the callback, and calling it after the body has ended
-// delivers nothing, except on a request that has already failed, whose error
-// it reports at once.
+// twice replaces the callback, and calling it after the body has ended, or
+// after the response has been written, delivers nothing, except on a request
+// that has already failed, whose error it reports.
 func (c *Context) OnBody(fn BodyFunc) {
 	if fn == nil {
 		return
@@ -286,21 +312,29 @@ func (c *Context) OnBody(fn BodyFunc) {
 		err := c.err
 		c.mu.Unlock()
 		if err != nil {
-			fn(nil, true, err)
+			c.later(func(bool) { fn(nil, true, err) })
 		}
 		return
 	}
-	c.body = fn
+	if !c.bodyHeld && !c.retain() {
+		// The response is written already, and the body with it.
+		c.mu.Unlock()
+		return
+	}
+	c.body, c.bodyHeld = fn, true
 	c.mu.Unlock()
 	if stream := c.RequestBody(); stream != nil {
 		// The body is still arriving; the stream hands it on from here,
 		// starting with whatever it has already taken off the connection.
-		stream.setSink(c.deliverBody)
+		if stream.setSink(c.deliverBody, c.handling()) {
+			c.later(stream.drain)
+		}
 		return
 	}
 	// The body was read whole before the handler ran, so it is all here. The
 	// callback may keep none of it past its call, so a body still in the
-	// server's buffer is handed over from there rather than copied out.
+	// server's buffer is handed over from there rather than copied out; the
+	// hold taken above keeps the buffer until then.
 	var data []byte
 	if whole, ok := c.Request.Body.(*wholeBody); ok && !whole.released {
 		data = whole.data[whole.read:]
@@ -311,7 +345,63 @@ func (c *Context) OnBody(fn BodyFunc) {
 	if c.Request.Body != nil {
 		c.Request.Body = emptyBody()
 	}
-	c.deliverBody(data, true, nil)
+	c.later(func(worker bool) { c.deliverBody(data, true, nil, worker) })
+}
+
+// handling reports whether the handler is still running, which later then
+// leaves a handover to its return.
+func (c *Context) handling() bool {
+	w := c.word.Load()
+	return w&ctxServed != 0 && w&ctxHandled == 0
+}
+
+// later runs handover once the handler has returned: on the handler's own
+// goroutine, after it returns, when it is still running, and on a goroutine
+// of its own when it is not, so that OnBody never calls a body callback
+// itself. handover is told whether it runs on the connection's worker.
+func (c *Context) later(handover func(worker bool)) {
+	c.mu.Lock()
+	for {
+		w := c.word.Load()
+		if w&ctxServed == 0 || w&ctxHandled != 0 {
+			break
+		}
+		if w&ctxHandover != 0 {
+			// Only one handover is ever owed: a second OnBody replaces the
+			// callback, which the first handover delivers to.
+			c.mu.Unlock()
+			return
+		}
+		c.handover = handover
+		if c.word.CompareAndSwap(w, w|ctxHandover) {
+			c.mu.Unlock()
+			return
+		}
+		c.handover = nil
+	}
+	c.mu.Unlock()
+	go handover(false)
+}
+
+// handled marks the handler's return, and hands over the body it asked for
+// while it ran. It runs before the handler's hold is given back, so the
+// response the body callbacks answer is still open.
+func (c *Context) handled() {
+	var w uint64
+	for {
+		w = c.word.Load()
+		if c.word.CompareAndSwap(w, w|ctxHandled) {
+			break
+		}
+	}
+	if w&ctxHandover == 0 {
+		return
+	}
+	c.mu.Lock()
+	handover := c.handover
+	c.handover = nil
+	c.mu.Unlock()
+	handover(true)
 }
 
 // begin takes the hold that serving a request stands on, which the handler's
@@ -480,7 +570,7 @@ func (c *Context) cancelWith(err error, gen uint64) {
 	c.cancel = nil
 	c.mu.Unlock()
 	c.forget()
-	c.deliverBody(nil, true, err)
+	c.deliverBody(nil, true, err, false)
 	if onCancel != nil {
 		onCancel(err)
 	}
@@ -499,30 +589,43 @@ func (c *Context) forget() {
 	}
 }
 
-// deliverBody hands one piece of the body to the callback OnBody registered.
-// deliverMu keeps the calls one at a time and in order, whichever goroutine
-// they come from, and is held while the callback runs; the state lock is not,
-// so the callback may Retain and Release from inside it.
-func (c *Context) deliverBody(data []byte, fin bool, err error) {
+// deliverBody hands one piece of the body to the callback OnBody registered,
+// and after the last one gives back the hold OnBody took. deliverMu keeps the
+// calls one at a time and in order, whichever goroutine they come from, and is
+// held while the callback runs; the state lock is not, so the callback may
+// Retain and Release from inside it. worker says the call is on the
+// connection's worker, holding its parser.
+func (c *Context) deliverBody(data []byte, fin bool, err error, worker bool) {
 	c.deliverMu.Lock()
 	defer c.deliverMu.Unlock()
 	c.mu.Lock()
 	fn := c.body
+	last := fin || err != nil
 	if c.bodyDone || fn == nil {
-		if fin || err != nil {
+		if last {
 			c.bodyDone = true
 		}
 		c.mu.Unlock()
 		return
 	}
-	if fin || err != nil {
-		c.bodyDone = true
+	held := last && c.bodyHeld
+	if last {
+		c.bodyDone, c.bodyHeld = true, false
 	}
 	c.mu.Unlock()
-	// deliverMu keeps the callbacks one at a time, so one bit counts them.
-	c.setDelivering(true)
+	if worker {
+		// A release from inside the callback cannot carry the connection on
+		// while this goroutine holds the parser; see giveBack. deliverMu keeps
+		// the callbacks one at a time, so one bit counts them.
+		c.setDelivering(true)
+	}
 	fn(data, fin, err)
-	c.setDelivering(false)
+	if held {
+		c.Release()
+	}
+	if worker {
+		c.setDelivering(false)
+	}
 }
 
 func (c *Context) setDelivering(on bool) {

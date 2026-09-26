@@ -24,16 +24,25 @@
 
 使用时需要了解的行为约束。
 
-### 消息体整体缓存，不支持流式
+### 请求 body 可以流式交付，响应整体发送
 
-- 请求 body 在 handler 运行前完整读入内存，响应通过 `Response.Body []byte` 一次性给出；
-  客户端同样把响应 body 完整缓存后再回调。
+- 请求 body 默认在 handler 运行前完整读入内存。设置 `Config.StreamRequestBody` 后，body
+  一开始到达就调用 handler——带 `content-length` 且超过 `StreamRequestBodyThreshold` 的在
+  HEADERS 到达时，不带 `content-length` 的在收到超过阈值的数据时——handler 从
+  `Request.Body`（不阻塞的 `*BodyStream`）读，或用 `Context.OnBody` 接收，和 HTTP/1 完全
+  一样（见 [`http1.zh-CN.md`](http1.zh-CN.md#流式请求-body)）。这时 stream 的接收窗口只在
+  handler 消费了 body 之后才补充，上传快于 handler 处理的客户端由 HTTP/2 流控限速，最多
+  领先一个窗口（1MB），同一连接上的其它 stream 不受影响。流式 body 的上限是
+  `MaxStreamedBodyBytes` 而不是 `MaxBodyBytes`；`Expect: 100-continue` 要等 handler
+  第一次要 body 时才回复 100。
+- 响应通过 `Response.Body []byte` 一次性给出；客户端同样把响应 body 完整缓存后再回调。
 - handler 也可以通过 `Context` 的 `http.ResponseWriter` 方法（`Header`/`WriteHeader`/
   `Write`/`Flush`）写响应（含 trailer），或把 `Context` 交给 `http.ServeFile`、
   `http.ServeContent`。在 HTTP/1 上这是真正的流式输出（chunked，文件走 sendfile，见
   [`http1.zh-CN.md`](http1.zh-CN.md)）；在 HTTP/2 上响应会先缓存，handler 返回后整体
   发送，`Flush` 不起作用。
-- 因此在 HTTP/2 上无法实现 SSE、长轮询流式输出、gRPC streaming、边收边处理的大文件上传等场景。
+- 因此在 HTTP/2 上无法实现 SSE、长轮询流式输出、gRPC streaming；边收边处理的大文件上传
+  可以用 `StreamRequestBody` 实现。
 - 内存上限：服务端单连接最坏约为 `MaxConcurrentStreams × MaxBodyBytes`
   （默认 250 × 16MB）；客户端单个响应受 `MaxResponseBodyBytes` 限制。
 - `CONNECT` 请求能被解析并交给 handler，但无法建立隧道（没有双向流式通道）。
@@ -155,8 +164,8 @@ CI 的 `Fuzz the parsers` job 每个目标跑 20 秒。还缺的是压测（例�
 ### 3. 流式 body 与 handler 模型（中）
 
 - 让 `Context` 已有的 `http.ResponseWriter` 方法在 HTTP/2 上也像 HTTP/1 一样流式输出，
-  并提供流式的请求 body 读取，以支持 SSE、gRPC、大文件传输；同时可以把接收窗口的补充
-  与实际消费挂钩，形成真正的端到端背压，而不是现在“收到即补充窗口”。
+  以支持 SSE、gRPC、大文件下载。流式请求 body 已经实现，接收窗口随 handler 的消费补充；
+  整体缓存的 body 仍然是“收到即补充窗口”。
 
 ### 4. 性能（中）
 

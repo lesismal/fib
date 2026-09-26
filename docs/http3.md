@@ -87,10 +87,20 @@ Behavior users need to be aware of.
 
 ### Whole bodies
 
-- A request body is read into memory in full before the handler runs, and a
-  response is given at once as `Response.Body []byte`; the client likewise
-  buffers the whole response body before the callback, so SSE and streaming
-  uploads or downloads are not possible. `Context`'s `http.ResponseWriter`
+- A request body is read into memory in full before the handler runs, unless
+  `Config.StreamRequestBody` is set: then the handler runs as soon as the body
+  has begun — at the HEADERS for a body with a `content-length` past
+  `StreamRequestBodyThreshold`, and once more than the threshold of it has
+  arrived for one without — and takes the body from `Request.Body`, an
+  `*http.BodyStream` read without waiting, or through `Context.OnBody`, as on
+  HTTP/1 and HTTP/2. QUIC then gives the stream's receive window back only as
+  the handler consumes the body, so a fast client is paced one window (1MB)
+  ahead at most. `MaxStreamedBodyBytes` bounds such a body in place of
+  `MaxBodyBytes`, and `Expect: 100-continue` is answered only once the handler
+  asks for the body.
+- A response is given at once as `Response.Body []byte`; the client buffers
+  the whole response body before the callback, so SSE and streaming downloads
+  are not possible. `Context`'s `http.ResponseWriter`
   methods work, trailers included, but as on HTTP/2 the response they write
   is held until the handler returns and sent whole; only HTTP/1 streams it.
 - Memory bounds: a server connection can hold up to about
@@ -227,9 +237,9 @@ In order of priority.
 
 ### 3. Streaming bodies and the handler model (medium)
 
-- As for HTTP/1 and HTTP/2: streaming request bodies and response writes, with
-  receive-window replenishment tied to actual consumption for end-to-end
-  backpressure. This is also what Extended CONNECT and WebTransport need.
+- As for HTTP/2: streaming response writes. Streamed request bodies are done,
+  with the receive window given back as the handler consumes the body.
+  Bidirectional streaming is what Extended CONNECT and WebTransport need.
 
 ### 4. Configurability (low)
 
@@ -277,5 +287,6 @@ skip; CI sets `FIB_REQUIRE_H3_INTEROP=1`, which turns a skip into a failure.
 | quic-go's HTTP/3 server, against the fib client | The same ground from the other side, and: the connection still serves after a timeout, a request in flight finishes when the server retires the connection with GOAWAY, a server that validates the address with Retry, and a certificate the client does not trust |
 | The suite's own hand-written HTTP/3 client (no dependency), against the fib server | What a sound implementation never sends: DATA before HEADERS, a control stream that does not start with SETTINGS, a second control stream, a request missing a pseudo-header, a reference to the QPACK dynamic table, CANCEL_PUSH, a lowered MAX_PUSH_ID, a raised GOAWAY, a QPACK insertion, an `:authority` and `Host` that disagree, and neither of them |
 | The suite's own hand-written HTTP/3 server (no dependency), against the fib client | How the client polices its peer: MAX_PUSH_ID from a server, CANCEL_PUSH, GOAWAY naming another kind of stream, a raised GOAWAY, a QPACK insertion, and a response that refers to the dynamic table |
+| The body matrix's raw QUIC client (`http3/body_matrix_test.go`), against the fib server | Request bodies every way they can come: no body, a content-length, DATA with no length, a trailer and `Expect: 100-continue`, small and large, the stream written whole or in pieces with pauses, taken by the handler by reading, through OnBody, as `BodyComplete` decides or from another goroutine, with the server reading bodies whole, streaming them all and streaming past a threshold; also a stream reset mid-body, the body limits, the stream window pacing a slow handler, and OnBody holding the body back until the handler returns |
 | Two QUIC connections over an in-memory path | Handshake, transfers under 5% and 20% loss, stream limits, resets, application close, idle timeout, keep-alive, stateless reset, key updates (with the AEAD limits lowered) and the decryption failure limit |
 | Fuzzing (`go test -fuzz`) | The parsers that take untrusted bytes: the HTTP/3 frame parser, building requests from fields, QPACK decoding and its round trip, QUIC packet headers, transport parameters and 1-RTT frame handling |

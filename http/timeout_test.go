@@ -63,6 +63,7 @@ func TestServerReadTimeoutClosesASlowBody(t *testing.T) {
 // a body the handler is already reading, which is the case worth having it for.
 func TestServerReadTimeoutClosesASlowStreamedBody(t *testing.T) {
 	config := timeoutConfig(0, 400*time.Millisecond, 0)
+	config.StreamRequestBody = true
 	config.StreamRequestBodyThreshold = 1 << 10
 	failed := make(chan error, 1)
 	addr := serveStreamingServer(t, config, func(c *Context, r *stdhttp.Request) {

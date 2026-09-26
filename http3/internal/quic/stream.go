@@ -46,6 +46,11 @@ type Stream struct {
 	// recvRead is how far the stream counts as read for flow control,
 	// which recv.offset alone is not once arriving data is discarded.
 	recvRead uint64
+	// holdCredit says the application gives back the room delivered data
+	// took as it consumes it, through Credit, rather than as it is
+	// delivered; creditAt is the offset it has consumed up to.
+	holdCredit bool
+	creditAt   uint64
 
 	queued bool
 	done   bool
@@ -405,11 +410,53 @@ func (s *Stream) onStreamFrame(off uint64, data []byte, fin bool) error {
 
 // deliver hands data to the application. The window it frees is given back
 // to the peer as it is delivered, since the application takes the data
-// whole and bounds what it keeps itself.
+// whole and bounds what it keeps itself, unless the application holds the
+// credit back; see HoldCredit.
 func (s *Stream) deliver(data []byte, fin bool) {
 	c := s.conn
-	c.consumed(s, s.recv.offset)
+	if s.holdCredit {
+		c.consumed(s, s.creditAt)
+	} else {
+		c.consumed(s, s.recv.offset)
+	}
 	c.events = append(c.events, event{kind: evStreamData, stream: s, data: data, fin: fin})
+}
+
+// HoldCredit makes the stream give the peer room for more only as the
+// application reports, through Credit, that it has consumed what it was
+// delivered, rather than as it is delivered: for an application that hands
+// the data on to something slower, which the peer is then paced by. What has
+// been delivered already counts as consumed.
+func (s *Stream) HoldCredit() {
+	c := s.conn
+	c.mu.Lock()
+	if !s.holdCredit {
+		s.holdCredit = true
+		s.creditAt = s.recv.offset
+	}
+	c.mu.Unlock()
+}
+
+// Credit reports that the application has consumed n more bytes of what the
+// stream delivered it, once HoldCredit has been called, and gives the peer
+// room for more when half of the window has been consumed.
+func (s *Stream) Credit(n int) {
+	c := s.conn
+	c.mu.Lock()
+	if !s.holdCredit || n <= 0 {
+		c.mu.Unlock()
+		return
+	}
+	s.creditAt = min(s.creditAt+uint64(n), s.recv.offset)
+	c.consumed(s, s.creditAt)
+	flush := s.maxDataPending || c.maxDataPending
+	if flush {
+		c.wantFlush = true
+	}
+	c.mu.Unlock()
+	if flush {
+		c.dispatch()
+	}
 }
 
 // consumed records that the stream has been read up to offset, and gives
