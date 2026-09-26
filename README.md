@@ -5,8 +5,8 @@
 [English](README.md) | [简体中文](README.zh-CN.md)
 
 An event-driven networking library for Go, with a matching C11 implementation. A single
-edge-triggered event loop collects I/O readiness (on Linux and macOS, `Config.IOPollers`
-spreads connections over several), and each connection is scheduled as one task onto a
+edge-triggered event loop collects I/O readiness (on Linux and macOS, `Config.IOPollers`,
+on by default, spreads connections over several), and each connection is scheduled as one task onto a
 pool of workers: events on a connection run in order, and any idle worker can
 run any connection, so load balances across real work rather than fd counts.
 

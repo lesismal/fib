@@ -6,6 +6,7 @@ import (
 	"bytes"
 	"io"
 	"net"
+	"runtime"
 	"sync"
 	"testing"
 	"time"
@@ -423,11 +424,12 @@ func TestRunOnWorkersUnderPollers(t *testing.T) {
 	}
 }
 
-// The default configuration creates no pollers and runs connections on a
-// pool of workers, not an inline one: IOPollers and ModeInline are opt-in.
-func TestDefaultConfigHasNoPollersAndWorkerPool(t *testing.T) {
+// The default configuration spreads connections over one poller per CPU,
+// each running its connections' rounds inline, and still describes a pool of
+// workers for the connections that ask for one: ModeInline stays opt-in.
+func TestDefaultConfigHasPollersAndWorkerPool(t *testing.T) {
 	config := DefaultConfig()
-	if config.IOPollers || config.TaskPoolMode == taskpool.ModeInline {
+	if !config.IOPollers || config.TaskPoolMode == taskpool.ModeInline {
 		t.Fatalf("DefaultConfig has IOPollers=%v, TaskPoolMode=%v", config.IOPollers, config.TaskPoolMode)
 	}
 	config.Name = "default-config"
@@ -437,11 +439,11 @@ func TestDefaultConfigHasNoPollersAndWorkerPool(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer server.Close()
-	if len(server.pollers) != 0 {
-		t.Fatalf("default engine has %d pollers, want none", len(server.pollers))
+	if len(server.pollers) != runtime.NumCPU() {
+		t.Fatalf("default engine has %d pollers, want %d", len(server.pollers), runtime.NumCPU())
 	}
 	pool, ok := server.taskPool.(*taskpool.TaskPool)
-	if !ok || pool.Mode() == taskpool.ModeInline || server.inlineTasks {
-		t.Fatalf("default engine runs on %v, want a pool of workers", server.taskPool)
+	if !ok || pool.Mode() != taskpool.ModeInline || !server.inlineTasks {
+		t.Fatalf("default engine runs on %v, want its inline pool", server.taskPool)
 	}
 }

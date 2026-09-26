@@ -3,8 +3,8 @@
 这是 [`c/`](../c) 目录下 C11 实现的 Go 移植版，保留相同的核心架构：
 
 - 单个 edge-triggered event loop（Linux 上是 epoll，macOS 上是 kqueue，Windows 上是 IOCP）
-  独占所有事件注册和 fd 关闭操作。Linux 和 macOS 上开启 `IOPollers` 时连接分到多个 event loop
-  上（见下）。
+  独占所有事件注册和 fd 关闭操作。Linux 和 macOS 上默认开启 `IOPollers`，连接分到多个 event loop
+  上（见下）；关闭后只有一个 event loop。
 - connection 是本地 `taskpool.TaskPool` 的任务单位。TaskPool 使用常驻、有界
   worker，避免短事件触发大量 goroutine 创建和栈扩容；connection 不与某个
   worker 固定绑定。
@@ -1174,12 +1174,12 @@ runtime.GOMAXPROCS(2 * runtime.NumCPU())
 ## IOPollers
 
 `Config.IOPollers` 把一个 Engine 拆到多个事件循环上（仅 Linux 的 epoll 和 macOS 的 kqueue；
-Windows 上忽略这个配置，保持单个循环和原来的 task pool）：
+Windows 上忽略这个配置，保持单个循环和原来的 task pool）。`DefaultConfig()` 默认开启；
+设为 `false` 时 listener 和连接都在同一个 event loop 上，每条连接的每一轮都在 worker 池上执行：
 
 - Engine 自己的循环只负责 accept 和它的 UDP socket；每条 accept 到的连接按 `fd % pollerCount`
   交给其中一个 poller，此后由那个 poller 负责它的事件注册、读写和关闭。poller 数量由
-  `Config.IOPollerCount` 指定，不大于 0 时取 `runtime.NumCPU()`；默认不创建 poller，
-  listener 和连接都在同一个 event loop 上。
+  `Config.IOPollerCount` 指定，不大于 0（默认）时取 `runtime.NumCPU()`。
   每 CPU 一个 poller 适合连接的每一轮都在 poller 上执行（Inline）的负载；如果连接的处理都交给
   worker（比如 HTTP/1，见下），`IOPollerCount` 应该设小（1 个或几个）。这时 poller 只负责等事件、
   交给 worker，一个就够用，多出来的 poller 会和 worker 抢同样的 P：每一轮结束后 poller 都要
@@ -1217,10 +1217,12 @@ Windows 上忽略这个配置，保持单个循环和原来的 task pool）：
   `Connection.Engine()` 返回的仍是用户创建的那个 Engine。
 
 ```go
-config := fib.DefaultConfig()
-config.IOPollers = true
-config.IOPollerCount = 0 // runtime.NumCPU() 个
-config.ReusePort = true  // Linux：每个 poller 自己 accept
+config := fib.DefaultConfig() // 默认已开启 IOPollers
+config.IOPollerCount = 0      // runtime.NumCPU() 个
+config.ReusePort = true       // Linux：每个 poller 自己 accept
+
+single := fib.DefaultConfig()
+single.IOPollers = false // 单个 event loop + worker 池
 ```
 
 ## OnClose 的顺序

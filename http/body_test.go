@@ -46,6 +46,9 @@ func serveOnPinnedPool(t *testing.T, config Config, handler HandlerFunc) string 
 	pool := taskpool.NewWithMode("test", taskpool.ModeCond, 8, 1024)
 	engine := fib.DefaultConfig()
 	engine.Addr = "127.0.0.1:0"
+	// Without pollers every round runs on the pinned pool; with them HTTP/1
+	// would build a pool of workers of its own.
+	engine.IOPollers = false
 	engine.SetTaskPool(pool)
 	server, err := fib.Bind(engine, NewHandlerWithConfig(config, handler))
 	if err != nil {

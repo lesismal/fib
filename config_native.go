@@ -124,8 +124,9 @@ type Config struct {
 	// runs its requests on the stream pool, which is unaffected and still
 	// sized from WorkerCount. A pool supplied through SetTaskPool is kept.
 	//
-	// Without it, the engine serves listeners and connections alike on its
-	// one loop.
+	// DefaultConfig sets it. Without it, the engine serves listeners and
+	// connections alike on its one loop, and runs every connection's rounds
+	// on the pool of workers.
 	//
 	// Only the Linux and macOS backends have pollers; on Windows the engine
 	// keeps its single loop and its task pool, as if this were unset.
@@ -176,5 +177,5 @@ func DefaultConfig() Config {
 	return Config{Name: DefaultName, Network: "tcp", Addr: ":9000", Backlog: defaultBacklog(), WorkerCount: sizing.WorkerCount,
 		MaxEvents: sizing.MaxEvents, ReadBufferSize: 16 * 1024,
 		WriteBufferHighWatermark: defaultWriteHighWatermark, MaxPendingBytes: defaultMaxPendingBytes,
-		UseWritev: true, TaskPoolMode: taskpool.ModeAdaptive, SharedTaskPool: true}
+		UseWritev: true, TaskPoolMode: taskpool.ModeAdaptive, SharedTaskPool: true, IOPollers: true}
 }

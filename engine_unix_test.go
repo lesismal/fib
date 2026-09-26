@@ -237,7 +237,11 @@ func TestReadDeferredBehindAnotherGoroutinesFlush(t *testing.T) {
 			}
 		},
 	}
-	_, addr := startEchoServer(t, DefaultConfig(), handler)
+	// The handler waits for the loop to note the next read, which a loop
+	// running the round inline never would.
+	config := DefaultConfig()
+	config.IOPollers = false
+	_, addr := startEchoServer(t, config, handler)
 	conn, err := net.DialTimeout("tcp", addr, 5*time.Second)
 	if err != nil {
 		t.Fatal(err)
