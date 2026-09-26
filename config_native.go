@@ -145,6 +145,21 @@ type Config struct {
 	// whose 99th percentile latency rose from 25ms to 37ms. Set it low, one
 	// or a few, for such a load.
 	IOPollerCount int
+	// ReusePort binds the engine's TCP listeners with SO_REUSEPORT, so that
+	// other sockets that set it too, in this process or another of the same
+	// user, may listen on the same address and share its connections.
+	//
+	// Under IOPollers on Linux it also moves accepting onto the pollers: each
+	// poller listens on a socket of its own, bound to the engine's address,
+	// and accepts the connections the kernel spreads onto that socket by a
+	// hash of their addresses. Without it, the engine's own loop accepts
+	// every connection and then wakes the poller it hands it to, and one loop
+	// doing that for every connection caps how fast connections are accepted
+	// however many cores there are to serve them. What it gives up is
+	// balance: a connection stays with the poller its hash picked, however
+	// busy that poller is. Unix sockets, and the other platforms, keep the
+	// engine's loop accepting.
+	ReusePort bool
 	// UDPIdleTimeout closes a UDP peer's connection once the peer has neither
 	// sent nor been sent a datagram for this long, since UDP has no close of
 	// its own to end it. OnClose receives ErrUDPIdleTimeout. Zero means

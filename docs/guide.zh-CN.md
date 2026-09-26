@@ -1186,6 +1186,14 @@ Windows 上忽略这个配置，保持单个循环和原来的 task pool）：
   让出 P 给刚唤醒的 worker，再排在它们后面等 P，于是每轮收集到的连接更少、请求被读到得更晚。
   实测 3 个 CPU、1 万连接的 HTTP/1 echo：不开 IOPollers 583k 请求/s，1 个 poller 584k，3 个
   poller 569k，p99 从 25ms 升到 37ms。
+- Linux 上同时设置 `Config.ReusePort` 时，accept 也移到 poller 上：每个 poller 在 Engine 的地址上
+  用 `SO_REUSEPORT` 监听一个自己的 socket，自己 accept 内核按连接地址哈希分给它的连接；
+  Engine 自己的 socket 只 bind（占住地址和内核选的端口）不 listen。不设置时 Engine 自己的循环
+  accept 所有连接，再逐条唤醒接手的 poller，于是 accept 的速度被这一个循环封顶，与核数无关：
+  每 10 条消息就重连一次的 WebSocket echo 在 64 核上停在约 9.5 万连接/s、35 个核。代价是
+  均衡：连接留在哈希选中的 poller 上，不管它多忙。Unix socket 和其他平台仍由 Engine 自己的
+  循环 accept；macOS 的 `SO_REUSEPORT` 不在多个 socket 之间分摊 TCP 连接。`ReusePort` 也让
+  同一用户的其他进程可以监听同一地址并分走连接。
 - `Dial` / `DialWithHandler` 发起的连接（TCP、UDP、Unix socket）也同样按 fd 取模分到 poller 上。
   UDP server 的各个 peer 共用监听的那一个 socket，所以留在 Engine 自己的循环上。
 - 开启后 Engine 自己的 task pool 固定为 `taskpool.ModeInline`（名为 `<Name>-inline`）：
@@ -1212,6 +1220,7 @@ Windows 上忽略这个配置，保持单个循环和原来的 task pool）：
 config := fib.DefaultConfig()
 config.IOPollers = true
 config.IOPollerCount = 0 // runtime.NumCPU() 个
+config.ReusePort = true  // Linux：每个 poller 自己 accept
 ```
 
 ## OnClose 的顺序

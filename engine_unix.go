@@ -45,6 +45,10 @@ type enginePlatform struct {
 	// udpBatch is what the loop reads UDP datagrams into.
 	udpBatch  *udpBatch
 	listenFDs []int
+	// pollersListen says the engine's pollers accept its connections on
+	// sockets of their own, and its listeners only hold their addresses;
+	// see Config.ReusePort.
+	pollersListen bool
 	// tcpListeners says the listeners accept TCP connections, which get
 	// TCP_NODELAY as they are accepted.
 	tcpListeners   bool
@@ -125,7 +129,20 @@ func (c *Connection) sysSendDatagrams(datagrams [][]byte) error {
 func (e *Engine) open(config Config, addrs []string) error {
 	e.nextGeneration.Store(firstGeneration)
 	e.tcpListeners = !isUnixNetwork(config.Network) && !isUDPNetwork(config.Network)
+	if p := e.parent; p != nil && p.pollersListen {
+		// A poller that accepts for itself listens beside its parent's
+		// other pollers, on every address the parent is bound to.
+		for _, like := range p.listenFDs {
+			fd, err := createListenerLike(config, like)
+			if err != nil {
+				e.closeListeners()
+				return err
+			}
+			e.listenFDs = append(e.listenFDs, fd)
+		}
+	}
 	udp := isUDPNetwork(config.Network)
+	e.pollersListen = e.parent == nil && pollersListen(config)
 	for _, addr := range addrs {
 		if udp {
 			fd, err := createUDPListener(config, addr)
@@ -137,7 +154,11 @@ func (e *Engine) open(config Config, addrs []string) error {
 				peers: make(map[netip.AddrPort]*Connection)})
 			continue
 		}
-		fd, err := createListener(config, addr)
+		// When the pollers listen, the engine's own socket only holds the
+		// address, and the port the kernel chose for it: were it to listen
+		// too, it would be handed a share of the connections that nothing
+		// accepts.
+		fd, err := createListener(config, addr, !e.pollersListen)
 		if err != nil {
 			e.closeListeners()
 			return err
@@ -540,17 +561,50 @@ func (e *Engine) Close() error {
 	return closeErr
 }
 
-func createListener(config Config, addr string) (int, error) {
+// pollersListen reports whether config has each poller listen on a socket
+// of its own and accept its connections itself; see Config.ReusePort.
+func pollersListen(config Config) bool {
+	return config.ReusePort && reusePortSpreads && pollerCount(config) > 0 &&
+		!isUnixNetwork(config.Network) && !isUDPNetwork(config.Network)
+}
+
+// createListener opens a socket bound to addr, and listening on it unless
+// listen is false.
+func createListener(config Config, addr string, listen bool) (int, error) {
 	family, bound, err := resolveListenAddr(config.Network, addr)
 	if err != nil {
 		return -1, err
 	}
+	return listenSocket(config, family, bound, listen)
+}
+
+// createListenerLike opens a socket listening where like is bound, which
+// SO_REUSEPORT lets it share with like; see Config.ReusePort.
+func createListenerLike(config Config, like int) (int, error) {
+	bound, err := syscall.Getsockname(like)
+	if err != nil {
+		return -1, err
+	}
+	family := syscall.AF_INET
+	if _, ok := bound.(*syscall.SockaddrInet6); ok {
+		family = syscall.AF_INET6
+	}
+	return listenSocket(config, family, bound, true)
+}
+
+func listenSocket(config Config, family int, bound syscall.Sockaddr, listen bool) (int, error) {
 	fd, err := newSocket(family)
 	if err != nil {
 		return -1, err
 	}
 	if family != syscall.AF_UNIX {
 		_ = syscall.SetsockoptInt(fd, syscall.SOL_SOCKET, syscall.SO_REUSEADDR, 1)
+		if config.ReusePort {
+			if err = syscall.SetsockoptInt(fd, syscall.SOL_SOCKET, soReusePort, 1); err != nil {
+				syscall.Close(fd)
+				return -1, err
+			}
+		}
 	}
 	if family == syscall.AF_INET6 {
 		// "tcp" accepts both families on one socket; "tcp6" is IPv6 only. This
@@ -561,7 +615,7 @@ func createListener(config Config, addr string) (int, error) {
 		}
 		_ = syscall.SetsockoptInt(fd, syscall.IPPROTO_IPV6, syscall.IPV6_V6ONLY, v6only)
 	}
-	if err = syscall.Bind(fd, bound); err == nil {
+	if err = syscall.Bind(fd, bound); err == nil && listen {
 		err = syscall.Listen(fd, config.Backlog)
 	}
 	if err != nil {

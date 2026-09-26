@@ -58,6 +58,9 @@ type Config struct {
 	// already, so both are ignored here.
 	IOPollers     bool
 	IOPollerCount int
+	// ReusePort binds a Linux or macOS engine's listeners with SO_REUSEPORT.
+	// This backend listens through the net package, and ignores it.
+	ReusePort bool
 	// UDPIdleTimeout closes a silent UDP peer's connection. Zero means
 	// DefaultUDPIdleTimeout and a negative value keeps peers until closed.
 	UDPIdleTimeout time.Duration

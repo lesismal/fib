@@ -39,6 +39,10 @@ func (e *Engine) openBackend() error {
 	}
 	e.epollFD, e.wakeFD = epfd, wakeFD
 	for _, fd := range e.listenFDs {
+		if e.pollersListen {
+			// Its pollers accept for it; see Config.ReusePort.
+			break
+		}
 		if err = e.addFD(fd, listenerToken(fd), uint32(syscall.EPOLLIN)|epollET); err != nil {
 			break
 		}

@@ -43,6 +43,10 @@ func (e *Engine) openBackend() error {
 	}
 	changes := make([]syscall.Kevent_t, 0, len(e.listenFDs)+1)
 	for _, fd := range e.listenFDs {
+		if e.pollersListen {
+			// Its pollers accept for it; see Config.ReusePort.
+			break
+		}
 		changes = append(changes, syscall.Kevent_t{Ident: uint64(fd), Filter: syscall.EVFILT_READ,
 			Flags: syscall.EV_ADD | syscall.EV_CLEAR})
 	}
