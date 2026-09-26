@@ -191,15 +191,21 @@ func TestStreamRequestBodyReadReportsWouldBlock(t *testing.T) {
 	})
 	conn := dialRaw(t, addr)
 	conn.send("POST /x HTTP/1.1\r\nHost: test\r\nContent-Length: 4096\r\n\r\n")
-	time.Sleep(50 * time.Millisecond)
+	// The body goes out only once the handler has read, so that the read
+	// finds nothing there however long the handler takes to run.
+	select {
+	case err := <-errs:
+		if !errors.Is(err, ErrWouldBlock) {
+			t.Fatalf("first read = %v, want ErrWouldBlock", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("the handler never ran")
+	}
 	if _, err := conn.Write(bytes.Repeat([]byte("q"), 4096)); err != nil {
 		t.Fatal(err)
 	}
 	if _, body := conn.response(stdhttp.MethodPost); body != "done" {
 		t.Fatalf("body = %q", body)
-	}
-	if err := <-errs; !errors.Is(err, ErrWouldBlock) {
-		t.Fatalf("first read = %v, want ErrWouldBlock", err)
 	}
 	if err := <-errs; !errors.Is(err, ErrBodyAbandoned) {
 		t.Fatalf("read after OnBody took the body = %v, want ErrBodyAbandoned", err)

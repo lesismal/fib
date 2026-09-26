@@ -112,16 +112,23 @@ func TestServerIdleTimeoutClosesAQuietConnection(t *testing.T) {
 	}
 }
 
+// TestServerIdleTimeoutIsRefreshedByEachRequest spaces its requests out over
+// longer than the idle timeout, so the connection outlives it only if each
+// request refreshes it. Each gap is well under the timeout, since a loaded CI
+// runner can oversleep one by a good part of it.
 func TestServerIdleTimeoutIsRefreshedByEachRequest(t *testing.T) {
-	addr := serveStreamingServer(t, timeoutConfig(0, 0, 400*time.Millisecond), echoPath)
+	const idle, gap = time.Second, 300 * time.Millisecond
+	addr := serveStreamingServer(t, timeoutConfig(0, 0, idle), echoPath)
 	conn := dialRaw(t, addr)
-	for i := 0; i < 4; i++ {
+	for i := 0; i < 5; i++ {
+		if i > 0 {
+			time.Sleep(gap)
+		}
 		path := fmt.Sprintf("/r%d", i)
 		conn.send("GET " + path + " HTTP/1.1\r\nHost: test\r\n\r\n")
 		if _, body := conn.response(stdhttp.MethodGet); body != path {
 			t.Fatalf("body = %q, want %q", body, path)
 		}
-		time.Sleep(200 * time.Millisecond)
 	}
 }
 
