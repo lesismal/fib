@@ -905,7 +905,7 @@ func TestHoldWaitsForSomethingToSend(t *testing.T) {
 	time.Sleep(50 * time.Millisecond)
 	type held struct {
 		deadline, ackDeadline, timerAt time.Time
-		ackNow                         bool
+		ackNow, ackPending             bool
 	}
 	seen := make(chan held, 1)
 	release := make(chan struct{})
@@ -921,7 +921,7 @@ func TestHoldWaitsForSomethingToSend(t *testing.T) {
 			time.Sleep(10 * time.Millisecond)
 			c.mu.Lock()
 			app := &c.spaces[spaceApp]
-			seen <- held{c.flushDeadline, app.ackDeadline, c.timerAt, app.ackNow}
+			seen <- held{c.flushDeadline, app.ackDeadline, c.timerAt, app.ackNow, app.ackPending}
 			c.mu.Unlock()
 			<-release
 			_ = s.WriteFinal(bufferpool.Append(nil, []byte("answer")), true)
@@ -939,6 +939,13 @@ func TestHoldWaitsForSomethingToSend(t *testing.T) {
 	waitFinished(t, p.clientH, s.ID())
 	if h.ackNow {
 		t.Skip("the request wanted an acknowledgement at once")
+	}
+	if !h.ackPending {
+		// The sleep above, and the wait for a P behind it, outlasted the
+		// acknowledgement delay, as on a loaded Windows runner whose timers
+		// tick every 15.6ms: the acknowledgement went out on its timer before
+		// the connection was looked at, and there is no timer left to check.
+		t.Skip("the acknowledgement went out before the connection was looked at")
 	}
 	if !h.deadline.IsZero() {
 		t.Fatal("a hold was set with nothing to hold back")
