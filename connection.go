@@ -70,6 +70,9 @@ type Connection struct {
 	// dialing is set while an outbound connect is still in progress, and
 	// cleared when it completes or fails. Event-loop ownership.
 	dialing *dialRequest
+	// dialed marks a connection Dial opened, as against one a listener
+	// accepted; it never changes.
+	dialed bool
 	// readDeadline and writeDeadline close the connection when they pass.
 	// Guarded by mu.
 	readDeadline  deadline
@@ -81,6 +84,17 @@ type Connection struct {
 	layer Layer
 	// udp is set for a UDP connection, which exchanges datagrams.
 	udp *udpState
+	// unix marks a Unix socket, which has none of TCP's options.
+	unix bool
+	// readShut records CloseRead: the connection reads nothing more, and the
+	// end of input that shutting the read side raises does not close it. It
+	// is read without the mutex by the read loop, as readHeld is.
+	readShut atomic.Bool
+	// writeShut records CloseWrite, after which sends are refused, and
+	// shutWritePending a CloseWrite still waiting for queued output to reach
+	// the socket before it shuts the write side. Guarded by mu.
+	writeShut        bool
+	shutWritePending bool
 	// onWorkers says the connection's rounds run on a pool of workers even
 	// where the engine runs rounds on its loops; see SetRunOnWorkers.
 	onWorkers atomic.Bool
@@ -372,7 +386,7 @@ func (c *Connection) sendRaw(data []byte) error {
 // sendClosed reports whether the connection has stopped accepting sends.
 func (c *Connection) sendClosed() bool {
 	c.mu.Lock()
-	closed := c.closing || c.closed || c.closeAfterSend
+	closed := c.closing || c.closed || c.closeAfterSend || c.writeShut
 	c.mu.Unlock()
 	return closed
 }
@@ -385,7 +399,7 @@ func (c *Connection) send(data []byte, copyData bool) error {
 		return nil
 	}
 	c.mu.Lock()
-	if c.closing || c.closed || c.closeAfterSend {
+	if c.closing || c.closed || c.closeAfterSend || c.writeShut {
 		c.mu.Unlock()
 		return syscall.EPIPE
 	}
@@ -452,7 +466,7 @@ func (c *Connection) SendParts(first, second []byte) error {
 		return nil
 	}
 	c.mu.Lock()
-	if c.closing || c.closed || c.closeAfterSend {
+	if c.closing || c.closed || c.closeAfterSend || c.writeShut {
 		c.mu.Unlock()
 		return syscall.EPIPE
 	}
@@ -562,6 +576,11 @@ func (c *Connection) process() {
 		c.pendingEvents = 0
 		closed := c.closed || c.closing
 		c.mu.Unlock()
+		if c.readShut.Load() {
+			// CloseRead ended input: what the socket still reports, the end
+			// of input the shutdown itself raises among it, is not read.
+			events &^= evIn | evPri | evRdHup
+		}
 		deferred = 0
 		alive := !closed
 		if c.udp != nil {
@@ -733,6 +752,10 @@ func (c *Connection) readLoop() error {
 	buf := bufferpool.Get(c.engine.readBufferSize)
 	defer bufferpool.Put(buf)
 	for {
+		if c.readShut.Load() {
+			// CloseRead, perhaps from inside OnData, ended input.
+			return nil
+		}
 		if c.readHeld.Load() {
 			// The application is holding reads until it has worked through
 			// what it already has. Leave the rest in the socket, where TCP
@@ -828,6 +851,7 @@ func (c *Connection) flushOutput() error {
 		if c.sendHead == len(c.sends) {
 			c.resetQueueLocked()
 			c.flushing = false
+			c.finishCloseWriteLocked()
 			closeAfterSend := c.closeAfterSend
 			refresh := c.pauseStateChangedLocked()
 			if c.readDeferred {

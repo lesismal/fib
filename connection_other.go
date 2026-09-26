@@ -32,14 +32,21 @@ type Connection struct {
 	scheduled, closing, closeDelivered bool
 	// readHeld is an application-driven read pause, set through HoldReads.
 	// readWake is what the reader goroutine parks on while it is set.
-	readHeld   bool
-	readWake   *sync.Cond
-	writeMu    sync.Mutex
-	attachment atomic.Pointer[connectionAttachment]
-	layer      Layer
+	readHeld bool
+	readWake *sync.Cond
+	// readShut and writeShut record CloseRead and CloseWrite. Guarded by mu.
+	readShut, writeShut bool
+	writeMu             sync.Mutex
+	attachment          atomic.Pointer[connectionAttachment]
+	layer               Layer
 	// udp marks a connection that exchanges datagrams: a peer of a UDP
 	// listener, whose conn is a udpPeerConn, or a dialed UDP socket.
 	udp bool
+	// unix marks a Unix socket.
+	unix bool
+	// dialed marks a connection Dial opened, as against one a listener
+	// accepted.
+	dialed bool
 	// udpActive is when a listener's peer last sent or was sent a datagram,
 	// in nanoseconds, for the idle timeout.
 	udpActive atomic.Int64
@@ -47,8 +54,17 @@ type Connection struct {
 	onWorkers atomic.Bool
 }
 
-// IsUDP reports whether the connection exchanges datagrams.
-func (c *Connection) IsUDP() bool { return c.udp }
+// Protocol returns the transport the connection runs over, which it keeps
+// for its whole life, after it closes too.
+func (c *Connection) Protocol() Protocol {
+	switch {
+	case c.udp:
+		return ProtocolUDP
+	case c.unix:
+		return ProtocolUnix
+	}
+	return ProtocolTCP
+}
 
 // SetRunOnWorkers asks for the connection's rounds to run on a pool of
 // workers. Every connection here is read by a goroutine of its own already,
@@ -159,9 +175,9 @@ func (c *Connection) sendRaw(data []byte) error {
 		return nil
 	}
 	c.mu.Lock()
-	closing := c.closing
+	closing, writeShut := c.closing, c.writeShut
 	c.mu.Unlock()
-	if closing {
+	if closing || writeShut {
 		return io.ErrClosedPipe
 	}
 	c.writeMu.Lock()

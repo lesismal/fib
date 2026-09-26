@@ -37,7 +37,7 @@ func (c *Connection) SendFile(f File, offset, count int64) error {
 		return err
 	}
 	c.mu.Lock()
-	if c.closing || c.closed || c.closeAfterSend {
+	if c.closing || c.closed || c.closeAfterSend || c.writeShut {
 		c.mu.Unlock()
 		seg.close()
 		return syscall.EPIPE

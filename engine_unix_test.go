@@ -288,3 +288,35 @@ func waitFor(done func() bool) bool {
 	}
 	return true
 }
+
+// TCP connections, accepted or dialed, must have Nagle off from the start.
+func TestTCPConnectionsSetNoDelay(t *testing.T) {
+	for _, pollers := range []bool{false, true} {
+		config := DefaultConfig()
+		config.IOPollers = pollers
+		accepted := make(chan int, 1)
+		_, addr := startEchoServer(t, config, HandlerFuncs{Open: func(c *Connection) {
+			v, _ := syscall.GetsockoptInt(c.FD(), syscall.IPPROTO_TCP, syscall.TCP_NODELAY)
+			accepted <- v
+		}})
+		client, _ := startEchoServer(t, config, HandlerFuncs{})
+		dialed := make(chan int, 1)
+		if err := client.Dial("tcp4", addr, 5*time.Second, func(c *Connection, err error) {
+			if err != nil {
+				t.Error(err)
+				dialed <- 0
+				return
+			}
+			v, _ := syscall.GetsockoptInt(c.FD(), syscall.IPPROTO_TCP, syscall.TCP_NODELAY)
+			dialed <- v
+		}); err != nil {
+			t.Fatal(err)
+		}
+		if v := <-dialed; v == 0 {
+			t.Errorf("IOPollers=%v: dialed connection has TCP_NODELAY off", pollers)
+		}
+		if v := <-accepted; v == 0 {
+			t.Errorf("IOPollers=%v: accepted connection has TCP_NODELAY off", pollers)
+		}
+	}
+}

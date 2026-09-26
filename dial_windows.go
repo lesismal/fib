@@ -47,7 +47,9 @@ func (e *Engine) connectSocket(d *dialRequest) (c *Connection, connected bool, e
 		syscall.Closesocket(s)
 		return nil, false, err
 	}
-	c = &Connection{engine: e, handler: d.handler, dialing: d}
+	// As for an accepted connection; see adopt.
+	_ = syscall.SetsockoptInt(s, syscall.IPPROTO_TCP, syscall.TCP_NODELAY, 1)
+	c = &Connection{engine: e, handler: d.handler, dialing: d, dialed: true}
 	c.handle.Store(uintptr(s))
 	c.readOp = ioOp{kind: opRead, conn: c}
 	// The connect borrows the write operation: no write can be posted before
@@ -82,7 +84,7 @@ func (e *Engine) connectDatagram(d *dialRequest) (c *Connection, connected bool,
 		syscall.Closesocket(s)
 		return nil, false, err
 	}
-	c = &Connection{engine: e, handler: d.handler, dialing: d,
+	c = &Connection{engine: e, handler: d.handler, dialing: d, dialed: true,
 		udp: &udpState{raddr: &net.UDPAddr{IP: d.raddr.IP, Port: d.raddr.Port, Zone: d.raddr.Zone}}}
 	c.udp.buf = make([]byte, maxDatagramSize)
 	c.handle.Store(uintptr(s))
@@ -119,7 +121,7 @@ func (e *Engine) connectUnix(d *dialRequest) (c *Connection, connected bool, err
 		syscall.Closesocket(s)
 		return nil, false, err
 	}
-	c = &Connection{engine: e, handler: d.handler, dialing: d}
+	c = &Connection{engine: e, handler: d.handler, dialing: d, dialed: true, unix: true}
 	c.handle.Store(uintptr(s))
 	c.readOp = ioOp{kind: opRead, conn: c}
 	c.writeOp = ioOp{kind: opWrite, conn: c}

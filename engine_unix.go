@@ -43,8 +43,11 @@ const (
 type enginePlatform struct {
 	backend
 	// udpBatch is what the loop reads UDP datagrams into.
-	udpBatch       *udpBatch
-	listenFDs      []int
+	udpBatch  *udpBatch
+	listenFDs []int
+	// tcpListeners says the listeners accept TCP connections, which get
+	// TCP_NODELAY as they are accepted.
+	tcpListeners   bool
 	nextGeneration atomic.Uint64
 	// connections is a paged table indexed by file descriptor: a descriptor is
 	// a small dense integer the kernel already allocates, so the lookup on
@@ -121,6 +124,7 @@ func (c *Connection) sysSendDatagrams(datagrams [][]byte) error {
 
 func (e *Engine) open(config Config, addrs []string) error {
 	e.nextGeneration.Store(firstGeneration)
+	e.tcpListeners = !isUnixNetwork(config.Network) && !isUDPNetwork(config.Network)
 	udp := isUDPNetwork(config.Network)
 	for _, addr := range addrs {
 		if udp {
@@ -418,14 +422,19 @@ func (e *Engine) acceptConnections(listenFD int) {
 		if err != nil {
 			return
 		}
+		if e.tcpListeners {
+			// Replies are written whole, so Nagle would only hold a small
+			// one back until the peer's delayed ACK.
+			_ = syscall.SetsockoptInt(fd, syscall.IPPROTO_TCP, syscall.TCP_NODELAY, 1)
+		}
 		if len(e.pollers) == 0 {
-			e.admit(&Connection{engine: e, handler: e.handler}, fd)
+			e.admit(&Connection{engine: e, handler: e.handler, unix: !e.tcpListeners}, fd)
 			continue
 		}
 		// The poller registers the descriptor itself, since its table and
 		// its backend are its loop's alone.
 		p := e.pollers[fd%len(e.pollers)]
-		c := &Connection{engine: p, handler: e.handler}
+		c := &Connection{engine: p, handler: e.handler, unix: !e.tcpListeners}
 		c.fd.Store(int32(fd))
 		if !p.request(command{kind: commandAccept, connection: c}) {
 			syscall.Close(fd)

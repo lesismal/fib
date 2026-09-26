@@ -353,8 +353,17 @@ func (e *Engine) LocalUDPAddr() (*net.UDPAddr, error) {
 // event loop reads and delivers whole.
 var errUDPRead = errors.New("fib: a UDP connection is read through OnData")
 
-// IsUDP reports whether the connection exchanges datagrams.
-func (c *Connection) IsUDP() bool { return c.udp != nil }
+// Protocol returns the transport the connection runs over, which it keeps
+// for its whole life, after it closes too.
+func (c *Connection) Protocol() Protocol {
+	switch {
+	case c.udp != nil:
+		return ProtocolUDP
+	case c.unix:
+		return ProtocolUnix
+	}
+	return ProtocolTCP
+}
 
 // RemoteAddr returns the peer's address: a *net.UDPAddr for a UDP
 // connection, a *net.UnixAddr for a Unix socket, whose name is empty when the

@@ -53,6 +53,10 @@ func (e *Engine) connectSocket(d *dialRequest) (c *Connection, connected bool, e
 	if err != nil {
 		return nil, false, err
 	}
+	if !isUnixNetwork(d.network) {
+		// As for an accepted connection; see acceptConnections.
+		_ = syscall.SetsockoptInt(fd, syscall.IPPROTO_TCP, syscall.TCP_NODELAY, 1)
+	}
 	for {
 		err = syscall.Connect(fd, d.sa)
 		if err != syscall.EINTR {
@@ -68,7 +72,7 @@ func (e *Engine) connectSocket(d *dialRequest) (c *Connection, connected bool, e
 		return nil, false, err
 	}
 	token := uint64(uint32(fd)) | e.nextGeneration.Add(1)<<32
-	c = &Connection{engine: e, handler: d.handler, dialing: d}
+	c = &Connection{engine: e, handler: d.handler, dialing: d, dialed: true, unix: isUnixNetwork(d.network)}
 	c.token = token
 	c.fd.Store(int32(fd))
 	// Registering an unconnected socket is what makes the connect
@@ -101,7 +105,7 @@ func (e *Engine) connectDatagram(d *dialRequest) (c *Connection, connected bool,
 		return nil, false, err
 	}
 	token := uint64(uint32(fd)) | e.nextGeneration.Add(1)<<32
-	c = &Connection{engine: e, handler: d.handler, dialing: d,
+	c = &Connection{engine: e, handler: d.handler, dialing: d, dialed: true,
 		udp: &udpState{raddr: &net.UDPAddr{IP: d.raddr.IP, Port: d.raddr.Port, Zone: d.raddr.Zone}}}
 	c.token = token
 	c.fd.Store(int32(fd))

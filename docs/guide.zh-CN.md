@@ -199,6 +199,44 @@ Close: func(c *fib.Connection, err error) {
 - UDP 连接没有 `Read`：数据报由事件循环读走并整包交给 `OnData`。非原生（portable）
   后端也没有 `Read`：那边由连接自己的读 goroutine 占着 socket，别处再读会把数据读走。
 
+### 协议类型
+
+`c.Protocol()` 返回连接的传输协议：`fib.ProtocolTCP`、`fib.ProtocolUDP`（拨出的 UDP 连接和
+UDP server 的 peer）或 `fib.ProtocolUnix`，`String()` 给出 net 包的网络名 `"tcp"`、`"udp"`、
+`"unix"`。判断某一种用 `c.IsTCP()`、`c.IsUDP()`、`c.IsUnix()`。协议在连接创建时确定，关闭
+之后也不变。
+
+`c.IsAccepted()` 表示连接由 Engine 的 listener 接受（accept 的 TCP、Unix 连接，以及向 UDP
+server 发来第一个数据报的 peer），`c.IsDialed()` 表示由 `Dial` / `DialWithHandler` 拨出，两者
+互斥，同样关闭之后也不变。同一个 handler 既服务 accept 的连接又服务拨出的连接时，可以用它区分
+服务端和客户端。
+
+### net.TCPConn 的方法
+
+`*fib.Connection` 也有 `net.TCPConn` 在 `net.Conn` 之外的方法：`SetNoDelay`、`SetKeepAlive`、
+`SetKeepAlivePeriod`、`SetKeepAliveConfig`、`SetLinger`、`SetReadBuffer`、`SetWriteBuffer`、
+`CloseRead`、`CloseWrite`、`MultipathTCP`、`SyscallConn`、`File`，参数和默认值的语义与
+`net.TCPConn` 一致（比如 keep-alive 时间为 0 取 15s，负数不改）。
+
+- 对连接类型没有意义的调用什么都不做、返回 nil：Unix socket、UDP 连接上的 TCP 选项
+  （`SetNoDelay`、keep-alive、`SetLinger`），UDP 连接上的 `CloseRead`/`CloseWrite`，以及
+  UDP server 的 peer 上所有要动 socket 的调用（peer 和其他 peer 共用监听的那个 socket）。
+  `SetReadBuffer`/`SetWriteBuffer` 对 Unix socket 和拨出的 UDP 连接照常生效。peer 的
+  `File`/`SyscallConn` 返回错误，因为没有自己的 socket 可给。
+- fib accept 和 dial 的 TCP 连接一开始就关闭了 Nagle（`TCP_NODELAY`），需要打开时调
+  `SetNoDelay(false)`。
+- `CloseWrite` 等 `Send` 已经收下的数据全部交给内核之后才 shutdown 写方向，对端先读完这些
+  数据再读到 EOF；调用之后 `Send` 返回 `EPIPE`，连接照常读。它在 Layer 之下工作，不发送
+  TLS 的 close_notify。
+- `CloseRead` 之后不再回调 `OnData`，之后读到的 EOF（包括对端 half-close）也不再关连接，
+  连接可以继续发送，直到被关闭。注意 macOS 上 shutdown 读方向之后如果对端还发数据，内核会
+  reset 连接（`net.TCPConn` 也一样）。
+- 这些调用都在连接的锁里执行 syscall，事件循环不会在调用中途关掉 fd 再把它分给别的连接。
+  所以 `SyscallConn().Control(f)` 的 f 里不能再调这个连接的方法，否则会死锁；它的
+  `Read`/`Write` 只调用一次 f，f 返回 false 时报告 `fib.ErrWouldBlock`，而不是等待就绪。
+- `File` 在 Windows 上返回 `syscall.EWINDOWS`（和 `net.TCPConn` 相同）。没有 `ReadFrom`/
+  `WriteTo`：`Write` 本来就不等待，而 `WriteTo` 需要阻塞读，数据却是经 `OnData` 交付的。
+
 ### HoldReads 读背压
 
 写方向有 `WriteHighWatermark`/`MaxPendingBytes` 两级水位自动暂停读；读方向由应用自己

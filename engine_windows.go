@@ -597,7 +597,12 @@ func (e *Engine) adopt(l *winListener, s syscall.Handle) error {
 	if err != nil {
 		return err
 	}
-	c := &Connection{engine: e, handler: e.handler}
+	if l.family != syscall.AF_UNIX {
+		// Replies are written whole, so Nagle would only hold a small one
+		// back until the peer's delayed ACK.
+		_ = syscall.SetsockoptInt(s, syscall.IPPROTO_TCP, syscall.TCP_NODELAY, 1)
+	}
+	c := &Connection{engine: e, handler: e.handler, unix: l.family == syscall.AF_UNIX}
 	c.handle.Store(uintptr(s))
 	c.readOp = ioOp{kind: opRead, conn: c}
 	c.writeOp = ioOp{kind: opWrite, conn: c}
@@ -614,12 +619,16 @@ func (e *Engine) completeRead(c *Connection, err error) *Connection {
 	c.mu.Lock()
 	c.readArmed = false
 	closed := c.closed
-	if err != nil && !closed {
+	if err != nil && !closed && !c.readShut.Load() {
 		c.failure = err
 	}
 	c.mu.Unlock()
 	if closed {
 		e.forget(c)
+		return nil
+	}
+	if c.readShut.Load() {
+		// CloseRead cancelled the read, or shut the side it was waiting on.
 		return nil
 	}
 	events := evIn
@@ -654,6 +663,7 @@ func (e *Engine) completeWrite(c *Connection, n int, err error) *Connection {
 	events := uint32(evOut)
 	if c.sendHead == len(c.sends) {
 		c.resetQueueLocked()
+		c.finishCloseWriteLocked()
 		closeAfterSend = c.closeAfterSend
 		if c.readDeferred {
 			// A round left its read to this drain; see process.
@@ -818,7 +828,7 @@ func (c *Connection) rearmRead() {
 }
 
 func (c *Connection) armReadLocked() error {
-	if c.readArmed || c.readPaused || c.closing || c.closed {
+	if c.readArmed || c.readPaused || c.closing || c.closed || c.readShut.Load() {
 		return nil
 	}
 	c.readOp.ov = syscall.Overlapped{}

@@ -225,12 +225,16 @@ func (e *Engine) serve(listener net.Listener) error {
 // connection was dialed, then its reader. It reports false, and closes conn,
 // if the engine has stopped in the meantime.
 func (e *Engine) adopt(conn net.Conn, handler Handler, done func(*Connection, error)) bool {
-	return e.adoptWith(conn, handler, done, false)
+	return e.adoptWith(conn, handler, done, false, false)
 }
 
-// adoptWith is adopt for a connection that may be a dialed UDP one.
-func (e *Engine) adoptWith(conn net.Conn, handler Handler, done func(*Connection, error), udp bool) bool {
-	c := &Connection{engine: e, handler: handler, conn: conn, udp: udp}
+// adoptWith is adopt for a connection that may be a dialed one, a dialed UDP
+// one among them.
+func (e *Engine) adoptWith(conn net.Conn, handler Handler, done func(*Connection, error), udp, dialed bool) bool {
+	c := &Connection{engine: e, handler: handler, conn: conn, udp: udp, dialed: dialed}
+	if addr := conn.LocalAddr(); !udp && addr != nil && addr.Network() == "unix" {
+		c.unix = true
+	}
 	c.fd.Store(-1)
 	e.mu.Lock()
 	if e.stopping.Load() {
@@ -278,7 +282,7 @@ func (e *Engine) DialWithHandler(network, addr string, timeout time.Duration, ha
 	}
 	go func() {
 		conn, err := net.DialTimeout(network, addr, timeout)
-		if err == nil && !e.adoptWith(conn, handler, done, isUDPNetwork(network)) {
+		if err == nil && !e.adoptWith(conn, handler, done, isUDPNetwork(network), true) {
 			err = &net.OpError{Op: "dial", Net: network, Addr: conn.RemoteAddr(), Err: net.ErrClosed}
 		}
 		if err != nil && done != nil {
@@ -302,6 +306,11 @@ func (e *Engine) readConnection(c *Connection) {
 		}
 		n, err := c.conn.Read(buf)
 		if n > 0 && !c.enqueueData(buf[:n]) {
+			return
+		}
+		if (err != nil || n == 0) && !c.udp && c.readEnded() {
+			// CloseRead ended input, and with it the reads; the connection
+			// stays open until it is closed.
 			return
 		}
 		if err != nil {
