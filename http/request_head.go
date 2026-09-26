@@ -17,9 +17,10 @@ import (
 // holds the whole header, and every key and value is a slice of it. Whatever
 // is not in that shape — an unusual method, a request target that is not a
 // plain origin-form path, a folded or otherwise irregular header line, a
-// Transfer-Encoding, a Content-Length that is not a single plain number — goes
-// to net/http instead, so that it is accepted or refused exactly as net/http
-// would, with net/http's own error.
+// Transfer-Encoding other than a lone chunked on an HTTP/1.1 request with no
+// Content-Length or Trailer beside it, a Content-Length that is not a single
+// plain number — goes to net/http instead, so that it is accepted or refused
+// exactly as net/http would, with net/http's own error.
 //
 // A request the simple parser takes comes with the block it was allocated in,
 // which has room for the rest of what serving it takes.
@@ -41,6 +42,8 @@ type requestBlock struct {
 	// values holds the header's values for a header with few enough fields,
 	// as ordinary requests have once Host has moved out of it.
 	values [4]string
+	// transferEncoding is the request's TransferEncoding, for a chunked one.
+	transferEncoding [1]string
 	// body is the request's body when it arrived whole.
 	body wholeBody
 	// pooled records that the block came from blockPool, and headerFromPool
@@ -103,6 +106,7 @@ func (b *requestBlock) recycle() bool {
 	b.request = stdhttp.Request{}
 	b.url = url.URL{}
 	b.values = [len(b.values)]string{}
+	b.transferEncoding = [1]string{}
 	b.body = wholeBody{}
 	b.recycleServerState()
 	blockPool.Put(b)
@@ -190,7 +194,7 @@ func parseSimpleRequestHead(head []byte, reuse reuseOptions) *requestBlock {
 	}
 	// The fields net/http gives a meaning are noticed on the way past, so
 	// that the map is not searched for each of them afterwards.
-	var sawHost, sawLength, sawConnection, sawPragma bool
+	var sawHost, sawLength, sawConnection, sawPragma, sawChunked, sawTrailer bool
 	for at, fields := lineEnd+1, 0; ; fields++ {
 		n := strings.IndexByte(text[at:], '\n')
 		if n <= 0 || text[at+n-1] != '\r' || fields > maxSimpleHeaderFields {
@@ -226,7 +230,17 @@ func parseSimpleRequestHead(head []byte, reuse reuseOptions) *requestBlock {
 			}
 			sawLength = true
 		case "Transfer-Encoding":
-			return nil
+			// net/http takes one field naming chunked alone, drops it from
+			// the header and records it in TransferEncoding, and refuses
+			// anything else, which is left to it to refuse. HTTP/1.0 has no
+			// transfer codings, and the parser refuses those itself.
+			if sawChunked || minor == 0 || !strings.EqualFold(value, "chunked") {
+				return nil
+			}
+			sawChunked = true
+			continue
+		case "Trailer":
+			sawTrailer = true
 		case "Connection":
 			sawConnection = true
 		case "Pragma":
@@ -246,6 +260,16 @@ func parseSimpleRequestHead(head []byte, reuse reuseOptions) *requestBlock {
 		header[key] = vv
 	}
 
+	if sawChunked {
+		if sawLength || sawTrailer {
+			// Framed two ways, or announcing a trailer net/http would move
+			// into Trailer: both are for net/http to settle.
+			return nil
+		}
+		block.transferEncoding[0] = "chunked"
+		req.TransferEncoding = block.transferEncoding[:]
+		req.ContentLength = -1
+	}
 	req.Method = method
 	req.URL = u
 	req.Proto, req.ProtoMajor, req.ProtoMinor = proto, 1, minor

@@ -347,9 +347,15 @@ func (p *Parser) feedOne() (*stdhttp.Request, bool, error) {
 		p.block = frame.block
 		return req, true, nil
 	}
-	if frame.chunked {
+	if frame.chunked && frame.block != nil && decodePlainChunks(p.buffer[frame.headerEnd:frame.end], &frame.block.body) {
+		// A body of plain chunks decodes here, into the block the header
+		// was parsed into; see decodePlainChunks.
+		req.Body = &frame.block.body
+	} else if frame.chunked {
 		// net/http owns the chunk decoder; only chunked requests need this
 		// second parse. Content-Length requests reuse the header parse below.
+		// The request it makes replaces the one parsed into the block.
+		frame.block = nil
 		var reader *requestReader
 		req, reader, err = readRequest(p.buffer[:frame.end], true)
 		if err != nil {
@@ -599,19 +605,19 @@ func (p *Parser) frameLength() (frameInfo, bool, error) {
 			// More has been sent than this server is willing to hold, and a
 			// chunked body never says how much more is coming. Hand the
 			// request over and decode the rest as it arrives.
-			return frameInfo{end: headerEnd, headerEnd: headerEnd, chunked: true, stream: true, request: req}, true, nil
+			return frameInfo{end: headerEnd, headerEnd: headerEnd, chunked: true, stream: true, request: req, block: block}, true, nil
 		}
 		end, complete, err := chunkedEnd(p.buffer, headerEnd, p.config.MaxHeaderBytes, p.config.MaxBodyBytes)
 		if err == nil && !complete {
 			p.expectContinue(req)
 		}
 		if err != nil || !complete {
-			return frameInfo{end: end, headerEnd: headerEnd, chunked: true, request: req}, complete, err
+			return frameInfo{end: end, headerEnd: headerEnd, chunked: true, request: req, block: block}, complete, err
 		}
 		if int64(end-headerEnd) > p.config.MaxBodyBytes+int64(p.config.MaxHeaderBytes) {
 			return frameInfo{}, false, ErrBodyTooLarge
 		}
-		return frameInfo{end: end, headerEnd: headerEnd, chunked: true, request: req}, true, nil
+		return frameInfo{end: end, headerEnd: headerEnd, chunked: true, request: req, block: block}, true, nil
 	}
 	if req.ContentLength < 0 {
 		return frameInfo{end: headerEnd, headerEnd: headerEnd, request: req, block: block}, true, nil
@@ -711,6 +717,84 @@ func chunkedEnd(data []byte, offset, maxTrailer int, maxBody int64) (int, bool, 
 		}
 		offset = chunkEnd + 2
 	}
+}
+
+// maxPlainChunkDigits is the longest chunk size decodePlainChunks takes,
+// which keeps every size it parses within a uint64.
+const maxPlainChunkDigits = 15
+
+// decodePlainChunks decodes body, a whole chunked body chunkedEnd has
+// framed, into a pooled buffer for into, when every chunk-size line is bare
+// hex digits and nothing follows the last chunk but the blank line: the shape
+// chunked bodies ordinarily take, which net/http decodes to the same bytes.
+// It reports false and fills nothing for any other, such as one with chunk
+// extensions, padded sizes or a trailer, which is left to net/http to decode,
+// or to refuse.
+func decodePlainChunks(body []byte, into *wholeBody) bool {
+	total := 0
+	for at := 0; ; {
+		size, n := plainChunkSize(body[at:])
+		if n == 0 {
+			return false
+		}
+		at += n
+		if size == 0 {
+			if len(body)-at != 2 || body[at] != '\r' || body[at+1] != '\n' {
+				return false
+			}
+			break
+		}
+		if size > len(body)-at-2 || body[at+size] != '\r' || body[at+size+1] != '\n' {
+			return false
+		}
+		at += size + 2
+		total += size
+	}
+	if total == 0 {
+		*into = wholeBody{}
+		return true
+	}
+	data := bufferpool.Get(total)[:0]
+	for at := 0; ; {
+		size, n := plainChunkSize(body[at:])
+		if size == 0 {
+			break
+		}
+		at += n
+		data = append(data, body[at:at+size]...)
+		at += size + 2
+	}
+	*into = wholeBody{data: data, pooled: true}
+	return true
+}
+
+// plainChunkSize parses a chunk-size line of bare hex digits at the front
+// of b, reporting the size and the length of the line with its CRLF, or a
+// zero length for any other line, and for a size larger than b, which no
+// chunk in b can have.
+func plainChunkSize(b []byte) (size, n int) {
+	var v uint64
+	for i, c := range b {
+		switch {
+		case '0' <= c && c <= '9':
+			v = v<<4 | uint64(c-'0')
+		case 'a' <= c && c <= 'f':
+			v = v<<4 | uint64(c-'a'+10)
+		case 'A' <= c && c <= 'F':
+			v = v<<4 | uint64(c-'A'+10)
+		case c == '\r' && i > 0 && i+1 < len(b) && b[i+1] == '\n':
+			if v > uint64(len(b)) {
+				return 0, 0
+			}
+			return int(v), i + 2
+		default:
+			return 0, 0
+		}
+		if i == maxPlainChunkDigits {
+			return 0, 0
+		}
+	}
+	return 0, 0
 }
 
 // hasHeaderField reports whether a raw header block has a field named name,
