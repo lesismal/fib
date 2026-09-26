@@ -625,12 +625,67 @@ func (e *Engine) closeCommands() {
 }
 
 // notify wakes the event loop, coalescing requests that arrive before it has
-// woken into a single wake-up.
+// woken into a single wake-up. A loop that is awake needs no wake-up at all,
+// since it looks at its queue before it waits again; see settle.
 func (e *Engine) notify() {
 	if !e.wakePending.CompareAndSwap(false, true) {
 		return
 	}
 	e.wake()
+}
+
+// maxSettleRounds bounds how many times settle goes back to the queue before
+// the loop waits, so that commands that keep arriving cannot keep it from the
+// sockets.
+const maxSettleRounds = 8
+
+// settle ends one pass of the loop: it runs what was queued for the loop
+// while it was awake, and the rounds that queues, until nothing is left, and
+// then lets the next request wake it again. Callers run on the event loop,
+// which marks itself awake, with wakePending, when its wait returns.
+//
+// While the loop is awake a request costs no wake-up: the rounds a loop runs
+// itself queue commands for it as they close connections, the close and
+// then the release of the descriptor, and waking itself for each was a
+// write to the wake-up descriptor, and another wait that returned at once
+// to read it, twice for every connection that ended.
+//
+// The flag is cleared before the queue is looked at, so a request lands
+// either before the look, which sees it, or after the flag, which wakes the
+// loop from the wait that follows.
+func (e *Engine) settle(ready []*Connection, tasks []taskpool.Task) ([]*Connection, []taskpool.Task) {
+	for i := 0; ; i++ {
+		e.wakePending.Store(false)
+		if !e.commandsQueued() && len(e.redeliver) == 0 {
+			return ready, tasks
+		}
+		if i == maxSettleRounds {
+			// What is left runs after the next wait, which this wake-up
+			// keeps from blocking.
+			e.notify()
+			return ready, tasks
+		}
+		e.wakePending.Store(true)
+		e.drainCommands()
+		ready, tasks = e.runReady(ready, tasks)
+	}
+}
+
+// commandsQueued reports whether requests are waiting for the loop.
+func (e *Engine) commandsQueued() bool {
+	e.commandMu.Lock()
+	queued := e.commands != nil && len(e.commands.items) > 0
+	e.commandMu.Unlock()
+	return queued
+}
+
+// drainWake answers a wake-up by running the commands it announced, for a
+// loop that has no settle step and so stays asleep between wake-ups, as far
+// as notify can tell.
+func (e *Engine) drainWake() {
+	e.ackWake()
+	e.wakePending.Store(false)
+	e.drainCommands()
 }
 
 // noteEvent folds readiness into the connection and reports whether it needs
@@ -672,9 +727,10 @@ func (e *Engine) noteEvent(c *Connection, events uint32) *Connection {
 	return c
 }
 
+// drainCommands runs the commands queued for the loop. Callers run on the
+// event loop, and acknowledge the wake-up that announced them, if one did,
+// themselves.
 func (e *Engine) drainCommands() {
-	e.ackWake()
-	e.wakePending.Store(false)
 	e.commandMu.Lock()
 	batch := e.commands
 	e.commands = nil

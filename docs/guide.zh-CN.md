@@ -102,7 +102,10 @@
 - `Send` 先直接发送，余量复制进发送队列。默认启用自适应 writev：单缓冲走
   write，`SendParts` 的两段数据和包含多个缓冲的发送队列走 writev；仅在背压
   时复制未发送部分。
-- worker 通过 command queue 与 `eventfd` 请求 event loop 刷新写关注或关闭连接。
+- worker 通过 command queue 与 `eventfd` 请求 event loop 刷新写关注或关闭连接。事件循环醒着时
+  （从一次 wait 返回到下一次 wait 之前）入队的命令不写 `eventfd`：循环在下一次 wait 之前自己
+  清空队列，以及这些命令排出的那一轮。在循环上执行的一轮关闭自己的连接时（关闭、再释放 fd），
+  这样每条结束的连接就省掉两次 `eventfd` 写和两次立即返回的 wait。
 
 ## 平台支持
 

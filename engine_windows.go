@@ -522,11 +522,11 @@ func (e *Engine) Run() error {
 			entries[i] = overlappedEntry{}
 		}
 		if woken {
-			e.drainCommands()
+			e.drainWake()
 		}
 		ready, tasks = e.runReady(ready, tasks)
 	}
-	e.drainCommands()
+	e.drainWake()
 	return nil
 }
 

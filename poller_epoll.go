@@ -86,12 +86,16 @@ func (e *Engine) runLoop() error {
 		if err != nil {
 			return err
 		}
+		// Awake until settle says otherwise: nothing queued from here on
+		// needs to wake the loop.
+		e.wakePending.Store(true)
 		for i := 0; i < n; i++ {
 			token := uint64(uint32(events[i].Fd)) | uint64(uint32(events[i].Pad))<<32
 			switch token >> 32 {
 			case listenerKind:
 				e.acceptConnections(int(uint32(token)))
 			case wakeKind:
+				e.ackWake()
 				e.drainCommands()
 			case udpKind:
 				if l := e.udpListenerAt(int(uint32(token))); l != nil {
@@ -115,6 +119,7 @@ func (e *Engine) runLoop() error {
 			}
 		}
 		ready, tasks = e.runReady(ready, tasks)
+		ready, tasks = e.settle(ready, tasks)
 	}
 	e.drainCommands()
 	return nil

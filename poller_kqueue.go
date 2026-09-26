@@ -81,6 +81,9 @@ func (e *Engine) runLoop() error {
 		if err != nil {
 			return err
 		}
+		// Awake until settle says otherwise: nothing queued from here on
+		// needs to wake the loop.
+		e.wakePending.Store(true)
 		woken := false
 		for i := 0; i < n; i++ {
 			ev := &events[i]
@@ -141,6 +144,7 @@ func (e *Engine) runLoop() error {
 		}
 		e.acceptable = e.acceptable[:0]
 		ready, tasks = e.runReady(ready, tasks)
+		ready, tasks = e.settle(ready, tasks)
 	}
 	e.drainCommands()
 	return nil
