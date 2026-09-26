@@ -275,6 +275,96 @@ func TestOverUnixSocket(t *testing.T) {
 	}
 }
 
+// A TLS connection's rounds run on workers unless the wrapped handler takes
+// them back, and once the handshake is over its records are decrypted from
+// the round's own buffer: nothing is copied into one the connection keeps.
+// What arrives with the handshake is collected, since no round is draining
+// then. Many small records, a write apiece, land several to a round and split
+// across rounds, so both ends of the borrowed buffer are exercised.
+func TestRoundsOnWorkersDecryptBorrowedInput(t *testing.T) {
+	for _, keep := range []bool{true, false} {
+		name := "workers"
+		if !keep {
+			name = "loop"
+		}
+		t.Run(name, func(t *testing.T) {
+			serverConfig, clientConfig := tlsConfigs(t)
+			var mu sync.Mutex
+			var problems []string
+			borrowed := 0
+			report := func(problem string) {
+				mu.Lock()
+				problems = append(problems, problem)
+				mu.Unlock()
+			}
+			inner := fib.HandlerFuncs{
+				Open: func(c *fib.Connection) {
+					if !c.RunsOnWorkers() {
+						report("OnOpen: rounds are not on workers")
+					}
+					if !keep {
+						c.SetRunOnWorkers(false)
+					}
+				},
+				Data: func(c *fib.Connection, b []byte) {
+					if c.RunsOnWorkers() != keep {
+						report("OnData: the wrapped handler's choice of workers did not hold")
+					}
+					layer := c.Layer().(*layer)
+					layer.mu.Lock()
+					fromRound, kept := layer.src != nil, layer.in != nil
+					layer.mu.Unlock()
+					if fromRound {
+						mu.Lock()
+						borrowed++
+						mu.Unlock()
+						if kept {
+							report("OnData: ciphertext was copied into a buffer the connection keeps")
+						}
+					}
+					if err := c.Send(b); err != nil {
+						c.Close()
+					}
+				},
+			}
+			_, addr := startEchoServer(t, fib.DefaultConfig(), NewServer(serverConfig, inner))
+
+			conn, err := stdtls.Dial("tcp", addr, clientConfig)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer conn.Close()
+			_ = conn.SetDeadline(time.Now().Add(15 * time.Second))
+			var payload []byte
+			for i := 0; i < 2000; i++ {
+				payload = append(payload, byte(i), byte(i>>8), 'x')
+			}
+			go func() {
+				for i := 0; i < len(payload); i += 3 {
+					if _, err := conn.Write(payload[i : i+3]); err != nil {
+						return
+					}
+				}
+			}()
+			received := make([]byte, len(payload))
+			if _, err := io.ReadFull(conn, received); err != nil {
+				t.Fatal(err)
+			}
+			if !bytes.Equal(received, payload) {
+				t.Fatal("echo mismatch")
+			}
+			mu.Lock()
+			defer mu.Unlock()
+			if len(problems) > 0 {
+				t.Fatalf("%d problems, the first: %s", len(problems), problems[0])
+			}
+			if borrowed == 0 {
+				t.Fatal("no record was decrypted from a round's own buffer")
+			}
+		})
+	}
+}
+
 // startEchoServer runs an engine listening on a loopback port, or, with a nil
 // handler, one that only dials, and returns it with its address.
 func startEchoServer(t *testing.T, config fib.Config, handler fib.Handler) (*fib.Engine, string) {

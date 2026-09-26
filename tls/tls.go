@@ -53,8 +53,18 @@ func (wouldBlockError) Temporary() bool { return true }
 //
 // The handshake needs a round trip or two with the peer, and crypto/tls runs
 // it as a blocking call, so each connection's handshake runs on a goroutine of
-// its own that exits once it completes. Records after that are decrypted by
-// the engine's workers in OnData like any other input.
+// its own that exits once it completes. Records after that are decrypted in
+// OnData like any other input, straight from the bytes the round read.
+//
+// Decrypting and encrypting are the costliest work a TLS connection's round
+// does, so OnOpen asks for the round to run on the engine's workers (see
+// fib.Connection.SetRunOnWorkers) before Handler's OnOpen runs, and under
+// fib.Config.IOPollers one loop's connections are then not decrypted one after
+// another on that loop. A TLS echo over 10k connections on three CPUs measured
+// 404k echoes/s with the rounds on three pollers, whose loops left 15% of the
+// CPUs idle, and 451k with them on workers. A handler whose rounds are better
+// kept on the loop, as HTTP/2's are, calls SetRunOnWorkers(false) in its own
+// OnOpen, or later.
 type Handler struct {
 	Config  *stdtls.Config
 	Handler fib.Handler
@@ -119,6 +129,7 @@ func (h *Handler) OnOpen(c *fib.Connection) {
 		t.conn = stdtls.Server(t, h.Config)
 	}
 	c.SetLayer(t)
+	c.SetRunOnWorkers(true)
 	h.inner().OnOpen(c)
 	timeout := h.HandshakeTimeout
 	if timeout == 0 {
@@ -163,11 +174,19 @@ type layer struct {
 	c    *fib.Connection
 	conn *stdtls.Conn
 
-	// mu guards the collected ciphertext and the handshake and closed flags.
-	// cond wakes a handshake waiting for the peer.
+	// mu guards the ciphertext and the handshake and closed flags. cond wakes
+	// a handshake waiting for the peer.
+	//
+	// in holds ciphertext that arrived while the handshake was running, or
+	// that a drain left unread, and goes back to the pool once it is empty.
+	// src is the ciphertext of the round being drained: the engine's own
+	// buffer, which Read serves crypto/tls from directly, after in, rather
+	// than copying it into one kept per connection; it is set only for the
+	// length of a drain.
 	mu          sync.Mutex
 	cond        sync.Cond
 	in          []byte
+	src         []byte
 	handshaking bool
 	closed      bool
 
@@ -231,32 +250,40 @@ func (t *layer) handshake(handler fib.Handler, timeout time.Duration) {
 	// The peer may have sent application data right behind its last handshake
 	// message, and crypto/tls may already have read it. Nothing raises another
 	// read for it, so it is delivered here.
-	t.drain(handler)
+	t.drain(handler, nil)
 }
 
-// feed collects ciphertext from a read round. During the handshake it only
-// wakes the handshake goroutine; afterwards it decrypts what it can.
+// feed takes ciphertext from a read round. During the handshake it collects
+// it and wakes the handshake goroutine; afterwards it decrypts what it can.
 func (t *layer) feed(handler fib.Handler, data []byte) {
 	t.mu.Lock()
 	if t.closed {
 		t.mu.Unlock()
 		return
 	}
-	t.in = bufferpool.Append(t.in, data)
 	if t.handshaking {
+		t.in = bufferpool.Append(t.in, data)
 		t.cond.Signal()
 		t.mu.Unlock()
 		return
 	}
 	t.mu.Unlock()
-	t.drain(handler)
+	t.drain(handler, data)
 }
 
-// drain decrypts every complete record collected so far and hands the
-// plaintext to handler.
-func (t *layer) drain(handler fib.Handler) {
+// drain decrypts every complete record in what was collected before and in
+// data, which is only borrowed for the call, and hands the plaintext to
+// handler. crypto/tls keeps an incomplete record's bytes itself, so nothing
+// of data outlives the call unless the drain stops early.
+func (t *layer) drain(handler fib.Handler, data []byte) {
 	t.readMu.Lock()
 	defer t.readMu.Unlock()
+	if len(data) > 0 {
+		t.mu.Lock()
+		t.src = data
+		t.mu.Unlock()
+		defer t.releaseSrc()
+	}
 	buf := bufferpool.Get(readBufferSize)
 	defer bufferpool.Put(buf)
 	for {
@@ -274,6 +301,18 @@ func (t *layer) drain(handler fib.Handler) {
 		t.c.CloseWithError(err)
 		return
 	}
+}
+
+// releaseSrc hands the round's buffer back to the engine at the end of a
+// drain, keeping a copy of whatever crypto/tls did not read, which only a
+// drain that stopped early leaves.
+func (t *layer) releaseSrc() {
+	t.mu.Lock()
+	if len(t.src) > 0 && !t.closed {
+		t.in = bufferpool.Append(t.in, t.src)
+	}
+	t.src = nil
+	t.mu.Unlock()
 }
 
 // shutdown wakes a handshake still waiting on the peer, which then fails.
@@ -353,6 +392,11 @@ func (t *layer) Read(p []byte) (int, error) {
 		if t.closed {
 			return 0, io.EOF
 		}
+		if len(t.src) > 0 {
+			n := copy(p, t.src)
+			t.src = t.src[n:]
+			return n, nil
+		}
 		if !t.handshaking {
 			return 0, errWouldBlock
 		}
@@ -360,15 +404,12 @@ func (t *layer) Read(p []byte) (int, error) {
 	}
 	n := copy(p, t.in)
 	if n == len(t.in) {
-		if cap(t.in) > 4*readBufferSize {
-			// A burst grew this connection's buffer past what is worth
-			// keeping attached to it. The pool keeps it instead, in the class
-			// it belongs to, for whoever needs one that size next.
-			bufferpool.Put(t.in)
-			t.in = nil
-		} else {
-			t.in = t.in[:0]
-		}
+		// Emptied, the buffer goes back to the pool rather than staying with
+		// the connection: once the handshake is over it is only needed
+		// again when a drain stops early, and at high connection counts a
+		// buffer kept apiece costs far more than taking one when it is.
+		bufferpool.Put(t.in)
+		t.in = nil
 	} else {
 		// Moving the rest down rather than reslicing past what was read keeps
 		// the buffer starting at its array, so what goes back to the pool is

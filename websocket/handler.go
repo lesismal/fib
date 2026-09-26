@@ -359,7 +359,8 @@ func NewHandlerWithConfig(config Config, handler Handler) *ServerHandler {
 // gives it, inline or not: unlike the http package's HTTP/1 connections, a
 // WebSocket connection does not ask for workers (see
 // fib.Connection.SetRunOnWorkers), so under Config.IOPollers its messages are
-// handled on its poller and a handler that blocks holds that poller up.
+// handled on its poller and a handler that blocks holds that poller up. Over
+// the tls package, which does ask for workers, they are handled on workers.
 func (h *ServerHandler) OnOpen(c *fib.Connection) {
 	c.SetAttachment(&connectionState{})
 }

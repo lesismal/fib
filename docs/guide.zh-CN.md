@@ -1210,8 +1210,14 @@ Windows 上忽略这个配置，保持单个循环和原来的 task pool）。`D
   `false`，由 Engine 自己的池（不论是否 Inline）读和解析，请求交给共享的 stream pool
   执行。HTTP/3 同样在 Engine 自己的池上读和解析，请求走 stream pool。stream pool 仍按
   `WorkerCount` 计算大小。
+- `tls` 子 package 的连接在 `OnOpen` 里、调用被包装 handler 的 `OnOpen` 之前先
+  `SetRunOnWorkers(true)`：解密和加密是 TLS 连接每一轮里最贵的工作，放在 poller 上会让同一个
+  poller 的连接排队逐条解密。3 个 CPU、1 万连接的 TLS echo，在 3 个 poller 上执行时 40.4 万
+  echo/s、约 15% 的 CPU 空闲，改到 worker 上是 45.1 万。被包装的 handler 可以在自己的
+  `OnOpen` 或之后改回 `false`，TLS 上的 HTTP/2 就是这样做的。
 - WebSocket 连接不调用 `SetRunOnWorkers`，跟随 Engine 的配置：开启 IOPollers 时消息在 poller
   上用 Inline 池处理，否则用 worker 池。所以开启 IOPollers 时 WebSocket 的消息回调同样不能阻塞。
+  TLS 上的 WebSocket（wss）由 `tls` 放到 worker 上。
 - `MaxPendingBytes` 仍是整个 Engine（含所有 poller）的总预算；一个 poller 上的连接把预算
   释放到恢复线以下时，会唤醒其他因预算暂停了连接的 poller。`Stats()` 汇总所有 poller 的计数，
   `Connection.Engine()` 返回的仍是用户创建的那个 Engine。
