@@ -51,6 +51,9 @@ func (wouldBlockError) Temporary() bool { return true }
 // the handshake, and it may send at once: whatever it sends is held until the
 // handshake completes and then encrypted in order. A handshake that fails or
 // times out closes the connection, and Handler's OnClose receives the error.
+// Plaintext the peer sent before it closed reaches OnData before OnClose, even
+// what arrived along with the handshake, and OnClose never runs alongside
+// OnHandshake.
 //
 // The handshake needs a round trip or two with the peer, and crypto/tls runs
 // it as a blocking call, so each connection's handshake runs on a worker of a
@@ -127,7 +130,7 @@ func (h *Handler) inner() fib.Handler {
 }
 
 func (h *Handler) OnOpen(c *fib.Connection) {
-	t := &layer{c: c, handshaking: true}
+	t := &layer{c: c, handshaking: true, settling: true}
 	t.cond.L = &t.mu
 	if h.Client {
 		t.conn = stdtls.Client(t, h.Config)
@@ -142,7 +145,13 @@ func (h *Handler) OnOpen(c *fib.Connection) {
 		timeout = DefaultHandshakeTimeout
 	}
 	inner := h.inner()
-	sidepool.Handshake().Go(func() { t.handshake(inner, timeout) })
+	if !sidepool.Handshake().Go(func() { t.handshake(inner, timeout) }) {
+		t.mu.Lock()
+		t.handshaking = false
+		t.mu.Unlock()
+		t.settle(inner)
+		c.CloseWithError(errNoHandshakeWorker)
+	}
 }
 
 func (h *Handler) OnData(c *fib.Connection, data []byte) {
@@ -158,8 +167,10 @@ func (h *Handler) OnPriorityData(c *fib.Connection, data []byte) {
 }
 
 func (h *Handler) OnClose(c *fib.Connection, err error) {
-	if t, ok := c.Layer().(*layer); ok {
-		t.shutdown()
+	if t, ok := c.Layer().(*layer); ok && !t.closing(err) {
+		// The handshake's worker reports the close, once it has delivered
+		// what arrived with the handshake.
+		return
 	}
 	h.inner().OnClose(c, err)
 }
@@ -185,17 +196,29 @@ type layer struct {
 	// a handshake waiting for the peer.
 	//
 	// in holds ciphertext that arrived while the handshake was running, or
-	// that a drain left unread, and goes back to the pool once it is empty.
-	// src is the ciphertext of the round being drained: the engine's own
-	// buffer, which Read serves crypto/tls from directly, after in, rather
-	// than copying it into one kept per connection; it is set only for the
-	// length of a drain.
+	// that a drain left unread, from inHead on, and goes back to the pool once
+	// it is empty. src is the ciphertext of the round being drained: the
+	// engine's own buffer, which Read serves crypto/tls from directly, after
+	// in, rather than copying it into one kept per connection; it is set only
+	// for the length of a drain. rec tracks where the records in that stream
+	// begin and end; see Read.
+	//
+	// settling holds from OnOpen until the handshake's worker has delivered
+	// what arrived with the handshake. A close in the meantime leaves in to
+	// that worker, and closeHeld and closeErr to report once it is done, so
+	// that the wrapped handler hears of the close after the plaintext the
+	// peer sent before it, and never while OnHandshake runs.
 	mu          sync.Mutex
 	cond        sync.Cond
 	in          []byte
+	inHead      int
 	src         []byte
+	rec         recordCursor
 	handshaking bool
+	settling    bool
 	closed      bool
+	closeHeld   bool
+	closeErr    error
 
 	// readMu makes whoever decrypts, the handshake's worker for the bytes
 	// that arrived with the handshake or a worker afterwards, the only one
@@ -251,18 +274,44 @@ func (t *layer) handshake(handler fib.Handler, timeout time.Duration) {
 	t.handshaking = false
 	t.mu.Unlock()
 	if err != nil {
+		t.settle(handler)
 		t.c.CloseWithError(err)
 		return
 	}
 	// The peer may have sent application data right behind its last handshake
-	// message, and crypto/tls may already have read it. Nothing raises another
-	// read for it, so it is delivered here.
-	t.drain(handler, nil)
+	// message, which feed collected while the handshake ran. Nothing raises
+	// another read for it, so it is delivered here, even if the connection
+	// has closed since: the peer sent it before it closed.
+	t.readMu.Lock()
+	t.drainLocked(handler)
+	t.readMu.Unlock()
+	t.settle(handler)
+}
+
+// settle ends the handshake's part: what arrived with it has been delivered,
+// so a close from now on goes straight to handler, and one that came before
+// is reported here.
+func (t *layer) settle(handler fib.Handler) {
+	t.mu.Lock()
+	t.settling = false
+	held, err := t.closeHeld, t.closeErr
+	t.closeHeld, t.closeErr = false, nil
+	if t.closed {
+		t.releaseInLocked()
+	}
+	t.mu.Unlock()
+	if held {
+		handler.OnClose(t.c, err)
+	}
 }
 
 // feed takes ciphertext from a read round. During the handshake it collects
 // it and wakes the handshake's worker; afterwards it decrypts what it can.
+// data is only borrowed for the call: crypto/tls keeps an incomplete record's
+// bytes itself, so nothing of data outlives it unless the drain stops early.
 func (t *layer) feed(handler fib.Handler, data []byte) {
+	t.readMu.Lock()
+	defer t.readMu.Unlock()
 	t.mu.Lock()
 	if t.closed {
 		t.mu.Unlock()
@@ -274,22 +323,23 @@ func (t *layer) feed(handler fib.Handler, data []byte) {
 		t.mu.Unlock()
 		return
 	}
+	t.src = data
 	t.mu.Unlock()
-	t.drain(handler, data)
+	defer t.releaseSrc()
+	t.drainLocked(handler)
 }
 
-// drain decrypts every complete record in what was collected before and in
-// data, which is only borrowed for the call, and hands the plaintext to
-// handler. crypto/tls keeps an incomplete record's bytes itself, so nothing
-// of data outlives the call unless the drain stops early.
-func (t *layer) drain(handler fib.Handler, data []byte) {
-	t.readMu.Lock()
-	defer t.readMu.Unlock()
-	if len(data) > 0 {
-		t.mu.Lock()
-		t.src = data
-		t.mu.Unlock()
-		defer t.releaseSrc()
+// drainLocked decrypts every complete record in what was collected before and
+// in the round's bytes, and hands the plaintext to handler. The caller holds
+// readMu.
+//
+// Read hands crypto/tls one record at a time, so once a Read has returned
+// plaintext crypto/tls holds no ciphertext it has not decrypted, and the
+// drain ends as soon as nothing is left to hand it, without the further
+// Read that would only have reported errWouldBlock.
+func (t *layer) drainLocked(handler fib.Handler) {
+	if !t.hasInput() {
+		return
 	}
 	buf := bufferpool.Get(readBufferSize)
 	defer bufferpool.Put(buf)
@@ -299,6 +349,9 @@ func (t *layer) drain(handler fib.Handler, data []byte) {
 			handler.OnData(t.c, buf[:n])
 		}
 		if err == nil {
+			if !t.hasInput() {
+				return
+			}
 			continue
 		}
 		if err == errWouldBlock {
@@ -308,6 +361,14 @@ func (t *layer) drain(handler fib.Handler, data []byte) {
 		t.c.CloseWithError(err)
 		return
 	}
+}
+
+// hasInput reports whether ciphertext is waiting that crypto/tls has not been
+// handed yet.
+func (t *layer) hasInput() bool {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return len(t.in) > t.inHead || len(t.src) > 0
 }
 
 // releaseSrc hands the round's buffer back to the engine at the end of a
@@ -322,14 +383,39 @@ func (t *layer) releaseSrc() {
 	t.mu.Unlock()
 }
 
-// shutdown wakes a handshake still waiting on the peer, which then fails.
+// shutdown wakes a handshake still waiting on the peer, which then fails
+// once it has read what already arrived.
 func (t *layer) shutdown() {
 	t.mu.Lock()
-	t.closed = true
-	bufferpool.Put(t.in)
-	t.in = nil
-	t.cond.Broadcast()
+	t.closeLocked()
 	t.mu.Unlock()
+}
+
+// closing is shutdown for Handler.OnClose. It reports whether the wrapped
+// handler hears of the close now; otherwise the handshake's worker reports it
+// with err once it is done.
+func (t *layer) closing(err error) bool {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.closeLocked()
+	if t.settling {
+		t.closeHeld, t.closeErr = true, err
+		return false
+	}
+	return true
+}
+
+func (t *layer) closeLocked() {
+	t.closed = true
+	if !t.settling {
+		t.releaseInLocked()
+	}
+	t.cond.Broadcast()
+}
+
+func (t *layer) releaseInLocked() {
+	bufferpool.Put(t.in)
+	t.in, t.inHead = nil, 0
 }
 
 // Send encrypts plaintext, or holds a copy of it until the handshake is done.
@@ -392,15 +478,21 @@ func (t *layer) isClosed() bool {
 
 // Read is crypto/tls reading the transport. During the handshake it waits for
 // the peer; afterwards it never waits, and reports errWouldBlock instead.
+//
+// It never hands over more than the rest of the record under way. crypto/tls
+// reads into a buffer it keeps for the life of the connection and grows to
+// fit whatever it is handed; given a round's worth of pipelined records at
+// once, that buffer would grow to the size of the round, and stay that size,
+// where one record at a time keeps it at the size of a record.
 func (t *layer) Read(p []byte) (int, error) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	for len(t.in) == 0 {
+	for len(t.in) == t.inHead {
 		if t.closed {
 			return 0, io.EOF
 		}
 		if len(t.src) > 0 {
-			n := copy(p, t.src)
+			n := t.rec.take(p, t.src)
 			t.src = t.src[n:]
 			return n, nil
 		}
@@ -409,21 +501,52 @@ func (t *layer) Read(p []byte) (int, error) {
 		}
 		t.cond.Wait()
 	}
-	n := copy(p, t.in)
-	if n == len(t.in) {
+	n := t.rec.take(p, t.in[t.inHead:])
+	t.inHead += n
+	if t.inHead == len(t.in) {
 		// Emptied, the buffer goes back to the pool rather than staying with
 		// the connection: once the handshake is over it is only needed
 		// again when a drain stops early, and at high connection counts a
 		// buffer kept apiece costs far more than taking one when it is.
-		bufferpool.Put(t.in)
-		t.in = nil
-	} else {
-		// Moving the rest down rather than reslicing past what was read keeps
-		// the buffer starting at its array, so what goes back to the pool is
-		// the whole of it.
-		t.in = t.in[:copy(t.in, t.in[n:])]
+		t.releaseInLocked()
 	}
 	return n, nil
+}
+
+// recordCursor follows the TLS record framing of the ciphertext stream, so
+// that Read can stop at the end of each record. A record is a five-byte
+// header, whose last two bytes are the length of the body that follows.
+type recordCursor struct {
+	header [5]byte
+	// headerLen is how much of the current record's header has been handed
+	// over, and bodyLeft how much of its body has not.
+	headerLen int
+	bodyLeft  int
+}
+
+// take copies into p what src holds of the current record, as much as p has
+// room for, and reports how many bytes it copied.
+func (r *recordCursor) take(p, src []byte) int {
+	if len(src) > len(p) {
+		src = src[:len(p)]
+	}
+	n := 0
+	if r.headerLen < len(r.header) {
+		k := copy(r.header[r.headerLen:], src)
+		r.headerLen += k
+		n = k
+		if r.headerLen < len(r.header) {
+			return copy(p, src[:n])
+		}
+		r.bodyLeft = int(r.header[3])<<8 | int(r.header[4])
+	}
+	k := min(r.bodyLeft, len(src)-n)
+	r.bodyLeft -= k
+	n += k
+	if r.bodyLeft == 0 {
+		r.headerLen = 0
+	}
+	return copy(p, src[:n])
 }
 
 // Write is crypto/tls writing records. The connection copies them, since
@@ -444,6 +567,10 @@ func (t *layer) Close() error {
 }
 
 var errHandshakeTimeout = errors.New("fib: tls handshake timed out")
+
+// errNoHandshakeWorker closes a connection whose handshake the handshake pool
+// refused to run.
+var errNoHandshakeWorker = errors.New("fib: tls handshake pool has stopped")
 
 func (t *layer) LocalAddr() net.Addr { return addr{} }
 

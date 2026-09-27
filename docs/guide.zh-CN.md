@@ -419,6 +419,12 @@ err = fibtls.Dial(engine, "tcp", "example.com:443", 3*time.Second, tlsConfig, ha
   Engine 的，也不是 handler 用的，所以握手不会排在喂它数据的那些连接的工作后面，Engine
   的 worker 提交握手也不会等自己的队列。之后的记录由 worker 在 `OnData` 中非阻塞解密，
   跨多轮读到达的记录会被正确拼接。
+- 密文直接从本轮读到的缓冲交给 `crypto/tls`，每次只交一条记录：`crypto/tls` 为每条连接
+  保留一个只增不减的输入缓冲，一次交给它整轮流水线数据，这个缓冲就会涨到一轮的大小
+  并一直留着。2 万连接、1 KiB 消息、每次写 10 条的 TLS 1.3 流水线压测中，服务端内存由
+  约 880 MB 降到约 490 MB。
+- 对端关闭前发出的明文一定先到 `OnData` 再到 `OnClose`，包括随握手一起到达的数据；
+  `OnClose` 也不会与 `OnHandshake` 同时执行。
 - `Handler.HandshakeTimeout` 限制握手时长，0 表示 `DefaultHandshakeTimeout`
   （10 秒），负数表示不限制。
 - `fibtls.ConnectionState(c)` 在握手完成后返回协商结果（版本、ALPN、对端证书等）。

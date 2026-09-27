@@ -292,6 +292,11 @@ func TestRoundsOnWorkersDecryptBorrowedInput(t *testing.T) {
 			var mu sync.Mutex
 			var problems []string
 			borrowed := 0
+			// What in still holds of what arrived during the handshake, when a
+			// round's own bytes were last decrypted: Read serves in before the
+			// round's bytes, a record at a time, so it may not be empty yet, but
+			// it only ever shrinks unless a round's bytes are copied into it.
+			kept := -1
 			report := func(problem string) {
 				mu.Lock()
 				problems = append(problems, problem)
@@ -312,13 +317,15 @@ func TestRoundsOnWorkersDecryptBorrowedInput(t *testing.T) {
 					}
 					layer := c.Layer().(*layer)
 					layer.mu.Lock()
-					fromRound, kept := layer.src != nil, layer.in != nil
+					fromRound, unread := layer.src != nil, len(layer.in)-layer.inHead
 					layer.mu.Unlock()
 					if fromRound {
 						mu.Lock()
 						borrowed++
+						grew := kept >= 0 && unread > kept
+						kept = unread
 						mu.Unlock()
-						if kept {
+						if grew {
 							report("OnData: ciphertext was copied into a buffer the connection keeps")
 						}
 					}
@@ -362,6 +369,53 @@ func TestRoundsOnWorkersDecryptBorrowedInput(t *testing.T) {
 				t.Fatal("no record was decrypted from a round's own buffer")
 			}
 		})
+	}
+}
+
+// TestReadStopsAtRecordEnds checks that Read never hands crypto/tls bytes
+// past the end of the record under way, however the records are split across
+// the collected input, the rounds and the room crypto/tls offers.
+func TestReadStopsAtRecordEnds(t *testing.T) {
+	var stream []byte
+	var ends []int
+	for i, n := range []int{0, 1, 4, 5, 300, 1024, 16408, 2} {
+		stream = append(stream, 23, 3, 3, byte(n>>8), byte(n))
+		for j := 0; j < n; j++ {
+			stream = append(stream, byte(i+j))
+		}
+		ends = append(ends, len(stream))
+	}
+	for _, chunk := range []int{1, 3, 5, 7, 1000, len(stream)} {
+		for _, room := range []int{1, 6, 517, 20000} {
+			l := &layer{}
+			l.in = append([]byte(nil), stream[:chunk/2]...)
+			var got []byte
+			for off := chunk / 2; len(got) < len(stream); {
+				if len(l.src) == 0 && off < len(stream) {
+					end := min(off+chunk, len(stream))
+					l.src, off = stream[off:end], end
+				}
+				p := make([]byte, room)
+				n, err := l.Read(p)
+				if err != nil {
+					t.Fatalf("chunk %d, room %d: %v after %d bytes", chunk, room, err, len(got))
+				}
+				start := len(got)
+				got = append(got, p[:n]...)
+				for _, e := range ends {
+					if start < e && len(got) > e {
+						t.Fatalf("chunk %d, room %d: a read ran from %d past the record end at %d to %d",
+							chunk, room, start, e, len(got))
+					}
+				}
+			}
+			if !bytes.Equal(got, stream) {
+				t.Fatalf("chunk %d, room %d: stream mismatch", chunk, room)
+			}
+			if _, err := l.Read(make([]byte, room)); err != errWouldBlock {
+				t.Fatalf("chunk %d, room %d: read past the stream: %v", chunk, room, err)
+			}
+		}
 	}
 }
 
