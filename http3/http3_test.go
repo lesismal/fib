@@ -38,12 +38,17 @@ func runEngine(t *testing.T, engine *fib.Engine) {
 // returns the base URL.
 func startServer(t *testing.T, config Config, handler fibhttp.HandlerFunc) string {
 	t.Helper()
+	return startServerOn(t, fib.DefaultConfig(), config, handler)
+}
+
+// startServerOn is startServer on an engine configured as fc.
+func startServerOn(t *testing.T, fc fib.Config, config Config, handler fibhttp.HandlerFunc) string {
+	t.Helper()
 	serverTLS, _, err := tlstest.Configs()
 	if err != nil {
 		t.Fatal(err)
 	}
 	config.TLSConfig = serverTLS
-	fc := fib.DefaultConfig()
 	fc.Network = "udp"
 	fc.Addr = "127.0.0.1:0"
 	engine, err := fib.Bind(fc, NewHandlerWithConfig(config, handler))

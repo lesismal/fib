@@ -293,6 +293,9 @@ func newEngine(config Config, handler Handler, addrs []string) (*Engine, error) 
 		return nil, err
 	}
 	e.startUDPSweeper()
+	for _, p := range e.pollers {
+		p.startUDPSweeper()
+	}
 	return e, nil
 }
 

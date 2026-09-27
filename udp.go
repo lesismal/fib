@@ -324,8 +324,14 @@ func (e *Engine) closeUDPPeers() {
 // LocalUDPAddrs returns one address per UDP listener, in configured order.
 // Ports left at zero report the port the kernel chose.
 func (e *Engine) LocalUDPAddrs() ([]*net.UDPAddr, error) {
-	addrs := make([]*net.UDPAddr, 0, len(e.udpListeners))
-	for _, l := range e.udpListeners {
+	listeners := e.udpListeners
+	if len(listeners) == 0 && len(e.pollers) > 0 {
+		// The pollers read the engine's addresses themselves, and the first
+		// holds the sockets the engine bound; see Config.ReusePort.
+		listeners = e.pollers[0].udpListeners
+	}
+	addrs := make([]*net.UDPAddr, 0, len(listeners))
+	for _, l := range listeners {
 		sa, err := l.sockname()
 		if err != nil {
 			return nil, err

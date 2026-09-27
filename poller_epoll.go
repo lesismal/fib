@@ -48,9 +48,10 @@ func (e *Engine) openBackend() error {
 		}
 	}
 	// UDP sockets are level-triggered, so the loop can stop reading one after
-	// its share of a round and still hear about the rest.
+	// its share of a round and still hear about the rest. Those of an engine
+	// whose pollers read for it go to the first poller; see openUDPBeside.
 	for _, l := range e.udpListeners {
-		if err == nil {
+		if err == nil && !e.pollersListen {
 			err = e.addFD(l.fd, udpToken(l.fd), uint32(syscall.EPOLLIN))
 		}
 	}

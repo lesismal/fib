@@ -4,9 +4,11 @@ package fib
 
 import (
 	"bytes"
+	"errors"
 	"io"
 	"net"
 	"path/filepath"
+	"strconv"
 	"sync"
 	"syscall"
 	"testing"
@@ -123,6 +125,106 @@ func TestReusePortLeavesUnixListenersOnEngine(t *testing.T) {
 	for i, p := range server.pollers {
 		if len(p.listenFDs) != 0 {
 			t.Fatalf("poller %d listens on %d sockets, want none", i, len(p.listenFDs))
+		}
+	}
+}
+
+// With ReusePort on a UDP address, each poller reads a socket of its own
+// bound there, the first holding the one the engine bound, and the engine
+// keeps none, since a bound UDP socket takes a share of the datagrams. Every
+// datagram of a peer reaches the one poller its hash picked, so a peer opens
+// one connection, and the pollers sweep their own idle peers.
+func TestPollersReadUDPWithReusePort(t *testing.T) {
+	const pollers, peers, rounds = 4, 32, 3
+	config := pollerConfig("pollers-udp-reuseport", pollers)
+	config.ReusePort = true
+	config.UDPIdleTimeout = 200 * time.Millisecond
+	var mu sync.Mutex
+	opened := map[string]*Connection{}
+	reopened := 0
+	closed := make(chan error, peers)
+	server, addr := startUDPServer(t, config, HandlerFuncs{
+		Open: func(c *Connection) {
+			mu.Lock()
+			if opened[c.RemoteAddr().String()] != nil {
+				reopened++
+			}
+			opened[c.RemoteAddr().String()] = c
+			mu.Unlock()
+		},
+		Data: func(c *Connection, b []byte) {
+			if c.engine.parent != c.Engine() {
+				t.Error("a UDP peer is served off the pollers")
+			}
+			if err := c.Send(b); err != nil {
+				c.Close()
+			}
+		},
+		Close: func(_ *Connection, err error) { closed <- err },
+	})
+	if !server.pollersListen || len(server.udpListeners) != 0 {
+		t.Fatalf("engine has pollersListen=%v and %d UDP sockets of its own", server.pollersListen, len(server.udpListeners))
+	}
+	fds := map[int]bool{}
+	for i, p := range server.pollers {
+		if len(p.udpListeners) != 1 {
+			t.Fatalf("poller %d has %d UDP sockets, want 1", i, len(p.udpListeners))
+		}
+		fd := p.udpListeners[0].fd
+		fds[fd] = true
+		got, err := syscall.Getsockname(fd)
+		if err != nil || sockaddrToUDPAddr(got).String() != addr.String() {
+			t.Fatalf("poller %d is bound to %v (%v), want %v", i, sockaddrToUDPAddr(got), err, addr)
+		}
+	}
+	if len(fds) != pollers {
+		t.Fatalf("%d pollers share %d sockets", pollers, len(fds))
+	}
+
+	conns := make([]*net.UDPConn, peers)
+	for i := range conns {
+		conn, err := net.DialUDP("udp4", nil, addr)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer conn.Close()
+		conns[i] = conn
+	}
+	reply := make([]byte, 64)
+	for round := 0; round < rounds; round++ {
+		for i, conn := range conns {
+			payload := []byte("peer " + strconv.Itoa(i) + " round " + strconv.Itoa(round))
+			_ = conn.SetDeadline(time.Now().Add(5 * time.Second))
+			if _, err := conn.Write(payload); err != nil {
+				t.Fatal(err)
+			}
+			n, err := conn.Read(reply)
+			if err != nil || !bytes.Equal(reply[:n], payload) {
+				t.Fatalf("peer %d read %q, %v", i, reply[:n], err)
+			}
+		}
+	}
+	mu.Lock()
+	used := map[*Engine]bool{}
+	for _, c := range opened {
+		used[c.engine] = true
+	}
+	count, again := len(opened), reopened
+	mu.Unlock()
+	if count != peers || again != 0 {
+		t.Fatalf("%d peers opened %d connections, %d of them again", peers, count, again)
+	}
+	if len(used) < 2 {
+		t.Fatalf("%d peers landed on %d poller(s)", peers, len(used))
+	}
+	for i := 0; i < peers; i++ {
+		select {
+		case err := <-closed:
+			if !errors.Is(err, ErrUDPIdleTimeout) {
+				t.Fatalf("closed with %v, want ErrUDPIdleTimeout", err)
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatalf("only %d of %d idle peers were closed", i, peers)
 		}
 	}
 }

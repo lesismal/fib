@@ -45,9 +45,9 @@ type enginePlatform struct {
 	// udpBatch is what the loop reads UDP datagrams into.
 	udpBatch  *udpBatch
 	listenFDs []int
-	// pollersListen says the engine's pollers accept its connections on
-	// sockets of their own, and its listeners only hold their addresses;
-	// see Config.ReusePort.
+	// pollersListen says the engine's pollers accept its connections, or
+	// read its datagrams, on sockets of their own, and its TCP listeners only
+	// hold their addresses; see Config.ReusePort.
 	pollersListen bool
 	// tcpListeners says the listeners accept TCP connections, which get
 	// TCP_NODELAY as they are accepted.
@@ -140,6 +140,10 @@ func (e *Engine) open(config Config, addrs []string) error {
 			}
 			e.listenFDs = append(e.listenFDs, fd)
 		}
+		if err := e.openUDPBeside(config, p); err != nil {
+			e.closeListeners()
+			return err
+		}
 	}
 	udp := isUDPNetwork(config.Network)
 	e.pollersListen = e.parent == nil && pollersListen(config)
@@ -169,6 +173,32 @@ func (e *Engine) open(config Config, addrs []string) error {
 	if err := e.openBackend(); err != nil {
 		e.closeListeners()
 		return err
+	}
+	return nil
+}
+
+// openUDPBeside gives a poller of an engine whose pollers read its UDP
+// addresses themselves (see Config.ReusePort) a socket on each of them. The
+// first poller takes the engine's own sockets, and every other one binds one
+// of its own beside them. The engine cannot keep a socket only to hold the
+// address, as it does a TCP listener it leaves unlistened: a bound UDP socket
+// is in its address's SO_REUSEPORT group whatever else it does, and would be
+// handed a share of the datagrams that nothing reads.
+func (e *Engine) openUDPBeside(config Config, parent *Engine) error {
+	if len(parent.udpListeners) > 0 {
+		e.udpListeners, parent.udpListeners = parent.udpListeners, nil
+		return nil
+	}
+	if len(parent.pollers) == 0 {
+		return nil
+	}
+	for _, like := range parent.pollers[0].udpListeners {
+		fd, err := createUDPListenerLike(config, like.fd)
+		if err != nil {
+			return err
+		}
+		e.udpListeners = append(e.udpListeners, &udpListener{udpListenerPlatform: udpListenerPlatform{fd: fd},
+			peers: make(map[netip.AddrPort]*Connection)})
 	}
 	return nil
 }
@@ -562,10 +592,11 @@ func (e *Engine) Close() error {
 }
 
 // pollersListen reports whether config has each poller listen on a socket
-// of its own and accept its connections itself; see Config.ReusePort.
+// of its own, accepting its TCP connections or reading its UDP datagrams
+// itself; see Config.ReusePort.
 func pollersListen(config Config) bool {
 	return config.ReusePort && reusePortSpreads && pollerCount(config) > 0 &&
-		!isUnixNetwork(config.Network) && !isUDPNetwork(config.Network)
+		!isUnixNetwork(config.Network)
 }
 
 // createListener opens a socket bound to addr, and listening on it unless
@@ -630,11 +661,35 @@ func createUDPListener(config Config, addr string) (int, error) {
 	if err != nil {
 		return -1, err
 	}
+	return bindUDPSocket(config, family, bound)
+}
+
+// createUDPListenerLike opens a UDP socket bound where like is, which
+// SO_REUSEPORT lets it share with like; see Config.ReusePort.
+func createUDPListenerLike(config Config, like int) (int, error) {
+	bound, err := syscall.Getsockname(like)
+	if err != nil {
+		return -1, err
+	}
+	family := syscall.AF_INET
+	if _, ok := bound.(*syscall.SockaddrInet6); ok {
+		family = syscall.AF_INET6
+	}
+	return bindUDPSocket(config, family, bound)
+}
+
+func bindUDPSocket(config Config, family int, bound syscall.Sockaddr) (int, error) {
 	fd, err := newDatagramSocket(family)
 	if err != nil {
 		return -1, err
 	}
 	_ = syscall.SetsockoptInt(fd, syscall.SOL_SOCKET, syscall.SO_REUSEADDR, 1)
+	if config.ReusePort {
+		if err = syscall.SetsockoptInt(fd, syscall.SOL_SOCKET, soReusePort, 1); err != nil {
+			syscall.Close(fd)
+			return -1, err
+		}
+	}
 	if family == syscall.AF_INET6 {
 		v6only := 0
 		if config.Network == "udp6" {

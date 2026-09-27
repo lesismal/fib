@@ -155,9 +155,10 @@ type Config struct {
 	// percentile latency rose from 25ms to 37ms. Set it low, one or a few,
 	// for such a load.
 	IOPollerCount int
-	// ReusePort binds the engine's TCP listeners with SO_REUSEPORT, so that
+	// ReusePort binds the engine's listeners with SO_REUSEPORT, so that
 	// other sockets that set it too, in this process or another of the same
-	// user, may listen on the same address and share its connections.
+	// user, may listen on the same address and share its connections, or
+	// its datagrams.
 	//
 	// Under IOPollers on Linux it also moves accepting onto the pollers: each
 	// poller listens on a socket of its own, bound to the engine's address,
@@ -169,6 +170,17 @@ type Config struct {
 	// balance: a connection stays with the poller its hash picked, however
 	// busy that poller is. Unix sockets, and the other platforms, keep the
 	// engine's loop accepting.
+	//
+	// On a UDP address it does the same for datagrams: each poller reads a
+	// socket of its own bound there, and the kernel hands each datagram to
+	// one of the sockets by a hash of its source and destination addresses,
+	// waking only the poller that reads it. A peer's datagrams therefore all
+	// reach one poller, which keeps its connection, its OnData and its idle
+	// timeout; without it the engine's own loop reads every peer. The hash
+	// holds only while the sockets sharing the address stay the same, so a
+	// socket another process binds there moves some peers to it, and a peer
+	// whose address changes, as a QUIC client's may, reaches whichever
+	// poller its new address hashes to.
 	ReusePort bool
 	// UDPIdleTimeout closes a UDP peer's connection once the peer has neither
 	// sent nor been sent a datagram for this long, since UDP has no close of

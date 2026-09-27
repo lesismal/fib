@@ -51,8 +51,12 @@ func (e *Engine) openBackend() error {
 			Flags: syscall.EV_ADD | syscall.EV_CLEAR})
 	}
 	// UDP sockets are level-triggered, so the loop can stop reading one after
-	// its share of a round and still hear about the rest.
+	// its share of a round and still hear about the rest. Those of an engine
+	// whose pollers read for it go to the first poller; see openUDPBeside.
 	for _, l := range e.udpListeners {
+		if e.pollersListen {
+			break
+		}
 		changes = append(changes, syscall.Kevent_t{Ident: uint64(l.fd), Filter: syscall.EVFILT_READ,
 			Flags: syscall.EV_ADD})
 	}

@@ -1225,7 +1225,16 @@ Windows 上忽略这个配置，保持单个循环和原来的 task pool）。`D
   循环 accept；macOS 的 `SO_REUSEPORT` 不在多个 socket 之间分摊 TCP 连接。`ReusePort` 也让
   同一用户的其他进程可以监听同一地址并分走连接。
 - `Dial` / `DialWithHandler` 发起的连接（TCP、UDP、Unix socket）也同样按 fd 取模分到 poller 上。
-  UDP server 的各个 peer 共用监听的那一个 socket，所以留在 Engine 自己的循环上。
+- UDP server 默认只有一个 socket，各个 peer 共用它，所以留在 Engine 自己的循环上。Linux 上设置
+  `ReusePort` 时，UDP 地址也改由 poller 读：每个 poller 在这个地址上用 `SO_REUSEPORT` bind 一个
+  自己的 socket（第一个 poller 直接接管 Engine bind 的那个，Engine 自己不留 socket，因为已 bind
+  的 UDP socket 就在 reuseport 组里，会分到一份数据报），只注册在自己的循环上。内核按四元组哈希
+  把每个数据报交给其中一个 socket，只唤醒读它的那个 poller，没有惊群；同一对端的数据报总落在同一个
+  poller 上，它的连接、`OnData` 和空闲超时都由这个 poller 负责，peer 表按 poller 分开、不加锁。
+  限制：组里的 socket 一变（例如同一用户的其他进程 bind 同一地址）哈希就变，部分对端会换到别的
+  socket；对端地址变了（NAT 重绑定）会被当成新的对端。HTTP/3 本来就不支持连接迁移（服务端声明
+  `disable_active_migration`），地址变了的包即使在单个循环上也会收到 stateless reset，所以
+  这一点对它没有额外影响。
 - 开启后 Engine 自己的 task pool 固定为 `taskpool.ModeInline`（名为 `<Name>-inline`）：
   每个 poller 在自己的 goroutine 上直接执行它那些连接的这一轮处理，handler panic 会被
   recover 并关闭该连接。和 `InlineHandlers` 一样，阻塞的回调会卡住同一个 poller 上的
