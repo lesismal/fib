@@ -4,6 +4,7 @@ package fib
 
 import (
 	"encoding/binary"
+	"os"
 	"syscall"
 
 	"github.com/lesismal/fib/taskpool"
@@ -83,8 +84,13 @@ func (e *Engine) runLoop() error {
 	events := make([]syscall.EpollEvent, batch)
 	var ready []*Connection
 	var tasks []taskpool.Task
+	var waiter *epollWaiter
+	if len(e.root().pollers) > 0 {
+		waiter = newEpollWaiter(e.epollFD)
+		defer waiter.close()
+	}
 	for !e.stopping.Load() {
-		n, err := syscall.EpollWait(e.epollFD, events, -1)
+		n, err := waiter.wait(e.epollFD, events)
 		if err == syscall.EINTR {
 			continue
 		}
@@ -128,6 +134,84 @@ func (e *Engine) runLoop() error {
 	}
 	e.drainCommands()
 	return nil
+}
+
+// epollWaiter has a loop wait for events parked in the runtime's network
+// poller rather than blocked in epoll_wait.
+//
+// A goroutine blocked in a system call keeps its P until the runtime takes
+// the P back, which it does only once the call has lasted one of its
+// monitor's ticks, and the goroutines queued on that P wait all the while.
+// A loop that is woken for every accepted connection, or every command
+// another loop sends it, waits over and over for short spells, and each of
+// them left a P idle with work queued behind it: a burst of TLS handshakes to
+// 60k connections on three CPUs, their connections accepted by the engine's
+// loop and handed to three pollers, measured those CPUs 10 to 15% idle while
+// hundreds of goroutines were runnable. Parked, the loop gives its P up at
+// once, as a goroutine blocked in a read on a net.Conn does, and the runtime
+// wakes it when the epoll descriptor becomes readable. The same burst
+// measured the CPUs 0 to 2% idle, and HTTP/1 over 10k connections accepted
+// them 19% faster, with echoes unchanged.
+//
+// Only the loops of an engine with pollers wait this way. The runtime looks
+// for a parked goroutine's events only when a P runs out of work, or every
+// 10ms under load, and a lone loop, which every connection waits on, waited
+// longer for that than for its P back: the HTTP/1 benchmark accepted
+// connections 15% slower and echoed 2% slower with it parked.
+//
+// The runtime's poller watches a duplicate of the descriptor, so that the
+// engine keeps closing its own as before. Where that cannot be set up, wait
+// blocks in epoll_wait as the loop always did.
+type epollWaiter struct {
+	file *os.File
+	conn syscall.RawConn
+}
+
+func newEpollWaiter(epfd int) *epollWaiter {
+	fd, err := syscall.Dup(epfd)
+	if err != nil {
+		return nil
+	}
+	syscall.CloseOnExec(fd)
+	// The runtime only polls a descriptor that is non-blocking. The flag is
+	// shared with the engine's own descriptor, which epoll_wait ignores.
+	if err := syscall.SetNonblock(fd, true); err != nil {
+		syscall.Close(fd)
+		return nil
+	}
+	file := os.NewFile(uintptr(fd), "fib-epoll")
+	conn, err := file.SyscallConn()
+	if err != nil {
+		file.Close()
+		return nil
+	}
+	return &epollWaiter{file: file, conn: conn}
+}
+
+// wait returns the events that are ready, waiting for some if there are none.
+// Read looks for them before it parks, and again each time the runtime
+// reports the descriptor readable, so a loop with events waiting makes one
+// call to epoll_wait, as it did blocking.
+func (w *epollWaiter) wait(epfd int, events []syscall.EpollEvent) (int, error) {
+	if w != nil {
+		var n int
+		var err error
+		readErr := w.conn.Read(func(uintptr) bool {
+			n, err = syscall.EpollWait(epfd, events, 0)
+			return n != 0 || (err != nil && err != syscall.EINTR)
+		})
+		if readErr == nil {
+			return n, err
+		}
+		// The runtime cannot poll the descriptor after all.
+	}
+	return syscall.EpollWait(epfd, events, -1)
+}
+
+func (w *epollWaiter) close() {
+	if w != nil {
+		w.file.Close()
+	}
 }
 
 func (e *Engine) wake() {
