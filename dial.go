@@ -8,6 +8,8 @@ import (
 	"strings"
 	"syscall"
 	"time"
+
+	"github.com/lesismal/fib/internal/sidepool"
 )
 
 // dialRequest is one outbound connect, from Dial until the event loop reports
@@ -45,7 +47,8 @@ type dialRequest struct {
 // "host:port", or for "unix" the socket's path. A UDP
 // dial connects its socket to addr, so the connection exchanges datagrams with
 // that peer alone: each Send is one datagram and each OnData one received. A host that is not an IP
-// literal is resolved on a goroutine of its own, so Dial never waits on DNS.
+// literal is resolved on a pool of workers kept for clients, never on the
+// caller's goroutine, so Dial never waits on DNS.
 // A timeout of zero leaves the connect to the operating system's own timeout.
 //
 // When the connect succeeds, the handler's OnOpen runs first and then done
@@ -81,10 +84,10 @@ func (e *Engine) DialWithHandler(network, addr string, timeout time.Duration, ha
 		if !isDialNetwork(network) {
 			return d.opError(net.UnknownNetworkError(network))
 		}
-		go func() {
+		sidepool.Go(func() {
 			d.family, d.sa, d.raddr, d.err = resolveDialAddr(network, addr)
 			e.requestDial(d)
-		}()
+		})
 		return nil
 	}
 	var err error

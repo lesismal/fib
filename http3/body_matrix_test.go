@@ -13,6 +13,7 @@ import (
 	"io"
 	stdhttp "net/http"
 	"net/url"
+	"runtime/debug"
 	"strconv"
 	"strings"
 	"sync"
@@ -92,6 +93,38 @@ func h3Violation(format string, args ...any) {
 	h3Violations.Lock()
 	h3Violations.list = append(h3Violations.list, fmt.Sprintf(format, args...))
 	h3Violations.Unlock()
+}
+
+// offPool reports the goroutine a body callback runs on unless it is a
+// worker of a pool: the engine's, which runs HTTP/1's reads, or the stream
+// pool, which takes what HTTP/2 and HTTP/3 read on the event loop. A callback
+// never runs on a goroutine started for it, nor on the event loop, nor inside
+// a call the handler made; "" means it did not.
+func offPool() string {
+	stack := debug.Stack()
+	if bytes.Contains(stack, []byte("taskpool.(*inlineBackend)")) {
+		// A task the event loop ran itself: a round of a connection that
+		// runs on the loop, as HTTP/2 and HTTP/3 connections do.
+		return "the event loop"
+	}
+	if bytes.Contains(stack, []byte("lesismal/fib/taskpool.")) {
+		return ""
+	}
+	if bytes.Contains(stack, []byte("lesismal/fib/tls.(*layer).handshake")) {
+		// fib/tls hands what arrived right behind the handshake to the
+		// connection's handler on the handshake's goroutine, the handler
+		// and its request with it; the body follows the request there.
+		return ""
+	}
+	at := bytes.LastIndex(stack, []byte("created by "))
+	if at < 0 {
+		return "the main goroutine"
+	}
+	line := stack[at:]
+	if end := bytes.IndexByte(line, '\n'); end >= 0 {
+		line = line[:end]
+	}
+	return string(line)
 }
 
 func checkH3Violations(t *testing.T) {
@@ -176,6 +209,9 @@ func (s *h3Serve) onBody(inHandler bool) {
 		}
 		if inHandler && !s.returned.Load() {
 			h3Violation("%s: a body callback ran before the handler returned", s.r.URL.Path)
+		}
+		if by := offPool(); by != "" {
+			h3Violation("%s: a body callback ran off the pools, on %s", s.r.URL.Path, by)
 		}
 		if s.ended {
 			h3Violation("%s: a body callback after the last one", s.r.URL.Path)
@@ -605,6 +641,8 @@ func checkH3Response(t *testing.T, m h3Config, req h3Request, gaps bool, status 
 // error; a body read whole never reaches its handler at all. Either way the
 // connection goes on serving other streams.
 func TestBodyMatrixAbort(t *testing.T) {
+	// The cases run in parallel, after this function returns.
+	t.Cleanup(func() { checkH3Violations(t) })
 	for _, m := range h3Configs {
 		t.Run(m.name, func(t *testing.T) {
 			t.Parallel()
@@ -622,6 +660,9 @@ func TestBodyMatrixAbort(t *testing.T) {
 				ran = true
 				mu.Unlock()
 				c.OnBody(func(data []byte, fin bool, err error) {
+					if by := offPool(); by != "" {
+						h3Violation("/cut: a body callback ran off the pools, on %s", by)
+					}
 					if fin || err != nil {
 						mu.Lock()
 						endings = append(endings, err)

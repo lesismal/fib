@@ -82,8 +82,14 @@ func(c *fibhttp.Context, r *http.Request) {
 - `OnBody` never calls the callback itself and never waits: it registers it
   and returns. What of the body has already arrived — all of it, when
   `BodyComplete` says so — is handed over once the handler returns, on the
-  goroutine that ran it; `OnBody` called after the handler has returned hands
-  it over on a goroutine of its own.
+  goroutine that ran it. No goroutine is ever started for a callback: what
+  arrives later is handed over as the event loop reads it — on the
+  connection's worker where the connection is read on one, and on the
+  engine's handler pool (`fib.Engine.HandlerPool`) where it is read on the
+  event loop itself, where a callback must not run: HTTP/2 and HTTP/3
+  always, and HTTP/1 with `ReadOnPollers` — and what is already here when
+  `OnBody` is called after the handler returned, which no read will bring
+  again, on the handler pool.
 - `OnBody` retains the request, and the server releases it once the callback
   has returned from its last call, so the response the callback wrote on
   `fin` is sent then, with no `Retain` or `Release` in the handler. A handler
@@ -92,9 +98,9 @@ func(c *fibhttp.Context, r *http.Request) {
 - `fin` marks the last call, and `err` a body that will not be finished, which
   is also a last call and comes exactly once. `data` is only valid for the
   duration of the call.
-- The callbacks run one at a time and in order, the ones after the handover
-  on the connection's worker, so a body of any size is taken without a
-  goroutine of the handler's own and without being buffered. What paces the
+- The callbacks run one at a time and in order, so a body of any size is
+  taken without a goroutine of the handler's own and without being
+  buffered. What paces the
   peer is the callback itself.
 - A body arrives in pieces only when it streams, which
   `StreamRequestBody` decides; one that was read whole before the
@@ -110,8 +116,8 @@ A connection that closes, a read timeout, or a body that cannot be finished
 ends a request the handler may still be working on. The request is cancelled:
 nothing more is written, every hold left on it is void, and the handler is
 told once, through `OnBody`'s `err` and through `Context.OnCancel`. Both run
-on a goroutine rather than on the event loop, so a handler's cleanup cannot
-hold the server up. `Context.Err()` reports the same reason to a handler that
+on the engine's handler pool rather than on the event loop, so a handler's
+cleanup cannot hold the server up. `Context.Err()` reports the same reason to a handler that
 would rather ask than be told.
 
 From there everything is idempotent: `Retain`, `Release` and `Finish` on a
@@ -179,9 +185,10 @@ retains nothing that is its return, which is the point at which `net/http`
 closes a request's body too. Reading it afterwards returns `ErrBodyReleased`; a handler
 that needs the bytes later keeps a copy of them, as `io.ReadAll` makes.
 
-**Reading it never waits.** The handler runs on the connection's worker like
-any other, and a worker that waited for the peer would be waiting on itself,
-so `Read` answers with what has arrived:
+**Reading it never waits.** The handler runs on a worker like any other —
+the one reading the connection, or with `ReadOnPollers` one of the handler
+pool's — and a worker that waited for the peer would be waiting on itself,
+or held for nothing, so `Read` answers with what has arrived:
 
 | Read returns | Means |
 | --- | --- |
@@ -306,8 +313,8 @@ instead, which costs less than the extra system calls.
   the request first; see
   [Holding a response open](#holding-a-response-open-and-body-callbacks).
 - **Reads do not block either.** A streamed body reports `ErrWouldBlock`
-  rather than waiting for the peer, since the handler runs on the connection's
-  own worker; the rest of it is taken through `OnBody`.
+  rather than waiting for the peer, since the handler runs on a worker that
+  would otherwise be held for it; the rest of it is taken through `OnBody`.
 - **Writes do not block.** A handler that writes faster than the peer reads
   queues the difference in memory (reads on the connection pause, but the
   handler is not held back). Files sent with `SendFile` are the exception:

@@ -91,9 +91,12 @@ type Context struct {
 	// server and parser are the HTTP/1 connection this request arrived on,
 	// which a release away from the worker needs to carry on with. They are
 	// nil for HTTP/2, HTTP/3 and anything else multiplexed, where a response
-	// holds up nothing else.
-	server *ServerHandler
-	parser *Parser
+	// holds up nothing else. offloaded says the handler runs without the
+	// parser's lock, as an offloading connection's do; see
+	// ServerHandler.drive.
+	server    *ServerHandler
+	parser    *Parser
+	offloaded bool
 	// whole is the request's body when it arrived whole, whose buffer goes
 	// back to the pool once the response is finished. block is where the
 	// request was allocated, when the simple parser took it.
@@ -450,18 +453,32 @@ func (h *ServerHandler) releaseTimeouts(c *fib.Connection, parser *Parser) {
 }
 
 func (h *ServerHandler) OnOpen(c *fib.Connection) {
-	// An HTTP/1 handler runs inside the connection's round, from its first
-	// byte read to its response, so the round belongs on a worker even where
-	// the engine runs rounds on its loops. A connection that turns out to be
-	// HTTP/2 goes back to the engine's own pool; see startH2.
-	c.SetRunOnWorkers(!h.config.HTTP2Only)
-	parser := h.newParser(c)
-	c.SetAttachment(parser)
+	parser := h.attachParser(c)
 	// A connection that opens and then says nothing is idle, and bounded like
 	// any other idle connection.
 	parser.mu.Lock()
 	h.armRead(c, parser)
 	parser.mu.Unlock()
+}
+
+// attachParser gives the connection its parser, and picks where its requests
+// are read and where they are served.
+//
+// With Config.ReadOnPollers, where the engine runs rounds on its pollers
+// (see fib.Engine.RoundsOnPollers), the connection is read and its requests
+// parsed on its poller's loop, and every handler runs on the engine's handler
+// pool, one request at a time, away from the loop. Otherwise a handler runs
+// inside the connection's round, from its first byte read to its response,
+// so the round belongs on a worker even where the engine runs rounds on its
+// loops.
+// A connection that turns out to be HTTP/2 reads on the engine's own pool
+// either way; see startH2.
+func (h *ServerHandler) attachParser(c *fib.Connection) *Parser {
+	parser := h.newParser(c)
+	parser.offload = !h.config.HTTP2Only && h.config.ReadOnPollers && c.Engine().RoundsOnPollers()
+	c.SetRunOnWorkers(!h.config.HTTP2Only && !parser.offload)
+	c.SetAttachment(parser)
+	return parser
 }
 
 // newParser starts a connection's parser, recording the peer's address so
@@ -484,27 +501,108 @@ func (h *ServerHandler) OnData(c *fib.Connection, data []byte) {
 	case *Parser:
 		parser = state
 	default:
-		c.SetRunOnWorkers(!h.config.HTTP2Only)
-		parser = h.newParser(c)
-		c.SetAttachment(parser)
+		parser = h.attachParser(c)
 	}
-	h.drive(c, parser, data)
+	// An offloading connection is read on its poller's loop, unless it has
+	// asked for workers since, which a handler it runs never waits for.
+	h.drive(c, parser, data, parser.offload && !c.RunsOnWorkers())
 }
 
-// drive turns whatever the connection has into requests and serves them,
-// handlers and all: nothing a handler does here waits on the peer, so the
-// connection's worker carries a request from its first byte to its response
-// without another goroutine. It also runs on whichever goroutine released the
-// last hold on a retained request, and holds the parser's lock throughout, so
-// a connection is never parsed by two goroutines at once and a request
-// pipelined behind a retained one waits its turn.
-func (h *ServerHandler) drive(c *fib.Connection, parser *Parser, data []byte) {
+// drive turns whatever the connection has into requests and serves them.
+//
+// A connection that does not offload is carried from a request's first byte
+// to its response by one goroutine, handlers and all: nothing a handler does
+// here waits on the peer, so the connection's worker serves its requests
+// without another goroutine. It also runs on whichever goroutine released
+// the last hold on a retained request, and holds the parser's lock while it
+// serves, so a connection is never parsed by two goroutines at once and a
+// request pipelined behind a retained one waits its turn.
+//
+// An offloading connection is parsed under the lock, as any other is, but
+// its handlers run without it, so that the loop reading the connection never
+// waits on one. onLoop says drive runs on that loop, which hands each request
+// to the handler pool and returns; there, and on any other goroutine that
+// carries the connection on, the request is served where drive runs, and so
+// are the requests already buffered behind it, one after another.
+func (h *ServerHandler) drive(c *fib.Connection, parser *Parser, data []byte, onLoop bool) {
+	for {
+		context := h.driveLocked(c, parser, data)
+		if context == nil {
+			return
+		}
+		data = nil
+		if onLoop {
+			// The request itself is the task, so handing it over allocates
+			// nothing, and the loop hands it over with the rest of its
+			// round's.
+			c.GoHandler((*offloadedRequest)(context))
+			return
+		}
+		if !h.serveOffloaded(c, parser, context) {
+			return
+		}
+	}
+}
+
+// offloadedRequest is the Context of a request an offloading connection
+// hands to the handler pool, as the task that serves it.
+type offloadedRequest Context
+
+// RunTask serves the request on the handler pool, and then the requests
+// already buffered behind it. The connection is corked meanwhile, as a read
+// round corks it, so that the responses to a run of pipelined requests reach
+// the socket in one write rather than one each.
+func (r *offloadedRequest) RunTask() {
+	// A recycled Context may be serving another request once this one has
+	// ended, so the connection is taken from it first.
+	context := (*Context)(r)
+	h, c, parser := context.server, context.Conn, context.parser
+	c.Cork()
+	defer c.Flush()
+	if h.serveOffloaded(c, parser, context) {
+		h.drive(c, parser, nil, false)
+	}
+}
+
+// serveOffloaded runs the handler of a request an offloading connection
+// parsed, without the parser's lock, and settles the connection once it has
+// returned. It reports whether the connection is ready for its next request,
+// which the caller then goes on to serve; otherwise the connection goes on
+// from wherever it is now waited on: the release that writes a retained
+// response, or the loop feeding a body that is still arriving.
+func (h *ServerHandler) serveOffloaded(c *fib.Connection, parser *Parser, context *Context) bool {
+	serveRequest(h.handler, context)
+	parser.mu.Lock()
+	defer parser.mu.Unlock()
+	if err := parser.offloadErr; err != nil {
+		// The body was refused or misframed before the handler even saw it,
+		// which its own read told it; the connection cannot go on.
+		parser.offloadErr = nil
+		h.failStream(c, parser, err)
+		return false
+	}
+	if !context.settle() {
+		return false
+	}
+	if h.endRequestLocked(context) {
+		c.CloseAfterSend()
+		return false
+	}
+	return true
+}
+
+// driveLocked is drive's work under the parser's lock. On a connection that
+// offloads, it stops at the first request it has readied for its handler and
+// returns it for drive to serve once the lock is released, leaving in
+// parser.offloadErr the error its body failed with before the handler saw
+// it; it returns nil when there is no such request.
+func (h *ServerHandler) driveLocked(c *fib.Connection, parser *Parser, data []byte) *Context {
 	parser.mu.Lock()
 	defer parser.mu.Unlock()
 	if parser.spent {
 		// The connection is ending, or has become HTTP/2; what is still
 		// arriving belongs to a message this parser will not answer.
-		return
+		return nil
 	}
 	// Whatever this round leaves the connection waiting for decides which
 	// timeout bounds it.
@@ -518,7 +616,7 @@ func (h *ServerHandler) drive(c *fib.Connection, parser *Parser, data []byte) {
 		if h.config.DisableHTTP2 {
 			parser.sniffed = true
 		} else if data = h.sniff(c, parser, data); data == nil {
-			return
+			return nil
 		}
 	}
 	// One request at a time, since one may switch the connection to HTTP/2
@@ -536,25 +634,27 @@ func (h *ServerHandler) drive(c *fib.Connection, parser *Parser, data []byte) {
 				// while this goroutine held the parser, so that is done here.
 				if h.endRequestLocked(context) {
 					c.CloseAfterSend()
-					return
+					return nil
 				}
 				resumed = true
 			}
 			if err != nil {
 				h.failStream(c, parser, err)
-				return
+				return nil
 			}
 			if !done && !resumed {
-				return
+				return nil
 			}
 			continue
 		}
 		if parser.busy {
 			// A request is still being answered: one whose handler retained
-			// it. Keep what arrives; the release that writes its response
+			// it, or, on a connection that offloads, one whose handler is
+			// running. Keep what arrives; whatever finishes that request
 			// drives the connection on from here.
 			parser.appendBuffer(data)
-			return
+			h.holdBacklog(c, parser)
+			return nil
 		}
 		var request *stdhttp.Request
 		var complete bool
@@ -570,7 +670,7 @@ func (h *ServerHandler) drive(c *fib.Connection, parser *Parser, data []byte) {
 		}
 		if settings, ok := h.h2cUpgrade(c, request); ok && parser.stream == nil {
 			h.upgradeH2C(c, parser, request, settings)
-			return
+			return nil
 		}
 		block := parser.block
 		if block != nil && &block.request != request {
@@ -581,6 +681,7 @@ func (h *ServerHandler) drive(c *fib.Connection, parser *Parser, data []byte) {
 		context.Conn, context.Request, context.server, context.parser = c, request, h, parser
 		context.whole, _ = request.Body.(*wholeBody)
 		context.block, context.streamed = block, parser.stream != nil
+		context.offloaded = parser.offload
 		// Nothing behind this request is served until its response is
 		// written, so that pipelined responses keep their order, and the
 		// connection knows which request to cancel if it closes first.
@@ -589,6 +690,9 @@ func (h *ServerHandler) drive(c *fib.Connection, parser *Parser, data []byte) {
 		parser.liveContext.Store(context)
 		var bodyErr error
 		if parser.stream != nil {
+			// A body read on the loop reaches its callback on the handler
+			// pool, as a multiplexed protocol's does.
+			parser.stream.offload = parser.offload
 			// Hand the body what has already arrived before the handler runs,
 			// so that its first read is of everything the connection has and
 			// a body that came in with its header reads straight to io.EOF.
@@ -601,6 +705,11 @@ func (h *ServerHandler) drive(c *fib.Connection, parser *Parser, data []byte) {
 			// whose body is still coming keeps the deadline that bounds it.
 			_ = c.SetReadDeadline(time.Time{})
 		}
+		if parser.offload {
+			// The handler runs once the lock is let go; see drive.
+			parser.offloadErr = bodyErr
+			return context
+		}
 		// The handler runs here, on the connection's worker, whether or not
 		// its body has all arrived: reading a streamed body never waits, so
 		// there is nothing for a goroutine of its own to wait on.
@@ -609,20 +718,20 @@ func (h *ServerHandler) drive(c *fib.Connection, parser *Parser, data []byte) {
 			// The body was refused or misframed before the handler even saw
 			// it, which its own read told it; the connection cannot go on.
 			h.failStream(c, parser, bodyErr)
-			return
+			return nil
 		}
 		if !context.settle() {
 			// The handler kept the response open. If its body is still
 			// arriving, feeding it is this loop's job; otherwise the release
 			// that writes the response carries the connection on.
 			if parser.stream == nil {
-				return
+				return nil
 			}
 			continue
 		}
 		if h.endRequestLocked(context) {
 			c.CloseAfterSend()
-			return
+			return nil
 		}
 		// A body the handler did not take is discarded by the loop, which
 		// goes back to parsing once it has run out.
@@ -639,6 +748,28 @@ func (h *ServerHandler) drive(c *fib.Connection, parser *Parser, data []byte) {
 		parser.spent = true
 		h.refuse(c, err)
 	}
+	return nil
+}
+
+// holdBacklog holds an offloading connection's reads once what it has
+// buffered behind a request whose handler is running reaches
+// StreamRequestBodyBuffer, so that a client pipelining ahead of a slow
+// handler is slowed by TCP flow control rather than by memory growing here,
+// as it is where the handler runs in the connection's round and nothing is
+// read until it returns. endRequestLocked lets go of the hold. Callers hold
+// parser.mu.
+func (h *ServerHandler) holdBacklog(c *fib.Connection, parser *Parser) {
+	if !parser.offload || parser.backlogHeld {
+		return
+	}
+	limit := h.config.StreamRequestBodyBuffer
+	if limit <= 0 {
+		limit = DefaultStreamRequestBodyBuffer
+	}
+	if len(parser.buffer) >= limit {
+		parser.backlogHeld = true
+		c.HoldReads(true)
+	}
 }
 
 // endRequestLocked settles the connection once a request's response has been
@@ -648,6 +779,12 @@ func (h *ServerHandler) drive(c *fib.Connection, parser *Parser, data []byte) {
 func (h *ServerHandler) endRequestLocked(context *Context) bool {
 	parser := context.parser
 	parser.busy = false
+	if parser.backlogHeld {
+		// What was pipelined behind the request is parsed from here on, so
+		// the connection may read again.
+		parser.backlogHeld = false
+		context.Conn.HoldReads(false)
+	}
 	// Whatever the handler left of the body has to come off the connection
 	// before the next request on it can be parsed, and abandon says when
 	// there is too much of it left to be worth reading and dropping.
@@ -715,7 +852,9 @@ func (h *ServerHandler) recycle(context *Context) {
 
 // finishRequest carries the connection on after a response written away from
 // its worker: the streamed request's own goroutine, or whichever goroutine
-// released the last hold on a retained one.
+// released the last hold on a retained one. That goroutine is never the loop
+// reading an offloading connection, so what is buffered behind the request
+// is served on it.
 func (h *ServerHandler) finishRequest(context *Context) {
 	c, parser := context.Conn, context.parser
 	parser.mu.Lock()
@@ -725,7 +864,7 @@ func (h *ServerHandler) finishRequest(context *Context) {
 		c.CloseAfterSend()
 		return
 	}
-	h.drive(c, parser, nil)
+	h.drive(c, parser, nil, false)
 }
 
 // failStream ends a connection whose streamed body could not be framed or grew
@@ -845,8 +984,8 @@ func (h *ServerHandler) startH2(c *fib.Connection, parser *Parser, state *stdtls
 	sc := newH2ServerConn(h, c, parser.remoteAddr)
 	sc.tlsState = state
 	// HTTP/2 only reads and parses in the connection's round, and runs its
-	// handlers on the stream pool, so the round goes back to the engine's
-	// own pool.
+	// handlers on the engine's handler pool, so the round goes back to the
+	// engine's own pool: a poller's loop, or a worker.
 	c.SetRunOnWorkers(false)
 	h.releaseTimeouts(c, parser)
 	c.SetAttachment(sc)
@@ -879,11 +1018,11 @@ func (h *ServerHandler) OnClose(c *fib.Connection, err error) {
 		// A handler waiting on the rest of a body has to hear that the rest
 		// will never come, rather than take a truncated upload for a complete
 		// one, and one still working on a request it retained has to hear
-		// that there is nothing left to answer. Both are reported from a
-		// goroutine, since this runs in the connection's last round, which
-		// may be on the event loop, and a handler's cleanup must never hold
-		// that up; the parser's own lock is not taken there either, for the
-		// same reason.
+		// that there is nothing left to answer. Both are reported on the
+		// engine's handler pool, since this runs in the connection's last
+		// round, which may be on the event loop, and a handler's cleanup must
+		// never hold that up; the parser's own lock is not taken there
+		// either, for the same reason.
 		stream, context := state.live.Load(), state.liveContext.Load()
 		var gen uint64
 		if context != nil {
@@ -897,14 +1036,14 @@ func (h *ServerHandler) OnClose(c *fib.Connection, err error) {
 			}
 		}
 		if stream != nil || context != nil {
-			go func() {
+			runOnStreams(c, func() {
 				if stream != nil {
 					stream.fail(err, false)
 				}
 				if context != nil {
 					context.cancelWith(err, gen)
 				}
-			}()
+			})
 		}
 	}
 	c.SetAttachment(nil)

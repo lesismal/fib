@@ -263,33 +263,35 @@ func (e *Engine) detachPeer(c *Connection) {
 	}
 }
 
-// startUDPSweeper starts the ticker that has the loop look for idle peers.
+// startUDPSweeper arms the timer that has the loop look for idle peers. The
+// timer arms itself again each time it fires, so nothing waits on it in
+// between.
 func (e *Engine) startUDPSweeper() {
 	if len(e.udpListeners) == 0 || e.udpIdleTimeout <= 0 {
 		return
 	}
-	e.udpSweepDone = make(chan struct{})
-	go func(done <-chan struct{}) {
-		ticker := time.NewTicker(udpSweepInterval(e.udpIdleTimeout))
-		defer ticker.Stop()
-		for {
-			select {
-			case <-done:
-				return
-			case <-ticker.C:
-				if !e.stopping.Load() && !e.request(command{kind: commandUDPSweep}) {
-					return
-				}
-			}
+	interval := udpSweepInterval(e.udpIdleTimeout)
+	e.udpSweepMu.Lock()
+	defer e.udpSweepMu.Unlock()
+	e.udpSweep = time.AfterFunc(interval, func() {
+		if e.stopping.Load() || !e.request(command{kind: commandUDPSweep}) {
+			return
 		}
-	}(e.udpSweepDone)
+		e.udpSweepMu.Lock()
+		if e.udpSweep != nil {
+			e.udpSweep.Reset(interval)
+		}
+		e.udpSweepMu.Unlock()
+	})
 }
 
 func (e *Engine) stopUDPSweeper() {
-	if e.udpSweepDone != nil {
-		close(e.udpSweepDone)
-		e.udpSweepDone = nil
+	e.udpSweepMu.Lock()
+	if e.udpSweep != nil {
+		e.udpSweep.Stop()
+		e.udpSweep = nil
 	}
+	e.udpSweepMu.Unlock()
 }
 
 // sweepUDP closes the peers that have been silent for the idle timeout.

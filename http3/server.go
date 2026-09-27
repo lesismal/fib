@@ -88,10 +88,10 @@ type Config struct {
 	// requests a client has open on one QUIC connection are served
 	// concurrently rather than one after another on the goroutine that
 	// reads its datagrams. Its zero value is the default, which does that
-	// on the stream pool of the engine the connection came from, shared
-	// with every other server whose connections come from engines of that
-	// name, HTTP/2 servers included, and sets no per-connection limit; see
-	// http.StreamPoolConfig.
+	// on the handler pool of the engine the connection came from (see
+	// fib.Engine.HandlerPool), shared with every other server whose
+	// connections come from that engine, HTTP/2 servers included, and sets
+	// no per-connection limit; see http.StreamPoolConfig.
 	StreamPool fibhttp.StreamPoolConfig
 }
 
@@ -273,8 +273,8 @@ type serverConn struct {
 	control    *quic.Stream
 	peer       peerStreams
 
-	// gate counts the requests of this connection running on the handler's
-	// stream pool, which is how the per-connection limit is kept, and batch
+	// gate counts the requests of this connection running on the engine's
+	// handler pool, which is how the per-connection limit is kept, and batch
 	// holds those of a run of QUIC's calls until the run ends, which hands
 	// them to the pool together (see OnCallsDone).
 	gate  fibhttp.StreamGate
@@ -376,7 +376,7 @@ func (sc *serverConn) OnStopSending(s *quic.Stream, _ uint64) {
 func (sc *serverConn) OnStreamsAvailable(*quic.Conn) {}
 
 // OnCallsDone hands the requests that arrived whole during the run of calls
-// to the stream pool, together.
+// to the handler pool, together.
 func (sc *serverConn) OnCallsDone(*quic.Conn) { sc.h.streams.Submit(&sc.batch) }
 
 func (sc *serverConn) OnClose(*quic.Conn, error) {
@@ -719,11 +719,12 @@ func (rs *requestStream) startStream(buffered []byte) {
 }
 
 // failBody tells the handler of a body still streaming that the rest of it
-// will not arrive, from a goroutine of its own: its callback may answer the
-// request, which may be what is failing it.
+// will not arrive. Its callback may answer the request, which may be what is
+// failing it, but Fail hands the callback its last call on the handler pool
+// rather than making it here.
 func (rs *requestStream) failBody(err error) {
 	if b := rs.streamed; b != nil && b.feed != nil {
-		go b.feed.Fail(err)
+		b.feed.Fail(err)
 	}
 }
 

@@ -625,19 +625,22 @@ func newCachedDate(now time.Time) *cachedDate {
 	return &cachedDate{value: now.UTC().AppendFormat(nil, stdhttp.TimeFormat)}
 }
 
-// The Date every response carries comes from a clock of its own: a goroutine
-// that wakes at each second boundary and formats the new second into
+// The Date every response carries comes from a clock of its own: a timer
+// that fires at each second boundary and formats the new second into
 // dateClock, so that a response reads the value rather than the time. Reading
 // the time for every response cost more than the rest of its head together.
+// Nothing waits on the clock between ticks: each tick arms the next.
 //
 // The clock runs only while responses are being written. dateUsed records
 // that one was written since the clock last ticked, and a clock that ticks
-// twice without one stops, clearing dateClock; the next response starts it
-// again, and until it has, formats the time it reads itself.
+// twice without one, which dateIdle counts, stops, clearing dateClock; the
+// next response starts it again, and until it has, formats the time it reads
+// itself.
 var (
 	dateClock   atomic.Pointer[cachedDate]
 	dateRunning atomic.Bool
 	dateUsed    atomic.Bool
+	dateIdle    atomic.Int32
 )
 
 // appendDate appends a Date header for now, which RFC 9110 section 6.6.1 asks
@@ -660,27 +663,34 @@ func appendDate(out []byte) []byte {
 // startDateClock starts the clock if it is not running, and returns the date
 // for now.
 func startDateClock() *cachedDate {
-	date := newCachedDate(time.Now())
+	now := time.Now()
+	date := newCachedDate(now)
 	if dateRunning.CompareAndSwap(false, true) {
+		dateIdle.Store(0)
 		dateClock.Store(date)
-		go runDateClock()
+		time.AfterFunc(untilNextSecond(now), tickDateClock)
 	}
 	return date
 }
 
-func runDateClock() {
-	for idle := 0; idle < 2; {
-		now := time.Now()
-		time.Sleep(time.Second - time.Duration(now.Nanosecond()))
-		if dateUsed.Swap(false) {
-			idle = 0
-		} else {
-			idle++
-		}
-		dateClock.Store(newCachedDate(time.Now()))
+// tickDateClock moves the clock on to the second that has just begun, and
+// arms the next tick, or stops the clock once it has gone unused.
+func tickDateClock() {
+	if dateUsed.Swap(false) {
+		dateIdle.Store(0)
+	} else if dateIdle.Add(1) >= 2 {
+		dateClock.Store(nil)
+		dateRunning.Store(false)
+		return
 	}
-	dateClock.Store(nil)
-	dateRunning.Store(false)
+	now := time.Now()
+	dateClock.Store(newCachedDate(now))
+	time.AfterFunc(untilNextSecond(now), tickDateClock)
+}
+
+// untilNextSecond is how long after now the next second begins.
+func untilNextSecond(now time.Time) time.Duration {
+	return time.Second - time.Duration(now.Nanosecond())
 }
 
 var (

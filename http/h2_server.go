@@ -124,8 +124,8 @@ type h2ServerConn struct {
 	// tlsState is the connection's TLS state, handed to every request, or
 	// nil in cleartext.
 	tlsState *stdtls.ConnectionState
-	// gate counts the requests of this connection running on the handler's
-	// stream pool, which is how the per-connection limit is kept.
+	// gate counts the requests of this connection running on the engine's
+	// handler pool, which is how the per-connection limit is kept.
 	gate StreamGate
 	// headerBlock is where response header blocks are encoded before they
 	// are framed, kept for the next one. lengthValue caches the last
@@ -991,11 +991,12 @@ func (sc *h2ServerConn) creditBody(st *h2ServerStream, n int) {
 }
 
 // failBodyLocked tells the handler of a body still streaming that the rest of
-// it will not arrive, from a goroutine of its own: its callback may answer
-// the request, which takes the lock held here.
+// it will not arrive. Its callback may answer the request, which takes the
+// lock held here, but Fail hands the callback its last call on the stream
+// pool rather than making it here.
 func (sc *h2ServerConn) failBodyLocked(st *h2ServerStream, err error) {
 	if feed := st.feed; feed != nil && !st.remoteDone {
-		go feed.Fail(err)
+		feed.Fail(err)
 	}
 }
 

@@ -115,18 +115,27 @@ type Config struct {
 	// registrations and wake-ups, over several cores, and each loop then runs
 	// its connections' rounds itself: the engine's task pool is a
 	// taskpool.ModeInline one, which recovers a panicking handler the way a
-	// worker does. As with InlineHandlers, a handler that blocks stalls every
-	// connection on its loop. A connection whose handlers may take a while
-	// asks for workers instead, with Connection.SetRunOnWorkers, and runs on
-	// the pool TaskPoolMode, WorkerCount and SharedTaskPool describe, built
-	// the first time one does: the http package has every HTTP/1 connection
-	// do so, while an HTTP/2 or HTTP/3 one reads on the engine's own pool and
-	// runs its requests on the stream pool, which is unaffected and still
-	// sized from WorkerCount. A pool supplied through SetTaskPool is kept.
+	// worker does. As with InlineHandlers, a callback that blocks stalls every
+	// connection on its loop.
+	//
+	// The engine's pool of workers, the one TaskPoolMode, WorkerCount and
+	// SharedTaskPool describe, is built the first time something asks for
+	// it, and runs what may take a while away from the loops. A protocol
+	// reads and parses on the loop and hands its request handlers to it,
+	// through Engine.HandlerPool or Connection.GoHandler, as the http package
+	// does for HTTP/2 and HTTP/3, and for HTTP/1 with its ReadOnPollers. A
+	// connection whose own rounds may take a while asks for them to run on
+	// that pool instead, with Connection.SetRunOnWorkers, as the http
+	// package's HTTP/1 connections do by default. A pool supplied
+	// through SetTaskPool is kept, and runs the rounds as it would without
+	// pollers.
 	//
 	// DefaultConfig sets it. Without it, the engine serves listeners and
 	// connections alike on its one loop, and runs every connection's rounds
-	// on the pool of workers.
+	// on the pool of workers: an HTTP/1 connection's requests are read,
+	// parsed and served there, and the handlers of HTTP/2 and HTTP/3
+	// requests run on a pool of their own, the stream pool, apart from the
+	// workers that read their connections; see Engine.HandlerPool.
 	//
 	// Only the Linux and macOS backends have pollers; on Windows the engine
 	// keeps its single loop and its task pool, as if this were unset.
@@ -135,16 +144,16 @@ type Config struct {
 	// one per CPU, runtime.NumCPU.
 	//
 	// One per CPU suits connections whose rounds run on their loops. Where
-	// they run on workers instead, as every HTTP/1 connection's do (see
-	// Connection.SetRunOnWorkers), a loop only waits for events and hands
-	// them on, which one loop keeps up with, and each further loop competes
-	// with the workers for the same Ps: after every round a loop yields to
-	// the workers it woke and then waits behind them for a P, so each loop's
-	// rounds gather fewer connections, and requests wait longer to be read.
-	// An HTTP/1 echo over 10k connections on three CPUs measured 583k
-	// requests/s without pollers, 584k with one poller, and 569k with three,
-	// whose 99th percentile latency rose from 25ms to 37ms. Set it low, one
-	// or a few, for such a load.
+	// they run on workers instead (see Connection.SetRunOnWorkers), a loop
+	// only waits for events and hands them on, which one loop keeps up with,
+	// and each further loop competes with the workers for the same Ps: after
+	// every round a loop yields to the workers it woke and then waits behind
+	// them for a P, so each loop's rounds gather fewer connections, and
+	// requests wait longer to be read. An HTTP/1 echo over 10k connections on
+	// three CPUs, with its rounds on workers, measured 583k requests/s
+	// without pollers, 584k with one poller, and 569k with three, whose 99th
+	// percentile latency rose from 25ms to 37ms. Set it low, one or a few,
+	// for such a load.
 	IOPollerCount int
 	// ReusePort binds the engine's TCP listeners with SO_REUSEPORT, so that
 	// other sockets that set it too, in this process or another of the same

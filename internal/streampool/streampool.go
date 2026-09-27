@@ -1,6 +1,9 @@
 // Package streampool holds the pools that HTTP/2 and HTTP/3 run their
-// request handlers on, one for each engine name, and keeps each one's ceiling
-// above the pools of the engines of that name that feed it.
+// request handlers on, one for each engine name, where the engine reads its
+// connections on its workers, and keeps each one's ceiling above the pools
+// of the engines of that name that feed it. An engine that reads on its
+// pollers' loops needs none: no worker of its reads a connection, so its
+// handlers run on its own pool of workers; see fib.Engine.HandlerPool.
 //
 // A stream pool is internal so that it cannot be handed to an engine as its
 // own: an engine worker that frames a request submits the handler here, and a

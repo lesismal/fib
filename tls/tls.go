@@ -20,6 +20,7 @@ import (
 
 	fib "github.com/lesismal/fib"
 	"github.com/lesismal/fib/bufferpool"
+	"github.com/lesismal/fib/internal/sidepool"
 )
 
 // DefaultHandshakeTimeout bounds a handshake when Handler leaves
@@ -52,9 +53,13 @@ func (wouldBlockError) Temporary() bool { return true }
 // times out closes the connection, and Handler's OnClose receives the error.
 //
 // The handshake needs a round trip or two with the peer, and crypto/tls runs
-// it as a blocking call, so each connection's handshake runs on a goroutine of
-// its own that exits once it completes. Records after that are decrypted in
-// OnData like any other input, straight from the bytes the round read.
+// it as a blocking call, so each connection's handshake runs on a worker of a
+// pool kept for handshakes alone, which waits there for the peer until the
+// handshake completes. That pool is neither the engine's nor the one its
+// handlers run on, so a handshake is never queued behind the work of the
+// connections whose reads feed it, and an engine worker that opens a
+// connection never waits on its own queue. Records after that are decrypted
+// in OnData like any other input, straight from the bytes the round read.
 //
 // Decrypting and encrypting are the costliest work a TLS connection's round
 // does, so OnOpen asks for the round to run on the engine's workers (see
@@ -63,8 +68,9 @@ func (wouldBlockError) Temporary() bool { return true }
 // another on that loop. A TLS echo over 10k connections on three CPUs measured
 // 404k echoes/s with the rounds on three pollers, whose loops left 15% of the
 // CPUs idle, and 451k with them on workers. A handler whose rounds are better
-// kept on the loop, as HTTP/2's are, calls SetRunOnWorkers(false) in its own
-// OnOpen, or later.
+// kept on the loop, as HTTP/2's are, and the http package's HTTP/1 ones with
+// its ReadOnPollers, calls SetRunOnWorkers(false) in its own OnOpen, or
+// later.
 type Handler struct {
 	Config  *stdtls.Config
 	Handler fib.Handler
@@ -135,7 +141,8 @@ func (h *Handler) OnOpen(c *fib.Connection) {
 	if timeout == 0 {
 		timeout = DefaultHandshakeTimeout
 	}
-	go t.handshake(h.inner(), timeout)
+	inner := h.inner()
+	sidepool.Handshake().Go(func() { t.handshake(inner, timeout) })
 }
 
 func (h *Handler) OnData(c *fib.Connection, data []byte) {
@@ -159,7 +166,7 @@ func (h *Handler) OnClose(c *fib.Connection, err error) {
 
 // HandshakeHandler is implemented by a wrapped handler that wants to know
 // when the handshake completes, such as one that speaks whichever protocol
-// ALPN negotiated. OnHandshake runs once, on the handshake's goroutine, after
+// ALPN negotiated. OnHandshake runs once, on the handshake's worker, after
 // what OnOpen sent has been encrypted and before OnData receives any
 // plaintext. A handshake that fails reaches OnClose instead.
 type HandshakeHandler interface {
@@ -190,7 +197,7 @@ type layer struct {
 	handshaking bool
 	closed      bool
 
-	// readMu makes whoever decrypts, the handshake goroutine for the bytes
+	// readMu makes whoever decrypts, the handshake's worker for the bytes
 	// that arrived with the handshake or a worker afterwards, the only one
 	// delivering plaintext, so OnData never runs twice at once.
 	readMu sync.Mutex
@@ -254,7 +261,7 @@ func (t *layer) handshake(handler fib.Handler, timeout time.Duration) {
 }
 
 // feed takes ciphertext from a read round. During the handshake it collects
-// it and wakes the handshake goroutine; afterwards it decrypts what it can.
+// it and wakes the handshake's worker; afterwards it decrypts what it can.
 func (t *layer) feed(handler fib.Handler, data []byte) {
 	t.mu.Lock()
 	if t.closed {

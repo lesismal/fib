@@ -106,9 +106,10 @@ Behavior users need to be aware of.
 - Memory bounds: a server connection can hold up to about
   `MaxConcurrentStreams × MaxBodyBytes` (100 × 16MB by default); a single
   client response is bounded by `MaxResponseBodyBytes`.
-- A request that is complete goes to the handler pool that `Config.StreamPool`
-  describes — the engine name's `<Name>-streams` pool, which the HTTP/2
-  server uses too, and never an engine's — so the requests one client
+- A request that is complete goes to the engine's handler pool, as
+  `Config.StreamPool` describes — under `IOPollers` the engine's own
+  `<Name>-workers`, and without it the engine name's `<Name>-streams` pool,
+  never an engine's; the HTTP/2 server uses the same — so the requests one client
   has open on a connection are served concurrently and a handler that blocks
   holds up only itself. `StreamPool.MaxConcurrentHandlers` bounds how many of
   one connection's requests run at once, the last of them on the goroutine

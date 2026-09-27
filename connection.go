@@ -10,6 +10,7 @@ import (
 	"syscall"
 
 	"github.com/lesismal/fib/bufferpool"
+	"github.com/lesismal/fib/taskpool"
 )
 
 // sendItem is one queued chunk. pooled says data came from the buffer pool,
@@ -111,6 +112,46 @@ type Connection struct {
 // runs rounds on workers it changes nothing. It takes effect from the next
 // round, and may be called from any goroutine.
 func (c *Connection) SetRunOnWorkers(on bool) { c.onWorkers.Store(on) }
+
+// GoHandler runs task on the engine's handler pool (see Engine.HandlerPool),
+// as a protocol that reads on the loop does with its request handlers.
+// Called from inside a round the loop is running itself, it keeps the task
+// until the loop has run the round's other connections too and then hands
+// all of the round's tasks to the pool at once, with one submission and the
+// workers woken for them together, and yields the loop's P to them, as it
+// does for connections it hands to workers; anywhere else it submits the
+// task straight away. A pool that has stopped taking work leaves the task to
+// run here. It may be called from any goroutine.
+func (c *Connection) GoHandler(task taskpool.Task) {
+	e := c.engine
+	e.handlerMu.Lock()
+	if e.inRound {
+		e.handlerTasks = append(e.handlerTasks, task)
+		e.handlerMu.Unlock()
+		return
+	}
+	e.handlerMu.Unlock()
+	if pool := e.root().HandlerPool(); pool == nil || !pool.GoTask(task) {
+		task.RunTask()
+	}
+}
+
+// Cork holds what is sent on the connection from now on until Flush, rather
+// than writing each send as it is made, as a read round does for the replies
+// its OnData makes. A goroutine that answers several requests of one
+// connection away from its round corks it first, so that the answers reach
+// the socket in one write, and must Flush when it is done: nothing else
+// writes what a Cork holds, unless a read round of the connection ends
+// meanwhile and flushes it along with its own. It does nothing on a UDP
+// connection.
+func (c *Connection) Cork() {
+	if c.udp != nil {
+		return
+	}
+	c.mu.Lock()
+	c.corked = true
+	c.mu.Unlock()
+}
 
 // RunsOnWorkers reports what SetRunOnWorkers last set.
 func (c *Connection) RunsOnWorkers() bool { return c.onWorkers.Load() }

@@ -71,14 +71,17 @@ func(c *fibhttp.Context, r *http.Request) {
 
 - `OnBody` 不阻塞，也从不在自身内部调用回调：它只登记回调然后返回。已经到达的 body
   （`BodyComplete` 为 true 时就是全部）在 handler 返回之后、在运行 handler 的那个
-  goroutine 上交给回调；handler 返回之后才调用 `OnBody` 的，则在单独的 goroutine 上交付。
+  goroutine 上交给回调。框架从不为回调单独启动 goroutine：之后到达的数据由事件循环读到时
+  触发交付——连接在 worker 上读时就在那个 worker 上；连接在事件循环上读时（HTTP/2 和
+  HTTP/3 一直如此，HTTP/1 在设置 `ReadOnPollers` 时），回调不能在那里执行，所以交给 engine 的
+  handler 协程池（`fib.Engine.HandlerPool`）；handler 返回之后才调用 `OnBody` 时已经到达
+  的部分，不会再有读来带它，也交给 handler 协程池。
 - `OnBody` 会自动 `Retain` 请求，回调的最后一次调用返回之后，框架自动 `Release`，回调在
   `fin` 时写的响应随即发出，handler 里不需要 `Retain`/`Release`。要在别处回复的 handler，
   在回调里自己再 `Retain` 一次，回复后 `Release`。
 - `fin` 标记最后一次回调；`err` 表示这个 body 不会有后续了，同样是最后一次回调，且只来
   一次。`data` 只在回调期间有效，需要保留先复制。
-- 回调一次一个、保持顺序，交接之后的回调在连接的 worker 上执行，所以任意大的 body 都能
-  处理，既不需要 handler 自己的 goroutine，也不会被缓存下来。给对端限速的就是回调本身。
+- 回调一次一个、保持顺序，所以任意大的 body 都能处理，既不需要 handler 自己的 goroutine，也不会被缓存下来。给对端限速的就是回调本身。
 - body 只有在流式交付时才会分多次到达（由 `StreamRequestBody` 决定）；handler
   运行前就收全的 body 会在一次 `fin` 为 true 的回调里全部给出。
 - `OnBody` 接管之后 `Request.Body` 不能再读。关闭它会让回调以 `ErrBodyAbandoned` 结束、
@@ -88,8 +91,8 @@ func(c *fibhttp.Context, r *http.Request) {
 
 连接断开、读超时、body 收不完，都会让一个 handler 可能还在处理的请求提前结束。这时请求
 被取消：不会再写出任何东西，它上面剩余的引用全部作废，handler 只会被告知一次——通过
-`OnBody` 的 `err`，以及 `Context.OnCancel`。两者都在单独的 goroutine 上执行而不是事件
-循环上，所以 handler 的清理逻辑拖不住服务端。想主动查的话 `Context.Err()` 给出同样的
+`OnBody` 的 `err`，以及 `Context.OnCancel`。两者都在 engine 的 handler 协程池上执行而不是
+事件循环上，所以 handler 的清理逻辑拖不住服务端。想主动查的话 `Context.Err()` 给出同样的
 原因。
 
 从这里开始一切都是幂等的：已经结束的请求上再调 `Retain`、`Release`、`Finish` 都是空操作，
@@ -146,8 +149,9 @@ handler 来说就是它返回的时刻，`net/http` 也是在这个时刻关闭�
 会返回 `ErrBodyReleased`；handler 如果之后还要用这些字节，应自己保留一份副本（比如
 `io.ReadAll` 得到的结果）。
 
-**读取不阻塞。** handler 和别的 handler 一样跑在连接的 worker 上，而 worker 去等对端
-就是在等自己，所以 `Read` 只给出已经到达的部分：
+**读取不阻塞。** handler 和别的 handler 一样跑在 worker 上（读这条连接的 worker，设置
+`ReadOnPollers` 时是 handler 协程池的 worker），worker 去等对端要么是在等自己、要么是白占着，
+所以 `Read` 只给出已经到达的部分：
 
 | Read 返回 | 含义 |
 | --- | --- |
@@ -240,7 +244,7 @@ body 的请求，以及不在 server 自行解析范围内、改由 `net/http` �
 - **响应在最后一个引用释放时结束**：什么都不 Retain 的 handler 就是它自己返回的时候，
   与 `net/http` 一致。要稍后回复、或者要在其他 goroutine 里接着写的 handler 先
   `Retain`，见[保持响应不结束](#保持响应不结束以及-body-回调)。
-- **读取同样不阻塞**：handler 跑在连接自己的 worker 上，所以流式 body 的读取返回
+- **读取同样不阻塞**：handler 跑在 worker 上，等对端只会白占着它，所以流式 body 的读取返回
   `ErrWouldBlock` 而不是等对端；剩下的部分用 `OnBody` 接管。
 - **写入不阻塞**：handler 写得比对端读得快时，差额排队在内存中（连接的读取会暂停，但
   handler 本身不会被阻塞）。`SendFile` 发送的文件例外：它只随 socket 的排空读取。

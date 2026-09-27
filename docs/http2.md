@@ -60,17 +60,24 @@ Behaviour to be aware of when using it.
 - A `CONNECT` request is parsed and handed to the handler, but no tunnel can be
   established (there is no bidirectional streaming channel).
 
-### Handlers run on a pool of their own
+### Handlers run on a pool
 
 - A connection's frames are processed in order, and a request that is complete
-  goes to the handler pool that `Config.StreamPool` describes, so the requests
-  one client has open on a connection are served concurrently and a handler
-  that blocks holds up only itself. There is one such pool for each engine
-  `Config.Name`, called `<Name>-streams` (`fib-streams` by default), shared by
-  every HTTP/2 and HTTP/3 server whose connections come from engines of that
-  name and never by an engine: an engine worker submits each request it
-  frames, and were the queue it submits to its own, every worker could end up
-  waiting for room that none is left to make. Its ceiling is twice the widest
+  goes to the engine's handler pool (`fib.Engine.HandlerPool`), as
+  `Config.StreamPool` describes, so the requests one client has open on a
+  connection are served concurrently and a handler that blocks holds up only
+  itself.
+- Under `IOPollers`, the default, connections are read and framed on the
+  pollers' loops, and the handler pool is the engine's own pool of workers,
+  `<Name>-workers`: the requests are handed to it by the loops, which are
+  not its workers, so none of them can wait on its own queue.
+- Without `IOPollers` the engine's workers read the connections, and the
+  handler pool is one of its own for each engine `Config.Name`, called
+  `<Name>-streams` (`fib-streams` by default), shared by every HTTP/2 and
+  HTTP/3 server whose connections come from engines of that name and never
+  by an engine: an engine worker submits each request it frames, and were the
+  queue it submits to its own, every worker could end up waiting for room
+  that none is left to make. Its ceiling is twice the widest
   engine pool of that name running, or `fib.DefaultStreamPoolSizing` while
   none is, and its floor is zero, so an idle one keeps no worker. It stops once the
   last engine of its name closes, without waiting for handlers still

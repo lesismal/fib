@@ -16,6 +16,7 @@ import (
 
 	"github.com/lesismal/fib/bufferpool"
 	"github.com/lesismal/fib/internal/hpack"
+	"github.com/lesismal/fib/internal/sidepool"
 )
 
 // HTTP/2 on the client side: a clientConn whose TLS handshake chose "h2", or
@@ -279,8 +280,9 @@ func (hc *h2ClientConn) shutdown(err error) {
 			continue
 		}
 		// OnClose runs in the connection's last round, which may be on the
-		// event loop, and the callback must not hold that up.
-		go r.finish(nil, err)
+		// event loop, and the callback must not hold that up, so it runs on
+		// the client pool.
+		sidepool.Go(func() { r.finish(nil, err) })
 	}
 }
 

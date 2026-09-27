@@ -5,9 +5,9 @@
 //
 //	go tool pprof http://localhost:8080/debug/pprof/profile?seconds=10
 //
-// A profile can take many seconds to gather, so each one is gathered on a
-// goroutine of its own rather than on the connection's worker, and answered
-// once it is done. A request whose connection goes first stops its profile.
+// A profile can take many seconds to gather, so each one is gathered on the
+// engine's handler pool (see fib.Engine.HandlerPool) rather than on the
+// goroutine that ran the handler, and answered once it is done. A request whose connection goes first stops its profile.
 //
 // The profiles tell a lot about the process; serve them only where the
 // people who can reach them may know it.
@@ -89,13 +89,13 @@ func New(config ...Config) middleware.Middleware {
 	}
 }
 
-// serve runs handler on a goroutine of its own and answers with what it
+// serve runs handler on the engine's handler pool and answers with what it
 // wrote.
 func serve(c *fibhttp.Context, r *stdhttp.Request, handler stdhttp.Handler) {
 	ctx, cancel := context.WithCancel(r.Context())
 	c.Retain()
 	c.OnCancel(func(error) { cancel() })
-	go func() {
+	gather := func() {
 		defer c.Release()
 		defer cancel()
 		w := &recorder{header: make(stdhttp.Header)}
@@ -104,7 +104,11 @@ func serve(c *fibhttp.Context, r *stdhttp.Request, handler stdhttp.Handler) {
 			w.status = stdhttp.StatusOK
 		}
 		_ = c.WriteResponse(fibhttp.Response{StatusCode: w.status, Header: w.header, Body: w.body})
-	}()
+	}
+	if pool := c.Conn.Engine().HandlerPool(); pool == nil || !pool.Go(gather) {
+		// The engine is closing; the profile is gathered here.
+		gather()
+	}
 }
 
 // recorder is the http.ResponseWriter a profile is written to, to be sent

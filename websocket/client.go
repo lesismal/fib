@@ -22,6 +22,7 @@ import (
 	"time"
 
 	fib "github.com/lesismal/fib"
+	"github.com/lesismal/fib/internal/sidepool"
 	fibtls "github.com/lesismal/fib/tls"
 )
 
@@ -293,7 +294,7 @@ func (cc *clientConn) fail(resp *stdhttp.Response, err error, onLoop bool) {
 		conn.Close()
 	}
 	if onLoop {
-		go cc.done(nil, resp, err)
+		sidepool.Go(func() { cc.done(nil, resp, err) })
 	} else {
 		cc.done(nil, resp, err)
 	}

@@ -18,6 +18,7 @@ import (
 	"time"
 
 	fib "github.com/lesismal/fib"
+	"github.com/lesismal/fib/internal/sidepool"
 	fibtls "github.com/lesismal/fib/tls"
 )
 
@@ -507,8 +508,8 @@ func (c *Client) dialed(cc *clientConn, err error) {
 	c.mu.Unlock()
 	if failed != nil {
 		// Dial callbacks run on the event loop, which a request's callback must
-		// never be allowed to hold up.
-		go failed.finish(nil, err)
+		// never be allowed to hold up, so it runs on the client pool.
+		sidepool.Go(func() { failed.finish(nil, err) })
 	}
 	c.carryOut(h, work, dials)
 }
@@ -903,7 +904,7 @@ func (cc *clientConn) OnClose(_ *fib.Connection, err error) {
 	}
 	r.detach()
 	if resp := cc.parser.finish(); resp != nil && (err == nil || err == io.EOF) {
-		go r.finish(resp, nil)
+		sidepool.Go(func() { r.finish(resp, nil) })
 		return
 	}
 	if retry && r.retryable() {
@@ -917,6 +918,7 @@ func (cc *clientConn) OnClose(_ *fib.Connection, err error) {
 		err = io.ErrUnexpectedEOF
 	}
 	// OnClose runs in the connection's last round, which may be on the event
-	// loop, and the callback must not hold that up.
-	go r.finish(nil, err)
+	// loop, and the callback must not hold that up, so it runs on the client
+	// pool.
+	sidepool.Go(func() { r.finish(nil, err) })
 }

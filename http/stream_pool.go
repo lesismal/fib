@@ -9,20 +9,27 @@ package http
 // head-of-line blocking multiplexing exists to remove, moved up into the
 // application.
 //
-// A StreamPool runs those handlers on a pool of its own instead. The reader
-// frames a request, hands it over and goes back to the socket, so one
-// connection's requests are served concurrently and a slow handler holds up
-// only itself.
+// A StreamPool runs those handlers on a pool instead. The reader frames a
+// request, hands it over and goes back to the socket, so one connection's
+// requests are served concurrently and a slow handler holds up only itself.
 
 // StreamPoolConfig describes whether a multiplexed protocol runs its request
-// handlers on the stream pool, and how much of one connection it may run
-// there at once. Its zero value is the default: every request goes to the
-// pool, with no limit of its own on how much of a connection runs at once.
+// handlers on the engine's handler pool, and how much of one connection it
+// may run there at once. Its zero value is the default: every request goes to
+// the pool, with no limit of its own on how much of a connection runs at
+// once.
 //
-// There is one stream pool for each engine name, "<Name>-streams", shared by
-// every HTTP/2 and HTTP/3 server whose connections come from engines of that
-// name, and it is never the pool of an engine: an engine worker that framed a
-// request and found an engine's own queue full of handlers would wait for
+// Which pool that is depends on where the engine reads its connections; see
+// fib.Engine.HandlerPool. An engine that runs its rounds on its pollers'
+// loops, as fib.Config.IOPollers has it do, reads on those loops and runs
+// the handlers on its own pool of workers, the one the HTTP/1 server's
+// handlers run on too.
+//
+// An engine that reads on its pool of workers instead runs them on a pool
+// apart, the stream pool, one for each engine name, "<Name>-streams", shared
+// by every HTTP/2 and HTTP/3 server whose connections come from engines of
+// that name. It is never the pool of an engine: an engine worker that framed
+// a request and found an engine's own queue full of handlers would wait for
 // room that only another engine worker, just as stuck, could make. Its
 // ceiling is twice the widest engine pool of that name running, or twice
 // what fib.DefaultPoolSizing reports while none is, and its floor zero, so an

@@ -87,11 +87,14 @@ const (
 	maxMaxEvents    = 100000
 
 	// streamPoolFactor is how much wider the pool HTTP/2 and HTTP/3 run
-	// their request handlers on is than the widest engine pool of the same
-	// Name. There is one such pool for each Name, shared by every HTTP/2 and
-	// HTTP/3 server whose connections come from engines of that Name, and it
-	// is never one an engine runs on; see package internal/streampool for
-	// the deadlock sharing an engine's pool would invite.
+	// their request handlers on, where an engine reads its connections on
+	// its workers, is than the widest engine pool of the same Name. There is
+	// one such pool for each Name, shared by every HTTP/2 and HTTP/3 server
+	// whose connections come from engines of that Name, and it is never one
+	// an engine runs on; see package internal/streampool for the deadlock
+	// sharing an engine's pool would invite. An engine that reads on its
+	// pollers' loops runs the handlers on its own pool of workers instead;
+	// see Engine.HandlerPool.
 	//
 	// The two pools do different work. An engine worker holds its connection
 	// for one round: it reads the socket, hands what came in to the protocol,

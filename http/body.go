@@ -126,6 +126,16 @@ type BodyStream struct {
 	// see BodyFeed. HTTP/1 holds the connection's reads instead.
 	sendContinue func()
 	credit       func(n int)
+	// offload says the body arrives on a goroutine that must not run the
+	// handler's callback: the one reading a multiplexed connection, or an
+	// HTTP/1 connection read on an event loop (see
+	// ServerHandler.attachParser). What arrives there is buffered, and the
+	// sink is handed it on the engine's handler pool (see runOnStreams)
+	// rather than there. owner is the connection whose engine's pool that
+	// is. Any other HTTP/1 body arrives on the connection's worker, where
+	// the handler runs too, and is handed on there.
+	offload bool
+	owner   *fib.Connection
 }
 
 // setSink hands the body to fn as it arrives rather than buffering it for
@@ -217,6 +227,7 @@ func newBodyStream(conn *fib.Connection, request *stdhttp.Request, config Config
 	}
 	s := &BodyStream{
 		conn:         conn,
+		owner:        conn,
 		request:      request,
 		remaining:    -1,
 		decoder:      decoder,
@@ -277,8 +288,18 @@ func (s *BodyStream) Close() error {
 		dropped = s.dropLocked()
 		s.releaseLocked()
 	}
-	s.deliverLocked(false)
+	// Close is the handler's own call, from whatever goroutine it likes; a
+	// callback that took the body hears that it ended on the handler pool,
+	// rather than inside Close.
+	owed := s.sink != nil && !s.sinkBusy && s.owedLocked()
+	if owed {
+		s.sinkBusy = true
+	}
+	s.mu.Unlock()
 	s.credited(dropped)
+	if owed {
+		runOnStreams(s.owner, func() { s.drain(false) })
+	}
 	return nil
 }
 
@@ -298,7 +319,41 @@ func (s *BodyStream) deliverLocked(worker bool) {
 	}
 	s.sinkBusy = true
 	s.mu.Unlock()
+	if s.offload {
+		runOnStreams(s.owner, func() { s.drain(false) })
+		return
+	}
 	s.drain(worker)
+}
+
+// failure is the error the body failed with, or nil.
+func (s *BodyStream) failure() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.err
+}
+
+// failSink fails the body with err, as fail does, once OnBody has taken it,
+// and reports whether it had. The body then hands its callback its last call
+// itself, with the first reason it met: one it ran into on its own, such as
+// ErrBodyTooLarge, may be what closed the connection, and that call may be on
+// its way from another goroutine already, which a call made beside it would
+// race.
+func (s *BodyStream) failSink(err error) bool {
+	if err == nil || errors.Is(err, io.EOF) {
+		err = io.ErrUnexpectedEOF
+	}
+	s.mu.Lock()
+	if s.sink == nil {
+		s.mu.Unlock()
+		return false
+	}
+	if s.err == nil && !s.ended {
+		s.err = err
+	}
+	s.releaseLocked()
+	s.deliverLocked(false)
+	return true
 }
 
 // Trailer is the trailer section of a chunked body, or nil. It is complete
@@ -378,7 +433,7 @@ func (s *BodyStream) push(data []byte) {
 		s.credited(len(data))
 		return
 	}
-	if sink := s.sink; sink != nil && !s.sinkBusy && s.read == len(s.buf) {
+	if sink := s.sink; sink != nil && !s.sinkBusy && !s.offload && s.read == len(s.buf) {
 		// Nothing is waiting ahead of data, so it goes to the sink straight
 		// from the connection's buffer.
 		s.sinkBusy = true

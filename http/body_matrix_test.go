@@ -15,6 +15,7 @@ import (
 	"io"
 	"net"
 	stdhttp "net/http"
+	"runtime/debug"
 	"strconv"
 	"strings"
 	"sync"
@@ -125,6 +126,38 @@ func matrixViolation(format string, args ...any) {
 	matrixViolations.Unlock()
 }
 
+// offPool reports the goroutine a body callback runs on unless it is a
+// worker of a pool: the engine's, which runs HTTP/1's reads, or the stream
+// pool, which takes what HTTP/2 and HTTP/3 read on the event loop. A callback
+// never runs on a goroutine started for it, nor on the event loop, nor inside
+// a call the handler made; "" means it did not.
+func offPool() string {
+	stack := debug.Stack()
+	if bytes.Contains(stack, []byte("taskpool.(*inlineBackend)")) {
+		// A task the event loop ran itself: a round of a connection that
+		// runs on the loop, as HTTP/2 and HTTP/3 connections do.
+		return "the event loop"
+	}
+	if bytes.Contains(stack, []byte("lesismal/fib/taskpool.")) {
+		return ""
+	}
+	if bytes.Contains(stack, []byte("lesismal/fib/tls.(*layer).handshake")) {
+		// fib/tls hands what arrived right behind the handshake to the
+		// connection's handler on the handshake's goroutine, the handler
+		// and its request with it; the body follows the request there.
+		return ""
+	}
+	at := bytes.LastIndex(stack, []byte("created by "))
+	if at < 0 {
+		return "the main goroutine"
+	}
+	line := stack[at:]
+	if end := bytes.IndexByte(line, '\n'); end >= 0 {
+		line = line[:end]
+	}
+	return string(line)
+}
+
 func checkMatrixViolations(t *testing.T) {
 	t.Helper()
 	// A callback after the last would come at once, if at all.
@@ -211,6 +244,9 @@ func (s *matrixServe) onBody(inHandler bool) {
 		}
 		if inHandler && !s.returned.Load() {
 			matrixViolation("%s: a body callback ran before the handler returned", s.r.URL.Path)
+		}
+		if by := offPool(); by != "" {
+			matrixViolation("%s: a body callback ran off the pools, on %s", s.r.URL.Path, by)
 		}
 		if s.ended {
 			matrixViolation("%s: a body callback after the last one", s.r.URL.Path)
@@ -659,6 +695,8 @@ func checkMatrixResponse(t *testing.T, proto matrixProto, m matrixConfig, req ma
 // it exactly once, through OnBody's error, and one whose server buffers the
 // body never runs at all. Either way the server goes on serving.
 func TestBodyMatrixAbort(t *testing.T) {
+	// The cases run in parallel, after this function returns.
+	t.Cleanup(func() { checkMatrixViolations(t) })
 	var (
 		mu      sync.Mutex
 		ran     = map[string]bool{}
@@ -674,6 +712,9 @@ func TestBodyMatrixAbort(t *testing.T) {
 			return
 		}
 		c.OnBody(func(data []byte, fin bool, err error) {
+			if by := offPool(); by != "" {
+				matrixViolation("%s: a body callback ran off the pools, on %s", key, by)
+			}
 			if fin || err != nil {
 				mu.Lock()
 				endings[key] = append(endings[key], err)

@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/lesismal/fib/bufferpool"
+	"github.com/lesismal/fib/internal/streampool"
 	"github.com/lesismal/fib/taskpool"
 )
 
@@ -146,16 +147,27 @@ type Engine struct {
 	workers workerPool
 	// offload collects a round's connections bound for workers. Event-loop
 	// ownership.
-	offload        []*Connection
+	offload []*Connection
+	// handlerMu guards inRound, which says the loop is running its round's
+	// connections itself, and handlerTasks, the tasks they handed the
+	// handler pool meanwhile, which the round's end submits together; see
+	// Connection.GoHandler. handlerSpare is the list swapped in while they
+	// are submitted.
+	handlerMu      sync.Mutex
+	inRound        bool
+	handlerTasks   []taskpool.Task
+	handlerSpare   []taskpool.Task
 	taskWG         sync.WaitGroup
 	readBufferSize int
 	closeOnce      sync.Once
 	// udpListeners are the engine's UDP sockets, when Config.Network names
-	// UDP. udpIdleTimeout closes their silent peers, and udpSweepDone stops
-	// the ticker that checks for them.
+	// UDP. udpIdleTimeout closes their silent peers, and udpSweep is the
+	// timer that has the loop check for them, nil once it has been stopped.
+	// udpSweepMu guards it.
 	udpListeners   []*udpListener
 	udpIdleTimeout time.Duration
-	udpSweepDone   chan struct{}
+	udpSweepMu     sync.Mutex
+	udpSweep       *time.Timer
 	// unixPaths are the socket files the engine's Unix listeners created,
 	// which it removes when it closes, as net.UnixListener does.
 	unixPaths []string
@@ -361,6 +373,39 @@ func (e *Engine) releaseWorkerPool() {
 	}
 }
 
+// RoundsOnPollers reports whether the engine runs its connections' rounds on
+// its pollers' loops, as Config.IOPollers has it do, rather than on a pool of
+// workers. A protocol served there reads and parses on the loop and runs its
+// request handlers on HandlerPool, so that a handler that takes a while holds
+// up only itself. A connection that asked for workers with
+// Connection.SetRunOnWorkers runs its rounds on them all the same.
+func (e *Engine) RoundsOnPollers() bool {
+	root := e.root()
+	return len(root.pollers) > 0 && root.inlineTasks
+}
+
+// HandlerPool returns the pool the protocols served on the engine run their
+// request handlers on, away from the goroutine that reads the connection.
+//
+// Where the rounds run on the pollers (see RoundsOnPollers), it is the
+// engine's pool of workers, the one Connection.SetRunOnWorkers asks for: the
+// requests handed to it are framed on the loops, which are not its workers,
+// so no worker waits on its own queue, and the one pool serves every
+// protocol.
+// Otherwise the engine's workers read the connections themselves, and the
+// handlers run on a pool apart from theirs, "<Name>-streams", for the reason
+// package internal/streampool gives. It returns nil once the engine has
+// closed, and the caller then runs the handler itself.
+func (e *Engine) HandlerPool() *taskpool.TaskPool {
+	root := e.root()
+	if root.RoundsOnPollers() {
+		pool, _ := root.workerPool().(*taskpool.TaskPool)
+		return pool
+	}
+	sizing := DefaultStreamPoolSizing(taskpool.ModeAdaptive)
+	return streampool.Get(root.name, sizing.WorkerCount, sizing.MaxEvents)
+}
+
 // root is the engine the application created: this one, or the one this
 // poller serves.
 func (e *Engine) root() *Engine {
@@ -442,12 +487,17 @@ func (e *Engine) runReady(ready []*Connection, tasks []taskpool.Task) ([]*Connec
 			ready, tasks, yield = e.submitToWorkers(ready, tasks)
 		}
 		if e.inlineHandlers {
+			e.setInRound(true)
 			for _, c := range ready {
 				c.process()
 			}
 		} else if len(ready) > 0 {
+			e.setInRound(e.inlineTasks)
 			tasks = e.submitReady(e.taskPool, ready, tasks[:0])
 			yield = yield || !e.inlineTasks
+		}
+		if e.submitHandlerTasks() {
+			yield = true
 		}
 		if yield {
 			// The workers just woken wait on this goroutine's P, and the loop
@@ -467,6 +517,40 @@ func (e *Engine) runReady(ready []*Connection, tasks []taskpool.Task) ([]*Connec
 		ready = ready[:0]
 	}
 	return ready, tasks
+}
+
+// setInRound marks the loop as running its round's connections itself, or
+// not; see Connection.GoHandler.
+func (e *Engine) setInRound(on bool) {
+	e.handlerMu.Lock()
+	e.inRound = on
+	e.handlerMu.Unlock()
+}
+
+// submitHandlerTasks ends the round's run on the loop and hands the handler
+// pool, together, the tasks the round's connections gave it, and reports
+// whether there were any. A pool that has stopped taking work leaves the
+// rest to run here, which only an engine that is closing does.
+func (e *Engine) submitHandlerTasks() bool {
+	e.handlerMu.Lock()
+	e.inRound = false
+	batch := e.handlerTasks
+	e.handlerTasks = e.handlerSpare[:0]
+	e.handlerMu.Unlock()
+	if len(batch) == 0 {
+		e.handlerSpare = batch
+		return false
+	}
+	n := 0
+	if pool := e.root().HandlerPool(); pool != nil {
+		n = pool.GoTasks(batch)
+	}
+	for _, task := range batch[n:] {
+		task.RunTask()
+	}
+	clear(batch)
+	e.handlerSpare = batch[:0]
+	return true
 }
 
 // submitToWorkers hands the connections of a round that asked for workers to

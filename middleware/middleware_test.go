@@ -5,6 +5,7 @@ package middleware_test
 import (
 	stdhttp "net/http"
 	"strings"
+	"sync"
 	"testing"
 
 	fibhttp "github.com/lesismal/fib/http"
@@ -15,11 +16,18 @@ import (
 // TestChainOrder checks that the first middleware is outermost: it sees the
 // request first and the response last.
 func TestChainOrder(t *testing.T) {
-	var seen []string
+	// The handlers run on the server's goroutines, which the response the
+	// test reads orders nothing with, so seen is shared under a lock.
+	var (
+		mu   sync.Mutex
+		seen []string
+	)
 	mark := func(name string) middleware.Middleware {
 		return func(next fibhttp.Handler) fibhttp.Handler {
 			return fibhttp.HandlerFunc(func(c *fibhttp.Context, r *stdhttp.Request) {
+				mu.Lock()
 				seen = append(seen, name)
+				mu.Unlock()
 				c.OnHeader(func(_ int, h stdhttp.Header) { h.Add("X-Seen", name) })
 				next.ServeHTTP(c, r)
 			})
@@ -31,7 +39,10 @@ func TestChainOrder(t *testing.T) {
 	url := mwtest.Serve(t, handler)
 	c := mwtest.Clients(t)[0]
 	resp, _ := c.Do(t, "GET", url, nil, "")
-	if got := strings.Join(seen, ","); got != "a,b" {
+	mu.Lock()
+	got := strings.Join(seen, ",")
+	mu.Unlock()
+	if got != "a,b" {
 		t.Errorf("requests went through %s, want a,b", got)
 	}
 	if got := strings.Join(resp.Header["X-Seen"], ","); got != "b,a" {

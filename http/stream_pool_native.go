@@ -15,18 +15,16 @@ import (
 // the goroutines that read its connections. Each connection keeps a
 // StreamGate of its own and passes it to Run for every request.
 //
-// The handlers run on the stream pool of the engine the connection came
-// from, one for each engine name, so a server whose connections come from
-// engines of different names runs each one's handlers on that name's pool.
+// The handlers run on the handler pool of the engine the connection came
+// from (see fib.Engine.HandlerPool): the engine's own pool of workers when
+// its rounds run on its pollers, and otherwise the stream pool of its name,
+// "<Name>-streams", so a server whose connections come from several engines
+// runs each one's handlers on that engine's pool.
 //
 // A nil *StreamPool runs every request on the calling goroutine, which is
 // what NewStreamPool returns for a configuration that asks for no pool, so
 // a server never has to test for one.
 type StreamPool struct {
-	// fallback and queueSize size an engine name's pool when it is built
-	// before any engine of that name asks for a ceiling.
-	fallback  int
-	queueSize int
 	// limit is StreamPoolConfig.MaxConcurrentHandlers.
 	limit int
 }
@@ -37,23 +35,28 @@ func NewStreamPool(config StreamPoolConfig) *StreamPool {
 	if config.Disable || config.MaxConcurrentHandlers == 1 {
 		return nil
 	}
-	sizing := fib.DefaultStreamPoolSizing(taskpool.ModeAdaptive)
-	return &StreamPool{fallback: sizing.WorkerCount, queueSize: sizing.MaxEvents,
-		limit: config.MaxConcurrentHandlers}
+	return &StreamPool{limit: config.MaxConcurrentHandlers}
 }
 
 // poolFor returns the pool conn's requests run on, looking it up the first
-// time the connection asks and keeping it on gate after that. A request with
-// no connection runs on the pool of DefaultName.
+// time the connection asks and keeping it on gate after that. It is nil once
+// the engine has closed, and the request is then served by its reader.
 func (p *StreamPool) poolFor(gate *StreamGate, conn *fib.Connection) *taskpool.TaskPool {
 	if gate.pool == nil {
-		engine := fib.DefaultName
-		if conn != nil {
-			engine = conn.Engine().Name()
-		}
-		gate.pool = streampool.Get(engine, p.fallback, p.queueSize)
+		gate.pool = handlerPool(conn)
 	}
 	return gate.pool
+}
+
+// handlerPool is the pool the handlers of conn's requests run on; see
+// fib.Engine.HandlerPool. A request with no connection runs on the stream
+// pool of DefaultName.
+func handlerPool(conn *fib.Connection) *taskpool.TaskPool {
+	if conn != nil {
+		return conn.Engine().HandlerPool()
+	}
+	sizing := fib.DefaultStreamPoolSizing(taskpool.ModeAdaptive)
+	return streampool.Get(fib.DefaultName, sizing.WorkerCount, sizing.MaxEvents)
 }
 
 // StreamGate is one connection's share of a StreamPool: it counts the
@@ -135,7 +138,10 @@ func (p *StreamPool) Submit(b *StreamBatch) {
 	if len(b.tasks) == 0 {
 		return
 	}
-	n := b.pool.GoTasks(b.tasks)
+	n := 0
+	if b.pool != nil {
+		n = b.pool.GoTasks(b.tasks)
+	}
 	for _, task := range b.tasks[n:] {
 		// The pool has stopped taking work; the request is served here.
 		task.(*streamTask).run()
@@ -168,7 +174,7 @@ func (p *StreamPool) admit(gate *StreamGate) bool {
 
 // submit hands an admitted request to pool.
 func (p *StreamPool) submit(pool *taskpool.TaskPool, task *streamTask) {
-	if !pool.GoTask(task) {
+	if pool == nil || !pool.GoTask(task) {
 		// The pool has stopped taking work; the request is served here.
 		task.run()
 	}
@@ -207,4 +213,17 @@ func (t *streamTask) run() {
 		return
 	}
 	serveRequest(t.handler, t.context)
+}
+
+// runOnStreams runs fn on the pool conn's request handlers run on (see
+// handlerPool), or here once that pool has stopped taking work. It carries
+// the body callbacks that no read of the connection will: a body already
+// here when OnBody is called away from its handler, a body read on an event
+// loop, and a body whose request has ended under it — a connection closing,
+// which may be reported on the event loop, or a stream reset. Those never
+// get a goroutine of their own.
+func runOnStreams(conn *fib.Connection, fn func()) {
+	if pool := handlerPool(conn); pool == nil || !pool.Go(fn) {
+		fn()
+	}
 }

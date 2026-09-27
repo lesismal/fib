@@ -114,37 +114,40 @@ func (p *udpPeerConn) SetReadDeadline(time.Time) error  { return nil }
 func (p *udpPeerConn) SetWriteDeadline(time.Time) error { return nil }
 
 // startUDPSweeper closes peers that have been silent for the idle timeout,
-// until the engine stops.
+// until the engine stops. A timer does the sweeping, and arms itself again
+// after each sweep, so nothing waits on it in between.
 func (e *Engine) startUDPSweeper() {
 	if len(e.udpListeners) == 0 || e.udpIdleTimeout <= 0 {
 		return
 	}
-	go func() {
-		ticker := time.NewTicker(udpSweepInterval(e.udpIdleTimeout))
-		defer ticker.Stop()
-		for {
-			select {
-			case <-e.stopped:
-				return
-			case <-ticker.C:
-			}
-			limit := int64(e.udpIdleTimeout)
-			now := time.Now().UnixNano()
-			var idle []*Connection
-			for _, l := range e.udpListeners {
-				l.mu.Lock()
-				for _, c := range l.peers {
-					if now-c.udpActive.Load() >= limit {
-						idle = append(idle, c)
-					}
-				}
-				l.mu.Unlock()
-			}
-			for _, c := range idle {
-				c.closeWithError(ErrUDPIdleTimeout)
+	interval := udpSweepInterval(e.udpIdleTimeout)
+	time.AfterFunc(interval, func() { e.sweepUDP(interval) })
+}
+
+// sweepUDP closes the peers that have been silent for the idle timeout, and
+// arms the next sweep.
+func (e *Engine) sweepUDP(interval time.Duration) {
+	select {
+	case <-e.stopped:
+		return
+	default:
+	}
+	limit := int64(e.udpIdleTimeout)
+	now := time.Now().UnixNano()
+	var idle []*Connection
+	for _, l := range e.udpListeners {
+		l.mu.Lock()
+		for _, c := range l.peers {
+			if now-c.udpActive.Load() >= limit {
+				idle = append(idle, c)
 			}
 		}
-	}()
+		l.mu.Unlock()
+	}
+	for _, c := range idle {
+		c.closeWithError(ErrUDPIdleTimeout)
+	}
+	time.AfterFunc(interval, func() { e.sweepUDP(interval) })
 }
 
 // LocalUDPAddrs returns one address per UDP listener, in configured order.
