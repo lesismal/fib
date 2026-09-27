@@ -1265,9 +1265,10 @@ Windows 上忽略这个配置，保持单个循环和原来的 task pool）。`D
   echo/s、约 15% 的 CPU 空闲，改到 worker 上是 45.1 万。被包装的 handler 可以在自己的
   `OnOpen` 或之后改回 `false`：TLS 上的 HTTP/2 就是这样做的，设置 `ReadOnPollers` 时 TLS 上
   的 HTTP/1 服务端连接也是（解密在 poller 上，handler 在 worker 池上）。
-- WebSocket 连接不调用 `SetRunOnWorkers`，跟随 Engine 的配置：开启 IOPollers 时消息在 poller
-  上用 Inline 池处理，否则用 worker 池。所以开启 IOPollers 时 WebSocket 的消息回调同样不能阻塞。
-  TLS 上的 WebSocket（wss）由 `tls` 放到 worker 上。
+- WebSocket 服务端连接与 HTTP/1 一样默认 `SetRunOnWorkers(true)`，每一轮（读、分帧、消息回调、
+  写）都在 worker 池上完成。设置 `websocket.Config.ReadOnPollers` 后改为 `SetRunOnWorkers(false)`，
+  读、分帧和消息回调都在 poller 的事件循环上执行（wss 的解密也在 poller 上），这时消息回调不能阻塞。
+  WebSocket client 连接不调用 `SetRunOnWorkers`，跟随 Engine 的配置。
 - `MaxPendingBytes` 仍是整个 Engine（含所有 poller）的总预算；一个 poller 上的连接把预算
   释放到恢复线以下时，会唤醒其他因预算暂停了连接的 poller。`Stats()` 汇总所有 poller 的计数，
   `Connection.Engine()` 返回的仍是用户创建的那个 Engine。

@@ -32,7 +32,18 @@ type Config struct {
 	// 7692). Messages are then sent compressed, and a client may send its own
 	// compressed. MaxMessageBytes bounds a message once decompressed.
 	EnableCompression bool
-	HTTP              epollhttp.Config
+	// ReadOnPollers has a connection read, its frames parsed and its
+	// callbacks run on its poller's loop where the engine runs rounds on its
+	// pollers (see fib.Config.IOPollers and fib.Engine.RoundsOnPollers), so
+	// a callback that blocks holds up every connection on that loop.
+	//
+	// It is off by default, and a connection then runs its whole round — the
+	// read, the parse, the callbacks and the write — on the engine's pool of
+	// workers, as an HTTP/1 connection does (see http.Config.ReadOnPollers)
+	// and as it does without pollers. Over the tls package it also has the
+	// decryption done on the loop.
+	ReadOnPollers bool
+	HTTP          epollhttp.Config
 }
 
 func DefaultConfig() Config {
@@ -355,13 +366,12 @@ func NewHandlerWithConfig(config Config, handler Handler) *ServerHandler {
 	return h
 }
 
-// OnOpen leaves the connection on whichever pool the engine's configuration
-// gives it, inline or not: unlike the http package's HTTP/1 connections, a
-// WebSocket connection does not ask for workers (see
-// fib.Connection.SetRunOnWorkers), so under Config.IOPollers its messages are
-// handled on its poller and a handler that blocks holds that poller up. Over
-// the tls package, which does ask for workers, they are handled on workers.
+// OnOpen has the connection's rounds run on the engine's pool of workers (see
+// fib.Connection.SetRunOnWorkers), from the read to the write, as the http
+// package's HTTP/1 connections do, unless Config.ReadOnPollers keeps them on
+// its poller's loop.
 func (h *ServerHandler) OnOpen(c *fib.Connection) {
+	c.SetRunOnWorkers(!(h.config.ReadOnPollers && c.Engine().RoundsOnPollers()))
 	c.SetAttachment(&connectionState{})
 }
 
