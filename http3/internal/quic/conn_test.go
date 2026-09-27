@@ -781,7 +781,17 @@ func TestExpectedWritesArePacked(t *testing.T) {
 	for _, id := range ids {
 		waitFinished(t, p.clientH, id)
 	}
-	if sent := sends(); len(sent) > requests/2 {
+	// Only the datagrams carrying answers count: acknowledgements of requests
+	// that arrive spread out, as on Windows whose timers are coarser than
+	// flushHold, may leave on their own before the burst is complete.
+	sent := sends()
+	answers := 0
+	for _, n := range sent {
+		if n >= 100 {
+			answers++
+		}
+	}
+	if answers > requests/2 {
 		t.Fatalf("%d answers of 600 bytes left in %v", requests, sent)
 	}
 }
