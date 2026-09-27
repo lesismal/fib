@@ -423,7 +423,7 @@ func createListener(config Config, addr string) (*winListener, error) {
 		_ = syscall.SetsockoptInt(fd, syscall.IPPROTO_IPV6, syscall.IPV6_V6ONLY, v6only)
 	}
 	if err = syscall.Bind(fd, bound); err == nil {
-		err = syscall.Listen(fd, config.Backlog)
+		err = syscall.Listen(fd, listenBacklog(config.Backlog))
 	}
 	if err != nil {
 		syscall.Closesocket(fd)

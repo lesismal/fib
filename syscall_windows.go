@@ -118,6 +118,18 @@ func newDatagramSocket(family int) (syscall.Handle, error) {
 
 func defaultBacklog() int { return syscall.SOMAXCONN }
 
+// listenBacklog is what listen is told for a backlog. SOMAXCONN leaves the
+// depth to Winsock, a couple of hundred on many versions, and a connection
+// burst beyond it is refused outright; SOMAXCONN_HINT(n), a negative n, asks
+// for n itself, which Winsock keeps between 200 and 65535.
+func listenBacklog(backlog int) int {
+	const hintMax = 65535
+	if backlog <= 200 {
+		return backlog
+	}
+	return -min(backlog, hintMax)
+}
+
 func isWouldBlock(err error) bool { return err == wsaEWOULDBLOCK }
 
 // wsaBufs fills bufs from the non-empty slices in data and reports how many it
