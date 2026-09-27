@@ -7,7 +7,12 @@
   上（见下）；关闭后只有一个 event loop。
 - connection 是本地 `taskpool.TaskPool` 的任务单位。TaskPool 使用常驻、有界
   worker，避免短事件触发大量 goroutine 创建和栈扩容；connection 不与某个
-  worker 固定绑定。
+  worker 固定绑定。事件循环只等事件、把变为可执行的连接交给 worker，从不自己执行
+  连接的一轮（读、`OnData`、`OnClose`），开不开 `IOPollers` 都一样。唯一的例外是多个 peer
+  共用的 UDP socket：由事件循环读取、按对端地址分给各连接的队列，`OnData` 仍在 worker 上
+  执行。实测把这个读取也交给 worker 更慢：3 个 CPU、50 个端口、1000 个连接的 HTTP/3，
+  multiplex 27.0 万请求/s 对 loop 读取的 28.9 万，开 ReusePort 时 echo 34.9 万对 37.2 万，
+  内存还多约 15%。
 - 每个 connection 有 FIFO 事件队列；同一 connection 串行执行，不同 connection 动态负载均衡。
 - ET 读写均排空到 `EAGAIN`；仅发送队列非空时关注 `EPOLLOUT`。
 - 每轮事件处理先 flush 发送队列，再读 OOB，再读普通数据；发送队列仍有数据时跳过读取，并把可读状态保留到下一轮，待可写事件清空队列后再读，既限制用户态缓冲又不会漏读。
@@ -17,8 +22,9 @@
   队列，按 worker 数分片）、`taskpool.ModeElastic`（nbio 风格的弹性
   fork/dispatcher）或 `taskpool.ModeAdaptive`（见下，所有后端的默认值，
   `taskpool.New` 也默认使用它）。`taskpool.ModeInline`（`taskpool.NewInline`）
-  不起 worker，也没有队列，直接在提交任务的 goroutine 上带 recover 执行，开启
-  `IOPollers` 时 Engine 自己的池就是这种（见下）。
+  不起 worker，也没有队列，直接在提交任务的 goroutine 上带 recover 执行；它只作为
+  独立的库功能保留，Engine 不接受它（`TaskPoolMode` 设为 `ModeInline`，或 `SetTaskPool`
+  传入 inline 池，`Bind` 都会报错），因为那样连接的一轮会在事件循环上执行。
 - `taskpool.ModeAdaptive` 同样分片，但常驻数量随负载在下限和上限之间变化，调度方式
   也不同：
   - 唤醒：每个空闲 worker 有自己的唤醒通道，按后进先出压在空闲栈上，被唤醒的总是
@@ -82,9 +88,8 @@
   余量，不会触发背压（`TestPingPongUnderWatermarkNeverPausesReads` 固定了这一点）。
 - `Config.Name` 是 Engine 的名字（`Engine.Name()`），未设置时为 `fib.DefaultName`
   即 `"fib"`。它出现在 Engine 启动（`Run`）时打印的日志里，也决定了协程池的名字：
-  Engine 自己的协程池叫 `<Name>-workers`；不开 IOPollers 时，HTTP/2 与 HTTP/3 的
-  handler 协程池叫 `<Name>-streams`（开启时 handler 直接用 `<Name>-workers`，见
-  IOPollers 一节）。另外还有两个进程级、与所有 Engine 分开的辅助协程池，第一次用到时
+  Engine 自己的协程池叫 `<Name>-workers`；HTTP/2 与 HTTP/3 的 handler 协程池叫
+  `<Name>-streams`。另外还有两个进程级、与所有 Engine 分开的辅助协程池，第一次用到时
   才创建、下限为 0：`fib-client` 负责 client 侧的异步工作（Dial 的 DNS 解析，HTTP 与
   WebSocket client 的完成回调），`fib-tls-handshake` 负责 TLS 握手。
 - `SharedTaskPool` 默认开启；同一进程内**同名**的多个 Engine 共享 worker 和任务队列，
@@ -699,9 +704,7 @@ server, err := fib.Bind(config, fibtls.NewServer(tlsConfig, fibhttp.NewHandler(h
 - handler 协程池：请求收齐后不在读取该连接的协程上执行，而是交给 Engine 的 handler
   协程池（`Engine.HandlerPool`），因此同一连接上并发到达的请求是并发处理的，阻塞的
   handler 只拖累它自己。用法由 `Config.StreamPool` 配置（`http.StreamPoolConfig`）。
-  开启 IOPollers 时连接在 poller 的事件循环上读和解析，handler 协程池就是 Engine 的
-  `<Name>-workers`（HTTP/1 的 handler 在 `ReadOnPollers` 下也用它）：往里提交请求的是
-  事件循环，不是它的 worker，不存在自己等自己的队列。不开 IOPollers 时连接由 Engine 的 worker 读和解析，handler 协程池是单独的
+  连接由 Engine 的 worker 读和解析，handler 协程池是单独的
   `<Name>-streams`（默认 `fib-streams`），由连接来自该名字 Engine 的所有 HTTP/2 与
   HTTP/3 server 共用，同名的最后一个 Engine 关闭后停止，且永远不是 Engine 的协程池：
   Engine 的 worker 解析出请求后要往这个池提交，若两者是同一个池，队列满时所有 worker
@@ -826,7 +829,7 @@ resp, err := client.Go(req).Wait() // Future：Wait 阻塞，Done() 可用于 se
   会在新连接上自动重试一次；其他方法直接返回错误。
 - 回调可能在任意 goroutine 上执行：成功的响应在读取它的 worker 上回调，超时和取消在
   定时器 goroutine 上，连接失败在 `fib-client` 协程池上，`Do` 立即拒绝的请求在调用方
-  goroutine 上。回调不要长时间阻塞；开启 `InlineHandlers` 时成功回调会在事件循环上执行。
+  goroutine 上。回调不要长时间阻塞。
 - `Do` 会在调用方 goroutine 里读完 `req.Body`。
 - 先 `client.Close()` 再关闭 Engine：`Close` 让排队中的请求以 `ErrClientClosed` 失败，
   已发出的请求照常完成；直接关闭 Engine 不会通知 client，已发出的请求只能等超时。
@@ -1194,30 +1197,21 @@ runtime.GOMAXPROCS(2 * runtime.NumCPU())
 需要注意 `runtime.NumCPU()` 取的是本进程的 CPU 亲和性掩码，被 taskset 或 cpuset 限制时它已经
 是实际可用的核数。
 
-## InlineHandlers
-
-`Config.InlineHandlers` 让事件循环直接执行连接的这一轮处理，不再交给工作协程。省掉这次交接
-在高消息速率下很可观：同一压测里 echo 446k/s 对 395k/s，建连 104k/s 对 95k/s。
-
-代价是 handler 会阻塞它所在的整个 server —— 在它返回之前，事件循环无法收事件、无法 accept、
-也无法服务这个 server 上的其他连接。只有在所有 handler 都很短且不会阻塞时才开启；会做 I/O、
-抢锁或执行不定长工作的 handler 应该继续走工作协程池，这个池存在的意义正是让一条慢连接不拖住其他连接。
-
 ## IOPollers
 
 `Config.IOPollers` 把一个 Engine 拆到多个事件循环上（仅 Linux 的 epoll 和 macOS 的 kqueue；
-Windows 上忽略这个配置，保持单个循环和原来的 task pool）。`DefaultConfig()` 默认开启；
-设为 `false` 时 listener 和连接都在同一个 event loop 上，每条连接的每一轮都在 worker 池上执行：
+Windows 上忽略这个配置，保持单个循环）。`DefaultConfig()` 默认开启；设为 `false` 时 listener
+和连接都在同一个 event loop 上。开不开都一样，事件循环只等事件、把变为可执行的连接交给
+Engine 的 worker 池（`<Name>-workers`），每条连接的每一轮都在 worker 上执行：
 
 - Engine 自己的循环只负责 accept 和它的 UDP socket；每条 accept 到的连接按 `fd % pollerCount`
   交给其中一个 poller，此后由那个 poller 负责它的事件注册、读写和关闭。poller 数量由
   `Config.IOPollerCount` 指定，不大于 0（默认）时取 `runtime.NumCPU()`。
-  每 CPU 一个 poller 适合连接的每一轮都在 poller 上执行（Inline）的负载；如果连接的每一轮都交给
-  worker（`SetRunOnWorkers(true)`，见下），`IOPollerCount` 应该设小（1 个或几个）。这时 poller 只负责等事件、
-  交给 worker，一个就够用，多出来的 poller 会和 worker 抢同样的 P：每一轮结束后 poller 都要
-  让出 P 给刚唤醒的 worker，再排在它们后面等 P，于是每轮收集到的连接更少、请求被读到得更晚。
-  实测 3 个 CPU、1 万连接、每一轮都在 worker 上的 HTTP/1 echo：不开 IOPollers 583k 请求/s，
-  1 个 poller 584k，3 个 poller 569k，p99 从 25ms 升到 37ms。
+  poller 只负责等事件、交给 worker，一个就能应付很多连接，多出来的 poller 会和 worker 抢同样
+  的 P：每一轮结束后 poller 都要让出 P 给刚唤醒的 worker，再排在它们后面等 P，于是每轮收集到的
+  连接更少、请求被读到得更晚。实测 3 个 CPU、1 万连接的 HTTP/1 echo：不开 IOPollers 583k
+  请求/s，1 个 poller 584k，3 个 poller 569k，p99 从 25ms 升到 37ms。poller 自己的工作（accept、
+  注册连接、被唤醒）成为瓶颈时，多开 poller 才划算。
 - Linux 上同时设置 `Config.ReusePort` 时，accept 也移到 poller 上：每个 poller 在 Engine 的地址上
   用 `SO_REUSEPORT` 监听一个自己的 socket，自己 accept 内核按连接地址哈希分给它的连接；
   Engine 自己的 socket 只 bind（占住地址和内核选的端口）不 listen。不设置时 Engine 自己的循环
@@ -1236,49 +1230,11 @@ Windows 上忽略这个配置，保持单个循环和原来的 task pool）。`D
   限制：组里的 socket 一变（例如同一用户的其他进程 bind 同一地址）哈希就变，部分对端会换到别的
   socket；对端地址变了（NAT 重绑定）会被当成新的对端。HTTP/3 按 Connection ID 把新地址的包
   找回原来的 QUIC 连接，不管新地址落在哪个 poller 上，连接都会跟过去。
-- 开启后 Engine 自己的 task pool 固定为 `taskpool.ModeInline`（名为 `<Name>-inline`）：
-  每个 poller 在自己的 goroutine 上直接执行它那些连接的这一轮处理，handler panic 会被
-  recover 并关闭该连接。和 `InlineHandlers` 一样，阻塞的回调会卡住同一个 poller 上的
-  所有连接。通过 `SetTaskPool` 传入的池不受影响，仍在它上面执行每一轮。
-- Engine 的 worker 池（`TaskPoolMode`、`WorkerCount`、`SharedTaskPool` 描述的那个，
-  `<Name>-workers`）第一次被用到时才创建，负责把可能耗时的工作从 poller 上挪走。协议在
-  poller 上读和解析，把请求的 handler 交给 `Engine.HandlerPool()`，开启 IOPollers 时它就是
-  这个 worker 池（`Engine.RoundsOnPollers()` 报告是否处于这种模式）。
-- 每一轮本身就可能耗时的连接调用 `Connection.SetRunOnWorkers(true)`，它的每一轮（读、
-  `OnData`、`OnClose`）就改在这个 worker 池上执行。Engine 本来就在 worker 上执行时这个
-  设置不起作用；`InlineHandlers` 和 `ModeInline` 下同样有效。
-- http 子 package 的服务端，开启 IOPollers 时：
-  - HTTP/1 连接默认 `SetRunOnWorkers(true)`，每一轮（读、解析、handler、写）都在 worker 池
-    上完成，与不开 IOPollers 时一样。一轮交给 worker 一次，读、handler、写在同一个 goroutine
-    上、写合并成一次：3 个 CPU、1 万连接的 HTTP/1 echo，这样是 54~58 万请求/s、内存 34MB，
-    下面的 `ReadOnPollers` 是 41~44 万、56~63MB；pipeline 两者都到客户端上限 200 万/s，但
-    `ReadOnPollers` 的 CPU 更高、内存 170~210MB 对 35MB（handler 运行时后面流水线过来的数据
-    要先缓存）。
-  - 设置 `http.Config.ReadOnPollers` 后，HTTP/1 连接改为 `SetRunOnWorkers(false)`，在 poller
-    的事件循环上读和解析，handler 交给 Engine 的 worker 池：事件循环一轮解析出的请求通过
-    `Connection.GoHandler` 在这一轮结束时一次性提交给 worker 池（一次提交、一起唤醒，随后
-    让出 P），然后继续读这条连接；handler 在 worker 上运行时，后面流水线（pipelining）过来的
-    请求先缓存在连接里，handler 返回、响应写出后，由这个 worker 接着按顺序处理已经缓存的
-    请求，所以响应顺序不变；这期间连接处于 `Connection.Cork` 状态，这些响应最后一次写出。缓存的部分达到 `StreamRequestBodyBuffer`（默认 256 KiB）时
-    连接暂停读 socket，由 TCP 流控给客户端限速，请求结束后恢复。事件循环从不在 handler
-    上等待：解析时持有的连接锁在 handler 运行时已经释放。流式请求 body 同样在事件循环上
-    读，交给回调时走 worker 池。
-  - HTTP/2（preface、ALPN `h2`、h2c upgrade）和 HTTP/3 在 Engine 自己的池（Inline）上读和
-    解析，请求交给同一个 worker 池（`Engine.HandlerPool()`）。
-  - 不开 IOPollers（单个事件循环）时，HTTP/1 连接 `SetRunOnWorkers(true)`，读、解析、handler
-    都在 worker 上完成；HTTP/2/3 在 worker 上读和解析，handler 交给单独创建的
-    `<Name>-streams`，不与 Engine 的协程池共用。
-  - HTTP/1 client 连接仍 `SetRunOnWorkers(true)`。
-- `tls` 子 package 的连接在 `OnOpen` 里、调用被包装 handler 的 `OnOpen` 之前先
-  `SetRunOnWorkers(true)`：解密和加密是 TLS 连接每一轮里最贵的工作，放在 poller 上会让同一个
-  poller 的连接排队逐条解密。3 个 CPU、1 万连接的 TLS echo，在 3 个 poller 上执行时 40.4 万
-  echo/s、约 15% 的 CPU 空闲，改到 worker 上是 45.1 万。被包装的 handler 可以在自己的
-  `OnOpen` 或之后改回 `false`：TLS 上的 HTTP/2 就是这样做的，设置 `ReadOnPollers` 时 TLS 上
-  的 HTTP/1 服务端连接也是（解密在 poller 上，handler 在 worker 池上）。
-- WebSocket 服务端连接与 HTTP/1 一样默认 `SetRunOnWorkers(true)`，每一轮（读、分帧、消息回调、
-  写）都在 worker 池上完成。设置 `websocket.Config.ReadOnPollers` 后改为 `SetRunOnWorkers(false)`，
-  读、分帧和消息回调都在 poller 的事件循环上执行（wss 的解密也在 poller 上），这时消息回调不能阻塞。
-  WebSocket client 连接不调用 `SetRunOnWorkers`，跟随 Engine 的配置。
+- http 子 package：HTTP/1 连接的每一轮（读、解析、handler、写）都在同一个 worker 上完成，写合并
+  成一次；HTTP/2（preface、ALPN `h2`、h2c upgrade）和 HTTP/3 在 worker 上读和解析，请求的
+  handler 交给 `<Name>-streams`（`Engine.HandlerPool()`），不与 Engine 的协程池共用。
+- `tls` 子 package 的解密和加密、WebSocket 的分帧和消息回调，同样都在连接的一轮里、在 worker
+  上执行，一个阻塞的回调只拖住它自己的连接。
 - `MaxPendingBytes` 仍是整个 Engine（含所有 poller）的总预算；一个 poller 上的连接把预算
   释放到恢复线以下时，会唤醒其他因预算暂停了连接的 poller。`Stats()` 汇总所有 poller 的计数，
   `Connection.Engine()` 返回的仍是用户创建的那个 Engine。
@@ -1289,7 +1245,7 @@ config.IOPollerCount = 0      // runtime.NumCPU() 个
 config.ReusePort = true       // Linux：每个 poller 自己 accept
 
 single := fib.DefaultConfig()
-single.IOPollers = false // 单个 event loop + worker 池
+single.IOPollers = false // 单个 event loop，同样把每一轮交给 worker 池
 ```
 
 ## OnClose 的顺序

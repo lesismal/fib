@@ -119,32 +119,7 @@ type Config struct {
 	// handler slower than its client is paid for by TCP flow control rather
 	// than by memory here. Zero means DefaultStreamRequestBodyBuffer. An
 	// HTTP/2 body is bounded by its stream's window instead.
-	//
-	// It bounds as well what an HTTP/1 connection read on an event loop
-	// buffers behind a request whose handler is running, the requests a
-	// client pipelines after it; see ReadOnPollers.
 	StreamRequestBodyBuffer int
-	// ReadOnPollers has an HTTP/1 connection read and parsed on its poller's
-	// loop where the engine runs rounds on its pollers (see
-	// fib.Config.IOPollers and fib.Engine.RoundsOnPollers), and only its
-	// handlers run on the engine's pool of workers, one request at a time:
-	// the loop hands the requests its round parsed to the pool together
-	// (see fib.Connection.GoHandler), and the worker that serves one goes on
-	// to those pipelined behind it and writes their responses together.
-	//
-	// It is off by default, and an HTTP/1 connection then runs its whole
-	// round — the read, the parse, the handler and the write — on a worker,
-	// as it does without pollers. That hands the worker one task per round
-	// instead of one per request, and keeps the read, the handler and the
-	// write on one goroutine: an HTTP/1 echo over 10k connections on three
-	// CPUs measured 540k to 575k requests/s that way against 410k to 445k
-	// with this set, and with more memory, 34MB against 56MB to 63MB. A
-	// pipelined load ran at the client's 2M requests/s either way, but with
-	// this set at more CPU and with 170MB to 210MB against 35MB, since what a
-	// client pipelines behind a running handler is buffered until it
-	// returns. HTTP/2 and HTTP/3 read on the loop and run their handlers on
-	// the pool of workers either way.
-	ReadOnPollers bool
 	// DisableHTTP2 serves HTTP/1 only. Otherwise a connection that opens with
 	// the HTTP/2 preface, over TLS after ALPN chose "h2" or in cleartext with
 	// prior knowledge, is served as HTTP/2.

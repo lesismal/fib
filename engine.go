@@ -98,7 +98,6 @@ type Engine struct {
 	logStatus          bool
 	maxEvents          int
 	useWritev          bool
-	inlineHandlers     bool
 	writeHighWatermark int
 	writeLowWatermark  int
 	maxPendingBytes    int64
@@ -139,27 +138,9 @@ type Engine struct {
 	redeliver       []*Connection
 	taskPool        TaskPool
 	releaseTaskPool func()
-	// inlineTasks says taskPool runs tasks on the loop that submits them.
-	inlineTasks bool
-	// workers is the pool of workers connections that ask for one run on
-	// while the engine's own rounds run on its loops; see workerPool. The
-	// application's engine keeps it for its pollers too.
-	workers workerPool
-	// offload collects a round's connections bound for workers. Event-loop
-	// ownership.
-	offload []*Connection
-	// handlerMu guards inRound, which says the loop is running its round's
-	// connections itself, and handlerTasks, the tasks they handed the
-	// handler pool meanwhile, which the round's end submits together; see
-	// Connection.GoHandler. handlerSpare is the list swapped in while they
-	// are submitted.
-	handlerMu      sync.Mutex
-	inRound        bool
-	handlerTasks   []taskpool.Task
-	handlerSpare   []taskpool.Task
-	taskWG         sync.WaitGroup
-	readBufferSize int
-	closeOnce      sync.Once
+	taskWG          sync.WaitGroup
+	readBufferSize  int
+	closeOnce       sync.Once
 	// udpListeners are the engine's UDP sockets, when Config.Network names
 	// UDP. udpIdleTimeout closes their silent peers, and udpSweep is the
 	// timer that has the loop check for them, nil once it has been stopped.
@@ -250,7 +231,7 @@ func newEngine(config Config, handler Handler, addrs []string) (*Engine, error) 
 	}
 
 	e := &Engine{name: engineName(config), logStatus: config.LogStatus, maxEvents: config.MaxEvents,
-		useWritev: config.UseWritev, inlineHandlers: config.InlineHandlers,
+		useWritev:          config.UseWritev,
 		writeHighWatermark: config.WriteBufferHighWatermark,
 		// Resume at a quarter of the budget rather than at the budget itself,
 		// so recovery admits a useful amount of work instead of re-pausing on
@@ -279,11 +260,7 @@ func newEngine(config Config, handler Handler, addrs []string) (*Engine, error) 
 		pendingTotal:   new(atomic.Int64),
 		handler:        handler}
 	e.readBufferSize = config.ReadBufferSize
-	e.workers.config = config
 	e.taskPool, e.releaseTaskPool = acquireTaskPool(config)
-	if pool, ok := e.taskPool.(*taskpool.TaskPool); ok {
-		e.inlineTasks = pool.Mode() == taskpool.ModeInline
-	}
 	if err := e.open(config, addrs); err != nil {
 		e.releaseTaskPool()
 		return nil, err
@@ -306,11 +283,11 @@ func (e *Engine) openPollers(config Config) error {
 	n := pollerCount(config)
 	for i := 0; i < n; i++ {
 		p := &Engine{parent: e, name: e.name, logStatus: e.logStatus, maxEvents: e.maxEvents, useWritev: e.useWritev,
-			inlineHandlers: e.inlineHandlers, writeHighWatermark: e.writeHighWatermark,
-			writeLowWatermark: e.writeLowWatermark, maxPendingBytes: e.maxPendingBytes,
+			writeHighWatermark: e.writeHighWatermark,
+			writeLowWatermark:  e.writeLowWatermark, maxPendingBytes: e.maxPendingBytes,
 			budgetResumeBytes: e.budgetResumeBytes, sendBufferSize: e.sendBufferSize,
 			udpIdleTimeout: e.udpIdleTimeout, pendingTotal: e.pendingTotal, handler: e.handler,
-			taskPool: e.taskPool, releaseTaskPool: func() {}, inlineTasks: e.inlineTasks,
+			taskPool: e.taskPool, releaseTaskPool: func() {},
 			readBufferSize: e.readBufferSize}
 		if err := p.open(config, nil); err != nil {
 			return err
@@ -320,93 +297,14 @@ func (e *Engine) openPollers(config Config) error {
 	return nil
 }
 
-// workerPool is an engine's pool of workers for connections that ask for one
-// while the engine runs rounds on its loops. It is built the first time one
-// asks, since an engine that serves nothing that does has no use for it.
-type workerPool struct {
-	// config is what the pool is built from.
-	config Config
-	// ready holds the pool once it is built, for the loops to read without
-	// the lock.
-	ready   atomic.Pointer[builtWorkerPool]
-	mu      sync.Mutex
-	release func()
-	// closed turns building away once the engine has released the pool.
-	closed bool
-}
-
-type builtWorkerPool struct{ pool TaskPool }
-
-// workerPool returns the pool the rounds of connections that asked for
-// workers run on, or nil once the engine has closed. It is the engine's own
-// pool unless that one runs rounds on the loops.
-func (e *Engine) workerPool() TaskPool {
-	if !e.inlineTasks && !e.inlineHandlers {
-		return e.taskPool
-	}
-	w := &e.root().workers
-	if built := w.ready.Load(); built != nil {
-		return built.pool
-	}
-	w.mu.Lock()
-	defer w.mu.Unlock()
-	if built := w.ready.Load(); built != nil || w.closed {
-		if built == nil {
-			return nil
-		}
-		return built.pool
-	}
-	pool, release := acquireWorkerPool(w.config)
-	w.release = release
-	w.ready.Store(&builtWorkerPool{pool: pool})
-	return pool
-}
-
-// releaseWorkerPool lets go of the pool of workers, if one was built, and
-// turns away building one after it.
-func (e *Engine) releaseWorkerPool() {
-	w := &e.workers
-	w.mu.Lock()
-	w.closed = true
-	release := w.release
-	w.release = nil
-	w.mu.Unlock()
-	if release != nil {
-		release()
-	}
-}
-
-// RoundsOnPollers reports whether the engine runs its connections' rounds on
-// its pollers' loops, as Config.IOPollers has it do, rather than on a pool of
-// workers. A protocol served there reads and parses on the loop and runs its
-// request handlers on HandlerPool, so that a handler that takes a while holds
-// up only itself. A connection that asked for workers with
-// Connection.SetRunOnWorkers runs its rounds on them all the same.
-func (e *Engine) RoundsOnPollers() bool {
-	root := e.root()
-	return len(root.pollers) > 0 && root.inlineTasks
-}
-
 // HandlerPool returns the pool the protocols served on the engine run their
-// request handlers on, away from the goroutine that reads the connection.
-//
-// Where the rounds run on the pollers (see RoundsOnPollers), it is the
-// engine's pool of workers, the one Connection.SetRunOnWorkers asks for: the
-// requests handed to it are framed on the loops, which are not its workers,
-// so no worker waits on its own queue, and the one pool serves every
-// protocol.
-// Otherwise the engine's workers read the connections themselves, and the
-// handlers run on a pool apart from theirs, "<Name>-streams", for the reason
-// package internal/streampool gives. It returns nil once the engine has
-// closed, and the caller then runs the handler itself.
+// request handlers on, away from the worker that reads the connection, as
+// HTTP/2 and HTTP/3 run theirs: "<Name>-streams", apart from the engine's own
+// pool for the reason package internal/streampool gives. It returns nil once
+// the engine has closed, and the caller then runs the handler itself.
 func (e *Engine) HandlerPool() *taskpool.TaskPool {
-	root := e.root()
-	if root.RoundsOnPollers() {
-		pool, _ := root.workerPool().(*taskpool.TaskPool)
-		return pool
-	}
 	sizing := DefaultStreamPoolSizing(taskpool.ModeAdaptive)
-	return streampool.Get(root.name, sizing.WorkerCount, sizing.MaxEvents)
+	return streampool.Get(e.root().name, sizing.WorkerCount, sizing.MaxEvents)
 }
 
 // root is the engine the application created: this one, or the one this
@@ -471,8 +369,8 @@ func (e *Engine) Stats() Stats {
 }
 
 // runReady ends one round of the loop: it hands the connections the round made
-// runnable to the workers, or runs them in place when handlers are inline, and
-// then gives connections parked on the server-wide budget a chance to resume.
+// runnable to the workers, and then gives connections parked on the
+// server-wide budget a chance to resume.
 func (e *Engine) runReady(ready []*Connection, tasks []taskpool.Task) ([]*Connection, []taskpool.Task) {
 	// Resuming comes first so that a connection it hands a read back to is
 	// scheduled in this round rather than whenever the loop next wakes.
@@ -481,100 +379,21 @@ func (e *Engine) runReady(ready []*Connection, tasks []taskpool.Task) ([]*Connec
 	clear(e.redeliver)
 	e.redeliver = e.redeliver[:0]
 	if len(ready) > 0 {
-		all := len(ready)
-		// yield says workers were just woken, rather than every round run
-		// here.
-		yield := false
-		if e.inlineHandlers || e.inlineTasks {
-			// Connections that asked for workers leave the loop even so.
-			ready, tasks, yield = e.submitToWorkers(ready, tasks)
-		}
-		if e.inlineHandlers {
-			e.setInRound(true)
-			for _, c := range ready {
-				c.process()
-			}
-		} else if len(ready) > 0 {
-			e.setInRound(e.inlineTasks)
-			tasks = e.submitReady(e.taskPool, ready, tasks[:0])
-			yield = yield || !e.inlineTasks
-		}
-		if e.submitHandlerTasks() {
-			yield = true
-		}
-		if yield {
-			// The workers just woken wait on this goroutine's P, and the loop
-			// is about to wait for events in a system call that keeps the P
-			// out of use: while there is other work, the runtime hands it on
-			// only after the call has lasted a while, and the loop then waits
-			// for a P of its own behind whatever is runnable. Yielding first
-			// runs the workers here straight away. Measured on Linux with 4
-			// Ps serving HTTP/2 echoes over 10k connections, it raised
-			// throughput by 10% to 25%, depending on the client, from a loop
-			// that had spent 40% of its time runnable and waiting for a P
-			// after each wait.
-			runtime.Gosched()
-		}
-		ready = ready[:all]
+		tasks = e.submitReady(e.taskPool, ready, tasks[:0])
+		// The workers just woken wait on this goroutine's P, and the loop is
+		// about to wait for events in a system call that keeps the P out of
+		// use: while there is other work, the runtime hands it on only after
+		// the call has lasted a while, and the loop then waits for a P of its
+		// own behind whatever is runnable. Yielding first runs the workers
+		// here straight away. Measured on Linux with 4 Ps serving HTTP/2
+		// echoes over 10k connections, it raised throughput by 10% to 25%,
+		// depending on the client, from a loop that had spent 40% of its time
+		// runnable and waiting for a P after each wait.
+		runtime.Gosched()
 		clear(ready)
 		ready = ready[:0]
 	}
 	return ready, tasks
-}
-
-// setInRound marks the loop as running its round's connections itself, or
-// not; see Connection.GoHandler.
-func (e *Engine) setInRound(on bool) {
-	e.handlerMu.Lock()
-	e.inRound = on
-	e.handlerMu.Unlock()
-}
-
-// submitHandlerTasks ends the round's run on the loop and hands the handler
-// pool, together, the tasks the round's connections gave it, and reports
-// whether there were any. A pool that has stopped taking work leaves the
-// rest to run here, which only an engine that is closing does.
-func (e *Engine) submitHandlerTasks() bool {
-	e.handlerMu.Lock()
-	e.inRound = false
-	batch := e.handlerTasks
-	e.handlerTasks = e.handlerSpare[:0]
-	e.handlerMu.Unlock()
-	if len(batch) == 0 {
-		e.handlerSpare = batch
-		return false
-	}
-	n := 0
-	if pool := e.root().HandlerPool(); pool != nil {
-		n = pool.GoTasks(batch)
-	}
-	for _, task := range batch[n:] {
-		task.RunTask()
-	}
-	clear(batch)
-	e.handlerSpare = batch[:0]
-	return true
-}
-
-// submitToWorkers hands the connections of a round that asked for workers to
-// the pool of them, and reports the rest, which the loop runs, compacted at
-// the front of ready, and whether there were any to hand over.
-func (e *Engine) submitToWorkers(ready []*Connection, tasks []taskpool.Task) ([]*Connection, []taskpool.Task, bool) {
-	kept := ready[:0]
-	for _, c := range ready {
-		if c.onWorkers.Load() {
-			e.offload = append(e.offload, c)
-		} else {
-			kept = append(kept, c)
-		}
-	}
-	if len(e.offload) == 0 {
-		return kept, tasks, false
-	}
-	tasks = e.submitReady(e.workerPool(), e.offload, tasks[:0])
-	clear(e.offload)
-	e.offload = e.offload[:0]
-	return kept, tasks, true
 }
 
 // resumeBudgetPaused re-arms reads on connections the server-wide budget held

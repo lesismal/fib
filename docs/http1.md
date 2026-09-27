@@ -83,13 +83,12 @@ func(c *fibhttp.Context, r *http.Request) {
   and returns. What of the body has already arrived — all of it, when
   `BodyComplete` says so — is handed over once the handler returns, on the
   goroutine that ran it. No goroutine is ever started for a callback: what
-  arrives later is handed over as the event loop reads it — on the
-  connection's worker where the connection is read on one, and on the
-  engine's handler pool (`fib.Engine.HandlerPool`) where it is read on the
-  event loop itself, where a callback must not run: HTTP/2 and HTTP/3
-  always, and HTTP/1 with `ReadOnPollers` — and what is already here when
-  `OnBody` is called after the handler returned, which no read will bring
-  again, on the handler pool.
+  arrives later is handed over as the connection is read — on the worker
+  reading an HTTP/1 connection, and on the engine's handler pool
+  (`fib.Engine.HandlerPool`) for HTTP/2 and HTTP/3, whose reader serves
+  every stream on the connection and must not run a callback — and what is
+  already here when `OnBody` is called after the handler returned, which no
+  read will bring again, on the handler pool.
 - `OnBody` retains the request, and the server releases it once the callback
   has returned from its last call, so the response the callback wrote on
   `fin` is sent then, with no `Retain` or `Release` in the handler. A handler
@@ -116,7 +115,7 @@ A connection that closes, a read timeout, or a body that cannot be finished
 ends a request the handler may still be working on. The request is cancelled:
 nothing more is written, every hold left on it is void, and the handler is
 told once, through `OnBody`'s `err` and through `Context.OnCancel`. Both run
-on the engine's handler pool rather than on the event loop, so a handler's
+on the engine's handler pool rather than in the connection's round, so a handler's
 cleanup cannot hold the server up. `Context.Err()` reports the same reason to a handler that
 would rather ask than be told.
 
@@ -185,9 +184,8 @@ retains nothing that is its return, which is the point at which `net/http`
 closes a request's body too. Reading it afterwards returns `ErrBodyReleased`; a handler
 that needs the bytes later keeps a copy of them, as `io.ReadAll` makes.
 
-**Reading it never waits.** The handler runs on a worker like any other —
-the one reading the connection, or with `ReadOnPollers` one of the handler
-pool's — and a worker that waited for the peer would be waiting on itself,
+**Reading it never waits.** The handler runs on a worker like any other, the
+one reading the connection, and a worker that waited for the peer would be waiting on itself,
 or held for nothing, so `Read` answers with what has arrived:
 
 | Read returns | Means |

@@ -87,14 +87,12 @@ const (
 	maxMaxEvents    = 100000
 
 	// streamPoolFactor is how much wider the pool HTTP/2 and HTTP/3 run
-	// their request handlers on, where an engine reads its connections on
-	// its workers, is than the widest engine pool of the same Name. There is
-	// one such pool for each Name, shared by every HTTP/2 and HTTP/3 server
-	// whose connections come from engines of that Name, and it is never one
-	// an engine runs on; see package internal/streampool for the deadlock
-	// sharing an engine's pool would invite. An engine that reads on its
-	// pollers' loops runs the handlers on its own pool of workers instead;
-	// see Engine.HandlerPool.
+	// their request handlers on is than the widest engine pool of the same
+	// Name. There is one such pool for each Name, shared by every HTTP/2 and
+	// HTTP/3 server whose connections come from engines of that Name, and it
+	// is never one an engine runs on; see package internal/streampool for
+	// the deadlock sharing an engine's pool would invite, and
+	// Engine.HandlerPool.
 	//
 	// The two pools do different work. An engine worker holds its connection
 	// for one round: it reads the socket, hands what came in to the protocol,
@@ -170,10 +168,18 @@ func (c *Config) SetTaskPool(pool TaskPool) *Config {
 	return c
 }
 
+// errInlinePool is what an engine asked to run on an inline pool reports: its
+// loops only wait for events and hand the connections those make runnable to
+// workers, and never run a connection's round themselves.
+var errInlinePool = errors.New("fib: an engine runs its connections on workers, not on an inline pool")
+
 // validateTaskPool checks the settings that describe the built-in pool, which
 // mean nothing when the caller supplies one.
 func (c *Config) validateTaskPool() error {
 	if c.TaskPool != nil {
+		if p, ok := c.TaskPool.(*taskpool.TaskPool); ok && p.Mode() == taskpool.ModeInline {
+			return errInlinePool
+		}
 		return nil
 	}
 	if c.WorkerCount <= 0 {
@@ -181,6 +187,9 @@ func (c *Config) validateTaskPool() error {
 	}
 	if !c.TaskPoolMode.Valid() {
 		return fmt.Errorf("invalid task pool mode %d", c.TaskPoolMode)
+	}
+	if c.TaskPoolMode == taskpool.ModeInline {
+		return errInlinePool
 	}
 	if c.TaskPoolMode == taskpool.ModeAdaptive && (c.MinWorkerCount < 0 || c.MinWorkerCount > c.WorkerCount) {
 		return fmt.Errorf("min worker count %d must be between zero and the worker count %d",

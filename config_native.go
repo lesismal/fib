@@ -85,75 +85,47 @@ type Config struct {
 	// TaskPool, when set, runs the engine's connections instead of a pool the
 	// engine builds from the fields above. See SetTaskPool.
 	TaskPool TaskPool
-	// InlineHandlers runs a ready connection's round on the event loop instead
-	// of handing it to a worker.
-	//
-	// The handoff is not free, and at high message rates it is the dominant
-	// cost: it makes a goroutine runnable, and that goroutine has to be given a
-	// P before it can issue the read. An execution trace of a 100k-connection
-	// echo run measured 872 seconds of runnable-but-not-running time in a
-	// 2-second window, almost all of it on workers woken from the loop.
-	// Skipping the handoff measured 446k echoes/s against 395k for the same
-	// build with workers, and 104k accepted connections/s against 95k.
-	//
-	// The cost is that a handler now blocks its whole server: the loop cannot
-	// collect events, accept, or serve any other connection while it runs. Set
-	// this only when every handler is short and never blocks. Handlers that do
-	// I/O, take contended locks, or run unbounded work want the worker pool,
-	// which exists precisely so that one slow connection cannot stall the rest.
-	InlineHandlers bool
 	// IOPollers splits the engine across several event loops. The engine's
 	// own loop is left to accept connections and serve its UDP sockets, and
 	// every connection it accepts is handed to one of IOPollerCount further
 	// loops, the one its descriptor picks modulo their number, which then
-	// serves that connection for the rest of its life. Connections the
+	// waits on that connection for the rest of its life. Connections the
 	// engine dials, over TCP, UDP or a Unix socket, go to those loops the
 	// same way. A UDP listener's peers share its one socket, so they stay on
-	// the engine's own loop.
+	// the engine's own loop, unless ReusePort gives each poller a socket of
+	// its own.
 	//
-	// Spreading the connections spreads the loop's own work, the waits,
-	// registrations and wake-ups, over several cores, and each loop then runs
-	// its connections' rounds itself: the engine's task pool is a
-	// taskpool.ModeInline one, which recovers a panicking handler the way a
-	// worker does. As with InlineHandlers, a callback that blocks stalls every
-	// connection on its loop.
-	//
-	// The engine's pool of workers, the one TaskPoolMode, WorkerCount and
-	// SharedTaskPool describe, is built the first time something asks for
-	// it, and runs what may take a while away from the loops. A protocol
-	// reads and parses on the loop and hands its request handlers to it,
-	// through Engine.HandlerPool or Connection.GoHandler, as the http package
-	// does for HTTP/2 and HTTP/3, and for HTTP/1 with its ReadOnPollers. A
-	// connection whose own rounds may take a while asks for them to run on
-	// that pool instead, with Connection.SetRunOnWorkers, as the http
-	// package's HTTP/1 connections do by default. A pool supplied
-	// through SetTaskPool is kept, and runs the rounds as it would without
-	// pollers.
+	// Spreading the connections spreads the loops' own work, the waits,
+	// registrations and wake-ups, over several cores. With or without it, a
+	// loop only waits for events, and reads the UDP sockets peers share, and
+	// hands the connections they make runnable to the engine's pool of
+	// workers, the one TaskPoolMode,
+	// WorkerCount and SharedTaskPool describe or SetTaskPool supplies: every
+	// round, its reads and the OnData and OnClose they call, runs on a
+	// worker, so a callback that takes a while holds up its own connection
+	// and no other. The handlers of HTTP/2 and HTTP/3 requests run on a pool
+	// of their own, apart from the workers that read their connections; see
+	// Engine.HandlerPool.
 	//
 	// DefaultConfig sets it. Without it, the engine serves listeners and
-	// connections alike on its one loop, and runs every connection's rounds
-	// on the pool of workers: an HTTP/1 connection's requests are read,
-	// parsed and served there, and the handlers of HTTP/2 and HTTP/3
-	// requests run on a pool of their own, the stream pool, apart from the
-	// workers that read their connections; see Engine.HandlerPool.
+	// connections alike on its one loop.
 	//
 	// Only the Linux and macOS backends have pollers; on Windows the engine
-	// keeps its single loop and its task pool, as if this were unset.
+	// keeps its single loop, as if this were unset.
 	IOPollers bool
 	// IOPollerCount is how many loops IOPollers creates. Zero or less means
 	// one per CPU, runtime.NumCPU.
 	//
-	// One per CPU suits connections whose rounds run on their loops. Where
-	// they run on workers instead (see Connection.SetRunOnWorkers), a loop
-	// only waits for events and hands them on, which one loop keeps up with,
-	// and each further loop competes with the workers for the same Ps: after
-	// every round a loop yields to the workers it woke and then waits behind
-	// them for a P, so each loop's rounds gather fewer connections, and
-	// requests wait longer to be read. An HTTP/1 echo over 10k connections on
-	// three CPUs, with its rounds on workers, measured 583k requests/s
-	// without pollers, 584k with one poller, and 569k with three, whose 99th
-	// percentile latency rose from 25ms to 37ms. Set it low, one or a few,
-	// for such a load.
+	// A loop only waits for events and hands them on, which one loop keeps
+	// up with for a good many connections, and each further loop competes
+	// with the workers for the same Ps: after every round a loop yields to
+	// the workers it woke and then waits behind them for a P, so each loop's
+	// rounds gather fewer connections, and requests wait longer to be read.
+	// An HTTP/1 echo over 10k connections on three CPUs measured 583k
+	// requests/s without pollers, 584k with one poller, and 569k with three,
+	// whose 99th percentile latency rose from 25ms to 37ms. More loops pay
+	// off where the loops' own work, accepting and registering connections
+	// and waking for them, is what runs short.
 	IOPollerCount int
 	// ReusePort binds the engine's listeners with SO_REUSEPORT, so that
 	// other sockets that set it too, in this process or another of the same

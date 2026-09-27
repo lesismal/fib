@@ -28,7 +28,12 @@ import (
 // connection, and a worker hands the queue to OnData one datagram per call.
 // Reading on the loop is what lets many peers share one socket without any of
 // them reading another's datagrams, and it keeps datagram boundaries intact:
-// OnData receives exactly one datagram, and each Send sends exactly one.
+// OnData receives exactly one datagram, and each Send sends exactly one. It
+// is the one read a loop makes; every OnData runs on a worker. Handing the
+// socket's reads to a worker as well, one at a time, was measured slower:
+// HTTP/3 over 1000 connections on 50 ports, three CPUs, served 270k
+// multiplexed requests/s against 289k with the loop reading, and 349k
+// echoes/s against 372k with ReusePort, with 15% more memory.
 //
 // Sends go straight to the socket and are never queued. A datagram the socket
 // has no room for is dropped and Send reports the error, which is what UDP

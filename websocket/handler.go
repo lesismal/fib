@@ -32,18 +32,7 @@ type Config struct {
 	// 7692). Messages are then sent compressed, and a client may send its own
 	// compressed. MaxMessageBytes bounds a message once decompressed.
 	EnableCompression bool
-	// ReadOnPollers has a connection read, its frames parsed and its
-	// callbacks run on its poller's loop where the engine runs rounds on its
-	// pollers (see fib.Config.IOPollers and fib.Engine.RoundsOnPollers), so
-	// a callback that blocks holds up every connection on that loop.
-	//
-	// It is off by default, and a connection then runs its whole round — the
-	// read, the parse, the callbacks and the write — on the engine's pool of
-	// workers, as an HTTP/1 connection does (see http.Config.ReadOnPollers)
-	// and as it does without pollers. Over the tls package it also has the
-	// decryption done on the loop.
-	ReadOnPollers bool
-	HTTP          epollhttp.Config
+	HTTP              epollhttp.Config
 }
 
 func DefaultConfig() Config {
@@ -366,12 +355,7 @@ func NewHandlerWithConfig(config Config, handler Handler) *ServerHandler {
 	return h
 }
 
-// OnOpen has the connection's rounds run on the engine's pool of workers (see
-// fib.Connection.SetRunOnWorkers), from the read to the write, as the http
-// package's HTTP/1 connections do, unless Config.ReadOnPollers keeps them on
-// its poller's loop.
 func (h *ServerHandler) OnOpen(c *fib.Connection) {
-	c.SetRunOnWorkers(!(h.config.ReadOnPollers && c.Engine().RoundsOnPollers()))
 	c.SetAttachment(&connectionState{})
 }
 

@@ -803,14 +803,7 @@ func (cc *clientConn) discard() {
 	cc.conn.Close()
 }
 
-// OnOpen has an HTTP/1 connection's rounds, which run the callbacks its
-// responses reach, run on a worker even where the engine runs rounds on its
-// loops, as the server's do. One that speaks HTTP/2 goes back to the
-// engine's own pool; see startH2.
-func (cc *clientConn) OnOpen(conn *fib.Connection) {
-	cc.conn = conn
-	conn.SetRunOnWorkers(true)
-}
+func (cc *clientConn) OnOpen(conn *fib.Connection) { cc.conn = conn }
 
 func (cc *clientConn) OnPriorityData(*fib.Connection, []byte) {}
 

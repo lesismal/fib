@@ -38,9 +38,9 @@ func checkPoller(t *testing.T, e *Engine, c *Connection, fd int) {
 	}
 }
 
-// Accepted connections go to the poller their descriptor picks, which runs
-// their rounds itself, and the stream pool is sized as it is without
-// pollers.
+// Accepted connections go to the poller their descriptor picks, which hands
+// their rounds to the engine's workers, and the stream pool is sized as it
+// is without pollers.
 func TestPollersServeAcceptedConnections(t *testing.T) {
 	const pollers, conns = 3, 24
 	config := pollerConfig("pollers-accept", pollers)
@@ -60,8 +60,8 @@ func TestPollersServeAcceptedConnections(t *testing.T) {
 	if len(server.pollers) != pollers {
 		t.Fatalf("engine has %d pollers, want %d", len(server.pollers), pollers)
 	}
-	if pool, ok := server.taskPool.(*taskpool.TaskPool); !ok || pool.Mode() != taskpool.ModeInline {
-		t.Fatalf("engine runs on %T, want an inline pool", server.taskPool)
+	if pool, ok := server.taskPool.(*taskpool.TaskPool); !ok || pool.Name() != "pollers-accept-workers" {
+		t.Fatalf("engine runs on %v, want its pool of workers", server.taskPool)
 	}
 	if got, want := streampool.Ceiling(server.Name()), config.WorkerCount*streamPoolFactor; got != want {
 		t.Fatalf("stream pool ceiling = %d, want %d as without pollers", got, want)
@@ -204,8 +204,8 @@ func TestPollersLeaveUDPPeersOnEngine(t *testing.T) {
 	}
 }
 
-// The inline pool recovers a handler that panics: its connection is closed,
-// and the poller goes on serving the others.
+// A worker recovers a handler that panics: its connection is closed, and the
+// poller goes on serving the others.
 func TestPollerSurvivesHandlerPanic(t *testing.T) {
 	_, addr := startEchoServer(t, pollerConfig("pollers-panic", 1), HandlerFuncs{Data: func(c *Connection, b []byte) {
 		if string(b) == "panic" {
@@ -360,15 +360,13 @@ func TestBudgetPausedConnectionResumesAcrossPollers(t *testing.T) {
 	}
 }
 
-// A connection that asks for workers runs its rounds on them though the
-// engine runs rounds on its pollers, so a handler of it that blocks leaves
-// the other connections on its loop running. The pool of workers is built
-// when the first connection asks for it.
-func TestRunOnWorkersUnderPollers(t *testing.T) {
+// A poller only waits for events and hands its connections' rounds to the
+// engine's workers, so a handler that blocks leaves the other connections on
+// its loop running.
+func TestPollersRunRoundsOnWorkers(t *testing.T) {
 	release := make(chan struct{})
 	entered := make(chan struct{}, 1)
 	server, addr := startEchoServer(t, pollerConfig("pollers-workers", 1), HandlerFuncs{
-		Open: func(c *Connection) { c.SetRunOnWorkers(true) },
 		Data: func(c *Connection, b []byte) {
 			if string(b) == "block" {
 				entered <- struct{}{}
@@ -379,9 +377,6 @@ func TestRunOnWorkersUnderPollers(t *testing.T) {
 			}
 		},
 	})
-	if server.workers.ready.Load() != nil {
-		t.Fatal("the pool of workers was built before any connection asked for it")
-	}
 	blocked, err := net.DialTimeout("tcp4", addr, 5*time.Second)
 	if err != nil {
 		t.Fatal(err)
@@ -411,22 +406,14 @@ func TestRunOnWorkersUnderPollers(t *testing.T) {
 	if _, err := io.ReadFull(blocked, reply); err != nil || string(reply) != "block" {
 		t.Fatalf("read %q, %v", reply, err)
 	}
-	built := server.workers.ready.Load()
-	if built == nil {
-		t.Fatal("no pool of workers was built")
-	}
-	pool, ok := built.pool.(*taskpool.TaskPool)
+	pool, ok := server.taskPool.(*taskpool.TaskPool)
 	if !ok || pool.Mode() == taskpool.ModeInline || pool.Name() != "pollers-workers-workers" {
-		t.Fatalf("connections ran on %v, want the engine's pool of workers", built.pool)
-	}
-	if name := server.taskPool.(*taskpool.TaskPool).Name(); name != "pollers-workers-inline" {
-		t.Fatalf("engine's own pool is %q", name)
+		t.Fatalf("connections ran on %v, want the engine's pool of workers", server.taskPool)
 	}
 }
 
 // The default configuration spreads connections over one poller per CPU,
-// each running its connections' rounds inline, and still describes a pool of
-// workers for the connections that ask for one: ModeInline stays opt-in.
+// which hand their rounds to the engine's pool of workers.
 func TestDefaultConfigHasPollersAndWorkerPool(t *testing.T) {
 	config := DefaultConfig()
 	if !config.IOPollers || config.TaskPoolMode == taskpool.ModeInline {
@@ -443,7 +430,7 @@ func TestDefaultConfigHasPollersAndWorkerPool(t *testing.T) {
 		t.Fatalf("default engine has %d pollers, want %d", len(server.pollers), runtime.NumCPU())
 	}
 	pool, ok := server.taskPool.(*taskpool.TaskPool)
-	if !ok || pool.Mode() != taskpool.ModeInline || !server.inlineTasks {
-		t.Fatalf("default engine runs on %v, want its inline pool", server.taskPool)
+	if !ok || pool.Mode() != config.TaskPoolMode || pool.Name() != "default-config-workers" {
+		t.Fatalf("default engine runs on %v, want its pool of workers", server.taskPool)
 	}
 }

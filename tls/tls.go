@@ -63,17 +63,6 @@ func (wouldBlockError) Temporary() bool { return true }
 // connections whose reads feed it, and an engine worker that opens a
 // connection never waits on its own queue. Records after that are decrypted
 // in OnData like any other input, straight from the bytes the round read.
-//
-// Decrypting and encrypting are the costliest work a TLS connection's round
-// does, so OnOpen asks for the round to run on the engine's workers (see
-// fib.Connection.SetRunOnWorkers) before Handler's OnOpen runs, and under
-// fib.Config.IOPollers one loop's connections are then not decrypted one after
-// another on that loop. A TLS echo over 10k connections on three CPUs measured
-// 404k echoes/s with the rounds on three pollers, whose loops left 15% of the
-// CPUs idle, and 451k with them on workers. A handler whose rounds are better
-// kept on the loop, as HTTP/2's are, and the http package's HTTP/1 ones with
-// its ReadOnPollers, calls SetRunOnWorkers(false) in its own OnOpen, or
-// later.
 type Handler struct {
 	Config  *stdtls.Config
 	Handler fib.Handler
@@ -138,7 +127,6 @@ func (h *Handler) OnOpen(c *fib.Connection) {
 		t.conn = stdtls.Server(t, h.Config)
 	}
 	c.SetLayer(t)
-	c.SetRunOnWorkers(true)
 	h.inner().OnOpen(c)
 	timeout := h.HandshakeTimeout
 	if timeout == 0 {

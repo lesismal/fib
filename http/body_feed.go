@@ -80,8 +80,8 @@ func (r *StreamRequest) streamBody(c *Context, config BodyFeedConfig) *BodyFeed 
 
 // Write hands the handler the next piece of the body, which Write copies, so
 // the caller keeps data. It never calls the handler's callback itself: it is
-// called on the goroutine reading the connection, which may be the event
-// loop, so a callback taking the body is handed what arrived on the engine's
+// called on the goroutine reading the connection, which serves every stream
+// on it, so a callback taking the body is handed what arrived on the engine's
 // handler pool. It fails, and fails the body with the same error, when the
 // body goes past its declared length (ErrMalformed) or past the limit
 // (ErrBodyTooLarge). What is written once the body has failed, has been
@@ -136,7 +136,7 @@ func (f *BodyFeed) End(trailer stdhttp.Header) error {
 // its response was written first. The handler hears err through Read, or
 // through OnBody once it has what arrived before it. Fail never calls the
 // handler's callback itself, so it may be called under the protocol's own
-// locks and on the event loop: when the callback is owed the news it is
+// locks and on the connection's reader: when the callback is owed the news it is
 // handed it on the engine's handler pool, unless a call to it is under way
 // already, which then hands it on.
 func (f *BodyFeed) Fail(err error) {

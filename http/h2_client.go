@@ -96,7 +96,6 @@ func (cc *clientConn) startH2() {
 	}
 	cc.maxStreams = h2InitialMaxStreams
 	cc.h2 = hc
-	cc.conn.SetRunOnWorkers(false)
 	out := append([]byte(nil), h2Preface...)
 	out = h2AppendSettings(out,
 		[2]uint32{uint32(h2SettingEnablePush), 0},

@@ -10,7 +10,6 @@ import (
 	"syscall"
 
 	"github.com/lesismal/fib/bufferpool"
-	"github.com/lesismal/fib/taskpool"
 )
 
 // sendItem is one queued chunk. pooled says data came from the buffer pool,
@@ -96,44 +95,6 @@ type Connection struct {
 	// the socket before it shuts the write side. Guarded by mu.
 	writeShut        bool
 	shutWritePending bool
-	// onWorkers says the connection's rounds run on a pool of workers even
-	// where the engine runs rounds on its loops; see SetRunOnWorkers.
-	onWorkers atomic.Bool
-}
-
-// SetRunOnWorkers has the connection's rounds, its reads and the OnData and
-// OnClose they call, run on a pool of workers even where the engine runs its
-// rounds on its event loops, as it does under Config.IOPollers, a
-// taskpool.ModeInline pool or Config.InlineHandlers. A protocol whose handlers
-// run inside OnData and may take a while, as HTTP/1's do, sets it in OnOpen,
-// so that one slow handler does not hold up every connection on its loop.
-// That pool is the one the engine would have run on without those settings,
-// built the first time a connection asks for it. Where the engine already
-// runs rounds on workers it changes nothing. It takes effect from the next
-// round, and may be called from any goroutine.
-func (c *Connection) SetRunOnWorkers(on bool) { c.onWorkers.Store(on) }
-
-// GoHandler runs task on the engine's handler pool (see Engine.HandlerPool),
-// as a protocol that reads on the loop does with its request handlers.
-// Called from inside a round the loop is running itself, it keeps the task
-// until the loop has run the round's other connections too and then hands
-// all of the round's tasks to the pool at once, with one submission and the
-// workers woken for them together, and yields the loop's P to them, as it
-// does for connections it hands to workers; anywhere else it submits the
-// task straight away. A pool that has stopped taking work leaves the task to
-// run here. It may be called from any goroutine.
-func (c *Connection) GoHandler(task taskpool.Task) {
-	e := c.engine
-	e.handlerMu.Lock()
-	if e.inRound {
-		e.handlerTasks = append(e.handlerTasks, task)
-		e.handlerMu.Unlock()
-		return
-	}
-	e.handlerMu.Unlock()
-	if pool := e.root().HandlerPool(); pool == nil || !pool.GoTask(task) {
-		task.RunTask()
-	}
 }
 
 // Cork holds what is sent on the connection from now on until Flush, rather
@@ -152,9 +113,6 @@ func (c *Connection) Cork() {
 	c.corked = true
 	c.mu.Unlock()
 }
-
-// RunsOnWorkers reports what SetRunOnWorkers last set.
-func (c *Connection) RunsOnWorkers() bool { return c.onWorkers.Load() }
 
 // Attachment returns application state associated with the connection.
 func (c *Connection) Attachment() any {

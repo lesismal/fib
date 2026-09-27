@@ -6,7 +6,7 @@
 
 事件驱动的 Go 网络库，附带同架构的 C11 实现。单个 edge-triggered 事件循环收集 I/O
 就绪事件（Linux 和 macOS 上默认开启的 `Config.IOPollers` 把连接分到多个事件循环上），每个
-connection 作为一个任务调度到 worker 池：同一 connection 的事件按顺序执行，任意空闲
+connection 作为一个任务调度到 worker 池，所有读取和回调都在 worker 上执行、事件循环只等事件（以及读取多个 peer 共用的 UDP socket、把数据报分给各自的连接）：同一 connection 的事件按顺序执行，任意空闲
 worker 都能执行任意 connection，负载按实际任务量均衡，而不是按 fd 数量。
 
 ## 特性

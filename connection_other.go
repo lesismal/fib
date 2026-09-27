@@ -50,8 +50,6 @@ type Connection struct {
 	// udpActive is when a listener's peer last sent or was sent a datagram,
 	// in nanoseconds, for the idle timeout.
 	udpActive atomic.Int64
-	// onWorkers is what SetRunOnWorkers set.
-	onWorkers atomic.Bool
 }
 
 // Protocol returns the transport the connection runs over, which it keeps
@@ -65,14 +63,6 @@ func (c *Connection) Protocol() Protocol {
 	}
 	return ProtocolTCP
 }
-
-// SetRunOnWorkers asks for the connection's rounds to run on a pool of
-// workers. Every connection here is read by a goroutine of its own already,
-// so it changes nothing.
-func (c *Connection) SetRunOnWorkers(on bool) { c.onWorkers.Store(on) }
-
-// RunsOnWorkers reports what SetRunOnWorkers last set.
-func (c *Connection) RunsOnWorkers() bool { return c.onWorkers.Load() }
 
 // RemoteAddr returns the peer's address.
 func (c *Connection) RemoteAddr() net.Addr { return c.conn.RemoteAddr() }

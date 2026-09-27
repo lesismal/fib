@@ -10,29 +10,13 @@ import (
 )
 
 // serverState is what a Parser keeps for the server driving it: the request
-// being served, reachable without the parser's lock so that a close on the
-// event-loop goroutine can cancel a request whose handler is still working on
-// it.
-//
-// offload says the connection is read on an event loop and its handlers run
-// on the engine's handler pool, never under the parser's lock; see
-// ServerHandler.attachParser. It is set once, when the parser is.
-// offloadErr is what the body of the request handed to that pool failed
-// with before its handler ran, for the handler's return to act on, and
-// backlogHeld says the connection's reads are held while the requests
-// pipelined behind it wait; see ServerHandler.holdBacklog. All three are
-// guarded by the parser's lock.
+// being served, reachable without the parser's lock so that a close can
+// cancel a request whose handler is still working on it.
 type serverState struct {
 	liveContext atomic.Pointer[Context]
-	offload     bool
-	offloadErr  error
-	backlogHeld bool
 }
 
-func (p *Parser) resetServerState() {
-	p.liveContext.Store(nil)
-	p.offloadErr, p.backlogHeld = nil, false
-}
+func (p *Parser) resetServerState() { p.liveContext.Store(nil) }
 
 // blockServerState is the part of a requestBlock a server serves the request
 // with: the Context it is answered through.
@@ -156,7 +140,7 @@ func (c *Context) recycle() {
 	c.wrote, c.closing, c.streamed = true, false, false
 	c.w, c.stream, c.external = nil, nil, nil
 	c.err, c.body, c.bodyDone, c.cancel = nil, nil, false, nil
-	c.bodyHeld, c.handover, c.offloaded = false, nil, false
+	c.bodyHeld, c.handover = false, nil
 	c.server, c.parser, c.whole, c.block = nil, nil, nil, nil
 }
 
@@ -239,7 +223,8 @@ func (c *Context) Err() error {
 // so it can stop and give back what it holds; a handler that takes the body
 // through OnBody hears the same thing there and needs no second callback.
 //
-// fn runs once, on the engine's handler pool rather than on the event loop, and
+// fn runs once, on the engine's handler pool rather than in the connection's
+// round, and
 // never after the response has been written. It still has to Release what it
 // retained. Nothing more is written then, but the request, its body and the
 // Context stay the handler's until it has, and are recycled or given back
@@ -292,8 +277,9 @@ func (c *Context) BodyComplete() bool {
 // returns, on the goroutine that ran it; when OnBody is called after the
 // handler has returned, it is handed over on the engine's handler pool, since
 // no read of the connection will bring it again. The rest follows as the
-// event loop reads it: on the goroutine the connection's read is handled on,
-// or, where that is the event loop itself, on the engine's handler pool.
+// connection is read: on the worker that reads an HTTP/1 connection, and on
+// the engine's handler pool for a multiplexed one, whose reader serves every
+// stream on it.
 // The calls are one at a time and in order, so a handler can take a body of
 // any size without a goroutine and without it being buffered: what holds the
 // connection back is fn itself.
@@ -429,7 +415,7 @@ func (c *Context) later(handover func(worker bool)) {
 
 // handled marks the handler's return, and hands over the body it asked for
 // while it ran, on the handler's goroutine, which holds the connection's
-// parser unless the request was offloaded. It runs before the handler's hold
+// parser. It runs before the handler's hold
 // is given back, so the response the body callbacks answer is still open.
 func (c *Context) handled() {
 	var w uint64
@@ -446,7 +432,7 @@ func (c *Context) handled() {
 	handover := c.handover
 	c.handover = nil
 	c.mu.Unlock()
-	handover(!c.offloaded)
+	handover(true)
 }
 
 // begin takes the hold that serving a request stands on, which the handler's

@@ -67,12 +67,8 @@ Behaviour to be aware of when using it.
   `Config.StreamPool` describes, so the requests one client has open on a
   connection are served concurrently and a handler that blocks holds up only
   itself.
-- Under `IOPollers`, the default, connections are read and framed on the
-  pollers' loops, and the handler pool is the engine's own pool of workers,
-  `<Name>-workers`: the requests are handed to it by the loops, which are
-  not its workers, so none of them can wait on its own queue.
-- Without `IOPollers` the engine's workers read the connections, and the
-  handler pool is one of its own for each engine `Config.Name`, called
+- The engine's workers read and frame the connections, with `IOPollers` or
+  without, and the handler pool is one of its own for each engine `Config.Name`, called
   `<Name>-streams` (`fib-streams` by default), shared by every HTTP/2 and
   HTTP/3 server whose connections come from engines of that name and never
   by an engine: an engine worker submits each request it frames, and were the

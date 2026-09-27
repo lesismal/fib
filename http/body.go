@@ -127,13 +127,12 @@ type BodyStream struct {
 	sendContinue func()
 	credit       func(n int)
 	// offload says the body arrives on a goroutine that must not run the
-	// handler's callback: the one reading a multiplexed connection, or an
-	// HTTP/1 connection read on an event loop (see
-	// ServerHandler.attachParser). What arrives there is buffered, and the
+	// handler's callback: the one reading a multiplexed connection, which
+	// serves every stream on it. What arrives there is buffered, and the
 	// sink is handed it on the engine's handler pool (see runOnStreams)
 	// rather than there. owner is the connection whose engine's pool that
-	// is. Any other HTTP/1 body arrives on the connection's worker, where
-	// the handler runs too, and is handed on there.
+	// is. An HTTP/1 body arrives on the connection's worker, where the
+	// handler runs too, and is handed on there.
 	offload bool
 	owner   *fib.Connection
 }

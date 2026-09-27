@@ -218,9 +218,9 @@ func (t *streamTask) run() {
 // runOnStreams runs fn on the pool conn's request handlers run on (see
 // handlerPool), or here once that pool has stopped taking work. It carries
 // the body callbacks that no read of the connection will: a body already
-// here when OnBody is called away from its handler, a body read on an event
-// loop, and a body whose request has ended under it — a connection closing,
-// which may be reported on the event loop, or a stream reset. Those never
+// here when OnBody is called away from its handler, a body read by a
+// multiplexed connection's reader, and a body whose request has ended under
+// it — a connection closing, or a stream reset. Those never
 // get a goroutine of their own.
 func runOnStreams(conn *fib.Connection, fn func()) {
 	if pool := handlerPool(conn); pool == nil || !pool.Go(fn) {

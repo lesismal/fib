@@ -562,7 +562,6 @@ func (e *Engine) Close() error {
 		}
 		e.taskWG.Wait()
 		e.releaseTaskPool()
-		e.releaseWorkerPool()
 		e.closeCommands()
 		for _, entries := range e.connections {
 			for _, c := range entries {

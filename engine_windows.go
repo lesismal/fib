@@ -761,7 +761,6 @@ func (e *Engine) Close() error {
 		e.stopUDPSweeper()
 		e.taskWG.Wait()
 		e.releaseTaskPool()
-		e.releaseWorkerPool()
 		e.closeCommands()
 		for c := range e.conns {
 			e.closeConnection(c, nil, false)
