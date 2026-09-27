@@ -388,13 +388,23 @@ func TestStatelessReset(t *testing.T) {
 	p.serverMu.Lock()
 	p.server.Abort(errors.New("forgotten"))
 	p.server = nil
-	p.serverEnd.closed = false
 	p.stray = func(d []byte) {
 		if reset := key.StatelessReset(d); reset != nil {
 			_ = p.serverEnd.Send(reset)
 		}
 	}
 	p.serverMu.Unlock()
+	// The server closes its end of the pipe as it closes, which may be on a
+	// goroutine of its own, one that was dispatching when Abort came: only
+	// once it has can the end be opened again for the reset.
+	select {
+	case <-p.serverH.closed:
+	case <-time.After(5 * time.Second):
+		t.Fatal("server not closed")
+	}
+	p.serverEnd.mu.Lock()
+	p.serverEnd.closed = false
+	p.serverEnd.mu.Unlock()
 	s, err := p.client.OpenStream()
 	if err != nil {
 		t.Fatal(err)
