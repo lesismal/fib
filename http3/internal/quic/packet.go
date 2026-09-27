@@ -276,6 +276,16 @@ func (k *ResetKey) token(cid []byte) []byte {
 	return mac.Sum(nil)[:statelessResetTokenLen]
 }
 
+// ShortHeaderDCID returns the connection ID a datagram's first packet is
+// for, if that is a short header packet to a connection ID of the length
+// this side chooses, and nil otherwise. It is a slice of datagram.
+func ShortHeaderDCID(datagram []byte) []byte {
+	if len(datagram) < 1+cidLen || datagram[0]&0x80 != 0 {
+		return nil
+	}
+	return datagram[1 : 1+cidLen]
+}
+
 // StatelessReset returns the stateless reset to answer datagram with, or nil
 // when datagram is not a short header packet to one of this side's
 // connection IDs, or is too small to be answered without the answer being

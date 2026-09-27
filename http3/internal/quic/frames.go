@@ -121,10 +121,16 @@ func (c *Conn) handleFrames(space int, payload []byte, now time.Time) (bool, err
 	}
 	r := reader{b: payload}
 	ackEliciting := false
+	c.nonProbing = false
 	for len(r.b) > 0 && !c.closed {
 		typ := r.varint()
 		if r.bad {
 			return false, transportErr(errFrameEncoding, "truncated frame type")
+		}
+		switch typ {
+		case framePadding, framePathChallenge, framePathResponse, frameNewConnectionID:
+		default:
+			c.nonProbing = true
 		}
 		if typ != framePadding && typ != frameAck && typ != frameAckECN &&
 			typ != frameConnectionClose && typ != frameConnectionCloseApp {
@@ -260,7 +266,11 @@ func (c *Conn) handleFrames(space int, payload []byte, now time.Time) (bool, err
 				c.queuePathResponse([8]byte(data))
 			}
 		case typ == framePathResponse:
-			r.bytes(8)
+			// A response on any path validates the path it answers (RFC
+			// 9000 section 8.2.3).
+			if data := r.bytes(8); !r.bad && !c.pathValidated && [8]byte(data) == c.challenge {
+				c.pathValidLocked()
+			}
 		case typ == frameConnectionClose || typ == frameConnectionCloseApp:
 			code := r.varint()
 			if typ == frameConnectionClose {

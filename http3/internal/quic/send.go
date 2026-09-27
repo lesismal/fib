@@ -114,6 +114,9 @@ func (c *Conn) sendRoundLocked() {
 			break
 		}
 		c.bytesSent += uint64(len(buf) - start)
+		if !c.pathValidated {
+			c.pathSent += uint64(len(buf) - start)
+		}
 		lens[n] = uint16(len(buf) - start)
 		n++
 	}
@@ -123,8 +126,11 @@ func (c *Conn) sendRoundLocked() {
 		c.armTimerLocked(now)
 	}
 	if n > 0 {
+		// The path is read with the lock held, since a datagram handled
+		// meanwhile may move the connection to another.
+		pc := c.pc
 		c.mu.Unlock()
-		c.sendDatagrams(buf, lens[:n])
+		sendDatagrams(pc, buf, lens[:n])
 		c.mu.Lock()
 	}
 	bufferpool.Put(mem)
@@ -136,11 +142,11 @@ func (c *Conn) sendRoundLocked() {
 // large as the rest of an idle connection.
 var roundDatagrams = sync.Pool{New: func() any { return new([maxRoundDatagrams][]byte) }}
 
-// sendDatagrams sends the datagrams laid one after another in buf, with one
-// call when the path takes several at once. Callers are the sending goroutine,
-// without c.mu.
-func (c *Conn) sendDatagrams(buf []byte, lens []uint16) {
-	if b, ok := c.pc.(BatchSender); ok && len(lens) > 1 {
+// sendDatagrams sends the datagrams laid one after another in buf through
+// pc, with one call when the path takes several at once. Callers are the
+// sending goroutine, without c.mu.
+func sendDatagrams(pc PacketConn, buf []byte, lens []uint16) {
+	if b, ok := pc.(BatchSender); ok && len(lens) > 1 {
 		datagrams := roundDatagrams.Get().(*[maxRoundDatagrams][]byte)
 		for i, n := range lens {
 			datagrams[i], buf = buf[:n], buf[n:]
@@ -151,7 +157,7 @@ func (c *Conn) sendDatagrams(buf []byte, lens []uint16) {
 		return
 	}
 	for _, n := range lens {
-		_ = c.pc.Send(buf[:n])
+		_ = pc.Send(buf[:n])
 		buf = buf[n:]
 	}
 }
@@ -168,6 +174,16 @@ func (c *Conn) appendDatagram(out, scratch []byte, now time.Time) []byte {
 		if c.bytesSent+uint64(limit) > 3*c.bytesRecv {
 			return out
 		}
+	}
+	if !c.pathValidated {
+		// Nor to a client's new address, until it is proven (RFC 9000
+		// section 9.3). The datagrams are cut short to fit rather than held
+		// back, since the PATH_CHALLENGE that proves it has to go.
+		budget := pathBudget(c.pathRecv, c.pathSent)
+		if budget < minPathDatagram {
+			return out
+		}
+		limit = min(limit, budget)
 	}
 	congestionOK := c.cc.canSend()
 	var plans [numSpaces]packetPlan
@@ -281,7 +297,7 @@ func (c *Conn) framesWaiting(space int) bool {
 	if cs.next < cs.end() || cs.hasLost() {
 		return true
 	}
-	return space == spaceApp && (len(c.sendQueue) > 0 || c.handshakeDonePending || c.maxDataPending ||
+	return space == spaceApp && (len(c.sendQueue) > 0 || c.handshakeDonePending || c.challengePending || c.maxDataPending ||
 		c.maxStreamsBidiPending || c.maxStreamsUniPending || len(c.pathResponses) > 0 ||
 		len(c.retireCIDs) > 0 || c.pingPending)
 }
@@ -323,6 +339,12 @@ func (c *Conn) appendControlFrames(b []byte, max int, sp *sentPacket) []byte {
 		b = AppendVarint(b, c.maxUni)
 		c.maxStreamsUniPending = false
 		sp.add(sentFrame{kind: sfMaxStreamsUni})
+	}
+	if c.challengePending && fits(9) {
+		b = append(b, framePathChallenge)
+		b = append(b, c.challenge[:]...)
+		c.challengePending = false
+		sp.add(sentFrame{kind: sfPathChallenge})
 	}
 	for len(c.pathResponses) > 0 && fits(9) {
 		b = append(b, framePathResponse)

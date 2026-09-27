@@ -27,17 +27,24 @@
 
 使用时需要了解的行为约束。
 
-### 连接按对端地址区分，不支持迁移
+### 跟随 NAT 重绑定，不支持主动迁移
 
-- Engine 的 UDP socket 按“对端 IP:端口”把数据报分给各自的 `fib.Connection`，每个地址
-  对应一个 QUIC 连接，**不按 Connection ID 路由**。客户端换网络或 NAT 重绑定后，旧连接
-  收不到后续数据，只能等空闲超时或由客户端重新连接。服务端在传输参数中声明了
-  `disable_active_migration`。
-- 同样的原因，无法在多个进程或多个 `SO_REUSEPORT` socket 之间按连接分流。
+- Engine 的 UDP socket 按“对端 IP:端口”把数据报分给各自的 `fib.Connection`，QUIC 连接
+  挂在客户端最初那个地址的连接上。从没有连接的地址来的 1-RTT 包，按 Connection ID 路由到
+  它所属的连接，这样 NAT 重绑定后客户端的连接不会断：新地址来的包通过认证、而且证明是客户端
+  最新的包（包号大于之前所有的包，并且带有探测帧以外的帧）后，服务端改向新地址发送，发送量
+  不超过从新地址收到的 3 倍，同时发 PATH_CHALLENGE 验证新地址，客户端回应后关闭旧路径
+  （RFC 9000 §9.3）。客户端没有按时回应就退回旧路径；旧路径上再来更新的包也会把连接拉回去。
+  除非只是端口变了，拥塞控制和 RTT 从头开始；新路径验证完成前数据报降到 1200 字节。迁移之后
+  的请求，`Request.RemoteAddr` 是新地址。
+- Linux 上开启 `Config.IOPollers` 和 `ReusePort` 时，新地址可能落到另一个 poller 的
+  socket 上；QUIC 连接可以从任意 goroutine 接收数据报，所以连接会跟过去。
+- 服务端仍然声明 `disable_active_migration`，除握手时的 Connection ID 外不再签发新的：
+  客户端主动迁移需要在新路径上用新的 Connection ID，所以不能主动迁移，但它的 NAT 可以换地址。
 - 本端只使用握手时的一个 Connection ID，从不发送 NEW_CONNECTION_ID。对端提供的
-  CID 会被记录，也会遵守 retire_prior_to，但本端不主动轮换 CID。PATH_CHALLENGE 只回复、
-  从不主动发起，待发送的回复最多保留最近 4 个（RFC 9000 §8.2.2 只要求回复最新的挑战）；
-  preferred_address 被忽略。
+  CID 会被记录，也会遵守 retire_prior_to，但本端不主动轮换 CID。PATH_CHALLENGE 在连接
+  当前发送的路径上回复，待发送的回复最多保留最近 4 个（RFC 9000 §8.2.2 只要求回复最新的
+  挑战）；preferred_address 被忽略。
 
 ### 与 Engine 的配合
 
@@ -143,7 +150,7 @@
 | 功能 | 原因 |
 | --- | --- |
 | 0-RTT | 0-RTT 请求可以被重放，需要 handler 识别并拒绝不幂等的请求，收益和复杂度不成比例。客户端不发送 early data，服务端丢弃 0-RTT 包，客户端随后按 1-RTT 重发。 |
-| 连接迁移 / 按 CID 路由 | 需要在 Engine 的 UDP 层加按 Connection ID 分发的逻辑，改变 Engine 按地址区分 UDP 连接的模型。 |
+| 主动连接迁移 | 客户端主动迁移时要在新路径上用新的 Connection ID，服务端就得为每个连接签发、路由并退役多个 CID。保留 Connection ID 的 NAT 重绑定会被跟随（见上）。 |
 | QPACK 动态表 | 两端都声明容量为 0：不会出现 blocked stream 造成的队头阻塞，编码器流和解码器流都没有内容，也没有额外的状态和内存。代价是重复出现的 header 每次都要完整发送。 |
 | Server push | 主流浏览器都不启用 HTTP/3 push。客户端不发 MAX_PUSH_ID，`Context.Push` 返回 `http.ErrNotSupported`。预加载推荐用 103 Early Hints（`WriteInterim`）。 |
 | 服务端发送 Retry / NEW_TOKEN | 地址验证只靠握手本身和 3 倍放大限制，省去令牌的签发与校验。客户端能处理服务端发来的 Retry，但会忽略 NEW_TOKEN。 |

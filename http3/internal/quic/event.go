@@ -11,6 +11,8 @@ const (
 	evStopSending
 	evStreamsAvailable
 	evHandshake
+	// evPath is PathHandler's OnPathChange.
+	evPath
 	evClose
 	// evRecycle is no call: it gives a datagram back to the pool once the
 	// calls queued ahead of it, which may refer to it, have run.
@@ -48,14 +50,22 @@ func (c *Conn) run(e *event) {
 		c.handler.OnStreamsAvailable(c)
 	case evHandshake:
 		c.handler.OnHandshake(c)
+	case evPath:
+		if h, ok := c.handler.(PathHandler); ok {
+			h.OnPathChange(c)
+		}
 	case evClose:
 		c.mu.Lock()
-		t := c.tls
+		t, pc, prev := c.tls, c.pc, c.prevPC
+		c.prevPC = nil
 		c.mu.Unlock()
 		if t != nil {
 			t.Close()
 		}
-		_ = c.pc.Close()
+		_ = pc.Close()
+		if prev != nil {
+			_ = prev.Close()
+		}
 		// closeErr is set once, before evClose is queued.
 		c.handler.OnClose(c, c.closeErr)
 	case evRecycle:

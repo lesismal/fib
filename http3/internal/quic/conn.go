@@ -3,9 +3,11 @@
 //
 // A Conn does no I/O of its own: it is fed the datagrams that arrive from
 // its peer and sends through a PacketConn, which in fib is a UDP
-// connection of the engine, one per peer address. A connection therefore
-// stays on the address it started on; migration is not supported, and
-// servers say so with disable_active_migration.
+// connection of the engine, one per peer address. The path a connection
+// sends on is that PacketConn and the peer's address. A server follows its
+// client to a new address when the client's address changes under it, as a
+// NAT rebinding does (see HandlePathDatagrams); a client never moves, and
+// servers ask clients not to with disable_active_migration.
 //
 // The TLS 1.3 handshake is crypto/tls's QUICConn. 0-RTT is not supported.
 package quic
@@ -75,6 +77,14 @@ type Handler interface {
 // of the run goes with it.
 type CallsDoneHandler interface {
 	OnCallsDone(c *Conn)
+}
+
+// PathHandler is a Handler that is also told when the connection moves to
+// another path, or back, which only a server's connections do (see
+// HandlePathDatagrams). It is called like the others, one at a time and
+// with no lock held; RemoteAddr is then the new address.
+type PathHandler interface {
+	OnPathChange(c *Conn)
 }
 
 // Config sets up a connection. Zero values take the defaults.
@@ -279,6 +289,29 @@ type Conn struct {
 	pingPending          bool
 	pathResponses        [][8]byte
 
+	// A server's path migration (see migrateLocked). pathValidated says the
+	// path the connection sends on is known to reach the peer. While it is
+	// not, prevPC and prevRemote are the last one that was, challenge is what
+	// the PATH_CHALLENGE to the new one asks of it, pathDeadline when
+	// validation gives up, and pathRecv and pathSent the bytes that crossed
+	// the new path, which the amplification limit holds to one to three.
+	pathValidated      bool
+	prevPC             PacketConn
+	prevRemote         net.Addr
+	challenge          [8]byte
+	challengePending   bool
+	pathDeadline       time.Time
+	pathRecv, pathSent uint64
+	// rxPC and rxRemote are the path of the datagram being handled, and
+	// nonProbing says whether the packet being handled carried a frame other
+	// than a probing one (RFC 9000 section 9.1).
+	rxPC       PacketConn
+	rxRemote   net.Addr
+	nonProbing bool
+	// givenUp are paths the connection has left for good, closed once the
+	// lock is let go.
+	givenUp []PacketConn
+
 	created     time.Time
 	idleTimeout time.Duration
 	// lastActivity restarts the idle timer: it is when a packet last
@@ -377,6 +410,9 @@ func newConn(pc PacketConn, remote net.Addr, config Config, handler Handler, isC
 		maxBidi:      config.MaxIncomingStreams,
 		maxUni:       config.MaxIncomingUniStreams,
 		maxDatagram:  maxDatagram,
+		// The path a connection starts on is validated by its handshake,
+		// with the amplification limit that addressValidated keeps.
+		pathValidated: true,
 	}
 	for i := range c.spaces {
 		c.spaces[i].largestAcked = -1
@@ -451,8 +487,25 @@ func Accept(pc PacketConn, remote net.Addr, config Config, handler Handler, data
 	return c
 }
 
-// RemoteAddr is the peer's address.
-func (c *Conn) RemoteAddr() net.Addr { return c.remote }
+// RemoteAddr is the peer's address: that of the path the connection sends
+// on.
+func (c *Conn) RemoteAddr() net.Addr {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.remote
+}
+
+// LocalCID is the connection ID this side chose, which the peer's packets
+// carry: a server that serves several connections finds a connection's
+// packets by it when they arrive from an address it does not know.
+func (c *Conn) LocalCID() []byte { return c.scid }
+
+// SendsOn reports whether pc is the path the connection sends on.
+func (c *Conn) SendsOn(pc PacketConn) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return pc == c.pc
+}
 
 // ConnectionState is the TLS state of the connection.
 func (c *Conn) ConnectionState() tls.ConnectionState {
@@ -465,31 +518,56 @@ func (c *Conn) ConnectionState() tls.ConnectionState {
 	return t.ConnectionState()
 }
 
-// HandleDatagram processes a datagram from the peer.
+// HandleDatagram processes a datagram from the peer, on the path the
+// connection sends on.
 //
 // What it has to send in reply - acknowledgements, and whatever the handler
 // writes while it is told about the datagram - goes out once the handler
 // calls are done, in as few packets as it fits in.
-func (c *Conn) HandleDatagram(datagram []byte) {
+func (c *Conn) HandleDatagram(datagram []byte) { c.HandlePathDatagram(nil, nil, datagram) }
+
+// HandleDatagrams processes datagrams that arrived together on the path the
+// connection sends on, and answers them together: one acknowledgement for
+// all of them, and what the handler writes for them packed into the same
+// packets.
+func (c *Conn) HandleDatagrams(datagrams [][]byte) { c.HandlePathDatagrams(nil, nil, datagrams) }
+
+// HandlePathDatagram is HandleDatagram for a datagram that arrived through
+// pc from remote, which need not be the path the connection sends on. A
+// nil pc is that path.
+//
+// A server whose client's address changed, as a NAT rebinding changes it,
+// finds the client's packets arriving from an address it has no connection
+// for, and hands them over with the path they came on. The connection moves
+// there once one of them proves to be the client's latest (RFC 9000 section
+// 9.3): an authentic 1-RTT packet, numbered above every one before it, with
+// a frame in it other than a probing one. It then sends there, at most three
+// times what arrived there, until the client has answered a PATH_CHALLENGE
+// on it, and goes back to the path it left if the client does not answer in
+// time. Once the new path is validated, the old one is closed.
+func (c *Conn) HandlePathDatagram(pc PacketConn, remote net.Addr, datagram []byte) {
 	c.mu.Lock()
 	if !c.closed {
 		now := c.now()
+		c.setRxPathLocked(pc, remote)
 		c.handleDatagramLocked(datagram, now)
 		c.armAckLocked(now)
 		c.wantFlush = true
 	}
 	c.recycleLocked(datagram)
+	givenUp := c.takeGivenUpLocked()
 	c.mu.Unlock()
+	closePaths(givenUp)
 	c.dispatch()
 }
 
-// HandleDatagrams processes datagrams that arrived together, and answers
-// them together: one acknowledgement for all of them, and what the handler
-// writes for them packed into the same packets.
-func (c *Conn) HandleDatagrams(datagrams [][]byte) {
+// HandlePathDatagrams is HandleDatagrams for datagrams that arrived through
+// pc from remote; see HandlePathDatagram.
+func (c *Conn) HandlePathDatagrams(pc PacketConn, remote net.Addr, datagrams [][]byte) {
 	c.mu.Lock()
 	if !c.closed {
 		now := c.now()
+		c.setRxPathLocked(pc, remote)
 		for _, d := range datagrams {
 			if c.closed {
 				break
@@ -502,8 +580,19 @@ func (c *Conn) HandleDatagrams(datagrams [][]byte) {
 	for _, d := range datagrams {
 		c.recycleLocked(d)
 	}
+	givenUp := c.takeGivenUpLocked()
 	c.mu.Unlock()
+	closePaths(givenUp)
 	c.dispatch()
+}
+
+// setRxPathLocked records the path the datagrams being handled arrived on.
+// Callers hold c.mu.
+func (c *Conn) setRxPathLocked(pc PacketConn, remote net.Addr) {
+	if pc == nil {
+		pc, remote = c.pc, c.remote
+	}
+	c.rxPC, c.rxRemote = pc, remote
 }
 
 // armAckLocked makes sure that the timer fires by the time an
@@ -872,6 +961,9 @@ func (c *Conn) handleDatagramLocked(d []byte, now time.Time) {
 		c.terminateLocked(ErrStatelessReset)
 		return
 	}
+	if !c.pathValidated && c.rxPC == c.pc {
+		c.pathRecv += uint64(len(whole))
+	}
 	c.retryBuffered(now)
 }
 
@@ -1031,6 +1123,9 @@ func (c *Conn) handlePacket(pkt []byte, h header, now time.Time) bool {
 	}
 	c.lastActivity = now
 	c.sentSinceRecv = false
+	// The calls the packet's frames queue start here, which is where a
+	// move to the path it came on goes (see migrateLocked).
+	firstEvent := len(c.events)
 	ackEliciting, err := c.handleFrames(space, payload, now)
 	if err != nil {
 		c.closeLocked(err)
@@ -1038,6 +1133,10 @@ func (c *Conn) handlePacket(pkt []byte, h header, now time.Time) bool {
 	}
 	if c.closed || s.discarded {
 		return true
+	}
+	if c.rxPC != c.pc && !c.isClient && c.handshakeConfirmed && space == spaceApp &&
+		c.nonProbing && int64(pn) > largest {
+		c.migrateLocked(now, firstEvent)
 	}
 	if int64(pn) >= largest {
 		s.largestRecvTime = now
@@ -1354,6 +1453,7 @@ func (c *Conn) armTimerLocked(now time.Time) {
 	}
 	earliest(c.lossDeadline)
 	earliest(c.flushDeadline)
+	earliest(c.pathDeadline)
 	if s := &c.spaces[spaceApp]; s.ackPending && !s.ackNow {
 		earliest(s.ackDeadline)
 	}
@@ -1402,6 +1502,9 @@ func (c *Conn) onTimer() {
 	case !now.Before(c.idleDeadline()):
 		c.terminateLocked(ErrIdleTimeout)
 	default:
+		if !c.pathDeadline.IsZero() && !now.Before(c.pathDeadline) {
+			c.pathFailedLocked()
+		}
 		if !c.lossDeadline.IsZero() && !now.Before(c.lossDeadline) {
 			c.onLossDetectionTimeout(now)
 		}
@@ -1419,6 +1522,8 @@ func (c *Conn) onTimer() {
 		c.wantFlush = true
 		c.sendLocked()
 	}
+	givenUp := c.takeGivenUpLocked()
 	c.mu.Unlock()
+	closePaths(givenUp)
 	c.dispatch()
 }

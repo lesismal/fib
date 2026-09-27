@@ -36,6 +36,9 @@ var (
 	// ErrHandshakeTimeout ends a connection whose handshake did not finish
 	// in time.
 	ErrHandshakeTimeout = errors.New("quic: handshake timeout")
+	// ErrPathValidation ends a connection whose peer moved to a path it did
+	// not answer on, with no path left that it did.
+	ErrPathValidation = errors.New("quic: path validation failed")
 	// ErrStatelessReset ends a connection the peer no longer knows.
 	ErrStatelessReset = errors.New("quic: stateless reset")
 	// ErrClosed is what operations on a closed connection or stream get.

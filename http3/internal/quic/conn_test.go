@@ -978,10 +978,9 @@ func (b *batchSink) Close() error               { return nil }
 // allocating the list of them.
 func TestSendDatagramsAllocs(t *testing.T) {
 	sink := &batchSink{}
-	c := &Conn{pc: sink}
 	buf := make([]byte, 3000)
 	lens := []uint16{1000, 1000, 1000}
-	if allocs := testing.AllocsPerRun(100, func() { c.sendDatagrams(buf, lens) }); allocs != 0 {
+	if allocs := testing.AllocsPerRun(100, func() { sendDatagrams(sink, buf, lens) }); allocs != 0 {
 		t.Fatalf("a batched round allocated %v times", allocs)
 	}
 	if sink.batches == 0 {

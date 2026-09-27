@@ -30,6 +30,7 @@ const (
 	sfStopSending
 	sfHandshakeDone
 	sfRetireCID
+	sfPathChallenge
 )
 
 type sentFrame struct {
@@ -369,6 +370,10 @@ func (c *Conn) frameLost(space int, f *sentFrame) {
 		c.handshakeDonePending = true
 	case sfRetireCID:
 		c.retireCIDs = append(c.retireCIDs, f.off)
+	case sfPathChallenge:
+		// The challenge of the path being validated goes again, whichever
+		// path the lost one was for.
+		c.challengePending = !c.pathValidated
 	}
 }
 
@@ -380,7 +385,8 @@ func (c *Conn) peerCompletedAddressValidation() bool {
 }
 
 func (c *Conn) atAmplificationLimit() bool {
-	return !c.isClient && !c.addressValidated && c.bytesSent+maxDatagram > 3*c.bytesRecv
+	return !c.isClient && (!c.addressValidated && c.bytesSent+maxDatagram > 3*c.bytesRecv ||
+		!c.pathValidated && pathBudget(c.pathRecv, c.pathSent) < minPathDatagram)
 }
 
 // lossTimeSpace is the space with the earliest time-threshold loss timer.

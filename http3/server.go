@@ -142,6 +142,11 @@ type ServerHandler struct {
 	// streams runs request handlers away from the goroutine that reads
 	// their connection, or is nil when they run on it.
 	streams *fibhttp.StreamPool
+	// routes finds a connection by the connection ID its client's packets
+	// carry, for packets that arrive from an address no connection is on,
+	// as they do once a client's address changes under it; see route.
+	routesMu sync.RWMutex
+	routes   map[string]*quic.Conn
 }
 
 // NewHandler serves handler over HTTP/3 with the default limits.
@@ -172,7 +177,7 @@ func NewHandlerWithConfig(config Config, handler fibhttp.Handler) *ServerHandler
 		})
 	}
 	h := &ServerHandler{handler: handler, config: config, resetKey: quic.NewResetKey(),
-		streams: fibhttp.NewStreamPool(config.StreamPool)}
+		streams: fibhttp.NewStreamPool(config.StreamPool), routes: make(map[string]*quic.Conn)}
 	h.quic = quic.Config{
 		TLSConfig:          ConfigureTLS(config.TLSConfig),
 		MaxIdleTimeout:     config.MaxIdleTimeout,
@@ -195,14 +200,27 @@ func (h *ServerHandler) OnPriorityData(*fib.Connection, []byte) {}
 // OnData hands a datagram to its peer's connection, starting one if it is a
 // client's first. The engine hands each UDP datagram over as a buffer of its
 // own from the pool, which QUIC gives back once it has done with it.
+//
+// A datagram from an address with no connection that belongs to one all the
+// same, by the connection ID in it, comes from a client whose address
+// changed: the peer's fib.Connection then serves that connection too, as a
+// path of it, which it moves to once the client proves to be there (see
+// quic.Conn.HandlePathDatagram). The engine hands the new address's
+// datagrams to whichever of its loops the address falls to, and the QUIC
+// connection, which takes datagrams from any goroutine, follows it there.
 func (h *ServerHandler) OnData(c *fib.Connection, data []byte) {
 	if qc, ok := c.Attachment().(*quic.Conn); ok {
-		qc.HandleDatagram(data)
+		qc.HandlePathDatagram(c, c.RemoteAddr(), data)
 		return
 	}
 	if vn := quic.VersionNegotiation(data); vn != nil {
 		_ = c.Send(vn)
 		c.Close()
+		return
+	}
+	if qc := h.route(data); qc != nil {
+		c.SetAttachment(qc)
+		qc.HandlePathDatagram(c, c.RemoteAddr(), data)
 		return
 	}
 	if !quic.IsInitial(data) {
@@ -230,7 +248,35 @@ func (h *ServerHandler) OnData(c *fib.Connection, data []byte) {
 		c.Close()
 		return
 	}
+	h.addRoute(qc)
 	c.SetAttachment(qc)
+}
+
+// route returns the connection a datagram's connection ID names, if it is a
+// 1-RTT packet of one; only those can move a connection to a new path.
+func (h *ServerHandler) route(datagram []byte) *quic.Conn {
+	cid := quic.ShortHeaderDCID(datagram)
+	if cid == nil {
+		return nil
+	}
+	h.routesMu.RLock()
+	qc := h.routes[string(cid)]
+	h.routesMu.RUnlock()
+	return qc
+}
+
+func (h *ServerHandler) addRoute(qc *quic.Conn) {
+	h.routesMu.Lock()
+	h.routes[string(qc.LocalCID())] = qc
+	h.routesMu.Unlock()
+}
+
+func (h *ServerHandler) removeRoute(qc *quic.Conn) {
+	h.routesMu.Lock()
+	if h.routes[string(qc.LocalCID())] == qc {
+		delete(h.routes, string(qc.LocalCID()))
+	}
+	h.routesMu.Unlock()
 }
 
 // OnDatagrams hands a burst of datagrams to their peer's connection, which
@@ -239,7 +285,7 @@ func (h *ServerHandler) OnData(c *fib.Connection, data []byte) {
 func (h *ServerHandler) OnDatagrams(c *fib.Connection, datagrams [][]byte) {
 	for len(datagrams) > 0 {
 		if qc, ok := c.Attachment().(*quic.Conn); ok {
-			qc.HandleDatagrams(datagrams)
+			qc.HandlePathDatagrams(c, c.RemoteAddr(), datagrams)
 			return
 		}
 		h.OnData(c, datagrams[0])
@@ -247,9 +293,10 @@ func (h *ServerHandler) OnDatagrams(c *fib.Connection, datagrams [][]byte) {
 	}
 }
 
-// OnClose ends the peer's connection with its path.
+// OnClose ends the peer's connection with its path, if it is the path the
+// connection sends on: one it has left, or not moved to, goes alone.
 func (h *ServerHandler) OnClose(c *fib.Connection, err error) {
-	if qc, ok := c.Attachment().(*quic.Conn); ok {
+	if qc, ok := c.Attachment().(*quic.Conn); ok && qc.SendsOn(c) {
 		if err == nil {
 			err = net.ErrClosed
 		}
@@ -261,6 +308,7 @@ func (h *ServerHandler) OnClose(c *fib.Connection, err error) {
 var (
 	_ fib.DatagramsHandler  = (*ServerHandler)(nil)
 	_ quic.CallsDoneHandler = (*serverConn)(nil)
+	_ quic.PathHandler      = (*serverConn)(nil)
 )
 
 // serverConn is one client's HTTP/3 connection.
@@ -311,6 +359,14 @@ func (sc *serverConn) OnHandshake(qc *quic.Conn) {
 }
 
 func (sc *serverConn) fail(err error) { closeWith(sc.qc, err) }
+
+// OnPathChange gives the requests that follow the client's new address.
+// Requests are read on the goroutine QUIC calls the handler on, as this is.
+func (sc *serverConn) OnPathChange(qc *quic.Conn) {
+	if addr := qc.RemoteAddr(); addr != nil {
+		sc.remoteAddr = addr.String()
+	}
+}
 
 func (sc *serverConn) OnStreamData(s *quic.Stream, data []byte, fin bool) {
 	switch st := s.Context.(type) {
@@ -379,7 +435,8 @@ func (sc *serverConn) OnStreamsAvailable(*quic.Conn) {}
 // to the handler pool, together.
 func (sc *serverConn) OnCallsDone(*quic.Conn) { sc.h.streams.Submit(&sc.batch) }
 
-func (sc *serverConn) OnClose(*quic.Conn, error) {
+func (sc *serverConn) OnClose(qc *quic.Conn, _ error) {
+	sc.h.removeRoute(qc)
 	sc.mu.Lock()
 	streams := sc.streams
 	sc.streams = nil

@@ -884,9 +884,11 @@ server, err := fib.Bind(config, http3.NewHandler(tlsConfig, handler))
   调整 `MaxHeaderBytes`、`MaxBodyBytes`、`MaxConcurrentStreams`、`MaxIdleTimeout`）。
   TLS 配置里的 ALPN 会自动加上 `h3`。
 - Engine 按对端地址区分 UDP 连接，每个发来 QUIC Initial 的地址对应一个 QUIC 连接，挂在
-  该地址的 `fib.Connection` 上；因此不支持连接迁移（NAT 重绑定后连接会失效），服务端在
-  传输参数里声明 `disable_active_migration`。没有连接状态的短包头包会收到 stateless
-  reset，让对端立即结束而不是等超时；不认识的 QUIC 版本收到 Version Negotiation。
+  该地址的 `fib.Connection` 上。NAT 重绑定后，新地址来的包按 Connection ID 找到原来的
+  连接，经过路径验证后连接改到新地址上（见 [`docs/http3.zh-CN.md`](http3.zh-CN.md)）；
+  主动迁移不支持，服务端在传输参数里声明 `disable_active_migration`。Connection ID
+  也不认识的短包头包会收到 stateless reset，让对端立即结束而不是等超时；不认识的 QUIC
+  版本收到 Version Negotiation。
 - QUIC 的空闲超时（`MaxIdleTimeout`，默认 30 秒）应小于 Engine 的
   `Config.UDPIdleTimeout`（默认 60 秒），否则 Engine 会先把静默的对端连接关掉。
 - Handler 不用改：请求的 `Proto` 为 `HTTP/3.0`，`Request.TLS` 带有 TLS 状态，用
@@ -929,7 +931,7 @@ QUIC 层的实现要点：
 
 HTTP/3 的一致性测试（与 quic-go 客户端、服务端的双向互通，以及用手写帧构造的协议错误
 用例，CI 中在三个平台运行；quic-go 放在 `http3/interop` 这个独立 module 里，fib 本身
-不增加依赖）、当前的限制（按对端地址区分连接、不支持迁移、固定 1200 字节数据报、关闭时
+不增加依赖）、当前的限制（只跟随 NAT 重绑定、不支持主动迁移、固定 1200 字节数据报、关闭时
 没有 closing/draining 期等）、有意未实现的功能及原因（0-RTT、QPACK 动态表、server push
 等），以及待优化项（安全加固、pacing、PMTU 探测、拥塞控制、批量收发等）见
 [`docs/http3.zh-CN.md`](http3.zh-CN.md)。
@@ -1232,9 +1234,8 @@ Windows 上忽略这个配置，保持单个循环和原来的 task pool）。`D
   把每个数据报交给其中一个 socket，只唤醒读它的那个 poller，没有惊群；同一对端的数据报总落在同一个
   poller 上，它的连接、`OnData` 和空闲超时都由这个 poller 负责，peer 表按 poller 分开、不加锁。
   限制：组里的 socket 一变（例如同一用户的其他进程 bind 同一地址）哈希就变，部分对端会换到别的
-  socket；对端地址变了（NAT 重绑定）会被当成新的对端。HTTP/3 本来就不支持连接迁移（服务端声明
-  `disable_active_migration`），地址变了的包即使在单个循环上也会收到 stateless reset，所以
-  这一点对它没有额外影响。
+  socket；对端地址变了（NAT 重绑定）会被当成新的对端。HTTP/3 按 Connection ID 把新地址的包
+  找回原来的 QUIC 连接，不管新地址落在哪个 poller 上，连接都会跟过去。
 - 开启后 Engine 自己的 task pool 固定为 `taskpool.ModeInline`（名为 `<Name>-inline`）：
   每个 poller 在自己的 goroutine 上直接执行它那些连接的这一轮处理，handler panic 会被
   recover 并关闭该连接。和 `InlineHandlers` 一样，阻塞的回调会卡住同一个 poller 上的

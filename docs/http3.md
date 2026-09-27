@@ -29,20 +29,34 @@ All of it is covered by tests that run in CI; see [Conformance tests](#conforman
 
 Behavior users need to be aware of.
 
-### Connections are keyed by peer address; no migration
+### Connections follow a NAT rebinding; no active migration
 
 - The engine's UDP socket hands each datagram to the `fib.Connection` of its
-  sender's IP:port, and each address has one QUIC connection. Routing is **not
-  by Connection ID**. When a client changes networks or its NAT rebinds, the
-  old connection receives nothing more; it ends on idle timeout or when the
-  client reconnects. The server advertises `disable_active_migration`.
-- For the same reason, connections cannot be spread across processes or
-  `SO_REUSEPORT` sockets.
+  sender's IP:port, and a QUIC connection hangs off the address its client
+  started from. A 1-RTT packet from an address with no connection is routed
+  by its Connection ID to the connection it belongs to, which is how a
+  client whose NAT rebound keeps its connection: once an authentic packet
+  from the new address proves to be the client's latest (numbered above
+  every one before it, with a frame other than a probing one), the server
+  sends there, at most three times what arrived there, validates the address
+  with PATH_CHALLENGE, and closes the old path once the client answers
+  (RFC 9000 §9.3). A client that does not answer in time is taken back to
+  the path it left, and a later packet on the old path takes it back too.
+  Congestion control and RTT start over unless only the port changed, and
+  datagrams drop to 1200 bytes until the new path is validated. Requests
+  after the move report the new address in `Request.RemoteAddr`.
+- Under `Config.IOPollers` with `ReusePort` on Linux, the new address may
+  fall to another poller's socket; the connection follows it there, since a
+  QUIC connection takes datagrams from any goroutine.
+- The server still advertises `disable_active_migration`, and issues no
+  Connection IDs beyond the handshake's: a client may not move on purpose,
+  which would take a fresh Connection ID for the new path. Its NAT may.
 - Only the Connection ID from the handshake is used; NEW_CONNECTION_ID is never
   sent. CIDs the peer offers are recorded and retire_prior_to is honored, but
-  this side never rotates CIDs. PATH_CHALLENGE is answered but never sent,
-  and at most the 4 latest answers wait to go out (RFC 9000 §8.2.2 asks only
-  that the latest challenge be answered); preferred_address is ignored.
+  this side never rotates CIDs. PATH_CHALLENGE is answered, on the path the
+  connection sends on, and at most the 4 latest answers wait to go out
+  (RFC 9000 §8.2.2 asks only that the latest challenge be answered);
+  preferred_address is ignored.
 
 ### Working with the engine
 
@@ -182,7 +196,7 @@ exposed through `http3.Config` or `http3.ClientConfig`:
 | Feature | Reason |
 | --- | --- |
 | 0-RTT | 0-RTT requests can be replayed, which needs handlers that recognize and refuse non-idempotent requests; the gain is not worth the complexity. The client sends no early data; the server drops 0-RTT packets, which the client then resends as 1-RTT. |
-| Connection migration / CID routing | Needs Connection ID demultiplexing in the engine's UDP layer, which changes the engine's model of keying UDP connections by address. |
+| Active connection migration | A client moving on purpose has to use a fresh Connection ID on its new path, so the server would have to issue and route several per connection, and retire them. A NAT rebinding, which keeps the Connection ID, is followed (see above). |
 | QPACK dynamic table | Both sides advertise a capacity of 0: no head-of-line blocking from blocked streams, silent encoder and decoder streams, and no extra state or memory. The cost is that repeated headers are sent in full every time. |
 | Server push | No major browser enables HTTP/3 push. The client sends no MAX_PUSH_ID, and `Context.Push` returns `http.ErrNotSupported`. Use 103 Early Hints (`WriteInterim`) for preloading. |
 | Server-sent Retry / NEW_TOKEN | Address validation relies on the handshake and the 3x amplification limit, which spares issuing and checking tokens. The client handles a Retry from a server but ignores NEW_TOKEN. |

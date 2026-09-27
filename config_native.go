@@ -179,8 +179,9 @@ type Config struct {
 	// timeout; without it the engine's own loop reads every peer. The hash
 	// holds only while the sockets sharing the address stay the same, so a
 	// socket another process binds there moves some peers to it, and a peer
-	// whose address changes, as a QUIC client's may, reaches whichever
-	// poller its new address hashes to.
+	// whose address changes reaches whichever poller its new address hashes
+	// to, as a new peer; package http3 finds its QUIC connection there by
+	// its connection ID.
 	ReusePort bool
 	// UDPIdleTimeout closes a UDP peer's connection once the peer has neither
 	// sent nor been sent a datagram for this long, since UDP has no close of
