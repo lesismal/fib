@@ -63,6 +63,14 @@ func (wouldBlockError) Temporary() bool { return true }
 // connections whose reads feed it, and an engine worker that opens a
 // connection never waits on its own queue. Records after that are decrypted
 // in OnData like any other input, straight from the bytes the round read.
+//
+// Once a handshake settles on an AES-GCM suite of TLS 1.3 or 1.2, the
+// connection's records are protected by this package rather than by
+// crypto/tls, which is then done with; the keys come from crypto/tls through
+// Config.KeyLogWriter. For that the Handler clones Config the first time it
+// is used and runs its handshakes with the clone, whose KeyLogWriter still
+// passes every line on to Config's own; changes made to Config after that
+// are not seen, as crypto/tls asks of a Config in use anyway.
 type Handler struct {
 	Config  *stdtls.Config
 	Handler fib.Handler
@@ -72,6 +80,12 @@ type Handler struct {
 	// HandshakeTimeout bounds the handshake. Zero means
 	// DefaultHandshakeTimeout and a negative value means no bound.
 	HandshakeTimeout time.Duration
+
+	// fastConfig is the clone of Config handshakes run with where the
+	// connection may leave crypto/tls afterwards; see fast.go.
+	fastOnce   sync.Once
+	fastConfig *stdtls.Config
+	fastReg    *registry
 }
 
 // NewServer returns a handler that serves TLS with config in front of
@@ -118,13 +132,27 @@ func (h *Handler) inner() fib.Handler {
 	return h.Handler
 }
 
+// config is the Config handshakes run with, and the registry of the
+// connections that may leave crypto/tls once theirs completes, or nil.
+func (h *Handler) config() (*stdtls.Config, *registry) {
+	h.fastOnce.Do(func() { h.fastConfig, h.fastReg = fastConfig(h.Config, h.Client) })
+	if h.fastConfig != nil {
+		return h.fastConfig, h.fastReg
+	}
+	return h.Config, nil
+}
+
 func (h *Handler) OnOpen(c *fib.Connection) {
-	t := &layer{c: c, handshaking: true, settling: true}
+	t := &layer{c: c, client: h.Client, handshaking: true, settling: true}
 	t.cond.L = &t.mu
+	config, reg := h.config()
+	if reg != nil {
+		t.capture = &capture{client: h.Client, reg: reg}
+	}
 	if h.Client {
-		t.conn = stdtls.Client(t, h.Config)
+		t.conn = stdtls.Client(t, config)
 	} else {
-		t.conn = stdtls.Server(t, h.Config)
+		t.conn = stdtls.Server(t, config)
 	}
 	c.SetLayer(t)
 	h.inner().OnOpen(c)
@@ -179,6 +207,21 @@ type HandshakeHandler interface {
 type layer struct {
 	c    *fib.Connection
 	conn *stdtls.Conn
+	// client is the side of the handshake the connection took.
+	client bool
+
+	// capture collects what taking the connection over from crypto/tls
+	// needs, during the handshake of one that may be. Once it has been, rx
+	// and tx protect its records, state is what ConnectionState reports, and
+	// conn is nil; see fast.go. The read side's fields, pend, the start of a
+	// record a round ended in, hsBuf, the start of a handshake message, and
+	// useless, the records in a row with no application data, are readMu's.
+	capture *capture
+	rx, tx  *recordKeys
+	state   *stdtls.ConnectionState
+	pend    []byte
+	hsBuf   []byte
+	useless int
 
 	// mu guards the ciphertext and the handshake and closed flags. cond wakes
 	// a handshake waiting for the peer.
@@ -230,16 +273,20 @@ func (t *layer) handshake(handler fib.Handler, timeout time.Duration) {
 		defer cancel()
 	}
 	err := t.conn.HandshakeContext(ctx)
-	if err == nil {
-		t.releaseHandshakeBuffers()
-	}
 
 	t.wmu.Lock()
+	if err == nil {
+		t.takeOver()
+	}
+	if t.capture != nil {
+		t.capture.release()
+		t.capture = nil
+	}
 	pending, closeAfterSend := t.pending, t.closeAfterSend
 	t.pending = nil
 	for i, held := range pending {
 		if err == nil {
-			_, err = t.conn.Write(held)
+			err = t.writeLocked(held, nil)
 		}
 		bufferpool.Put(held)
 		pending[i] = nil
@@ -258,7 +305,7 @@ func (t *layer) handshake(handler fib.Handler, timeout time.Duration) {
 		// Before any plaintext reaches OnData, so that a handler can pick its
 		// protocol from what ALPN chose.
 		if h, ok := handler.(HandshakeHandler); ok {
-			h.OnHandshake(t.c, t.conn.ConnectionState())
+			h.OnHandshake(t.c, t.connectionState())
 		}
 	}
 	t.mu.Lock()
@@ -332,9 +379,9 @@ func (t *layer) drainLocked(handler fib.Handler) {
 	if !t.hasInput() {
 		return
 	}
-	if lendRawInput {
-		t.lendInput()
-		defer t.reclaimInput()
+	if t.rx != nil {
+		t.drainFast(handler)
+		return
 	}
 	buf := bufferpool.Get(readBufferSize)
 	defer bufferpool.Put(buf)
@@ -427,6 +474,15 @@ func (t *layer) Send(first, second []byte) error {
 		t.pending = append(t.pending, bufferpool.Join(nil, first, second))
 		return nil
 	}
+	return t.writeLocked(first, second)
+}
+
+// writeLocked encrypts first followed by second and sends them. The caller
+// holds wmu.
+func (t *layer) writeLocked(first, second []byte) error {
+	if t.tx != nil {
+		return t.sealSendLocked(recordTypeApplicationData, first, second)
+	}
 	data := first
 	if len(second) > 0 {
 		// One record for both parts: a frame header sent as a record of its
@@ -460,8 +516,21 @@ func (t *layer) CloseAfterSend() {
 }
 
 func (t *layer) closeNotifyLocked() {
-	_ = t.conn.CloseWrite()
+	if t.tx != nil {
+		_ = t.sealSendLocked(recordTypeAlert, []byte{alertLevelWarning, alertCloseNotify}, nil)
+	} else {
+		_ = t.conn.CloseWrite()
+	}
 	t.c.CloseAfterSendRaw()
+}
+
+// connectionState is what ConnectionState reports once the handshake has
+// completed.
+func (t *layer) connectionState() stdtls.ConnectionState {
+	if t.state != nil {
+		return *t.state
+	}
+	return t.conn.ConnectionState()
 }
 
 // isClosed reports whether the connection has closed.
@@ -489,6 +558,9 @@ func (t *layer) Read(p []byte) (int, error) {
 		if len(t.src) > 0 {
 			n := t.rec.take(p, t.src)
 			t.src = t.src[n:]
+			if t.capture != nil {
+				t.capture.readBytes(p[:n])
+			}
 			return n, nil
 		}
 		if !t.handshaking {
@@ -498,6 +570,9 @@ func (t *layer) Read(p []byte) (int, error) {
 	}
 	n := t.rec.take(p, t.in[t.inHead:])
 	t.inHead += n
+	if t.capture != nil {
+		t.capture.readBytes(p[:n])
+	}
 	if t.inHead == len(t.in) {
 		// Emptied, the buffer goes back to the pool rather than staying with
 		// the connection: once the handshake is over it is only needed
@@ -547,6 +622,9 @@ func (r *recordCursor) take(p, src []byte) int {
 // Write is crypto/tls writing records. The connection copies them, since
 // crypto/tls reuses its buffer for the next record.
 func (t *layer) Write(p []byte) (int, error) {
+	if t.capture != nil {
+		t.capture.wrote(p)
+	}
 	if err := t.c.SendRaw(p); err != nil {
 		return 0, err
 	}
@@ -600,5 +678,5 @@ func ConnectionState(c *fib.Connection) (stdtls.ConnectionState, bool) {
 	if !ready {
 		return stdtls.ConnectionState{}, false
 	}
-	return t.conn.ConnectionState(), true
+	return t.connectionState(), true
 }

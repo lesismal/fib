@@ -428,11 +428,18 @@ err = fibtls.Dial(engine, "tcp", "example.com:443", 3*time.Second, tlsConfig, ha
   保留一个只增不减的输入缓冲，一次交给它整轮流水线数据，这个缓冲就会涨到一轮的大小
   并一直留着。2 万连接、1 KiB 消息、每次写 10 条的 TLS 1.3 流水线压测中，服务端内存由
   约 880 MB 降到约 490 MB。
-- 连接在两轮之间不保留 `crypto/tls` 的缓冲：握手结束后，把它为握手撑大、之后一直空着的
-  输入缓冲和握手消息缓冲置空；之后每轮解密时从缓冲池借一块作输入缓冲，解密完即收回
-  （只剩半条记录时留到下一轮）。`crypto/tls` 不提供释放这两个缓冲的接口，所以这里按字段名
-  找到它们；某个 Go 版本里找不到时就不做处理，行为和原来一样。同样的压测中，echo 阶段内存
-  由约 360 MB 降到约 260 MB，流水线阶段由约 470 MB 降到约 260 MB，吞吐不变。
+- 握手由 `crypto/tls` 完成；协商出 TLS 1.3 或 TLS 1.2 的 AES-GCM 套件时，握手之后的记录由
+  本 package 自己的记录层处理，`crypto/tls` 的 `Conn` 随即丢弃：密文在本轮读到的缓冲里原地
+  解密、明文直接交给 `OnData`，发送时一次加密进缓冲再交给连接，连接之后只保留两个方向的
+  密钥。密钥通过公开的 `Config.KeyLogWriter` 取得（`Handler` 为此克隆一份 Config，原有的
+  `KeyLogWriter` 照常收到每一行），握手结束时两个方向的序号，用握手期间 `crypto/tls` 收发的
+  记录逐条试解密来确定。TLS 1.3 的 KeyUpdate、alert、close_notify 都由记录层处理。其他情况
+  留在 `crypto/tls`：ChaCha20、CBC 套件和 TLS 1.1，服务端 Config 设置了 `GetConfigForClient`，
+  客户端 Config 设置了 `ClientSessionCache` 或开启了重协商，以及 TLS 1.2 的会话恢复（这时
+  `crypto/tls` 不输出密钥）。3 个 CPU、2 万连接、1 KiB 消息的压测中，echo 吞吐不变，每次
+  echo 的服务端 CPU 下降约 20%；TLS 1.3 的内存在 echo 阶段由约 360 MB 降到约 260 MB，流水线
+  阶段由约 460 MB 降到约 260 MB，TLS 1.2 分别由约 235 MB、约 385 MB 降到约 185 MB。流水线
+  吞吐低约 3%：响应写得更及时，合并进同一次写的就少了。
 - 对端关闭前发出的明文一定先到 `OnData` 再到 `OnClose`，包括随握手一起到达的数据；
   `OnClose` 也不会与 `OnHandshake` 同时执行。
 - `Handler.HandshakeTimeout` 限制握手时长，0 表示 `DefaultHandshakeTimeout`
