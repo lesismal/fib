@@ -39,41 +39,30 @@ type PoolSizing struct {
 // a round inside the kernel rather than on a P. Sizing a pool to GOMAXPROCS
 // leaves cores idle whenever its workers are in flight.
 //
-// How far to oversubscribe depends on the mode, because the worker count does
-// not mean the same thing in both.
-//
-// ModeCond creates every worker up front and parks it on a condition variable,
-// so the count is a population of goroutines that exists whether or not there
-// is work, and paying for more of them than the load needs makes the scheduler
-// move more goroutines between the same cores. A 100k-connection echo run
-// measured, on a five-core cpuset: 255k echoes/s with 16 workers, 319k with 64,
-// 331k with 250, 350k with 500, then back down to 340k with 2000 and 314k with
-// 5000.
+// Every mode that has workers grows and shrinks them with the load, so the
+// worker count is a ceiling rather than a population: raising it costs
+// nothing until the load actually climbs to it, and lowering it throttles a
+// burst that the cores could have absorbed. The default is set high for that
+// reason.
 //
 // ModeElastic forks a worker per submission while it has capacity and retires
-// it after a short idle linger, so the count is a ceiling instead of a
-// population: raising it costs nothing until the load actually climbs to it,
-// and lowering it throttles a burst that the cores could have absorbed. Its
-// default is therefore an order of magnitude higher than the cond one.
+// it after a short idle linger.
 //
-// Its floor follows the cores rather than GOMAXPROCS, since the ceiling is
+// The default's floor follows the cores rather than GOMAXPROCS, since it is
 // sized from GOMAXPROCS and the floor is what keeps a lowered GOMAXPROCS from
 // throttling the pool below what the machine's cores can keep busy. It is
 // elasticMinWorkersPerCPU workers per core, where a fixed floor would hand a
 // two-core machine 5000 workers per core.
 //
-// ModeAdaptive keeps parked workers the way ModeCond does but grows and shrinks
-// the population with the load, so its count is a ceiling as under
-// ModeElastic, and it takes the same default. The floor it retires down to is
-// Config.MinWorkerCount.
+// ModeAdaptive and ModeAdaptiveChan keep parked workers between tasks and
+// grow and shrink the population with the load, and take the same default.
+// The floor they retire down to is Config.MinWorkerCount.
 //
 // GOMAXPROCS is best left at the runtime's default, the cores: raising it
 // above them served HTTP/2 over 10k connections 3% to 17% fewer multiplexed
 // requests on 3, 4 and 6 cores, with echoes no faster; see the note on
 // GOMAXPROCS in docs/guide.zh-CN.md.
 const (
-	condWorkersPerCPU    = 100
-	condMinWorkers       = 256
 	elasticWorkersPerCPU = 1000
 	// elasticMinWorkersPerCPU is the floor per core; see above.
 	elasticMinWorkersPerCPU = 20
@@ -108,18 +97,10 @@ const (
 )
 
 // DefaultPoolSizing reports the sizing mode is tuned for, which is what
-// DefaultConfig and SetTaskPoolMode install.
+// DefaultConfig and SetTaskPoolMode install. Every mode now takes the same
+// one; the parameter stays so that a mode tuned otherwise can be told apart.
 func DefaultPoolSizing(mode taskpool.Mode) PoolSizing {
-	cpuCount := runtime.GOMAXPROCS(0)
-	workerCount := cpuCount * condWorkersPerCPU
-	minWorkers := condMinWorkers
-	if mode == taskpool.ModeElastic || mode.Adaptive() {
-		workerCount = cpuCount * elasticWorkersPerCPU
-		minWorkers = runtime.NumCPU() * elasticMinWorkersPerCPU
-	}
-	if workerCount < minWorkers {
-		workerCount = minWorkers
-	}
+	workerCount := max(runtime.GOMAXPROCS(0)*elasticWorkersPerCPU, runtime.NumCPU()*elasticMinWorkersPerCPU)
 	return poolSizing(workerCount)
 }
 
@@ -233,9 +214,9 @@ func defaultPollerCount(cpus int) int {
 // SetTaskPoolMode then keeps. A value that is not positive leaves that field at
 // what it already held.
 //
-// WorkerCount is a population of parked goroutines under ModeCond, a ceiling
-// on forked ones under ModeElastic, and a ceiling on parked ones under
-// ModeAdaptive; DefaultPoolSizing documents what each mode does with it.
+// WorkerCount is a ceiling on forked goroutines under ModeElastic and on
+// parked ones under ModeAdaptive and ModeAdaptiveChan; DefaultPoolSizing
+// documents what each mode does with it.
 func (c *Config) SetPoolSizing(workerCount, maxEvents int) *Config {
 	if workerCount > 0 {
 		c.WorkerCount = workerCount

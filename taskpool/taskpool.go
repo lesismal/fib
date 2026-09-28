@@ -11,15 +11,15 @@ import (
 
 type Mode uint8
 
+// Every mode grows and shrinks its workers with the load, except ModeInline,
+// which has none. The zero Mode is not a mode: it was ModeCond, a fixed set of
+// workers, which is gone, and the others keep the values they had.
 const (
-	// ModeCond runs a fixed set of workers that park on a condition variable
-	// between tasks. The worker count is the number of goroutines that exist.
-	ModeCond Mode = iota
 	// ModeElastic forks a worker per submission while it has capacity, lets
 	// idle ones linger briefly, and retires them after that. The worker count
 	// is a ceiling rather than a population.
-	ModeElastic
-	// ModeAdaptive keeps parked workers as ModeCond does, but grows the
+	ModeElastic Mode = iota + 1
+	// ModeAdaptive keeps parked workers between tasks, but grows the
 	// population when tasks arrive to find every worker busy and retires
 	// workers that stay idle, between a floor and a ceiling that Resize can
 	// move while the pool runs. See NewAdaptive.
@@ -42,8 +42,6 @@ func (m Mode) String() string {
 	switch m {
 	case ModeElastic:
 		return "elastic"
-	case ModeCond:
-		return "cond"
 	case ModeAdaptive:
 		return "adaptive"
 	case ModeInline:
@@ -56,7 +54,7 @@ func (m Mode) String() string {
 }
 
 func (m Mode) Valid() bool {
-	return m == ModeElastic || m == ModeCond || m == ModeAdaptive || m == ModeInline || m == ModeAdaptiveChan
+	return m == ModeElastic || m == ModeAdaptive || m == ModeInline || m == ModeAdaptiveChan
 }
 
 // Adaptive reports whether the pool grows and shrinks between a floor and a
@@ -142,10 +140,6 @@ func NewWithMode(name string, mode Mode, maxConcurrent, queueSize int) *TaskPool
 		return start(name, mode, func(executor *executor) backend {
 			return newElasticPool(executor, maxConcurrent, queueSize)
 		})
-	case ModeCond:
-		return start(name, mode, func(executor *executor) backend {
-			return newCondBackend(executor, maxConcurrent, queueSize)
-		})
 	case ModeAdaptive:
 		return NewAdaptive(AdaptiveConfig{
 			Name: name, MaxWorkers: maxConcurrent, QueueSize: queueSize,
@@ -225,9 +219,8 @@ func (tp *TaskPool) Call(f func()) { tp.executor.call(taskFunc(f)) }
 
 func (tp *TaskPool) Stop() { tp.backend.stop() }
 
-// Workers reports how many workers the pool is running: the fixed count under
-// ModeCond, the forked workers under ModeElastic, the current population
-// under ModeAdaptive and ModeAdaptiveChan, and none under ModeInline.
+// Workers reports how many workers the pool is running: the forked workers
+// under ModeElastic, the current population under ModeAdaptive and ModeAdaptiveChan, and none under ModeInline.
 func (tp *TaskPool) Workers() int { return tp.backend.workerCount() }
 
 // Resize moves a ModeAdaptive or ModeAdaptiveChan pool's floor and ceiling while it runs. Raising

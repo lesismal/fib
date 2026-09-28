@@ -18,22 +18,23 @@
 - 每轮事件处理先 flush 发送队列，再读 OOB，再读普通数据；发送队列仍有数据时跳过读取，并把可读状态保留到下一轮，待可写事件清空队列后再读，既限制用户态缓冲又不会漏读。
 - 读 buffer 由 `bufferpool` 子 package 按字节对齐的尺寸档复用（见下），大小通过
   `Config.ReadBufferSize` 设置，默认 16 KiB。
-- `Config.TaskPoolMode` 可选 `taskpool.ModeCond`（基于 `sync.Cond` 的有界环形
-  队列，按 worker 数分片）、`taskpool.ModeElastic`（nbio 风格的弹性
-  fork/dispatcher）或 `taskpool.ModeAdaptive`（见下，所有后端的默认值，
-  `taskpool.New` 也默认使用它）。`taskpool.ModeInline`（`taskpool.NewInline`）
+- `Config.TaskPoolMode` 可选 `taskpool.ModeElastic`（nbio 风格的弹性
+  fork/dispatcher，空闲 worker 短暂驻留）、`taskpool.ModeAdaptive`（见下，所有后端的
+  默认值，`taskpool.New` 也默认使用它）或 `taskpool.ModeAdaptiveChan`（扩缩容机制与
+  ModeAdaptive 相同，但 worker 在 channel 上等任务，不用 mutex 和条件变量，也不分片）。
+  这几种都会随负载扩容缩容；固定 worker 数的 ModeCond 已删除，`Mode` 的零值因此不再是
+  合法的 Mode。`taskpool.ModeInline`（`taskpool.NewInline`）
   不起 worker，也没有队列，直接在提交任务的 goroutine 上带 recover 执行；它只作为
   独立的库功能保留，Engine 不接受它（`TaskPoolMode` 设为 `ModeInline`，或 `SetTaskPool`
   传入 inline 池，`Bind` 都会报错），因为那样连接的一轮会在事件循环上执行。
-- `taskpool.ModeAdaptive` 同样分片，但常驻数量随负载在下限和上限之间变化，调度方式
-  也不同：
+- `taskpool.ModeAdaptive` 按 worker 数分片，常驻数量随负载在下限和上限之间变化：
   - 唤醒：每个空闲 worker 有自己的唤醒通道，按后进先出压在空闲栈上，被唤醒的总是
     最近停下、栈和缓存都还热的那个。唤醒的对象是"队列"而不是"某个任务"：到达队列的
     worker 会一直取任务直到取空。每个分片最多保持 2 个"已唤醒、尚未到达队列"的
     worker；worker 取走一个任务后如果还剩下比正在赶来的更多的任务，就再叫醒下一个。
     于是任务阻塞时 worker 逐跳扇出，任务很短时已经在跑的 worker 就能消化，不必为
-    一批 n 个任务付出 n 次唤醒（ModeCond 的做法，在繁忙服务器上这部分调度开销占了
-    池的大部分 CPU）。
+    一批 n 个任务付出 n 次唤醒（每个任务 Signal 一次条件变量的做法，在繁忙服务器上
+    这部分调度开销占了池的大部分 CPU）。
   - 扩容：只有当所有 worker 都在忙、且没有正在赶来的 worker 时才新起一个，直到上限。
     已被唤醒、还没开始跑的 worker 算作"正在赶来"，所以一批连发的任务按实际忙起来的
     worker 数扩容，而不是一个任务一个。
@@ -53,17 +54,15 @@
     退是为了突发过后分几个周期逐步回落，而不是把下一次突发要用的 worker 一次退光。
   - 运行中可以用 `TaskPool.Resize(min, max)` 调整上下限：调高下限立即补足 worker；
     调低上限时，空闲 worker 立即退出，忙碌的在手头任务完成后退出。
-    `TaskPool.Workers()` 返回当前 worker 数（其他 Mode 调 `Resize` 返回 false）。
+    `TaskPool.Workers()` 返回当前 worker 数（ModeAdaptiveChan 同样支持 `Resize`，其他
+    Mode 调 `Resize` 返回 false）。
   - 直接使用：`taskpool.NewAdaptive(taskpool.AdaptiveConfig{Name: "jobs", MinWorkers: 16,
     MaxWorkers: 4096, QueueSize: 10000})`；`NewWithMode(name, ModeAdaptive, max, queue)`
     的下限为 0。下限为 0 时，空闲的池会把 worker 全部退掉，有任务来时再启动。在 fib 里，
     `WorkerCount` 是上限，`Config.MinWorkerCount` 是下限（默认 0）。
-- 池容量按 Mode 分别给默认值，因为 `WorkerCount` 在不同 Mode 下含义不同
-  （ModeAdaptive 与 ModeElastic 一样是上限，默认值也相同）：
-  ModeCond 会预先创建这么多协程并让它们挂在条件变量上，这个数就是实际存在的
-  协程数量，多了只是让调度器在同样的核上搬运更多协程；ModeElastic 则是按需
-  fork、空闲短暂驻留后回收，这个数是上限而不是实际数量，调高在负载没到之前
-  不产生开销。`DefaultPoolSizing(mode)` 返回对应 Mode 的默认值。
+- 每种 Mode 的 `WorkerCount` 都是上限而不是实际协程数：按需起 worker、空闲后回收，
+  调高在负载没到之前不产生开销，所以各 Mode 的默认值相同。`DefaultPoolSizing(mode)`
+  返回默认值。
 - `SetTaskPoolMode(mode)` 切换 Mode 时会同时把 `WorkerCount`、`MaxEvents`
   换成该 Mode 的默认值；`SetPoolSizing(workerCount, maxEvents)` 固定为自己的
   取值，之后再调 `SetTaskPoolMode` 也不会被覆盖，两者调用顺序无关。传 0 表示
@@ -71,8 +70,8 @@
 
   ```go
   config := fib.DefaultConfig()
-  config.SetTaskPoolMode(taskpool.ModeCond)  // 容量随之切到 cond 的默认值
-  config.SetPoolSizing(500, 10000)           // 固定成自己的取值
+  config.SetTaskPoolMode(taskpool.ModeElastic)  // 容量随之切到该 Mode 的默认值
+  config.SetPoolSizing(500, 10000)              // 固定成自己的取值
   ```
 - 背压有两道界，暂停读的原因只能是其中之一，`Engine.Stats()` 会分别计数
   （`ReadsPausedByWatermark`、`ReadsPausedByBudget`、`ReadsResumed`、

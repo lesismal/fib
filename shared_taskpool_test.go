@@ -10,7 +10,7 @@ import (
 func TestSharedTaskPoolReferenceLifecycle(t *testing.T) {
 	// A name of its own keeps the pools other tests' engines left running out
 	// of what this one counts.
-	config := Config{Name: "lifecycle", WorkerCount: 1, MaxEvents: 4, TaskPoolMode: taskpool.ModeCond, SharedTaskPool: true}
+	config := Config{Name: "lifecycle", WorkerCount: 1, MaxEvents: 4, TaskPoolMode: taskpool.ModeElastic, SharedTaskPool: true}
 	first, releaseFirst := acquireTaskPool(config)
 	second, releaseSecond := acquireTaskPool(config)
 	if first != second {
@@ -95,7 +95,7 @@ func TestEngineNameDefaultsToFib(t *testing.T) {
 	if got := DefaultConfig().Name; got != DefaultName {
 		t.Fatalf("DefaultConfig().Name = %q, want %q", got, DefaultName)
 	}
-	pool, release := acquireTaskPool(Config{WorkerCount: 1, MaxEvents: 4, TaskPoolMode: taskpool.ModeCond})
+	pool, release := acquireTaskPool(Config{WorkerCount: 1, MaxEvents: 4, TaskPoolMode: taskpool.ModeElastic})
 	defer release()
 	if got := pool.(*taskpool.TaskPool).Name(); got != "fib-workers" {
 		t.Fatalf("Name() = %q, want fib-workers", got)

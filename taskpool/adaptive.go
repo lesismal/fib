@@ -34,7 +34,7 @@ type AdaptiveConfig struct {
 
 // NewAdaptive creates a ModeAdaptive pool.
 //
-// Its workers park between tasks, as ModeCond's do, but their number follows
+// Its workers park between tasks, but their number follows
 // the load. Tasks that find every worker busy and none on its way to the
 // queue start a new one, up to MaxWorkers, so a burst of tasks that block is
 // absorbed by more workers rather than a longer queue, while short tasks are
@@ -64,8 +64,9 @@ func validateAdaptiveRange(minWorkers, maxWorkers int) {
 	}
 }
 
-// adaptiveBackend spreads an adaptive pool over shards, for the same reason
-// ModeCond is sharded, and runs the one goroutine that shrinks all of them.
+// adaptiveBackend spreads an adaptive pool over shards, since one queue and
+// lock shared by every producer and worker would be the limit on many cores,
+// and runs the one goroutine that shrinks all of them.
 //
 // The shards share one ceiling rather than splitting it, and a shard that
 // needs a worker the ceiling will not start takes a parked one from another
@@ -319,10 +320,11 @@ func newAdaptiveWorker() *adaptiveWorker {
 //
 // A worker is woken for the queue rather than for a task, and whichever
 // worker reaches the queue takes the tasks there until it is empty. Waking
-// one worker per task, as ModeCond does, makes a batch of n tasks cost n
-// wake-ups although a woken worker usually finds the batch half drained by
-// the ones before it; every wake-up readies a goroutine and often a whole
-// thread, and on a busy server that churn was most of the pool's CPU time.
+// one worker per task, as signalling a condition variable per task does,
+// makes a batch of n tasks cost n wake-ups although a woken worker usually
+// finds the batch half drained by the ones before it; every wake-up readies a
+// goroutine and often a whole thread, and on a busy server that churn was
+// most of the pool's CPU time.
 // So a shard keeps at most maxWaking workers on their way to the queue, and
 // each worker that takes a task and still sees more waiting than are coming
 // for them wakes the next one. The pool fans out one worker per hop for as

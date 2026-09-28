@@ -39,12 +39,12 @@ func serveStreamingServer(t *testing.T, config Config, handler HandlerFunc) stri
 // serveOnPinnedPool runs a server whose rounds go to a pool of a fixed size,
 // for a test that counts goroutines: the built-in pool grows with how many
 // connections happen to be busy at once, which is not a cost of the requests
-// themselves and differs from one machine to the next. ModeCond starts all of
-// its workers with the pool, so they are already there when the count is
-// taken and none is added later.
+// themselves and differs from one machine to the next. An adaptive pool whose
+// floor is its ceiling starts all of its workers with the pool, so they are
+// already there when the count is taken and none is added or retired later.
 func serveOnPinnedPool(t *testing.T, config Config, handler HandlerFunc) string {
 	t.Helper()
-	pool := taskpool.NewWithMode("test", taskpool.ModeCond, 8, 1024)
+	pool := taskpool.NewAdaptive(taskpool.AdaptiveConfig{Name: "test", MinWorkers: 8, MaxWorkers: 8, QueueSize: 1024})
 	engine := fib.DefaultConfig()
 	engine.Addr = "127.0.0.1:0"
 	// Without pollers every round runs on the pinned pool; with them HTTP/1

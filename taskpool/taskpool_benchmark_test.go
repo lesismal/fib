@@ -10,7 +10,7 @@ import (
 	"time"
 )
 
-var benchmarkModes = []Mode{ModeElastic, ModeCond, ModeAdaptive, ModeAdaptiveChan}
+var benchmarkModes = []Mode{ModeElastic, ModeAdaptive, ModeAdaptiveChan}
 
 type benchmarkTask struct{ done chan struct{} }
 
@@ -68,11 +68,7 @@ func reportCPU(b *testing.B, start time.Duration, tasks int) {
 }
 
 func newBenchPool(mode Mode) *TaskPool {
-	sizing := 1000 * runtime.GOMAXPROCS(0)
-	if mode == ModeCond {
-		sizing = 100 * runtime.GOMAXPROCS(0)
-	}
-	return NewWithMode("test", mode, sizing, 100000)
+	return NewWithMode("test", mode, 1000*runtime.GOMAXPROCS(0), 100000)
 }
 
 // BenchmarkLoopBatch submits the way an engine's event loops do: a few
@@ -209,8 +205,6 @@ func BenchmarkLatency(b *testing.B) {
 // BenchmarkBlockingFanOut submits rounds of tasks that each block for a
 // while, as handlers waiting on a database do. Every task needs a worker of
 // its own at once, so a round is only as short as the pool is quick to fan out.
-// ModeCond is left out: its fixed workers are split over shards too small to
-// hold a round.
 func BenchmarkBlockingFanOut(b *testing.B) {
 	for _, mode := range []Mode{ModeElastic, ModeAdaptive, ModeAdaptiveChan} {
 		b.Run(mode.String(), func(b *testing.B) {

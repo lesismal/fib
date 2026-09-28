@@ -178,7 +178,7 @@ func TestAdaptiveResize(t *testing.T) {
 }
 
 func TestResizeRefusedByOtherModes(t *testing.T) {
-	for _, mode := range []Mode{ModeCond, ModeElastic} {
+	for _, mode := range []Mode{ModeElastic, ModeInline} {
 		tp := NewWithMode("test", mode, 4, 4)
 		if tp.Resize(1, 8) {
 			t.Errorf("%v pool accepted Resize", mode)

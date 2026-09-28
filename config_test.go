@@ -61,7 +61,7 @@ func TestDefaultConfigPoolSizing(t *testing.T) {
 // own, and a handler waits on the application where an engine worker only
 // waits on the kernel, so it has to be the wider of the two.
 func TestDefaultStreamPoolSizingExceedsTheEnginePool(t *testing.T) {
-	for _, mode := range []taskpool.Mode{taskpool.ModeCond, taskpool.ModeElastic, taskpool.ModeAdaptive} {
+	for _, mode := range []taskpool.Mode{taskpool.ModeElastic, taskpool.ModeAdaptive, taskpool.ModeAdaptiveChan} {
 		engine := DefaultPoolSizing(mode)
 		streams := DefaultStreamPoolSizing(mode)
 		if streams.WorkerCount <= engine.WorkerCount {
@@ -75,22 +75,19 @@ func TestDefaultStreamPoolSizingExceedsTheEnginePool(t *testing.T) {
 	}
 }
 
-// A worker count means a population of goroutines under one mode and a ceiling
-// under the other, so the modes cannot share one default.
-func TestDefaultPoolSizingDiffersByMode(t *testing.T) {
-	cond := DefaultPoolSizing(taskpool.ModeCond)
-	elastic := DefaultPoolSizing(taskpool.ModeElastic)
-	if cond.WorkerCount <= runtime.GOMAXPROCS(0) {
-		t.Fatalf("cond WorkerCount = %d, want more than GOMAXPROCS %d", cond.WorkerCount, runtime.GOMAXPROCS(0))
+// Every mode's worker count is a ceiling, so they share one default, and its
+// queue stays within the bounds poolSizing keeps it to.
+func TestDefaultPoolSizingIsSharedByModes(t *testing.T) {
+	want := DefaultPoolSizing(taskpool.ModeAdaptive)
+	if want.WorkerCount <= runtime.GOMAXPROCS(0) {
+		t.Fatalf("WorkerCount = %d, want more than GOMAXPROCS %d", want.WorkerCount, runtime.GOMAXPROCS(0))
 	}
-	// Elastic only forks what the load asks for, so its ceiling is set far
-	// above the population cond pays for up front.
-	if elastic.WorkerCount <= cond.WorkerCount {
-		t.Fatalf("elastic WorkerCount = %d, want more than cond's %d", elastic.WorkerCount, cond.WorkerCount)
+	if want.MaxEvents < minMaxEvents || want.MaxEvents > maxMaxEvents {
+		t.Fatalf("MaxEvents = %d, want within [%d, %d]", want.MaxEvents, minMaxEvents, maxMaxEvents)
 	}
-	for _, sizing := range []PoolSizing{cond, elastic} {
-		if sizing.MaxEvents < minMaxEvents || sizing.MaxEvents > maxMaxEvents {
-			t.Fatalf("MaxEvents = %d, want within [%d, %d]", sizing.MaxEvents, minMaxEvents, maxMaxEvents)
+	for _, mode := range []taskpool.Mode{taskpool.ModeElastic, taskpool.ModeAdaptiveChan} {
+		if got := DefaultPoolSizing(mode); got != want {
+			t.Fatalf("%v sizing = %+v, want adaptive's %+v", mode, got, want)
 		}
 	}
 }
@@ -102,7 +99,7 @@ func TestElasticFloorFollowsCores(t *testing.T) {
 	defer runtime.GOMAXPROCS(runtime.GOMAXPROCS(1))
 	floor := runtime.NumCPU() * elasticMinWorkersPerCPU
 	want := max(elasticWorkersPerCPU, floor)
-	for _, mode := range []taskpool.Mode{taskpool.ModeElastic, taskpool.ModeAdaptive} {
+	for _, mode := range []taskpool.Mode{taskpool.ModeElastic, taskpool.ModeAdaptive, taskpool.ModeAdaptiveChan} {
 		if got := DefaultPoolSizing(mode).WorkerCount; got != want {
 			t.Fatalf("%v WorkerCount at GOMAXPROCS 1 = %d, want %d", mode, got, want)
 		}
@@ -110,21 +107,15 @@ func TestElasticFloorFollowsCores(t *testing.T) {
 }
 
 // Switching the mode has to carry the sizing with it, or a config keeps numbers
-// tuned for the mode it no longer runs.
+// that no mode's default gave it.
 func TestSetTaskPoolModeMovesSizing(t *testing.T) {
 	config := DefaultConfig()
-	config.SetTaskPoolMode(taskpool.ModeCond)
-	want := DefaultPoolSizing(taskpool.ModeCond)
-	if config.TaskPoolMode != taskpool.ModeCond {
-		t.Fatalf("TaskPoolMode = %v, want cond", config.TaskPoolMode)
-	}
-	if config.WorkerCount != want.WorkerCount || config.MaxEvents != want.MaxEvents {
-		t.Fatalf("sizing = %d/%d, want cond's %d/%d",
-			config.WorkerCount, config.MaxEvents, want.WorkerCount, want.MaxEvents)
-	}
-
+	config.WorkerCount, config.MaxEvents = 7, 70
 	config.SetTaskPoolMode(taskpool.ModeElastic)
-	want = DefaultPoolSizing(taskpool.ModeElastic)
+	want := DefaultPoolSizing(taskpool.ModeElastic)
+	if config.TaskPoolMode != taskpool.ModeElastic {
+		t.Fatalf("TaskPoolMode = %v, want elastic", config.TaskPoolMode)
+	}
 	if config.WorkerCount != want.WorkerCount || config.MaxEvents != want.MaxEvents {
 		t.Fatalf("sizing = %d/%d, want elastic's %d/%d",
 			config.WorkerCount, config.MaxEvents, want.WorkerCount, want.MaxEvents)
@@ -140,9 +131,9 @@ func TestSetPoolSizingSurvivesModeSwitch(t *testing.T) {
 			config := DefaultConfig()
 			if order == "sizing first" {
 				config.SetPoolSizing(workers, events)
-				config.SetTaskPoolMode(taskpool.ModeCond)
+				config.SetTaskPoolMode(taskpool.ModeAdaptiveChan)
 			} else {
-				config.SetTaskPoolMode(taskpool.ModeCond)
+				config.SetTaskPoolMode(taskpool.ModeAdaptiveChan)
 				config.SetPoolSizing(workers, events)
 			}
 			if config.WorkerCount != workers || config.MaxEvents != events {
