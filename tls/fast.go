@@ -15,8 +15,9 @@ import (
 )
 
 // Once crypto/tls has completed a handshake that settled on an AES-GCM suite
-// of TLS 1.2 or 1.3, the connection leaves it: the layer protects the
-// connection's records itself, with record.go, and drops the crypto/tls Conn.
+// of TLS 1.3 or 1.2, or an AES-CBC suite of TLS 1.2 or 1.1, the connection
+// leaves it: the layer protects the connection's records itself, with
+// record.go, and drops the crypto/tls Conn.
 //
 // crypto/tls does everything a record passes through one at a time and
 // behind copies: the layer hands it ciphertext, it decrypts into a buffer of
@@ -28,19 +29,20 @@ import (
 // the connection copies; what a connection keeps is its two directions' keys.
 //
 // The keys come from crypto/tls through Config.KeyLogWriter, the one way it
-// hands them out: TLS 1.3's traffic secrets, and TLS 1.2's master secret. The
+// hands them out: TLS 1.3's traffic secrets, and the master secret of TLS 1.2
+// and 1.1. The
 // Handler gives crypto/tls a clone of its Config whose KeyLogWriter passes
 // every line on to the Config's own and keeps the secrets of the connections
 // it is serving, found in the Handler's registry by the client random their
-// line names. A TLS 1.2 handshake that resumes a session logs no secret, and
-// its connection stays with crypto/tls.
+// line names. A TLS 1.2 or 1.1 handshake that resumes a session logs no
+// secret, and its connection stays with crypto/tls.
 //
 // Where the two directions' sequence numbers stand when the handshake ends
 // is found the same way the peer will check them: the records crypto/tls
 // wrote and read during the handshake are kept, and those that authenticate
 // under the keys that follow it are counted. For TLS 1.3 that is the session
-// tickets a server sends in its first flight; for TLS 1.2, each side's
-// Finished.
+// tickets a server sends in its first flight; for TLS 1.2 and 1.1, each
+// side's Finished.
 //
 // Anything else stays with crypto/tls: another suite or version, a server
 // Config with GetConfigForClient, whose Config would log the keys instead, a
@@ -52,7 +54,7 @@ import (
 // connection may leave it afterwards, and the registry its key log files
 // secrets in, or nil when it may not.
 func fastConfig(config *stdtls.Config, client bool) (*stdtls.Config, *registry) {
-	if config == nil || (config.MaxVersion != 0 && config.MaxVersion < stdtls.VersionTLS12) {
+	if config == nil || (config.MaxVersion != 0 && config.MaxVersion < stdtls.VersionTLS11) {
 		return nil, nil
 	}
 	if client {
@@ -257,7 +259,7 @@ func (t *layer) takeOver() bool {
 		return false
 	}
 	state := t.conn.ConnectionState()
-	keyLen, h, ok := suiteParams(state.Version, state.CipherSuite)
+	s, ok := lookupSuite(state.Version, state.CipherSuite)
 	if !ok {
 		return false
 	}
@@ -267,10 +269,10 @@ func (t *layer) takeOver() bool {
 		if clientSecret == nil || serverSecret == nil {
 			return false
 		}
-		if client, err = newKeys13(keyLen, h, clientSecret); err != nil {
+		if client, err = newKeys13(s.keyLen, s.hash, clientSecret); err != nil {
 			return false
 		}
-		if server, err = newKeys13(keyLen, h, serverSecret); err != nil {
+		if server, err = newKeys13(s.keyLen, s.hash, serverSecret); err != nil {
 			return false
 		}
 	} else {
@@ -282,7 +284,7 @@ func (t *layer) takeOver() bool {
 		if master == nil || !ok {
 			return false
 		}
-		if client, server, err = newKeys12(keyLen, h, master, c.random[:], serverRandom[:]); err != nil {
+		if client, server, err = newKeysFromMaster(state.Version, s, master, c.random[:], serverRandom[:]); err != nil {
 			return false
 		}
 	}
@@ -292,9 +294,9 @@ func (t *layer) takeOver() bool {
 	}
 	rx.seq = sealedCount(c.read, rx)
 	tx.seq = sealedCount(c.written, tx)
-	if !rx.tls13 && (rx.seq != 1 || tx.seq != 1) {
+	if !rx.tls13() && (rx.seq != 1 || tx.seq != 1) {
 		// Each side's Finished, and nothing else, goes under the keys a TLS
-		// 1.2 handshake ends with.
+		// 1.2 or 1.1 handshake ends with.
 		return false
 	}
 	// TLSUnique points into the Conn, which it would keep alive.
@@ -327,7 +329,7 @@ func sealedCount(stream []byte, k *recordKeys) uint64 {
 			changed = true
 			continue
 		}
-		if k.tls13 && typ != recordTypeApplicationData || !k.tls13 && !changed {
+		if k.tls13() && typ != recordTypeApplicationData || !k.tls13() && !changed {
 			continue
 		}
 		if k.authenticates(record, n) {
@@ -430,7 +432,7 @@ func (t *layer) openRecord(handler fib.Handler, record []byte) bool {
 		t.fail(alert)
 		return false
 	}
-	if t.rx.tls13 && typ != recordTypeHandshake && len(t.hsBuf) > 0 {
+	if t.rx.tls13() && typ != recordTypeHandshake && len(t.hsBuf) > 0 {
 		// A handshake message split across records must not have other
 		// records between its parts.
 		t.fail(alertUnexpectedMessage)
@@ -473,7 +475,7 @@ func (t *layer) handleAlert(data []byte) bool {
 		t.c.CloseWithError(io.EOF)
 		return false
 	}
-	if !t.rx.tls13 && data[0] == alertLevelWarning {
+	if !t.rx.tls13() && data[0] == alertLevelWarning {
 		return true
 	}
 	t.c.CloseWithError(&net.OpError{Op: "remote error", Err: stdtls.AlertError(data[1])})
@@ -485,7 +487,7 @@ func (t *layer) handleAlert(data []byte) bool {
 // client, which this client does not keep; see fastConfig. A TLS 1.2 peer
 // that sends one is asking to renegotiate, which is refused.
 func (t *layer) handlePostHandshake(data []byte) bool {
-	if !t.rx.tls13 {
+	if !t.rx.tls13() {
 		t.fail(alertNoRenegotiation)
 		return false
 	}
@@ -578,7 +580,10 @@ func (t *layer) sealSendLocked(typ byte, first, second []byte) error {
 	for {
 		a := first[:min(len(first), maxPlaintext)]
 		b := second[:min(len(second), maxPlaintext-len(a))]
-		buf = t.tx.seal(buf, typ, a, b)
+		var err error
+		if buf, err = t.tx.seal(buf, typ, a, b); err != nil {
+			return err
+		}
 		first, second = first[len(a):], second[len(b):]
 		if len(first)+len(second) == 0 {
 			break

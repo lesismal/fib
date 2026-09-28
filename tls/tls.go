@@ -64,8 +64,9 @@ func (wouldBlockError) Temporary() bool { return true }
 // connection never waits on its own queue. Records after that are decrypted
 // in OnData like any other input, straight from the bytes the round read.
 //
-// Once a handshake settles on an AES-GCM suite of TLS 1.3 or 1.2, the
-// connection's records are protected by this package rather than by
+// Once a handshake settles on an AES-GCM suite of TLS 1.3 or 1.2, or an
+// AES-CBC suite of TLS 1.2 or 1.1, the connection's records are protected by
+// this package rather than by
 // crypto/tls, which is then done with; the keys come from crypto/tls through
 // Config.KeyLogWriter. For that the Handler clones Config the first time it
 // is used and runs its handshakes with the clone, whose KeyLogWriter still

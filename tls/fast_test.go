@@ -73,15 +73,15 @@ func TestTakeOverBySuite(t *testing.T) {
 		{"TLS12-AES128-GCM", stdtls.VersionTLS12, stdtls.TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256, true},
 		{"TLS12-AES256-GCM", stdtls.VersionTLS12, stdtls.TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384, true},
 		{"TLS12-CHACHA20", stdtls.VersionTLS12, stdtls.TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256, false},
-		{"TLS12-CBC", stdtls.VersionTLS12, stdtls.TLS_ECDHE_ECDSA_WITH_AES_128_CBC_SHA, false},
+		{"TLS12-AES128-CBC", stdtls.VersionTLS12, stdtls.TLS_ECDHE_ECDSA_WITH_AES_128_CBC_SHA, true},
+		{"TLS12-AES128-CBC-SHA256", stdtls.VersionTLS12, stdtls.TLS_ECDHE_ECDSA_WITH_AES_128_CBC_SHA256, true},
+		{"TLS11-AES128-CBC", stdtls.VersionTLS11, stdtls.TLS_ECDHE_ECDSA_WITH_AES_128_CBC_SHA, true},
+		{"TLS11-AES256-CBC", stdtls.VersionTLS11, stdtls.TLS_ECDHE_ECDSA_WITH_AES_256_CBC_SHA, true},
+		{"TLS10-AES128-CBC", stdtls.VersionTLS10, stdtls.TLS_ECDHE_ECDSA_WITH_AES_128_CBC_SHA, false},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			serverConfig, clientConfig := tlsConfigs(t)
-			serverConfig.CipherSuites = append(serverConfig.CipherSuites, stdtls.TLS_ECDHE_ECDSA_WITH_AES_128_CBC_SHA,
-				stdtls.TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256, stdtls.TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384,
-				stdtls.TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256)
-			clientConfig.MinVersion, clientConfig.MaxVersion = tc.version, tc.version
+			serverConfig, clientConfig := suiteConfigs(t, tc.version, tc.suite)
 			if tc.suite != 0 {
 				clientConfig.CipherSuites = []uint16{tc.suite}
 			}
@@ -269,7 +269,21 @@ func waitFor(t *testing.T, mu *sync.Mutex, got *[]byte, n int, received chan str
 // A record that does not authenticate ends the connection with bad_record_mac,
 // which the peer hears.
 func TestTamperedRecordFails(t *testing.T) {
-	serverConfig, clientConfig := tlsConfigs(t)
+	for _, tc := range []struct {
+		name    string
+		version uint16
+		suite   uint16
+	}{
+		{"TLS13", stdtls.VersionTLS13, 0},
+		{"TLS12-CBC", stdtls.VersionTLS12, stdtls.TLS_ECDHE_ECDSA_WITH_AES_128_CBC_SHA},
+		{"TLS11-CBC", stdtls.VersionTLS11, stdtls.TLS_ECDHE_ECDSA_WITH_AES_128_CBC_SHA},
+	} {
+		t.Run(tc.name, func(t *testing.T) { testTamperedRecordFails(t, tc.version, tc.suite) })
+	}
+}
+
+func testTamperedRecordFails(t *testing.T, version, suite uint16) {
+	serverConfig, clientConfig := suiteConfigs(t, version, suite)
 	closed := make(chan error, 1)
 	layers := make(layerOf, 1)
 	inner := layers.handler().(*settledHandler)
@@ -450,6 +464,68 @@ func TestTakeOverReleasesConn(t *testing.T) {
 	for i, p := range dropped {
 		if p.Value() != nil {
 			t.Errorf("the Conn of connection %d is still reachable", i)
+		}
+	}
+}
+
+// suiteConfigs are configs that settle on version and, unless it is zero,
+// suite: the server offers every suite the tests pick from.
+func suiteConfigs(t *testing.T, version, suite uint16) (server, client *stdtls.Config) {
+	t.Helper()
+	server, client = tlsConfigs(t)
+	server.MinVersion = stdtls.VersionTLS10
+	server.CipherSuites = []uint16{
+		stdtls.TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256, stdtls.TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384,
+		stdtls.TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256, stdtls.TLS_ECDHE_ECDSA_WITH_AES_128_CBC_SHA,
+		stdtls.TLS_ECDHE_ECDSA_WITH_AES_256_CBC_SHA, stdtls.TLS_ECDHE_ECDSA_WITH_AES_128_CBC_SHA256,
+	}
+	client.MinVersion, client.MaxVersion = version, version
+	if suite != 0 {
+		client.CipherSuites = []uint16{suite}
+	}
+	return server, client
+}
+
+// Sealed and opened again, CBC records of every length around the block
+// come back whole, and any one bit flipped in one fails to open, with the
+// same alert wherever it is.
+func TestCBCRecords(t *testing.T) {
+	for _, version := range []uint16{stdtls.VersionTLS11, stdtls.VersionTLS12} {
+		for _, id := range []uint16{stdtls.TLS_ECDHE_ECDSA_WITH_AES_128_CBC_SHA, stdtls.TLS_ECDHE_ECDSA_WITH_AES_256_CBC_SHA} {
+			s, ok := lookupSuite(version, id)
+			if !ok {
+				t.Fatalf("%x %x: not a record layer suite", version, id)
+			}
+			random := bytes.Repeat([]byte{7}, 32)
+			// The sender's keys and the receiver's copy of them.
+			client, _, err := newKeysFromMaster(version, s, bytes.Repeat([]byte{1}, 48), random, random)
+			if err != nil {
+				t.Fatal(err)
+			}
+			server, _, err := newKeysFromMaster(version, s, bytes.Repeat([]byte{1}, 48), random, random)
+			if err != nil {
+				t.Fatal(err)
+			}
+			for n := 0; n <= 70; n++ {
+				payload := bytes.Repeat([]byte{byte(n)}, n)
+				record, err := client.seal(nil, recordTypeApplicationData, payload[:n/2], payload[n/2:])
+				if err != nil {
+					t.Fatal(err)
+				}
+				typ, plain, _, ok := server.open(append([]byte(nil), record...))
+				if !ok || typ != recordTypeApplicationData || !bytes.Equal(plain, payload) {
+					t.Fatalf("%x %d bytes: opened %v %d %q", version, n, ok, typ, plain)
+				}
+				for bit := recordHeaderLen * 8; bit < len(record)*8; bit += 3 {
+					tampered := append([]byte(nil), record...)
+					tampered[bit/8] ^= 1 << (bit % 8)
+					server.seq--
+					if _, _, alert, ok := server.open(tampered); ok || alert != alertBadRecordMAC {
+						t.Fatalf("%x %d bytes, bit %d flipped: opened %v, alert %d", version, n, bit, ok, alert)
+					}
+					server.seq++
+				}
+			}
 		}
 	}
 }
