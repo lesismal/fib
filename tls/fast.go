@@ -387,7 +387,7 @@ func (t *layer) drainFast(handler fib.Handler) {
 func (t *layer) openStream(handler fib.Handler, data []byte) bool {
 	maxSize := recordHeaderLen + t.rx.maxBody()
 	for len(data) > 0 {
-		if t.isClosed() {
+		if t.dropsInput() {
 			return false
 		}
 		var record []byte
@@ -435,6 +435,16 @@ func (t *layer) openStream(handler fib.Handler, data []byte) bool {
 		}
 	}
 	return true
+}
+
+// dropsInput reports whether what is left of the input goes undelivered: once
+// the connection has closed, unless the handshake's worker is still
+// delivering what arrived with the handshake, which the peer sent before it
+// closed and which the close leaves in place until then.
+func (t *layer) dropsInput() bool {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.closed && !t.settling
 }
 
 // openRecord decrypts one record and acts on it.
