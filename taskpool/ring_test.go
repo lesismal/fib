@@ -10,12 +10,12 @@ type indexTask int
 
 func (indexTask) RunTask() {}
 
-// One producer pushes through rings of every small size while consumers race
-// to pop. Every task must come out exactly once: a ring of one cell used to
-// let the producer write over a task a consumer had claimed but not yet read.
+// Producers push through rings of every small size while consumers race to
+// pop. Every task must come out exactly once: a ring of one cell used to let
+// the producer write over a task a consumer had claimed but not yet read.
 func TestTaskRingDeliversEachTaskOnce(t *testing.T) {
 	for _, limit := range []int{1, 2, 3, 5, 8} {
-		const tasks, consumers = 200000, 4
+		const tasks, producers, consumers = 200000, 3, 4
 		r := newTaskRing(limit)
 		var seen [tasks]atomic.Int32
 		var taken atomic.Int64
@@ -32,9 +32,15 @@ func TestTaskRingDeliversEachTaskOnce(t *testing.T) {
 				}
 			}()
 		}
-		for i := 0; i < tasks; i++ {
-			for !r.push(indexTask(i)) {
-			}
+		for p := 0; p < producers; p++ {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				for i := p; i < tasks; i += producers {
+					for !r.push(indexTask(i)) {
+					}
+				}
+			}()
 		}
 		wg.Wait()
 		for i := range seen {

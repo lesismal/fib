@@ -2,9 +2,11 @@ package taskpool
 
 import (
 	"math/rand/v2"
+	"runtime"
 	"sync"
 	"sync/atomic"
 	"time"
+	_ "unsafe" // for go:linkname
 )
 
 // defaultShrinkInterval is how often an adaptive pool looks for workers it
@@ -76,7 +78,6 @@ type adaptiveBackend struct {
 	shards      []*adaptivePool
 	budget      workerBudget
 	interval    time.Duration
-	next        atomic.Uint32
 	workerWG    sync.WaitGroup
 	stopJanitor chan struct{}
 	janitorDone chan struct{}
@@ -114,17 +115,18 @@ func share(total, shards, i int) int {
 	return part
 }
 
-// pick chooses the shard a submission goes to. The shards take turns, so
-// that submissions spread evenly, but a shard whose turn it is and that has
-// tasks queued and no parked worker to take them is weighed against another,
-// chosen at random, and the one with the less work waiting on it is taken.
-// Two choices rather than one keep a shard that its tasks have tied up, or
-// whose queue is full, from being handed more while others are idle. The
-// look at a second shard's counters is paid only then: a shard whose workers
-// are all busy but keep its queue empty is keeping up.
+// pick chooses the shard a submission goes to: the one of the P the
+// submitter runs on, so that a submitter keeps feeding the shard whose
+// workers are already running its tasks and take the next without being
+// woken, and submitters on different Ps do not contend for one shard or one
+// counter. A shard that has tasks queued and no parked worker to take them
+// is weighed against another, chosen at random, and the one with the less
+// work waiting on it is taken, so that a shard its tasks have tied up, or
+// whose queue is full, is not handed more while others are idle.
 func (b *adaptiveBackend) pick() *adaptivePool {
 	n := len(b.shards)
-	i := int(b.next.Add(1)-1) % n
+	i := procPin() % n
+	procUnpin()
 	p := b.shards[i]
 	if n == 1 || p.idleCount.Load() > 0 || p.ring.len() == 0 {
 		return p
@@ -192,7 +194,7 @@ func (b *adaptiveBackend) resize(minWorkers, maxWorkers int) {
 // to spare.
 func (b *adaptiveBackend) adopt(p *adaptivePool) *adaptiveWorker {
 	n := len(b.shards)
-	from := int(b.next.Load())
+	from := rand.IntN(n)
 	for i := 0; i < n; i++ {
 		q := b.shards[(from+i)%n]
 		if q == p || q.idleCount.Load() == 0 {
@@ -201,7 +203,7 @@ func (b *adaptiveBackend) adopt(p *adaptivePool) *adaptiveWorker {
 		q.mu.Lock()
 		var w *adaptiveWorker
 		floor := false
-		if !q.stopped && q.workers.Load() > 1 {
+		if !q.stopped.Load() && q.workers.Load() > 1 {
 			w = q.popIdleLocked()
 		}
 		if w != nil {
@@ -340,9 +342,12 @@ func newAdaptiveWorker() *adaptiveWorker {
 // last, whose stack and cache are warm, and the ones at the bottom are those
 // the load has not needed for longest, which are the ones shrink retires.
 //
-// A worker going back for its next task takes it from the queue without the
-// lock; the lock covers submissions, the idle stack, and waiting for room. A
-// busy shard's workers thus never queue behind each other. What the lock no
+// Submitters queue tasks and workers take them without the lock; the lock
+// covers the idle stack and waiting for room. A busy shard's submitters and
+// workers thus never queue behind each other, nor behind a worker parking: a
+// mutex that a parking worker has waited on for long hands itself over in
+// turn to every waiter, and a submitter taking it per task then parked and
+// was woken per task. What the lock no
 // longer orders, two checks cover, each made after the change it races with
 // so that the sequentially consistent atomics let one side or the other see
 // both: a worker that parks looks at the queue again once it is on the idle
@@ -367,10 +372,25 @@ type adaptivePool struct {
 	// workers counts the live workers, including those just started and not
 	// yet running, and excluding those told to retire. Those past the first
 	// are on the budget; see addWorker.
-	workers     atomic.Int32
-	idleCount   atomic.Int32
-	fullWaiters atomic.Int32
-	_           cacheLinePad
+	workers   atomic.Int32
+	idleCount atomic.Int32
+	// roomWanted is set by a submitter that waits for room, and cleared by
+	// the one worker that wakes the waiters.
+	roomWanted atomic.Bool
+	_          cacheLinePad
+	// What every submission reads and writes has a line of its own, so that
+	// submitting does not move the line the wake-ups use.
+	//
+	// stopped is set under the lock, and read without it too.
+	stopped atomic.Bool
+	// submitting counts the submissions in flight, which stop waits out
+	// before it sets draining.
+	submitting atomic.Int32
+	// draining tells the workers to leave once they find the queue empty.
+	// It is set under the lock, after stopped and once no submission can
+	// queue another task.
+	draining atomic.Bool
+	_        cacheLinePad
 
 	mu      sync.Mutex
 	notFull *sync.Cond
@@ -381,8 +401,6 @@ type adaptivePool struct {
 	// lowIdle is the fewest workers parked at any moment since the last
 	// shrink: the ones at the bottom of the stack that no task reached.
 	lowIdle int
-	stopped bool
-	pending sync.WaitGroup
 }
 
 func newAdaptivePool(b *adaptiveBackend, executor *executor, queueSize int) *adaptivePool {
@@ -535,8 +553,8 @@ func (p *adaptivePool) kickLocked(w *wakeups) {
 	}
 }
 
-// kick is kickLocked for a worker, which does not hold the lock and takes it
-// only when there is a parked worker to wake.
+// kick is kickLocked for a submitter or a worker, which does not hold the
+// lock and takes it only when there is a parked worker to wake.
 func (p *adaptivePool) kick() {
 	for p.reserveWaking() {
 		if p.idleCount.Load() > 0 {
@@ -568,10 +586,18 @@ func (p *adaptivePool) kick() {
 	}
 }
 
-// waitForRoomLocked parks a submitter until the queue has room, making sure
-// first that a worker is on its way to drain it. A worker that frees a cell
-// signals only if it sees the submitter counted, so the count goes up before
-// the queue is looked at again.
+// lowWater is how far the queue drains before the submitters waiting for
+// room are woken. Waking one each time a cell frees would take the lock once
+// per task, with the waiters queued behind it and filling the queue again one
+// cell at a time; waking them all once half the queue is free lets them queue
+// a run of tasks each.
+func (p *adaptivePool) lowWater() int { return int(p.ring.limit / 2) }
+
+// waitForRoomLocked parks a submitter until the queue has drained to its low
+// water mark, making sure first that a worker is on its way to drain it. A
+// worker that takes a task signals only if it sees the submitter counted, so
+// the count goes up before the queue is looked at again; a waiter that finds
+// the queue full is then woken by whichever worker takes it down to the mark.
 func (p *adaptivePool) waitForRoomLocked() {
 	var w wakeups
 	p.kickLocked(&w)
@@ -580,17 +606,16 @@ func (p *adaptivePool) waitForRoomLocked() {
 		w.run(p)
 		p.mu.Lock()
 	}
-	p.fullWaiters.Add(1)
-	if !p.stopped && p.ring.len() >= int(p.ring.limit) {
+	p.roomWanted.Store(true)
+	if !p.stopped.Load() && p.ring.len() >= int(p.ring.limit) {
 		p.notFull.Wait()
 	}
-	p.fullWaiters.Add(-1)
 }
 
 // pushLocked queues task, waiting for room while the queue is full, and
 // reports false if the pool stopped first.
 func (p *adaptivePool) pushLocked(task Task) bool {
-	for !p.stopped {
+	for !p.stopped.Load() {
 		if p.ring.push(task) {
 			return true
 		}
@@ -599,49 +624,47 @@ func (p *adaptivePool) pushLocked(task Task) bool {
 	return false
 }
 
+// submit queues task without the lock, which it takes only to wait for room
+// when the queue is full, and sends a worker to the queue for it the way a
+// worker that took a task sends the next one; see kick.
 func (p *adaptivePool) submit(task Task) bool {
-	p.mu.Lock()
-	if p.stopped {
-		p.mu.Unlock()
+	p.submitting.Add(1)
+	defer p.submitting.Add(-1)
+	if p.stopped.Load() {
 		return false
 	}
-	p.pending.Add(1)
-	if !p.pushLocked(task) {
-		p.mu.Unlock()
-		p.pending.Done()
+	if !p.ring.push(task) && !p.pushSlow(task) {
 		return false
 	}
-	var w wakeups
-	p.kickLocked(&w)
-	p.mu.Unlock()
-	w.run(p)
+	p.kick()
 	return true
 }
 
-// submitBatch queues tasks under one lock acquisition and then sends workers
-// to the queue for them, which fan out from there. It returns how many tasks
-// were accepted; a shorter count means the pool stopped mid-batch.
-func (p *adaptivePool) submitBatch(tasks []Task) int {
-	submitted := 0
+// pushSlow queues task once the queue was found full, waiting for room under
+// the lock, and reports false if the pool stopped first.
+func (p *adaptivePool) pushSlow(task Task) bool {
 	p.mu.Lock()
-	if p.stopped {
-		p.mu.Unlock()
-		return 0
-	}
-	p.pending.Add(len(tasks))
+	ok := p.pushLocked(task)
+	p.mu.Unlock()
+	return ok
+}
+
+// submitBatch queues tasks and then sends workers to the queue for them,
+// which fan out from there. It returns how many tasks were accepted; a
+// shorter count means the pool stopped mid-batch.
+func (p *adaptivePool) submitBatch(tasks []Task) int {
+	p.submitting.Add(1)
+	defer p.submitting.Add(-1)
+	submitted := 0
 	for _, task := range tasks {
-		if !p.pushLocked(task) {
+		if p.stopped.Load() || !p.ring.push(task) && !p.pushSlow(task) {
 			break
 		}
 		submitted++
 	}
-	if rejected := len(tasks) - submitted; rejected > 0 {
-		p.pending.Add(-rejected)
+	if submitted > 0 {
+		p.kick()
 	}
-	var w wakeups
-	p.kickLocked(&w)
-	p.mu.Unlock()
-	w.run(p)
 	return submitted
 }
 
@@ -681,16 +704,23 @@ func (p *adaptivePool) worker(self *adaptiveWorker) {
 				break
 			}
 			p.kick()
-			if p.fullWaiters.Load() > 0 {
+			if p.roomWanted.Load() && p.ring.len() <= p.lowWater() && p.roomWanted.Swap(false) {
 				p.mu.Lock()
-				p.notFull.Signal()
+				p.notFull.Broadcast()
 				p.mu.Unlock()
 			}
 			p.executor.call(task)
-			p.pending.Done()
 		}
 		p.mu.Lock()
-		if p.stopped {
+		if p.draining.Load() {
+			if p.ring.len() > 0 {
+				// A task queued since the queue was found empty may have
+				// been left to this worker by a submitter that saw it
+				// running.
+				p.mu.Unlock()
+				p.waking.Add(1)
+				continue
+			}
 			p.count(-1)
 			p.mu.Unlock()
 			return
@@ -756,7 +786,7 @@ func (p *adaptivePool) shrink() {
 	p.mu.Lock()
 	idle := p.lowIdle
 	var retired []*adaptiveWorker
-	if surplus := int(p.workers.Load()) - p.minWorkers; idle > 0 && surplus > 0 && !p.stopped {
+	if surplus := int(p.workers.Load()) - p.minWorkers; idle > 0 && surplus > 0 && !p.stopped.Load() {
 		retired = p.retireLocked(min((idle+1)/2, surplus))
 	}
 	p.lowIdle = len(p.idle)
@@ -772,7 +802,7 @@ func (p *adaptivePool) resize(minWorkers int) {
 	p.mu.Lock()
 	p.minWorkers = minWorkers
 	spawn := 0
-	for !p.stopped && int(p.workers.Load()) < minWorkers && p.spawnReserve() {
+	for !p.stopped.Load() && int(p.workers.Load()) < minWorkers && p.spawnReserve() {
 		p.waking.Add(1)
 		spawn++
 	}
@@ -786,17 +816,36 @@ func (p *adaptivePool) resize(minWorkers int) {
 
 func (p *adaptivePool) workerCount() int { return int(p.workers.Load()) }
 
-// stop rejects new tasks, waits for the queued ones to run, and then retires
-// every parked worker. Workers still running leave when they next find the
-// queue empty. The backend waits for all of them.
+// stop rejects new tasks and sends every parked worker to the queue, where
+// each one runs what is left and then leaves, as the workers still running do
+// once they find the queue empty. The backend waits for all of them.
 func (p *adaptivePool) stop() {
 	p.mu.Lock()
-	p.stopped = true
+	p.stopped.Store(true)
 	p.notFull.Broadcast()
 	p.mu.Unlock()
-	p.pending.Wait()
+	// A submission counts itself in before it looks at stopped, and stop
+	// sets stopped before it looks at the count, so a submission either sees
+	// stopped or is waited for here, and its task is queued before the
+	// workers are told to drain. One waiting for room was woken above.
+	for p.submitting.Load() > 0 {
+		runtime.Gosched()
+	}
 	p.mu.Lock()
-	retired := p.retireLocked(len(p.idle))
+	p.draining.Store(true)
+	idle := p.idle
+	p.idle = nil
+	p.idleCount.Store(0)
+	p.lowIdle = 0
+	p.waking.Add(int32(len(idle)))
 	p.mu.Unlock()
-	dismiss(retired)
+	for _, w := range idle {
+		w.wake <- p
+	}
 }
+
+//go:linkname procPin runtime.procPin
+func procPin() int
+
+//go:linkname procUnpin runtime.procUnpin
+func procUnpin()

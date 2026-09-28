@@ -16,11 +16,10 @@ type ringCell struct {
 	task Task
 }
 
-// taskRing is a bounded queue with one producer at a time and any number of
-// consumers, after Dmitry Vyukov's bounded MPMC queue. The producer side is
-// serialized by the caller's lock; consumers take tasks with a compare and
-// swap on the head, so that a worker going back for its next task never
-// waits behind a lock.
+// taskRing is a bounded queue for any number of producers and consumers,
+// after Dmitry Vyukov's bounded MPMC queue. Producers claim a position with a
+// compare and swap on the tail and consumers one on the head, so that neither
+// a submitter nor a worker going back for its next task waits behind a lock.
 type taskRing struct {
 	cells []ringCell
 	mask  uint64
@@ -51,36 +50,53 @@ func newTaskRing(limit int) *taskRing {
 	return r
 }
 
-// push publishes task and reports whether there was room for it. Only one
-// goroutine may push at a time. The tail moves only once the task is
-// published, so a consumer that sees the tail past a position finds a task
-// there.
+// push publishes task and reports whether there was room for it. A producer
+// claims a position before it publishes the task there, so for a moment the
+// tail is past a task that is not in its cell yet; see pop.
 func (r *taskRing) push(task Task) bool {
-	tail := r.tail.Load()
-	if tail-r.head.Load() >= r.limit {
-		return false
+	for {
+		tail := r.tail.Load()
+		head := r.head.Load()
+		if head > tail {
+			// The tail moved on since it was read.
+			continue
+		}
+		if tail-head >= r.limit {
+			return false
+		}
+		cell := &r.cells[tail&r.mask]
+		seq := cell.seq.Load()
+		if seq != tail {
+			if seq < tail {
+				// The consumer that took the task a lap ago has not handed
+				// the cell back yet.
+				return false
+			}
+			// Another producer claimed this position first.
+			continue
+		}
+		if !r.tail.CompareAndSwap(tail, tail+1) {
+			continue
+		}
+		cell.task = task
+		cell.seq.Store(tail + 1)
+		return true
 	}
-	cell := &r.cells[tail&r.mask]
-	if cell.seq.Load() != tail {
-		// The consumer that took the task a lap ago has not handed the
-		// cell back yet.
-		return false
-	}
-	cell.task = task
-	cell.seq.Store(tail + 1)
-	r.tail.Store(tail + 1)
-	return true
 }
 
-// pop takes the oldest task, or reports that there is none.
+// pop takes the oldest task, or reports that there is none. A position a
+// producer has claimed but not yet published counts as none: that producer
+// sends a worker to the queue once it has published, as every producer does.
 func (r *taskRing) pop() (Task, bool) {
 	for {
 		head := r.head.Load()
-		if head == r.tail.Load() {
-			return nil, false
-		}
 		cell := &r.cells[head&r.mask]
-		if cell.seq.Load() != head+1 {
+		seq := cell.seq.Load()
+		if seq != head+1 {
+			if seq == head {
+				// Empty, or its producer is still publishing.
+				return nil, false
+			}
 			// Another consumer took this position first.
 			continue
 		}
@@ -94,9 +110,10 @@ func (r *taskRing) pop() (Task, bool) {
 	}
 }
 
-// len is how many tasks are published and not yet claimed. It is exact only
-// when nothing is moving, which is all its callers need: each one that acts
-// on it checks again after.
+// len is how many positions are claimed and not yet taken, including any
+// whose task is still being published. It is exact only when nothing is
+// moving, which is all its callers need: each one that acts on it checks
+// again after.
 func (r *taskRing) len() int {
 	tail := r.tail.Load()
 	head := r.head.Load()

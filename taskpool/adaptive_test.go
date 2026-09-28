@@ -413,8 +413,38 @@ func TestAdaptiveShardsShareTheCeiling(t *testing.T) {
 	}
 }
 
-// A submission whose turn falls on a shard with no parked worker goes to a
-// shard that has one.
+// Submissions race Stop, which must not return before every task it let in
+// has run: a submission queues without the lock, so it may still be
+// publishing its task when Stop has already turned new ones away.
+func TestAdaptiveStopRunsEveryAcceptedTask(t *testing.T) {
+	for round := 0; round < 50; round++ {
+		tp := NewAdaptive(AdaptiveConfig{MaxWorkers: 32, QueueSize: 16})
+		var accepted, ran atomic.Int64
+		var wg sync.WaitGroup
+		for s := 0; s < 4; s++ {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				for i := 0; i < 2000; i++ {
+					if !tp.Go(func() { ran.Add(1) }) {
+						return
+					}
+					accepted.Add(1)
+				}
+			}()
+		}
+		time.Sleep(time.Duration(round%5) * 100 * time.Microsecond)
+		tp.Stop()
+		got := ran.Load()
+		wg.Wait()
+		if want := accepted.Load(); got != want {
+			t.Fatalf("round %d: Stop returned with %d of %d accepted tasks run", round, got, want)
+		}
+	}
+}
+
+// A submission from a P whose shard has work queued and no parked worker goes
+// to a shard that has one.
 func TestAdaptivePickPrefersAnIdleShard(t *testing.T) {
 	tp, b := shardedAdaptive(t, AdaptiveConfig{MinWorkers: 16, MaxWorkers: 16, QueueSize: 64})
 	defer tp.Stop()
@@ -433,7 +463,6 @@ func TestAdaptivePickPrefersAnIdleShard(t *testing.T) {
 	for w := busy.popIdleLocked(); w != nil; w = busy.popIdleLocked() {
 		held = append(held, w)
 	}
-	busy.pending.Add(1)
 	busy.ring.push(taskFunc(func() {}))
 	busy.mu.Unlock()
 	defer func() {
