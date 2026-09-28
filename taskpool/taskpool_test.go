@@ -87,7 +87,7 @@ func TestEachTaskRunsOnce(t *testing.T) {
 }
 
 func TestGoTasksRunsBatchesOnce(t *testing.T) {
-	for _, mode := range []Mode{ModeElastic, ModeCond, ModeAdaptive} {
+	for _, mode := range []Mode{ModeElastic, ModeCond, ModeAdaptive, ModeAdaptiveChan} {
 		t.Run(mode.String(), func(t *testing.T) {
 			// A queue smaller than the batch forces submitBatch through its
 			// queue-full wait path.
@@ -115,7 +115,7 @@ func TestGoTasksRunsBatchesOnce(t *testing.T) {
 }
 
 func TestAllModesExecuteAndStop(t *testing.T) {
-	for _, mode := range []Mode{ModeElastic, ModeCond, ModeAdaptive} {
+	for _, mode := range []Mode{ModeElastic, ModeCond, ModeAdaptive, ModeAdaptiveChan} {
 		t.Run(mode.String(), func(t *testing.T) {
 			tp := NewWithMode("test", mode, 4, 16)
 			var count atomic.Int64
@@ -163,7 +163,7 @@ func TestLogsCarryThePoolName(t *testing.T) {
 	defer slog.SetDefault(previous)
 	SetLogStatus(true)
 	defer SetLogStatus(false)
-	for _, mode := range []Mode{ModeCond, ModeElastic, ModeAdaptive, ModeInline} {
+	for _, mode := range []Mode{ModeCond, ModeElastic, ModeAdaptive, ModeAdaptiveChan, ModeInline} {
 		out.buf.Reset()
 		tp := NewWithMode("named-"+mode.String(), mode, 2, 4)
 		if got := tp.Name(); got != "named-"+mode.String() {

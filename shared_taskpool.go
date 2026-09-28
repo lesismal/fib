@@ -22,10 +22,14 @@ func taskPoolName(engine string) string { return engine + "-workers" }
 // newTaskPool builds the pool config describes.
 func newTaskPool(config Config) *taskpool.TaskPool {
 	name := taskPoolName(engineName(config))
-	if config.TaskPoolMode == taskpool.ModeAdaptive {
-		return taskpool.NewAdaptive(taskpool.AdaptiveConfig{
-			Name: name, MinWorkers: config.MinWorkerCount, MaxWorkers: config.WorkerCount, QueueSize: config.MaxEvents,
-		})
+	adaptive := taskpool.AdaptiveConfig{
+		Name: name, MinWorkers: config.MinWorkerCount, MaxWorkers: config.WorkerCount, QueueSize: config.MaxEvents,
+	}
+	switch config.TaskPoolMode {
+	case taskpool.ModeAdaptive:
+		return taskpool.NewAdaptive(adaptive)
+	case taskpool.ModeAdaptiveChan:
+		return taskpool.NewAdaptiveChan(adaptive)
 	}
 	return taskpool.NewWithMode(name, config.TaskPoolMode, config.WorkerCount, config.MaxEvents)
 }

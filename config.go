@@ -113,7 +113,7 @@ func DefaultPoolSizing(mode taskpool.Mode) PoolSizing {
 	cpuCount := runtime.GOMAXPROCS(0)
 	workerCount := cpuCount * condWorkersPerCPU
 	minWorkers := condMinWorkers
-	if mode == taskpool.ModeElastic || mode == taskpool.ModeAdaptive {
+	if mode == taskpool.ModeElastic || mode.Adaptive() {
 		workerCount = cpuCount * elasticWorkersPerCPU
 		minWorkers = runtime.NumCPU() * elasticMinWorkersPerCPU
 	}
@@ -191,7 +191,7 @@ func (c *Config) validateTaskPool() error {
 	if c.TaskPoolMode == taskpool.ModeInline {
 		return errInlinePool
 	}
-	if c.TaskPoolMode == taskpool.ModeAdaptive && (c.MinWorkerCount < 0 || c.MinWorkerCount > c.WorkerCount) {
+	if c.TaskPoolMode.Adaptive() && (c.MinWorkerCount < 0 || c.MinWorkerCount > c.WorkerCount) {
 		return fmt.Errorf("min worker count %d must be between zero and the worker count %d",
 			c.MinWorkerCount, c.WorkerCount)
 	}

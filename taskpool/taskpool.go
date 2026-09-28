@@ -30,6 +30,12 @@ const (
 	// spreading the load, such as one event loop among several, where handing
 	// the task to another goroutine would only add a wake-up. See NewInline.
 	ModeInline
+	// ModeAdaptiveChan grows and shrinks as ModeAdaptive does, but its
+	// workers wait on the queue, a channel, rather than on a mutex-guarded
+	// stack, and a submitter waits for room on the channel rather than on a
+	// condition variable. Resize moves its floor and ceiling as well. See
+	// NewAdaptiveChan.
+	ModeAdaptiveChan
 )
 
 func (m Mode) String() string {
@@ -42,14 +48,20 @@ func (m Mode) String() string {
 		return "adaptive"
 	case ModeInline:
 		return "inline"
+	case ModeAdaptiveChan:
+		return "adaptive-chan"
 	default:
 		return fmt.Sprintf("Mode(%d)", m)
 	}
 }
 
 func (m Mode) Valid() bool {
-	return m == ModeElastic || m == ModeCond || m == ModeAdaptive || m == ModeInline
+	return m == ModeElastic || m == ModeCond || m == ModeAdaptive || m == ModeInline || m == ModeAdaptiveChan
 }
+
+// Adaptive reports whether the pool grows and shrinks between a floor and a
+// ceiling, which Resize can move: ModeAdaptive and ModeAdaptiveChan.
+func (m Mode) Adaptive() bool { return m == ModeAdaptive || m == ModeAdaptiveChan }
 
 type Task interface{ RunTask() }
 
@@ -113,8 +125,8 @@ func New(name string, maxConcurrent, queueSize int) *TaskPool {
 }
 
 // NewWithMode creates a pool of the given mode, labelled name in what it
-// logs. For ModeAdaptive, maxConcurrent is the ceiling and the floor is
-// zero; NewAdaptive sets both. ModeInline ignores both sizes.
+// logs. For ModeAdaptive and ModeAdaptiveChan, maxConcurrent is the ceiling
+// and the floor is zero; NewAdaptive and NewAdaptiveChan set both. ModeInline ignores both sizes.
 func NewWithMode(name string, mode Mode, maxConcurrent, queueSize int) *TaskPool {
 	if mode == ModeInline {
 		return NewInline(name)
@@ -136,6 +148,10 @@ func NewWithMode(name string, mode Mode, maxConcurrent, queueSize int) *TaskPool
 		})
 	case ModeAdaptive:
 		return NewAdaptive(AdaptiveConfig{
+			Name: name, MaxWorkers: maxConcurrent, QueueSize: queueSize,
+		})
+	case ModeAdaptiveChan:
+		return NewAdaptiveChan(AdaptiveConfig{
 			Name: name, MaxWorkers: maxConcurrent, QueueSize: queueSize,
 		})
 	default:
@@ -211,21 +227,23 @@ func (tp *TaskPool) Stop() { tp.backend.stop() }
 
 // Workers reports how many workers the pool is running: the fixed count under
 // ModeCond, the forked workers under ModeElastic, the current population
-// under ModeAdaptive, and none under ModeInline.
+// under ModeAdaptive and ModeAdaptiveChan, and none under ModeInline.
 func (tp *TaskPool) Workers() int { return tp.backend.workerCount() }
 
-// Resize moves a ModeAdaptive pool's floor and ceiling while it runs. Raising
+// Resize moves a ModeAdaptive or ModeAdaptiveChan pool's floor and ceiling while it runs. Raising
 // the floor starts workers at once, and lowering the ceiling retires the
 // workers over it: idle ones at once, busy ones as they finish their task.
 // It reports false, and changes nothing, for a pool of any other mode. It
 // panics if maxWorkers is not positive or minWorkers is not between zero and
 // maxWorkers.
 func (tp *TaskPool) Resize(minWorkers, maxWorkers int) bool {
-	adaptive, ok := tp.backend.(*adaptiveBackend)
+	resizer, ok := tp.backend.(interface {
+		resize(minWorkers, maxWorkers int)
+	})
 	if !ok {
 		return false
 	}
 	validateAdaptiveRange(minWorkers, maxWorkers)
-	adaptive.resize(minWorkers, maxWorkers)
+	resizer.resize(minWorkers, maxWorkers)
 	return true
 }

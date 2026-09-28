@@ -10,7 +10,7 @@ import (
 	"time"
 )
 
-var benchmarkModes = []Mode{ModeElastic, ModeCond, ModeAdaptive}
+var benchmarkModes = []Mode{ModeElastic, ModeCond, ModeAdaptive, ModeAdaptiveChan}
 
 type benchmarkTask struct{ done chan struct{} }
 
@@ -212,7 +212,7 @@ func BenchmarkLatency(b *testing.B) {
 // ModeCond is left out: its fixed workers are split over shards too small to
 // hold a round.
 func BenchmarkBlockingFanOut(b *testing.B) {
-	for _, mode := range []Mode{ModeElastic, ModeAdaptive} {
+	for _, mode := range []Mode{ModeElastic, ModeAdaptive, ModeAdaptiveChan} {
 		b.Run(mode.String(), func(b *testing.B) {
 			tp := newBenchPool(mode)
 			defer tp.Stop()
