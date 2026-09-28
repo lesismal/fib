@@ -399,6 +399,60 @@ func TestReadStopsAtRecordEnds(t *testing.T) {
 	}
 }
 
+// crypto/tls keeps its input and handshake buffers under the names this
+// package reaches them by; a Go release that renames them would leave every
+// connection holding them again, silently.
+func TestConnBuffersFound(t *testing.T) {
+	if rawInputOffset == 0 || handOffset == 0 {
+		t.Fatalf("crypto/tls.Conn has no rawInput or hand buffer: offsets %d, %d", rawInputOffset, handOffset)
+	}
+}
+
+// Between rounds, a connection keeps neither the handshake's buffer nor one
+// for ciphertext, for either version.
+func TestIdleConnectionKeepsNoBuffers(t *testing.T) {
+	for _, version := range []uint16{stdtls.VersionTLS12, stdtls.VersionTLS13} {
+		t.Run(stdtls.VersionName(version), func(t *testing.T) {
+			serverConfig, clientConfig := tlsConfigs(t)
+			clientConfig.MaxVersion = version
+			layers := make(chan *layer, 1)
+			inner := fib.HandlerFuncs{
+				Open: func(c *fib.Connection) { layers <- c.Layer().(*layer) },
+				Data: func(c *fib.Connection, b []byte) {
+					if err := c.Send(b); err != nil {
+						c.Close()
+					}
+				},
+			}
+			_, addr := startEchoServer(t, fib.DefaultConfig(), NewServer(serverConfig, inner))
+			conn, err := stdtls.Dial("tcp", addr, clientConfig)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer conn.Close()
+			_ = conn.SetDeadline(time.Now().Add(10 * time.Second))
+			l := <-layers
+			for _, size := range []int{1, 1024, 40000} {
+				payload := bytes.Repeat([]byte{'x'}, size)
+				if _, err := conn.Write(payload); err != nil {
+					t.Fatal(err)
+				}
+				if _, err := io.ReadFull(conn, payload); err != nil {
+					t.Fatal(err)
+				}
+				// The echo went out from inside the drain; once readMu is
+				// free, the drain has put its buffer back.
+				l.readMu.Lock()
+				raw, hand := l.connBuffer(rawInputOffset).Cap(), l.connBuffer(handOffset).Cap()
+				l.readMu.Unlock()
+				if raw != 0 || hand != 0 {
+					t.Fatalf("after a %d-byte echo the connection keeps %d bytes of rawInput and %d of hand", size, raw, hand)
+				}
+			}
+		})
+	}
+}
+
 // startEchoServer runs an engine listening on a loopback port, or, with a nil
 // handler, one that only dials, and returns it with its address.
 func startEchoServer(t *testing.T, config fib.Config, handler fib.Handler) (*fib.Engine, string) {

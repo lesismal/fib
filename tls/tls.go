@@ -230,6 +230,9 @@ func (t *layer) handshake(handler fib.Handler, timeout time.Duration) {
 		defer cancel()
 	}
 	err := t.conn.HandshakeContext(ctx)
+	if err == nil {
+		t.releaseHandshakeBuffers()
+	}
 
 	t.wmu.Lock()
 	pending, closeAfterSend := t.pending, t.closeAfterSend
@@ -328,6 +331,10 @@ func (t *layer) feed(handler fib.Handler, data []byte) {
 func (t *layer) drainLocked(handler fib.Handler) {
 	if !t.hasInput() {
 		return
+	}
+	if lendRawInput {
+		t.lendInput()
+		defer t.reclaimInput()
 	}
 	buf := bufferpool.Get(readBufferSize)
 	defer bufferpool.Put(buf)

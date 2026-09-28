@@ -428,6 +428,11 @@ err = fibtls.Dial(engine, "tcp", "example.com:443", 3*time.Second, tlsConfig, ha
   保留一个只增不减的输入缓冲，一次交给它整轮流水线数据，这个缓冲就会涨到一轮的大小
   并一直留着。2 万连接、1 KiB 消息、每次写 10 条的 TLS 1.3 流水线压测中，服务端内存由
   约 880 MB 降到约 490 MB。
+- 连接在两轮之间不保留 `crypto/tls` 的缓冲：握手结束后，把它为握手撑大、之后一直空着的
+  输入缓冲和握手消息缓冲置空；之后每轮解密时从缓冲池借一块作输入缓冲，解密完即收回
+  （只剩半条记录时留到下一轮）。`crypto/tls` 不提供释放这两个缓冲的接口，所以这里按字段名
+  找到它们；某个 Go 版本里找不到时就不做处理，行为和原来一样。同样的压测中，echo 阶段内存
+  由约 360 MB 降到约 260 MB，流水线阶段由约 470 MB 降到约 260 MB，吞吐不变。
 - 对端关闭前发出的明文一定先到 `OnData` 再到 `OnClose`，包括随握手一起到达的数据；
   `OnClose` 也不会与 `OnHandshake` 同时执行。
 - `Handler.HandshakeTimeout` 限制握手时长，0 表示 `DefaultHandshakeTimeout`
