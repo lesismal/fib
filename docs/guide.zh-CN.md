@@ -1182,17 +1182,22 @@ go run ./examples/tcp/tls/client -n 10
 
 ## GOMAXPROCS
 
-工作协程在自己的协程里直接执行连接的 read/write，而协程进入系统调用时会一直占着它的 P，
-直到调度器把这个 P 收回转交出去。所以 GOMAXPROCS 等于核数时，核会在等这次转交的过程中空转：
-10 万连接的 echo 压测里，进程在分到的 5 个核上只用掉 2.3 个核，execution trace 显示 2 秒窗口内
-有 872 秒的「已就绪但没在运行」时间，几乎全部落在被事件循环唤醒的 worker 上。
+fib 不调整 GOMAXPROCS，保持 Go 运行时的默认值（等于可用的核数）就是最好的设置。
 
-把 GOMAXPROCS 设成核数的 2 倍即可：同一份构建下 echo 从 330k/s 提升到 415k/s，建连从 55k/s
-提升到 71k/s，TP99 从 145ms 降到 69ms。这是使用方的选择，库不会去改这个全局设置：
+曾经的实测是把 GOMAXPROCS 设成核数的 2 倍更快（echo 330k/s 到 415k/s），那是早期架构下的
+结果：工作协程在系统调用里占着 P，事件循环也在 `epoll_wait` 里占着 P。现在的事件循环只等事件、
+开启 IOPollers 时停在运行时的网络轮询器里等待，这个收益已经不存在，调高反而更慢。1 万连接的
+HTTP/2（1 个 poller），相对 GOMAXPROCS 等于核数：
 
-```go
-runtime.GOMAXPROCS(2 * runtime.NumCPU())
-```
+| 服务端核数 | 核数 + 2 | 2 倍核数 |
+|---|---|---|
+| 3 核 | multiplex −9% | multiplex −15% |
+| 4 核 | multiplex −3% | multiplex −14% |
+| 6 核 | multiplex −13% | multiplex −11% |
+
+echo 和 p99 在等于核数时最好或持平，内存随 GOMAXPROCS 升高而增加（2 倍核数时多 25–40%）；
+不开 IOPollers 时，为阻塞在 `epoll_wait` 里的那一个循环多给一个 P 也慢 5–6%。WebSocket 在这些
+配置之间的差别在噪声范围内。
 
 需要注意 `runtime.NumCPU()` 取的是本进程的 CPU 亲和性掩码，被 taskset 或 cpuset 限制时它已经
 是实际可用的核数。

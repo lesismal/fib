@@ -67,10 +67,10 @@ type PoolSizing struct {
 // ModeElastic, and it takes the same default. The floor it retires down to is
 // Config.MinWorkerCount.
 //
-// Note that every pool needs a GOMAXPROCS above the core count to pay off,
-// since its workers hold their P while they are in a syscall. See the note on
-// GOMAXPROCS in README.zh-CN.md: the same run went from 330k to 415k echoes/s,
-// and from 55k to 71k accepted connections/s, on GOMAXPROCS alone.
+// GOMAXPROCS is best left at the runtime's default, the cores: raising it
+// above them served HTTP/2 over 10k connections 3% to 17% fewer multiplexed
+// requests on 3, 4 and 6 cores, with echoes no faster; see the note on
+// GOMAXPROCS in docs/guide.zh-CN.md.
 const (
 	condWorkersPerCPU    = 100
 	condMinWorkers       = 256
