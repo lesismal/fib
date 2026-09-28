@@ -138,12 +138,9 @@ type Engine struct {
 	redeliver       []*Connection
 	taskPool        TaskPool
 	releaseTaskPool func()
-	// loops is how many event loops the engine counted toward GOMAXPROCS
-	// when it started, which Close takes back; see SetAutoMaxProcs.
-	loops          int
-	taskWG         sync.WaitGroup
-	readBufferSize int
-	closeOnce      sync.Once
+	taskWG          sync.WaitGroup
+	readBufferSize  int
+	closeOnce       sync.Once
 	// udpListeners are the engine's UDP sockets, when Config.Network names
 	// UDP. udpIdleTimeout closes their silent peers, and udpSweep is the
 	// timer that has the loop check for them, nil once it has been stopped.
@@ -276,9 +273,6 @@ func newEngine(config Config, handler Handler, addrs []string) (*Engine, error) 
 	for _, p := range e.pollers {
 		p.startUDPSweeper()
 	}
-	// The engine's own loop and its pollers'; see SetAutoMaxProcs.
-	e.loops = 1 + len(e.pollers)
-	addLoops(e.loops)
 	return e, nil
 }
 

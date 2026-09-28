@@ -757,10 +757,6 @@ func (e *Engine) detach(c *Connection) {
 func (e *Engine) Close() error {
 	var closeErr error
 	e.closeOnce.Do(func() {
-		if e.loops > 0 {
-			addLoops(-e.loops)
-			e.loops = 0
-		}
 		e.Stop()
 		e.stopUDPSweeper()
 		e.taskWG.Wait()

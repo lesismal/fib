@@ -1187,28 +1187,15 @@ go run ./examples/tcp/tls/client -n 10
 10 万连接的 echo 压测里，进程在分到的 5 个核上只用掉 2.3 个核，execution trace 显示 2 秒窗口内
 有 872 秒的「已就绪但没在运行」时间，几乎全部落在被事件循环唤醒的 worker 上。
 
-把 GOMAXPROCS 设成核数的 2 倍：同一份构建下 echo 从 330k/s 提升到 415k/s，建连从 55k/s
-提升到 71k/s，TP99 从 145ms 降到 69ms。事件循环被唤醒处理事件时也要占一个 P。
-
-所以 fib 默认自己设置 GOMAXPROCS：全局维护进程里所有 Engine 的事件循环总数（每个 Engine
-自己的循环加上它的 poller），Engine 启动和关闭、总数变化时设为 `runtime.NumCPU()` 加上循环
-总数，最多为核数的 2 倍；没有 Engine 在运行时回到核数。例如 8 核上一个默认配置的 Engine
-（自己的循环加 1 个 poller）是 10。
-
-- 启动进程时设置了 `GOMAXPROCS` 环境变量的，fib 不会覆盖它。
-- `fib.SetAutoMaxProcs(false)` 关闭自动设置，并调用一次
-  `runtime.GOMAXPROCS(2 * runtime.NumCPU())`；要用自己的值，在这之后再调用
-  `runtime.GOMAXPROCS`。`fib.SetAutoMaxProcs(true)` 重新开启，立即按当前的循环总数设置。
-  `fib.AutoMaxProcs()` 报告当前是否自动设置。
+把 GOMAXPROCS 设成核数的 2 倍即可：同一份构建下 echo 从 330k/s 提升到 415k/s，建连从 55k/s
+提升到 71k/s，TP99 从 145ms 降到 69ms。这是使用方的选择，库不会去改这个全局设置：
 
 ```go
-fib.SetAutoMaxProcs(false)  // 固定为 2 * NumCPU
-runtime.GOMAXPROCS(n)       // 需要自己的值时
+runtime.GOMAXPROCS(2 * runtime.NumCPU())
 ```
 
 需要注意 `runtime.NumCPU()` 取的是本进程的 CPU 亲和性掩码，被 taskset 或 cpuset 限制时它已经
-是实际可用的核数；只用 CPU 配额（cgroup quota，例如 Kubernetes 的 CPU limit）限制时它仍是整机的
-核数。
+是实际可用的核数。
 
 ## IOPollers
 
