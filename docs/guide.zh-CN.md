@@ -1206,11 +1206,15 @@ Engine 的 worker 池（`<Name>-workers`），每条连接的每一轮都在 wor
 
 - Engine 自己的循环只负责 accept 和它的 UDP socket；每条 accept 到的连接按 `fd % pollerCount`
   交给其中一个 poller，此后由那个 poller 负责它的事件注册、读写和关闭。poller 数量由
-  `Config.IOPollerCount` 指定，不大于 0（默认）时取 `runtime.NumCPU()`。
+  `Config.IOPollerCount` 指定，不大于 0（默认）时每 8 个 CPU 一个（`runtime.NumCPU()` 向上取整，
+  至少 1 个）：8 核以内 1 个，16 核 2 个，64 核 8 个。profile 下来，poller 每个请求只花约 0.2µs，
+  worker 花约 4.5µs（1 万连接的 WebSocket、HTTP/2 echo），一个 poller 大约跟得上 20 个核的
+  worker，每 8 个核一个时每个循环约 40% 忙。
   poller 只负责等事件、交给 worker，一个就能应付很多连接，多出来的 poller 会和 worker 抢同样
   的 P：每一轮结束后 poller 都要让出 P 给刚唤醒的 worker，再排在它们后面等 P，于是每轮收集到的
   连接更少、请求被读到得更晚。实测 3 个 CPU、1 万连接的 HTTP/1 echo：不开 IOPollers 583k
-  请求/s，1 个 poller 584k，3 个 poller 569k，p99 从 25ms 升到 37ms。poller 自己的工作（accept、
+  请求/s，1 个 poller 584k，3 个 poller 569k，p99 从 25ms 升到 37ms；4 个 CPU 的 HTTP/2 echo，
+  1 个 poller 411k、4 个 399k，p99 从 55ms 升到 64ms。poller 自己的工作（accept、
   注册连接、被唤醒）成为瓶颈时，多开 poller 才划算。
 - Linux 上同时设置 `Config.ReusePort` 时，accept 也移到 poller 上：每个 poller 在 Engine 的地址上
   用 `SO_REUSEPORT` 监听一个自己的 socket，自己 accept 内核按连接地址哈希分给它的连接；
@@ -1241,7 +1245,7 @@ Engine 的 worker 池（`<Name>-workers`），每条连接的每一轮都在 wor
 
 ```go
 config := fib.DefaultConfig() // 默认已开启 IOPollers
-config.IOPollerCount = 0      // runtime.NumCPU() 个
+config.IOPollerCount = 0      // 每 8 个 CPU 一个，至少 1 个
 config.ReusePort = true       // Linux：每个 poller 自己 accept
 
 single := fib.DefaultConfig()

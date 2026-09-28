@@ -172,3 +172,12 @@ func TestSetPoolSizingKeepsFieldsLeftUnset(t *testing.T) {
 		t.Fatalf("MaxEvents = %d, want it left at %d", config.MaxEvents, events)
 	}
 }
+
+// The engine gives itself one poller for every eight CPUs, and at least one.
+func TestDefaultPollerCount(t *testing.T) {
+	for cpus, want := range map[int]int{1: 1, 3: 1, 8: 1, 9: 2, 16: 2, 64: 8, 96: 12} {
+		if got := defaultPollerCount(cpus); got != want {
+			t.Errorf("%d CPUs: %d pollers, want %d", cpus, got, want)
+		}
+	}
+}

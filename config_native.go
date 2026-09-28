@@ -114,18 +114,20 @@ type Config struct {
 	// keeps its single loop, as if this were unset.
 	IOPollers bool
 	// IOPollerCount is how many loops IOPollers creates. Zero or less means
-	// one per CPU, runtime.NumCPU.
+	// one for every eight CPUs, runtime.NumCPU, and at least one: 1 up to 8
+	// CPUs, 2 on 16, 8 on 64.
 	//
-	// A loop only waits for events and hands them on, which one loop keeps
-	// up with for a good many connections, and each further loop competes
-	// with the workers for the same Ps: after every round a loop yields to
-	// the workers it woke and then waits behind them for a P, so each loop's
-	// rounds gather fewer connections, and requests wait longer to be read.
-	// An HTTP/1 echo over 10k connections on three CPUs measured 583k
-	// requests/s without pollers, 584k with one poller, and 569k with three,
-	// whose 99th percentile latency rose from 25ms to 37ms. More loops pay
-	// off where the loops' own work, accepting and registering connections
-	// and waking for them, is what runs short.
+	// A loop only waits for events and hands them on, which costs a small
+	// share of what the workers spend on them, so one loop keeps up with the
+	// workers of many CPUs, and each further loop competes with the workers
+	// for the same Ps: after every round a loop yields to the workers it woke
+	// and then waits behind them for a P, so each loop's rounds gather fewer
+	// connections, and requests wait longer to be read. HTTP/2 echoes over
+	// 10k connections on 4 CPUs measured 411k requests/s with one poller and
+	// 399k with four, whose 99th percentile latency rose from 55ms to 64ms.
+	// More loops pay off where the loops' own work, accepting and registering
+	// connections and waking for them, is what runs short, as it may with
+	// ReusePort and many connections arriving at once.
 	IOPollerCount int
 	// ReusePort binds the engine's listeners with SO_REUSEPORT, so that
 	// other sockets that set it too, in this process or another of the same

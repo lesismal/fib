@@ -426,8 +426,8 @@ func TestDefaultConfigHasPollersAndWorkerPool(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer server.Close()
-	if len(server.pollers) != runtime.NumCPU() {
-		t.Fatalf("default engine has %d pollers, want %d", len(server.pollers), runtime.NumCPU())
+	if want := defaultPollerCount(runtime.NumCPU()); len(server.pollers) != want {
+		t.Fatalf("default engine has %d pollers, want %d", len(server.pollers), want)
 	}
 	pool, ok := server.taskPool.(*taskpool.TaskPool)
 	if !ok || pool.Mode() != config.TaskPoolMode || pool.Name() != "default-config-workers" {
