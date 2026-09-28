@@ -160,10 +160,13 @@ func (c *capture) release() {
 	c.written, c.read = nil, nil
 }
 
-// helloRandom finds, in a stream of records, the random of the last
+// helloRandom finds, in a stream of records, the random of the first
 // handshake message of hsType, 1 for ClientHello or 2 for ServerHello, that
 // opens a record: crypto/tls writes both at the start of one. A ServerHello
-// that is a HelloRetryRequest comes before the real one.
+// that is a HelloRetryRequest is passed over for the real one behind it; a
+// ClientHello sent again after one keeps its random. The first one counts
+// because a TLS 1.2 Finished is a handshake record too, whose encrypted
+// body, a CBC one's random IV in particular, may start with hsType.
 func helloRandom(stream []byte, hsType byte) (random [32]byte, ok bool) {
 	for len(stream) >= recordHeaderLen {
 		size := recordHeaderLen + int(binary.BigEndian.Uint16(stream[3:5]))
@@ -177,11 +180,20 @@ func helloRandom(stream []byte, hsType byte) (random [32]byte, ok bool) {
 		// two of version, then the random.
 		if record[0] == recordTypeHandshake && len(record) >= 43 && record[5] == hsType {
 			copy(random[:], record[11:43])
-			ok = true
+			if hsType != 2 || random != helloRetryRandom {
+				return random, true
+			}
 		}
 		stream = stream[size:]
 	}
-	return random, ok
+	return [32]byte{}, false
+}
+
+// helloRetryRandom is the random of a ServerHello that is a HelloRetryRequest
+// (RFC 8446 section 4.1.3).
+var helloRetryRandom = [32]byte{
+	0xcf, 0x21, 0xad, 0x74, 0xe5, 0x9a, 0x61, 0x11, 0xbe, 0x1d, 0x8c, 0x02, 0x1e, 0x65, 0xb8, 0x91,
+	0xc2, 0xa2, 0x11, 0x16, 0x7a, 0xbb, 0x8c, 0x5e, 0x07, 0x9e, 0x09, 0xe2, 0xc8, 0xa8, 0x33, 0x9c,
 }
 
 // keyLogWriter keeps the secrets crypto/tls logs for the connections reg is

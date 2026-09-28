@@ -1,3 +1,5 @@
+//go:build linux || darwin || windows
+
 package tls
 
 import (
@@ -527,5 +529,32 @@ func TestCBCRecords(t *testing.T) {
 				}
 			}
 		}
+	}
+}
+
+// A TLS 1.2 Finished is a handshake record whose encrypted body may start
+// like a hello, as a CBC one's random IV does now and then: the hello that
+// came first is the one that names the connection, unless it asked for a
+// retry.
+func TestHelloRandomTakesTheFirstHello(t *testing.T) {
+	record := func(typ byte, body ...byte) []byte {
+		return append([]byte{typ, 3, 3, byte(len(body) >> 8), byte(len(body))}, body...)
+	}
+	hello := func(hsType byte, random [32]byte) []byte {
+		body := append([]byte{hsType, 0, 0, 38, 3, 3}, random[:]...)
+		return record(recordTypeHandshake, append(body, 0, 0, 0, 0)...)
+	}
+	var want, lookalike [32]byte
+	for i := range want {
+		want[i], lookalike[i] = byte(i), byte(0xff-i)
+	}
+	var stream []byte
+	stream = append(stream, hello(2, helloRetryRandom)...)
+	stream = append(stream, record(recordTypeChangeCipherSpec, 1)...)
+	stream = append(stream, hello(2, want)...)
+	stream = append(stream, record(recordTypeChangeCipherSpec, 1)...)
+	stream = append(stream, hello(2, lookalike)...)
+	if got, ok := helloRandom(stream, 2); !ok || got != want {
+		t.Fatalf("helloRandom: %x %v, want %x", got, ok, want)
 	}
 }
