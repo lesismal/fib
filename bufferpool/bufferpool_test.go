@@ -93,15 +93,24 @@ func TestOversizedBuffersAreServedButNotPooled(t *testing.T) {
 // reused reports whether one of the buffers Put just took came back out of the
 // pool. A collection between the two empties the pool, so the check is given a
 // few attempts before it is believed.
+//
+// The buffers are all taken before any is returned, so the pool ends up
+// holding several of them rather than one passed back and forth: under the
+// race detector sync.Pool drops a quarter of what it is given, and a buffer
+// left in another P's private slot cannot be taken from this one, so a single
+// buffer is lost often enough to fail the test.
 func reused(t *testing.T, size int) bool {
 	t.Helper()
 	const attempts = 5
 	for range attempts {
 		const buffers = 8
 		want := map[uintptr]bool{}
-		for range buffers {
-			buf := Get(size)
-			want[uintptr(unsafe.Pointer(unsafe.SliceData(buf)))] = true
+		taken := make([][]byte, buffers)
+		for i := range taken {
+			taken[i] = Get(size)
+			want[uintptr(unsafe.Pointer(unsafe.SliceData(taken[i])))] = true
+		}
+		for _, buf := range taken {
 			Put(buf)
 		}
 		for range buffers {
