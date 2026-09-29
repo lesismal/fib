@@ -25,6 +25,8 @@ type rawConn struct {
 	handshake chan struct{}
 	closed    chan error
 	resets    chan uint64
+	// onStream, when set, is handed what arrives on the streams.
+	onStream func(s *quic.Stream, data []byte, fin bool)
 }
 
 func (r *rawConn) OnOpen(*fib.Connection)                 {}
@@ -41,8 +43,15 @@ func (r *rawConn) OnClose(*fib.Connection, error) {}
 
 type rawHandler struct{ r *rawConn }
 
-func (h rawHandler) OnHandshake(*quic.Conn)                  { close(h.r.handshake) }
-func (h rawHandler) OnStreamData(*quic.Stream, []byte, bool) {}
+func (h rawHandler) OnHandshake(*quic.Conn) { close(h.r.handshake) }
+func (h rawHandler) OnStreamData(s *quic.Stream, data []byte, fin bool) {
+	h.r.mu.Lock()
+	onStream := h.r.onStream
+	h.r.mu.Unlock()
+	if onStream != nil {
+		onStream(s, data, fin)
+	}
+}
 func (h rawHandler) OnStreamReset(_ *quic.Stream, code uint64) {
 	h.r.resets <- code
 }

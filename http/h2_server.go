@@ -169,6 +169,10 @@ type h2ServerStream struct {
 	sendWindow int64
 	pending    []byte
 
+	// tunnel is the tunnel of an extended CONNECT (RFC 8441), or nil; see
+	// h2Tunnel. It is set before the handler runs and never changes.
+	tunnel *h2Tunnel
+
 	// block is the request, its URL and the Context it is answered through,
 	// allocated with the stream, and values holds its header's values.
 	block  StreamRequest
@@ -214,6 +218,7 @@ func (sc *h2ServerConn) start() {
 		[2]uint32{uint32(h2SettingInitialWindowSize), h2StreamWindow},
 		[2]uint32{uint32(h2SettingMaxHeaderListSize), uint32(sc.handler.config.MaxHeaderBytes)},
 		[2]uint32{uint32(h2SettingEnablePush), 0},
+		[2]uint32{uint32(h2SettingEnableConnectProtocol), 1},
 	)
 	out = h2AppendWindowUpdate(out, 0, h2ConnWindow-h2DefaultWindow)
 	sc.mu.Lock()
@@ -563,6 +568,9 @@ func (sc *h2ServerConn) handleData(f *h2Frame) error {
 	if st.feed != nil {
 		return sc.handleStreamedData(st, f)
 	}
+	if st.tunnel != nil {
+		return sc.handleTunnelData(st, f)
+	}
 	if length > st.recvWindow {
 		return &H2StreamError{StreamID: f.streamID, Code: H2FlowControlError}
 	}
@@ -713,6 +721,12 @@ func (sc *h2ServerConn) handleHeaderBlock(id uint32, block []byte, endStream boo
 		return &H2StreamError{StreamID: id, Code: H2ProtocolError}
 	}
 	st.req = req
+	if _, ok := req.Header[":protocol"]; ok && !endStream {
+		// An extended CONNECT: its handler runs now, and may switch the
+		// stream to a tunnel. What arrives meanwhile waits for it there.
+		sc.serveTunnel(st)
+		return nil
+	}
 	if cl := req.Header.Get("Content-Length"); cl != "" {
 		n, err := strconv.ParseInt(cl, 10, 64)
 		if err != nil || n < 0 {
@@ -776,8 +790,8 @@ func (sc *h2ServerConn) handleTrailers(st *h2ServerStream, fields []hpack.Header
 // stream's, and the header's values, as far as they go, are slices of the
 // stream's values.
 func (sc *h2ServerConn) newRequest(fields []hpack.HeaderField, st *h2ServerStream) (*stdhttp.Request, error) {
-	var method, scheme, authority, path string
-	var seen [4]bool
+	var method, scheme, authority, path, protocol string
+	var seen [5]bool
 	header := make(stdhttp.Header, len(fields))
 	values := st.values[:]
 	var cookies []string
@@ -797,6 +811,9 @@ func (sc *h2ServerConn) newRequest(fields []hpack.HeaderField, st *h2ServerStrea
 				slot, authority = 2, f.Value
 			case ":path":
 				slot, path = 3, f.Value
+			case ":protocol":
+				// Extended CONNECT (RFC 8441), which the server allows.
+				slot, protocol = 4, f.Value
 			default:
 				return nil, fmt.Errorf("unknown pseudo-header %q", f.Name)
 			}
@@ -847,7 +864,19 @@ func (sc *h2ServerConn) newRequest(fields []hpack.HeaderField, st *h2ServerStrea
 		Body:       stdhttp.NoBody,
 	}
 	u := &st.block.URL
-	if method == stdhttp.MethodConnect {
+	if seen[4] {
+		// An extended CONNECT names the resource it opens a tunnel to as
+		// any request does (RFC 8441 section 4), and reports the protocol
+		// in the header, as golang.org/x/net/http2 does.
+		if method != stdhttp.MethodConnect || protocol == "" || scheme == "" || path == "" || authority == "" {
+			return nil, errors.New("malformed extended CONNECT")
+		}
+		if err := ParseRequestTarget(u, path); err != nil {
+			return nil, err
+		}
+		req.RequestURI = path
+		header[":protocol"] = []string{protocol}
+	} else if method == stdhttp.MethodConnect {
 		if scheme != "" || path != "" || authority == "" {
 			return nil, errors.New("malformed CONNECT")
 		}
@@ -998,6 +1027,7 @@ func (sc *h2ServerConn) failBodyLocked(st *h2ServerStream, err error) {
 	if feed := st.feed; feed != nil && !st.remoteDone {
 		feed.Fail(err)
 	}
+	sc.endTunnelLocked(st, err)
 }
 
 // failBodiesLocked fails every body still streaming on the connection.
@@ -1248,6 +1278,11 @@ func (st *h2ServerStream) writeInterim(status int, header stdhttp.Header) error 
 func (sc *h2ServerConn) forgetLocked(st *h2ServerStream) {
 	st.reset = st.reset || !st.localDone
 	st.pending = nil
+	if st.tunnel != nil {
+		bufferpool.Put(st.tunnel.sendBuf)
+		st.tunnel.sendBuf = nil
+		sc.endTunnelLocked(st, errH2StreamClosed)
+	}
 	if sc.streams[st.id] != st {
 		return
 	}
@@ -1262,6 +1297,14 @@ func (sc *h2ServerConn) forgetLocked(st *h2ServerStream) {
 // with RST_STREAM(NO_ERROR) as RFC 9113 section 8.1 describes.
 func (sc *h2ServerConn) finishStreamLocked(st *h2ServerStream) {
 	if !st.localDone || st.reset {
+		return
+	}
+	if st.upgraded() {
+		// A tunnel ends when both sides have ended it.
+		if st.remoteDone {
+			sc.forgetLocked(st)
+			sc.closeFinishedLocked()
+		}
 		return
 	}
 	if !st.remoteDone {
@@ -1301,7 +1344,14 @@ func (sc *h2ServerConn) flushStreamLocked(out []byte, st *h2ServerStream) []byte
 		last := len(st.pending) == 0
 		if last {
 			st.pending = nil
-			if st.trailer == nil {
+			switch {
+			case st.upgraded():
+				// A tunnel's stream goes on until it is asked to end.
+				last = st.tunnel.ending
+				if last {
+					flags = h2FlagEndStream
+				}
+			case st.trailer == nil:
 				flags = h2FlagEndStream
 			}
 		}

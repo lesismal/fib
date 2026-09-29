@@ -229,8 +229,10 @@ type Parser struct {
 	stream *BodyStream
 	busy   bool
 	// spent marks a connection that is ending, or that has become HTTP/2,
-	// whose remaining bytes this parser will not answer.
-	spent bool
+	// whose remaining bytes this parser will not answer. upgraded marks one
+	// that a handler switched to another protocol through Context.Upgrade.
+	spent    bool
+	upgraded bool
 	// headerComplete records that the request being parsed has its header and
 	// is waiting for its body, which is what tells ReadHeaderTimeout from
 	// ReadTimeout. requestStart is when that request's first byte arrived,
@@ -276,7 +278,7 @@ func (p *Parser) Reset() {
 	p.discard()
 	p.headerScan = 0
 	p.continued, p.wantContinue = false, false
-	p.stream, p.busy, p.spent = nil, false, false
+	p.stream, p.busy, p.spent, p.upgraded = nil, false, false, false
 	p.headerComplete, p.requestStart = false, time.Time{}
 	p.live.Store(nil)
 	p.resetServerState()

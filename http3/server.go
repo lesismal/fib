@@ -348,7 +348,7 @@ func (sc *serverConn) OnHandshake(qc *quic.Conn) {
 	sc.qc = qc
 	state := qc.ConnectionState()
 	sc.tlsState = &state
-	control, err := openControl(qc, sc.h.config.MaxHeaderBytes)
+	control, err := openControl(qc, sc.h.config.MaxHeaderBytes, [2]uint64{settingEnableConnectProtocol, 1})
 	if err != nil {
 		closeWith(qc, connErr(ErrCodeStreamCreationError, "cannot open the control stream"))
 		return
@@ -504,6 +504,10 @@ type requestStream struct {
 	// streamed is what the request keeps when the server streams bodies, or
 	// nil when it does not.
 	streamed *streamedBody
+	// tunnel is the tunnel of an extended CONNECT (RFC 9220), or nil. It is
+	// set before the handler runs, which may switch the stream to it with
+	// Context.Upgrade; what arrives on the stream waits in it until then.
+	tunnel *fibhttp.TunnelFeed
 
 	mu sync.Mutex
 	// remoteDone is set when the whole request has arrived.
@@ -511,6 +515,9 @@ type requestStream struct {
 
 	responded bool
 	closed    bool
+	// upgraded is set once the handler has switched the stream to its
+	// tunnel; see tunnel.
+	upgraded bool
 	// expected is set while the connection expects the response, and holds
 	// what it has to send for it; see quic.Conn.ExpectWrite.
 	expected bool
@@ -602,6 +609,11 @@ func (rs *requestStream) feed(data []byte, fin bool) {
 		rs.abort(ErrCodeRequestIncomplete)
 		return
 	}
+	if rs.tunnel != nil {
+		rs.done = true
+		rs.peerEndedTunnel()
+		return
+	}
 	if b != nil && b.feed != nil {
 		rs.done = true
 		if err := b.feed.End(b.trailer); err != nil {
@@ -618,6 +630,12 @@ func (rs *requestStream) onData(chunk []byte) error {
 	}
 	if rs.req == nil || rs.trailers {
 		return connErr(ErrCodeFrameUnexpected, "DATA before HEADERS or after trailers")
+	}
+	if rs.tunnel != nil {
+		if err := rs.tunnel.Write(chunk); err != nil {
+			rs.abort(ErrCodeExcessiveLoad)
+		}
+		return nil
 	}
 	if b := rs.streamed; b != nil {
 		if b.feed != nil {
@@ -718,6 +736,12 @@ func (rs *requestStream) onFrame(typ uint64, payload []byte) error {
 	req.TLS = rs.sc.tlsState
 	rs.req = req
 	rs.sc.track(rs)
+	if _, ok := req.Header[":protocol"]; ok {
+		// An extended CONNECT: its handler runs now, and may switch the
+		// stream to a tunnel.
+		rs.serveTunnel()
+		return nil
+	}
 	if cl := req.Header.Get("Content-Length"); cl != "" {
 		n, err := strconv.ParseInt(cl, 10, 64)
 		if err != nil || n < 0 {
@@ -782,6 +806,9 @@ func (rs *requestStream) startStream(buffered []byte) {
 func (rs *requestStream) failBody(err error) {
 	if b := rs.streamed; b != nil && b.feed != nil {
 		b.feed.Fail(err)
+	}
+	if rs.tunnel != nil {
+		rs.tunnel.End(err)
 	}
 }
 
@@ -850,7 +877,7 @@ func (rs *requestStream) peerReset() {
 	rs.dropBody()
 	rs.failBody(errRequestReset)
 	rs.mu.Lock()
-	wasOpen := !rs.closed && !rs.responded
+	wasOpen := !rs.closed && (!rs.responded || rs.upgraded)
 	rs.closed = true
 	rs.mu.Unlock()
 	if wasOpen {

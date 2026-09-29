@@ -34,6 +34,8 @@ const (
 	settingQPACKMaxTableCapacity = 0x01
 	settingMaxFieldSectionSize   = 0x06
 	settingQPACKBlockedStreams   = 0x07
+	// settingEnableConnectProtocol allows extended CONNECT (RFC 9220).
+	settingEnableConnectProtocol = 0x08
 )
 
 // ErrorCode is an HTTP/3 error code (RFC 9114 section 8.1), carried by a

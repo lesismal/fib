@@ -36,8 +36,9 @@ type peerStreams struct {
 	onGoAway func(id uint64) error
 }
 
-// openControl opens this side's control stream and sends SETTINGS on it.
-func openControl(qc *quic.Conn, maxFieldSection int) (*quic.Stream, error) {
+// openControl opens this side's control stream and sends SETTINGS on it,
+// with extra settings of the side's own after those both sides send.
+func openControl(qc *quic.Conn, maxFieldSection int, extra ...[2]uint64) (*quic.Stream, error) {
 	s, err := qc.OpenUniStream()
 	if err != nil {
 		return nil, err
@@ -45,7 +46,7 @@ func openControl(qc *quic.Conn, maxFieldSection int) (*quic.Stream, error) {
 	b := quic.AppendVarint(nil, streamControl)
 	// The dynamic table capacity and blocked streams are left at their
 	// default of zero, which is what keeps the QPACK streams silent.
-	b = appendSettings(b, [2]uint64{settingMaxFieldSectionSize, uint64(maxFieldSection)})
+	b = appendSettings(b, append([][2]uint64{{settingMaxFieldSectionSize, uint64(maxFieldSection)}}, extra...)...)
 	return s, s.Write(b, false)
 }
 

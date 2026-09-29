@@ -1066,6 +1066,33 @@ handler := websocket.HandlerFuncs{
 - `MaxMessageBytes` 限制的是解压后的大小，超过时以 1009 关闭；解压失败或解压后的
   Text 不是合法 UTF-8 时以 1007 关闭。
 
+### 在 HTTP server 中升级为 WebSocket
+
+同一个 `http` 或 `http3` server 既要答普通请求又要提供 WebSocket 时，在 handler 里调用
+`ServerHandler.Upgrade`，连接之后由这个 `ServerHandler` 的 Handler 处理，和直接接入它的
+连接一样：
+
+```go
+ws := websocket.NewHandler(wsHandler)
+handler := http.HandlerFunc(func(c *http.Context, r *stdhttp.Request) {
+    if r.URL.Path == "/ws" {
+        _, _ = ws.Upgrade(c, nil) // 握手不合法时自己回 400/403 并返回错误
+        return
+    }
+    _ = c.Respond(200, "text/plain", []byte("hello"))
+})
+```
+
+- HTTP/1.1 上是 RFC 6455 的 Upgrade 握手，回 101 后整个连接切换过去，紧跟在请求后面
+  发来的帧也会交付。
+- HTTP/2、HTTP/3 上是 `:protocol` 为 `websocket` 的 Extended CONNECT（RFC 8441、
+  RFC 9220），server 会在 SETTINGS 里声明 `SETTINGS_ENABLE_CONNECT_PROTOCOL`。只有这个
+  stream 切换过去，回 200 并保持打开，帧放在 DATA 里双向传输，受 stream 流控约束；同一
+  连接上的其他请求照常处理。关闭时各自发 END_STREAM（HTTP/3 为 FIN）。
+- `CheckOrigin`、`Subprotocols`、`EnableCompression` 同样生效；`header` 会随接受握手的
+  响应发出。`Upgrade` 返回前 `OnOpen` 已经调用，传给它的 request 不能保留。
+- 底层是 `http.Context.Upgrade` 返回的 `http.Tunnel`，其他协议也可以借它实现。
+
 ### 异步 WebSocket client
 
 `Dialer` 在 Engine 上发起 WebSocket 连接并完成握手，调用方不会阻塞。握手成功后，

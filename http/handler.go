@@ -484,6 +484,11 @@ func (h *ServerHandler) OnData(c *fib.Connection, data []byte) {
 	case *h2ServerConn:
 		state.feed(data)
 		return
+	case *TunnelFeed:
+		if err := state.Write(data); err != nil {
+			c.CloseWithError(err)
+		}
+		return
 	case *Parser:
 		parser = state
 	default:
@@ -606,6 +611,13 @@ func (h *ServerHandler) drive(c *fib.Connection, parser *Parser, data []byte) {
 		// its body has all arrived: reading a streamed body never waits, so
 		// there is nothing for a goroutine of its own to wait on.
 		serveRequest(h.handler, context)
+		if parser.upgraded {
+			// The handler switched the connection to another protocol, which
+			// has it, and whatever it sends, from here on.
+			parser.busy = false
+			context.drop(ctxConn)
+			return
+		}
 		if bodyErr != nil {
 			// The body was refused or misframed before the handler even saw
 			// it, which its own read told it; the connection cannot go on.
@@ -872,6 +884,8 @@ func (h *ServerHandler) OnClose(c *fib.Connection, err error) {
 	switch state := c.Attachment().(type) {
 	case *h2ServerConn:
 		state.shutdown()
+	case *TunnelFeed:
+		state.End(err)
 	case *Parser:
 		// A handler waiting on the rest of a body has to hear that the rest
 		// will never come, rather than take a truncated upload for a complete

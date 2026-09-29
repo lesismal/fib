@@ -68,7 +68,7 @@ func main() {
 | [`tls`](tls) | 叠加在 connection 上的 TLS，上层协议无需改动 |
 | [`http`](http) | HTTP/1.x 与 HTTP/2 的 server 和 client |
 | [`http3`](http3) | HTTP/3、QUIC、QPACK 的 server 和 client |
-| [`websocket`](websocket) | RFC 6455 server 和 client，支持 permessage-deflate |
+| [`websocket`](websocket) | RFC 6455 server 和 client，支持 permessage-deflate；可在 `http`、`http3` server 的请求中升级，HTTP/1.1 之外也支持 HTTP/2、HTTP/3 上的 Extended CONNECT（RFC 8441、RFC 9220） |
 | [`middleware`](middleware) | HTTP 中间件链与常用中间件 |
 
 ## 示例

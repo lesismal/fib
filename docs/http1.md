@@ -295,6 +295,38 @@ followed by the remainder once the socket drains.
 over one (what `http.ServeContent` passes). Ranges under 16KB are copied
 instead, which costs less than the extra system calls.
 
+### Switching protocols
+
+`Context.Upgrade(protocol, header, handler)` switches a request to another
+protocol and returns the `Tunnel` its bytes go through. Over HTTP/1.1 the
+request has to ask for `protocol` in `Upgrade` and `Connection: Upgrade`; the
+server answers `101 Switching Protocols` with `header`, and the whole
+connection is the tunnel's from then on, bytes the client sent behind the
+request included. Over HTTP/2 and HTTP/3 the servers advertise
+`SETTINGS_ENABLE_CONNECT_PROTOCOL`, and an extended CONNECT whose `:protocol`
+is `protocol` (reported as `Request.Header[":protocol"]`) switches only its
+own stream: the answer is a 200 that leaves it open, and the stream's DATA
+frames carry the tunnel both ways under its flow control. Anything else gets
+`ErrNotUpgradable`, and the handler answers it as usual.
+
+The `TunnelHandler` hears `OnTunnelOpen` before `Upgrade` returns, then
+`OnTunnelData` for what arrives, and `OnTunnelClose` once, with its calls one
+at a time and in order. `Tunnel.Send`, `SendParts` and `SendOwned` may be
+called from any goroutine; `CloseAfterSend` ends the connection, or this side
+of the stream, once what was sent has gone, and `Close` ends it at once.
+`Upgrade` is called from the handler, before it has written anything.
+
+```go
+ws := websocket.NewHandler(wsHandler)
+handler := http.HandlerFunc(func(c *http.Context, r *stdhttp.Request) {
+	if r.URL.Path == "/ws" {
+		_, _ = ws.Upgrade(c, nil) // answers 400/403 itself when it fails
+		return
+	}
+	_ = c.Respond(200, "text/plain", []byte("hello"))
+})
+```
+
 ## Current limitations
 
 - **Request bodies are buffered whole by default.** A request is handed to the
@@ -323,9 +355,11 @@ instead, which costs less than the extra system calls.
   response until the handler returns (see their documents).
 - **No transfer codings besides chunked** (gzip, deflate, compress) are
   decoded; such requests get 501, such responses fail.
-- **No `Upgrade` handling other than h2c and WebSocket** (the latter in the
-  `websocket` package); `CONNECT` requests reach the handler but cannot become
-  tunnels.
+- **`Upgrade` is up to the handler**, apart from h2c: `Context.Upgrade`
+  answers 101 and hands the connection to a `TunnelHandler`, which is how
+  `websocket.ServerHandler.Upgrade` serves WebSocket from an HTTP handler (see
+  [Switching protocols](#switching-protocols)). A classic `CONNECT` to a host
+  and port reaches the handler but cannot become a tunnel.
 
 ## Planned improvements
 

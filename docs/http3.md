@@ -18,7 +18,7 @@ from scratch. The TLS 1.3 handshake is the standard library's
 | Area | Content |
 | --- | --- |
 | QUIC | Version 1; Initial, Handshake and 1-RTT packet number spaces; AES-128-GCM, AES-256-GCM and ChaCha20-Poly1305 packet and header protection; key updates in both directions (started here when a key reaches its AEAD limit, and answered when the peer starts one) and a limit on decryption failures; Retry on the client; Version Negotiation; stateless reset; RFC 9002 loss detection, PTO and NewReno congestion control; the server's 3x amplification limit; connection- and stream-level flow control in both directions; MAX_STREAMS; idle timeout and optional keep-alive |
-| Server | Shares one `Handler` and `Context` with HTTP/1 and HTTP/2; 1xx interim responses, automatic 100 Continue, request and response trailers, graceful `Response.Close` via GOAWAY, 413/431/417, malformed requests (including an `:authority` and `Host` that disagree) reset with H3_MESSAGE_ERROR, protocol errors closing the connection with RFC 9114 and RFC 9204 codes, `Request.TLS`, an `AltSvc` helper |
+| Server | Shares one `Handler` and `Context` with HTTP/1 and HTTP/2; 1xx interim responses, automatic 100 Continue, request and response trailers, graceful `Response.Close` via GOAWAY, 413/431/417, malformed requests (including an `:authority` and `Host` that disagree) reset with H3_MESSAGE_ERROR, protocol errors closing the connection with RFC 9114 and RFC 9204 codes, `Request.TLS`, an `AltSvc` helper, extended CONNECT (RFC 9220) switched to a tunnel with `Context.Upgrade`, which is how `websocket.ServerHandler.Upgrade` serves WebSocket over HTTP/3 |
 | Client | Asynchronous `Do`/`Go`; one multiplexed connection per host:port; honors MAX_STREAMS and queues the rest; cancellation resets only its own stream; requests the server marks as unprocessed (GOAWAY, H3_REQUEST_REJECTED) are retried on a new connection; request and response trailers; a peer that breaks the protocol ends the connection with its error code |
 | Conformance | Both directions against quic-go, and protocol errors written frame by frame, all run in CI |
 | Interop | quic-go client and server, both directions, including 5% packet loss; the client against the live services of Cloudflare, Google, nginx, Facebook (mvfst), Varnish and quiche |
@@ -200,7 +200,7 @@ exposed through `http3.Config` or `http3.ClientConfig`:
 | Server push | No major browser enables HTTP/3 push. The client sends no MAX_PUSH_ID, and `Context.Push` returns `http.ErrNotSupported`. Use 103 Early Hints (`WriteInterim`) for preloading. |
 | Server-sent Retry / NEW_TOKEN | Address validation relies on the handshake and the 3x amplification limit, which spares issuing and checking tokens. The client handles a Retry from a server but ignores NEW_TOKEN. |
 | QUIC v2 (RFC 9369) and other versions | Version 1 is enough in practice. The client fails on Version Negotiation. |
-| DATAGRAM (RFC 9221), Extended CONNECT (RFC 9220), WebTransport | They need APIs for streaming or unreliable datagrams, which the current handler model lacks. A DATAGRAM frame from the peer is an unknown frame and closes the connection with FRAME_ENCODING_ERROR. |
+| DATAGRAM (RFC 9221), WebTransport | They need APIs for streaming or unreliable datagrams, which the current handler model lacks. A DATAGRAM frame from the peer is an unknown frame and closes the connection with FRAME_ENCODING_ERROR. |
 | RFC 9218 extensible priorities | With whole bodies, scheduling gains little. |
 | ECN | Needs reading and writing the IP header's ECN bits in the engine's UDP layer; the gain is mostly in congestion control. |
 
@@ -253,7 +253,8 @@ In order of priority.
 
 - As for HTTP/2: streaming response writes. Streamed request bodies are done,
   with the receive window given back as the handler consumes the body.
-  Bidirectional streaming is what Extended CONNECT and WebTransport need.
+  Bidirectional streaming is what WebTransport needs; extended CONNECT has
+  it through `Context.Upgrade`.
 
 ### 4. Configurability (low)
 

@@ -253,8 +253,9 @@ body 的请求，以及不在 server 自行解析范围内、改由 `net/http` �
   后整体发送（见各自的文档）。
 - **不解码 chunked 以外的 transfer coding**（gzip、deflate、compress）：这样的请求返回
   501，这样的响应会失败。
-- **除 h2c 和 WebSocket（在 `websocket` package 中）外不处理 `Upgrade`**；`CONNECT`
-  请求会交给 handler，但无法建立隧道。
+- **除 h2c 外，`Upgrade` 由 handler 处理**：`Context.Upgrade` 回复 101 并把连接交给
+  `TunnelHandler`，`websocket.ServerHandler.Upgrade` 就是这样在 HTTP handler 里提供
+  WebSocket 的。指向 host:port 的传统 `CONNECT` 请求会交给 handler，但无法建立隧道。
 
 ## 待优化
 

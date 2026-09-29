@@ -15,7 +15,7 @@ internal hpack package. It is written from scratch and does not depend on
 
 | Side | Features |
 | --- | --- |
-| Server | TLS + ALPN (h2), cleartext with prior knowledge (h2c), HTTP/1.1 `Upgrade: h2c`; multiplexing, flow control in both directions, HPACK (Huffman and dynamic table), CONTINUATION, trailers, server push, 1xx interim responses, automatic 100 Continue, graceful GOAWAY on `Response.Close`, `Request.TLS` |
+| Server | TLS + ALPN (h2), cleartext with prior knowledge (h2c), HTTP/1.1 `Upgrade: h2c`; multiplexing, flow control in both directions, HPACK (Huffman and dynamic table), CONTINUATION, trailers, server push, 1xx interim responses, automatic 100 Continue, graceful GOAWAY on `Response.Close`, `Request.TLS`, extended CONNECT (RFC 8441) switched to a tunnel with `Context.Upgrade`, which is how `websocket.ServerHandler.Upgrade` serves WebSocket over HTTP/2 |
 | Client | h2 over https through ALPN, cleartext prior knowledge with `UnencryptedHTTP2`; multiplexing on one connection, honouring the server's `MAX_CONCURRENT_STREAMS`, cancellation that resets only its own stream, automatic retry after GOAWAY / REFUSED_STREAM |
 | Conformance | h2spec: 145 of 145 cases, over h2c and TLS |
 | Interop | Go `net/http` client and server (TLS and h2c); curl (nghttp2) over h2, h2c and Upgrade |
@@ -153,7 +153,6 @@ These are constants today and cannot be configured:
 | --- | --- |
 | Receiving server push in the client | Chrome and Firefox have removed push, and Go's `net/http` client never supported it. The client sends `ENABLE_PUSH=0`; the server's push support remains for clients that still want it. For preloading, 103 Early Hints (`Context.WriteInterim`) is the recommended replacement. |
 | RFC 9218 extensible priorities (`priority` header, PRIORITY_UPDATE) | With bodies buffered whole, scheduling has little to gain. The RFC 7540 priority tree is deprecated by RFC 9113 and is not implemented either. |
-| Extended CONNECT (RFC 8441, WebSocket over HTTP/2) | Needs bidirectional streaming streams, which need streaming bodies first; WebSocket uses the HTTP/1.1 Upgrade. |
 | `Upgrade: h2c` initiated by the client | RFC 9113 deprecates this upgrade; cleartext HTTP/2 uses prior knowledge (`UnencryptedHTTP2`). The server still accepts the upgrade for compatibility with curl and others. |
 | `Upgrade: h2c` over TLS | The RFCs allow switching protocols over TLS only through ALPN. |
 | 1xx interim responses to HTTP/1.0 requests | HTTP/1.0 clients do not understand 1xx; `WriteInterim` returns `http.ErrNotSupported`. |

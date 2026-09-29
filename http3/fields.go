@@ -158,8 +158,8 @@ func appendHeadersFrame(b, block []byte) []byte {
 // the header's values, as far as they go, are slices of values; block may be
 // nil, for a request of its own.
 func newRequest(fields []qpack.HeaderField, block *fibhttp.StreamRequest, values []string) (*stdhttp.Request, error) {
-	var method, scheme, authority, path string
-	var seen [4]bool
+	var method, scheme, authority, path, protocol string
+	var seen [5]bool
 	header := make(stdhttp.Header, len(fields))
 	var cookies []string
 	regular := false
@@ -178,6 +178,9 @@ func newRequest(fields []qpack.HeaderField, block *fibhttp.StreamRequest, values
 				slot, authority = 2, f.Value
 			case ":path":
 				slot, path = 3, f.Value
+			case ":protocol":
+				// Extended CONNECT (RFC 9220), which the server allows.
+				slot, protocol = 4, f.Value
 			default:
 				return nil, fmt.Errorf("unknown pseudo-header %q", f.Name)
 			}
@@ -227,7 +230,19 @@ func newRequest(fields []qpack.HeaderField, block *fibhttp.StreamRequest, values
 		Body:       stdhttp.NoBody,
 	}
 	u := &block.URL
-	if method == stdhttp.MethodConnect {
+	if seen[4] {
+		// An extended CONNECT names the resource it opens a tunnel to as
+		// any request does (RFC 8441 section 4), and reports the protocol
+		// in the header, as package http does for HTTP/2.
+		if method != stdhttp.MethodConnect || protocol == "" || scheme == "" || path == "" || authority == "" {
+			return nil, errors.New("malformed extended CONNECT")
+		}
+		if err := fibhttp.ParseRequestTarget(u, path); err != nil {
+			return nil, err
+		}
+		req.RequestURI = path
+		header[":protocol"] = []string{protocol}
+	} else if method == stdhttp.MethodConnect {
 		if scheme != "" || path != "" || authority == "" {
 			return nil, errors.New("malformed CONNECT")
 		}

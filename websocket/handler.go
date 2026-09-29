@@ -158,7 +158,10 @@ func frameHandler(handler Handler) FrameHandler {
 // Connection is a WebSocket connection. Its write methods are safe to call
 // from application goroutines.
 type Connection struct {
-	conn        *fib.Connection
+	// conn is what the frames go through: the fib.Connection of a server or
+	// client of this package's own, or the http.Tunnel of a request that
+	// ServerHandler.Upgrade switched, on HTTP/1.1, HTTP/2 or HTTP/3.
+	conn        transport
 	subprotocol string
 	// client marks the dialing side, whose frames must be masked.
 	client bool
@@ -168,6 +171,15 @@ type Connection struct {
 	windowBits int
 	closeSent  atomic.Bool
 	closeState atomic.Pointer[connectionCloseState]
+}
+
+// transport is what a Connection sends its frames through, which a
+// *fib.Connection and an *http.Tunnel both are.
+type transport interface {
+	SendParts(first, second []byte) error
+	SendOwned(data []byte) error
+	CloseAfterSend()
+	Close() error
 }
 
 type connectionCloseState struct {
@@ -537,8 +549,14 @@ func (h *ServerHandler) validateHandshakeRequest(request *stdhttp.Request) (stri
 		return "", ErrProtocol
 	}
 	if h.config.CheckOrigin != nil && !h.config.CheckOrigin(request) {
-		return "", errors.New("websocket: origin rejected")
+		return "", errOriginRejected
 	}
+	return h.selectSubprotocol(request)
+}
+
+// selectSubprotocol picks the first of the subprotocols request offers that
+// the server supports, or none.
+func (h *ServerHandler) selectSubprotocol(request *stdhttp.Request) (string, error) {
 	for _, value := range request.Header.Values("Sec-Websocket-Protocol") {
 		for len(value) != 0 {
 			candidate, rest := nextHeaderToken(value)

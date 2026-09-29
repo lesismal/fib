@@ -56,6 +56,8 @@ const (
 	h2SettingInitialWindowSize    h2SettingID = 0x4
 	h2SettingMaxFrameSize         h2SettingID = 0x5
 	h2SettingMaxHeaderListSize    h2SettingID = 0x6
+	// h2SettingEnableConnectProtocol allows extended CONNECT (RFC 8441).
+	h2SettingEnableConnectProtocol h2SettingID = 0x8
 )
 
 // H2ErrorCode is an HTTP/2 error code, carried by RST_STREAM and GOAWAY.

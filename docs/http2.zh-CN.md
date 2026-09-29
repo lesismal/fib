@@ -13,7 +13,7 @@
 
 | 方向 | 内容 |
 | --- | --- |
-| 服务端 | TLS + ALPN（h2）、明文 prior knowledge（h2c）、HTTP/1.1 `Upgrade: h2c`；多路复用、双向流控、HPACK（含 Huffman、动态表）、CONTINUATION、trailer、server push、1xx 中间响应、自动 100 Continue、`Response.Close` 优雅 GOAWAY、`Request.TLS` |
+| 服务端 | TLS + ALPN（h2）、明文 prior knowledge（h2c）、HTTP/1.1 `Upgrade: h2c`；多路复用、双向流控、HPACK（含 Huffman、动态表）、CONTINUATION、trailer、server push、1xx 中间响应、自动 100 Continue、`Response.Close` 优雅 GOAWAY、`Request.TLS`、Extended CONNECT（RFC 8441）经 `Context.Upgrade` 切换为隧道，`websocket.ServerHandler.Upgrade` 即借此提供 WebSocket over HTTP/2 |
 | 客户端 | https 经 ALPN 协商 h2、`UnencryptedHTTP2` 明文 prior knowledge；单连接多路复用、遵守服务端 `MAX_CONCURRENT_STREAMS`、取消只重置单个 stream、GOAWAY / REFUSED_STREAM 自动重发 |
 | 一致性 | h2spec：145 项全部通过，h2c 与 TLS 两种方式 |
 | 互通验证 | Go `net/http` 客户端与服务端（TLS 与 h2c）、curl（nghttp2）的 h2 / h2c / Upgrade |
@@ -116,7 +116,6 @@
 | --- | --- |
 | 客户端接收 server push | Chrome、Firefox 已移除 push，Go 的 `net/http` 客户端也从未支持。客户端在 SETTINGS 中声明 `ENABLE_PUSH=0`，服务端 push 能力保留给仍然需要它的客户端。预加载推荐用 103 Early Hints（`Context.WriteInterim`）。 |
 | RFC 9218 可扩展优先级（`priority` 头、PRIORITY_UPDATE） | 在当前“body 整体缓存”的模型下，调度收益有限；RFC 7540 的优先级树已被 RFC 9113 废弃，同样不实现。 |
-| Extended CONNECT（RFC 8441，WebSocket over HTTP/2） | 依赖双向流式 stream，需要先支持流式 body；WebSocket 目前走 HTTP/1.1 Upgrade。 |
 | 客户端发起 `Upgrade: h2c` | RFC 9113 已废弃这种升级方式；需要明文 HTTP/2 的场景使用 prior knowledge（`UnencryptedHTTP2`）。服务端仍然接受升级，以兼容 curl 等客户端。 |
 | TLS 连接上的 `Upgrade: h2c` | RFC 规定 TLS 上只能通过 ALPN 切换协议。 |
 | HTTP/1.0 请求的 1xx 中间响应 | HTTP/1.0 客户端不认识 1xx，`WriteInterim` 返回 `http.ErrNotSupported`。 |

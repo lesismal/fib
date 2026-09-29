@@ -69,7 +69,7 @@ The same `Handler` serves HTTP/1.x and HTTP/2 on one port. For HTTP/3, see `exam
 | [`tls`](tls) | TLS layered on a connection, transparent to the protocols above it |
 | [`http`](http) | HTTP/1.x and HTTP/2 server and client |
 | [`http3`](http3) | HTTP/3, QUIC and QPACK server and client |
-| [`websocket`](websocket) | RFC 6455 server and client, with permessage-deflate |
+| [`websocket`](websocket) | RFC 6455 server and client, with permessage-deflate; upgrades requests of the `http` and `http3` servers, over HTTP/1.1 and, with extended CONNECT (RFC 8441, RFC 9220), over HTTP/2 and HTTP/3 |
 | [`middleware`](middleware) | HTTP middleware chain and the common middleware |
 
 ## Examples

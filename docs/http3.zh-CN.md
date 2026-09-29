@@ -16,7 +16,7 @@
 | 方向 | 内容 |
 | --- | --- |
 | QUIC | version 1；Initial、Handshake、1-RTT 三个包号空间；AES-128-GCM、AES-256-GCM、ChaCha20-Poly1305 包保护与头部保护；双向 key update（本端按 AEAD 使用上限主动发起，也响应对端发起）与解密失败次数上限；客户端处理 Retry；Version Negotiation；stateless reset；RFC 9002 丢包检测、PTO 与 NewReno 拥塞控制；服务端 3 倍放大限制；连接级与 stream 级双向流控；MAX_STREAMS；空闲超时与可选 keep-alive |
-| 服务端 | 与 HTTP/1、HTTP/2 共用同一个 `Handler` 和 `Context`；1xx 中间响应、自动 100 Continue、请求与响应 trailer、`Response.Close` 通过 GOAWAY 优雅关闭、413/431/417、非法请求（含 `:authority` 与 `Host` 不一致）以 H3_MESSAGE_ERROR 重置、协议错误按 RFC 9114 / RFC 9204 错误码关闭连接、`Request.TLS`、`AltSvc` 辅助函数 |
+| 服务端 | 与 HTTP/1、HTTP/2 共用同一个 `Handler` 和 `Context`；1xx 中间响应、自动 100 Continue、请求与响应 trailer、`Response.Close` 通过 GOAWAY 优雅关闭、413/431/417、非法请求（含 `:authority` 与 `Host` 不一致）以 H3_MESSAGE_ERROR 重置、协议错误按 RFC 9114 / RFC 9204 错误码关闭连接、`Request.TLS`、`AltSvc` 辅助函数、Extended CONNECT（RFC 9220）经 `Context.Upgrade` 切换为隧道，`websocket.ServerHandler.Upgrade` 即借此提供 WebSocket over HTTP/3 |
 | 客户端 | 异步 `Do`/`Go`；每个 host:port 一条连接、多路复用；遵守 MAX_STREAMS 并排队；取消只重置单个 stream；GOAWAY 与 H3_REQUEST_REJECTED 的请求自动在新连接上重发；请求与响应 trailer；对端违反协议时按错误码关闭连接 |
 | 一致性 | 与 quic-go 客户端、服务端双向互通，以及用手写帧构造的协议错误用例，都在 CI 中运行 |
 | 互通验证 | quic-go 客户端与服务端（双向，含 5% 丢包）；客户端访问 Cloudflare、Google、nginx、Facebook（mvfst）、Varnish、quiche 的线上服务 |
@@ -154,7 +154,7 @@
 | Server push | 主流浏览器都不启用 HTTP/3 push。客户端不发 MAX_PUSH_ID，`Context.Push` 返回 `http.ErrNotSupported`。预加载推荐用 103 Early Hints（`WriteInterim`）。 |
 | 服务端发送 Retry / NEW_TOKEN | 地址验证只靠握手本身和 3 倍放大限制，省去令牌的签发与校验。客户端能处理服务端发来的 Retry，但会忽略 NEW_TOKEN。 |
 | QUIC v2（RFC 9369）等其他版本 | 部署上 version 1 已足够。客户端收到 Version Negotiation 时直接失败。 |
-| DATAGRAM（RFC 9221）、Extended CONNECT（RFC 9220）、WebTransport | 依赖流式 stream 或不可靠数据报的 API，当前 handler 模型不支持。对端发来的 DATAGRAM 帧会被当作未知帧，连接以 FRAME_ENCODING_ERROR 关闭。 |
+| DATAGRAM（RFC 9221）、WebTransport | 依赖流式 stream 或不可靠数据报的 API，当前 handler 模型不支持。对端发来的 DATAGRAM 帧会被当作未知帧，连接以 FRAME_ENCODING_ERROR 关闭。 |
 | RFC 9218 可扩展优先级 | 在“body 整体缓存”的模型下，调度收益有限。 |
 | ECN | 需要在 Engine 的 UDP 层读写 IP 头的 ECN 位，收益主要体现在拥塞控制上。 |
 
@@ -197,7 +197,8 @@
 ### 3. 流式 body 与 handler 模型（中）
 
 - 与 HTTP/2 相同：提供流式的响应写出。流式请求 body 已经实现，接收窗口随 handler 的
-  消费补充。双向流式是实现 Extended CONNECT、WebTransport 的前提。
+  消费补充。双向流式是实现 WebTransport 的前提；Extended CONNECT 已通过
+  `Context.Upgrade` 实现。
 
 ### 4. 可配置性（低）
 
