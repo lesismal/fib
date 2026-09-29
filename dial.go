@@ -9,7 +9,7 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/lesismal/fib/internal/sidepool"
+	"github.com/lesismal/fib/sidepool"
 )
 
 // dialRequest is one outbound connect, from Dial until the event loop reports

@@ -15,7 +15,7 @@ import (
 	"time"
 
 	fib "github.com/lesismal/fib"
-	"github.com/lesismal/fib/internal/tlstest"
+	"github.com/lesismal/fib/tlstest"
 )
 
 func tlsConfigs(t *testing.T) (server, client *stdtls.Config) {

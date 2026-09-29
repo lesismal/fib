@@ -7,8 +7,8 @@
 [Go 使用指南的 HTTP/3 章节](guide.zh-CN.md#http3-子-package)。
 
 实现位于 [`http3`](../http3)，QUIC 传输层在
-[`http3/internal/quic`](../http3/internal/quic)，QPACK 在
-[`http3/internal/qpack`](../http3/internal/qpack)。三者全部自行实现，TLS 1.3 握手
+[`http3/quic`](../http3/quic)，QPACK 在
+[`http3/qpack`](../http3/qpack)。三者全部自行实现，TLS 1.3 握手
 使用标准库的 `crypto/tls.QUICConn`，不依赖 quic-go 或 `golang.org/x/net`。
 
 ## 已支持的范围（概览）

@@ -19,7 +19,7 @@ import (
 
 	fib "github.com/lesismal/fib"
 	"github.com/lesismal/fib/bufferpool"
-	"github.com/lesismal/fib/internal/hpack"
+	"github.com/lesismal/fib/hpack"
 )
 
 // HTTP/2 on the server side. ServerHandler recognizes a connection that

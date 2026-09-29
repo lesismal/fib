@@ -7,7 +7,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/lesismal/fib/internal/tlstest"
+	"github.com/lesismal/fib/tlstest"
 )
 
 // FuzzParseHeader reads arbitrary datagrams as packet headers, which is the

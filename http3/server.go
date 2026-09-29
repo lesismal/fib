@@ -35,8 +35,8 @@ import (
 	fib "github.com/lesismal/fib"
 	"github.com/lesismal/fib/bufferpool"
 	fibhttp "github.com/lesismal/fib/http"
-	"github.com/lesismal/fib/http3/internal/qpack"
-	"github.com/lesismal/fib/http3/internal/quic"
+	"github.com/lesismal/fib/http3/qpack"
+	"github.com/lesismal/fib/http3/quic"
 )
 
 // NextProto is the ALPN protocol ID of HTTP/3.

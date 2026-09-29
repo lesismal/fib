@@ -18,7 +18,7 @@ import (
 	"strings"
 
 	fib "github.com/lesismal/fib"
-	"github.com/lesismal/fib/examples/internal/example"
+	"github.com/lesismal/fib/examples/example"
 	fibhttp "github.com/lesismal/fib/http"
 )
 

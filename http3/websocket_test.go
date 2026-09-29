@@ -10,8 +10,8 @@ import (
 	"time"
 
 	fibhttp "github.com/lesismal/fib/http"
-	"github.com/lesismal/fib/http3/internal/qpack"
-	"github.com/lesismal/fib/http3/internal/quic"
+	"github.com/lesismal/fib/http3/qpack"
+	"github.com/lesismal/fib/http3/quic"
 	"github.com/lesismal/fib/websocket"
 )
 

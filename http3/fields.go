@@ -12,7 +12,7 @@ import (
 	"strings"
 
 	fibhttp "github.com/lesismal/fib/http"
-	"github.com/lesismal/fib/http3/internal/qpack"
+	"github.com/lesismal/fib/http3/qpack"
 )
 
 // HTTP/3 carries fields as HTTP/2 does (RFC 9114 section 4.2): names

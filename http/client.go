@@ -18,7 +18,7 @@ import (
 	"time"
 
 	fib "github.com/lesismal/fib"
-	"github.com/lesismal/fib/internal/sidepool"
+	"github.com/lesismal/fib/sidepool"
 	fibtls "github.com/lesismal/fib/tls"
 )
 

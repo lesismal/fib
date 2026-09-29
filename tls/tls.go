@@ -20,7 +20,7 @@ import (
 
 	fib "github.com/lesismal/fib"
 	"github.com/lesismal/fib/bufferpool"
-	"github.com/lesismal/fib/internal/sidepool"
+	"github.com/lesismal/fib/sidepool"
 )
 
 // DefaultHandshakeTimeout bounds a handshake when Handler leaves

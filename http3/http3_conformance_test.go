@@ -37,7 +37,7 @@ import (
 	"time"
 
 	fibhttp "github.com/lesismal/fib/http"
-	"github.com/lesismal/fib/internal/tlstest"
+	"github.com/lesismal/fib/tlstest"
 )
 
 // hashBody is what both sides report a body as, so that large ones are

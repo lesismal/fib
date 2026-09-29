@@ -223,7 +223,7 @@ jobs:
           if-no-files-found: ignore
       - name: HPACK tests
         # HTTP/2 header compression, checked against RFC 7541's own vectors.
-        run: go test -race -count=1 ./internal/hpack/
+        run: go test -race -count=1 ./hpack/
 
   # A standalone h2spec report. http2-conformance above already runs h2spec
   # inside go test and fails on any case it reports, but only keeps its last
@@ -398,16 +398,16 @@ jobs:
           for entry in \
             ./http:FuzzParser \
             ./http:FuzzH2Frame \
-            ./internal/hpack:FuzzDecode \
-            ./internal/hpack:FuzzRoundTrip \
-            ./internal/hpack:FuzzHuffman \
+            ./hpack:FuzzDecode \
+            ./hpack:FuzzRoundTrip \
+            ./hpack:FuzzHuffman \
             ./http3:FuzzFrameParser \
             ./http3:FuzzNewRequest \
-            ./http3/internal/qpack:FuzzDecode \
-            ./http3/internal/qpack:FuzzRoundTrip \
-            ./http3/internal/quic:FuzzParseHeader \
-            ./http3/internal/quic:FuzzParseParams \
-            ./http3/internal/quic:FuzzFrames; do
+            ./http3/qpack:FuzzDecode \
+            ./http3/qpack:FuzzRoundTrip \
+            ./http3/quic:FuzzParseHeader \
+            ./http3/quic:FuzzParseParams \
+            ./http3/quic:FuzzFrames; do
             package=${entry%%:*}
             target=${entry##*:}
             echo "::group::$package $target"

@@ -13,7 +13,7 @@ import (
 	stdhttp "net/http"
 	"strings"
 
-	"github.com/lesismal/fib/examples/internal/example"
+	"github.com/lesismal/fib/examples/example"
 	fibhttp "github.com/lesismal/fib/http"
 )
 

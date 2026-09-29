@@ -10,7 +10,7 @@ import (
 
 	"github.com/lesismal/fib/bufferpool"
 	fibhttp "github.com/lesismal/fib/http"
-	"github.com/lesismal/fib/http3/internal/qpack"
+	"github.com/lesismal/fib/http3/qpack"
 )
 
 // Extended CONNECT over HTTP/3 (RFC 9220): a request whose :protocol names

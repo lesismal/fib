@@ -9,7 +9,7 @@ import (
 	"testing"
 
 	fibhttp "github.com/lesismal/fib/http"
-	"github.com/lesismal/fib/http3/internal/qpack"
+	"github.com/lesismal/fib/http3/qpack"
 )
 
 // FuzzFrameParser feeds the frame parser arbitrary bytes, split in two at

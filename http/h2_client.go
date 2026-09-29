@@ -15,8 +15,8 @@ import (
 	"sync"
 
 	"github.com/lesismal/fib/bufferpool"
-	"github.com/lesismal/fib/internal/hpack"
-	"github.com/lesismal/fib/internal/sidepool"
+	"github.com/lesismal/fib/hpack"
+	"github.com/lesismal/fib/sidepool"
 )
 
 // HTTP/2 on the client side: a clientConn whose TLS handshake chose "h2", or

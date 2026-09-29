@@ -158,7 +158,7 @@ h2spec 只会说 HTTP/2，所以跑它时服务端要设置 `Config.HTTP2Only`�
 ### 2. 协议一致性测试
 
 已完成，见[一致性测试](#一致性测试)。HTTP/1 请求解析、HTTP/2 帧读取和 HPACK
-编解码都有 fuzz 目标（`http/fuzz_test.go`、`internal/hpack/fuzz_test.go`），
+编解码都有 fuzz 目标（`http/fuzz_test.go`、`hpack/fuzz_test.go`），
 CI 的 `Fuzz the parsers` job 每个目标跑 20 秒。还缺的是压测（例如 h2load）才能暴露的
 并发问题。
 

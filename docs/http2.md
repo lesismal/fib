@@ -7,8 +7,8 @@ This document records the boundaries of the HTTP/2 implementation in the Go
 what was deliberately left out, and where it can be improved. For usage, see
 the [HTTP/2 section of the Go guide](guide.zh-CN.md#http2) (Chinese).
 
-The implementation lives in [`http`](../http) (`h2_*.go`) and an
-internal hpack package. It is written from scratch and does not depend on
+The implementation lives in [`http`](../http) (`h2_*.go`) and the
+[`hpack`](../hpack) package. It is written from scratch and does not depend on
 `golang.org/x/net`.
 
 ## What is supported (overview)
@@ -204,7 +204,7 @@ still lacks:
 
 Done: see [Conformance testing](#conformance-testing). Parsing HTTP/1
 requests, reading HTTP/2 frames and coding HPACK all have fuzz targets
-(`http/fuzz_test.go` and `internal/hpack/fuzz_test.go`), which the
+(`http/fuzz_test.go` and `hpack/fuzz_test.go`), which the
 `Fuzz the parsers` CI job runs for 20 seconds each. What is still missing is a
 load-oriented check (h2load, for example) to catch what only shows up under
 concurrency.

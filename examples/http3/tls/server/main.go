@@ -22,8 +22,8 @@ import (
 	"strconv"
 
 	fib "github.com/lesismal/fib"
-	"github.com/lesismal/fib/examples/internal/certs"
-	"github.com/lesismal/fib/examples/internal/example"
+	"github.com/lesismal/fib/examples/certs"
+	"github.com/lesismal/fib/examples/example"
 	fibhttp "github.com/lesismal/fib/http"
 	"github.com/lesismal/fib/http3"
 	fibtls "github.com/lesismal/fib/tls"

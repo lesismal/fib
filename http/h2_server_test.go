@@ -17,9 +17,9 @@ import (
 	"time"
 
 	fib "github.com/lesismal/fib"
-	"github.com/lesismal/fib/internal/hpack"
-	"github.com/lesismal/fib/internal/tlstest"
+	"github.com/lesismal/fib/hpack"
 	fibtls "github.com/lesismal/fib/tls"
+	"github.com/lesismal/fib/tlstest"
 )
 
 // serve runs an engine serving handler and returns its address.

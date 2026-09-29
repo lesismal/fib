@@ -29,9 +29,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/lesismal/fib/internal/hpack"
-	"github.com/lesismal/fib/internal/tlstest"
+	"github.com/lesismal/fib/hpack"
 	fibtls "github.com/lesismal/fib/tls"
+	"github.com/lesismal/fib/tlstest"
 )
 
 // ---------------------------------------------------------------------------

@@ -8,8 +8,8 @@ out, and where it can be improved. For usage, see the
 [HTTP/3 section of the Go guide](guide.zh-CN.md#http3-子-package) (Chinese).
 
 The implementation lives in [`http3`](../http3), with the QUIC transport
-in [`http3/internal/quic`](../http3/internal/quic) and QPACK in
-[`http3/internal/qpack`](../http3/internal/qpack). All three are written
+in [`http3/quic`](../http3/quic) and QPACK in
+[`http3/qpack`](../http3/qpack). All three are written
 from scratch. The TLS 1.3 handshake is the standard library's
 `crypto/tls.QUICConn`; there is no dependency on quic-go or `golang.org/x/net`.
 
@@ -134,7 +134,7 @@ Behavior users need to be aware of.
 
 ### Fixed parameters
 
-These are constants, or exist only in the internal `quic.Config` without being
+These are constants, or exist only in `quic.Config` without being
 exposed through `http3.Config` or `http3.ClientConfig`:
 
 | Parameter | Value |

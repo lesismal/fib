@@ -15,8 +15,8 @@ import (
 	"time"
 
 	fib "github.com/lesismal/fib"
+	"github.com/lesismal/fib/hpack"
 	epollhttp "github.com/lesismal/fib/http"
-	"github.com/lesismal/fib/internal/hpack"
 )
 
 // upgradeServer serves plain HTTP and, on /ws, WebSocket through Upgrade,

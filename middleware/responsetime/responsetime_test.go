@@ -11,7 +11,7 @@ import (
 	"time"
 
 	fibhttp "github.com/lesismal/fib/http"
-	"github.com/lesismal/fib/middleware/internal/mwtest"
+	"github.com/lesismal/fib/middleware/mwtest"
 	"github.com/lesismal/fib/middleware/responsetime"
 )
 

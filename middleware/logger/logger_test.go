@@ -11,8 +11,8 @@ import (
 	"time"
 
 	fibhttp "github.com/lesismal/fib/http"
-	"github.com/lesismal/fib/middleware/internal/mwtest"
 	"github.com/lesismal/fib/middleware/logger"
+	"github.com/lesismal/fib/middleware/mwtest"
 )
 
 type syncBuffer struct {

@@ -16,7 +16,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/lesismal/fib/internal/hpack"
+	"github.com/lesismal/fib/hpack"
 )
 
 // TestH2HeaderKeyTables holds the lookup tables to what they stand in for:

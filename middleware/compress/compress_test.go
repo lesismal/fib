@@ -14,7 +14,7 @@ import (
 	"github.com/lesismal/fib/middleware"
 	"github.com/lesismal/fib/middleware/compress"
 	"github.com/lesismal/fib/middleware/etag"
-	"github.com/lesismal/fib/middleware/internal/mwtest"
+	"github.com/lesismal/fib/middleware/mwtest"
 )
 
 var text = strings.Repeat("the quick brown fox jumps over the lazy dog\n", 500)

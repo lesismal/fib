@@ -13,7 +13,7 @@ import (
 	"time"
 
 	"github.com/lesismal/fib/bufferpool"
-	"github.com/lesismal/fib/internal/streampool"
+	"github.com/lesismal/fib/streampool"
 	"github.com/lesismal/fib/taskpool"
 )
 
@@ -300,7 +300,7 @@ func (e *Engine) openPollers(config Config) error {
 // HandlerPool returns the pool the protocols served on the engine run their
 // request handlers on, away from the worker that reads the connection, as
 // HTTP/2 and HTTP/3 run theirs: "<Name>-streams", apart from the engine's own
-// pool for the reason package internal/streampool gives. It returns nil once
+// pool for the reason package streampool gives. It returns nil once
 // the engine has closed, and the caller then runs the handler itself.
 func (e *Engine) HandlerPool() *taskpool.TaskPool {
 	sizing := DefaultStreamPoolSizing(taskpool.ModeAdaptive)

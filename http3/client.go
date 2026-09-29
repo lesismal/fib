@@ -20,8 +20,8 @@ import (
 
 	fib "github.com/lesismal/fib"
 	"github.com/lesismal/fib/bufferpool"
-	"github.com/lesismal/fib/http3/internal/qpack"
-	"github.com/lesismal/fib/http3/internal/quic"
+	"github.com/lesismal/fib/http3/qpack"
+	"github.com/lesismal/fib/http3/quic"
 )
 
 var (

@@ -18,7 +18,7 @@ import (
 
 	fib "github.com/lesismal/fib"
 	fibhttp "github.com/lesismal/fib/http"
-	"github.com/lesismal/fib/internal/tlstest"
+	"github.com/lesismal/fib/tlstest"
 )
 
 func runEngine(t *testing.T, engine *fib.Engine) {

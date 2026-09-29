@@ -12,7 +12,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/lesismal/fib/internal/hpack"
+	"github.com/lesismal/fib/hpack"
 )
 
 // echoTunnel sends back what arrives through the tunnel, after greeting, and

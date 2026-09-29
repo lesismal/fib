@@ -8,7 +8,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/lesismal/fib/internal/tlstest"
+	"github.com/lesismal/fib/tlstest"
 )
 
 // serverPath is a path of the server's to the client: what it sends

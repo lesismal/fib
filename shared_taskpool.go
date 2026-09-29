@@ -3,7 +3,7 @@ package fib
 import (
 	"sync"
 
-	"github.com/lesismal/fib/internal/streampool"
+	"github.com/lesismal/fib/streampool"
 	"github.com/lesismal/fib/taskpool"
 )
 

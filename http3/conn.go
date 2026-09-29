@@ -5,8 +5,8 @@ package http3
 import (
 	"errors"
 
-	"github.com/lesismal/fib/http3/internal/qpack"
-	"github.com/lesismal/fib/http3/internal/quic"
+	"github.com/lesismal/fib/http3/qpack"
+	"github.com/lesismal/fib/http3/quic"
 )
 
 // What both sides of an HTTP/3 connection do alike: the control stream

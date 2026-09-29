@@ -14,7 +14,7 @@ import (
 	"time"
 
 	"github.com/lesismal/fib/bufferpool"
-	"github.com/lesismal/fib/internal/tlstest"
+	"github.com/lesismal/fib/tlstest"
 )
 
 // pipeEnd is one side of an in-memory path. Datagrams are delivered in

@@ -23,8 +23,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/lesismal/fib/internal/tlstest"
 	fibtls "github.com/lesismal/fib/tls"
+	"github.com/lesismal/fib/tlstest"
 )
 
 // The body matrix drives every way a request body can reach a handler through

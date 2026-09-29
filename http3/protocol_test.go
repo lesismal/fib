@@ -12,9 +12,9 @@ import (
 	"time"
 
 	fib "github.com/lesismal/fib"
-	"github.com/lesismal/fib/http3/internal/qpack"
-	"github.com/lesismal/fib/http3/internal/quic"
-	"github.com/lesismal/fib/internal/tlstest"
+	"github.com/lesismal/fib/http3/qpack"
+	"github.com/lesismal/fib/http3/quic"
+	"github.com/lesismal/fib/tlstest"
 )
 
 // rawConn is a bare QUIC connection to the server, for sending what a

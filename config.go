@@ -79,7 +79,7 @@ const (
 	// their request handlers on is than the widest engine pool of the same
 	// Name. There is one such pool for each Name, shared by every HTTP/2 and
 	// HTTP/3 server whose connections come from engines of that Name, and it
-	// is never one an engine runs on; see package internal/streampool for
+	// is never one an engine runs on; see package streampool for
 	// the deadlock sharing an engine's pool would invite, and
 	// Engine.HandlerPool.
 	//

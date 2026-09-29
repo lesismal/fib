@@ -19,8 +19,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/lesismal/fib/internal/tlstest"
 	fibtls "github.com/lesismal/fib/tls"
+	"github.com/lesismal/fib/tlstest"
 )
 
 // pushHandler pushes /style.css and /app.js ahead of /index.html, and

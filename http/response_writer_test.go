@@ -10,8 +10,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/lesismal/fib/internal/tlstest"
 	fibtls "github.com/lesismal/fib/tls"
+	"github.com/lesismal/fib/tlstest"
 )
 
 // recordingWriter keeps the reader io.Copy hands to ReadFrom.

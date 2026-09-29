@@ -23,9 +23,9 @@ import (
 
 	fib "github.com/lesismal/fib"
 	fibhttp "github.com/lesismal/fib/http"
-	"github.com/lesismal/fib/http3/internal/qpack"
-	"github.com/lesismal/fib/http3/internal/quic"
-	"github.com/lesismal/fib/internal/tlstest"
+	"github.com/lesismal/fib/http3/qpack"
+	"github.com/lesismal/fib/http3/quic"
+	"github.com/lesismal/fib/tlstest"
 )
 
 // The HTTP/3 body matrix is the HTTP/1 and HTTP/2 one of package http run

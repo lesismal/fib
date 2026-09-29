@@ -10,7 +10,7 @@ import (
 
 	fibhttp "github.com/lesismal/fib/http"
 	"github.com/lesismal/fib/middleware"
-	"github.com/lesismal/fib/middleware/internal/mwtest"
+	"github.com/lesismal/fib/middleware/mwtest"
 )
 
 // TestChainOrder checks that the first middleware is outermost: it sees the

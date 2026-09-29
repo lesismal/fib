@@ -5,8 +5,9 @@
 // pollers' loops needs none: no worker of its reads a connection, so its
 // handlers run on its own pool of workers; see fib.Engine.HandlerPool.
 //
-// A stream pool is internal so that it cannot be handed to an engine as its
-// own: an engine worker that frames a request submits the handler here, and a
+// A stream pool must never be handed to an engine as its own, which is why
+// its name is not an engine's and it lives apart from the engines' shared
+// pools: an engine worker that frames a request submits the handler here, and a
 // submission to a full queue waits for a worker of this pool to take one off.
 // Were the two pools one, every worker could end up waiting in a submission
 // with none left to drain the queue, and the event loop, which submits to the

@@ -12,8 +12,8 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/lesismal/fib/examples/internal/certs"
-	"github.com/lesismal/fib/examples/internal/example"
+	"github.com/lesismal/fib/examples/certs"
+	"github.com/lesismal/fib/examples/example"
 	"github.com/lesismal/fib/websocket"
 )
 

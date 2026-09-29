@@ -6,7 +6,7 @@ import (
 	"errors"
 	"fmt"
 
-	"github.com/lesismal/fib/http3/internal/quic"
+	"github.com/lesismal/fib/http3/quic"
 )
 
 // Frame types (RFC 9114 section 7.2).

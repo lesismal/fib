@@ -8,7 +8,7 @@ package qpack
 import (
 	"errors"
 
-	"github.com/lesismal/fib/internal/hpack"
+	"github.com/lesismal/fib/hpack"
 )
 
 // HeaderField is one field line, with its name lowercased.
