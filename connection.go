@@ -595,7 +595,7 @@ func (c *Connection) process() {
 		// space and delivers new input never reads while output is still
 		// queued behind it. This keeps userspace buffering bounded by what the
 		// peer is willing to accept instead of what it is willing to send.
-		if alive && events&evOut != 0 && c.hasQueuedOutput() {
+		if alive && events&evOut != 0 && c.hasFlushableOutput() {
 			closeErr = c.flushOutput()
 			alive = closeErr == nil
 		}
@@ -654,6 +654,20 @@ func (c *Connection) hasQueuedOutput() bool {
 	queued := c.sendHead != len(c.sends)
 	c.mu.Unlock()
 	return queued
+}
+
+// hasFlushableOutput reports whether a write edge has queued output to hand
+// to the socket. Output held by Cork is not: it waits for Flush, however
+// writable the socket is. A round's own cork never shows here, since rounds do
+// not overlap and each uncorks before it ends, so a cork this sees is the
+// application's. The first round of a connection is the edge that matters:
+// the socket reports writable once it is registered, and that round may reach
+// a worker only after the application corked the connection and sent.
+func (c *Connection) hasFlushableOutput() bool {
+	c.mu.Lock()
+	flushable := c.sendHead != len(c.sends) && !c.corked
+	c.mu.Unlock()
+	return flushable
 }
 
 // drainInput reads until the socket is empty, handing each chunk to the
