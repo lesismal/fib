@@ -1,4 +1,4 @@
-//go:build linux && !race && !msan && !asan
+//go:build linux && !386 && !race && !msan && !asan
 
 package fib
 
@@ -19,11 +19,21 @@ import (
 // 8 server CPUs, the client on the other 6 and on their SMT siblings) the same
 // ~705k messages a second cost 734-742% CPU through syscall.Read/Write and
 // 662-664% raw, P99 fell from 18-19ms to 15.6ms, and pipelined echo cost 3-4%
-// less CPU at the same 5.55M messages a second. The
-// time saved was the kernel's: 608% system time fell to 564%, and the Ps,
-// which through syscall.Read/Write were almost never idle, went idle and were
-// woken again ten times as often, as those of frameworks that already make
-// these calls raw do.
+// less CPU at the same 5.55M messages a second. The time saved was the
+// kernel's: 608% system time fell to 564%, and the Ps, which through
+// syscall.Read/Write were almost never idle, went idle and were woken again
+// ten times as often, as those of frameworks that already make these calls raw
+// do.
+//
+// They are also the socket calls, recvfrom, sendto and sendmsg, rather than
+// read, write and writev. Those go through the VFS on their way to the same
+// socket code, which checks the file's access mode, runs the security
+// module's file permission hook and notifies fsnotify on every call; in a
+// Docker container, whose AppArmor profile that hook consults, that was a
+// fifth of the server's CPU. The same benchmark with 50k connections and the
+// client on all 8 SMT siblings echoed 613k messages a second at 630% CPU
+// through read and write, and 638k at 508% through the socket calls. A
+// descriptor that turns out not to be a socket falls back to the VFS calls.
 //
 // A race, memory or address sanitizer build keeps the syscall package's
 // wrappers instead, which tell the sanitizer what the kernel read and wrote.
@@ -31,22 +41,52 @@ import (
 // sockRead reads from a non-blocking descriptor. It never reports a negative
 // count: an error comes with 0.
 func sockRead(fd int, b []byte) (int, error) {
-	return rawSockIO(syscall.SYS_READ, fd, unsafe.Pointer(unsafe.SliceData(b)), len(b))
+	p := unsafe.Pointer(unsafe.SliceData(b))
+	n, err := rawSockIO6(syscall.SYS_RECVFROM, fd, p, len(b))
+	if err == syscall.ENOTSOCK {
+		return rawSockIO(syscall.SYS_READ, fd, p, len(b))
+	}
+	return n, err
 }
 
 // sockWrite writes to a non-blocking descriptor, and may write less than b.
 func sockWrite(fd int, b []byte) (int, error) {
-	return rawSockIO(syscall.SYS_WRITE, fd, unsafe.Pointer(unsafe.SliceData(b)), len(b))
+	p := unsafe.Pointer(unsafe.SliceData(b))
+	n, err := rawSockIO6(syscall.SYS_SENDTO, fd, p, len(b))
+	if err == syscall.ENOTSOCK {
+		return rawSockIO(syscall.SYS_WRITE, fd, p, len(b))
+	}
+	return n, err
 }
 
 // sockWritev writes iov, which must not be empty, to a non-blocking
 // descriptor, and may write less than all of it.
 func sockWritev(fd int, iov []syscall.Iovec) (int, error) {
-	return rawSockIO(syscall.SYS_WRITEV, fd, unsafe.Pointer(&iov[0]), len(iov))
+	var msg syscall.Msghdr
+	msg.Iov = &iov[0]
+	setIovlen(&msg.Iovlen, len(iov))
+	n, err := rawSockIO(syscall.SYS_SENDMSG, fd, unsafe.Pointer(&msg), 0)
+	if err == syscall.ENOTSOCK {
+		return rawSockIO(syscall.SYS_WRITEV, fd, unsafe.Pointer(&iov[0]), len(iov))
+	}
+	return n, err
 }
+
+// setIovlen sets a Msghdr's Iovlen, which is 32 or 64 bits wide depending on
+// the architecture.
+func setIovlen[T ~uint32 | ~uint64](field *T, n int) { *field = T(n) }
 
 func rawSockIO(trap uintptr, fd int, p unsafe.Pointer, n int) (int, error) {
 	r, _, errno := syscall.RawSyscall(trap, uintptr(fd), uintptr(p), uintptr(n))
+	if errno != 0 {
+		return 0, errno
+	}
+	return int(r), nil
+}
+
+// rawSockIO6 makes a recvfrom or sendto with no flags and no address.
+func rawSockIO6(trap uintptr, fd int, p unsafe.Pointer, n int) (int, error) {
+	r, _, errno := syscall.RawSyscall6(trap, uintptr(fd), uintptr(p), uintptr(n), 0, 0, 0)
 	if errno != 0 {
 		return 0, errno
 	}
