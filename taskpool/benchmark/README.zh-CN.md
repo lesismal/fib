@@ -39,7 +39,7 @@
 Linux、macOS：
 
 ```bash
-./bench.sh                                          # 全部场景和池，各跑 5 次
+./bench.sh                                          # 全部场景和池，各跑 1 次
 ./bench.sh -s Handoff,Bursts -p nbio,fib-elastic -c 3
 ./bench.sh -cpu 4,8 -s LoopBlocking                 # 每个 GOMAXPROCS 一行
 ./bench.sh -docker -cpus 8                          # 在 golang:1.27 Linux 容器里跑
@@ -64,5 +64,6 @@ powershell -ExecutionPolicy Bypass -File bench.ps1
 go run ./summarize results/*.txt
 ```
 
-全部场景和池各跑 5 次大约需要 15 分钟。运行时尽量不要有其他负载，阻塞类和突发类
+全部场景和池各跑 1 次大约需要 3 分钟；用 `-c` / `-Count` 多跑几次，中位数和 `*`
+波动标记才有意义。运行时尽量不要有其他负载，阻塞类和突发类
 场景对干扰最敏感。

@@ -42,7 +42,7 @@ macOS, GetProcessTimes on Windows).
 Linux and macOS:
 
 ```bash
-./bench.sh                                          # everything, 5 runs each
+./bench.sh                                          # everything, once each
 ./bench.sh -s Handoff,Bursts -p nbio,fib-elastic -c 3
 ./bench.sh -cpu 4,8 -s LoopBlocking                 # one row per GOMAXPROCS
 ./bench.sh -docker -cpus 8                          # in a golang:1.27 Linux container
@@ -68,6 +68,8 @@ spread more than 1.3x. To summarize earlier output again:
 go run ./summarize results/*.txt
 ```
 
-A full run of all scenarios and pools at 5 counts takes about 15 minutes.
+A full run of all scenarios and pools, once each, takes about 3 minutes;
+`-c` / `-Count` runs each more times, which is what the medians and the
+`*` spread notes need.
 Keep the machine otherwise idle while it runs; the blocking and burst
 scenarios are the most sensitive to noise.

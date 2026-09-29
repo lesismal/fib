@@ -6,7 +6,7 @@ param(
     # Pools, comma-separated (default: all).
     [string]$Pools = "",
     # Runs of each benchmark.
-    [int]$Count = 5,
+    [int]$Count = 1,
     # -benchtime, e.g. 1s or 100000x.
     [string]$Benchtime = "1s",
     # GOMAXPROCS values, e.g. 4,8 (default: the machine's).

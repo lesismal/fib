@@ -11,7 +11,7 @@ POOLS="nbio,ants,gopool,fib-adaptive,fib-adaptive-chan,fib-elastic"
 
 scenarios=""
 pools=""
-count=5
+count=1
 benchtime=1s
 cpu=""
 out=""

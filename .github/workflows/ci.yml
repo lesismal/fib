@@ -451,12 +451,12 @@ jobs:
       - name: Benchmark
         if: runner.os != 'Windows'
         working-directory: taskpool/benchmark
-        run: ./bench.sh -c 3 -o "$RUNNER_TEMP/taskpool-bench.txt"
+        run: ./bench.sh -o "$RUNNER_TEMP/taskpool-bench.txt"
       - name: Benchmark
         if: runner.os == 'Windows'
         working-directory: taskpool/benchmark
         shell: pwsh
-        run: ./bench.ps1 -Count 3 -Out "$env:RUNNER_TEMP/taskpool-bench.txt"
+        run: ./bench.ps1 -Out "$env:RUNNER_TEMP/taskpool-bench.txt"
       - name: Summary
         if: success()
         shell: bash
