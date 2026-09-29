@@ -422,6 +422,59 @@ jobs:
           path: "**/testdata/fuzz/**"
           if-no-files-found: ignore
 
+  # The taskpool comparison against nbio, ants and gopool. It is a module of
+  # its own under taskpool/benchmark, so the pools it compares with never
+  # become fib's dependencies. Shared runners are too noisy for the numbers
+  # to gate anything: the job fails only if a benchmark does, and keeps the
+  # raw output and the summary for comparing runs by hand.
+  taskpool-benchmark:
+    name: Taskpool benchmark (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v6
+        with:
+          go-version: stable
+          cache-dependency-path: |
+            go.mod
+            taskpool/benchmark/go.sum
+      - name: Vet
+        working-directory: taskpool/benchmark
+        run: |
+          go vet ./...
+          go mod tidy -diff
+      - name: Benchmark
+        if: runner.os != 'Windows'
+        working-directory: taskpool/benchmark
+        run: ./bench.sh -c 3 -o "$RUNNER_TEMP/taskpool-bench.txt"
+      - name: Benchmark
+        if: runner.os == 'Windows'
+        working-directory: taskpool/benchmark
+        shell: pwsh
+        run: ./bench.ps1 -Count 3 -Out "$env:RUNNER_TEMP/taskpool-bench.txt"
+      - name: Summary
+        if: success()
+        shell: bash
+        working-directory: taskpool/benchmark
+        run: |
+          {
+            echo "### Taskpool benchmark (${{ matrix.os }}, $(nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo "$NUMBER_OF_PROCESSORS") CPUs)"
+            echo
+            go run ./summarize "$RUNNER_TEMP/taskpool-bench.txt"
+          } >> "$GITHUB_STEP_SUMMARY"
+      - name: Upload the results
+        if: always()
+        uses: actions/upload-artifact@v5
+        with:
+          name: taskpool-benchmark-${{ matrix.os }}
+          path: ${{ runner.temp }}/taskpool-bench.txt
+          if-no-files-found: ignore
+
   # Known vulnerabilities in the standard library the module builds against,
   # and in the conformance peer's dependencies.
   vulncheck:
