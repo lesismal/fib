@@ -85,32 +85,117 @@ func main() {
 
 	fmt.Println("median ns/op / cpu-ns/op; fastest in bold; * runs spread more than", spreadNote, "x")
 	fmt.Println()
-	fmt.Println("| scenario | " + strings.Join(pools, " | ") + " |")
-	fmt.Println("|---" + strings.Repeat("|---", len(pools)) + "|")
-	for _, sc := range scenarios {
+	printTable(scenarios, pools, cells)
+}
+
+// printTable prints the table with every column padded to one width, so that
+// it reads as well in a terminal as it renders as Markdown. Within a column
+// the ns/op and cpu-ns/op figures are padded apart, so that their slashes
+// line up. The padding stays outside the bold markers, which Markdown only
+// honours around text that starts and ends with a non-space, and a column
+// that has a bold or flagged cell pads the others where the markers go.
+func printTable(scenarios, pools []string, cells map[[2]string]*cell) {
+	type entry struct {
+		ns, cpu     string
+		best, noisy bool
+	}
+	entries := make([][]*entry, len(scenarios))
+	nsWidth := make([]int, len(pools))
+	cpuWidth := make([]int, len(pools))
+	hasBest := make([]bool, len(pools))
+	hasNoisy := make([]bool, len(pools))
+	for i, sc := range scenarios {
 		best := -1.0
 		for _, p := range pools {
 			if c := cells[[2]string{sc, p}]; c != nil && (best < 0 || median(c.ns) < best) {
 				best = median(c.ns)
 			}
 		}
-		row := []string{sc}
-		for _, p := range pools {
+		entries[i] = make([]*entry, len(pools))
+		for j, p := range pools {
 			c := cells[[2]string{sc, p}]
 			if c == nil {
-				row = append(row, "-")
 				continue
 			}
-			text := format(median(c.ns)) + " / " + format(median(c.cpu))
-			if median(c.ns) == best {
-				text = "**" + text + "**"
+			e := &entry{
+				ns: format(median(c.ns)), cpu: format(median(c.cpu)),
+				best: median(c.ns) == best, noisy: slices.Max(c.ns) > spreadNote*slices.Min(c.ns),
 			}
-			if slices.Max(c.ns) > spreadNote*slices.Min(c.ns) {
-				text += " *"
-			}
-			row = append(row, text)
+			entries[i][j] = e
+			nsWidth[j] = max(nsWidth[j], len(e.ns))
+			cpuWidth[j] = max(cpuWidth[j], len(e.cpu))
+			hasBest[j] = hasBest[j] || e.best
+			hasNoisy[j] = hasNoisy[j] || e.noisy
 		}
-		fmt.Println("| " + strings.Join(row, " | ") + " |")
+	}
+
+	// A cell is "  **ns / cpu** *": the padding of ns, the bold markers
+	// each side, and the flag.
+	markWidth := func(j int) int {
+		if hasBest[j] {
+			return len("**")
+		}
+		return 0
+	}
+	flagWidth := func(j int) int {
+		if hasNoisy[j] {
+			return len(" *")
+		}
+		return 0
+	}
+	widths := []int{len("scenario")}
+	for _, sc := range scenarios {
+		widths[0] = max(widths[0], len(sc))
+	}
+	for j, p := range pools {
+		cell := 2*markWidth(j) + nsWidth[j] + len(" / ") + cpuWidth[j] + flagWidth(j)
+		widths = append(widths, max(len(p), cell))
+	}
+
+	row := func(cols []string) {
+		for j, col := range cols {
+			if j == 0 {
+				cols[j] = col + strings.Repeat(" ", widths[j]-len(col))
+			} else {
+				cols[j] = strings.Repeat(" ", widths[j]-len(col)) + col
+			}
+		}
+		fmt.Println("| " + strings.Join(cols, " | ") + " |")
+	}
+	row(append([]string{"scenario"}, pools...))
+	var rule []string
+	for _, w := range widths {
+		rule = append(rule, strings.Repeat("-", w))
+	}
+	fmt.Println("| " + strings.Join(rule, " | ") + " |")
+	for i, sc := range scenarios {
+		cols := []string{sc}
+		for j := range pools {
+			e := entries[i][j]
+			if e == nil {
+				cols = append(cols, "-")
+				continue
+			}
+			mark := strings.Repeat(" ", markWidth(j))
+			if e.best {
+				mark = "**"
+			}
+			flag := strings.Repeat(" ", flagWidth(j))
+			if e.noisy {
+				flag = " *"
+			}
+			pad := strings.Repeat(" ", nsWidth[j]-len(e.ns))
+			cpu := strings.Repeat(" ", cpuWidth[j]-len(e.cpu)) + e.cpu
+			closing := mark
+			if !e.best {
+				// The spaces standing in for the markers go before the
+				// closing ones' place, keeping the cell's right edge.
+				pad += mark
+				mark, closing = "", strings.Repeat(" ", markWidth(j))
+			}
+			cols = append(cols, pad+mark+e.ns+" / "+cpu+closing+flag)
+		}
+		row(cols)
 	}
 }
 
