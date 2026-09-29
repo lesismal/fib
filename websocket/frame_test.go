@@ -369,3 +369,26 @@ func TestParserPerFrameValidatesTextAcrossFrames(t *testing.T) {
 		}
 	}
 }
+
+func TestApplyMaskMatchesBytewise(t *testing.T) {
+	mask := []byte{0x12, 0x34, 0x56, 0x78}
+	for size := 0; size <= 137; size++ {
+		src := make([]byte, size)
+		for i := range src {
+			src[i] = byte(i*31 + size)
+		}
+		want := make([]byte, size)
+		for i := range src {
+			want[i] = src[i] ^ mask[i&3]
+		}
+		dst := make([]byte, size+3)
+		applyMask(dst, src, mask)
+		if !bytes.Equal(dst[:size], want) {
+			t.Fatalf("size %d: masked into another buffer wrong", size)
+		}
+		applyMask(src, src, mask)
+		if !bytes.Equal(src, want) {
+			t.Fatalf("size %d: masked in place wrong", size)
+		}
+	}
+}

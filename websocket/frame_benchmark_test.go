@@ -58,6 +58,15 @@ func BenchmarkParser1KiBBorrowed(b *testing.B) {
 	}
 }
 
+func BenchmarkApplyMask1KiB(b *testing.B) {
+	payload := make([]byte, 1024)
+	mask := []byte{0x12, 0x34, 0x56, 0x78}
+	b.SetBytes(int64(len(payload)))
+	for b.Loop() {
+		applyMask(payload, payload, mask)
+	}
+}
+
 // BenchmarkParserBorrowedSplitFrames mirrors a socket read that does not end on
 // a frame boundary, which is the normal case whenever the read buffer size and
 // the payload size are unrelated. Every other round leaves a partial frame that
