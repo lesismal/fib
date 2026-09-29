@@ -37,6 +37,10 @@ type Config struct {
 	ReadBufferSize                  int
 	WriteBufferHighWatermark        int
 	UseWritev                       bool
+	// SocketSyscalls has a Linux engine read and write its sockets with
+	// recvfrom, sendto and sendmsg rather than read, write and writev. This
+	// backend reads and writes through the net package, and ignores it.
+	SocketSyscalls bool
 	// TaskPoolMode picks the scheduler the workers run under. Prefer
 	// SetTaskPoolMode over assigning it, so that WorkerCount and MaxEvents
 	// follow the mode rather than staying at numbers tuned for the other one.

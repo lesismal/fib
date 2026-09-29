@@ -711,8 +711,13 @@ func (c *Connection) rearmRead()                 {}
 
 func isWouldBlock(err error) bool { return err == syscall.EAGAIN || err == syscall.EWOULDBLOCK }
 
-func (c *Connection) sysRead(buf []byte) (int, error)  { return sockRead(c.FD(), buf) }
-func (c *Connection) sysWrite(buf []byte) (int, error) { return sockWrite(c.FD(), buf) }
+func (c *Connection) sysRead(buf []byte) (int, error) {
+	return sockRead(c.FD(), buf, c.engine.socketSyscalls)
+}
+
+func (c *Connection) sysWrite(buf []byte) (int, error) {
+	return sockWrite(c.FD(), buf, c.engine.socketSyscalls)
+}
 
 func (c *Connection) sysRecvOOB(buf []byte) (int, error) {
 	n, _, err := syscall.Recvfrom(c.FD(), buf, syscall.MSG_OOB)
@@ -721,17 +726,17 @@ func (c *Connection) sysRecvOOB(buf []byte) (int, error) {
 
 func (c *Connection) sysWrite2(first, second []byte) (int, error) {
 	if len(first) == 0 {
-		return sockWrite(c.FD(), second)
+		return sockWrite(c.FD(), second, c.engine.socketSyscalls)
 	}
 	if len(second) == 0 {
-		return sockWrite(c.FD(), first)
+		return sockWrite(c.FD(), first, c.engine.socketSyscalls)
 	}
 	var iov [2]syscall.Iovec
 	iov[0].Base = &first[0]
 	iov[0].SetLen(len(first))
 	iov[1].Base = &second[0]
 	iov[1].SetLen(len(second))
-	return sockWritev(c.FD(), iov[:])
+	return sockWritev(c.FD(), iov[:], c.engine.socketSyscalls)
 }
 
 func (c *Connection) sysWritev(buffers [][]byte) (int, error) {
@@ -750,7 +755,7 @@ func (c *Connection) sysWritev(buffers [][]byte) (int, error) {
 	if count == 0 {
 		return 0, nil
 	}
-	return sockWritev(c.FD(), iov[:count])
+	return sockWritev(c.FD(), iov[:count], c.engine.socketSyscalls)
 }
 
 func (c *Connection) socketError() error {

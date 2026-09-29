@@ -363,14 +363,18 @@ func TestPingPongUnderWatermarkNeverPausesReads(t *testing.T) {
 		header    = 6
 		rounds    = 200
 	)
-	for _, useWritev := range []bool{true, false} {
-		t.Run(map[bool]string{false: "write", true: "writev"}[useWritev], func(t *testing.T) {
+	for _, mode := range []struct {
+		name                      string
+		useWritev, socketSyscalls bool
+	}{{"writev", true, false}, {"write", false, false}, {"sendmsg", true, true}, {"sendto", false, true}} {
+		t.Run(mode.name, func(t *testing.T) {
 			config := DefaultConfig()
 			config.WriteBufferHighWatermark = watermark
 			// Leave the server-wide budget off: one connection cannot exhaust
 			// it, and it would pause reads for reasons this test is not about.
 			config.MaxPendingBytes = 0
-			config.UseWritev = useWritev
+			config.UseWritev = mode.useWritev
+			config.SocketSyscalls = mode.socketSyscalls
 			server, addr := startEchoServer(t, config, HandlerFuncs{Data: func(c *Connection, b []byte) {
 				// Reply in two parts, as a framed protocol does.
 				if err := c.SendParts(bytes.Repeat([]byte{'h'}, header), b); err != nil {

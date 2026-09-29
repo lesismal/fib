@@ -25,51 +25,50 @@ import (
 // ten times as often, as those of frameworks that already make these calls raw
 // do.
 //
-// They are also the socket calls, recvfrom, sendto and sendmsg, rather than
-// read, write and writev. Those go through the VFS on their way to the same
-// socket code, which checks the file's access mode, runs the security
-// module's file permission hook and notifies fsnotify on every call; in a
-// Docker container, whose AppArmor profile that hook consults, that was a
-// fifth of the server's CPU. The same benchmark with 50k connections and the
-// client on all 8 SMT siblings echoed 613k messages a second at 630% CPU
-// through read and write, and 638k at 508% through the socket calls. A
-// descriptor that turns out not to be a socket falls back to the VFS calls.
+// With socketCalls, which Config.SocketSyscalls sets, they are the socket
+// calls, recvfrom, sendto and sendmsg, rather than read, write and writev,
+// which reach the same socket code through the VFS; the option says what that
+// costs. A descriptor that turns out not to be a socket falls back to the VFS
+// calls.
 //
 // A race, memory or address sanitizer build keeps the syscall package's
 // wrappers instead, which tell the sanitizer what the kernel read and wrote.
 
 // sockRead reads from a non-blocking descriptor. It never reports a negative
 // count: an error comes with 0.
-func sockRead(fd int, b []byte) (int, error) {
+func sockRead(fd int, b []byte, socketCalls bool) (int, error) {
 	p := unsafe.Pointer(unsafe.SliceData(b))
-	n, err := rawSockIO6(syscall.SYS_RECVFROM, fd, p, len(b))
-	if err == syscall.ENOTSOCK {
-		return rawSockIO(syscall.SYS_READ, fd, p, len(b))
+	if socketCalls {
+		if n, err := rawSockIO6(syscall.SYS_RECVFROM, fd, p, len(b)); err != syscall.ENOTSOCK {
+			return n, err
+		}
 	}
-	return n, err
+	return rawSockIO(syscall.SYS_READ, fd, p, len(b))
 }
 
 // sockWrite writes to a non-blocking descriptor, and may write less than b.
-func sockWrite(fd int, b []byte) (int, error) {
+func sockWrite(fd int, b []byte, socketCalls bool) (int, error) {
 	p := unsafe.Pointer(unsafe.SliceData(b))
-	n, err := rawSockIO6(syscall.SYS_SENDTO, fd, p, len(b))
-	if err == syscall.ENOTSOCK {
-		return rawSockIO(syscall.SYS_WRITE, fd, p, len(b))
+	if socketCalls {
+		if n, err := rawSockIO6(syscall.SYS_SENDTO, fd, p, len(b)); err != syscall.ENOTSOCK {
+			return n, err
+		}
 	}
-	return n, err
+	return rawSockIO(syscall.SYS_WRITE, fd, p, len(b))
 }
 
 // sockWritev writes iov, which must not be empty, to a non-blocking
 // descriptor, and may write less than all of it.
-func sockWritev(fd int, iov []syscall.Iovec) (int, error) {
-	var msg syscall.Msghdr
-	msg.Iov = &iov[0]
-	setIovlen(&msg.Iovlen, len(iov))
-	n, err := rawSockIO(syscall.SYS_SENDMSG, fd, unsafe.Pointer(&msg), 0)
-	if err == syscall.ENOTSOCK {
-		return rawSockIO(syscall.SYS_WRITEV, fd, unsafe.Pointer(&iov[0]), len(iov))
+func sockWritev(fd int, iov []syscall.Iovec, socketCalls bool) (int, error) {
+	if socketCalls {
+		var msg syscall.Msghdr
+		msg.Iov = &iov[0]
+		setIovlen(&msg.Iovlen, len(iov))
+		if n, err := rawSockIO(syscall.SYS_SENDMSG, fd, unsafe.Pointer(&msg), 0); err != syscall.ENOTSOCK {
+			return n, err
+		}
 	}
-	return n, err
+	return rawSockIO(syscall.SYS_WRITEV, fd, unsafe.Pointer(&iov[0]), len(iov))
 }
 
 // setIovlen sets a Msghdr's Iovlen, which is 32 or 64 bits wide depending on

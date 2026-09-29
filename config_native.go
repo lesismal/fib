@@ -69,6 +69,22 @@ type Config struct {
 	// every connection while the budget is exhausted. Zero means unlimited.
 	MaxPendingBytes int64
 	UseWritev       bool
+	// SocketSyscalls has connections read and write their sockets with
+	// recvfrom, sendto and sendmsg rather than read, write and writev. Both
+	// sets end in the same socket code, but read, write and writev reach it
+	// through the VFS, which on every call checks the file's access mode,
+	// runs the security module's file permission hook and notifies fsnotify.
+	// Where a security module mediates file access, as AppArmor does in a
+	// Docker container, that is a large share of a busy server's time:
+	// go-websocket-benchmark's echo in such a container (50k connections, 8
+	// server CPUs) served 611k messages a second at 634% CPU through read and
+	// write, and 639k at 507% through the socket calls. A descriptor that is
+	// not a socket falls back to read and write.
+	//
+	// It is off by default. Only Linux honours it, and not on 386, which
+	// reaches the socket calls only through socketcall, nor in a race, memory
+	// or address sanitizer build.
+	SocketSyscalls bool
 	// TaskPoolMode picks the scheduler the workers run under. Prefer
 	// SetTaskPoolMode over assigning it, so that WorkerCount and MaxEvents
 	// follow the mode rather than staying at numbers tuned for the other one.

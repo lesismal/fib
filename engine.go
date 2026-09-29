@@ -98,6 +98,7 @@ type Engine struct {
 	logStatus          bool
 	maxEvents          int
 	useWritev          bool
+	socketSyscalls     bool // see Config.SocketSyscalls
 	writeHighWatermark int
 	writeLowWatermark  int
 	maxPendingBytes    int64
@@ -232,6 +233,7 @@ func newEngine(config Config, handler Handler, addrs []string) (*Engine, error) 
 
 	e := &Engine{name: engineName(config), logStatus: config.LogStatus, maxEvents: config.MaxEvents,
 		useWritev:          config.UseWritev,
+		socketSyscalls:     config.SocketSyscalls,
 		writeHighWatermark: config.WriteBufferHighWatermark,
 		// Resume at a quarter of the budget rather than at the budget itself,
 		// so recovery admits a useful amount of work instead of re-pausing on
@@ -283,6 +285,7 @@ func (e *Engine) openPollers(config Config) error {
 	n := pollerCount(config)
 	for i := 0; i < n; i++ {
 		p := &Engine{parent: e, name: e.name, logStatus: e.logStatus, maxEvents: e.maxEvents, useWritev: e.useWritev,
+			socketSyscalls:     e.socketSyscalls,
 			writeHighWatermark: e.writeHighWatermark,
 			writeLowWatermark:  e.writeLowWatermark, maxPendingBytes: e.maxPendingBytes,
 			budgetResumeBytes: e.budgetResumeBytes, sendBufferSize: e.sendBufferSize,
