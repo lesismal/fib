@@ -2,6 +2,7 @@ package websocket
 
 import (
 	"bytes"
+	"fmt"
 	"testing"
 )
 
@@ -89,6 +90,45 @@ func BenchmarkParserBorrowedSplitFrames(b *testing.B) {
 			}
 		}
 		parser.ReleaseBorrowed()
+	}
+}
+
+// BenchmarkParserBorrowedPipelined feeds reads that each carry several whole
+// frames, as a client that pipelines its messages sends them: a 16KiB read
+// holds 15 of these 1KiB frames. Parsing is linear in the read, so the
+// throughput should not fall as the frames per read grow.
+func BenchmarkParserBorrowedPipelined(b *testing.B) {
+	frame := clientFrame(Binary, true, make([]byte, 1024))
+	for _, frames := range []int{1, 4, 15} {
+		b.Run(fmt.Sprintf("frames=%d", frames), func(b *testing.B) {
+			stream := bytes.Repeat(frame, frames)
+			parser := NewParser(1 << 20)
+			buf := make([]byte, len(stream))
+			b.ReportAllocs()
+			b.SetBytes(int64(len(stream)))
+			for i := 0; i < b.N; i++ {
+				// Copy into a reusable buffer the way drainInput hands one to
+				// OnData; unmasking rewrites it in place.
+				copy(buf, stream)
+				data := buf
+				parsed := 0
+				for {
+					_, complete, err := parser.FeedOneBorrowed(data)
+					data = nil
+					if err != nil {
+						b.Fatal(err)
+					}
+					if !complete {
+						break
+					}
+					parsed++
+				}
+				parser.ReleaseBorrowed()
+				if parsed != frames {
+					b.Fatalf("parsed %d frames, want %d", parsed, frames)
+				}
+			}
+		})
 	}
 }
 

@@ -627,6 +627,14 @@ func (p *Parser) consume(n int) {
 		p.borrowedBuffer = false
 		return
 	}
+	if p.borrowedBuffer {
+		// A borrowed buffer is the read buffer, lent for this callback only,
+		// so there is nothing to keep at its front: step past the frame.
+		// Moving the rest down over it instead copied everything behind every
+		// frame, about k*k/2 frames for a read of k pipelined ones.
+		p.buffer = p.buffer[n:]
+		return
+	}
 	copy(p.buffer, p.buffer[n:])
 	p.buffer = p.buffer[:len(p.buffer)-n]
 }
