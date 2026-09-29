@@ -63,7 +63,7 @@ func BenchmarkApplyMask1KiB(b *testing.B) {
 	mask := []byte{0x12, 0x34, 0x56, 0x78}
 	b.SetBytes(int64(len(payload)))
 	for b.Loop() {
-		applyMask(payload, payload, mask)
+		applyMask(payload, mask)
 	}
 }
 

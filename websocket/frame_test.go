@@ -381,14 +381,9 @@ func TestApplyMaskMatchesBytewise(t *testing.T) {
 		for i := range src {
 			want[i] = src[i] ^ mask[i&3]
 		}
-		dst := make([]byte, size+3)
-		applyMask(dst, src, mask)
-		if !bytes.Equal(dst[:size], want) {
-			t.Fatalf("size %d: masked into another buffer wrong", size)
-		}
-		applyMask(src, src, mask)
+		applyMask(src, mask)
 		if !bytes.Equal(src, want) {
-			t.Fatalf("size %d: masked in place wrong", size)
+			t.Fatalf("size %d: masked wrong", size)
 		}
 	}
 }

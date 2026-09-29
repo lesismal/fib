@@ -294,7 +294,8 @@ func (c *Connection) sendMaskedFrame(opcode Opcode, payload []byte, compressed b
 	frame[1] |= 0x80
 	mask := frame[headerLen : headerLen+4]
 	binary.LittleEndian.PutUint32(mask, rand.Uint32())
-	applyMask(frame[headerLen+4:], payload, mask)
+	copy(frame[headerLen+4:], payload)
+	applyMask(frame[headerLen+4:], mask)
 	return c.conn.SendOwned(frame)
 }
 
