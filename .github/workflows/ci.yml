@@ -59,7 +59,7 @@ jobs:
       - name: go mod tidy
         shell: bash
         run: |
-          for module in . http3/interop; do
+          for module in . http3/interop taskpool/benchmark; do
             echo "::group::$module"
             (cd "$module" && go mod tidy -diff)
             echo "::endgroup::"
@@ -443,11 +443,11 @@ jobs:
           cache-dependency-path: |
             go.mod
             taskpool/benchmark/go.sum
+      # go mod tidy -diff runs in the lint job: on Windows the checkout's CRLF
+      # line endings make it report every line of go.mod as changed.
       - name: Vet
         working-directory: taskpool/benchmark
-        run: |
-          go vet ./...
-          go mod tidy -diff
+        run: go vet ./...
       - name: Benchmark
         if: runner.os != 'Windows'
         working-directory: taskpool/benchmark
