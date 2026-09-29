@@ -1,6 +1,7 @@
 package taskpool
 
 import (
+	"math/rand/v2"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -88,5 +89,64 @@ func TestElasticBoundsConcurrency(t *testing.T) {
 	}
 	if got := tp.Workers(); got != 0 {
 		t.Fatalf("Workers() = %d after Stop, want 0", got)
+	}
+}
+
+// Submissions of every shape race lingering workers that time out, on
+// ceilings and queues small enough that tasks queue behind workers holding
+// every slot. Every task must run exactly once, and Stop must return with no
+// worker left.
+func TestElasticNeverStrandsATask(t *testing.T) {
+	deadline := time.Now().Add(2 * time.Second)
+	for iter := 0; time.Now().Before(deadline); iter++ {
+		rng := rand.New(rand.NewPCG(uint64(iter), 3))
+		tp := NewWithMode("test", ModeElastic, 1+rng.IntN(16), 1+rng.IntN(8))
+		const producers, perProducer = 4, 200
+		var counts [producers * perProducer]atomic.Int64
+		var wg sync.WaitGroup
+		for g := 0; g < producers; g++ {
+			wg.Add(1)
+			go func(base int, seed uint64) {
+				defer wg.Done()
+				rng := rand.New(rand.NewPCG(seed, 4))
+				for i := 0; i < perProducer; {
+					n := min(1+rng.IntN(6), perProducer-i)
+					tasks := make([]Task, n)
+					for j := range tasks {
+						index, block := base+i+j, rng.IntN(10) == 0
+						tasks[j] = taskFunc(func() {
+							if block {
+								time.Sleep(20 * time.Microsecond)
+							}
+							counts[index].Add(1)
+						})
+					}
+					if got := tp.GoTasks(tasks); got != n {
+						t.Errorf("GoTasks accepted %d of %d", got, n)
+					}
+					i += n
+					if rng.IntN(20) == 0 {
+						// Long enough for some lingering workers to retire.
+						time.Sleep(idleLinger + time.Millisecond)
+					}
+				}
+			}(g*perProducer, uint64(iter*producers+g))
+		}
+		wg.Wait()
+		stopped := make(chan struct{})
+		go func() { tp.Stop(); close(stopped) }()
+		select {
+		case <-stopped:
+		case <-time.After(5 * time.Second):
+			t.Fatalf("iteration %d: Stop did not return", iter)
+		}
+		for i := range counts {
+			if got := counts[i].Load(); got != 1 {
+				t.Fatalf("iteration %d: task %d ran %d times", iter, i, got)
+			}
+		}
+		if got := tp.Workers(); got != 0 {
+			t.Fatalf("iteration %d: Workers() = %d after Stop", iter, got)
+		}
 	}
 }
