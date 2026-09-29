@@ -81,7 +81,7 @@ type Config struct {
 	// write, and 639k at 507% through the socket calls. A descriptor that is
 	// not a socket falls back to read and write.
 	//
-	// It is off by default. Only Linux honours it, and not on 386, which
+	// DefaultConfig sets it. Only Linux honours it, and not on 386, which
 	// reaches the socket calls only through socketcall, nor in a race, memory
 	// or address sanitizer build.
 	SocketSyscalls bool
@@ -189,5 +189,5 @@ func DefaultConfig() Config {
 	return Config{Name: DefaultName, Network: "tcp", Addr: ":9000", Backlog: defaultBacklog(), WorkerCount: sizing.WorkerCount,
 		MaxEvents: sizing.MaxEvents, ReadBufferSize: 16 * 1024,
 		WriteBufferHighWatermark: defaultWriteHighWatermark, MaxPendingBytes: defaultMaxPendingBytes,
-		UseWritev: true, TaskPoolMode: taskpool.ModeAdaptive, SharedTaskPool: true, IOPollers: true}
+		UseWritev: true, SocketSyscalls: true, TaskPoolMode: taskpool.ModeAdaptive, SharedTaskPool: true, IOPollers: true}
 }
