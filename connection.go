@@ -591,10 +591,9 @@ func (c *Connection) process() {
 			continue
 		}
 		var closeErr error
-		// Flush before reading so that a round which both frees socket send
-		// space and delivers new input never reads while output is still
-		// queued behind it. This keeps userspace buffering bounded by what the
-		// peer is willing to accept instead of what it is willing to send.
+		// Flush before reading, so that a round which both frees socket send
+		// space and delivers new input hands the older output to the socket
+		// first.
 		if alive && events&evOut != 0 && c.hasFlushableOutput() {
 			closeErr = c.flushOutput()
 			alive = closeErr == nil
@@ -604,11 +603,25 @@ func (c *Connection) process() {
 			alive = closeErr == nil
 		}
 		if alive && events&evIn != 0 {
-			if c.hasQueuedOutput() {
-				// Queued output means write interest is armed or a write is in
-				// flight, so a later round is guaranteed. Carry the read,
-				// and any half-close that arrived with it, into that round so
-				// the peer's final bytes are still delivered after the flush.
+			if c.hasQueuedOutput() && (c.engine.writeHighWatermark <= 0 || c.readShouldStop()) {
+				// The output queued already fills the connection's budget, or
+				// the handler holds reads, or there is no watermark and the
+				// queue is all that bounds this connection's buffering. Queued
+				// output means write interest is armed or a write is in
+				// flight, so a later round is guaranteed. Carry the read, and
+				// any half-close that arrived with it, into that round so the
+				// peer's final bytes are still delivered after the flush.
+				//
+				// Output queued below the watermark does not stop the read: the
+				// watermark is what bounds a connection's buffering. Stopping at
+				// the first queued byte left the peer's requests in the socket
+				// while it waited for their replies, and a pipelining client
+				// kept sending into a receive queue that filled with small
+				// segments until the kernel dropped them: go-websocket-benchmark's
+				// pipelined echo (50k connections, 8 server CPUs, the client on
+				// their SMT siblings) retransmitted 310-330k segments a second
+				// and served 3.06-3.10M messages a second, and reading on to the
+				// watermark halved the retransmits and served 3.96-3.99M.
 				deferred = evIn | events&evRdHup
 			} else {
 				closeErr = c.drainInput()

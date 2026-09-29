@@ -116,9 +116,10 @@ func TestOnCloseReportsPeerEOF(t *testing.T) {
 }
 
 // TestReadsDeferredWhileOutputQueued covers the flush-before-read ordering in
-// process: while Send output is still queued the worker must not read, and the
-// deferred readiness must survive until the queue drains so the socket does
-// not turn into a zombie with unread bytes and no further edge.
+// process: without a watermark, while Send output is still queued the worker
+// must not read, and the deferred readiness must survive until the queue
+// drains so the socket does not turn into a zombie with unread bytes and no
+// further edge.
 func TestReadsDeferredWhileOutputQueued(t *testing.T) {
 	for _, halfClose := range []bool{false, true} {
 		t.Run(map[bool]string{false: "open", true: "halfclose"}[halfClose], func(t *testing.T) {
@@ -227,6 +228,90 @@ func TestReadsDeferredWhileOutputQueued(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// TestReadsContinueBelowWatermark covers the other side of that ordering: with
+// a watermark, output queued below it does not stop the worker from reading,
+// so a peer that sends while its replies are still queued is not left waiting
+// on a full receive queue.
+func TestReadsContinueBelowWatermark(t *testing.T) {
+	payload := bytes.Repeat([]byte{0xCD}, 8*1024*1024)
+	second := make(chan []byte, 1)
+	config := DefaultConfig()
+	config.Addr = "127.0.0.1:0"
+	config.WriteBufferHighWatermark = 4 * len(payload)
+	var first sync.Once
+	var sender atomic.Pointer[Connection]
+	server, err := Bind(config, HandlerFuncs{
+		Data: func(c *Connection, data []byte) {
+			started := false
+			first.Do(func() {
+				started = true
+				sender.Store(c)
+				for offset := 0; offset < len(payload); offset += 1 << 20 {
+					if err := c.SendOwned(payload[offset : offset+1<<20]); err != nil {
+						t.Error(err)
+						return
+					}
+				}
+			})
+			if !started {
+				second <- append([]byte(nil), data...)
+			}
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	addr, err := server.LocalAddr()
+	if err != nil {
+		t.Fatal(err)
+	}
+	runDone := make(chan error, 1)
+	go func() { runDone <- server.Run() }()
+	defer func() {
+		server.Stop()
+		if err := <-runDone; err != nil {
+			t.Error(err)
+		}
+		if err := server.Close(); err != nil {
+			t.Error(err)
+		}
+	}()
+	conn, err := net.DialTCP("tcp4", nil, addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	_ = conn.SetDeadline(time.Now().Add(30 * time.Second))
+	if _, err := conn.Write([]byte("start")); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(300 * time.Millisecond)
+	if c := sender.Load(); c == nil || !c.hasQueuedOutput() {
+		t.Skip("the kernel accepted the whole payload; no output is queued")
+	}
+	if _, err := conn.Write([]byte("ping")); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case data := <-second:
+		if !bytes.Equal(data, []byte("ping")) {
+			t.Fatalf("second message = %q", data)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("read deferred behind output queued below the watermark")
+	}
+	if c := sender.Load(); !c.hasQueuedOutput() {
+		t.Log("the queue drained before the second read; the test proved less than it meant to")
+	}
+	received := make([]byte, len(payload))
+	if _, err := io.ReadFull(conn, received); err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(received, payload) {
+		t.Fatal("payload mismatch")
 	}
 }
 
