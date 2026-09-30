@@ -253,7 +253,13 @@ func (c *Conn) buildPacket(space, room int, mayElicit bool, now time.Time, scrat
 	sp := c.newSentPacket(pn)
 	payload := scratch[:0]
 	withAck := false
-	if s.ackPending && len(s.recv) > 0 {
+	// A handshake packet carries the acknowledgement again even when it has
+	// already been sent: the datagram that had it may be the one that was
+	// lost, and until the peer hears it has no round-trip time to go by, so
+	// it sends its flight again only as its probe timeout doubles from the
+	// one second it starts at. There are few such packets and most are padded
+	// anyway, so it costs nothing.
+	if (s.ackPending || space != spaceApp) && len(s.recv) > 0 {
 		if ack := c.appendAck(payload, s, now); len(ack) <= max/2 {
 			payload = ack
 			withAck = true

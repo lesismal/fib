@@ -144,6 +144,21 @@ func newTestPair(t *testing.T, loss float64, configure func(client, server *Conf
 	if configure != nil {
 		configure(&cc, &sc)
 	}
+	// On a path that loses datagrams the first flights can be lost several
+	// times over before either side has a round-trip time, and each probe
+	// timeout until then is twice the last, starting from a second: at one
+	// datagram in five, a handshake in a few thousand is still going after
+	// the ten seconds it is given by default. That is the path, not the
+	// connection, so such a pair is given longer.
+	handshakeWait := 10 * time.Second
+	if loss > 0 {
+		handshakeWait = 60 * time.Second
+		for _, c := range []*Config{&cc, &sc} {
+			if c.HandshakeTimeout == 0 {
+				c.HandshakeTimeout = handshakeWait
+			}
+		}
+	}
 	p := &testPair{clientH: newTestHandler(), serverH: newTestHandler(), done: make(chan struct{})}
 	p.clientEnd, p.serverEnd = newPipe()
 	p.clientEnd.loss, p.serverEnd.loss = loss, loss
@@ -207,7 +222,7 @@ func newTestPair(t *testing.T, loss float64, configure func(client, server *Conf
 	case <-p.clientH.handshake:
 	case err := <-p.clientH.closed:
 		t.Fatalf("client closed during handshake: %v", err)
-	case <-time.After(10 * time.Second):
+	case <-time.After(handshakeWait):
 		t.Fatal("handshake timed out")
 	}
 	// The client's handshake is complete before its Finished is sent, so
@@ -219,7 +234,7 @@ func newTestPair(t *testing.T, loss float64, configure func(client, server *Conf
 	case <-p.serverH.handshake:
 	case err := <-p.serverH.closed:
 		t.Fatalf("server closed during handshake: %v", err)
-	case <-time.After(10 * time.Second):
+	case <-time.After(handshakeWait):
 		t.Fatal("server handshake timed out")
 	}
 	return p
