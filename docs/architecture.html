@@ -1,488 +1,427 @@
 <!doctype html>
 <html lang="en">
 <head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <meta name="description" content="Architecture of a single epoll event loop, per-connection event queues, and a logical worker pool">
-  <title>Single-loop epoll · Architecture</title>
-  <style>
-    :root {
-      --ink: #e8edf7;
-      --muted: #8c98ad;
-      --bg: #070b12;
-      --panel: #0d131e;
-      --panel-2: #111a27;
-      --line: #233047;
-      --blue: #65a7ff;
-      --cyan: #54e1d1;
-      --amber: #ffbf69;
-      --rose: #ff7285;
-      --violet: #ae8cff;
-      --green: #69dfa0;
-      --shadow: 0 28px 80px rgba(0, 0, 0, .38);
-    }
-    * { box-sizing: border-box; }
-    html { scroll-behavior: smooth; }
-    body {
-      margin: 0;
-      color: var(--ink);
-      background:
-        radial-gradient(circle at 12% 0%, rgba(75, 132, 255, .15), transparent 29rem),
-        radial-gradient(circle at 88% 10%, rgba(84, 225, 209, .10), transparent 30rem),
-        var(--bg);
-      font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
-      line-height: 1.55;
-    }
-    body::before {
-      content: "";
-      position: fixed;
-      inset: 0;
-      pointer-events: none;
-      opacity: .22;
-      background-image: linear-gradient(rgba(255,255,255,.025) 1px, transparent 1px),
-                        linear-gradient(90deg, rgba(255,255,255,.025) 1px, transparent 1px);
-      background-size: 44px 44px;
-      mask-image: linear-gradient(to bottom, black, transparent 80%);
-    }
-    a { color: inherit; }
-    code, .mono { font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospace; }
-    .shell { width: min(1440px, calc(100% - 40px)); margin: 0 auto; position: relative; }
-    nav {
-      height: 72px;
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
-      border-bottom: 1px solid rgba(255,255,255,.08);
-    }
-    .brand { display: flex; align-items: center; gap: 12px; font-weight: 760; letter-spacing: -.02em; }
-    .brand-mark { width: 30px; height: 30px; display: grid; place-items: center; border: 1px solid #3c5d88; border-radius: 9px; color: var(--cyan); background: #0c1725; }
-    .nav-note { color: var(--muted); font-size: 13px; }
-    .nav-end { display: flex; align-items: center; gap: 15px; }
-    .language { display: flex; padding: 3px; border: 1px solid var(--line); border-radius: 9px; background: #0a1019; }
-    .language button { border: 0; border-radius: 6px; padding: 6px 9px; color: #748198; background: transparent; cursor: pointer; font: 700 10px "SFMono-Regular", monospace; }
-    .language button[aria-pressed="true"] { color: var(--ink); background: #1a2637; }
-    header { padding: 74px 0 46px; display: grid; grid-template-columns: 1.3fr .7fr; gap: 48px; align-items: end; }
-    .eyebrow { color: var(--cyan); font: 700 12px/1.3 "SFMono-Regular", monospace; letter-spacing: .16em; text-transform: uppercase; }
-    h1 { font-size: clamp(44px, 6.2vw, 88px); line-height: .98; margin: 19px 0 24px; letter-spacing: -.062em; max-width: 950px; }
-    h1 span { color: transparent; -webkit-text-stroke: 1px #75849c; }
-    .lede { color: #aeb8c9; font-size: clamp(17px, 2vw, 21px); max-width: 780px; margin: 0; }
-    .principle { border-left: 1px solid var(--cyan); padding: 4px 0 4px 24px; color: #b9c4d6; font-size: 14px; }
-    .principle strong { display: block; color: var(--ink); font-size: 16px; margin-bottom: 5px; }
-    .panel { background: linear-gradient(145deg, rgba(17,26,39,.94), rgba(10,16,25,.94)); border: 1px solid var(--line); border-radius: 20px; box-shadow: var(--shadow); }
-    .overview { padding: 28px; overflow: hidden; }
-    .section-head { display: flex; align-items: end; justify-content: space-between; gap: 30px; margin-bottom: 24px; }
-    h2 { font-size: clamp(26px, 3vw, 38px); line-height: 1.1; letter-spacing: -.035em; margin: 0; }
-    .section-head p { color: var(--muted); max-width: 560px; margin: 0; font-size: 14px; }
-    .dispatch-contract { display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px; margin: 8px 0 2px; }
-    .contract-item { display: flex; align-items: center; gap: 12px; min-height: 68px; padding: 13px 15px; border: 1px solid #283850; border-radius: 12px; background: rgba(8,14,23,.72); }
-    .contract-item b { width: 27px; height: 27px; display: grid; place-items: center; flex: 0 0 auto; border-radius: 8px; color: var(--cyan); background: rgba(84,225,209,.09); font: 800 11px "SFMono-Regular", monospace; }
-    .contract-item span { color: #b8c4d7; font-size: 12px; }
-    .contract-item strong { color: var(--ink); }
-    .diagram { position: relative; min-height: 600px; display: grid; grid-template-columns: 1fr 1.25fr 1fr; gap: 66px; align-items: center; padding: 52px 20px 38px; }
-    .diagram svg.links { position: absolute; inset: 0; width: 100%; height: 100%; z-index: 0; overflow: visible; }
-    .lane { position: relative; z-index: 1; display: flex; flex-direction: column; gap: 14px; }
-    .lane-label { color: #718098; font: 700 11px/1 "SFMono-Regular", monospace; letter-spacing: .12em; text-transform: uppercase; margin: 0 0 5px 5px; }
-    .node { position: relative; border: 1px solid #2a3850; background: rgba(12,19,30,.94); border-radius: 15px; padding: 18px; transition: border-color .2s, transform .2s, opacity .2s; }
-    .node:hover { border-color: #5477a8; transform: translateY(-2px); }
-    .node.primary { border-color: rgba(84,225,209,.48); box-shadow: inset 0 0 50px rgba(84,225,209,.035); }
-    .node.pool { border-color: rgba(174,140,255,.42); }
-    .node-title { display: flex; justify-content: space-between; align-items: center; gap: 12px; font-weight: 720; }
-    .chip { padding: 3px 8px; border-radius: 20px; border: 1px solid currentColor; color: var(--blue); font: 700 10px/1.4 "SFMono-Regular", monospace; letter-spacing: .04em; }
-    .node p { margin: 8px 0 0; color: var(--muted); font-size: 13px; }
-    .node ul { margin: 12px 0 0; padding: 0; list-style: none; display: grid; gap: 7px; }
-    .node li { color: #bcc6d7; font: 12px/1.35 "SFMono-Regular", monospace; padding-left: 15px; position: relative; }
-    .node li::before { content: "›"; position: absolute; left: 0; color: var(--cyan); }
-    .fd-stack { display: grid; gap: 12px; }
-    .fd { padding: 16px; }
-    .fd-top { display: flex; justify-content: space-between; gap: 12px; align-items: center; }
-    .fd-id { font: 700 13px "SFMono-Regular", monospace; color: var(--cyan); }
-    .fd-state { font: 700 10px "SFMono-Regular", monospace; color: var(--green); }
-    .queue { display: flex; align-items: center; margin-top: 13px; min-width: 0; }
-    .queue-label { color: #718098; font: 10px "SFMono-Regular", monospace; width: 54px; flex: 0 0 auto; }
-    .event { padding: 5px 8px; margin-left: -1px; border: 1px solid #34465f; background: #111b2a; color: #aebbd0; font: 700 9px "SFMono-Regular", monospace; white-space: nowrap; }
-    .event:first-of-type { border-radius: 7px 0 0 7px; }
-    .event:last-child { border-radius: 0 7px 7px 0; }
-    .event.read { color: var(--cyan); }
-    .event.write { color: var(--amber); }
-    .event.error { color: var(--rose); }
-    .mutex { margin-top: 12px; display: flex; gap: 8px; align-items: center; color: #718098; font: 10px "SFMono-Regular", monospace; }
-    .mutex::before { content: "LOCK"; color: var(--blue); border: 1px solid #35527a; border-radius: 5px; padding: 2px 5px; }
-    .flow-section { padding: 92px 0 20px; }
-    .tabs { display: flex; gap: 6px; padding: 5px; border: 1px solid var(--line); border-radius: 13px; background: #0a1019; width: fit-content; }
-    .tab { appearance: none; border: 0; border-radius: 9px; padding: 10px 14px; background: transparent; color: var(--muted); cursor: pointer; font: 650 12px/1 "SFMono-Regular", monospace; }
-    .tab[aria-selected="true"] { background: #192538; color: var(--ink); box-shadow: 0 2px 12px rgba(0,0,0,.25); }
-    .flow-card { margin-top: 18px; padding: 28px; }
-    .flow { display: none; grid-template-columns: repeat(5, 1fr); gap: 16px; position: relative; }
-    .flow.active { display: grid; }
-    .capture .flow, .capture .flow[hidden] { display: grid !important; margin-bottom: 34px; }
-    .capture .flow:last-child { margin-bottom: 0; }
-    .capture .flow::before { grid-column: 1 / -1; color: var(--cyan); font: 800 11px "SFMono-Regular", monospace; letter-spacing: .1em; }
-    .capture #flow-read::before { content: "READ & SCHEDULE"; }
-    .capture #flow-write::before { content: "WRITE BACKPRESSURE"; }
-    .capture #flow-close::before { content: "CLOSE & RECLAIM"; }
-    .capture .tabs { display: none; }
-    .step { min-height: 190px; padding: 18px; border-radius: 14px; background: #0b121d; border: 1px solid #24334b; position: relative; }
-    .step:not(:last-child)::after { content: "→"; position: absolute; right: -24px; top: 43%; color: #60708a; z-index: 2; }
-    .step-no { color: var(--blue); font: 800 10px "SFMono-Regular", monospace; letter-spacing: .12em; }
-    .step h3 { margin: 14px 0 8px; font-size: 15px; }
-    .step p { color: var(--muted); font-size: 12px; margin: 0; }
-    .step code { display: block; color: #c4d1e5; background: #111c2a; border: 1px solid #24344c; border-radius: 7px; padding: 8px; font-size: 10px; margin-top: 12px; overflow-wrap: anywhere; }
-    .invariants { padding: 92px 0 90px; }
-    .balance-section { padding: 92px 0 10px; }
-    .balance-grid { display: grid; grid-template-columns: 1fr 74px 1fr; gap: 16px; align-items: stretch; margin-top: 26px; }
-    .model { padding: 26px; min-height: 360px; }
-    .model.fixed { border-color: rgba(255,114,133,.34); }
-    .model.dynamic { border-color: rgba(84,225,209,.46); box-shadow: inset 0 0 80px rgba(84,225,209,.025), var(--shadow); }
-    .model-kicker { font: 800 10px "SFMono-Regular", monospace; letter-spacing: .12em; text-transform: uppercase; color: var(--rose); }
-    .dynamic .model-kicker { color: var(--cyan); }
-    .model h3 { margin: 13px 0 9px; font-size: 21px; letter-spacing: -.025em; }
-    .model > p { margin: 0; color: var(--muted); font-size: 13px; max-width: 560px; }
-    .worker-map { display: grid; gap: 9px; margin-top: 24px; }
-    .worker-row { display: grid; grid-template-columns: 86px 1fr 52px; align-items: center; gap: 11px; color: #9ba9bd; font: 10px "SFMono-Regular", monospace; }
-    .worker-row strong { color: #c7d2e4; font-weight: 650; }
-    .load-track { height: 9px; background: #141f2e; border: 1px solid #26364e; border-radius: 20px; overflow: hidden; }
-    .load { display: block; height: 100%; border-radius: inherit; background: linear-gradient(90deg, #ff7285, #ffae70); }
-    .dynamic .load { background: linear-gradient(90deg, #54e1d1, #65a7ff); }
-    .why-list { display: grid; gap: 9px; margin-top: 22px; }
-    .why-list div { display: flex; gap: 9px; color: #aab6c9; font-size: 12px; }
-    .why-list div::before { content: "×"; color: var(--rose); font: 800 12px "SFMono-Regular", monospace; }
-    .dynamic .why-list div::before { content: "✓"; color: var(--cyan); }
-    .versus { display: grid; place-items: center; color: #63728a; font: 800 11px "SFMono-Regular", monospace; letter-spacing: .1em; }
-    .balance-result { margin-top: 16px; padding: 16px 18px; border: 1px solid #2a3a52; border-radius: 12px; background: #0a111b; display: flex; justify-content: space-between; gap: 22px; align-items: center; }
-    .balance-result strong { color: var(--cyan); font-size: 13px; }
-    .balance-result span { color: var(--muted); font-size: 12px; text-align: right; }
-    .source-note { margin-top: 13px; color: #66748a; font-size: 11px; }
-    .source-note a { color: #8ea8cc; text-decoration-color: #40536f; text-underline-offset: 3px; }
-    .rule-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 16px; margin-top: 25px; }
-    .rule { padding: 23px; border-top: 2px solid var(--blue); }
-    .rule:nth-child(2) { border-top-color: var(--cyan); }
-    .rule:nth-child(3) { border-top-color: var(--violet); }
-    .rule-no { color: #68768c; font: 700 11px "SFMono-Regular", monospace; }
-    .rule h3 { margin: 26px 0 8px; font-size: 18px; }
-    .rule p { margin: 0; color: var(--muted); font-size: 13px; }
-    .state-strip { margin-top: 16px; display: flex; gap: 7px; flex-wrap: wrap; }
-    .state-strip span { color: #a9b6ca; font: 10px "SFMono-Regular", monospace; border: 1px solid #2c3b53; border-radius: 6px; padding: 5px 7px; }
-    footer { border-top: 1px solid rgba(255,255,255,.08); padding: 27px 0 45px; display: flex; justify-content: space-between; color: #66748a; font-size: 12px; }
-    .pulse { animation: pulse 2.5s ease-in-out infinite; }
-    @keyframes pulse { 0%,100% { opacity: .35; } 50% { opacity: 1; } }
-    @media (max-width: 1050px) {
-      header { grid-template-columns: 1fr; }
-      .principle { max-width: 650px; }
-      .diagram { grid-template-columns: 1fr; gap: 30px; padding-top: 25px; }
-      .diagram svg.links { display: none; }
-      .dispatch-contract { grid-template-columns: 1fr; }
-      .balance-grid { grid-template-columns: 1fr; }
-      .versus { min-height: 38px; }
-      .flow.active { grid-template-columns: 1fr 1fr; }
-      .step:not(:last-child)::after { display: none; }
-    }
-    @media (max-width: 680px) {
-      .shell { width: min(100% - 24px, 1440px); }
-      nav { height: 60px; }
-      .nav-note { display: none; }
-      header { padding-top: 52px; }
-      .overview, .flow-card { padding: 18px; }
-      .section-head { align-items: start; flex-direction: column; }
-      .flow.active, .rule-grid { grid-template-columns: 1fr; }
-      .balance-result { align-items: start; flex-direction: column; }
-      .balance-result span { text-align: left; }
-      .tabs { width: 100%; overflow-x: auto; }
-      .tab { flex: 1 0 auto; }
-      footer { flex-direction: column; gap: 7px; }
-    }
-    @media (prefers-reduced-motion: reduce) { * { scroll-behavior: auto !important; animation: none !important; transition: none !important; } }
-  </style>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>fib architecture</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;500;600&display=swap">
+<style>
+:root{
+  --bg:#f3f5f8; --surface:#ffffff; --ink:#16202c; --muted:#5a6676; --line:#d8dee7;
+  --paper:#ffffff; --paper-line:#e2e6ed;
+  --loop:#2458c6; --work:#0c7d72; --hs:#a86a12; --str:#6b45c8; --tmr:#5f6b7a; --usr:#b23a62;
+  --loop-bg:#e8effc; --work-bg:#e3f4f1; --hs-bg:#fbf0de; --str-bg:#efe9fb; --tmr-bg:#eceff3; --usr-bg:#fae6ed;
+  --code-bg:#eef1f5;
+  --sans:"IBM Plex Sans","PingFang SC","Hiragino Sans GB","Microsoft YaHei",system-ui,sans-serif;
+  --mono:"IBM Plex Mono",ui-monospace,"SF Mono",Menlo,monospace;
+}
+@media (prefers-color-scheme: dark){
+  :root:not([data-theme="light"]){
+    color-scheme:dark;
+    --bg:#0f141b; --surface:#161d27; --ink:#e4e9f0; --muted:#94a0b0; --line:#2a3443;
+    --paper:#eef1f5; --paper-line:#c9d0da;
+    --loop:#7aa4ff; --work:#4fd1bf; --hs:#f0b35a; --str:#b39cff; --tmr:#a3adba; --usr:#f27fa3;
+    --loop-bg:#1b2842; --work-bg:#12302c; --hs-bg:#35280f; --str-bg:#271f40; --tmr-bg:#222a35; --usr-bg:#3a1a27;
+    --code-bg:#1f2833;
+  }
+}
+:root[data-theme="dark"]{
+  color-scheme:dark;
+  --bg:#0f141b; --surface:#161d27; --ink:#e4e9f0; --muted:#94a0b0; --line:#2a3443;
+  --paper:#eef1f5; --paper-line:#c9d0da;
+  --loop:#7aa4ff; --work:#4fd1bf; --hs:#f0b35a; --str:#b39cff; --tmr:#a3adba; --usr:#f27fa3;
+  --loop-bg:#1b2842; --work-bg:#12302c; --hs-bg:#35280f; --str-bg:#271f40; --tmr-bg:#222a35; --usr-bg:#3a1a27;
+  --code-bg:#1f2833;
+}
+*{box-sizing:border-box}
+body{background:var(--bg);color:var(--ink);font:15px/1.7 var(--sans);padding-inline:16px;padding-block:0 64px}
+.wrap{max-width:1180px;margin:0 auto;display:grid;grid-template-columns:220px minmax(0,1fr);gap:40px}
+nav.toc{position:sticky;top:env(safe-area-inset-top,0px);align-self:start;padding-top:40px;font-size:13px}
+nav.toc b{display:block;font:600 11px/1 var(--mono);letter-spacing:.12em;color:var(--muted);text-transform:uppercase;margin-bottom:12px}
+nav.toc ol{list-style:none;margin:0;padding:0;display:grid;gap:2px}
+nav.toc a{display:block;padding:5px 10px;border-radius:6px;color:var(--ink);text-decoration:none}
+nav.toc a:hover,nav.toc a:focus-visible{background:var(--surface);outline:none}
+nav.toc a span{font-family:var(--mono);color:var(--muted);margin-right:6px}
+main{min-width:0;padding-top:40px}
+header h1{font-size:34px;line-height:1.2;margin:0 0 12px;letter-spacing:-.01em;text-wrap:balance}
+header p{color:var(--muted);max-width:72ch;margin:0 0 8px}
+h2{font-size:23px;line-height:1.3;margin:0 0 6px;text-wrap:balance}
+h3{font-size:16px;margin:22px 0 8px}
+section{padding-top:48px;scroll-margin-top:12px}
+section>.lede{color:var(--muted);margin:0 0 14px;max-width:78ch}
+code,.mono{font-family:var(--mono);font-size:.88em}
+p code,li code,td code{background:var(--code-bg);padding:1px 5px;border-radius:4px}
+.legend{display:flex;flex-wrap:wrap;gap:8px;margin:18px 0 0}
+.chip{display:inline-flex;align-items:center;gap:6px;padding:3px 10px;border-radius:999px;font:500 12px/1.6 var(--mono);border:1px solid currentColor}
+.chip i{width:8px;height:8px;border-radius:2px;background:currentColor}
+.c-loop{color:var(--loop);background:var(--loop-bg)} .c-work{color:var(--work);background:var(--work-bg)}
+.c-hs{color:var(--hs);background:var(--hs-bg)} .c-str{color:var(--str);background:var(--str-bg)}
+.c-tmr{color:var(--tmr);background:var(--tmr-bg)} .c-usr{color:var(--usr);background:var(--usr-bg)}
+.runs{display:flex;flex-wrap:wrap;gap:6px;margin:0 0 14px}
+.diagram{background:var(--paper);border:1px solid var(--paper-line);border-radius:10px;padding:18px 12px;overflow-x:auto}
+.diagram pre.mermaid{margin:0;background:transparent;text-align:center;color:#16202c}
+.notes{margin:14px 0 0;padding-left:20px;display:grid;gap:6px;max-width:82ch}
+.notes li::marker{color:var(--muted)}
+.ref{font:12px/1.5 var(--mono);color:var(--muted);margin-top:10px}
+.tbl{overflow-x:auto;margin-top:14px;border:1px solid var(--line);border-radius:10px;background:var(--surface)}
+table{border-collapse:collapse;width:100%;min-width:760px;font-size:13.5px}
+th,td{text-align:left;vertical-align:top;padding:9px 12px;border-bottom:1px solid var(--line)}
+th{font:600 11px/1.4 var(--mono);letter-spacing:.06em;text-transform:uppercase;color:var(--muted);background:var(--bg)}
+tr:last-child td{border-bottom:0}
+td:first-child{font-weight:600;white-space:nowrap}
+.dash{color:var(--muted)}
+.callout{border-left:3px solid var(--hs);background:var(--surface);padding:10px 14px;border-radius:0 8px 8px 0;margin-top:14px;max-width:82ch}
+@media (max-width:860px){
+  .wrap{grid-template-columns:1fr;gap:0}
+  nav.toc{position:static;padding-top:24px}
+  nav.toc ol{grid-template-columns:repeat(auto-fill,minmax(150px,1fr))}
+  header h1{font-size:27px}
+}
+.toplinks{display:flex;flex-wrap:wrap;gap:6px;margin:0 0 22px}
+.toplinks a{display:inline-block;padding:3px 10px;border:1px solid var(--line);border-radius:999px;font:500 12px/1.6 var(--mono);color:var(--ink);text-decoration:none;background:var(--surface)}
+.toplinks a[aria-current]{border-color:var(--loop);color:var(--loop);background:var(--loop-bg)}
+.toplinks a:hover,.toplinks a:focus-visible{border-color:var(--loop);outline:none}
+header p a,.lede a{color:var(--loop)}
+.rules{display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));gap:14px;margin-top:14px}
+.rule{background:var(--surface);border:1px solid var(--line);border-radius:10px;padding:16px 18px}
+.rule b{display:block;font-size:16px;margin-bottom:6px}
+.rule p{margin:0;color:var(--muted);font-size:14px}
+body{margin:0}
+</style>
+
+
 </head>
 <body>
-  <div class="shell">
-    <nav>
-      <div class="brand"><span class="brand-mark mono">ep</span> Single-loop epoll</div>
-      <div class="nav-end"><div class="nav-note mono">architecture / implementation-aligned</div><div class="language" aria-label="Language"><button type="button" data-language="en" aria-pressed="true">EN</button><button type="button" data-language="zh-CN" aria-pressed="false">中文</button></div></div>
-    </nav>
+<div class="wrap">
+<nav class="toc" aria-label="Contents">
+  <div class="toplinks"><a href="architecture.html" aria-current="page">Architecture</a><a href="flows.html">Flows</a><a href="architecture.html" aria-current="page">English</a><a href="architecture.zh-CN.html">中文</a></div>
+  <b>Contents</b>
+  <ol>
+    <li><a href="#rules"><span>00</span>Three invariants</a></li>
+    <li><a href="#parts"><span>01</span>The parts</a></li>
+    <li><a href="#layers"><span>02</span>Handler layers</a></li>
+    <li><a href="#read"><span>03</span>Reading and scheduling</a></li>
+    <li><a href="#write"><span>04</span>Writes and backpressure</a></li>
+    <li><a href="#close"><span>05</span>Close and reclaim</a></li>
+    <li><a href="#balance"><span>06</span>Load balance</a></li>
+    <li><a href="#memory"><span>07</span>Buffers and memory</a></li>
+    <li><a href="#platform"><span>08</span>Platform backends</a></li>
+    <li><a href="#packages"><span>09</span>Packages</a></li>
+  </ol>
+</nav>
 
-    <header>
-      <div>
-        <div class="eyebrow">Concurrency architecture · Linux · ET</div>
-        <h1>一个 I/O 核心，<br><span>逐连接串行。</span></h1>
-        <p class="lede">单个 epoll event loop 管理所有 fd 和 I/O 关注；每个 connection 用自己的 FIFO 保存事件顺序；线程池动态选择空闲 worker，一次排空该 connection 的全部事件。</p>
-      </div>
-      <aside class="principle">
-        <strong>核心不变量</strong>
-        调度单位是 <code>connection</code>，不是单个事件。connection 与 worker 没有固定绑定；但同一时刻，一个 connection 最多只有一个 worker 执行。
-      </aside>
-    </header>
-
-    <main>
-      <section class="panel overview" aria-labelledby="overview-title">
-        <div class="section-head">
-          <h2 id="overview-title">系统关系图</h2>
-          <p>实线代表事件/任务前向流动，虚线代表 worker 经 command queue + eventfd 返回 event loop 的控制请求。</p>
-        </div>
-        <div class="dispatch-contract" aria-label="连接调度契约">
-          <div class="contract-item"><b>01</b><span><strong>顺序保存在 connection 内</strong><br>事件先进入逐连接 FIFO，再参与线程池调度</span></div>
-          <div class="contract-item"><b>02</b><span><strong>connection 不绑定 worker</strong><br>每次由当时可用的空闲线程领取并执行</span></div>
-          <div class="contract-item"><b>03</b><span><strong>一次领取，持续排空</strong><br>执行期间 scheduled 保持 true，禁止重复投递</span></div>
-        </div>
-        <div class="diagram">
-          <svg class="links" viewBox="0 0 1380 600" preserveAspectRatio="none" aria-hidden="true">
-            <defs>
-              <marker id="arrow-cyan" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 Z" fill="#54e1d1"/></marker>
-              <marker id="arrow-violet" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 Z" fill="#ae8cff"/></marker>
-              <linearGradient id="fadeLine"><stop stop-color="#54e1d1"/><stop offset="1" stop-color="#65a7ff"/></linearGradient>
-            </defs>
-            <path d="M265 245 C370 245 375 170 485 170" fill="none" stroke="url(#fadeLine)" stroke-width="2" marker-end="url(#arrow-cyan)"/>
-            <path d="M840 190 C950 190 955 235 1075 235" fill="none" stroke="#ae8cff" stroke-width="2" marker-end="url(#arrow-violet)"/>
-            <path d="M1075 365 C950 365 960 445 820 445" fill="none" stroke="#ffbf69" stroke-width="1.5" stroke-dasharray="7 7" marker-end="url(#arrow-cyan)"/>
-            <circle cx="370" cy="220" r="4" fill="#54e1d1" class="pulse"/>
-            <circle cx="955" cy="215" r="4" fill="#ae8cff" class="pulse"/>
-          </svg>
-
-          <div class="lane">
-            <div class="lane-label">01 / I/O ownership</div>
-            <article class="node primary">
-              <div class="node-title">epoll event loop <span class="chip">ONE THREAD</span></div>
-              <p>唯一的内核 I/O 编排者，所有连接共享。</p>
-              <ul>
-                <li>epoll_wait · EPOLLET</li>
-                <li>accept4 until EAGAIN</li>
-                <li>epoll_ctl ADD / MOD / DEL</li>
-                <li>close(fd) · lifecycle owner</li>
-              </ul>
-            </article>
-            <article class="node">
-              <div class="node-title">data.ptr dispatch</div>
-              <p><code>NULL</code> → listener；<code>&amp;wake_tag</code> → command；其他值 → connection。</p>
-            </article>
-          </div>
-
-          <div class="lane">
-            <div class="lane-label">02 / Per-fd serialization</div>
-            <div class="fd-stack">
-              <article class="node fd primary">
-                <div class="fd-top"><span class="fd-id">connection · fd 42</span><span class="fd-state">scheduled = true</span></div>
-                <div class="queue"><span class="queue-label">events</span><span class="event read">IN</span><span class="event write">OUT</span><span class="event error">RDHUP</span></div>
-                <div class="queue"><span class="queue-label">sends</span><span class="event">0..4K</span><span class="event">4K..8K</span></div>
-                <div class="mutex">event queue · send queue · state</div>
-              </article>
-              <article class="node fd">
-                <div class="fd-top"><span class="fd-id">connection · fd 57</span><span class="fd-state">scheduled = false</span></div>
-                <div class="queue"><span class="queue-label">events</span><span class="event">EMPTY</span></div>
-                <div class="mutex">independent ordering domain</div>
-              </article>
-              <article class="node fd">
-                <div class="fd-top"><span class="fd-id">connection · fd 81</span><span class="fd-state">scheduled = true</span></div>
-                <div class="queue"><span class="queue-label">events</span><span class="event read">IN</span></div>
-                <div class="mutex">parallel with fd 42</div>
-              </article>
-            </div>
-          </div>
-
-          <div class="lane">
-            <div class="lane-label">03 / Logical execution</div>
-            <article class="node pool">
-              <div class="node-title">thread pool <span class="chip" style="color:var(--violet)">M WORKERS</span></div>
-              <p>ready queue 保存 connection，而不是裸事件；pthread_cond_t 唤醒任意一个空闲 worker。</p>
-              <ul>
-                <li>mutex + pthread_cond_t</li>
-                <li>本轮：空闲 worker #2 → fd 42</li>
-                <li>下轮：可能 worker #0 → fd 42</li>
-                <li>no affinity · no fixed binding</li>
-                <li>at most 1 worker / connection</li>
-              </ul>
-            </article>
-            <article class="node">
-              <div class="node-title">command return path <span class="chip" style="color:var(--amber)">eventfd</span></div>
-              <p><code>COMMAND_REFRESH</code> 调整 EPOLLOUT；<code>COMMAND_CLOSE</code> 统一关闭。</p>
-            </article>
-          </div>
-        </div>
-      </section>
-
-      <section class="flow-section" aria-labelledby="flows-title">
-        <div class="section-head">
-          <div><div class="eyebrow" style="margin-bottom:12px">Execution paths</div><h2 id="flows-title">关键流程</h2></div>
-          <p>选择一个路径查看从内核事件到业务执行，再回到 event loop 的完整闭环。</p>
-        </div>
-        <div class="tabs" role="tablist" aria-label="关键流程">
-          <button class="tab" role="tab" aria-selected="true" aria-controls="flow-read" id="tab-read">读取与调度</button>
-          <button class="tab" role="tab" aria-selected="false" aria-controls="flow-write" id="tab-write">写背压</button>
-          <button class="tab" role="tab" aria-selected="false" aria-controls="flow-close" id="tab-close">关闭与回收</button>
-        </div>
-        <div class="panel flow-card">
-          <div class="flow active" id="flow-read" role="tabpanel" aria-labelledby="tab-read">
-            <article class="step"><span class="step-no">STEP 01</span><h3>epoll 返回事件</h3><p>通过 <code>data.ptr</code> 直接取得 connection，无需 fd → 对象查表。</p><code>EPOLLIN | EPOLLET</code></article>
-            <article class="step"><span class="step-no">STEP 02</span><h3>连接队列去重</h3><p>持连接锁扫描尚未执行的队列；已有 IN 时合并新 IN。</p><code>enqueue_event(conn, events)</code></article>
-            <article class="step"><span class="step-no">STEP 03</span><h3>投递 connection</h3><p>若原先未调度，锁内先设 scheduled，再把整个 connection 放入 ready queue，而非逐事件投递。</p><code>false → true · pool_submit(conn)</code></article>
-            <article class="step"><span class="step-no">STEP 04</span><h3>空闲 worker 领取</h3><p>任意空闲 worker 领取后，独占执行该 connection 的 FIFO，直到所有已排队事件处理完。</p><code>worker N · no thread affinity</code></article>
-            <article class="step"><span class="step-no">STEP 05</span><h3>原子退出</h3><p>持锁确认队列为空才清除 scheduled。之后的新事件可再次投递，并可能由另一个 worker 执行。</p><code>empty · true → false</code></article>
-          </div>
-          <div class="flow" id="flow-write" role="tabpanel" aria-labelledby="tab-write" hidden>
-            <article class="step"><span class="step-no">STEP 01</span><h3>空队列直接发送</h3><p>send queue 为空且没有 flush 时，持 connection 锁先调用 send，完整写入则立即返回。</p><code>empty → send(MSG_NOSIGNAL)</code></article>
-            <article class="step"><span class="step-no">STEP 02</span><h3>必要时才入队</h3><p>已有排队数据、flush 正在执行、部分写入或 EAGAIN 时，才把剩余数据追加到队尾。</p><code>partial / EAGAIN → enqueue</code></article>
-            <article class="step"><span class="step-no">STEP 03</span><h3>开启写关注</h3><p>首次产生排队数据时发送 REFRESH command，由 event loop 加入 EPOLLOUT。</p><code>COMMAND_REFRESH → EPOLLOUT</code></article>
-            <article class="step"><span class="step-no">STEP 04</span><h3>摘取批次再发送</h3><p>锁内摘空共享队列，锁外使用 write 或可配置 writev；已完成 item 进入本地清理链表。</p><code>detach → write[v] → completed</code></article>
-            <article class="step"><span class="step-no">STEP 05</span><h3>锁内确认排空</h3><p>再次持锁接管并发新数据；确认队列为空后先保持空队列并清除 flushing，再解锁并移除 EPOLLOUT。</p><code>empty → flushing=false → unlock</code></article>
-          </div>
-          <div class="flow" id="flow-close" role="tabpanel" aria-labelledby="tab-close" hidden>
-            <article class="step"><span class="step-no">STEP 01</span><h3>检测终止条件</h3><p>EOF、ERR、HUP、RDHUP 或业务主动关闭都汇入同一路径。</p><code>alive = false</code></article>
-            <article class="step"><span class="step-no">STEP 02</span><h3>标记 closing</h3><p>持连接锁只允许第一个调用者创建 CLOSE command。</p><code>closing = true</code></article>
-            <article class="step"><span class="step-no">STEP 03</span><h3>引用保护命令</h3><p>command 持有一份 connection 引用，避免跨线程悬空。</p><code>references++</code></article>
-            <article class="step"><span class="step-no">STEP 04</span><h3>event loop 关闭</h3><p>统一执行 DEL、close、on_close，并从连接链表移除。</p><code>epoll_ctl DEL → close</code></article>
-            <article class="step"><span class="step-no">STEP 05</span><h3>最终回收</h3><p>event loop、worker、command 各自释放所有权；引用归零后释放对象。</p><code>references → 0 → free</code></article>
-          </div>
-        </div>
-      </section>
-
-      <section class="balance-section" aria-labelledby="balance-title">
-        <div class="section-head">
-          <div><div class="eyebrow" style="margin-bottom:12px">Why no affinity?</div><h2 id="balance-title">让任务追随空闲算力，而不是固守连接归属</h2></div>
-          <p>无连接亲和性不是偶然结果，而是为了解决“连接分配完成后，实际负载仍持续变化”的动态不均衡。</p>
-        </div>
-        <div class="balance-grid">
-          <article class="panel model fixed">
-            <div class="model-kicker">Fixed ownership · classic multi-worker</div>
-            <h3>fd 长期归属某个 worker</h3>
-            <p>类似经典 Nginx 多 worker 进程模型：每个 worker 有自己的事件循环和连接集合。即使接入阶段尽量均分，后续负载仍可能倾斜。</p>
-            <div class="worker-map" aria-label="固定归属下的不均衡负载示意">
-              <div class="worker-row"><strong>worker #0</strong><span class="load-track"><span class="load" style="width:94%"></span></span><span>94%</span></div>
-              <div class="worker-row"><strong>worker #1</strong><span class="load-track"><span class="load" style="width:31%"></span></span><span>31%</span></div>
-              <div class="worker-row"><strong>worker #2</strong><span class="load-track"><span class="load" style="width:67%"></span></span><span>67%</span></div>
-            </div>
-            <div class="why-list">
-              <div>连接数量均衡，不代表事件频率与业务任务量均衡</div>
-              <div>少数热点或重任务连接可能集中在同一 worker</div>
-              <div>繁忙 worker 排队时，其他 worker 仍可能空闲</div>
-            </div>
-          </article>
-
-          <div class="versus">VS</div>
-
-          <article class="panel model dynamic">
-            <div class="model-kicker">Dynamic dispatch · this architecture</div>
-            <h3>connection 每轮由空闲 worker 领取</h3>
-            <p>所有可执行 connection 进入共享 ready queue。线程池把下一份连接任务交给当时空闲的 worker，调度依据是实时可用算力，而不是历史 fd 归属。</p>
-            <div class="worker-map" aria-label="动态调度下的均衡负载示意">
-              <div class="worker-row"><strong>worker #0</strong><span class="load-track"><span class="load" style="width:72%"></span></span><span>72%</span></div>
-              <div class="worker-row"><strong>worker #1</strong><span class="load-track"><span class="load" style="width:68%"></span></span><span>68%</span></div>
-              <div class="worker-row"><strong>worker #2</strong><span class="load-track"><span class="load" style="width:71%"></span></span><span>71%</span></div>
-            </div>
-            <div class="why-list">
-              <div>connection 是可迁移的调度单位，不固定绑定线程</div>
-              <div>空闲 worker 主动消费 ready queue，吸收任务量波动</div>
-              <div>每轮仍由单 worker 排空 FIFO，动态均衡不破坏顺序</div>
-            </div>
-          </article>
-        </div>
-        <div class="balance-result"><strong>平衡的对象是“待执行任务量”，而不只是 fd 数量。</strong><span>动态 worker 选择提升线程池利用率；connection 自身队列继续承担顺序与并发隔离。</span></div>
-        <p class="source-note">背景参考：Nginx 官方资料说明其采用多个 worker 进程，每个 worker 具有事件处理能力和连接容量；具体接入分配还会受到 accept_mutex、EPOLLEXCLUSIVE 或 reuseport 等机制影响。参见 <a href="https://nginx.org/en/docs/dev/development_guide.html">Development guide</a> 与 <a href="https://nginx.org/en/docs/ngx_core_module.html">Core functionality</a>。</p>
-      </section>
-
-      <section class="invariants" aria-labelledby="rules-title">
-        <div class="section-head"><h2 id="rules-title">并发设计的三条边界</h2><p>这三条规则共同把“一个全局 I/O 循环”和“多个业务执行线程”组合成可推理的系统。</p></div>
-        <div class="rule-grid">
-          <article class="panel rule"><span class="rule-no">RULE / 01</span><h3>fd 控制权属于 event loop</h3><p>worker 不直接修改 epoll 注册或最终 close；它只通过 command queue 表达意图，减少 fd 重用与生命周期竞争。</p><div class="state-strip"><span>epoll_ctl</span><span>accept</span><span>close</span></div></article>
-          <article class="panel rule"><span class="rule-no">RULE / 02</span><h3>顺序属于 connection</h3><p>事件先进入逐 connection FIFO；scheduled 为 true 的整个期间不会再次投递。领取它的 worker 连续排空队列，因此同一连接不会有两个线程并发执行，也不会乱序。</p><div class="state-strip"><span>mutex</span><span>FIFO</span><span>scheduled</span><span>single executor</span></div></article>
-          <article class="panel rule"><span class="rule-no">RULE / 03</span><h3>线程没有连接亲和性</h3><p>connection 不固定绑定某个 worker，用共享 ready queue 避免 fd 数量或任务量分布不均造成的 worker 负载倾斜。本轮可能由 worker #2 执行，下轮可能由 worker #0 执行；顺序保证来自连接队列与状态锁，而非线程绑定。</p><div class="state-strip"><span>ready queue</span><span>any idle worker</span><span>dynamic balance</span><span>no affinity</span></div></article>
-        </div>
-      </section>
-    </main>
-
-    <footer><span>Source of truth: c/src/epoll_server.c</span><span class="mono">EPOLL · ET · eventfd · pthread</span></footer>
+<main>
+<header>
+  <h1>fib architecture</h1>
+  <p>fib (Fast In Balance) is edge-triggered event loops with a pool of goroutines: the loops only wait for events and schedule the connections those make runnable onto logical workers, and every round of a connection, its reads, callbacks and writes, runs on a worker. This page describes the Go implementation as a whole, from the source at <code>main</code> (8a388d4). The step-by-step flow of each protocol is in <a href="flows.html">Protocol flows</a>.</p>
+  <div class="legend">
+    <span class="chip c-loop"><i></i>event loop (root / poller)</span>
+    <span class="chip c-work"><i></i>‹Name›-workers, the engine pool</span>
+    <span class="chip c-hs"><i></i>fib-tls-handshake pool</span>
+    <span class="chip c-str"><i></i>‹Name›-streams pool</span>
+    <span class="chip c-tmr"><i></i>timer goroutine</span>
+    <span class="chip c-usr"><i></i>the application's own goroutine</span>
   </div>
-  <script>
-    const translations = new Map([
-      ['一个 I/O 核心，', 'One I/O core,'], ['逐连接串行。', 'ordered per connection.'],
-      ['单个 epoll event loop 管理所有 fd 和 I/O 关注；每个 connection 用自己的 FIFO 保存事件顺序；线程池动态选择空闲 worker，一次排空该 connection 的全部事件。', 'One epoll event loop manages every fd and I/O interest. Each connection preserves event order in its own FIFO, while the pool dynamically selects an idle worker to drain that connection.'],
-      ['核心不变量', 'Core invariant'], ['调度单位是', 'The scheduling unit is the'], ['，不是单个事件。connection 与 worker 没有固定绑定；但同一时刻，一个 connection 最多只有一个 worker 执行。', ', not an individual event. Connections are not permanently bound to workers, but each connection has at most one executor at any instant.'],
-      ['系统关系图', 'System relationship'], ['实线代表事件/任务前向流动，虚线代表 worker 经 command queue + eventfd 返回 event loop 的控制请求。', 'Solid lines show events and tasks moving forward; the dashed line shows control requests returning to the event loop through the command queue and eventfd.'],
-      ['连接调度契约', 'Connection scheduling contract'],
-      ['顺序保存在 connection 内', 'Order lives inside the connection'], ['事件先进入逐连接 FIFO，再参与线程池调度', 'Events enter the per-connection FIFO before pool scheduling'],
-      ['connection 不绑定 worker', 'Connections are not bound to workers'], ['每次由当时可用的空闲线程领取并执行', 'Each round is claimed by whichever worker is idle'],
-      ['一次领取，持续排空', 'One claim, drain to empty'], ['执行期间 scheduled 保持 true，禁止重复投递', 'scheduled stays true during execution, preventing duplicate submission'],
-      ['唯一的内核 I/O 编排者，所有连接共享。', 'The sole kernel I/O coordinator, shared by every connection.'],
-      ['；', '; '], ['其他值 → connection。', 'any other value → connection.'], ['→ listener；', '→ listener;'], ['→ command；其他值 → connection。', '→ command; any other value → connection.'],
-      ['本轮：空闲 worker #2 → fd 42', 'this round: idle worker #2 → fd 42'], ['下轮：可能 worker #0 → fd 42', 'next round: possibly worker #0 → fd 42'],
-      ['ready queue 保存 connection，而不是裸事件；pthread_cond_t 唤醒任意一个空闲 worker。', 'The ready queue stores connections, not raw events; pthread_cond_t wakes any idle worker.'],
-      ['调整 EPOLLOUT；', ' adjusts EPOLLOUT; '], ['统一关闭。', ' performs serialized closure.'],
-      ['关键流程', 'Critical flows'], ['选择一个路径查看从内核事件到业务执行，再回到 event loop 的完整闭环。', 'Select a path to follow the complete loop from kernel event to logical execution and back to the event loop.'],
-      ['固定归属下的不均衡负载示意', 'Uneven load under fixed ownership'], ['动态调度下的均衡负载示意', 'Balanced load under dynamic dispatch'],
-      ['读取与调度', 'Read & schedule'], ['写背压', 'Write backpressure'], ['关闭与回收', 'Close & reclaim'],
-      ['epoll 返回事件', 'epoll returns an event'], ['通过', 'Use'], ['直接取得 connection，无需 fd → 对象查表。', 'to obtain the connection directly—no fd-to-object lookup.'],
-      ['连接队列去重', 'Coalesce queued reads'], ['持连接锁扫描尚未执行的队列；已有 IN 时合并新 IN。', 'Under the connection lock, scan unexecuted events and coalesce a new IN if one is already queued.'],
-      ['投递 connection', 'Submit the connection'], ['若原先未调度，锁内先设 scheduled，再把整个 connection 放入 ready queue，而非逐事件投递。', 'If idle, set scheduled under the lock and submit the entire connection to the ready queue—not each event separately.'],
-      ['空闲 worker 领取', 'An idle worker claims it'], ['任意空闲 worker 领取后，独占执行该 connection 的 FIFO，直到所有已排队事件处理完。', 'Any idle worker may claim it, then exclusively drains that connection FIFO until all queued events finish.'],
-      ['原子退出', 'Atomic exit'], ['持锁确认队列为空才清除 scheduled。之后的新事件可再次投递，并可能由另一个 worker 执行。', 'Clear scheduled only after confirming an empty queue under the lock. A later event resubmits the connection and may run on another worker.'],
-      ['空队列直接发送', 'Send immediately on an empty queue'], ['send queue 为空且没有 flush 时，持 connection 锁先调用 send，完整写入则立即返回。', 'When the send queue is empty and no flush is active, call send under the connection lock and return immediately if it completes.'],
-      ['必要时才入队', 'Queue only when needed'], ['已有排队数据、flush 正在执行、部分写入或 EAGAIN 时，才把剩余数据追加到队尾。', 'Append the remainder only when data is already queued, a flush is active, or send is partial or returns EAGAIN.'],
-      ['开启写关注', 'Enable write interest'], ['首次产生排队数据时发送 REFRESH command，由 event loop 加入 EPOLLOUT。', 'When queued data first appears, send a REFRESH command so the event loop adds EPOLLOUT.'],
-      ['摘取批次再发送', 'Detach a batch, then write'], ['锁内摘空共享队列，锁外使用 write 或可配置 writev；已完成 item 进入本地清理链表。', 'Detach and clear the shared queue under the lock, then use write or configurable writev outside it; completed items move to a local cleanup list.'],
-      ['锁内确认排空', 'Confirm empty under the lock'], ['再次持锁接管并发新数据；确认队列为空后先保持空队列并清除 flushing，再解锁并移除 EPOLLOUT。', 'Re-lock to claim concurrently queued data. Once empty, keep the queue empty and clear flushing before unlocking and removing EPOLLOUT.'],
-      ['检测终止条件', 'Detect termination'], ['EOF、ERR、HUP、RDHUP 或业务主动关闭都汇入同一路径。', 'EOF, ERR, HUP, RDHUP, and application closure converge on one path.'],
-      ['标记 closing', 'Mark closing'], ['持连接锁只允许第一个调用者创建 CLOSE command。', 'The connection lock allows only the first caller to create a CLOSE command.'],
-      ['引用保护命令', 'Retain for the command'], ['command 持有一份 connection 引用，避免跨线程悬空。', 'The command holds a connection reference to prevent a cross-thread dangling pointer.'],
-      ['event loop 关闭', 'Event loop closes'], ['统一执行 DEL、close、on_close，并从连接链表移除。', 'Perform DEL, close, on_close, and unlinking in one place.'],
-      ['最终回收', 'Final reclamation'], ['event loop、worker、command 各自释放所有权；引用归零后释放对象。', 'The event loop, worker, and command release ownership; the object is freed at zero references.'],
-      ['让任务追随空闲算力，而不是固守连接归属', 'Let work follow idle capacity—not fixed connection ownership'], ['无连接亲和性不是偶然结果，而是为了解决“连接分配完成后，实际负载仍持续变化”的动态不均衡。', 'No connection affinity is intentional: it addresses dynamic imbalance after the initial connection distribution, as real workloads keep changing.'],
-      ['fd 长期归属某个 worker', 'An fd stays with one worker'], ['类似经典 Nginx 多 worker 进程模型：每个 worker 有自己的事件循环和连接集合。即使接入阶段尽量均分，后续负载仍可能倾斜。', 'As in a classic Nginx-style multi-worker process model, each worker owns an event loop and connection set. Even if accepts are initially balanced, later workload may skew.'],
-      ['连接数量均衡，不代表事件频率与业务任务量均衡', 'Equal connection counts do not imply equal event rates or task volume'], ['少数热点或重任务连接可能集中在同一 worker', 'A few hot or expensive connections may cluster on one worker'], ['繁忙 worker 排队时，其他 worker 仍可能空闲', 'One worker may queue work while another remains idle'],
-      ['connection 每轮由空闲 worker 领取', 'An idle worker claims each connection round'], ['所有可执行 connection 进入共享 ready queue。线程池把下一份连接任务交给当时空闲的 worker，调度依据是实时可用算力，而不是历史 fd 归属。', 'Runnable connections enter one shared ready queue. The pool gives the next connection to a currently idle worker, using real-time capacity rather than historical fd ownership.'],
-      ['connection 是可迁移的调度单位，不固定绑定线程', 'The connection is a movable scheduling unit with no fixed thread binding'], ['空闲 worker 主动消费 ready queue，吸收任务量波动', 'Idle workers consume the ready queue and absorb workload variation'], ['每轮仍由单 worker 排空 FIFO，动态均衡不破坏顺序', 'One worker still drains each FIFO, so dynamic balancing preserves order'],
-      ['平衡的对象是“待执行任务量”，而不只是 fd 数量。', 'Balance pending work—not merely fd counts.'], ['动态 worker 选择提升线程池利用率；connection 自身队列继续承担顺序与并发隔离。', 'Dynamic worker selection improves utilization; the connection queue continues to provide ordering and concurrency isolation.'],
-      ['背景参考：Nginx 官方资料说明其采用多个 worker 进程，每个 worker 具有事件处理能力和连接容量；具体接入分配还会受到 accept_mutex、EPOLLEXCLUSIVE 或 reuseport 等机制影响。参见', 'Background: official Nginx material describes multiple worker processes, each with event processing and connection capacity. Accept distribution also depends on mechanisms such as accept_mutex, EPOLLEXCLUSIVE, or reuseport. See'], ['与', 'and'], ['。', '.'],
-      ['并发设计的三条边界', 'Three concurrency boundaries'], ['这三条规则共同把“一个全局 I/O 循环”和“多个业务执行线程”组合成可推理的系统。', 'Together, these rules make one global I/O loop and multiple logical workers a system that remains easy to reason about.'],
-      ['fd 控制权属于 event loop', 'fd control belongs to the event loop'], ['worker 不直接修改 epoll 注册或最终 close；它只通过 command queue 表达意图，减少 fd 重用与生命周期竞争。', 'Workers never directly change epoll registration or perform the final close. They express intent through the command queue, reducing fd-reuse and lifetime races.'],
-      ['顺序属于 connection', 'Order belongs to the connection'], ['事件先进入逐 connection FIFO；scheduled 为 true 的整个期间不会再次投递。领取它的 worker 连续排空队列，因此同一连接不会有两个线程并发执行，也不会乱序。', 'Events enter a per-connection FIFO. While scheduled is true, the connection is not submitted again. Its worker drains the queue, so two threads never execute one connection concurrently or out of order.'],
-      ['线程没有连接亲和性', 'Workers have no connection affinity'], ['connection 不固定绑定某个 worker，用共享 ready queue 避免 fd 数量或任务量分布不均造成的 worker 负载倾斜。本轮可能由 worker #2 执行，下轮可能由 worker #0 执行；顺序保证来自连接队列与状态锁，而非线程绑定。', 'A connection is not fixed to one worker. The shared ready queue reduces worker skew caused by uneven fd counts or task volume. Worker #2 may run this round and worker #0 the next; ordering comes from the connection queue and state lock, not thread affinity.']
-    ]);
-    const localizedNodes = [];
-    const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
-    while (walker.nextNode()) {
-      const node = walker.currentNode;
-      const key = node.nodeValue.trim();
-      if (translations.has(key)) localizedNodes.push({ node, zh: key, en: translations.get(key) });
-    }
-    const localizedAttributes = [...document.querySelectorAll('[aria-label]')].map(node => ({ node, zh: node.getAttribute('aria-label') })).filter(item => translations.has(item.zh));
-    function setLanguage(language) {
-      const english = language === 'en';
-      document.documentElement.lang = english ? 'en' : 'zh-CN';
-      document.title = english ? 'Single-loop epoll · Architecture' : '单 Event Loop epoll · 架构';
-      localizedNodes.forEach(item => {
-        const leading = item.node.nodeValue.match(/^\s*/)[0];
-        const trailing = item.node.nodeValue.match(/\s*$/)[0];
-        item.node.nodeValue = leading + (english ? item.en : item.zh) + trailing;
-      });
-      localizedAttributes.forEach(item => item.node.setAttribute('aria-label', english ? translations.get(item.zh) : item.zh));
-      document.querySelectorAll('[data-language]').forEach(button => button.setAttribute('aria-pressed', String(button.dataset.language === language)));
-    }
-    document.querySelectorAll('[data-language]').forEach(button => button.addEventListener('click', () => setLanguage(button.dataset.language)));
-    const pageParameters = new URLSearchParams(location.search);
-    if (pageParameters.get('capture') === '1') document.body.classList.add('capture');
-    setLanguage(pageParameters.get('lang') === 'zh-CN' ? 'zh-CN' : 'en');
-    if (document.documentElement.lang === 'zh-CN' && document.body.classList.contains('capture')) {
-      document.head.appendChild(Object.assign(document.createElement('style'), { textContent: '.capture #flow-read::before{content:"读取与调度"}.capture #flow-write::before{content:"写背压"}.capture #flow-close::before{content:"关闭与回收"}' }));
-    }
+</header>
 
-    const tabs = [...document.querySelectorAll('[role="tab"]')];
-    const panels = [...document.querySelectorAll('[role="tabpanel"]')];
-    function selectTab(tab) {
-      tabs.forEach(item => item.setAttribute('aria-selected', String(item === tab)));
-      panels.forEach(panel => {
-        const active = panel.id === tab.getAttribute('aria-controls');
-        panel.hidden = !active;
-        panel.classList.toggle('active', active);
-      });
-    }
-    tabs.forEach((tab, index) => {
-      tab.addEventListener('click', () => selectTab(tab));
-      tab.addEventListener('keydown', event => {
-        if (event.key !== 'ArrowLeft' && event.key !== 'ArrowRight') return;
-        event.preventDefault();
-        const offset = event.key === 'ArrowRight' ? 1 : -1;
-        const next = tabs[(index + offset + tabs.length) % tabs.length];
-        next.focus();
-        selectTab(next);
-      });
-    });
-  </script>
+<section id="rules">
+  <h2>Three invariants</h2>
+  <p class="lede">The whole concurrency model is reasoned about from these three rules. The rest of the design follows from them.</p>
+  <div class="rules">
+    <div class="rule"><b>Descriptors belong to the event loop</b><p>Only a loop calls <code>epoll_ctl</code>, accepts, and finally closes a descriptor. A worker that wants reads paused, a connection closed or a descriptor released says so through the command queue and an eventfd, and a loop that is already awake needs no wake-up.</p></div>
+    <div class="rule"><b>Order belongs to the connection</b><p>The unit of scheduling is the connection, not the event. The loop folds readiness into the connection's <code>pendingEvents</code> and does not submit it again while <code>scheduled</code> is set. A connection has at most one worker at a time, so OnData never runs twice at once or out of order, and OnClose always follows the OnData before it.</p></div>
+    <div class="rule"><b>Connections are bound to no thread</b><p>Each round is taken by whichever worker is idle, and the next round may be another goroutine's. What is balanced is the work waiting to run, not the number of connections.</p></div>
+  </div>
+</section>
+
+<section id="parts">
+  <h2>The parts</h2>
+  <p class="lede">An Engine owns the listeners, the event loop, its command queue and the worker pool. With <code>IOPollers</code>, the default, it also owns pollers: each is an Engine without listeners, with a loop, command queue and descriptor table of its own, sharing its parent's settings, handler, worker pool and server-wide budget.</p>
+  <div class="diagram"><pre class="mermaid">
+flowchart LR
+  subgraph ENG["Engine (fib.Bind / fib.NewEngine)"]
+    ROOT["root loop&lt;br/&gt;accept · UDP reads · commands"]
+    P0["poller 0&lt;br/&gt;waits · registers · closes fds"]
+    P1["poller N-1"]
+    CMD["command queue + eventfd&lt;br/&gt;refresh · close · detach · accept · dial"]
+    BUD["server-wide budget pendingTotal&lt;br/&gt;MaxPendingBytes"]
+  end
+  subgraph POOLS["goroutine pools"]
+    WK["‹Name›-workers&lt;br/&gt;every round of a connection"]
+    STR["‹Name›-streams&lt;br/&gt;HTTP/2 and HTTP/3 handlers"]
+    HS["fib-tls-handshake&lt;br/&gt;crypto/tls handshakes"]
+  end
+  BP["bufferpool&lt;br/&gt;power-of-two classes, one per process"]
+  TM["time.AfterFunc&lt;br/&gt;deadlines · UDP sweep · QUIC"]
+  ROOT -- "fd % N" --> P0
+  ROOT --> P1
+  P0 -- "GoTasks, one batch" --> WK
+  P1 --> WK
+  ROOT -- "UDP peer runnable" --> WK
+  WK -- "commands" --> CMD --> P0
+  WK -- "requests of multiplexed protocols" --> STR
+  P0 -- "OnOpen submits the handshake" --> HS
+  TM --> CMD
+  WK -.-> BP
+  STR -.-> BP
+  classDef loop fill:#e8effc,stroke:#2458c6,color:#16202c
+  classDef work fill:#e3f4f1,stroke:#0c7d72,color:#16202c
+  classDef hs fill:#fbf0de,stroke:#a86a12,color:#16202c
+  classDef str fill:#efe9fb,stroke:#6b45c8,color:#16202c
+  classDef tmr fill:#eceff3,stroke:#5f6b7a,color:#16202c
+  classDef usr fill:#fae6ed,stroke:#b23a62,color:#16202c
+  class ROOT,P0,P1,CMD,BUD loop
+  class WK work
+  class STR str
+  class HS hs
+  class TM,BP tmr
+  </pre></div>
+  <div class="tbl"><table>
+    <thead><tr><th>Part</th><th>How many, how large</th><th>What it does</th></tr></thead>
+    <tbody>
+      <tr><td>Root loop</td><td>One per Engine, the goroutine in <code>Run</code></td><td>Accepts; reads the shared UDP socket and sorts datagrams by peer; runs its own command queue</td></tr>
+      <tr><td>Poller</td><td>NumCPU÷4 rounded down, at least 1; <code>IOPollerCount</code> overrides; ignored on Windows</td><td>For the connections handed to it: waiting for events, pausing and resuming reads, registering and closing descriptors, OnOpen</td></tr>
+      <tr><td>‹Name›-workers</td><td>Adaptive; ceiling max(GOMAXPROCS×1000, NumCPU×20); shared by engines of one Name by default</td><td>Every round of every connection: reads, the OnData chain, coalesced writes, OnClose</td></tr>
+      <tr><td>‹Name›-streams</td><td>Adaptive; ceiling twice the widest engine pool of that Name, floor 0</td><td>HTTP/2 and HTTP/3 request handlers; HTTP/1's asynchronous handovers</td></tr>
+      <tr><td>fib-tls-handshake</td><td>Adaptive; ceiling 65536, one per process</td><td>Blocking TLS handshakes</td></tr>
+    </tbody>
+  </table></div>
+  <ul class="notes">
+    <li>A worker count is a ceiling, not a population. An adaptive pool grows when a task finds every worker busy, and at intervals retires half of the workers that sat idle throughout. A high ceiling costs nothing; a low one throttles bursts.</li>
+    <li>A worker makes its connection's read and write system calls itself and spends much of a round in the kernel rather than on a P, so the pool is oversubscribed relative to the cores. GOMAXPROCS is best left at the runtime's default, the cores.</li>
+    <li>The three pools are separate. An engine worker may wait on the stream pool's or the handshake pool's queue, never the reverse, so workers cannot all end up stuck in a submission.</li>
+  </ul>
+  <p class="ref">engine.go Engine · :284 openPollers · config.go DefaultPoolSizing · pollerCount · shared_taskpool.go · streampool · sidepool · taskpool/adaptive.go</p>
+</section>
+
+<section id="layers">
+  <h2>Handler layers</h2>
+  <p class="lede">Protocols stack by wrapping a <code>fib.Handler</code>. Input climbs the OnData chain; output goes through <code>Connection.Send</code>, and through the connection's <code>Layer</code> first when it has one. The handler on top always sees an ordinary connection.</p>
+  <div class="diagram"><pre class="mermaid">
+flowchart TD
+  SOCK[("socket")]
+  CONN["fib.Connection&lt;br/&gt;readLoop · send queue · cork · watermarks"]
+  TLS["tls.Handler + layer&lt;br/&gt;decrypt → plaintext OnData; Send → encrypt → SendRaw"]
+  HTTP["http.ServerHandler&lt;br/&gt;HTTP/1 parsing · HTTP/2 framing · h2c upgrade"]
+  WS["websocket.ServerHandler&lt;br/&gt;opening handshake · frames"]
+  APP1["http.Handler&lt;br/&gt;ServeHTTP(Context, Request)"]
+  APP2["websocket.Handler&lt;br/&gt;OnOpen / OnMessage / OnClose"]
+  TUN["http.Tunnel&lt;br/&gt;ws.Upgrade: 101 or extended CONNECT"]
+  H3["http3.ServerHandler&lt;br/&gt;QUIC · QPACK, on a UDP engine"]
+  SOCK --> CONN
+  CONN --> TLS
+  CONN -- "cleartext" --> HTTP
+  CONN -- "cleartext" --> WS
+  TLS --> HTTP
+  TLS --> WS
+  HTTP --> APP1
+  WS --> APP2
+  APP1 -- "Upgrade" --> TUN --> APP2
+  CONN -- "UDP datagrams" --> H3 --> APP1
+  classDef loop fill:#e8effc,stroke:#2458c6,color:#16202c
+  classDef work fill:#e3f4f1,stroke:#0c7d72,color:#16202c
+  classDef hs fill:#fbf0de,stroke:#a86a12,color:#16202c
+  classDef str fill:#efe9fb,stroke:#6b45c8,color:#16202c
+  classDef tmr fill:#eceff3,stroke:#5f6b7a,color:#16202c
+  classDef usr fill:#fae6ed,stroke:#b23a62,color:#16202c
+  class CONN,SOCK loop
+  class TLS hs
+  class HTTP,WS,H3,TUN work
+  class APP1,APP2 usr
+  </pre></div>
+  <ul class="notes">
+    <li>A <code>fib.Handler</code> has four callbacks: <code>OnOpen</code>, <code>OnData</code>, <code>OnPriorityData</code> and <code>OnClose</code>. OnOpen runs on the event loop, the others on workers.</li>
+    <li>One <code>http.Handler</code> can serve HTTP/1 and HTTP/2 (a TCP engine) and HTTP/3 (a UDP engine), answering through the same <code>Context</code>.</li>
+    <li>WebSocket attaches in two ways: <code>websocket.ServerHandler</code> as a <code>fib.Handler</code> itself, or <code>Upgrade</code> called from an HTTP handler, which switches the whole connection on HTTP/1.1 and one stream on HTTP/2 and HTTP/3.</li>
+    <li>The HTTP middleware (compress, cors, csrf, etag, limiter, logger, pprof, recover, requestid, responsetime) wraps an <code>http.Handler</code> and knows nothing of the transport.</li>
+  </ul>
+  <p class="ref">handler.go · layer.go · tls/tls.go · http/handler.go · http/tunnel.go · websocket/handler.go · websocket/upgrade.go · http3/server.go</p>
+</section>
+
+<section id="read">
+  <h2>Reading and scheduling</h2>
+  <p class="lede">From a kernel event to the application's callback and back to a connection that can be scheduled again. A loop submits one batch of connections per round, rather than one lock-and-wake cycle per connection.</p>
+  <div class="diagram"><pre class="mermaid">
+flowchart LR
+  A["epoll_wait returns&lt;br/&gt;ET, 1024 events at most"] --> B["token → connection&lt;br/&gt;paged fd table + generation check"]
+  B --> C["noteEvent&lt;br/&gt;fold into pendingEvents&lt;br/&gt;ready only if not scheduled"]
+  C --> D["runReady&lt;br/&gt;GoTasks, the whole batch&lt;br/&gt;runtime.Gosched gives up the P"]
+  D --> E["worker: process&lt;br/&gt;flush, then read until empty&lt;br/&gt;OnData; one write at the end"]
+  E --> F["under the lock, no new events:&lt;br/&gt;scheduled = false"]
+  F -. "later events submit it again, perhaps to another worker" .-> C
+  classDef loop fill:#e8effc,stroke:#2458c6,color:#16202c
+  classDef work fill:#e3f4f1,stroke:#0c7d72,color:#16202c
+  classDef hs fill:#fbf0de,stroke:#a86a12,color:#16202c
+  classDef str fill:#efe9fb,stroke:#6b45c8,color:#16202c
+  classDef tmr fill:#eceff3,stroke:#5f6b7a,color:#16202c
+  classDef usr fill:#fae6ed,stroke:#b23a62,color:#16202c
+  class A,B,C,D loop
+  class E,F work
+  </pre></div>
+  <ul class="notes">
+    <li><b>Coalescing.</b> Readiness is level information to a connection, so repeated notifications are or-ed together and a hot connection cannot grow an unbounded event queue. A notification that is only EPOLLOUT with nothing queued is dropped, which keeps every new connection from being scheduled a second time.</li>
+    <li><b>Giving up the P.</b> After submitting, the loop calls <code>Gosched</code> so that the workers it just woke run on its P straight away. With 4 Ps serving HTTP/2 echoes over 10k connections that was worth 10% to 25%.</li>
+    <li><b>A loop holds no P while it waits.</b> With IOPollers a loop parks in the Go runtime's network poller instead of blocking in the <code>epoll_wait</code> system call.</li>
+    <li><b>Read buffers are borrowed per round.</b> The 16KB read buffer comes from bufferpool for the round and goes back at its end, so an idle connection holds none. A short read says the socket is empty, and no further read is made only to get EAGAIN.</li>
+    <li><b>UDP is the exception.</b> The loop reads a shared UDP socket itself, in batches, and queues each datagram on its peer's connection; the worker's round only hands the queue to the handler.</li>
+  </ul>
+  <p class="ref">poller_epoll.go:79 runLoop · engine.go:602 noteEvent · :377 runReady · :456 submitReady · connection.go:524 process · :777 readLoop · udp.go:138 deliverDatagram</p>
+</section>
+
+<section id="write">
+  <h2>Writes and backpressure</h2>
+  <p class="lede">What can be written at once is written at once; only the rest is queued. Queued bytes have two bounds, a watermark per connection and a budget for the whole engine, and crossing either pauses reads, leaving TCP flow control to slow the peer.</p>
+  <div class="diagram"><pre class="mermaid">
+flowchart TD
+  S["Send / SendParts / SendOwned&lt;br/&gt;any goroutine"] --> L{"has a Layer"}
+  L -- "yes, TLS" --> ENC["layer.Send encrypts → SendRaw"] --> Q
+  L -- no --> Q{"queue empty, no flush running, not corked"}
+  Q -- yes --> W["non-blocking write"]
+  W --> F{"all written"}
+  F -- yes --> DONE["return: nothing queued, no registration change"]
+  F -- no --> QU
+  Q -- "no; corked in a round" --> QU["queue the rest&lt;br/&gt;pendingBytes and pendingTotal grow together"]
+  QU --> CK["end of round, uncork: flushOutput&lt;br/&gt;writev of up to 64 items / sendfile"]
+  QU --> WM{"high watermark, 64KB&lt;br/&gt;or the 1GiB budget exhausted"}
+  WM -- yes --> RF["commandRefresh → loop&lt;br/&gt;pauseDecision → EPOLL_CTL_MOD drops EPOLLIN"]
+  QU --> EDGE["EPOLLOUT edge → a round → flushOutput"]
+  EDGE --> LOW{"down to the low watermark, 16KB&lt;br/&gt;budget back to a quarter"}
+  LOW -- yes --> RS["commandRefresh → reads resume&lt;br/&gt;re-arming reports bytes already in the socket"]
+  classDef loop fill:#e8effc,stroke:#2458c6,color:#16202c
+  classDef work fill:#e3f4f1,stroke:#0c7d72,color:#16202c
+  classDef hs fill:#fbf0de,stroke:#a86a12,color:#16202c
+  classDef str fill:#efe9fb,stroke:#6b45c8,color:#16202c
+  classDef tmr fill:#eceff3,stroke:#5f6b7a,color:#16202c
+  classDef usr fill:#fae6ed,stroke:#b23a62,color:#16202c
+  class S,ENC,Q,W,F,DONE,QU,CK,WM,EDGE,LOW,L work
+  class RF,RS loop
+  </pre></div>
+  <ul class="notes">
+    <li><b>Write interest is permanent.</b> EPOLLOUT is armed from registration on, so queueing needs no registration change; only a watermark crossing costs an <code>epoll_ctl</code>.</li>
+    <li><b>Cork.</b> A round's replies accumulate in one contiguous buffer and reach the socket in one write when it ends. A handler streaming a response calls <code>Flush</code> to send its first part early, and an application may <code>Cork</code> for itself.</li>
+    <li><b>Hysteresis.</b> Reads pause at the high watermark (64KB by default) and resume at a quarter of it, so that replies do not cross the line back and forth; the budget (1GiB by default) likewise resumes at a quarter. At high connection counts the budget is the bound that holds.</li>
+    <li><b>A connection paused by the budget</b> may have nothing of its own left to flush, and so no event of its own to re-evaluate it. The loop keeps such connections in <code>budgetPaused</code> and resumes them when the budget recovers, and a connection on another poller that drains the budget wakes the loops holding some.</li>
+    <li><b>Read-side backpressure.</b> <code>HoldReads</code> lets an application stop reading while it works through what it has, as a streamed request body does; releasing it redelivers what the socket already held.</li>
+    <li><code>Stats()</code> reports how often each kind of pause happened, how many have been lifted and the total queued now. <code>SendFile</code> uses sendfile and is not charged to the budget.</li>
+  </ul>
+  <p class="ref">connection.go:393 send · :308 pauseDecision · :709 uncork · flushOutput · engine.go:677 refreshConnection · resumeBudgetPaused · releaseBudget · Stats</p>
+</section>
+
+<section id="close">
+  <h2>Close and reclaim</h2>
+  <p class="lede">Every close takes the same path through the loop. The connection stops at once, but OnClose and the descriptor's release are queued with its rounds, as an event is.</p>
+  <div class="diagram"><pre class="mermaid">
+flowchart LR
+  subgraph SRC["where a close comes from"]
+    S1["Close / CloseWithError"]
+    S2["in a round: EOF, I/O error, RDHUP"]
+    S3["deadline timer"]
+    S4["CloseAfterSend: queue drained"]
+    S5["UDP idle sweep"]
+  end
+  C["commandClose"]
+  subgraph LOOP["event loop: closeConnection"]
+    L1["closed = true, reason kept&lt;br/&gt;send queue dropped, budget returned&lt;br/&gt;deadlines stopped"]
+    L2["closePending = true&lt;br/&gt;schedule a last round unless one is"]
+    L3["detach&lt;br/&gt;EPOLL_CTL_DEL · close(fd)&lt;br/&gt;clear the table entry"]
+    L1 --> L2
+  end
+  subgraph WK["worker: the last round"]
+    W1["the OnData before it returns first"]
+    W2["finishClose → OnClose(c, err)"]
+    W1 --> W2
+  end
+  S1 --> C
+  S2 --> C
+  S3 --> C
+  S4 --> C
+  S5 -- "commandUDPSweep" --> L1
+  C --> L1
+  L2 --> W1
+  W2 -- "commandDetach" --> L3
+  classDef loop fill:#e8effc,stroke:#2458c6,color:#16202c
+  classDef work fill:#e3f4f1,stroke:#0c7d72,color:#16202c
+  classDef hs fill:#fbf0de,stroke:#a86a12,color:#16202c
+  classDef str fill:#efe9fb,stroke:#6b45c8,color:#16202c
+  classDef tmr fill:#eceff3,stroke:#5f6b7a,color:#16202c
+  classDef usr fill:#fae6ed,stroke:#b23a62,color:#16202c
+  class L1,L2,L3,C loop
+  class W1,W2,S2,S4 work
+  class S3,S5 tmr
+  class S1 usr
+  </pre></div>
+  <ul class="notes">
+    <li>While a round is still running on a worker, the descriptor it reads and writes is not closed, and so cannot be handed to another connection under it.</li>
+    <li>Descriptor reuse is guarded by a generation: a token's low half is the descriptor and its high half a generation, so an event left over from a descriptor's previous owner resolves to nothing.</li>
+    <li>Closing your own connection in OnData and then waiting for what OnClose reports deadlocks: that report waits for this round to return.</li>
+    <li>When an engine closes it stops its loops and pollers, waits for the rounds in flight, and then runs the last rounds still owed, so no closed connection loses its OnClose.</li>
+  </ul>
+  <p class="ref">engine.go:742 closeConnection · connection.go:650 finishClose · engine_unix.go detach · Close · deadline.go</p>
+</section>
+
+<section id="balance">
+  <h2>Load balance</h2>
+  <p class="lede">Connections spread evenly are not work spread evenly: a few hot connections or heavy tasks can land on one thread. fib deals with that at four levels.</p>
+  <div class="tbl"><table>
+    <thead><tr><th>Level</th><th>What it does</th><th>Cost and trade-off</th></tr></thead>
+    <tbody>
+      <tr><td>Workers</td><td>Each round of a connection goes to an idle worker, with no affinity; the adaptive pool queues by P and takes batches</td><td>A handler that blocks holds up its own connection only, and the pool grows to absorb it</td></tr>
+      <tr><td>Pollers</td><td>Accepted connections go to <code>fd % pollerCount</code>; a poller only waits, about 0.2µs a request against 4.5µs on the workers</td><td>More pollers compete with the workers for Ps; one per 4 CPUs is the default</td></tr>
+      <tr><td>Accept</td><td>The root loop accepts and hands on by default; on Linux <code>ReusePort</code> has every poller listen and accept for itself</td><td>ReusePort lifts the one loop's accept ceiling, but a connection stays on the poller the kernel's hash chose, however busy</td></tr>
+      <tr><td>Multiplexing</td><td>HTTP/2 and HTTP/3 handlers run on the stream pool, so one connection's requests are served concurrently</td><td><code>MaxConcurrentHandlers</code> bounds one connection; the request over the limit runs on the reader</td></tr>
+    </tbody>
+  </table></div>
+</section>
+
+<section id="memory">
+  <h2>Buffers and memory</h2>
+  <ul class="notes">
+    <li><b>bufferpool</b> is one package-level pool for the process. Every capacity is a power of two, which is exactly one of Go's allocator size classes, so nothing is paid for rounding, and each class keeps a reserve behind its <code>sync.Pool</code> that a collection does not empty.</li>
+    <li><b>Read buffers</b> are 16KB and borrowed per round. The bytes are lent to the handler for the length of OnData; protocol parsers parse in place and copy only what is left over.</li>
+    <li><b>Send buffers</b> are taken at twice the read buffer, aligned to a pool class, which holds a round's replies. A buffer a single large message grew goes back to the class its capacity belongs to and cannot inflate the ordinary ones.</li>
+    <li><b>The connection table</b> is paged and indexed by descriptor, 4096 entries a page: a lookup is two bounds checks rather than a hash, and only the page directory ever grows.</li>
+    <li><b>TLS</b> keeps no crypto/tls buffers after the handshake and opens records straight from the round's read buffer. Each UDP datagram takes a buffer from the pool, which QUIC gives back when it is done.</li>
+  </ul>
+  <p class="ref">bufferpool/bufferpool.go · engine.go acquireSendBuffer · engine_unix.go trackConnection</p>
+</section>
+
+<section id="platform">
+  <h2>Platform backends</h2>
+  <p class="lede">The rest of the engine is written against readiness. Each backend translates what it observes into the same event bits, so the workers, the queueing and the backpressure are the same code everywhere.</p>
+  <div class="tbl"><table>
+    <thead><tr><th>Platform</th><th>Backend</th><th>Notes</th></tr></thead>
+    <tbody>
+      <tr><td>Linux</td><td>epoll, edge-triggered, eventfd wake-ups</td><td>IOPollers; ReusePort spreads accepts and UDP; reads and writes are raw system calls, recvfrom / sendto / sendmsg under <code>SocketSyscalls</code>; UDP uses recvmmsg / sendmmsg</td></tr>
+      <tr><td>macOS</td><td>kqueue</td><td>IOPollers supported; <code>SO_REUSEPORT</code> does not spread TCP connections between sockets, so the root loop still accepts</td></tr>
+      <tr><td>Windows</td><td>I/O completion port</td><td>A zero-byte overlapped WSARecv plays the read edge and an overlapped WSASend's completion the write edge; one loop, IOPollers ignored</td></tr>
+      <tr><td>Others</td><td><code>*_other.go</code></td><td>A fallback on the standard library, a goroutine per connection, with the same API</td></tr>
+    </tbody>
+  </table></div>
+  <p class="ref">poller_epoll.go · poller_kqueue.go · engine_windows.go · sockio_linux.go · udp_batch_linux.go · engine_other.go</p>
+</section>
+
+<section id="packages">
+  <h2>Packages</h2>
+  <div class="tbl"><table>
+    <thead><tr><th>Package</th><th>Contents</th></tr></thead>
+    <tbody>
+      <tr><td><code>fib</code></td><td>Engine, Connection, Handler, Config; TCP, Unix sockets and UDP; Dial, the net.Conn adapter, deadlines, SendFile, HoldReads</td></tr>
+      <tr><td><code>taskpool</code></td><td>Interchangeable bounded schedulers: Elastic, Adaptive, AdaptiveChan, Inline</td></tr>
+      <tr><td><code>streampool</code> · <code>sidepool</code></td><td>The stream pools, one per engine name; the handshake and client pools, one per process</td></tr>
+      <tr><td><code>bufferpool</code></td><td>The shared buffer pool in power-of-two classes</td></tr>
+      <tr><td><code>tls</code></td><td>TLS over a connection: crypto/tls handshakes, with AES-GCM and AES-CBC records protected by the package itself</td></tr>
+      <tr><td><code>http</code> · <code>hpack</code></td><td>HTTP/1.x and HTTP/2 servers and asynchronous clients; Context, streamed bodies, Tunnel, StreamPool</td></tr>
+      <tr><td><code>http3</code> · <code>http3/quic</code> · <code>http3/qpack</code></td><td>HTTP/3 server and client, with their own QUIC and QPACK</td></tr>
+      <tr><td><code>websocket</code></td><td>Server, client, frame-at-a-time delivery, permessage-deflate, upgrades over HTTP/1, 2 and 3</td></tr>
+      <tr><td><code>middleware/*</code></td><td>HTTP middleware</td></tr>
+      <tr><td><code>c/</code></td><td>The earlier C implementation (one epoll loop and a pthread pool), not covered here</td></tr>
+    </tbody>
+  </table></div>
+</section>
+</main>
+</div>
+<script src="https://cdn.jsdelivr.net/npm/mermaid@10.9.1/dist/mermaid.min.js"></script>
+<script>mermaid.initialize({startOnLoad:true,theme:"neutral",flowchart:{htmlLabels:true}});</script>
 </body>
 </html>

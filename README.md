@@ -87,7 +87,8 @@ Each server has a matching `client` beside it.
 
 - [Go guide](docs/guide.zh-CN.md) (Chinese): configuration, API and every sub-package
 - [HTTP/1.x](docs/http1.md), [HTTP/2](docs/http2.md), [HTTP/3](docs/http3.md): what is supported, the limitations, and the conformance tests
-- [Architecture](docs/architecture.html): an interactive, bilingual diagram of read scheduling, write backpressure, load balancing and connection teardown
+- [Architecture](docs/architecture.html): event loops, pollers and pools, handler layers, read scheduling, write backpressure, load balancing and connection teardown
+- [Protocol flows](docs/flows.html): which loop and which pool runs what for TLS, HTTP/1, HTTP/2, HTTP/3 and WebSocket, one diagram per case
 
 ## C implementation
 

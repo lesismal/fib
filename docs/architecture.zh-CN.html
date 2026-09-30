@@ -1,0 +1,428 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>fib 架构说明</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;500;600&display=swap">
+<style>
+:root{
+  --bg:#f3f5f8; --surface:#ffffff; --ink:#16202c; --muted:#5a6676; --line:#d8dee7;
+  --paper:#ffffff; --paper-line:#e2e6ed;
+  --loop:#2458c6; --work:#0c7d72; --hs:#a86a12; --str:#6b45c8; --tmr:#5f6b7a; --usr:#b23a62;
+  --loop-bg:#e8effc; --work-bg:#e3f4f1; --hs-bg:#fbf0de; --str-bg:#efe9fb; --tmr-bg:#eceff3; --usr-bg:#fae6ed;
+  --code-bg:#eef1f5;
+  --sans:"IBM Plex Sans","PingFang SC","Hiragino Sans GB","Microsoft YaHei",system-ui,sans-serif;
+  --mono:"IBM Plex Mono",ui-monospace,"SF Mono",Menlo,monospace;
+}
+@media (prefers-color-scheme: dark){
+  :root:not([data-theme="light"]){
+    color-scheme:dark;
+    --bg:#0f141b; --surface:#161d27; --ink:#e4e9f0; --muted:#94a0b0; --line:#2a3443;
+    --paper:#eef1f5; --paper-line:#c9d0da;
+    --loop:#7aa4ff; --work:#4fd1bf; --hs:#f0b35a; --str:#b39cff; --tmr:#a3adba; --usr:#f27fa3;
+    --loop-bg:#1b2842; --work-bg:#12302c; --hs-bg:#35280f; --str-bg:#271f40; --tmr-bg:#222a35; --usr-bg:#3a1a27;
+    --code-bg:#1f2833;
+  }
+}
+:root[data-theme="dark"]{
+  color-scheme:dark;
+  --bg:#0f141b; --surface:#161d27; --ink:#e4e9f0; --muted:#94a0b0; --line:#2a3443;
+  --paper:#eef1f5; --paper-line:#c9d0da;
+  --loop:#7aa4ff; --work:#4fd1bf; --hs:#f0b35a; --str:#b39cff; --tmr:#a3adba; --usr:#f27fa3;
+  --loop-bg:#1b2842; --work-bg:#12302c; --hs-bg:#35280f; --str-bg:#271f40; --tmr-bg:#222a35; --usr-bg:#3a1a27;
+  --code-bg:#1f2833;
+}
+*{box-sizing:border-box}
+body{background:var(--bg);color:var(--ink);font:15px/1.7 var(--sans);padding-inline:16px;padding-block:0 64px}
+.wrap{max-width:1180px;margin:0 auto;display:grid;grid-template-columns:220px minmax(0,1fr);gap:40px}
+nav.toc{position:sticky;top:env(safe-area-inset-top,0px);align-self:start;padding-top:40px;font-size:13px}
+nav.toc b{display:block;font:600 11px/1 var(--mono);letter-spacing:.12em;color:var(--muted);text-transform:uppercase;margin-bottom:12px}
+nav.toc ol{list-style:none;margin:0;padding:0;display:grid;gap:2px}
+nav.toc a{display:block;padding:5px 10px;border-radius:6px;color:var(--ink);text-decoration:none}
+nav.toc a:hover,nav.toc a:focus-visible{background:var(--surface);outline:none}
+nav.toc a span{font-family:var(--mono);color:var(--muted);margin-right:6px}
+main{min-width:0;padding-top:40px}
+header h1{font-size:34px;line-height:1.2;margin:0 0 12px;letter-spacing:-.01em;text-wrap:balance}
+header p{color:var(--muted);max-width:72ch;margin:0 0 8px}
+h2{font-size:23px;line-height:1.3;margin:0 0 6px;text-wrap:balance}
+h3{font-size:16px;margin:22px 0 8px}
+section{padding-top:48px;scroll-margin-top:12px}
+section>.lede{color:var(--muted);margin:0 0 14px;max-width:78ch}
+code,.mono{font-family:var(--mono);font-size:.88em}
+p code,li code,td code{background:var(--code-bg);padding:1px 5px;border-radius:4px}
+.legend{display:flex;flex-wrap:wrap;gap:8px;margin:18px 0 0}
+.chip{display:inline-flex;align-items:center;gap:6px;padding:3px 10px;border-radius:999px;font:500 12px/1.6 var(--mono);border:1px solid currentColor}
+.chip i{width:8px;height:8px;border-radius:2px;background:currentColor}
+.c-loop{color:var(--loop);background:var(--loop-bg)} .c-work{color:var(--work);background:var(--work-bg)}
+.c-hs{color:var(--hs);background:var(--hs-bg)} .c-str{color:var(--str);background:var(--str-bg)}
+.c-tmr{color:var(--tmr);background:var(--tmr-bg)} .c-usr{color:var(--usr);background:var(--usr-bg)}
+.runs{display:flex;flex-wrap:wrap;gap:6px;margin:0 0 14px}
+.diagram{background:var(--paper);border:1px solid var(--paper-line);border-radius:10px;padding:18px 12px;overflow-x:auto}
+.diagram pre.mermaid{margin:0;background:transparent;text-align:center;color:#16202c}
+.notes{margin:14px 0 0;padding-left:20px;display:grid;gap:6px;max-width:82ch}
+.notes li::marker{color:var(--muted)}
+.ref{font:12px/1.5 var(--mono);color:var(--muted);margin-top:10px}
+.tbl{overflow-x:auto;margin-top:14px;border:1px solid var(--line);border-radius:10px;background:var(--surface)}
+table{border-collapse:collapse;width:100%;min-width:760px;font-size:13.5px}
+th,td{text-align:left;vertical-align:top;padding:9px 12px;border-bottom:1px solid var(--line)}
+th{font:600 11px/1.4 var(--mono);letter-spacing:.06em;text-transform:uppercase;color:var(--muted);background:var(--bg)}
+tr:last-child td{border-bottom:0}
+td:first-child{font-weight:600;white-space:nowrap}
+.dash{color:var(--muted)}
+.callout{border-left:3px solid var(--hs);background:var(--surface);padding:10px 14px;border-radius:0 8px 8px 0;margin-top:14px;max-width:82ch}
+@media (max-width:860px){
+  .wrap{grid-template-columns:1fr;gap:0}
+  nav.toc{position:static;padding-top:24px}
+  nav.toc ol{grid-template-columns:repeat(auto-fill,minmax(150px,1fr))}
+  header h1{font-size:27px}
+}
+.toplinks{display:flex;flex-wrap:wrap;gap:6px;margin:0 0 22px}
+.toplinks a{display:inline-block;padding:3px 10px;border:1px solid var(--line);border-radius:999px;font:500 12px/1.6 var(--mono);color:var(--ink);text-decoration:none;background:var(--surface)}
+.toplinks a[aria-current]{border-color:var(--loop);color:var(--loop);background:var(--loop-bg)}
+.toplinks a:hover,.toplinks a:focus-visible{border-color:var(--loop);outline:none}
+header p a,.lede a{color:var(--loop)}
+.rules{display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));gap:14px;margin-top:14px}
+.rule{background:var(--surface);border:1px solid var(--line);border-radius:10px;padding:16px 18px}
+.rule b{display:block;font-size:16px;margin-bottom:6px}
+.rule p{margin:0;color:var(--muted);font-size:14px}
+body{margin:0}
+</style>
+
+
+</head>
+<body>
+<div class="wrap">
+<nav class="toc" aria-label="目录">
+  <div class="toplinks"><a href="architecture.zh-CN.html" aria-current="page">架构</a><a href="flows.zh-CN.html">协议流程</a><a href="architecture.html">English</a><a href="architecture.zh-CN.html" aria-current="page">中文</a></div>
+  <b>目录</b>
+  <ol>
+    <li><a href="#rules"><span>00</span>三条不变量</a></li>
+    <li><a href="#parts"><span>01</span>组成</a></li>
+    <li><a href="#layers"><span>02</span>Handler 分层</a></li>
+    <li><a href="#read"><span>03</span>读取与调度</a></li>
+    <li><a href="#write"><span>04</span>写路径与背压</a></li>
+    <li><a href="#close"><span>05</span>关闭与回收</a></li>
+    <li><a href="#balance"><span>06</span>负载均衡</a></li>
+    <li><a href="#memory"><span>07</span>缓冲与内存</a></li>
+    <li><a href="#platform"><span>08</span>平台后端</a></li>
+    <li><a href="#packages"><span>09</span>包一览</a></li>
+  </ol>
+</nav>
+
+<main>
+<header>
+  <h1>fib 架构说明</h1>
+  <p>fib（Fast In Balance）是边沿触发的事件循环加协程池：循环只等事件，把变为可执行的连接动态调度到逻辑 worker 上，连接的每一轮（读、回调、写）都在 worker 上执行。本文说明 Go 实现的整体结构，依据 <code>main</code>（8a388d4）的源码；各协议的逐步流程见<a href="flows.zh-CN.html">协议流程图</a>。</p>
+  <div class="legend">
+    <span class="chip c-loop"><i></i>事件循环（根 / poller）</span>
+    <span class="chip c-work"><i></i>‹Name›-workers 引擎池</span>
+    <span class="chip c-hs"><i></i>fib-tls-handshake 握手池</span>
+    <span class="chip c-str"><i></i>‹Name›-streams 流池</span>
+    <span class="chip c-tmr"><i></i>定时器 goroutine</span>
+    <span class="chip c-usr"><i></i>用户自己的 goroutine</span>
+  </div>
+</header>
+
+<section id="rules">
+  <h2>三条不变量</h2>
+  <p class="lede">整个并发模型靠这三条规则推理。其余设计都是它们的推论。</p>
+  <div class="rules">
+    <div class="rule"><b>fd 归事件循环</b><p>只有循环做 <code>epoll_ctl</code>、accept 和最终的 <code>close(fd)</code>。worker 想暂停读、关闭连接或释放 fd，都通过命令队列加 eventfd 告诉循环，循环醒着时不需要唤醒。</p></div>
+    <div class="rule"><b>顺序归连接</b><p>调度单位是连接，不是事件。循环把就绪事件并入连接的 <code>pendingEvents</code>，<code>scheduled</code> 为真时不再投递。同一时刻一条连接最多一个 worker，OnData 不会并发也不会乱序，OnClose 总在之前的 OnData 之后。</p></div>
+    <div class="rule"><b>连接不绑定线程</b><p>每一轮由当时空闲的 worker 领取，这一轮和下一轮可能是不同的 goroutine。均衡的对象是待执行的工作量，不是连接数。</p></div>
+  </div>
+</section>
+
+<section id="parts">
+  <h2>组成</h2>
+  <p class="lede">一个 Engine 拥有监听器、事件循环、命令队列和 worker 池。开启 <code>IOPollers</code>（默认）时，它还拥有若干 poller：每个 poller 是一个没有监听器的 Engine，有自己的循环、命令队列和 fd 表，配置、handler、worker 池和全局预算与父 Engine 共用。</p>
+  <div class="diagram"><pre class="mermaid">
+flowchart LR
+  subgraph ENG["Engine（fib.Bind / fib.NewEngine）"]
+    ROOT["根循环&lt;br/&gt;accept · UDP 收包 · 命令"]
+    P0["poller 0&lt;br/&gt;等事件 · 注册 · 关 fd"]
+    P1["poller N-1"]
+    CMD["命令队列 + eventfd&lt;br/&gt;refresh · close · detach · accept · dial"]
+    BUD["全局预算 pendingTotal&lt;br/&gt;MaxPendingBytes"]
+  end
+  subgraph POOLS["协程池"]
+    WK["‹Name›-workers&lt;br/&gt;连接的每一轮"]
+    STR["‹Name›-streams&lt;br/&gt;HTTP/2、HTTP/3 的 handler"]
+    HS["fib-tls-handshake&lt;br/&gt;crypto/tls 握手"]
+  end
+  BP["bufferpool&lt;br/&gt;2 的幂分级，进程内共享"]
+  TM["time.AfterFunc&lt;br/&gt;deadline · UDP sweep · QUIC"]
+  ROOT -- "fd % N" --> P0
+  ROOT --> P1
+  P0 -- "GoTasks 批量提交" --> WK
+  P1 --> WK
+  ROOT -- "UDP peer 就绪" --> WK
+  WK -- "命令" --> CMD --> P0
+  WK -- "多路复用协议的请求" --> STR
+  P0 -- "OnOpen 提交握手" --> HS
+  TM --> CMD
+  WK -.-> BP
+  STR -.-> BP
+  classDef loop fill:#e8effc,stroke:#2458c6,color:#16202c
+  classDef work fill:#e3f4f1,stroke:#0c7d72,color:#16202c
+  classDef hs fill:#fbf0de,stroke:#a86a12,color:#16202c
+  classDef str fill:#efe9fb,stroke:#6b45c8,color:#16202c
+  classDef tmr fill:#eceff3,stroke:#5f6b7a,color:#16202c
+  classDef usr fill:#fae6ed,stroke:#b23a62,color:#16202c
+  class ROOT,P0,P1,CMD,BUD loop
+  class WK work
+  class STR str
+  class HS hs
+  class TM,BP tmr
+  </pre></div>
+  <div class="tbl"><table>
+    <thead><tr><th>部件</th><th>数量与规模</th><th>职责</th></tr></thead>
+    <tbody>
+      <tr><td>根循环</td><td>每个 Engine 1 个，即 <code>Run</code> 所在 goroutine</td><td>accept；读共享的 UDP socket 并按对端分拣；执行自己的命令队列</td></tr>
+      <tr><td>poller</td><td>NumCPU÷4 向下取整，至少 1；<code>IOPollerCount</code> 可改；Windows 忽略</td><td>接手的连接的事件等待、读暂停与恢复、fd 注册与关闭、OnOpen</td></tr>
+      <tr><td>‹Name›-workers</td><td>Adaptive；上限 max(GOMAXPROCS×1000, NumCPU×20)；默认同名 Engine 共用</td><td>每条连接的每一轮：读、OnData 链、写合并、OnClose</td></tr>
+      <tr><td>‹Name›-streams</td><td>Adaptive；上限为同名最宽引擎池的 2 倍，下限 0</td><td>HTTP/2、HTTP/3 的请求 handler；HTTP/1 的异步交接</td></tr>
+      <tr><td>fib-tls-handshake</td><td>Adaptive；上限 65536，进程内 1 个</td><td>阻塞的 TLS 握手</td></tr>
+    </tbody>
+  </table></div>
+  <ul class="notes">
+    <li>worker 数是上限而不是常驻数量：Adaptive 池在任务发现所有 worker 都忙时增长，按间隔把一直空闲的 worker 减半回收。把上限设高没有成本，设低会限制突发。</li>
+    <li>worker 自己做读写系统调用，很多时间在内核里而不在 P 上，所以池相对核数是超额配置的。GOMAXPROCS 保持运行时默认值（核数）最好。</li>
+    <li>三个池互相独立：引擎 worker 可以等流池和握手池的队列，反过来从不发生，所以不会出现所有 worker 都卡在提交上的死锁。</li>
+  </ul>
+  <p class="ref">engine.go Engine · :284 openPollers · config.go DefaultPoolSizing · pollerCount · shared_taskpool.go · streampool · sidepool · taskpool/adaptive.go</p>
+</section>
+
+<section id="layers">
+  <h2>Handler 分层</h2>
+  <p class="lede">协议靠包裹 <code>fib.Handler</code> 叠起来。入方向沿 OnData 链向上，出方向经 <code>Connection.Send</code>，有 <code>Layer</code> 时先经过它再到 socket。上层 Handler 看到的始终是一条普通连接。</p>
+  <div class="diagram"><pre class="mermaid">
+flowchart TD
+  SOCK[("socket")]
+  CONN["fib.Connection&lt;br/&gt;readLoop · 发送队列 · cork · 水位"]
+  TLS["tls.Handler + layer&lt;br/&gt;解密 → 明文 OnData；Send → 加密 → SendRaw"]
+  HTTP["http.ServerHandler&lt;br/&gt;HTTP/1 解析 · HTTP/2 分帧 · h2c 升级"]
+  WS["websocket.ServerHandler&lt;br/&gt;升级握手 · 解帧"]
+  APP1["http.Handler&lt;br/&gt;ServeHTTP(Context, Request)"]
+  APP2["websocket.Handler&lt;br/&gt;OnOpen / OnMessage / OnClose"]
+  TUN["http.Tunnel&lt;br/&gt;ws.Upgrade：101 或扩展 CONNECT"]
+  H3["http3.ServerHandler&lt;br/&gt;QUIC · QPACK，UDP Engine"]
+  SOCK --> CONN
+  CONN --> TLS
+  CONN -- "明文" --> HTTP
+  CONN -- "明文" --> WS
+  TLS --> HTTP
+  TLS --> WS
+  HTTP --> APP1
+  WS --> APP2
+  APP1 -- "Upgrade" --> TUN --> APP2
+  CONN -- "UDP 数据报" --> H3 --> APP1
+  classDef loop fill:#e8effc,stroke:#2458c6,color:#16202c
+  classDef work fill:#e3f4f1,stroke:#0c7d72,color:#16202c
+  classDef hs fill:#fbf0de,stroke:#a86a12,color:#16202c
+  classDef str fill:#efe9fb,stroke:#6b45c8,color:#16202c
+  classDef tmr fill:#eceff3,stroke:#5f6b7a,color:#16202c
+  classDef usr fill:#fae6ed,stroke:#b23a62,color:#16202c
+  class CONN,SOCK loop
+  class TLS hs
+  class HTTP,WS,H3,TUN work
+  class APP1,APP2 usr
+  </pre></div>
+  <ul class="notes">
+    <li><code>fib.Handler</code> 只有四个回调：<code>OnOpen</code>、<code>OnData</code>、<code>OnPriorityData</code>、<code>OnClose</code>。OnOpen 在事件循环上执行，其余在 worker 上。</li>
+    <li>同一个 <code>http.Handler</code> 可以同时服务 HTTP/1、HTTP/2（TCP Engine）和 HTTP/3（UDP Engine），通过同一个 <code>Context</code> 应答。</li>
+    <li>WebSocket 有两种接法：<code>websocket.ServerHandler</code> 直接作为 <code>fib.Handler</code>；或由 HTTP handler 调 <code>Upgrade</code>，在 HTTP/1.1 上切换整条连接，在 HTTP/2、HTTP/3 上切换一条流。</li>
+    <li>HTTP 中间件（compress、cors、csrf、etag、limiter、logger、pprof、recover、requestid、responsetime）包的是 <code>http.Handler</code>，与传输层无关。</li>
+  </ul>
+  <p class="ref">handler.go · layer.go · tls/tls.go · http/handler.go · http/tunnel.go · websocket/handler.go · websocket/upgrade.go · http3/server.go</p>
+</section>
+
+<section id="read">
+  <h2>读取与调度</h2>
+  <p class="lede">从内核事件到业务回调，再回到可再次调度的状态。循环一轮提交一批连接，而不是每条连接一次加锁和唤醒。</p>
+  <div class="diagram"><pre class="mermaid">
+flowchart LR
+  A["epoll_wait 返回&lt;br/&gt;ET，一次至多 1024 个"] --> B["token → 连接&lt;br/&gt;fd 分页表 + 代次校验"]
+  B --> C["noteEvent&lt;br/&gt;事件并入 pendingEvents&lt;br/&gt;scheduled 为假才入 ready"]
+  C --> D["runReady&lt;br/&gt;GoTasks 整批提交&lt;br/&gt;runtime.Gosched 让出 P"]
+  D --> E["worker：process&lt;br/&gt;先刷写，再读到空&lt;br/&gt;OnData，轮末一次写出"]
+  E --> F["持锁确认无新事件&lt;br/&gt;scheduled = false"]
+  F -. "之后的事件再次投递，可能换 worker" .-> C
+  classDef loop fill:#e8effc,stroke:#2458c6,color:#16202c
+  classDef work fill:#e3f4f1,stroke:#0c7d72,color:#16202c
+  classDef hs fill:#fbf0de,stroke:#a86a12,color:#16202c
+  classDef str fill:#efe9fb,stroke:#6b45c8,color:#16202c
+  classDef tmr fill:#eceff3,stroke:#5f6b7a,color:#16202c
+  classDef usr fill:#fae6ed,stroke:#b23a62,color:#16202c
+  class A,B,C,D loop
+  class E,F work
+  </pre></div>
+  <ul class="notes">
+    <li><b>事件合并</b>：就绪对连接来说是电平信息，重复通知按位或在一起，热连接不会攒出无界的事件队列。只有 EPOLLOUT 且没有排队输出的通知直接丢弃，避免每条新连接被多调度一次。</li>
+    <li><b>让出 P</b>：提交后循环先 <code>Gosched</code>，刚唤醒的 worker 立刻用上这个 P。4 个 P、1 万连接的 HTTP/2 echo 上这一步提升 10% 到 25%。</li>
+    <li><b>循环不占 P</b>：开启 IOPollers 时，循环停在 Go 运行时的网络轮询器里等待，而不是阻塞在 <code>epoll_wait</code> 系统调用里。</li>
+    <li><b>读缓冲按轮借用</b>：16KB 读缓冲每轮从 bufferpool 取、轮末归还，空闲连接不占读缓冲。短读说明 socket 已空，不再多读一次去拿 EAGAIN。</li>
+    <li><b>UDP 例外</b>：共享的 UDP socket 由循环自己读（批量收包），按对端地址把数据报放进各 peer 连接的队列，worker 的一轮只负责把队列交给 handler。</li>
+  </ul>
+  <p class="ref">poller_epoll.go:79 runLoop · engine.go:602 noteEvent · :377 runReady · :456 submitReady · connection.go:524 process · :777 readLoop · udp.go:138 deliverDatagram</p>
+</section>
+
+<section id="write">
+  <h2>写路径与背压</h2>
+  <p class="lede">能直接写就直接写，写不完才排队。排队的字节数有两道界限：每条连接的水位和整个 Engine 的总预算，越界时暂停的是读，让 TCP 流控去限制对端。</p>
+  <div class="diagram"><pre class="mermaid">
+flowchart TD
+  S["Send / SendParts / SendOwned&lt;br/&gt;任意 goroutine"] --> L{"有 Layer"}
+  L -- "是，TLS" --> ENC["layer.Send 加密 → SendRaw"] --> Q
+  L -- 否 --> Q{"队列空、未在 flush、未 corked"}
+  Q -- 是 --> W["非阻塞写 socket"]
+  W --> F{"全部写完"}
+  F -- 是 --> DONE["返回：不排队，不改注册"]
+  F -- 否 --> QU
+  Q -- "否；轮内 corked" --> QU["剩余部分入发送队列&lt;br/&gt;pendingBytes 与 pendingTotal 同步增加"]
+  QU --> CK["轮末 uncork：flushOutput&lt;br/&gt;writev 至多 64 项 / sendfile"]
+  QU --> WM{"到高水位 64KB&lt;br/&gt;或总预算 1GiB 用尽"}
+  WM -- 是 --> RF["commandRefresh → 循环&lt;br/&gt;pauseDecision → EPOLL_CTL_MOD 去掉 EPOLLIN"]
+  QU --> EDGE["EPOLLOUT 边沿 → 一轮 → flushOutput"]
+  EDGE --> LOW{"回落到低水位 16KB&lt;br/&gt;总预算回到 1/4"}
+  LOW -- 是 --> RS["commandRefresh → 恢复读&lt;br/&gt;重新注册会重报已在 socket 里的字节"]
+  classDef loop fill:#e8effc,stroke:#2458c6,color:#16202c
+  classDef work fill:#e3f4f1,stroke:#0c7d72,color:#16202c
+  classDef hs fill:#fbf0de,stroke:#a86a12,color:#16202c
+  classDef str fill:#efe9fb,stroke:#6b45c8,color:#16202c
+  classDef tmr fill:#eceff3,stroke:#5f6b7a,color:#16202c
+  classDef usr fill:#fae6ed,stroke:#b23a62,color:#16202c
+  class S,ENC,Q,W,F,DONE,QU,CK,WM,EDGE,LOW work
+  class L work
+  class RF,RS loop
+  </pre></div>
+  <ul class="notes">
+    <li><b>写关注常驻</b>：EPOLLOUT 从注册起一直开着，排队本身不需要改注册，只有越过水位才需要一次 <code>epoll_ctl</code>。</li>
+    <li><b>cork</b>：一轮之内的回复先攒在一个连续缓冲里，轮末一次写出。流式响应想先把前一部分发出去时调 <code>Flush</code>；应用也可以自己 <code>Cork</code>。</li>
+    <li><b>滞回</b>：暂停在高水位（默认 64KB），恢复在其 1/4，避免每个回复都来回越线；总预算（默认 1GiB）同样在 1/4 处恢复。连接数很多时真正起作用的是总预算。</li>
+    <li><b>被总预算暂停的连接</b>自己可能没有任何待发数据，不会有自己的事件来重新评估，所以循环把它们记在 <code>budgetPaused</code> 里，预算回落时统一恢复；释放预算的连接在别的 poller 上时会唤醒这些循环。</li>
+    <li><b>读侧背压</b>：<code>HoldReads</code> 让应用在自己消化不完时暂停读（流式请求 body 就是这样用的），释放后重新交付 socket 里已有的字节。</li>
+    <li><code>Stats()</code> 报告两种暂停各发生多少次、已恢复多少次和当前排队总量；<code>SendFile</code> 走 sendfile，不计入预算。</li>
+  </ul>
+  <p class="ref">connection.go:393 send · :308 pauseDecision · :709 uncork · flushOutput · engine.go:677 refreshConnection · resumeBudgetPaused · releaseBudget · Stats</p>
+</section>
+
+<section id="close">
+  <h2>关闭与回收</h2>
+  <p class="lede">所有关闭都汇到循环上的同一条路径。连接立即停止收发，但 OnClose 和 fd 的释放像一个事件一样排进它的轮次里。</p>
+  <div class="diagram"><pre class="mermaid">
+flowchart LR
+  subgraph SRC["关闭的来源"]
+    S1["Close / CloseWithError"]
+    S2["轮内：EOF、读写错误、RDHUP"]
+    S3["deadline 定时器"]
+    S4["CloseAfterSend：队列发完"]
+    S5["UDP 空闲扫描"]
+  end
+  C["commandClose"]
+  subgraph LOOP["事件循环：closeConnection"]
+    L1["closed = true，记下原因&lt;br/&gt;丢弃发送队列，归还预算&lt;br/&gt;停掉 deadline"]
+    L2["closePending = true&lt;br/&gt;未调度则安排最后一轮"]
+    L3["detach&lt;br/&gt;EPOLL_CTL_DEL · close(fd)&lt;br/&gt;清 fd 表项"]
+    L1 --> L2
+  end
+  subgraph WK["worker：最后一轮"]
+    W1["之前的 OnData 先返回"]
+    W2["finishClose → OnClose(c, err)"]
+    W1 --> W2
+  end
+  S1 --> C
+  S2 --> C
+  S3 --> C
+  S4 --> C
+  S5 -- "commandUDPSweep" --> L1
+  C --> L1
+  L2 --> W1
+  W2 -- "commandDetach" --> L3
+  classDef loop fill:#e8effc,stroke:#2458c6,color:#16202c
+  classDef work fill:#e3f4f1,stroke:#0c7d72,color:#16202c
+  classDef hs fill:#fbf0de,stroke:#a86a12,color:#16202c
+  classDef str fill:#efe9fb,stroke:#6b45c8,color:#16202c
+  classDef tmr fill:#eceff3,stroke:#5f6b7a,color:#16202c
+  classDef usr fill:#fae6ed,stroke:#b23a62,color:#16202c
+  class L1,L2,L3,C loop
+  class W1,W2,S2,S4 work
+  class S3,S5 tmr
+  class S1 usr
+  </pre></div>
+  <ul class="notes">
+    <li>一轮还在 worker 上跑时，它读写的 fd 不会被关闭，也就不会被内核分给别的连接。</li>
+    <li>fd 复用由代次防护：token 低 32 位是 fd，高 32 位是代次，旧连接遗留的事件解析不到新连接。</li>
+    <li>在 OnData 里关闭自己的连接后再等待 OnClose 带来的通知会死锁：那个通知要等这一轮返回。</li>
+    <li>Engine 关闭时先停循环和 poller，等在跑的轮次结束，再执行欠下的最后一轮，保证已关闭连接的 OnClose 不丢。</li>
+  </ul>
+  <p class="ref">engine.go:742 closeConnection · connection.go:650 finishClose · engine_unix.go detach · Close · deadline.go</p>
+</section>
+
+<section id="balance">
+  <h2>负载均衡</h2>
+  <p class="lede">连接数均分不等于工作量均分：少数热连接或重任务可能集中在同一个线程上。fib 在四个层次上处理这件事。</p>
+  <div class="tbl"><table>
+    <thead><tr><th>层次</th><th>做法</th><th>代价与取舍</th></tr></thead>
+    <tbody>
+      <tr><td>worker</td><td>连接每一轮由空闲 worker 领取，没有亲和性；Adaptive 池按 P 分片入队，批量提交</td><td>阻塞的 handler 只拖住自己的连接，池会增长来吸收</td></tr>
+      <tr><td>poller</td><td>accept 到的连接按 <code>fd % pollerCount</code> 分配；poller 只等事件，每请求约 0.2µs，worker 约 4.5µs</td><td>poller 多了会和 worker 抢 P：每 4 个 CPU 一个是默认值</td></tr>
+      <tr><td>accept</td><td>默认由根循环 accept 再分发；Linux 上 <code>ReusePort</code> 让每个 poller 自己 listen、自己 accept</td><td>ReusePort 解除单循环的 accept 上限，但连接留在内核哈希选中的 poller 上，不管它多忙</td></tr>
+      <tr><td>多路复用</td><td>HTTP/2、HTTP/3 的 handler 进流池，一条连接上的请求并发执行</td><td><code>MaxConcurrentHandlers</code> 可限制单连接并发，超限的在读者上执行</td></tr>
+    </tbody>
+  </table></div>
+</section>
+
+<section id="memory">
+  <h2>缓冲与内存</h2>
+  <ul class="notes">
+    <li><b>bufferpool</b> 是包级的、进程内共享的池：容量都是 2 的幂，正好落在 Go 分配器的尺寸类上，不为取整付费；每个类在 <code>sync.Pool</code> 后面留一份不受 GC 清空的储备。</li>
+    <li><b>读缓冲</b> 16KB，按轮借用；数据在 OnData 期间借给 handler，协议解析器直接在上面解析，剩余的才复制。</li>
+    <li><b>发送缓冲</b> 取 2 倍读缓冲大小对齐到池的类，容纳一轮的回复；被单条大消息撑大的缓冲回到它容量所属的类，不会污染普通缓冲。</li>
+    <li><b>连接表</b> 是按 fd 索引的分页表（每页 4096 项），查找是两次边界检查而不是哈希；只在页目录上扩容。</li>
+    <li><b>TLS</b> 握手后不保留 crypto/tls 的缓冲，记录直接从本轮的读缓冲解密；UDP 数据报逐个从池里取缓冲，QUIC 用完归还。</li>
+  </ul>
+  <p class="ref">bufferpool/bufferpool.go · engine.go acquireSendBuffer · engine_unix.go trackConnection</p>
+</section>
+
+<section id="platform">
+  <h2>平台后端</h2>
+  <p class="lede">引擎的其余部分只依赖就绪模型，三个后端把各自观察到的东西翻译成同一组事件位，worker、排队和背压在所有平台上是同一份代码。</p>
+  <div class="tbl"><table>
+    <thead><tr><th>平台</th><th>后端</th><th>要点</th></tr></thead>
+    <tbody>
+      <tr><td>Linux</td><td>epoll，边沿触发，eventfd 唤醒</td><td>IOPollers、ReusePort 分摊 accept 和 UDP；读写是原始系统调用，<code>SocketSyscalls</code> 时走 recvfrom / sendto / sendmsg；UDP 用 recvmmsg / sendmmsg</td></tr>
+      <tr><td>macOS</td><td>kqueue</td><td>支持 IOPollers；<code>SO_REUSEPORT</code> 不在多个 socket 间分摊 TCP 连接，accept 仍在根循环</td></tr>
+      <tr><td>Windows</td><td>I/O 完成端口</td><td>零字节重叠 WSARecv 充当读边沿，重叠 WSASend 的完成充当写边沿；保持单个循环，忽略 IOPollers</td></tr>
+      <tr><td>其他</td><td><code>*_other.go</code></td><td>基于标准库的回退实现，每条连接一个 goroutine，API 相同</td></tr>
+    </tbody>
+  </table></div>
+  <p class="ref">poller_epoll.go · poller_kqueue.go · engine_windows.go · sockio_linux.go · udp_batch_linux.go · engine_other.go</p>
+</section>
+
+<section id="packages">
+  <h2>包一览</h2>
+  <div class="tbl"><table>
+    <thead><tr><th>包</th><th>内容</th></tr></thead>
+    <tbody>
+      <tr><td><code>fib</code></td><td>Engine、Connection、Handler、Config；TCP / Unix socket / UDP；Dial、net.Conn 适配、deadline、SendFile、HoldReads</td></tr>
+      <tr><td><code>taskpool</code></td><td>可互换的有界调度器：Elastic、Adaptive、AdaptiveChan、Inline</td></tr>
+      <tr><td><code>streampool</code> · <code>sidepool</code></td><td>流池（按 Engine 名）；握手池与客户端池（进程级）</td></tr>
+      <tr><td><code>bufferpool</code></td><td>2 的幂分级的共享缓冲池</td></tr>
+      <tr><td><code>tls</code></td><td>在连接上运行 TLS：crypto/tls 握手，AES-GCM / AES-CBC 记录由本包加解密</td></tr>
+      <tr><td><code>http</code> · <code>hpack</code></td><td>HTTP/1.x 与 HTTP/2 服务端和异步客户端，Context、流式 body、Tunnel、StreamPool</td></tr>
+      <tr><td><code>http3</code> · <code>http3/quic</code> · <code>http3/qpack</code></td><td>HTTP/3 服务端和客户端，自带 QUIC 与 QPACK 实现</td></tr>
+      <tr><td><code>websocket</code></td><td>服务端、客户端、按帧接收、permessage-deflate、经 HTTP/1、2、3 升级</td></tr>
+      <tr><td><code>middleware/*</code></td><td>HTTP 中间件</td></tr>
+      <tr><td><code>c/</code></td><td>早期的 C 实现（单循环 epoll + pthread 线程池），本文不涉及</td></tr>
+    </tbody>
+  </table></div>
+</section>
+</main>
+</div>
+<script src="https://cdn.jsdelivr.net/npm/mermaid@10.9.1/dist/mermaid.min.js"></script>
+<script>mermaid.initialize({startOnLoad:true,theme:"neutral",flowchart:{htmlLabels:true}});</script>
+</body>
+</html>

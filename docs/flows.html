@@ -1,0 +1,867 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>fib protocol flows</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;500;600&display=swap">
+<style>
+:root{
+  --bg:#f3f5f8; --surface:#ffffff; --ink:#16202c; --muted:#5a6676; --line:#d8dee7;
+  --paper:#ffffff; --paper-line:#e2e6ed;
+  --loop:#2458c6; --work:#0c7d72; --hs:#a86a12; --str:#6b45c8; --tmr:#5f6b7a; --usr:#b23a62;
+  --loop-bg:#e8effc; --work-bg:#e3f4f1; --hs-bg:#fbf0de; --str-bg:#efe9fb; --tmr-bg:#eceff3; --usr-bg:#fae6ed;
+  --code-bg:#eef1f5;
+  --sans:"IBM Plex Sans","PingFang SC","Hiragino Sans GB","Microsoft YaHei",system-ui,sans-serif;
+  --mono:"IBM Plex Mono",ui-monospace,"SF Mono",Menlo,monospace;
+}
+@media (prefers-color-scheme: dark){
+  :root:not([data-theme="light"]){
+    color-scheme:dark;
+    --bg:#0f141b; --surface:#161d27; --ink:#e4e9f0; --muted:#94a0b0; --line:#2a3443;
+    --paper:#eef1f5; --paper-line:#c9d0da;
+    --loop:#7aa4ff; --work:#4fd1bf; --hs:#f0b35a; --str:#b39cff; --tmr:#a3adba; --usr:#f27fa3;
+    --loop-bg:#1b2842; --work-bg:#12302c; --hs-bg:#35280f; --str-bg:#271f40; --tmr-bg:#222a35; --usr-bg:#3a1a27;
+    --code-bg:#1f2833;
+  }
+}
+:root[data-theme="dark"]{
+  color-scheme:dark;
+  --bg:#0f141b; --surface:#161d27; --ink:#e4e9f0; --muted:#94a0b0; --line:#2a3443;
+  --paper:#eef1f5; --paper-line:#c9d0da;
+  --loop:#7aa4ff; --work:#4fd1bf; --hs:#f0b35a; --str:#b39cff; --tmr:#a3adba; --usr:#f27fa3;
+  --loop-bg:#1b2842; --work-bg:#12302c; --hs-bg:#35280f; --str-bg:#271f40; --tmr-bg:#222a35; --usr-bg:#3a1a27;
+  --code-bg:#1f2833;
+}
+*{box-sizing:border-box}
+body{background:var(--bg);color:var(--ink);font:15px/1.7 var(--sans);padding-inline:16px;padding-block:0 64px}
+.wrap{max-width:1180px;margin:0 auto;display:grid;grid-template-columns:220px minmax(0,1fr);gap:40px}
+nav.toc{position:sticky;top:env(safe-area-inset-top,0px);align-self:start;padding-top:40px;font-size:13px}
+nav.toc b{display:block;font:600 11px/1 var(--mono);letter-spacing:.12em;color:var(--muted);text-transform:uppercase;margin-bottom:12px}
+nav.toc ol{list-style:none;margin:0;padding:0;display:grid;gap:2px}
+nav.toc a{display:block;padding:5px 10px;border-radius:6px;color:var(--ink);text-decoration:none}
+nav.toc a:hover,nav.toc a:focus-visible{background:var(--surface);outline:none}
+nav.toc a span{font-family:var(--mono);color:var(--muted);margin-right:6px}
+main{min-width:0;padding-top:40px}
+header h1{font-size:34px;line-height:1.2;margin:0 0 12px;letter-spacing:-.01em;text-wrap:balance}
+header p{color:var(--muted);max-width:72ch;margin:0 0 8px}
+h2{font-size:23px;line-height:1.3;margin:0 0 6px;text-wrap:balance}
+h3{font-size:16px;margin:22px 0 8px}
+section{padding-top:48px;scroll-margin-top:12px}
+section>.lede{color:var(--muted);margin:0 0 14px;max-width:78ch}
+code,.mono{font-family:var(--mono);font-size:.88em}
+p code,li code,td code{background:var(--code-bg);padding:1px 5px;border-radius:4px}
+.legend{display:flex;flex-wrap:wrap;gap:8px;margin:18px 0 0}
+.chip{display:inline-flex;align-items:center;gap:6px;padding:3px 10px;border-radius:999px;font:500 12px/1.6 var(--mono);border:1px solid currentColor}
+.chip i{width:8px;height:8px;border-radius:2px;background:currentColor}
+.c-loop{color:var(--loop);background:var(--loop-bg)} .c-work{color:var(--work);background:var(--work-bg)}
+.c-hs{color:var(--hs);background:var(--hs-bg)} .c-str{color:var(--str);background:var(--str-bg)}
+.c-tmr{color:var(--tmr);background:var(--tmr-bg)} .c-usr{color:var(--usr);background:var(--usr-bg)}
+.runs{display:flex;flex-wrap:wrap;gap:6px;margin:0 0 14px}
+.diagram{background:var(--paper);border:1px solid var(--paper-line);border-radius:10px;padding:18px 12px;overflow-x:auto}
+.diagram pre.mermaid{margin:0;background:transparent;text-align:center;color:#16202c}
+.notes{margin:14px 0 0;padding-left:20px;display:grid;gap:6px;max-width:82ch}
+.notes li::marker{color:var(--muted)}
+.ref{font:12px/1.5 var(--mono);color:var(--muted);margin-top:10px}
+.tbl{overflow-x:auto;margin-top:14px;border:1px solid var(--line);border-radius:10px;background:var(--surface)}
+table{border-collapse:collapse;width:100%;min-width:760px;font-size:13.5px}
+th,td{text-align:left;vertical-align:top;padding:9px 12px;border-bottom:1px solid var(--line)}
+th{font:600 11px/1.4 var(--mono);letter-spacing:.06em;text-transform:uppercase;color:var(--muted);background:var(--bg)}
+tr:last-child td{border-bottom:0}
+td:first-child{font-weight:600;white-space:nowrap}
+.dash{color:var(--muted)}
+.callout{border-left:3px solid var(--hs);background:var(--surface);padding:10px 14px;border-radius:0 8px 8px 0;margin-top:14px;max-width:82ch}
+@media (max-width:860px){
+  .wrap{grid-template-columns:1fr;gap:0}
+  nav.toc{position:static;padding-top:24px}
+  nav.toc ol{grid-template-columns:repeat(auto-fill,minmax(150px,1fr))}
+  header h1{font-size:27px}
+}
+.toplinks{display:flex;flex-wrap:wrap;gap:6px;margin:0 0 22px}
+.toplinks a{display:inline-block;padding:3px 10px;border:1px solid var(--line);border-radius:999px;font:500 12px/1.6 var(--mono);color:var(--ink);text-decoration:none;background:var(--surface)}
+.toplinks a[aria-current]{border-color:var(--loop);color:var(--loop);background:var(--loop-bg)}
+.toplinks a:hover,.toplinks a:focus-visible{border-color:var(--loop);outline:none}
+header p a,.lede a{color:var(--loop)}
+.rules{display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));gap:14px;margin-top:14px}
+.rule{background:var(--surface);border:1px solid var(--line);border-radius:10px;padding:16px 18px}
+.rule b{display:block;font-size:16px;margin-bottom:6px}
+.rule p{margin:0;color:var(--muted);font-size:14px}
+body{margin:0}
+</style>
+
+
+</head>
+<body>
+<div class="wrap">
+<nav class="toc" aria-label="Contents">
+  <div class="toplinks"><a href="architecture.html">Architecture</a><a href="flows.html" aria-current="page">Flows</a><a href="flows.html" aria-current="page">English</a><a href="flows.zh-CN.html">中文</a></div>
+  <b>Contents</b>
+  <ol>
+    <li><a href="#pools"><span>00</span>The pools</a></li>
+    <li><a href="#engine"><span>01</span>Engine topology</a></li>
+    <li><a href="#round"><span>02</span>One round</a></li>
+    <li><a href="#tls"><span>03</span>TLS</a></li>
+    <li><a href="#h1"><span>04</span>HTTP/1.x</a></li>
+    <li><a href="#h1tls"><span>05</span>HTTP/1.x over TLS</a></li>
+    <li><a href="#h2c"><span>06</span>HTTP/2 cleartext</a></li>
+    <li><a href="#h2tls"><span>07</span>HTTP/2 over TLS</a></li>
+    <li><a href="#ws"><span>08</span>WebSocket handler</a></li>
+    <li><a href="#wss"><span>09</span>WebSocket over TLS</a></li>
+    <li><a href="#h3"><span>10</span>HTTP/3 (QUIC)</a></li>
+    <li><a href="#wsh1"><span>11</span>WS via HTTP/1.1</a></li>
+    <li><a href="#wsh2"><span>12</span>WS over HTTP/2</a></li>
+    <li><a href="#wsh3"><span>13</span>WS over HTTP/3</a></li>
+    <li><a href="#matrix"><span>14</span>Summary table</a></li>
+  </ol>
+</nav>
+
+<main>
+<header>
+  <h1>fib event loops and goroutine pools, protocol by protocol</h1>
+  <p>For each protocol: which event loop waits for events, which pool runs which code, and how data and control move between them. Drawn from the source at <code>main</code> (8a388d4), for Linux epoll and macOS kqueue, under <code>fib.DefaultConfig()</code>: <code>IOPollers=true</code>, <code>TaskPoolMode=ModeAdaptive</code>, <code>SharedTaskPool=true</code>, <code>SocketSyscalls=true</code>.</p>
+  <p>A colour always means the same executor:</p>
+  <div class="legend">
+    <span class="chip c-loop"><i></i>event loop (root / poller)</span>
+    <span class="chip c-work"><i></i>‹Name›-workers, the engine pool</span>
+    <span class="chip c-hs"><i></i>fib-tls-handshake pool</span>
+    <span class="chip c-str"><i></i>‹Name›-streams pool</span>
+    <span class="chip c-tmr"><i></i>timer goroutine</span>
+    <span class="chip c-usr"><i></i>the application's own goroutine</span>
+  </div>
+</header>
+
+<section id="pools">
+  <h2>The pools</h2>
+  <p class="lede">A server has three kinds of pool, plus the Go runtime's timers. An event loop never runs a connection's round: it waits for events, folds them into connections and submits those in batches.</p>
+  <div class="tbl"><table>
+    <thead><tr><th>Executor</th><th>Where it comes from</th><th>Mode / size</th><th>What it runs</th></tr></thead>
+    <tbody>
+      <tr><td><span class="chip c-loop"><i></i>event loop</span></td><td><code>Engine.runLoop</code></td><td>One root loop; NumCPU÷4 pollers, rounded down, at least one: 1 up to 7 CPUs, 2 on 8, 4 on 16; <code>IOPollerCount</code> overrides</td><td>epoll_wait/kevent, accept, reading and sorting UDP datagrams, the command queue (close / refresh / detach / accept), <b>OnOpen</b></td></tr>
+      <tr><td><span class="chip c-work"><i></i>‹Name›-workers</span></td><td><code>acquireTaskPool</code> (shared_taskpool.go)</td><td>Adaptive, queues sharded by P; ceiling max(GOMAXPROCS×1000, NumCPU×20), floor <code>MinWorkerCount</code>; shared by engines of one Name</td><td><code>Connection.RunTask → process()</code>: socket reads, the OnData chain (TLS decryption → protocol parsing → HTTP/1 handler / WebSocket callbacks), coalesced writes, OnClose</td></tr>
+      <tr><td><span class="chip c-hs"><i></i>fib-tls-handshake</span></td><td><code>sidepool</code></td><td>Adaptive; ceiling 65536, queue 10000, floor 0; one for the process</td><td>The blocking <code>crypto/tls.HandshakeContext</code> call, and delivery of the plaintext that arrived with the handshake</td></tr>
+      <tr><td><span class="chip c-str"><i></i>‹Name›-streams</span></td><td><code>streampool</code>, <code>Engine.HandlerPool()</code></td><td>Adaptive; ceiling twice the widest engine pool of that Name, floor 0</td><td>HTTP/2 and HTTP/3 request handlers (extended CONNECT upgrades and WebSocket OnOpen among them); HTTP/1 OnBody handovers and cancellation when a connection closes</td></tr>
+      <tr><td><span class="chip c-tmr"><i></i>timers</span></td><td><code>time.AfterFunc</code></td><td>As the runtime needs</td><td>Read/write deadlines → <code>commandClose</code>; UDP idle sweep → <code>commandUDPSweep</code>; QUIC's ACK, loss, idle and flushHold sends</td></tr>
+    </tbody>
+  </table></div>
+  <p class="callout">The three pools have to be separate. An engine worker submits handlers to the stream pool and handshakes to the handshake pool, and waits when a queue is full. Were they one pool, every worker could be waiting in a submission with none left to drain the queue, and the event loop would stop behind them. Waiting only runs one way: an engine worker may wait on the other two pools, never the reverse.</p>
+  <p class="ref">There is also <code>fib-client</code> (sidepool, ceiling 4096), which only runs clients' DNS lookups and result callbacks. Pool modes are now ModeElastic, ModeAdaptive, ModeAdaptiveChan and ModeInline; ModeCond is gone, and an engine refuses ModeInline.</p>
+</section>
+
+<section id="engine">
+  <h2>Engine topology: root loop, pollers and workers</h2>
+  <p class="lede">Every protocol shares this layer. They differ only in which Handler sits in the OnData chain.</p>
+  <div class="runs"><span class="chip c-loop"><i></i>root loop</span><span class="chip c-loop"><i></i>poller × N</span><span class="chip c-work"><i></i>workers</span><span class="chip c-tmr"><i></i>timers</span></div>
+  <div class="diagram"><pre class="mermaid">
+flowchart LR
+  subgraph KER["kernel"]
+    LFD[("listen fd")]
+    CFD[("conn fd")]
+    UFD[("UDP fd")]
+  end
+  subgraph ROOT["root engine loop · the goroutine in Run"]
+    R1["epoll_wait"] --> R2{"token kind"}
+    R2 -- listener --> R3["acceptConnections&lt;br/&gt;TCP_NODELAY"]
+    R2 -- udp --> R4["readUDPListener&lt;br/&gt;recvmmsg, 256 a round at most&lt;br/&gt;sorted by peer address onto peer Connections"]
+    R2 -- wake --> R5["drainCommands"]
+  end
+  subgraph POL["poller i loop · one per 4 CPUs"]
+    P1["commandAccept → admit&lt;br/&gt;EPOLL_CTL_ADD + OnOpen"]
+    P2["epoll_wait → noteEvent&lt;br/&gt;fold events into pendingEvents&lt;br/&gt;ready only if not scheduled"]
+    P3["runReady: GoTasks in one batch&lt;br/&gt;then runtime.Gosched"]
+    P4["settle: commands queued meanwhile&lt;br/&gt;refresh / close / detach"]
+    P2 --> P3 --> P4 --> P2
+  end
+  subgraph WK["‹Name›-workers pool"]
+    W1["Connection.RunTask&lt;br/&gt;→ process, one round"]
+  end
+  TM["time.AfterFunc&lt;br/&gt;deadline / UDP sweep"]
+  LFD -.-> R1
+  UFD -.-> R1
+  CFD -.-> P2
+  R3 -- "fd % pollerCount&lt;br/&gt;commandAccept + eventfd" --> P1
+  R4 -- "peer runnable" --> W1
+  P3 --> W1
+  W1 -- "commandRefresh / Close / Detach&lt;br/&gt;+ eventfd wake-up" --> P4
+  TM -- "commandClose / UDPSweep" --> P4
+  classDef loop fill:#e8effc,stroke:#2458c6,color:#16202c
+  classDef work fill:#e3f4f1,stroke:#0c7d72,color:#16202c
+  classDef hs fill:#fbf0de,stroke:#a86a12,color:#16202c
+  classDef str fill:#efe9fb,stroke:#6b45c8,color:#16202c
+  classDef tmr fill:#eceff3,stroke:#5f6b7a,color:#16202c
+  classDef usr fill:#fae6ed,stroke:#b23a62,color:#16202c
+  class R1,R2,R3,R4,R5,P1,P2,P3,P4 loop
+  class W1 work
+  class TM tmr
+  </pre></div>
+  <ul class="notes">
+    <li><b>Without IOPollers</b> there are no pollers: the root loop accepts, registers and waits for every connection itself. The rest is the same.</li>
+    <li><b>ReusePort (Linux only)</b>: each poller listens on a socket of its own at the engine's address and accepts for itself; the root socket is bound but does not listen. UDP likewise: each poller reads its own UDP socket.</li>
+    <li><b>OnOpen runs on the event loop</b> (<code>admit</code> / <code>udpPeer</code>), so it must not block. That is where TLS hands the handshake to its pool.</li>
+    <li>A send made outside a round (<code>Send</code> while not corked) writes to the socket at once. Only what the socket does not take is queued, and the standing EPOLLOUT edge carries it on.</li>
+    <li>On Linux connections read and write with raw system calls that bypass the scheduler, since a non-blocking socket never waits. With <code>SocketSyscalls</code>, the default, they are <code>recvfrom</code> / <code>sendto</code> / <code>sendmsg</code>, which skip the VFS permission hooks.</li>
+    <li>The loop closes a connection in <code>closeConnection</code>: it stops at once and gives back its budget, but OnClose and the descriptor's release are folded into the connection's next round, so OnClose always follows the OnData before it.</li>
+  </ul>
+  <p class="ref">engine_unix.go:442 Run · :467 acceptConnections · :511 admit · poller_epoll.go:79 runLoop · engine.go:377 runReady · :602 noteEvent · :742 closeConnection · sockio_linux.go</p>
+</section>
+
+<section id="round">
+  <h2>One round: process() on a worker</h2>
+  <p class="lede">Every TCP protocol's callbacks are called from here. A round's replies are corked and reach the socket in one write or writev when it ends.</p>
+  <div class="runs"><span class="chip c-work"><i></i>workers</span><span class="chip c-loop"><i></i>loop (fallback path)</span></div>
+  <div class="diagram"><pre class="mermaid">
+flowchart TD
+  A["take pendingEvents"] --> B{"EPOLLOUT and flushable output&lt;br/&gt;not what the application corked"}
+  B -- yes --> C["flushOutput"]
+  B -- no --> D
+  C --> D{"EPOLLIN"}
+  D -- "queued output at the watermark&lt;br/&gt;or HoldReads / no watermark" --> E["defer the read to the next round&lt;br/&gt;let the peer catch up first"]
+  D -- "readable, also with output queued below the watermark" --> F["drainInput: corked = true"]
+  F --> G["readLoop: read 16KB&lt;br/&gt;→ handler.OnData(c, buf)"]
+  G --> H{"readShouldStop&lt;br/&gt;watermark / budget / HoldReads"}
+  H -- yes --> I["uncork and flush first&lt;br/&gt;still over: stallRead"]
+  I --> LP["loop: commandRefresh&lt;br/&gt;EPOLL_CTL_MOD pauses reads"]
+  H -- no --> J{"short read"}
+  J -- no --> G
+  J -- yes --> K["uncork: the round's replies in one write"]
+  E --> M
+  K --> M{"new events meanwhile"}
+  M -- yes --> A
+  M -- no --> N["scheduled = false, round ends"]
+  N --> O{"closePending"}
+  O -- yes --> P["finishClose: OnClose&lt;br/&gt;→ commandDetach, the loop closes the fd"]
+  classDef loop fill:#e8effc,stroke:#2458c6,color:#16202c
+  classDef work fill:#e3f4f1,stroke:#0c7d72,color:#16202c
+  classDef hs fill:#fbf0de,stroke:#a86a12,color:#16202c
+  classDef str fill:#efe9fb,stroke:#6b45c8,color:#16202c
+  classDef tmr fill:#eceff3,stroke:#5f6b7a,color:#16202c
+  classDef usr fill:#fae6ed,stroke:#b23a62,color:#16202c
+  class A,B,C,D,E,F,G,H,I,J,K,M,N,O,P work
+  class LP loop
+  </pre></div>
+  <ul class="notes">
+    <li>At most one worker runs a connection at a time (the <code>scheduled</code> flag). Events the loop sees meanwhile only go into <code>pendingEvents</code>, and the round picks them up before it ends.</li>
+    <li>Output queued below <code>WriteBufferHighWatermark</code> no longer stops the read: the watermark bounds a connection's buffering, not its first queued byte. Stopping there left a pipelining client's requests in the kernel's receive queue and caused heavy retransmission.</li>
+    <li>A write edge only flushes flushable output. What the application holds with <code>Cork</code> waits for <code>Flush</code>, however writable the socket is.</li>
+    <li>A handler that panics has <code>scheduled</code> rolled back and its connection closed, and the panic goes on to the pool's panic handler.</li>
+  </ul>
+  <p class="ref">connection.go:519 RunTask · :524 process · :679 hasFlushableOutput · :690 drainInput · :777 readLoop · :709 uncork · :650 finishClose</p>
+</section>
+
+<section id="tls">
+  <h2>TLS (fibtls.NewServer in front of any fib.Handler)</h2>
+  <p class="lede">The handshake is a blocking crypto/tls call, so it runs on a pool of its own; the ciphertext it reads is still read from the socket by an engine worker and fed to it. Afterwards, AES-GCM and AES-CBC suites are protected by fib itself, decrypting on the worker straight from the round's read buffer.</p>
+  <div class="runs"><span class="chip c-loop"><i></i>loop</span><span class="chip c-hs"><i></i>handshake pool</span><span class="chip c-work"><i></i>workers</span></div>
+  <div class="diagram"><pre class="mermaid">
+flowchart TD
+  subgraph LOOP["poller loop"]
+    L1["admit → tls.Handler.OnOpen&lt;br/&gt;layer + crypto/tls Server&lt;br/&gt;inner.OnOpen may Send; held in pending"]
+    L2["EPOLLIN → noteEvent → GoTasks"]
+  end
+  subgraph HS["fib-tls-handshake pool"]
+    H1["layer.handshake&lt;br/&gt;HandshakeContext, 10s by default"]
+    H2["layer.Read&lt;br/&gt;no ciphertext: cond.Wait"]
+    H3["layer.Write → c.SendRaw&lt;br/&gt;outside a round, written at once"]
+    H4["takeOver: GCM / CBC move to fib's own rx / tx"]
+    H5["encrypt and send pending&lt;br/&gt;inner.OnHandshake, if implemented"]
+    H6["decrypt what came with the handshake&lt;br/&gt;→ inner.OnData"]
+    H7["settle: report a close held meanwhile"]
+    H1 <--> H2
+    H1 <--> H3
+    H1 --> H4 --> H5 --> H6 --> H7
+  end
+  subgraph WK["‹Name›-workers"]
+    W1["process → readLoop&lt;br/&gt;→ tls.Handler.OnData(ciphertext)"]
+    W2{"handshaking"}
+    W3["feed: append to t.in&lt;br/&gt;cond.Signal"]
+    W4["drain: open record by record&lt;br/&gt;fast path rx.open, else conn.Read&lt;br/&gt;→ inner.OnData(plaintext)"]
+    W5["inner's Send → layer.Send&lt;br/&gt;seal under wmu → SendRaw, corked"]
+    W1 --> W2
+    W2 -- yes --> W3
+    W2 -- no --> W4 --> W5
+  end
+  L1 -- "sidepool.Handshake().Go" --> H1
+  L2 --> W1
+  W3 -. "wakes" .-> H2
+  classDef loop fill:#e8effc,stroke:#2458c6,color:#16202c
+  classDef work fill:#e3f4f1,stroke:#0c7d72,color:#16202c
+  classDef hs fill:#fbf0de,stroke:#a86a12,color:#16202c
+  classDef str fill:#efe9fb,stroke:#6b45c8,color:#16202c
+  classDef tmr fill:#eceff3,stroke:#5f6b7a,color:#16202c
+  classDef usr fill:#fae6ed,stroke:#b23a62,color:#16202c
+  class L1,L2 loop
+  class W1,W2,W3,W4,W5 work
+  class H1,H2,H3,H4,H5,H6,H7 hs
+  </pre></div>
+  <ul class="notes">
+    <li><code>readMu</code> leaves one goroutine delivering plaintext at a time: while the handshake's worker delivers the first of it, an engine worker's <code>feed</code> waits.</li>
+    <li>During the handshake a worker only appends ciphertext and returns, so a round is never held up by it. A handshake worker is held by a slow peer for HandshakeTimeout at most.</li>
+    <li>OnClose never runs beside OnHandshake: a close before the handshake settles is kept as <code>closeHeld</code> and reported by the handshake's worker. Plaintext a peer sent right behind its handshake and then closed is still delivered first (<code>dropsInput</code> drops nothing while settling).</li>
+    <li>Sends are encrypted one at a time under <code>wmu</code> whichever goroutine makes them, so HTTP/2's stream workers queue here when they answer on one connection.</li>
+  </ul>
+  <p class="ref">tls/tls.go:146 OnOpen · :269 handshake · :351 feed · :379 drainLocked · :465 Send · :552 Read · tls/fast.go:260 takeOver · :365 drainFast · sidepool/sidepool.go</p>
+</section>
+
+<section id="h1">
+  <h2>HTTP/1.x (cleartext)</h2>
+  <p class="lede">A request is carried from its first byte to its response by one worker in one round, handler included. The stream pool only does what has to happen after a handler has returned.</p>
+  <div class="runs"><span class="chip c-loop"><i></i>loop</span><span class="chip c-work"><i></i>workers</span><span class="chip c-str"><i></i>stream pool (async only)</span><span class="chip c-usr"><i></i>application goroutine (Retain)</span><span class="chip c-tmr"><i></i>timers</span></div>
+  <div class="diagram"><pre class="mermaid">
+flowchart TD
+  subgraph LOOP["poller loop"]
+    L1["OnOpen: attachParser&lt;br/&gt;armRead sets the header / idle deadline"]
+    L2["EPOLLIN → GoTasks"]
+    L3["closeConnection → schedules the last round"]
+  end
+  subgraph WK["‹Name›-workers, within one round"]
+    W1["OnData → drive, holding parser.mu"]
+    W2{"sniff: starts with the PRI preface"}
+    W3["feedBorrowed parses a request"]
+    W4{"Upgrade: h2c"}
+    W5["serveRequest: ServeHTTP runs on this worker"]
+    W6["Respond → SendParts, corked"]
+    W7{"context.settle"}
+    W8["endRequestLocked&lt;br/&gt;parse the next pipelined request"]
+    W9["parser.busy, the round returns"]
+    WX["end of round, uncork: responses in one write"]
+    WC["OnClose: runOnStreams reports the cancellation"]
+    W1 --> W2
+    W2 -- no --> W3 --> W4
+    W4 -- no --> W5 --> W6 --> W7
+    W7 -- "written" --> W8 --> W3
+    W7 -- "retained" --> W9
+    W8 --> WX
+  end
+  H2C["on to the HTTP/2 flow"]
+  subgraph USR["application goroutine"]
+    U1["Release / write the response&lt;br/&gt;drive carries on here"]
+  end
+  subgraph STR["‹Name›-streams"]
+    S1["OnBody handover, once the handler has returned"]
+    S2["Context.OnCancel, body.fail"]
+  end
+  TM["deadline timer"]
+  L2 --> W1
+  W2 -- yes --> H2C
+  W4 -- yes --> H2C
+  W9 -.-> U1
+  W5 -. "OnBody" .-> S1
+  L3 --> WC --> S2
+  TM -- "commandClose" --> L3
+  classDef loop fill:#e8effc,stroke:#2458c6,color:#16202c
+  classDef work fill:#e3f4f1,stroke:#0c7d72,color:#16202c
+  classDef hs fill:#fbf0de,stroke:#a86a12,color:#16202c
+  classDef str fill:#efe9fb,stroke:#6b45c8,color:#16202c
+  classDef tmr fill:#eceff3,stroke:#5f6b7a,color:#16202c
+  classDef usr fill:#fae6ed,stroke:#b23a62,color:#16202c
+  class L1,L2,L3 loop
+  class W1,W2,W3,W4,W5,W6,W7,W8,W9,WX,WC work
+  class S1,S2 str
+  class U1 usr
+  class TM,H2C tmr
+  </pre></div>
+  <ul class="notes">
+    <li>A handler that blocks holds up its own connection, and the requests pipelined on it, and no other. To wait on something external, <code>Retain</code> the request and <code>Release</code> it from a goroutine of your own; the response is written there, outside a round and uncorked.</li>
+    <li>A streamed body (<code>StreamRequestBody</code>) is still read by workers in later rounds and fed to the BodyStream. When its buffer is full, <code>HoldReads</code> stops reading and TCP flow control slows the client.</li>
+    <li>Closing your own connection in a handler and then waiting for <code>OnCancel</code> deadlocks: OnClose runs only after this round returns.</li>
+  </ul>
+  <p class="ref">http/handler.go:452 OnOpen · :481 OnData · :507 drive · :800 serveRequest · :837 sniff · :883 OnClose · http/context.go:392 later · http/stream_pool_native.go:225 runOnStreams</p>
+</section>
+
+<section id="h1tls">
+  <h2>HTTP/1.x over TLS</h2>
+  <p class="lede">The HTTP/1 flow sits unchanged beneath the TLS layer: a worker decrypts, hands the plaintext to drive, and the response is encrypted by layer.Send and still leaves in one write at the end of the round. The exception is a first request that arrives with the handshake.</p>
+  <div class="runs"><span class="chip c-loop"><i></i>loop</span><span class="chip c-hs"><i></i>handshake pool</span><span class="chip c-work"><i></i>workers</span><span class="chip c-str"><i></i>stream pool (async only)</span></div>
+  <div class="diagram"><pre class="mermaid">
+flowchart TD
+  subgraph LOOP["poller loop"]
+    L1["tls.OnOpen → http.OnOpen&lt;br/&gt;attachParser + armRead"]
+    L2["EPOLLIN → GoTasks"]
+  end
+  subgraph HS["fib-tls-handshake"]
+    H1["HandshakeContext&lt;br/&gt;ALPN picks http/1.1"]
+    H2["first plaintext → http.drive&lt;br/&gt;the request may be served right here"]
+    H3["response: layer.Send encrypts&lt;br/&gt;outside a round, written at once"]
+    H1 --> H2 --> H3
+  end
+  subgraph WK["‹Name›-workers"]
+    W0["handshaking: feed ciphertext, wake the handshake worker"]
+    W1["decrypt → http.drive"]
+    W2["ServeHTTP"]
+    W3["Respond → layer.Send&lt;br/&gt;seal → SendRaw, corked"]
+    W4["end of round, uncork: one write"]
+    W1 --> W2 --> W3 --> W4
+  end
+  subgraph STR["‹Name›-streams"]
+    S1["OnBody handover / cancellation"]
+  end
+  L1 -- "Handshake().Go" --> H1
+  L2 --> W0
+  L2 --> W1
+  W0 -. "cond.Signal" .-> H1
+  W2 -.-> S1
+  classDef loop fill:#e8effc,stroke:#2458c6,color:#16202c
+  classDef work fill:#e3f4f1,stroke:#0c7d72,color:#16202c
+  classDef hs fill:#fbf0de,stroke:#a86a12,color:#16202c
+  classDef str fill:#efe9fb,stroke:#6b45c8,color:#16202c
+  classDef tmr fill:#eceff3,stroke:#5f6b7a,color:#16202c
+  classDef usr fill:#fae6ed,stroke:#b23a62,color:#16202c
+  class L1,L2 loop
+  class W0,W1,W2,W3,W4 work
+  class H1,H2,H3 hs
+  class S1 str
+  </pre></div>
+  <ul class="notes">
+    <li><code>request.TLS</code> is looked up once, through <code>fibtls.ConnectionState</code>, on the first drive, and kept on the parser.</li>
+    <li>With <code>ReadTimeout</code> / <code>IdleTimeout</code> set, the idle timeout runs from OnOpen, so the TLS handshake counts against it.</li>
+    <li>For HTTP/2, <code>fibhttp.ConfigureTLS</code> adds <code>h2</code> to ALPN, and the same Handler then follows the HTTP/2 flow below for connections that negotiate it.</li>
+  </ul>
+</section>
+
+<section id="h2c">
+  <h2>HTTP/2 cleartext (h2c: preface or Upgrade)</h2>
+  <p class="lede">A worker reads and frames the connection, and hands each request's handler to the stream pool, going straight back to the socket. Responses are encoded on the stream workers and written directly, as far as the flow-control windows allow.</p>
+  <div class="runs"><span class="chip c-loop"><i></i>loop</span><span class="chip c-work"><i></i>workers (read / frame)</span><span class="chip c-str"><i></i>stream pool (handlers)</span></div>
+  <div class="diagram"><pre class="mermaid">
+flowchart TD
+  subgraph WK["‹Name›-workers, the connection's reader"]
+    W1["drive → sniff sees the PRI preface&lt;br/&gt;or Upgrade: h2c, answered with 101"]
+    W2["startH2: newH2ServerConn&lt;br/&gt;start sends SETTINGS + WINDOW_UPDATE"]
+    W3["h2ServerConn.feed&lt;br/&gt;h2ReadFrame → handleFrame"]
+    W4["HEADERS / CONTINUATION&lt;br/&gt;HPACK decode → newRequest"]
+    W5["DATA: take the body, send WINDOW_UPDATE"]
+    W6["WINDOW_UPDATE: flushLocked&lt;br/&gt;sends DATA the window held back"]
+    W7["finishRequest / streamRequest"]
+    W8{"StreamPool.admit&lt;br/&gt;MaxConcurrentHandlers"}
+    W9["at the limit: the handler runs on the reader"]
+    W1 --> W2 --> W3
+    W3 --> W4 --> W7
+    W3 --> W5 --> W7
+    W3 --> W6
+    W7 --> W8
+    W8 -- "over" --> W9
+  end
+  subgraph STR["‹Name›-streams"]
+    S1["streamTask.run → serveRequest&lt;br/&gt;ServeHTTP"]
+    S2["st.respond: holding sc.mu&lt;br/&gt;HPACK-encode HEADERS&lt;br/&gt;cut DATA frames to the windows"]
+    S3["conn.Send: written at once unless corked"]
+    S4["defer conn.Flush"]
+    S1 --> S2 --> S3 --> S4
+  end
+  subgraph LOOP["poller loop"]
+    L1["EPOLLIN → GoTasks"]
+    L2["OnClose → sc.shutdown"]
+  end
+  L1 --> W3
+  W8 -- "GoTask" --> S1
+  S2 -. "no window: left in st.pending" .-> W6
+  classDef loop fill:#e8effc,stroke:#2458c6,color:#16202c
+  classDef work fill:#e3f4f1,stroke:#0c7d72,color:#16202c
+  classDef hs fill:#fbf0de,stroke:#a86a12,color:#16202c
+  classDef str fill:#efe9fb,stroke:#6b45c8,color:#16202c
+  classDef tmr fill:#eceff3,stroke:#5f6b7a,color:#16202c
+  classDef usr fill:#fae6ed,stroke:#b23a62,color:#16202c
+  class L1,L2 loop
+  class W1,W2,W3,W4,W5,W6,W7,W8,W9 work
+  class S1,S2,S3,S4 str
+  </pre></div>
+  <ul class="notes">
+    <li><code>MaxConcurrentHandlers=0</code>, the default, sends every request to the stream pool; <code>MaxConcurrentStreams</code> is what bounds a connection. With N, the Nth handler runs on the reader, which then reads nothing more, so the peer's flow control pays for the limit. <code>Disable</code> is N=1.</li>
+    <li>A stream worker's response goes into the round's send buffer if the reader's round is corked at that moment, and out with it; otherwise it is written at once.</li>
+    <li>A streamed request body: <code>streamRequest</code> submits the handler before the body is complete, the reader feeds later DATA frames to its BodyFeed, and the receive window is given back as the handler consumes.</li>
+    <li>The server's SETTINGS now carry <code>ENABLE_CONNECT_PROTOCOL=1</code>; an extended CONNECT with <code>:protocol</code> takes the tunnel flow, see WS over HTTP/2.</li>
+    <li>The stream pool's ceiling is twice the engine pool's and its floor zero. It stops when the last engine of its name closes; a request that comes after is served by its reader.</li>
+  </ul>
+  <p class="ref">http/handler.go:857 startH2 · http/h2_upgrade.go:45 upgradeH2C · http/h2_server.go:248 feed · :907 finishRequest · :939 streamRequest · :1115 respond · http/stream_pool_native.go:86 Run · :98 Serve · :198 streamTask.run</p>
+</section>
+
+<section id="h2tls">
+  <h2>HTTP/2 over TLS (ALPN h2)</h2>
+  <p class="lede">Two layers around the h2c flow: the handshake pool runs the handshake, and a worker decrypts before it frames. Stream workers encrypt their responses one at a time under the TLS layer's <code>wmu</code>.</p>
+  <div class="runs"><span class="chip c-loop"><i></i>loop</span><span class="chip c-hs"><i></i>handshake pool</span><span class="chip c-work"><i></i>workers</span><span class="chip c-str"><i></i>stream pool</span></div>
+  <div class="diagram"><pre class="mermaid">
+flowchart TD
+  subgraph LOOP["poller loop"]
+    L1["tls.OnOpen → http.OnOpen"]
+    L2["EPOLLIN → GoTasks"]
+  end
+  subgraph HS["fib-tls-handshake"]
+    H1["HandshakeContext&lt;br/&gt;ALPN picks h2"]
+    H2["first plaintext: client preface, SETTINGS,&lt;br/&gt;perhaps the first HEADERS"]
+    H3["http.drive → sniff&lt;br/&gt;NegotiatedProtocol is h2 → startH2"]
+    H1 --> H2 --> H3
+  end
+  subgraph WK["‹Name›-workers"]
+    W1["decrypt records"]
+    W2["h2ServerConn.feed frames"]
+    W3["finishRequest → StreamPool.Serve"]
+    W1 --> W2 --> W3
+  end
+  subgraph STR["‹Name›-streams"]
+    S1["ServeHTTP"]
+    S2["respond: HEADERS + DATA"]
+    S3["conn.Send → layer.Send&lt;br/&gt;seal under wmu → SendRaw"]
+    S1 --> S2 --> S3
+  end
+  L1 -- "Handshake().Go" --> H1
+  L2 --> W1
+  H3 -- "Serve" --> S1
+  W3 -- "Serve" --> S1
+  classDef loop fill:#e8effc,stroke:#2458c6,color:#16202c
+  classDef work fill:#e3f4f1,stroke:#0c7d72,color:#16202c
+  classDef hs fill:#fbf0de,stroke:#a86a12,color:#16202c
+  classDef str fill:#efe9fb,stroke:#6b45c8,color:#16202c
+  classDef tmr fill:#eceff3,stroke:#5f6b7a,color:#16202c
+  classDef usr fill:#fae6ed,stroke:#b23a62,color:#16202c
+  class L1,L2 loop
+  class W1,W2,W3 work
+  class H1,H2,H3 hs
+  class S1,S2,S3 str
+  </pre></div>
+  <ul class="notes">
+    <li>Once ALPN has chosen h2 the preface is not sniffed for: the first bytes go to HTTP/2, and anything that does not start with the preface is a connection error.</li>
+    <li>Frames that came with the handshake are framed on the handshake's worker, which also submits their complete requests to the stream pool.</li>
+    <li>Encryption is serial under <code>wmu</code>: stream workers answering on one connection queue there, each sealing and queueing one piece at a time.</li>
+  </ul>
+</section>
+
+<section id="ws">
+  <h2>WebSocket as its own Handler (cleartext)</h2>
+  <p class="lede">The opening handshake and every frame after it are handled in a worker's round, and the message callbacks run on that worker. No other pool is involved.</p>
+  <div class="runs"><span class="chip c-loop"><i></i>loop</span><span class="chip c-work"><i></i>workers</span><span class="chip c-usr"><i></i>application goroutine (writes, optional)</span></div>
+  <div class="diagram"><pre class="mermaid">
+flowchart TD
+  subgraph LOOP["poller loop"]
+    L1["OnOpen: attach connectionState"]
+    L2["EPOLLIN → GoTasks"]
+    L3["closeConnection → last round"]
+  end
+  subgraph WK["‹Name›-workers"]
+    W1["ServerHandler.OnData"]
+    W2{"upgraded"}
+    W3["validateMinimalHandshake&lt;br/&gt;byte-level fast path"]
+    W4["incomplete, or a Request is wanted:&lt;br/&gt;handshakeParser accumulates"]
+    W5["upgrade: send 101, corked&lt;br/&gt;negotiate permessage-deflate&lt;br/&gt;handler.OnOpen(ws, req)"]
+    W6["serveFrames: FeedOneBorrowed"]
+    W7["Text / Binary → OnMessage or OnFrame"]
+    W8["Ping → automatic Pong&lt;br/&gt;Close → echo Close"]
+    W9["WriteMessage → sendFrame&lt;br/&gt;corked in the round, one write at its end"]
+    WC["OnClose(ws, code, reason, err)"]
+    W1 --> W2
+    W2 -- no --> W3
+    W3 -- incomplete --> W4 --> W5
+    W3 -- complete --> W5
+    W5 -- "bytes left over" --> W6
+    W2 -- yes --> W6
+    W6 --> W7 --> W9
+    W6 --> W8
+  end
+  subgraph USR["application goroutine"]
+    U1["WriteMessage, written at once"]
+  end
+  L2 --> W1
+  L3 --> WC
+  classDef loop fill:#e8effc,stroke:#2458c6,color:#16202c
+  classDef work fill:#e3f4f1,stroke:#0c7d72,color:#16202c
+  classDef hs fill:#fbf0de,stroke:#a86a12,color:#16202c
+  classDef str fill:#efe9fb,stroke:#6b45c8,color:#16202c
+  classDef tmr fill:#eceff3,stroke:#5f6b7a,color:#16202c
+  classDef usr fill:#fae6ed,stroke:#b23a62,color:#16202c
+  class L1,L2,L3 loop
+  class W1,W2,W3,W4,W5,W6,W7,W8,W9,WC work
+  class U1 usr
+  </pre></div>
+  <ul class="notes">
+    <li>An OnMessage that blocks holds up its own connection only. For long work, copy the payload out in the callback and hand it to a goroutine of your own; its <code>WriteMessage</code> writes to the socket directly.</li>
+    <li>Deflate compression and decompression also run in the round, on the worker.</li>
+    <li>Here <code>websocket.ServerHandler</code> is bound to the engine as a <code>fib.Handler</code>: it does not go through package http's drive or the stream pool. The same ServerHandler can also be reached from an HTTP server's handler through <code>Upgrade</code>; see the three sections after HTTP/3.</li>
+  </ul>
+  <p class="ref">websocket/handler.go:371 OnOpen · :375 OnData · :441 upgrade · :478 serveFrames · :740 OnClose</p>
+</section>
+
+<section id="wss">
+  <h2>WebSocket over TLS</h2>
+  <p class="lede">Once the handshake pool has finished the TLS handshake, the upgrade request and the frames are handled as in cleartext, decrypted first on the worker and encrypted by the TLS layer on the way out.</p>
+  <div class="runs"><span class="chip c-loop"><i></i>loop</span><span class="chip c-hs"><i></i>handshake pool</span><span class="chip c-work"><i></i>workers</span></div>
+  <div class="diagram"><pre class="mermaid">
+flowchart TD
+  subgraph LOOP["poller loop"]
+    L1["tls.OnOpen → ws.OnOpen"]
+    L2["EPOLLIN → GoTasks"]
+  end
+  subgraph HS["fib-tls-handshake"]
+    H1["HandshakeContext"]
+    H2["an upgrade request that came with the handshake&lt;br/&gt;is parsed and answered with 101 here,&lt;br/&gt;and handler.OnOpen is called"]
+    H1 --> H2
+  end
+  subgraph WK["‹Name›-workers"]
+    W1["decrypt records"]
+    W2["upgrade request / serveFrames"]
+    W3["OnMessage / OnFrame"]
+    W4["WriteMessage → layer.Send&lt;br/&gt;seal → SendRaw, corked"]
+    W1 --> W2 --> W3 --> W4
+  end
+  L1 -- "Handshake().Go" --> H1
+  L2 --> W1
+  classDef loop fill:#e8effc,stroke:#2458c6,color:#16202c
+  classDef work fill:#e3f4f1,stroke:#0c7d72,color:#16202c
+  classDef hs fill:#fbf0de,stroke:#a86a12,color:#16202c
+  classDef str fill:#efe9fb,stroke:#6b45c8,color:#16202c
+  classDef tmr fill:#eceff3,stroke:#5f6b7a,color:#16202c
+  classDef usr fill:#fae6ed,stroke:#b23a62,color:#16202c
+  class L1,L2 loop
+  class W1,W2,W3,W4 work
+  class H1,H2 hs
+  </pre></div>
+  <ul class="notes">
+    <li>Clients often send the upgrade request right behind their Finished, so WebSocket's <code>OnOpen</code> runs sometimes on a handshake worker and sometimes on an engine worker. <code>readMu</code> keeps the two in order, never at once.</li>
+    <li>A frame's header and payload are sealed as one TLS record (<code>SendParts</code> → one seal), rather than paying a record's overhead for the header alone.</li>
+  </ul>
+</section>
+
+<section id="h3">
+  <h2>HTTP/3 (QUIC, with TLS 1.3 built in)</h2>
+  <p class="lede">HTTP/3 has no cleartext form: TLS 1.3 is part of QUIC. The event loop reads the UDP datagrams itself and sorts them by peer address; QUIC's packets, handshake and frames are handled on workers; request handlers go to the stream pool in batches; and QUIC's own timers send from the runtime's timer goroutines.</p>
+  <div class="runs"><span class="chip c-loop"><i></i>root loop reads UDP</span><span class="chip c-work"><i></i>workers</span><span class="chip c-str"><i></i>stream pool</span><span class="chip c-tmr"><i></i>QUIC timers / UDP sweep</span></div>
+  <div class="diagram"><pre class="mermaid">
+flowchart TD
+  subgraph LOOP["root loop, or each poller under ReusePort"]
+    L1["UDP fd readable → readUDPListener&lt;br/&gt;recvmmsg, 256 a round at most"]
+    L2["udpPeer: peer Connection by address&lt;br/&gt;a new peer gets a connection + OnOpen"]
+    L3["deliverDatagram: copy onto the peer's queue&lt;br/&gt;noteEvent → GoTasks"]
+    L1 --> L2 --> L3
+  end
+  subgraph WK["‹Name›-workers"]
+    W1["process → drainDatagrams&lt;br/&gt;→ OnDatagrams(batch)"]
+    W2{"quic.Conn attached"}
+    W3["version negotiation / migrated connection by CID /&lt;br/&gt;Initial → quic.Accept&lt;br/&gt;crypto/tls QUICServer, non-blocking"]
+    W4["HandlePathDatagrams: open packets, handle frames, note ACKs"]
+    W5["dispatch → OnStreamData&lt;br/&gt;requestStream.feed, QPACK decode"]
+    W6["finish → streams.Queue onto the batch"]
+    W7["OnCallsDone → streams.Submit&lt;br/&gt;the whole batch in one GoTasks"]
+    W8["flush: held during dispatch,&lt;br/&gt;then packed and sent"]
+    W1 --> W2
+    W2 -- no --> W3 --> W4
+    W2 -- yes --> W4
+    W4 --> W5 --> W6 --> W7 --> W8
+  end
+  subgraph STR["‹Name›-streams"]
+    S1["ServeHTTP"]
+    S2["WriteResponse: QPACK encode&lt;br/&gt;write to the QUIC stream"]
+    S3["writeDone → qc.flush → sendLocked&lt;br/&gt;SendBatch: sendmmsg through the listener's fd"]
+    S1 --> S2 --> S3
+  end
+  subgraph TMR["runtime timer goroutines"]
+    T1["quic onTimer: ACK delay, loss / PTO,&lt;br/&gt;idle, handshake timeout, flushHold&lt;br/&gt;→ sendLocked sends directly"]
+    T2["UDP sweep → commandUDPSweep"]
+  end
+  L3 --> W1
+  W7 --> S1
+  T2 --> LOOP
+  classDef loop fill:#e8effc,stroke:#2458c6,color:#16202c
+  classDef work fill:#e3f4f1,stroke:#0c7d72,color:#16202c
+  classDef hs fill:#fbf0de,stroke:#a86a12,color:#16202c
+  classDef str fill:#efe9fb,stroke:#6b45c8,color:#16202c
+  classDef tmr fill:#eceff3,stroke:#5f6b7a,color:#16202c
+  classDef usr fill:#fae6ed,stroke:#b23a62,color:#16202c
+  class L1,L2,L3 loop
+  class W1,W2,W3,W4,W5,W6,W7,W8 work
+  class S1,S2,S3 str
+  class T1,T2 tmr
+  </pre></div>
+  <ul class="notes">
+    <li><b>Who reads UDP.</b> By default there is one UDP socket that every peer shares, so it stays on the root loop and the pollers take no part. With <code>ReusePort</code> on Linux each poller binds a socket of its own, and the kernel's four-tuple hash always hands a peer to the same poller.</li>
+    <li><b>The handshake uses no handshake pool.</b> QUIC runs <code>crypto/tls</code>'s QUICConn, which is event-driven and never blocks, so the TLS 1.3 handshake advances within the worker's round.</li>
+    <li><b>Batching.</b> The requests a burst of datagrams brings are submitted together, land on one shard and are taken by the same few workers, so their responses fit into the same UDP packets, along with the burst's acknowledgement.</li>
+    <li>A stream worker writing a response and a timer goroutine both send through the UDP listener's descriptor directly, holding <code>quic.Conn.mu</code>, without going back to the event loop.</li>
+    <li>A peer whose address changes (NAT rebinding) looks like a new peer; <code>route</code> finds its <code>quic.Conn</code> by Connection ID, whichever loop the new address falls to.</li>
+    <li>The control stream's SETTINGS now carry <code>ENABLE_CONNECT_PROTOCOL=1</code>; an extended CONNECT takes the tunnel flow, see WS over HTTP/3.</li>
+    <li>A second, TCP engine usually runs <code>fibtls + fibhttp</code> (HTTP/1, HTTP/2) beside it and advertises HTTP/3 through Alt-Svc. Two engines of one Name share the workers pool and the stream pool.</li>
+  </ul>
+  <p class="ref">engine_unix.go readUDPListener · udp.go:111 udpPeer · :138 deliverDatagram · :159 drainDatagrams · http3/server.go:211 OnData · :285 OnDatagrams · :436 OnCallsDone · :816 finish · :894 WriteResponse · http3/quic/conn.go:463 Accept · :799 dispatch · :877 flush · :1491 onTimer</p>
+</section>
+
+<section id="wsh1">
+  <h2>WebSocket via an HTTP/1.1 upgrade (ws.Upgrade, with or without TLS)</h2>
+  <p class="lede">An HTTP server's handler calls <code>websocket.ServerHandler.Upgrade</code>, and the whole connection becomes a tunnel. The handler already runs on the connection's worker, so the upgrade, OnOpen and every frame after it stay on workers, with no other pool.</p>
+  <div class="runs"><span class="chip c-loop"><i></i>loop</span><span class="chip c-work"><i></i>workers</span><span class="chip c-hs"><i></i>handshake pool (TLS only)</span></div>
+  <div class="diagram"><pre class="mermaid">
+flowchart TD
+  subgraph LOOP["poller loop"]
+    L1["EPOLLIN → GoTasks"]
+    L2["closeConnection → last round"]
+  end
+  subgraph WK["‹Name›-workers"]
+    W0["under TLS, decrypt first"]
+    W1["http.drive parses the request&lt;br/&gt;ServeHTTP"]
+    W2["the handler calls ws.Upgrade(c, header)&lt;br/&gt;validateHandshake"]
+    W3["Context.Upgrade → upgradeHTTP1&lt;br/&gt;send 101, attachment becomes a TunnelFeed&lt;br/&gt;parser.upgraded = true"]
+    W4["Tunnel.open → OnTunnelOpen&lt;br/&gt;→ ws handler.OnOpen"]
+    W5["bytes already behind the request are delivered"]
+    W6["later rounds: OnData → TunnelFeed.Write&lt;br/&gt;→ OnTunnelData → serveFrames"]
+    W7["OnMessage / OnFrame&lt;br/&gt;WriteMessage → conn.SendParts, corked"]
+    W8["OnClose → TunnelFeed.End&lt;br/&gt;→ OnTunnelClose → ws OnClose"]
+    W0 --> W1 --> W2 --> W3 --> W4 --> W5
+    W6 --> W7
+  end
+  HS["fib-tls-handshake&lt;br/&gt;handshake; an upgrade request that came with it is served here"]
+  L1 --> W0
+  L1 --> W6
+  L2 --> W8
+  HS -.-> W1
+  classDef loop fill:#e8effc,stroke:#2458c6,color:#16202c
+  classDef work fill:#e3f4f1,stroke:#0c7d72,color:#16202c
+  classDef hs fill:#fbf0de,stroke:#a86a12,color:#16202c
+  classDef str fill:#efe9fb,stroke:#6b45c8,color:#16202c
+  classDef tmr fill:#eceff3,stroke:#5f6b7a,color:#16202c
+  classDef usr fill:#fae6ed,stroke:#b23a62,color:#16202c
+  class L1,L2 loop
+  class W0,W1,W2,W3,W4,W5,W6,W7,W8 work
+  class HS hs
+  </pre></div>
+  <ul class="notes">
+    <li>The HTTP parser lets go after the upgrade: <code>drive</code> returns when it sees <code>parser.upgraded</code>, and HTTP's read timeouts go with it.</li>
+    <li>A tunnel's callbacks run one at a time and in order (<code>Tunnel.delivering</code>): data that arrives while another goroutine is delivering is queued, and that goroutine delivers it.</li>
+    <li>A request whose body is still streaming in, or an HTTP/1.0 one, cannot upgrade and gets <code>ErrNotUpgradable</code>; an invalid handshake is answered by Upgrade with 400 or 403.</li>
+    <li>Over TLS only two things are added: the worker decrypts first, and sends are encrypted by <code>layer.Send</code>.</li>
+  </ul>
+  <p class="ref">websocket/upgrade.go:43 Upgrade · http/tunnel.go:246 Context.Upgrade · :302 upgradeHTTP1 · :110 deliver · :163 open · http/handler.go:481 OnData</p>
+</section>
+
+<section id="wsh2">
+  <h2>WebSocket over HTTP/2 (RFC 8441 extended CONNECT, with or without TLS)</h2>
+  <p class="lede">Only the one stream becomes a tunnel; the connection goes on serving other requests. The upgrade and OnOpen run on the stream pool. Later frames are delivered by the connection's reader, an engine worker, as it takes them out of DATA, so OnMessage usually runs on an engine worker.</p>
+  <div class="runs"><span class="chip c-loop"><i></i>loop</span><span class="chip c-work"><i></i>workers (the reader)</span><span class="chip c-str"><i></i>stream pool</span><span class="chip c-hs"><i></i>handshake pool (TLS only)</span></div>
+  <div class="diagram"><pre class="mermaid">
+flowchart TD
+  subgraph WK["‹Name›-workers, the connection's reader"]
+    W1["feed frames: HEADERS with :protocol = websocket&lt;br/&gt;and no END_STREAM"]
+    W2["serveTunnel: h2Tunnel / TunnelFeed&lt;br/&gt;streams.Serve"]
+    W3["later DATA → handleTunnelData&lt;br/&gt;give the window back, feed.Write"]
+    W4{"tunnel open&lt;br/&gt;and nobody delivering"}
+    W5["OnTunnelData → serveFrames&lt;br/&gt;OnMessage runs on the reader"]
+    W6["append to queued&lt;br/&gt;past MaxBodyBytes: RST_STREAM"]
+    W7["WINDOW_UPDATE: sends what the tunnel has pending"]
+    W1 --> W2
+    W3 --> W4
+    W4 -- yes --> W5
+    W4 -- no --> W6
+  end
+  subgraph STR["‹Name›-streams"]
+    S1["ServeHTTP → ws.Upgrade&lt;br/&gt;validateExtendedConnect"]
+    S2["st.upgrade: 200, the stream stays open"]
+    S3["Tunnel.open → OnTunnelOpen → ws OnOpen"]
+    S4["drain: data queued meanwhile&lt;br/&gt;its OnMessage runs on the stream pool"]
+    S1 --> S2 --> S3 --> S4
+  end
+  subgraph OUT["sending, from any goroutine"]
+    O1["WriteMessage → Tunnel.SendParts&lt;br/&gt;→ sendTunnel: holding sc.mu&lt;br/&gt;DATA frames cut to stream / connection windows"]
+    O2["conn.Send, then layer.Send encrypts under TLS"]
+    O1 --> O2
+  end
+  L1["poller: EPOLLIN → GoTasks"]
+  L1 --> W1
+  L1 --> W3
+  W2 -- "GoTask" --> S1
+  W6 -. "taken by the goroutine delivering" .-> S4
+  O1 -. "no window: pending" .-> W7
+  classDef loop fill:#e8effc,stroke:#2458c6,color:#16202c
+  classDef work fill:#e3f4f1,stroke:#0c7d72,color:#16202c
+  classDef hs fill:#fbf0de,stroke:#a86a12,color:#16202c
+  classDef str fill:#efe9fb,stroke:#6b45c8,color:#16202c
+  classDef tmr fill:#eceff3,stroke:#5f6b7a,color:#16202c
+  classDef usr fill:#fae6ed,stroke:#b23a62,color:#16202c
+  class L1 loop
+  class W1,W2,W3,W4,W5,W6,W7 work
+  class S1,S2,S3,S4 str
+  class O1,O2 usr
+  </pre></div>
+  <ul class="notes">
+    <li><b>An OnMessage that blocks stops the whole HTTP/2 connection from being read</b>, not just this stream: it is holding the connection's reader. That is a wider cost than under the standalone Handler, since the connection may carry many other requests.</li>
+    <li>OnOpen, OnMessage and OnClose may run on a stream worker or an engine worker, but the tunnel keeps them one at a time and in order.</li>
+    <li>Ending the stream: the peer's END_STREAM ends the tunnel; <code>CloseAfterSend</code> sends END_STREAM once what is pending has gone; <code>Close</code> resets the stream. When the connection closes, every tunnel gets OnTunnelClose.</li>
+    <li>Over TLS (ALPN h2) the reader decrypts before it frames and the rest is the same; the handshake pool only runs the handshake and the frames that came with it.</li>
+  </ul>
+  <p class="ref">http/h2_tunnel.go:43 serveTunnel · :54 handleTunnelData · :112 upgrade · :142 sendTunnel · http/tunnel.go:110 deliver · websocket/upgrade.go:43 Upgrade</p>
+</section>
+
+<section id="wsh3">
+  <h2>WebSocket over HTTP/3 (RFC 9220 extended CONNECT)</h2>
+  <p class="lede">The same shape as over HTTP/2, with a QUIC request stream as the tunnel: the upgrade runs on the stream pool, later data is delivered by the engine worker handling the datagrams, and sends go out in DATA frames on the QUIC stream.</p>
+  <div class="runs"><span class="chip c-loop"><i></i>loop reads UDP</span><span class="chip c-work"><i></i>workers</span><span class="chip c-str"><i></i>stream pool</span><span class="chip c-tmr"><i></i>QUIC timers</span></div>
+  <div class="diagram"><pre class="mermaid">
+flowchart TD
+  L1["root loop: recvmmsg → sort onto peers → GoTasks"]
+  subgraph WK["‹Name›-workers"]
+    W1["HandlePathDatagrams → dispatch&lt;br/&gt;OnStreamData → requestStream"]
+    W2["HEADERS with :protocol&lt;br/&gt;→ serveTunnel: NewTunnelFeed&lt;br/&gt;streams.Queue, Submit at OnCallsDone"]
+    W3["later DATA frames → tunnel.Write"]
+    W4{"tunnel open&lt;br/&gt;and nobody delivering"}
+    W5["OnTunnelData → serveFrames&lt;br/&gt;OnMessage runs on this worker"]
+    W6["queued; past the limit the stream is aborted"]
+    W1 --> W2
+    W1 --> W3 --> W4
+    W4 -- yes --> W5
+    W4 -- no --> W6
+  end
+  subgraph STR["‹Name›-streams"]
+    S1["ServeHTTP → ws.Upgrade"]
+    S2["requestStream.Upgrade: 200, the stream stays open"]
+    S3["Tunnel.open → ws OnOpen&lt;br/&gt;drain what queued"]
+    S1 --> S2 --> S3
+  end
+  subgraph OUT["sending, from any goroutine"]
+    O1["WriteMessage → tunnelWriter.SendParts&lt;br/&gt;one DATA frame per send, written to the QUIC stream"]
+    O2["qc.flush → sendLocked → sendmmsg"]
+    O1 --> O2
+  end
+  T1["quic onTimer: retransmission / ACK / idle"]
+  L1 --> W1
+  W2 -- "GoTasks" --> S1
+  W6 -.-> S3
+  classDef loop fill:#e8effc,stroke:#2458c6,color:#16202c
+  classDef work fill:#e3f4f1,stroke:#0c7d72,color:#16202c
+  classDef hs fill:#fbf0de,stroke:#a86a12,color:#16202c
+  classDef str fill:#efe9fb,stroke:#6b45c8,color:#16202c
+  classDef tmr fill:#eceff3,stroke:#5f6b7a,color:#16202c
+  classDef usr fill:#fae6ed,stroke:#b23a62,color:#16202c
+  class L1 loop
+  class W1,W2,W3,W4,W5,W6 work
+  class S1,S2,S3 str
+  class O1,O2 usr
+  class T1 tmr
+  </pre></div>
+  <ul class="notes">
+    <li>An OnMessage that blocks holds up this QUIC connection's datagram handling, that peer's round, and the connection's other request streams wait with it.</li>
+    <li>Sends are bounded by QUIC's flow control, and buffered and retransmitted by QUIC; loss recovery still runs on the timer goroutines.</li>
+    <li>When the peer ends the stream the tunnel gets <code>io.EOF</code>, and an upgraded stream then closes its own side; <code>Close</code> resets both directions.</li>
+  </ul>
+  <p class="ref">http3/tunnel.go:25 serveTunnel · :50 Upgrade · http3/server.go:436 OnCallsDone · http/tunnel.go:110 deliver</p>
+</section>
+
+<section id="matrix">
+  <h2>Summary: who runs what in each case</h2>
+  <div class="tbl"><table>
+    <thead><tr><th>Case</th><th>Event loop</th><th>Workers</th><th>Handshake pool</th><th>Stream pool</th><th>Others</th></tr></thead>
+    <tbody>
+      <tr><td>Plain TCP</td><td>accept, register, OnOpen, fold events</td><td>read, OnData, coalesced write, OnClose</td><td class="dash">—</td><td class="dash">—</td><td>deadline timers</td></tr>
+      <tr><td>TLS</td><td>as above; OnOpen submits the handshake</td><td>feed ciphertext / decrypt, inner.OnData, encrypt</td><td>HandshakeContext, first plaintext</td><td class="dash">—</td><td>HandshakeTimeout through the context</td></tr>
+      <tr><td>HTTP/1.x</td><td>as plain TCP</td><td>parse, handler, response</td><td class="dash">—</td><td>OnBody handover, cancellation</td><td>a retained response is written on the application's goroutine</td></tr>
+      <tr><td>HTTP/1.x + TLS</td><td>as TLS</td><td>decrypt, parse, handler, encrypt</td><td>handshake; the first request may be served here</td><td>as HTTP/1</td><td>as HTTP/1</td></tr>
+      <tr><td>HTTP/2 h2c</td><td>as plain TCP</td><td>framing, HPACK decode, flow control, held-back DATA</td><td class="dash">—</td><td>every request's handler, HPACK encode, response write</td><td class="dash">—</td></tr>
+      <tr><td>HTTP/2 + TLS</td><td>as TLS</td><td>decrypt, framing</td><td>handshake; the first frames are framed here</td><td>handler, encode, encrypt and send</td><td class="dash">—</td></tr>
+      <tr><td>WebSocket handler</td><td>as plain TCP</td><td>upgrade, frames, OnMessage, automatic Pong, deflate</td><td class="dash">—</td><td class="dash">—</td><td>application goroutines may write directly</td></tr>
+      <tr><td>WebSocket handler + TLS</td><td>as TLS</td><td>decrypt, frames, callbacks, encrypt</td><td>handshake; the upgrade request may be handled here</td><td class="dash">—</td><td>as WebSocket</td></tr>
+      <tr><td>WS via HTTP/1.1 (±TLS)</td><td>as HTTP/1</td><td>handler calls Upgrade, OnOpen, frames, OnMessage</td><td>TLS only: handshake</td><td class="dash">—</td><td>application goroutines may write directly</td></tr>
+      <tr><td>WS over HTTP/2 (±TLS)</td><td>as HTTP/2</td><td>framing, tunnel DATA delivery, OnMessage (usually)</td><td>TLS only: handshake</td><td>Upgrade, OnOpen, OnMessage for queued data</td><td>sends cut to the flow-control windows</td></tr>
+      <tr><td>WS over HTTP/3</td><td>read UDP, sort by peer</td><td>QUIC packets, tunnel DATA delivery, OnMessage (usually)</td><td class="dash">—</td><td>Upgrade, OnOpen, OnMessage for queued data</td><td>QUIC timers</td></tr>
+      <tr><td>HTTP/3</td><td>read UDP, sort by peer (root loop, or each poller)</td><td>QUIC packets, TLS 1.3 handshake, frames, QPACK decode</td><td class="dash">—</td><td>handler, QPACK encode, sendmmsg</td><td>QUIC timers send; UDP sweep</td></tr>
+    </tbody>
+  </table></div>
+</section>
+</main>
+</div>
+<script src="https://cdn.jsdelivr.net/npm/mermaid@10.9.1/dist/mermaid.min.js"></script>
+<script>mermaid.initialize({startOnLoad:true,theme:"neutral",flowchart:{htmlLabels:true}});</script>
+</body>
+</html>

@@ -1,0 +1,841 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>fib 调度流程图</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;500;600&display=swap">
+<style>
+:root{
+  --bg:#f3f5f8; --surface:#ffffff; --ink:#16202c; --muted:#5a6676; --line:#d8dee7;
+  --paper:#ffffff; --paper-line:#e2e6ed;
+  --loop:#2458c6; --work:#0c7d72; --hs:#a86a12; --str:#6b45c8; --tmr:#5f6b7a; --usr:#b23a62;
+  --loop-bg:#e8effc; --work-bg:#e3f4f1; --hs-bg:#fbf0de; --str-bg:#efe9fb; --tmr-bg:#eceff3; --usr-bg:#fae6ed;
+  --code-bg:#eef1f5;
+  --sans:"IBM Plex Sans","PingFang SC","Hiragino Sans GB","Microsoft YaHei",system-ui,sans-serif;
+  --mono:"IBM Plex Mono",ui-monospace,"SF Mono",Menlo,monospace;
+}
+@media (prefers-color-scheme: dark){
+  :root:not([data-theme="light"]){
+    color-scheme:dark;
+    --bg:#0f141b; --surface:#161d27; --ink:#e4e9f0; --muted:#94a0b0; --line:#2a3443;
+    --paper:#eef1f5; --paper-line:#c9d0da;
+    --loop:#7aa4ff; --work:#4fd1bf; --hs:#f0b35a; --str:#b39cff; --tmr:#a3adba; --usr:#f27fa3;
+    --loop-bg:#1b2842; --work-bg:#12302c; --hs-bg:#35280f; --str-bg:#271f40; --tmr-bg:#222a35; --usr-bg:#3a1a27;
+    --code-bg:#1f2833;
+  }
+}
+:root[data-theme="dark"]{
+  color-scheme:dark;
+  --bg:#0f141b; --surface:#161d27; --ink:#e4e9f0; --muted:#94a0b0; --line:#2a3443;
+  --paper:#eef1f5; --paper-line:#c9d0da;
+  --loop:#7aa4ff; --work:#4fd1bf; --hs:#f0b35a; --str:#b39cff; --tmr:#a3adba; --usr:#f27fa3;
+  --loop-bg:#1b2842; --work-bg:#12302c; --hs-bg:#35280f; --str-bg:#271f40; --tmr-bg:#222a35; --usr-bg:#3a1a27;
+  --code-bg:#1f2833;
+}
+*{box-sizing:border-box}
+body{background:var(--bg);color:var(--ink);font:15px/1.7 var(--sans);padding-inline:16px;padding-block:0 64px}
+.wrap{max-width:1180px;margin:0 auto;display:grid;grid-template-columns:220px minmax(0,1fr);gap:40px}
+nav.toc{position:sticky;top:env(safe-area-inset-top,0px);align-self:start;padding-top:40px;font-size:13px}
+nav.toc b{display:block;font:600 11px/1 var(--mono);letter-spacing:.12em;color:var(--muted);text-transform:uppercase;margin-bottom:12px}
+nav.toc ol{list-style:none;margin:0;padding:0;display:grid;gap:2px}
+nav.toc a{display:block;padding:5px 10px;border-radius:6px;color:var(--ink);text-decoration:none}
+nav.toc a:hover,nav.toc a:focus-visible{background:var(--surface);outline:none}
+nav.toc a span{font-family:var(--mono);color:var(--muted);margin-right:6px}
+main{min-width:0;padding-top:40px}
+header h1{font-size:34px;line-height:1.2;margin:0 0 12px;letter-spacing:-.01em;text-wrap:balance}
+header p{color:var(--muted);max-width:72ch;margin:0 0 8px}
+h2{font-size:23px;line-height:1.3;margin:0 0 6px;text-wrap:balance}
+h3{font-size:16px;margin:22px 0 8px}
+section{padding-top:48px;scroll-margin-top:12px}
+section>.lede{color:var(--muted);margin:0 0 14px;max-width:78ch}
+code,.mono{font-family:var(--mono);font-size:.88em}
+p code,li code,td code{background:var(--code-bg);padding:1px 5px;border-radius:4px}
+.legend{display:flex;flex-wrap:wrap;gap:8px;margin:18px 0 0}
+.chip{display:inline-flex;align-items:center;gap:6px;padding:3px 10px;border-radius:999px;font:500 12px/1.6 var(--mono);border:1px solid currentColor}
+.chip i{width:8px;height:8px;border-radius:2px;background:currentColor}
+.c-loop{color:var(--loop);background:var(--loop-bg)} .c-work{color:var(--work);background:var(--work-bg)}
+.c-hs{color:var(--hs);background:var(--hs-bg)} .c-str{color:var(--str);background:var(--str-bg)}
+.c-tmr{color:var(--tmr);background:var(--tmr-bg)} .c-usr{color:var(--usr);background:var(--usr-bg)}
+.runs{display:flex;flex-wrap:wrap;gap:6px;margin:0 0 14px}
+.diagram{background:var(--paper);border:1px solid var(--paper-line);border-radius:10px;padding:18px 12px;overflow-x:auto}
+.diagram pre.mermaid{margin:0;background:transparent;text-align:center;color:#16202c}
+.notes{margin:14px 0 0;padding-left:20px;display:grid;gap:6px;max-width:82ch}
+.notes li::marker{color:var(--muted)}
+.ref{font:12px/1.5 var(--mono);color:var(--muted);margin-top:10px}
+.tbl{overflow-x:auto;margin-top:14px;border:1px solid var(--line);border-radius:10px;background:var(--surface)}
+table{border-collapse:collapse;width:100%;min-width:760px;font-size:13.5px}
+th,td{text-align:left;vertical-align:top;padding:9px 12px;border-bottom:1px solid var(--line)}
+th{font:600 11px/1.4 var(--mono);letter-spacing:.06em;text-transform:uppercase;color:var(--muted);background:var(--bg)}
+tr:last-child td{border-bottom:0}
+td:first-child{font-weight:600;white-space:nowrap}
+.dash{color:var(--muted)}
+.callout{border-left:3px solid var(--hs);background:var(--surface);padding:10px 14px;border-radius:0 8px 8px 0;margin-top:14px;max-width:82ch}
+@media (max-width:860px){
+  .wrap{grid-template-columns:1fr;gap:0}
+  nav.toc{position:static;padding-top:24px}
+  nav.toc ol{grid-template-columns:repeat(auto-fill,minmax(150px,1fr))}
+  header h1{font-size:27px}
+}
+.toplinks{display:flex;flex-wrap:wrap;gap:6px;margin:0 0 22px}
+.toplinks a{display:inline-block;padding:3px 10px;border:1px solid var(--line);border-radius:999px;font:500 12px/1.6 var(--mono);color:var(--ink);text-decoration:none;background:var(--surface)}
+.toplinks a[aria-current]{border-color:var(--loop);color:var(--loop);background:var(--loop-bg)}
+.toplinks a:hover,.toplinks a:focus-visible{border-color:var(--loop);outline:none}
+header p a,.lede a{color:var(--loop)}
+.rules{display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));gap:14px;margin-top:14px}
+.rule{background:var(--surface);border:1px solid var(--line);border-radius:10px;padding:16px 18px}
+.rule b{display:block;font-size:16px;margin-bottom:6px}
+.rule p{margin:0;color:var(--muted);font-size:14px}
+body{margin:0}
+</style>
+
+
+</head>
+<body>
+<div class="wrap">
+<nav class="toc" aria-label="目录">
+  <div class="toplinks"><a href="architecture.zh-CN.html">架构</a><a href="flows.zh-CN.html" aria-current="page">协议流程</a><a href="flows.html">English</a><a href="flows.zh-CN.html" aria-current="page">中文</a></div>
+  <b>目录</b>
+  <ol>
+    <li><a href="#pools"><span>00</span>协程池一览</a></li>
+    <li><a href="#engine"><span>01</span>Engine 拓扑</a></li>
+    <li><a href="#round"><span>02</span>一轮 round</a></li>
+    <li><a href="#tls"><span>03</span>TLS</a></li>
+    <li><a href="#h1"><span>04</span>HTTP/1.x</a></li>
+    <li><a href="#h1tls"><span>05</span>HTTP/1.x over TLS</a></li>
+    <li><a href="#h2c"><span>06</span>HTTP/2 明文 h2c</a></li>
+    <li><a href="#h2tls"><span>07</span>HTTP/2 over TLS</a></li>
+    <li><a href="#ws"><span>08</span>WebSocket 独立 Handler</a></li>
+    <li><a href="#wss"><span>09</span>WebSocket over TLS</a></li>
+    <li><a href="#h3"><span>10</span>HTTP/3 (QUIC)</a></li>
+    <li><a href="#wsh1"><span>11</span>WS 经 HTTP/1.1 升级</a></li>
+    <li><a href="#wsh2"><span>12</span>WS over HTTP/2</a></li>
+    <li><a href="#wsh3"><span>13</span>WS over HTTP/3</a></li>
+    <li><a href="#matrix"><span>14</span>对照表</a></li>
+  </ol>
+</nav>
+
+<main>
+<header>
+  <h1>fib 事件循环与协程池流程图</h1>
+  <p>按协议逐一画出：哪个事件循环等事件，哪个协程池跑哪段代码，数据和控制在它们之间怎么流动。依据当前 <code>main</code>（8a388d4）的源码，平台按 Linux epoll / macOS kqueue 描述，配置按 <code>fib.DefaultConfig()</code>：<code>IOPollers=true</code>、<code>TaskPoolMode=ModeAdaptive</code>、<code>SharedTaskPool=true</code>、<code>SocketSyscalls=true</code>。</p>
+  <p>图中颜色固定对应执行者：</p>
+  <div class="legend">
+    <span class="chip c-loop"><i></i>事件循环（根 / poller）</span>
+    <span class="chip c-work"><i></i>‹Name›-workers 引擎池</span>
+    <span class="chip c-hs"><i></i>fib-tls-handshake 握手池</span>
+    <span class="chip c-str"><i></i>‹Name›-streams 流池</span>
+    <span class="chip c-tmr"><i></i>定时器 goroutine</span>
+    <span class="chip c-usr"><i></i>用户自己的 goroutine</span>
+  </div>
+</header>
+
+<section id="pools">
+  <h2>协程池一览</h2>
+  <p class="lede">服务端一共只有三类池，外加 Go 运行时定时器。事件循环本身从不执行连接的一轮，只等事件、合并事件、批量提交。</p>
+  <div class="tbl"><table>
+    <thead><tr><th>执行者</th><th>来源</th><th>模式 / 规模</th><th>跑什么</th></tr></thead>
+    <tbody>
+      <tr><td><span class="chip c-loop"><i></i>事件循环</span></td><td><code>Engine.runLoop</code></td><td>根循环 1 个；poller 数为 NumCPU÷4 向下取整（至少 1）：7 核以内 1 个，8 核 2 个，16 核 4 个；<code>IOPollerCount</code> 可改</td><td>epoll_wait/kevent、accept、UDP 收包分拣、命令队列（close / refresh / detach / accept）、<b>OnOpen</b></td></tr>
+      <tr><td><span class="chip c-work"><i></i>‹Name›-workers</span></td><td><code>acquireTaskPool</code>（shared_taskpool.go）</td><td>Adaptive（按 P 分片入队）；上限 max(GOMAXPROCS×1000, NumCPU×20)，常驻下限 <code>MinWorkerCount</code>，同 Name 的 Engine 共用</td><td><code>Connection.RunTask → process()</code>：读 socket、OnData 链（TLS 解密 → 协议解析 → HTTP/1 handler / WS 回调）、写合并、OnClose</td></tr>
+      <tr><td><span class="chip c-hs"><i></i>fib-tls-handshake</span></td><td><code>sidepool</code></td><td>Adaptive；上限 65536，队列 10000，下限 0，进程内全局共享</td><td><code>crypto/tls.HandshakeContext</code> 这个阻塞调用，以及与握手同到的首批明文的交付</td></tr>
+      <tr><td><span class="chip c-str"><i></i>‹Name›-streams</span></td><td><code>streampool</code>，<code>Engine.HandlerPool()</code></td><td>Adaptive；上限 = 同 Name 最宽引擎池 ×2，下限 0</td><td>HTTP/2、HTTP/3 的请求 handler（含扩展 CONNECT 的升级和 WebSocket OnOpen）；HTTP/1 的 OnBody 交接、连接关闭时的取消通知</td></tr>
+      <tr><td><span class="chip c-tmr"><i></i>定时器</span></td><td><code>time.AfterFunc</code></td><td>运行时按需</td><td>读写 deadline → <code>commandClose</code>；UDP 空闲扫描 → <code>commandUDPSweep</code>；QUIC 的 ACK / 丢包 / 空闲 / flushHold 定时发送</td></tr>
+    </tbody>
+  </table></div>
+  <p class="callout">三个池必须互相独立：引擎 worker 向流池提交 handler、向握手池提交握手，队列满时会等待；如果共用同一个池，所有 worker 都可能卡在提交上，没人去消费队列，事件循环也会跟着停住。等待只能单向发生：引擎 worker 等流池/握手池，反过来从不发生。</p>
+  <p class="ref">另有 <code>fib-client</code>（sidepool，上限 4096），只给客户端的 DNS 解析和结果回调用，服务端流程不涉及。池的模式现在只有 ModeElastic、ModeAdaptive、ModeAdaptiveChan 和 ModeInline，ModeCond 已移除；Engine 不接受 ModeInline。</p>
+</section>
+
+<section id="engine">
+  <h2>Engine 拓扑：根循环、poller 与 worker</h2>
+  <p class="lede">所有协议共用这一层。区别只在 OnData 链里挂了什么 Handler。</p>
+  <div class="runs"><span class="chip c-loop"><i></i>根循环</span><span class="chip c-loop"><i></i>poller × N</span><span class="chip c-work"><i></i>workers</span><span class="chip c-tmr"><i></i>定时器</span></div>
+  <div class="diagram"><pre class="mermaid">
+flowchart LR
+  subgraph KER["内核"]
+    LFD[("listen fd")]
+    CFD[("conn fd")]
+    UFD[("UDP fd")]
+  end
+  subgraph ROOT["根 Engine 事件循环 · Run 所在 goroutine"]
+    R1["epoll_wait"] --> R2{"token 类型"}
+    R2 -- listener --> R3["acceptConnections&lt;br/&gt;TCP_NODELAY"]
+    R2 -- udp --> R4["readUDPListener&lt;br/&gt;recvmmsg，每轮至多 256 个&lt;br/&gt;按对端地址分到 peer Connection"]
+    R2 -- wake --> R5["drainCommands"]
+  end
+  subgraph POL["poller i 事件循环 · 每 4 CPU 一个"]
+    P1["commandAccept → admit&lt;br/&gt;EPOLL_CTL_ADD + OnOpen"]
+    P2["epoll_wait → noteEvent&lt;br/&gt;事件并入 pendingEvents&lt;br/&gt;scheduled 为假才入 ready"]
+    P3["runReady：GoTasks 批量提交&lt;br/&gt;然后 runtime.Gosched"]
+    P4["settle：处理本轮新到的命令&lt;br/&gt;refresh / close / detach"]
+    P2 --> P3 --> P4 --> P2
+  end
+  subgraph WK["‹Name›-workers 池"]
+    W1["Connection.RunTask&lt;br/&gt;→ process 一轮"]
+  end
+  TM["time.AfterFunc&lt;br/&gt;deadline / UDP sweep"]
+  LFD -.-> R1
+  UFD -.-> R1
+  CFD -.-> P2
+  R3 -- "fd % pollerCount&lt;br/&gt;commandAccept + eventfd" --> P1
+  R4 -- "peer 就绪" --> W1
+  P3 --> W1
+  W1 -- "commandRefresh / Close / Detach&lt;br/&gt;+ eventfd 唤醒" --> P4
+  TM -- "commandClose / UDPSweep" --> P4
+  classDef loop fill:#e8effc,stroke:#2458c6,color:#16202c
+  classDef work fill:#e3f4f1,stroke:#0c7d72,color:#16202c
+  classDef tmr fill:#eceff3,stroke:#5f6b7a,color:#16202c
+  class R1,R2,R3,R4,R5,P1,P2,P3,P4 loop
+  class W1 work
+  class TM tmr
+  </pre></div>
+  <ul class="notes">
+    <li><b>不开 IOPollers</b>：没有 poller，根循环自己 accept、注册、等所有连接的事件，其余相同。</li>
+    <li><b>ReusePort（仅 Linux）</b>：每个 poller 在同一地址上 listen 自己的 socket，自己 accept；根 socket 只 bind 不 listen。UDP 同理，每个 poller 读自己的 UDP socket。</li>
+    <li><b>OnOpen 在事件循环上执行</b>（<code>admit</code> / <code>udpPeer</code>），所以 OnOpen 里不能阻塞；TLS 正是在这里把握手交给握手池。</li>
+    <li>worker 在轮外发送（<code>Send</code> 在非 corked 状态）会直接写 socket；写不完才排队、靠常驻的 EPOLLOUT 边沿续写。</li>
+    <li>Linux 上连接的读写是不经调度器的原始系统调用（socket 非阻塞，不会等待）；<code>SocketSyscalls</code> 默认开启时用 <code>recvfrom</code> / <code>sendto</code> / <code>sendmsg</code>，绕开 VFS 层的权限钩子。</li>
+    <li>关闭由循环执行 <code>closeConnection</code>：立即停止收发、释放预算，但 OnClose 和 fd 释放被折叠进该连接的下一轮，保证 OnClose 在之前的 OnData 之后。</li>
+  </ul>
+  <p class="ref">engine_unix.go:442 Run · :467 acceptConnections · :511 admit · poller_epoll.go:79 runLoop · engine.go:377 runReady · :602 noteEvent · :742 closeConnection · sockio_linux.go</p>
+</section>
+
+<section id="round">
+  <h2>一轮 round：worker 上的 process()</h2>
+  <p class="lede">所有 TCP 协议的回调都在这里被调用。每一轮的回复被 cork 住，在轮末合并成一次 write / writev。</p>
+  <div class="runs"><span class="chip c-work"><i></i>workers</span><span class="chip c-loop"><i></i>循环（回退路径）</span></div>
+  <div class="diagram"><pre class="mermaid">
+flowchart TD
+  A["取出 pendingEvents"] --> B{"EPOLLOUT 且有可刷出的输出&lt;br/&gt;应用 Cork 住的不算"}
+  B -- 是 --> C["flushOutput"]
+  B -- 否 --> D
+  C --> D{"EPOLLIN"}
+  D -- "排队输出已到水位&lt;br/&gt;或 HoldReads / 未设水位" --> E["读推迟到下一轮&lt;br/&gt;先让对端收完"]
+  D -- "可读，排队输出低于水位也继续" --> F["drainInput：corked = true"]
+  F --> G["readLoop：read 16KB&lt;br/&gt;→ handler.OnData(c, buf)"]
+  G --> H{"readShouldStop&lt;br/&gt;水位 / 总预算 / HoldReads"}
+  H -- 是 --> I["先 uncork 刷出&lt;br/&gt;仍超限则 stallRead"]
+  I --> LP["循环：commandRefresh&lt;br/&gt;EPOLL_CTL_MOD 暂停读"]
+  H -- 否 --> J{"短读"}
+  J -- 否 --> G
+  J -- 是 --> K["uncork：本轮回复一次写出"]
+  E --> M
+  K --> M{"期间又有新事件"}
+  M -- 有 --> A
+  M -- 无 --> N["scheduled = false，结束本轮"]
+  N --> O{"closePending"}
+  O -- 是 --> P["finishClose：OnClose&lt;br/&gt;→ commandDetach 让循环关 fd"]
+  classDef work fill:#e3f4f1,stroke:#0c7d72,color:#16202c
+  classDef loop fill:#e8effc,stroke:#2458c6,color:#16202c
+  class A,B,C,D,E,F,G,H,I,J,K,M,N,O,P work
+  class LP loop
+  </pre></div>
+  <ul class="notes">
+    <li>一条连接同一时刻最多只有一个 worker 在跑它（<code>scheduled</code> 标志），循环在这期间收到的事件只并入 <code>pendingEvents</code>，由这一轮在结尾处接着处理。</li>
+    <li>排队输出低于 <code>WriteBufferHighWatermark</code> 时不再停读：界定连接缓冲的是水位，而不是第一个排队的字节。此前 pipelining 客户端的请求会滞留在内核接收队列里，导致大量重传。</li>
+    <li>写边沿只刷「可刷出」的输出：应用自己 <code>Cork</code> 住的内容要等 <code>Flush</code>，socket 再可写也不发。</li>
+    <li>handler panic 时回滚 <code>scheduled</code> 并关闭连接，panic 再交给池的 panic handler。</li>
+  </ul>
+  <p class="ref">connection.go:519 RunTask · :524 process · :679 hasFlushableOutput · :690 drainInput · :777 readLoop · :709 uncork · :650 finishClose</p>
+</section>
+
+<section id="tls">
+  <h2>TLS（fibtls.NewServer 包裹任意 fib.Handler）</h2>
+  <p class="lede">握手是 crypto/tls 的阻塞调用，放进独立的握手池；它要读的密文仍由引擎 worker 读 socket 后喂进来。握手完成后，AES-GCM / AES-CBC 套件改由 fib 自己加解密，在 worker 上直接从本轮的读缓冲解密。</p>
+  <div class="runs"><span class="chip c-loop"><i></i>循环</span><span class="chip c-hs"><i></i>握手池</span><span class="chip c-work"><i></i>workers</span></div>
+  <div class="diagram"><pre class="mermaid">
+flowchart TD
+  subgraph LOOP["poller 事件循环"]
+    L1["admit → tls.Handler.OnOpen&lt;br/&gt;建 layer + crypto/tls Server&lt;br/&gt;inner.OnOpen，可先 Send，先存 pending"]
+    L2["EPOLLIN → noteEvent → GoTasks"]
+  end
+  subgraph HS["fib-tls-handshake 池"]
+    H1["layer.handshake&lt;br/&gt;HandshakeContext，默认 10s"]
+    H2["layer.Read&lt;br/&gt;无密文则 cond.Wait"]
+    H3["layer.Write → c.SendRaw&lt;br/&gt;不在轮内，直接 write"]
+    H4["takeOver：GCM / CBC 转为 fib 自己的 rx / tx"]
+    H5["加密并发出 pending&lt;br/&gt;inner.OnHandshake，若实现"]
+    H6["解密与握手同到的明文&lt;br/&gt;→ inner.OnData"]
+    H7["settle：补报握手期间的 close"]
+    H1 <--> H2
+    H1 <--> H3
+    H1 --> H4 --> H5 --> H6 --> H7
+  end
+  subgraph WK["‹Name›-workers"]
+    W1["process → readLoop&lt;br/&gt;→ tls.Handler.OnData(密文)"]
+    W2{"handshaking"}
+    W3["feed：追加到 t.in&lt;br/&gt;cond.Signal"]
+    W4["drain：逐条记录解密&lt;br/&gt;fast 路径 rx.open，否则 conn.Read&lt;br/&gt;→ inner.OnData(明文)"]
+    W5["inner 的 Send → layer.Send&lt;br/&gt;wmu 下 seal → SendRaw，corked"]
+    W1 --> W2
+    W2 -- 是 --> W3
+    W2 -- 否 --> W4 --> W5
+  end
+  L1 -- "sidepool.Handshake().Go" --> H1
+  L2 --> W1
+  W3 -. "唤醒" .-> H2
+  classDef loop fill:#e8effc,stroke:#2458c6,color:#16202c
+  classDef work fill:#e3f4f1,stroke:#0c7d72,color:#16202c
+  classDef hs fill:#fbf0de,stroke:#a86a12,color:#16202c
+  class L1,L2 loop
+  class W1,W2,W3,W4,W5 work
+  class H1,H2,H3,H4,H5,H6,H7 hs
+  </pre></div>
+  <ul class="notes">
+    <li><code>readMu</code> 保证同一时刻只有一个 goroutine 交付明文：握手 worker 交付首批明文时，引擎 worker 的 <code>feed</code> 会等它。</li>
+    <li>握手期间 worker 只追加密文、立即返回，一轮不会被握手拖住；握手 worker 被慢对端占住最长到 HandshakeTimeout。</li>
+    <li>OnClose 从不与 OnHandshake 并行：握手未结束时的关闭记为 <code>closeHeld</code>，由握手 worker 在 settle 里补报。对端紧跟握手发完数据就关闭时，这批明文仍会先交付（<code>dropsInput</code> 在 settling 期间不丢输入）。</li>
+    <li>发送方向在任何 goroutine 上都经 <code>wmu</code> 串行加密，所以 HTTP/2 的流池 worker 发响应时也在这里排队。</li>
+  </ul>
+  <p class="ref">tls/tls.go:146 OnOpen · :269 handshake · :351 feed · :379 drainLocked · :465 Send · :552 Read · tls/fast.go:260 takeOver · :365 drainFast · sidepool/sidepool.go</p>
+</section>
+
+<section id="h1">
+  <h2>HTTP/1.x（明文）</h2>
+  <p class="lede">一条连接的一个请求，从第一个字节到响应，都在同一个 worker 的同一轮里完成，handler 也在这个 worker 上执行。流池只处理 handler 返回之后才需要交付的事情。</p>
+  <div class="runs"><span class="chip c-loop"><i></i>循环</span><span class="chip c-work"><i></i>workers</span><span class="chip c-str"><i></i>流池（仅异步）</span><span class="chip c-usr"><i></i>用户 goroutine（Retain）</span><span class="chip c-tmr"><i></i>定时器</span></div>
+  <div class="diagram"><pre class="mermaid">
+flowchart TD
+  subgraph LOOP["poller 事件循环"]
+    L1["OnOpen：attachParser&lt;br/&gt;armRead 设 header / idle deadline"]
+    L2["EPOLLIN → GoTasks"]
+    L3["closeConnection → 安排最后一轮"]
+  end
+  subgraph WK["‹Name›-workers，一轮之内"]
+    W1["OnData → drive，持 parser.mu"]
+    W2{"sniff：以 PRI 前言开头"}
+    W3["feedBorrowed 解析请求"]
+    W4{"Upgrade: h2c"}
+    W5["serveRequest：ServeHTTP 在此 worker 执行"]
+    W6["Respond → SendParts，corked"]
+    W7{"context.settle"}
+    W8["endRequestLocked&lt;br/&gt;继续解析下一个 pipelined 请求"]
+    W9["parser.busy，本轮返回"]
+    WX["轮末 uncork：多个响应一次写出"]
+    WC["OnClose：runOnStreams 通知取消"]
+    W1 --> W2
+    W2 -- 否 --> W3 --> W4
+    W4 -- 否 --> W5 --> W6 --> W7
+    W7 -- "已写完" --> W8 --> W3
+    W7 -- "Retain 未释放" --> W9
+    W8 --> WX
+  end
+  H2C["转入 HTTP/2 流程"]
+  subgraph USR["用户 goroutine"]
+    U1["Release / 写响应&lt;br/&gt;在此 goroutine 上继续 drive"]
+  end
+  subgraph STR["‹Name›-streams"]
+    S1["OnBody 交接，handler 已返回时"]
+    S2["Context.OnCancel、body.fail"]
+  end
+  TM["deadline 定时器"]
+  L2 --> W1
+  W2 -- 是 --> H2C
+  W4 -- 是 --> H2C
+  W9 -.-> U1
+  W5 -. "OnBody" .-> S1
+  L3 --> WC --> S2
+  TM -- "commandClose" --> L3
+  classDef loop fill:#e8effc,stroke:#2458c6,color:#16202c
+  classDef work fill:#e3f4f1,stroke:#0c7d72,color:#16202c
+  classDef str fill:#efe9fb,stroke:#6b45c8,color:#16202c
+  classDef usr fill:#fae6ed,stroke:#b23a62,color:#16202c
+  classDef tmr fill:#eceff3,stroke:#5f6b7a,color:#16202c
+  class L1,L2,L3 loop
+  class W1,W2,W3,W4,W5,W6,W7,W8,W9,WX,WC work
+  class S1,S2 str
+  class U1 usr
+  class TM,H2C tmr
+  </pre></div>
+  <ul class="notes">
+    <li>handler 阻塞会拖住这条连接（以及它的 pipelined 请求），不影响别的连接；需要等外部资源时用 <code>Retain</code>，在自己的 goroutine 里 <code>Release</code>，响应在那个 goroutine 上直接写出（不在轮内，不 cork）。</li>
+    <li>流式 body（<code>StreamRequestBody</code>）：body 仍在后续轮次由 worker 读取并喂给 BodyStream；缓冲满时 <code>HoldReads</code> 暂停读，靠 TCP 流控限速。</li>
+    <li>在 handler 里关闭自己的连接后再等 <code>OnCancel</code> 会死锁：OnClose 要等本轮返回才会执行。</li>
+  </ul>
+  <p class="ref">http/handler.go:452 OnOpen · :481 OnData · :507 drive · :800 serveRequest · :837 sniff · :883 OnClose · http/context.go:392 later · http/stream_pool_native.go:225 runOnStreams</p>
+</section>
+
+<section id="h1tls">
+  <h2>HTTP/1.x over TLS</h2>
+  <p class="lede">HTTP/1 的流程原样套在 TLS 层下面：worker 先解密，再把明文交给 drive；响应经 layer.Send 加密后仍在轮末合并写出。唯一的例外是与握手同到的首个请求。</p>
+  <div class="runs"><span class="chip c-loop"><i></i>循环</span><span class="chip c-hs"><i></i>握手池</span><span class="chip c-work"><i></i>workers</span><span class="chip c-str"><i></i>流池（仅异步）</span></div>
+  <div class="diagram"><pre class="mermaid">
+flowchart TD
+  subgraph LOOP["poller 事件循环"]
+    L1["tls.OnOpen → http.OnOpen&lt;br/&gt;attachParser + armRead"]
+    L2["EPOLLIN → GoTasks"]
+  end
+  subgraph HS["fib-tls-handshake"]
+    H1["HandshakeContext&lt;br/&gt;ALPN 选中 http/1.1"]
+    H2["首批明文 → http.drive&lt;br/&gt;请求可能就在这里被服务"]
+    H3["响应：layer.Send 加密&lt;br/&gt;不在轮内，直接 write"]
+    H1 --> H2 --> H3
+  end
+  subgraph WK["‹Name›-workers"]
+    W0["握手中：feed 密文，唤醒握手 worker"]
+    W1["解密 → http.drive"]
+    W2["ServeHTTP"]
+    W3["Respond → layer.Send&lt;br/&gt;seal → SendRaw，corked"]
+    W4["轮末 uncork，一次写出"]
+    W1 --> W2 --> W3 --> W4
+  end
+  subgraph STR["‹Name›-streams"]
+    S1["OnBody 交接 / 取消通知"]
+  end
+  L1 -- "Handshake().Go" --> H1
+  L2 --> W0
+  L2 --> W1
+  W0 -. "cond.Signal" .-> H1
+  W2 -.-> S1
+  classDef loop fill:#e8effc,stroke:#2458c6,color:#16202c
+  classDef work fill:#e3f4f1,stroke:#0c7d72,color:#16202c
+  classDef hs fill:#fbf0de,stroke:#a86a12,color:#16202c
+  classDef str fill:#efe9fb,stroke:#6b45c8,color:#16202c
+  class L1,L2 loop
+  class W0,W1,W2,W3,W4 work
+  class H1,H2,H3 hs
+  class S1 str
+  </pre></div>
+  <ul class="notes">
+    <li><code>request.TLS</code> 在首次 drive 时通过 <code>fibtls.ConnectionState</code> 取一次并缓存在 parser 上。</li>
+    <li>配置了 <code>ReadTimeout</code> / <code>IdleTimeout</code> 时，空闲超时从 OnOpen 就开始计时，TLS 握手的时间也算在里面。</li>
+    <li>要开 HTTP/2 就用 <code>fibhttp.ConfigureTLS</code> 把 <code>h2</code> 加进 ALPN，此时同一个 Handler 按协商结果走下面的 HTTP/2 流程。</li>
+  </ul>
+</section>
+
+<section id="h2c">
+  <h2>HTTP/2 明文（h2c：前言直连或 Upgrade）</h2>
+  <p class="lede">连接由 worker 读和分帧，每个请求的 handler 交给流池并发执行，读者立刻回到 socket。响应在流池 worker 上编码、按流控窗口直接写出。</p>
+  <div class="runs"><span class="chip c-loop"><i></i>循环</span><span class="chip c-work"><i></i>workers（读 / 分帧）</span><span class="chip c-str"><i></i>流池（handler）</span></div>
+  <div class="diagram"><pre class="mermaid">
+flowchart TD
+  subgraph WK["‹Name›-workers，连接的读者"]
+    W1["drive → sniff 见 PRI 前言&lt;br/&gt;或 Upgrade: h2c，先回 101"]
+    W2["startH2：newH2ServerConn&lt;br/&gt;start 发 SETTINGS + WINDOW_UPDATE"]
+    W3["h2ServerConn.feed&lt;br/&gt;h2ReadFrame → handleFrame"]
+    W4["HEADERS / CONTINUATION&lt;br/&gt;HPACK 解码 → newRequest"]
+    W5["DATA：收 body，回 WINDOW_UPDATE"]
+    W6["WINDOW_UPDATE：flushLocked&lt;br/&gt;续发被窗口卡住的 DATA"]
+    W7["finishRequest / streamRequest"]
+    W8{"StreamPool.admit&lt;br/&gt;MaxConcurrentHandlers"}
+    W9["达到上限：handler 在读者上执行"]
+    W1 --> W2 --> W3
+    W3 --> W4 --> W7
+    W3 --> W5 --> W7
+    W3 --> W6
+    W7 --> W8
+    W8 -- 超限 --> W9
+  end
+  subgraph STR["‹Name›-streams"]
+    S1["streamTask.run → serveRequest&lt;br/&gt;ServeHTTP"]
+    S2["st.respond：持 sc.mu&lt;br/&gt;HPACK 编码 HEADERS&lt;br/&gt;窗口内切 DATA 帧"]
+    S3["conn.Send：未 corked 则直接 write"]
+    S4["defer conn.Flush"]
+    S1 --> S2 --> S3 --> S4
+  end
+  subgraph LOOP["poller 事件循环"]
+    L1["EPOLLIN → GoTasks"]
+    L2["OnClose → sc.shutdown"]
+  end
+  L1 --> W3
+  W8 -- "GoTask" --> S1
+  S2 -. "窗口不足，挂在 st.pending" .-> W6
+  classDef loop fill:#e8effc,stroke:#2458c6,color:#16202c
+  classDef work fill:#e3f4f1,stroke:#0c7d72,color:#16202c
+  classDef str fill:#efe9fb,stroke:#6b45c8,color:#16202c
+  class L1,L2 loop
+  class W1,W2,W3,W4,W5,W6,W7,W8,W9 work
+  class S1,S2,S3,S4 str
+  </pre></div>
+  <ul class="notes">
+    <li>默认 <code>MaxConcurrentHandlers=0</code>：每个请求都进流池，一条连接能并发多少由 <code>MaxConcurrentStreams</code> 决定。设为 N 时第 N 个在读者上执行，读者停读，靠对端流控限速；<code>Disable</code> 等于 N=1。</li>
+    <li>流池 worker 写响应时，如果读者那一轮正 corked，数据进入本轮的发送缓冲，随轮末一起写出；否则直接 write。</li>
+    <li>流式请求 body：<code>streamRequest</code> 在 body 到齐前就提交 handler，后续 DATA 帧由读者喂进 BodyFeed，接收窗口按 handler 消费的速度归还。</li>
+    <li>服务端的 SETTINGS 现在带 <code>ENABLE_CONNECT_PROTOCOL=1</code>，带 <code>:protocol</code> 的扩展 CONNECT 走隧道流程，见「WS over HTTP/2」。</li>
+    <li>流池上限是引擎池的 2 倍，下限 0；最后一个同名 Engine 关闭时流池停止，之后到达的请求由读者自己执行。</li>
+  </ul>
+  <p class="ref">http/handler.go:857 startH2 · http/h2_upgrade.go:45 upgradeH2C · http/h2_server.go:248 feed · :907 finishRequest · :939 streamRequest · :1115 respond · http/stream_pool_native.go:86 Run · :98 Serve · :198 streamTask.run</p>
+</section>
+
+<section id="h2tls">
+  <h2>HTTP/2 over TLS（ALPN h2）</h2>
+  <p class="lede">在 h2c 的流程外面多两层：握手池负责握手，worker 在分帧前先解密；流池 worker 写响应时在 TLS 层的 <code>wmu</code> 下逐个加密。</p>
+  <div class="runs"><span class="chip c-loop"><i></i>循环</span><span class="chip c-hs"><i></i>握手池</span><span class="chip c-work"><i></i>workers</span><span class="chip c-str"><i></i>流池</span></div>
+  <div class="diagram"><pre class="mermaid">
+flowchart TD
+  subgraph LOOP["poller 事件循环"]
+    L1["tls.OnOpen → http.OnOpen"]
+    L2["EPOLLIN → GoTasks"]
+  end
+  subgraph HS["fib-tls-handshake"]
+    H1["HandshakeContext&lt;br/&gt;ALPN 选中 h2"]
+    H2["首批明文：客户端前言、SETTINGS、&lt;br/&gt;可能还有首个 HEADERS"]
+    H3["http.drive → sniff&lt;br/&gt;NegotiatedProtocol 为 h2 → startH2"]
+    H1 --> H2 --> H3
+  end
+  subgraph WK["‹Name›-workers"]
+    W1["解密记录"]
+    W2["h2ServerConn.feed 分帧"]
+    W3["finishRequest → StreamPool.Serve"]
+    W1 --> W2 --> W3
+  end
+  subgraph STR["‹Name›-streams"]
+    S1["ServeHTTP"]
+    S2["respond：HEADERS + DATA"]
+    S3["conn.Send → layer.Send&lt;br/&gt;wmu 下 seal → SendRaw"]
+    S1 --> S2 --> S3
+  end
+  L1 -- "Handshake().Go" --> H1
+  L2 --> W1
+  H3 -- "Serve" --> S1
+  W3 -- "Serve" --> S1
+  classDef loop fill:#e8effc,stroke:#2458c6,color:#16202c
+  classDef work fill:#e3f4f1,stroke:#0c7d72,color:#16202c
+  classDef hs fill:#fbf0de,stroke:#a86a12,color:#16202c
+  classDef str fill:#efe9fb,stroke:#6b45c8,color:#16202c
+  class L1,L2 loop
+  class W1,W2,W3 work
+  class H1,H2,H3 hs
+  class S1,S2,S3 str
+  </pre></div>
+  <ul class="notes">
+    <li>ALPN 选中 h2 时不再看前言，首批数据就直接交给 HTTP/2；不以前言开头算连接错误。</li>
+    <li>与握手同到的帧在握手 worker 上分帧，其中完整的请求也从握手 worker 提交到流池。</li>
+    <li>加密串行在 <code>wmu</code> 上：多个流池 worker 同时回同一条连接时会在这里排队，每次只加密一段并入队发送。</li>
+  </ul>
+</section>
+
+<section id="ws">
+  <h2>WebSocket 独立 Handler（明文）</h2>
+  <p class="lede">升级握手和之后的每一帧都在 worker 的一轮里处理，消息回调直接在 worker 上执行，不经过任何额外的池。</p>
+  <div class="runs"><span class="chip c-loop"><i></i>循环</span><span class="chip c-work"><i></i>workers</span><span class="chip c-usr"><i></i>用户 goroutine（可选写）</span></div>
+  <div class="diagram"><pre class="mermaid">
+flowchart TD
+  subgraph LOOP["poller 事件循环"]
+    L1["OnOpen：挂 connectionState"]
+    L2["EPOLLIN → GoTasks"]
+    L3["closeConnection → 最后一轮"]
+  end
+  subgraph WK["‹Name›-workers"]
+    W1["ServerHandler.OnData"]
+    W2{"已升级"}
+    W3["validateMinimalHandshake&lt;br/&gt;字节级快路径"]
+    W4["不完整或需要 Request：&lt;br/&gt;handshakeParser 累积解析"]
+    W5["upgrade：发 101，corked&lt;br/&gt;协商 permessage-deflate&lt;br/&gt;handler.OnOpen(ws, req)"]
+    W6["serveFrames：FeedOneBorrowed"]
+    W7["Text / Binary → OnMessage 或 OnFrame"]
+    W8["Ping → 自动 Pong&lt;br/&gt;Close → 回 Close"]
+    W9["WriteMessage → sendFrame&lt;br/&gt;轮内 corked，轮末合并写出"]
+    WC["OnClose(ws, code, reason, err)"]
+    W1 --> W2
+    W2 -- 否 --> W3
+    W3 -- 不完整 --> W4 --> W5
+    W3 -- 完整 --> W5
+    W5 -- "剩余字节" --> W6
+    W2 -- 是 --> W6
+    W6 --> W7 --> W9
+    W6 --> W8
+  end
+  subgraph USR["用户 goroutine"]
+    U1["WriteMessage，直接 write"]
+  end
+  L2 --> W1
+  L3 --> WC
+  classDef loop fill:#e8effc,stroke:#2458c6,color:#16202c
+  classDef work fill:#e3f4f1,stroke:#0c7d72,color:#16202c
+  classDef usr fill:#fae6ed,stroke:#b23a62,color:#16202c
+  class L1,L2,L3 loop
+  class W1,W2,W3,W4,W5,W6,W7,W8,W9,WC work
+  class U1 usr
+  </pre></div>
+  <ul class="notes">
+    <li>一个阻塞的 OnMessage 只拖住它自己的连接；需要长时间处理就在回调里把 payload 复制出去，交给自己的 goroutine，那边的 <code>WriteMessage</code> 直接写 socket。</li>
+    <li>deflate 的压缩和解压也在这一轮里、在 worker 上执行。</li>
+    <li>这里的 <code>websocket.ServerHandler</code> 直接作为 <code>fib.Handler</code> 绑在 Engine 上，不经过 http 包的 drive，也不用流池。同一个 ServerHandler 也可以由 HTTP 服务器的 handler 调 <code>Upgrade</code> 接入，见后面三节。</li>
+  </ul>
+  <p class="ref">websocket/handler.go:371 OnOpen · :375 OnData · :441 upgrade · :478 serveFrames · :740 OnClose</p>
+</section>
+
+<section id="wss">
+  <h2>WebSocket over TLS</h2>
+  <p class="lede">握手池完成 TLS 握手后，升级请求和帧的处理与明文相同，只是先在 worker 上解密，发送时经 TLS 层加密。</p>
+  <div class="runs"><span class="chip c-loop"><i></i>循环</span><span class="chip c-hs"><i></i>握手池</span><span class="chip c-work"><i></i>workers</span></div>
+  <div class="diagram"><pre class="mermaid">
+flowchart TD
+  subgraph LOOP["poller 事件循环"]
+    L1["tls.OnOpen → ws.OnOpen"]
+    L2["EPOLLIN → GoTasks"]
+  end
+  subgraph HS["fib-tls-handshake"]
+    H1["HandshakeContext"]
+    H2["与握手同到的升级请求&lt;br/&gt;在这里解析、回 101、&lt;br/&gt;调 handler.OnOpen"]
+    H1 --> H2
+  end
+  subgraph WK["‹Name›-workers"]
+    W1["解密记录"]
+    W2["升级请求 / serveFrames"]
+    W3["OnMessage / OnFrame"]
+    W4["WriteMessage → layer.Send&lt;br/&gt;seal → SendRaw，corked"]
+    W1 --> W2 --> W3 --> W4
+  end
+  L1 -- "Handshake().Go" --> H1
+  L2 --> W1
+  classDef loop fill:#e8effc,stroke:#2458c6,color:#16202c
+  classDef work fill:#e3f4f1,stroke:#0c7d72,color:#16202c
+  classDef hs fill:#fbf0de,stroke:#a86a12,color:#16202c
+  class L1,L2 loop
+  class W1,W2,W3,W4 work
+  class H1,H2 hs
+  </pre></div>
+  <ul class="notes">
+    <li>客户端常在收到 Finished 后立刻发升级请求，所以 WebSocket 的 <code>OnOpen</code> 有时在握手 worker 上执行，有时在引擎 worker 上执行，两者由 <code>readMu</code> 串行，不会并发。</li>
+    <li>帧头和负载合成一条 TLS 记录加密（<code>SendParts</code> → 一次 seal），避免单独为帧头付记录开销。</li>
+  </ul>
+</section>
+
+<section id="h3">
+  <h2>HTTP/3（QUIC，TLS 1.3 内置）</h2>
+  <p class="lede">HTTP/3 没有明文形态，TLS 1.3 是 QUIC 的一部分。UDP 数据报由事件循环自己读并按对端地址分拣，QUIC 的解包、握手和帧处理在 worker 上执行，请求 handler 批量交给流池；QUIC 自己的定时器在运行时定时器 goroutine 上发包。</p>
+  <div class="runs"><span class="chip c-loop"><i></i>根循环读 UDP</span><span class="chip c-work"><i></i>workers</span><span class="chip c-str"><i></i>流池</span><span class="chip c-tmr"><i></i>QUIC 定时器 / UDP sweep</span></div>
+  <div class="diagram"><pre class="mermaid">
+flowchart TD
+  subgraph LOOP["根事件循环，ReusePort 时为各 poller"]
+    L1["UDP fd 可读 → readUDPListener&lt;br/&gt;recvmmsg，每轮至多 256 个"]
+    L2["udpPeer：按四元组找 peer Connection&lt;br/&gt;新对端则建连接 + OnOpen"]
+    L3["deliverDatagram：复制进 peer 队列&lt;br/&gt;noteEvent → GoTasks"]
+    L1 --> L2 --> L3
+  end
+  subgraph WK["‹Name›-workers"]
+    W1["process → drainDatagrams&lt;br/&gt;→ OnDatagrams(批)"]
+    W2{"已挂 quic.Conn"}
+    W3["版本协商 / 按 CID 找回迁移连接 /&lt;br/&gt;Initial → quic.Accept&lt;br/&gt;crypto/tls QUICServer，非阻塞"]
+    W4["HandlePathDatagrams：解密、处理帧、记 ACK"]
+    W5["dispatch → OnStreamData&lt;br/&gt;requestStream.feed，QPACK 解码"]
+    W6["finish → streams.Queue 入批"]
+    W7["OnCallsDone → streams.Submit&lt;br/&gt;整批 GoTasks"]
+    W8["flush：dispatch 期间先扣住，&lt;br/&gt;结束后打包发送"]
+    W1 --> W2
+    W2 -- 否 --> W3 --> W4
+    W2 -- 是 --> W4
+    W4 --> W5 --> W6 --> W7 --> W8
+  end
+  subgraph STR["‹Name›-streams"]
+    S1["ServeHTTP"]
+    S2["WriteResponse：QPACK 编码&lt;br/&gt;写入 QUIC 流"]
+    S3["writeDone → qc.flush → sendLocked&lt;br/&gt;SendBatch：sendmmsg，经监听 fd"]
+    S1 --> S2 --> S3
+  end
+  subgraph TMR["运行时定时器 goroutine"]
+    T1["quic onTimer：ACK 延迟、丢包 / PTO、&lt;br/&gt;空闲、握手超时、flushHold 到期&lt;br/&gt;→ sendLocked 直接发包"]
+    T2["UDP sweep → commandUDPSweep"]
+  end
+  L3 --> W1
+  W7 --> S1
+  T2 --> LOOP
+  classDef loop fill:#e8effc,stroke:#2458c6,color:#16202c
+  classDef work fill:#e3f4f1,stroke:#0c7d72,color:#16202c
+  classDef str fill:#efe9fb,stroke:#6b45c8,color:#16202c
+  classDef tmr fill:#eceff3,stroke:#5f6b7a,color:#16202c
+  class L1,L2,L3 loop
+  class W1,W2,W3,W4,W5,W6,W7,W8 work
+  class S1,S2,S3 str
+  class T1,T2 tmr
+  </pre></div>
+  <ul class="notes">
+    <li><b>谁读 UDP</b>：默认只有一个 UDP socket，所有对端共用，留在根循环上读，poller 不参与。Linux 下设 <code>ReusePort</code> 时每个 poller 各 bind 一个 socket，内核按四元组哈希分流，同一对端总落在同一个 poller 上。</li>
+    <li><b>握手不进握手池</b>：QUIC 用 <code>crypto/tls</code> 的 QUICConn，事件驱动、不阻塞，所以 TLS 1.3 握手就在 worker 的一轮里推进。</li>
+    <li><b>批量</b>：一批数据报触发的多个请求整批提交给流池，落在同一分片、由少数 worker 连续取走，响应因此能挤进同一批 UDP 包，连同本批的 ACK 一起发出。</li>
+    <li>流池 worker 写响应和定时器 goroutine 发包，都持 <code>quic.Conn.mu</code> 直接经 UDP 监听 fd 发送，不回到事件循环。</li>
+    <li>对端地址变化（NAT 重绑定）时新地址会被当成新 peer，<code>route</code> 按 Connection ID 把它挂回原来的 <code>quic.Conn</code>，无论它落在哪个循环上。</li>
+    <li>控制流的 SETTINGS 现在带 <code>ENABLE_CONNECT_PROTOCOL=1</code>，扩展 CONNECT 走隧道流程，见「WS over HTTP/3」。</li>
+    <li>通常还会另起一个 TCP Engine 跑 <code>fibtls + fibhttp</code>（HTTP/1、HTTP/2），用 Alt-Svc 引导到 HTTP/3；两个 Engine 同 Name 时共用 workers 池和流池。</li>
+  </ul>
+  <p class="ref">engine_unix.go readUDPListener · udp.go:111 udpPeer · :138 deliverDatagram · :159 drainDatagrams · http3/server.go:211 OnData · :285 OnDatagrams · :436 OnCallsDone · :816 finish · :894 WriteResponse · http3/quic/conn.go:463 Accept · :799 dispatch · :877 flush · :1491 onTimer</p>
+</section>
+
+<section id="wsh1">
+  <h2>WebSocket 经 HTTP/1.1 升级（ws.Upgrade，含 TLS）</h2>
+  <p class="lede">HTTP 服务器的 handler 里调 <code>websocket.ServerHandler.Upgrade</code>，整条连接切换成隧道。handler 本来就在连接的 worker 上执行，所以升级、OnOpen 和之后的每一帧都留在 worker 上，不用额外的池。</p>
+  <div class="runs"><span class="chip c-loop"><i></i>循环</span><span class="chip c-work"><i></i>workers</span><span class="chip c-hs"><i></i>握手池（仅 TLS）</span></div>
+  <div class="diagram"><pre class="mermaid">
+flowchart TD
+  subgraph LOOP["poller 事件循环"]
+    L1["EPOLLIN → GoTasks"]
+    L2["closeConnection → 最后一轮"]
+  end
+  subgraph WK["‹Name›-workers"]
+    W0["TLS 时先解密"]
+    W1["http.drive 解析请求&lt;br/&gt;ServeHTTP"]
+    W2["handler 调 ws.Upgrade(c, header)&lt;br/&gt;validateHandshake"]
+    W3["Context.Upgrade → upgradeHTTP1&lt;br/&gt;发 101，attachment 换成 TunnelFeed&lt;br/&gt;parser.upgraded = true"]
+    W4["Tunnel.open → OnTunnelOpen&lt;br/&gt;→ ws handler.OnOpen"]
+    W5["请求后面已到的字节先交付"]
+    W6["之后每轮：OnData → TunnelFeed.Write&lt;br/&gt;→ OnTunnelData → serveFrames"]
+    W7["OnMessage / OnFrame&lt;br/&gt;WriteMessage → conn.SendParts，corked"]
+    W8["OnClose → TunnelFeed.End&lt;br/&gt;→ OnTunnelClose → ws OnClose"]
+    W0 --> W1 --> W2 --> W3 --> W4 --> W5
+    W6 --> W7
+  end
+  HS["fib-tls-handshake&lt;br/&gt;握手；与握手同到的升级请求在此服务"]
+  L1 --> W0
+  L1 --> W6
+  L2 --> W8
+  HS -.-> W1
+  classDef loop fill:#e8effc,stroke:#2458c6,color:#16202c
+  classDef work fill:#e3f4f1,stroke:#0c7d72,color:#16202c
+  classDef hs fill:#fbf0de,stroke:#a86a12,color:#16202c
+  classDef str fill:#efe9fb,stroke:#6b45c8,color:#16202c
+  classDef tmr fill:#eceff3,stroke:#5f6b7a,color:#16202c
+  classDef usr fill:#fae6ed,stroke:#b23a62,color:#16202c
+  class L1,L2 loop
+  class W0,W1,W2,W3,W4,W5,W6,W7,W8 work
+  class HS hs
+  </pre></div>
+  <ul class="notes">
+    <li>升级后 HTTP 解析器放手：<code>drive</code> 看到 <code>parser.upgraded</code> 就返回，HTTP 的读超时也一并取消。</li>
+    <li>隧道的回调一次一个、按序执行（<code>Tunnel.delivering</code>）：别的 goroutine 正在交付时，新数据排队，由那个 goroutine 接着交付。</li>
+    <li>请求 body 还在流式到达的请求、HTTP/1.0 请求不能升级，返回 <code>ErrNotUpgradable</code>；握手不合法由 Upgrade 直接回 400 / 403。</li>
+    <li>over TLS 时只多两件事：worker 先解密，发送经 <code>layer.Send</code> 加密。</li>
+  </ul>
+  <p class="ref">websocket/upgrade.go:43 Upgrade · http/tunnel.go:246 Context.Upgrade · :302 upgradeHTTP1 · :110 deliver · :163 open · http/handler.go:481 OnData</p>
+</section>
+
+<section id="wsh2">
+  <h2>WebSocket over HTTP/2（RFC 8441 扩展 CONNECT，含 TLS）</h2>
+  <p class="lede">只有这一条流切换成隧道，连接继续服务其他请求。升级和 OnOpen 在流池上执行；之后的帧由连接的读者（引擎 worker）解出 DATA 后直接交付，所以 OnMessage 通常在引擎 worker 上执行。</p>
+  <div class="runs"><span class="chip c-loop"><i></i>循环</span><span class="chip c-work"><i></i>workers（读者）</span><span class="chip c-str"><i></i>流池</span><span class="chip c-hs"><i></i>握手池（仅 TLS）</span></div>
+  <div class="diagram"><pre class="mermaid">
+flowchart TD
+  subgraph WK["‹Name›-workers，连接的读者"]
+    W1["feed 分帧：HEADERS 带 :protocol = websocket&lt;br/&gt;且未 END_STREAM"]
+    W2["serveTunnel：建 h2Tunnel / TunnelFeed&lt;br/&gt;streams.Serve"]
+    W3["后续 DATA → handleTunnelData&lt;br/&gt;归还接收窗口，feed.Write"]
+    W4{"隧道已打开&lt;br/&gt;且无人在交付"}
+    W5["OnTunnelData → serveFrames&lt;br/&gt;OnMessage 在读者上执行"]
+    W6["追加到 queued&lt;br/&gt;超过 MaxBodyBytes 则 RST_STREAM"]
+    W7["WINDOW_UPDATE：续发隧道挂起的字节"]
+    W1 --> W2
+    W3 --> W4
+    W4 -- 是 --> W5
+    W4 -- 否 --> W6
+  end
+  subgraph STR["‹Name›-streams"]
+    S1["ServeHTTP → ws.Upgrade&lt;br/&gt;validateExtendedConnect"]
+    S2["st.upgrade：回 200，流保持打开"]
+    S3["Tunnel.open → OnTunnelOpen → ws OnOpen"]
+    S4["drain：交付期间排队的数据&lt;br/&gt;这部分 OnMessage 在流池上执行"]
+    S1 --> S2 --> S3 --> S4
+  end
+  subgraph OUT["发送，任意 goroutine"]
+    O1["WriteMessage → Tunnel.SendParts&lt;br/&gt;→ sendTunnel：持 sc.mu&lt;br/&gt;按流 / 连接窗口切 DATA 帧"]
+    O2["conn.Send，TLS 时再经 layer.Send 加密"]
+    O1 --> O2
+  end
+  L1["poller：EPOLLIN → GoTasks"]
+  L1 --> W1
+  L1 --> W3
+  W2 -- "GoTask" --> S1
+  W6 -. "由正在交付的 goroutine 取走" .-> S4
+  O1 -. "窗口不足，挂起" .-> W7
+  classDef loop fill:#e8effc,stroke:#2458c6,color:#16202c
+  classDef work fill:#e3f4f1,stroke:#0c7d72,color:#16202c
+  classDef hs fill:#fbf0de,stroke:#a86a12,color:#16202c
+  classDef str fill:#efe9fb,stroke:#6b45c8,color:#16202c
+  classDef tmr fill:#eceff3,stroke:#5f6b7a,color:#16202c
+  classDef usr fill:#fae6ed,stroke:#b23a62,color:#16202c
+  class L1 loop
+  class W1,W2,W3,W4,W5,W6,W7 work
+  class S1,S2,S3,S4 str
+  class O1,O2 usr
+  </pre></div>
+  <ul class="notes">
+    <li><b>阻塞的 OnMessage 会拖住整条 HTTP/2 连接的读取</b>，不只是这一条流：它占着的是连接的读者。和独立 Handler 下「只拖住自己的连接」含义不同，这里一条连接上可能还有很多别的请求。</li>
+    <li>OnOpen、OnMessage、OnClose 可能出现在流池 worker 或引擎 worker 上，但隧道保证一次一个、按序。</li>
+    <li>流的结束：对端 END_STREAM 结束隧道；本端 <code>CloseAfterSend</code> 在挂起数据发完后带 END_STREAM；<code>Close</code> 直接 RST_STREAM。连接关闭时所有隧道收到 OnTunnelClose。</li>
+    <li>over TLS（ALPN h2）时读者先解密再分帧，其余相同；握手池只负责握手和首批帧。</li>
+  </ul>
+  <p class="ref">http/h2_tunnel.go:43 serveTunnel · :54 handleTunnelData · :112 upgrade · :142 sendTunnel · http/tunnel.go:110 deliver · websocket/upgrade.go:43 Upgrade</p>
+</section>
+
+<section id="wsh3">
+  <h2>WebSocket over HTTP/3（RFC 9220 扩展 CONNECT）</h2>
+  <p class="lede">结构与 HTTP/2 相同，隧道是一条 QUIC 请求流：升级在流池上，之后的数据由处理数据报的引擎 worker 交付，发送走 QUIC 流的 DATA 帧。</p>
+  <div class="runs"><span class="chip c-loop"><i></i>循环读 UDP</span><span class="chip c-work"><i></i>workers</span><span class="chip c-str"><i></i>流池</span><span class="chip c-tmr"><i></i>QUIC 定时器</span></div>
+  <div class="diagram"><pre class="mermaid">
+flowchart TD
+  L1["根循环：recvmmsg → 分拣到 peer → GoTasks"]
+  subgraph WK["‹Name›-workers"]
+    W1["HandlePathDatagrams → dispatch&lt;br/&gt;OnStreamData → requestStream"]
+    W2["HEADERS 带 :protocol&lt;br/&gt;→ serveTunnel：NewTunnelFeed&lt;br/&gt;streams.Queue，OnCallsDone 时 Submit"]
+    W3["后续 DATA 帧 → tunnel.Write"]
+    W4{"隧道已打开&lt;br/&gt;且无人在交付"}
+    W5["OnTunnelData → serveFrames&lt;br/&gt;OnMessage 在此 worker 执行"]
+    W6["排队，超限则 abort 流"]
+    W1 --> W2
+    W1 --> W3 --> W4
+    W4 -- 是 --> W5
+    W4 -- 否 --> W6
+  end
+  subgraph STR["‹Name›-streams"]
+    S1["ServeHTTP → ws.Upgrade"]
+    S2["requestStream.Upgrade：回 200，流保持打开"]
+    S3["Tunnel.open → ws OnOpen&lt;br/&gt;drain 排队数据"]
+    S1 --> S2 --> S3
+  end
+  subgraph OUT["发送，任意 goroutine"]
+    O1["WriteMessage → tunnelWriter.SendParts&lt;br/&gt;每次发送一个 DATA 帧写入 QUIC 流"]
+    O2["qc.flush → sendLocked → sendmmsg"]
+    O1 --> O2
+  end
+  T1["quic onTimer：重传 / ACK / 空闲"]
+  L1 --> W1
+  W2 -- "GoTasks" --> S1
+  W6 -.-> S3
+  classDef loop fill:#e8effc,stroke:#2458c6,color:#16202c
+  classDef work fill:#e3f4f1,stroke:#0c7d72,color:#16202c
+  classDef hs fill:#fbf0de,stroke:#a86a12,color:#16202c
+  classDef str fill:#efe9fb,stroke:#6b45c8,color:#16202c
+  classDef tmr fill:#eceff3,stroke:#5f6b7a,color:#16202c
+  classDef usr fill:#fae6ed,stroke:#b23a62,color:#16202c
+  class L1 loop
+  class W1,W2,W3,W4,W5,W6 work
+  class S1,S2,S3 str
+  class O1,O2 usr
+  class T1 tmr
+  </pre></div>
+  <ul class="notes">
+    <li>阻塞的 OnMessage 拖住的是这个 QUIC 连接的数据报处理（该 peer 的这一轮），同一连接上的其他请求流也跟着等。</li>
+    <li>发送受 QUIC 流控约束，由 QUIC 层缓冲和重传；丢包恢复仍在定时器 goroutine 上。</li>
+    <li>对端结束流时隧道收到 <code>io.EOF</code>，本端已升级则关闭自己这一侧；<code>Close</code> 会 reset 流的两个方向。</li>
+  </ul>
+  <p class="ref">http3/tunnel.go:25 serveTunnel · :50 Upgrade · http3/server.go:436 OnCallsDone · http/tunnel.go:110 deliver</p>
+</section>
+
+<section id="matrix">
+  <h2>对照表：每种情况谁跑什么</h2>
+  <div class="tbl"><table>
+    <thead><tr><th>情况</th><th>事件循环</th><th>workers</th><th>握手池</th><th>流池</th><th>其他</th></tr></thead>
+    <tbody>
+      <tr><td>裸 TCP</td><td>accept、注册、OnOpen、合并事件</td><td>读、OnData、写合并、OnClose</td><td class="dash">—</td><td class="dash">—</td><td>deadline 定时器</td></tr>
+      <tr><td>TLS</td><td>同上；OnOpen 提交握手</td><td>喂密文 / 解密、inner.OnData、加密</td><td>HandshakeContext、首批明文</td><td class="dash">—</td><td>HandshakeTimeout 靠 context</td></tr>
+      <tr><td>HTTP/1.x</td><td>同裸 TCP</td><td>解析、handler、响应</td><td class="dash">—</td><td>OnBody 交接、取消通知</td><td>Retain 后在用户 goroutine 写响应</td></tr>
+      <tr><td>HTTP/1.x + TLS</td><td>同 TLS</td><td>解密、解析、handler、加密</td><td>握手，首个请求可能在此服务</td><td>同 HTTP/1</td><td>同 HTTP/1</td></tr>
+      <tr><td>HTTP/2 h2c</td><td>同裸 TCP</td><td>分帧、HPACK 解码、流控、续发 DATA</td><td class="dash">—</td><td>每个请求的 handler、HPACK 编码、写响应</td><td class="dash">—</td></tr>
+      <tr><td>HTTP/2 + TLS</td><td>同 TLS</td><td>解密、分帧</td><td>握手，首批帧在此分帧</td><td>handler、编码、加密发送</td><td class="dash">—</td></tr>
+      <tr><td>WebSocket 独立</td><td>同裸 TCP</td><td>升级、解帧、OnMessage、自动 Pong、deflate</td><td class="dash">—</td><td class="dash">—</td><td>用户 goroutine 可直接写</td></tr>
+      <tr><td>WebSocket 独立 + TLS</td><td>同 TLS</td><td>解密、解帧、回调、加密</td><td>握手，升级请求可能在此处理</td><td class="dash">—</td><td>同 WebSocket</td></tr>
+      <tr><td>WS 经 HTTP/1.1 升级（±TLS）</td><td>同 HTTP/1</td><td>handler 调 Upgrade、OnOpen、解帧、OnMessage</td><td>仅 TLS：握手</td><td class="dash">—</td><td>用户 goroutine 可直接写</td></tr>
+      <tr><td>WS over HTTP/2（±TLS）</td><td>同 HTTP/2</td><td>分帧、隧道 DATA 交付、OnMessage（通常）</td><td>仅 TLS：握手</td><td>Upgrade、OnOpen、排队数据的 OnMessage</td><td>发送按流控窗口切帧</td></tr>
+      <tr><td>WS over HTTP/3</td><td>读 UDP、分拣</td><td>QUIC 解包、隧道 DATA 交付、OnMessage（通常）</td><td class="dash">—</td><td>Upgrade、OnOpen、排队数据的 OnMessage</td><td>QUIC 定时器</td></tr>
+      <tr><td>HTTP/3</td><td>读 UDP、按对端分拣（根循环或各 poller）</td><td>QUIC 解包、TLS 1.3 握手、帧、QPACK 解码</td><td class="dash">—</td><td>handler、QPACK 编码、sendmmsg</td><td>QUIC 定时器发包；UDP sweep</td></tr>
+    </tbody>
+  </table></div>
+</section>
+</main>
+</div>
+<script src="https://cdn.jsdelivr.net/npm/mermaid@10.9.1/dist/mermaid.min.js"></script>
+<script>mermaid.initialize({startOnLoad:true,theme:"neutral",flowchart:{htmlLabels:true}});</script>
+</body>
+</html>

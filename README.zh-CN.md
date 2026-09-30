@@ -86,7 +86,8 @@ go run ./examples/http3/tls/server
 
 - [Go 使用指南](docs/guide.zh-CN.md)：配置、API 和各子 package 的用法
 - [HTTP/1.x](docs/http1.zh-CN.md)、[HTTP/2](docs/http2.zh-CN.md)、[HTTP/3](docs/http3.zh-CN.md)：支持范围、限制和一致性测试
-- [架构文档](docs/architecture.html)：中英文可切换的交互式架构图，涵盖读取调度、写背压、负载均衡和连接关闭回收流程
+- [架构说明](docs/architecture.zh-CN.html)：事件循环、poller 与协程池，Handler 分层，读取调度、写背压、负载均衡和连接关闭回收
+- [协议流程图](docs/flows.zh-CN.html)：TLS、HTTP/1、HTTP/2、HTTP/3、WebSocket 每种情况由哪个循环、哪个协程池执行，每种一张图
 
 ## C 实现
 
