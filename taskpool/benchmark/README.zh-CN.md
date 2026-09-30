@@ -59,7 +59,7 @@ powershell -ExecutionPolicy Bypass -File bench.ps1
 
 `go test` 的原始输出写到 `results/<os>-<arch>-<时间>.txt`（或 `-o` / `-Out`
 指定的文件），之后输出一张 Markdown 汇总表：中位数 `ns/op / cpu-ns/op`，每个场景
-最快的池加粗，多次运行波动超过 1.3 倍的格子标 `*`。重新汇总已有结果：
+最快的池加粗，多次运行波动超过 1.3 倍的格子标 `*`；表后列出其中每个场景测什么。重新汇总已有结果：
 
 ```bash
 go run ./summarize results/*.txt

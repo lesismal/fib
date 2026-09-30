@@ -1,7 +1,7 @@
 // Command summarize turns the output of BenchmarkPools into a Markdown table:
 // for each scenario and pool the median ns/op and cpu-ns/op over the runs,
 // the fastest of each scenario in bold, and a note on the cells whose runs
-// were spread wide.
+// were spread wide, followed by what each scenario in it measures.
 //
 //	go run ./summarize bench.txt [more.txt ...]
 //
@@ -26,6 +26,18 @@ type cell struct{ ns, cpu []float64 }
 // spreadNote is the max/min ratio over a cell's runs above which the table
 // flags it.
 const spreadNote = 1.3
+
+// descriptions says what each scenario of BenchmarkPools measures; keep it in
+// step with the scenarios in pools_test.go and the table in README.md.
+var descriptions = map[string]string{
+	"Handoff":      "one submitter, one task at a time, waiting for each: latency on a lightly loaded server",
+	"ParallelTiny": "every P submits empty tasks at once: contention on the pool itself",
+	"LoopCPUShort": "GOMAXPROCS/4 submitters, as event loops, feeding CPU-bound tasks of ~50 rounds",
+	"LoopCPULong":  "GOMAXPROCS/4 submitters, as event loops, feeding CPU-bound tasks of ~2000 rounds",
+	"LoopBlocking": "GOMAXPROCS/4 submitters, as event loops, feeding tasks that sleep 1ms: how fast the pool fans out",
+	"LoopMixed":    "GOMAXPROCS/4 submitters, as event loops; one task in ten sleeps 500µs, the rest spin 500 rounds",
+	"Bursts":       "rounds of 256 short tasks with a 2ms idle gap, left out of the timing: reuse of warm workers",
+}
 
 func main() {
 	var inputs []io.Reader
@@ -86,6 +98,32 @@ func main() {
 	fmt.Println("median ns/op / cpu-ns/op; fastest in bold; * runs spread more than", spreadNote, "x")
 	fmt.Println()
 	printTable(scenarios, pools, cells)
+	printDescriptions(records)
+}
+
+// printDescriptions lists the scenarios found in the records, once each
+// whatever their GOMAXPROCS, with what they measure.
+func printDescriptions(records [][]string) {
+	var names []string
+	for _, m := range records {
+		if !slices.Contains(names, m[1]) {
+			names = append(names, m[1])
+		}
+	}
+	width := 0
+	for _, name := range names {
+		width = max(width, len(name))
+	}
+	fmt.Println()
+	fmt.Println("scenarios:")
+	fmt.Println()
+	for _, name := range names {
+		d, ok := descriptions[name]
+		if !ok {
+			d = "(no description)"
+		}
+		fmt.Printf("- `%s`%s  %s\n", name, strings.Repeat(" ", width-len(name)), d)
+	}
 }
 
 // printTable prints the table with every column padded to one width, so that

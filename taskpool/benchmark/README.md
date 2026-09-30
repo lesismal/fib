@@ -63,7 +63,8 @@ powershell -ExecutionPolicy Bypass -File bench.ps1
 The raw `go test` output goes to `results/<os>-<arch>-<time>.txt` (or `-o` /
 `-Out`), and a Markdown table of medians follows it: `ns/op / cpu-ns/op`,
 the fastest pool of each scenario in bold, and `*` on cells whose runs
-spread more than 1.3x. To summarize earlier output again:
+spread more than 1.3x, then a list of what each scenario in it measures.
+To summarize earlier output again:
 
 ```bash
 go run ./summarize results/*.txt
