@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/bytedance/gopkg/util/gopool"
+	fnetpool "github.com/linfeip/fnet/pool"
 	"github.com/panjf2000/ants/v2"
 
 	fibpool "github.com/lesismal/fib/taskpool"
@@ -55,6 +56,18 @@ type gopoolPool struct{ gopool.Pool }
 
 func (gopoolPool) Stop() {}
 
+// fnetPool runs on fnet's defaults apart from the ceiling: per-core shards,
+// an unbounded queue per shard, and idle workers exit after 5s.
+type fnetPool struct{ *fnetpool.Pool }
+
+func (p fnetPool) Go(f func()) {
+	if err := p.Submit(f); err != nil {
+		panic(err)
+	}
+}
+
+func (p fnetPool) Stop() { p.Close() }
+
 var pools = []struct {
 	name string
 	new  func() pool
@@ -70,6 +83,7 @@ var pools = []struct {
 	{"gopool", func() pool {
 		return gopoolPool{gopool.NewPool("benchmark", int32(maxWorkers()), gopool.NewConfig())}
 	}},
+	{"fnet", func() pool { return fnetPool{fnetpool.New(fnetpool.Config{MaxWorkers: maxWorkers()})} }},
 	{"fib-adaptive", func() pool {
 		return fibPool{fibpool.NewWithMode("benchmark", fibpool.ModeAdaptive, maxWorkers(), queueSize)}
 	}},

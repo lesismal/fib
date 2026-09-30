@@ -24,7 +24,7 @@ if ($Out -ne "") { $Out = $ExecutionContext.SessionState.Path.GetUnresolvedProvi
 Set-Location -Path $PSScriptRoot
 
 $AllScenarios = "Handoff,ParallelTiny,LoopCPUShort,LoopCPULong,LoopBlocking,LoopMixed,Bursts"
-$AllPools = "nbio,ants,gopool,fib-adaptive,fib-adaptive-chan,fib-elastic"
+$AllPools = "nbio,ants,gopool,fnet,fib-adaptive,fib-adaptive-chan,fib-elastic"
 
 if ($Help) {
     @"

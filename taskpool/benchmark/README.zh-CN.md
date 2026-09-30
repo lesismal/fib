@@ -13,6 +13,7 @@
 | `nbio` | `github.com/lesismal/nbio/taskpool` v1.7.0 | `New(上限, 100000)` |
 | `ants` | `github.com/panjf2000/ants/v2` v2.12.1 | `NewPool(上限)`，默认配置：worker 全忙时 `Submit` 阻塞 |
 | `gopool` | `github.com/bytedance/gopkg/util/gopool` v0.1.4 | `NewPool(name, 上限, NewConfig())`，任务链表不限长 |
+| `fnet` | `github.com/linfeip/fnet/pool` (b3e61d2) | `New(Config{MaxWorkers: 上限})`，其余默认：按核分片、队列不限长、空闲 5s 退出 |
 | `fib-adaptive` | `taskpool.ModeAdaptive` | 下限 0，队列 100000 |
 | `fib-adaptive-chan` | `taskpool.ModeAdaptiveChan` | 下限 0，队列 100000 |
 | `fib-elastic` | `taskpool.ModeElastic` | 队列 100000 |

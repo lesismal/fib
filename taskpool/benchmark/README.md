@@ -15,6 +15,7 @@ dependencies of fib itself.
 | `nbio` | `github.com/lesismal/nbio/taskpool` v1.7.0 | `New(ceiling, 100000)` |
 | `ants` | `github.com/panjf2000/ants/v2` v2.12.1 | `NewPool(ceiling)`, defaults: `Submit` blocks while every worker is busy |
 | `gopool` | `github.com/bytedance/gopkg/util/gopool` v0.1.4 | `NewPool(name, ceiling, NewConfig())`, unbounded task list |
+| `fnet` | `github.com/linfeip/fnet/pool` (b3e61d2) | `New(Config{MaxWorkers: ceiling})`, defaults otherwise: per-core shards, unbounded queues, 5s idle timeout |
 | `fib-adaptive` | `taskpool.ModeAdaptive` | floor 0, queue 100000 |
 | `fib-adaptive-chan` | `taskpool.ModeAdaptiveChan` | floor 0, queue 100000 |
 | `fib-elastic` | `taskpool.ModeElastic` | queue 100000 |

@@ -7,7 +7,7 @@ caller="$(pwd)"
 cd "$(dirname "$0")"
 
 SCENARIOS="Handoff,ParallelTiny,LoopCPUShort,LoopCPULong,LoopBlocking,LoopMixed,Bursts"
-POOLS="nbio,ants,gopool,fib-adaptive,fib-adaptive-chan,fib-elastic"
+POOLS="nbio,ants,gopool,fnet,fib-adaptive,fib-adaptive-chan,fib-elastic"
 
 scenarios=""
 pools=""
