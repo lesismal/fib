@@ -164,9 +164,10 @@ func TestSetPoolSizingKeepsFieldsLeftUnset(t *testing.T) {
 	}
 }
 
-// The engine gives itself one poller for every eight CPUs, and at least one.
+// The engine gives itself one poller for every four CPUs, rounded down, and at
+// least one.
 func TestDefaultPollerCount(t *testing.T) {
-	for cpus, want := range map[int]int{1: 1, 3: 1, 8: 1, 9: 2, 16: 2, 64: 8, 96: 12} {
+	for cpus, want := range map[int]int{1: 1, 3: 1, 4: 1, 7: 1, 8: 2, 9: 2, 16: 4, 64: 16, 96: 24} {
 		if got := defaultPollerCount(cpus); got != want {
 			t.Errorf("%d CPUs: %d pollers, want %d", cpus, got, want)
 		}

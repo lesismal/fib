@@ -1253,10 +1253,9 @@ Engine 的 worker 池（`<Name>-workers`），每条连接的每一轮都在 wor
 
 - Engine 自己的循环只负责 accept 和它的 UDP socket；每条 accept 到的连接按 `fd % pollerCount`
   交给其中一个 poller，此后由那个 poller 负责它的事件注册、读写和关闭。poller 数量由
-  `Config.IOPollerCount` 指定，不大于 0（默认）时每 8 个 CPU 一个（`runtime.NumCPU()` 向上取整，
-  至少 1 个）：8 核以内 1 个，16 核 2 个，64 核 8 个。profile 下来，poller 每个请求只花约 0.2µs，
-  worker 花约 4.5µs（1 万连接的 WebSocket、HTTP/2 echo），一个 poller 大约跟得上 20 个核的
-  worker，每 8 个核一个时每个循环约 40% 忙。
+  `Config.IOPollerCount` 指定，不大于 0（默认）时为 `max(1, runtime.NumCPU()/4)`（向下取整，
+  至少 1 个）：7 核以内 1 个，8 核 2 个，16 核 4 个，64 核 16 个。profile 下来，poller 每个请求
+  只花约 0.2µs，worker 花约 4.5µs（1 万连接的 WebSocket、HTTP/2 echo）。
   poller 只负责等事件、交给 worker，一个就能应付很多连接，多出来的 poller 会和 worker 抢同样
   的 P：每一轮结束后 poller 都要让出 P 给刚唤醒的 worker，再排在它们后面等 P，于是每轮收集到的
   连接更少、请求被读到得更晚。实测 3 个 CPU、1 万连接的 HTTP/1 echo：不开 IOPollers 583k
@@ -1292,7 +1291,7 @@ Engine 的 worker 池（`<Name>-workers`），每条连接的每一轮都在 wor
 
 ```go
 config := fib.DefaultConfig() // 默认已开启 IOPollers
-config.IOPollerCount = 0      // 每 8 个 CPU 一个，至少 1 个
+config.IOPollerCount = 0      // max(1, NumCPU/4)
 config.ReusePort = true       // Linux：每个 poller 自己 accept
 
 single := fib.DefaultConfig()

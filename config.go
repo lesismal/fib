@@ -195,19 +195,17 @@ func pollerCount(config Config) int {
 // only waits for events and hands the connections they make runnable to the
 // workers, which costs a small share of what the workers then spend on them:
 // profiled at 0.2us a request against 4.5us on the workers, for WebSocket and
-// HTTP/2 echoes over 10k connections. One poller then keeps up with the
-// workers of about 20 CPUs, and one for every 8 leaves each loop around 40%
-// busy, where rounds still gather many events and wait little for a P.
-// Every loop more than that competes with the workers for the same Ps: on 3
-// and 4 CPUs, one poller served as many requests as none or more, and one per
-// CPU served 2% to 6% fewer with a 99th percentile 10% to 15% higher.
-const cpusPerPoller = 8
+// HTTP/2 echoes over 10k connections. Every loop competes with the workers
+// for the same Ps: on 3 and 4 CPUs, one poller served as many requests as
+// none or more, and one per CPU served 2% to 6% fewer with a 99th percentile
+// 10% to 15% higher.
+const cpusPerPoller = 4
 
 // defaultPollerCount is how many pollers IOPollers creates on cpus CPUs when
-// IOPollerCount leaves it to the engine: one for every cpusPerPoller of them,
-// and at least one.
+// IOPollerCount leaves it to the engine: cpus divided by cpusPerPoller,
+// rounded down, and at least one.
 func defaultPollerCount(cpus int) int {
-	return max(1, (cpus+cpusPerPoller-1)/cpusPerPoller)
+	return max(1, cpus/cpusPerPoller)
 }
 
 // SetPoolSizing pins the pool sizing to the caller's own numbers, which a later
