@@ -30,8 +30,10 @@ import (
 	fibhttp "github.com/lesismal/fib/http"
 )
 
-// Middleware wraps a handler in another that does something around it.
-type Middleware func(next fibhttp.Handler) fibhttp.Handler
+// Middleware wraps a handler in another that does something around it. It
+// is the type fibhttp.Router's Use and With take, so that a []Middleware can
+// be passed to them as it is.
+type Middleware = func(next fibhttp.Handler) fibhttp.Handler
 
 // Chain wraps handler in middlewares, the first of them outermost: it sees
 // each request first, and the response last.

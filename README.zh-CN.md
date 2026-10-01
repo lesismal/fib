@@ -17,6 +17,7 @@ worker 都能执行任意 connection，负载按实际任务量均衡，而不�
 - **零拷贝路径**：`sendfile`、批量 `writev`、池化 buffer
 - **协议**：TCP、UDP、Unix socket、TLS、HTTP/1.x、HTTP/2（h2 与 h2c）、基于 QUIC 的 HTTP/3、WebSocket
 - **异步 client**：非阻塞 Dial，以及 HTTP/1.x、HTTP/2、HTTP/3 client
+- **路由**：chi 风格的路由，支持参数、正则、通配、分组、子路由与挂载，每个请求零分配
 - **中间件**：compress、cors、csrf、etag、limiter、logger、pprof、recover、requestid、responsetime
 
 ## 快速上手
@@ -58,6 +59,30 @@ func main() {
 
 同一个 `Handler` 在同一端口上同时服务 HTTP/1.x 和 HTTP/2；HTTP/3 见 `examples/http3`。
 
+### 路由
+
+`fibhttp.Router` 沿用 [chi](https://github.com/go-chi/chi) 的 API，handler 则是 fib 自己的
+`func(*fibhttp.Context, *http.Request)`，Router 本身也是一个 `Handler`：
+
+```go
+r := fibhttp.NewRouter()
+r.Use(recover.New(), logger.New()) // 所有请求都经过，包括 404
+r.Get("/", index)
+r.Route("/users", func(r *fibhttp.Router) {
+	r.Use(auth) // 只作用于 /users 下
+	r.Get("/{id:[0-9]+}", func(c *fibhttp.Context, req *http.Request) {
+		_ = c.Respond(http.StatusOK, "text/plain", []byte("user "+c.Param("id")))
+	})
+	r.Get("/{id}/files/*", file) // c.Param("*") 是剩余路径
+})
+r.Mount("/api/{version}", apiRouter)
+engine, err := fib.Bind(config, fibhttp.NewHandler(r))
+```
+
+静态文本优先于参数，带正则的参数优先于不带的，二者都优先于通配；GET 路由同时服务 HEAD，
+路径匹配但方法不匹配时返回 405 并带 `Allow`。路由一个请求不分配内存（与 chi、`http.ServeMux`
+的对比见 [`http/routerbench`](http/routerbench)）；可运行的示例见 `examples/http/router`。
+
 ## 子 package
 
 | Package | 说明 |
@@ -76,6 +101,7 @@ func main() {
 ```sh
 go run ./examples/tcp/nontls/server
 go run ./examples/http/nontls/server
+go run ./examples/http/router
 go run ./examples/websocket/nontls/server
 go run ./examples/http3/tls/server
 ```

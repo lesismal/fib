@@ -849,6 +849,73 @@ resp, err := client.Go(req).Wait() // Future：Wait 阻塞，Done() 可用于 se
 - 先 `client.Close()` 再关闭 Engine：`Close` 让排队中的请求以 `ErrClientClosed` 失败，
   已发出的请求照常完成；直接关闭 Engine 不会通知 client，已发出的请求只能等超时。
 
+### 路由（Router）
+
+`fibhttp.Router` 参照 [chi](https://github.com/go-chi/chi) 的 API 设计：chi 的 handler 是标准库的
+`http.Handler`，fib 的 Router 则保持 fib 自己的 `Handler` / `HandlerFunc` 格式
+`func(*fibhttp.Context, *http.Request)`。Router 本身就是 `Handler`，可以直接交给 `NewHandler`，
+也可以 `Mount` 到另一个 Router 下：
+
+```go
+r := fibhttp.NewRouter()
+r.Use(recover.New(), logger.New())            // 根 Router 的中间件包住整个路由，404/405 也经过
+r.Get("/", index)
+r.Post("/login", login)
+r.With(auth).Get("/admin", admin)             // 只作用于这一条路由
+r.Group(func(r *fibhttp.Router) {             // 只作用于组内注册的路由
+    r.Use(auth)
+    r.Put("/profile", updateProfile)
+})
+r.Route("/users", func(r *fibhttp.Router) {   // 前缀 /users 下的一切都归它
+    r.Use(requestid.New())
+    r.Get("/", listUsers)                     // 同时匹配 /users 与 /users/
+    r.Get("/{id:[0-9]+}", getUser)            // c.Param("id")
+    r.Get("/{name}", getUserByName)
+    r.Get("/{id}/files/*", getFile)           // c.Param("*") 为剩余路径，可为空
+    r.NotFound(usersNotFound)                 // /users 下的 404，在 requestid 内执行
+})
+r.Handle("DELETE /users/{id}", deleteUser)    // 与 ServeMux 相同的 "METHOD /path" 写法
+r.Mount("/api/{version}", apiRouter)          // 挂载的 Router 路由剩余路径，带自己的中间件
+r.Mount("/debug/", pprofHandler)              // 非 Router 的 handler 拿到完整请求
+server, err := fib.Bind(config, fibhttp.NewHandler(r))
+```
+
+pattern 语法：
+
+| 写法 | 匹配 |
+| --- | --- |
+| `{name}` | 非空、不含 `/` 的值，到下一个 `/` 或 pattern 中紧跟的静态文本为止，如 `/archive/{year}-{month}`、`/file.{ext}` |
+| `{name:regexp}` | 整个值都要匹配正则，如 `{id:[0-9]+}`；`[0-9]+` 与 `\d+` 不走 regexp，直接逐字节判断 |
+| `*` / `{name...}` | 放在末尾，匹配剩余路径（可含 `/`、可为空），键分别为 `"*"` 与 `name` |
+
+- **优先级**：逐段比较，静态文本 > 带正则的参数 > 普通参数 > 通配；某一分支走不通会回溯尝试下一个，
+  例如 `/users/new` 与 `/users/{id}` 并存时，`/users/new` 命中前者、`/users/new2` 命中后者。
+- **方法**：`Get`、`Post` 等九个标准方法，`Method`/`MethodFunc` 支持任意方法（如 `PROPFIND`），
+  `Handle` 不带方法时匹配所有方法。GET 路由在没有单独注册 HEAD 时也服务 HEAD（和 `ServeMux`
+  一样，响应 body 会被丢弃）。路径匹配但方法不匹配时返回 405，并带列出可用方法的 `Allow`；
+  自定义 `MethodNotAllowed` handler 被调用时 `Allow` 已经设在 `c.Header()` 中。
+- **取值**：`c.Param(name)` 取参数，`c.Params()` 遍历全部，`c.RoutePattern()` 返回命中的完整
+  pattern（如 `/api/{version}/users/{id}`，适合作日志、指标的标签）。路径中有 `%2F` 之类的转义时
+  按 `URL.RawPath` 路由，转义的 `/` 属于值而不是分隔符，`Param` 返回解码后的值。
+  `SetPathValues(true)` 让 `r.PathValue(name)` 也能取到值，便于复用为 `ServeMux` 写的 handler，
+  代价是每个带参数的请求多一次分配。
+- **中间件作用范围**：根 Router 的 `Use` 包住整个路由过程；`Route` 子 Router 的中间件作用于其前缀
+  下的路由以及该前缀下的 404/405；`With`、`Group` 的中间件只作用于通过它们注册的路由。中间件必须
+  在路由之前添加，否则 panic（与 chi 相同）。`middleware.Middleware` 与 `Use` 的参数类型相同，
+  `[]middleware.Middleware` 可以直接 `r.Use(mws...)`。
+- **与 chi 的差异**：`Route` 不是嵌套的子 Router，而是把路由直接并入同一棵树，请求只走一次查找；
+  只有 `Mount` 才是嵌套路由。同一方法、同一 pattern 重复注册会 panic，而不是静默覆盖。
+- **性能**：radix tree，静态子节点按首字节索引，只有存在可回溯分支的节点才递归；参数值是路径的子串，
+  不拷贝。路由状态挂在 `Context` 上，开启 `Config.ReuseContexts` 时随 Context 复用，路由一个请求零分配；
+  不复用时，带参数（或经过 `Mount`）的请求分配一次。注册路由与服务请求不能并发进行。
+
+`http/routerbench` 是单独的 module，在 GitHub API 的 203 条路由上对比 fib、chi 与 `http.ServeMux`
+（只测路由本身）：
+
+```sh
+cd http/routerbench && go test -bench . -benchmem
+```
+
 ### 中间件（middleware）
 
 `middleware` package 用 `Chain` 把中间件套在 handler 外面，第一个在最外层（最先看到
@@ -1221,6 +1288,8 @@ go run ./examples/tcp/tls/client -n 10
 - HTTP server 的 `-dir` 用 `net/http` 的 `FileServer` 在 `/files/` 下提供该目录的文件
   （支持 Range、条件请求，文件走 sendfile），例如 `go run ./examples/http/nontls/server -dir .`
   后 `curl -O http://127.0.0.1:8080/files/go.mod`。
+- `examples/http/router` 演示 Router：带参数与正则的路由、带自己中间件的 `Route`、`Mount`
+  的子 Router，以及 404/405，`go run ./examples/http/router` 后用文件头注释里的 curl 命令访问。
 
 ## GOMAXPROCS
 

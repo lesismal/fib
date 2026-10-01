@@ -142,6 +142,13 @@ func (c *Context) recycle() {
 	c.err, c.body, c.bodyDone, c.cancel = nil, nil, false, nil
 	c.bodyHeld, c.handover = false, nil
 	c.server, c.parser, c.whole, c.block = nil, nil, nil, nil
+	if st := c.route; st != nil {
+		if st.shared {
+			c.route = nil
+		} else {
+			st.reset()
+		}
+	}
 }
 
 // reopen readies a recycled Context for the request it is about to serve.

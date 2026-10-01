@@ -18,6 +18,7 @@ run any connection, so load balances across real work rather than fd counts.
 - **Zero-copy paths**: `sendfile`, batched `writev`, pooled buffers
 - **Protocols**: TCP, UDP, Unix sockets, TLS, HTTP/1.x, HTTP/2 (h2 and h2c), HTTP/3 over QUIC, WebSocket
 - **Asynchronous clients**: non-blocking dial, and HTTP/1.x, HTTP/2 and HTTP/3 clients
+- **Router**: chi-style routes with parameters, regexps and catch-alls, groups, sub-routes and mounts, zero allocations per request
 - **Middleware**: compress, cors, csrf, etag, limiter, logger, pprof, recover, requestid, responsetime
 
 ## Quick start
@@ -59,6 +60,31 @@ func main() {
 
 The same `Handler` serves HTTP/1.x and HTTP/2 on one port. For HTTP/3, see `examples/http3`.
 
+### Routing
+
+`fibhttp.Router` follows [chi](https://github.com/go-chi/chi)'s API with fib's own handlers,
+`func(*fibhttp.Context, *http.Request)`, and is itself a `Handler`:
+
+```go
+r := fibhttp.NewRouter()
+r.Use(recover.New(), logger.New()) // sees every request, 404s included
+r.Get("/", index)
+r.Route("/users", func(r *fibhttp.Router) {
+	r.Use(auth) // only under /users
+	r.Get("/{id:[0-9]+}", func(c *fibhttp.Context, req *http.Request) {
+		_ = c.Respond(http.StatusOK, "text/plain", []byte("user "+c.Param("id")))
+	})
+	r.Get("/{id}/files/*", file) // c.Param("*") is the rest of the path
+})
+r.Mount("/api/{version}", apiRouter)
+engine, err := fib.Bind(config, fibhttp.NewHandler(r))
+```
+
+Static text beats a parameter, a parameter with a regexp beats one without, and either beats a
+catch-all; a GET route also serves HEAD, and a path served for other methods gets 405 with
+`Allow`. Routing a request allocates nothing (see [`http/routerbench`](http/routerbench) for a
+comparison with chi and `http.ServeMux`); `examples/http/router` is a runnable example.
+
 ## Packages
 
 | Package | Description |
@@ -77,6 +103,7 @@ The same `Handler` serves HTTP/1.x and HTTP/2 on one port. For HTTP/3, see `exam
 ```sh
 go run ./examples/tcp/nontls/server
 go run ./examples/http/nontls/server
+go run ./examples/http/router
 go run ./examples/websocket/nontls/server
 go run ./examples/http3/tls/server
 ```

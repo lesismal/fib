@@ -59,10 +59,14 @@ type Context struct {
 	// no request pipelined behind it is served.
 	closing bool
 	// pooled records that the Context came from contextPool, and streamed
-	// that its request's body was still arriving when the handler ran. The
-	// flags sit together so that they share a word.
+	// that its request's body was still arriving when the handler ran.
+	// bodyDone records that OnBody's callback has had its last call, and
+	// bodyHeld that OnBody holds the response open until then. The flags sit
+	// together so that they share a word.
 	pooled   bool
 	streamed bool
+	bodyDone bool
+	bodyHeld bool
 	// w is the response being written through the ResponseWriter methods.
 	w *responseWriter
 	// stream is the HTTP/2 stream the request arrived on, or nil for HTTP/1.
@@ -77,15 +81,11 @@ type Context struct {
 	word atomic.Uint64
 	mu   sync.Mutex
 	err  error
-	// body is OnBody's callback, bodyDone that it has had its last call, and
-	// bodyHeld that OnBody holds the response open until then. handover is
-	// the body OnBody was asked for while the handler ran, owed once it
-	// returns; see later. cancel is OnCancel's. deliverMu keeps body
-	// callbacks one at a time.
+	// body is OnBody's callback. handover is the body OnBody was asked for
+	// while the handler ran, owed once it returns; see later. cancel is
+	// OnCancel's. deliverMu keeps body callbacks one at a time.
 	body      BodyFunc
 	handover  func(worker bool)
-	bodyDone  bool
-	bodyHeld  bool
 	cancel    func(error)
 	deliverMu sync.Mutex
 	// server and parser are the HTTP/1 connection this request arrived on,
@@ -99,6 +99,9 @@ type Context struct {
 	// request was allocated, when the simple parser took it.
 	whole *wholeBody
 	block *requestBlock
+	// route is the route a Router served the request by, and the values its
+	// parameters matched; see Param.
+	route *routeState
 }
 
 // Stream answers a request that arrived over a protocol served outside this
