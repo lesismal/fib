@@ -56,17 +56,21 @@ func TestLimiter(t *testing.T) {
 }
 
 func TestLimiterWindowPasses(t *testing.T) {
-	url := mwtest.Serve(t, limiter.New(limiter.Config{Max: 1, Expiration: 200 * time.Millisecond, KeyGenerator: byHeader})(
+	const window = time.Second
+	url := mwtest.Serve(t, limiter.New(limiter.Config{Max: 1, Expiration: window, KeyGenerator: byHeader})(
 		fibhttp.HandlerFunc(handler)))
 	c := mwtest.Clients(t)[0]
 	key := stdhttp.Header{"X-Key": {"k"}}
-	// Start at the beginning of a window, so the second request lands in it.
-	time.Sleep(time.Until(time.Now().Truncate(200 * time.Millisecond).Add(200 * time.Millisecond)))
+	// Start at the beginning of a window, so that the second request lands in
+	// it whatever the machine makes of the first.
+	time.Sleep(time.Until(time.Now().Truncate(window).Add(window)))
 	c.Do(t, "GET", url, key, "")
 	if resp, _ := c.Do(t, "GET", url, key, ""); resp.StatusCode != stdhttp.StatusTooManyRequests {
 		t.Fatalf("second request: %d", resp.StatusCode)
 	}
-	time.Sleep(250 * time.Millisecond)
+	// The next window counts from nothing again, and every later one would
+	// too, so waiting for it is not a race.
+	time.Sleep(time.Until(time.Now().Truncate(window).Add(window)))
 	if resp, _ := c.Do(t, "GET", url, key, ""); resp.StatusCode != stdhttp.StatusOK {
 		t.Errorf("in the next window: %d", resp.StatusCode)
 	}
@@ -94,20 +98,42 @@ func TestLimiterSkipFailed(t *testing.T) {
 	})
 }
 
+// The proportions a sliding window counts by are checked exactly, against a
+// store given the time, in TestStoreSlidingWindow. This one is about a server
+// answering by them, so it keeps well clear of the edges: a window filled at
+// its beginning refuses the next request for the first window/Max of the
+// window after it, which here is half a second.
 func TestLimiterSliding(t *testing.T) {
+	const window = time.Second
+	const maxRequests = 2
 	url := mwtest.Serve(t, limiter.New(limiter.Config{
-		Max: 4, Expiration: 400 * time.Millisecond, KeyGenerator: byHeader, SlidingWindow: true,
+		Max: maxRequests, Expiration: window, KeyGenerator: byHeader, SlidingWindow: true,
 	})(fibhttp.HandlerFunc(handler)))
 	c := mwtest.Clients(t)[0]
-	key := stdhttp.Header{"X-Key": {"k"}}
-	window := 400 * time.Millisecond
-	time.Sleep(time.Until(time.Now().Truncate(window).Add(window)))
-	for i := 0; i < 4; i++ {
-		c.Do(t, "GET", url, key, "")
+	// Fill a window from its beginning, so that all of the requests land in
+	// it. A fill that ran into the next window would leave the count split
+	// between the two, which is not what the check below is about, so it is
+	// made again on a key of its own.
+	var key stdhttp.Header
+	for attempt := 0; ; attempt++ {
+		if attempt == 3 {
+			t.Fatal("the requests kept outlasting the window they were filling")
+		}
+		key = stdhttp.Header{"X-Key": {"k" + strconv.Itoa(attempt)}}
+		time.Sleep(time.Until(time.Now().Truncate(window).Add(window)))
+		filling := time.Now().Truncate(window)
+		for i := 0; i < maxRequests; i++ {
+			if resp, _ := c.Do(t, "GET", url, key, ""); resp.StatusCode != stdhttp.StatusOK {
+				t.Fatalf("request %d filling the window: %d", i, resp.StatusCode)
+			}
+		}
+		if time.Now().Truncate(window).Equal(filling) {
+			break
+		}
 	}
-	// Early in the next window most of the last one still counts, which a
-	// fixed window would have forgotten.
-	time.Sleep(time.Until(time.Now().Truncate(window).Add(window + 20*time.Millisecond)))
+	// Early in the next window the ones just past still count, which a fixed
+	// window would have forgotten.
+	time.Sleep(time.Until(time.Now().Truncate(window).Add(window + window/10)))
 	if resp, _ := c.Do(t, "GET", url, key, ""); resp.StatusCode != stdhttp.StatusTooManyRequests {
 		t.Errorf("early in the next window: %d", resp.StatusCode)
 	}
