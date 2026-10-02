@@ -3,6 +3,7 @@
 package fib
 
 import (
+	"runtime"
 	"time"
 
 	"github.com/lesismal/fib/taskpool"
@@ -123,8 +124,11 @@ type Config struct {
 	// of their own, apart from the workers that read their connections; see
 	// Engine.HandlerPool.
 	//
-	// DefaultConfig sets it. Without it, the engine serves listeners and
-	// connections alike on its one loop.
+	// DefaultConfig sets it on more than four CPUs, and leaves it off on four
+	// or fewer, where one loop serves as many requests as a poller would.
+	// Without it, the engine serves listeners and connections alike on its
+	// one loop. Setting it explicitly gives an engine pollers on any number
+	// of CPUs.
 	//
 	// Only the Linux and macOS backends have pollers; on Windows the engine
 	// keeps its single loop, as if this were unset.
@@ -189,5 +193,6 @@ func DefaultConfig() Config {
 	return Config{Name: DefaultName, Network: "tcp", Addr: ":9000", Backlog: defaultBacklog(), WorkerCount: sizing.WorkerCount,
 		MaxEvents: sizing.MaxEvents, ReadBufferSize: 16 * 1024,
 		WriteBufferHighWatermark: defaultWriteHighWatermark, MaxPendingBytes: defaultMaxPendingBytes,
-		UseWritev: true, SocketSyscalls: true, TaskPoolMode: taskpool.ModeAdaptive, SharedTaskPool: true, IOPollers: true}
+		UseWritev: true, SocketSyscalls: true, TaskPoolMode: taskpool.ModeAdaptive, SharedTaskPool: true,
+		IOPollers: defaultIOPollers(runtime.NumCPU())}
 }

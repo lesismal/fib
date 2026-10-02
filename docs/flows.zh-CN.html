@@ -119,7 +119,7 @@ body{margin:0}
 <main>
 <header>
   <h1>fib 事件循环与协程池流程图</h1>
-  <p>按协议逐一画出：哪个事件循环等事件，哪个协程池跑哪段代码，数据和控制在它们之间怎么流动。依据当前 <code>main</code>（8a388d4）的源码，平台按 Linux epoll / macOS kqueue 描述，配置按 <code>fib.DefaultConfig()</code>：<code>IOPollers=true</code>、<code>TaskPoolMode=ModeAdaptive</code>、<code>SharedTaskPool=true</code>、<code>SocketSyscalls=true</code>。</p>
+  <p>按协议逐一画出：哪个事件循环等事件，哪个协程池跑哪段代码，数据和控制在它们之间怎么流动。依据当前 <code>main</code>（8a388d4）的源码，平台按 Linux epoll / macOS kqueue 描述，配置按 CPU 多于 4 个时的 <code>fib.DefaultConfig()</code>：<code>IOPollers=true</code>（4 个及以下默认关闭，由 Engine 自己的循环服务连接）、<code>TaskPoolMode=ModeAdaptive</code>、<code>SharedTaskPool=true</code>、<code>SocketSyscalls=true</code>。</p>
   <p>图中颜色固定对应执行者：</p>
   <div class="legend">
     <span class="chip c-loop"><i></i>事件循环（根 / poller）</span>

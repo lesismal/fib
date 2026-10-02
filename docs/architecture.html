@@ -137,7 +137,7 @@ body{margin:0}
 
 <section id="parts">
   <h2>The parts</h2>
-  <p class="lede">An Engine owns the listeners, the event loop, its command queue and the worker pool. With <code>IOPollers</code>, the default, it also owns pollers: each is an Engine without listeners, with a loop, command queue and descriptor table of its own, sharing its parent's settings, handler, worker pool and server-wide budget.</p>
+  <p class="lede">An Engine owns the listeners, the event loop, its command queue and the worker pool. With <code>IOPollers</code>, the default on more than four CPUs, it also owns pollers: each is an Engine without listeners, with a loop, command queue and descriptor table of its own, sharing its parent's settings, handler, worker pool and server-wide budget.</p>
   <div class="diagram"><pre class="mermaid">
 flowchart LR
   subgraph ENG["Engine (fib.Bind / fib.NewEngine)"]

@@ -137,7 +137,7 @@ body{margin:0}
 
 <section id="parts">
   <h2>组成</h2>
-  <p class="lede">一个 Engine 拥有监听器、事件循环、命令队列和 worker 池。开启 <code>IOPollers</code>（默认）时，它还拥有若干 poller：每个 poller 是一个没有监听器的 Engine，有自己的循环、命令队列和 fd 表，配置、handler、worker 池和全局预算与父 Engine 共用。</p>
+  <p class="lede">一个 Engine 拥有监听器、事件循环、命令队列和 worker 池。开启 <code>IOPollers</code>（CPU 多于 4 个时默认开启）时，它还拥有若干 poller：每个 poller 是一个没有监听器的 Engine，有自己的循环、命令队列和 fd 表，配置、handler、worker 池和全局预算与父 Engine 共用。</p>
   <div class="diagram"><pre class="mermaid">
 flowchart LR
   subgraph ENG["Engine（fib.Bind / fib.NewEngine）"]

@@ -164,6 +164,16 @@ func TestSetPoolSizingKeepsFieldsLeftUnset(t *testing.T) {
 	}
 }
 
+// DefaultConfig leaves IOPollers off on four CPUs or fewer, where the
+// engine's own loop serves its connections, and sets it on more.
+func TestDefaultIOPollers(t *testing.T) {
+	for cpus, want := range map[int]bool{1: false, 2: false, 3: false, 4: false, 5: true, 8: true, 64: true} {
+		if got := defaultIOPollers(cpus); got != want {
+			t.Errorf("%d CPUs: IOPollers %v, want %v", cpus, got, want)
+		}
+	}
+}
+
 // The engine gives itself one poller for every four CPUs, rounded down, and at
 // least one.
 func TestDefaultPollerCount(t *testing.T) {

@@ -201,6 +201,16 @@ func pollerCount(config Config) int {
 // 10% to 15% higher.
 const cpusPerPoller = 4
 
+// singleLoopCPUs is the most CPUs on which DefaultConfig leaves IOPollers
+// off, so that the engine serves its listeners and connections on its own
+// loop. Up to there a poller only adds a loop: on 3 CPUs an HTTP/1 echo over
+// 10k connections served 583k requests/s on the single loop and 584k with
+// one poller, and on 4 CPUs one poller is all the default would create.
+const singleLoopCPUs = 4
+
+// defaultIOPollers is what DefaultConfig sets IOPollers to on cpus CPUs.
+func defaultIOPollers(cpus int) bool { return cpus > singleLoopCPUs }
+
 // defaultPollerCount is how many pollers IOPollers creates on cpus CPUs when
 // IOPollerCount leaves it to the engine: cpus divided by cpusPerPoller,
 // rounded down, and at least one.

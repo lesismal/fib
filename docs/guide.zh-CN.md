@@ -3,8 +3,8 @@
 这是 [`c/`](../c) 目录下 C11 实现的 Go 移植版，保留相同的核心架构：
 
 - 单个 edge-triggered event loop（Linux 上是 epoll，macOS 上是 kqueue，Windows 上是 IOCP）
-  独占所有事件注册和 fd 关闭操作。Linux 和 macOS 上默认开启 `IOPollers`，连接分到多个 event loop
-  上（见下）；关闭后只有一个 event loop。
+  独占所有事件注册和 fd 关闭操作。Linux 和 macOS 上 CPU 多于 4 个时默认开启 `IOPollers`，连接
+  分到多个 event loop 上（见下）；4 个及以下默认关闭，只有一个 event loop。
 - connection 是本地 `taskpool.TaskPool` 的任务单位。TaskPool 使用常驻、有界
   worker，避免短事件触发大量 goroutine 创建和栈扩容；connection 不与某个
   worker 固定绑定。事件循环只等事件、把变为可执行的连接交给 worker，从不自己执行
@@ -1316,8 +1316,10 @@ echo 和 p99 在等于核数时最好或持平，内存随 GOMAXPROCS 升高而�
 ## IOPollers
 
 `Config.IOPollers` 把一个 Engine 拆到多个事件循环上（仅 Linux 的 epoll 和 macOS 的 kqueue；
-Windows 上忽略这个配置，保持单个循环）。`DefaultConfig()` 默认开启；设为 `false` 时 listener
-和连接都在同一个 event loop 上。开不开都一样，事件循环只等事件、把变为可执行的连接交给
+Windows 上忽略这个配置，保持单个循环）。`DefaultConfig()` 在 `runtime.NumCPU()` 大于 4 时开启，
+4 个及以下时关闭：这么少的核上一个 poller 只是多一个循环，3 个 CPU 的 HTTP/1 echo 单循环 583k、
+1 个 poller 584k，而 4 核默认也只会建 1 个 poller。显式设为 `true` 则任何核数都有 poller；为 `false`
+时 listener 和连接都在同一个 event loop 上。开不开都一样，事件循环只等事件、把变为可执行的连接交给
 Engine 的 worker 池（`<Name>-workers`），每条连接的每一轮都在 worker 上执行：
 
 - Engine 自己的循环只负责 accept 和它的 UDP socket；每条 accept 到的连接按 `fd % pollerCount`
@@ -1359,7 +1361,8 @@ Engine 的 worker 池（`<Name>-workers`），每条连接的每一轮都在 wor
   `Connection.Engine()` 返回的仍是用户创建的那个 Engine。
 
 ```go
-config := fib.DefaultConfig() // 默认已开启 IOPollers
+config := fib.DefaultConfig() // CPU 多于 4 个时默认已开启 IOPollers
+config.IOPollers = true       // 4 核及以下也要 poller 时显式打开
 config.IOPollerCount = 0      // max(1, NumCPU/4)
 config.ReusePort = true       // Linux：每个 poller 自己 accept
 

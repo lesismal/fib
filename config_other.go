@@ -3,6 +3,7 @@
 package fib
 
 import (
+	"runtime"
 	"time"
 
 	"github.com/lesismal/fib/taskpool"
@@ -60,7 +61,7 @@ type Config struct {
 	// IOPollers and IOPollerCount split a Linux or macOS engine across
 	// several event loops. This backend has one goroutine per connection
 	// already, so both are ignored here, though DefaultConfig sets IOPollers
-	// as it does on the other backends.
+	// as it does on the other backends: on more than four CPUs.
 	IOPollers     bool
 	IOPollerCount int
 	// ReusePort binds a Linux or macOS engine's listeners with SO_REUSEPORT.
@@ -76,5 +77,5 @@ type Config struct {
 
 func DefaultConfig() Config {
 	sizing := DefaultPoolSizing(taskpool.ModeAdaptive)
-	return Config{Name: DefaultName, Network: "tcp", Addr: ":9000", Backlog: 128, WorkerCount: sizing.WorkerCount, MaxEvents: sizing.MaxEvents, ReadBufferSize: 16 * 1024, WriteBufferHighWatermark: 4 * 1024, UseWritev: true, SocketSyscalls: true, TaskPoolMode: taskpool.ModeAdaptive, SharedTaskPool: true, IOPollers: true}
+	return Config{Name: DefaultName, Network: "tcp", Addr: ":9000", Backlog: 128, WorkerCount: sizing.WorkerCount, MaxEvents: sizing.MaxEvents, ReadBufferSize: 16 * 1024, WriteBufferHighWatermark: 4 * 1024, UseWritev: true, SocketSyscalls: true, TaskPoolMode: taskpool.ModeAdaptive, SharedTaskPool: true, IOPollers: defaultIOPollers(runtime.NumCPU())}
 }

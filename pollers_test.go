@@ -412,12 +412,15 @@ func TestPollersRunRoundsOnWorkers(t *testing.T) {
 	}
 }
 
-// The default configuration spreads connections over one poller per CPU,
-// which hand their rounds to the engine's pool of workers.
+// The default configuration spreads connections over pollers on more than
+// four CPUs and keeps them on the engine's own loop otherwise, and either way
+// hands their rounds to the engine's pool of workers.
 func TestDefaultConfigHasPollersAndWorkerPool(t *testing.T) {
 	config := DefaultConfig()
-	if !config.IOPollers || config.TaskPoolMode == taskpool.ModeInline {
-		t.Fatalf("DefaultConfig has IOPollers=%v, TaskPoolMode=%v", config.IOPollers, config.TaskPoolMode)
+	wantPollers := runtime.NumCPU() > 4
+	if config.IOPollers != wantPollers || config.TaskPoolMode == taskpool.ModeInline {
+		t.Fatalf("DefaultConfig on %d CPUs has IOPollers=%v, TaskPoolMode=%v",
+			runtime.NumCPU(), config.IOPollers, config.TaskPoolMode)
 	}
 	config.Name = "default-config"
 	config.Addr = "127.0.0.1:0"
@@ -426,7 +429,11 @@ func TestDefaultConfigHasPollersAndWorkerPool(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer server.Close()
-	if want := defaultPollerCount(runtime.NumCPU()); len(server.pollers) != want {
+	want := 0
+	if wantPollers && pollersSupported {
+		want = defaultPollerCount(runtime.NumCPU())
+	}
+	if len(server.pollers) != want {
 		t.Fatalf("default engine has %d pollers, want %d", len(server.pollers), want)
 	}
 	pool, ok := server.taskPool.(*taskpool.TaskPool)

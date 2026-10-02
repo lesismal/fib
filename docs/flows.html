@@ -119,7 +119,7 @@ body{margin:0}
 <main>
 <header>
   <h1>fib event loops and goroutine pools, protocol by protocol</h1>
-  <p>For each protocol: which event loop waits for events, which pool runs which code, and how data and control move between them. Drawn from the source at <code>main</code> (8a388d4), for Linux epoll and macOS kqueue, under <code>fib.DefaultConfig()</code>: <code>IOPollers=true</code>, <code>TaskPoolMode=ModeAdaptive</code>, <code>SharedTaskPool=true</code>, <code>SocketSyscalls=true</code>.</p>
+  <p>For each protocol: which event loop waits for events, which pool runs which code, and how data and control move between them. Drawn from the source at <code>main</code> (8a388d4), for Linux epoll and macOS kqueue, under <code>fib.DefaultConfig()</code> on more than four CPUs: <code>IOPollers=true</code> (on four or fewer it is off and the engine's loop serves the connections itself), <code>TaskPoolMode=ModeAdaptive</code>, <code>SharedTaskPool=true</code>, <code>SocketSyscalls=true</code>.</p>
   <p>A colour always means the same executor:</p>
   <div class="legend">
     <span class="chip c-loop"><i></i>event loop (root / poller)</span>
