@@ -43,6 +43,7 @@ HTTP/3 和 WebSocket。少量事件循环负责等待 I/O 就绪，具体工作�
 | HTTP/3 + QUIC | ✓ | ✓ | QUIC 和 QPACK 基于 `crypto/tls.QUICConn` 自行实现，不依赖 quic-go 或 x/net |
 | WebSocket | ✓ | ✓ | RFC 6455、permessage-deflate，可经 HTTP/1.1、HTTP/2（RFC 8441）、HTTP/3（RFC 9220）升级；CI 跑 Autobahn |
 | arpc | ✓ | ✓ | 与 [lesismal/arpc](https://github.com/lesismal/arpc) 相同的协议格式和 API：双向调用、notify、异步调用、stream、广播、中间件、断线重连 |
+| gRPC | ✓ h2 和 h2c | ✓ | unary 与双向 streaming、metadata、deadline、拦截器、gzip；可直接用 protoc-gen-go-grpc 生成的代码，与 grpc-go 互通 |
 
 ### 引擎
 
@@ -197,6 +198,22 @@ handler 默认在 engine 的 handler 池（与 HTTP/2、HTTP/3 相同的 streams
 `Handler.SetAsyncResponse(false)` 全局、`Handle(method, h, false)` 单个方法改为在读连接的 worker 上同步执行，
 `Handler.SetTaskPool` 可以换成自己的协程池。
 
+### gRPC
+
+```go
+server := grpc.NewServer()                    // grpc.TaskPool(pool) 可改用自己的协程池
+pb.RegisterGreeterServer(server, &greeter{})  // protoc-gen-go-grpc 生成的代码，import 改指向 fib/grpc
+engine, err := fib.Bind(config, server)       // h2c；TLS 用 fibtls.NewServer(grpc.ConfigureTLS(c), server)
+
+conn, err := grpc.NewClient("127.0.0.1:50051", grpc.WithEngine(clientEngine))
+reply, err := pb.NewGreeterClient(conn).SayHello(ctx, &pb.HelloRequest{Name: "fib"})
+```
+
+每个调用都在 engine 的 handler 池（与 HTTP/2、HTTP/3 相同的 streams 池）上执行，配置了
+`grpc.TaskPool` 时则用用户的池。生成的 `_grpc.pb.go` 只需把 `google.golang.org/grpc` 的 import
+改为 `github.com/lesismal/fib/grpc`。fib 不依赖标准库以外的模块，所以 google.golang.org/protobuf
+的消息需要用 `grpc.RegisterCodec` 注册一个 codec，包文档里有这五行代码。
+
 ### 裸 TCP
 
 ```go
@@ -219,6 +236,7 @@ go run ./examples/http/nontls/server
 go run ./examples/http/router
 go run ./examples/websocket/nontls/server
 go run ./examples/arpc/server
+go run ./examples/grpc/server
 go run ./examples/http3/tls/server
 ```
 
@@ -274,6 +292,7 @@ poller 数量（`Config.IOPollers`、`IOPollerCount`）取决于 CPU 数：4 核
 | HTTP/3 | 批量读 UDP、按对端分拣数据报 | QUIC 包、TLS 1.3、QPACK | `<Name>-streams`（handler） |
 | WebSocket | — | 握手、帧、`OnMessage`、deflate | 经 HTTP/2 或 HTTP/3 时：`Upgrade` 和 `OnOpen` 在 streams 池 |
 | arpc | — | 拆包、响应、注册为同步的 handler | `<Name>-streams`（异步 handler，默认） |
+| gRPC | — | HTTP/2 分帧、HPACK、流控 | `<Name>-streams`（所有调用） |
 
 等待只有一个方向：从 engine worker 到其他池，所以池之间不会互相死锁。完整说明和每个协议的流程图见
 [docs/architecture.zh-CN.html](docs/architecture.zh-CN.html) 和
@@ -503,6 +522,7 @@ CI 每次 push 都在 Linux、macOS、Windows 上运行 [`taskpool/benchmark`](t
 | [`http3`](http3) | HTTP/3、QUIC、QPACK 服务端和客户端 |
 | [`websocket`](websocket) | RFC 6455 服务端和客户端、permessage-deflate，支持经 HTTP/1.1、HTTP/2、HTTP/3 升级 |
 | [`arpc`](arpc) | [lesismal/arpc](https://github.com/lesismal/arpc) 服务端和客户端，协议兼容 |
+| [`grpc`](grpc) | gRPC 服务端和客户端，自带 HTTP/2 传输层，与 grpc-go 及其生成代码兼容 |
 | [`middleware`](middleware) | 中间件链和常用中间件 |
 
 ## 文档

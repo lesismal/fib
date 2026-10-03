@@ -41,8 +41,9 @@
   `http.ServeContent`。在 HTTP/1 上这是真正的流式输出（chunked，文件走 sendfile，见
   [`http1.zh-CN.md`](http1.zh-CN.md)）；在 HTTP/2 上响应会先缓存，handler 返回后整体
   发送，`Flush` 不起作用。
-- 因此在 HTTP/2 上无法实现 SSE、长轮询流式输出、gRPC streaming；边收边处理的大文件上传
-  可以用 `StreamRequestBody` 实现。
+- 因此在 HTTP/2 上无法实现 SSE、长轮询流式输出；边收边处理的大文件上传
+  可以用 `StreamRequestBody` 实现。gRPC（含 streaming）由 [`grpc`](../grpc) 包提供，
+  它有自己的 HTTP/2 传输层。
 - 内存上限：服务端单连接最坏约为 `MaxConcurrentStreams × MaxBodyBytes`
   （默认 250 × 16MB）；客户端单个响应受 `MaxResponseBodyBytes` 限制。
 - `CONNECT` 请求能被解析并交给 handler，但无法建立隧道（没有双向流式通道）。

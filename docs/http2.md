@@ -50,9 +50,10 @@ Behaviour to be aware of when using it.
   streams, chunked, with files sent by sendfile (see [`http1.md`](http1.md));
   on HTTP/2 the response is held until the handler returns and then sent
   whole, and `Flush` does nothing.
-- Server-sent events, streamed long-polling output and gRPC streaming are
-  therefore not possible over HTTP/2; large uploads can be processed as they
-  arrive with `StreamRequestBody`.
+- Server-sent events and streamed long-polling output are therefore not
+  possible over HTTP/2; large uploads can be processed as they arrive with
+  `StreamRequestBody`. gRPC, streaming included, is served by package
+  [`grpc`](../grpc), which has an HTTP/2 transport of its own.
 - Memory bound: on the server, one connection can hold up to about
   `MaxConcurrentStreams × MaxBodyBytes` (250 × 16MB by default) of bodies read
   whole, and a window (1MB) per streamed body; on the client,

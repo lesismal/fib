@@ -44,6 +44,7 @@ uSockets, workflow, axum, h2, quiche and rustls.
 | HTTP/3 + QUIC | ✓ | ✓ | QUIC and QPACK written from scratch on `crypto/tls.QUICConn`, with no quic-go or x/net dependency |
 | WebSocket | ✓ | ✓ | RFC 6455 and permessage-deflate, over HTTP/1.1, HTTP/2 (RFC 8441) and HTTP/3 (RFC 9220); Autobahn in CI |
 | arpc | ✓ | ✓ | [lesismal/arpc](https://github.com/lesismal/arpc)'s wire format and API: two-way calls, notify, async calls, streams, broadcast, middleware, reconnect |
+| gRPC | ✓ h2 and h2c | ✓ | unary and streaming both ways, metadata, deadlines, interceptors, gzip; works with protoc-gen-go-grpc code and talks to grpc-go |
 
 ### Engine
 
@@ -202,6 +203,23 @@ Handlers run on the engine's handler pool, the one HTTP/2 and HTTP/3 use, unless
 `Handler.SetAsyncResponse(false)` or `Handle(method, h, false)` runs them where the connection is
 read, or `Handler.SetTaskPool` names another pool.
 
+### gRPC
+
+```go
+server := grpc.NewServer()                    // grpc.TaskPool(pool) to run calls on your own pool
+pb.RegisterGreeterServer(server, &greeter{})  // protoc-gen-go-grpc code, imports pointed at fib/grpc
+engine, err := fib.Bind(config, server)       // h2c; fibtls.NewServer(grpc.ConfigureTLS(c), server) for TLS
+
+conn, err := grpc.NewClient("127.0.0.1:50051", grpc.WithEngine(clientEngine))
+reply, err := pb.NewGreeterClient(conn).SayHello(ctx, &pb.HelloRequest{Name: "fib"})
+```
+
+Every call runs on the engine's handler pool, the one HTTP/2 and HTTP/3 use, or on the pool the
+`grpc.TaskPool` option names. Generated `_grpc.pb.go` files work once their `google.golang.org/grpc`
+imports name `github.com/lesismal/fib/grpc`. fib depends on nothing outside the standard library,
+so messages of google.golang.org/protobuf need a codec registered with `grpc.RegisterCodec`; the
+package doc shows the five lines.
+
 ### Raw TCP
 
 ```go
@@ -225,6 +243,7 @@ go run ./examples/http/router
 go run ./examples/websocket/nontls/server
 go run ./examples/http3/tls/server
 go run ./examples/arpc/server
+go run ./examples/grpc/server
 ```
 
 Each server directory has a matching `client` next to it.
@@ -286,6 +305,7 @@ in `epoll_wait`, so it never holds a P while goroutines wait to run.
 | HTTP/3 | reads UDP in batches, sorts datagrams by peer | QUIC packets, TLS 1.3, QPACK | `<Name>-streams` (handlers) |
 | WebSocket | — | handshake, frames, `OnMessage`, deflate | over HTTP/2 or HTTP/3: `Upgrade` and `OnOpen` on streams |
 | arpc | — | framing, responses, handlers registered sync | `<Name>-streams` (async handlers, the default) |
+| gRPC | — | HTTP/2 framing, HPACK, flow control | `<Name>-streams` (every call) |
 
 Waits only go one way, from engine workers to the other pools, so the pools cannot deadlock each
 other. [docs/architecture.html](docs/architecture.html) and [docs/flows.html](docs/flows.html)
@@ -535,6 +555,7 @@ Run it yourself with `cd taskpool/benchmark && ./bench.sh` (or `bench.ps1` on Wi
 | [`http3`](http3) | HTTP/3, QUIC and QPACK server and client |
 | [`websocket`](websocket) | RFC 6455 server and client, permessage-deflate, upgrades over HTTP/1.1, HTTP/2 and HTTP/3 |
 | [`arpc`](arpc) | [lesismal/arpc](https://github.com/lesismal/arpc) server and client, wire compatible |
+| [`grpc`](grpc) | gRPC server and client over an HTTP/2 transport of its own, compatible with grpc-go and its generated code |
 | [`middleware`](middleware) | Middleware chain and the common middleware |
 
 ## Documentation
