@@ -1,4 +1,4 @@
-# 我和 Claude 合作写了一个 Go 网络库：fib，代码几乎全部由 Claude 生成
+# fib：性能几乎超过以往所有 Go 网络库，我和 Claude 合作完成，代码几乎全部由 Claude 生成
 
 [English](introducing-fib.md) | 简体中文
 
@@ -6,7 +6,7 @@
 
 最近我和 Claude 合作完成了一个新的 Go 网络库，叫 fib。想法和方向是我的，代码几乎全部由 Claude 生成。它支持 TCP/UDP、TLS、HTTP/1.x、HTTP/2、HTTP/3（QUIC）和 WebSocket，HTTP handler 用的是标准库的 `*http.Request` 和 `http.ResponseWriter`。
 
-先说结果。在 GitHub Actions 上自动运行的 benchmark 里，和标准库相比，fib 在一些场景下的吞吐能高出数倍，内存也少得多；和 fasthttp 这类以性能著称的库相比，性能也有提升；和 C/C++/Rust 的框架相比，已经很接近，有些场景还能超过。这些 Action 所在的仓库里有完整的测试代码，每个数字都可以追溯和复现。
+先说结果。在 GitHub Actions 上自动运行的 benchmark 里，和标准库相比，fib 在一些场景下的吞吐能高出数倍，内存也少得多；和 fasthttp 这类以性能著称的库相比，性能也有提升；和参测的其他 Go 库相比，除了 WebSocket pipeline 还落后 uws 和 fnet，其余场景 fib 都排在第一。和 C/C++/Rust 的框架相比，也已经很接近，有些场景还能超过。这些 Action 所在的仓库里有完整的测试代码，每个数字都可以追溯和复现。
 
 当然，不同的硬件规格、测试参数和框架配置，跑出来的结果可能会不一样。欢迎大家在自己的机器上亲自跑一跑这些 benchmark。
 
