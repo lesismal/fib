@@ -11,10 +11,9 @@ HTTP/1.x, HTTP/2, HTTP/3 (QUIC) and WebSocket, and its HTTP handlers take the st
 
 The short version: in benchmarks that run automatically on GitHub Actions, fib gets several
 times the standard library's throughput in some scenarios, on much less memory. Against libraries
-known for speed, such as fasthttp, it's faster too. Of all the Go libraries tested, fib comes
-first in every scenario except WebSocket pipelining, where uws and fnet are still ahead. Against
-C, C++ and Rust servers, it's close, and ahead in some cases. The repositories those Actions live
-in contain the complete benchmark code, so every number can be traced back and reproduced.
+known for speed, such as fasthttp, it's faster too. Against C, C++ and Rust servers, it's close, 
+and ahead in some cases. The repositories those Actions live in contain the complete benchmark 
+code, so every number can be traced back and reproduced.
 
 Of course, different hardware, test parameters and framework settings can give different results.
 You're very welcome to run the benchmarks on your own machines.
@@ -38,12 +37,12 @@ The headline gains:
 
 **HTTP/1.1** ([Actions run](https://github.com/lesismal/go-http1-benchmark/actions/runs/36839290265), Rust tokio client)
 
-| Server | Echo TPS | Echo MEM | Pipeline TPS | Pipeline MEM |
-| --- | ---: | ---: | ---: | ---: |
-| fib | 194,671 | 32 MB | 1,140,457 | 36 MB |
-| axum (Rust) | 236,244 | 227 MB | 301,804 | 490 MB |
-| fasthttp | 139,830 | 197 MB | 692,671 | 197 MB |
-| net/http | 84,739 | 314 MB | 164,811 | 323 MB |
+| Server      | Echo TPS | Echo MEM | Pipeline TPS | Pipeline MEM |
+| ----------- | -------: | -------: | -----------: | -----------: |
+| fib         |  194,671 |    32 MB |    1,140,457 |        36 MB |
+| axum (Rust) |  236,244 |   227 MB |      301,804 |       490 MB |
+| fasthttp    |  139,830 |   197 MB |      692,671 |       197 MB |
+| net/http    |   84,739 |   314 MB |      164,811 |       323 MB |
 
 Echo is 39% ahead of fasthttp on a sixth of its memory. Pipelining shows the biggest gap: fib
 reaches 1.14 million TPS, 3.8× axum, and stays around 36 MB the whole time. In my own runs at
@@ -51,46 +50,46 @@ other connection counts, fib also matches or beats fasthttp.
 
 **HTTP/2 h2c** ([Actions run](https://github.com/lesismal/go-http2-benchmark/actions/runs/36839294047))
 
-| Server | Echo TPS | Echo MEM | Multiplex TPS | Multiplex MEM |
-| --- | ---: | ---: | ---: | ---: |
-| fib | 129,676 | 119 MB | 333,692 | 432 MB |
-| h2 (Rust) | 143,107 | 246 MB | 129,729 | 870 MB |
-| net/http | 35,415 | 633 MB | 25,051 | 809 MB |
+| Server    | Echo TPS | Echo MEM | Multiplex TPS | Multiplex MEM |
+| --------- | -------: | -------: | ------------: | ------------: |
+| fib       |  129,676 |   119 MB |       333,692 |        432 MB |
+| h2 (Rust) |  143,107 |   246 MB |       129,729 |        870 MB |
+| net/http  |   35,415 |   633 MB |        25,051 |        809 MB |
 
 Echo reaches 90% of Rust's h2 on half its memory. Multiplexed, it turns around and fib is 2.6×
 ahead of h2.
 
 **HTTP/3** ([Actions run](https://github.com/lesismal/go-http3-benchmark/actions/runs/36839296383), quiche client)
 
-| Server | Echo TPS | Echo MEM | Multiplex TPS | Multiplex MEM |
-| --- | ---: | ---: | ---: | ---: |
-| quiche (Rust) | 72,919 | 387 MB | 101,233 | 881 MB |
-| fib | 67,396 | 504 MB | 94,443 | 1.05 GB |
-| quic-go | 19,545 | 1.20 GB | 17,505 | 1.80 GB |
+| Server        | Echo TPS | Echo MEM | Multiplex TPS | Multiplex MEM |
+| ------------- | -------: | -------: | ------------: | ------------: |
+| quiche (Rust) |   72,919 |   387 MB |       101,233 |        881 MB |
+| fib           |   67,396 |   504 MB |        94,443 |       1.05 GB |
+| quic-go       |   19,545 |  1.20 GB |        17,505 |       1.80 GB |
 
 This is the biggest jump of the lot: several times quic-go's throughput, on 40–60% less memory.
 fib still uses more memory than quiche, which is next on the list.
 
 **TLS** ([Actions run](https://github.com/lesismal/go-tls-benchmark/actions/runs/36839299713), C client on uSockets + BoringSSL)
 
-| Server | TLS 1.3 Echo | TLS 1.3 Pipeline | MEM |
-| --- | ---: | ---: | ---: |
-| fib | 103,427 | 690,000 | 180 MB |
-| crypto/tls + net | 92,494 | 241,106 | 285–518 MB |
-| uSockets (C) | 103,972 | 735,000 | 51 MB |
-| rustls (Rust) | 107,406 | 195,835 | 110–201 MB |
+| Server           | TLS 1.3 Echo | TLS 1.3 Pipeline |        MEM |
+| ---------------- | -----------: | ---------------: | ---------: |
+| fib              |      103,427 |          690,000 |     180 MB |
+| crypto/tls + net |       92,494 |          241,106 | 285–518 MB |
+| uSockets (C)     |      103,972 |          735,000 |      51 MB |
+| rustls (Rust)    |      107,406 |          195,835 | 110–201 MB |
 
 Echo is within 4% of the C and Rust servers. Pipelined, fib gets above 90% of uSockets and 3.5×
 rustls.
 
 **WebSocket** ([Actions run](https://github.com/lesismal/go-websocket-benchmark/actions/runs/36999378687), C++ uWebSockets client)
 
-| Server | Echo TPS | Echo MEM | Pipeline TPS | Pipeline MEM |
-| --- | ---: | ---: | ---: | ---: |
-| fib | 138,592 | 32 MB | 984,917 | 32 MB |
-| gorilla | 122,296 | 229 MB | 205,224 | 235 MB |
-| nbio | 121,398 | 62 MB | 191,091 | 100 MB |
-| tokio-tungstenite (Rust) | 83,841 | 105 MB | 748,297 | 286 MB |
+| Server                   | Echo TPS | Echo MEM | Pipeline TPS | Pipeline MEM |
+| ------------------------ | -------: | -------: | -----------: | -----------: |
+| fib                      |  138,592 |    32 MB |      984,917 |        32 MB |
+| gorilla                  |  122,296 |   229 MB |      205,224 |       235 MB |
+| nbio                     |  121,398 |    62 MB |      191,091 |       100 MB |
+| tokio-tungstenite (Rust) |   83,841 |   105 MB |      748,297 |       286 MB |
 
 Pipelined, fib is 4.8× gorilla on a seventh of its memory, though still a bit behind uws and fnet.
 

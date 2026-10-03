@@ -6,7 +6,7 @@
 
 最近我和 Claude 合作完成了一个新的 Go 网络库，叫 fib。想法和方向是我的，代码几乎全部由 Claude 生成。它支持 TCP/UDP、TLS、HTTP/1.x、HTTP/2、HTTP/3（QUIC）和 WebSocket，HTTP handler 用的是标准库的 `*http.Request` 和 `http.ResponseWriter`。
 
-先说结果。在 GitHub Actions 上自动运行的 benchmark 里，和标准库相比，fib 在一些场景下的吞吐能高出数倍，内存也少得多；和 fasthttp 这类以性能著称的库相比，性能也有提升；和参测的其他 Go 库相比，除了 WebSocket pipeline 还落后 uws 和 fnet，其余场景 fib 都排在第一。和 C/C++/Rust 的框架相比，也已经很接近，有些场景还能超过。这些 Action 所在的仓库里有完整的测试代码，每个数字都可以追溯和复现。
+先说结果。在 GitHub Actions 上自动运行的 benchmark 里，和标准库相比，fib 在一些场景下的吞吐能高出数倍，内存也少得多；和 fasthttp 这类以性能著称的库相比，性能也有提升；和 C/C++/Rust 的框架相比，也已经很接近，有些场景还能超过。这些 Action 所在的仓库里有完整的测试代码，每个数字都可以追溯和复现。
 
 当然，不同的硬件规格、测试参数和框架配置，跑出来的结果可能会不一样。欢迎大家在自己的机器上亲自跑一跑这些 benchmark。
 
@@ -24,54 +24,54 @@
 
 **HTTP/1.1**（[Actions run](https://github.com/lesismal/go-http1-benchmark/actions/runs/36839290265)，客户端是 Rust tokio）
 
-| Server | Echo TPS | Echo MEM | Pipeline TPS | Pipeline MEM |
-| --- | ---: | ---: | ---: | ---: |
-| fib | 194,671 | 32 MB | 1,140,457 | 36 MB |
-| axum (Rust) | 236,244 | 227 MB | 301,804 | 490 MB |
-| fasthttp | 139,830 | 197 MB | 692,671 | 197 MB |
-| net/http | 84,739 | 314 MB | 164,811 | 323 MB |
+| Server      | Echo TPS | Echo MEM | Pipeline TPS | Pipeline MEM |
+| ----------- | -------: | -------: | -----------: | -----------: |
+| fib         |  194,671 |    32 MB |    1,140,457 |        36 MB |
+| axum (Rust) |  236,244 |   227 MB |      301,804 |       490 MB |
+| fasthttp    |  139,830 |   197 MB |      692,671 |       197 MB |
+| net/http    |   84,739 |   314 MB |      164,811 |       323 MB |
 
 echo 比 fasthttp 高 39%，内存只有它的六分之一。pipeline 场景差距最大，fib 跑到 114 万 TPS，是 axum 的 3.8 倍，内存始终在 36 MB 左右。在我自己不同连接数的测试里，fib 也基本能达到或超过 fasthttp。
 
 **HTTP/2 h2c**（[Actions run](https://github.com/lesismal/go-http2-benchmark/actions/runs/36839294047)）
 
-| Server | Echo TPS | Echo MEM | Multiplex TPS | Multiplex MEM |
-| --- | ---: | ---: | ---: | ---: |
-| fib | 129,676 | 119 MB | 333,692 | 432 MB |
-| h2 (Rust) | 143,107 | 246 MB | 129,729 | 870 MB |
-| net/http | 35,415 | 633 MB | 25,051 | 809 MB |
+| Server    | Echo TPS | Echo MEM | Multiplex TPS | Multiplex MEM |
+| --------- | -------: | -------: | ------------: | ------------: |
+| fib       |  129,676 |   119 MB |       333,692 |        432 MB |
+| h2 (Rust) |  143,107 |   246 MB |       129,729 |        870 MB |
+| net/http  |   35,415 |   633 MB |        25,051 |        809 MB |
 
 echo 达到 Rust h2 的九成，内存只有它的一半；multiplex 则反过来领先 h2 2.6 倍。
 
 **HTTP/3**（[Actions run](https://github.com/lesismal/go-http3-benchmark/actions/runs/36839296383)，客户端是 quiche）
 
-| Server | Echo TPS | Echo MEM | Multiplex TPS | Multiplex MEM |
-| --- | ---: | ---: | ---: | ---: |
-| quiche (Rust) | 72,919 | 387 MB | 101,233 | 881 MB |
-| fib | 67,396 | 504 MB | 94,443 | 1.05 GB |
-| quic-go | 19,545 | 1.20 GB | 17,505 | 1.80 GB |
+| Server        | Echo TPS | Echo MEM | Multiplex TPS | Multiplex MEM |
+| ------------- | -------: | -------: | ------------: | ------------: |
+| quiche (Rust) |   72,919 |   387 MB |       101,233 |        881 MB |
+| fib           |   67,396 |   504 MB |        94,443 |       1.05 GB |
+| quic-go       |   19,545 |  1.20 GB |        17,505 |       1.80 GB |
 
 这是提升最明显的一组：和 quic-go 相比，吞吐翻了几倍，内存还少了四到六成。和 quiche 比，内存上还多一些，这是接下来要继续做的。
 
 **TLS**（[Actions run](https://github.com/lesismal/go-tls-benchmark/actions/runs/36839299713)，客户端是 C 的 uSockets + BoringSSL）
 
-| Server | TLS 1.3 Echo | TLS 1.3 Pipeline | MEM |
-| --- | ---: | ---: | ---: |
-| fib | 103,427 | 690,000 | 180 MB |
-| crypto/tls + net | 92,494 | 241,106 | 285–518 MB |
-| uSockets (C) | 103,972 | 735,000 | 51 MB |
-| rustls (Rust) | 107,406 | 195,835 | 110–201 MB |
+| Server           | TLS 1.3 Echo | TLS 1.3 Pipeline |        MEM |
+| ---------------- | -----------: | ---------------: | ---------: |
+| fib              |      103,427 |          690,000 |     180 MB |
+| crypto/tls + net |       92,494 |          241,106 | 285–518 MB |
+| uSockets (C)     |      103,972 |          735,000 |      51 MB |
+| rustls (Rust)    |      107,406 |          195,835 | 110–201 MB |
 
 echo 和 C、Rust 的实现相差不到 4%，pipeline 到了 uSockets 的九成以上，是 rustls 的 3.5 倍。
 
 **WebSocket**（[Actions run](https://github.com/lesismal/go-websocket-benchmark/actions/runs/36999378687)，客户端是 C++ uWebSockets）
 
-| Server | Echo TPS | Echo MEM | Pipeline TPS | Pipeline MEM |
-| --- | ---: | ---: | ---: | ---: |
-| fib | 138,592 | 32 MB | 984,917 | 32 MB |
-| gorilla | 122,296 | 229 MB | 205,224 | 235 MB |
-| nbio | 121,398 | 62 MB | 191,091 | 100 MB |
-| tokio-tungstenite (Rust) | 83,841 | 105 MB | 748,297 | 286 MB |
+| Server                   | Echo TPS | Echo MEM | Pipeline TPS | Pipeline MEM |
+| ------------------------ | -------: | -------: | -----------: | -----------: |
+| fib                      |  138,592 |    32 MB |      984,917 |        32 MB |
+| gorilla                  |  122,296 |   229 MB |      205,224 |       235 MB |
+| nbio                     |  121,398 |    62 MB |      191,091 |       100 MB |
+| tokio-tungstenite (Rust) |   83,841 |   105 MB |      748,297 |       286 MB |
 
 pipeline 是 gorilla 的 4.8 倍，内存是它的七分之一，不过还落后 uws 和 fnet 一些。
 
