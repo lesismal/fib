@@ -43,6 +43,7 @@ uSockets, workflow, axum, h2, quiche and rustls.
 | HTTP/2 | ✓ h2 and h2c | ✓ | h2c by prior knowledge or `Upgrade: h2c`, server push, h2spec in CI |
 | HTTP/3 + QUIC | ✓ | ✓ | QUIC and QPACK written from scratch on `crypto/tls.QUICConn`, with no quic-go or x/net dependency |
 | WebSocket | ✓ | ✓ | RFC 6455 and permessage-deflate, over HTTP/1.1, HTTP/2 (RFC 8441) and HTTP/3 (RFC 9220); Autobahn in CI |
+| arpc | ✓ | ✓ | [lesismal/arpc](https://github.com/lesismal/arpc)'s wire format and API: two-way calls, notify, async calls, streams, broadcast, middleware, reconnect |
 
 ### Engine
 
@@ -185,6 +186,22 @@ app := fibhttp.HandlerFunc(func(c *fibhttp.Context, r *stdhttp.Request) {
 To serve only WebSocket, bind the WebSocket handler directly:
 `fib.Bind(config, websocket.NewHandlerWithConfig(cfg, handlers))`.
 
+### arpc
+
+```go
+server := arpc.NewServer()
+server.Handler.Handle("/echo", func(ctx *arpc.Context) { ctx.Write(ctx.Body()) })
+engine, err := fib.Bind(config, server) // or fibtls.NewServer(tlsConfig, server)
+
+client, err := arpc.Dial(clientEngine, "tcp", addr, 3*time.Second, nil)
+var rsp string
+err = client.Call("/echo", "hello", &rsp, time.Second)
+```
+
+Handlers run on the engine's handler pool, the one HTTP/2 and HTTP/3 use, unless
+`Handler.SetAsyncResponse(false)` or `Handle(method, h, false)` runs them where the connection is
+read, or `Handler.SetTaskPool` names another pool.
+
 ### Raw TCP
 
 ```go
@@ -207,6 +224,7 @@ go run ./examples/http/nontls/server
 go run ./examples/http/router
 go run ./examples/websocket/nontls/server
 go run ./examples/http3/tls/server
+go run ./examples/arpc/server
 ```
 
 Each server directory has a matching `client` next to it.
@@ -267,6 +285,7 @@ in `epoll_wait`, so it never holds a P while goroutines wait to run.
 | HTTP/2 | — | framing, HPACK decoding | `<Name>-streams` runs handlers, HPACK encoding and writes |
 | HTTP/3 | reads UDP in batches, sorts datagrams by peer | QUIC packets, TLS 1.3, QPACK | `<Name>-streams` (handlers) |
 | WebSocket | — | handshake, frames, `OnMessage`, deflate | over HTTP/2 or HTTP/3: `Upgrade` and `OnOpen` on streams |
+| arpc | — | framing, responses, handlers registered sync | `<Name>-streams` (async handlers, the default) |
 
 Waits only go one way, from engine workers to the other pools, so the pools cannot deadlock each
 other. [docs/architecture.html](docs/architecture.html) and [docs/flows.html](docs/flows.html)
@@ -515,6 +534,7 @@ Run it yourself with `cd taskpool/benchmark && ./bench.sh` (or `bench.ps1` on Wi
 | [`http`](http) | HTTP/1.x and HTTP/2 server and client, Router |
 | [`http3`](http3) | HTTP/3, QUIC and QPACK server and client |
 | [`websocket`](websocket) | RFC 6455 server and client, permessage-deflate, upgrades over HTTP/1.1, HTTP/2 and HTTP/3 |
+| [`arpc`](arpc) | [lesismal/arpc](https://github.com/lesismal/arpc) server and client, wire compatible |
 | [`middleware`](middleware) | Middleware chain and the common middleware |
 
 ## Documentation

@@ -42,6 +42,7 @@ HTTP/3 和 WebSocket。少量事件循环负责等待 I/O 就绪，具体工作�
 | HTTP/2 | ✓ h2 与 h2c | ✓ | h2c 支持 prior knowledge 和 `Upgrade: h2c`，支持 server push，CI 跑 h2spec |
 | HTTP/3 + QUIC | ✓ | ✓ | QUIC 和 QPACK 基于 `crypto/tls.QUICConn` 自行实现，不依赖 quic-go 或 x/net |
 | WebSocket | ✓ | ✓ | RFC 6455、permessage-deflate，可经 HTTP/1.1、HTTP/2（RFC 8441）、HTTP/3（RFC 9220）升级；CI 跑 Autobahn |
+| arpc | ✓ | ✓ | 与 [lesismal/arpc](https://github.com/lesismal/arpc) 相同的协议格式和 API：双向调用、notify、异步调用、stream、广播、中间件、断线重连 |
 
 ### 引擎
 
@@ -180,6 +181,22 @@ app := fibhttp.HandlerFunc(func(c *fibhttp.Context, r *stdhttp.Request) {
 只提供 WebSocket 时，可以直接 bind WebSocket handler：
 `fib.Bind(config, websocket.NewHandlerWithConfig(cfg, handlers))`。
 
+### arpc
+
+```go
+server := arpc.NewServer()
+server.Handler.Handle("/echo", func(ctx *arpc.Context) { ctx.Write(ctx.Body()) })
+engine, err := fib.Bind(config, server) // 或 fibtls.NewServer(tlsConfig, server)
+
+client, err := arpc.Dial(clientEngine, "tcp", addr, 3*time.Second, nil)
+var rsp string
+err = client.Call("/echo", "hello", &rsp, time.Second)
+```
+
+handler 默认在 engine 的 handler 池（与 HTTP/2、HTTP/3 相同的 streams 池）上异步执行；
+`Handler.SetAsyncResponse(false)` 全局、`Handle(method, h, false)` 单个方法改为在读连接的 worker 上同步执行，
+`Handler.SetTaskPool` 可以换成自己的协程池。
+
 ### 裸 TCP
 
 ```go
@@ -201,6 +218,7 @@ go run ./examples/tcp/nontls/server
 go run ./examples/http/nontls/server
 go run ./examples/http/router
 go run ./examples/websocket/nontls/server
+go run ./examples/arpc/server
 go run ./examples/http3/tls/server
 ```
 
@@ -255,6 +273,7 @@ poller 数量（`Config.IOPollers`、`IOPollerCount`）取决于 CPU 数：4 核
 | HTTP/2 | — | 分帧、HPACK 解码 | `<Name>-streams` 执行 handler、HPACK 编码和写 |
 | HTTP/3 | 批量读 UDP、按对端分拣数据报 | QUIC 包、TLS 1.3、QPACK | `<Name>-streams`（handler） |
 | WebSocket | — | 握手、帧、`OnMessage`、deflate | 经 HTTP/2 或 HTTP/3 时：`Upgrade` 和 `OnOpen` 在 streams 池 |
+| arpc | — | 拆包、响应、注册为同步的 handler | `<Name>-streams`（异步 handler，默认） |
 
 等待只有一个方向：从 engine worker 到其他池，所以池之间不会互相死锁。完整说明和每个协议的流程图见
 [docs/architecture.zh-CN.html](docs/architecture.zh-CN.html) 和
@@ -483,6 +502,7 @@ CI 每次 push 都在 Linux、macOS、Windows 上运行 [`taskpool/benchmark`](t
 | [`http`](http) | HTTP/1.x 与 HTTP/2 服务端和客户端、Router |
 | [`http3`](http3) | HTTP/3、QUIC、QPACK 服务端和客户端 |
 | [`websocket`](websocket) | RFC 6455 服务端和客户端、permessage-deflate，支持经 HTTP/1.1、HTTP/2、HTTP/3 升级 |
+| [`arpc`](arpc) | [lesismal/arpc](https://github.com/lesismal/arpc) 服务端和客户端，协议兼容 |
 | [`middleware`](middleware) | 中间件链和常用中间件 |
 
 ## 文档
