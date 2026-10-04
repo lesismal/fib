@@ -749,13 +749,27 @@ func TestReconnect(t *testing.T) {
 		return s, served
 	}
 	s, served := serve()
-	_, c := dial(t, addr)
+	cc, c := dial(t, addr)
 	ctx := testCtx(t)
 	if _, err := c.Unary(ctx, &Req{Msg: "one"}, WaitForReady(true)); err != nil {
 		t.Fatal(err)
 	}
 	s.Stop()
 	<-served
+	// Until the client has read the close, a call still goes out on the old
+	// connection and fails with it: wait for it to let the connection go.
+	for deadline := time.Now().Add(5 * time.Second); ; {
+		cc.mu.Lock()
+		lost := cc.t == nil
+		cc.mu.Unlock()
+		if lost {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("the client never noticed the connection was lost")
+		}
+		time.Sleep(time.Millisecond)
+	}
 	s, served = serve()
 	defer func() {
 		s.Stop()
@@ -763,6 +777,25 @@ func TestReconnect(t *testing.T) {
 	}()
 	if r, err := c.Unary(ctx, &Req{Msg: "two"}, WaitForReady(true)); err != nil || r.Msg != "two" {
 		t.Fatalf("after the server came back = %v", err)
+	}
+}
+
+// TestServeAfterStop checks that a Server stopped before Serve made its
+// engine does not then serve forever.
+func TestServeAfterStop(t *testing.T) {
+	s := NewServer()
+	s.Stop()
+	config := fib.DefaultConfig()
+	config.Addr = "127.0.0.1:0"
+	served := make(chan error, 1)
+	go func() { served <- s.Serve(config) }()
+	select {
+	case err := <-served:
+		if err != ErrServerStopped {
+			t.Fatalf("Serve after Stop = %v, want ErrServerStopped", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Serve after Stop never returned")
 	}
 }
 

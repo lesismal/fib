@@ -654,9 +654,11 @@ func TestReconnectGivesUp(t *testing.T) {
 	engine.Stop()
 	<-runDone
 	_ = engine.Close()
+	// Windows retries a refused connect for about 2 seconds before failing
+	// it, so the three attempts take over 6 there.
 	select {
 	case <-stopped:
-	case <-time.After(5 * time.Second):
+	case <-time.After(20 * time.Second):
 		t.Fatal("the client never gave up")
 	}
 	if n := attempts.Load(); n != 3 {

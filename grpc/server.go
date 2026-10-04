@@ -5,6 +5,7 @@ package grpc
 import (
 	"context"
 	stdtls "crypto/tls"
+	"errors"
 	"fmt"
 	"log/slog"
 	"math"
@@ -244,6 +245,10 @@ func (s *Server) removeTransport(t *transport) {
 	s.mu.Unlock()
 }
 
+// ErrServerStopped is what Serve and ServeTLS return once Stop or
+// GracefulStop has been called.
+var ErrServerStopped = errors.New("grpc: the server has been stopped")
+
 // Serve binds an engine of config, serving gRPC over h2c, and runs it until
 // Stop or GracefulStop, after which it closes the engine and returns.
 func (s *Server) Serve(config fib.Config) error { return s.serve(config, s) }
@@ -261,6 +266,12 @@ func (s *Server) serve(config fib.Config, handler fib.Handler) error {
 	served := make(chan struct{})
 	defer close(served)
 	s.mu.Lock()
+	if s.draining {
+		// Stopped before there was an engine to stop.
+		s.mu.Unlock()
+		_ = engine.Close()
+		return ErrServerStopped
+	}
 	s.engine, s.served = engine, served
 	s.mu.Unlock()
 	err = engine.Run()
