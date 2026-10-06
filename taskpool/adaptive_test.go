@@ -469,7 +469,7 @@ func TestAdaptivePickPrefersAnIdleShard(t *testing.T) {
 		// Send them back to their queue, to run the task and park again.
 		for _, w := range held {
 			busy.waking.Add(1)
-			w.wake <- busy
+			w.wake <- busy.index
 		}
 	}()
 	for i := 0; i < 100; i++ {

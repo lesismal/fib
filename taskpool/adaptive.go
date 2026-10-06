@@ -97,7 +97,7 @@ func newAdaptiveBackend(executor *executor, config AdaptiveConfig) *adaptiveBack
 	}
 	b := &adaptiveBackend{interval: interval, stopJanitor: make(chan struct{}), janitorDone: make(chan struct{})}
 	for i := 0; i < shards; i++ {
-		p := newAdaptivePool(b, executor, share(queueSize, shards, i))
+		p := newAdaptivePool(b, executor, share(queueSize, shards, i), int32(i))
 		b.shards = append(b.shards, p)
 	}
 	b.resize(config.MinWorkers, config.MaxWorkers)
@@ -309,12 +309,29 @@ const maxWaking = 2
 
 // adaptiveWorker is a parked worker's own wake-up. A worker is taken off the
 // idle stack by whoever wakes it, so it is never woken twice and a send never
-// blocks: a shard sends it to that shard's queue, which is another shard's
-// when adopt moved it, and nil retires it.
-type adaptiveWorker struct{ wake chan *adaptivePool }
+// blocks: a shard sends it the index of the shard whose queue it goes to,
+// which is another shard's when adopt moved it, and retireWorker retires it.
+//
+// Nothing a parked worker's frames hold may be a stack object: a variable
+// whose address is taken and that holds a pointer. The collector indexes the
+// stack objects of every goroutine it scans with work buffers from one global
+// list, and a server keeps thousands of workers parked, so with them it took
+// those buffers for each of them on every cycle: on 64 CPUs, HttpArena's
+// pipelined HTTP/1 profile spent 6% of the server's CPU contending for that
+// list with them, and 2.7% once they held none, serving 6% more requests.
+// Hence a shard's index on the channel rather than the shard itself,
+// whose address the receive would take, wakeups kept here rather than on the
+// worker's stack, and no defer in the worker's frame.
+type adaptiveWorker struct {
+	wake    chan int32
+	wakeups wakeups
+}
+
+// retireWorker is what a parked worker is sent to leave.
+const retireWorker = -1
 
 func newAdaptiveWorker() *adaptiveWorker {
-	return &adaptiveWorker{wake: make(chan *adaptivePool, 1)}
+	return &adaptiveWorker{wake: make(chan int32, 1)}
 }
 
 // adaptivePool is one shard: a bounded queue, and workers that park on a
@@ -357,6 +374,9 @@ type adaptivePool struct {
 	backend  *adaptiveBackend
 	budget   *workerBudget
 	executor *executor
+	// index is the shard's place in backend.shards, which is what its
+	// workers are sent; see adaptiveWorker.
+	index int32
 	// workerWG is the backend's, since a worker may move between shards.
 	workerWG *sync.WaitGroup
 	ring     *taskRing
@@ -403,9 +423,9 @@ type adaptivePool struct {
 	lowIdle int
 }
 
-func newAdaptivePool(b *adaptiveBackend, executor *executor, queueSize int) *adaptivePool {
+func newAdaptivePool(b *adaptiveBackend, executor *executor, queueSize int, index int32) *adaptivePool {
 	p := &adaptivePool{backend: b, budget: &b.budget, executor: executor, workerWG: &b.workerWG,
-		ring: newTaskRing(queueSize)}
+		ring: newTaskRing(queueSize), index: index}
 	p.notFull = sync.NewCond(&p.mu)
 	return p
 }
@@ -480,7 +500,7 @@ type wakeups struct {
 
 func (w *wakeups) run(p *adaptivePool) {
 	for i := 0; i < w.woken; i++ {
-		w.workers[i].wake <- p
+		w.workers[i].wake <- p.index
 		w.workers[i] = nil
 	}
 	for ; w.spawn > 0; w.spawn-- {
@@ -562,7 +582,7 @@ func (p *adaptivePool) kick() {
 			worker := p.popIdleLocked()
 			p.mu.Unlock()
 			if worker != nil {
-				worker.wake <- p
+				worker.wake <- p.index
 				continue
 			}
 		}
@@ -571,7 +591,7 @@ func (p *adaptivePool) kick() {
 			continue
 		}
 		if worker := p.backend.adopt(p); worker != nil {
-			worker.wake <- p
+			worker.wake <- p.index
 			continue
 		}
 		p.waking.Add(-1)
@@ -686,8 +706,17 @@ func (p *adaptivePool) retireOverCeiling() bool {
 	return false
 }
 
+// worker runs a worker until it leaves, and then counts it out of the
+// backend's WaitGroup. A task's panic does not reach it, since the executor
+// isolates each task's, so no defer is needed for that; see adaptiveWorker
+// for why there is none.
 func (p *adaptivePool) worker(self *adaptiveWorker) {
-	defer p.workerWG.Done()
+	wg := p.workerWG
+	p.work(self)
+	wg.Done()
+}
+
+func (p *adaptivePool) work(self *adaptiveWorker) {
 	for {
 		// This worker was on its way to the queue and has reached it.
 		p.waking.Add(-1)
@@ -730,8 +759,8 @@ func (p *adaptivePool) worker(self *adaptiveWorker) {
 			// it. A task queued since the queue was found empty may have
 			// been left to it, so it is passed on, and the budget it gives
 			// back on to a shard that ran short.
-			var w wakeups
-			p.kickLocked(&w)
+			w := &self.wakeups
+			p.kickLocked(w)
 			p.mu.Unlock()
 			w.run(p)
 			p.backend.rescue(p)
@@ -741,17 +770,17 @@ func (p *adaptivePool) worker(self *adaptiveWorker) {
 		p.idleCount.Add(1)
 		// A task queued after the queue was found empty may have been left
 		// to this worker by a submitter that saw it running.
-		var w wakeups
-		p.kickLocked(&w)
+		w := &self.wakeups
+		p.kickLocked(w)
 		p.mu.Unlock()
 		w.run(p)
 		next := <-self.wake
-		if next == nil {
+		if next == retireWorker {
 			// Retired by shrink, resize or stop, which counted it out.
 			return
 		}
 		// Sent to its own shard, or to another that adopted it.
-		p = next
+		p = p.backend.shards[next]
 	}
 }
 
@@ -776,7 +805,7 @@ func (p *adaptivePool) retireLocked(n int) []*adaptiveWorker {
 
 func dismiss(workers []*adaptiveWorker) {
 	for _, w := range workers {
-		w.wake <- nil
+		w.wake <- retireWorker
 	}
 }
 
@@ -840,7 +869,7 @@ func (p *adaptivePool) stop() {
 	p.waking.Add(int32(len(idle)))
 	p.mu.Unlock()
 	for _, w := range idle {
-		w.wake <- p
+		w.wake <- p.index
 	}
 }
 
