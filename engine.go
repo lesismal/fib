@@ -351,7 +351,9 @@ type Stats struct {
 	// ReadsResumed counts the pauses that have since been lifted.
 	ReadsResumed uint64
 	// PendingBytes is the outbound total queued across this server's
-	// connections right now, which is what MaxPendingBytes bounds.
+	// connections right now that their sockets have not taken, which is what
+	// MaxPendingBytes bounds. The replies a read round holds under its cork
+	// until it ends count only if its flush leaves them queued.
 	PendingBytes int64
 }
 
@@ -780,8 +782,10 @@ func (e *Engine) closeConnection(c *Connection, closeErr error, callback bool) {
 	// Drop this connection's share of the server-wide budget in the same step
 	// that abandons its queue, so a closed connection cannot hold the budget
 	// against the ones still running.
-	if pending := c.pendingBytes.Swap(0); pending > 0 {
-		e.releaseBudget(pending)
+	c.pendingBytes.Store(0)
+	if charged := c.charged; charged > 0 {
+		c.charged = 0
+		e.releaseBudget(charged)
 	}
 	if !callback {
 		c.mu.Unlock()

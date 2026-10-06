@@ -66,7 +66,10 @@ type Connection struct {
 	corked         bool
 	closeAfterSend bool
 	pendingBytes   atomic.Int64
-	attachment     atomic.Pointer[connectionAttachment]
+	// charged is how much of pendingBytes counts against the server-wide
+	// budget; see chargeLocked. Guarded by mu.
+	charged    int64
+	attachment atomic.Pointer[connectionAttachment]
 	// dialing is set while an outbound connect is still in progress, and
 	// cleared when it completes or fails. Event-loop ownership.
 	dialing *dialRequest
@@ -333,30 +336,75 @@ func (c *Connection) pauseDecision(readPaused bool) (pause, byBudget bool) {
 	return readPaused && pendingBytes > int64(e.writeLowWatermark), false
 }
 
-// addPending grows both the connection's outbound backlog and the server-wide
-// total, which are kept in step so that the budget is always the sum of its
-// connections.
+// addPending grows the connection's outbound backlog by n bytes it has just
+// queued. Bytes queued outside a cork are queued because the socket would not
+// take them, which is backlog, and count against the server-wide budget at
+// once; bytes a corked round queues for its own replies count only if they are
+// still queued once the round has flushed them; see chargeLocked. Callers hold
+// c.mu.
 func (c *Connection) addPending(n int64) {
 	if n <= 0 {
 		return
 	}
 	c.pendingBytes.Add(n)
-	c.engine.pendingTotal.Add(n)
+	if !c.corked {
+		c.chargeLocked()
+	}
 }
 
-// subPending shrinks both counters. If the connection counter would go below
-// zero the decrement is trimmed to what was actually there, so a clamp on one
-// counter cannot let the other drift.
+// chargeLocked counts against the server-wide budget whatever of the
+// connection's backlog it does not count yet.
+//
+// The budget is one counter for every connection of the engine and its
+// pollers, so moving it is a write every CPU contends for. A round's replies
+// are queued under its cork and nearly always flushed whole when it ends, so
+// they are kept out of it: counting each reply in and out again held HttpArena's
+// pipelined HTTP/1 profile on 64 CPUs to 15.3M responses a second against
+// 16.6M without. Only what a write leaves behind is counted, which is what the
+// budget bounds anyway: output the peers are not taking. Callers hold c.mu.
+func (c *Connection) chargeLocked() {
+	if delta := c.pendingBytes.Load() - c.charged; delta > 0 {
+		c.charged += delta
+		c.engine.pendingTotal.Add(delta)
+	}
+}
+
+// roundChargeBytes is how much output a round may hold under its cork before
+// it counts against the server-wide budget anyway. A round's replies are kept
+// out of the budget because they nearly always go out when it ends; one that
+// queues more than this is the kind the budget is there for, and many such
+// rounds at once would otherwise read on, each to its own watermark, past a
+// budget that cannot see what they hold.
+const roundChargeBytes = 32 << 10
+
+// chargeRound counts a round's output against the budget once it has grown
+// past roundChargeBytes, so that the budget sees it before the round decides
+// whether to read on. A round that holds less costs one atomic load.
+func (c *Connection) chargeRound() {
+	if c.pendingBytes.Load() < roundChargeBytes {
+		return
+	}
+	c.mu.Lock()
+	c.chargeLocked()
+	c.mu.Unlock()
+}
+
+// subPending shrinks the connection's backlog by n bytes the socket took, and
+// gives back whatever of it the budget no longer has to count. Callers hold
+// c.mu.
 func (c *Connection) subPending(n int64) {
 	if n <= 0 {
 		return
 	}
-	if pending := c.pendingBytes.Add(-n); pending < 0 {
+	pending := c.pendingBytes.Add(-n)
+	if pending < 0 {
 		c.pendingBytes.Store(0)
-		n += pending
+		pending = 0
 	}
-	if n > 0 {
-		c.engine.releaseBudget(n)
+	if c.charged > pending {
+		released := c.charged - pending
+		c.charged = pending
+		c.engine.releaseBudget(released)
 	}
 }
 
@@ -794,6 +842,7 @@ func (c *Connection) readLoop() error {
 		n, err := c.sysRead(buf)
 		if n > 0 {
 			c.handler.OnData(c, buf[:n])
+			c.chargeRound()
 			if c.readShouldStop() {
 				// Either the replies queued so far already fill the write
 				// budget or the handler is holding reads. Hand what is queued
@@ -864,6 +913,11 @@ func (c *Connection) flushOutput() error {
 	c.mu.Lock()
 	if c.closing || c.closed || c.flushing || c.writeBusyLocked() {
 		usable := !c.closing && !c.closed
+		if usable {
+			// What is queued waits on another flush or a write in flight,
+			// which is backlog the budget counts.
+			c.chargeLocked()
+		}
 		c.mu.Unlock()
 		if usable {
 			return nil
@@ -940,6 +994,7 @@ func (c *Connection) flushOutput() error {
 				// retrying now would only earn an EAGAIN. Wait for the socket
 				// to become writable again.
 				c.flushing = false
+				c.chargeLocked()
 				armErr := c.awaitWritableLocked()
 				refresh := c.pauseStateChangedLocked()
 				c.mu.Unlock()
@@ -960,6 +1015,7 @@ func (c *Connection) flushOutput() error {
 		}
 		c.flushing = false
 		if isWouldBlock(err) {
+			c.chargeLocked()
 			armErr := c.awaitWritableLocked()
 			refresh := c.pauseStateChangedLocked()
 			c.mu.Unlock()
