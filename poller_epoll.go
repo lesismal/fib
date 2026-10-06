@@ -165,6 +165,15 @@ func (e *Engine) runLoop() error {
 type epollWaiter struct {
 	file *os.File
 	conn syscall.RawConn
+	// poll is what conn.Read calls, made once with the waiter rather than as
+	// a closure on every wait, which would escape to the heap each time: a
+	// loop waits once per round. epfd and events are what it polls, and n and
+	// err what it found.
+	poll   func(uintptr) bool
+	epfd   int
+	events []syscall.EpollEvent
+	n      int
+	err    error
 }
 
 func newEpollWaiter(epfd int) *epollWaiter {
@@ -185,7 +194,12 @@ func newEpollWaiter(epfd int) *epollWaiter {
 		file.Close()
 		return nil
 	}
-	return &epollWaiter{file: file, conn: conn}
+	w := &epollWaiter{file: file, conn: conn, epfd: epfd}
+	w.poll = func(uintptr) bool {
+		w.n, w.err = syscall.EpollWait(w.epfd, w.events, 0)
+		return w.n != 0 || (w.err != nil && w.err != syscall.EINTR)
+	}
+	return w
 }
 
 // wait returns the events that are ready, waiting for some if there are none.
@@ -194,14 +208,11 @@ func newEpollWaiter(epfd int) *epollWaiter {
 // call to epoll_wait, as it did blocking.
 func (w *epollWaiter) wait(epfd int, events []syscall.EpollEvent) (int, error) {
 	if w != nil {
-		var n int
-		var err error
-		readErr := w.conn.Read(func(uintptr) bool {
-			n, err = syscall.EpollWait(epfd, events, 0)
-			return n != 0 || (err != nil && err != syscall.EINTR)
-		})
+		w.events = events
+		readErr := w.conn.Read(w.poll)
+		w.events = nil
 		if readErr == nil {
-			return n, err
+			return w.n, w.err
 		}
 		// The runtime cannot poll the descriptor after all.
 	}
