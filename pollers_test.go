@@ -6,7 +6,6 @@ import (
 	"bytes"
 	"io"
 	"net"
-	"runtime"
 	"sync"
 	"testing"
 	"time"
@@ -423,10 +422,10 @@ func TestPollersRunRoundsOnWorkers(t *testing.T) {
 // hands their rounds to the engine's pool of workers.
 func TestDefaultConfigHasPollersAndWorkerPool(t *testing.T) {
 	config := DefaultConfig()
-	wantPollers := runtime.NumCPU() > 4
+	wantPollers := defaultCPUs() > 4
 	if config.IOPollers != wantPollers || config.TaskPoolMode == taskpool.ModeInline {
 		t.Fatalf("DefaultConfig on %d CPUs has IOPollers=%v, TaskPoolMode=%v",
-			runtime.NumCPU(), config.IOPollers, config.TaskPoolMode)
+			defaultCPUs(), config.IOPollers, config.TaskPoolMode)
 	}
 	config.Name = "default-config"
 	config.Addr = "127.0.0.1:0"
@@ -437,7 +436,7 @@ func TestDefaultConfigHasPollersAndWorkerPool(t *testing.T) {
 	defer server.Close()
 	want := 0
 	if wantPollers && pollersSupported {
-		want = defaultPollerCount(runtime.NumCPU())
+		want = defaultPollerCount(defaultCPUs())
 	}
 	if len(server.pollers) != want {
 		t.Fatalf("default engine has %d pollers, want %d", len(server.pollers), want)

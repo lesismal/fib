@@ -176,6 +176,24 @@ func TestDefaultIOPollers(t *testing.T) {
 	}
 }
 
+// The defaults go by GOMAXPROCS where it is below the cores, as in a child of
+// package prefork: a process held to four Ps gets no pollers, and one held to
+// eight gets two, however many cores the machine has.
+func TestDefaultsFollowGOMAXPROCS(t *testing.T) {
+	if runtime.NumCPU() < 8 {
+		t.Skip("needs 8 CPUs")
+	}
+	defer runtime.GOMAXPROCS(runtime.GOMAXPROCS(4))
+	if config := DefaultConfig(); config.IOPollers {
+		t.Error("GOMAXPROCS 4: IOPollers on, want off")
+	}
+	runtime.GOMAXPROCS(8)
+	config := DefaultConfig()
+	if got := pollerCount(config); !config.IOPollers || got != 2 {
+		t.Errorf("GOMAXPROCS 8: IOPollers %v with %d pollers, want on with 2", config.IOPollers, got)
+	}
+}
+
 // The engine gives itself one poller for every four CPUs, rounded down, and at
 // least one.
 func TestDefaultPollerCount(t *testing.T) {

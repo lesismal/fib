@@ -230,6 +230,9 @@ func newEngine(config Config, handler Handler, addrs []string) (*Engine, error) 
 	if handler == nil {
 		handler = HandlerFuncs{}
 	}
+	if preforkChild && len(addrs) > 0 {
+		config.ReusePort = true
+	}
 
 	e := &Engine{name: engineName(config), logStatus: config.LogStatus, maxEvents: config.MaxEvents,
 		useWritev:          config.UseWritev,

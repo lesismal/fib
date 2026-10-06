@@ -1313,18 +1313,67 @@ echo 和 p99 在等于核数时最好或持平，内存随 GOMAXPROCS 升高而�
 需要注意 `runtime.NumCPU()` 取的是本进程的 CPU 亲和性掩码，被 taskset 或 cpuset 限制时它已经
 是实际可用的核数。
 
+## Prefork
+
+`prefork` 包把一个程序拆到多个进程上服务，做法同 fasthttp/fiber 的 prefork：调用 `prefork.Run`
+的进程成为 master，按同样的参数重新执行本程序启动若干子进程，自己不监听也不服务，只负责等待子
+进程、把 SIGINT/SIGTERM 转给它们；每个子进程里 `Run` 调用传入的 `serve`，`serve` 照常 `fib.Bind`
+各个 Engine。子进程里绑定的每个 Engine 都自动带 `SO_REUSEPORT`（相当于设置了
+`Config.ReusePort`），于是所有子进程监听同样的端口，内核按连接（UDP 按数据报）的地址哈希分给它们。
+
+```go
+func run(ctx context.Context) error {
+	engine, err := fib.Bind(config, handler) // 每个子进程各自加载数据、绑定 Engine
+	if err != nil {
+		return err
+	}
+	go func() { <-ctx.Done(); engine.Stop() }() // SIGINT/SIGTERM 或 master 退出时 ctx 结束
+	return engine.Run()
+}
+
+func main() {
+	if err := prefork.Run(prefork.Config{}, run); err != nil {
+		log.Fatal(err)
+	}
+}
+```
+
+为什么需要它：每个子进程有自己的堆和 GC。一个进程里有 64 个 P 时，GC 标记阶段的工作缓冲区、
+堆的锁由所有 P 共用，分配多的服务大部分时间花在这上面而不是请求上。64 核的 HttpArena 实测（每个
+子进程 1 个 P，对比单进程）：json-tls 每秒 56 万请求到 99 万（每请求用户态 CPU 66µs 降到 43µs），
+baseline 279 万到 368 万，limited-conn 163 万到 292 万，pipelined 1820 万到 2670 万，latency-1m
+的 p99 从 1.6ms 降到 157µs、同时少用四分之一的核。
+
+- `Config.ProcsPerChild` 是每个子进程的 GOMAXPROCS，默认 `DefaultProcsPerChild`（1）：同样 64 核，
+  每子进程 2 个 P 的 json-tls 87 万、4 个 P 88 万，baseline 353 万、324 万，都不如 1 个 P。
+  `Config.Children` 是子进程数，默认 master 的 GOMAXPROCS 除以 `ProcsPerChild`（向上取整）。
+  子进程的 GOMAXPROCS 小，fib 的默认值随之变化：CPU 数取 `runtime.NumCPU()` 与 GOMAXPROCS 中
+  较小的那个，4 个 P 及以下不开 IOPollers，每个 Engine 只有自己的一个循环。
+- 调用 `Run` 之前的代码 master 和每个子进程都会执行一遍，只有子进程需要的初始化（加载数据、连接池）
+  放进 `serve`。子进程之间除了端口什么都不共享，内存里的状态每个子进程一份；整个机器或容器只有
+  一份的资源（比如数据库的连接数上限）按 `prefork.Children()` 分给每个子进程。`prefork.Child()`
+  是子进程编号（从 1 开始），`prefork.IsChild()` 判断当前是否子进程。
+- 任何一个子进程在要求停止之前退出（崩溃或 `serve` 返回），master 让其余子进程停止，`Run` 返回
+  说明是哪个子进程的错误；要求停止后 `Config.ShutdownTimeout`（默认 10 秒）内没退出的子进程被
+  kill。master 意外退出时子进程收到 SIGTERM（Linux 的 `Pdeathsig`）。
+- 只支持 Linux：macOS 的 `SO_REUSEPORT` 不在进程间分摊连接，Windows 没有 fork。其他平台上
+  `Run` 直接在当前进程里调用 `serve`，相当于只有一个子进程。
+- UDP（HTTP/3）的 socket 同样共享：同一对端的数据报按四元组哈希总落在同一个子进程上。对端地址
+  变化（NAT 重绑定、连接迁移）后可能落到另一个子进程，那个子进程里没有这条 QUIC 连接。
+
 ## IOPollers
 
 `Config.IOPollers` 把一个 Engine 拆到多个事件循环上（仅 Linux 的 epoll 和 macOS 的 kqueue；
-Windows 上忽略这个配置，保持单个循环）。`DefaultConfig()` 在 `runtime.NumCPU()` 大于 4 时开启，
-4 个及以下时关闭：这么少的核上一个 poller 只是多一个循环，3 个 CPU 的 HTTP/1 echo 单循环 583k、
+Windows 上忽略这个配置，保持单个循环）。`DefaultConfig()` 在 CPU 数大于 4 时开启，
+4 个及以下时关闭（CPU 数取 `runtime.NumCPU()`，GOMAXPROCS 更小时取 GOMAXPROCS，例如 prefork
+的子进程、或运行时按容器 CPU 配额调低了它）：这么少的核上一个 poller 只是多一个循环，3 个 CPU 的 HTTP/1 echo 单循环 583k、
 1 个 poller 584k，而 4 核默认也只会建 1 个 poller。显式设为 `true` 则任何核数都有 poller；为 `false`
 时 listener 和连接都在同一个 event loop 上。开不开都一样，事件循环只等事件、把变为可执行的连接交给
 Engine 的 worker 池（`<Name>-workers`），每条连接的每一轮都在 worker 上执行：
 
 - Engine 自己的循环只负责 accept 和它的 UDP socket；每条 accept 到的连接按 `fd % pollerCount`
   交给其中一个 poller，此后由那个 poller 负责它的事件注册、读写和关闭。poller 数量由
-  `Config.IOPollerCount` 指定，不大于 0（默认）时为 `max(1, runtime.NumCPU()/4)`（向下取整，
+  `Config.IOPollerCount` 指定，不大于 0（默认）时为 `max(1, CPU 数/4)`（CPU 数同上，向下取整，
   至少 1 个）：7 核以内 1 个，8 核 2 个，16 核 4 个，64 核 16 个。profile 下来，poller 每个请求
   只花约 0.2µs，worker 花约 4.5µs（1 万连接的 WebSocket、HTTP/2 echo）。
   poller 只负责等事件、交给 worker，一个就能应付很多连接，多出来的 poller 会和 worker 抢同样
@@ -1365,7 +1414,7 @@ Engine 的 worker 池（`<Name>-workers`），每条连接的每一轮都在 wor
 ```go
 config := fib.DefaultConfig() // CPU 多于 4 个时默认已开启 IOPollers
 config.IOPollers = true       // 4 核及以下也要 poller 时显式打开
-config.IOPollerCount = 0      // max(1, NumCPU/4)
+config.IOPollerCount = 0      // max(1, CPU 数/4)
 config.ReusePort = true       // 允许其他进程共享地址；UDP 也改由各 poller 读
 
 single := fib.DefaultConfig()

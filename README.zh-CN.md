@@ -60,6 +60,8 @@ HTTP/3 和 WebSocket。少量事件循环负责等待 I/O 就绪，具体工作�
   子路由和挂载，路由过程零分配。
 - **中间件**：compress、cors、csrf、etag、limiter、logger、pprof、recover、requestid、
   responsetime。
+- **Prefork**：Linux 上 `prefork` 包把一个程序拆到每 CPU 一个进程上运行，各自有自己的堆和 GC，
+  通过 `SO_REUSEPORT` 共享程序的端口。
 - **平台**：Linux、macOS、Windows，支持 amd64、arm64、386、arm、riscv64、loong64，需要 Go 1.27
   或更新版本。
 
@@ -525,6 +527,7 @@ CI 每次 push 都在 Linux、macOS、Windows 上运行 [`taskpool/benchmark`](t
 | [`arpc`](arpc) | [lesismal/arpc](https://github.com/lesismal/arpc) 服务端和客户端，协议兼容 |
 | [`grpc`](grpc) | gRPC 服务端和客户端，自带 HTTP/2 传输层，与 grpc-go 及其生成代码兼容 |
 | [`middleware`](middleware) | 中间件链和常用中间件 |
+| [`prefork`](prefork) | 一个程序由多个共享端口的进程服务（Linux） |
 
 ## 文档
 

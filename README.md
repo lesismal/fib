@@ -62,6 +62,8 @@ uSockets, workflow, axum, h2, quiche and rustls.
   catch-alls, groups, sub-routers and mounts. Routing allocates nothing.
 - **Middleware**: compress, cors, csrf, etag, limiter, logger, pprof, recover, requestid and
   responsetime.
+- **Prefork**: on Linux, package `prefork` serves a program from one process per CPU, each with its
+  own heap and collector, sharing the program's ports through `SO_REUSEPORT`.
 - **Platforms**: Linux, macOS and Windows, on amd64, arm64, 386, arm, riscv64 and loong64. Needs
   Go 1.27 or later.
 
@@ -559,6 +561,7 @@ Run it yourself with `cd taskpool/benchmark && ./bench.sh` (or `bench.ps1` on Wi
 | [`arpc`](arpc) | [lesismal/arpc](https://github.com/lesismal/arpc) server and client, wire compatible |
 | [`grpc`](grpc) | gRPC server and client over an HTTP/2 transport of its own, compatible with grpc-go and its generated code |
 | [`middleware`](middleware) | Middleware chain and the common middleware |
+| [`prefork`](prefork) | One program served from several processes sharing its ports (Linux) |
 
 ## Documentation
 

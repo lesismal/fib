@@ -3,7 +3,6 @@
 package fib
 
 import (
-	"runtime"
 	"time"
 
 	"github.com/lesismal/fib/taskpool"
@@ -124,8 +123,9 @@ type Config struct {
 	// of their own, apart from the workers that read their connections; see
 	// Engine.HandlerPool.
 	//
-	// DefaultConfig sets it on more than four CPUs, and leaves it off on four
-	// or fewer, where one loop serves as many requests as a poller would.
+	// DefaultConfig sets it on more than four CPUs, counting GOMAXPROCS where
+	// it is below runtime.NumCPU, and leaves it off on four or fewer, where
+	// one loop serves as many requests as a poller would.
 	// Without it, the engine serves listeners and connections alike on its
 	// one loop. Setting it explicitly gives an engine pollers on any number
 	// of CPUs.
@@ -134,8 +134,9 @@ type Config struct {
 	// keeps its single loop, as if this were unset.
 	IOPollers bool
 	// IOPollerCount is how many loops IOPollers creates. Zero or less means
-	// runtime.NumCPU divided by four, rounded down, and at least one: 1 up to
-	// 7 CPUs, 2 on 8, 4 on 16, 16 on 64.
+	// the CPUs divided by four, rounded down, and at least one: 1 up to 7
+	// CPUs, 2 on 8, 4 on 16, 16 on 64. The CPUs are runtime.NumCPU, or
+	// GOMAXPROCS where that is lower.
 	//
 	// A loop only waits for events and hands them on, which costs a small
 	// share of what the workers spend on them, so one loop keeps up with the
@@ -183,6 +184,9 @@ type Config struct {
 	// whose address changes reaches whichever poller its new address hashes
 	// to, as a new peer; package http3 finds its QUIC connection there by
 	// its connection ID.
+	//
+	// In a child of package prefork it is always set, since the children
+	// all listen on the same addresses.
 	ReusePort bool
 	// UDPIdleTimeout closes a UDP peer's connection once the peer has neither
 	// sent nor been sent a datagram for this long, since UDP has no close of
@@ -201,5 +205,5 @@ func DefaultConfig() Config {
 		MaxEvents: sizing.MaxEvents, ReadBufferSize: 16 * 1024,
 		WriteBufferHighWatermark: defaultWriteHighWatermark, MaxPendingBytes: defaultMaxPendingBytes,
 		UseWritev: true, SocketSyscalls: true, TaskPoolMode: taskpool.ModeAdaptive, SharedTaskPool: true,
-		IOPollers: defaultIOPollers(runtime.NumCPU())}
+		IOPollers: defaultIOPollers(defaultCPUs())}
 }

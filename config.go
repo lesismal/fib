@@ -188,8 +188,16 @@ func pollerCount(config Config) int {
 	if config.IOPollerCount > 0 {
 		return config.IOPollerCount
 	}
-	return defaultPollerCount(runtime.NumCPU())
+	return defaultPollerCount(defaultCPUs())
 }
+
+// defaultCPUs is how many CPUs the defaults that depend on the machine's
+// size go by: the cores the process may run on, or GOMAXPROCS when that is
+// lower, as it is in a child of package prefork, which serves on a few Ps
+// of a machine its siblings share, or where the runtime has lowered it to a
+// container's CPU quota. Pollers beyond the Ps there are to run them, and
+// the workers they feed, would only wait for one another.
+func defaultCPUs() int { return min(runtime.NumCPU(), runtime.GOMAXPROCS(0)) }
 
 // cpusPerPoller is how many CPUs one poller waits for by default. A poller
 // only waits for events and hands the connections they make runnable to the
