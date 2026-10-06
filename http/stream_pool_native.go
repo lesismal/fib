@@ -68,6 +68,10 @@ type StreamGate struct {
 	// pool is the pool the connection's requests run on, once the first of
 	// them has looked it up. Only the connection's reader touches it.
 	pool *taskpool.TaskPool
+	// ownFlush says the connection flushes what its requests send itself,
+	// so that a request the pool ran leaves its response to that rather
+	// than flushing the connection on its own; see h2ServerConn.sendLocked.
+	ownFlush bool
 }
 
 // Running is how many of the connection's requests the pool is running now.
@@ -204,7 +208,7 @@ func (t *streamTask) run() {
 			}
 			panic(recovered)
 		}
-		if t.conn != nil {
+		if t.conn != nil && !t.gate.ownFlush {
 			_ = t.conn.Flush()
 		}
 	}()

@@ -15,11 +15,13 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	fib "github.com/lesismal/fib"
 	"github.com/lesismal/fib/bufferpool"
 	"github.com/lesismal/fib/hpack"
+	"github.com/lesismal/fib/taskpool"
 )
 
 // HTTP/2 on the server side. ServerHandler recognizes a connection that
@@ -135,6 +137,21 @@ type h2ServerConn struct {
 	headerBlock []byte
 	lengthOf    int64
 	lengthValue string
+
+	// flushPending says flusher is on its way to write what the connection
+	// has queued, and flushPool is the pool it is sent to; see sendLocked.
+	flushPending atomic.Bool
+	flusher      h2Flusher
+	flushPool    *taskpool.TaskPool
+}
+
+// h2Flusher writes out what a connection's frames queued, all at once; see
+// h2ServerConn.sendLocked.
+type h2Flusher struct{ sc *h2ServerConn }
+
+func (f *h2Flusher) RunTask() {
+	f.sc.flushPending.Store(false)
+	_ = f.sc.conn.Flush()
 }
 
 // h2ServerStream is one request and its response.
@@ -192,7 +209,7 @@ func newH2ServerConn(h *ServerHandler, c *fib.Connection, remoteAddr string) *h2
 	}
 	dec := hpack.NewDecoder(hpack.DefaultTableSize)
 	dec.MaxStringLength = h.config.MaxHeaderBytes
-	return &h2ServerConn{
+	sc := &h2ServerConn{
 		handler:      h,
 		conn:         c,
 		remoteAddr:   remoteAddr,
@@ -207,7 +224,11 @@ func newH2ServerConn(h *ServerHandler, c *fib.Connection, remoteAddr string) *h2
 		pushEnabled:  true,
 		nextPushID:   2,
 		peerMaxPush:  math.MaxUint32,
+		flushPool:    handlerPool(c),
 	}
+	sc.flusher.sc = sc
+	sc.gate.ownFlush = true
+	return sc
 }
 
 // start sends the server's connection preface: its SETTINGS, and a window
@@ -227,20 +248,46 @@ func (sc *h2ServerConn) start() {
 }
 
 // sendLocked sends out unless the connection has ended.
+//
+// What the connection sends is queued, corked, and written by flusher, which
+// the first frames queued since it last ran send to the pool the requests
+// run on, behind the requests the reader has handed it already: the
+// responses of a burst of requests leave in one write rather than one each.
+// A response that comes in after the flusher ran sends it again, so none
+// waits for another, a slow handler's included. On 64 CPUs, the responses
+// of h2load's 100 streams a connection each written as they came spent 60%
+// of the server's time in write.
 func (sc *h2ServerConn) sendLocked(out []byte) {
 	if len(out) > 0 && !sc.closed {
+		sc.conn.Cork()
 		_ = sc.conn.SendOwned(out)
+		sc.scheduleFlush()
 	}
 }
 
-// sendPooledLocked sends out, a buffer from the pool, unless the connection
-// has ended, and gives it back. The connection copies what the socket does
-// not take at once, so a response that goes straight out is never copied.
+// sendPooledLocked sends out, a buffer from the pool, as sendLocked does,
+// unless the connection has ended, and gives it back: the connection copies
+// it into what it has queued.
 func (sc *h2ServerConn) sendPooledLocked(out []byte) {
 	if len(out) > 0 && !sc.closed {
+		sc.conn.Cork()
 		_ = sc.conn.Send(out)
+		sc.scheduleFlush()
 	}
 	bufferpool.Put(out)
+}
+
+// scheduleFlush sends flusher to the pool unless it is on its way already,
+// and runs it here if the pool takes no more work. A flusher that has not
+// begun yet writes what was queued before this call; one that has begun
+// leaves flushPending false for this call to set again.
+func (sc *h2ServerConn) scheduleFlush() {
+	if !sc.flushPending.CompareAndSwap(false, true) {
+		return
+	}
+	if sc.flushPool == nil || !sc.flushPool.GoTask(&sc.flusher) {
+		sc.flusher.RunTask()
+	}
 }
 
 // feed takes bytes from the connection, preface included, and handles every
