@@ -25,8 +25,13 @@ import (
 // serve runs an engine serving handler and returns its address.
 func serve(t *testing.T, handler fib.Handler) string {
 	t.Helper()
-	if server, ok := handler.(*ServerHandler); ok {
-		setReuse(&server.config, testReuse)
+	// FIB_TEST_REUSE=0 turns recycling off for every server; otherwise each
+	// keeps what its config says, which is DefaultConfig's recycling unless
+	// the test turned it off, as one that touches a Context after its
+	// response must: forcing it back on there let that test's late Release
+	// end a request another test's server was serving.
+	if server, ok := handler.(*ServerHandler); ok && !testReuse {
+		setReuse(&server.config, false)
 	}
 	config := fib.DefaultConfig()
 	config.Addr = "127.0.0.1:0"
