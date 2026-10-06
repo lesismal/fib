@@ -106,7 +106,16 @@ type Decoder struct {
 	recent     [recentStrings]string
 	nextRecent int
 	huffman    []byte
+	// coded holds the Huffman-coded form of short literals decoded lately
+	// beside the string each decoded to, so that one a peer sends coded on
+	// every block is decoded once: h2load sends its :path that way, and
+	// decoding it took 8% of a server's time.
+	coded     [recentStrings]codedString
+	nextCoded int
 }
+
+// codedString is a Huffman-coded literal and the string it decodes to.
+type codedString struct{ coded, plain string }
 
 // recentStrings is how many literals a Decoder remembers, and
 // maxRecentString the longest it remembers, which together bound what a
@@ -226,6 +235,15 @@ func (d *Decoder) readString(block []byte) (string, []byte, error) {
 	raw := rest[:length]
 	rest = rest[length:]
 	if huffman {
+		short := len(raw) <= maxRecentString
+		if short {
+			for i := range d.coded {
+				if c := &d.coded[i]; len(c.coded) == len(raw) && c.coded == string(raw) {
+					return c.plain, rest, nil
+				}
+			}
+		}
+		coded := raw
 		d.huffman, err = huffmanDecodeAppend(d.huffman[:0], raw, d.MaxStringLength)
 		if err != nil {
 			return "", nil, err
@@ -235,6 +253,12 @@ func (d *Decoder) readString(block []byte) (string, []byte, error) {
 			// Kept for the next string only while it stays small.
 			d.huffman = nil
 		}
+		plain := d.intern(raw)
+		if short && plain != "" {
+			d.coded[d.nextCoded] = codedString{string(coded), plain}
+			d.nextCoded = (d.nextCoded + 1) % recentStrings
+		}
+		return plain, rest, nil
 	} else if d.MaxStringLength > 0 && len(raw) > d.MaxStringLength {
 		return "", nil, ErrStringTooLong
 	}

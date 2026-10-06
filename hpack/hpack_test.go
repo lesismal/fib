@@ -215,3 +215,15 @@ func TestDecodeInternsRepeatedLiterals(t *testing.T) {
 		}
 	}
 }
+
+// BenchmarkDecodeRepeatedHuffman decodes the block a load generator sends on
+// every request: the same Huffman-coded literals, none of them indexed.
+func BenchmarkDecodeRepeatedHuffman(b *testing.B) {
+	d := NewDecoder(DefaultTableSize)
+	block := literalBlock(true, HeaderField{":path", "/baseline2?a=1&b=1"},
+		HeaderField{":authority", "localhost:8082"}, HeaderField{"user-agent", "h2load nghttp2/1.59.0"})
+	b.ReportAllocs()
+	for b.Loop() {
+		_ = d.Decode(block, func(HeaderField) error { return nil })
+	}
+}
