@@ -156,7 +156,15 @@ type Config struct {
 	// longer, or hands it to a goroutine that outlives the response, reads
 	// or writes another request's: keep a copy of what is needed instead,
 	// as http.Request.Clone and http.Header.Clone make. That is fasthttp's
-	// rule for its RequestCtx, and the reason these are off by default.
+	// rule for its RequestCtx, and Fiber's and Gin's for their contexts.
+	//
+	// DefaultConfig turns all four on: on many cores the collector, not the
+	// handler, is what the request rate runs into otherwise. In HttpArena's
+	// baseline profile on 64 CPUs, every request's Request, URL and Context
+	// left to it ran the server at 1.23M requests a second on 36 of the CPUs,
+	// the rest waiting on the runtime's heap lock, and recycling them served
+	// 1.63M. A handler that keeps these objects past its request turns the
+	// options off, each on its own.
 	//
 	// A request whose body streams (see StreamRequestBody), and one
 	// net/http parsed because it is outside the shape parsed here, keep
@@ -173,7 +181,8 @@ func (c *Config) reuse() reuseOptions {
 }
 
 func DefaultConfig() Config {
-	return Config{MaxHeaderBytes: 1 << 20, MaxBodyBytes: 16 << 20}
+	return Config{MaxHeaderBytes: 1 << 20, MaxBodyBytes: 16 << 20,
+		ReuseRequests: true, ReuseHeaders: true, ReuseURLs: true, ReuseContexts: true}
 }
 
 // Parser incrementally turns arbitrary TCP chunks into complete HTTP requests.

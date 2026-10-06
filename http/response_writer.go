@@ -29,6 +29,19 @@ const (
 	// minSendFileSize is the smallest file range ReadFrom hands to sendfile.
 	// Below it, copying the bytes costs less than the extra system calls.
 	minSendFileSize = 16 << 10
+	// maxHeldBody is the longest declared body the ResponseWriter methods
+	// hold back whole, and send with the header when it is all written,
+	// rather than streaming it. A body whose Content-Length is set up front,
+	// as http.ServeContent sets it, and no longer than this is one response
+	// rather than a stream: streaming it sent the header and the body in
+	// writes of their own, and over TLS sealed them into records of their
+	// own. HttpArena's static-tls profile, files of a few kilobytes to a few
+	// tens of them, made two writes a response where one does.
+	maxHeldBody = 64 << 10
+	// copyBufferSize is the buffer ReadFrom copies a reader it cannot hand to
+	// sendfile through, taken from the pool rather than made by io.Copy for
+	// every response.
+	copyBufferSize = 32 << 10
 )
 
 // responseWriter is a response written through Context's ResponseWriter
@@ -58,6 +71,12 @@ type responseWriter struct {
 	// live here rather than in Context so that a Context, which HTTP/3
 	// allocates with each request, costs no more for a feature few use.
 	hooks *responseHooks
+}
+
+// holdsDeclared reports whether a body is held back whole because its declared
+// length is short; see maxHeldBody.
+func (w *responseWriter) holdsDeclared() bool {
+	return w.declared >= 0 && w.declared <= maxHeldBody
 }
 
 // Header returns the header of the response written through Write, as
@@ -154,7 +173,7 @@ func (c *Context) Write(p []byte) (int, error) {
 		w.buf = append(w.buf, p...)
 		return len(p), nil
 	}
-	if !w.committed && len(w.buf)+len(p) <= writerBufferSize {
+	if !w.committed && (len(w.buf)+len(p) <= writerBufferSize || w.holdsDeclared()) {
 		// Held back in a pooled buffer, which commit gives back once the
 		// header has gone out with it.
 		w.buf = bufferpool.Append(w.buf, p)
@@ -195,7 +214,9 @@ func (c *Context) FlushError() error {
 		return nil
 	}
 	if !w.committed {
-		return c.commit(false)
+		if err := c.commit(false); err != nil {
+			return err
+		}
 	}
 	return c.Conn.Flush()
 }
@@ -216,7 +237,9 @@ func (c *Context) ReadFrom(src io.Reader) (int64, error) {
 	if !ok || c.holdsWhole() || c.Request.Method == stdhttp.MethodHead || w.finished ||
 		w.status != 0 && !statusHasBody(w.status) || file.size < minSendFileSize ||
 		w.declared >= 0 && w.written+file.size > w.declared {
-		return io.Copy(writerOnly{c}, src)
+		buf := bufferpool.Get(copyBufferSize)
+		defer bufferpool.Put(buf)
+		return io.CopyBuffer(writerOnly{c}, src, buf)
 	}
 	if w.status == 0 {
 		if _, set := w.header["Content-Type"]; !set && w.written == 0 {
@@ -377,9 +400,9 @@ func (c *Context) commit(final bool) error {
 	if err != nil {
 		return err
 	}
-	if final {
-		// The whole response is out, and goes to the socket with whatever
-		// else this read round answers.
+	if final || w.holdsDeclared() {
+		// The whole response is out, or short enough that it is one: it goes
+		// to the socket with whatever else this read round answers.
 		return nil
 	}
 	// A body too long to hold back is streamed: from here on it goes to the

@@ -46,13 +46,16 @@ func serveHTTP1(t *testing.T, handler HandlerFunc) string {
 }
 
 // testReuse says whether the servers the tests start recycle everything
-// Config.ReuseRequests and its siblings let them, which FIB_TEST_REUSE=1 in
-// the environment asks for, so that the suite can be run against that too.
-var testReuse = os.Getenv("FIB_TEST_REUSE") == "1"
+// Config.ReuseRequests and its siblings let them, as DefaultConfig does.
+// FIB_TEST_REUSE=0 in the environment turns them off, so that the suite can
+// be run against that too.
+var testReuse = os.Getenv("FIB_TEST_REUSE") != "0"
 
-func setReuseAll(config *Config) {
-	config.ReuseRequests, config.ReuseHeaders = true, true
-	config.ReuseURLs, config.ReuseContexts = true, true
+func setReuseAll(config *Config) { setReuse(config, true) }
+
+func setReuse(config *Config, on bool) {
+	config.ReuseRequests, config.ReuseHeaders = on, on
+	config.ReuseURLs, config.ReuseContexts = on, on
 }
 
 // stdClient is a net/http client that keeps to HTTP/1.1 and counts the

@@ -5,6 +5,8 @@ package http
 import (
 	"io"
 	"net"
+	"net/url"
+	"strings"
 	"sync"
 	"sync/atomic"
 )
@@ -269,6 +271,76 @@ func (c *Context) BodyComplete() bool {
 		return stream.Complete()
 	}
 	return true
+}
+
+// Body returns the request body that arrived whole before the handler ran, as
+// every body does that does not stream (see Config.StreamRequestBody): the
+// server's own buffer, rather than a copy read out of Request.Body, which
+// io.ReadAll makes by growing a buffer of its own a piece at a time. It is
+// the whole body whatever has been read from Request.Body already, and
+// reading Request.Body afterwards still returns it.
+//
+// The bytes stay the handler's for as long as the body does: until the
+// response is finished, at the handler's return or at the last Release of a
+// request it retained. They must not be changed, nor kept past that; keep a
+// copy instead. Respond and Write copy what they are given, so the body can
+// be answered with as it is.
+//
+// It returns nil for a request without a body, and for one whose body streams,
+// which RequestBody and OnBody read instead.
+func (c *Context) Body() []byte {
+	if b := c.whole; b != nil && !b.released {
+		return b.data
+	}
+	return nil
+}
+
+// Query returns the first value of the query parameter name, as
+// Request.URL.Query().Get(name) does, decoded the same way and skipping the
+// same malformed pairs, but without building the map Query builds on every
+// call: a value that needs no decoding is a slice of the request's raw query,
+// so looking one up allocates nothing. It returns "" when the parameter is
+// absent, as Get does.
+func (c *Context) Query(name string) string {
+	if c.Request == nil || c.Request.URL == nil {
+		return ""
+	}
+	value, _ := lookupQuery(c.Request.URL.RawQuery, name)
+	return value
+}
+
+// lookupQuery finds name's first value in query, as url.ParseQuery followed
+// by Get finds it: pairs are split at '&', a pair holding a ';' is skipped,
+// and so is one whose key or value does not decode.
+func lookupQuery(query, name string) (string, bool) {
+	for query != "" {
+		var pair string
+		pair, query, _ = strings.Cut(query, "&")
+		if pair == "" || strings.IndexByte(pair, ';') >= 0 {
+			continue
+		}
+		key, value, _ := strings.Cut(pair, "=")
+		if !queryKeyIs(key, name) {
+			continue
+		}
+		if strings.IndexByte(value, '%') < 0 && strings.IndexByte(value, '+') < 0 {
+			return value, true
+		}
+		if decoded, err := url.QueryUnescape(value); err == nil {
+			return decoded, true
+		}
+	}
+	return "", false
+}
+
+// queryKeyIs reports whether the raw key of a query pair decodes to name. A
+// key that does not decode is no key at all, as url.ParseQuery skips it.
+func queryKeyIs(key, name string) bool {
+	if strings.IndexByte(key, '%') < 0 && strings.IndexByte(key, '+') < 0 {
+		return key == name
+	}
+	decoded, err := url.QueryUnescape(key)
+	return err == nil && decoded == name
 }
 
 // OnBody delivers the request body to fn as it arrives, rather than through

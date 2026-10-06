@@ -351,8 +351,10 @@ have the full picture, with one diagram per protocol.
   32–36 MB while most other servers grow to hundreds of MB.
 - **TLS state is dropped after the handshake.** On the fast path, the `tls.Conn` and its input and
   handshake buffers are released, keeping only the keys and sequence numbers.
-- **Opt-in object reuse for HTTP/1.** `Config.ReuseRequests`, `ReuseHeaders`, `ReuseURLs` and
-  `ReuseContexts` recycle request objects, under the same lifetime rule as fasthttp.
+- **Object reuse for HTTP/1, on by default.** `Config.ReuseRequests`, `ReuseHeaders`, `ReuseURLs`
+  and `ReuseContexts` recycle request objects, under the same lifetime rule as fasthttp and Fiber;
+  each can be turned off. `Context.Body` and `Context.Query` read the body and the query without
+  copying them.
 
 ## Benchmarks
 

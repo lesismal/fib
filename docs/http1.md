@@ -256,13 +256,18 @@ default.
 ### Recycling request objects
 
 `Config.ReuseRequests`, `ReuseHeaders`, `ReuseURLs` and `ReuseContexts`,
-each off by default, recycle the `*http.Request`, its `Header`, its `URL` and
-the `*Context` of an HTTP/1 request once its response is finished, instead
-of leaving a request's worth of them to the collector for every request. At
-a high request rate collecting them is what holds a server back: in
-go-http-benchmark's pipelined test, 10,000 connections on three cores went
+all on in `DefaultConfig`, recycle the `*http.Request`, its `Header`, its
+`URL` and the `*Context` of an HTTP/1 request once its response is finished,
+instead of leaving a request's worth of them to the collector for every
+request. At a high request rate collecting them is what holds a server back:
+in go-http-benchmark's pipelined test, 10,000 connections on three cores went
 from 1.77-1.81M to 1.99M responses a second with all four on, the most the
-client asks for, at less CPU.
+client asks for, at less CPU. On many cores it matters more, since one heap
+serves every core: in HttpArena's HTTP/1 profiles on 64 CPUs, leaving them to
+the collector held the server at 1.23M requests a second in the baseline
+profile and 5.7M in the pipelined one, on 36 and 27 of the CPUs, the rest
+waiting on the runtime's heap lock, against 1.63M and 15.0M recycling them.
+Set an option to false to have its object left to the collector instead.
 
 What they ask of a handler is fasthttp's rule for its `RequestCtx`: a
 recycled object is the handler's until it is done with the request: it has
@@ -275,10 +280,31 @@ of what is needed instead, as `http.Request.Clone` and `http.Header.Clone`
 make. A `Context` waiting for its next request reads as finished, so a stray
 `Retain`, `Release` or `Respond` on one does nothing.
 
+This is the rule Fiber, Gin and Echo have for their contexts as well. A
+handler written for `net/http` that keeps the `*http.Request` after it
+returns, say in a goroutine it starts without a `Retain`, turns
+`ReuseRequests` off, or takes `r.Clone(ctx)` first.
+
 Each option recycles its own object, so a handler that keeps only, say, the
 `Context` can recycle the rest. A request whose body streams, and one outside
 the shape the server parses itself (which `net/http` parses instead), keep
 their `Request`, `Header` and `URL` whatever the options say.
+
+### Reading the body and the query without copying
+
+`Context.Body()` returns the request body that arrived whole before the
+handler ran, as every body does that does not stream: the server's own buffer,
+where `io.ReadAll(r.Body)` copies it out through a buffer it grows a piece at
+a time. The bytes are the handler's for as long as the body is, until the
+response is finished, and must be neither changed nor kept past that.
+`Respond` and `Write` copy what they are given, so an echo answers with
+`c.Respond(200, "application/octet-stream", c.Body())`. For a body that
+streams, `Body` returns nil.
+
+`Context.Query(name)` returns the first value of a query parameter, decoded
+as `r.URL.Query().Get(name)` decodes it, without building the map `Query`
+builds on every call; a value that needs no decoding is a slice of the raw
+query and costs no allocation.
 
 ### Zero-copy file sending
 

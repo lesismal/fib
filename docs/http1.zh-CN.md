@@ -204,11 +204,14 @@ handler 收下 128MB 的上传并计数：整体缓存时堆内存峰值约 470M
 
 ### 复用请求对象
 
-`Config.ReuseRequests`、`ReuseHeaders`、`ReuseURLs`、`ReuseContexts` 默认都关闭。
-打开后，HTTP/1 请求的 `*http.Request`、它的 `Header`、`URL` 以及 `*Context` 会在响应
-结束后回收复用，而不是每个请求都留一整套对象给 GC。请求速率很高时，回收这些对象正是
+`Config.ReuseRequests`、`ReuseHeaders`、`ReuseURLs`、`ReuseContexts` 在 `DefaultConfig`
+中默认全部开启：HTTP/1 请求的 `*http.Request`、它的 `Header`、`URL` 以及 `*Context` 会在
+响应结束后回收复用，而不是每个请求都留一整套对象给 GC。请求速率很高时，回收这些对象正是
 server 的瓶颈：go-http-benchmark 的流水线测试里，3 核 1 万连接从每秒 177–181 万响应
-提升到 199 万（即客户端请求的上限），CPU 还更少。
+提升到 199 万（即客户端请求的上限），CPU 还更少。核数越多影响越大，因为所有核共用一个堆：
+HttpArena 的 HTTP/1 测试在 64 核上，不复用时 baseline 只有每秒 123 万请求、pipelined
+570 万，只用到 36 和 27 个核，其余都在等 runtime 的堆锁；复用后分别是 163 万和 1500 万。
+把某个选项设为 false 即可让对应对象交回 GC。
 
 对 handler 的要求与 fasthttp 对 `RequestCtx` 的要求相同：被复用的对象在 handler 用完
 这个请求之前都属于它，即 handler 已经返回，并且释放了它取得的每一个 `Retain`。被 Retain
@@ -218,9 +221,24 @@ server 的瓶颈：go-http-benchmark 的流水线测试里，3 核 1 万连接�
 自己保留副本，比如用 `http.Request.Clone`、`http.Header.Clone`。等待下一个请求的
 `Context` 处于已结束状态，误调用的 `Retain`、`Release`、`Respond` 不会产生任何作用。
 
+Fiber、Gin、Echo 对各自的 context 也是这条规则。为 `net/http` 写的 handler 如果在返回后
+还持有 `*http.Request`（比如交给一个没有 `Retain` 的 goroutine），请关闭 `ReuseRequests`，
+或者先 `r.Clone(ctx)`。
+
 每个选项只管自己那个对象，所以比如只持有 `Context` 的 handler 可以复用其余对象。流式
 body 的请求，以及不在 server 自行解析范围内、改由 `net/http` 解析的请求，无论选项如何
 都不复用 `Request`、`Header`、`URL`。
+
+### 不拷贝地读取 body 与 query
+
+`Context.Body()` 返回 handler 运行前已整体读完的请求 body（不走流式的 body 都是如此），
+即 server 自己的 buffer；`io.ReadAll(r.Body)` 则要用一个逐步增长的 buffer 再拷贝一遍。
+这些字节在 body 有效期内（直到响应结束）属于 handler，不能修改，也不能保留到之后。
+`Respond` 和 `Write` 都会拷贝传入的数据，所以 echo 可以直接
+`c.Respond(200, "application/octet-stream", c.Body())`。流式 body 时 `Body` 返回 nil。
+
+`Context.Query(name)` 返回某个 query 参数的第一个值，解码方式与 `r.URL.Query().Get(name)`
+相同，但不像 `Query` 那样每次都构建 map；不需要解码的值直接是原始 query 的子串，零分配。
 
 ### 零拷贝发送文件
 
