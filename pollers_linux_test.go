@@ -25,13 +25,22 @@ func acceptsConnections(t *testing.T, fd int) bool {
 	return listening != 0
 }
 
-// With ReusePort, each poller listens on a socket of its own, bound where
-// the engine's is, and accepts its connections itself; the engine's socket
-// only holds the address and the port the kernel chose, and takes none.
+// Each poller listens on a TCP socket of its own, bound where the engine's
+// is, and accepts its connections itself, with ReusePort or without it; the
+// engine's socket only holds the address and the port the kernel chose, and
+// takes none.
 func TestPollersAcceptWithReusePort(t *testing.T) {
+	for _, reusePort := range []bool{true, false} {
+		t.Run("ReusePort="+strconv.FormatBool(reusePort), func(t *testing.T) {
+			testPollersAccept(t, reusePort)
+		})
+	}
+}
+
+func testPollersAccept(t *testing.T, reusePort bool) {
 	const pollers, conns = 3, 30
 	config := pollerConfig("pollers-reuseport", pollers)
-	config.ReusePort = true
+	config.ReusePort = reusePort
 	opened := make(chan *Connection, conns)
 	server, addr := startEchoServer(t, config, HandlerFuncs{
 		Open: func(c *Connection) { opened <- c },
@@ -105,6 +114,58 @@ func TestPollersAcceptWithReusePort(t *testing.T) {
 	if len(used) < 2 {
 		t.Fatalf("%d connections landed on %d poller(s)", conns, len(used))
 	}
+}
+
+// Without ReusePort the pollers still listen with SO_REUSEPORT, but an
+// address another socket holds is refused as it would be without pollers,
+// whether a plain listener holds it or another engine.
+func TestPollersRefuseAddressInUse(t *testing.T) {
+	held, err := net.Listen("tcp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer held.Close()
+	config := pollerConfig("pollers-in-use", 2)
+	config.Addr = held.Addr().String()
+	if e, err := Bind(config, HandlerFuncs{}); err == nil {
+		e.Close()
+		t.Fatalf("bound %s, which a listener holds", config.Addr)
+	} else if !errors.Is(err, syscall.EADDRINUSE) {
+		t.Fatalf("bind error = %v, want EADDRINUSE", err)
+	}
+
+	config.Addr = "127.0.0.1:0"
+	first, err := Bind(config, HandlerFuncs{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer first.Close()
+	addr, err := first.LocalAddr()
+	if err != nil {
+		t.Fatal(err)
+	}
+	config.Addr = addr.String()
+	if e, err := Bind(config, HandlerFuncs{}); err == nil {
+		e.Close()
+		t.Fatalf("a second engine bound %s", config.Addr)
+	} else if !errors.Is(err, syscall.EADDRINUSE) {
+		t.Fatalf("second bind error = %v, want EADDRINUSE", err)
+	}
+	// With ReusePort both ask to share it, and do.
+	config.ReusePort = true
+	config.Addr = "127.0.0.1:0"
+	a, err := Bind(config, HandlerFuncs{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer a.Close()
+	addr, _ = a.LocalAddr()
+	config.Addr = addr.String()
+	b, err := Bind(config, HandlerFuncs{})
+	if err != nil {
+		t.Fatalf("ReusePort engines could not share %s: %v", config.Addr, err)
+	}
+	b.Close()
 }
 
 // A Unix socket has no SO_REUSEPORT to share, so its engine keeps accepting

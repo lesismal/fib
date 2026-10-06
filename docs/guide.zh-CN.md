@@ -906,7 +906,7 @@ pattern 语法：
 - **与 chi 的差异**：`Route` 不是嵌套的子 Router，而是把路由直接并入同一棵树，请求只走一次查找；
   只有 `Mount` 才是嵌套路由。同一方法、同一 pattern 重复注册会 panic，而不是静默覆盖。
 - **性能**：radix tree，静态子节点按首字节索引，只有存在可回溯分支的节点才递归；参数值是路径的子串，
-  不拷贝。路由状态挂在 `Context` 上，开启 `Config.ReuseContexts` 时随 Context 复用，路由一个请求零分配；
+  不拷贝。路由状态挂在 `Context` 上，`Config.ReuseContexts`（默认开启）时随 Context 复用，路由一个请求零分配；
   不复用时，带参数（或经过 `Mount`）的请求分配一次。注册路由与服务请求不能并发进行。
 
 `http/routerbench` 是单独的 module，在 GitHub API 的 203 条路由上对比 fib、chi 与 `http.ServeMux`
@@ -1333,14 +1333,16 @@ Engine 的 worker 池（`<Name>-workers`），每条连接的每一轮都在 wor
   请求/s，1 个 poller 584k，3 个 poller 569k，p99 从 25ms 升到 37ms；4 个 CPU 的 HTTP/2 echo，
   1 个 poller 411k、4 个 399k，p99 从 55ms 升到 64ms。poller 自己的工作（accept、
   注册连接、被唤醒）成为瓶颈时，多开 poller 才划算。
-- Linux 上同时设置 `Config.ReusePort` 时，accept 也移到 poller 上：每个 poller 在 Engine 的地址上
-  用 `SO_REUSEPORT` 监听一个自己的 socket，自己 accept 内核按连接地址哈希分给它的连接；
-  Engine 自己的 socket 只 bind（占住地址和内核选的端口）不 listen。不设置时 Engine 自己的循环
-  accept 所有连接，再逐条唤醒接手的 poller，于是 accept 的速度被这一个循环封顶，与核数无关：
-  每 10 条消息就重连一次的 WebSocket echo 在 64 核上停在约 9.5 万连接/s、35 个核。代价是
-  均衡：连接留在哈希选中的 poller 上，不管它多忙。Unix socket 和其他平台仍由 Engine 自己的
-  循环 accept；macOS 的 `SO_REUSEPORT` 不在多个 socket 之间分摊 TCP 连接。`ReusePort` 也让
-  同一用户的其他进程可以监听同一地址并分走连接。
+- Linux 上 TCP 的 accept 在 poller 上进行，不论是否设置 `Config.ReusePort`：每个 poller 在 Engine 的
+  地址上用 `SO_REUSEPORT` 监听一个自己的 socket，自己 accept 内核按连接地址哈希分给它的连接；
+  Engine 自己的 socket 只 bind（占住地址和内核选的端口）不 listen。以前由 Engine 自己的循环
+  accept 所有连接、再逐条唤醒接手的 poller，accept 的速度被这一个循环封顶，与核数无关：HttpArena
+  的 limited-conn（每条连接 10 个请求、同时 4096 条，64 核）这样只有每秒 94 万请求，poller 自己
+  accept 后是 165 万。代价是均衡：连接留在哈希选中的 poller 上，不管它多忙。不设置 `ReusePort`
+  时，Engine 先用一个不带 `SO_REUSEPORT` 的 socket 试 bind 这个地址，地址已被占用就照常返回
+  `EADDRINUSE`，之后也只有自己设置了 `SO_REUSEPORT` 的 socket 能加入；设置 `ReusePort` 则是明确
+  允许同一用户的其他进程监听同一地址并分走连接（例如平滑重启）。Unix socket 和其他平台仍由
+  Engine 自己的循环 accept；macOS 的 `SO_REUSEPORT` 不在多个 socket 之间分摊 TCP 连接。
 - `Dial` / `DialWithHandler` 发起的连接（TCP、UDP、Unix socket）也同样按 fd 取模分到 poller 上。
 - UDP server 默认只有一个 socket，各个 peer 共用它，所以留在 Engine 自己的循环上。Linux 上设置
   `ReusePort` 时，UDP 地址也改由 poller 读：每个 poller 在这个地址上用 `SO_REUSEPORT` bind 一个
@@ -1364,7 +1366,7 @@ Engine 的 worker 池（`<Name>-workers`），每条连接的每一轮都在 wor
 config := fib.DefaultConfig() // CPU 多于 4 个时默认已开启 IOPollers
 config.IOPollers = true       // 4 核及以下也要 poller 时显式打开
 config.IOPollerCount = 0      // max(1, NumCPU/4)
-config.ReusePort = true       // Linux：每个 poller 自己 accept
+config.ReusePort = true       // 允许其他进程共享地址；UDP 也改由各 poller 读
 
 single := fib.DefaultConfig()
 single.IOPollers = false // 单个 event loop，同样把每一轮交给 worker 池

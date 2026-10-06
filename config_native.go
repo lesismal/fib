@@ -154,18 +154,25 @@ type Config struct {
 	// user, may listen on the same address and share its connections, or
 	// its datagrams.
 	//
-	// Under IOPollers on Linux it also moves accepting onto the pollers: each
-	// poller listens on a socket of its own, bound to the engine's address,
-	// and accepts the connections the kernel spreads onto that socket by a
-	// hash of their addresses. Without it, the engine's own loop accepts
-	// every connection and then wakes the poller it hands it to, and one loop
-	// doing that for every connection caps how fast connections are accepted
-	// however many cores there are to serve them. What it gives up is
-	// balance: a connection stays with the poller its hash picked, however
-	// busy that poller is. Unix sockets, and the other platforms, keep the
-	// engine's loop accepting.
+	// Under IOPollers on Linux the pollers accept TCP connections themselves
+	// whether or not it is set: each poller listens on a socket of its own,
+	// bound to the engine's address with SO_REUSEPORT, and accepts the
+	// connections the kernel spreads onto that socket by a hash of their
+	// addresses. The engine's own loop accepting every connection and waking
+	// the poller it hands it to capped how fast connections were accepted
+	// however many cores there were to serve them: HttpArena's limited-conn
+	// profile, ten requests a connection over 4096 at a time on 64 CPUs,
+	// served 0.94M requests a second that way and 1.65M with the pollers
+	// accepting. What it gives up is balance: a connection stays with the
+	// poller its hash picked, however busy that poller is. Without
+	// ReusePort the engine first claims the address with a socket bound
+	// without SO_REUSEPORT, so that an address another socket holds is
+	// refused with EADDRINUSE as it always was, and only a socket that sets
+	// SO_REUSEPORT itself can join the engine's afterwards. Unix sockets, and
+	// the other platforms, keep the engine's loop accepting.
 	//
-	// On a UDP address it does the same for datagrams: each poller reads a
+	// On a UDP address it has the pollers read datagrams in the same way,
+	// which they do only with it set: each poller reads a
 	// socket of its own bound there, and the kernel hands each datagram to
 	// one of the sockets by a hash of its source and destination addresses,
 	// waking only the poller that reads it. A peer's datagrams therefore all

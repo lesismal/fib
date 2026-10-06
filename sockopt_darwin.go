@@ -11,3 +11,7 @@ const soReusePort = syscall.SO_REUSEPORT
 // spreading connections over all of them, so the pollers cannot each accept
 // their own; see Config.ReusePort.
 const reusePortSpreads = false
+
+// acceptedInheritNoDelay is false: each accepted connection is given
+// TCP_NODELAY itself.
+const acceptedInheritNoDelay = false

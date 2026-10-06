@@ -71,7 +71,7 @@ func (e *Engine) connectSocket(d *dialRequest) (c *Connection, connected bool, e
 		syscall.Close(fd)
 		return nil, false, err
 	}
-	token := uint64(uint32(fd)) | e.nextGeneration.Add(1)<<32
+	token := e.newToken(fd)
 	c = &Connection{engine: e, handler: d.handler, dialing: d, dialed: true, unix: isUnixNetwork(d.network)}
 	c.token = token
 	c.fd.Store(int32(fd))
@@ -104,7 +104,7 @@ func (e *Engine) connectDatagram(d *dialRequest) (c *Connection, connected bool,
 		syscall.Close(fd)
 		return nil, false, err
 	}
-	token := uint64(uint32(fd)) | e.nextGeneration.Add(1)<<32
+	token := e.newToken(fd)
 	c = &Connection{engine: e, handler: d.handler, dialing: d, dialed: true,
 		udp: &udpState{raddr: &net.UDPAddr{IP: d.raddr.IP, Port: d.raddr.Port, Zone: d.raddr.Zone}}}
 	c.token = token

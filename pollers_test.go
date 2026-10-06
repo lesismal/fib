@@ -30,6 +30,12 @@ func checkPoller(t *testing.T, e *Engine, c *Connection, fd int) {
 	t.Helper()
 	if fd < 0 {
 		t.Errorf("connection has no descriptor")
+	} else if e.pollersListen && !c.dialed {
+		// The pollers accept for themselves, each the connections the kernel
+		// hands its own socket.
+		if c.engine.parent != e {
+			t.Errorf("descriptor %d is served by %p, want one of the engine's pollers", fd, c.engine)
+		}
 	} else if want := e.pollers[fd%len(e.pollers)]; c.engine != want {
 		t.Errorf("descriptor %d is served by %p, want poller %p", fd, c.engine, want)
 	}

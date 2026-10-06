@@ -30,8 +30,10 @@ func TestDefaultConfigPoolSizing(t *testing.T) {
 	}
 	// The event batch sizes the task queue, which has to be able to hold a
 	// round's worth of runnable connections; a queue narrower than the pool
-	// would make the event loop wait on workers it has already woken.
-	if config.MaxEvents < config.WorkerCount {
+	// would make the event loop wait on workers it has already woken. Past
+	// maxMaxEvents it is capped rather than grown with the pool, which it is
+	// on 100 CPUs and more.
+	if config.MaxEvents < config.WorkerCount && config.MaxEvents != maxMaxEvents {
 		t.Fatalf("MaxEvents = %d, want at least WorkerCount %d", config.MaxEvents, config.WorkerCount)
 	}
 	if !config.UseWritev {

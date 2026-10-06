@@ -162,7 +162,7 @@ func (e *Engine) open(config Config, addrs []string) error {
 		// address, and the port the kernel chose for it: were it to listen
 		// too, it would be handed a share of the connections that nothing
 		// accepts.
-		fd, err := createListener(config, addr, !e.pollersListen)
+		fd, err := createListener(config, addr, !e.pollersListen, e.pollersListen)
 		if err != nil {
 			e.closeListeners()
 			return err
@@ -213,6 +213,14 @@ func (e *Engine) closeListeners() {
 	}
 	e.udpListeners = nil
 	e.removeUnixPaths()
+}
+
+// newToken pairs fd with the next generation. The engine and its pollers
+// draw on one counter, the engine's, so that a descriptor reused on another
+// poller, which accepting on sockets of their own lets happen, still comes
+// back with a token of its own.
+func (e *Engine) newToken(fd int) uint64 {
+	return uint64(uint32(fd)) | e.root().nextGeneration.Add(1)<<32
 }
 
 func listenerToken(fd int) uint64 { return uint64(uint32(fd)) | listenerKind<<32 }
@@ -473,7 +481,7 @@ func (e *Engine) acceptConnections(listenFD int) {
 		if err != nil {
 			return
 		}
-		if e.tcpListeners {
+		if e.tcpListeners && !acceptedInheritNoDelay {
 			// Replies are written whole, so Nagle would only hold a small
 			// one back until the peer's delayed ACK.
 			_ = syscall.SetsockoptInt(fd, syscall.IPPROTO_TCP, syscall.TCP_NODELAY, 1)
@@ -512,7 +520,7 @@ func (e *Engine) admit(c *Connection, fd int) {
 	// The token pairs the descriptor with a generation: the descriptor
 	// indexes the table, and the generation makes an event left over from a
 	// previous owner of the same descriptor resolve to nothing.
-	token := uint64(uint32(fd)) | e.nextGeneration.Add(1)<<32
+	token := e.newToken(fd)
 	c.token = token
 	c.fd.Store(int32(fd))
 	// Write interest is registered up front and never modified again. The
@@ -592,20 +600,63 @@ func (e *Engine) Close() error {
 
 // pollersListen reports whether config has each poller listen on a socket
 // of its own, accepting its TCP connections or reading its UDP datagrams
-// itself; see Config.ReusePort.
+// itself. Under IOPollers it does for TCP whatever ReusePort says, where
+// SO_REUSEPORT spreads connections; see Config.ReusePort. UDP needs
+// ReusePort, since a peer's datagrams move between sockets as sockets join.
 func pollersListen(config Config) bool {
-	return config.ReusePort && reusePortSpreads && pollerCount(config) > 0 &&
-		!isUnixNetwork(config.Network)
+	return (config.ReusePort || !isUDPNetwork(config.Network)) && reusePortSpreads &&
+		pollerCount(config) > 0 && !isUnixNetwork(config.Network)
 }
 
 // createListener opens a socket bound to addr, and listening on it unless
-// listen is false.
-func createListener(config Config, addr string, listen bool) (int, error) {
+// listen is false. spread binds it with SO_REUSEPORT for the engine's pollers
+// to listen beside it. Without Config.ReusePort, which would let other
+// sockets share the address, the address is claimed first by a socket bound
+// without SO_REUSEPORT, so that one another socket holds already is refused
+// with EADDRINUSE, as it is without pollers: see claimAddress.
+func createListener(config Config, addr string, listen, spread bool) (int, error) {
 	family, bound, err := resolveListenAddr(config.Network, addr)
 	if err != nil {
 		return -1, err
 	}
-	return listenSocket(config, family, bound, listen)
+	reusePort := config.ReusePort
+	if spread && !reusePort {
+		if bound, err = claimAddress(config, family, bound); err != nil {
+			return -1, err
+		}
+		reusePort = true
+	}
+	return listenSocket(config, family, bound, listen, reusePort)
+}
+
+// claimAddress binds a socket to bound without SO_REUSEPORT, which fails if
+// any other socket holds the address, and gives it up again, returning the
+// address it was bound to: bound itself, with the port the kernel chose when
+// bound left that to it. The engine's sockets then bind there with
+// SO_REUSEPORT. Only a socket that sets SO_REUSEPORT itself, under the same
+// user, can join them afterwards, which is what Config.ReusePort asks for and
+// an engine without it does not, so a second server on the address fails as
+// it would have.
+func claimAddress(config Config, family int, bound syscall.Sockaddr) (syscall.Sockaddr, error) {
+	fd, err := newSocket(family)
+	if err != nil {
+		return nil, err
+	}
+	defer syscall.Close(fd)
+	_ = syscall.SetsockoptInt(fd, syscall.SOL_SOCKET, syscall.SO_REUSEADDR, 1)
+	if family == syscall.AF_INET6 {
+		// As listenSocket binds it, so that the claim covers what the
+		// listener will.
+		v6only := 0
+		if config.Network == "tcp6" {
+			v6only = 1
+		}
+		_ = syscall.SetsockoptInt(fd, syscall.IPPROTO_IPV6, syscall.IPV6_V6ONLY, v6only)
+	}
+	if err := syscall.Bind(fd, bound); err != nil {
+		return nil, err
+	}
+	return syscall.Getsockname(fd)
 }
 
 // createListenerLike opens a socket listening where like is bound, which
@@ -619,17 +670,22 @@ func createListenerLike(config Config, like int) (int, error) {
 	if _, ok := bound.(*syscall.SockaddrInet6); ok {
 		family = syscall.AF_INET6
 	}
-	return listenSocket(config, family, bound, true)
+	return listenSocket(config, family, bound, true, true)
 }
 
-func listenSocket(config Config, family int, bound syscall.Sockaddr, listen bool) (int, error) {
+func listenSocket(config Config, family int, bound syscall.Sockaddr, listen, reusePort bool) (int, error) {
 	fd, err := newSocket(family)
 	if err != nil {
 		return -1, err
 	}
 	if family != syscall.AF_UNIX {
 		_ = syscall.SetsockoptInt(fd, syscall.SOL_SOCKET, syscall.SO_REUSEADDR, 1)
-		if config.ReusePort {
+		if acceptedInheritNoDelay {
+			// Set once here rather than on every connection accepted, which
+			// takes it over from the listener.
+			_ = syscall.SetsockoptInt(fd, syscall.IPPROTO_TCP, syscall.TCP_NODELAY, 1)
+		}
+		if reusePort {
 			if err = syscall.SetsockoptInt(fd, syscall.SOL_SOCKET, soReusePort, 1); err != nil {
 				syscall.Close(fd)
 				return -1, err
