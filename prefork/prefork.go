@@ -4,10 +4,10 @@
 // collection in many small processes than in one with a P for every CPU,
 // where every collection's mark phase shares its work buffers, and every span
 // its heap lock, between all the Ps. On 64 CPUs a single process spent 66µs
-// of user time on each request of HttpArena's json-tls profile, two thirds
-// more than the 43µs a child of one P spent, and served 0.56M requests a
-// second against 0.99M; latency-1m's 99th percentile fell from 1.6ms to
-// 157µs, on a quarter fewer cores.
+// of user time on each request of HttpArena's json-tls profile, against the
+// 46µs of a child of one or two Ps, and served 0.56M requests a second
+// against 0.87M to 0.99M; latency-1m's 99th percentile fell from 1.6ms to
+// 124µs, on a quarter fewer cores.
 //
 // The process Run is called in becomes the master. It starts the children,
 // each running the same program with the same arguments, and serves nothing
@@ -49,13 +49,17 @@ const (
 )
 
 // DefaultProcsPerChild is the GOMAXPROCS a child runs with when
-// Config.ProcsPerChild leaves it to the package: one, as fasthttp's prefork
-// gives each child. On 64 CPUs, one child per CPU served HttpArena's
-// json-tls profile at 0.99M requests a second, against 0.87M with two Ps a
-// child, 0.88M with four and 0.56M from a single process; baseline at 3.68M
-// against 3.53M, 3.24M and 2.79M; and limited-conn, which reconnects every
-// ten requests, at 2.92M against 2.74M, 2.42M and 1.63M.
-const DefaultProcsPerChild = 1
+// Config.ProcsPerChild leaves it to the package: two. A child of one P has
+// nothing to run anything else on while its event loop, or a handler,
+// waits in a system call, and each wait for an event costs it a trip
+// through the runtime's poller as well as its own; see fib's epollWaiter.
+// On 64 CPUs, against 64 children of one P, 32 of two served HttpArena's
+// async profile, 32000 connections each waiting 10ms in its handler, at
+// 1.94M requests a second against 1.73M, and latency-1m on 25 cores against
+// 33, with a 99th percentile of 124us against 174us; they served baseline
+// at 3.51M against 3.72M and json-tls at 0.87M against 0.99M. A single
+// process served 1.61M, 2.79M and 0.56M, with a 99th percentile of 1.6ms.
+const DefaultProcsPerChild = 2
 
 // DefaultShutdownTimeout is how long the master waits for its children to
 // exit, once it has asked them to, when Config.ShutdownTimeout leaves it to

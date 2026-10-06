@@ -1339,14 +1339,18 @@ func main() {
 ```
 
 为什么需要它：每个子进程有自己的堆和 GC。一个进程里有 64 个 P 时，GC 标记阶段的工作缓冲区、
-堆的锁由所有 P 共用，分配多的服务大部分时间花在这上面而不是请求上。64 核的 HttpArena 实测（每个
-子进程 1 个 P，对比单进程）：json-tls 每秒 56 万请求到 99 万（每请求用户态 CPU 66µs 降到 43µs），
-baseline 279 万到 368 万，limited-conn 163 万到 292 万，pipelined 1820 万到 2670 万，latency-1m
-的 p99 从 1.6ms 降到 157µs、同时少用四分之一的核。
+堆的锁由所有 P 共用，分配多的服务大部分时间花在这上面而不是请求上。64 核的 HttpArena 实测（默认
+32 个子进程、每个 2 个 P，对比单进程）：json-tls 每秒 56 万请求到 87 万（每请求用户态 CPU 66µs
+降到 46µs），baseline 279 万到 351 万，limited-conn 163 万到 273 万，pipelined 1820 万到 2540 万，
+async 161 万到 194 万，latency-1m 的 p99 从 1.6ms 降到 124µs、同时少用四分之一的核。
 
-- `Config.ProcsPerChild` 是每个子进程的 GOMAXPROCS，默认 `DefaultProcsPerChild`（1）：同样 64 核，
-  每子进程 2 个 P 的 json-tls 87 万、4 个 P 88 万，baseline 353 万、324 万，都不如 1 个 P。
-  `Config.Children` 是子进程数，默认 master 的 GOMAXPROCS 除以 `ProcsPerChild`（向上取整）。
+- `Config.ProcsPerChild` 是每个子进程的 GOMAXPROCS，默认 `DefaultProcsPerChild`（2）。1 个 P 的
+  子进程在事件循环或 handler 停在系统调用里时没有别的 P 可用，每次等事件还要多经过一次运行时的
+  netpoller（GOMAXPROCS 为 1 时单个事件循环停在 netpoller 里等，否则 handler 里的定时器要等到
+  循环醒来）。同样 64 核，64 个 1 P 的子进程对比 32 个 2 P 的：json-tls 99 万对 87 万、baseline
+  372 万对 351 万更高，但 async 173 万对 194 万、latency-1m 用 33 个核对 25 个、p99 174µs 对
+  124µs 更差；4 个 P 的子进程除 json-tls 持平外都不如 2 个 P。`Config.Children` 是子进程数，默认 master 的
+  GOMAXPROCS 除以 `ProcsPerChild`（向上取整）。
   子进程的 GOMAXPROCS 小，fib 的默认值随之变化：CPU 数取 `runtime.NumCPU()` 与 GOMAXPROCS 中
   较小的那个，4 个 P 及以下不开 IOPollers，每个 Engine 只有自己的一个循环。
 - 调用 `Run` 之前的代码 master 和每个子进程都会执行一遍，只有子进程需要的初始化（加载数据、连接池）

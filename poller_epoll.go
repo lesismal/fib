@@ -5,6 +5,7 @@ package fib
 import (
 	"encoding/binary"
 	"os"
+	"runtime"
 	"syscall"
 
 	"github.com/lesismal/fib/taskpool"
@@ -85,7 +86,7 @@ func (e *Engine) runLoop() error {
 	var ready []*Connection
 	var tasks []taskpool.Task
 	var waiter *epollWaiter
-	if len(e.root().pollers) > 0 {
+	if len(e.root().pollers) > 0 || runtime.GOMAXPROCS(0) == 1 {
 		waiter = newEpollWaiter(e.epollFD)
 		defer waiter.close()
 	}
@@ -153,11 +154,19 @@ func (e *Engine) runLoop() error {
 // measured the CPUs 0 to 2% idle, and HTTP/1 over 10k connections accepted
 // them 19% faster, with echoes unchanged.
 //
-// Only the loops of an engine with pollers wait this way. The runtime looks
-// for a parked goroutine's events only when a P runs out of work, or every
-// 10ms under load, and a lone loop, which every connection waits on, waited
-// longer for that than for its P back: the HTTP/1 benchmark accepted
-// connections 15% slower and echoed 2% slower with it parked.
+// Only the loops of an engine with pollers wait this way, and a lone loop
+// where GOMAXPROCS is 1. The runtime looks for a parked goroutine's events
+// only when a P runs out of work, or every 10ms under load, and a lone loop,
+// which every connection waits on, waited longer for that than for its P
+// back: the HTTP/1 benchmark accepted connections 15% slower and echoed 2%
+// slower with it parked. With one P, though, a loop blocked in epoll_wait
+// holds the only P there is, and nothing else runs until events arrive or
+// the monitor takes it back, which an idle monitor checks for every 10ms:
+// not the timers of handlers sleeping on the workers, nor the goroutines a
+// response from elsewhere wakes. In a child of package prefork with one P,
+// HttpArena's async profile, 32000 connections each waiting 10ms in its
+// handler, served 1.27M requests a second with the loop blocking, with 26.6ms
+// for the median request, and with two Ps 2.02M.
 //
 // The runtime's poller watches a duplicate of the descriptor, so that the
 // engine keeps closing its own as before. Where that cannot be set up, wait
