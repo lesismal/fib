@@ -42,13 +42,30 @@ func benchmarkServer(b *testing.B, request []byte) {
 	benchmarkServerWith(b, DefaultConfig(), request)
 }
 
-func benchmarkServerWith(b *testing.B, config Config, request []byte) {
-	const connections = 8
-	reply := []byte("hello")
+// BenchmarkServerKeepAliveHooked is BenchmarkServerKeepAlive with an
+// OnResponse hook on every response, as a middleware such as compress
+// registers one.
+func BenchmarkServerKeepAliveHooked(b *testing.B) {
+	benchmarkServerHandler(b, DefaultConfig(), []byte("GET /hello HTTP/1.1\r\nHost: localhost\r\nUser-Agent: bench\r\nAccept: */*\r\n\r\n"),
+		HandlerFunc(func(c *Context, r *stdhttp.Request) {
+			c.OnResponse(func(*Response) {})
+			_ = c.Respond(stdhttp.StatusOK, "text/plain", benchReply)
+		}))
+}
 
-	server, addr := startBenchServer(b, config, HandlerFunc(func(c *Context, r *stdhttp.Request) {
-		_ = c.Respond(stdhttp.StatusOK, "text/plain", reply)
+var benchReply = []byte("hello")
+
+func benchmarkServerWith(b *testing.B, config Config, request []byte) {
+	benchmarkServerHandler(b, config, request, HandlerFunc(func(c *Context, r *stdhttp.Request) {
+		_ = c.Respond(stdhttp.StatusOK, "text/plain", benchReply)
 	}))
+}
+
+func benchmarkServerHandler(b *testing.B, config Config, request []byte, handler Handler) {
+	const connections = 8
+	reply := benchReply
+
+	server, addr := startBenchServer(b, config, handler)
 	defer server()
 
 	perConnection := (b.N + connections - 1) / connections

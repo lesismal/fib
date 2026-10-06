@@ -11,6 +11,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -156,5 +157,68 @@ func TestReuseWaitsForTheLastRelease(t *testing.T) {
 		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("the retained request never finished")
+	}
+}
+
+// TestRecycledHooksStayWithTheirRequest serves requests that register hooks
+// alternately with ones that register others, on one connection, so that
+// each reuses the Context, response writer and hooks the one before it had,
+// and Respond's pooled header: a field one request's hook added must not
+// reach the next response, and no hook may run for a request but its own.
+func TestRecycledHooksStayWithTheirRequest(t *testing.T) {
+	config := DefaultConfig()
+	var seq atomic.Int64
+	var ran sync.Map
+	addr := serve(t, NewHandlerWithConfig(config, HandlerFunc(func(c *Context, r *stdhttp.Request) {
+		path := r.URL.Path
+		switch path {
+		case "/tag":
+			c.OnHeader(func(_ int, h stdhttp.Header) { h.Set("X-Tag", "tag") })
+		case "/strip":
+			// As a 304 does: Content-Type goes, and a field of the hook's
+			// own is all the header has left.
+			c.OnResponse(func(response *Response) {
+				delete(response.Header, "Content-Type")
+				response.Header["X-Tag"] = []string{"strip"}
+			})
+		default:
+			c.OnResponse(func(*Response) {})
+		}
+		id := seq.Add(1)
+		c.OnFinish(func(int, stdhttp.Header, int64) {
+			if _, loaded := ran.LoadOrStore(id, path); loaded {
+				t.Errorf("%s: finish hook ran twice", path)
+			}
+		})
+		_ = c.Respond(stdhttp.StatusOK, "text/plain", []byte(path))
+	})))
+	conn := dialRaw(t, addr)
+	paths := []string{"/tag", "/plain", "/strip", "/plain"}
+	for i := 0; i < 50; i++ {
+		path := paths[i%len(paths)]
+		conn.send("GET " + path + " HTTP/1.1\r\nHost: x\r\n\r\n")
+		resp, body := conn.response("GET")
+		if string(body) != path {
+			t.Fatalf("%s: body %q", path, body)
+		}
+		if got, want := resp.Header.Get("X-Tag"), map[string]string{"/tag": "tag", "/strip": "strip"}[path]; got != want {
+			t.Fatalf("%s: X-Tag %q, want %q", path, got, want)
+		}
+		if got, want := resp.Header.Get("Content-Type"), map[bool]string{false: "text/plain"}[path == "/strip"]; got != want {
+			t.Fatalf("%s: Content-Type %q, want %q", path, got, want)
+		}
+	}
+	// The last finish hook runs once its response is handed over, which
+	// the client can have read by then.
+	finished := 0
+	for deadline := time.Now().Add(5 * time.Second); ; time.Sleep(time.Millisecond) {
+		finished = 0
+		ran.Range(func(any, any) bool { finished++; return true })
+		if finished >= 50 || time.Now().After(deadline) {
+			break
+		}
+	}
+	if finished != 50 {
+		t.Fatalf("%d finish hooks ran for 50 requests", finished)
 	}
 }

@@ -140,6 +140,12 @@ func (c *Context) recycle() {
 	c.word.Store(withState(gen<<ctxGenShift, ctxDone))
 	c.Conn, c.Request = nil, nil
 	c.wrote, c.closing, c.streamed = true, false, false
+	if w := c.w; w != nil {
+		// Nothing reaches the writer but through the Context, so it is as
+		// free to serve another request, once cleared, as the Context is.
+		w.reset()
+		writerPool.Put(w)
+	}
 	c.w, c.stream, c.external = nil, nil, nil
 	c.err, c.body, c.bodyDone, c.cancel = nil, nil, false, nil
 	c.bodyHeld, c.handover = false, nil

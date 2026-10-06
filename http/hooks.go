@@ -14,6 +14,8 @@ type responseHooks struct {
 	// that the hooks that change the response have run.
 	whole bool
 	ran   bool
+	// response is the copy of a whole response the hooks are handed.
+	response Response
 }
 
 // responseHook is one registered callback; exactly one of its fields is set.
@@ -89,7 +91,11 @@ func (c *Context) hooked() *responseHooks {
 func (c *Context) addHook(hook responseHook) {
 	w := c.writer()
 	if w.hooks == nil {
-		w.hooks = &responseHooks{list: make([]responseHook, 0, 4)}
+		if spare := w.spareHooks; spare != nil {
+			w.spareHooks, w.hooks = nil, spare
+		} else {
+			w.hooks = &responseHooks{list: make([]responseHook, 0, 4)}
+		}
 	}
 	w.hooks.list = append(w.hooks.list, hook)
 }

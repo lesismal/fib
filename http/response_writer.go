@@ -10,6 +10,7 @@ import (
 	stdhttp "net/http"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -71,6 +72,9 @@ type responseWriter struct {
 	// live here rather than in Context so that a Context, which HTTP/3
 	// allocates with each request, costs no more for a feature few use.
 	hooks *responseHooks
+	// spareHooks is the storage for hooks a request this writer served
+	// before registered, which addHook takes rather than allocating.
+	spareHooks *responseHooks
 }
 
 // holdsDeclared reports whether a body is held back whole because its declared
@@ -94,9 +98,25 @@ func (c *Context) Header() stdhttp.Header {
 
 func (c *Context) writer() *responseWriter {
 	if c.w == nil {
-		c.w = &responseWriter{declared: -1}
+		c.w = writerPool.Get().(*responseWriter)
 	}
 	return c.w
+}
+
+// writerPool holds the writers of recycled Contexts, cleared, for the
+// requests that need one next.
+var writerPool = sync.Pool{New: func() any { return &responseWriter{declared: -1} }}
+
+// reset clears the writer for its Context's next request. Of what it held
+// it keeps only its hooks' storage, emptied, for that request's hooks.
+func (w *responseWriter) reset() {
+	spare := w.spareHooks
+	if h := w.hooks; h != nil {
+		clear(h.list)
+		*h = responseHooks{list: h.list[:0]}
+		spare = h
+	}
+	*w = responseWriter{declared: -1, spareHooks: spare}
 }
 
 // WriteHeader sends the response's status with the header Header returned,

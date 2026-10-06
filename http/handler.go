@@ -215,7 +215,23 @@ func (c *Context) Respond(status int, contentType string, body []byte) error {
 	// answering allocates.
 	header := contentTypeHeaders.Get().(stdhttp.Header)
 	header["Content-Type"] = append(header["Content-Type"][:0], contentType)
-	err := c.WriteResponse(Response{StatusCode: status, Header: header, Body: body})
+	var err error
+	if c.w != nil && c.w.status != 0 {
+		err = ErrResponseWritten
+	} else {
+		// The header is this call's own, so the hooks may change it without
+		// the copy WriteResponse makes of a caller's. Whatever fields they
+		// added go before it serves another reply, including when they took
+		// Content-Type out, as a 304 does, and left one field of their own.
+		err = c.writeResponse(Response{StatusCode: status, Header: header, Body: body})
+		if _, kept := header["Content-Type"]; len(header) > 1 || !kept {
+			for key := range header {
+				if key != "Content-Type" {
+					delete(header, key)
+				}
+			}
+		}
+	}
 	contentTypeHeaders.Put(header)
 	return err
 }
@@ -252,10 +268,12 @@ func (c *Context) writeResponse(response Response) error {
 	if hooks != nil {
 		// The hooks are handed a copy, so that a response nothing hooks
 		// stays off the heap: taking its own address would move it there.
-		hooked := new(Response)
-		*hooked = response
-		hooks.before(hooked)
-		response = *hooked
+		// The copy lives with the hooks, which are recycled with the
+		// Context.
+		hooks.response = response
+		hooks.before(&hooks.response)
+		response = hooks.response
+		hooks.response = Response{}
 	}
 	var err error
 	switch {
@@ -876,7 +894,10 @@ func (h *ServerHandler) tlsState(c *fib.Connection, parser *Parser) *stdtls.Conn
 	if !parser.tlsChecked {
 		parser.tlsChecked = true
 		if state, ok := fibtls.ConnectionState(c); ok {
-			parser.tls = &state
+			// A copy made here, not &state: that would move state to the
+			// heap for every connection, TLS or not.
+			parser.tls = new(stdtls.ConnectionState)
+			*parser.tls = state
 		}
 	}
 	return parser.tls

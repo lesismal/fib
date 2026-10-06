@@ -6,6 +6,7 @@ import (
 	"net/url"
 	"strings"
 	"sync"
+	"unsafe"
 )
 
 // parseRequestHead parses the request line and header that head holds, up to
@@ -160,7 +161,7 @@ func parseSimpleRequestHead(head []byte, reuse reuseOptions) *requestBlock {
 	req := &block.request
 	// One string for everything the request keeps of head: its target and
 	// every field's key and value are slices of it.
-	text := string(head)
+	text := headString(head)
 	target := text[targetStart:targetEnd]
 	u := &block.url
 	switch {
@@ -293,6 +294,44 @@ func parseSimpleRequestHead(head []byte, reuse reuseOptions) *requestBlock {
 		req.Close = !headerValuesHaveToken(connection, "keep-alive")
 	}
 	return block
+}
+
+// headChunkSize is the size of the chunks headString copies heads into, and
+// maxChunkedHead the longest head it copies into one; a longer head is a
+// string of its own.
+const (
+	headChunkSize  = 4096
+	maxChunkedHead = 1024
+)
+
+// headChunk is the chunk headString is filling: buf's bytes up to its length
+// are strings requests hold, and are never written again.
+type headChunk struct{ buf []byte }
+
+var headChunks = sync.Pool{New: func() any { return new(headChunk) }}
+
+// headString returns a string holding head's bytes. Rather than allocating
+// one per request, it copies head onto the end of a chunk shared by the
+// requests parsed on the same P, so that a busy server allocates one chunk
+// for dozens of requests. Every byte of a chunk is written once, before the
+// string over it is made, so a string never changes under whoever holds it,
+// whatever the request it came from goes on to: a chunk is collected as any
+// object is, once no string points into it. What that costs is that a string
+// kept past its request keeps its whole chunk with it, as a slice of the head
+// keeps the whole head.
+func headString(head []byte) string {
+	if len(head) == 0 || len(head) > maxChunkedHead {
+		return string(head)
+	}
+	chunk := headChunks.Get().(*headChunk)
+	if cap(chunk.buf)-len(chunk.buf) < len(head) {
+		chunk.buf = make([]byte, 0, headChunkSize)
+	}
+	start := len(chunk.buf)
+	chunk.buf = append(chunk.buf, head...)
+	text := unsafe.String(&chunk.buf[start], len(head))
+	headChunks.Put(chunk)
+	return text
 }
 
 // simpleMethod returns the method b names, as an interned string, when it is
