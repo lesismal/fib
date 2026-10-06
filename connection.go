@@ -5,6 +5,7 @@ package fib
 import (
 	"fmt"
 	"io"
+	"net/netip"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -33,6 +34,15 @@ type connectionAttachment struct{ value any }
 type Connection struct {
 	connPlatform
 	engine *Engine
+	// peer is the address the connection was accepted from, when accepting
+	// it told; see RemoteAddrPort.
+	peer netip.AddrPort
+	// rawExposed records that the socket has been handed out, through File
+	// or a RawConn, and so may have been duplicated: closing a socket then
+	// leaves it in the event loop's interest set, from which it has to be
+	// taken out first. It is set under mu, before the socket is handed out,
+	// so a close, which marks the connection closed under mu first, sees it.
+	rawExposed atomic.Bool
 	// handler receives this connection's callbacks: the engine's handler for
 	// an accepted connection, or the one DialWithHandler was given.
 	handler       Handler

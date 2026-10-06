@@ -55,6 +55,7 @@ func (c *Connection) File() (*os.File, error) {
 	name := fileName(c.LocalAddr(), c.RemoteAddr())
 	var f *os.File
 	err := c.control("dup", func(s int) error {
+		c.rawExposed.Store(true)
 		syscall.ForkLock.RLock()
 		dup, err := syscall.Dup(s)
 		if err == nil {

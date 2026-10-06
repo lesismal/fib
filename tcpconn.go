@@ -170,6 +170,7 @@ type rawConn struct{ c *Connection }
 
 func (r rawConn) Control(f func(fd uintptr)) error {
 	return r.c.control("raw-control", func(s rawSocket) error {
+		r.c.rawExposed.Store(true)
 		f(uintptr(s))
 		return nil
 	})
@@ -177,6 +178,7 @@ func (r rawConn) Control(f func(fd uintptr)) error {
 
 func (r rawConn) Read(f func(fd uintptr) bool) error {
 	return r.c.control("raw-read", func(s rawSocket) error {
+		r.c.rawExposed.Store(true)
 		if !f(uintptr(s)) {
 			return ErrWouldBlock
 		}
@@ -186,6 +188,7 @@ func (r rawConn) Read(f func(fd uintptr) bool) error {
 
 func (r rawConn) Write(f func(fd uintptr) bool) error {
 	return r.c.control("raw-write", func(s rawSocket) error {
+		r.c.rawExposed.Store(true)
 		if !f(uintptr(s)) {
 			return ErrWouldBlock
 		}

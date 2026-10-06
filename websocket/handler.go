@@ -456,7 +456,9 @@ func (h *ServerHandler) upgrade(c *fib.Connection, state *connectionState, reque
 	}
 	h.releaseHandshakeParser(state)
 	if request != nil {
-		if addr := c.RemoteAddr(); addr != nil {
+		if ap := c.RemoteAddrPort(); ap.IsValid() {
+			request.RemoteAddr = ap.String()
+		} else if addr := c.RemoteAddr(); addr != nil {
 			request.RemoteAddr = addr.String()
 		}
 		h.handler.OnOpen(&state.websocket, request)

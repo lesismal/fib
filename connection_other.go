@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"net/netip"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -66,6 +67,27 @@ func (c *Connection) Protocol() Protocol {
 
 // RemoteAddr returns the peer's address.
 func (c *Connection) RemoteAddr() net.Addr { return c.conn.RemoteAddr() }
+
+// RemoteAddrPort returns the peer's IP address and port, or the zero
+// AddrPort for a peer without one, or with an IPv6 zone.
+func (c *Connection) RemoteAddrPort() netip.AddrPort {
+	var ap netip.AddrPort
+	switch addr := c.conn.RemoteAddr().(type) {
+	case *net.TCPAddr:
+		if addr.Zone != "" {
+			return netip.AddrPort{}
+		}
+		ap = addr.AddrPort()
+	case *net.UDPAddr:
+		if addr.Zone != "" {
+			return netip.AddrPort{}
+		}
+		ap = addr.AddrPort()
+	default:
+		return netip.AddrPort{}
+	}
+	return netip.AddrPortFrom(ap.Addr().Unmap(), ap.Port())
+}
 
 func (c *Connection) FD() int { return int(c.fd.Load()) }
 

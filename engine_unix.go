@@ -474,7 +474,7 @@ func (e *Engine) Run() error {
 
 func (e *Engine) acceptConnections(listenFD int) {
 	for {
-		fd, err := acceptSocket(listenFD)
+		fd, peer, err := acceptSocket(listenFD)
 		if err == syscall.EINTR {
 			continue
 		}
@@ -487,13 +487,13 @@ func (e *Engine) acceptConnections(listenFD int) {
 			_ = syscall.SetsockoptInt(fd, syscall.IPPROTO_TCP, syscall.TCP_NODELAY, 1)
 		}
 		if len(e.pollers) == 0 {
-			e.admit(&Connection{engine: e, handler: e.handler, unix: !e.tcpListeners}, fd)
+			e.admit(&Connection{engine: e, handler: e.handler, unix: !e.tcpListeners, peer: peer}, fd)
 			continue
 		}
 		// The poller registers the descriptor itself, since its table and
 		// its backend are its loop's alone.
 		p := e.pollers[fd%len(e.pollers)]
-		c := &Connection{engine: p, handler: e.handler, unix: !e.tcpListeners}
+		c := &Connection{engine: p, handler: e.handler, unix: !e.tcpListeners, peer: peer}
 		c.fd.Store(int32(fd))
 		if !p.request(command{kind: commandAccept, connection: c}) {
 			syscall.Close(fd)
@@ -546,7 +546,12 @@ func (e *Engine) detach(c *Connection) {
 	if fd < 0 {
 		return
 	}
-	e.unregister(fd)
+	// Closing the last descriptor of a socket takes it out of the event
+	// loop's interest set, so only one that may have been duplicated needs
+	// taking out first, a system call every connection would otherwise make.
+	if c.rawExposed.Load() {
+		e.unregister(fd)
+	}
 	_ = syscall.Close(fd)
 	if page := fd >> connPageShift; page < len(e.connections) {
 		if entries := e.connections[page]; entries != nil && entries[fd&connPageMask] == c {

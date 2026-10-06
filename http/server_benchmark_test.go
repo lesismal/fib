@@ -130,3 +130,39 @@ func startBenchServer(b *testing.B, httpConfig Config, handler Handler) (stop fu
 		_ = server.Close()
 	}, local.String()
 }
+
+// BenchmarkServerShortLived opens a connection for every ten requests and
+// closes it after them, as HttpArena's limited-conn profile does, so that
+// what a connection costs to accept, set up and tear down shows beside what
+// its requests cost. One op is one connection.
+func BenchmarkServerShortLived(b *testing.B) {
+	const perConnection = 10
+	request := []byte("GET /hello HTTP/1.1\r\nHost: localhost\r\nUser-Agent: bench\r\nAccept: */*\r\n\r\n")
+	server, addr := startBenchServer(b, DefaultConfig(), HandlerFunc(func(c *Context, r *stdhttp.Request) {
+		_ = c.Respond(stdhttp.StatusOK, "text/plain", benchReply)
+	}))
+	defer server()
+	b.ReportAllocs()
+	b.RunParallel(func(pb *testing.PB) {
+		buf := make([]byte, 4096)
+		for pb.Next() {
+			conn, err := net.Dial("tcp", addr)
+			if err != nil {
+				b.Error(err)
+				return
+			}
+			for i := 0; i < perConnection; i++ {
+				if _, err := conn.Write(request); err != nil {
+					b.Error(err)
+					return
+				}
+				// The reply is small enough to arrive in one read.
+				if _, err := conn.Read(buf); err != nil {
+					b.Error(err)
+					return
+				}
+			}
+			conn.Close()
+		}
+	})
+}

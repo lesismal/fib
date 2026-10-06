@@ -3,6 +3,7 @@
 package fib
 
 import (
+	"net/netip"
 	"sync"
 	"syscall"
 	_ "unsafe" // for go:linkname
@@ -11,24 +12,24 @@ import (
 // Darwin has neither accept4 nor SOCK_NONBLOCK, so a new descriptor gets its
 // flags after the call that creates it. ForkLock keeps a concurrent fork from
 // inheriting it in between.
-func acceptSocket(listenFD int) (int, error) {
+func acceptSocket(listenFD int) (int, netip.AddrPort, error) {
 	syscall.ForkLock.RLock()
-	fd, _, err := syscall.Accept(listenFD)
+	fd, sa, err := syscall.Accept(listenFD)
 	if err == nil {
 		syscall.CloseOnExec(fd)
 	}
 	syscall.ForkLock.RUnlock()
 	if err != nil {
-		return -1, err
+		return -1, netip.AddrPort{}, err
 	}
 	if err = syscall.SetNonblock(fd, true); err != nil {
 		syscall.Close(fd)
-		return -1, err
+		return -1, netip.AddrPort{}, err
 	}
 	// Writing to a socket the peer has reset raises SIGPIPE on Darwin unless
 	// the socket opts out; the error return is all this package needs.
 	_ = syscall.SetsockoptInt(fd, syscall.SOL_SOCKET, syscall.SO_NOSIGPIPE, 1)
-	return fd, nil
+	return fd, sockaddrAddrPort(sa), nil
 }
 
 func newSocket(family int) (int, error) {

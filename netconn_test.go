@@ -5,6 +5,7 @@ package fib
 import (
 	"bytes"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"os"
@@ -347,5 +348,68 @@ func TestConnectionAddresses(t *testing.T) {
 		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("the handler never ran")
+	}
+}
+
+// TestRemoteAddrPort checks that an accepted connection reports the address
+// its peer dialed from, the same as RemoteAddr's, on an IPv4 listener, an
+// IPv6 one, and one listening on both, whose IPv4 peers arrive v4-mapped,
+// with the engine's loop accepting and with pollers accepting.
+func TestRemoteAddrPort(t *testing.T) {
+	for _, tc := range []struct{ name, listen, dial string }{
+		{"ipv4", "127.0.0.1:0", "127.0.0.1"},
+		{"ipv6", "[::1]:0", "::1"},
+		{"dualstack", ":0", "127.0.0.1"},
+	} {
+		for _, pollers := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%s/pollers=%v", tc.name, pollers), func(t *testing.T) {
+				got := make(chan [2]string, 1)
+				config := DefaultConfig()
+				config.Addr = tc.listen
+				config.IOPollers, config.IOPollerCount = pollers, 2
+				server, err := Bind(config, HandlerFuncs{Data: func(c *Connection, _ []byte) {
+					remote := ""
+					if addr := c.RemoteAddr(); addr != nil {
+						remote = addr.String()
+					}
+					select {
+					case got <- [2]string{c.RemoteAddrPort().String(), remote}:
+					default:
+					}
+				}})
+				if err != nil {
+					t.Skipf("listen %s: %v", tc.listen, err)
+				}
+				addr, err := server.LocalAddr()
+				if err != nil {
+					t.Fatal(err)
+				}
+				done := make(chan error, 1)
+				go func() { done <- server.Run() }()
+				t.Cleanup(func() {
+					server.Stop()
+					<-done
+					_ = server.Close()
+				})
+				_, port, _ := net.SplitHostPort(addr.String())
+				conn, err := net.DialTimeout("tcp", net.JoinHostPort(tc.dial, port), 5*time.Second)
+				if err != nil {
+					t.Skipf("dial %s: %v", tc.dial, err)
+				}
+				defer conn.Close()
+				if _, err = conn.Write([]byte("hi")); err != nil {
+					t.Fatal(err)
+				}
+				select {
+				case addrs := <-got:
+					want := conn.LocalAddr().String()
+					if addrs[0] != want || addrs[1] != want {
+						t.Fatalf("RemoteAddrPort %q, RemoteAddr %q; the peer dialed from %q", addrs[0], addrs[1], want)
+					}
+				case <-time.After(5 * time.Second):
+					t.Fatal("no data reached the server")
+				}
+			})
+		}
 	}
 }

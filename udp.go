@@ -378,6 +378,33 @@ func (c *Connection) Protocol() Protocol {
 	return ProtocolTCP
 }
 
+// RemoteAddrPort returns the peer's IP address and port, the zero AddrPort
+// for a Unix socket, for an IPv6 peer with a zone, which RemoteAddr reports
+// with its zone, and once the socket is gone. An IPv4 peer of an IPv6
+// socket is reported as the IPv4 address it is, as net.TCPAddr's String
+// shows it. For a connection the engine accepted it is the address accept
+// returned, which takes no system call and no allocation to report.
+func (c *Connection) RemoteAddrPort() netip.AddrPort {
+	if c.peer.IsValid() {
+		return c.peer
+	}
+	if c.udp != nil {
+		if c.udp.raddr == nil || c.udp.raddr.Zone != "" {
+			return netip.AddrPort{}
+		}
+		ap := c.udp.raddr.AddrPort()
+		return netip.AddrPortFrom(ap.Addr().Unmap(), ap.Port())
+	}
+	if c.unix {
+		return netip.AddrPort{}
+	}
+	sa, err := c.peerSockaddr()
+	if err != nil {
+		return netip.AddrPort{}
+	}
+	return sockaddrAddrPort(sa)
+}
+
 // RemoteAddr returns the peer's address: a *net.UDPAddr for a UDP
 // connection, a *net.UnixAddr for a Unix socket, whose name is empty when the
 // peer never bound one, and a *net.TCPAddr otherwise. It returns nil once the

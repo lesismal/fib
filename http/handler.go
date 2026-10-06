@@ -493,7 +493,12 @@ func (h *ServerHandler) attachParser(c *fib.Connection) *Parser {
 func (h *ServerHandler) newParser(c *fib.Connection) *Parser {
 	parser := NewParser(h.config)
 	parser.conn = c
-	if addr := c.RemoteAddr(); addr != nil {
+	// The address the engine accepted the connection from is at hand, with
+	// no system call to ask for it and no net.Addr to build; RemoteAddr is
+	// left for the peers it does not cover.
+	if ap := c.RemoteAddrPort(); ap.IsValid() {
+		parser.remoteAddr = ap.String()
+	} else if addr := c.RemoteAddr(); addr != nil {
 		parser.remoteAddr = addr.String()
 	}
 	return parser
