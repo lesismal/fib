@@ -603,8 +603,23 @@ func TestRetainStress(t *testing.T) {
 		}
 	})
 
+	// serve returns before Run has started the engine's pollers, a goroutine
+	// each and as many as the cores allow; a request answered means they are
+	// all running, so they are counted in before rather than taken for leaks.
+	warm, err := net.DialTimeout("tcp", addr, 5*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = warm.SetDeadline(time.Now().Add(10 * time.Second))
+	_, _ = io.WriteString(warm, "GET /inline HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n")
+	if _, err = io.ReadAll(warm); err != nil {
+		t.Fatal(err)
+	}
+	warm.Close()
+	ended.Store(0)
+
 	const clients = 24
-	before := runtime.NumGoroutine()
+	before := busyGoroutines()
 	payload := bytes.Repeat([]byte("s"), 128<<10)
 	var wg sync.WaitGroup
 	for i := 0; i < clients; i++ {
@@ -674,14 +689,62 @@ func TestRetainStress(t *testing.T) {
 	if ended.Load() < answered.Load() {
 		t.Fatalf("%d requests answered but only %d reached an end", answered.Load(), ended.Load())
 	}
-	// Nothing should still be running on the requests' behalf.
+	// Nothing should still be running on the requests' behalf. The pools the
+	// rounds ran on keep the workers they grew parked for a while, and how
+	// many that is follows the cores and the race detector's pace rather
+	// than the requests, so a parked worker is not counted; one still inside
+	// a task is.
+	var after int
 	for i := 0; i < 100; i++ {
-		if runtime.NumGoroutine() <= before+clients {
+		if after = busyGoroutines(); after <= before+clients {
 			return
 		}
 		time.Sleep(20 * time.Millisecond)
 	}
-	t.Fatalf("goroutines went from %d to %d", before, runtime.NumGoroutine())
+	t.Fatalf("goroutines went from %d to %d, not counting parked pool workers:\n%s",
+		before, after, strings.Join(busyStacks(), "\n\n"))
+}
+
+// parkedWorkerFrame is the function a task pool worker waits for work in.
+const parkedWorkerFrame = "github.com/lesismal/fib/taskpool.(*adaptivePool).worker("
+
+// busyGoroutines counts the goroutines that are not task pool workers parked
+// between tasks.
+func busyGoroutines() int { return len(busyStacks()) }
+
+// busyStacks returns the stacks of the goroutines busyGoroutines counts. A
+// goroutine is a parked worker when the first frame outside the runtime is
+// the worker loop itself: a worker running a task has the task's frames
+// above it and is counted.
+func busyStacks() []string {
+	buf := make([]byte, 1<<20)
+	for {
+		n := runtime.Stack(buf, true)
+		if n < len(buf) {
+			buf = buf[:n]
+			break
+		}
+		buf = make([]byte, 2*len(buf))
+	}
+	var busy []string
+	for _, g := range strings.Split(strings.TrimSpace(string(buf)), "\n\n") {
+		if !parkedWorker(g) {
+			busy = append(busy, g)
+		}
+	}
+	return busy
+}
+
+func parkedWorker(stack string) bool {
+	lines := strings.Split(stack, "\n")
+	// The header, then a function line and a file line per frame.
+	for i := 1; i < len(lines); i += 2 {
+		if strings.HasPrefix(lines[i], "runtime.") {
+			continue
+		}
+		return strings.HasPrefix(lines[i], parkedWorkerFrame)
+	}
+	return false
 }
 
 // TestRetainOverHTTP2 checks that the same handler code works on a
