@@ -181,6 +181,14 @@ func (c *Connection) Send(data []byte) error {
 	return c.sendRaw(data)
 }
 
+// sendRawPooled is sendRaw for a buffer from package bufferpool, which goes
+// back to the pool once written: this backend writes before it returns.
+func (c *Connection) sendRawPooled(data []byte) error {
+	err := c.sendRaw(data)
+	bufferpool.Put(data)
+	return err
+}
+
 // sendRaw writes bytes to the socket below any layer.
 func (c *Connection) sendRaw(data []byte) error {
 	if len(data) == 0 {

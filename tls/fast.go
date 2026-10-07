@@ -598,12 +598,12 @@ func (t *layer) sealSendLocked(typ byte, first, second []byte) error {
 		return errSequenceExhausted
 	}
 	buf := bufferpool.Get(n + records*t.tx.overhead())[:0]
-	defer bufferpool.Put(buf)
 	for {
 		a := first[:min(len(first), maxPlaintext)]
 		b := second[:min(len(second), maxPlaintext-len(a))]
 		var err error
 		if buf, err = t.tx.seal(buf, typ, a, b); err != nil {
+			bufferpool.Put(buf)
 			return err
 		}
 		first, second = first[len(a):], second[len(b):]
@@ -611,5 +611,7 @@ func (t *layer) sealSendLocked(typ byte, first, second []byte) error {
 			break
 		}
 	}
-	return t.c.SendRaw(buf)
+	// The connection takes the sealed records over, rather than copying
+	// them into its queue while it is corked.
+	return t.c.SendRawPooled(buf)
 }

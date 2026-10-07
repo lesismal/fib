@@ -423,7 +423,7 @@ func (c *Connection) Send(data []byte) error {
 	if l := c.layer; l != nil {
 		return l.Send(data, nil)
 	}
-	return c.send(data, true)
+	return c.send(data, sendCopy)
 }
 
 // SendOwned sends data without copying it. Ownership transfers to the
@@ -432,13 +432,30 @@ func (c *Connection) SendOwned(data []byte) error {
 	if l := c.layer; l != nil {
 		return l.Send(data, nil)
 	}
-	return c.send(data, false)
+	return c.send(data, sendOwned)
 }
 
 // sendRaw writes bytes to the socket below any layer.
 func (c *Connection) sendRaw(data []byte) error {
-	return c.send(data, true)
+	return c.send(data, sendCopy)
 }
+
+// sendRawPooled is sendRaw for a buffer from package bufferpool, which the
+// connection takes over; see SendRawPooled.
+func (c *Connection) sendRawPooled(data []byte) error {
+	return c.send(data, sendPooled)
+}
+
+// sendMode is what send does with the bytes it does not write at once:
+// copies them into its queue, keeps the caller's array, or keeps the caller's
+// buffer from the pool and gives it back once it is written.
+type sendMode uint8
+
+const (
+	sendCopy sendMode = iota
+	sendOwned
+	sendPooled
+)
 
 // sendClosed reports whether the connection has stopped accepting sends.
 func (c *Connection) sendClosed() bool {
@@ -448,16 +465,26 @@ func (c *Connection) sendClosed() bool {
 	return closed
 }
 
-func (c *Connection) send(data []byte, copyData bool) error {
+func (c *Connection) send(data []byte, mode sendMode) error {
 	if c.udp != nil {
-		return c.sendDatagram(data)
+		err := c.sendDatagram(data)
+		if mode == sendPooled {
+			bufferpool.Put(data)
+		}
+		return err
 	}
 	if len(data) == 0 {
+		if mode == sendPooled {
+			bufferpool.Put(data)
+		}
 		return nil
 	}
 	c.mu.Lock()
 	if c.closing || c.closed || c.closeAfterSend || c.writeShut {
 		c.mu.Unlock()
+		if mode == sendPooled {
+			bufferpool.Put(data)
+		}
 		return syscall.EPIPE
 	}
 	sent := 0
@@ -470,6 +497,9 @@ func (c *Connection) send(data []byte, copyData bool) error {
 			}
 			if err != nil && !isWouldBlock(err) {
 				c.mu.Unlock()
+				if mode == sendPooled {
+					bufferpool.Put(data)
+				}
 				c.closeWithError(err)
 				return err
 			}
@@ -480,14 +510,25 @@ func (c *Connection) send(data []byte, copyData bool) error {
 		}
 		if sent == len(data) {
 			c.mu.Unlock()
+			if mode == sendPooled {
+				bufferpool.Put(data)
+			}
 			return nil
 		}
 	}
 	queued := data[sent:]
-	if copyData {
+	switch mode {
+	case sendCopy:
 		c.queueLocked(queued, nil)
-	} else {
+	case sendOwned:
 		c.queueOwnedLocked(queued)
+	default:
+		// Kept whole, with what the socket took past as the item's offset,
+		// so that it goes back to the pool in the size class it came from.
+		if c.sendHead == len(c.sends) {
+			c.rewindQueueLocked()
+		}
+		c.sends = append(c.sends, sendItem{data: data, offset: sent, pooled: true})
 	}
 	c.addPending(int64(len(queued)))
 	// Write interest stays armed, so queueing alone needs no registration

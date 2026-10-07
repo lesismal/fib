@@ -39,5 +39,14 @@ func (c *Connection) Layer() Layer { return c.layer }
 // Send does. On a UDP connection each call is one datagram.
 func (c *Connection) SendRaw(data []byte) error { return c.sendRaw(data) }
 
+// SendRawPooled is SendRaw for data, a buffer from package bufferpool, which
+// the connection takes over whatever happens: what the socket takes at once
+// is not copied, and what it does not is kept rather than copied into the
+// queue, and data goes back to the pool once it has been written. A layer
+// that seals its output into a buffer from the pool hands it over this way,
+// saving the copy SendRaw would make of all it sends while the connection is
+// corked.
+func (c *Connection) SendRawPooled(data []byte) error { return c.sendRawPooled(data) }
+
 // CloseAfterSendRaw is CloseAfterSend bypassing any layer.
 func (c *Connection) CloseAfterSendRaw() { c.closeAfterSendRaw() }
