@@ -195,9 +195,10 @@ func TestDefaultsFollowGOMAXPROCS(t *testing.T) {
 }
 
 // The engine gives itself one poller for every four CPUs, rounded down, and at
-// least one, up to 32 CPUs, and one for every two on more.
+// least two on more than four CPUs, up to 32 CPUs, and one for every two on
+// more. Asked for on four CPUs or fewer, it gets one.
 func TestDefaultPollerCount(t *testing.T) {
-	for cpus, want := range map[int]int{1: 1, 3: 1, 4: 1, 7: 1, 8: 2, 9: 2, 16: 4, 32: 8, 33: 16, 64: 32, 96: 48} {
+	for cpus, want := range map[int]int{1: 1, 3: 1, 4: 1, 5: 2, 7: 2, 8: 2, 9: 2, 16: 4, 32: 8, 33: 16, 64: 32, 96: 48} {
 		if got := defaultPollerCount(cpus); got != want {
 			t.Errorf("%d CPUs: %d pollers, want %d", cpus, got, want)
 		}

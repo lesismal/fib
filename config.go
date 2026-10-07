@@ -233,13 +233,27 @@ const manyPollerCPUs = 32
 
 // defaultPollerCount is how many pollers IOPollers creates on cpus CPUs when
 // IOPollerCount leaves it to the engine: cpus divided by cpusPerPoller,
-// rounded down, and at least one, up to manyPollerCPUs, and half the CPUs
-// above it.
+// rounded down, and at least two, up to manyPollerCPUs, and half the CPUs
+// above it. On singleLoopCPUs or fewer, where the default has no pollers,
+// asking for them gets one.
+//
+// Two, not one, on 5 to 7 CPUs, where cpus/cpusPerPoller is 1: a lone poller
+// is the one thread every readiness and every accepted connection goes
+// through, and it left CPUs idle with the workers short of work. WebSocket
+// echoes over 10k connections, the server on 5, 6 and 7 CPUs of an 8-core
+// Ryzen with the client on the others, served 713k, 826k and 925k messages a
+// second with one poller and 756k, 885k and 1010k with two (+6%, +7%, +9%);
+// 30k connections were accepted and upgraded at 104k a second against 138k
+// (+33%); a pipelined echo was unchanged. On 8 CPUs, where the default was
+// already two, one poller served 878k and two 1006k.
 func defaultPollerCount(cpus int) int {
 	if cpus > manyPollerCPUs {
 		return cpus / 2
 	}
-	return max(1, cpus/cpusPerPoller)
+	if cpus <= singleLoopCPUs {
+		return 1
+	}
+	return max(2, cpus/cpusPerPoller)
 }
 
 // SetPoolSizing pins the pool sizing to the caller's own numbers, which a later

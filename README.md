@@ -313,9 +313,9 @@ flowchart TB
    past the watermark reads pause until the queue drains.
 
 The number of pollers (`Config.IOPollers`, `IOPollerCount`) depends on the CPU count. With four
-CPUs or fewer, one loop does everything. Above that, there is one poller per four CPUs, and
-connections are spread over them by fd. A poller parks in Go's own netpoller rather than blocking
-in `epoll_wait`, so it never holds a P while goroutines wait to run.
+CPUs or fewer, one loop does everything. Above that, there is one poller per four CPUs and never fewer than
+two, and connections are spread over them by fd. A poller parks in Go's own netpoller rather than blocking in
+`epoll_wait`, so it never holds a P while goroutines wait to run.
 
 ### Where each protocol runs
 
