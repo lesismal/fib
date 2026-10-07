@@ -3,6 +3,7 @@
 package http
 
 import (
+	"bytes"
 	"encoding/json"
 	"sync"
 )
@@ -27,15 +28,21 @@ func (c *Context) JSON(status int, v any) error {
 	buf := jsonBuffers.Get().(*[]byte)
 	body, err := JSONEncoder((*buf)[:0], v)
 	if err == nil {
-		err = c.Respond(status, "application/json", body)
+		if c.isHTTP1() {
+			// HTTP/1 has copied the body out by the time Respond returns,
+			// and a hook keeps none of it past its call, so the buffer serves
+			// the next response.
+			err = c.Respond(status, "application/json", body)
+		} else {
+			// HTTP/2 holds a body until flow control lets the rest go, and a
+			// stream served outside this package may hold it too, so theirs
+			// is a copy of its own, made at its length, as json.Marshal
+			// makes one.
+			err = c.Respond(status, "application/json", bytes.Clone(body))
+		}
 	}
-	// HTTP/1 has copied the body out by the time Respond returns, so the
-	// buffer serves the next response, unless a hook was handed the body and
-	// may have kept it. HTTP/2 holds the body until flow control lets the
-	// rest go, and a stream served outside this package may hold it too, so
-	// theirs is left to the collector.
-	if c.stream == nil && c.external == nil && c.hooked() == nil && cap(body) <= maxJSONBuffer {
-		*buf = body
+	if cap(body) <= maxJSONBuffer {
+		*buf = body[:0]
 		jsonBuffers.Put(buf)
 	}
 	return err

@@ -52,7 +52,9 @@ func (c *Context) OnHeader(fn func(status int, header stdhttp.Header)) {
 // body; on HTTP/1 that means Flush does nothing and a file is not sent by
 // sendfile, as on HTTP/2 and HTTP/3 already. The header fn is given is the
 // response's own, a copy of any the handler passed to WriteResponse, and
-// the body is the handler's: fn replaces it rather than writing into it.
+// the body is the handler's: fn replaces it rather than writing into it, and
+// keeps none of it past the call, since the handler may reuse it once the
+// response is sent, as Context.JSON does; keep a copy instead.
 // Registering it once the response has been begun does nothing.
 func (c *Context) OnResponse(fn func(response *Response)) {
 	if fn != nil && !c.begun() {

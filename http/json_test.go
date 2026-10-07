@@ -7,6 +7,7 @@ import (
 	"errors"
 	"io"
 	"math"
+	"runtime"
 	stdhttp "net/http"
 	"strconv"
 	"strings"
@@ -107,9 +108,13 @@ func TestContextJSON(t *testing.T) {
 }
 
 // Responses encoded at once on many connections each get their own bytes,
-// although HTTP/1 recycles the buffers they are encoded into.
+// although HTTP/1 recycles the buffers they are encoded into, with a hook
+// that sees the body or without one.
 func TestContextJSONConcurrent(t *testing.T) {
 	addr := serveHTTP1(t, func(c *Context, r *stdhttp.Request) {
+		if strings.HasPrefix(r.URL.Path, "/1") {
+			c.OnResponse(func(response *Response) { response.Header.Set("X-Length", strconv.Itoa(len(response.Body))) })
+		}
 		_ = c.JSON(stdhttp.StatusOK, map[string]string{"path": r.URL.Path, "pad": strings.Repeat(r.URL.Path, 100)})
 	})
 	client := &stdhttp.Client{Transport: &stdhttp.Transport{MaxIdleConnsPerHost: 16}}
@@ -174,6 +179,10 @@ func TestContextJSONRecyclesItsBuffer(t *testing.T) {
 // An HTTP/2 body that waits on flow control after JSON returns is not
 // overwritten by the next response JSON encodes.
 func TestContextJSONHeldByHTTP2FlowControl(t *testing.T) {
+	// One P, so that both streams' handlers take their buffers from the same
+	// cache of the pool, and the second would be handed the first's buffer
+	// if JSON gave it back while HTTP/2 still held it.
+	defer runtime.GOMAXPROCS(runtime.GOMAXPROCS(1))
 	addr := serve(t, NewHandler(HandlerFunc(func(c *Context, r *stdhttp.Request) {
 		_ = c.JSON(stdhttp.StatusOK, map[string]string{"v": strings.Repeat(r.URL.Path[1:], 500)})
 	})))
