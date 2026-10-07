@@ -157,6 +157,14 @@ func newRebindPair(t *testing.T) *rebindPair {
 	t.Cleanup(func() {
 		close(done)
 		wg.Wait()
+		serverMu.Lock()
+		server := p.server
+		serverMu.Unlock()
+		for _, c := range []*Conn{p.client, server} {
+			if c != nil {
+				c.Abort(errTestOver)
+			}
+		}
 	})
 	for _, h := range []*testHandler{p.clientH, p.serverH.testHandler} {
 		select {

@@ -103,7 +103,15 @@ func (h *testHandler) OnStreamData(s *Stream, data []byte, fin bool) {
 func (h *testHandler) OnStreamReset(s *Stream, code uint64) { h.reset <- s.ID() }
 func (h *testHandler) OnStopSending(*Stream, uint64)        {}
 func (h *testHandler) OnStreamsAvailable(*Conn)             {}
-func (h *testHandler) OnClose(_ *Conn, err error)           { h.closed <- err }
+func (h *testHandler) OnClose(_ *Conn, err error) {
+	// A connection closes once, but a handler that a test gave a second
+	// one keeps the first close for the test to read: the second never
+	// blocks the goroutine that ends the connection.
+	select {
+	case h.closed <- err:
+	default:
+	}
+}
 
 func (h *testHandler) received(id uint64) []byte {
 	h.mu.Lock()
@@ -128,10 +136,25 @@ type testPair struct {
 	gather atomic.Int32
 }
 
+// close stops the pair's goroutines and ends its connections, whose timers
+// would otherwise go on probing and sending until they idle out, a load on
+// the tests that run after them.
 func (p *testPair) close() {
 	close(p.done)
 	p.wg.Wait()
+	p.serverMu.Lock()
+	server := p.server
+	p.serverMu.Unlock()
+	for _, c := range []*Conn{p.client, server} {
+		if c != nil {
+			c.Abort(errTestOver)
+		}
+	}
 }
+
+// errTestOver is what a test pair's connections end with once the test is
+// over.
+var errTestOver = errors.New("test over")
 
 // newTestPair connects a client and a server over a pipe. The server starts
 // on the first datagram that reaches it, as a fib server does.
