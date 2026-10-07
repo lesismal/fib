@@ -213,6 +213,30 @@ func (r *StreamRequest) Recycle() {
 	r.body, r.task = wholeBody{}, streamTask{}
 }
 
+// Cancel ends the request r holds because its stream failed before its
+// response was written: the client reset it, or the connection went. The
+// handler hears of it as one on an HTTP/1 connection that closed does,
+// through OnCancel, OnBody and Err, and nothing more is written; the request
+// stays the handler's until it returns and releases what it retained. Cancel
+// does nothing for a request whose response is finished, or one that has
+// not been handed a Context yet.
+//
+// The protocol calls it before it lets go of r, from the goroutine that
+// readies and recycles r, and only for a response it has not written whole:
+// a handler that answered and goes on working is not told, since its
+// response is not lost. The cancellation runs on the handler pool, since an
+// OnCancel callback may answer, which may take what the caller holds; a
+// Context recycled for another request by then is left alone.
+func (r *StreamRequest) Cancel(err error) {
+	c := &r.context
+	if c.Request == nil {
+		return
+	}
+	if w := c.word.Load(); ctxState(w) == ctxOpen {
+		cancelElsewhere(c.Conn, func() { c.cancelWith(err, w>>ctxGenShift) })
+	}
+}
+
 // StreamEnder is implemented by a Stream that is told when the request it
 // answers has ended: the handler has returned, every Retain has been
 // released, and the response, or the cancellation, has finished, so that

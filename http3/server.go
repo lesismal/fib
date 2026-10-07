@@ -467,6 +467,7 @@ func (sc *serverConn) OnClose(qc *quic.Conn, _ error) {
 	sc.streams = nil
 	sc.mu.Unlock()
 	for _, rs := range streams {
+		rs.cancel(net.ErrClosed)
 		rs.mu.Lock()
 		rs.closed = true
 		rs.mu.Unlock()
@@ -972,7 +973,9 @@ func (rs *requestStream) finish() {
 func (rs *requestStream) abort(code ErrorCode) {
 	rs.done = true
 	rs.dropBody()
-	rs.failBody(fmt.Errorf("http3: request stream aborted: %v", code))
+	err := fmt.Errorf("http3: request stream aborted: %v", code)
+	rs.failBody(err)
+	rs.cancel(err)
 	rs.mu.Lock()
 	rs.closed = true
 	rs.mu.Unlock()
@@ -998,11 +1001,26 @@ func (rs *requestStream) reject(status int) {
 	})
 }
 
+// cancel tells a handler still at work on the request, whose response has
+// not been written whole, that the stream failed under it; see
+// http.StreamRequest.Cancel. It runs on the goroutine QUIC calls the
+// connection's handler on, which is the one that recycles rs, before rs is
+// untracked.
+func (rs *requestStream) cancel(err error) {
+	rs.mu.Lock()
+	open := !rs.responded || rs.streaming
+	rs.mu.Unlock()
+	if open {
+		rs.block.Cancel(err)
+	}
+}
+
 // peerReset is the client abandoning the request.
 func (rs *requestStream) peerReset() {
 	rs.done = true
 	rs.dropBody()
 	rs.failBody(errRequestReset)
+	rs.cancel(errRequestReset)
 	rs.mu.Lock()
 	wasOpen := !rs.closed && (!rs.responded || rs.upgraded || rs.streaming)
 	rs.closed = true

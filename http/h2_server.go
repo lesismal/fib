@@ -1127,16 +1127,12 @@ func (sc *h2ServerConn) failBodyLocked(st *h2ServerStream, err error) {
 		// A handler waiting for room to write finds the stream gone.
 		o.room.Broadcast()
 	}
-	// A response still streaming is still being written, as one not begun is.
-	if c := &st.block.context; c.stream == st && (!st.responded || st.out != nil) {
-		// The generation is read while the stream is still the connection's,
-		// so that a Context recycled for another request by the time the
-		// cancellation runs is left alone. The cancellation runs elsewhere,
-		// since an OnCancel callback may answer, which takes the lock held
-		// here.
-		if w := c.word.Load(); ctxState(w) == ctxOpen {
-			cancelElsewhere(sc.conn, func() { c.cancelWith(err, w>>ctxGenShift) })
-		}
+	// A response still streaming is still being written, as one not begun
+	// is. The stream is still the connection's, which is what Cancel needs,
+	// and the cancellation runs elsewhere, since an OnCancel callback may
+	// answer, which takes the lock held here.
+	if st.block.context.stream == st && (!st.responded || st.out != nil) {
+		st.block.Cancel(err)
 	}
 }
 

@@ -195,3 +195,89 @@ func TestResponseOnTheReaderDoesNotWait(t *testing.T) {
 		t.Fatalf("status %d, %d bytes", status, len(body))
 	}
 }
+
+// A handler still at work on a request whose stream fails under it hears of
+// it through OnCancel, whether it has not answered or is streaming its
+// answer: the client resetting the request, asking the server to stop
+// sending, or closing the connection. One that answered whole is not told.
+func TestStreamFailureCancelsTheContext(t *testing.T) {
+	config := Config{StreamRequestBody: true}
+	cancelled := make(chan error, 8)
+	entered := make(chan string, 8)
+	base := startServer(t, config, func(c *fibhttp.Context, r *stdhttp.Request) {
+		if r.URL.Path == "/quick" {
+			c.OnCancel(func(err error) { cancelled <- err })
+			_ = c.Respond(stdhttp.StatusOK, "text/plain", []byte("done"))
+			return
+		}
+		done := make(chan struct{})
+		c.OnCancel(func(err error) {
+			cancelled <- err
+			close(done)
+		})
+		if r.URL.Path == "/streaming" {
+			c.Flush()
+		}
+		entered <- r.URL.Path
+		select {
+		case <-done:
+			if c.Err() == nil {
+				t.Error("Err is nil in a cancelled Context")
+			}
+		case <-time.After(5 * time.Second):
+			t.Errorf("%s: the handler was never told", r.URL.Path)
+		}
+	})
+	expectCancel := func(how string) {
+		t.Helper()
+		select {
+		case err := <-cancelled:
+			if err == nil {
+				t.Fatalf("%s: cancelled with a nil error", how)
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatalf("%s: no cancellation", how)
+		}
+	}
+	w := dialH3Wire(t, nil, base)
+	if status, body := w.response(w.send(t, h3Request{path: "/quick"}, false)); status != 200 || string(body) != "done" {
+		t.Fatalf("quick: %d %q", status, body)
+	}
+	for _, path := range []string{"/slow", "/streaming"} {
+		// The client resets a request whose body is still arriving, which
+		// the handler runs before it has.
+		s, err := w.qc.OpenStream()
+		if err != nil {
+			t.Fatal(err)
+		}
+		head, body := h3Request{path: path, framing: h3Length, body: make([]byte, 100)}.frames()
+		if err := s.Write(append(head, body[:20]...), false); err != nil {
+			t.Fatal(err)
+		}
+		<-entered
+		s.Reset(uint64(ErrCodeRequestCancelled))
+		expectCancel(path + " reset")
+
+		// The client asks the server to stop sending.
+		if s, err = w.qc.OpenStream(); err != nil {
+			t.Fatal(err)
+		}
+		head, _ = h3Request{path: path}.frames()
+		if err := s.Write(head, true); err != nil {
+			t.Fatal(err)
+		}
+		<-entered
+		s.StopSending(uint64(ErrCodeRequestCancelled))
+		expectCancel(path + " stop sending")
+	}
+	// The connection closes under a request.
+	w.send(t, h3Request{path: "/streaming"}, false)
+	<-entered
+	w.qc.Close(0, "")
+	expectCancel("connection closed")
+	select {
+	case err := <-cancelled:
+		t.Fatalf("an answered request was cancelled too: %v", err)
+	case <-time.After(100 * time.Millisecond):
+	}
+}
