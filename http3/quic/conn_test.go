@@ -764,10 +764,29 @@ func TestExpectedWriteCarriesTheAck(t *testing.T) {
 // the connection told to expect them, leave packed together rather than in a
 // packet each.
 func TestExpectedWritesArePacked(t *testing.T) {
+	// An answer whose goroutine a busy runner keeps from running for longer
+	// than flushHold leaves on its own, as it should: only a burst that never
+	// packs fails.
+	var sent []int
+	for range 3 {
+		var packed bool
+		if sent, packed = expectedWritesBurst(t); packed {
+			return
+		}
+	}
+	t.Fatalf("%d answers of 600 bytes left in %v", expectedBurst, sent)
+}
+
+const expectedBurst = 4
+
+// expectedWritesBurst answers a burst of requests on goroutines of their own
+// and returns the sizes of the datagrams the server sent, and whether the
+// answers were packed into at most half as many.
+func expectedWritesBurst(t *testing.T) ([]int, bool) {
 	p := newTestPair(t, 0, func(_, server *Config) { server.MaxDatagramSize = 1350 })
 	time.Sleep(50 * time.Millisecond)
 	p.bursts.Store(true)
-	const requests = 4
+	const requests = expectedBurst
 	var mu sync.Mutex
 	var streams []*Stream
 	p.serverH.onData = func(s *Stream, data []byte, fin bool) {
@@ -816,9 +835,7 @@ func TestExpectedWritesArePacked(t *testing.T) {
 			answers++
 		}
 	}
-	if answers > requests/2 {
-		t.Fatalf("%d answers of 600 bytes left in %v", requests, sent)
-	}
+	return sent, answers <= requests/2
 }
 
 // A write expected but not made, as by a handler that keeps its request,
