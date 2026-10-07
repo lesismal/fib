@@ -203,6 +203,18 @@ func (e *Engine) openUDPBeside(config Config, parent *Engine) error {
 	return nil
 }
 
+// stopListening shuts the engine's TCP listeners down, which stops them
+// taking connections without closing their descriptors. Where a platform does
+// not stop a listening socket this way, its listeners listen until closed.
+func (e *Engine) stopListening() {
+	if !e.tcpListeners {
+		return
+	}
+	for _, fd := range e.listenFDs {
+		_ = syscall.Shutdown(fd, syscall.SHUT_RD)
+	}
+}
+
 func (e *Engine) closeListeners() {
 	for _, fd := range e.listenFDs {
 		syscall.Close(fd)
@@ -565,6 +577,18 @@ func (e *Engine) Close() error {
 	var closeErr error
 	e.closeOnce.Do(func() {
 		e.Stop()
+		// No connection is taken from here on. Closing the ones there are
+		// tells their peers, which may connect again at once, and with a
+		// listener for each of many pollers some would still be listening:
+		// on 128 CPUs, 64 pollers' listeners, a client reconnecting 10ms
+		// after the server closed its connection was mostly let in. A
+		// listening socket that is shut down stops listening, and keeps its
+		// descriptor until it is closed below, so no loop that has yet to
+		// see Stop can be left waiting on a descriptor reused elsewhere.
+		e.stopListening()
+		for _, p := range e.pollers {
+			p.stopListening()
+		}
 		e.stopUDPSweeper()
 		// The pollers' connections are the engine's, so they close first,
 		// while the task pool they run on is still there.
@@ -618,14 +642,18 @@ func pollersListen(config Config) bool {
 // to listen beside it. Without Config.ReusePort, which would let other
 // sockets share the address, the address is claimed first by a socket bound
 // without SO_REUSEPORT, so that one another socket holds already is refused
-// with EADDRINUSE, as it is without pollers: see claimAddress.
+// with EADDRINUSE, as it is without pollers: see claimAddress. A port left to
+// the kernel is not claimed: it never chooses one a socket holds, even with
+// SO_REUSEPORT, whereas the port a claim chose is free again once the claim
+// gives it up, and another process claiming then would be given it too and
+// share it, its connections split between the two.
 func createListener(config Config, addr string, listen, spread bool) (int, error) {
 	family, bound, err := resolveListenAddr(config.Network, addr)
 	if err != nil {
 		return -1, err
 	}
 	reusePort := config.ReusePort
-	if spread && !reusePort {
+	if spread && !reusePort && sockaddrPort(bound) != 0 {
 		if bound, err = claimAddress(config, family, bound); err != nil {
 			return -1, err
 		}
@@ -662,6 +690,18 @@ func claimAddress(config Config, family int, bound syscall.Sockaddr) (syscall.So
 		return nil, err
 	}
 	return syscall.Getsockname(fd)
+}
+
+// sockaddrPort returns the port of an IPv4 or IPv6 sockaddr, and 0 for any
+// other.
+func sockaddrPort(sa syscall.Sockaddr) int {
+	switch sa := sa.(type) {
+	case *syscall.SockaddrInet4:
+		return sa.Port
+	case *syscall.SockaddrInet6:
+		return sa.Port
+	}
+	return 0
 }
 
 // createListenerLike opens a socket listening where like is bound, which

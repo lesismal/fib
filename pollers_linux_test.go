@@ -289,3 +289,115 @@ func TestPollersReadUDPWithReusePort(t *testing.T) {
 		}
 	}
 }
+
+// Engines that listen on ports of the kernel's choosing at once, as the
+// tests of many packages do, are each given a port of their own: none is
+// given one another engine's pollers listen on, which would split its
+// connections between them.
+func TestPollersOnChosenPortsShareNone(t *testing.T) {
+	const engines = 32
+	var wg sync.WaitGroup
+	addrs := make([]string, engines)
+	for i := range engines {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			config := DefaultConfig()
+			config.Addr = "127.0.0.1:0"
+			config.IOPollers, config.IOPollerCount = true, 8
+			reply := []byte(strconv.Itoa(i))
+			engine, err := Bind(config, HandlerFuncs{Data: func(c *Connection, _ []byte) { _ = c.Send(reply) }})
+			if err != nil {
+				t.Error(err)
+				return
+			}
+			done := make(chan error, 1)
+			go func() { done <- engine.Run() }()
+			t.Cleanup(func() {
+				engine.Stop()
+				<-done
+				_ = engine.Close()
+			})
+			addr, err := engine.LocalAddr()
+			if err != nil {
+				t.Error(err)
+				return
+			}
+			addrs[i] = addr.String()
+		}()
+	}
+	wg.Wait()
+	if t.Failed() {
+		return
+	}
+	for i, addr := range addrs {
+		for range 16 {
+			conn, err := net.DialTimeout("tcp", addr, 5*time.Second)
+			if err != nil {
+				t.Fatal(err)
+			}
+			_ = conn.SetDeadline(time.Now().Add(5 * time.Second))
+			_, _ = conn.Write([]byte("hi"))
+			buf := make([]byte, 8)
+			n, err := conn.Read(buf)
+			conn.Close()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got := string(buf[:n]); got != strconv.Itoa(i) {
+				t.Fatalf("engine %d's address %s was answered by engine %s", i, addr, got)
+			}
+		}
+	}
+}
+
+// Close stops every poller's listener before it closes a connection, so that
+// a peer that reconnects the moment its connection is closed is refused, not
+// let into a listener of a poller still waiting its turn to close.
+func TestCloseStopsListeningFirst(t *testing.T) {
+	config := DefaultConfig()
+	config.Addr = "127.0.0.1:0"
+	config.IOPollers, config.IOPollerCount = true, 32
+	engine, err := Bind(config, HandlerFuncs{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	addr, err := engine.LocalAddr()
+	if err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan error, 1)
+	go func() { done <- engine.Run() }()
+	var conns []net.Conn
+	for range 8 {
+		conn, err := net.DialTimeout("tcp", addr.String(), 5*time.Second)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer conn.Close()
+		conns = append(conns, conn)
+	}
+	// Each client dials again as soon as its connection is closed.
+	redialed := make(chan error, len(conns))
+	for _, conn := range conns {
+		go func() {
+			_, _ = conn.Read(make([]byte, 1))
+			again, err := net.DialTimeout("tcp", addr.String(), time.Second)
+			if err == nil {
+				again.Close()
+			}
+			redialed <- err
+		}()
+	}
+	time.Sleep(50 * time.Millisecond)
+	engine.Stop()
+	<-done
+	if err := engine.Close(); err != nil {
+		t.Fatal(err)
+	}
+	for range conns {
+		if err := <-redialed; err == nil {
+			t.Fatal("a client reconnected to a closed engine")
+		}
+	}
+}
