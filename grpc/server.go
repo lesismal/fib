@@ -457,7 +457,18 @@ func (s *Server) openStream(t *transport, id uint32, fields []hpack.HeaderField,
 	t.run(ss)
 }
 
+// streamKey keys the call a handler's context is for, which SetHeader and
+// the other functions taking that context find there.
 type streamKey struct{}
+
+// call is the server's side of a call as the functions taking a handler's
+// context see it, whichever transport carries it.
+type call interface {
+	SetHeader(metadata.MD) error
+	SendHeader(metadata.MD) error
+	SetTrailer(metadata.MD)
+	fullMethod() string
+}
 
 // serverStream is the server's side of a call.
 type serverStream struct {
@@ -490,15 +501,21 @@ func (ss *serverStream) cancel() {
 
 // resolve finds the method of path, "/service/method".
 func (ss *serverStream) resolve(path string) *status.Status {
-	s := ss.server
+	var fail *status.Status
+	ss.svc, ss.unary, ss.stream, fail = ss.server.lookup(path)
+	return fail
+}
+
+// lookup finds the method of path, "/service/method": the service and
+// either its unary method or its streaming one.
+func (s *Server) lookup(path string) (*service, *MethodDesc, *StreamDesc, *status.Status) {
 	name := strings.TrimPrefix(path, "/")
 	i := strings.LastIndexByte(name, '/')
 	if i <= 0 {
 		if s.opts.unknown != nil {
-			ss.stream = &StreamDesc{StreamName: name, Handler: s.opts.unknown, ServerStreams: true, ClientStreams: true}
-			return nil
+			return nil, nil, &StreamDesc{StreamName: name, Handler: s.opts.unknown, ServerStreams: true, ClientStreams: true}, nil
 		}
-		return status.Newf(codes.Unimplemented, "malformed method name: %q", path)
+		return nil, nil, nil, status.Newf(codes.Unimplemented, "malformed method name: %q", path)
 	}
 	svcName, methodName := name[:i], name[i+1:]
 	s.mu.Lock()
@@ -506,22 +523,19 @@ func (ss *serverStream) resolve(path string) *status.Status {
 	s.mu.Unlock()
 	if svc != nil {
 		if md := svc.methods[methodName]; md != nil {
-			ss.svc, ss.unary = svc, md
-			return nil
+			return svc, md, nil, nil
 		}
 		if sd := svc.streams[methodName]; sd != nil {
-			ss.svc, ss.stream = svc, sd
-			return nil
+			return svc, nil, sd, nil
 		}
 	}
 	if s.opts.unknown != nil {
-		ss.stream = &StreamDesc{StreamName: methodName, Handler: s.opts.unknown, ServerStreams: true, ClientStreams: true}
-		return nil
+		return nil, nil, &StreamDesc{StreamName: methodName, Handler: s.opts.unknown, ServerStreams: true, ClientStreams: true}, nil
 	}
 	if svc == nil {
-		return status.Newf(codes.Unimplemented, "unknown service %v", svcName)
+		return nil, nil, nil, status.Newf(codes.Unimplemented, "unknown service %v", svcName)
 	}
-	return status.Newf(codes.Unimplemented, "unknown method %v for service %v", methodName, svcName)
+	return nil, nil, nil, status.Newf(codes.Unimplemented, "unknown method %v for service %v", methodName, svcName)
 }
 
 // rejectHTTP answers a request that is not a gRPC call with an HTTP status.
@@ -544,33 +558,37 @@ func (ss *serverStream) rejectHTTP(t *transport, id uint32, grpcType, endStream 
 
 // RunTask serves the call on the pool.
 func (ss *serverStream) RunTask() {
-	var err error
+	err := ss.server.invoke(ss, ss.method, ss.svc, ss.unary, ss.stream)
+	ss.finish(status.Convert(errOrContext(err, ss.ctx)))
+}
+
+// invoke runs the handler of the call on ss to method, which lookup found to
+// be svc's unary method or sd, and returns the error it ended with, one for
+// its panic included.
+func (s *Server) invoke(ss ServerStream, method string, svc *service, unary *MethodDesc, sd *StreamDesc) (err error) {
 	defer func() {
 		if recovered := recover(); recovered != nil {
-			slog.Error("grpc: handler panicked", "method", ss.method, "panic", recovered, "stack", string(debug.Stack()))
+			slog.Error("grpc: handler panicked", "method", method, "panic", recovered, "stack", string(debug.Stack()))
 			err = status.Errorf(codes.Internal, "grpc: handler panicked: %v", recovered)
 		}
-		ss.finish(status.Convert(errOrContext(err, ss.ctx)))
 	}()
-	s := ss.server
-	if ss.unary != nil {
+	if unary != nil {
 		var reply any
-		reply, err = ss.unary.Handler(ss.svc.impl, ss.ctx, ss.RecvMsg, s.opts.unaryInt)
+		reply, err = unary.Handler(svc.impl, ss.Context(), ss.RecvMsg, s.opts.unaryInt)
 		if err == nil {
 			err = ss.SendMsg(reply)
 		}
-		return
+		return err
 	}
 	var impl any
-	if ss.svc != nil {
-		impl = ss.svc.impl
+	if svc != nil {
+		impl = svc.impl
 	}
 	if s.opts.streamInt != nil {
-		info := &StreamServerInfo{FullMethod: ss.method, IsClientStream: ss.stream.ClientStreams, IsServerStream: ss.stream.ServerStreams}
-		err = s.opts.streamInt(impl, ss, info, ss.stream.Handler)
-		return
+		info := &StreamServerInfo{FullMethod: method, IsClientStream: sd.ClientStreams, IsServerStream: sd.ServerStreams}
+		return s.opts.streamInt(impl, ss, info, sd.Handler)
 	}
-	err = ss.stream.Handler(impl, ss)
+	return sd.Handler(impl, ss)
 }
 
 // errOrContext is err, or, for an error the call's context caused, the
@@ -586,6 +604,8 @@ func errOrContext(err error, ctx context.Context) error {
 }
 
 func (ss *serverStream) Context() context.Context { return ss.ctx }
+
+func (ss *serverStream) fullMethod() string { return ss.method }
 
 func (ss *serverStream) SetHeader(md metadata.MD) error {
 	t := ss.s.t
@@ -749,7 +769,7 @@ func (ss *serverStream) finish(st *status.Status) {
 
 // SetHeader sets header metadata of the call of ctx, a server handler's.
 func SetHeader(ctx context.Context, md metadata.MD) error {
-	ss, ok := ctx.Value(streamKey{}).(*serverStream)
+	ss, ok := ctx.Value(streamKey{}).(call)
 	if !ok {
 		return status.Errorf(codes.Internal, "grpc: failed to fetch the stream from the context %v", ctx)
 	}
@@ -758,7 +778,7 @@ func SetHeader(ctx context.Context, md metadata.MD) error {
 
 // SendHeader sends the header metadata of the call of ctx.
 func SendHeader(ctx context.Context, md metadata.MD) error {
-	ss, ok := ctx.Value(streamKey{}).(*serverStream)
+	ss, ok := ctx.Value(streamKey{}).(call)
 	if !ok {
 		return status.Errorf(codes.Internal, "grpc: failed to fetch the stream from the context %v", ctx)
 	}
@@ -767,7 +787,7 @@ func SendHeader(ctx context.Context, md metadata.MD) error {
 
 // SetTrailer sets trailer metadata of the call of ctx.
 func SetTrailer(ctx context.Context, md metadata.MD) error {
-	ss, ok := ctx.Value(streamKey{}).(*serverStream)
+	ss, ok := ctx.Value(streamKey{}).(call)
 	if !ok {
 		return status.Errorf(codes.Internal, "grpc: failed to fetch the stream from the context %v", ctx)
 	}
@@ -777,9 +797,9 @@ func SetTrailer(ctx context.Context, md metadata.MD) error {
 
 // Method returns the full method name of the call of ctx.
 func Method(ctx context.Context) (string, bool) {
-	ss, ok := ctx.Value(streamKey{}).(*serverStream)
+	ss, ok := ctx.Value(streamKey{}).(call)
 	if !ok {
 		return "", false
 	}
-	return ss.method, true
+	return ss.fullMethod(), true
 }

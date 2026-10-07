@@ -171,6 +171,10 @@ parameter, then a catch-all. A GET route also answers HEAD. A path that exists o
 methods gets a 405 with an `Allow` header. [`http/routerbench`](http/routerbench) compares the
 router with chi and `http.ServeMux`.
 
+`c.JSON(status, v)` answers with `v` encoded as JSON, as `json.Marshal` encodes it, into a buffer
+reused once HTTP/1 has copied the body out. Set `fibhttp.JSONEncoder` once at startup to use
+another encoder, such as sonic's.
+
 ### WebSocket
 
 ```go
@@ -223,6 +227,21 @@ Every call runs on the engine's handler pool, the one HTTP/2 and HTTP/3 use, or 
 imports name `github.com/lesismal/fib/grpc`. fib depends on nothing outside the standard library,
 so messages of google.golang.org/protobuf need a codec registered with `grpc.RegisterCodec`; the
 package doc shows the five lines.
+
+To serve gRPC on the same port as HTTP, route the service's paths to the server. `Server` has a
+`ServeHTTP` for calls that come in through fib's HTTP/2, h2c or h2 over TLS:
+
+```go
+r := fibhttp.NewRouter()
+r.Handle("/helloworld.Greeter/*", server)
+r.Get("/", index)
+engine, err := fib.Bind(config, fibhttp.NewHandler(r))
+```
+
+fib's HTTP/2 sends each response whole once its handler returns. So a call served this way sends
+its reply when it ends: a server stream's messages reach the client together, and a
+bidirectional call that waits for replies before it has sent everything needs the server's own
+connections.
 
 ### Raw TCP
 

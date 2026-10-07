@@ -30,6 +30,10 @@
 // For TLS, wrap it: fibtls.NewServer(grpc.ConfigureTLS(tlsConfig), server).
 // Serve and ServeTLS make the engine themselves.
 //
+// To serve gRPC on the same port as package http's HTTP, route the
+// service's paths to the Server, whose ServeHTTP serves the calls that
+// package http's HTTP/2 brings it; see ServeHTTP for what that can serve.
+//
 // Every call's handler runs on a task pool, never on the engine worker that
 // reads the connection, so a handler that blocks holds up only its own call.
 // The pool is fib.Engine.HandlerPool of the connection's engine, the one

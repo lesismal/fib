@@ -166,6 +166,9 @@ engine, err := fib.Bind(config, fibhttp.NewHandler(r))
 不匹配时返回 405，并带 `Allow` 头。[`http/routerbench`](http/routerbench) 有与 chi、
 `http.ServeMux` 的对比。
 
+`c.JSON(status, v)` 把 `v` 编码成 JSON 回复，编码结果与 `json.Marshal` 相同，写入的缓冲区在
+HTTP/1 把 body 拷出后复用。启动时给 `fibhttp.JSONEncoder` 赋值一次即可换用其他编码器，例如 sonic。
+
 ### WebSocket
 
 ```go
@@ -217,6 +220,19 @@ reply, err := pb.NewGreeterClient(conn).SayHello(ctx, &pb.HelloRequest{Name: "fi
 `grpc.TaskPool` 时则用用户的池。生成的 `_grpc.pb.go` 只需把 `google.golang.org/grpc` 的 import
 改为 `github.com/lesismal/fib/grpc`。fib 不依赖标准库以外的模块，所以 google.golang.org/protobuf
 的消息需要用 `grpc.RegisterCodec` 注册一个 codec，包文档里有这五行代码。
+
+要让 gRPC 和 HTTP 共用一个端口，把服务的路径路由给 server 即可。`Server` 实现了 `ServeHTTP`，
+处理从 fib 的 HTTP/2（h2c 或 TLS 上的 h2）进来的调用：
+
+```go
+r := fibhttp.NewRouter()
+r.Handle("/helloworld.Greeter/*", server)
+r.Get("/", index)
+engine, err := fib.Bind(config, fibhttp.NewHandler(r))
+```
+
+fib 的 HTTP/2 在 handler 返回后整体发送响应，所以这样服务的调用在结束时才发出回复：服务端流的
+消息会一起到达客户端；双向流若要在发完所有消息之前收到回复，需要用 server 自己的连接。
 
 ### 裸 TCP
 
