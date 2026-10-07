@@ -58,6 +58,8 @@ uSockets, workflow, axum, h2, quiche and rustls.
   pool aligned to the Go allocator's size classes.
 - **Async clients**: non-blocking dial, plus HTTP/1.x, HTTP/2, HTTP/3 and WebSocket clients that
   report results through callbacks or futures.
+- **Static files**: `http.FileCache` serves a directory from memory, with pre-compressed `.br`/`.gz`
+  twins, and follows the disk: an inotify watch on Linux, a stat per request elsewhere.
 - **Router**: a [chi](https://github.com/go-chi/chi)-style API with parameters, regexps,
   catch-alls, groups, sub-routers and mounts. Routing allocates nothing.
 - **Middleware**: compress, cors, csrf, etag, limiter, logger, pprof, recover, requestid and
