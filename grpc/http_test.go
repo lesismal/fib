@@ -81,14 +81,21 @@ func TestServeHTTPUnary(t *testing.T) {
 }
 
 func TestServeHTTPStreams(t *testing.T) {
-	// A server stream needs nothing more than the request whole.
-	_, c := dial(t, startHTTP(t, &echoImpl{}, fibhttp.DefaultConfig()))
+	// A server stream needs nothing more than the request whole, and its
+	// messages reach the client as they are sent: the first arrives while
+	// the method waits to send the rest.
+	impl := &echoImpl{block: make(chan struct{})}
+	_, c := dial(t, startHTTP(t, impl, fibhttp.DefaultConfig()))
 	ctx := testCtx(t)
-	count, err := c.Count(ctx, &Req{Msg: "c", N: 500})
+	count, err := c.Count(ctx, &Req{Msg: "block", N: 500})
 	if err != nil {
 		t.Fatal(err)
 	}
-	for i := 0; ; i++ {
+	if m, err := count.Recv(); err != nil || m.N != 0 {
+		t.Fatalf("Count's first message, sent alone = %+v, %v", m, err)
+	}
+	close(impl.block)
+	for i := 1; ; i++ {
 		m, err := count.Recv()
 		if err == io.EOF {
 			if i != 500 {
@@ -118,23 +125,47 @@ func TestServeHTTPStreams(t *testing.T) {
 	if err != nil || r.N != 5050 || len(r.Msg) != 100*len(chunk) {
 		t.Fatalf("Sum = %+v, %v", r, err)
 	}
-	// A bidirectional call is answered when it ends, so its client sends
-	// everything before it reads.
+	// An interactive bidirectional call: the client waits for each reply
+	// before it sends the next message.
 	chat, err := c.Chat(ctx)
 	if err != nil {
 		t.Fatal(err)
 	}
-	words := []string{"a", "b", "c"}
-	for i, w := range words {
+	for i, w := range []string{"a", "b", "c", "slow", "d"} {
 		if err := chat.Send(&Req{Msg: w, N: i}); err != nil {
 			t.Fatal(err)
 		}
-	}
-	chat.CloseSend()
-	for i, w := range words {
 		m, err := chat.Recv()
 		if err != nil || m.Msg != strings.ToUpper(w) || m.N != i {
 			t.Fatalf("Chat %s = %+v, %v", w, m, err)
+		}
+	}
+	_ = chat.CloseSend()
+	if _, err := chat.Recv(); err != io.EOF {
+		t.Fatalf("Chat end = %v", err)
+	}
+	// And one whose replies outrun what the client's windows hold, read only
+	// once everything has been sent: the call waits for the client to read,
+	// rather than the server holding every reply.
+	chat, err = c.Chat(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	big := strings.Repeat("y", 64<<10)
+	const n = 200
+	go func() {
+		for i := range n {
+			if err := chat.Send(&Req{Msg: big, N: i}); err != nil {
+				t.Error(err)
+				return
+			}
+		}
+		_ = chat.CloseSend()
+	}()
+	for i := range n {
+		m, err := chat.Recv()
+		if err != nil || len(m.Msg) != len(big) || m.N != i {
+			t.Fatalf("Chat reply %d = %d bytes, %v", i, len(m.GetMsg()), err)
 		}
 	}
 	if _, err := chat.Recv(); err != io.EOF {

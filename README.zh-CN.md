@@ -231,8 +231,9 @@ r.Get("/", index)
 engine, err := fib.Bind(config, fibhttp.NewHandler(r))
 ```
 
-fib 的 HTTP/2 在 handler 返回后整体发送响应，所以这样服务的调用在结束时才发出回复：服务端流的
-消息会一起到达客户端；双向流若要在发完所有消息之前收到回复，需要用 server 自己的连接。
+调用发送的每条消息都会立即发出，并受 stream 流控限速，因此服务端流的消息逐条到达客户端。客户端
+流式发送的调用，尤其是双向流，需要设置 `Config.StreamRequestBody`，让调用在请求开始到达时就
+运行，而不是等请求完整到达。
 
 ### 裸 TCP
 

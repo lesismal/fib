@@ -57,12 +57,12 @@ type responseWriter struct {
 	// much body it has written so far.
 	declared int64
 	written  int64
-	// buf holds body not yet sent: on HTTP/1 until the header goes out, and
-	// on HTTP/2 and HTTP/3 until the handler is done.
+	// buf holds body not yet sent, until the header goes out, or until the
+	// handler is done when the response is held whole.
 	buf []byte
-	// committed records that the HTTP/1 header has been sent, and chunked
-	// and closeAfter how its body is framed and whether the connection ends
-	// with it. trailers are the names the header announced.
+	// committed records that the header has been sent, and chunked and
+	// closeAfter how an HTTP/1 body is framed and whether the connection
+	// ends with it. trailers are the names the header announced.
 	committed  bool
 	chunked    bool
 	closeAfter bool
@@ -124,14 +124,16 @@ func (w *responseWriter) reset() {
 // as an interim response, and may be followed by others; the final status
 // may only be set once, and Write sets 200 if it has not been set.
 //
-// On HTTP/1 the header goes out with the first part of the body. A handler
-// whose body is no longer than a few kilobytes, or that set Content-Length
-// itself, gets a response with Content-Length; a longer one is chunked, which
-// is also what carries trailers. An HTTP/1.0 client, which does not know
-// chunked framing, gets a body that ends when the connection closes.
-//
-// On HTTP/2 and HTTP/3 the whole response is held until the handler returns
-// and then sent at once, trailers included.
+// The header goes out with the first part of the body. A handler whose body
+// is no longer than a few kilobytes, or that set a Content-Length of no more
+// than 64 kilobytes itself, and that does not flush, gets its response sent
+// whole once it is done, with Content-Length. A longer body, or a flushed
+// one, streams: on HTTP/1 it is chunked, which is also what carries trailers,
+// unless Content-Length was set, and an HTTP/1.0 client, which does not know
+// chunked framing, gets a body that ends when the connection closes. On
+// HTTP/2, and on HTTP/3, the header goes out in a HEADERS frame of its own,
+// the body in DATA frames as it is written and as the client's flow control
+// lets it go, and trailers in HEADERS after it.
 func (c *Context) WriteHeader(status int) {
 	if status < 100 || status > 999 {
 		panic(fmt.Sprintf("http: invalid WriteHeader code %d", status))
@@ -168,6 +170,13 @@ func (c *Context) WriteHeader(status int) {
 // Write adds p to the response body, as http.ResponseWriter's does, sending
 // the header first if it has not gone yet. A response to HEAD counts what is
 // written but sends none of it.
+//
+// On HTTP/2 and HTTP/3 a response that streams is paced by the client: once
+// 64 kilobytes of it are held back by flow control, Write waits for the
+// client to take some, or for the stream to end, which it then reports. A
+// handler its connection runs on its own reader, which StreamPoolConfig
+// describes, is the exception, since the client's go-ahead would arrive on
+// the goroutine that is waiting: what it writes is held until it can go.
 func (c *Context) Write(p []byte) (int, error) {
 	if c.wrote {
 		return 0, ErrResponseWritten
@@ -194,9 +203,16 @@ func (c *Context) Write(p []byte) (int, error) {
 		return len(p), nil
 	}
 	if !w.committed && (len(w.buf)+len(p) <= writerBufferSize || w.holdsDeclared()) {
-		// Held back in a pooled buffer, which commit gives back once the
-		// header has gone out with it.
-		w.buf = bufferpool.Append(w.buf, p)
+		if c.isHTTP1() {
+			// Held back in a pooled buffer, which commit gives back once the
+			// header has gone out with it.
+			w.buf = bufferpool.Append(w.buf, p)
+		} else {
+			// A body sent whole on a stream may stay with the stream after
+			// the response is finished, waiting for the client's window, so
+			// it is not the pool's to have back.
+			w.buf = append(w.buf, p...)
+		}
 		return len(p), nil
 	}
 	if !w.committed {
@@ -215,13 +231,15 @@ func (c *Context) WriteString(s string) (int, error) { return c.Write([]byte(s))
 
 // Flush sends the header and whatever body is held back, as http.Flusher's
 // does, and hands it to the socket at once rather than when the handler
-// returns. It does nothing on HTTP/2 and HTTP/3, whose responses go out
-// whole.
+// returns; the response streams from then on. On HTTP/2 and HTTP/3 what the
+// client's flow control holds back goes as it lets it.
 func (c *Context) Flush() { _ = c.FlushError() }
 
 // FlushError is Flush reporting what went wrong, which is what
 // http.ResponseController looks for. A response an OnResponse hook needs
-// whole is held as on HTTP/2, so Flush does nothing for it either.
+// whole is held until the handler is done, so Flush does nothing for it, nor
+// on a stream served outside this package that cannot send a response as it
+// is written (see ResponseStreamer).
 func (c *Context) FlushError() error {
 	if c.wrote {
 		return ErrResponseWritten
@@ -237,6 +255,10 @@ func (c *Context) FlushError() error {
 		if err := c.commit(false); err != nil {
 			return err
 		}
+	}
+	if !c.isHTTP1() {
+		// The stream sends what it is given without being asked.
+		return nil
 	}
 	return c.Conn.Flush()
 }
@@ -254,7 +276,7 @@ func (c *Context) ReadFrom(src io.Reader) (int64, error) {
 	}
 	w := c.writer()
 	file, ok := sendableFileOf(src)
-	if !ok || c.holdsWhole() || c.Request.Method == stdhttp.MethodHead || w.finished ||
+	if !ok || c.holdsWhole() || !c.isHTTP1() || c.Request.Method == stdhttp.MethodHead || w.finished ||
 		w.status != 0 && !statusHasBody(w.status) || file.size < minSendFileSize ||
 		w.declared >= 0 && w.written+file.size > w.declared {
 		buf := bufferpool.Get(copyBufferSize)
@@ -347,11 +369,28 @@ func (s sendableFile) advance() {
 }
 
 // holdsWhole reports whether a response written through the ResponseWriter
-// methods is held until the handler is done and then sent at once: always on
-// HTTP/2 and HTTP/3, and on HTTP/1 when an OnResponse hook needs its body
-// whole.
+// methods is held until the handler is done and then sent at once: when an
+// OnResponse hook needs its body whole, and on a stream of a protocol served
+// outside this package that cannot send it as it is written.
 func (c *Context) holdsWhole() bool {
-	return !c.isHTTP1() || c.w != nil && c.w.hooks != nil && c.w.hooks.whole
+	if c.w != nil && c.w.hooks != nil && c.w.hooks.whole {
+		return true
+	}
+	if c.external != nil {
+		_, streams := c.external.(ResponseStreamer)
+		return !streams
+	}
+	return false
+}
+
+// streamer is what the response to a request that arrived on a multiplexed
+// stream is sent through as it is written.
+func (c *Context) streamer() ResponseStreamer {
+	if c.stream != nil {
+		return (*h2Responder)(c.stream)
+	}
+	streamer, _ := c.external.(ResponseStreamer)
+	return streamer
 }
 
 // isHTTP1 reports whether the response goes straight onto an HTTP/1
@@ -363,10 +402,13 @@ func statusHasBody(status int) bool {
 	return status >= 200 && status != stdhttp.StatusNoContent && status != stdhttp.StatusNotModified
 }
 
-// commit sends the HTTP/1 header, with whatever body is held back. final
-// says the handler is done, so that a body held back whole can be sent with
-// its length.
+// commit sends the header, with whatever body is held back. final says the
+// handler is done, so that a body held back whole can be sent with its
+// length; HTTP/2 and HTTP/3 send such a body whole instead.
 func (c *Context) commit(final bool) error {
+	if !c.isHTTP1() {
+		return c.commitStream()
+	}
 	w := c.w
 	req := c.Request
 	head := responseHead{status: w.status, header: w.sent, contentLength: -1}
@@ -431,8 +473,30 @@ func (c *Context) commit(final bool) error {
 	return c.Conn.Flush()
 }
 
-// sendBody sends part of a committed HTTP/1 body.
+// commitStream begins a response that streams on an HTTP/2 or HTTP/3 stream:
+// its header goes out, and whatever body is held back behind it.
+func (c *Context) commitStream() error {
+	w := c.w
+	w.trailers = announcedTrailers(w.sent)
+	w.sniff()
+	streamer := c.streamer()
+	if err := streamer.BeginResponse(c.Request, w.status, w.sent); err != nil {
+		return err
+	}
+	w.committed = true
+	held := w.buf
+	w.buf = nil
+	if len(held) == 0 {
+		return nil
+	}
+	return streamer.WriteBody(held, !c.onReader())
+}
+
+// sendBody sends part of a committed body.
 func (c *Context) sendBody(p []byte) error {
+	if !c.isHTTP1() {
+		return c.streamer().WriteBody(p, !c.onReader())
+	}
 	if !c.w.chunked {
 		return c.Conn.Send(p)
 	}
@@ -462,7 +526,8 @@ func (c *Context) Finish() error {
 		return nil
 	}
 	w.finished = true
-	if c.holdsWhole() {
+	if c.holdsWhole() || !c.isHTTP1() && !w.committed {
+		// Held whole, or short enough to send whole now the handler is done.
 		w.sniff()
 		response := Response{StatusCode: w.status, Header: w.sent, Body: w.buf, Trailer: w.trailer()}
 		switch {
@@ -477,6 +542,9 @@ func (c *Context) Finish() error {
 			delete(response.Header, "Content-Length")
 		}
 		return c.writeResponse(response)
+	}
+	if !c.isHTTP1() {
+		return c.endStream()
 	}
 	if !w.committed {
 		if err := c.commit(true); err != nil {
@@ -508,6 +576,31 @@ func (c *Context) Finish() error {
 		// for bytes that will never come, so the connection has to end.
 		c.closing = true
 		c.Conn.CloseAfterSend()
+	}
+	return nil
+}
+
+// endStream ends a response that streams on an HTTP/2 or HTTP/3 stream, with
+// its trailers, or resets the stream when its body fell short of its
+// Content-Length.
+func (c *Context) endStream() error {
+	w := c.w
+	hasBody := statusHasBody(w.status) && c.Request.Method != stdhttp.MethodHead
+	var trailer stdhttp.Header
+	if hasBody {
+		trailer = w.trailer()
+	}
+	complete := !hasBody || w.declared < 0 || w.written >= w.declared
+	if err := c.streamer().EndResponse(trailer, complete); err != nil {
+		return err
+	}
+	c.wrote = true
+	if w.hooks != nil {
+		size := w.written
+		if !hasBody {
+			size = 0
+		}
+		w.hooks.finished(w.status, w.sent, size)
 	}
 	return nil
 }

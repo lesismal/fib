@@ -27,7 +27,7 @@ func TestRequestStreamRecycleResets(t *testing.T) {
 		fields = append(fields, typ.Field(i).Name)
 	}
 	cleared := []string{"sc", "s", "parser", "req", "body", "declared", "trailers", "done", "streamed", "tunnel",
-		"mu", "remoteDone", "responded", "closed", "upgraded", "expected", "block", "values",
+		"mu", "remoteDone", "responded", "closed", "upgraded", "streaming", "expected", "block", "values",
 		"pooled", "refs", "nextDead", "headerFromPool"}
 	sort.Strings(fields)
 	sort.Strings(cleared)

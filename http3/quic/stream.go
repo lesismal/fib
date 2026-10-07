@@ -140,6 +140,31 @@ func (s *Stream) writeLocked(p []byte, fin, owned bool) error {
 	return nil
 }
 
+// WaitSendable waits while more than limit bytes written to the stream are
+// still to be sent, held back by the peer's flow control or by congestion
+// control, so that a writer faster than the peer reads is paced by it rather
+// than buffered without bound. It returns ErrClosed once the sending side has
+// been reset or the connection has ended. The sends it waits for wait on the
+// connection's handler calls and on what arrives from the peer, so it must
+// not be called from the handler, nor from the goroutine that hands the
+// connection its datagrams.
+func (s *Stream) WaitSendable(limit int) error {
+	c := s.conn
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	for {
+		switch {
+		case c.closed, !s.hasSend || s.reset:
+			return ErrClosed
+		case s.send.end()-s.send.next <= uint64(limit):
+			return nil
+		}
+		c.roomWaiters++
+		c.sendRoom.Wait()
+		c.roomWaiters--
+	}
+}
+
 // Close ends the sending side once what has been written is sent.
 func (s *Stream) Close() error { return s.Write(nil, true) }
 
@@ -167,6 +192,7 @@ func (s *Stream) resetLocked(code uint64) {
 	s.finalSize = s.send.next
 	s.send = sendBuffer{base: s.send.next, next: s.send.next}
 	s.conn.queueStream(s)
+	s.conn.wakeWritersLocked()
 }
 
 // StopSending asks the peer to stop sending, with code, and discards what

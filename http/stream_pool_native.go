@@ -101,11 +101,20 @@ func (p *StreamPool) Run(gate *StreamGate, conn *fib.Connection, fn func()) {
 // r.Context first.
 func (p *StreamPool) Serve(gate *StreamGate, conn *fib.Connection, handler Handler, r *StreamRequest) {
 	if !p.admit(gate) {
-		Serve(handler, &r.context)
+		serveOnReader(handler, &r.context)
 		return
 	}
 	r.task = streamTask{gate: gate, conn: conn, handler: handler, context: &r.context}
 	p.submit(p.poolFor(gate, conn), &r.task)
+}
+
+// serveContext is Serve for a Context no StreamRequest holds.
+func (p *StreamPool) serveContext(gate *StreamGate, conn *fib.Connection, handler Handler, c *Context) {
+	if !p.admit(gate) {
+		serveOnReader(handler, c)
+		return
+	}
+	p.submit(p.poolFor(gate, conn), &streamTask{gate: gate, conn: conn, handler: handler, context: c})
 }
 
 // StreamBatch holds requests of one connection that Queue has admitted to a
@@ -129,7 +138,7 @@ type StreamBatch struct {
 func (p *StreamPool) Queue(b *StreamBatch, gate *StreamGate, conn *fib.Connection, handler Handler, r *StreamRequest) {
 	if !p.admit(gate) {
 		p.Submit(b)
-		Serve(handler, &r.context)
+		serveOnReader(handler, &r.context)
 		return
 	}
 	r.task = streamTask{gate: gate, conn: conn, handler: handler, context: &r.context}

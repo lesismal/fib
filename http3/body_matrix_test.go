@@ -387,6 +387,13 @@ func (w *h3Wire) awaitContinue(id uint64) {
 // engine is nil.
 func dialH3Wire(t *testing.T, engine *fib.Engine, base string) *h3Wire {
 	t.Helper()
+	return dialH3WireWith(t, engine, base, quic.Config{})
+}
+
+// dialH3WireWith is dialH3Wire with config for the QUIC connection, whose
+// TLSConfig it sets.
+func dialH3WireWith(t *testing.T, engine *fib.Engine, base string, config quic.Config) *h3Wire {
+	t.Helper()
 	u, err := url.Parse(base)
 	if err != nil {
 		t.Fatal(err)
@@ -407,7 +414,8 @@ func dialH3Wire(t *testing.T, engine *fib.Engine, base string) *h3Wire {
 			return
 		}
 		w.mu.Lock()
-		w.qc, err = quic.Dial(fc, fc.RemoteAddr(), quic.Config{TLSConfig: clientTLS}, h3WireHandler{w})
+		config.TLSConfig = clientTLS
+		w.qc, err = quic.Dial(fc, fc.RemoteAddr(), config, h3WireHandler{w})
 		w.mu.Unlock()
 		dialed <- err
 	})

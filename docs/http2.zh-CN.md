@@ -24,7 +24,7 @@
 
 使用时需要了解的行为约束。
 
-### 请求 body 可以流式交付，响应整体发送
+### 请求 body 可以流式交付，响应边写边发
 
 - 请求 body 默认在 handler 运行前完整读入内存。设置 `Config.StreamRequestBody` 后，body
   一开始到达就调用 handler——带 `content-length` 且超过 `StreamRequestBodyThreshold` 的在
@@ -35,15 +35,22 @@
   领先一个窗口（1MB），同一连接上的其它 stream 不受影响。流式 body 的上限是
   `MaxStreamedBodyBytes` 而不是 `MaxBodyBytes`；`Expect: 100-continue` 要等 handler
   第一次要 body 时才回复 100。
-- 响应通过 `Response.Body []byte` 一次性给出；客户端同样把响应 body 完整缓存后再回调。
+- 交给 `WriteResponse` 或 `Respond` 的响应通过 `Response.Body []byte` 一次性给出；客户端
+  同样把响应 body 完整缓存后再回调。
 - handler 也可以通过 `Context` 的 `http.ResponseWriter` 方法（`Header`/`WriteHeader`/
   `Write`/`Flush`）写响应（含 trailer），或把 `Context` 交给 `http.ServeFile`、
-  `http.ServeContent`。在 HTTP/1 上这是真正的流式输出（chunked，文件走 sendfile，见
-  [`http1.zh-CN.md`](http1.zh-CN.md)）；在 HTTP/2 上响应会先缓存，handler 返回后整体
-  发送，`Flush` 不起作用。
-- 因此在 HTTP/2 上无法实现 SSE、长轮询流式输出；边收边处理的大文件上传
-  可以用 `StreamRequestBody` 实现。gRPC（含 streaming）由 [`grpc`](../grpc) 包提供，
-  它有自己的 HTTP/2 传输层。
+  `http.ServeContent`。不超过 4KB（或设置了不超过 64KB 的 `Content-Length`）且没有
+  `Flush` 的响应仍在 handler 返回后整体发送，带 `content-length`；更长的或 `Flush` 过的
+  响应和 HTTP/1 一样流式输出：先发一个不结束 stream 的 HEADERS，body 边写边按客户端的
+  窗口以 DATA 帧发出，handler 结束后发 END_STREAM 或携带 trailer 的 HEADERS。因此 SSE、
+  长轮询、大文件下载在 HTTP/2 上都可以实现。
+- handler 写得比客户端读得快时，一旦有 64KB body 被流控压住，`Write` 就会等待，直到客户端
+  取走一部分或 stream 结束，内存因此有上界。等待发生在 handler 协程池上，池会为阻塞的
+  handler 扩容；连接在自己的读协程上运行的 handler（见下文 `StreamPool`）从不等待，因为
+  结束等待的 WINDOW_UPDATE 正要由这个协程读取，它写的 body 会一直保留到客户端窗口放行。
+  body 比 handler 设置的 `Content-Length` 短时，stream 会被重置而不是正常结束。
+- [`grpc`](../grpc) 包通过这一机制（`Server.ServeHTTP`）提供 gRPC（含 streaming），它也有
+  自己的 HTTP/2 传输层。
 - 内存上限：服务端单连接最坏约为 `MaxConcurrentStreams × MaxBodyBytes`
   （默认 250 × 16MB）；客户端单个响应受 `MaxResponseBodyBytes` 限制。
 - `CONNECT` 请求能被解析并交给 handler，但无法建立隧道（没有双向流式通道）。
@@ -172,9 +179,8 @@ CI 的 `Fuzz the parsers` job 每个目标跑 20 秒。还缺的是压测（例�
 
 ### 3. 流式 body 与 handler 模型（中）
 
-- 让 `Context` 已有的 `http.ResponseWriter` 方法在 HTTP/2 上也像 HTTP/1 一样流式输出，
-  以支持 SSE、gRPC、大文件下载。流式请求 body 已经实现，接收窗口随 handler 的消费补充；
-  整体缓存的 body 仍然是“收到即补充窗口”。
+- 流式请求 body 已经实现，接收窗口随 handler 的消费补充；流式响应也已实现，由客户端的
+  窗口限速。整体缓存的 body 仍然是“收到即补充窗口”，客户端仍把每个响应完整缓存。
 
 ### 4. 性能（中）
 

@@ -69,10 +69,13 @@ const (
 	// then; see later.
 	ctxHandled  uint64 = 1 << 23
 	ctxHandover uint64 = 1 << 24
+	// ctxReader marks a handler running on the goroutine that reads its
+	// multiplexed connection, until it returns; see onReader.
+	ctxReader uint64 = 1 << 25
 	// The state takes two bits, and the generation the rest.
-	ctxStateShift        = 25
+	ctxStateShift        = 26
 	ctxStateMask  uint64 = 3 << ctxStateShift
-	ctxGenShift          = 27
+	ctxGenShift          = 28
 
 	// ctxAlive is what keeps the Context the request's.
 	ctxAlive = ctxHolds | ctxServed | ctxConn | ctxCancelling | ctxFinishing
@@ -526,11 +529,15 @@ func (c *Context) handled() {
 
 // begin takes the hold that serving a request stands on, which the handler's
 // return gives back. conn says the connection has the request too, until
-// endRequestLocked is done with it.
-func (c *Context) begin(conn bool) {
+// endRequestLocked is done with it, and reader that the handler runs on the
+// goroutine reading its multiplexed connection.
+func (c *Context) begin(conn, reader bool) {
 	add := ctxServed | ctxShare
 	if conn {
 		add |= ctxConn
+	}
+	if reader {
+		add |= ctxReader
 	}
 	for {
 		w := c.word.Load()
@@ -543,6 +550,15 @@ func (c *Context) begin(conn bool) {
 	}
 }
 
+// onReader reports whether the handler runs on the goroutine that reads its
+// multiplexed connection, which the stream pool makes it do once the
+// connection has as many handlers running as it may. A response written
+// there must not wait for the client to take what was sent before, since the
+// goroutine that would read the client's go-ahead is the one waiting. Once
+// the handler has returned, a response it retained is written from
+// elsewhere, and may wait.
+func (c *Context) onReader() bool { return c.word.Load()&ctxReader != 0 }
+
 // returned is the handler's return, which gives back the hold serving the
 // request took.
 func (c *Context) returned() { c.giveBack(true) }
@@ -554,7 +570,8 @@ func (c *Context) giveBack(returning bool) {
 		w := c.word.Load()
 		next := w
 		if returning {
-			next &^= ctxServed
+			// The handler is done with the goroutine it ran on too.
+			next &^= ctxServed | ctxReader
 		}
 		if ctxState(w) != ctxOpen {
 			// Nothing more is written, but the hold still counts for how long

@@ -41,7 +41,7 @@ var h2PushForbiddenHeaders = map[string]bool{
 
 // push promises target on st and serves the promised request through the
 // handler before returning.
-func (st *h2ServerStream) push(parent *stdhttp.Request, target string, opts *stdhttp.PushOptions) error {
+func (st *h2ServerStream) push(parent *stdhttp.Request, target string, opts *stdhttp.PushOptions, reader bool) error {
 	if st.pushed {
 		// Promises ride on streams the client opened, never on pushed ones.
 		return stdhttp.ErrNotSupported
@@ -127,6 +127,8 @@ func (st *h2ServerStream) push(parent *stdhttp.Request, target string, opts *std
 	sc.sendLocked(h2AppendPushPromise(nil, st.id, id, block, sc.peerMaxFrame))
 	sc.mu.Unlock()
 
-	serveRequest(sc.handler.handler, &Context{Conn: sc.conn, Request: req, stream: promised})
+	// Its handler runs here, on the goroutine of the one pushing it, which
+	// may be the one reading the connection.
+	serveRequestOn(sc.handler.handler, &Context{Conn: sc.conn, Request: req, stream: promised}, reader)
 	return nil
 }

@@ -84,10 +84,14 @@
   HTTP/2 一样。这时 QUIC 只在 handler 消费了 body 之后才补充 stream 的接收窗口，快速上传
   的客户端最多领先一个窗口（1MB）。流式 body 的上限是 `MaxStreamedBodyBytes` 而不是
   `MaxBodyBytes`；`Expect: 100-continue` 要等 handler 第一次要 body 时才回复 100。
-- 响应通过 `Response.Body []byte` 一次性给出；客户端同样把响应 body 完整缓存后再回调，
-  因此不支持 SSE、流式下载等场景。
-  `Context` 的 `http.ResponseWriter` 方法可以使用（含 trailer），但与 HTTP/2 一样，
-  写出的响应会先缓存，handler 返回后整体发送；只有 HTTP/1 是流式的。
+- 交给 `WriteResponse` 或 `Respond` 的响应通过 `Response.Body []byte` 一次性给出；客户端
+  同样把响应 body 完整缓存后再回调。`Context` 的 `http.ResponseWriter` 方法可以使用（含
+  trailer），并与 HTTP/1、HTTP/2 一样流式输出：不超过 4KB（或设置了不超过 64KB 的
+  `Content-Length`）且没有 `Flush` 的响应在 handler 返回后整体发送，更长的或 `Flush` 过的
+  响应边写边发——header 单独一个 HEADERS 帧，body 用 DATA 帧，trailer 跟在后面——因此
+  SSE、流式下载都可以实现。handler 写得比客户端读得快时，一旦有 64KB body 在 QUIC stream
+  里等待流控或拥塞控制，`Write` 就会等待，直到部分发出或 stream 结束；连接在接收数据报的
+  协程上运行的 handler 从不等待，它写的内容留在 stream 里等待发送。
 - 内存上限：服务端单连接最坏约为 `MaxConcurrentStreams × MaxBodyBytes`（默认
   100 × 16MB），客户端单个响应受 `MaxResponseBodyBytes` 限制。
 - 请求完整后按 `Config.StreamPool` 的描述交给 engine 的 handler 协程池（与 HTTP/2 server

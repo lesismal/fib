@@ -548,6 +548,9 @@ type requestStream struct {
 	// upgraded is set once the handler has switched the stream to its
 	// tunnel; see tunnel.
 	upgraded bool
+	// streaming is set while a response that streams is being written,
+	// from BeginResponse to EndResponse.
+	streaming bool
 	// expected is set while the connection expects the response, and holds
 	// what it has to send for it; see quic.Conn.ExpectWrite.
 	expected bool
@@ -636,6 +639,7 @@ func (rs *requestStream) recycle() {
 	rs.declared, rs.trailers, rs.done = 0, false, false
 	rs.streamed, rs.tunnel = nil, nil
 	rs.remoteDone, rs.responded, rs.closed, rs.upgraded, rs.expected = false, false, false, false, false
+	rs.streaming = false
 	rs.values = [requestValues]string{}
 	rs.pooled, rs.nextDead, rs.headerFromPool = false, nil, nil
 	rs.refs.Store(0)
@@ -1000,7 +1004,7 @@ func (rs *requestStream) peerReset() {
 	rs.dropBody()
 	rs.failBody(errRequestReset)
 	rs.mu.Lock()
-	wasOpen := !rs.closed && (!rs.responded || rs.upgraded)
+	wasOpen := !rs.closed && (!rs.responded || rs.upgraded || rs.streaming)
 	rs.closed = true
 	rs.mu.Unlock()
 	if wasOpen {
@@ -1064,21 +1068,8 @@ func (rs *requestStream) WriteResponse(req *stdhttp.Request, response fibhttp.Re
 		out = appendFrameHeader(out, frameData, len(body))
 		out = append(out, body...)
 	}
-	if bodyAllowed(req, status) && len(response.Trailer) > 0 {
-		trailer := bufferpool.Append(nil, qpack.Prefix)
-		for key, values := range response.Trailer {
-			name := strings.ToLower(key)
-			if !validTrailer(name, values) {
-				continue
-			}
-			for _, value := range values {
-				trailer = qpack.AppendField(trailer, name, value, false)
-			}
-		}
-		if len(trailer) > len(qpack.Prefix) {
-			out = appendHeadersFrame(out, trailer)
-		}
-		bufferpool.Put(trailer)
+	if bodyAllowed(req, status) {
+		out = appendTrailer(out, response.Trailer)
 	}
 	// The response is all this stream sends, and a request whose response
 	// is written wants nothing more of what arrives for it, so QUIC is told
@@ -1107,6 +1098,29 @@ func (rs *requestStream) WriteResponse(req *stdhttp.Request, response fibhttp.Re
 		return errStreamClosed
 	}
 	return nil
+}
+
+// appendTrailer appends a HEADERS frame carrying what of trailer HTTP/3 can
+// send, if that is anything.
+func appendTrailer(out []byte, trailer stdhttp.Header) []byte {
+	if len(trailer) == 0 {
+		return out
+	}
+	block := bufferpool.Append(nil, qpack.Prefix)
+	for key, values := range trailer {
+		name := strings.ToLower(key)
+		if !validTrailer(name, values) {
+			continue
+		}
+		for _, value := range values {
+			block = qpack.AppendField(block, name, value, false)
+		}
+	}
+	if len(block) > len(qpack.Prefix) {
+		out = appendHeadersFrame(out, block)
+	}
+	bufferpool.Put(block)
+	return out
 }
 
 // writeDone tells the connection, once, that the response finish told it to
@@ -1151,4 +1165,7 @@ func (rs *requestStream) Push(*stdhttp.Request, string, *stdhttp.PushOptions) er
 	return stdhttp.ErrNotSupported
 }
 
-var _ fibhttp.Stream = (*requestStream)(nil)
+var (
+	_ fibhttp.Stream           = (*requestStream)(nil)
+	_ fibhttp.ResponseStreamer = (*requestStream)(nil)
+)

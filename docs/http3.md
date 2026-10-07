@@ -112,11 +112,19 @@ Behavior users need to be aware of.
   ahead at most. `MaxStreamedBodyBytes` bounds such a body in place of
   `MaxBodyBytes`, and `Expect: 100-continue` is answered only once the handler
   asks for the body.
-- A response is given at once as `Response.Body []byte`; the client buffers
-  the whole response body before the callback, so SSE and streaming downloads
-  are not possible. `Context`'s `http.ResponseWriter`
-  methods work, trailers included, but as on HTTP/2 the response they write
-  is held until the handler returns and sent whole; only HTTP/1 streams it.
+- A response given to `WriteResponse` or `Respond` is given at once as
+  `Response.Body []byte`; the client buffers the whole response body before
+  the callback. `Context`'s `http.ResponseWriter` methods work, trailers
+  included, and stream as on HTTP/1 and HTTP/2: a response no longer than 4KB
+  (or with a `Content-Length` of at most 64KB) that is not flushed is sent
+  whole when the handler returns, and a longer or flushed one goes out as it
+  is written, its header in a HEADERS frame of its own, its body in DATA
+  frames and its trailers after them, so SSE and streaming downloads work.
+  A handler that writes faster than the client reads waits in `Write` once
+  64KB of its body waits in the QUIC stream for flow or congestion control,
+  until some of it has gone or the stream ends; one the connection runs on
+  the goroutine its datagrams arrive on never waits, and what it writes waits
+  in the stream instead.
 - Memory bounds: a server connection can hold up to about
   `MaxConcurrentStreams × MaxBodyBytes` (100 × 16MB by default); a single
   client response is bounded by `MaxResponseBodyBytes`.

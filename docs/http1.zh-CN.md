@@ -267,8 +267,8 @@ body 的请求，以及不在 server 自行解析范围内、改由 `net/http` �
   handler 本身不会被阻塞）。`SendFile` 发送的文件例外：它只随 socket 的排空读取。
 - **TLS 无法使用 sendfile**：TLS 连接上 `SendFile` 在返回前读出并加密整段文件，整段
   都会排队在内存中。
-- **HTTP/2 和 HTTP/3** 同样接受这些 `ResponseWriter` 调用，但响应会缓存到 handler 返回
-  后整体发送（见各自的文档）。
+- **HTTP/2 和 HTTP/3** 同样接受这些 `ResponseWriter` 调用，并以同样的方式用 DATA 帧
+  流式输出；在那里，超过客户端流控的写入会等待客户端（见各自的文档）。
 - **不解码 chunked 以外的 transfer coding**（gzip、deflate、compress）：这样的请求返回
   501，这样的响应会失败。
 - **除 h2c 外，`Upgrade` 由 handler 处理**：`Context.Upgrade` 回复 101 并把连接交给

@@ -119,6 +119,32 @@ type Stream interface {
 	Push(req *stdhttp.Request, target string, opts *stdhttp.PushOptions) error
 }
 
+// ResponseStreamer is implemented by a Stream that can send a response as
+// its handler writes it through Context's ResponseWriter methods, rather than
+// whole once the handler is done: a response that outgrows what those
+// methods hold back, or is flushed, begins with BeginResponse, its body goes
+// through WriteBody, and EndResponse ends it. A Stream that does not
+// implement it has every such response held and sent with WriteResponse.
+// Its methods are called one at a time, from the goroutines the handler
+// writes on.
+type ResponseStreamer interface {
+	// BeginResponse sends req's final status and header, leaving the stream
+	// open for the body. A Content-Length in header is the length the body
+	// is declared to have, which the body written is held to.
+	BeginResponse(req *stdhttp.Request, status int, header stdhttp.Header) error
+	// WriteBody sends p, which the caller may reuse once it returns. With
+	// wait set it may wait for the peer to take what was sent before, so
+	// that a handler that writes faster than its client reads is held back
+	// rather than buffered without bound. wait is false for a handler the
+	// stream pool runs on the goroutine that reads the connection, which
+	// would be waiting for itself.
+	WriteBody(p []byte, wait bool) error
+	// EndResponse ends the response, sending trailer after the body if it
+	// holds anything the protocol can send. With complete false the body is
+	// shorter than declared, and the stream is reset rather than ended.
+	EndResponse(trailer stdhttp.Header, complete bool) error
+}
+
 // NewStreamContext returns the Context through which a handler answers req,
 // which arrived on conn and is answered through stream.
 func NewStreamContext(conn *fib.Connection, req *stdhttp.Request, stream Stream) *Context {
@@ -368,7 +394,7 @@ func (c *Context) Push(target string, opts *stdhttp.PushOptions) error {
 	if c.stream == nil {
 		return stdhttp.ErrNotSupported
 	}
-	return c.stream.push(c.Request, target, opts)
+	return c.stream.push(c.Request, target, opts, c.onReader())
 }
 
 // WriteInterim sends an informational 1xx response ahead of the final one,
@@ -645,7 +671,7 @@ func (h *ServerHandler) drive(c *fib.Connection, parser *Parser, data []byte) {
 		// Nothing behind this request is served until its response is
 		// written, so that pipelined responses keep their order, and the
 		// connection knows which request to cancel if it closes first.
-		context.begin(true)
+		context.begin(true, false)
 		parser.busy = true
 		parser.liveContext.Store(context)
 		var bodyErr error
@@ -846,14 +872,21 @@ func (h *ServerHandler) refuse(c *fib.Connection, err error) {
 // outside this package, as HTTP/3 is by package http3, calls it in place of
 // calling the handler itself, so that Retain, Release and OnBody work there
 // too.
-func Serve(handler Handler, context *Context) { serveRequest(handler, context) }
+func Serve(handler Handler, context *Context) { serveRequestOn(handler, context, false) }
 
 // serveRequest runs the handler for the request context carries, hands over
 // the body it asked for through OnBody, and gives back the hold that serving
 // it took, which writes the response unless the handler, or OnBody, retained
 // it.
-func serveRequest(handler Handler, context *Context) {
-	context.begin(false)
+func serveRequest(handler Handler, context *Context) { serveRequestOn(handler, context, false) }
+
+// serveOnReader is serveRequest for a request served on the goroutine that
+// reads its multiplexed connection, which the handler's response is not to
+// wait on; see Context.onReader.
+func serveOnReader(handler Handler, context *Context) { serveRequestOn(handler, context, true) }
+
+func serveRequestOn(handler Handler, context *Context, reader bool) {
+	context.begin(false, reader)
 	handler.ServeHTTP(context, context.Request)
 	context.handled()
 	context.returned()

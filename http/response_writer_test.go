@@ -59,8 +59,8 @@ func TestSendableFileOf(t *testing.T) {
 	}
 }
 
-// On HTTP/2 the ResponseWriter methods hold the response and send it whole,
-// trailers included, and files are served through them too.
+// On HTTP/2 the ResponseWriter methods send a response whole or stream it,
+// trailers included either way, and files are served through them too.
 func TestResponseWriterOverHTTP2(t *testing.T) {
 	path, data := randomFile(t, 300000)
 	serverConfig, clientConfig, err := tlstest.Configs()

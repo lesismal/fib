@@ -192,6 +192,9 @@ type h2ServerStream struct {
 	reset      bool
 	sendWindow int64
 	pending    []byte
+	// out is what the stream keeps while its response streams, or nil; see
+	// h2Output. It is set as the response begins and never changes after.
+	out *h2Output
 
 	// tunnel is the tunnel of an extended CONNECT (RFC 8441), or nil; see
 	// h2Tunnel. It is set before the handler runs and never changes.
@@ -1120,7 +1123,12 @@ func (sc *h2ServerConn) failBodyLocked(st *h2ServerStream, err error) {
 		feed.Fail(err)
 	}
 	sc.endTunnelLocked(st, err)
-	if c := &st.block.context; c.stream == st && !st.responded {
+	if o := st.out; o != nil {
+		// A handler waiting for room to write finds the stream gone.
+		o.room.Broadcast()
+	}
+	// A response still streaming is still being written, as one not begun is.
+	if c := &st.block.context; c.stream == st && (!st.responded || st.out != nil) {
 		// The generation is read while the stream is still the connection's,
 		// so that a Context recycled for another request by the time the
 		// cancellation runs is left alone. The cancellation runs elsewhere,
@@ -1144,9 +1152,7 @@ func (sc *h2ServerConn) failBodiesLocked(err error) {
 // one reading the connection, so serving a request here is what stops the
 // next one from being framed until this is answered.
 func (sc *h2ServerConn) serve(context *Context) {
-	sc.handler.streams.Run(&sc.gate, sc.conn, func() {
-		serveRequest(sc.handler.handler, context)
-	})
+	sc.handler.streams.serveContext(&sc.gate, sc.conn, sc.handler.handler, context)
 }
 
 // reject answers a stream with an error status before its request is
@@ -1388,6 +1394,11 @@ func (st *h2ServerStream) writeInterim(status int, header stdhttp.Header) error 
 func (sc *h2ServerConn) forgetLocked(st *h2ServerStream) {
 	st.reset = st.reset || !st.localDone
 	st.pending = nil
+	if o := st.out; o != nil {
+		bufferpool.Put(o.buf)
+		o.buf = nil
+		o.room.Broadcast()
+	}
 	if st.tunnel != nil {
 		bufferpool.Put(st.tunnel.sendBuf)
 		st.tunnel.sendBuf = nil
@@ -1465,7 +1476,7 @@ func (st *h2ServerStream) recycle() {
 	st.body, st.declared, st.recvWindow, st.recvUnacked = nil, 0, 0, 0
 	st.feed, st.creditSkip = nil, 0
 	st.remoteDone, st.responded, st.trailer, st.localDone, st.reset = false, false, nil, false, false
-	st.sendWindow, st.pending, st.tunnel = 0, nil, nil
+	st.sendWindow, st.pending, st.out, st.tunnel = 0, nil, nil, nil
 	st.pooled, st.nextDead, st.headerFromPool = false, nil, nil
 	st.refs.Store(0)
 }
@@ -1504,6 +1515,7 @@ func (sc *h2ServerConn) flushLocked(out []byte) []byte {
 			continue
 		}
 		out = sc.flushStreamLocked(out, st)
+		st.wakeWritersLocked()
 		sc.finishStreamLocked(st)
 	}
 	return out
@@ -1529,6 +1541,9 @@ func (sc *h2ServerConn) flushStreamLocked(out []byte, st *h2ServerStream) []byte
 				if last {
 					flags = h2FlagEndStream
 				}
+			case st.out != nil && !st.out.ending:
+				// So does a response that streams, until its handler is done.
+				last = false
 			case st.trailer == nil:
 				flags = h2FlagEndStream
 			}

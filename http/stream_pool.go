@@ -45,7 +45,9 @@ type StreamPoolConfig struct {
 	// the connection then reads nothing more until that handler returns, so
 	// the limit is paid for by the peer's flow control rather than by a
 	// queue of requests here. N of 1 therefore runs every handler on the
-	// reader, as Disable does.
+	// reader, as Disable does. A handler on the reader cannot wait for the
+	// peer to take a response it streams, so what it writes past the peer's
+	// flow control is held until the peer takes it; see Context.Write.
 	//
 	// The limit is per connection, not per server. What bounds all the
 	// connections of every server at once is the pool's ceiling.

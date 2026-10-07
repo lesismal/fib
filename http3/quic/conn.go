@@ -340,6 +340,10 @@ type Conn struct {
 	flushDeadline time.Time
 	// awaited counts the writes ExpectWrite said are on their way.
 	awaited int
+	// sendRoom is what writers waiting for their streams' unsent bytes to
+	// drain wait on, and roomWaiters counts them; see Stream.WaitSendable.
+	sendRoom    sync.Cond
+	roomWaiters int
 	// buffered are packets that arrived before their keys.
 	buffered [][]byte
 	// roundLens are the lengths of the datagrams a round of sending sends,
@@ -414,6 +418,7 @@ func newConn(pc PacketConn, remote net.Addr, config Config, handler Handler, isC
 		// with the amplification limit that addressValidated keeps.
 		pathValidated: true,
 	}
+	c.sendRoom.L = &c.mu
 	for i := range c.spaces {
 		c.spaces[i].largestAcked = -1
 	}
@@ -927,6 +932,15 @@ func (c *Conn) sendLocked() {
 		c.sendRoundLocked()
 	}
 	c.sending = false
+	c.wakeWritersLocked()
+}
+
+// wakeWritersLocked lets the writers waiting in WaitSendable look again at
+// what their streams have left to send. Callers hold c.mu.
+func (c *Conn) wakeWritersLocked() {
+	if c.roomWaiters > 0 {
+		c.sendRoom.Broadcast()
+	}
 }
 
 func (c *Conn) handleDatagramLocked(d []byte, now time.Time) {
@@ -1427,6 +1441,7 @@ func (c *Conn) terminateLocked(err error) {
 	if c.timer != nil {
 		c.timer.Stop()
 	}
+	c.wakeWritersLocked()
 	for _, s := range c.streams {
 		s.done = true
 	}

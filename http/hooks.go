@@ -49,8 +49,8 @@ func (c *Context) OnHeader(fn func(status int, header stdhttp.Header)) {
 //
 // A response the handler writes through the ResponseWriter methods is held
 // until the handler is done and sent at once, so that fn sees all of its
-// body; on HTTP/1 that means Flush does nothing and a file is not sent by
-// sendfile, as on HTTP/2 and HTTP/3 already. The header fn is given is the
+// body: Flush does nothing for it, it does not stream however long it is, and
+// on HTTP/1 a file is not sent by sendfile. The header fn is given is the
 // response's own, a copy of any the handler passed to WriteResponse, and
 // the body is the handler's: fn replaces it rather than writing into it, and
 // keeps none of it past the call, since the handler may reuse it once the

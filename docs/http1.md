@@ -379,8 +379,9 @@ handler := http.HandlerFunc(func(c *http.Context, r *stdhttp.Request) {
   they are read only as the socket drains.
 - **TLS cannot use sendfile.** Over TLS, `SendFile` reads the range and
   encrypts it before returning, so the whole range is queued in memory.
-- **HTTP/2 and HTTP/3** accept the same `ResponseWriter` calls but hold the
-  response until the handler returns (see their documents).
+- **HTTP/2 and HTTP/3** accept the same `ResponseWriter` calls and stream the
+  same way, in DATA frames; there a write that outruns the client's flow
+  control does wait for it (see their documents).
 - **No transfer codings besides chunked** (gzip, deflate, compress) are
   decoded; such requests get 501, such responses fail.
 - **`Upgrade` is up to the handler**, apart from h2c: `Context.Upgrade`

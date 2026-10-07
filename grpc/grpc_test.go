@@ -120,6 +120,10 @@ func (e *echoImpl) Unary(ctx context.Context, in *Req) (*Rsp, error) {
 
 func (e *echoImpl) Count(in *Req, s ServerStreamingServer[Rsp]) error {
 	for i := 0; i < in.N; i++ {
+		if in.Msg == "block" && i == 1 {
+			// The first message is out; the rest wait to be let go.
+			<-e.block
+		}
 		if err := s.Send(&Rsp{Msg: in.Msg, N: i}); err != nil {
 			return err
 		}

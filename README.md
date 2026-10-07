@@ -238,10 +238,10 @@ r.Get("/", index)
 engine, err := fib.Bind(config, fibhttp.NewHandler(r))
 ```
 
-fib's HTTP/2 sends each response whole once its handler returns. So a call served this way sends
-its reply when it ends: a server stream's messages reach the client together, and a
-bidirectional call that waits for replies before it has sent everything needs the server's own
-connections.
+Each message a call sends goes out as it is sent, paced by the stream's flow control, so server
+streams reach the client message by message. A call whose client streams, a bidirectional one
+above all, needs `Config.StreamRequestBody`, so that the call starts as its request starts
+arriving rather than once it has arrived whole.
 
 ### Raw TCP
 

@@ -37,16 +37,14 @@ import (
 // TaskPool options apply only there, package http's Config bounding the
 // streams here, whose handlers run on the engine's handler pool.
 //
-// Package http sends an HTTP/2 or HTTP/3 response whole, once its handler is
-// done, so a call served here answers when it ends: unary and
-// client-streaming calls are served as they are on the Server's own
-// connections, but a server stream's messages reach the client together at
-// its end, and a bidirectional call whose client waits for replies before it
-// has sent everything cannot be served at all. Those need the Server's own
-// connections. With package http's defaults a handler runs once its request
-// has arrived whole; a call whose client streams more than is worth holding
-// takes Config.StreamRequestBody, with which the call reads its messages as
-// they arrive.
+// Each message a call sends is flushed, so it reaches the client as it is
+// sent, under the stream's flow control: a call that sends faster than its
+// client reads waits for it, as on the Server's own connections. With package
+// http's defaults a handler runs once its request has arrived whole, which
+// serves unary and server-streaming calls; a call whose client streams, and
+// above all a bidirectional one whose client waits for replies before it has
+// sent everything, takes Config.StreamRequestBody, with which the call reads
+// its messages as they arrive.
 //
 // A request that is not a gRPC call is answered as grpc-go answers it: one
 // over HTTP/1 400, one not a POST 405 and one whose Content-Type is not
