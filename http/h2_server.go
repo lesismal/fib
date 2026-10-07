@@ -1328,13 +1328,21 @@ func h2Status(status int) string {
 // any is encoded, since encoding changes the table the client tracks.
 func h2CheckHeader(header stdhttp.Header) error {
 	for key, values := range header {
-		if key == "" || textproto.CanonicalMIMEHeaderKey(key) == "" || !h2ValidHeaderName(h2LowerKey(key)) {
-			return errors.New("http: invalid header name " + strconv.Quote(key))
+		if err := h2CheckField(key, values); err != nil {
+			return err
 		}
-		for _, value := range values {
-			if !validHeaderValue(value) {
-				return errors.New("http: invalid header value for " + key)
-			}
+	}
+	return nil
+}
+
+// h2CheckField is h2CheckHeader for one field.
+func h2CheckField(key string, values []string) error {
+	if key == "" || textproto.CanonicalMIMEHeaderKey(key) == "" || !h2ValidHeaderName(h2LowerKey(key)) {
+		return errors.New("http: invalid header name " + strconv.Quote(key))
+	}
+	for _, value := range values {
+		if !validHeaderValue(value) {
+			return errors.New("http: invalid header value for " + key)
 		}
 	}
 	return nil
@@ -1544,23 +1552,37 @@ func (sc *h2ServerConn) endStreamLocked(out []byte, st *h2ServerStream) []byte {
 	if st.trailer == nil {
 		return out
 	}
-	block := sc.enc.Begin(nil)
+	// Encoded in the connection's scratch block, as a response's header is:
+	// whatever was encoded there before has been framed already.
+	block := sc.enc.Begin(sc.headerBlock[:0])
 	block = sc.appendHeaderLocked(block, st.trailer)
 	st.trailer = nil
-	return h2AppendHeaderBlock(out, st.id, block, true, sc.peerMaxFrame)
+	out = h2AppendHeaderBlock(out, st.id, block, true, sc.peerMaxFrame)
+	sc.keepHeaderBlockLocked(block)
+	return out
 }
 
-// h2Trailer is the part of trailer HTTP/2 can send, or nil if that is none.
+// h2Trailer is what of trailer a response may send after its body, or nil if
+// that is none: trailer itself when all of it may go, which it nearly always
+// may, and otherwise a copy without the fields that may not.
 func h2Trailer(trailer stdhttp.Header) stdhttp.Header {
-	var out stdhttp.Header
-	for key, values := range trailer {
-		if forbiddenTrailer(key) || h2CheckHeader(stdhttp.Header{key: values}) != nil {
-			continue
-		}
-		if out == nil {
-			out = make(stdhttp.Header, len(trailer))
-		}
-		out[key] = values
+	if len(trailer) == 0 {
+		return nil
 	}
-	return out
+	for key, values := range trailer {
+		if forbiddenTrailer(key) || h2CheckField(key, values) != nil {
+			var out stdhttp.Header
+			for key, values := range trailer {
+				if forbiddenTrailer(key) || h2CheckField(key, values) != nil {
+					continue
+				}
+				if out == nil {
+					out = make(stdhttp.Header, len(trailer))
+				}
+				out[key] = values
+			}
+			return out
+		}
+	}
+	return trailer
 }

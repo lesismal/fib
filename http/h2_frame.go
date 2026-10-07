@@ -291,6 +291,9 @@ var h2LowerKeys = func() map[string]string {
 		"Age", "Allow", "Authorization", "Cache-Control", "Content-Disposition", "Content-Encoding",
 		"Content-Language", "Content-Length", "Content-Location", "Content-Range", "Content-Type",
 		"Cookie", "Date", "Etag", "Expect", "Expires", "Forwarded", "Host", "If-Match",
+		// gRPC's own, which every call carries.
+		"Grpc-Accept-Encoding", "Grpc-Encoding", "Grpc-Message", "Grpc-Status",
+		"Grpc-Status-Details-Bin", "Grpc-Timeout",
 		"If-Modified-Since", "If-None-Match", "If-Range", "If-Unmodified-Since", "Last-Modified",
 		"Link", "Location", "Origin", "Pragma", "Range", "Referer", "Retry-After", "Server",
 		"Set-Cookie", "Strict-Transport-Security", "Te", "Trailer", "User-Agent", "Vary", "Via",

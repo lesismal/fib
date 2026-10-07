@@ -36,7 +36,9 @@ type Response struct {
 	// Trailer is sent after the body. HTTP/1.1 carries it by sending the
 	// body chunked, and announces its names in a Trailer header; HTTP/2 and
 	// HTTP/3 send it as a trailing header block. An HTTP/1.0 client, and a
-	// response that has no body, gets none of it.
+	// response that has no body, gets none of it. Like Body, it is read
+	// until it is sent, which on HTTP/2 can be after WriteResponse returns,
+	// so it must not be changed until the response is finished.
 	Trailer stdhttp.Header
 	Close   bool
 }
