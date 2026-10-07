@@ -66,6 +66,13 @@
   逐个执行，也就是引入协程池之前的行为（应用层的队头阻塞）。
 - `Push` 仍然在调用它的协程上同步执行被推送请求的 handler，在它返回后才返回；被推送的
   handler 慢，父请求的响应也会随之推迟。
+- 响应先排队，由其中第一个发往 handler 协程池的 flush 统一写出，排在已经交给协程池的请求
+  之后，因此一批响应一次写出而不是各写一次，也没有响应要等慢的 handler。
+- stream 连同它持有的 `*http.Request`、`Header`、`URL`、`*Context`，在响应完成、handler
+  返回并释放所有 `Retain` 之后被复用，受 `Config.ReuseRequests` 等选项控制（默认开启），规则与
+  HTTP/1 请求对象相同：handler 不能在那之后继续持有它们（见 HTTP/1 文档）。body 流式交付的
+  stream、push 的 stream、extended CONNECT 隧道不复用。64 核上这两项把 HttpArena 的
+  baseline-h2c 从每秒 390 万请求提到 1850 万。
 
 ### 不能向连接直接写字节
 
@@ -173,10 +180,8 @@ CI 的 `Fuzz the parsers` job 每个目标跑 20 秒。还缺的是压测（例�
 
 - **HPACK Huffman 解码**：目前逐 bit 遍历解码树，可改为按 4 bit 或 8 bit 查表解码。
 - **HPACK 编码器**：动态表按线性查找，可以加索引；静态表查找已经是 map。
-- **内存分配**：每个请求会分配 header map、帧缓冲、`stdhttp.Request` 等对象，可以像
-  HTTP/1 路径一样用 `sync.Pool` 复用帧缓冲和 header 解码缓冲。
-- **发送合并**：同一次处理中产生的多个控制帧（WINDOW_UPDATE、SETTINGS ACK、PING ACK）
-  分别调用发送，可以合并为一次写入。
+- **内存分配**：body 流式交付的 stream 和 push 的 stream 仍各自分配；`static-h2` 的响应 body
+  依次拷贝进 handler 的 buffer、帧和 TLS record。
 - **基准测试**：补充 HTTP/2 的 benchmark（单连接多路复用吞吐、HPACK 编解码），
   用 pprof 指导优化。
 

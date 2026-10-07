@@ -127,9 +127,11 @@ func NewStreamContext(conn *fib.Connection, req *stdhttp.Request, stream Stream)
 // served outside this package takes from this package — the request, its
 // URL, the Context that answers it, its body and its place on a StreamPool —
 // for that protocol to allocate together with what it keeps of its own for
-// the request, rather than each on its own. Nothing in it is reused: like a
-// request and its Context, all of it lives for as long as anything refers to
-// any of it. The zero value is ready to use, for one request.
+// the request, rather than each on its own. This package does not reuse a
+// StreamRequest it is handed: like a request and its Context, all of it
+// lives for as long as anything refers to any of it, unless the protocol
+// recycles it, as this package's HTTP/2 server recycles its streams' under
+// the Reuse options. The zero value is ready to use, for one request.
 type StreamRequest struct {
 	Request stdhttp.Request
 	URL     url.URL

@@ -301,9 +301,11 @@ func TestH2ServerResponseCloseGoesAwayGracefully(t *testing.T) {
 	addr := serve(t, NewHandler(HandlerFunc(func(c *Context, r *stdhttp.Request) {
 		switch r.URL.Path {
 		case "/slow":
+			c.Retain()
 			go func() {
 				<-release
 				_ = c.Respond(200, "", []byte("slow"))
+				c.Release()
 			}()
 		case "/close":
 			_ = c.WriteResponse(Response{StatusCode: 200, Body: []byte("bye"), Close: true})

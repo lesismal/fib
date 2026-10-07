@@ -267,7 +267,9 @@ serves every core: in HttpArena's HTTP/1 profiles on 64 CPUs, leaving them to
 the collector held the server at 1.23M requests a second in the baseline
 profile and 5.7M in the pipelined one, on 36 and 27 of the CPUs, the rest
 waiting on the runtime's heap lock, against 1.63M and 15.0M recycling them.
-Set an option to false to have its object left to the collector instead.
+Set an option to false to have its object left to the collector instead. The
+HTTP/2 server recycles its streams, which hold a request's objects together,
+under the same options and the same rule; see the HTTP/2 notes.
 
 What they ask of a handler is fasthttp's rule for its `RequestCtx`: a
 recycled object is the handler's until it is done with the request: it has

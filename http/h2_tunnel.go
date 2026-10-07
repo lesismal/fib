@@ -41,6 +41,8 @@ func (st *h2ServerStream) upgraded() bool { return st.tunnel != nil && st.tunnel
 // open for it: it has no body, only whatever the tunnel carries once the
 // handler has accepted it, which waits in the tunnel until then.
 func (sc *h2ServerConn) serveTunnel(st *h2ServerStream) {
+	// A tunnel outlives its handler's return; its stream is not recycled.
+	st.pooled = false
 	st.tunnel = &h2Tunnel{feed: TunnelFeed{tunnel: Tunnel{conn: sc.conn, w: (*h2TunnelWriter)(st),
 		limit: int(sc.handler.config.MaxBodyBytes)}}}
 	st.block.bind(sc.conn, nil).stream = st

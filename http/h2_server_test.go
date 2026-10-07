@@ -462,9 +462,11 @@ func TestH2ServerResetsMalformedRequestAndRefusesExcessStreams(t *testing.T) {
 	release := make(chan struct{})
 	addr := serve(t, NewHandlerWithConfig(config, HandlerFunc(func(c *Context, r *stdhttp.Request) {
 		if r.URL.Path == "/slow" {
+			c.Retain()
 			go func() {
 				<-release
 				_ = c.Respond(200, "", []byte("slow"))
+				c.Release()
 			}()
 			return
 		}

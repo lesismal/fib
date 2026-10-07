@@ -143,6 +143,13 @@ type h2ServerConn struct {
 	flushPending atomic.Bool
 	flusher      h2Flusher
 	flushPool    *taskpool.TaskPool
+
+	// reuseStreams and reuseHeaders say what the Reuse options have the
+	// connection recycle, and dead is the list of its streams nothing can
+	// reach any more, which its reader recycles; see recycleDead.
+	reuseStreams bool
+	reuseHeaders bool
+	dead         atomic.Pointer[h2ServerStream]
 }
 
 // h2Flusher writes out what a connection's frames queued, all at once; see
@@ -194,13 +201,28 @@ type h2ServerStream struct {
 	// allocated with the stream, and values holds its header's values.
 	block  StreamRequest
 	values [h2RequestValues]string
+
+	// pooled marks a stream the server recycles once nothing can reach it,
+	// under the Reuse options: refs counts what still may, the connection's
+	// table until forgetLocked and the Context from its handler's dispatch
+	// until it ends, and the last of them to go puts the stream on the
+	// connection's dead list through nextDead; see recycleDead. A request
+	// header taken from the pool is headerFromPool.
+	pooled         bool
+	refs           atomic.Int32
+	nextDead       *h2ServerStream
+	headerFromPool *pooledHeader
 }
 
 // h2RequestValues is how many of a request's header values its stream has
 // room for, which is about what a browser's request carries. It is also what
-// fills an h2ServerStream to 1016 bytes on a 64-bit platform, just inside
-// the allocator's size class of 1024; one more would put it in the next.
-const h2RequestValues = 10
+// keeps an h2ServerStream at 1016 bytes on a 64-bit platform, just inside the
+// allocator's size class of 1024; one more would put it in the next.
+const h2RequestValues = 8
+
+// h2StreamPool holds the streams connections have recycled; see
+// h2ServerConn.recycleDead.
+var h2StreamPool = sync.Pool{New: func() any { return new(h2ServerStream) }}
 
 func newH2ServerConn(h *ServerHandler, c *fib.Connection, remoteAddr string) *h2ServerConn {
 	maxStreams := h.config.MaxConcurrentStreams
@@ -225,6 +247,8 @@ func newH2ServerConn(h *ServerHandler, c *fib.Connection, remoteAddr string) *h2
 		nextPushID:   2,
 		peerMaxPush:  math.MaxUint32,
 		flushPool:    handlerPool(c),
+		reuseStreams: h.config.ReuseRequests && h.config.ReuseURLs && h.config.ReuseContexts,
+		reuseHeaders: h.config.ReuseHeaders,
 	}
 	sc.flusher.sc = sc
 	sc.gate.ownFlush = true
@@ -293,6 +317,7 @@ func (sc *h2ServerConn) scheduleFlush() {
 // feed takes bytes from the connection, preface included, and handles every
 // complete frame among them.
 func (sc *h2ServerConn) feed(data []byte) {
+	sc.recycleDead()
 	sc.in = bufferpool.Append(sc.in, data)
 	offset := 0
 	if !sc.gotPreface {
@@ -754,7 +779,7 @@ func (sc *h2ServerConn) handleHeaderBlock(id uint32, block []byte, endStream boo
 		sc.mu.Unlock()
 		return &H2StreamError{StreamID: id, Code: H2RefusedStream}
 	}
-	st = &h2ServerStream{sc: sc, id: id, recvWindow: h2StreamWindow, sendWindow: sc.peerWindow, declared: -1}
+	st = sc.newStream(id)
 	sc.streams[id] = st
 	sc.lastStreamID = id
 	sc.mu.Unlock()
@@ -839,8 +864,20 @@ func (sc *h2ServerConn) handleTrailers(st *h2ServerStream, fields []hpack.Header
 func (sc *h2ServerConn) newRequest(fields []hpack.HeaderField, st *h2ServerStream) (*stdhttp.Request, error) {
 	var method, scheme, authority, path, protocol string
 	var seen [5]bool
-	header := make(stdhttp.Header, len(fields))
+	var header stdhttp.Header
 	values := st.values[:]
+	switch {
+	case st.pooled && sc.reuseHeaders:
+		pooled := headerPool.Get().(*pooledHeader)
+		st.headerFromPool = pooled
+		header, values = pooled.header, pooled.values[:]
+	case st.pooled:
+		// A header that is not recycled cannot keep its values in a stream
+		// that is, since a handler may keep the header past the request.
+		header, values = make(stdhttp.Header, len(fields)), nil
+	default:
+		header = make(stdhttp.Header, len(fields))
+	}
 	var cookies []string
 	regular := false
 	for _, f := range fields {
@@ -970,6 +1007,8 @@ func (sc *h2ServerConn) finishRequest(st *h2ServerStream) error {
 	st.req.ContentLength = int64(len(st.body))
 	st.block.bind(sc.conn, st.body).stream = st
 	st.body = nil
+	// The Context holds the stream from here until it ends.
+	st.refs.Add(1)
 	sc.handler.streams.Serve(&sc.gate, sc.conn, sc.handler.handler, &st.block)
 	return nil
 }
@@ -985,6 +1024,9 @@ func (sc *h2ServerConn) finishRequest(st *h2ServerStream) error {
 // handler consumes it.
 func (sc *h2ServerConn) streamRequest(st *h2ServerStream, buffered []byte) {
 	config := &sc.handler.config
+	// A body that streams keeps the stream from callbacks of its own, which
+	// the stream's references do not count; such a stream is not recycled.
+	st.pooled = false
 	var sendContinue func()
 	if len(buffered) == 0 && strings.EqualFold(st.req.Header.Get("Expect"), "100-continue") {
 		sendContinue = func() { _ = st.writeInterim(stdhttp.StatusContinue, nil) }
@@ -1337,6 +1379,77 @@ func (sc *h2ServerConn) forgetLocked(st *h2ServerStream) {
 	if st.pushed {
 		sc.pushedStreams--
 	}
+	st.unref()
+}
+
+// newStream returns a stream for the client's stream id: a recycled one when
+// the Reuse options have the connection recycle them. Callers hold mu.
+func (sc *h2ServerConn) newStream(id uint32) *h2ServerStream {
+	var st *h2ServerStream
+	if sc.reuseStreams {
+		st = h2StreamPool.Get().(*h2ServerStream)
+		st.pooled = true
+		st.block.context.reopen()
+	} else {
+		st = new(h2ServerStream)
+	}
+	st.sc, st.id, st.declared = sc, id, -1
+	st.recvWindow, st.sendWindow = h2StreamWindow, sc.peerWindow
+	st.refs.Store(1)
+	return st
+}
+
+// unref gives up one of st's references, and puts a recycled stream that
+// nothing can reach any more on its connection's dead list. It may run with
+// the connection's mu held, and without.
+func (st *h2ServerStream) unref() {
+	if st.refs.Add(-1) != 0 || !st.pooled {
+		return
+	}
+	sc := st.sc
+	for {
+		head := sc.dead.Load()
+		st.nextDead = head
+		if sc.dead.CompareAndSwap(head, st) {
+			return
+		}
+	}
+}
+
+// recycleDead hands the streams on the dead list back to the pool. Only the
+// reader recycles them, at the start of each read: within one, it may still
+// hold a stream it looked up before another goroutine let go of it, but
+// never from one read to the next.
+func (sc *h2ServerConn) recycleDead() {
+	for st := sc.dead.Swap(nil); st != nil; {
+		next := st.nextDead
+		st.recycle()
+		h2StreamPool.Put(st)
+		st = next
+	}
+}
+
+// recycle clears st for another request: everything but its Context's
+// lifetime word, whose generation moves on as Context.recycle has it, and
+// the Context's mutexes. TestH2StreamRecycleResetsEveryField holds it to
+// that.
+func (st *h2ServerStream) recycle() {
+	if h := st.headerFromPool; h != nil {
+		clear(h.header)
+		clear(h.values[:])
+		headerPool.Put(h)
+	}
+	st.block.context.recycle()
+	st.block.Request, st.block.URL = stdhttp.Request{}, url.URL{}
+	st.block.body, st.block.task = wholeBody{}, streamTask{}
+	st.values = [h2RequestValues]string{}
+	st.sc, st.id, st.req, st.pushed = nil, 0, nil, false
+	st.body, st.declared, st.recvWindow, st.recvUnacked = nil, 0, 0, 0
+	st.feed, st.creditSkip = nil, 0
+	st.remoteDone, st.responded, st.trailer, st.localDone, st.reset = false, false, nil, false, false
+	st.sendWindow, st.pending, st.tunnel = 0, nil, nil
+	st.pooled, st.nextDead, st.headerFromPool = false, nil, nil
+	st.refs.Store(0)
 }
 
 // finishStreamLocked forgets a stream once both sides are done with it. A

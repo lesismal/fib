@@ -118,6 +118,8 @@ func (c *Context) ended() {
 	}
 	if c.server != nil {
 		c.server.recycle(c)
+	} else if st := c.stream; st != nil {
+		st.unref()
 	}
 }
 

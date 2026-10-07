@@ -142,10 +142,14 @@ func TestH2NewRequestAllocations(t *testing.T) {
 // buffer is the pool's, stays the request's until its last Release: read
 // after the handler has returned, while other streams take buffers from the
 // pool and give them back, it is still what the client sent; read after the
-// Release, it reports ErrBodyReleased.
+// Release, it reports ErrBodyReleased. That last read keeps the request past
+// its response, which only a server that does not recycle its requests
+// allows, so this one does not.
 func TestH2RetainedBodyOutlivesHandler(t *testing.T) {
 	released := make(chan error, 64)
-	addr := serve(t, NewHandler(HandlerFunc(func(c *Context, r *stdhttp.Request) {
+	config := DefaultConfig()
+	setReuse(&config, false)
+	addr := serve(t, NewHandlerWithConfig(config, HandlerFunc(func(c *Context, r *stdhttp.Request) {
 		c.Retain()
 		go func() {
 			time.Sleep(10 * time.Millisecond)

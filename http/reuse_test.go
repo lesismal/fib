@@ -9,11 +9,15 @@ import (
 	stdhttp "net/http"
 	"reflect"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
+
+	fibtls "github.com/lesismal/fib/tls"
+	"github.com/lesismal/fib/tlstest"
 )
 
 // TestContextRecycleResetsEveryField keeps recycle in step with Context: a
@@ -220,5 +224,99 @@ func TestRecycledHooksStayWithTheirRequest(t *testing.T) {
 	}
 	if finished != 50 {
 		t.Fatalf("%d finish hooks ran for 50 requests", finished)
+	}
+}
+
+// TestH2StreamRecycleResetsEveryField keeps h2ServerStream.recycle in step
+// with the stream and its StreamRequest: a field added to either has to be
+// cleared there, and then listed here. The stream also has to stay in the
+// allocator's size class of 1024 bytes.
+func TestH2StreamRecycleResetsEveryField(t *testing.T) {
+	check := func(typ reflect.Type, cleared ...string) {
+		var fields []string
+		for i := 0; i < typ.NumField(); i++ {
+			fields = append(fields, typ.Field(i).Name)
+		}
+		sort.Strings(fields)
+		sort.Strings(cleared)
+		if !reflect.DeepEqual(fields, cleared) {
+			t.Fatalf("%s has fields %v; recycle clears %v", typ, fields, cleared)
+		}
+	}
+	check(reflect.TypeFor[h2ServerStream](), "sc", "id", "req", "pushed", "body", "declared", "recvWindow",
+		"recvUnacked", "feed", "creditSkip", "remoteDone", "responded", "trailer", "localDone", "reset",
+		"sendWindow", "pending", "tunnel", "block", "values", "pooled", "refs", "nextDead", "headerFromPool")
+	check(reflect.TypeFor[StreamRequest](), "Request", "URL", "context", "body", "task")
+	if size := reflect.TypeFor[h2ServerStream]().Size(); size > 1024 && reflect.TypeFor[uintptr]().Size() == 8 {
+		t.Fatalf("an h2ServerStream takes %d bytes, past the 1024-byte size class", size)
+	}
+}
+
+// TestH2RecycledStreamsKeepRequestsApart serves many concurrent HTTP/2
+// streams on one connection, half of them retained and answered from another
+// goroutine after a pause, with the server recycling its streams, and checks
+// that every handler sees its own request throughout, and every response is
+// its own: nothing of a stream's earlier request leaks into its next one.
+func TestH2RecycledStreamsKeepRequestsApart(t *testing.T) {
+	serverConfig, clientConfig, err := tlstest.Configs()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var retained sync.WaitGroup
+	t.Cleanup(retained.Wait)
+	describe := func(r *stdhttp.Request, body []byte) string {
+		return fmt.Sprintf("%s %s n=%s x=%s %s", r.Method, r.URL.Path, r.URL.Query().Get("n"), r.Header.Get("X-N"), body)
+	}
+	addr := serve(t, fibtls.NewServer(ConfigureTLS(serverConfig), NewHandler(HandlerFunc(func(c *Context, r *stdhttp.Request) {
+		body, _ := io.ReadAll(r.Body)
+		n := strings.TrimPrefix(r.URL.Path, "/r")
+		if len(n)%2 == 0 {
+			_ = c.Respond(stdhttp.StatusOK, "text/plain", []byte(describe(r, body)))
+			return
+		}
+		c.Retain()
+		retained.Add(1)
+		go func() {
+			defer retained.Done()
+			time.Sleep(time.Millisecond)
+			_ = c.Respond(stdhttp.StatusOK, "text/plain", []byte(describe(r, body)))
+			c.Release()
+		}()
+	}))))
+	client := &stdhttp.Client{
+		Timeout:   20 * time.Second,
+		Transport: &stdhttp.Transport{TLSClientConfig: clientConfig, ForceAttemptHTTP2: true},
+	}
+	defer client.CloseIdleConnections()
+
+	var wg sync.WaitGroup
+	errs := make(chan error, 1000)
+	for i := 0; i < 1000; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			n := strconv.Itoa(i)
+			method, body := stdhttp.MethodGet, ""
+			if i%3 == 0 {
+				method, body = stdhttp.MethodPost, strings.Repeat(n, 1+i%7)
+			}
+			req, _ := stdhttp.NewRequest(method, fmt.Sprintf("https://%s/r%s?n=%s", addr, n, n), strings.NewReader(body))
+			req.Header.Set("X-N", n)
+			resp, err := client.Do(req)
+			if err != nil {
+				errs <- err
+				return
+			}
+			got, _ := io.ReadAll(resp.Body)
+			resp.Body.Close()
+			if want := fmt.Sprintf("%s /r%s n=%s x=%s %s", method, n, n, n, body); resp.ProtoMajor != 2 || string(got) != want {
+				errs <- fmt.Errorf("request %d over %s: got %q, want %q", i, resp.Proto, got, want)
+			}
+		}(i)
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		t.Error(err)
 	}
 }

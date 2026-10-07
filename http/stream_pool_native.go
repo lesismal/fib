@@ -199,17 +199,22 @@ func (t *streamTask) RunTask() { t.run() }
 // that panics ends its connection, as one that panics on the connection's
 // own worker does, since the engine is not there to do it: the panic reaches
 // the pool afterwards, where a panic handler can see it.
+//
+// Nothing of t is read once the request is served: t lives in the request's
+// StreamRequest, which a protocol that recycles its streams may have handed
+// to another request by then.
 func (t *streamTask) run() {
+	gate, conn := t.gate, t.conn
 	defer func() {
-		t.gate.running.Add(-1)
+		gate.running.Add(-1)
 		if recovered := recover(); recovered != nil {
-			if t.conn != nil {
-				t.conn.CloseWithError(fmt.Errorf("handler panic: %v", recovered))
+			if conn != nil {
+				conn.CloseWithError(fmt.Errorf("handler panic: %v", recovered))
 			}
 			panic(recovered)
 		}
-		if t.conn != nil && !t.gate.ownFlush {
-			_ = t.conn.Flush()
+		if conn != nil && !gate.ownFlush {
+			_ = conn.Flush()
 		}
 	}()
 	if t.fn != nil {

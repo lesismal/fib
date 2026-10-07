@@ -142,11 +142,17 @@ type Config struct {
 	// anyway.
 	StreamPool StreamPoolConfig
 	// ReuseRequests, ReuseHeaders, ReuseURLs and ReuseContexts recycle the
-	// objects an HTTP/1 request is served with once its response is finished,
-	// rather than leaving each request's to the collector: the
-	// *http.Request, its Header, its URL, and the *Context it is answered
-	// through. A busy server makes a request's worth of them for every
-	// request, and at a high rate collecting them is what holds it back.
+	// objects an HTTP/1 request, or an HTTP/2 stream, is served with once its
+	// response is finished, rather than leaving each request's to the
+	// collector: the *http.Request, its Header, its URL, and the *Context it
+	// is answered through. A busy server makes a request's worth of them for
+	// every request, and at a high rate collecting them is what holds it
+	// back. HTTP/2 recycles a stream's, which it holds together, when
+	// ReuseRequests, ReuseURLs and ReuseContexts are all set, and its Header
+	// with ReuseHeaders as well; a stream whose body streams to its handler,
+	// a pushed stream and an extended CONNECT's are left to the collector.
+	// In HttpArena's baseline-h2c profile on 64 CPUs that took the server
+	// from 11.5M requests a second to 18.5M.
 	//
 	// The price is that a recycled object is only the handler's until the
 	// request is done with: the handler has returned and has released every
