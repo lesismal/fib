@@ -134,9 +134,10 @@ type Config struct {
 	// keeps its single loop, as if this were unset.
 	IOPollers bool
 	// IOPollerCount is how many loops IOPollers creates. Zero or less means
-	// the CPUs divided by four, rounded down, and at least one: 1 up to 7
-	// CPUs, 2 on 8, 4 on 16, 16 on 64. The CPUs are runtime.NumCPU, or
-	// GOMAXPROCS where that is lower.
+	// the CPUs divided by four, rounded down, and at least one, up to 32
+	// CPUs, and half the CPUs on more: 1 up to 7 CPUs, 2 on 8, 4 on 16, 8 on
+	// 32, 32 on 64. The CPUs are runtime.NumCPU, or GOMAXPROCS where that is
+	// lower.
 	//
 	// A loop only waits for events and hands them on, which costs a small
 	// share of what the workers spend on them, so one loop keeps up with the

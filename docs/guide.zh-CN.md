@@ -1377,8 +1377,12 @@ Engine 的 worker 池（`<Name>-workers`），每条连接的每一轮都在 wor
 
 - Engine 自己的循环只负责 accept 和它的 UDP socket；每条 accept 到的连接按 `fd % pollerCount`
   交给其中一个 poller，此后由那个 poller 负责它的事件注册、读写和关闭。poller 数量由
-  `Config.IOPollerCount` 指定，不大于 0（默认）时为 `max(1, CPU 数/4)`（CPU 数同上，向下取整，
-  至少 1 个）：7 核以内 1 个，8 核 2 个，16 核 4 个，64 核 16 个。profile 下来，poller 每个请求
+  `Config.IOPollerCount` 指定，不大于 0（默认）时 32 个 CPU 以内为 `max(1, CPU 数/4)`（CPU 数同上，
+  向下取整，至少 1 个），超过 32 个 CPU 为 CPU 数/2：7 核以内 1 个，8 核 2 个，16 核 4 个，32 核 8 个，
+  64 核 32 个。8、16、32 个 CPU 上 poller 数取 CPU/4、CPU/2 还是每 CPU 一个，HTTP/1 和 WebSocket
+  （长连接和每 10 个请求重连两种）差别都在 3% 以内；64 个 CPU 上 CPU/4 个 poller 在连接频繁建立、
+  关闭时 accept 跟不上，有四分之一的 CPU 空闲，改为 CPU/2 个后 HttpArena 的 limited-conn 快 15%、
+  WebSocket 的对应测试快 6%，长连接不变。profile 下来，poller 每个请求
   只花约 0.2µs，worker 花约 4.5µs（1 万连接的 WebSocket、HTTP/2 echo）。
   poller 只负责等事件、交给 worker，一个就能应付很多连接，多出来的 poller 会和 worker 抢同样
   的 P：每一轮结束后 poller 都要让出 P 给刚唤醒的 worker，再排在它们后面等 P，于是每轮收集到的
@@ -1418,7 +1422,7 @@ Engine 的 worker 池（`<Name>-workers`），每条连接的每一轮都在 wor
 ```go
 config := fib.DefaultConfig() // CPU 多于 4 个时默认已开启 IOPollers
 config.IOPollers = true       // 4 核及以下也要 poller 时显式打开
-config.IOPollerCount = 0      // max(1, CPU 数/4)
+config.IOPollerCount = 0      // 32 个 CPU 以内 max(1, CPU 数/4)，更多时 CPU 数/2
 config.ReusePort = true       // 允许其他进程共享地址；UDP 也改由各 poller 读
 
 single := fib.DefaultConfig()

@@ -219,10 +219,26 @@ const singleLoopCPUs = 4
 // defaultIOPollers is what DefaultConfig sets IOPollers to on cpus CPUs.
 func defaultIOPollers(cpus int) bool { return cpus > singleLoopCPUs }
 
+// manyPollerCPUs is the most CPUs on which the default gives a poller to
+// cpusPerPoller of them; above it, one goes to every two CPUs. Up to 32 CPUs
+// the count made no difference: HTTP/1 and WebSocket, with connections held
+// and reconnecting every ten requests, served within 3% of one another with a
+// poller for every four CPUs, every two and every one, on 8, 16 and 32 CPUs,
+// every one of them busy. On 64 CPUs a poller for every four left a quarter
+// of them idle where connections come and go, the pollers accepting them
+// being what ran short: a poller for every two served HttpArena's
+// limited-conn 15% faster, and its WebSocket counterpart 6% faster, with
+// held connections unchanged.
+const manyPollerCPUs = 32
+
 // defaultPollerCount is how many pollers IOPollers creates on cpus CPUs when
 // IOPollerCount leaves it to the engine: cpus divided by cpusPerPoller,
-// rounded down, and at least one.
+// rounded down, and at least one, up to manyPollerCPUs, and half the CPUs
+// above it.
 func defaultPollerCount(cpus int) int {
+	if cpus > manyPollerCPUs {
+		return cpus / 2
+	}
 	return max(1, cpus/cpusPerPoller)
 }
 
