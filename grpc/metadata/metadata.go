@@ -6,6 +6,8 @@ import (
 	"context"
 	"fmt"
 	"strings"
+
+	"github.com/lesismal/fib/grpc/internal/ctxkeys"
 )
 
 // MD maps lowercase keys to values. A key ending in "-bin" holds binary
@@ -81,7 +83,9 @@ func Join(mds ...MD) MD {
 	return out
 }
 
-type incomingKey struct{}
+// incomingKey is shared with package grpc, which answers for it from a
+// call's own context.
+type incomingKey = ctxkeys.Incoming
 type outgoingKey struct{}
 
 // NewIncomingContext returns a copy of ctx carrying md as the metadata that

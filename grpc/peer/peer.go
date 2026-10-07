@@ -5,6 +5,8 @@ package peer
 import (
 	"context"
 	"net"
+
+	"github.com/lesismal/fib/grpc/internal/ctxkeys"
 )
 
 // Peer is the other side of an RPC.
@@ -15,7 +17,9 @@ type Peer struct {
 	LocalAddr net.Addr
 }
 
-type peerKey struct{}
+// peerKey is shared with package grpc, which answers for it from a call's
+// own context.
+type peerKey = ctxkeys.Peer
 
 // NewContext returns a copy of ctx carrying p.
 func NewContext(ctx context.Context, p *Peer) context.Context {

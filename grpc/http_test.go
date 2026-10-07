@@ -241,3 +241,34 @@ func TestServeHTTPOverTLS(t *testing.T) {
 		t.Fatalf("over TLS = %+v, %v", r, err)
 	}
 }
+
+// BenchmarkServeHTTPUnary runs unary calls through package http's HTTP/2;
+// profile with -memprofile and focus on ServeHTTP for what a call costs the
+// server.
+func BenchmarkServeHTTPUnary(b *testing.B) {
+	t := &testing.T{}
+	addr := startHandler(t, fibhttp.NewHandler(httpRouter(&echoImpl{})))
+	engine, err := fib.NewEngine(fib.DefaultConfig(), nil)
+	if err != nil {
+		b.Fatal(err)
+	}
+	go engine.Run()
+	defer engine.Close()
+	defer engine.Stop()
+	cc, err := NewClient(addr, WithEngine(engine), WithDefaultCallOptions(CallContentSubtype("json")))
+	if err != nil {
+		b.Fatal(err)
+	}
+	defer cc.Close()
+	c := echoClient{cc}
+	ctx := context.Background()
+	b.ReportAllocs()
+	b.RunParallel(func(pb *testing.PB) {
+		for pb.Next() {
+			if _, err := c.Unary(ctx, &Req{Msg: "x", N: 1}); err != nil {
+				b.Error(err)
+				return
+			}
+		}
+	})
+}

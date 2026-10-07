@@ -5,13 +5,17 @@ package grpc
 import (
 	"context"
 	"encoding/binary"
+	"fmt"
 	"io"
 	stdhttp "net/http"
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
+	fib "github.com/lesismal/fib"
 	"github.com/lesismal/fib/grpc/codes"
+	"github.com/lesismal/fib/grpc/internal/ctxkeys"
 	"github.com/lesismal/fib/grpc/metadata"
 	"github.com/lesismal/fib/grpc/peer"
 	"github.com/lesismal/fib/grpc/status"
@@ -61,45 +65,36 @@ func (s *Server) ServeHTTP(c *fibhttp.Context, r *stdhttp.Request) {
 		_ = c.Respond(stdhttp.StatusUnsupportedMediaType, "text/plain", []byte("invalid gRPC request content-type"))
 		return
 	}
-	hs := &httpStream{server: s, c: c, r: r, method: r.URL.Path, codec: s.opts.codec,
+	hs := &httpStream{server: s, c: c, r: r, conn: c.Conn, method: r.URL.Path, codec: s.opts.codec,
 		whole: c.RequestBody() == nil, body: c.Body()}
 	if hs.codec == nil {
 		hs.codec = GetCodec(subtype)
 	}
-	md := metadata.MD{}
 	var fail *status.Status
-	for key, values := range r.Header {
-		name := strings.ToLower(key)
-		if reservedHeader(name) {
-			continue
-		}
-		for _, value := range values {
-			if err := addMetadata(md, name, value); err != nil {
-				fail = status.Newf(codes.Internal, "grpc: malformed binary metadata %q: %v", name, err)
+	for key := range r.Header {
+		if len(key) > 4 && strings.EqualFold(key[len(key)-4:], "-bin") {
+			// Binary metadata is decoded now, so that a malformed value
+			// fails the call rather than vanishing from its metadata.
+			if _, err := hs.incoming(); err != nil {
+				fail = status.Newf(codes.Internal, "grpc: malformed binary metadata: %v", err)
 			}
+			break
 		}
 	}
-	ctx := metadata.NewIncomingContext(context.Background(), md)
-	ctx = peer.NewContext(ctx, &peer.Peer{Addr: c.Conn.RemoteAddr(), LocalAddr: c.Conn.LocalAddr()})
-	ctx = context.WithValue(ctx, streamKey{}, hs)
-	var cancel context.CancelFunc
+	// The call's context is hs itself, which answers for its metadata, its
+	// peer and the call, and is cancelled with the request; a deadline the
+	// client set goes on top of it.
+	hs.ctx = hs
+	cancel := context.CancelFunc(func() {})
 	if timeout, ok := decodeTimeout(r.Header.Get("Grpc-Timeout")); ok {
-		ctx, cancel = context.WithTimeout(ctx, timeout)
-	} else {
-		ctx, cancel = context.WithCancel(ctx)
+		hs.ctx, cancel = context.WithTimeout(hs, timeout)
 	}
-	hs.ctx = ctx
 	if !hs.whole {
 		hs.in = newBodyPipe()
 	}
 	// A client that resets the stream, or a connection that goes, ends the
 	// call's context, and a read waiting on the rest of the request.
-	c.OnCancel(func(err error) {
-		cancel()
-		if hs.in != nil {
-			hs.in.close(err)
-		}
-	})
+	c.OnCancel(hs.cancel)
 	if hs.whole {
 		hs.serve(fail, subtype)
 		cancel()
@@ -145,12 +140,14 @@ func (hs *httpStream) serve(fail *status.Status, subtype string) {
 }
 
 // httpStream is the server's side of a call that arrived through package
-// http. Like grpc-go's, its methods are for the handler's goroutine, one at
-// a time.
+// http, and the call's context. Like grpc-go's, its stream methods are for
+// the handler's goroutine, one at a time; its context methods are for any.
 type httpStream struct {
 	server *Server
 	c      *fibhttp.Context
 	r      *stdhttp.Request
+	// ctx is the context the handler is given: the stream itself, or a
+	// context with the client's deadline over it.
 	ctx    context.Context
 	method string
 	codec  Codec
@@ -175,9 +172,142 @@ type httpStream struct {
 	trailer    metadata.MD
 	headerSent bool
 	done       bool
+
+	// The context's state, guarded by mu: why it was cancelled, the channel
+	// Done made, if one asked; and the call's metadata and peer, made when
+	// first asked for from the request and the connection, which conn and
+	// ended let go of once the call has ended, after which neither is the
+	// call's any more.
+	mu       sync.Mutex
+	err      error
+	doneCh   chan struct{}
+	conn     *fib.Connection
+	md       metadata.MD
+	mdErr    error
+	mdMade   bool
+	peerAddr *peer.Peer
+	ended    bool
 }
 
 func (hs *httpStream) Context() context.Context { return hs.ctx }
+
+// Deadline is none: a deadline the client set is on the context the handler
+// is given, over this one.
+func (hs *httpStream) Deadline() (time.Time, bool) { return time.Time{}, false }
+
+func (hs *httpStream) Done() <-chan struct{} {
+	hs.mu.Lock()
+	defer hs.mu.Unlock()
+	if hs.doneCh == nil {
+		hs.doneCh = make(chan struct{})
+		if hs.err != nil {
+			close(hs.doneCh)
+		}
+	}
+	return hs.doneCh
+}
+
+func (hs *httpStream) Err() error {
+	hs.mu.Lock()
+	defer hs.mu.Unlock()
+	return hs.err
+}
+
+func (hs *httpStream) Value(key any) any {
+	switch key.(type) {
+	case streamKey:
+		return hs
+	case ctxkeys.Incoming:
+		if md, err := hs.incoming(); err == nil {
+			return md
+		}
+		return metadata.MD{}
+	case ctxkeys.Peer:
+		return hs.peer()
+	}
+	return nil
+}
+
+// cancel is OnCancel's callback: the request ended before the call did.
+func (hs *httpStream) cancel(err error) {
+	hs.mu.Lock()
+	if hs.err == nil {
+		hs.err = context.Canceled
+		if hs.doneCh != nil {
+			close(hs.doneCh)
+		}
+	}
+	hs.mu.Unlock()
+	if hs.in != nil {
+		hs.in.close(err)
+	}
+}
+
+// incoming is the metadata that came with the call, made from the request's
+// header the first time it is asked for while the call lasts.
+func (hs *httpStream) incoming() (metadata.MD, error) {
+	hs.mu.Lock()
+	defer hs.mu.Unlock()
+	if !hs.mdMade && !hs.ended {
+		hs.mdMade = true
+		hs.md = metadata.MD{}
+		for key, values := range hs.r.Header {
+			name := lowerKey(key)
+			if reservedHeader(name) {
+				continue
+			}
+			for _, value := range values {
+				if err := addMetadata(hs.md, name, value); err != nil && hs.mdErr == nil {
+					hs.mdErr = fmt.Errorf("%q: %w", name, err)
+				}
+			}
+		}
+	}
+	if hs.md == nil {
+		return metadata.MD{}, hs.mdErr
+	}
+	return hs.md, hs.mdErr
+}
+
+// peer is the other side of the call, found the first time it is asked for
+// while the call lasts.
+func (hs *httpStream) peer() *peer.Peer {
+	hs.mu.Lock()
+	defer hs.mu.Unlock()
+	if hs.peerAddr == nil && hs.conn != nil {
+		hs.peerAddr = &peer.Peer{Addr: hs.conn.RemoteAddr(), LocalAddr: hs.conn.LocalAddr()}
+	}
+	return hs.peerAddr
+}
+
+// end lets go of what the call's metadata and peer are made from, which are
+// recycled once the response is finished; what was made of them stays.
+func (hs *httpStream) end() {
+	hs.mu.Lock()
+	hs.ended = true
+	hs.conn = nil
+	hs.mu.Unlock()
+}
+
+// lowerKey is a canonical header key in lower case, as metadata keys are,
+// without an allocation for the names calls nearly always carry.
+func lowerKey(key string) string {
+	switch key {
+	case "User-Agent":
+		return "user-agent"
+	case "Te":
+		return "te"
+	case "Content-Type":
+		return "content-type"
+	case "Grpc-Timeout":
+		return "grpc-timeout"
+	case "Grpc-Encoding":
+		return "grpc-encoding"
+	case "Grpc-Accept-Encoding":
+		return "grpc-accept-encoding"
+	}
+	return strings.ToLower(key)
+}
 
 func (hs *httpStream) fullMethod() string { return hs.method }
 
@@ -358,6 +488,7 @@ func (hs *httpStream) finish(st *status.Status) {
 		return
 	}
 	hs.done = true
+	hs.end()
 	if hs.in != nil {
 		// What more the client sends is not wanted.
 		hs.in.close(io.ErrClosedPipe)
@@ -369,8 +500,13 @@ func (hs *httpStream) finish(st *status.Status) {
 		_ = hs.c.Finish()
 		return
 	}
-	header := stdhttp.Header{}
-	hs.responseHeader(header)
+	var header stdhttp.Header
+	if hs.reply == nil || st.Code() != codes.OK || hs.sendComp != nil || len(hs.header) > 0 {
+		header = stdhttp.Header{}
+		hs.responseHeader(header)
+	} else {
+		header = codecHeader(hs.codec.Name())
+	}
 	if hs.reply == nil || st.Code() != codes.OK {
 		// Trailers-only: one HEADERS is the whole response.
 		setStatus(header, "", st)
@@ -378,10 +514,31 @@ func (hs *httpStream) finish(st *status.Status) {
 		_ = hs.c.WriteResponse(fibhttp.Response{StatusCode: stdhttp.StatusOK, Header: header})
 		return
 	}
-	trailer := stdhttp.Header{}
-	setStatus(trailer, "", st)
-	setMetadata(trailer, "", hs.trailer)
+	trailer := okTrailer
+	if len(hs.trailer) > 0 {
+		trailer = stdhttp.Header{}
+		setStatus(trailer, "", st)
+		setMetadata(trailer, "", hs.trailer)
+	}
 	_ = hs.c.WriteResponse(fibhttp.Response{StatusCode: stdhttp.StatusOK, Header: header, Body: hs.reply, Trailer: trailer})
+}
+
+// okTrailer is the trailer of nearly every unary call's response, and
+// codecHeaders hold the header of one for each codec, which package http only
+// reads, so that one of each serves them all.
+var (
+	okTrailer    = stdhttp.Header{"Grpc-Status": {"0"}}
+	codecHeaders sync.Map
+)
+
+// codecHeader is the header of a response whose messages codec name encodes,
+// carrying nothing else.
+func codecHeader(name string) stdhttp.Header {
+	if h, ok := codecHeaders.Load(name); ok {
+		return h.(stdhttp.Header)
+	}
+	h, _ := codecHeaders.LoadOrStore(name, stdhttp.Header{"Content-Type": {contentType(name)}})
+	return h.(stdhttp.Header)
 }
 
 // setStatus sets st's fields on h, each name behind prefix.
