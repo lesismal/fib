@@ -185,7 +185,8 @@
 - **拥塞控制**：增加 CUBIC 或 BBR，判断应用受限，实现持续拥塞判定。
 - **批量收发**：Engine 在 Linux 上用 `recvmmsg`、macOS 上用 `recvmsg_x` 批量读取；一轮
   发送多于一个数据报时用 `sendmmsg` 或 `sendmsg_x` 一次发出（`fib.Connection.SendBatch`）。
-  GSO/GRO（把发给同一对端的一批数据报作为一个缓冲区交给内核）尚未实现。
+  Linux 上一批里大小相同的连续数据报用 GSO（`UDP_SEGMENT`）作为一条消息交给内核分段，8 个 CPU
+  的服务端上 static-h3 从每秒 4 万请求提高到 7.7 万。接收方向的 GRO 尚未实现。
 - **减少复制与分配**：发送时 `Write` 复制一次（复制进缓冲池里的缓冲区）、组包时再复制
   一次；接收时 Engine 复制一次（复制进缓冲池里的缓冲区），HTTP/3 帧解析器只复制跨片段的帧
   和请求 body。每个请求仍要分配它的 QUIC stream；请求 stream 和 header 会被复用（见上文）。

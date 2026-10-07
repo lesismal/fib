@@ -78,7 +78,16 @@ type sendScratch struct {
 	name syscall.RawSockaddrAny
 	hdrs [udpBatchSize]batchHeader
 	iovs [udpBatchSize]syscall.Iovec
+	// ctl holds the UDP_SEGMENT control message of each message that sends
+	// a run of datagrams as one, and ends where each message's datagrams
+	// end; see sendBatchSys on Linux.
+	ctl  [udpBatchSize][gsoControlLen]byte
+	ends [udpBatchSize]int
 }
+
+// gsoControlLen has room for a control message carrying a uint16, which is
+// what UDP_SEGMENT takes, on every platform.
+const gsoControlLen = 32
 
 var sendScratches = sync.Pool{New: func() any { return new(sendScratch) }}
 
