@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"crypto/tls"
 	"errors"
+	"fmt"
 	mrand "math/rand/v2"
 	"net"
 	"slices"
@@ -122,6 +123,9 @@ type testPair struct {
 	// bursts has the server take what has piled up for it with one
 	// HandleDatagrams, as a fib server does, rather than a datagram a call.
 	bursts atomic.Bool
+	// gather, when set, has the server take that many datagrams with one
+	// HandleDatagrams, however far apart a busy runner sends them.
+	gather atomic.Int32
 }
 
 func (p *testPair) close() {
@@ -181,6 +185,19 @@ func newTestPair(t *testing.T, loss float64, configure func(client, server *Conf
 				}
 				s := p.server
 				p.serverMu.Unlock()
+				if n := int(p.gather.Swap(0)); n > 0 {
+					burst := [][]byte{d}
+					for len(burst) < n {
+						select {
+						case d := <-p.serverEnd.queue:
+							burst = append(burst, d)
+						case <-p.done:
+							return
+						}
+					}
+					s.HandleDatagrams(burst)
+					continue
+				}
 				if !p.bursts.Load() {
 					s.HandleDatagram(d)
 					continue
@@ -253,6 +270,34 @@ func waitFinished(t *testing.T, h *testHandler, id uint64) {
 			t.Fatalf("stream %d not finished", id)
 		}
 	}
+}
+
+// waitQuiet waits for the end of the handshake to go by: neither end with a
+// packet in flight that asks for an acknowledgement, nor an acknowledgement
+// still to send. A test that counts what is sent after it counts only what
+// it asks for, not the probe a waiting acknowledgement leads to: on a path
+// this fast the probe timeout is barely longer than the peer may hold its
+// acknowledgement back, and a busy runner makes up the difference.
+func waitQuiet(t *testing.T, p *testPair) {
+	t.Helper()
+	quiet := func(c *Conn) bool {
+		c.mu.Lock()
+		defer c.mu.Unlock()
+		for i := range c.spaces {
+			s := &c.spaces[i]
+			if s.tx != nil && !s.discarded && (s.ackElicitingInFlight > 0 || s.ackPending) {
+				return false
+			}
+		}
+		return true
+	}
+	server := p.serverConn(t)
+	for deadline := time.Now().Add(5 * time.Second); time.Now().Before(deadline); time.Sleep(time.Millisecond) {
+		if quiet(p.client) && quiet(server) {
+			return
+		}
+	}
+	t.Fatal("the handshake's last packets still waiting for acknowledgement")
 }
 
 func TestHandshakeAndEcho(t *testing.T) {
@@ -667,7 +712,7 @@ func TestWritesDuringHandlerCallShareDatagrams(t *testing.T) {
 		t.Fatal(err)
 	}
 	waitFinished(t, p.clientH, first.ID())
-	time.Sleep(50 * time.Millisecond)
+	waitQuiet(t, p)
 	serverSizes := watchSends(p.serverEnd)
 	s, err := p.client.OpenStream()
 	if err != nil {
@@ -720,44 +765,173 @@ func TestAckRangesForgotten(t *testing.T) {
 // its own ahead of it, even when the request took packets enough to want an
 // acknowledgement at once; one whose answer is late is acknowledged anyway.
 func TestExpectedWriteCarriesTheAck(t *testing.T) {
-	for _, delay := range []time.Duration{0, 20 * time.Millisecond} {
-		t.Run(delay.String(), func(t *testing.T) {
-			p := newTestPair(t, 0, nil)
-			time.Sleep(50 * time.Millisecond) // the handshake's last packets
-			p.bursts.Store(true)
-			sends := watchSends(p.serverEnd)
-			p.serverH.onData = func(s *Stream, data []byte, fin bool) {
-				if !fin {
-					return
-				}
-				s.Conn().ExpectWrite()
-				go func() {
-					time.Sleep(delay)
-					_ = s.Write(bytes.Repeat([]byte("a"), 500), true)
-					s.Conn().WriteDone()
-				}()
+	t.Run("prompt", func(t *testing.T) {
+		// An answer whose goroutine a busy runner keeps from running for
+		// longer than flushHold finds the acknowledgement gone ahead of it,
+		// as it should: only an answer written while the connection was
+		// still waiting for it that leaves without it fails.
+		for range 3 {
+			sent, waited := expectedAnswer(t, false)
+			if !waited {
+				continue
 			}
-			s, err := p.client.OpenStream()
-			if err != nil {
-				t.Fatal(err)
+			if small(sent) > 0 {
+				t.Fatalf("the server sent %v", sent)
 			}
-			// Three packets of request, which want an acknowledgement at once.
-			if err := s.Write(make([]byte, 3000), true); err != nil {
-				t.Fatal(err)
-			}
-			waitFinished(t, p.clientH, s.ID())
-			sent := sends()
-			small := 0
-			for _, n := range sent {
-				if n < 100 {
-					small++
-				}
-			}
-			if late := delay > flushHold; late != (small > 0) {
-				t.Fatalf("answered after %v: the server sent %v", delay, sent)
-			}
-		})
+			return
+		}
+		t.Fatal("three answers in a row were written after the connection stopped waiting for them")
+	})
+	t.Run("late", func(t *testing.T) {
+		// The answer is written once the acknowledgement has gone without
+		// it, which it does once flushHold is over.
+		if sent, _ := expectedAnswer(t, true); len(sent) < 2 || sent[0] >= 100 {
+			t.Fatalf("the server sent %v", sent)
+		}
+	})
+}
+
+// small counts the datagrams too small to carry anything but an
+// acknowledgement.
+func small(sent []int) int {
+	n := 0
+	for _, size := range sent {
+		if size < 100 {
+			n++
+		}
 	}
+	return n
+}
+
+// expectedAnswer has the client send a request of three packets, which
+// wants an acknowledgement at once, and the server answer it on a goroutine
+// of its own, with the connection told to expect the answer; late has the
+// answer wait until the server has sent something without it. It returns
+// the sizes of the datagrams the server sent after the request, and whether
+// the connection was still waiting for the answer once it was written.
+func expectedAnswer(t *testing.T, late bool) (sent []int, waited bool) {
+	p := newTestPair(t, 0, nil)
+	waitQuiet(t, p)
+	sends := watchSends(p.serverEnd)
+	waitedc := make(chan bool, 1)
+	p.serverH.onData = func(s *Stream, data []byte, fin bool) {
+		if !fin {
+			return
+		}
+		c := s.Conn()
+		c.ExpectWrite()
+		go func() {
+			for deadline := time.Now().Add(5 * time.Second); late && len(sends()) == 0 && time.Now().Before(deadline); {
+				time.Sleep(time.Millisecond)
+			}
+			_ = s.Write(bytes.Repeat([]byte("a"), 500), true)
+			waitedc <- stillAwaited(c)
+			c.WriteDone()
+		}()
+	}
+	p.gather.Store(3)
+	s, err := p.client.OpenStream()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Write(make([]byte, 3000), true); err != nil {
+		t.Fatal(err)
+	}
+	waitFinished(t, p.clientH, s.ID())
+	return sends(), <-waitedc
+}
+
+// stillAwaited reports whether c is still waiting for the writes it was told
+// to expect, rather than having stopped once flushHold was over: what it held
+// back for them has not been sent without them.
+func stillAwaited(c *Conn) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.awaited > 0
+}
+
+// A timer that fires with nothing of its own due, as one set for the probe
+// timeout of packets the request has just acknowledged does when its
+// goroutine runs late, leaves what waits for an expected write waiting: the
+// acknowledgement of the request still leaves with the answer.
+func TestMootTimerKeepsTheHold(t *testing.T) {
+	// As in TestExpectedWriteCarriesTheAck, only an answer written while
+	// the connection was still waiting for it counts.
+	for range 3 {
+		if mootTimerHold(t) {
+			return
+		}
+	}
+	t.Fatal("three answers in a row were written after the connection stopped waiting for them")
+}
+
+// mootTimerHold runs TestMootTimerKeepsTheHold once and reports whether the
+// answer was written while the connection was still waiting for it.
+func mootTimerHold(t *testing.T) bool {
+	p := newTestPair(t, 0, nil)
+	waitQuiet(t, p)
+	server := p.serverConn(t)
+	// Something of the server's in flight, which the client acknowledges
+	// with its request, since it holds the acknowledgement back for a while.
+	push, err := server.OpenStream()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := push.Write(make([]byte, 200), true); err != nil {
+		t.Fatal(err)
+	}
+	waitFinished(t, p.clientH, push.ID())
+	sends := watchSends(p.serverEnd)
+	var before int
+	moot := make(chan string, 1)
+	waitedc := make(chan bool, 1)
+	p.serverH.onData = func(s *Stream, data []byte, fin bool) {
+		if !fin || s == push {
+			return
+		}
+		// Should the client's acknowledgement have gone ahead of its
+		// request after all, the request's first packets were acknowledged
+		// before it was all there: what counts is what follows.
+		before = len(sends())
+		c := s.Conn()
+		c.ExpectWrite()
+		c.mu.Lock()
+		if !c.ackElicitingInFlight() && !c.lossDeadline.IsZero() {
+			moot <- fmt.Sprintf("the probe timeout is still set %v from now for packets acknowledged", c.lossDeadline.Sub(c.now()))
+		}
+		c.mu.Unlock()
+		// The timer fires now, for whatever it was set for.
+		c.onTimer()
+		go func() {
+			_ = s.Write(bytes.Repeat([]byte("a"), 500), true)
+			waitedc <- stillAwaited(c)
+			c.WriteDone()
+		}()
+	}
+	p.gather.Store(3)
+	s, err := p.client.OpenStream()
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Three packets of request, which want an acknowledgement at once.
+	if err := s.Write(make([]byte, 3000), true); err != nil {
+		t.Fatal(err)
+	}
+	waitFinished(t, p.clientH, s.ID())
+	select {
+	case m := <-moot:
+		t.Fatal(m)
+	default:
+	}
+	if !<-waitedc {
+		return false
+	}
+	// A probe of the push, should one go, carries the push again: only an
+	// acknowledgement on its own is this small.
+	if sent := sends(); small(sent[before:]) > 0 {
+		t.Fatalf("the server sent %v", sent[before:])
+	}
+	return true
 }
 
 // Answers to a burst of requests written on goroutines of their own, with
@@ -784,7 +958,7 @@ const expectedBurst = 4
 // answers were packed into at most half as many.
 func expectedWritesBurst(t *testing.T) ([]int, bool) {
 	p := newTestPair(t, 0, func(_, server *Config) { server.MaxDatagramSize = 1350 })
-	time.Sleep(50 * time.Millisecond)
+	waitQuiet(t, p)
 	p.bursts.Store(true)
 	const requests = expectedBurst
 	var mu sync.Mutex
@@ -842,7 +1016,7 @@ func expectedWritesBurst(t *testing.T) ([]int, bool) {
 // holds the connection's other writes back once, for flushHold, and not after.
 func TestExpectedWriteThatDoesNotCome(t *testing.T) {
 	p := newTestPair(t, 0, nil)
-	time.Sleep(50 * time.Millisecond)
+	waitQuiet(t, p)
 	sends := watchSends(p.clientEnd)
 	p.client.ExpectWrite()
 	s, err := p.client.OpenStream()

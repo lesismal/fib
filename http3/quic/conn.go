@@ -1517,25 +1517,42 @@ func (c *Conn) onTimer() {
 	case !now.Before(c.idleDeadline()):
 		c.terminateLocked(ErrIdleTimeout)
 	default:
+		due := false
 		if !c.pathDeadline.IsZero() && !now.Before(c.pathDeadline) {
 			c.pathFailedLocked()
+			due = true
 		}
 		if !c.lossDeadline.IsZero() && !now.Before(c.lossDeadline) {
 			c.onLossDetectionTimeout(now)
+			due = true
 		}
 		if c.config.KeepAlivePeriod > 0 && c.handshakeComplete && !now.Before(c.keepAliveAt()) {
 			c.pingPending = true
+			due = true
 		}
 		if !c.flushDeadline.IsZero() && !now.Before(c.flushDeadline) {
 			// Writes expected that have held the rest back for flushHold are
 			// not coming soon, a handler that keeps its request, say: they no
 			// longer hold anything back.
 			c.awaited = 0
+			due = true
 		}
-		// The timer sends whether or not the handler is being called: loss
-		// recovery does not wait for a handler that takes its time.
-		c.wantFlush = true
-		c.sendLocked()
+		if s := &c.spaces[spaceApp]; s.ackPending && !s.ackDeadline.IsZero() && !now.Before(s.ackDeadline) {
+			due = true
+		}
+		if due {
+			// The timer sends whether or not the handler is being called:
+			// loss recovery does not wait for a handler that takes its time.
+			c.wantFlush = true
+			c.sendLocked()
+		} else {
+			// The timer was set for something that has since been done or
+			// moved, a probe timeout the acknowledgement just handled made
+			// moot, say: what there is to send keeps waiting for the
+			// handler, or it would leave the acknowledgement of a request
+			// without the answer being written to it.
+			c.armTimerLocked(now)
+		}
 	}
 	givenUp := c.takeGivenUpLocked()
 	c.mu.Unlock()

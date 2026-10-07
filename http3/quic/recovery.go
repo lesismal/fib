@@ -276,6 +276,15 @@ func (c *Conn) onAckReceived(space int, ranges []pnRange, ackDelay time.Duration
 	if c.peerCompletedAddressValidation() {
 		c.ptoCount = 0
 	}
+	// What is acknowledged no longer needs probing (RFC 9002 appendix
+	// A.7): the timer the probe timeout of the packets was set for is
+	// moved now, rather than by the next round of sending, which a handler
+	// that is still being called holds back. One that is due sooner than
+	// the timer is set for, a packet's loss by time, sets it.
+	c.setLossDetectionTimer(now)
+	if !c.lossDeadline.IsZero() && (c.timerAt.IsZero() || c.lossDeadline.Before(c.timerAt)) {
+		c.armTimerLocked(now)
+	}
 	return nil
 }
 
