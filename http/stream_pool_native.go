@@ -236,3 +236,12 @@ func runOnStreams(conn *fib.Connection, fn func()) {
 		fn()
 	}
 }
+
+// cancelElsewhere runs fn, a cancellation found under a lock its callback
+// may take, on the pool conn's request handlers run on, or on a goroutine of
+// its own once that pool has stopped taking work: never here.
+func cancelElsewhere(conn *fib.Connection, fn func()) {
+	if pool := handlerPool(conn); pool == nil || !pool.Go(fn) {
+		go fn()
+	}
+}

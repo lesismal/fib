@@ -1111,12 +1111,25 @@ func (sc *h2ServerConn) creditBody(st *h2ServerStream, n int) {
 // failBodyLocked tells the handler of a body still streaming that the rest of
 // it will not arrive. Its callback may answer the request, which takes the
 // lock held here, but Fail hands the callback its last call on the stream
-// pool rather than making it here.
+// pool rather than making it here. A handler still at work on the stream's
+// request hears that there is nothing left to answer, as one on an HTTP/1
+// connection that closed does: its Context is cancelled, see
+// Context.OnCancel.
 func (sc *h2ServerConn) failBodyLocked(st *h2ServerStream, err error) {
 	if feed := st.feed; feed != nil && !st.remoteDone {
 		feed.Fail(err)
 	}
 	sc.endTunnelLocked(st, err)
+	if c := &st.block.context; c.stream == st && !st.responded {
+		// The generation is read while the stream is still the connection's,
+		// so that a Context recycled for another request by the time the
+		// cancellation runs is left alone. The cancellation runs elsewhere,
+		// since an OnCancel callback may answer, which takes the lock held
+		// here.
+		if w := c.word.Load(); ctxState(w) == ctxOpen {
+			cancelElsewhere(sc.conn, func() { c.cancelWith(err, w>>ctxGenShift) })
+		}
+	}
 }
 
 // failBodiesLocked fails every body still streaming on the connection.

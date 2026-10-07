@@ -583,3 +583,61 @@ func TestH2ServerHeadLengthMatchesHTTP1(t *testing.T) {
 		}
 	}
 }
+
+// A handler at work on a stream the client resets hears it, as one on an
+// HTTP/1 connection that closes does: its Context is cancelled. So is one
+// whose connection goes, and a stream already answered is left alone.
+func TestH2ServerCancelsTheContextOfAResetStream(t *testing.T) {
+	cancelled := make(chan error, 4)
+	entered := make(chan struct{}, 4)
+	addr := serve(t, NewHandler(HandlerFunc(func(c *Context, r *stdhttp.Request) {
+		if r.URL.Path == "/quick" {
+			c.OnCancel(func(err error) { cancelled <- err })
+			_ = c.Respond(200, "text/plain", []byte("done"))
+			return
+		}
+		done := make(chan struct{})
+		c.OnCancel(func(err error) {
+			cancelled <- err
+			close(done)
+		})
+		entered <- struct{}{}
+		select {
+		case <-done:
+			if c.Err() == nil {
+				t.Error("Err is nil in a cancelled Context")
+			}
+		case <-time.After(5 * time.Second):
+			t.Error("the handler was never told of the reset")
+		}
+	})))
+	tc := dialH2(t, addr)
+	tc.headers(1, true, get("/quick")...)
+	if _, body := tc.response(1); string(body) != "done" {
+		t.Fatalf("quick: %q", body)
+	}
+	tc.headers(3, true, get("/slow")...)
+	<-entered
+	tc.write(h2AppendRSTStream(nil, 3, H2Cancel))
+	select {
+	case err := <-cancelled:
+		if err == nil {
+			t.Fatal("cancelled with a nil error")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("no cancellation after RST_STREAM")
+	}
+	tc.headers(5, true, get("/slow")...)
+	<-entered
+	tc.c.Close()
+	select {
+	case <-cancelled:
+	case <-time.After(5 * time.Second):
+		t.Fatal("no cancellation after the connection closed")
+	}
+	select {
+	case err := <-cancelled:
+		t.Fatalf("an answered stream was cancelled too: %v", err)
+	case <-time.After(100 * time.Millisecond):
+	}
+}
