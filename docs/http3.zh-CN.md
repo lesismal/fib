@@ -97,6 +97,10 @@
   `StreamPool.Disable` 相同）又回到引入协程池之前的串行处理。
 - 不要调用 `Context.Conn.Send` 直接写数据：`Conn` 是 UDP 连接，所有输出都必须经过
   `Context`。
+- 请求结束后，请求的 stream 连同它持有的 `*http.Request`、`Header`、`URL`、`*Context` 会被
+  复用（设置 `Config.DisableReuse` 则不复用）：handler 不能在响应完成、最后一次 `Release` 之后
+  继续持有它们，规则同 `http.Config.ReuseRequests`。body 流式交付的请求和 extended CONNECT
+  不复用。服务端限制在 8 个 CPU 时，复用后每秒 156 万请求，不复用 119 万。
 
 ### 固定参数
 
@@ -184,8 +188,7 @@
   GSO/GRO（把发给同一对端的一批数据报作为一个缓冲区交给内核）尚未实现。
 - **减少复制与分配**：发送时 `Write` 复制一次（复制进缓冲池里的缓冲区）、组包时再复制
   一次；接收时 Engine 复制一次（复制进缓冲池里的缓冲区），HTTP/3 帧解析器只复制跨片段的帧
-  和请求 body。每个请求仍要分配它的 QUIC stream、header map，以及一块装着 request、URL、
-  `Context` 等服务它所需其余对象的内存。
+  和请求 body。每个请求仍要分配它的 QUIC stream；请求 stream 和 header 会被复用（见上文）。
 - **数据结构**：已发送的包存在切片里，ACK 处理和丢包检测都是线性扫描；每轮发送都会重置
   一次 `time.Timer`。
 - **ACK 频率**：大流量时可以实现 ACK_FREQUENCY 扩展，减少 ACK 数量。

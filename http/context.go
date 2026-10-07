@@ -120,6 +120,8 @@ func (c *Context) ended() {
 		c.server.recycle(c)
 	} else if st := c.stream; st != nil {
 		st.unref()
+	} else if ender, ok := c.external.(StreamEnder); ok {
+		ender.RequestEnded()
 	}
 }
 

@@ -152,7 +152,8 @@ type Config struct {
 	// with ReuseHeaders as well; a stream whose body streams to its handler,
 	// a pushed stream and an extended CONNECT's are left to the collector.
 	// In HttpArena's baseline-h2c profile on 64 CPUs that took the server
-	// from 11.5M requests a second to 18.5M.
+	// from 11.5M requests a second to 18.5M. Package http3 recycles its
+	// requests' by default too; see its Config.DisableReuse.
 	//
 	// The price is that a recycled object is only the handler's until the
 	// request is done with: the handler has returned and has released every

@@ -1389,7 +1389,6 @@ func (sc *h2ServerConn) newStream(id uint32) *h2ServerStream {
 	if sc.reuseStreams {
 		st = h2StreamPool.Get().(*h2ServerStream)
 		st.pooled = true
-		st.block.context.reopen()
 	} else {
 		st = new(h2ServerStream)
 	}
@@ -1439,9 +1438,7 @@ func (st *h2ServerStream) recycle() {
 		clear(h.values[:])
 		headerPool.Put(h)
 	}
-	st.block.context.recycle()
-	st.block.Request, st.block.URL = stdhttp.Request{}, url.URL{}
-	st.block.body, st.block.task = wholeBody{}, streamTask{}
+	st.block.Recycle()
 	st.values = [h2RequestValues]string{}
 	st.sc, st.id, st.req, st.pushed = nil, 0, nil, false
 	st.body, st.declared, st.recvWindow, st.recvUnacked = nil, 0, 0, 0

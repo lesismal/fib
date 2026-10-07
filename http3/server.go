@@ -30,6 +30,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	fib "github.com/lesismal/fib"
@@ -93,6 +94,15 @@ type Config struct {
 	// connections come from that engine, HTTP/2 servers included, and sets
 	// no per-connection limit; see http.StreamPoolConfig.
 	StreamPool fibhttp.StreamPoolConfig
+	// DisableReuse leaves each request's objects to the collector. By
+	// default the server recycles them once the request has ended: the
+	// *http.Request, its Header and URL, and the *Context it is answered
+	// through, which the request's stream holds together, under the rule
+	// http.Config.ReuseRequests describes: a handler must not keep any of
+	// them past its response and its last Release. A request whose body
+	// streams to its handler, and an extended CONNECT's, are left to the
+	// collector either way.
+	DisableReuse bool
 }
 
 // DefaultConfig returns the defaults, which are what zero values in a Config
@@ -337,6 +347,10 @@ type serverConn struct {
 	mu sync.Mutex
 	// streams are the requests not yet answered.
 	streams map[uint64]*requestStream
+
+	// dead is the list of the connection's recycled request streams that
+	// nothing can reach any more, which recycleDead hands back to the pool.
+	dead atomic.Pointer[requestStream]
 	// nextID is the stream ID after the highest request seen, which is
 	// what GOAWAY names.
 	nextID    uint64
@@ -401,8 +415,16 @@ func (sc *serverConn) newRequestStream(s *quic.Stream) *requestStream {
 	}
 	sc.nextID = max(sc.nextID, id+4)
 	sc.mu.Unlock()
-	rs := &requestStream{sc: sc, s: s, declared: -1,
-		parser: frameParser{maxFrame: uint64(sc.h.config.MaxHeaderBytes)}}
+	var rs *requestStream
+	if !sc.h.config.DisableReuse && !sc.h.config.StreamRequestBody {
+		rs = requestStreamPool.Get().(*requestStream)
+		rs.pooled = true
+	} else {
+		rs = new(requestStream)
+	}
+	rs.sc, rs.s, rs.declared = sc, s, -1
+	rs.parser = frameParser{maxFrame: uint64(sc.h.config.MaxHeaderBytes)}
+	rs.refs.Store(1)
 	if sc.h.config.StreamRequestBody {
 		// The stream's flow control is given back by the request from here,
 		// so that a body that streams paces the client; see streamedBody.
@@ -433,7 +455,10 @@ func (sc *serverConn) OnStreamsAvailable(*quic.Conn) {}
 
 // OnCallsDone hands the requests that arrived whole during the run of calls
 // to the handler pool, together.
-func (sc *serverConn) OnCallsDone(*quic.Conn) { sc.h.streams.Submit(&sc.batch) }
+func (sc *serverConn) OnCallsDone(*quic.Conn) {
+	sc.h.streams.Submit(&sc.batch)
+	sc.recycleDead()
+}
 
 func (sc *serverConn) OnClose(qc *quic.Conn, _ error) {
 	sc.h.removeRoute(qc)
@@ -462,9 +487,14 @@ func (sc *serverConn) track(rs *requestStream) {
 // once the last one is gone.
 func (sc *serverConn) untrack(rs *requestStream) {
 	sc.mu.Lock()
-	delete(sc.streams, rs.s.ID())
+	id := rs.s.ID()
+	tracked := sc.streams[id] == rs
+	delete(sc.streams, id)
 	done := sc.goingAway && len(sc.streams) == 0
 	sc.mu.Unlock()
+	if tracked {
+		rs.unref()
+	}
 	if done {
 		sc.qc.CloseWhenDone(uint64(ErrCodeNoError), "")
 	}
@@ -526,13 +556,97 @@ type requestStream struct {
 	// allocated with the stream, and values holds its header's values.
 	block  fibhttp.StreamRequest
 	values [requestValues]string
+
+	// pooled marks a stream the server recycles once nothing can reach it:
+	// refs counts what still may, the connection's table until untrack and
+	// the Context from the handler's dispatch until it ends, and the last
+	// of them to go puts the stream on the connection's dead list through
+	// nextDead; see serverConn.recycleDead. A request header taken from the
+	// pool is headerFromPool.
+	pooled         bool
+	refs           atomic.Int32
+	nextDead       *requestStream
+	headerFromPool *pooledHeader
+}
+
+// requestStreamPool holds the request streams connections have recycled.
+var requestStreamPool = sync.Pool{New: func() any { return new(requestStream) }}
+
+// pooledHeader is a recycled request Header, with room for its values.
+type pooledHeader struct {
+	header stdhttp.Header
+	values [8]string
+}
+
+var headerPool = sync.Pool{New: func() any { return &pooledHeader{header: make(stdhttp.Header)} }}
+
+// retiredStream is the Context of a QUIC stream whose request stream has
+// been recycled, which the connection's callbacks pass over: nil would have
+// a late packet start a new request.
+type retiredStream struct{}
+
+// unref gives up one of rs's references, and puts a recycled stream that
+// nothing can reach any more on its connection's dead list.
+func (rs *requestStream) unref() {
+	if rs.refs.Add(-1) != 0 || !rs.pooled {
+		return
+	}
+	sc := rs.sc
+	for {
+		head := sc.dead.Load()
+		rs.nextDead = head
+		if sc.dead.CompareAndSwap(head, rs) {
+			return
+		}
+	}
+}
+
+// RequestEnded is told that nothing but the server can reach the request
+// any more; see http.StreamEnder.
+func (rs *requestStream) RequestEnded() { rs.unref() }
+
+// recycleDead hands the request streams on the dead list back to the pool.
+// It runs on the goroutine QUIC calls the connection's handler on, which is
+// where a QUIC stream's callbacks reach its request stream through its
+// Context: that is pointed elsewhere first, so that a packet arriving for the
+// stream later does not reach the request the stream goes on to serve.
+func (sc *serverConn) recycleDead() {
+	for rs := sc.dead.Swap(nil); rs != nil; {
+		next := rs.nextDead
+		if s := rs.s; s != nil && s.Context == rs {
+			s.Context = retiredStream{}
+		}
+		rs.recycle()
+		requestStreamPool.Put(rs)
+		rs = next
+	}
+}
+
+// recycle clears rs for another request. TestRequestStreamRecycleResets
+// holds it to clearing every field.
+func (rs *requestStream) recycle() {
+	if h := rs.headerFromPool; h != nil {
+		clear(h.header)
+		clear(h.values[:])
+		headerPool.Put(h)
+	}
+	rs.block.Recycle()
+	rs.sc, rs.s, rs.req, rs.body = nil, nil, nil, nil
+	rs.parser = frameParser{}
+	rs.declared, rs.trailers, rs.done = 0, false, false
+	rs.streamed, rs.tunnel = nil, nil
+	rs.remoteDone, rs.responded, rs.closed, rs.upgraded, rs.expected = false, false, false, false, false
+	rs.values = [requestValues]string{}
+	rs.pooled, rs.nextDead, rs.headerFromPool = false, nil, nil
+	rs.refs.Store(0)
 }
 
 // requestValues is how many of a request's header values its stream has
-// room for, which is more than an ordinary request's regular fields. It is
-// also what keeps a requestStream within 896 bytes, one of the allocator's
-// size classes; one more value would put it in the class of 1024.
-const requestValues = 4
+// room for when the stream is not recycled; a recycled one keeps them in the
+// header it takes from the pool. It is also what keeps a requestStream
+// within 896 bytes, one of the allocator's size classes; one more value
+// would put it in the class of 1024.
+const requestValues = 2
 
 // streamedBody is what a request stream keeps when the server streams bodies;
 // see Config.StreamRequestBody. The stream then gives back its flow control
@@ -727,7 +841,14 @@ func (rs *requestStream) onFrame(typ uint64, payload []byte) error {
 		rs.req.Trailer = trailer
 		return nil
 	}
-	req, err := newRequest(fields, &rs.block, rs.values[:])
+	var header stdhttp.Header
+	values := rs.values[:]
+	if rs.pooled {
+		pooled := headerPool.Get().(*pooledHeader)
+		rs.headerFromPool = pooled
+		header, values = pooled.header, pooled.values[:]
+	}
+	req, err := newRequest(fields, &rs.block, header, values)
 	if err != nil {
 		rs.abort(ErrCodeMessageError)
 		return nil
@@ -824,6 +945,8 @@ func (rs *requestStream) finish() {
 	sc := rs.sc
 	rs.block.Context(sc.conn, rs, rs.body)
 	rs.body = nil
+	// The Context holds the stream from here until it ends.
+	rs.refs.Add(1)
 	// The response comes from another goroutine, soon: the connection holds
 	// what it has to send, the acknowledgement of the request included, to
 	// send it with the response, and with the rest of the burst's.

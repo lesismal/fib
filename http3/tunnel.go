@@ -23,6 +23,8 @@ import (
 // open for it: it has no body, only whatever the tunnel carries once the
 // handler has accepted it, which waits in the tunnel until then.
 func (rs *requestStream) serveTunnel() {
+	// A tunnel outlives its handler's return; its stream is not recycled.
+	rs.pooled = false
 	sc := rs.sc
 	rs.tunnel = fibhttp.NewTunnelFeed(sc.conn, (*tunnelWriter)(rs), int(sc.h.config.MaxBodyBytes))
 	rs.block.Context(sc.conn, rs, nil)

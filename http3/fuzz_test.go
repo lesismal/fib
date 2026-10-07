@@ -48,7 +48,7 @@ func FuzzNewRequest(f *testing.F) {
 	f.Add("POST", "https", "localhost", "/p", "te", "trailers")
 	f.Fuzz(func(t *testing.T, method, scheme, authority, path, name, value string) {
 		fields := headerFields(method, scheme, authority, path, name, value)
-		req, err := newRequest(fields, nil, nil)
+		req, err := newRequest(fields, nil, nil, nil)
 		if err != nil {
 			return
 		}
@@ -80,7 +80,7 @@ func FuzzNewRequest(f *testing.F) {
 		// the same request.
 		var block fibhttp.StreamRequest
 		var values [2]string
-		inBlock, err := newRequest(fields, &block, values[:])
+		inBlock, err := newRequest(fields, &block, nil, values[:])
 		if err != nil {
 			t.Fatalf("refused in a block: %v", err)
 		}

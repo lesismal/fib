@@ -279,7 +279,14 @@ func TestH2RecycledStreamsKeepRequestsApart(t *testing.T) {
 		go func() {
 			defer retained.Done()
 			time.Sleep(time.Millisecond)
-			_ = c.Respond(stdhttp.StatusOK, "text/plain", []byte(describe(r, body)))
+			want := describe(r, body)
+			_ = c.Respond(stdhttp.StatusOK, "text/plain", []byte(want))
+			// Until its last Release the request is still this handler's,
+			// response written or not.
+			time.Sleep(time.Millisecond)
+			if got := describe(r, body); got != want {
+				t.Errorf("request changed under its handler before Release: %q, was %q", got, want)
+			}
 			c.Release()
 		}()
 	}))))

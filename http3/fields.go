@@ -157,10 +157,12 @@ func appendHeadersFrame(b, block []byte) []byte {
 // section 4.3.1 calls malformed. The request and its URL are block's, and
 // the header's values, as far as they go, are slices of values; block may be
 // nil, for a request of its own.
-func newRequest(fields []qpack.HeaderField, block *fibhttp.StreamRequest, values []string) (*stdhttp.Request, error) {
+func newRequest(fields []qpack.HeaderField, block *fibhttp.StreamRequest, header stdhttp.Header, values []string) (*stdhttp.Request, error) {
 	var method, scheme, authority, path, protocol string
 	var seen [5]bool
-	header := make(stdhttp.Header, len(fields))
+	if header == nil {
+		header = make(stdhttp.Header, len(fields))
+	}
 	var cookies []string
 	regular := false
 	for _, f := range fields {

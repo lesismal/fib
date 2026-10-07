@@ -296,9 +296,11 @@ func TestResponseHeaders(t *testing.T) {
 
 func TestAsyncHandler(t *testing.T) {
 	url := startServer(t, Config{}, func(c *fibhttp.Context, r *stdhttp.Request) {
+		c.Retain()
 		go func() {
 			time.Sleep(10 * time.Millisecond)
 			_ = c.Respond(stdhttp.StatusOK, "text/plain", []byte("later"))
+			c.Release()
 		}()
 	})
 	client := newClient(t, nil)
@@ -312,9 +314,11 @@ func TestTimeoutAndCancel(t *testing.T) {
 	release := make(chan struct{})
 	t.Cleanup(func() { close(release) })
 	url := startServer(t, Config{}, func(c *fibhttp.Context, r *stdhttp.Request) {
+		c.Retain()
 		go func() {
 			<-release
 			_ = c.Respond(stdhttp.StatusOK, "text/plain", nil)
+			c.Release()
 		}()
 	})
 	client := newClient(t, func(config *ClientConfig) { config.Timeout = 200 * time.Millisecond })

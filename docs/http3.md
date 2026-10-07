@@ -131,6 +131,13 @@ Behavior users need to be aware of.
   again, as they were before the pool existed.
 - Do not write with `Context.Conn.Send`: `Conn` is the UDP connection, and all
   output must go through `Context`.
+- A request's stream, with the `*http.Request`, `Header`, `URL` and `*Context`
+  it holds, is recycled once the request has ended, unless
+  `Config.DisableReuse` is set: a handler must not keep any of them past its
+  response and its last `Release`, the rule `http.Config.ReuseRequests`
+  describes. Requests whose body streams and extended CONNECTs are not
+  recycled. On a server held to 8 CPUs this served 1.56M requests a second
+  where leaving them to the collector served 1.19M.
 
 ### Fixed parameters
 
@@ -238,8 +245,7 @@ In order of priority.
   pooled buffer, and again when packets are built; receiving copies in the
   engine, into a pooled buffer, and in the HTTP/3 frame parser only a frame
   split across pieces and the request body. A request still allocates its
-  QUIC stream, its header map and one block holding its request, URL,
-  `Context` and the rest of what serving it takes.
+  QUIC stream; its request stream and header are recycled (see above).
 - **Data structures**: sent packets live in a slice, so ACK processing and loss
   detection scan linearly; every round of sending resets a `time.Timer`.
 - **ACK frequency**: implement the ACK_FREQUENCY extension to send fewer ACKs

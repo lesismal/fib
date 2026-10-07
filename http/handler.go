@@ -160,6 +160,8 @@ func (r *StreamRequest) Context(conn *fib.Connection, stream Stream, body []byte
 // stream, or this package's own HTTP/2 stream.
 func (r *StreamRequest) bind(conn *fib.Connection, body []byte) *Context {
 	c := &r.context
+	// A recycled Context waits for its next request reading as finished.
+	c.reopen()
 	c.Conn, c.Request = conn, &r.Request
 	if len(body) == 0 {
 		bufferpool.Put(body)
@@ -169,6 +171,29 @@ func (r *StreamRequest) bind(conn *fib.Connection, body []byte) *Context {
 	r.Request.Body, r.Request.ContentLength = &r.body, int64(len(body))
 	c.whole = &r.body
 	return c
+}
+
+// Recycle readies r for another request, once nothing can reach the one it
+// held but the protocol that allocated r: its Context has ended, which a
+// Stream that implements StreamEnder is told, and the protocol has done with
+// it. The Context's generation moves on, so that a handler that wrongly kept
+// it finds it finished, as a recycled HTTP/1 Context reads, and
+// Context or StreamContext opens it for the next request.
+func (r *StreamRequest) Recycle() {
+	r.context.recycle()
+	r.Request, r.URL = stdhttp.Request{}, url.URL{}
+	r.body, r.task = wholeBody{}, streamTask{}
+}
+
+// StreamEnder is implemented by a Stream that is told when the request it
+// answers has ended: the handler has returned, every Retain has been
+// released, and the response, or the cancellation, has finished, so that
+// nothing but the protocol can reach the request, its Context or the
+// StreamRequest holding them any more. A protocol that recycles its streams
+// recycles them from there, once it has done with them itself; see
+// StreamRequest.Recycle.
+type StreamEnder interface {
+	RequestEnded()
 }
 
 // ParseRequestTarget parses an origin-form request target into u, as

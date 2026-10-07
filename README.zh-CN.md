@@ -332,9 +332,9 @@ poller 数量（`Config.IOPollers`、`IOPollerCount`）取决于 CPU 数：4 核
   而多数其他实现涨到几百 MB。
 - **握手后丢弃 TLS 状态。** 快速路径上，`tls.Conn` 及其输入和握手 buffer 都被释放，只保留密钥和
   序列号。
-- **HTTP/1、HTTP/2 默认复用对象。** `Config.ReuseRequests`、`ReuseHeaders`、`ReuseURLs`、
-  `ReuseContexts` 复用请求对象（HTTP/2 连同它的 stream），生命周期规则与 fasthttp、Fiber 相同，
-  每项都可以关闭。
+- **默认复用对象。** `Config.ReuseRequests`、`ReuseHeaders`、`ReuseURLs`、`ReuseContexts`
+  复用请求对象（HTTP/2 连同它的 stream），生命周期规则与 fasthttp、Fiber 相同，每项都可以关闭；
+  HTTP/3 同样复用请求 stream，设置 `http3.Config.DisableReuse` 则不复用。
   `Context.Body`、`Context.Query` 不拷贝地读取 body 与 query。
 
 ## 基准测试
