@@ -5,14 +5,9 @@
 // request header has arrived, and takes the body piece by piece through
 // Context.OnBody as the connection reads it; while the handler's callback is
 // busy the connection stops reading, and TCP flow control slows the sender, so
-// memory stays flat however large the body is. It serves three endpoints:
-//
-//	POST|PUT   /upload?name=F   Context.SaveBody: the whole file in one request
-//	PUT|PATCH  /resume?name=F   Context.SaveBodyResumable: the file in chunks,
-//	                            each with a Content-Range, and continued after a
-//	                            dropped connection from the offset the server
-//	                            reports (Content-Range: bytes */TOTAL asks)
-//	POST       /echo            answers with the body it receives, as it receives it
+// memory stays flat however large the body is. The endpoints (/upload,
+// /resume and /echo) are the shared service package's; examples/http2/upload
+// and examples/http3/upload serve the same ones over HTTP/2 and HTTP/3.
 //
 // Try it with the client and the test file generator beside it:
 //
@@ -29,16 +24,13 @@ import (
 	"flag"
 	"fmt"
 	"io"
-	"log"
-	"net/http"
 	"os"
 	"os/signal"
-	"path/filepath"
 	"syscall"
-	"time"
 
 	fib "github.com/lesismal/fib"
 	"github.com/lesismal/fib/examples/example"
+	"github.com/lesismal/fib/examples/http/upload/service"
 	fibhttp "github.com/lesismal/fib/http"
 )
 
@@ -89,99 +81,7 @@ func newEngine(addr, dir string, maxSize int64) (*fib.Engine, error) {
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return nil, err
 	}
-	httpConfig := fibhttp.DefaultConfig()
-	// Hand a request to its handler once the header is in, whatever the
-	// body's size, and bound the body by MaxStreamedBodyBytes, which is for
-	// bodies that stream, rather than MaxBodyBytes, which is for those held whole.
-	httpConfig.StreamRequestBody = true
-	httpConfig.StreamRequestBodyThreshold = 0
-	httpConfig.MaxStreamedBodyBytes = maxSize
-	// How much of the body may wait unread before the connection stops
-	// reading its socket. Small, to show that memory stays bounded.
-	httpConfig.StreamRequestBodyBuffer = 1 << 20
-	httpConfig.IdleTimeout = time.Minute
-
 	config := fib.DefaultConfig()
 	config.Addr = addr
-	return fib.Bind(config, fibhttp.NewHandlerWithConfig(httpConfig, handler(dir)))
-}
-
-func handler(dir string) fibhttp.HandlerFunc {
-	return func(c *fibhttp.Context, r *http.Request) {
-		switch r.URL.Path {
-		case "/upload":
-			if allow(c, r, http.MethodPost, http.MethodPut) {
-				if path, ok := target(c, dir); ok {
-					c.SaveBody(path, logged(c, r))
-				}
-			}
-		case "/resume":
-			if allow(c, r, http.MethodPut, http.MethodPatch) {
-				if path, ok := target(c, dir); ok {
-					c.SaveBodyResumable(path, logged(c, r))
-				}
-			}
-		case "/echo":
-			if allow(c, r, http.MethodPost) {
-				echo(c)
-			}
-		default:
-			_ = c.Respond(http.StatusNotFound, "text/plain; charset=utf-8", []byte("POST /upload, PUT /resume or POST /echo\n"))
-		}
-	}
-}
-
-// allow answers 405 unless the request's method is one of methods.
-func allow(c *fibhttp.Context, r *http.Request, methods ...string) bool {
-	for _, method := range methods {
-		if r.Method == method {
-			return true
-		}
-	}
-	_ = c.Respond(http.StatusMethodNotAllowed, "text/plain; charset=utf-8", []byte("method not allowed\n"))
-	return false
-}
-
-// target is the file the request's name parameter stands for, inside dir. It
-// answers 400 if there is no name. Base keeps a name from reaching outside dir.
-func target(c *fibhttp.Context, dir string) (string, bool) {
-	name := filepath.Base(c.Query("name"))
-	if name == "." || name == string(filepath.Separator) {
-		_ = c.Respond(http.StatusBadRequest, "text/plain; charset=utf-8", []byte("name is required\n"))
-		return "", false
-	}
-	return filepath.Join(dir, name), true
-}
-
-// logged is the done callback of the Save functions here: it logs how the
-// upload ended, and then answers it as they would by themselves.
-func logged(c *fibhttp.Context, r *http.Request) func(fibhttp.Saved, error) {
-	started := time.Now()
-	return func(saved fibhttp.Saved, err error) {
-		if err != nil {
-			log.Printf("%s %s: %d of %d bytes stored: %v", r.Method, r.URL.Path, saved.Size, saved.Total, err)
-		} else {
-			log.Printf("%s %s: %d bytes stored in %v, complete: %v", r.Method, r.URL.Path, saved.Size,
-				time.Since(started).Round(time.Millisecond), saved.Complete)
-		}
-		_ = c.RespondSaved(saved, err)
-	}
-}
-
-// echo sends the request's body back as it arrives. Each piece OnBody hands
-// over is written to the response, which streams, chunked, so that neither
-// the body nor the response is ever held whole; Finish ends it with the last
-// piece, and answers an empty body with an empty response. A body that fails
-// midway has no one to answer: the connection is gone or about to be closed.
-func echo(c *fibhttp.Context) {
-	c.Header().Set("Content-Type", "application/octet-stream")
-	c.OnBody(func(data []byte, fin bool, err error) {
-		if err != nil {
-			return
-		}
-		_, _ = c.Write(data)
-		if fin {
-			_ = c.Finish()
-		}
-	})
+	return fib.Bind(config, fibhttp.NewHandlerWithConfig(service.Config(maxSize), service.Handler(dir)))
 }

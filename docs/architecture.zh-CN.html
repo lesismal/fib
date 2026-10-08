@@ -236,7 +236,7 @@ flowchart TD
     <li>WebSocket 有两种接法：<code>websocket.ServerHandler</code> 直接作为 <code>fib.Handler</code>；或由 HTTP handler 调 <code>Upgrade</code>，在 HTTP/1.1 上切换整条连接，在 HTTP/2、HTTP/3 上切换一条流。</li>
     <li>HTTP 中间件（compress、cors、csrf、etag、limiter、logger、pprof、recover、requestid、responsetime）包的是 <code>http.Handler</code>，与传输层无关。</li>
   </ul>
-  <p class="ref">handler.go · layer.go · tls/tls.go · http/handler.go · http/tunnel.go · websocket/handler.go · websocket/upgrade.go · http3/server.go</p>
+  <p class="ref">handler.go · tls/tls.go · http/handler.go · http/tunnel.go · websocket/handler.go · websocket/upgrade.go · http3/server.go</p>
 </section>
 
 <section id="read">

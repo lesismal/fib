@@ -5,14 +5,19 @@ package fib
 import (
 	"bytes"
 	"errors"
+	"fmt"
 	"io"
 	"net"
+	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"sync"
 	"syscall"
 	"testing"
 	"time"
+
+	"github.com/lesismal/fib/internal/udpbatch"
 )
 
 // acceptsConnections reports whether fd is a listening socket.
@@ -399,5 +404,91 @@ func TestCloseStopsListeningFirst(t *testing.T) {
 		if err := <-redialed; err == nil {
 			t.Fatal("a client reconnected to a closed engine")
 		}
+	}
+}
+
+// TestDefaultBacklogMatchesKernelLimit keeps the accept queue as deep as the
+// one net.Listen asks for, which is what every framework built on it gets. An
+// overflowing accept queue does not refuse connections: the kernel drops the
+// client's ACK, so a connection burst shows up only as clients sitting on
+// SYN-ACK retransmission timers. Measured against a 3000-connection burst, the
+// historical SOMAXCONN of 128 cost 1399 upgrades per second and a median of
+// 1.06s, against 63064 per second and 34ms at the kernel's own limit.
+func TestDefaultBacklogMatchesKernelLimit(t *testing.T) {
+	want := syscall.SOMAXCONN
+	if data, err := os.ReadFile("/proc/sys/net/core/somaxconn"); err == nil {
+		if limit, parseErr := strconv.Atoi(strings.TrimSpace(string(data))); parseErr == nil && limit > 0 {
+			want = limit
+			if want > 1<<16-1 {
+				want = 1<<16 - 1
+			}
+		}
+	}
+	if got := DefaultConfig().Backlog; got != want {
+		t.Fatalf("default backlog = %d, want the kernel limit %d", got, want)
+	}
+}
+
+// SendBatch sends runs of datagrams of one size as one segmented message,
+// and the peer receives each datagram whole and in order all the same: runs
+// that end in a shorter one, runs broken by a larger one, a run longer than
+// a message takes, and datagrams of their own size between them. With GSO
+// refused, as by a kernel without it, the same batch goes a message each.
+func TestUDPSendBatchSegments(t *testing.T) {
+	var sizes []int
+	for range 13 {
+		sizes = append(sizes, 1200)
+	}
+	sizes = append(sizes, 500, 800, 800, 800, 300, 1200, 100)
+	for range 40 {
+		sizes = append(sizes, 1000)
+	}
+	batch := make([][]byte, len(sizes))
+	for i, n := range sizes {
+		batch[i] = bytes.Repeat([]byte{byte('A' + i%26)}, n)
+		copy(batch[i], fmt.Sprintf("%03d", i))
+	}
+	for _, off := range []bool{false, true} {
+		t.Run(fmt.Sprintf("gsoOff=%v", off), func(t *testing.T) {
+			defer udpbatch.SetGSOOff(udpbatch.SetGSOOff(off))
+			sink, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer sink.Close()
+			_ = sink.SetReadBuffer(4 << 20)
+			engine, _ := startEchoServer(t, DefaultConfig(), nil)
+			dialed := make(chan *Connection, 1)
+			if err := engine.Dial("udp", sink.LocalAddr().String(), 5*time.Second, func(c *Connection, err error) {
+				if err != nil {
+					t.Error(err)
+				}
+				dialed <- c
+			}); err != nil {
+				t.Fatal(err)
+			}
+			client := <-dialed
+			if client == nil {
+				t.FailNow()
+			}
+			defer client.Close()
+			if err := client.SendBatch(batch); err != nil {
+				t.Fatal(err)
+			}
+			if !off && udpbatch.GSOOff() {
+				t.Fatal("the kernel refused UDP_SEGMENT, and the batch went a message each")
+			}
+			buf := make([]byte, 65536)
+			_ = sink.SetReadDeadline(time.Now().Add(5 * time.Second))
+			for i := range batch {
+				n, _, err := sink.ReadFromUDP(buf)
+				if err != nil {
+					t.Fatalf("datagram %d: %v", i, err)
+				}
+				if !bytes.Equal(buf[:n], batch[i]) {
+					t.Fatalf("datagram %d of %d bytes arrived as %d bytes starting %q", i, len(batch[i]), n, buf[:min(n, 8)])
+				}
+			}
+		})
 	}
 }

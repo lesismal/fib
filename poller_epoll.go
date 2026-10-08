@@ -280,3 +280,26 @@ func (e *Engine) setReadPaused(c *Connection, paused bool) error {
 	ev := syscall.EpollEvent{Events: events, Fd: int32(c.token), Pad: int32(c.token >> 32)}
 	return syscall.EpollCtl(e.epollFD, syscall.EPOLL_CTL_MOD, c.FD(), &ev)
 }
+
+const (
+	tcpKeepIdle     = syscall.TCP_KEEPIDLE
+	tcpKeepInterval = syscall.TCP_KEEPINTVL
+	tcpKeepCount    = syscall.TCP_KEEPCNT
+)
+
+const (
+	ipprotoMPTCP = 262
+	solMPTCP     = 284
+	mptcpInfo    = 1
+)
+
+// usingMultipathTCP reports a socket opened for Multipath TCP that has not
+// fallen back to plain TCP, which is how the net package tells.
+func usingMultipathTCP(s int) bool {
+	proto, err := syscall.GetsockoptInt(s, syscall.SOL_SOCKET, syscall.SO_PROTOCOL)
+	if err != nil || proto != ipprotoMPTCP {
+		return false
+	}
+	_, err = syscall.GetsockoptInt(s, solMPTCP, mptcpInfo)
+	return err != syscall.EOPNOTSUPP && err != syscall.ENOPROTOOPT
+}

@@ -3,8 +3,10 @@
 package fib
 
 import (
+	"io"
 	"net"
 	"net/netip"
+	"os"
 	"sync/atomic"
 	"syscall"
 	"time"
@@ -969,4 +971,314 @@ func (c *Connection) socketError() error {
 		return syscall.Errno(errno)
 	}
 	return syscall.ECONNRESET
+}
+
+// dialLoop picks the loop a dial is to run on, which without pollers is
+// always the engine's own.
+func (e *Engine) dialLoop(*dialRequest) *Engine { return e }
+
+// closeDialSocket closes a socket opened for a dial ahead of its loop, which
+// never happens here.
+func closeDialSocket(fd int) { _ = syscall.Closesocket(syscall.Handle(fd)) }
+
+// connectSocket opens a socket and starts an overlapped ConnectEx on it, whose
+// completion reports the connect's outcome. ConnectEx always completes through
+// the port, even when it finishes at once, so connected is always false here.
+// Callers run on the event loop.
+func (e *Engine) connectSocket(d *dialRequest) (c *Connection, connected bool, err error) {
+	if isUDPNetwork(d.network) {
+		return e.connectDatagram(d)
+	}
+	if isUnixNetwork(d.network) {
+		return e.connectUnix(d)
+	}
+	s, err := sys.NewSocket(d.family)
+	if err != nil {
+		return nil, false, err
+	}
+	// ConnectEx requires a bound socket, and binding the wildcard address leaves
+	// the choice of interface and port to the kernel, as connect() would.
+	var local syscall.Sockaddr = &syscall.SockaddrInet4{}
+	if d.family == syscall.AF_INET6 {
+		local = &syscall.SockaddrInet6{}
+	}
+	err = syscall.Bind(s, local)
+	if err == nil {
+		err = sys.SetNonblock(s)
+	}
+	if err == nil {
+		_, err = syscall.CreateIoCompletionPort(s, e.port, 0, 0)
+	}
+	if err != nil {
+		syscall.Closesocket(s)
+		return nil, false, err
+	}
+	// As for an accepted connection; see adopt.
+	_ = syscall.SetsockoptInt(s, syscall.IPPROTO_TCP, syscall.TCP_NODELAY, 1)
+	c = &Connection{engine: e, handler: d.handler, dialing: d, dialed: true}
+	c.handle.Store(uintptr(s))
+	c.readOp = ioOp{kind: opRead, conn: c}
+	// The connect borrows the write operation: no write can be posted before
+	// the connection exists, and completeConnect hands it back to writes.
+	c.writeOp = ioOp{kind: opConnect, conn: c}
+	e.conns[c] = struct{}{}
+	c.outstanding.Add(1)
+	err = syscall.ConnectEx(s, d.sa, nil, 0, &c.connectSent, &c.writeOp.ov)
+	if err != nil && err != syscall.ERROR_IO_PENDING {
+		c.outstanding.Add(-1)
+		delete(e.conns, c)
+		syscall.Closesocket(s)
+		return nil, false, err
+	}
+	return c, false, nil
+}
+
+// connectDatagram opens a UDP socket connected to the dialed peer and posts
+// its first receive. Connecting a UDP socket only records the peer, so it is
+// done on the spot; the receive cannot complete before the dial is reported,
+// since its completion is handled on the event loop that is reporting it.
+func (e *Engine) connectDatagram(d *dialRequest) (c *Connection, connected bool, err error) {
+	s, err := sys.NewDatagramSocket(d.family)
+	if err != nil {
+		return nil, false, err
+	}
+	err = syscall.Connect(s, d.sa)
+	if err == nil {
+		_, err = syscall.CreateIoCompletionPort(s, e.port, 0, 0)
+	}
+	if err != nil {
+		syscall.Closesocket(s)
+		return nil, false, err
+	}
+	c = &Connection{engine: e, handler: d.handler, dialing: d, dialed: true,
+		udp: &udpState{raddr: &net.UDPAddr{IP: d.raddr.IP, Port: d.raddr.Port, Zone: d.raddr.Zone}}}
+	c.udp.buf = make([]byte, maxDatagramSize)
+	c.handle.Store(uintptr(s))
+	c.readOp = ioOp{kind: opRecvDatagram, conn: c}
+	c.writeOp = ioOp{kind: opWrite, conn: c}
+	e.conns[c] = struct{}{}
+	c.mu.Lock()
+	err = c.armDatagramReadLocked()
+	c.mu.Unlock()
+	if err != nil {
+		delete(e.conns, c)
+		syscall.Closesocket(s)
+		return nil, false, err
+	}
+	return c, true, nil
+}
+
+// connectUnix connects a Unix socket. ConnectEx only takes TCP, so this is a
+// plain connect, as the net package makes on Windows too; a local connect
+// finishes, or is refused, without waiting on a network.
+func (e *Engine) connectUnix(d *dialRequest) (c *Connection, connected bool, err error) {
+	s, err := sys.NewSocket(d.family)
+	if err != nil {
+		return nil, false, err
+	}
+	err = syscall.Connect(s, d.sa)
+	if err == nil {
+		err = sys.SetNonblock(s)
+	}
+	if err == nil {
+		_, err = syscall.CreateIoCompletionPort(s, e.port, 0, 0)
+	}
+	if err != nil {
+		syscall.Closesocket(s)
+		return nil, false, err
+	}
+	c = &Connection{engine: e, handler: d.handler, dialing: d, dialed: true, unix: true}
+	c.handle.Store(uintptr(s))
+	c.readOp = ioOp{kind: opRead, conn: c}
+	c.writeOp = ioOp{kind: opWrite, conn: c}
+	e.conns[c] = struct{}{}
+	return c, true, nil
+}
+
+// completeConnect settles a ConnectEx. A dial that was abandoned while the
+// connect was in flight, by its timeout or by the engine closing, has already
+// been reported, and only its memory is left to release.
+func (e *Engine) completeConnect(c *Connection, err error) {
+	c.outstanding.Add(-1)
+	c.writeOp.kind = opWrite
+	if c.dialing == nil {
+		e.forget(c)
+		return
+	}
+	if err == nil {
+		// Without this the socket does not know it is connected, and
+		// shutdown and getpeername fail on it.
+		err = syscall.Setsockopt(c.socket(), syscall.SOL_SOCKET, syscall.SO_UPDATE_CONNECT_CONTEXT, nil, 0)
+	}
+	if err != nil {
+		e.failDial(c, err)
+		return
+	}
+	e.completeDial(c)
+	c.rearmRead()
+}
+
+// fileSegment is the part of a file SendFile has yet to send, read through
+// the connection's own duplicate of the caller's handle. Windows has no
+// sendfile for an overlapped socket the engine could use, so the file is read
+// a chunk at a time, each chunk once the socket has taken the one before.
+type fileSegment struct {
+	// file owns the duplicate handle. Keeping it an *os.File lets the
+	// garbage collector close it if the connection drops its queue while an
+	// overlapped send still holds a chunk.
+	file      *os.File
+	offset    int64
+	remaining int64
+	chunk     []byte
+}
+
+func newFileSegment(f File, offset, count int64) (*fileSegment, error) {
+	rc, err := f.SyscallConn()
+	if err != nil {
+		return nil, err
+	}
+	var dup syscall.Handle
+	var dupErr error
+	err = rc.Control(func(fd uintptr) {
+		process, _ := syscall.GetCurrentProcess()
+		dupErr = syscall.DuplicateHandle(process, syscall.Handle(fd), process, &dup, 0, false, syscall.DUPLICATE_SAME_ACCESS)
+	})
+	if err == nil {
+		err = dupErr
+	}
+	if err != nil {
+		return nil, err
+	}
+	return &fileSegment{file: os.NewFile(uintptr(dup), ""), offset: offset, remaining: count}, nil
+}
+
+func (s *fileSegment) advance(n int64) {
+	s.offset += n
+	s.remaining -= n
+}
+
+func (s *fileSegment) close() {
+	if s.file != nil {
+		_ = s.file.Close()
+		s.file = nil
+	}
+}
+
+// stageLocked reads the file item's next chunk into its data, unless one is
+// already waiting there. Callers hold c.mu.
+func (c *Connection) stageLocked(item *sendItem) error {
+	if item.data != nil {
+		return nil
+	}
+	s := item.file
+	if s.chunk == nil {
+		s.chunk = make([]byte, min(s.remaining, sendFileChunk))
+	}
+	n, err := s.file.ReadAt(s.chunk[:min(s.remaining, int64(len(s.chunk)))], s.offset)
+	if n == 0 {
+		if err == nil || err == io.EOF {
+			err = io.ErrUnexpectedEOF
+		}
+		return err
+	}
+	item.data, item.offset = s.chunk[:n], 0
+	s.advance(int64(n))
+	c.addPending(int64(n))
+	return nil
+}
+
+// sysSendFileLocked sends what it can of the file item at the head of the
+// queue, from a chunk staged in memory, which counts as pending like any
+// other queued bytes. Callers hold c.mu.
+func (c *Connection) sysSendFileLocked(item *sendItem) (n, attempted int, fromFile bool, err error) {
+	if err = c.stageLocked(item); err != nil {
+		return 0, 0, false, err
+	}
+	data := item.data[item.offset:]
+	n, err = c.sysWrite(data)
+	return n, len(data), false, err
+}
+
+// rawSocket is what the kernel names a socket by: a handle here.
+type rawSocket = syscall.Handle
+
+func (c *Connection) rawSocket() rawSocket { return c.socket() }
+
+// shutdownReadLocked shuts the socket's reading side and cancels the
+// zero-byte read posted on it, whose completion then arms nothing more; see
+// completeRead. Callers hold c.mu.
+func (c *Connection) shutdownReadLocked() error {
+	h := c.socket()
+	err := syscall.Shutdown(h, syscall.SHUT_RD)
+	if c.readArmed {
+		_ = syscall.CancelIoEx(h, &c.readOp.ov)
+	}
+	return err
+}
+
+// The keep-alive options Windows 10 added as socket options, in place of the
+// SIO_KEEPALIVE_VALS control code, which is what older versions have.
+const (
+	tcpKeepIdle     = 3
+	tcpKeepCount    = 16
+	tcpKeepInterval = 17
+)
+
+// setKeepAliveTimes sets the idle time before the first keep-alive probe and
+// the interval between probes; see Connection.SetKeepAliveConfig. A Windows
+// without the socket options sets both at once through SIO_KEEPALIVE_VALS,
+// where one left alone takes the net package's default instead.
+func setKeepAliveTimes(s syscall.Handle, idle, interval time.Duration) error {
+	if idle < 0 && interval < 0 {
+		return nil
+	}
+	var err error
+	if idle >= 0 {
+		err = syscall.SetsockoptInt(s, syscall.IPPROTO_TCP, tcpKeepIdle, keepAliveSeconds(idle))
+	}
+	if err == nil && interval >= 0 {
+		err = syscall.SetsockoptInt(s, syscall.IPPROTO_TCP, tcpKeepInterval, keepAliveSeconds(interval))
+	}
+	if err != syscall.WSAENOPROTOOPT {
+		return err
+	}
+	if idle < 0 {
+		idle = 0
+	}
+	if interval < 0 {
+		interval = 0
+	}
+	vals := syscall.TCPKeepalive{
+		OnOff:    1,
+		Time:     uint32(keepAliveSeconds(idle)) * 1000,
+		Interval: uint32(keepAliveSeconds(interval)) * 1000,
+	}
+	var n uint32
+	return syscall.WSAIoctl(s, syscall.SIO_KEEPALIVE_VALS, (*byte)(unsafe.Pointer(&vals)),
+		uint32(unsafe.Sizeof(vals)), nil, 0, &n, nil, 0)
+}
+
+// setKeepAliveCount sets how many unanswered probes end the connection. A
+// Windows without the option keeps its own count.
+func setKeepAliveCount(s syscall.Handle, count int) error {
+	if count < 0 {
+		return nil
+	}
+	if count == 0 {
+		count = defaultKeepAliveCount
+	}
+	err := syscall.SetsockoptInt(s, syscall.IPPROTO_TCP, tcpKeepCount, count)
+	if err == syscall.WSAENOPROTOOPT {
+		return nil
+	}
+	return err
+}
+
+// usingMultipathTCP is false: Windows has no Multipath TCP.
+func usingMultipathTCP(syscall.Handle) bool { return false }
+
+// File is not available on Windows, where a socket cannot be duplicated into
+// a file; it reports syscall.EWINDOWS, as net.TCPConn.File does there.
+func (c *Connection) File() (*os.File, error) {
+	return nil, os.NewSyscallError("dup", syscall.EWINDOWS)
 }

@@ -3,12 +3,15 @@
 package fib
 
 import (
+	"io"
 	"net"
 	"net/netip"
+	"os"
 	"sync/atomic"
 	"syscall"
 	"time"
 
+	"github.com/lesismal/fib/bufferpool"
 	"github.com/lesismal/fib/internal/sys"
 	"github.com/lesismal/fib/internal/udpbatch"
 )
@@ -869,4 +872,335 @@ func (c *Connection) socketError() error {
 		return syscall.Errno(errno)
 	}
 	return syscall.ECONNRESET
+}
+
+// dialLoop picks the loop a dial is to run on. With pollers, that is the one
+// its descriptor picks, as for an accepted connection, so the socket is
+// opened here, on whatever goroutine asked for the dial, rather than on the
+// loop. A dial that cannot open one runs on the engine's own loop, which
+// only has to report why.
+func (e *Engine) dialLoop(d *dialRequest) *Engine {
+	if len(e.pollers) == 0 || d.err != nil || d.hasSocket {
+		return e
+	}
+	fd, err := d.openSocket()
+	if err != nil {
+		d.err = err
+		return e
+	}
+	d.socket, d.hasSocket = fd, true
+	return e.pollers[fd%len(e.pollers)]
+}
+
+// openSocket returns the socket opened for d ahead of time, if there is one,
+// and otherwise opens one of the kind d's network needs. The caller owns it.
+func (d *dialRequest) openSocket() (int, error) {
+	if d.hasSocket {
+		d.hasSocket = false
+		return d.socket, nil
+	}
+	if isUDPNetwork(d.network) {
+		return sys.NewDatagramSocket(d.family)
+	}
+	return sys.NewSocket(d.family)
+}
+
+// closeDialSocket closes a socket opened for a dial that never connected it.
+func closeDialSocket(fd int) { _ = syscall.Close(fd) }
+
+// connectSocket opens a non-blocking socket, starts connecting it and
+// registers it with the backend, where the connect's outcome arrives as the
+// socket's first events. connected reports a connect the kernel finished on the
+// spot, as it may over loopback. Callers run on the event loop.
+func (e *Engine) connectSocket(d *dialRequest) (c *Connection, connected bool, err error) {
+	if isUDPNetwork(d.network) {
+		return e.connectDatagram(d)
+	}
+	fd, err := d.openSocket()
+	if err != nil {
+		return nil, false, err
+	}
+	if !isUnixNetwork(d.network) {
+		// As for an accepted connection; see acceptConnections.
+		_ = syscall.SetsockoptInt(fd, syscall.IPPROTO_TCP, syscall.TCP_NODELAY, 1)
+	}
+	for {
+		err = syscall.Connect(fd, d.sa)
+		if err != syscall.EINTR {
+			break
+		}
+	}
+	switch err {
+	case nil:
+		connected = true
+	case syscall.EINPROGRESS, syscall.EALREADY:
+	default:
+		syscall.Close(fd)
+		return nil, false, err
+	}
+	token := e.newToken(fd)
+	c = &Connection{engine: e, handler: d.handler, dialing: d, dialed: true, unix: isUnixNetwork(d.network)}
+	c.token = token
+	c.fd.Store(int32(fd))
+	// Registering an unconnected socket is what makes the connect
+	// asynchronous: its first write edge says the connect has finished, one
+	// way or the other. A connect that finished before the registration still
+	// raises that edge, since adding a descriptor reports its current state.
+	if err = e.registerConnection(fd, token); err != nil {
+		syscall.Close(fd)
+		return nil, false, err
+	}
+	e.trackConnection(fd, c)
+	return c, connected, nil
+}
+
+// connectDatagram opens a UDP socket connected to the dialed peer. Connecting
+// a UDP socket only records the peer, so it is done on the spot.
+func (e *Engine) connectDatagram(d *dialRequest) (c *Connection, connected bool, err error) {
+	fd, err := d.openSocket()
+	if err != nil {
+		return nil, false, err
+	}
+	for {
+		err = syscall.Connect(fd, d.sa)
+		if err != syscall.EINTR {
+			break
+		}
+	}
+	if err != nil {
+		syscall.Close(fd)
+		return nil, false, err
+	}
+	token := e.newToken(fd)
+	c = &Connection{engine: e, handler: d.handler, dialing: d, dialed: true,
+		udp: &udpState{raddr: &net.UDPAddr{IP: d.raddr.IP, Port: d.raddr.Port, Zone: d.raddr.Zone}}}
+	c.token = token
+	c.fd.Store(int32(fd))
+	if err = e.registerDatagram(fd, token); err != nil {
+		syscall.Close(fd)
+		return nil, false, err
+	}
+	e.trackConnection(fd, c)
+	return c, true, nil
+}
+
+// finishDial settles a connect from the events its socket raised and reports
+// the connection if those events also need a worker. reported is the error the
+// backend delivered with the events, if it carries one; the socket's own error
+// takes precedence. Callers run on the event loop.
+func (e *Engine) finishDial(c *Connection, events uint32, reported error) *Connection {
+	fd := c.FD()
+	var err error
+	errno, sockErr := syscall.GetsockoptInt(fd, syscall.SOL_SOCKET, syscall.SO_ERROR)
+	switch {
+	case sockErr != nil:
+		err = sockErr
+	case errno == int(syscall.EINPROGRESS), errno == int(syscall.EALREADY), errno == int(syscall.EINTR):
+		// Still connecting: an event can arrive before the connect settles.
+		return nil
+	case errno != 0 && errno != int(syscall.EISCONN):
+		err = syscall.Errno(errno)
+	case reported != nil:
+		err = reported
+	}
+	if err == nil {
+		// A clean socket error does not prove the connect finished, since
+		// events can arrive spuriously. Having a peer does.
+		if _, peerErr := syscall.Getpeername(fd); peerErr != nil {
+			if events&(evErr|evHup) == 0 {
+				return nil
+			}
+			// The kernel says the socket is finished but names no error.
+			// Waiting would never end: no further edge is coming.
+			err = syscall.ECONNREFUSED
+		}
+	}
+	if err != nil {
+		e.failDial(c, err)
+		return nil
+	}
+	e.completeDial(c)
+	// Whatever else arrived with the connect, bytes the peer sent straight
+	// away above all, is now the connection's to handle.
+	return e.noteEvent(c, events)
+}
+
+// maxSendFileCall bounds one sendfile call, below the 2GB Linux takes at most.
+const maxSendFileCall = 1 << 30
+
+// fileSegment is the part of a file SendFile has yet to send, read through
+// the connection's own duplicate of the caller's descriptor.
+type fileSegment struct {
+	fd        int
+	offset    int64
+	remaining int64
+	// copyBuf is set once sendfile has refused this pair of descriptors, as
+	// macOS does for anything but a TCP socket, after which the segment is
+	// copied through it instead.
+	copyBuf []byte
+}
+
+func newFileSegment(f File, offset, count int64) (*fileSegment, error) {
+	rc, err := f.SyscallConn()
+	if err != nil {
+		return nil, err
+	}
+	dup := -1
+	var dupErr error
+	err = rc.Control(func(fd uintptr) {
+		syscall.ForkLock.RLock()
+		dup, dupErr = syscall.Dup(int(fd))
+		if dupErr == nil {
+			syscall.CloseOnExec(dup)
+		}
+		syscall.ForkLock.RUnlock()
+	})
+	if err == nil {
+		err = dupErr
+	}
+	if err != nil {
+		return nil, err
+	}
+	return &fileSegment{fd: dup, offset: offset, remaining: count}, nil
+}
+
+func (s *fileSegment) advance(n int64) {
+	s.offset += n
+	s.remaining -= n
+}
+
+func (s *fileSegment) close() {
+	if s.fd >= 0 {
+		_ = syscall.Close(s.fd)
+		s.fd = -1
+	}
+	// A copy through this segment is a synchronous write, so nothing is
+	// reading the staging buffer by the time the segment ends.
+	bufferpool.Put(s.copyBuf)
+	s.copyBuf = nil
+}
+
+// sysSendFileLocked sends what it can of the file item at the head of the
+// queue. fromFile reports that the bytes went by sendfile, from the file
+// rather than from memory. Callers hold c.mu.
+func (c *Connection) sysSendFileLocked(item *sendItem) (n, attempted int, fromFile bool, err error) {
+	s := item.file
+	attempted = int(min(s.remaining, maxSendFileCall))
+	if s.copyBuf == nil {
+		for {
+			offset := s.offset
+			n, err = syscall.Sendfile(c.FD(), s.fd, &offset, attempted)
+			n = max(n, 0)
+			if err == syscall.EINTR && n == 0 {
+				continue
+			}
+			if n > 0 && err != nil {
+				// macOS reports what it sent along with EAGAIN or EINTR. A
+				// partial count stands, and a full socket raises the write
+				// edge that resumes the rest; an interrupted call is short
+				// only because it was interrupted, so it must not wait for an
+				// edge that may never come.
+				if err == syscall.EINTR {
+					attempted = n
+				}
+				err = nil
+			}
+			break
+		}
+		switch {
+		case err == nil && n == 0:
+			return 0, attempted, true, io.ErrUnexpectedEOF
+		case err == syscall.EINVAL || err == syscall.ENOTSUP || err == syscall.EOPNOTSUPP || err == syscall.ENOTSOCK:
+			// This kind of socket or file cannot be spliced; copy it.
+			s.copyBuf = bufferpool.Get(sendFileChunk)
+		default:
+			return n, attempted, true, err
+		}
+	}
+	chunk := s.copyBuf[:min(s.remaining, int64(len(s.copyBuf)))]
+	read, err := syscall.Pread(s.fd, chunk, s.offset)
+	if err != nil {
+		return 0, len(chunk), true, err
+	}
+	if read == 0 {
+		return 0, len(chunk), true, io.ErrUnexpectedEOF
+	}
+	n, err = c.sysWrite(chunk[:read])
+	// The bytes were read for this write alone; what it did not take is read
+	// again next time, so none of it is ever counted as pending.
+	return max(n, 0), read, true, err
+}
+
+// rawSocket is what the kernel names a socket by: a file descriptor here.
+type rawSocket = int
+
+func (c *Connection) rawSocket() rawSocket { return c.FD() }
+
+// shutdownReadLocked shuts the socket's reading side. Callers hold c.mu.
+func (c *Connection) shutdownReadLocked() error {
+	return syscall.Shutdown(c.FD(), syscall.SHUT_RD)
+}
+
+// setKeepAliveTimes sets the idle time before the first keep-alive probe and
+// the interval between probes; see Connection.SetKeepAliveConfig.
+func setKeepAliveTimes(s int, idle, interval time.Duration) error {
+	if idle >= 0 {
+		if err := syscall.SetsockoptInt(s, syscall.IPPROTO_TCP, tcpKeepIdle, keepAliveSeconds(idle)); err != nil {
+			return err
+		}
+	}
+	if interval >= 0 {
+		return syscall.SetsockoptInt(s, syscall.IPPROTO_TCP, tcpKeepInterval, keepAliveSeconds(interval))
+	}
+	return nil
+}
+
+// setKeepAliveCount sets how many unanswered probes end the connection.
+func setKeepAliveCount(s int, count int) error {
+	if count < 0 {
+		return nil
+	}
+	if count == 0 {
+		count = defaultKeepAliveCount
+	}
+	return syscall.SetsockoptInt(s, syscall.IPPROTO_TCP, tcpKeepCount, count)
+}
+
+// File returns a duplicate of the connection's socket, as net.TCPConn.File
+// does. The two share the socket, but closing the file does not close the
+// connection, nor the other way round. A UDP listener's peer has no socket of
+// its own and returns an error.
+func (c *Connection) File() (*os.File, error) {
+	if c.udp != nil && c.udp.listener != nil {
+		return nil, errNoSocket
+	}
+	name := fileName(c.LocalAddr(), c.RemoteAddr())
+	var f *os.File
+	err := c.control("dup", func(s int) error {
+		c.rawExposed.Store(true)
+		syscall.ForkLock.RLock()
+		dup, err := syscall.Dup(s)
+		if err == nil {
+			syscall.CloseOnExec(dup)
+		}
+		syscall.ForkLock.RUnlock()
+		if err != nil {
+			return err
+		}
+		f = os.NewFile(uintptr(dup), name)
+		return nil
+	})
+	return f, err
+}
+
+// fileName names a connection's file as the net package does.
+func fileName(local, remote net.Addr) string {
+	name := ""
+	if local != nil {
+		name = local.Network() + ":" + local.String()
+	}
+	if remote != nil {
+		name += "->" + remote.String()
+	}
+	return name
 }

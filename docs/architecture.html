@@ -236,7 +236,7 @@ flowchart TD
     <li>WebSocket attaches in two ways: <code>websocket.ServerHandler</code> as a <code>fib.Handler</code> itself, or <code>Upgrade</code> called from an HTTP handler, which switches the whole connection on HTTP/1.1 and one stream on HTTP/2 and HTTP/3.</li>
     <li>The HTTP middleware (compress, cors, csrf, etag, limiter, logger, pprof, recover, requestid, responsetime) wraps an <code>http.Handler</code> and knows nothing of the transport.</li>
   </ul>
-  <p class="ref">handler.go · layer.go · tls/tls.go · http/handler.go · http/tunnel.go · websocket/handler.go · websocket/upgrade.go · http3/server.go</p>
+  <p class="ref">handler.go · tls/tls.go · http/handler.go · http/tunnel.go · websocket/handler.go · websocket/upgrade.go · http3/server.go</p>
 </section>
 
 <section id="read">

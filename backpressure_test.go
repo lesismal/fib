@@ -7,11 +7,13 @@ import (
 	"io"
 	"net"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"testing"
 	"time"
 
 	"github.com/lesismal/fib/bufferpool"
+	"github.com/lesismal/fib/taskpool"
 )
 
 // startEchoServer brings up a server on a loopback port and returns its address
@@ -485,5 +487,248 @@ func TestStatsAttributesBudgetPausesToTheBudget(t *testing.T) {
 	stats := server.Stats()
 	if stats.ReadsPausedByBudget == 0 {
 		t.Fatalf("no pause was attributed to the budget; stats = %+v", stats)
+	}
+}
+
+// What is sent on a corked connection away from its rounds waits for Flush,
+// and reaches the peer in one piece once it comes.
+func TestCorkHoldsSendsUntilFlush(t *testing.T) {
+	opened := make(chan *Connection, 1)
+	addr := startServer(t, "tcp", "127.0.0.1:0", HandlerFuncs{Open: func(c *Connection) { opened <- c }})
+	peer, err := net.DialTimeout("tcp", addr, 5*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer peer.Close()
+	c := <-opened
+	c.Cork()
+	for _, part := range []string{"one ", "two ", "three"} {
+		if err := c.Send([]byte(part)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	buf := make([]byte, 64)
+	_ = peer.SetReadDeadline(time.Now().Add(100 * time.Millisecond))
+	if n, err := peer.Read(buf); n > 0 || err == nil {
+		t.Fatalf("read %q before Flush", buf[:n])
+	}
+	if err := c.Flush(); err != nil {
+		t.Fatal(err)
+	}
+	_ = peer.SetReadDeadline(time.Now().Add(5 * time.Second))
+	if _, err := io.ReadFull(peer, buf[:len("one two three")]); err != nil {
+		t.Fatal(err)
+	}
+	if got := string(buf[:len("one two three")]); got != "one two three" {
+		t.Fatalf("read %q", got)
+	}
+	// Uncorked again, a send goes out on its own.
+	if err := c.Send([]byte("four")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := io.ReadFull(peer, buf[:4]); err != nil || string(buf[:4]) != "four" {
+		t.Fatalf("read %q, %v", buf[:4], err)
+	}
+}
+
+func TestEngineServesOnAdaptivePool(t *testing.T) {
+	config := DefaultConfig()
+	config.SetTaskPoolMode(taskpool.ModeAdaptive)
+	config.MinWorkerCount = 2
+	config.SharedTaskPool = false
+	_, addr := startEchoServer(t, config, echoHandler())
+	payload := bytes.Repeat([]byte("adaptive"), 1024)
+	for i := 0; i < 8; i++ {
+		conn, err := net.DialTimeout("tcp4", addr, 5*time.Second)
+		if err != nil {
+			t.Fatal(err)
+		}
+		_ = conn.SetDeadline(time.Now().Add(10 * time.Second))
+		if _, err := conn.Write(payload); err != nil {
+			t.Fatal(err)
+		}
+		reply := make([]byte, len(payload))
+		if _, err := io.ReadFull(conn, reply); err != nil {
+			t.Fatal(err)
+		}
+		if !bytes.Equal(reply, payload) {
+			t.Fatal("echo mismatch")
+		}
+		conn.Close()
+	}
+}
+
+func TestBindRejectsAdaptiveFloorAboveCeiling(t *testing.T) {
+	for _, floor := range []int{-1, 65} {
+		config := DefaultConfig()
+		config.Addr = "127.0.0.1:0"
+		config.SetTaskPoolMode(taskpool.ModeAdaptive)
+		config.SetPoolSizing(64, 0)
+		config.MinWorkerCount = floor
+		if server, err := Bind(config, nil); err == nil {
+			server.Close()
+			t.Fatalf("Bind accepted MinWorkerCount %d with WorkerCount 64", floor)
+		}
+	}
+}
+
+// TestHoldReadsStopsAndResumesDelivery checks the read-side counterpart of the
+// write watermarks: a handler that holds reads stops hearing from its peer
+// however much the peer sends, and releasing the hold delivers what the socket
+// kept without the peer having to send anything more.
+func TestHoldReadsStopsAndResumesDelivery(t *testing.T) {
+	const payload = 512 << 10
+	var (
+		mu       sync.Mutex
+		received []byte
+		held     atomic.Bool
+		holder   atomic.Pointer[Connection]
+	)
+	delivered := make(chan int, 64)
+	handler := HandlerFuncs{
+		Data: func(c *Connection, data []byte) {
+			mu.Lock()
+			received = append(received, data...)
+			total := len(received)
+			mu.Unlock()
+			if held.CompareAndSwap(false, true) {
+				// Stop after the first read, with the rest still in flight.
+				holder.Store(c)
+				c.HoldReads(true)
+			}
+			delivered <- total
+		},
+	}
+	_, addr := startEchoServer(t, DefaultConfig(), handler)
+
+	conn, err := net.DialTimeout("tcp", addr, 5*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	_ = conn.SetDeadline(time.Now().Add(20 * time.Second))
+	body := bytes.Repeat([]byte("hold"), payload/4)
+	writeDone := make(chan error, 1)
+	go func() { _, err := conn.Write(body); writeDone <- err }()
+
+	// Wait for the hold, then check that nothing more is delivered under it.
+	select {
+	case <-delivered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("no data was delivered")
+	}
+	var before int
+	deadline := time.After(300 * time.Millisecond)
+	quiet := false
+	for !quiet {
+		select {
+		case before = <-delivered:
+		case <-deadline:
+			quiet = true
+		}
+	}
+	mu.Lock()
+	stalled := len(received)
+	mu.Unlock()
+	if stalled == len(body) {
+		t.Skip("the whole payload fitted in one read round; nothing was left to hold back")
+	}
+	if before > stalled {
+		t.Fatalf("delivery reported %d bytes with only %d received", before, stalled)
+	}
+
+	// Releasing the hold must deliver what the socket kept, although the peer
+	// has sent nothing since.
+	holder.Load().HoldReads(false)
+	for {
+		mu.Lock()
+		total := len(received)
+		mu.Unlock()
+		if total == len(body) {
+			break
+		}
+		select {
+		case <-delivered:
+		case <-time.After(10 * time.Second):
+			t.Fatalf("after the hold was released %d of %d bytes arrived", total, len(body))
+		}
+	}
+	if err := <-writeDone; err != nil {
+		t.Fatal(err)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if !bytes.Equal(received, body) {
+		t.Fatal("the bytes delivered around the hold do not match what was sent")
+	}
+}
+
+// Large echoes over TCP and Unix sockets, which queue replies, write them in
+// pieces and read in several calls, come back intact whichever set of system
+// calls Config.SocketSyscalls picks, and with writev on or off.
+func TestSocketSyscallsEcho(t *testing.T) {
+	for _, network := range []string{"tcp", "unix"} {
+		for _, mode := range []struct {
+			name                      string
+			useWritev, socketSyscalls bool
+		}{{"writev", true, false}, {"write", false, false}, {"sendmsg", true, true}, {"sendto", false, true}} {
+			t.Run(network+"/"+mode.name, func(t *testing.T) {
+				config := DefaultConfig()
+				config.Network = network
+				config.Addr = "127.0.0.1:0"
+				if network == "unix" {
+					config.Addr = unixSocketPath(t)
+				}
+				config.UseWritev = mode.useWritev
+				config.SocketSyscalls = mode.socketSyscalls
+				server, err := Bind(config, HandlerFuncs{Data: func(c *Connection, b []byte) {
+					if c.Send(b) != nil {
+						c.Close()
+					}
+				}})
+				if err != nil {
+					t.Fatal(err)
+				}
+				runDone := make(chan error, 1)
+				go func() { runDone <- server.Run() }()
+				t.Cleanup(func() {
+					server.Stop()
+					if err := <-runDone; err != nil {
+						t.Error(err)
+					}
+					_ = server.Close()
+				})
+				addrs, err := server.ListenAddrs()
+				if err != nil {
+					t.Fatal(err)
+				}
+
+				var wg sync.WaitGroup
+				for i := 0; i < 4; i++ {
+					wg.Add(1)
+					go func(value byte) {
+						defer wg.Done()
+						conn, err := net.DialTimeout(network, addrs[0].String(), 5*time.Second)
+						if err != nil {
+							t.Error(err)
+							return
+						}
+						defer conn.Close()
+						_ = conn.SetDeadline(time.Now().Add(15 * time.Second))
+						payload := bytes.Repeat([]byte{value}, 1<<20)
+						go func() { _, _ = conn.Write(payload) }()
+						received := make([]byte, len(payload))
+						if _, err := io.ReadFull(conn, received); err != nil {
+							t.Error(err)
+							return
+						}
+						if !bytes.Equal(received, payload) {
+							t.Error("echo mismatch")
+						}
+					}(byte(i + 1))
+				}
+				wg.Wait()
+			})
+		}
 	}
 }

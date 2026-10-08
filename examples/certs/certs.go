@@ -35,11 +35,14 @@ type ServerFlags struct {
 }
 
 // RegisterServerFlags adds -cert, -key and -cert-out to the command line.
-func RegisterServerFlags() ServerFlags {
+func RegisterServerFlags() ServerFlags { return ServerFlagsOn(flag.CommandLine) }
+
+// ServerFlagsOn adds -cert, -key and -cert-out to flags.
+func ServerFlagsOn(flags *flag.FlagSet) ServerFlags {
 	return ServerFlags{
-		certFile: flag.String("cert", "", "PEM certificate to serve; empty issues a self-signed one"),
-		keyFile:  flag.String("key", "", "PEM private key for -cert"),
-		certOut:  flag.String("cert-out", DefaultCertFile, "where to write a self-signed certificate for clients to trust"),
+		certFile: flags.String("cert", "", "PEM certificate to serve; empty issues a self-signed one"),
+		keyFile:  flags.String("key", "", "PEM private key for -cert"),
+		certOut:  flags.String("cert-out", DefaultCertFile, "where to write a self-signed certificate for clients to trust"),
 	}
 }
 
@@ -74,10 +77,13 @@ type ClientFlags struct {
 }
 
 // RegisterClientFlags adds -ca and -insecure to the command line.
-func RegisterClientFlags() ClientFlags {
+func RegisterClientFlags() ClientFlags { return ClientFlagsOn(flag.CommandLine) }
+
+// ClientFlagsOn adds -ca and -insecure to flags.
+func ClientFlagsOn(flags *flag.FlagSet) ClientFlags {
 	return ClientFlags{
-		caFile:   flag.String("ca", DefaultCertFile, "PEM certificate to trust; empty trusts the system roots"),
-		insecure: flag.Bool("insecure", false, "skip verifying the server's certificate"),
+		caFile:   flags.String("ca", DefaultCertFile, "PEM certificate to trust; empty trusts the system roots"),
+		insecure: flags.Bool("insecure", false, "skip verifying the server's certificate"),
 	}
 }
 
