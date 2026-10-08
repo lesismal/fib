@@ -592,6 +592,8 @@ Run it yourself with `cd taskpool/benchmark && ./bench.sh` (or `bench.ps1` on Wi
   scheduling, write backpressure, load balancing and connection teardown
 - [Protocol flows](docs/flows.html): which loop and which pool runs what for TLS, HTTP/1, HTTP/2,
   HTTP/3 and WebSocket
+- [Hack guide](docs/hacks.md): async responses with Retain/Release, large bodies with OnBody, pipeline/multiplex,
+  HoldReads, Cork, object reuse and the pitfalls of each
 - [HTTP/1.x](docs/http1.md), [HTTP/2](docs/http2.md), [HTTP/3](docs/http3.md): what is supported,
   the limitations, and the conformance tests
 

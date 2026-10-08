@@ -554,6 +554,8 @@ CI 每次 push 都在 Linux、macOS、Windows 上运行 [`taskpool/benchmark`](t
 - [架构](docs/architecture.zh-CN.html)：事件循环、poller 与池、handler 分层、读调度、写背压、负载
   均衡、连接关闭
 - [协议流程](docs/flows.zh-CN.html)：TLS、HTTP/1、HTTP/2、HTTP/3、WebSocket 各由哪个循环、哪个池执行
+- [奇技淫巧](docs/hacks.zh-CN.md)：Retain/Release 异步响应、OnBody 大 body、pipeline/multiplex、
+  HoldReads、Cork、对象复用等非标准库式用法与坑
 - [HTTP/1.x](docs/http1.zh-CN.md)、[HTTP/2](docs/http2.zh-CN.md)、[HTTP/3](docs/http3.zh-CN.md)：
   支持范围、限制和一致性测试
 
