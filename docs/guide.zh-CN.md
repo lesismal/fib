@@ -1335,6 +1335,10 @@ go run ./examples/tcp/tls/client -n 10
   让 resume 提前停下，再跑一次就从服务端已有的位置接着传）。
   `go run ./examples/http/upload/mkfile -size 1GiB -o /tmp/big.bin`，`go run ./examples/http/upload/server -dir /tmp/uploads`，
   `go run ./examples/http/upload/client -mode resume -file /tmp/big.bin -name part.bin -max-chunks 3` 后再不带 `-max-chunks` 运行一次。
+  同一套接口（handler 在 `examples/http/upload/service`，客户端逻辑在 `uploadclient`）也用 HTTP/2 和 HTTP/3 跑：
+  `examples/http2/upload`（TLS，`HTTP2Only`，用 `net/http` 客户端流式发送）和 `examples/http3/upload`（QUIC，
+  用 fib 的 HTTP/3 客户端——它把每个请求的 body 整个读进内存，所以大文件用 `-mode resume` 分块发送）。
+  body 的接收不论走哪个协议都是 `OnBody`，背压分别来自 TCP、HTTP/2 流控窗口和 QUIC 流控。
 - `examples/http/router` 演示 Router：带参数与正则的路由、带自己中间件的 `Route`、`Mount`
   的子 Router，以及 404/405，`go run ./examples/http/router` 后用文件头注释里的 curl 命令访问。
 

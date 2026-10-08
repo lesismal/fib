@@ -264,6 +264,8 @@ go run ./examples/tcp/nontls/server
 go run ./examples/http/nontls/server
 go run ./examples/http/router
 go run ./examples/http/upload/server   # big bodies: SaveBody, resumable SaveBodyResumable, OnBody echo; see its mkfile and client
+go run ./examples/http2/upload/server  # the same upload endpoints over HTTP/2 (TLS)
+go run ./examples/http3/upload/server  # ... and over HTTP/3 (QUIC)
 go run ./examples/websocket/nontls/server
 go run ./examples/http3/tls/server
 go run ./examples/arpc/server
