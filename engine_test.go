@@ -5,6 +5,7 @@ package fib
 import (
 	"bytes"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"os"
@@ -921,5 +922,704 @@ func TestUnixAbstractSocket(t *testing.T) {
 	buf := make([]byte, 8)
 	if _, err := io.ReadFull(conn, buf); err != nil || string(buf) != "abstract" {
 		t.Fatalf("echo %q, %v", buf, err)
+	}
+}
+
+// dialResult is what one Dial's done callback reported.
+type dialResult struct {
+	c   *Connection
+	err error
+}
+
+func echoHandler() Handler {
+	return HandlerFuncs{Data: func(c *Connection, b []byte) {
+		if err := c.Send(b); err != nil {
+			c.Close()
+		}
+	}}
+}
+
+// A dialed connection joins the engine the way an accepted one does: OnOpen
+// runs before the dialer hears of it, and its replies arrive through the same
+// handler and workers.
+func TestDialedConnectionsEcho(t *testing.T) {
+	_, serverAddr := startEchoServer(t, DefaultConfig(), echoHandler())
+
+	const conns = 64
+	payload := []byte("dialed through the event loop")
+	var mu sync.Mutex
+	opened := map[*Connection]bool{}
+	received := map[*Connection][]byte{}
+	echoed := make(chan *Connection, conns)
+	client, _ := startEchoServer(t, DefaultConfig(), HandlerFuncs{
+		Open: func(c *Connection) {
+			mu.Lock()
+			opened[c] = true
+			mu.Unlock()
+		},
+		Data: func(c *Connection, b []byte) {
+			mu.Lock()
+			received[c] = append(received[c], b...)
+			done := len(received[c]) == len(payload)
+			mu.Unlock()
+			if done {
+				echoed <- c
+			}
+		},
+	})
+
+	results := make(chan dialResult, conns)
+	for i := 0; i < conns; i++ {
+		err := client.Dial("tcp4", serverAddr, 5*time.Second, func(c *Connection, err error) {
+			if err == nil {
+				mu.Lock()
+				if !opened[c] {
+					t.Error("done ran before OnOpen")
+				}
+				mu.Unlock()
+				err = c.Send(payload)
+			}
+			results <- dialResult{c, err}
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	for i := 0; i < conns; i++ {
+		if r := <-results; r.err != nil {
+			t.Fatalf("dial %d: %v", i, r.err)
+		}
+	}
+	timeout := time.After(10 * time.Second)
+	for i := 0; i < conns; i++ {
+		select {
+		case c := <-echoed:
+			mu.Lock()
+			got := received[c]
+			mu.Unlock()
+			if !bytes.Equal(got, payload) {
+				t.Fatalf("echo mismatch: %q", got)
+			}
+		case <-timeout:
+			t.Fatalf("only %d of %d connections were echoed", i, conns)
+		}
+	}
+}
+
+// A host name goes through the resolver on a goroutine of its own, and must
+// still end up on the event loop.
+func TestDialResolvesHostName(t *testing.T) {
+	_, serverAddr := startEchoServer(t, DefaultConfig(), echoHandler())
+	_, port, _ := net.SplitHostPort(serverAddr)
+	client, _ := startEchoServer(t, DefaultConfig(), nil)
+	results := make(chan dialResult, 1)
+	if err := client.Dial("tcp4", net.JoinHostPort("localhost", port), 5*time.Second, func(c *Connection, err error) {
+		results <- dialResult{c, err}
+	}); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case r := <-results:
+		if r.err != nil {
+			t.Fatal(r.err)
+		}
+		r.c.Close()
+	case <-time.After(10 * time.Second):
+		t.Fatal("dial never reported")
+	}
+}
+
+// A refused connect reaches the dialer as an error, and the handler never hears
+// of the connection.
+func TestDialRefusedReportsError(t *testing.T) {
+	// A port that was just listened on and closed has nobody behind it.
+	listener, err := net.Listen("tcp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	addr := listener.Addr().String()
+	listener.Close()
+
+	var handlerCalls int
+	var mu sync.Mutex
+	count := func(*Connection) { mu.Lock(); handlerCalls++; mu.Unlock() }
+	client, _ := startEchoServer(t, DefaultConfig(), HandlerFuncs{
+		Open:  count,
+		Close: func(c *Connection, _ error) { count(c) },
+	})
+	results := make(chan dialResult, 1)
+	if err := client.Dial("tcp4", addr, 5*time.Second, func(c *Connection, err error) {
+		results <- dialResult{c, err}
+	}); err != nil {
+		t.Fatal(err)
+	}
+	r := <-results
+	if r.err == nil || r.c != nil {
+		t.Fatalf("dial to a closed port: connection %v, error %v", r.c, r.err)
+	}
+	var opErr *net.OpError
+	if !errors.As(r.err, &opErr) || opErr.Op != "dial" {
+		t.Fatalf("error is not a dial *net.OpError: %#v", r.err)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if handlerCalls != 0 {
+		t.Fatalf("handler called %d times for a refused dial", handlerCalls)
+	}
+}
+
+// blackholeAddr names an address from TEST-NET-1, which is never routed, so a
+// connect to it hangs until something gives up. Where a network refuses it
+// outright instead, the tests that need a hanging connect are skipped.
+const blackholeAddr = "192.0.2.1:81"
+
+func TestDialTimeout(t *testing.T) {
+	client, _ := startEchoServer(t, DefaultConfig(), nil)
+	results := make(chan dialResult, 1)
+	start := time.Now()
+	if err := client.Dial("tcp4", blackholeAddr, 200*time.Millisecond, func(c *Connection, err error) {
+		results <- dialResult{c, err}
+	}); err != nil {
+		t.Fatal(err)
+	}
+	r := <-results
+	if !errors.Is(r.err, os.ErrDeadlineExceeded) {
+		t.Skipf("connect to %s did not hang: %v", blackholeAddr, r.err)
+	}
+	if elapsed := time.Since(start); elapsed > 5*time.Second {
+		t.Fatalf("timeout took %v", elapsed)
+	}
+	var netErr net.Error
+	if !errors.As(r.err, &netErr) || !netErr.Timeout() {
+		t.Fatalf("timeout does not report Timeout(): %v", r.err)
+	}
+}
+
+// Closing the engine settles a connect still in flight rather than leaving
+// its dialer waiting forever.
+func TestCloseFailsPendingDial(t *testing.T) {
+	config := DefaultConfig()
+	config.Addr = "127.0.0.1:0"
+	client, err := Bind(config, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	runDone := make(chan error, 1)
+	go func() { runDone <- client.Run() }()
+	results := make(chan dialResult, 1)
+	if err := client.Dial("tcp4", blackholeAddr, 0, func(c *Connection, err error) {
+		results <- dialResult{c, err}
+	}); err != nil {
+		t.Fatal(err)
+	}
+	// Give the loop time to start the connect.
+	time.Sleep(100 * time.Millisecond)
+	select {
+	case r := <-results:
+		t.Skipf("connect to %s did not hang: %v", blackholeAddr, r.err)
+	default:
+	}
+	client.Stop()
+	if err := <-runDone; err != nil {
+		t.Fatal(err)
+	}
+	if err := client.Close(); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case r := <-results:
+		if !errors.Is(r.err, net.ErrClosed) {
+			t.Fatalf("pending dial reported %v, want net.ErrClosed", r.err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("closing the engine never settled the pending dial")
+	}
+}
+
+func TestDialRejectsWhatCannotStart(t *testing.T) {
+	client, _ := startEchoServer(t, DefaultConfig(), nil)
+	never := func(*Connection, error) { t.Error("done called for a dial that could not start") }
+	for _, tc := range []struct{ network, addr string }{
+		{"unixgram", "127.0.0.1:80"},
+		{"unixgram", "localhost:80"},
+		{"tcp", "127.0.0.1"},
+		{"tcp", "127.0.0.1:99999"},
+		{"tcp4", "[::1]:80"},
+	} {
+		if err := client.Dial(tc.network, tc.addr, 0, never); err == nil {
+			t.Errorf("Dial(%q, %q) started", tc.network, tc.addr)
+		}
+	}
+
+	config := DefaultConfig()
+	config.Addr = "127.0.0.1:0"
+	closed, err := Bind(config, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	closed.Stop()
+	if err := closed.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := closed.Dial("tcp4", "127.0.0.1:"+strconv.Itoa(80), 0, never); !errors.Is(err, net.ErrClosed) {
+		t.Fatalf("Dial on a closed engine: %v, want net.ErrClosed", err)
+	}
+}
+
+// A dialed connection with a handler of its own gets every callback there, and
+// the engine's handler hears nothing of it. An engine made by NewEngine has no
+// listener at all.
+func TestDialWithHandlerOnListenerlessEngine(t *testing.T) {
+	_, addr := startEchoServer(t, DefaultConfig(), echoHandler())
+	var engineCalls atomic.Int64
+	client, err := NewEngine(DefaultConfig(), HandlerFuncs{
+		Open: func(*Connection) { engineCalls.Add(1) },
+		Data: func(*Connection, []byte) { engineCalls.Add(1) },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := client.LocalAddr(); err == nil {
+		t.Fatal("LocalAddr on an engine without listeners reported an address")
+	}
+	runDone := make(chan error, 1)
+	go func() { runDone <- client.Run() }()
+	defer func() {
+		client.Stop()
+		if err := <-runDone; err != nil {
+			t.Error(err)
+		}
+		_ = client.Close()
+	}()
+
+	opened := make(chan struct{})
+	echoed := make(chan []byte, 1)
+	closed := make(chan error, 1)
+	own := HandlerFuncs{
+		Open:  func(*Connection) { close(opened) },
+		Data:  func(_ *Connection, b []byte) { echoed <- append([]byte(nil), b...) },
+		Close: func(_ *Connection, err error) { closed <- err },
+	}
+	err = client.DialWithHandler("tcp", addr, 5*time.Second, own, func(c *Connection, err error) {
+		if err != nil {
+			t.Error(err)
+			return
+		}
+		_ = c.Send([]byte("own handler"))
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case got := <-echoed:
+		if string(got) != "own handler" {
+			t.Fatalf("echo = %q", got)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("no echo reached the dial's own handler")
+	}
+	<-opened
+	if n := engineCalls.Load(); n != 0 {
+		t.Fatalf("the engine's handler was called %d times for a connection dialed with its own", n)
+	}
+}
+
+// closeWatcher reports the error each connection closed with.
+type closeWatcher struct {
+	HandlerFuncs
+	closed chan error
+}
+
+func newCloseWatcher(data func(*Connection, []byte)) *closeWatcher {
+	w := &closeWatcher{closed: make(chan error, 8)}
+	w.HandlerFuncs = HandlerFuncs{
+		Data:  data,
+		Close: func(_ *Connection, err error) { w.closed <- err },
+	}
+	return w
+}
+
+func (w *closeWatcher) await(t *testing.T, within time.Duration) error {
+	t.Helper()
+	select {
+	case err := <-w.closed:
+		return err
+	case <-time.After(within):
+		t.Fatal("the connection did not close")
+		return nil
+	}
+}
+
+func (w *closeWatcher) quiet(t *testing.T, for_ time.Duration) {
+	t.Helper()
+	select {
+	case err := <-w.closed:
+		t.Fatalf("the connection closed with %v", err)
+	case <-time.After(for_):
+	}
+}
+
+func TestReadDeadlineClosesTheConnection(t *testing.T) {
+	watcher := newCloseWatcher(func(c *Connection, _ []byte) {
+		_ = c.SetReadDeadline(time.Now().Add(150 * time.Millisecond))
+	})
+	_, addr := startEchoServer(t, DefaultConfig(), watcher)
+	conn, err := net.DialTimeout("tcp", addr, 5*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	if _, err = conn.Write([]byte("hello")); err != nil {
+		t.Fatal(err)
+	}
+	if err := watcher.await(t, 5*time.Second); !errors.Is(err, os.ErrDeadlineExceeded) {
+		t.Fatalf("OnClose error = %v, want os.ErrDeadlineExceeded", err)
+	}
+	// The peer sees the close too.
+	_ = conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+	if _, err := conn.Read(make([]byte, 1)); err == nil {
+		t.Fatal("the peer's connection stayed open")
+	}
+}
+
+// TestReadDeadlineMovedBeforeItFires checks the generation guard: a deadline
+// pushed back must not be closed by the timer it outlived.
+func TestReadDeadlineMovedBeforeItFires(t *testing.T) {
+	var reads atomic.Int64
+	watcher := newCloseWatcher(func(c *Connection, _ []byte) {
+		reads.Add(1)
+		_ = c.SetReadDeadline(time.Now().Add(200 * time.Millisecond))
+	})
+	_, addr := startEchoServer(t, DefaultConfig(), watcher)
+	conn, err := net.DialTimeout("tcp", addr, 5*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	// Keep pushing the deadline back for well past its length.
+	for i := 0; i < 10; i++ {
+		if _, err = conn.Write([]byte("tick")); err != nil {
+			t.Fatal(err)
+		}
+		time.Sleep(80 * time.Millisecond)
+	}
+	select {
+	case err := <-watcher.closed:
+		t.Fatalf("a deadline that kept moving closed the connection with %v", err)
+	default:
+	}
+	if reads.Load() == 0 {
+		t.Fatal("nothing was delivered")
+	}
+	// Stop moving it and it fires.
+	if err := watcher.await(t, 5*time.Second); !errors.Is(err, os.ErrDeadlineExceeded) {
+		t.Fatalf("OnClose error = %v, want os.ErrDeadlineExceeded", err)
+	}
+}
+
+func TestZeroDeadlineRemovesIt(t *testing.T) {
+	watcher := newCloseWatcher(func(c *Connection, data []byte) {
+		if string(data) == "arm" {
+			_ = c.SetReadDeadline(time.Now().Add(150 * time.Millisecond))
+			return
+		}
+		_ = c.SetReadDeadline(time.Time{})
+	})
+	_, addr := startEchoServer(t, DefaultConfig(), watcher)
+	conn, err := net.DialTimeout("tcp", addr, 5*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	if _, err = conn.Write([]byte("arm")); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(50 * time.Millisecond)
+	if _, err = conn.Write([]byte("off")); err != nil {
+		t.Fatal(err)
+	}
+	watcher.quiet(t, 500*time.Millisecond)
+}
+
+func TestWriteDeadlineIgnoresADrainedConnection(t *testing.T) {
+	watcher := newCloseWatcher(func(c *Connection, data []byte) {
+		_ = c.SetWriteDeadline(time.Now().Add(150 * time.Millisecond))
+		_ = c.Send(data)
+	})
+	_, addr := startEchoServer(t, DefaultConfig(), watcher)
+	conn, err := net.DialTimeout("tcp", addr, 5*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	if _, err = conn.Write([]byte("echo")); err != nil {
+		t.Fatal(err)
+	}
+	_ = conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+	if _, err = io.ReadFull(conn, make([]byte, 4)); err != nil {
+		t.Fatal(err)
+	}
+	// The reply went out, so the write deadline has nothing to be about.
+	watcher.quiet(t, 500*time.Millisecond)
+}
+
+// backlogOnceSettled reports how much output a connection is still holding,
+// once the count has stopped moving. A reply is queued before the round that
+// sent it hands it to the socket, so the count taken straight after a Send
+// says what was offered rather than what the kernel would not take.
+func backlogOnceSettled(t *testing.T, c *Connection) int64 {
+	t.Helper()
+	last := int64(-1)
+	for stop := time.Now().Add(10 * time.Second); time.Now().Before(stop); {
+		time.Sleep(200 * time.Millisecond)
+		queued := c.pendingBytes.Load()
+		if queued == last {
+			return queued
+		}
+		last = queued
+	}
+	t.Fatal("the connection's backlog never settled")
+	return 0
+}
+
+func TestWriteDeadlineClosesAStalledConnection(t *testing.T) {
+	payload := bytes.Repeat([]byte("x"), 16<<20)
+	replied := make(chan *Connection, 1)
+	watcher := newCloseWatcher(func(c *Connection, _ []byte) {
+		_ = c.Send(payload)
+		select {
+		case replied <- c:
+		default:
+		}
+	})
+	config := DefaultConfig()
+	// Keep the backlog off the watermarks, so the connection is closed by its
+	// deadline rather than paused by its own backpressure.
+	config.WriteBufferHighWatermark = 64 << 20
+	config.MaxPendingBytes = 128 << 20
+	_, addr := startEchoServer(t, config, watcher)
+	conn, err := net.DialTimeout("tcp", addr, 5*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	if tcp, ok := conn.(*net.TCPConn); ok {
+		// Pin this side's receive buffer before anything is sent. Left alone,
+		// a receive window that auto-tunes as far as the payload — which is
+		// what Windows does — would take the whole reply into the kernel even
+		// though nothing here ever reads it.
+		if err = tcp.SetReadBuffer(16 << 10); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// Never read, so nothing the server sends can drain.
+	if _, err = conn.Write([]byte("go")); err != nil {
+		t.Fatal(err)
+	}
+	var stalled *Connection
+	select {
+	case stalled = <-replied:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the reply was never sent")
+	}
+	// A write deadline is only about output the connection still owes, so
+	// there has to be some before one is armed. The first reply can leave
+	// none: Windows accepts one send of any size while its own send backlog
+	// is below the socket's send buffer, so the kernel takes all sixteen
+	// megabytes however little of it the peer has room for. It does that once
+	// — the backlog stands above the buffer afterwards, and a peer that never
+	// reads does not bring it back down — so send again until the engine is
+	// left holding something.
+	queued := backlogOnceSettled(t, stalled)
+	for attempt := 0; queued == 0; attempt++ {
+		if attempt == 2 {
+			t.Fatal("every reply went into the kernel; a write deadline would have nothing to be about")
+		}
+		if err = stalled.Send(payload); err != nil {
+			t.Fatalf("Send: %v", err)
+		}
+		queued = backlogOnceSettled(t, stalled)
+	}
+	if err = stalled.SetWriteDeadline(time.Now().Add(500 * time.Millisecond)); err != nil {
+		t.Fatal(err)
+	}
+	if err = watcher.await(t, 5*time.Second); !errors.Is(err, os.ErrDeadlineExceeded) {
+		t.Fatalf("OnClose error = %v, want os.ErrDeadlineExceeded", err)
+	}
+}
+
+func TestReadTakesBytesOffTheSocket(t *testing.T) {
+	got := make(chan string, 1)
+	handler := HandlerFuncs{Data: func(c *Connection, data []byte) {
+		// The read loop delivered the first byte; take the rest by hand.
+		rest := make([]byte, 64)
+		deadline := time.Now().Add(2 * time.Second)
+		read := append([]byte(nil), data...)
+		for len(read) < 5 && time.Now().Before(deadline) {
+			n, err := c.Read(rest)
+			if n > 0 {
+				read = append(read, rest[:n]...)
+				continue
+			}
+			if !errors.Is(err, ErrWouldBlock) {
+				t.Errorf("Read error = %v", err)
+				break
+			}
+			time.Sleep(time.Millisecond)
+		}
+		select {
+		case got <- string(read):
+		default:
+		}
+	}}
+	_, addr := startEchoServer(t, DefaultConfig(), handler)
+	conn, err := net.DialTimeout("tcp", addr, 5*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	for _, b := range []string{"h", "e", "l", "l", "o"} {
+		if _, err = io.WriteString(conn, b); err != nil {
+			t.Fatal(err)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	select {
+	case s := <-got:
+		if s != "hello" {
+			t.Fatalf("read %q, want %q", s, "hello")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("the handler never assembled the message")
+	}
+}
+
+func TestReadAndWriteReportWhyTheConnectionClosed(t *testing.T) {
+	reported := make(chan error, 1)
+	watcher := newCloseWatcher(func(c *Connection, _ []byte) {
+		_ = c.SetReadDeadline(time.Now().Add(50 * time.Millisecond))
+		go func() {
+			time.Sleep(300 * time.Millisecond)
+			_, err := c.Read(make([]byte, 1))
+			reported <- err
+		}()
+	})
+	_, addr := startEchoServer(t, DefaultConfig(), watcher)
+	conn, err := net.DialTimeout("tcp", addr, 5*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	if _, err = conn.Write([]byte("hi")); err != nil {
+		t.Fatal(err)
+	}
+	if err := watcher.await(t, 5*time.Second); !errors.Is(err, os.ErrDeadlineExceeded) {
+		t.Fatalf("OnClose error = %v", err)
+	}
+	select {
+	case err := <-reported:
+		if !errors.Is(err, os.ErrDeadlineExceeded) {
+			t.Fatalf("Read after the deadline closed it = %v, want os.ErrDeadlineExceeded", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("the read never reported")
+	}
+}
+
+func TestConnectionAddresses(t *testing.T) {
+	addrs := make(chan [2]string, 1)
+	handler := HandlerFuncs{Data: func(c *Connection, _ []byte) {
+		local, remote := c.LocalAddr(), c.RemoteAddr()
+		if local == nil || remote == nil {
+			t.Errorf("LocalAddr=%v RemoteAddr=%v", local, remote)
+			return
+		}
+		select {
+		case addrs <- [2]string{local.String(), remote.String()}:
+		default:
+		}
+	}}
+	_, addr := startEchoServer(t, DefaultConfig(), handler)
+	conn, err := net.DialTimeout("tcp", addr, 5*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	if _, err = conn.Write([]byte("hi")); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case got := <-addrs:
+		if got[0] != addr {
+			t.Fatalf("LocalAddr = %q, want the listener's %q", got[0], addr)
+		}
+		if got[1] != conn.LocalAddr().String() {
+			t.Fatalf("RemoteAddr = %q, want the client's %q", got[1], conn.LocalAddr())
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("the handler never ran")
+	}
+}
+
+// TestRemoteAddrPort checks that an accepted connection reports the address
+// its peer dialed from, the same as RemoteAddr's, on an IPv4 listener, an
+// IPv6 one, and one listening on both, whose IPv4 peers arrive v4-mapped,
+// with the engine's loop accepting and with pollers accepting.
+func TestRemoteAddrPort(t *testing.T) {
+	for _, tc := range []struct{ name, listen, dial string }{
+		{"ipv4", "127.0.0.1:0", "127.0.0.1"},
+		{"ipv6", "[::1]:0", "::1"},
+		{"dualstack", ":0", "127.0.0.1"},
+	} {
+		for _, pollers := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%s/pollers=%v", tc.name, pollers), func(t *testing.T) {
+				got := make(chan [2]string, 1)
+				config := DefaultConfig()
+				config.Addr = tc.listen
+				config.IOPollers, config.IOPollerCount = pollers, 2
+				server, err := Bind(config, HandlerFuncs{Data: func(c *Connection, _ []byte) {
+					remote := ""
+					if addr := c.RemoteAddr(); addr != nil {
+						remote = addr.String()
+					}
+					select {
+					case got <- [2]string{c.RemoteAddrPort().String(), remote}:
+					default:
+					}
+				}})
+				if err != nil {
+					t.Skipf("listen %s: %v", tc.listen, err)
+				}
+				addr, err := server.LocalAddr()
+				if err != nil {
+					t.Fatal(err)
+				}
+				done := make(chan error, 1)
+				go func() { done <- server.Run() }()
+				t.Cleanup(func() {
+					server.Stop()
+					<-done
+					_ = server.Close()
+				})
+				_, port, _ := net.SplitHostPort(addr.String())
+				conn, err := net.DialTimeout("tcp", net.JoinHostPort(tc.dial, port), 5*time.Second)
+				if err != nil {
+					t.Skipf("dial %s: %v", tc.dial, err)
+				}
+				defer conn.Close()
+				if _, err = conn.Write([]byte("hi")); err != nil {
+					t.Fatal(err)
+				}
+				select {
+				case addrs := <-got:
+					want := conn.LocalAddr().String()
+					if addrs[0] != want || addrs[1] != want {
+						t.Fatalf("RemoteAddrPort %q, RemoteAddr %q; the peer dialed from %q", addrs[0], addrs[1], want)
+					}
+				case <-time.After(5 * time.Second):
+					t.Fatal("no data reached the server")
+				}
+			})
+		}
 	}
 }

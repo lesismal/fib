@@ -138,7 +138,7 @@ body{margin:0}
     <thead><tr><th>执行者</th><th>来源</th><th>模式 / 规模</th><th>跑什么</th></tr></thead>
     <tbody>
       <tr><td><span class="chip c-loop"><i></i>事件循环</span></td><td><code>Engine.runLoop</code></td><td>根循环 1 个；poller 数为 NumCPU÷4 向下取整（至少 1）：7 核以内 1 个，8 核 2 个，16 核 4 个；<code>IOPollerCount</code> 可改</td><td>epoll_wait/kevent、accept、UDP 收包分拣、命令队列（close / refresh / detach / accept）、<b>OnOpen</b></td></tr>
-      <tr><td><span class="chip c-work"><i></i>‹Name›-workers</span></td><td><code>acquireTaskPool</code>（shared_taskpool.go）</td><td>Adaptive（按 P 分片入队）；上限 max(GOMAXPROCS×1000, NumCPU×20)，常驻下限 <code>MinWorkerCount</code>，同 Name 的 Engine 共用</td><td><code>Connection.RunTask → process()</code>：读 socket、OnData 链（TLS 解密 → 协议解析 → HTTP/1 handler / WS 回调）、写合并、OnClose</td></tr>
+      <tr><td><span class="chip c-work"><i></i>‹Name›-workers</span></td><td><code>acquireTaskPool</code>（config.go）</td><td>Adaptive（按 P 分片入队）；上限 max(GOMAXPROCS×1000, NumCPU×20)，常驻下限 <code>MinWorkerCount</code>，同 Name 的 Engine 共用</td><td><code>Connection.RunTask → process()</code>：读 socket、OnData 链（TLS 解密 → 协议解析 → HTTP/1 handler / WS 回调）、写合并、OnClose</td></tr>
       <tr><td><span class="chip c-hs"><i></i>fib-tls-handshake</span></td><td><code>sidepool</code></td><td>Adaptive；上限 65536，队列 10000，下限 0，进程内全局共享</td><td><code>crypto/tls.HandshakeContext</code> 这个阻塞调用，以及与握手同到的首批明文的交付</td></tr>
       <tr><td><span class="chip c-str"><i></i>‹Name›-streams</span></td><td><code>streampool</code>，<code>Engine.HandlerPool()</code></td><td>Adaptive；上限 = 同 Name 最宽引擎池 ×2，下限 0</td><td>HTTP/2、HTTP/3 的请求 handler（含扩展 CONNECT 的升级和 WebSocket OnOpen）；HTTP/1 的 OnBody 交接、连接关闭时的取消通知</td></tr>
       <tr><td><span class="chip c-tmr"><i></i>定时器</span></td><td><code>time.AfterFunc</code></td><td>运行时按需</td><td>读写 deadline → <code>commandClose</code>；UDP 空闲扫描 → <code>commandUDPSweep</code>；QUIC 的 ACK / 丢包 / 空闲 / flushHold 定时发送</td></tr>
@@ -652,7 +652,7 @@ flowchart TD
     <li>控制流的 SETTINGS 现在带 <code>ENABLE_CONNECT_PROTOCOL=1</code>，扩展 CONNECT 走隧道流程，见「WS over HTTP/3」。</li>
     <li>通常还会另起一个 TCP Engine 跑 <code>fibtls + fibhttp</code>（HTTP/1、HTTP/2），用 Alt-Svc 引导到 HTTP/3；两个 Engine 同 Name 时共用 workers 池和流池。</li>
   </ul>
-  <p class="ref">engine_unix.go readUDPListener · udp.go:111 udpPeer · :138 deliverDatagram · :159 drainDatagrams · http3/server.go:211 OnData · :285 OnDatagrams · :436 OnCallsDone · :816 finish · :894 WriteResponse · http3/quic/conn.go:463 Accept · :799 dispatch · :877 flush · :1491 onTimer</p>
+  <p class="ref">engine_unix.go readUDPListener · engine.go:111 udpPeer · :138 deliverDatagram · :159 drainDatagrams · http3/server.go:211 OnData · :285 OnDatagrams · :436 OnCallsDone · :816 finish · :894 WriteResponse · http3/quic/conn.go:463 Accept · :799 dispatch · :877 flush · :1491 onTimer</p>
 </section>
 
 <section id="wsh1">

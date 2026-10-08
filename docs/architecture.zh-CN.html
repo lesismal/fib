@@ -192,7 +192,7 @@ flowchart LR
     <li>worker 自己做读写系统调用，很多时间在内核里而不在 P 上，所以池相对核数是超额配置的。GOMAXPROCS 保持运行时默认值（核数）最好。</li>
     <li>三个池互相独立：引擎 worker 可以等流池和握手池的队列，反过来从不发生，所以不会出现所有 worker 都卡在提交上的死锁。</li>
   </ul>
-  <p class="ref">engine.go Engine · :284 openPollers · config.go DefaultPoolSizing · pollerCount · shared_taskpool.go · streampool · sidepool · taskpool/adaptive.go</p>
+  <p class="ref">engine.go Engine · :284 openPollers · config.go DefaultPoolSizing · pollerCount · config.go · streampool · sidepool · taskpool/adaptive.go</p>
 </section>
 
 <section id="layers">
@@ -266,7 +266,7 @@ flowchart LR
     <li><b>读缓冲按轮借用</b>：16KB 读缓冲每轮从 bufferpool 取、轮末归还，空闲连接不占读缓冲。短读说明 socket 已空，不再多读一次去拿 EAGAIN。</li>
     <li><b>UDP 例外</b>：共享的 UDP socket 由循环自己读（批量收包），按对端地址把数据报放进各 peer 连接的队列，worker 的一轮只负责把队列交给 handler。</li>
   </ul>
-  <p class="ref">poller_epoll.go:79 runLoop · engine.go:602 noteEvent · :377 runReady · :456 submitReady · connection.go:524 process · :777 readLoop · udp.go:138 deliverDatagram</p>
+  <p class="ref">poller_epoll.go:79 runLoop · engine.go:602 noteEvent · :377 runReady · :456 submitReady · connection.go:524 process · :777 readLoop · engine.go:138 deliverDatagram</p>
 </section>
 
 <section id="write">

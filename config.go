@@ -4,7 +4,11 @@ import (
 	"errors"
 	"fmt"
 	"runtime"
+	"sync"
+	"time"
 
+	"github.com/lesismal/fib/internal/udpbatch"
+	"github.com/lesismal/fib/streampool"
 	"github.com/lesismal/fib/taskpool"
 )
 
@@ -272,4 +276,140 @@ func (c *Config) SetPoolSizing(workerCount, maxEvents int) *Config {
 	}
 	c.customPoolSizing = true
 	return c
+}
+
+// DefaultUDPIdleTimeout is how long a UDP peer may stay silent before its
+// connection is closed, when Config.UDPIdleTimeout is left at zero.
+const DefaultUDPIdleTimeout = 60 * time.Second
+
+// ErrUDPIdleTimeout is what OnClose receives for a UDP peer that neither sent
+// nor was sent anything for Config.UDPIdleTimeout.
+var ErrUDPIdleTimeout = errors.New("fib: udp peer idle timeout")
+
+const (
+	// maxDatagramSize holds the largest UDP payload, so no datagram is ever
+	// truncated on the way in.
+	maxDatagramSize = udpbatch.MaxDatagramSize
+	// maxQueuedDatagrams bounds the datagrams a connection holds for its
+	// handler. Beyond it new ones are dropped, as the kernel drops them when
+	// a socket's receive buffer is full: a peer that sends faster than its
+	// handler keeps up loses datagrams instead of growing memory.
+	maxQueuedDatagrams = 1024
+	// maxDatagramsPerRound bounds the datagrams one socket may deliver in a
+	// single round of the event loop, so a flooded socket cannot starve the
+	// others. UDP sockets are level-triggered, so what is left is picked up in
+	// the next round.
+	maxDatagramsPerRound = 256
+)
+
+// isUDPNetwork reports whether network names UDP.
+func isUDPNetwork(network string) bool {
+	switch network {
+	case "udp", "udp4", "udp6":
+		return true
+	}
+	return false
+}
+
+// udpIdleTimeout reads Config.UDPIdleTimeout: zero is the default, and a
+// negative value turns the timeout off, which is reported as zero.
+func udpIdleTimeout(configured time.Duration) time.Duration {
+	switch {
+	case configured == 0:
+		return DefaultUDPIdleTimeout
+	case configured < 0:
+		return 0
+	}
+	return configured
+}
+
+// udpSweepInterval is how often idle peers are looked for: often enough that
+// a peer outlives its timeout by at most a quarter of it.
+func udpSweepInterval(timeout time.Duration) time.Duration {
+	return max(timeout/4, 10*time.Millisecond)
+}
+
+// engineName is the name config gives its engine.
+func engineName(config Config) string {
+	if config.Name == "" {
+		return DefaultName
+	}
+	return config.Name
+}
+
+// taskPoolName is the name of the pool an engine named engine builds for its
+// connections.
+func taskPoolName(engine string) string { return engine + "-workers" }
+
+// newTaskPool builds the pool config describes.
+func newTaskPool(config Config) *taskpool.TaskPool {
+	name := taskPoolName(engineName(config))
+	adaptive := taskpool.AdaptiveConfig{
+		Name: name, MinWorkers: config.MinWorkerCount, MaxWorkers: config.WorkerCount, QueueSize: config.MaxEvents,
+	}
+	switch config.TaskPoolMode {
+	case taskpool.ModeAdaptive:
+		return taskpool.NewAdaptive(adaptive)
+	case taskpool.ModeAdaptiveChan:
+		return taskpool.NewAdaptiveChan(adaptive)
+	}
+	return taskpool.NewWithMode(name, config.TaskPoolMode, config.WorkerCount, config.MaxEvents)
+}
+
+type sharedTaskPoolEntry struct {
+	pool *taskpool.TaskPool
+	// workers is the WorkerCount the pool was built with, which the engines
+	// sharing it run on whatever theirs say.
+	workers int
+	refs    int
+}
+
+// sharedTaskPools holds the pools engines share, by the pool's name.
+var sharedTaskPools = struct {
+	sync.Mutex
+	entries map[string]*sharedTaskPoolEntry
+}{entries: make(map[string]*sharedTaskPoolEntry)}
+
+func acquireTaskPool(config Config) (TaskPool, func()) {
+	if config.TaskPool != nil {
+		// The caller owns a pool it supplied, so releasing it is a no-op.
+		return config.TaskPool, func() {}
+	}
+	engine := engineName(config)
+	if !config.SharedTaskPool {
+		// The pool HTTP/2 and HTTP/3 run their handlers on has to stay wider
+		// than every engine pool that feeds it; see streamPoolFactor.
+		releaseStreams := streampool.Require(engine, config.WorkerCount*streamPoolFactor)
+		pool := newTaskPool(config)
+		return pool, func() {
+			pool.Stop()
+			releaseStreams()
+		}
+	}
+	name := taskPoolName(engine)
+	sharedTaskPools.Lock()
+	entry := sharedTaskPools.entries[name]
+	if entry == nil {
+		entry = &sharedTaskPoolEntry{pool: newTaskPool(config), workers: config.WorkerCount}
+		sharedTaskPools.entries[name] = entry
+	}
+	entry.refs++
+	sharedTaskPools.Unlock()
+	releaseStreams := streampool.Require(engine, entry.workers*streamPoolFactor)
+	var once sync.Once
+	return entry.pool, func() {
+		once.Do(func() {
+			sharedTaskPools.Lock()
+			entry.refs--
+			last := entry.refs == 0
+			if last {
+				delete(sharedTaskPools.entries, name)
+			}
+			sharedTaskPools.Unlock()
+			if last {
+				entry.pool.Stop()
+			}
+			releaseStreams()
+		})
+	}
 }

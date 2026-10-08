@@ -6,11 +6,14 @@ import (
 	"errors"
 	"io"
 	"net"
+	"net/netip"
 	"os"
 	"runtime"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
+	"unsafe"
 
 	"github.com/lesismal/fib/bufferpool"
 	"github.com/lesismal/fib/internal/sys"
@@ -813,3 +816,610 @@ func (e *Engine) closeConnection(c *Connection, closeErr error, callback bool) {
 }
 
 var _ io.Closer = (*Engine)(nil)
+
+// Config controls listener and worker-pool sizing.
+type Config struct {
+	// Name labels the engine in what it logs, and names the task pools its
+	// connections run on: "<Name>-workers" for the engine's own and
+	// "<Name>-streams" for the HTTP/2 and HTTP/3 handlers. Engines of the
+	// same name share both pools; see SharedTaskPool. Empty means
+	// DefaultName.
+	Name string
+	// LogStatus has the engine log a line when it starts serving, with its
+	// name, the addresses it listens on, its task pool and its pollers. It is
+	// off by default. The task pools' own lines are switched separately, with
+	// taskpool.SetLogStatus.
+	LogStatus bool
+	// Network and Addr name the listener the way net.Listen does: Network is
+	// "tcp", "tcp4" or "tcp6", and Addr is a "host:port" such as ":9000",
+	// "127.0.0.1:9000" or "[::1]:9000". A host resolves through the net
+	// package, and a zero port asks the kernel to choose one. An empty Network
+	// means "tcp", and an empty Addr means ":0", again as net.Listen reads
+	// them.
+	//
+	// "tcp" with no host listens on both families where the kernel has IPv6,
+	// "tcp4" and "tcp6" pin it to one. This is the same choice net.Listen
+	// makes from the same arguments.
+	//
+	// "unix" listens on a Unix domain stream socket, with Addr as its path, as
+	// net.Listen does: the path must not exist yet, it is removed when the
+	// engine closes, and on Linux a leading '@' names an abstract socket.
+	// Connections on it behave exactly like TCP ones.
+	//
+	// "udp", "udp4" and "udp6" bind UDP sockets instead, as net.ListenPacket
+	// does. Each peer address that sends a datagram becomes a connection of
+	// its own, whose OnData receives one datagram per call and whose Send
+	// sends one; see UDPIdleTimeout for how such a connection ends.
+	Network string
+	Addr    string
+	// Addrs, when it is not empty, is the complete set of addresses to listen
+	// on and Addr is ignored; they all share Network. One server spanning
+	// several addresses shares a single event loop, descriptor table, task
+	// pool and buffer pool across all of them, where a server per address
+	// gives each its own copy of all four.
+	Addrs          []string
+	Backlog        int
+	WorkerCount    int
+	MaxEvents      int
+	ReadBufferSize int
+	// WriteBufferHighWatermark pauses socket reads while at least this many
+	// bytes are waiting to be written. This bounds userspace buffering while
+	// TCP backpressure catches up. Set below zero to disable write backpressure.
+	//
+	// Crossing it is not free: the worker hands a command to the event loop,
+	// which costs an eventfd write and an epoll_ctl. A watermark near the
+	// message size makes every reply a crossing, so keep it well above one
+	// round's worth of output.
+	WriteBufferHighWatermark int
+	// MaxPendingBytes caps the bytes this server may hold across all of its
+	// connections waiting for their sockets. WriteBufferHighWatermark bounds a
+	// single connection, which at 100k connections still admits a per-server
+	// total of watermark*100k; this is the bound on the sum. Reads pause on
+	// every connection while the budget is exhausted. Zero means unlimited.
+	MaxPendingBytes int64
+	UseWritev       bool
+	// SocketSyscalls has connections read and write their sockets with
+	// recvfrom, sendto and sendmsg rather than read, write and writev. Both
+	// sets end in the same socket code, but read, write and writev reach it
+	// through the VFS, which on every call checks the file's access mode,
+	// runs the security module's file permission hook and notifies fsnotify.
+	// Where a security module mediates file access, as AppArmor does in a
+	// Docker container, that is a large share of a busy server's time:
+	// go-websocket-benchmark's echo in such a container (50k connections, 8
+	// server CPUs) served 611k messages a second at 634% CPU through read and
+	// write, and 639k at 507% through the socket calls. A descriptor that is
+	// not a socket falls back to read and write.
+	//
+	// DefaultConfig sets it. Only Linux honours it, and not on 386, which
+	// reaches the socket calls only through socketcall, nor in a race, memory
+	// or address sanitizer build.
+	SocketSyscalls bool
+	// TaskPoolMode picks the scheduler the workers run under. Prefer
+	// SetTaskPoolMode over assigning it, so that WorkerCount and MaxEvents
+	// follow the mode rather than staying at numbers tuned for the other one.
+	TaskPoolMode taskpool.Mode
+	// MinWorkerCount is the resident floor a ModeAdaptive pool retires down
+	// to, with WorkerCount as the ceiling it grows to. Zero, the default,
+	// lets an idle pool retire every worker and start them again when work
+	// arrives. The other modes ignore it.
+	MinWorkerCount int
+	// SharedTaskPool has the engines of one Name run on one task pool. The
+	// first of them builds it from its own settings, and those that follow
+	// run on it as it is, whatever theirs say.
+	SharedTaskPool bool
+	// TaskPool, when set, runs the engine's connections instead of a pool the
+	// engine builds from the fields above. See SetTaskPool.
+	TaskPool TaskPool
+	// IOPollers splits the engine across several event loops. The engine's
+	// own loop is left to accept connections and serve its UDP sockets, and
+	// every connection it accepts is handed to one of IOPollerCount further
+	// loops, the one its descriptor picks modulo their number, which then
+	// waits on that connection for the rest of its life. Connections the
+	// engine dials, over TCP, UDP or a Unix socket, go to those loops the
+	// same way. A UDP listener's peers share its one socket, so they stay on
+	// the engine's own loop, unless ReusePort gives each poller a socket of
+	// its own.
+	//
+	// Spreading the connections spreads the loops' own work, the waits,
+	// registrations and wake-ups, over several cores. With or without it, a
+	// loop only waits for events, and reads the UDP sockets peers share, and
+	// hands the connections they make runnable to the engine's pool of
+	// workers, the one TaskPoolMode,
+	// WorkerCount and SharedTaskPool describe or SetTaskPool supplies: every
+	// round, its reads and the OnData and OnClose they call, runs on a
+	// worker, so a callback that takes a while holds up its own connection
+	// and no other. The handlers of HTTP/2 and HTTP/3 requests run on a pool
+	// of their own, apart from the workers that read their connections; see
+	// Engine.HandlerPool.
+	//
+	// DefaultConfig sets it on more than four CPUs, counting GOMAXPROCS where
+	// it is below runtime.NumCPU, and leaves it off on four or fewer, where
+	// one loop serves as many requests as a poller would.
+	// Without it, the engine serves listeners and connections alike on its
+	// one loop. Setting it explicitly gives an engine pollers on any number
+	// of CPUs.
+	//
+	// Only the Linux and macOS backends have pollers; on Windows the engine
+	// keeps its single loop, as if this were unset.
+	IOPollers bool
+	// IOPollerCount is how many loops IOPollers creates. Zero or less means
+	// the CPUs divided by four, rounded down, and at least one, up to 32
+	// CPUs, and half the CPUs on more: 1 up to 7 CPUs, 2 on 8, 4 on 16, 8 on
+	// 32, 32 on 64. The CPUs are runtime.NumCPU, or GOMAXPROCS where that is
+	// lower.
+	//
+	// A loop only waits for events and hands them on, which costs a small
+	// share of what the workers spend on them, so one loop keeps up with the
+	// workers of many CPUs, and each further loop competes with the workers
+	// for the same Ps: after every round a loop yields to the workers it woke
+	// and then waits behind them for a P, so each loop's rounds gather fewer
+	// connections, and requests wait longer to be read. HTTP/2 echoes over
+	// 10k connections on 4 CPUs measured 411k requests/s with one poller and
+	// 399k with four, whose 99th percentile latency rose from 55ms to 64ms.
+	// More loops pay off where the loops' own work, accepting and registering
+	// connections and waking for them, is what runs short, as it may with
+	// ReusePort and many connections arriving at once.
+	IOPollerCount int
+	// ReusePort binds the engine's listeners with SO_REUSEPORT, so that
+	// other sockets that set it too, in this process or another of the same
+	// user, may listen on the same address and share its connections, or
+	// its datagrams.
+	//
+	// Under IOPollers on Linux the pollers accept TCP connections themselves
+	// whether or not it is set: each poller listens on a socket of its own,
+	// bound to the engine's address with SO_REUSEPORT, and accepts the
+	// connections the kernel spreads onto that socket by a hash of their
+	// addresses. The engine's own loop accepting every connection and waking
+	// the poller it hands it to capped how fast connections were accepted
+	// however many cores there were to serve them: HttpArena's limited-conn
+	// profile, ten requests a connection over 4096 at a time on 64 CPUs,
+	// served 0.94M requests a second that way and 1.65M with the pollers
+	// accepting. What it gives up is balance: a connection stays with the
+	// poller its hash picked, however busy that poller is. Without
+	// ReusePort the engine first claims the address with a socket bound
+	// without SO_REUSEPORT, so that an address another socket holds is
+	// refused with EADDRINUSE as it always was, and only a socket that sets
+	// SO_REUSEPORT itself can join the engine's afterwards. Unix sockets, and
+	// the other platforms, keep the engine's loop accepting.
+	//
+	// On a UDP address it has the pollers read datagrams in the same way,
+	// which they do only with it set: each poller reads a
+	// socket of its own bound there, and the kernel hands each datagram to
+	// one of the sockets by a hash of its source and destination addresses,
+	// waking only the poller that reads it. A peer's datagrams therefore all
+	// reach one poller, which keeps its connection, its OnData and its idle
+	// timeout; without it the engine's own loop reads every peer. The hash
+	// holds only while the sockets sharing the address stay the same, so a
+	// socket another process binds there moves some peers to it, and a peer
+	// whose address changes reaches whichever poller its new address hashes
+	// to, as a new peer; package http3 finds its QUIC connection there by
+	// its connection ID.
+	//
+	// In a child of package prefork it is always set, since the children
+	// all listen on the same addresses.
+	ReusePort bool
+	// UDPIdleTimeout closes a UDP peer's connection once the peer has neither
+	// sent nor been sent a datagram for this long, since UDP has no close of
+	// its own to end it. OnClose receives ErrUDPIdleTimeout. Zero means
+	// DefaultUDPIdleTimeout and a negative value keeps peers until they are
+	// closed. Dialed UDP connections are never timed out.
+	UDPIdleTimeout time.Duration
+	// customPoolSizing records that SetPoolSizing pinned the sizing, so that a
+	// later SetTaskPoolMode does not overwrite it.
+	customPoolSizing bool
+}
+
+func DefaultConfig() Config {
+	sizing := DefaultPoolSizing(taskpool.ModeAdaptive)
+	return Config{Name: DefaultName, Network: "tcp", Addr: ":9000", Backlog: sys.DefaultBacklog(), WorkerCount: sizing.WorkerCount,
+		MaxEvents: sizing.MaxEvents, ReadBufferSize: 16 * 1024,
+		WriteBufferHighWatermark: defaultWriteHighWatermark, MaxPendingBytes: defaultMaxPendingBytes,
+		UseWritev: true, SocketSyscalls: true, TaskPoolMode: taskpool.ModeAdaptive, SharedTaskPool: true,
+		IOPollers: defaultIOPollers(defaultCPUs())}
+}
+
+// UDP rides on the same connections, handlers and workers as TCP. What is
+// different is who reads the socket and what a connection is.
+//
+// A listening UDP socket has no connections of its own, so the engine makes
+// one per peer address: the first datagram from an address opens a
+// connection for it, OnOpen runs, and every datagram from that address is
+// then that connection's input. The connection closes when it is closed, or
+// when the peer has been silent for Config.UDPIdleTimeout. A dialed UDP
+// connection is a socket connected to one peer and is simply that peer's.
+//
+// The event loop reads UDP sockets itself and queues each datagram on its
+// connection, and a worker hands the queue to OnData one datagram per call.
+// Reading on the loop is what lets many peers share one socket without any of
+// them reading another's datagrams, and it keeps datagram boundaries intact:
+// OnData receives exactly one datagram, and each Send sends exactly one. It
+// is the one read a loop makes; every OnData runs on a worker. Handing the
+// socket's reads to a worker as well, one at a time, was measured slower:
+// HTTP/3 over 1000 connections on 50 ports, three CPUs, served 270k
+// multiplexed requests/s against 289k with the loop reading, and 349k
+// echoes/s against 372k with ReusePort, with 15% more memory.
+//
+// Sends go straight to the socket and are never queued. A datagram the socket
+// has no room for is dropped and Send reports the error, which is what UDP
+// does anyway when a router has no room for it, so there is no backpressure
+// and no write watermark to pause reads on.
+
+// udpState is what a UDP connection keeps on top of an ordinary one.
+type udpState struct {
+	udpPlatform
+	// listener is the socket a peer's datagrams arrive on and its replies
+	// leave from, or nil for a dialed connection, which has its own socket.
+	listener *udpListener
+	// sa and key are a peer's address, as the socket calls take it and as the
+	// listener's peer table is keyed. raddr is the same for RemoteAddr.
+	sa    syscall.Sockaddr
+	key   netip.AddrPort
+	raddr *net.UDPAddr
+	// queue holds datagrams the loop has read and the handler has not seen
+	// yet, from head on. Guarded by the connection's mu. spare is the array
+	// the queue last handed to a DatagramsHandler, kept for the next swap.
+	queue [][]byte
+	head  int
+	spare [][]byte
+	// lastActive is when the peer last sent or was sent a datagram, in
+	// nanoseconds, for the idle timeout.
+	lastActive atomic.Int64
+}
+
+// udpListener is a bound UDP socket and the peers it has seen.
+type udpListener struct {
+	udpListenerPlatform
+	// peers maps an address to its open connection. Event-loop ownership.
+	peers map[netip.AddrPort]*Connection
+}
+
+// rawSockaddrKey reads the table key of the peer a receive left its address
+// in, and the scope of an IPv6 one, which the key leaves out. It reads the
+// raw address where the kernel wrote it rather than through a
+// syscall.Sockaddr, which would be an allocation for every datagram when only
+// a new peer needs one.
+func rawSockaddrKey(rsa *syscall.RawSockaddrAny) (key netip.AddrPort, zone uint32, ok bool) {
+	switch rsa.Addr.Family {
+	case syscall.AF_INET:
+		pp := (*syscall.RawSockaddrInet4)(unsafe.Pointer(rsa))
+		port := (*[2]byte)(unsafe.Pointer(&pp.Port))
+		return netip.AddrPortFrom(netip.AddrFrom4(pp.Addr), uint16(port[0])<<8|uint16(port[1])), 0, true
+	case syscall.AF_INET6:
+		pp := (*syscall.RawSockaddrInet6)(unsafe.Pointer(rsa))
+		port := (*[2]byte)(unsafe.Pointer(&pp.Port))
+		return netip.AddrPortFrom(netip.AddrFrom16(pp.Addr), uint16(port[0])<<8|uint16(port[1])), pp.Scope_id, true
+	}
+	return netip.AddrPort{}, 0, false
+}
+
+// keySockaddr is the socket address a peer's replies are sent to: the
+// address its key was read from.
+func keySockaddr(key netip.AddrPort, zone uint32) syscall.Sockaddr {
+	if addr := key.Addr(); addr.Is4() {
+		return &syscall.SockaddrInet4{Port: int(key.Port()), Addr: addr.As4()}
+	}
+	return &syscall.SockaddrInet6{Port: int(key.Port()), ZoneId: zone, Addr: key.Addr().As16()}
+}
+
+func sockaddrToUDPAddr(sa syscall.Sockaddr) *net.UDPAddr {
+	addr, err := sockaddrToTCPAddr(sa)
+	if err != nil {
+		return nil
+	}
+	return &net.UDPAddr{IP: addr.IP, Port: addr.Port, Zone: addr.Zone}
+}
+
+// udpPeer returns the connection for the peer whose address a receive left
+// in from, opening one if this is the first datagram from it. It returns nil
+// once the engine is stopping. Callers run on the event loop.
+func (e *Engine) udpPeer(l *udpListener, from *syscall.RawSockaddrAny) *Connection {
+	key, zone, ok := rawSockaddrKey(from)
+	if !ok {
+		return nil
+	}
+	if c := l.peers[key]; c != nil {
+		return c
+	}
+	if e.stopping.Load() {
+		return nil
+	}
+	sa := keySockaddr(key, zone)
+	c := &Connection{engine: e, handler: e.handler,
+		udp: &udpState{listener: l, sa: sa, key: key, raddr: sockaddrToUDPAddr(sa)}}
+	c.initUDPPeer()
+	c.udp.lastActive.Store(time.Now().UnixNano())
+	l.peers[key] = c
+	c.handler.OnOpen(c)
+	return c
+}
+
+// deliverDatagram queues a copy of one datagram on its connection and reports
+// the connection if that made it runnable. The copy is a buffer from package
+// bufferpool, which a handler done with it may give back. now, in Unix
+// nanoseconds, is when the datagram was read, which a read shares between
+// the datagrams it took rather than ask the clock for each. Callers run on
+// the event loop.
+func (e *Engine) deliverDatagram(c *Connection, data []byte, now int64) *Connection {
+	u := c.udp
+	c.mu.Lock()
+	if c.closing || c.closed || len(u.queue)-u.head >= maxQueuedDatagrams {
+		c.mu.Unlock()
+		return nil
+	}
+	if u.head == len(u.queue) {
+		u.queue = u.queue[:0]
+		u.head = 0
+	}
+	datagram := bufferpool.Get(len(data))
+	copy(datagram, data)
+	u.queue = append(u.queue, datagram)
+	c.mu.Unlock()
+	u.lastActive.Store(now)
+	return e.noteEvent(c, evIn)
+}
+
+// drainDatagrams hands every queued datagram to the handler, one per OnData,
+// or all of them at once to a DatagramsHandler.
+func (c *Connection) drainDatagrams() {
+	u := c.udp
+	if h, ok := c.handler.(DatagramsHandler); ok {
+		for {
+			c.mu.Lock()
+			if u.head == len(u.queue) || c.closing || c.closed {
+				c.mu.Unlock()
+				return
+			}
+			queue := u.queue
+			batch := queue[u.head:]
+			// The loop queues what arrives meanwhile on the spare array, so
+			// the batch is the handler's alone while it runs.
+			u.queue, u.head, u.spare = u.spare[:0], 0, nil
+			c.mu.Unlock()
+			h.OnDatagrams(c, batch)
+			clear(queue)
+			c.mu.Lock()
+			if u.spare == nil {
+				u.spare = queue[:0]
+			}
+			c.mu.Unlock()
+		}
+	}
+	for {
+		c.mu.Lock()
+		if u.head == len(u.queue) || c.closing || c.closed {
+			c.mu.Unlock()
+			return
+		}
+		data := u.queue[u.head]
+		u.queue[u.head] = nil
+		u.head++
+		c.mu.Unlock()
+		c.handler.OnData(c, data)
+	}
+}
+
+// sendDatagram sends data as one datagram, or drops it and reports why.
+func (c *Connection) sendDatagram(data []byte) error {
+	if len(data) == 0 {
+		return nil
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.closing || c.closed || c.closeAfterSend {
+		return syscall.EPIPE
+	}
+	err := c.sysSendDatagram(data)
+	if err == nil {
+		c.udp.lastActive.Store(time.Now().UnixNano())
+	}
+	return err
+}
+
+// SendBatch sends each of datagrams as a datagram of its own, in order, as
+// that many Sends would, but on Linux and macOS with one system call for as
+// many of them as it can: sendmmsg, or sendmsg_x. A datagram the socket has
+// no room for is dropped, with those after it, and SendBatch reports why;
+// those before it were sent. On a connection that is not UDP it Sends each
+// in turn.
+func (c *Connection) SendBatch(datagrams [][]byte) error {
+	batch := c.udp != nil
+	for _, d := range datagrams {
+		// Send sends nothing for an empty datagram, where a batch would
+		// send an empty one.
+		batch = batch && len(d) > 0
+	}
+	if !batch {
+		for _, d := range datagrams {
+			if err := c.Send(d); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.closing || c.closed || c.closeAfterSend {
+		return syscall.EPIPE
+	}
+	err := c.sysSendDatagrams(datagrams)
+	if err == nil {
+		c.udp.lastActive.Store(time.Now().UnixNano())
+	}
+	return err
+}
+
+// sendDatagramParts sends two parts as one datagram.
+func (c *Connection) sendDatagramParts(first, second []byte) error {
+	if len(second) == 0 {
+		return c.sendDatagram(first)
+	}
+	if len(first) == 0 {
+		return c.sendDatagram(second)
+	}
+	// sendDatagram hands the bytes to the socket before it returns, so the
+	// joined copy goes straight back to the pool.
+	data := bufferpool.Join(nil, first, second)
+	defer bufferpool.Put(data)
+	return c.sendDatagram(data)
+}
+
+// detachPeer drops a closed peer from its listener's table. The socket is the
+// listener's, so there is nothing to close. Callers run on the event loop.
+func (e *Engine) detachPeer(c *Connection) {
+	u := c.udp
+	if u.listener.peers[u.key] == c {
+		delete(u.listener.peers, u.key)
+	}
+}
+
+// startUDPSweeper arms the timer that has the loop look for idle peers. The
+// timer arms itself again each time it fires, so nothing waits on it in
+// between.
+func (e *Engine) startUDPSweeper() {
+	if len(e.udpListeners) == 0 || e.udpIdleTimeout <= 0 {
+		return
+	}
+	interval := udpSweepInterval(e.udpIdleTimeout)
+	e.udpSweepMu.Lock()
+	defer e.udpSweepMu.Unlock()
+	e.udpSweep = time.AfterFunc(interval, func() {
+		if e.stopping.Load() || !e.request(command{kind: commandUDPSweep}) {
+			return
+		}
+		e.udpSweepMu.Lock()
+		if e.udpSweep != nil {
+			e.udpSweep.Reset(interval)
+		}
+		e.udpSweepMu.Unlock()
+	})
+}
+
+func (e *Engine) stopUDPSweeper() {
+	e.udpSweepMu.Lock()
+	if e.udpSweep != nil {
+		e.udpSweep.Stop()
+		e.udpSweep = nil
+	}
+	e.udpSweepMu.Unlock()
+}
+
+// sweepUDP closes the peers that have been silent for the idle timeout.
+// Callers run on the event loop.
+func (e *Engine) sweepUDP() {
+	limit := int64(e.udpIdleTimeout)
+	if limit <= 0 {
+		return
+	}
+	now := time.Now().UnixNano()
+	for _, l := range e.udpListeners {
+		for _, c := range l.peers {
+			if now-c.udp.lastActive.Load() >= limit {
+				e.closeConnection(c, ErrUDPIdleTimeout, true)
+			}
+		}
+	}
+}
+
+// closeUDPPeers closes every peer without a callback, as Close does for TCP
+// connections.
+func (e *Engine) closeUDPPeers() {
+	for _, l := range e.udpListeners {
+		for _, c := range l.peers {
+			e.closeConnection(c, nil, false)
+		}
+	}
+}
+
+// LocalUDPAddrs returns one address per UDP listener, in configured order.
+// Ports left at zero report the port the kernel chose.
+func (e *Engine) LocalUDPAddrs() ([]*net.UDPAddr, error) {
+	listeners := e.udpListeners
+	if len(listeners) == 0 && len(e.pollers) > 0 {
+		// The pollers read the engine's addresses themselves, and the first
+		// holds the sockets the engine bound; see Config.ReusePort.
+		listeners = e.pollers[0].udpListeners
+	}
+	addrs := make([]*net.UDPAddr, 0, len(listeners))
+	for _, l := range listeners {
+		sa, err := l.sockname()
+		if err != nil {
+			return nil, err
+		}
+		addr := sockaddrToUDPAddr(sa)
+		if addr == nil {
+			return nil, syscall.EAFNOSUPPORT
+		}
+		addrs = append(addrs, addr)
+	}
+	return addrs, nil
+}
+
+// LocalUDPAddr returns the address of the engine's first UDP listener.
+func (e *Engine) LocalUDPAddr() (*net.UDPAddr, error) {
+	addrs, err := e.LocalUDPAddrs()
+	if err != nil {
+		return nil, err
+	}
+	if len(addrs) == 0 {
+		return nil, errNoListener
+	}
+	return addrs[0], nil
+}
+
+// errUDPRead is what Read reports on a UDP connection, whose datagrams the
+// event loop reads and delivers whole.
+var errUDPRead = errors.New("fib: a UDP connection is read through OnData")
+
+// Protocol returns the transport the connection runs over, which it keeps
+// for its whole life, after it closes too.
+func (c *Connection) Protocol() Protocol {
+	switch {
+	case c.udp != nil:
+		return ProtocolUDP
+	case c.unix:
+		return ProtocolUnix
+	}
+	return ProtocolTCP
+}
+
+// RemoteAddrPort returns the peer's IP address and port, the zero AddrPort
+// for a Unix socket, for an IPv6 peer with a zone, which RemoteAddr reports
+// with its zone, and once the socket is gone. An IPv4 peer of an IPv6
+// socket is reported as the IPv4 address it is, as net.TCPAddr's String
+// shows it. For a connection the engine accepted it is the address accept
+// returned, which takes no system call and no allocation to report.
+func (c *Connection) RemoteAddrPort() netip.AddrPort {
+	if c.peer.IsValid() {
+		return c.peer
+	}
+	if c.udp != nil {
+		if c.udp.raddr == nil || c.udp.raddr.Zone != "" {
+			return netip.AddrPort{}
+		}
+		ap := c.udp.raddr.AddrPort()
+		return netip.AddrPortFrom(ap.Addr().Unmap(), ap.Port())
+	}
+	if c.unix {
+		return netip.AddrPort{}
+	}
+	sa, err := c.peerSockaddr()
+	if err != nil {
+		return netip.AddrPort{}
+	}
+	return sys.SockaddrAddrPort(sa)
+}
+
+// RemoteAddr returns the peer's address: a *net.UDPAddr for a UDP
+// connection, a *net.UnixAddr for a Unix socket, whose name is empty when the
+// peer never bound one, and a *net.TCPAddr otherwise. It returns nil once the
+// socket is gone.
+func (c *Connection) RemoteAddr() net.Addr {
+	if c.udp != nil {
+		return c.udp.raddr
+	}
+	sa, err := c.peerSockaddr()
+	if err != nil {
+		return nil
+	}
+	return sockaddrToAddr(sa)
+}

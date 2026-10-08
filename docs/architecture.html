@@ -192,7 +192,7 @@ flowchart LR
     <li>A worker makes its connection's read and write system calls itself and spends much of a round in the kernel rather than on a P, so the pool is oversubscribed relative to the cores. GOMAXPROCS is best left at the runtime's default, the cores.</li>
     <li>The three pools are separate. An engine worker may wait on the stream pool's or the handshake pool's queue, never the reverse, so workers cannot all end up stuck in a submission.</li>
   </ul>
-  <p class="ref">engine.go Engine · :284 openPollers · config.go DefaultPoolSizing · pollerCount · shared_taskpool.go · streampool · sidepool · taskpool/adaptive.go</p>
+  <p class="ref">engine.go Engine · :284 openPollers · config.go DefaultPoolSizing · pollerCount · config.go · streampool · sidepool · taskpool/adaptive.go</p>
 </section>
 
 <section id="layers">
@@ -266,7 +266,7 @@ flowchart LR
     <li><b>Read buffers are borrowed per round.</b> The 16KB read buffer comes from bufferpool for the round and goes back at its end, so an idle connection holds none. A short read says the socket is empty, and no further read is made only to get EAGAIN.</li>
     <li><b>UDP is the exception.</b> The loop reads a shared UDP socket itself, in batches, and queues each datagram on its peer's connection; the worker's round only hands the queue to the handler.</li>
   </ul>
-  <p class="ref">poller_epoll.go:79 runLoop · engine.go:602 noteEvent · :377 runReady · :456 submitReady · connection.go:524 process · :777 readLoop · udp.go:138 deliverDatagram</p>
+  <p class="ref">poller_epoll.go:79 runLoop · engine.go:602 noteEvent · :377 runReady · :456 submitReady · connection.go:524 process · :777 readLoop · engine.go:138 deliverDatagram</p>
 </section>
 
 <section id="write">

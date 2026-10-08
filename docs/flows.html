@@ -138,7 +138,7 @@ body{margin:0}
     <thead><tr><th>Executor</th><th>Where it comes from</th><th>Mode / size</th><th>What it runs</th></tr></thead>
     <tbody>
       <tr><td><span class="chip c-loop"><i></i>event loop</span></td><td><code>Engine.runLoop</code></td><td>One root loop; NumCPU÷4 pollers, rounded down, at least one: 1 up to 7 CPUs, 2 on 8, 4 on 16; <code>IOPollerCount</code> overrides</td><td>epoll_wait/kevent, accept, reading and sorting UDP datagrams, the command queue (close / refresh / detach / accept), <b>OnOpen</b></td></tr>
-      <tr><td><span class="chip c-work"><i></i>‹Name›-workers</span></td><td><code>acquireTaskPool</code> (shared_taskpool.go)</td><td>Adaptive, queues sharded by P; ceiling max(GOMAXPROCS×1000, NumCPU×20), floor <code>MinWorkerCount</code>; shared by engines of one Name</td><td><code>Connection.RunTask → process()</code>: socket reads, the OnData chain (TLS decryption → protocol parsing → HTTP/1 handler / WebSocket callbacks), coalesced writes, OnClose</td></tr>
+      <tr><td><span class="chip c-work"><i></i>‹Name›-workers</span></td><td><code>acquireTaskPool</code> (config.go)</td><td>Adaptive, queues sharded by P; ceiling max(GOMAXPROCS×1000, NumCPU×20), floor <code>MinWorkerCount</code>; shared by engines of one Name</td><td><code>Connection.RunTask → process()</code>: socket reads, the OnData chain (TLS decryption → protocol parsing → HTTP/1 handler / WebSocket callbacks), coalesced writes, OnClose</td></tr>
       <tr><td><span class="chip c-hs"><i></i>fib-tls-handshake</span></td><td><code>sidepool</code></td><td>Adaptive; ceiling 65536, queue 10000, floor 0; one for the process</td><td>The blocking <code>crypto/tls.HandshakeContext</code> call, and delivery of the plaintext that arrived with the handshake</td></tr>
       <tr><td><span class="chip c-str"><i></i>‹Name›-streams</span></td><td><code>streampool</code>, <code>Engine.HandlerPool()</code></td><td>Adaptive; ceiling twice the widest engine pool of that Name, floor 0</td><td>HTTP/2 and HTTP/3 request handlers (extended CONNECT upgrades and WebSocket OnOpen among them); HTTP/1 OnBody handovers and cancellation when a connection closes</td></tr>
       <tr><td><span class="chip c-tmr"><i></i>timers</span></td><td><code>time.AfterFunc</code></td><td>As the runtime needs</td><td>Read/write deadlines → <code>commandClose</code>; UDP idle sweep → <code>commandUDPSweep</code>; QUIC's ACK, loss, idle and flushHold sends</td></tr>
@@ -678,7 +678,7 @@ flowchart TD
     <li>The control stream's SETTINGS now carry <code>ENABLE_CONNECT_PROTOCOL=1</code>; an extended CONNECT takes the tunnel flow, see WS over HTTP/3.</li>
     <li>A second, TCP engine usually runs <code>fibtls + fibhttp</code> (HTTP/1, HTTP/2) beside it and advertises HTTP/3 through Alt-Svc. Two engines of one Name share the workers pool and the stream pool.</li>
   </ul>
-  <p class="ref">engine_unix.go readUDPListener · udp.go:111 udpPeer · :138 deliverDatagram · :159 drainDatagrams · http3/server.go:211 OnData · :285 OnDatagrams · :436 OnCallsDone · :816 finish · :894 WriteResponse · http3/quic/conn.go:463 Accept · :799 dispatch · :877 flush · :1491 onTimer</p>
+  <p class="ref">engine_unix.go readUDPListener · engine.go:111 udpPeer · :138 deliverDatagram · :159 drainDatagrams · http3/server.go:211 OnData · :285 OnDatagrams · :436 OnCallsDone · :816 finish · :894 WriteResponse · http3/quic/conn.go:463 Accept · :799 dispatch · :877 flush · :1491 onTimer</p>
 </section>
 
 <section id="wsh1">
