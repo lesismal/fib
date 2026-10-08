@@ -1311,6 +1311,10 @@ go run ./examples/tcp/tls/client -n 10
 - HTTP server 的 `-dir` 用 `net/http` 的 `FileServer` 在 `/files/` 下提供该目录的文件
   （支持 Range、条件请求，文件走 sendfile），例如 `go run ./examples/http/nontls/server -dir .`
   后 `curl -O http://127.0.0.1:8080/files/go.mod`。
+- `examples/http/upload` 演示 HTTP/1 大文件上传：server 开启 `StreamRequestBody`，请求头到达就回调 Handler，
+  再用 `Context.OnBody` 分段把 body 写入文件并计算 SHA-256，内存不随文件大小增长；`mkfile` 生成测试文件，
+  `client` 流式上传并校验。`go run ./examples/http/upload/mkfile -size 1GiB -o /tmp/big.bin`，
+  `go run ./examples/http/upload/server -dir /tmp/uploads`，`go run ./examples/http/upload/client -file /tmp/big.bin`。
 - `examples/http/router` 演示 Router：带参数与正则的路由、带自己中间件的 `Route`、`Mount`
   的子 Router，以及 404/405，`go run ./examples/http/router` 后用文件头注释里的 curl 命令访问。
 

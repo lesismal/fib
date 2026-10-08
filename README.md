@@ -263,6 +263,7 @@ engine, err := fib.Bind(config, fib.HandlerFuncs{
 go run ./examples/tcp/nontls/server
 go run ./examples/http/nontls/server
 go run ./examples/http/router
+go run ./examples/http/upload/server   # large uploads through Context.OnBody; see its mkfile and client
 go run ./examples/websocket/nontls/server
 go run ./examples/http3/tls/server
 go run ./examples/arpc/server
