@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/lesismal/fib/bufferpool"
+	"github.com/lesismal/fib/internal/netaddr"
 	"github.com/lesismal/fib/taskpool"
 )
 
@@ -83,7 +84,7 @@ func newEngine(config Config, handler Handler, addrs []string) (*Engine, error) 
 		network = "tcp"
 	}
 	var udpListeners []*udpListener
-	if isUDPNetwork(network) {
+	if netaddr.IsUDP(network) {
 		var err error
 		if udpListeners, err = listenUDP(network, addrs); err != nil {
 			return nil, err
@@ -287,7 +288,7 @@ func (e *Engine) DialWithHandler(network, addr string, timeout time.Duration, ha
 	}
 	go func() {
 		conn, err := net.DialTimeout(network, addr, timeout)
-		if err == nil && !e.adoptWith(conn, handler, done, isUDPNetwork(network), true) {
+		if err == nil && !e.adoptWith(conn, handler, done, netaddr.IsUDP(network), true) {
 			err = &net.OpError{Op: "dial", Net: network, Addr: conn.RemoteAddr(), Err: net.ErrClosed}
 		}
 		if err != nil && done != nil {

@@ -16,6 +16,7 @@ import (
 	"unsafe"
 
 	"github.com/lesismal/fib/bufferpool"
+	"github.com/lesismal/fib/internal/netaddr"
 	"github.com/lesismal/fib/internal/sys"
 	"github.com/lesismal/fib/streampool"
 	"github.com/lesismal/fib/taskpool"
@@ -169,7 +170,7 @@ func (e *Engine) removeUnixPaths() {
 
 // noteUnixPath records a socket file a listener just created.
 func (e *Engine) noteUnixPath(network, path string) {
-	if isUnixNetwork(network) && !isAbstractUnixPath(path) {
+	if netaddr.IsUnix(network) && !netaddr.IsAbstractUnixPath(path) {
 		e.unixPaths = append(e.unixPaths, path)
 	}
 }
@@ -1102,7 +1103,7 @@ func keySockaddr(key netip.AddrPort, zone uint32) syscall.Sockaddr {
 }
 
 func sockaddrToUDPAddr(sa syscall.Sockaddr) *net.UDPAddr {
-	addr, err := sockaddrToTCPAddr(sa)
+	addr, err := netaddr.ToTCPAddr(sa)
 	if err != nil {
 		return nil
 	}
@@ -1421,5 +1422,5 @@ func (c *Connection) RemoteAddr() net.Addr {
 	if err != nil {
 		return nil
 	}
-	return sockaddrToAddr(sa)
+	return netaddr.ToAddr(sa)
 }

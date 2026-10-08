@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/lesismal/fib/bufferpool"
+	"github.com/lesismal/fib/internal/netaddr"
 	"github.com/lesismal/fib/internal/sys"
 )
 
@@ -1565,7 +1566,7 @@ func (c *Connection) LocalAddr() net.Addr {
 	if c.udp != nil {
 		return sockaddrToUDPAddr(sa)
 	}
-	return sockaddrToAddr(sa)
+	return netaddr.ToAddr(sa)
 }
 
 // closedError is why the connection is no longer usable, or nil while it is.

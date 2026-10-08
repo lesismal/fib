@@ -12,6 +12,7 @@ import (
 	"time"
 	"unsafe"
 
+	"github.com/lesismal/fib/internal/netaddr"
 	"github.com/lesismal/fib/internal/sys"
 	"github.com/lesismal/fib/taskpool"
 )
@@ -207,7 +208,7 @@ func (e *Engine) open(config Config, addrs []string) error {
 	}
 	e.port = port
 	e.conns = make(map[*Connection]struct{})
-	if isUDPNetwork(config.Network) {
+	if netaddr.IsUDP(config.Network) {
 		return e.openUDP(config, addrs)
 	}
 	for _, addr := range addrs {
@@ -267,7 +268,7 @@ func (e *Engine) openUDP(config Config, addrs []string) error {
 }
 
 func createUDPListener(config Config, addr string) (*udpListener, error) {
-	family, bound, err := resolveListenAddr(config.Network, addr)
+	family, bound, err := netaddr.ResolveListen(config.Network, addr)
 	if err != nil {
 		return nil, err
 	}
@@ -406,7 +407,7 @@ func (e *Engine) abandon() {
 }
 
 func createListener(config Config, addr string) (*winListener, error) {
-	family, bound, err := resolveListenAddr(config.Network, addr)
+	family, bound, err := netaddr.ResolveListen(config.Network, addr)
 	if err != nil {
 		return nil, err
 	}
@@ -464,7 +465,7 @@ func (e *Engine) ListenAddrs() ([]net.Addr, error) {
 		if err != nil {
 			return nil, err
 		}
-		addrs = append(addrs, sockaddrToAddr(sa))
+		addrs = append(addrs, netaddr.ToAddr(sa))
 	}
 	udpAddrs, err := e.LocalUDPAddrs()
 	if err != nil {
@@ -486,7 +487,7 @@ func (e *Engine) LocalAddrs() ([]*net.TCPAddr, error) {
 		if err != nil {
 			return nil, err
 		}
-		addr, err := sockaddrToTCPAddr(sa)
+		addr, err := netaddr.ToTCPAddr(sa)
 		if err != nil {
 			return nil, err
 		}
@@ -986,10 +987,10 @@ func closeDialSocket(fd int) { _ = syscall.Closesocket(syscall.Handle(fd)) }
 // the port, even when it finishes at once, so connected is always false here.
 // Callers run on the event loop.
 func (e *Engine) connectSocket(d *dialRequest) (c *Connection, connected bool, err error) {
-	if isUDPNetwork(d.network) {
+	if netaddr.IsUDP(d.network) {
 		return e.connectDatagram(d)
 	}
-	if isUnixNetwork(d.network) {
+	if netaddr.IsUnix(d.network) {
 		return e.connectUnix(d)
 	}
 	s, err := sys.NewSocket(d.family)

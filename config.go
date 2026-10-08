@@ -302,15 +302,6 @@ const (
 	maxDatagramsPerRound = 256
 )
 
-// isUDPNetwork reports whether network names UDP.
-func isUDPNetwork(network string) bool {
-	switch network {
-	case "udp", "udp4", "udp6":
-		return true
-	}
-	return false
-}
-
 // udpIdleTimeout reads Config.UDPIdleTimeout: zero is the default, and a
 // negative value turns the timeout off, which is reported as zero.
 func udpIdleTimeout(configured time.Duration) time.Duration {

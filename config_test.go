@@ -18,6 +18,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/lesismal/fib/internal/netaddr"
 	"github.com/lesismal/fib/internal/udpbatch"
 	"github.com/lesismal/fib/taskpool"
 )
@@ -270,8 +271,8 @@ func testPollersAccept(t *testing.T, reusePort bool) {
 		if !acceptsConnections(t, p.listenFDs[0]) {
 			t.Fatalf("poller %d's socket does not listen", i)
 		}
-		if got, err := syscall.Getsockname(p.listenFDs[0]); err != nil || sockaddrToAddr(got).String() != sockaddrToAddr(bound).String() {
-			t.Fatalf("poller %d is bound to %v (%v), want %v", i, sockaddrToAddr(got), err, sockaddrToAddr(bound))
+		if got, err := syscall.Getsockname(p.listenFDs[0]); err != nil || netaddr.ToAddr(got).String() != netaddr.ToAddr(bound).String() {
+			t.Fatalf("poller %d is bound to %v (%v), want %v", i, netaddr.ToAddr(got), err, netaddr.ToAddr(bound))
 		}
 	}
 
