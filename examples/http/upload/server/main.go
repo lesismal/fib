@@ -39,8 +39,18 @@ func main() {
 	maxSize := flag.Int64("max", 64<<30, "largest upload accepted, in bytes (0 for no limit)")
 	flag.Parse()
 
-	if err := os.MkdirAll(*dir, 0o755); err != nil {
+	engine, err := newEngine(*addr, *dir, *maxSize)
+	if err != nil {
 		example.Fatal(err)
+	}
+	example.Serve(engine, fmt.Sprintf("upload server listening on http://%s, storing into %s", *addr, *dir))
+}
+
+// newEngine binds the upload server to addr, storing into dir and refusing
+// bodies larger than maxSize (zero for no limit).
+func newEngine(addr, dir string, maxSize int64) (*fib.Engine, error) {
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return nil, err
 	}
 
 	httpConfig := fibhttp.DefaultConfig()
@@ -49,7 +59,7 @@ func main() {
 	// MaxBodyBytes, which only applies to a body held whole.
 	httpConfig.StreamRequestBody = true
 	httpConfig.StreamRequestBodyThreshold = 0
-	httpConfig.MaxStreamedBodyBytes = *maxSize
+	httpConfig.MaxStreamedBodyBytes = maxSize
 	// How much of the body may wait unread before the connection stops
 	// reading its socket. Small here, to show that memory stays bounded.
 	httpConfig.StreamRequestBodyBuffer = 1 << 20
@@ -58,12 +68,8 @@ func main() {
 	httpConfig.IdleTimeout = time.Minute
 
 	config := fib.DefaultConfig()
-	config.Addr = *addr
-	engine, err := fib.Bind(config, fibhttp.NewHandlerWithConfig(httpConfig, upload(*dir)))
-	if err != nil {
-		example.Fatal(err)
-	}
-	example.Serve(engine, fmt.Sprintf("upload server listening on http://%s, storing into %s", *addr, *dir))
+	config.Addr = addr
+	return fib.Bind(config, fibhttp.NewHandlerWithConfig(httpConfig, upload(dir)))
 }
 
 // upload answers POST and PUT on /upload?name=<file name>, storing the body
@@ -116,6 +122,7 @@ func upload(dir string) fibhttp.HandlerFunc {
 		// OnBody keeps the request open until the last call returns, so the
 		// response written from it needs no Retain.
 		c.OnBody(func(data []byte, fin bool, err error) {
+			log.Printf("upload %s: got %d bytes, fin=%v, err=%v", name, len(data), fin, err)
 			if failed {
 				return
 			}
