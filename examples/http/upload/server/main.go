@@ -1,31 +1,40 @@
 //go:build linux || darwin || windows
 
-// Command server receives large file uploads over HTTP/1 without holding them
-// in memory. With Config.StreamRequestBody on, the handler runs as soon as the
-// request header has arrived, and Context.OnBody hands it the body piece by
-// piece as the connection reads it: each piece is written to a file and fed
-// to a SHA-256, then dropped. What holds a fast client back is the handler
-// itself — while OnBody's callback is busy the connection stops reading, and
-// TCP flow control slows the sender — so memory stays flat however large the
-// upload is.
+// Command server takes large HTTP/1 request bodies without holding them in
+// memory. With Config.StreamRequestBody on, a handler runs as soon as the
+// request header has arrived, and takes the body piece by piece through
+// Context.OnBody as the connection reads it; while the handler's callback is
+// busy the connection stops reading, and TCP flow control slows the sender, so
+// memory stays flat however large the body is. It serves three endpoints:
+//
+//	POST|PUT   /upload?name=F   Context.SaveBody: the whole file in one request
+//	PUT|PATCH  /resume?name=F   Context.SaveBodyResumable: the file in chunks,
+//	                            each with a Content-Range, and continued after a
+//	                            dropped connection from the offset the server
+//	                            reports (Content-Range: bytes */TOTAL asks)
+//	POST       /echo            answers with the body it receives, as it receives it
+//
+// Try it with the client and the test file generator beside it:
 //
 //	go run ./examples/http/upload/mkfile -size 1GiB -o /tmp/big.bin
 //	go run ./examples/http/upload/server -dir /tmp/uploads
-//	go run ./examples/http/upload/client -file /tmp/big.bin
-//
-// or with curl:
-//
-//	curl -T /tmp/big.bin 'http://127.0.0.1:8080/upload?name=big.bin'
+//	go run ./examples/http/upload/client -mode upload -file /tmp/big.bin
+//	go run ./examples/http/upload/client -mode resume -file /tmp/big.bin -name part.bin -max-chunks 3
+//	go run ./examples/http/upload/client -mode resume -file /tmp/big.bin -name part.bin
+//	go run ./examples/http/upload/client -mode echo   -file /tmp/big.bin
 package main
 
 import (
-	"crypto/sha256"
+	"context"
 	"flag"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"os"
+	"os/signal"
 	"path/filepath"
+	"syscall"
 	"time"
 
 	fib "github.com/lesismal/fib"
@@ -33,135 +42,146 @@ import (
 	fibhttp "github.com/lesismal/fib/http"
 )
 
-func main() {
-	addr := flag.String("addr", "127.0.0.1:8080", "listen address")
-	dir := flag.String("dir", "uploads", "directory the uploads are stored in")
-	maxSize := flag.Int64("max", 64<<30, "largest upload accepted, in bytes (0 for no limit)")
-	flag.Parse()
+// fatal reports a startup error and exits; a test replaces it.
+var fatal = example.Fatal
 
-	engine, err := newEngine(*addr, *dir, *maxSize)
-	if err != nil {
-		example.Fatal(err)
+func main() {
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+	if err := run(ctx, os.Args[1:], os.Stdout, nil); err != nil {
+		fatal(err)
 	}
-	example.Serve(engine, fmt.Sprintf("upload server listening on http://%s, storing into %s", *addr, *dir))
 }
 
-// newEngine binds the upload server to addr, storing into dir and refusing
-// bodies larger than maxSize (zero for no limit).
+// run serves until ctx ends. ready, if not nil, is told the address once the
+// server is listening.
+func run(ctx context.Context, args []string, out io.Writer, ready func(addr string)) error {
+	flags := flag.NewFlagSet("server", flag.ContinueOnError)
+	flags.SetOutput(out)
+	addr := flags.String("addr", "127.0.0.1:8080", "listen address")
+	dir := flags.String("dir", "uploads", "directory the uploads are stored in")
+	maxSize := flags.Int64("max", 64<<30, "largest body accepted, in bytes (0 for no limit)")
+	if err := flags.Parse(args); err != nil {
+		return err
+	}
+	engine, err := newEngine(*addr, *dir, *maxSize)
+	if err != nil {
+		return err
+	}
+	// Bind has opened the listener, so there is an address to report.
+	local, _ := engine.LocalAddr()
+	running := make(chan error, 1)
+	go func() { running <- engine.Run() }()
+	fmt.Fprintf(out, "upload server listening on http://%s, storing into %s\n", local, *dir)
+	if ready != nil {
+		ready(local.String())
+	}
+	<-ctx.Done()
+	engine.Stop()
+	err = <-running
+	_ = engine.Close()
+	return err
+}
+
+// newEngine binds the server to addr, storing into dir and refusing bodies
+// larger than maxSize (zero for no limit).
 func newEngine(addr, dir string, maxSize int64) (*fib.Engine, error) {
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return nil, err
 	}
-
 	httpConfig := fibhttp.DefaultConfig()
-	// Hand the request to the handler once its header is in, whatever the
-	// body's size, and bound the body by MaxStreamedBodyBytes rather than by
-	// MaxBodyBytes, which only applies to a body held whole.
+	// Hand a request to its handler once the header is in, whatever the
+	// body's size, and bound the body by MaxStreamedBodyBytes, which is for
+	// bodies that stream, rather than MaxBodyBytes, which is for those held whole.
 	httpConfig.StreamRequestBody = true
 	httpConfig.StreamRequestBodyThreshold = 0
 	httpConfig.MaxStreamedBodyBytes = maxSize
 	// How much of the body may wait unread before the connection stops
-	// reading its socket. Small here, to show that memory stays bounded.
+	// reading its socket. Small, to show that memory stays bounded.
 	httpConfig.StreamRequestBodyBuffer = 1 << 20
-	// A client that stalls mid-upload is cut off, a slow one is not.
-	httpConfig.ReadTimeout = 0
 	httpConfig.IdleTimeout = time.Minute
 
 	config := fib.DefaultConfig()
 	config.Addr = addr
-	return fib.Bind(config, fibhttp.NewHandlerWithConfig(httpConfig, upload(dir)))
+	return fib.Bind(config, fibhttp.NewHandlerWithConfig(httpConfig, handler(dir)))
 }
 
-// upload answers POST and PUT on /upload?name=<file name>, storing the body
-// as <dir>/<name>.
-func upload(dir string) fibhttp.HandlerFunc {
+func handler(dir string) fibhttp.HandlerFunc {
 	return func(c *fibhttp.Context, r *http.Request) {
-		if r.URL.Path != "/upload" {
-			_ = c.Respond(http.StatusNotFound, "text/plain; charset=utf-8", []byte("POST or PUT /upload?name=<file>\n"))
-			return
-		}
-		if r.Method != http.MethodPost && r.Method != http.MethodPut {
-			_ = c.Respond(http.StatusMethodNotAllowed, "text/plain; charset=utf-8", []byte("use POST or PUT\n"))
-			return
-		}
-		// Base keeps the name from reaching outside dir.
-		name := filepath.Base(r.URL.Query().Get("name"))
-		if name == "." || name == string(filepath.Separator) || name == "" {
-			_ = c.Respond(http.StatusBadRequest, "text/plain; charset=utf-8", []byte("name is required\n"))
-			return
-		}
-		final := filepath.Join(dir, name)
-		partial := final + ".part"
-		file, err := os.Create(partial)
-		if err != nil {
-			_ = c.Respond(http.StatusInternalServerError, "text/plain; charset=utf-8", []byte(err.Error()+"\n"))
-			return
-		}
-
-		// The handler is called before the body has arrived: BodyComplete is
-		// false for anything larger than what came with the header.
-		log.Printf("upload %s: handler called, content-length=%d, body complete yet: %v",
-			name, r.ContentLength, c.BodyComplete())
-
-		var (
-			sum      = sha256.New()
-			received int64
-			started  = time.Now()
-			failed   bool
-		)
-		fail := func(why error) {
-			failed = true
-			file.Close()
-			os.Remove(partial)
-			log.Printf("upload %s: %v after %d bytes", name, why, received)
-		}
-
-		// OnBody registers the callback and returns; the handler is done
-		// here. The calls come one at a time and in order, on the worker that
-		// reads this connection, and data is only valid during each call.
-		// OnBody keeps the request open until the last call returns, so the
-		// response written from it needs no Retain.
-		c.OnBody(func(data []byte, fin bool, err error) {
-			log.Printf("upload %s: got %d bytes, fin=%v, err=%v", name, len(data), fin, err)
-			if failed {
-				return
-			}
-			if err != nil {
-				// The connection went, the body outgrew MaxStreamedBodyBytes,
-				// or its framing was broken: the last call, with no response
-				// to give.
-				fail(err)
-				return
-			}
-			if len(data) > 0 {
-				if _, err := file.Write(data); err != nil {
-					fail(err)
-					_ = c.Respond(http.StatusInternalServerError, "text/plain; charset=utf-8", []byte(err.Error()+"\n"))
-					return
+		switch r.URL.Path {
+		case "/upload":
+			if allow(c, r, http.MethodPost, http.MethodPut) {
+				if path, ok := target(c, dir); ok {
+					c.SaveBody(path, logged(c, r))
 				}
-				sum.Write(data)
-				received += int64(len(data))
 			}
-			if !fin {
-				return
+		case "/resume":
+			if allow(c, r, http.MethodPut, http.MethodPatch) {
+				if path, ok := target(c, dir); ok {
+					c.SaveBodyResumable(path, logged(c, r))
+				}
 			}
-			if err := file.Close(); err != nil {
-				fail(err)
-				_ = c.Respond(http.StatusInternalServerError, "text/plain; charset=utf-8", []byte(err.Error()+"\n"))
-				return
+		case "/echo":
+			if allow(c, r, http.MethodPost) {
+				echo(c)
 			}
-			if err := os.Rename(partial, final); err != nil {
-				fail(err)
-				_ = c.Respond(http.StatusInternalServerError, "text/plain; charset=utf-8", []byte(err.Error()+"\n"))
-				return
-			}
-			elapsed := time.Since(started)
-			log.Printf("upload %s: %d bytes in %v (%.1f MiB/s)", name, received, elapsed.Round(time.Millisecond),
-				float64(received)/(1<<20)/elapsed.Seconds())
-			reply := fmt.Sprintf("stored %s bytes=%d sha256=%x\n", name, received, sum.Sum(nil))
-			if err := c.Respond(http.StatusOK, "text/plain; charset=utf-8", []byte(reply)); err != nil {
-				log.Printf("respond: %v", err)
-			}
-		})
+		default:
+			_ = c.Respond(http.StatusNotFound, "text/plain; charset=utf-8", []byte("POST /upload, PUT /resume or POST /echo\n"))
+		}
 	}
+}
+
+// allow answers 405 unless the request's method is one of methods.
+func allow(c *fibhttp.Context, r *http.Request, methods ...string) bool {
+	for _, method := range methods {
+		if r.Method == method {
+			return true
+		}
+	}
+	_ = c.Respond(http.StatusMethodNotAllowed, "text/plain; charset=utf-8", []byte("method not allowed\n"))
+	return false
+}
+
+// target is the file the request's name parameter stands for, inside dir. It
+// answers 400 if there is no name. Base keeps a name from reaching outside dir.
+func target(c *fibhttp.Context, dir string) (string, bool) {
+	name := filepath.Base(c.Query("name"))
+	if name == "." || name == string(filepath.Separator) {
+		_ = c.Respond(http.StatusBadRequest, "text/plain; charset=utf-8", []byte("name is required\n"))
+		return "", false
+	}
+	return filepath.Join(dir, name), true
+}
+
+// logged is the done callback of the Save functions here: it logs how the
+// upload ended, and then answers it as they would by themselves.
+func logged(c *fibhttp.Context, r *http.Request) func(fibhttp.Saved, error) {
+	started := time.Now()
+	return func(saved fibhttp.Saved, err error) {
+		if err != nil {
+			log.Printf("%s %s: %d of %d bytes stored: %v", r.Method, r.URL.Path, saved.Size, saved.Total, err)
+		} else {
+			log.Printf("%s %s: %d bytes stored in %v, complete: %v", r.Method, r.URL.Path, saved.Size,
+				time.Since(started).Round(time.Millisecond), saved.Complete)
+		}
+		_ = c.RespondSaved(saved, err)
+	}
+}
+
+// echo sends the request's body back as it arrives. Each piece OnBody hands
+// over is written to the response, which streams, chunked, so that neither
+// the body nor the response is ever held whole; Finish ends it with the last
+// piece, and answers an empty body with an empty response. A body that fails
+// midway has no one to answer: the connection is gone or about to be closed.
+func echo(c *fibhttp.Context) {
+	c.Header().Set("Content-Type", "application/octet-stream")
+	c.OnBody(func(data []byte, fin bool, err error) {
+		if err != nil {
+			return
+		}
+		_, _ = c.Write(data)
+		if fin {
+			_ = c.Finish()
+		}
+	})
 }

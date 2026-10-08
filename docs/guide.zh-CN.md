@@ -587,6 +587,23 @@ func(c *fibhttp.Context, r *http.Request) {
 
 `Context.Flush()` 语义不变，仍然是 `http.Flusher`：把暂存的 body 立即发出去，响应不结束。
 
+**把上传存成文件（SaveBody / SaveBodyResumable）**：存文件是 `OnBody` 最常见的用法，两个方法把写文件、
+计算摘要、出错清理都做好了，`done` 回调里只管回复（传 `nil` 则用 `RespondSaved` 默认回复）：
+
+```go
+// 一次上传整个文件：写到 path+".part"，收完改名为 path；任何失败（连接断开、body 超限、写盘失败）
+// 都不留下文件。done 在最后一次 body 回调里被调用一次。
+c.SaveBody(path, func(saved fibhttp.Saved, err error) { c.RespondSaved(saved, err) })
+
+// 断点续传：文件分多个请求发送，每个带 Content-Range: bytes 起-止/总大小，body 恰好是这一段。
+// 分段追加到 path+".part"，总大小收齐后改名为 path，并回读文件算出 SHA-256。
+// 起点必须等于已存的大小（0 表示从头来过），否则 done 收到 *OffsetError{Have}，回复 409 + Upload-Offset；
+// 一段中途断开时已收到的部分保留，客户端用 "Content-Range: bytes */总大小"（无 body）探测已存多少再继续。
+c.SaveBodyResumable(path, nil)
+```
+
+需要 `StreamRequestBody` 才能边收边存；没开时 body 已经整个到达，同样能存。示例见 `examples/http/upload`。
+
 ### 静态文件（FileCache）
 
 `http.FileCache` 从内存提供一个目录下的文件，并跟随磁盘：
@@ -1311,10 +1328,13 @@ go run ./examples/tcp/tls/client -n 10
 - HTTP server 的 `-dir` 用 `net/http` 的 `FileServer` 在 `/files/` 下提供该目录的文件
   （支持 Range、条件请求，文件走 sendfile），例如 `go run ./examples/http/nontls/server -dir .`
   后 `curl -O http://127.0.0.1:8080/files/go.mod`。
-- `examples/http/upload` 演示 HTTP/1 大文件上传：server 开启 `StreamRequestBody`，请求头到达就回调 Handler，
-  再用 `Context.OnBody` 分段把 body 写入文件并计算 SHA-256，内存不随文件大小增长；`mkfile` 生成测试文件，
-  `client` 流式上传并校验。`go run ./examples/http/upload/mkfile -size 1GiB -o /tmp/big.bin`，
-  `go run ./examples/http/upload/server -dir /tmp/uploads`，`go run ./examples/http/upload/client -file /tmp/big.bin`。
+- `examples/http/upload` 演示 HTTP/1 大 body：server 开启 `StreamRequestBody`，请求头到达就回调 Handler，
+  不等完整 body，再分段处理，内存不随 body 大小增长。三个接口：`POST /upload`（`SaveBody`，单次上传）、
+  `PUT /resume`（`SaveBodyResumable`，分块断点续传）、`POST /echo`（`OnBody` 边收边原样写回的大 body echo）。
+  `mkfile` 生成可复现的测试文件，`client -mode upload|resume|echo` 流式发送并校验 SHA-256（`-max-chunks`
+  让 resume 提前停下，再跑一次就从服务端已有的位置接着传）。
+  `go run ./examples/http/upload/mkfile -size 1GiB -o /tmp/big.bin`，`go run ./examples/http/upload/server -dir /tmp/uploads`，
+  `go run ./examples/http/upload/client -mode resume -file /tmp/big.bin -name part.bin -max-chunks 3` 后再不带 `-max-chunks` 运行一次。
 - `examples/http/router` 演示 Router：带参数与正则的路由、带自己中间件的 `Route`、`Mount`
   的子 Router，以及 404/405，`go run ./examples/http/router` 后用文件头注释里的 curl 命令访问。
 

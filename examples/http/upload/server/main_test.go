@@ -4,20 +4,38 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"crypto/sha256"
 	"fmt"
 	"io"
+	"log"
 	"math/rand/v2"
+	"net"
 	"net/http"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
 
-// startServer runs the upload server on a free port, storing into a fresh
-// directory, and returns its URL and that directory.
+func TestMain(m *testing.M) {
+	log.SetOutput(io.Discard)
+	os.Exit(m.Run())
+}
+
+func randomBytes(n int) []byte {
+	b := make([]byte, n)
+	rng := rand.New(rand.NewPCG(3, 5))
+	for i := range b {
+		b[i] = byte(rng.Uint32())
+	}
+	return b
+}
+
+// startServer runs the server on a free port, storing into a fresh directory.
 func startServer(t *testing.T, maxSize int64) (base, dir string) {
 	t.Helper()
 	dir = t.TempDir()
@@ -39,153 +57,371 @@ func startServer(t *testing.T, maxSize int64) (base, dir string) {
 	return "http://" + addr.String(), dir
 }
 
-func randomBytes(n int) []byte {
-	var key [32]byte
-	b := make([]byte, n)
-	_, _ = io.ReadFull(rand.NewChaCha8(key), b)
-	return b
-}
-
-func do(t *testing.T, method, url string, body io.Reader, length int64) (int, string) {
+func send(t *testing.T, method, url string, header http.Header, body io.Reader, length int64) (*http.Response, string) {
 	t.Helper()
 	req, err := http.NewRequest(method, url, body)
 	if err != nil {
 		t.Fatal(err)
 	}
 	req.ContentLength = length
-	client := &http.Client{Timeout: 30 * time.Second}
+	req.Header = header
+	client := &http.Client{Timeout: 60 * time.Second}
 	resp, err := client.Do(req)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer resp.Body.Close()
-	reply, _ := io.ReadAll(resp.Body)
-	return resp.StatusCode, string(reply)
-}
-
-func TestUploadStoresWhatWasSent(t *testing.T) {
-	base, dir := startServer(t, 0)
-	data := randomBytes(8<<20 + 123)
-	for _, method := range []string{http.MethodPost, http.MethodPut} {
-		name := strings.ToLower(method) + ".bin"
-		status, reply := do(t, method, base+"/upload?name="+name, bytes.NewReader(data), int64(len(data)))
-		if status != http.StatusOK {
-			t.Fatalf("%s: status %d: %s", method, status, reply)
-		}
-		want := fmt.Sprintf("stored %s bytes=%d sha256=%x\n", name, len(data), sha256.Sum256(data))
-		if reply != want {
-			t.Fatalf("%s: reply %q, want %q", method, reply, want)
-		}
-		got, err := os.ReadFile(filepath.Join(dir, name))
-		if err != nil || !bytes.Equal(got, data) {
-			t.Fatalf("%s: stored file differs from what was sent (err %v)", method, err)
-		}
-	}
-	if parts, _ := filepath.Glob(filepath.Join(dir, "*.part")); len(parts) != 0 {
-		t.Fatalf("partial files left behind: %v", parts)
-	}
-}
-
-// The handler must run, and the body must be written out, while the client
-// still holds the rest of it back: a server that read the whole body first
-// would show nothing on disk until the last byte was sent.
-func TestUploadStreamsBeforeBodyIsComplete(t *testing.T) {
-	base, dir := startServer(t, 0)
-	data := randomBytes(4 << 20)
-	half := len(data) / 2
-
-	pr, pw := io.Pipe()
-	type result struct {
-		status int
-		reply  string
-	}
-	done := make(chan result, 1)
-	go func() {
-		status, reply := do(t, http.MethodPost, base+"/upload?name=slow.bin", pr, int64(len(data)))
-		done <- result{status, reply}
-	}()
-
-	if _, err := pw.Write(data[:half]); err != nil {
-		t.Fatal(err)
-	}
-	partial := filepath.Join(dir, "slow.bin.part")
-	deadline := time.Now().Add(10 * time.Second)
-	for {
-		if info, err := os.Stat(partial); err == nil && info.Size() > 0 {
-			break
-		}
-		if time.Now().After(deadline) {
-			t.Fatal("nothing was written while the client still held half the body back")
-		}
-		time.Sleep(10 * time.Millisecond)
-	}
-	select {
-	case r := <-done:
-		t.Fatalf("answered before the body was complete: %d %s", r.status, r.reply)
-	default:
-	}
-
-	if _, err := pw.Write(data[half:]); err != nil {
-		t.Fatal(err)
-	}
-	_ = pw.Close()
-	r := <-done
-	if r.status != http.StatusOK || !strings.Contains(r.reply, fmt.Sprintf("sha256=%x", sha256.Sum256(data))) {
-		t.Fatalf("got %d %q", r.status, r.reply)
-	}
-	if _, err := os.Stat(partial); !os.IsNotExist(err) {
-		t.Fatalf("partial file still there after the upload: %v", err)
-	}
-}
-
-func TestUploadOverTheLimitLeavesNothing(t *testing.T) {
-	base, dir := startServer(t, 1<<20)
-	data := randomBytes(4 << 20)
-	req, err := http.NewRequest(http.MethodPost, base+"/upload?name=big.bin", bytes.NewReader(data))
+	text, err := io.ReadAll(resp.Body)
 	if err != nil {
 		t.Fatal(err)
 	}
-	client := &http.Client{Timeout: 30 * time.Second}
-	if resp, err := client.Do(req); err == nil {
-		resp.Body.Close()
-		if resp.StatusCode == http.StatusOK {
-			t.Fatal("an upload past the limit was accepted")
-		}
+	return resp, string(text)
+}
+
+// rawBody opens a connection, sends a request header announcing length body
+// bytes and the first sent of them, and returns the connection, which the
+// caller closes to cut the body short.
+func rawBody(t *testing.T, base, method, target, extra string, length int, sent []byte) net.Conn {
+	t.Helper()
+	conn, err := net.DialTimeout("tcp", strings.TrimPrefix(base, "http://"), 5*time.Second)
+	if err != nil {
+		t.Fatal(err)
 	}
-	// The server removes the partial file once it has given up on the body.
-	deadline := time.Now().Add(5 * time.Second)
-	for {
-		entries, _ := os.ReadDir(dir)
-		if len(entries) == 0 {
-			return
-		}
+	t.Cleanup(func() { conn.Close() })
+	if _, err := fmt.Fprintf(conn, "%s %s HTTP/1.1\r\nHost: test\r\nContent-Length: %d\r\n%s\r\n", method, target, length, extra); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := conn.Write(sent); err != nil {
+		t.Fatal(err)
+	}
+	return conn
+}
+
+func eventually(t *testing.T, what string, cond func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(10 * time.Second)
+	for !cond() {
 		if time.Now().After(deadline) {
-			t.Fatalf("files left behind: %v", entries)
+			t.Fatalf("timed out waiting for %s", what)
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
 }
 
-func TestUploadRejectsBadRequests(t *testing.T) {
+func dirEntries(dir string) []string {
+	entries, _ := os.ReadDir(dir)
+	names := make([]string, 0, len(entries))
+	for _, e := range entries {
+		names = append(names, e.Name())
+	}
+	return names
+}
+
+// settledSize waits for the size of path to stop changing and returns it, or
+// -1 if there is no such file.
+func settledSize(path string) int64 {
+	last := int64(-2)
+	for stable := 0; stable < 4; {
+		size := int64(-1)
+		if info, err := os.Stat(path); err == nil {
+			size = info.Size()
+		}
+		if size == last {
+			stable++
+		} else {
+			stable, last = 0, size
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
+	return last
+}
+
+func TestUploadStoresALargeBody(t *testing.T) {
 	base, dir := startServer(t, 0)
-	body := []byte("hello")
+	data := randomBytes(32<<20 + 99)
+	for _, method := range []string{http.MethodPost, http.MethodPut} {
+		name := strings.ToLower(method) + ".bin"
+		resp, text := send(t, method, base+"/upload?name="+name, nil, bytes.NewReader(data), int64(len(data)))
+		want := fmt.Sprintf("stored bytes=%d sha256=%x\n", len(data), sha256.Sum256(data))
+		if resp.StatusCode != 200 || text != want {
+			t.Fatalf("%s: %d %q", method, resp.StatusCode, text)
+		}
+		if stored, err := os.ReadFile(filepath.Join(dir, name)); err != nil || !bytes.Equal(stored, data) {
+			t.Fatalf("%s: the stored file differs (err %v)", method, err)
+		}
+	}
+	if names := dirEntries(dir); len(names) != 2 {
+		t.Fatalf("directory holds %v", names)
+	}
+}
 
-	if status, _ := do(t, http.MethodGet, base+"/upload?name=a", nil, 0); status != http.StatusMethodNotAllowed {
-		t.Errorf("GET: status %d, want 405", status)
+// The handler runs, and the body reaches the disk, while the client still
+// holds the rest of it back.
+func TestUploadStreamsBeforeTheBodyIsComplete(t *testing.T) {
+	base, dir := startServer(t, 0)
+	data := randomBytes(4 << 20)
+	conn := rawBody(t, base, "POST", "/upload?name=slow.bin", "", len(data), data[:len(data)/2])
+	eventually(t, "half the body on disk", func() bool {
+		info, err := os.Stat(filepath.Join(dir, "slow.bin.part"))
+		return err == nil && info.Size() > 0
+	})
+	if _, err := conn.Write(data[len(data)/2:]); err != nil {
+		t.Fatal(err)
 	}
-	if status, _ := do(t, http.MethodPost, base+"/other?name=a", bytes.NewReader(body), int64(len(body))); status != http.StatusNotFound {
-		t.Errorf("other path: status %d, want 404", status)
+	eventually(t, "the upload to finish", func() bool {
+		stored, err := os.ReadFile(filepath.Join(dir, "slow.bin"))
+		return err == nil && bytes.Equal(stored, data)
+	})
+}
+
+func TestUploadConnectionLostMidBody(t *testing.T) {
+	base, dir := startServer(t, 0)
+	data := randomBytes(8 << 20)
+	conn := rawBody(t, base, "POST", "/upload?name=lost.bin", "", len(data), data[:2<<20])
+	eventually(t, "the body to start arriving", func() bool { return len(dirEntries(dir)) == 1 })
+	conn.Close()
+	// Nothing of a failed upload is left, and the server goes on serving.
+	eventually(t, "the partial file to be removed", func() bool { return len(dirEntries(dir)) == 0 })
+	resp, _ := send(t, "POST", base+"/upload?name=after.bin", nil, strings.NewReader("ok"), 2)
+	if resp.StatusCode != 200 {
+		t.Fatalf("status %d after the failed upload", resp.StatusCode)
 	}
-	if status, _ := do(t, http.MethodPost, base+"/upload", bytes.NewReader(body), int64(len(body))); status != http.StatusBadRequest {
-		t.Errorf("no name: status %d, want 400", status)
+}
+
+func TestUploadPastTheLimit(t *testing.T) {
+	base, dir := startServer(t, 256<<10)
+	// Announced past the limit: refused before the handler runs.
+	data := randomBytes(1 << 20)
+	req, _ := http.NewRequest("POST", base+"/upload?name=big.bin", bytes.NewReader(data))
+	resp, err := http.DefaultClient.Do(req)
+	if err == nil {
+		resp.Body.Close()
+		if resp.StatusCode != 413 {
+			t.Fatalf("status %d, want 413", resp.StatusCode)
+		}
+	}
+	// Chunked, so it is only found out as it grows: the handler is told.
+	conn2, err := net.Dial("tcp", strings.TrimPrefix(base, "http://"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn2.Close()
+	fmt.Fprint(conn2, "POST /upload?name=chunked.bin HTTP/1.1\r\nHost: test\r\nTransfer-Encoding: chunked\r\n\r\n")
+	piece := randomBytes(64 << 10)
+	for i := 0; i < 16; i++ {
+		if _, err := fmt.Fprintf(conn2, "%x\r\n%s\r\n", len(piece), piece); err != nil {
+			break
+		}
+	}
+	// Neither was kept, nor a partial file of either.
+	eventually(t, "the oversized uploads to leave nothing", func() bool { return len(dirEntries(dir)) == 0 })
+}
+
+func TestResumeInChunksAcrossInterruptions(t *testing.T) {
+	base, dir := startServer(t, 0)
+	data := randomBytes(24<<20 + 7)
+	total := len(data)
+	path := filepath.Join(dir, "r.bin")
+	rangeOf := func(from, to int) http.Header {
+		return http.Header{"Content-Range": {fmt.Sprintf("bytes %d-%d/%d", from, to, total)}}
+	}
+	probe := func() (int, string, string) {
+		resp, text := send(t, "PUT", base+"/resume?name=r.bin", http.Header{"Content-Range": {fmt.Sprintf("bytes */%d", total)}}, nil, 0)
+		return resp.StatusCode, resp.Header.Get("Upload-Offset"), text
+	}
+	if status, offset, _ := probe(); status != 202 || offset != "0" {
+		t.Fatalf("probe: %d offset %q", status, offset)
 	}
 
+	// The first chunk arrives whole.
+	const chunk = 8 << 20
+	resp, _ := send(t, "PUT", base+"/resume?name=r.bin", rangeOf(0, chunk-1), bytes.NewReader(data[:chunk]), chunk)
+	if resp.StatusCode != 202 || resp.Header.Get("Upload-Offset") != strconv.Itoa(chunk) {
+		t.Fatalf("first chunk: %d offset %q", resp.StatusCode, resp.Header.Get("Upload-Offset"))
+	}
+
+	// The second is cut off partway through.
+	conn := rawBody(t, base, "PATCH", "/resume?name=r.bin", fmt.Sprintf("Content-Range: bytes %d-%d/%d\r\n", chunk, 2*chunk-1, total), chunk, data[chunk:chunk+3<<20])
+	eventually(t, "part of the second chunk on disk", func() bool { return settledSize(path+".part") > chunk })
+	conn.Close()
+	kept := settledSize(path + ".part")
+	if kept <= chunk || kept >= 2*chunk {
+		t.Fatalf("the server kept %d bytes, expected part of the second chunk", kept)
+	}
+	if status, offset, _ := probe(); status != 202 || offset != strconv.FormatInt(kept, 10) {
+		t.Fatalf("probe after the interruption: %d offset %q, want %d", status, offset, kept)
+	}
+
+	// A chunk in the wrong place is refused with the place it belongs.
+	resp, _ = send(t, "PUT", base+"/resume?name=r.bin", rangeOf(total-100, total-1), bytes.NewReader(data[total-100:]), 100)
+	if resp.StatusCode != 409 || resp.Header.Get("Upload-Offset") != strconv.FormatInt(kept, 10) {
+		t.Fatalf("misplaced chunk: %d offset %q", resp.StatusCode, resp.Header.Get("Upload-Offset"))
+	}
+
+	// The rest goes in one request from where the server has it.
+	resp, text := send(t, "PUT", base+"/resume?name=r.bin", rangeOf(int(kept), total-1), bytes.NewReader(data[kept:]), int64(total)-kept)
+	if resp.StatusCode != 200 || text != fmt.Sprintf("stored bytes=%d sha256=%x\n", total, sha256.Sum256(data)) {
+		t.Fatalf("last chunk: %d %q", resp.StatusCode, text)
+	}
+	if stored, err := os.ReadFile(path); err != nil || !bytes.Equal(stored, data) {
+		t.Fatalf("the stored file differs (err %v)", err)
+	}
+	if status, _, text := probe(); status != 200 || !strings.Contains(text, "stored") {
+		t.Fatalf("probe of the finished upload: %d %q", status, text)
+	}
+	if names := dirEntries(dir); len(names) != 1 {
+		t.Fatalf("directory holds %v", names)
+	}
+}
+
+func TestEchoesALargeBody(t *testing.T) {
+	base, _ := startServer(t, 0)
+	data := randomBytes(48<<20 + 13)
+	resp, text := send(t, "POST", base+"/echo", nil, bytes.NewReader(data), int64(len(data)))
+	if resp.StatusCode != 200 || len(text) != len(data) || sha256.Sum256([]byte(text)) != sha256.Sum256(data) {
+		t.Fatalf("echo: %d, %d bytes back of %d", resp.StatusCode, len(text), len(data))
+	}
+	// An empty body is answered with an empty one.
+	resp, text = send(t, "POST", base+"/echo", nil, nil, 0)
+	if resp.StatusCode != 200 || text != "" {
+		t.Fatalf("empty echo: %d %q", resp.StatusCode, text)
+	}
+}
+
+func TestEchoConnectionLostMidBody(t *testing.T) {
+	base, _ := startServer(t, 0)
+	data := randomBytes(16 << 20)
+	conn, err := net.DialTimeout("tcp", strings.TrimPrefix(base, "http://"), 5*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	fmt.Fprintf(conn, "POST /echo HTTP/1.1\r\nHost: test\r\nContent-Length: %d\r\n\r\n", len(data))
+	// The body goes out from another goroutine: the server stops reading it
+	// while this end is not reading the echo, so one goroutine doing both
+	// would wait on itself.
+	go func() { _, _ = conn.Write(data[:3<<20]) }()
+	_ = conn.SetReadDeadline(time.Now().Add(10 * time.Second))
+	if _, err := io.ReadFull(conn, make([]byte, 1<<10)); err != nil {
+		t.Fatal(err)
+	}
+	conn.Close()
+	resp, text := send(t, "POST", base+"/echo", nil, strings.NewReader("still serving"), 13)
+	if resp.StatusCode != 200 || text != "still serving" {
+		t.Fatalf("after the lost connection: %d %q", resp.StatusCode, text)
+	}
+}
+
+func TestEchoPastTheLimit(t *testing.T) {
+	base, _ := startServer(t, 128<<10)
+	conn, err := net.Dial("tcp", strings.TrimPrefix(base, "http://"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	fmt.Fprint(conn, "POST /echo HTTP/1.1\r\nHost: test\r\nTransfer-Encoding: chunked\r\n\r\n")
+	piece := randomBytes(32 << 10)
+	for i := 0; i < 32; i++ {
+		if _, err := fmt.Fprintf(conn, "%x\r\n%s\r\n", len(piece), piece); err != nil {
+			break
+		}
+	}
+	// The connection is closed on a body that outgrows the limit, and the
+	// server goes on.
+	resp, text := send(t, "POST", base+"/echo", nil, strings.NewReader("fine"), 4)
+	if resp.StatusCode != 200 || text != "fine" {
+		t.Fatalf("after the oversized body: %d %q", resp.StatusCode, text)
+	}
+}
+
+func TestRoutingAndNames(t *testing.T) {
+	base, dir := startServer(t, 0)
+	cases := []struct {
+		method, target string
+		status         int
+	}{
+		{"GET", "/upload?name=a", 405},
+		{"GET", "/resume?name=a", 405},
+		{"GET", "/echo", 405},
+		{"GET", "/nothing", 404},
+		{"POST", "/upload", 400},
+		{"POST", "/upload?name=.", 400},
+		{"POST", "/upload?name=%2F", 400},
+		{"PUT", "/resume", 400},
+	}
+	for _, tc := range cases {
+		resp, _ := send(t, tc.method, base+tc.target, nil, strings.NewReader("x"), 1)
+		if resp.StatusCode != tc.status {
+			t.Errorf("%s %s: status %d, want %d", tc.method, tc.target, resp.StatusCode, tc.status)
+		}
+	}
 	// A name that climbs out of the directory is cut down to its last element.
-	status, reply := do(t, http.MethodPost, base+"/upload?name=../../escape.txt", bytes.NewReader(body), int64(len(body)))
-	if status != http.StatusOK {
-		t.Fatalf("traversal name: status %d: %s", status, reply)
+	if resp, _ := send(t, "POST", base+"/upload?name=../../escape.txt", nil, strings.NewReader("x"), 1); resp.StatusCode != 200 {
+		t.Fatalf("status %d", resp.StatusCode)
 	}
-	if got, err := os.ReadFile(filepath.Join(dir, "escape.txt")); err != nil || string(got) != "hello" {
-		t.Fatalf("file not stored inside the directory: %q, %v", got, err)
+	if names := dirEntries(dir); len(names) != 1 || names[0] != "escape.txt" {
+		t.Fatalf("directory holds %v", names)
+	}
+}
+
+func TestNewEngineErrors(t *testing.T) {
+	file := filepath.Join(t.TempDir(), "file")
+	if err := os.WriteFile(file, nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := newEngine("127.0.0.1:0", filepath.Join(file, "sub"), 0); err == nil {
+		t.Error("created a directory inside a file")
+	}
+	if _, err := newEngine("not an address", t.TempDir(), 0); err == nil {
+		t.Error("bound a bad address")
+	}
+}
+
+func TestRun(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	var out bytes.Buffer
+	addrs := make(chan string, 1)
+	done := make(chan error, 1)
+	go func() {
+		done <- run(ctx, []string{"-addr", "127.0.0.1:0", "-dir", t.TempDir()}, &out, func(addr string) { addrs <- addr })
+	}()
+	addr := <-addrs
+	if resp, _ := send(t, "POST", "http://"+addr+"/echo", nil, strings.NewReader("hi"), 2); resp.StatusCode != 200 {
+		t.Fatalf("status %d", resp.StatusCode)
+	}
+	cancel()
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out.String(), "upload server listening on http://"+addr) {
+		t.Fatalf("output %q", out.String())
+	}
+
+	// Without a ready callback, and with the errors a bad start gives.
+	ctx2, cancel2 := context.WithCancel(context.Background())
+	cancel2()
+	if err := run(ctx2, []string{"-addr", "127.0.0.1:0", "-dir", t.TempDir()}, io.Discard, nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := run(ctx, []string{"-nope"}, io.Discard, nil); err == nil {
+		t.Error("accepted an unknown flag")
+	}
+	if err := run(ctx, []string{"-addr", "not an address", "-dir", t.TempDir()}, io.Discard, nil); err == nil {
+		t.Error("started on a bad address")
+	}
+}
+
+func TestMainReportsAStartupError(t *testing.T) {
+	var mu sync.Mutex
+	var got error
+	oldFatal, oldArgs := fatal, os.Args
+	defer func() { fatal, os.Args = oldFatal, oldArgs }()
+	fatal = func(err error) { mu.Lock(); got = err; mu.Unlock() }
+	os.Args = []string{"server", "-nope"}
+	main()
+	mu.Lock()
+	defer mu.Unlock()
+	if got == nil {
+		t.Fatal("fatal was not called")
 	}
 }

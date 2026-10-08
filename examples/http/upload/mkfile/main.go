@@ -19,19 +19,37 @@ import (
 	"strings"
 )
 
-func main() {
-	out := flag.String("o", "upload-test.bin", "file to write")
-	size := flag.String("size", "256MiB", "size, e.g. 100MB, 256MiB, 1GiB or a number of bytes")
-	seed := flag.Uint64("seed", 1, "seed of the content")
-	flag.Parse()
+// fatal reports an error and exits; a test replaces it.
+var fatal = func(err error) {
+	fmt.Fprintln(os.Stderr, "error:", err)
+	os.Exit(1)
+}
 
-	n, err := parseSize(*size)
-	if err != nil {
+// create opens the file to write; a test replaces it.
+var create = func(path string) (io.WriteCloser, error) { return os.Create(path) }
+
+func main() {
+	if err := run(os.Args[1:], os.Stdout); err != nil {
 		fatal(err)
 	}
-	file, err := os.Create(*out)
+}
+
+func run(args []string, out io.Writer) error {
+	flags := flag.NewFlagSet("mkfile", flag.ContinueOnError)
+	flags.SetOutput(out)
+	path := flags.String("o", "upload-test.bin", "file to write")
+	size := flags.String("size", "256MiB", "size, e.g. 100MB, 256MiB, 1GiB or a number of bytes")
+	seed := flags.Uint64("seed", 1, "seed of the content")
+	if err := flags.Parse(args); err != nil {
+		return err
+	}
+	n, err := parseSize(*size)
 	if err != nil {
-		fatal(err)
+		return err
+	}
+	file, err := create(*path)
+	if err != nil {
+		return err
 	}
 	defer file.Close()
 
@@ -39,16 +57,19 @@ func main() {
 	for i := 0; i < 8; i++ {
 		key[i] = byte(*seed >> (8 * i))
 	}
-	rng := rand.NewChaCha8(key)
 	sum := sha256.New()
 	w := bufio.NewWriterSize(io.MultiWriter(file, sum), 1<<20)
-	if _, err := io.CopyN(w, rng, n); err != nil {
-		fatal(err)
-	}
+	// ChaCha8 never fails to read, and w writes to a file: a failure of that
+	// file surfaces at Flush or Close.
+	_, _ = io.CopyN(w, rand.NewChaCha8(key), n)
 	if err := w.Flush(); err != nil {
-		fatal(err)
+		return err
 	}
-	fmt.Printf("%s bytes=%d sha256=%x\n", *out, n, sum.Sum(nil))
+	if err := file.Close(); err != nil {
+		return err
+	}
+	_, err = fmt.Fprintf(out, "%s bytes=%d sha256=%x\n", *path, n, sum.Sum(nil))
+	return err
 }
 
 func parseSize(s string) (int64, error) {
@@ -69,9 +90,4 @@ func parseSize(s string) (int64, error) {
 		return 0, fmt.Errorf("bad size %q", s)
 	}
 	return v * mult, nil
-}
-
-func fatal(err error) {
-	fmt.Fprintln(os.Stderr, "error:", err)
-	os.Exit(1)
 }
