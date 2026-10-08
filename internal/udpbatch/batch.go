@@ -1,53 +1,59 @@
 //go:build linux || darwin
 
-package fib
+package udpbatch
 
 import (
 	"sync"
 	"sync/atomic"
 	"syscall"
+
+	"github.com/lesismal/fib/internal/sys"
 )
 
-// udpBatchSize is the most datagrams one batched receive takes.
-const udpBatchSize = 32
+// Size is the most datagrams one batched receive takes.
+const Size = 32
 
-// udpBatch is where the event loop reads a UDP socket's datagrams, as many
-// as udpBatchSize with one system call: recvmmsg on Linux, recvmsg_x on
-// macOS. Each datagram gets a slot of maxDatagramSize, since its size is not
+// Batch is where the event loop reads a UDP socket's datagrams, as many
+// as Size with one system call: recvmmsg on Linux, recvmsg_x on
+// macOS. Each datagram gets a slot of MaxDatagramSize, since its size is not
 // known before it is read, but the kernel writes only what a datagram fills,
 // so what the batch holds of memory is about a page a slot. Event-loop
 // ownership.
-type udpBatch struct {
+type Batch struct {
 	buf   []byte
-	names [udpBatchSize]syscall.RawSockaddrAny
-	iovs  [udpBatchSize]syscall.Iovec
-	hdrs  [udpBatchSize]batchHeader
-	lens  [udpBatchSize]int
+	names [Size]syscall.RawSockaddrAny
+	iovs  [Size]syscall.Iovec
+	hdrs  [Size]batchHeader
+	lens  [Size]int
 	// single is set once the kernel has refused a batched receive, after
 	// which datagrams are read one at a time.
 	single bool
 }
 
-func newUDPBatch() *udpBatch {
-	b := &udpBatch{buf: make([]byte, udpBatchSize*maxDatagramSize)}
+func New() *Batch {
+	b := &Batch{buf: make([]byte, Size*MaxDatagramSize)}
 	for i := range b.iovs {
-		b.iovs[i].Base = &b.buf[i*maxDatagramSize]
-		b.iovs[i].SetLen(maxDatagramSize)
+		b.iovs[i].Base = &b.buf[i*MaxDatagramSize]
+		b.iovs[i].SetLen(MaxDatagramSize)
 	}
 	return b
 }
 
-// datagram is the i-th datagram the last receive read.
-func (b *udpBatch) datagram(i int) []byte {
-	return b.buf[i*maxDatagramSize : i*maxDatagramSize+b.lens[i]]
+// Addr is the address the i-th datagram the last receive read came from, as
+// the kernel wrote it.
+func (b *Batch) Addr(i int) *syscall.RawSockaddrAny { return &b.names[i] }
+
+// Datagram is the i-th datagram the last receive read.
+func (b *Batch) Datagram(i int) []byte {
+	return b.buf[i*MaxDatagramSize : i*MaxDatagramSize+b.lens[i]]
 }
 
-// recv reads up to n datagrams from fd, and reports how many it read and
+// Recv reads up to n datagrams from fd, and reports how many it read and
 // whether that emptied the socket, which a batch that came back short says.
 // one reads a single datagram with an ordinary receive, which costs less
 // than a batch of one does: for a socket the poller says holds no more than
 // a datagram or so.
-func (b *udpBatch) recv(fd, n int, one bool) (int, bool, error) {
+func (b *Batch) Recv(fd, n int, one bool) (int, bool, error) {
 	if !b.single && !one {
 		got, err := b.recvBatch(fd, n)
 		if err == nil {
@@ -58,7 +64,7 @@ func (b *udpBatch) recv(fd, n int, one bool) (int, bool, error) {
 		}
 		b.single = true
 	}
-	got, err := recvfrom(fd, b.buf[:maxDatagramSize], &b.names[0])
+	got, err := sys.Recvfrom(fd, b.buf[:MaxDatagramSize], &b.names[0])
 	if err != nil {
 		return 0, false, err
 	}
@@ -76,13 +82,13 @@ func batchRefused(err error) bool { return err == syscall.ENOSYS || err == sysca
 // on every send; one from the pool is not.
 type sendScratch struct {
 	name syscall.RawSockaddrAny
-	hdrs [udpBatchSize]batchHeader
-	iovs [udpBatchSize]syscall.Iovec
+	hdrs [Size]batchHeader
+	iovs [Size]syscall.Iovec
 	// ctl holds the UDP_SEGMENT control message of each message that sends
 	// a run of datagrams as one, and ends where each message's datagrams
 	// end; see sendBatchSys on Linux.
-	ctl  [udpBatchSize][gsoControlLen]byte
-	ends [udpBatchSize]int
+	ctl  [Size][gsoControlLen]byte
+	ends [Size]int
 }
 
 // gsoControlLen has room for a control message carrying a uint16, which is
@@ -95,12 +101,12 @@ var sendScratches = sync.Pool{New: func() any { return new(sendScratch) }}
 // datagrams are sent one at a time.
 var singleSends atomic.Bool
 
-// sendBatch sends as many of datagrams as one system call takes, up to
-// udpBatchSize, to to, or on a connected socket when to is nil, and reports
+// Send sends as many of datagrams as one system call takes, up to
+// Size, to to, or on a connected socket when to is nil, and reports
 // how many it sent.
-func sendBatch(fd int, to syscall.Sockaddr, datagrams [][]byte) (int, error) {
+func Send(fd int, to syscall.Sockaddr, datagrams [][]byte) (int, error) {
 	if !singleSends.Load() {
-		n, err := sendBatchSys(fd, to, datagrams[:min(len(datagrams), udpBatchSize)])
+		n, err := sendBatchSys(fd, to, datagrams[:min(len(datagrams), Size)])
 		if err == nil || !batchRefused(err) {
 			return n, err
 		}

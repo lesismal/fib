@@ -1,6 +1,6 @@
 //go:build darwin
 
-package fib
+package sys
 
 import (
 	"net/netip"
@@ -12,7 +12,7 @@ import (
 // Darwin has neither accept4 nor SOCK_NONBLOCK, so a new descriptor gets its
 // flags after the call that creates it. ForkLock keeps a concurrent fork from
 // inheriting it in between.
-func acceptSocket(listenFD int) (int, netip.AddrPort, error) {
+func AcceptSocket(listenFD int) (int, netip.AddrPort, error) {
 	syscall.ForkLock.RLock()
 	fd, sa, err := syscall.Accept(listenFD)
 	if err == nil {
@@ -29,10 +29,10 @@ func acceptSocket(listenFD int) (int, netip.AddrPort, error) {
 	// Writing to a socket the peer has reset raises SIGPIPE on Darwin unless
 	// the socket opts out; the error return is all this package needs.
 	_ = syscall.SetsockoptInt(fd, syscall.SOL_SOCKET, syscall.SO_NOSIGPIPE, 1)
-	return fd, sockaddrAddrPort(sa), nil
+	return fd, SockaddrAddrPort(sa), nil
 }
 
-func newSocket(family int) (int, error) {
+func NewSocket(family int) (int, error) {
 	syscall.ForkLock.RLock()
 	fd, err := syscall.Socket(family, syscall.SOCK_STREAM, 0)
 	if err == nil {
@@ -52,7 +52,7 @@ func newSocket(family int) (int, error) {
 	return fd, nil
 }
 
-func newDatagramSocket(family int) (int, error) {
+func NewDatagramSocket(family int) (int, error) {
 	syscall.ForkLock.RLock()
 	fd, err := syscall.Socket(family, syscall.SOCK_DGRAM, 0)
 	if err == nil {
@@ -74,10 +74,10 @@ var (
 	backlogValue int
 )
 
-// defaultBacklog reports the accept queue depth the kernel is willing to
+// DefaultBacklog reports the accept queue depth the kernel is willing to
 // honour, which is what net.Listen asks for. See the Linux version for why the
 // historical SOMAXCONN of 128 is too shallow for a connection burst.
-func defaultBacklog() int {
+func DefaultBacklog() int {
 	backlogOnce.Do(func() {
 		backlogValue = syscall.SOMAXCONN
 		if limit, err := syscall.SysctlUint32("kern.ipc.somaxconn"); err == nil && limit > 0 {
@@ -93,7 +93,7 @@ func defaultBacklog() int {
 //go:linkname writev syscall.writev
 func writev(fd int, iovecs []syscall.Iovec) (cnt uintptr, err error)
 
-func writevRaw(fd int, iov []syscall.Iovec) (int, error) {
+func WritevRaw(fd int, iov []syscall.Iovec) (int, error) {
 	n, err := writev(fd, iov)
 	return int(n), err
 }

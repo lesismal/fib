@@ -1,6 +1,6 @@
 //go:build linux && !386
 
-package fib
+package sys
 
 import (
 	"net/netip"
@@ -8,11 +8,11 @@ import (
 	"unsafe"
 )
 
-// acceptSocket accepts a connection already non-blocking and close-on-exec,
+// AcceptSocket accepts a connection already non-blocking and close-on-exec,
 // and returns the peer's address with it. It calls accept4 directly, with the
 // address read into a buffer on the stack rather than decoded into the
 // Sockaddr syscall.Accept4 would allocate.
-func acceptSocket(listenFD int) (int, netip.AddrPort, error) {
+func AcceptSocket(listenFD int) (int, netip.AddrPort, error) {
 	var raw syscall.RawSockaddrAny
 	size := uint32(syscall.SizeofSockaddrAny)
 	r0, _, errno := syscall.RawSyscall6(

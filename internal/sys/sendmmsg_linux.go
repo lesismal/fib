@@ -1,7 +1,7 @@
 //go:build linux && !amd64 && !386
 
-package fib
+package sys
 
 import "syscall"
 
-const sysSendmmsg = syscall.SYS_SENDMMSG
+const SysSendmmsg = syscall.SYS_SENDMMSG

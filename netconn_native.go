@@ -6,6 +6,8 @@ import (
 	"io"
 	"net"
 	"syscall"
+
+	"github.com/lesismal/fib/internal/sys"
 )
 
 // Read takes what the socket has without waiting for the peer, and reports
@@ -37,7 +39,7 @@ func (c *Connection) Read(b []byte) (int, error) {
 			return 0, io.EOF
 		case err == syscall.EINTR:
 			continue
-		case isWouldBlock(err):
+		case sys.IsWouldBlock(err):
 			return 0, ErrWouldBlock
 		case err == syscall.EBADF:
 			// The connection closed between the check above and the read.

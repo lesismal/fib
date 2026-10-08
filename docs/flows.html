@@ -202,7 +202,7 @@ flowchart LR
     <li>On Linux connections read and write with raw system calls that bypass the scheduler, since a non-blocking socket never waits. With <code>SocketSyscalls</code>, the default, they are <code>recvfrom</code> / <code>sendto</code> / <code>sendmsg</code>, which skip the VFS permission hooks.</li>
     <li>The loop closes a connection in <code>closeConnection</code>: it stops at once and gives back its budget, but OnClose and the descriptor's release are folded into the connection's next round, so OnClose always follows the OnData before it.</li>
   </ul>
-  <p class="ref">engine_unix.go:442 Run · :467 acceptConnections · :511 admit · poller_epoll.go:79 runLoop · engine.go:377 runReady · :602 noteEvent · :742 closeConnection · sockio_linux.go</p>
+  <p class="ref">engine_unix.go:442 Run · :467 acceptConnections · :511 admit · poller_epoll.go:79 runLoop · engine.go:377 runReady · :602 noteEvent · :742 closeConnection · internal/sys/sockio_linux.go</p>
 </section>
 
 <section id="round">

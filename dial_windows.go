@@ -5,6 +5,8 @@ package fib
 import (
 	"net"
 	"syscall"
+
+	"github.com/lesismal/fib/internal/sys"
 )
 
 // dialLoop picks the loop a dial is to run on, which without pollers is
@@ -26,7 +28,7 @@ func (e *Engine) connectSocket(d *dialRequest) (c *Connection, connected bool, e
 	if isUnixNetwork(d.network) {
 		return e.connectUnix(d)
 	}
-	s, err := newSocket(d.family)
+	s, err := sys.NewSocket(d.family)
 	if err != nil {
 		return nil, false, err
 	}
@@ -38,7 +40,7 @@ func (e *Engine) connectSocket(d *dialRequest) (c *Connection, connected bool, e
 	}
 	err = syscall.Bind(s, local)
 	if err == nil {
-		err = setNonblock(s)
+		err = sys.SetNonblock(s)
 	}
 	if err == nil {
 		_, err = syscall.CreateIoCompletionPort(s, e.port, 0, 0)
@@ -72,7 +74,7 @@ func (e *Engine) connectSocket(d *dialRequest) (c *Connection, connected bool, e
 // done on the spot; the receive cannot complete before the dial is reported,
 // since its completion is handled on the event loop that is reporting it.
 func (e *Engine) connectDatagram(d *dialRequest) (c *Connection, connected bool, err error) {
-	s, err := newDatagramSocket(d.family)
+	s, err := sys.NewDatagramSocket(d.family)
 	if err != nil {
 		return nil, false, err
 	}
@@ -106,13 +108,13 @@ func (e *Engine) connectDatagram(d *dialRequest) (c *Connection, connected bool,
 // plain connect, as the net package makes on Windows too; a local connect
 // finishes, or is refused, without waiting on a network.
 func (e *Engine) connectUnix(d *dialRequest) (c *Connection, connected bool, err error) {
-	s, err := newSocket(d.family)
+	s, err := sys.NewSocket(d.family)
 	if err != nil {
 		return nil, false, err
 	}
 	err = syscall.Connect(s, d.sa)
 	if err == nil {
-		err = setNonblock(s)
+		err = sys.SetNonblock(s)
 	}
 	if err == nil {
 		_, err = syscall.CreateIoCompletionPort(s, e.port, 0, 0)

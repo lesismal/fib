@@ -11,6 +11,7 @@ import (
 	"syscall"
 
 	"github.com/lesismal/fib/bufferpool"
+	"github.com/lesismal/fib/internal/sys"
 )
 
 // sendItem is one queued chunk. pooled says data came from the buffer pool,
@@ -495,7 +496,7 @@ func (c *Connection) send(data []byte, mode sendMode) error {
 			if err == syscall.EINTR {
 				continue
 			}
-			if err != nil && !isWouldBlock(err) {
+			if err != nil && !sys.IsWouldBlock(err) {
 				c.mu.Unlock()
 				if mode == sendPooled {
 					bufferpool.Put(data)
@@ -576,7 +577,7 @@ func (c *Connection) SendParts(first, second []byte) error {
 			if err == syscall.EINTR {
 				continue
 			}
-			if err != nil && !isWouldBlock(err) {
+			if err != nil && !sys.IsWouldBlock(err) {
 				c.mu.Unlock()
 				c.closeWithError(err)
 				return err
@@ -930,7 +931,7 @@ func (c *Connection) readLoop() error {
 		if err == syscall.EINTR {
 			continue
 		}
-		if isWouldBlock(err) {
+		if sys.IsWouldBlock(err) {
 			return nil
 		}
 		return err
@@ -953,7 +954,7 @@ func (c *Connection) drainPriorityInput() error {
 		}
 		// EINVAL means no urgent data is waiting, and EOPNOTSUPP a socket
 		// that has none at all, such as a Unix one.
-		if isWouldBlock(err) || err == syscall.EINVAL || err == syscall.EOPNOTSUPP {
+		if sys.IsWouldBlock(err) || err == syscall.EINVAL || err == syscall.EOPNOTSUPP {
 			return nil
 		}
 		return err
@@ -1065,7 +1066,7 @@ func (c *Connection) flushOutput() error {
 			continue
 		}
 		c.flushing = false
-		if isWouldBlock(err) {
+		if sys.IsWouldBlock(err) {
 			c.chargeLocked()
 			armErr := c.awaitWritableLocked()
 			refresh := c.pauseStateChangedLocked()

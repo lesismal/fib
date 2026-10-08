@@ -1,11 +1,13 @@
 //go:build linux
 
-package fib
+package udpbatch
 
 import (
 	"sync/atomic"
 	"syscall"
 	"unsafe"
+
+	"github.com/lesismal/fib/internal/sys"
 )
 
 // batchHeader is the kernel's struct mmsghdr: a message header and the length
@@ -16,7 +18,7 @@ type batchHeader struct {
 }
 
 // recvBatch reads up to n datagrams with recvmmsg.
-func (b *udpBatch) recvBatch(fd, n int) (int, error) {
+func (b *Batch) recvBatch(fd, n int) (int, error) {
 	for i := 0; i < n; i++ {
 		h := &b.hdrs[i].hdr
 		h.Name = (*byte)(unsafe.Pointer(&b.names[i]))
@@ -100,7 +102,7 @@ func sendBatchSys(fd int, to syscall.Sockaddr, datagrams [][]byte) (int, error) 
 		s.ends[msgs] = j
 		i = j
 	}
-	got, _, errno := syscall.Syscall6(sysSendmmsg, uintptr(fd),
+	got, _, errno := syscall.Syscall6(sys.SysSendmmsg, uintptr(fd),
 		uintptr(unsafe.Pointer(&s.hdrs[0])), uintptr(msgs), 0, 0, 0)
 	sent := 0
 	if errno == 0 && got > 0 {

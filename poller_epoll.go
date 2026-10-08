@@ -8,6 +8,7 @@ import (
 	"runtime"
 	"syscall"
 
+	"github.com/lesismal/fib/internal/sys"
 	"github.com/lesismal/fib/taskpool"
 )
 
@@ -34,7 +35,7 @@ func (e *Engine) openBackend() error {
 	if err != nil {
 		return err
 	}
-	wakeFD, err := eventfd()
+	wakeFD, err := sys.EventFD()
 	if err != nil {
 		syscall.Close(epfd)
 		return err

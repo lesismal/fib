@@ -1,6 +1,6 @@
 //go:build linux
 
-package fib
+package sys
 
 import (
 	"os"
@@ -16,13 +16,13 @@ var (
 	backlogValue int
 )
 
-// defaultBacklog reports the accept queue depth the kernel is willing to
+// DefaultBacklog reports the accept queue depth the kernel is willing to
 // honour, which is what net.Listen asks for and therefore what every framework
 // built on it gets. The historical SOMAXCONN of 128 is far below a connection
 // burst: an overflowing accept queue makes the kernel drop the client's ACK
 // rather than refuse it, so the client learns nothing until its SYN-ACK
 // retransmission timer fires a second later.
-func defaultBacklog() int {
+func DefaultBacklog() int {
 	backlogOnce.Do(func() {
 		backlogValue = syscall.SOMAXCONN
 		data, err := os.ReadFile("/proc/sys/net/core/somaxconn")
@@ -42,7 +42,7 @@ func defaultBacklog() int {
 	return backlogValue
 }
 
-func eventfd() (int, error) {
+func EventFD() (int, error) {
 	r0, _, errno := syscall.Syscall(syscall.SYS_EVENTFD2, 0, uintptr(syscall.O_NONBLOCK|syscall.O_CLOEXEC), 0)
 	if errno != 0 {
 		return -1, errno
@@ -50,15 +50,15 @@ func eventfd() (int, error) {
 	return int(r0), nil
 }
 
-func newSocket(family int) (int, error) {
+func NewSocket(family int) (int, error) {
 	return syscall.Socket(family, syscall.SOCK_STREAM|syscall.SOCK_NONBLOCK|syscall.SOCK_CLOEXEC, 0)
 }
 
-func newDatagramSocket(family int) (int, error) {
+func NewDatagramSocket(family int) (int, error) {
 	return syscall.Socket(family, syscall.SOCK_DGRAM|syscall.SOCK_NONBLOCK|syscall.SOCK_CLOEXEC, 0)
 }
 
-func writevRaw(fd int, iov []syscall.Iovec) (int, error) {
+func WritevRaw(fd int, iov []syscall.Iovec) (int, error) {
 	r0, _, errno := syscall.Syscall(syscall.SYS_WRITEV, uintptr(fd), uintptr(unsafe.Pointer(&iov[0])), uintptr(len(iov)))
 	if errno != 0 {
 		return int(r0), errno

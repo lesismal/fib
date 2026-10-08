@@ -1,6 +1,6 @@
 //go:build darwin
 
-package fib
+package udpbatch
 
 import (
 	"syscall"
@@ -27,7 +27,7 @@ type batchHeader struct {
 }
 
 // recvBatch reads up to n datagrams with recvmsg_x.
-func (b *udpBatch) recvBatch(fd, n int) (int, error) {
+func (b *Batch) recvBatch(fd, n int) (int, error) {
 	for i := 0; i < n; i++ {
 		b.hdrs[i] = batchHeader{name: (*byte)(unsafe.Pointer(&b.names[i])),
 			namelen: syscall.SizeofSockaddrAny, iov: &b.iovs[i], iovlen: 1}

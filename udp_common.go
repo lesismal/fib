@@ -3,6 +3,8 @@ package fib
 import (
 	"errors"
 	"time"
+
+	"github.com/lesismal/fib/internal/udpbatch"
 )
 
 // DefaultUDPIdleTimeout is how long a UDP peer may stay silent before its
@@ -16,7 +18,7 @@ var ErrUDPIdleTimeout = errors.New("fib: udp peer idle timeout")
 const (
 	// maxDatagramSize holds the largest UDP payload, so no datagram is ever
 	// truncated on the way in.
-	maxDatagramSize = 64 << 10
+	maxDatagramSize = udpbatch.MaxDatagramSize
 	// maxQueuedDatagrams bounds the datagrams a connection holds for its
 	// handler. Beyond it new ones are dropped, as the kernel drops them when
 	// a socket's receive buffer is full: a peer that sends faster than its

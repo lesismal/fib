@@ -12,6 +12,7 @@ import (
 	"unsafe"
 
 	"github.com/lesismal/fib/bufferpool"
+	"github.com/lesismal/fib/internal/sys"
 )
 
 // UDP rides on the same connections, handlers and workers as TCP. What is
@@ -402,7 +403,7 @@ func (c *Connection) RemoteAddrPort() netip.AddrPort {
 	if err != nil {
 		return netip.AddrPort{}
 	}
-	return sockaddrAddrPort(sa)
+	return sys.SockaddrAddrPort(sa)
 }
 
 // RemoteAddr returns the peer's address: a *net.UDPAddr for a UDP

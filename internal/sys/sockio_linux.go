@@ -1,6 +1,6 @@
 //go:build linux && !386 && !race && !msan && !asan
 
-package fib
+package sys
 
 import (
 	"syscall"
@@ -34,9 +34,9 @@ import (
 // A race, memory or address sanitizer build keeps the syscall package's
 // wrappers instead, which tell the sanitizer what the kernel read and wrote.
 
-// sockRead reads from a non-blocking descriptor. It never reports a negative
+// Read reads from a non-blocking descriptor. It never reports a negative
 // count: an error comes with 0.
-func sockRead(fd int, b []byte, socketCalls bool) (int, error) {
+func Read(fd int, b []byte, socketCalls bool) (int, error) {
 	p := unsafe.Pointer(unsafe.SliceData(b))
 	if socketCalls {
 		if n, err := rawSockIO6(syscall.SYS_RECVFROM, fd, p, len(b)); err != syscall.ENOTSOCK {
@@ -46,8 +46,8 @@ func sockRead(fd int, b []byte, socketCalls bool) (int, error) {
 	return rawSockIO(syscall.SYS_READ, fd, p, len(b))
 }
 
-// sockWrite writes to a non-blocking descriptor, and may write less than b.
-func sockWrite(fd int, b []byte, socketCalls bool) (int, error) {
+// Write writes to a non-blocking descriptor, and may write less than b.
+func Write(fd int, b []byte, socketCalls bool) (int, error) {
 	p := unsafe.Pointer(unsafe.SliceData(b))
 	if socketCalls {
 		if n, err := rawSockIO6(syscall.SYS_SENDTO, fd, p, len(b)); err != syscall.ENOTSOCK {
@@ -57,9 +57,9 @@ func sockWrite(fd int, b []byte, socketCalls bool) (int, error) {
 	return rawSockIO(syscall.SYS_WRITE, fd, p, len(b))
 }
 
-// sockWritev writes iov, which must not be empty, to a non-blocking
+// Writev writes iov, which must not be empty, to a non-blocking
 // descriptor, and may write less than all of it.
-func sockWritev(fd int, iov []syscall.Iovec, socketCalls bool) (int, error) {
+func Writev(fd int, iov []syscall.Iovec, socketCalls bool) (int, error) {
 	if socketCalls {
 		var msg syscall.Msghdr
 		msg.Iov = &iov[0]

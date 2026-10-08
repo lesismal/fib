@@ -8,6 +8,8 @@ import (
 	"syscall"
 	"testing"
 	"time"
+
+	"github.com/lesismal/fib/internal/udpbatch"
 )
 
 // A batch reads what the socket holds in one receive, each datagram with its
@@ -36,23 +38,23 @@ func TestUDPBatchReceive(t *testing.T) {
 				}
 			}
 			time.Sleep(50 * time.Millisecond)
-			b := newUDPBatch()
-			b.single = single
+			b := udpbatch.New()
+			b.SetSingle(single)
 			var got []string
 			var empty bool
 			_ = raw.Read(func(fd uintptr) bool {
 				for len(got) < len(peers) {
-					n, e, err := b.recv(int(fd), udpBatchSize, false)
+					n, e, err := b.Recv(int(fd), udpbatch.Size, false)
 					if err != nil {
 						t.Fatal(err)
 					}
 					empty = e
 					for i := 0; i < n; i++ {
-						key, _, ok := rawSockaddrKey(&b.names[i])
+						key, _, ok := rawSockaddrKey(b.Addr(i))
 						if !ok {
 							t.Fatal("no sender address")
 						}
-						got = append(got, fmt.Sprintf("%s from %v", b.datagram(i), key))
+						got = append(got, fmt.Sprintf("%s from %v", b.Datagram(i), key))
 					}
 				}
 				return true
@@ -65,7 +67,7 @@ func TestUDPBatchReceive(t *testing.T) {
 			if empty == single {
 				t.Fatalf("empty %v after the last datagram, reading one at a time %v", empty, single)
 			}
-			if _, _, err := b.recv(int(fdOf(t, raw)), udpBatchSize, false); err != syscall.EAGAIN {
+			if _, _, err := b.Recv(int(fdOf(t, raw)), udpbatch.Size, false); err != syscall.EAGAIN {
 				t.Fatalf("a receive from the empty socket: %v", err)
 			}
 		})
@@ -128,9 +130,8 @@ func TestUDPBurstFromManyPeers(t *testing.T) {
 func TestUDPSendBatch(t *testing.T) {
 	for _, single := range []bool{false, true} {
 		t.Run(fmt.Sprintf("single=%v", single), func(t *testing.T) {
-			singleSends.Store(single)
-			defer singleSends.Store(false)
-			batch := make([][]byte, udpBatchSize+5)
+			defer udpbatch.SetSingleSends(udpbatch.SetSingleSends(single))
+			batch := make([][]byte, udpbatch.Size+5)
 			for i := range batch {
 				batch[i] = []byte(fmt.Sprintf("datagram %d", i))
 			}
@@ -198,30 +199,5 @@ func TestUDPSendBatch(t *testing.T) {
 				}
 			}
 		})
-	}
-}
-
-// A batched send describes its datagrams to the kernel without allocating.
-func TestUDPSendBatchAllocs(t *testing.T) {
-	sink, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer sink.Close()
-	fd, err := syscall.Socket(syscall.AF_INET, syscall.SOCK_DGRAM, 0)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer syscall.Close(fd)
-	to := &syscall.SockaddrInet4{Port: sink.LocalAddr().(*net.UDPAddr).Port, Addr: [4]byte{127, 0, 0, 1}}
-	batch := [][]byte{[]byte("one"), []byte("two"), []byte("three")}
-	if _, err := sendBatch(fd, to, batch); err != nil {
-		t.Fatal(err)
-	}
-	if singleSends.Load() {
-		t.Skip("the kernel sends one datagram at a time")
-	}
-	if allocs := testing.AllocsPerRun(100, func() { _, _ = sendBatchSys(fd, to, batch) }); allocs != 0 {
-		t.Fatalf("a batched send allocated %v times", allocs)
 	}
 }

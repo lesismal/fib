@@ -8,6 +8,8 @@ import (
 	"net"
 	"testing"
 	"time"
+
+	"github.com/lesismal/fib/internal/udpbatch"
 )
 
 // SendBatch sends runs of datagrams of one size as one segmented message,
@@ -31,9 +33,7 @@ func TestUDPSendBatchSegments(t *testing.T) {
 	}
 	for _, off := range []bool{false, true} {
 		t.Run(fmt.Sprintf("gsoOff=%v", off), func(t *testing.T) {
-			was := gsoOff.Load()
-			gsoOff.Store(off)
-			defer gsoOff.Store(was)
+			defer udpbatch.SetGSOOff(udpbatch.SetGSOOff(off))
 			sink, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
 			if err != nil {
 				t.Fatal(err)
@@ -58,7 +58,7 @@ func TestUDPSendBatchSegments(t *testing.T) {
 			if err := client.SendBatch(batch); err != nil {
 				t.Fatal(err)
 			}
-			if !off && gsoOff.Load() {
+			if !off && udpbatch.GSOOff() {
 				t.Fatal("the kernel refused UDP_SEGMENT, and the batch went a message each")
 			}
 			buf := make([]byte, 65536)

@@ -5,6 +5,7 @@ package fib
 import (
 	"time"
 
+	"github.com/lesismal/fib/internal/sys"
 	"github.com/lesismal/fib/taskpool"
 )
 
@@ -202,7 +203,7 @@ type Config struct {
 
 func DefaultConfig() Config {
 	sizing := DefaultPoolSizing(taskpool.ModeAdaptive)
-	return Config{Name: DefaultName, Network: "tcp", Addr: ":9000", Backlog: defaultBacklog(), WorkerCount: sizing.WorkerCount,
+	return Config{Name: DefaultName, Network: "tcp", Addr: ":9000", Backlog: sys.DefaultBacklog(), WorkerCount: sizing.WorkerCount,
 		MaxEvents: sizing.MaxEvents, ReadBufferSize: 16 * 1024,
 		WriteBufferHighWatermark: defaultWriteHighWatermark, MaxPendingBytes: defaultMaxPendingBytes,
 		UseWritev: true, SocketSyscalls: true, TaskPoolMode: taskpool.ModeAdaptive, SharedTaskPool: true,

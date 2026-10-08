@@ -5,6 +5,8 @@ package fib
 import (
 	"net"
 	"syscall"
+
+	"github.com/lesismal/fib/internal/sys"
 )
 
 // dialLoop picks the loop a dial is to run on. With pollers, that is the one
@@ -33,9 +35,9 @@ func (d *dialRequest) openSocket() (int, error) {
 		return d.socket, nil
 	}
 	if isUDPNetwork(d.network) {
-		return newDatagramSocket(d.family)
+		return sys.NewDatagramSocket(d.family)
 	}
-	return newSocket(d.family)
+	return sys.NewSocket(d.family)
 }
 
 // closeDialSocket closes a socket opened for a dial that never connected it.

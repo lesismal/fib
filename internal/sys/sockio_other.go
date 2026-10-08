@@ -1,6 +1,6 @@
 //go:build darwin || (linux && (386 || race || msan || asan))
 
-package fib
+package sys
 
 import "syscall"
 
@@ -10,17 +10,17 @@ import "syscall"
 // VFS calls whatever Config.SocketSyscalls says. sockio_linux.go says why
 // Linux otherwise makes them raw.
 
-func sockRead(fd int, b []byte, _ bool) (int, error) {
+func Read(fd int, b []byte, _ bool) (int, error) {
 	n, err := syscall.Read(fd, b)
 	return max(n, 0), err
 }
 
-func sockWrite(fd int, b []byte, _ bool) (int, error) {
+func Write(fd int, b []byte, _ bool) (int, error) {
 	n, err := syscall.Write(fd, b)
 	return max(n, 0), err
 }
 
-func sockWritev(fd int, iov []syscall.Iovec, _ bool) (int, error) {
-	n, err := writevRaw(fd, iov)
+func Writev(fd int, iov []syscall.Iovec, _ bool) (int, error) {
+	n, err := WritevRaw(fd, iov)
 	return max(n, 0), err
 }

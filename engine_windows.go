@@ -10,6 +10,7 @@ import (
 	"time"
 	"unsafe"
 
+	"github.com/lesismal/fib/internal/sys"
 	"github.com/lesismal/fib/taskpool"
 )
 
@@ -179,7 +180,7 @@ func (c *Connection) sysSendDatagrams(datagrams [][]byte) error {
 // sysSendDatagram sends one datagram without waiting. Callers hold c.mu.
 func (c *Connection) sysSendDatagram(data []byte) error {
 	var bufs [1]syscall.WSABuf
-	wsaBufs(bufs[:], data)
+	sys.WSABufs(bufs[:], data)
 	var n uint32
 	if l := c.udp.listener; l != nil {
 		return syscall.WSASendto(l.fd, &bufs[0], 1, &n, 0, c.udp.sa, nil, nil)
@@ -268,7 +269,7 @@ func createUDPListener(config Config, addr string) (*udpListener, error) {
 	if err != nil {
 		return nil, err
 	}
-	fd, err := newDatagramSocket(family)
+	fd, err := sys.NewDatagramSocket(family)
 	if err != nil {
 		return nil, err
 	}
@@ -300,14 +301,14 @@ func (e *Engine) postRecvFrom(l *udpListener) error {
 		l.flags = 0
 		l.fromLen = int32(unsafe.Sizeof(l.from))
 		var bufs [1]syscall.WSABuf
-		wsaBufs(bufs[:], l.buf)
+		sys.WSABufs(bufs[:], l.buf)
 		var n uint32
 		err = syscall.WSARecvFrom(l.fd, &bufs[0], 1, &n, &l.flags, &l.from, &l.fromLen, &l.op.ov, nil)
 		if err == nil || err == syscall.ERROR_IO_PENDING {
 			e.udpRecvs++
 			return nil
 		}
-		if err != wsaEMSGSIZE && err != wsaECONNRESET {
+		if err != sys.WSAEMSGSIZE && err != sys.WSAECONNRESET {
 			break
 		}
 	}
@@ -346,7 +347,7 @@ func (e *Engine) completeDatagramRead(c *Connection, n int, err error) *Connecti
 		e.forget(c)
 		return nil
 	}
-	if err != nil && err != wsaEMSGSIZE {
+	if err != nil && err != sys.WSAEMSGSIZE {
 		// A refusal from the peer's host, for one, arrives here.
 		c.closeWithError(err)
 		return nil
@@ -375,7 +376,7 @@ func (c *Connection) armDatagramReadLocked() error {
 	c.readArmed = true
 	c.outstanding.Add(1)
 	var bufs [1]syscall.WSABuf
-	wsaBufs(bufs[:], c.udp.buf)
+	sys.WSABufs(bufs[:], c.udp.buf)
 	var n uint32
 	err := syscall.WSARecv(c.socket(), &bufs[0], 1, &n, &c.recvFlags, &c.readOp.ov, nil)
 	if err != nil && err != syscall.ERROR_IO_PENDING {
@@ -407,7 +408,7 @@ func createListener(config Config, addr string) (*winListener, error) {
 	if err != nil {
 		return nil, err
 	}
-	fd, err := newSocket(family)
+	fd, err := sys.NewSocket(family)
 	if err != nil {
 		return nil, err
 	}
@@ -423,7 +424,7 @@ func createListener(config Config, addr string) (*winListener, error) {
 		_ = syscall.SetsockoptInt(fd, syscall.IPPROTO_IPV6, syscall.IPV6_V6ONLY, v6only)
 	}
 	if err = syscall.Bind(fd, bound); err == nil {
-		err = syscall.Listen(fd, listenBacklog(config.Backlog))
+		err = syscall.Listen(fd, sys.ListenBacklog(config.Backlog))
 	}
 	if err != nil {
 		syscall.Closesocket(fd)
@@ -434,7 +435,7 @@ func createListener(config Config, addr string) (*winListener, error) {
 
 // postAccept starts one AcceptEx on a fresh socket.
 func (e *Engine) postAccept(op *acceptOp) error {
-	s, err := newSocket(op.listener.family)
+	s, err := sys.NewSocket(op.listener.family)
 	if err != nil {
 		return err
 	}
@@ -498,11 +499,11 @@ func (e *Engine) Run() error {
 	if batch > maxWaitBatch {
 		batch = maxWaitBatch
 	}
-	entries := make([]overlappedEntry, batch)
+	entries := make([]sys.OverlappedEntry, batch)
 	var ready []*Connection
 	var tasks []taskpool.Task
 	for !e.stopping.Load() {
-		n, err := getQueuedCompletionStatusEx(e.port, entries, syscall.INFINITE)
+		n, err := sys.GetQueuedCompletionStatusEx(e.port, entries, syscall.INFINITE)
 		if err != nil {
 			if err == syscall.Errno(syscall.WAIT_TIMEOUT) {
 				continue
@@ -511,7 +512,7 @@ func (e *Engine) Run() error {
 		}
 		woken := false
 		for i := 0; i < n; i++ {
-			if entries[i].overlapped == nil {
+			if entries[i].Overlapped == nil {
 				// Only the wake-up is posted without an OVERLAPPED.
 				woken = true
 				continue
@@ -519,7 +520,7 @@ func (e *Engine) Run() error {
 			if c := e.complete(&entries[i]); c != nil {
 				ready = append(ready, c)
 			}
-			entries[i] = overlappedEntry{}
+			entries[i] = sys.OverlappedEntry{}
 		}
 		if woken {
 			e.drainWake()
@@ -531,11 +532,11 @@ func (e *Engine) Run() error {
 }
 
 // complete routes one completion and reports a connection it made runnable.
-func (e *Engine) complete(entry *overlappedEntry) *Connection {
-	op := (*ioOp)(unsafe.Pointer(entry.overlapped))
+func (e *Engine) complete(entry *sys.OverlappedEntry) *Connection {
+	op := (*ioOp)(unsafe.Pointer(entry.Overlapped))
 	var err error
-	if entry.status != 0 {
-		err = ntStatusError(entry.status)
+	if entry.Status != 0 {
+		err = sys.NtStatusError(entry.Status)
 	}
 	switch op.kind {
 	case opAccept:
@@ -547,11 +548,11 @@ func (e *Engine) complete(entry *overlappedEntry) *Connection {
 	case opRead:
 		return e.completeRead(op.conn, err)
 	case opRecvFrom:
-		return e.completeRecvFrom(op.listener, int(entry.qty), err)
+		return e.completeRecvFrom(op.listener, int(entry.Qty), err)
 	case opRecvDatagram:
-		return e.completeDatagramRead(op.conn, int(entry.qty), err)
+		return e.completeDatagramRead(op.conn, int(entry.Qty), err)
 	default:
-		return e.completeWrite(op.conn, int(entry.qty), err)
+		return e.completeWrite(op.conn, int(entry.Qty), err)
 	}
 }
 
@@ -589,7 +590,7 @@ func (e *Engine) adopt(l *winListener, s syscall.Handle) error {
 	err := syscall.Setsockopt(s, syscall.SOL_SOCKET, syscall.SO_UPDATE_ACCEPT_CONTEXT,
 		(*byte)(unsafe.Pointer(&lfd)), int32(unsafe.Sizeof(lfd)))
 	if err == nil {
-		err = setNonblock(s)
+		err = sys.SetNonblock(s)
 	}
 	if err == nil {
 		_, err = syscall.CreateIoCompletionPort(s, e.port, 0, 0)
@@ -798,18 +799,18 @@ func (e *Engine) Close() error {
 // cancelled. Until each has arrived the kernel may still write into its
 // OVERLAPPED, so the memory holding it cannot be let go before then.
 func (e *Engine) drainPort() {
-	entries := make([]overlappedEntry, 64)
+	entries := make([]sys.OverlappedEntry, 64)
 	deadline := time.Now().Add(closeDrainTimeout)
 	for (len(e.conns) > 0 || e.accepts > 0 || e.udpRecvs > 0) && time.Now().Before(deadline) {
-		n, err := getQueuedCompletionStatusEx(e.port, entries, 100)
+		n, err := sys.GetQueuedCompletionStatusEx(e.port, entries, 100)
 		if err != nil {
 			continue
 		}
 		for i := 0; i < n; i++ {
-			if entries[i].overlapped != nil {
+			if entries[i].Overlapped != nil {
 				e.complete(&entries[i])
 			}
-			entries[i] = overlappedEntry{}
+			entries[i] = sys.OverlappedEntry{}
 		}
 	}
 }
@@ -870,8 +871,8 @@ func (c *Connection) awaitWritableLocked() error {
 		if len(data) == 0 {
 			continue
 		}
-		if len(data) > maxWSABufLen {
-			data = data[:maxWSABufLen]
+		if len(data) > sys.MaxWSABufLen {
+			data = data[:sys.MaxWSABufLen]
 		}
 		bufs[count] = syscall.WSABuf{Len: uint32(len(data)), Buf: &data[0]}
 		c.inFlight[count] = data
@@ -905,7 +906,7 @@ func (c *Connection) sysRead(buf []byte) (int, error) {
 		return 0, nil
 	}
 	var bufs [1]syscall.WSABuf
-	wsaBufs(bufs[:], buf)
+	sys.WSABufs(bufs[:], buf)
 	var n, flags uint32
 	if err := syscall.WSARecv(c.socket(), &bufs[0], 1, &n, &flags, nil, nil); err != nil {
 		return 0, err
@@ -915,11 +916,11 @@ func (c *Connection) sysRead(buf []byte) (int, error) {
 
 func (c *Connection) sysRecvOOB(buf []byte) (int, error) {
 	var bufs [1]syscall.WSABuf
-	wsaBufs(bufs[:], buf)
+	sys.WSABufs(bufs[:], buf)
 	var n uint32
-	flags := uint32(msgOOB)
+	flags := uint32(sys.MsgOOB)
 	if err := syscall.WSARecv(c.socket(), &bufs[0], 1, &n, &flags, nil, nil); err != nil {
-		if err == wsaEINVAL {
+		if err == sys.WSAEINVAL {
 			err = syscall.EINVAL
 		}
 		return 0, err
@@ -929,17 +930,17 @@ func (c *Connection) sysRecvOOB(buf []byte) (int, error) {
 
 func (c *Connection) sysWrite(buf []byte) (int, error) {
 	var bufs [1]syscall.WSABuf
-	return c.wsaSend(bufs[:wsaBufs(bufs[:], buf)])
+	return c.wsaSend(bufs[:sys.WSABufs(bufs[:], buf)])
 }
 
 func (c *Connection) sysWrite2(first, second []byte) (int, error) {
 	var bufs [2]syscall.WSABuf
-	return c.wsaSend(bufs[:wsaBufs(bufs[:], first, second)])
+	return c.wsaSend(bufs[:sys.WSABufs(bufs[:], first, second)])
 }
 
 func (c *Connection) sysWritev(buffers [][]byte) (int, error) {
 	var bufs [maxWritevItems]syscall.WSABuf
-	return c.wsaSend(bufs[:wsaBufs(bufs[:], buffers...)])
+	return c.wsaSend(bufs[:sys.WSABufs(bufs[:], buffers...)])
 }
 
 func (c *Connection) wsaSend(bufs []syscall.WSABuf) (int, error) {
@@ -960,7 +961,7 @@ func (c *Connection) socketError() error {
 	if failure != nil {
 		return failure
 	}
-	errno, err := syscall.GetsockoptInt(c.socket(), syscall.SOL_SOCKET, soError)
+	errno, err := syscall.GetsockoptInt(c.socket(), syscall.SOL_SOCKET, sys.SoError)
 	if err != nil {
 		return err
 	}

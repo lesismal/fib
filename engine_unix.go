@@ -8,6 +8,9 @@ import (
 	"sync/atomic"
 	"syscall"
 	"time"
+
+	"github.com/lesismal/fib/internal/sys"
+	"github.com/lesismal/fib/internal/udpbatch"
 )
 
 // pollersSupported says Config.IOPollers applies: the readiness backends
@@ -43,7 +46,7 @@ const (
 type enginePlatform struct {
 	backend
 	// udpBatch is what the loop reads UDP datagrams into.
-	udpBatch  *udpBatch
+	udpBatch  *udpbatch.Batch
 	listenFDs []int
 	// pollersListen says the engine's pollers accept its connections, or
 	// read its datagrams, on sockets of their own, and its TCP listeners only
@@ -114,7 +117,7 @@ func (c *Connection) sysSendDatagrams(datagrams [][]byte) error {
 		fd, to = l.fd, c.udp.sa
 	}
 	for len(datagrams) > 0 {
-		n, err := sendBatch(fd, to, datagrams)
+		n, err := udpbatch.Send(fd, to, datagrams)
 		if err == syscall.EINTR {
 			continue
 		}
@@ -269,7 +272,7 @@ func (e *Engine) readUDPListener(l *udpListener, avail int, ready []*Connection)
 	last := 0
 	for read := 0; read < maxDatagramsPerRound; {
 		want, one := nextRead(read, avail, last)
-		n, empty, err := b.recv(l.fd, want, one)
+		n, empty, err := b.Recv(l.fd, want, one)
 		if err == syscall.EINTR {
 			continue
 		}
@@ -278,16 +281,16 @@ func (e *Engine) readUDPListener(l *udpListener, avail int, ready []*Connection)
 		}
 		now := time.Now().UnixNano()
 		for i := 0; i < n; i++ {
-			data := b.datagram(i)
+			data := b.Datagram(i)
 			avail -= len(data)
-			if c := e.udpPeer(l, &b.names[i]); c != nil {
+			if c := e.udpPeer(l, b.Addr(i)); c != nil {
 				if r := e.deliverDatagram(c, data, now); r != nil {
 					ready = append(ready, r)
 				}
 			}
 		}
 		read += n
-		last = len(b.datagram(n - 1))
+		last = len(b.Datagram(n - 1))
 		if empty || counted && avail <= 0 {
 			return ready
 		}
@@ -306,7 +309,7 @@ const minCountedBatch = 4
 // as still waiting, or -1 where it does not count, and last the size of the
 // last one read, from which left gives how many there are.
 func nextRead(read, left, last int) (int, bool) {
-	want := min(udpBatchSize, maxDatagramsPerRound-read)
+	want := min(udpbatch.Size, maxDatagramsPerRound-read)
 	switch {
 	case left < 0:
 		return want, false
@@ -329,26 +332,26 @@ func (e *Engine) readUDPConnection(c *Connection, avail int, ready []*Connection
 	last := 0
 	for read := 0; read < maxDatagramsPerRound; {
 		want, one := nextRead(read, avail, last)
-		n, empty, err := b.recv(c.FD(), want, one)
+		n, empty, err := b.Recv(c.FD(), want, one)
 		if err == syscall.EINTR {
 			continue
 		}
 		if err != nil {
-			if !isWouldBlock(err) {
+			if !sys.IsWouldBlock(err) {
 				c.closeWithError(err)
 			}
 			return ready
 		}
 		now := time.Now().UnixNano()
 		for i := 0; i < n; i++ {
-			data := b.datagram(i)
+			data := b.Datagram(i)
 			avail -= len(data)
 			if r := e.deliverDatagram(c, data, now); r != nil {
 				ready = append(ready, r)
 			}
 		}
 		read += n
-		last = len(b.datagram(n - 1))
+		last = len(b.Datagram(n - 1))
 		if empty || counted && avail <= 0 {
 			return ready
 		}
@@ -357,9 +360,9 @@ func (e *Engine) readUDPConnection(c *Connection, avail int, ready []*Connection
 }
 
 // datagramBatch returns the loop's batch to read datagrams into.
-func (e *Engine) datagramBatch() *udpBatch {
+func (e *Engine) datagramBatch() *udpbatch.Batch {
 	if e.udpBatch == nil {
-		e.udpBatch = newUDPBatch()
+		e.udpBatch = udpbatch.New()
 	}
 	return e.udpBatch
 }
@@ -486,14 +489,14 @@ func (e *Engine) Run() error {
 
 func (e *Engine) acceptConnections(listenFD int) {
 	for {
-		fd, peer, err := acceptSocket(listenFD)
+		fd, peer, err := sys.AcceptSocket(listenFD)
 		if err == syscall.EINTR {
 			continue
 		}
 		if err != nil {
 			return
 		}
-		if e.tcpListeners && !acceptedInheritNoDelay {
+		if e.tcpListeners && !sys.AcceptedInheritNoDelay {
 			// Replies are written whole, so Nagle would only hold a small
 			// one back until the peer's delayed ACK.
 			_ = syscall.SetsockoptInt(fd, syscall.IPPROTO_TCP, syscall.TCP_NODELAY, 1)
@@ -633,7 +636,7 @@ func (e *Engine) Close() error {
 // SO_REUSEPORT spreads connections; see Config.ReusePort. UDP needs
 // ReusePort, since a peer's datagrams move between sockets as sockets join.
 func pollersListen(config Config) bool {
-	return (config.ReusePort || !isUDPNetwork(config.Network)) && reusePortSpreads &&
+	return (config.ReusePort || !isUDPNetwork(config.Network)) && sys.ReusePortSpreads &&
 		pollerCount(config) > 0 && !isUnixNetwork(config.Network)
 }
 
@@ -671,7 +674,7 @@ func createListener(config Config, addr string, listen, spread bool) (int, error
 // an engine without it does not, so a second server on the address fails as
 // it would have.
 func claimAddress(config Config, family int, bound syscall.Sockaddr) (syscall.Sockaddr, error) {
-	fd, err := newSocket(family)
+	fd, err := sys.NewSocket(family)
 	if err != nil {
 		return nil, err
 	}
@@ -719,19 +722,19 @@ func createListenerLike(config Config, like int) (int, error) {
 }
 
 func listenSocket(config Config, family int, bound syscall.Sockaddr, listen, reusePort bool) (int, error) {
-	fd, err := newSocket(family)
+	fd, err := sys.NewSocket(family)
 	if err != nil {
 		return -1, err
 	}
 	if family != syscall.AF_UNIX {
 		_ = syscall.SetsockoptInt(fd, syscall.SOL_SOCKET, syscall.SO_REUSEADDR, 1)
-		if acceptedInheritNoDelay {
+		if sys.AcceptedInheritNoDelay {
 			// Set once here rather than on every connection accepted, which
 			// takes it over from the listener.
 			_ = syscall.SetsockoptInt(fd, syscall.IPPROTO_TCP, syscall.TCP_NODELAY, 1)
 		}
 		if reusePort {
-			if err = syscall.SetsockoptInt(fd, syscall.SOL_SOCKET, soReusePort, 1); err != nil {
+			if err = syscall.SetsockoptInt(fd, syscall.SOL_SOCKET, sys.SoReusePort, 1); err != nil {
 				syscall.Close(fd)
 				return -1, err
 			}
@@ -779,13 +782,13 @@ func createUDPListenerLike(config Config, like int) (int, error) {
 }
 
 func bindUDPSocket(config Config, family int, bound syscall.Sockaddr) (int, error) {
-	fd, err := newDatagramSocket(family)
+	fd, err := sys.NewDatagramSocket(family)
 	if err != nil {
 		return -1, err
 	}
 	_ = syscall.SetsockoptInt(fd, syscall.SOL_SOCKET, syscall.SO_REUSEADDR, 1)
 	if config.ReusePort {
-		if err = syscall.SetsockoptInt(fd, syscall.SOL_SOCKET, soReusePort, 1); err != nil {
+		if err = syscall.SetsockoptInt(fd, syscall.SOL_SOCKET, sys.SoReusePort, 1); err != nil {
 			syscall.Close(fd)
 			return -1, err
 		}
@@ -810,14 +813,12 @@ func (c *Connection) writeBusyLocked() bool      { return false }
 func (c *Connection) awaitWritableLocked() error { return nil }
 func (c *Connection) rearmRead()                 {}
 
-func isWouldBlock(err error) bool { return err == syscall.EAGAIN || err == syscall.EWOULDBLOCK }
-
 func (c *Connection) sysRead(buf []byte) (int, error) {
-	return sockRead(c.FD(), buf, c.engine.socketSyscalls)
+	return sys.Read(c.FD(), buf, c.engine.socketSyscalls)
 }
 
 func (c *Connection) sysWrite(buf []byte) (int, error) {
-	return sockWrite(c.FD(), buf, c.engine.socketSyscalls)
+	return sys.Write(c.FD(), buf, c.engine.socketSyscalls)
 }
 
 func (c *Connection) sysRecvOOB(buf []byte) (int, error) {
@@ -827,17 +828,17 @@ func (c *Connection) sysRecvOOB(buf []byte) (int, error) {
 
 func (c *Connection) sysWrite2(first, second []byte) (int, error) {
 	if len(first) == 0 {
-		return sockWrite(c.FD(), second, c.engine.socketSyscalls)
+		return sys.Write(c.FD(), second, c.engine.socketSyscalls)
 	}
 	if len(second) == 0 {
-		return sockWrite(c.FD(), first, c.engine.socketSyscalls)
+		return sys.Write(c.FD(), first, c.engine.socketSyscalls)
 	}
 	var iov [2]syscall.Iovec
 	iov[0].Base = &first[0]
 	iov[0].SetLen(len(first))
 	iov[1].Base = &second[0]
 	iov[1].SetLen(len(second))
-	return sockWritev(c.FD(), iov[:], c.engine.socketSyscalls)
+	return sys.Writev(c.FD(), iov[:], c.engine.socketSyscalls)
 }
 
 func (c *Connection) sysWritev(buffers [][]byte) (int, error) {
@@ -856,7 +857,7 @@ func (c *Connection) sysWritev(buffers [][]byte) (int, error) {
 	if count == 0 {
 		return 0, nil
 	}
-	return sockWritev(c.FD(), iov[:count], c.engine.socketSyscalls)
+	return sys.Writev(c.FD(), iov[:count], c.engine.socketSyscalls)
 }
 
 func (c *Connection) socketError() error {

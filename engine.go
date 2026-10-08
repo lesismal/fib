@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/lesismal/fib/bufferpool"
+	"github.com/lesismal/fib/internal/sys"
 	"github.com/lesismal/fib/streampool"
 	"github.com/lesismal/fib/taskpool"
 )
@@ -225,7 +226,7 @@ func newEngine(config Config, handler Handler, addrs []string) (*Engine, error) 
 		config.WriteBufferHighWatermark = 4 * 1024
 	}
 	if config.Backlog <= 0 {
-		config.Backlog = defaultBacklog()
+		config.Backlog = sys.DefaultBacklog()
 	}
 	if handler == nil {
 		handler = HandlerFuncs{}
