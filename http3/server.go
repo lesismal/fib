@@ -238,6 +238,16 @@ func (h *ServerHandler) OnData(c *fib.Connection, data []byte) {
 		return
 	}
 	if !quic.IsInitial(data) {
+		if quic.ShortHeaderDCID(data) == nil {
+			// A Handshake or 0-RTT packet, which route does not look up: a
+			// client whose address changed before its handshake packets
+			// stopped still sends some from the new address. They cannot
+			// move the connection, but the 1-RTT packets behind them can,
+			// so the datagram is dropped and the path kept. Closed, it would
+			// still take the next of them while it closed, and the
+			// connection that moved onto it would end with it.
+			return
+		}
 		// A packet for a connection this server no longer has, perhaps from
 		// before a restart: tell the client, so that it need not time out.
 		if reset := h.resetKey.StatelessReset(data); reset != nil {
