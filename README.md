@@ -1,6 +1,6 @@
 # fib — Fast In Balance
 
-[![CI](https://github.com/lesismal/fib/actions/workflows/ci.yml/badge.svg)](https://github.com/lesismal/fib/actions/workflows/ci.yml)
+[![CI](https://github.com/lesismal/fib/actions/workflows/ci.yml/badge.svg)](https://github.com/lesismal/fib/actions/workflows/ci.yml) [![Coverage](https://img.shields.io/endpoint?url=https%3A%2F%2Fraw.githubusercontent.com%2Flesismal%2Ffib%2Fbadges%2Fcoverage.json)](https://github.com/lesismal/fib/actions/workflows/ci.yml)
 
 [English](README.md) | [简体中文](README.zh-CN.md)
 
@@ -91,7 +91,7 @@ import (
 )
 
 func main() {
-	app := fibhttp.HandlerFunc(func(c *fibhttp.Context, r *stdhttp.Request) {
+	app := fibhttp.HandlerFunc(func(c *fibhttp.Context) {
 		_ = c.Respond(stdhttp.StatusOK, "text/plain; charset=utf-8", []byte("hello\n"))
 	})
 
@@ -124,12 +124,12 @@ with the Context as its writer:
 ```go
 mux := stdhttp.NewServeMux()
 mux.HandleFunc("GET /hello/{name}", func(w stdhttp.ResponseWriter, r *stdhttp.Request) {
-	fmt.Fprintf(w, "hello %s over %s\n", r.PathValue("name"), r.Proto)
+	fmt.Fprintf(w, "hello %s over %s\n", c.Request.PathValue("name"), c.Request.Proto)
 })
 mux.Handle("/files/", stdhttp.StripPrefix("/files/", stdhttp.FileServer(stdhttp.Dir("."))))
 
-std := fibhttp.HandlerFunc(func(c *fibhttp.Context, r *stdhttp.Request) {
-	mux.ServeHTTP(c, r) // c is the http.ResponseWriter
+std := fibhttp.HandlerFunc(func(c *fibhttp.Context) {
+	mux.ServeHTTP(c, c.Request) // c is the http.ResponseWriter
 })
 engine, err := fib.Bind(config, fibhttp.NewHandler(std))
 ```
@@ -144,7 +144,7 @@ over HTTP/1.x, HTTP/2 and HTTP/3. Here is what carries over and what behaves dif
 - **Hijacking**: `http.Hijacker` is not implemented, so libraries that hijack the connection, such
   as gorilla/websocket, do not work. Switch protocols with `Context.Upgrade` or
   `websocket.ServerHandler.Upgrade` instead.
-- **Cancellation**: `r.Context()` is not cancelled when the client goes away. Use `c.OnCancel` or
+- **Cancellation**: `c.Request.Context()` is not cancelled when the client goes away. Use `c.OnCancel` or
   `c.Err()`.
 
 ### Router
@@ -157,7 +157,7 @@ r.Use(recover.New(), logger.New()) // sees every request, 404s included
 r.Get("/", index)
 r.Route("/users", func(r *fibhttp.Router) {
 	r.Use(auth) // only under /users
-	r.Get("/{id:[0-9]+}", func(c *fibhttp.Context, req *stdhttp.Request) {
+	r.Get("/{id:[0-9]+}", func(c *fibhttp.Context) {
 		_ = c.Respond(stdhttp.StatusOK, "text/plain", []byte("user "+c.Param("id")))
 	})
 	r.Get("/{id}/files/*", file) // c.Param("*") is the rest of the path
@@ -183,8 +183,8 @@ ws := websocket.NewHandler(websocket.HandlerFuncs{
 		_ = c.WriteMessage(op, data)
 	},
 })
-app := fibhttp.HandlerFunc(func(c *fibhttp.Context, r *stdhttp.Request) {
-	if r.URL.Path == "/ws" {
+app := fibhttp.HandlerFunc(func(c *fibhttp.Context) {
+	if c.Request.URL.Path == "/ws" {
 		_, _ = ws.Upgrade(c, nil) // HTTP/1.1, HTTP/2 or HTTP/3, whichever the request came on
 		return
 	}

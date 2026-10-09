@@ -1,6 +1,6 @@
 # fib — Fast In Balance
 
-[![CI](https://github.com/lesismal/fib/actions/workflows/ci.yml/badge.svg)](https://github.com/lesismal/fib/actions/workflows/ci.yml)
+[![CI](https://github.com/lesismal/fib/actions/workflows/ci.yml/badge.svg)](https://github.com/lesismal/fib/actions/workflows/ci.yml) [![Coverage](https://img.shields.io/endpoint?url=https%3A%2F%2Fraw.githubusercontent.com%2Flesismal%2Ffib%2Fbadges%2Fcoverage.json)](https://github.com/lesismal/fib/actions/workflows/ci.yml)
 
 [English](README.md) | [简体中文](README.zh-CN.md)
 
@@ -89,7 +89,7 @@ import (
 )
 
 func main() {
-	app := fibhttp.HandlerFunc(func(c *fibhttp.Context, r *stdhttp.Request) {
+	app := fibhttp.HandlerFunc(func(c *fibhttp.Context) {
 		_ = c.Respond(stdhttp.StatusOK, "text/plain; charset=utf-8", []byte("hello\n"))
 	})
 
@@ -122,12 +122,12 @@ handler 即可：
 ```go
 mux := stdhttp.NewServeMux()
 mux.HandleFunc("GET /hello/{name}", func(w stdhttp.ResponseWriter, r *stdhttp.Request) {
-	fmt.Fprintf(w, "hello %s over %s\n", r.PathValue("name"), r.Proto)
+	fmt.Fprintf(w, "hello %s over %s\n", c.Request.PathValue("name"), c.Request.Proto)
 })
 mux.Handle("/files/", stdhttp.StripPrefix("/files/", stdhttp.FileServer(stdhttp.Dir("."))))
 
-std := fibhttp.HandlerFunc(func(c *fibhttp.Context, r *stdhttp.Request) {
-	mux.ServeHTTP(c, r) // c 就是 http.ResponseWriter
+std := fibhttp.HandlerFunc(func(c *fibhttp.Context) {
+	mux.ServeHTTP(c, c.Request) // c 就是 http.ResponseWriter
 })
 engine, err := fib.Bind(config, fibhttp.NewHandler(std))
 ```
@@ -141,7 +141,7 @@ HTTP/2、HTTP/3 上都适用。兼容的部分与行为不同的部分：
 - **`http.ResponseController`** 可用，因为 Context 实现了 `FlushError`。
 - **Hijack**：没有实现 `http.Hijacker`，所以需要 hijack 连接的库（如 gorilla/websocket）不能用。
   切换协议请用 `Context.Upgrade` 或 `websocket.ServerHandler.Upgrade`。
-- **取消**：客户端断开时 `r.Context()` 不会被取消，请用 `c.OnCancel` 或 `c.Err()`。
+- **取消**：客户端断开时 `c.Request.Context()` 不会被取消，请用 `c.OnCancel` 或 `c.Err()`。
 
 ### 路由
 
@@ -153,7 +153,7 @@ r.Use(recover.New(), logger.New()) // 所有请求都经过，包括 404
 r.Get("/", index)
 r.Route("/users", func(r *fibhttp.Router) {
 	r.Use(auth) // 只作用于 /users 下
-	r.Get("/{id:[0-9]+}", func(c *fibhttp.Context, req *stdhttp.Request) {
+	r.Get("/{id:[0-9]+}", func(c *fibhttp.Context) {
 		_ = c.Respond(stdhttp.StatusOK, "text/plain", []byte("user "+c.Param("id")))
 	})
 	r.Get("/{id}/files/*", file) // c.Param("*") 是路径的剩余部分
@@ -177,8 +177,8 @@ ws := websocket.NewHandler(websocket.HandlerFuncs{
 		_ = c.WriteMessage(op, data)
 	},
 })
-app := fibhttp.HandlerFunc(func(c *fibhttp.Context, r *stdhttp.Request) {
-	if r.URL.Path == "/ws" {
+app := fibhttp.HandlerFunc(func(c *fibhttp.Context) {
+	if c.Request.URL.Path == "/ws" {
 		_, _ = ws.Upgrade(c, nil) // 请求来自 HTTP/1.1、HTTP/2 还是 HTTP/3 都可以
 		return
 	}

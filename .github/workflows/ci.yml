@@ -114,6 +114,57 @@ jobs:
           path: ${{ runner.temp }}/test.log
           if-no-files-found: ignore
 
+  # Statement coverage across every package, counted for the whole module
+  # (-coverpkg) so a package exercised only by another's tests still counts.
+  # On main the total is published as a shields.io endpoint file on the
+  # `badges` branch, which the README badge reads.
+  coverage:
+    name: Coverage
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v6
+        with:
+          go-version: stable
+          cache-dependency-path: go.mod
+      - name: Test with coverage
+        run: |
+          go test -race -count=1 -timeout 20m -covermode=atomic \
+            -coverpkg=./... -coverprofile="$RUNNER_TEMP/cover.out" ./...
+      - name: Summarize
+        id: cover
+        run: |
+          go tool cover -func="$RUNNER_TEMP/cover.out" > "$RUNNER_TEMP/cover.txt"
+          total=$(awk '/^total:/ {gsub("%","",$3); print $3}' "$RUNNER_TEMP/cover.txt")
+          echo "total=$total" >> "$GITHUB_OUTPUT"
+          echo "### Coverage: ${total}%" >> "$GITHUB_STEP_SUMMARY"
+          go tool cover -html="$RUNNER_TEMP/cover.out" -o "$RUNNER_TEMP/coverage.html"
+      - uses: actions/upload-artifact@v5
+        with:
+          name: coverage
+          path: |
+            ${{ runner.temp }}/cover.out
+            ${{ runner.temp }}/cover.txt
+            ${{ runner.temp }}/coverage.html
+      - name: Publish the badge
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        env:
+          TOTAL: ${{ steps.cover.outputs.total }}
+        run: |
+          color=$(awk -v t="$TOTAL" 'BEGIN{ if (t>=80) print "brightgreen"; else if (t>=70) print "green"; else if (t>=60) print "yellowgreen"; else if (t>=50) print "yellow"; else if (t>=40) print "orange"; else print "red" }')
+          mkdir "$RUNNER_TEMP/badges"
+          cd "$RUNNER_TEMP/badges"
+          printf '{"schemaVersion":1,"label":"coverage","message":"%s%%","color":"%s"}\n' "$TOTAL" "$color" > coverage.json
+          git init -q -b badges
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add coverage.json
+          git commit -q -m "coverage: ${TOTAL}%"
+          git push -f "https://x-access-token:${{ github.token }}@github.com/${{ github.repository }}.git" badges
+
   # HTTP/1.0 and HTTP/1.1 conformance: the fib server against net/http's
   # client, raw sockets and curl, the fib client against net/http's server and
   # raw servers, and SendFile under both. The peers are the standard library
@@ -165,6 +216,27 @@ jobs:
           name: http1-conformance-log-${{ matrix.os }}
           path: ${{ runner.temp }}/conformance.log
           if-no-files-found: ignore
+
+  # Static files over HTTP/1.1, HTTP/2 (h2c and TLS) and HTTP/3: FileCache,
+  # net/http's ServeFile and FileServer and io.Copy from a file (sendfile),
+  # with big files, ranges and conditional requests, and several downloads
+  # at once. go test ./... above runs these too; this job keeps them in view.
+  static-files:
+    name: Static files (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v6
+        with:
+          go-version: stable
+          cache-dependency-path: go.mod
+      - name: Static file tests
+        run: go test -race -count=1 -timeout 10m -v -run 'TestStaticFiles|TestFileCache' ./http/ ./http3/
 
   # HTTP/2 conformance: the fib server against net/http's client, h2spec and
   # curl, and the fib client against net/http's server and a raw frame server.
