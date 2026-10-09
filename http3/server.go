@@ -68,7 +68,11 @@ type Config struct {
 	// StreamRequestBodyThreshold keeps the smaller bodies read whole when
 	// StreamRequestBody is set: only a body whose content-length is larger
 	// than this, or one without a content-length of which more than this has
-	// arrived, streams. Zero streams every body.
+	// arrived, streams. A streamed body's handler is not called until at
+	// least this many bytes of it have arrived, so that a handler that knows
+	// its ordinary requests are smaller can read Request.Body whole and
+	// leave Context.OnBody to the few endpoints that take large bodies. Zero
+	// streams every body as soon as its header has arrived.
 	StreamRequestBodyThreshold int64
 	// MaxStreamedBodyBytes bounds a streamed body, which MaxBodyBytes does
 	// not; zero leaves it unbounded.
@@ -767,21 +771,25 @@ func (rs *requestStream) onData(chunk []byte) error {
 			}
 			return nil
 		}
-		if config := &rs.sc.h.config; rs.declared < 0 && int64(len(rs.body)+len(chunk)) > config.StreamRequestBodyThreshold {
-			// A body of no declared length streams once more than the
-			// threshold of it has arrived. What arrived before was given
-			// back as it came, this chunk included.
+		config := &rs.sc.h.config
+		got := int64(len(rs.body) + len(chunk))
+		if rs.declared < 0 && got > config.StreamRequestBodyThreshold ||
+			rs.declared > config.StreamRequestBodyThreshold && got >= config.StreamRequestBodyThreshold {
+			// A body streams once the threshold of it has arrived: more than
+			// that for one of no declared length. What arrived before was
+			// given back as it came, this chunk included.
 			buffered := bufferpool.Append(rs.body, chunk)
 			rs.body = nil
 			rs.startStream(buffered)
 			return nil
 		}
 	}
-	if int64(len(rs.body)+len(chunk)) > rs.sc.h.config.MaxBodyBytes {
+	waiting := rs.streamed != nil && rs.declared > rs.sc.h.config.StreamRequestBodyThreshold
+	if !waiting && int64(len(rs.body)+len(chunk)) > rs.sc.h.config.MaxBodyBytes {
 		rs.reject(stdhttp.StatusRequestEntityTooLarge)
 		return nil
 	}
-	if rs.body == nil && rs.declared > 0 {
+	if rs.body == nil && rs.declared > 0 && !waiting {
 		// The datagram the body arrives in goes back to the pool once QUIC
 		// has done with it, so the body is gathered in a pooled buffer of
 		// its own, sized once when its length is known, which the Context
@@ -888,7 +896,8 @@ func (rs *requestStream) onFrame(typ uint64, payload []byte) error {
 		rs.reject(stdhttp.StatusExpectationFailed)
 		return nil
 	}
-	if rs.streamed != nil && rs.declared > rs.sc.h.config.StreamRequestBodyThreshold {
+	if rs.streamed != nil && rs.declared > rs.sc.h.config.StreamRequestBodyThreshold &&
+		rs.sc.h.config.StreamRequestBodyThreshold == 0 {
 		// The body streams to the handler, which runs now.
 		rs.startStream(nil)
 		return nil

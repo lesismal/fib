@@ -301,7 +301,7 @@ func TestOnBodyDoesNotCallBack(t *testing.T) {
 // request behind it served once it has.
 func TestBodyCompleteOnAStreamedBody(t *testing.T) {
 	incomplete := make(chan bool, 2)
-	addr := serveStreamingServer(t, streamingConfig(), func(c *Context, r *stdhttp.Request) {
+	addr := serveStreamingServer(t, immediateStreamingConfig(), func(c *Context, r *stdhttp.Request) {
 		if r.URL.Path != "/upload" {
 			_ = c.Respond(stdhttp.StatusOK, "text/plain", []byte(r.URL.Path))
 			return
@@ -382,7 +382,7 @@ func TestOnBodyReportsAClosedConnection(t *testing.T) {
 		calls int
 	}
 	done := make(chan outcome, 1)
-	addr := serveStreamingServer(t, streamingConfig(), func(c *Context, r *stdhttp.Request) {
+	addr := serveStreamingServer(t, immediateStreamingConfig(), func(c *Context, r *stdhttp.Request) {
 		calls := 0
 		c.Retain()
 		c.OnBody(func(data []byte, fin bool, err error) {

@@ -651,10 +651,13 @@ func (sc *h2ServerConn) handleData(f *h2Frame) error {
 	}
 	st.recvWindow -= length
 	st.recvUnacked += length
-	if config := &sc.handler.config; config.StreamRequestBody && st.declared < 0 && st.req != nil &&
-		int64(len(st.body))+int64(len(f.payload)) > config.StreamRequestBodyThreshold {
-		// A body of no declared length streams once more than the threshold
-		// of it has arrived, as a chunked HTTP/1 body does.
+	config := &sc.handler.config
+	got := int64(len(st.body)) + int64(len(f.payload))
+	waiting := config.StreamRequestBody && st.req != nil && st.declared > config.StreamRequestBodyThreshold
+	if waiting && got >= config.StreamRequestBodyThreshold ||
+		config.StreamRequestBody && st.declared < 0 && st.req != nil && got > config.StreamRequestBodyThreshold {
+		// A body streams once the threshold of it has arrived: more than
+		// that for one of no declared length, as a chunked HTTP/1 body does.
 		buffered := bufferpool.Append(st.body, f.payload)
 		st.body = nil
 		sc.streamRequest(st, buffered)
@@ -663,7 +666,7 @@ func (sc *h2ServerConn) handleData(f *h2Frame) error {
 		}
 		return nil
 	}
-	if int64(len(st.body))+int64(len(f.payload)) > sc.handler.config.MaxBodyBytes {
+	if !waiting && got > config.MaxBodyBytes {
 		sc.reject(st, stdhttp.StatusRequestEntityTooLarge)
 		return nil
 	}
@@ -818,14 +821,16 @@ func (sc *h2ServerConn) handleHeaderBlock(id uint32, block []byte, endStream boo
 	if endStream {
 		return sc.finishRequest(st)
 	}
-	if config := &sc.handler.config; config.StreamRequestBody && st.declared > config.StreamRequestBodyThreshold {
+	if config := &sc.handler.config; config.StreamRequestBody && st.declared > config.StreamRequestBodyThreshold &&
+		config.StreamRequestBodyThreshold == 0 {
 		// The body streams to the handler, which runs now.
 		sc.streamRequest(st, nil)
 		return nil
 	}
 	if strings.EqualFold(req.Header.Get("Expect"), "100-continue") {
-		// The body is read whole before the handler runs, so there is no
-		// reason to keep the client waiting for permission to send it.
+		// The body is read, whole or up to the streaming threshold, before
+		// the handler runs, so there is no reason to keep the client waiting
+		// for permission to send it.
 		_ = st.writeInterim(stdhttp.StatusContinue, nil)
 	}
 	return nil

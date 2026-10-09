@@ -30,6 +30,14 @@ func streamingConfig() Config {
 	return config
 }
 
+// immediateStreamingConfig is a server that hands over every body as soon as
+// its header has arrived.
+func immediateStreamingConfig() Config {
+	config := streamingConfig()
+	config.StreamRequestBodyThreshold = 0
+	return config
+}
+
 // serveStreaming runs a server with config and returns its host:port.
 func serveStreamingServer(t *testing.T, config Config, handler HandlerFunc) string {
 	t.Helper()
@@ -135,7 +143,7 @@ func wantSizeAndDigest(payload []byte) string {
 func TestStreamRequestBodyReachesHandlerBeforeTheBodyEnds(t *testing.T) {
 	const size = 1 << 20
 	started := make(chan int64, 1)
-	addr := serveStreamingServer(t, streamingConfig(), func(c *Context, r *stdhttp.Request) {
+	addr := serveStreamingServer(t, immediateStreamingConfig(), func(c *Context, r *stdhttp.Request) {
 		stream := bodyOf(r)
 		if stream == nil {
 			t.Errorf("body is %T, want a *BodyStream", r.Body)
@@ -172,7 +180,7 @@ func TestStreamRequestBodyReachesHandlerBeforeTheBodyEnds(t *testing.T) {
 // handler steers by: nothing here yet, and the body already taken over.
 func TestStreamRequestBodyReadReportsWouldBlock(t *testing.T) {
 	errs := make(chan error, 2)
-	addr := serveStreamingServer(t, streamingConfig(), func(c *Context, r *stdhttp.Request) {
+	addr := serveStreamingServer(t, immediateStreamingConfig(), func(c *Context, r *stdhttp.Request) {
 		buf := make([]byte, 64<<10)
 		_, err := r.Body.Read(buf)
 		errs <- err
@@ -391,7 +399,7 @@ func TestStreamRequestBodyClosesAfterALongDiscard(t *testing.T) {
 
 func TestStreamRequestBodyExpectContinueWaitsForTheFirstRead(t *testing.T) {
 	read := make(chan struct{})
-	addr := serveStreamingServer(t, streamingConfig(), func(c *Context, r *stdhttp.Request) {
+	addr := serveStreamingServer(t, immediateStreamingConfig(), func(c *Context, r *stdhttp.Request) {
 		c.Retain()
 		go func() {
 			<-read
@@ -452,7 +460,7 @@ func TestStreamRequestBodyExpectContinueGrantedByOnBody(t *testing.T) {
 	}
 }
 func TestStreamRequestBodyRefusedExpectationSendsNoContinue(t *testing.T) {
-	addr := serveStreamingServer(t, streamingConfig(), func(c *Context, r *stdhttp.Request) {
+	addr := serveStreamingServer(t, immediateStreamingConfig(), func(c *Context, r *stdhttp.Request) {
 		_ = c.Respond(stdhttp.StatusForbidden, "text/plain", []byte("no"))
 	})
 	conn := dialRaw(t, addr)
@@ -492,7 +500,7 @@ func TestStreamRequestBodyLimitFailsTheRead(t *testing.T) {
 }
 func TestStreamRequestBodyTruncatedUploadFailsTheRead(t *testing.T) {
 	failed := make(chan error, 1)
-	addr := serveStreamingServer(t, streamingConfig(), collectBody(func(c *Context, _ int64, _ []byte, err error) {
+	addr := serveStreamingServer(t, immediateStreamingConfig(), collectBody(func(c *Context, _ int64, _ []byte, err error) {
 		failed <- err
 	}))
 	conn, err := net.DialTimeout("tcp", addr, 5*time.Second)
@@ -822,5 +830,61 @@ func TestStreamRequestBodyWithoutThresholdStreamsEveryBody(t *testing.T) {
 	conn.send("hello")
 	if _, body := conn.response(stdhttp.MethodPost); body != "hello" {
 		t.Fatalf("body = %q, want %q", body, "hello")
+	}
+}
+
+// TestStreamRequestBodyHandlerWaitsForTheThreshold checks that a streamed
+// body's handler is not called until the threshold of the body has arrived,
+// and that the bytes it has then are all there for the first read.
+func TestStreamRequestBodyHandlerWaitsForTheThreshold(t *testing.T) {
+	started := make(chan int64, 1)
+	addr := serveStreamingServer(t, streamingConfig(), func(c *Context, r *stdhttp.Request) {
+		if stream := bodyOf(r); stream != nil {
+			started <- stream.Consumed()
+		} else {
+			started <- -1
+		}
+		collectBody(sizeAndDigest)(c, r)
+	})
+	payload := bytes.Repeat([]byte("threshold "), 1<<10)
+	conn := dialRaw(t, addr)
+	conn.send(fmt.Sprintf("POST /upload HTTP/1.1\r\nHost: test\r\nContent-Length: %d\r\n\r\n", len(payload)))
+	if _, err := conn.Write(payload[:1<<10-1]); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-started:
+		t.Fatal("the handler ran before the threshold of the body had arrived")
+	case <-time.After(300 * time.Millisecond):
+	}
+	if _, err := conn.Write(payload[1<<10-1:]); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-started:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the handler did not run once the threshold had arrived")
+	}
+	if _, body := conn.response(stdhttp.MethodPost); body != wantSizeAndDigest(payload) {
+		t.Fatalf("body = %q, want %q", body, wantSizeAndDigest(payload))
+	}
+}
+
+// TestStreamRequestBodyExpectContinueIsGrantedWhileWaitingForTheThreshold
+// checks that a client that holds its body back for 100 Continue is not left
+// waiting for a handler that waits for the body.
+func TestStreamRequestBodyExpectContinueIsGrantedWhileWaitingForTheThreshold(t *testing.T) {
+	addr := serveStreamingServer(t, streamingConfig(), collectBody(sizeAndDigest))
+	payload := bytes.Repeat([]byte("q"), 8<<10)
+	conn := dialRaw(t, addr)
+	conn.send(fmt.Sprintf("POST /expect HTTP/1.1\r\nHost: test\r\nExpect: 100-continue\r\nContent-Length: %d\r\n\r\n", len(payload)))
+	if head := conn.head(); !strings.HasPrefix(head, "HTTP/1.1 100 Continue") {
+		t.Fatalf("interim response = %q", head)
+	}
+	if _, err := conn.Write(payload); err != nil {
+		t.Fatal(err)
+	}
+	if _, body := conn.response(stdhttp.MethodPost); body != wantSizeAndDigest(payload) {
+		t.Fatalf("body = %q, want %q", body, wantSizeAndDigest(payload))
 	}
 }

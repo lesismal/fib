@@ -93,8 +93,12 @@ type Config struct {
 	// StreamRequestBodyThreshold keeps the smaller bodies buffered whole when
 	// StreamRequestBody is set: only a body whose Content-Length is larger
 	// than this, or one without a length of which more than this has
-	// arrived, streams. Zero streams every body. It has no effect without
-	// StreamRequestBody.
+	// arrived, streams. A streamed body's handler is not called until at
+	// least this many bytes of it have arrived, so that a handler that knows
+	// its ordinary requests are smaller than this can read Request.Body
+	// whole and leave Context.OnBody to the few endpoints that take large
+	// bodies. Zero streams every body as soon as its header has arrived. It
+	// has no effect without StreamRequestBody.
 	StreamRequestBodyThreshold int64
 	// MaxStreamedBodyBytes bounds a streamed body, which MaxBodyBytes does
 	// not: the point of streaming is to accept an upload larger than the
@@ -269,8 +273,11 @@ type frameInfo struct {
 	chunked   bool
 	// stream marks a body too big to wait for: the request is complete at
 	// headerEnd and the body that follows is delivered as it arrives.
-	stream  bool
-	request *stdhttp.Request
+	stream bool
+	// continued marks a streamed request whose 100 Continue went out while
+	// its handler waited for the threshold of the body.
+	continued bool
+	request   *stdhttp.Request
 	// block is where request was allocated, when the simple parser took it.
 	block *requestBlock
 }
@@ -371,7 +378,7 @@ func (p *Parser) feedOne() (*stdhttp.Request, bool, error) {
 		if frame.chunked {
 			decoder = &chunkedDecoder{maxTrailer: p.config.MaxHeaderBytes}
 		}
-		wantContinue := req.ProtoAtLeast(1, 1) && strings.EqualFold(req.Header.Get("Expect"), "100-continue")
+		wantContinue := !frame.continued && req.ProtoAtLeast(1, 1) && strings.EqualFold(req.Header.Get("Expect"), "100-continue")
 		p.stream = newBodyStream(p.conn, req, p.config, decoder, wantContinue)
 		p.live.Store(p.stream)
 		req.Body = p.stream
@@ -584,6 +591,11 @@ func (p *Parser) frameLength() (frameInfo, bool, error) {
 			return frameInfo{}, false, nil
 		}
 		p.awaiting = frameInfo{}
+		if frame.stream {
+			// The threshold is in; the request is complete at its header
+			// and the body bytes buffered after it are the stream's first.
+			frame.end = frame.headerEnd
+		}
 		return frame, true, nil
 	}
 	headerAt := bytes.Index(p.buffer[p.headerScan:], []byte("\r\n\r\n"))
@@ -656,7 +668,13 @@ func (p *Parser) frameLength() (frameInfo, bool, error) {
 		if limit := p.config.MaxStreamedBodyBytes; limit > 0 && req.ContentLength > limit {
 			return frameInfo{}, false, ErrBodyTooLarge
 		}
-		return frameInfo{end: headerEnd, headerEnd: headerEnd, stream: true, request: req, block: block}, true, nil
+		if int64(len(p.buffer)-headerEnd) >= p.config.StreamRequestBodyThreshold {
+			return frameInfo{end: headerEnd, headerEnd: headerEnd, stream: true, request: req, block: block}, true, nil
+		}
+		// The handler waits until the threshold of the body has arrived.
+		p.expectContinue(req)
+		p.awaiting = frameInfo{end: headerEnd + int(p.config.StreamRequestBodyThreshold), headerEnd: headerEnd, stream: true, continued: p.wantContinue, request: req, block: block}
+		return frameInfo{}, false, nil
 	}
 	if req.ContentLength > p.config.MaxBodyBytes {
 		return frameInfo{}, false, ErrBodyTooLarge
