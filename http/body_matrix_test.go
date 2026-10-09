@@ -739,11 +739,26 @@ func TestBodyMatrixAbort(t *testing.T) {
 				}
 				w.write(head)
 				w.write(body[:len(body)/2])
+				// A streamed body is cut once its handler runs. Closing the
+				// socket with the server's frames unread resets the
+				// connection, and Windows then discards what the server had
+				// not read yet: a cut after a fixed pause could leave it short
+				// of the threshold, with no handler to tell.
+				streams := m.stream
+				deadline := time.Now().Add(5 * time.Second)
+				for streams && time.Now().Before(deadline) {
+					mu.Lock()
+					started := ran[key]
+					mu.Unlock()
+					if started {
+						break
+					}
+					time.Sleep(5 * time.Millisecond)
+				}
 				time.Sleep(50 * time.Millisecond)
 				w.close()
 
-				streams := m.stream
-				deadline := time.Now().Add(5 * time.Second)
+				deadline = time.Now().Add(5 * time.Second)
 				for streams && time.Now().Before(deadline) {
 					mu.Lock()
 					n := len(endings[key])
