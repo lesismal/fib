@@ -3,7 +3,8 @@
 package http
 
 import (
-	"encoding/json"
+	"encoding/json/jsontext"
+	json "encoding/json/v2"
 	"errors"
 	"io"
 	"math"
@@ -26,7 +27,7 @@ func TestAppendJSONEncodesAsMarshal(t *testing.T) {
 			Tags []string
 			Skip int `json:"-"`
 		}{"fib", nil, 3},
-		json.RawMessage(`{"raw" : true}`),
+		jsontext.Value(`{"raw":true}`),
 	}
 	for _, v := range values {
 		want, err := json.Marshal(v)
@@ -133,7 +134,7 @@ func TestContextJSONConcurrent(t *testing.T) {
 					return
 				}
 				var got map[string]string
-				err = json.NewDecoder(resp.Body).Decode(&got)
+				err = json.UnmarshalRead(resp.Body, &got)
 				resp.Body.Close()
 				if err != nil || got["path"] != path || got["pad"] != strings.Repeat(path, 100) {
 					errs <- errors.New(path + ": answered " + got["path"])

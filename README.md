@@ -171,9 +171,13 @@ parameter, then a catch-all. A GET route also answers HEAD. A path that exists o
 methods gets a 405 with an `Allow` header. [`http/routerbench`](http/routerbench) compares the
 router with chi and `http.ServeMux`.
 
-`c.JSON(status, v)` answers with `v` encoded as JSON, as `json.Marshal` encodes it, into a buffer
+`c.JSON(status, v)` answers with `v` encoded as JSON by `encoding/json/v2`, into a buffer
 reused once HTTP/1 has copied the body out. Set `fibhttp.JSONEncoder` once at startup to use
 another encoder, such as sonic's.
+
+Context also has one-call helpers like gin's and fiber's: `String`, `Data`, `JSON`, `IndentedJSON`,
+`XML`, `IndentedXML`, `HTML`, `HTMLTemplate`, `File` and `FileAttachment`. The ones that encode
+send nothing and return the error when they cannot, so the handler can answer otherwise.
 
 ### WebSocket
 

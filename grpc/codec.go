@@ -5,7 +5,7 @@ package grpc
 import (
 	"bytes"
 	"compress/gzip"
-	"encoding/json"
+	json "encoding/json/v2"
 	"fmt"
 	"io"
 	"strings"

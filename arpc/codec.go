@@ -3,7 +3,7 @@
 package arpc
 
 import (
-	"encoding/json"
+	json "encoding/json/v2"
 	"errors"
 	"log/slog"
 	"sync/atomic"
@@ -16,7 +16,7 @@ type Codec interface {
 	Unmarshal(data []byte, v any) error
 }
 
-// JSONCodec is a Codec of encoding/json.
+// JSONCodec is a Codec of encoding/json/v2.
 type JSONCodec struct{}
 
 func (JSONCodec) Marshal(v any) ([]byte, error)      { return json.Marshal(v) }
