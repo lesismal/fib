@@ -34,7 +34,7 @@ func (e *echoTunnel) OnTunnelClose(_ *Tunnel, err error)  { e.closed <- err }
 // one that cannot be with 426 and the error.
 func tunnelServer(t *testing.T, echo *echoTunnel) string {
 	t.Helper()
-	return serve(t, NewHandler(HandlerFunc(func(c *Context, r *stdhttp.Request) {
+	return serve(t, NewHandler(HandlerFunc(func(c *Context) {
 		if _, err := c.Upgrade("echo", stdhttp.Header{"X-Tunnel": {"1"}}, echo); err != nil {
 			_ = c.Respond(stdhttp.StatusUpgradeRequired, "text/plain", []byte(err.Error()))
 		}

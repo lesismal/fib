@@ -48,7 +48,7 @@ func Chain(handler fibhttp.Handler, middlewares ...Middleware) fibhttp.Handler {
 
 // Skipper is the Next function of a middleware's Config: reporting true
 // passes the request straight on to the handler.
-type Skipper func(c *fibhttp.Context, r *stdhttp.Request) bool
+type Skipper func(c *fibhttp.Context) bool
 
 // RemoteIP is the address the request came from, without its port.
 func RemoteIP(r *stdhttp.Request) string {

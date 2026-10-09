@@ -41,11 +41,11 @@ func main() {
 }
 
 func echo() fibhttp.HandlerFunc {
-	return func(c *fibhttp.Context, r *stdhttp.Request) {
+	return func(c *fibhttp.Context) {
 		// The body has already been read off the connection whole, so
 		// reading it here never waits on the network.
-		body, _ := io.ReadAll(r.Body)
-		reply := fmt.Sprintf("%s %s %s", r.Method, r.URL.Path, body)
+		body, _ := io.ReadAll(c.Request.Body)
+		reply := fmt.Sprintf("%s %s %s", c.Request.Method, c.Request.URL.Path, body)
 		if err := c.Respond(stdhttp.StatusOK, "text/plain; charset=utf-8", []byte(reply)); err != nil {
 			// The request went away before its answer did — an HTTP/2 client
 			// resetting one stream, or a peer that hung up. The connection
@@ -60,11 +60,11 @@ func echo() fibhttp.HandlerFunc {
 // Context is an http.ResponseWriter, so net/http's handlers answer through it.
 func withFiles(dir string, next fibhttp.HandlerFunc) fibhttp.HandlerFunc {
 	files := stdhttp.StripPrefix("/files/", stdhttp.FileServer(stdhttp.Dir(dir)))
-	return func(c *fibhttp.Context, r *stdhttp.Request) {
-		if strings.HasPrefix(r.URL.Path, "/files/") {
-			files.ServeHTTP(c, r)
+	return func(c *fibhttp.Context) {
+		if strings.HasPrefix(c.Request.URL.Path, "/files/") {
+			files.ServeHTTP(c, c.Request)
 			return
 		}
-		next(c, r)
+		next(c)
 	}
 }

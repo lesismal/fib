@@ -25,8 +25,8 @@ func TestRecover(t *testing.T) {
 			}
 			logged = append(logged, r.URL.Path)
 		},
-	})(fibhttp.HandlerFunc(func(c *fibhttp.Context, r *stdhttp.Request) {
-		if r.URL.Path == "/panic" {
+	})(fibhttp.HandlerFunc(func(c *fibhttp.Context) {
+		if c.Request.URL.Path == "/panic" {
 			panic("boom")
 		}
 		_ = c.Respond(stdhttp.StatusOK, "text/plain", []byte("ok"))

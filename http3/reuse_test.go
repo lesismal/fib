@@ -47,11 +47,11 @@ func TestRecycledStreamsKeepRequestsApart(t *testing.T) {
 	describe := func(r *stdhttp.Request, body []byte) string {
 		return fmt.Sprintf("%s %s n=%s x=%s %s", r.Method, r.URL.Path, r.URL.Query().Get("n"), r.Header.Get("X-N"), body)
 	}
-	base := startServer(t, Config{}, func(c *fibhttp.Context, r *stdhttp.Request) {
-		body, _ := io.ReadAll(r.Body)
-		n := strings.TrimPrefix(r.URL.Path, "/r")
+	base := startServer(t, Config{}, func(c *fibhttp.Context) {
+		body, _ := io.ReadAll(c.Request.Body)
+		n := strings.TrimPrefix(c.Request.URL.Path, "/r")
 		if len(n)%2 == 0 {
-			_ = c.Respond(stdhttp.StatusOK, "text/plain", []byte(describe(r, body)))
+			_ = c.Respond(stdhttp.StatusOK, "text/plain", []byte(describe(c.Request, body)))
 			return
 		}
 		c.Retain()
@@ -59,12 +59,12 @@ func TestRecycledStreamsKeepRequestsApart(t *testing.T) {
 		go func() {
 			defer retained.Done()
 			time.Sleep(time.Millisecond)
-			want := describe(r, body)
+			want := describe(c.Request, body)
 			_ = c.Respond(stdhttp.StatusOK, "text/plain", []byte(want))
 			// Until its last Release the request is still this handler's,
 			// response written or not.
 			time.Sleep(time.Millisecond)
-			if got := describe(r, body); got != want {
+			if got := describe(c.Request, body); got != want {
 				t.Errorf("request changed under its handler before Release: %q, was %q", got, want)
 			}
 			c.Release()

@@ -185,8 +185,8 @@ func (b *trailerBody) Read(p []byte) (int, error) {
 // Server: HTTP/1.0
 
 func TestHTTP1ConformanceServerHTTP10CloseByDefault(t *testing.T) {
-	addr := serveHTTP1(t, func(c *Context, r *stdhttp.Request) {
-		_ = c.Respond(200, "text/plain", []byte(r.Proto))
+	addr := serveHTTP1(t, func(c *Context) {
+		_ = c.Respond(200, "text/plain", []byte(c.Request.Proto))
 	})
 	conn := dialRaw(t, addr)
 	conn.send("GET /a HTTP/1.0\r\n\r\n")
@@ -203,9 +203,9 @@ func TestHTTP1ConformanceServerHTTP10CloseByDefault(t *testing.T) {
 }
 
 func TestHTTP1ConformanceServerHTTP10KeepAlive(t *testing.T) {
-	addr := serveHTTP1(t, func(c *Context, r *stdhttp.Request) {
-		body, _ := io.ReadAll(r.Body)
-		_ = c.Respond(200, "text/plain", append([]byte(r.URL.Path), body...))
+	addr := serveHTTP1(t, func(c *Context) {
+		body, _ := io.ReadAll(c.Request.Body)
+		_ = c.Respond(200, "text/plain", append([]byte(c.Request.URL.Path), body...))
 	})
 	conn := dialRaw(t, addr)
 	conn.send("GET /one HTTP/1.0\r\nConnection: keep-alive\r\n\r\n")
@@ -230,7 +230,7 @@ func TestHTTP1ConformanceServerHTTP10KeepAlive(t *testing.T) {
 // with the connection, and trailers are dropped.
 func TestHTTP1ConformanceServerHTTP10StreamedBody(t *testing.T) {
 	part := strings.Repeat("s", writerBufferSize)
-	addr := serveHTTP1(t, func(c *Context, r *stdhttp.Request) {
+	addr := serveHTTP1(t, func(c *Context) {
 		c.Header().Set("Trailer", "X-After")
 		for i := 0; i < 4; i++ {
 			_, _ = c.WriteString(part)
@@ -255,7 +255,7 @@ func TestHTTP1ConformanceServerHTTP10StreamedBody(t *testing.T) {
 }
 
 func TestHTTP1ConformanceServerHTTP10RejectsTransferEncoding(t *testing.T) {
-	addr := serveHTTP1(t, func(c *Context, r *stdhttp.Request) { _ = c.Respond(200, "", nil) })
+	addr := serveHTTP1(t, func(c *Context) { _ = c.Respond(200, "", nil) })
 	conn := dialRaw(t, addr)
 	conn.send("POST / HTTP/1.0\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nabc\r\n0\r\n\r\n")
 	if resp, _ := conn.response("POST"); resp.StatusCode != 400 {
@@ -269,7 +269,7 @@ func TestHTTP1ConformanceServerHTTP10RejectsTransferEncoding(t *testing.T) {
 // Interim responses do not exist in HTTP/1.0.
 func TestHTTP1ConformanceServerHTTP10NoInterim(t *testing.T) {
 	result := make(chan error, 1)
-	addr := serveHTTP1(t, func(c *Context, r *stdhttp.Request) {
+	addr := serveHTTP1(t, func(c *Context) {
 		result <- c.WriteInterim(103, stdhttp.Header{"Link": {"</a>"}})
 		_ = c.Respond(200, "", nil)
 	})
@@ -287,9 +287,9 @@ func TestHTTP1ConformanceServerHTTP10NoInterim(t *testing.T) {
 // Server: HTTP/1.1 framing, keep-alive and pipelining
 
 func TestHTTP1ConformanceServerKeepAliveWithNetHTTP(t *testing.T) {
-	addr := serveHTTP1(t, func(c *Context, r *stdhttp.Request) {
-		body, _ := io.ReadAll(r.Body)
-		_ = c.Respond(200, "text/plain", append([]byte(r.Method+" "), body...))
+	addr := serveHTTP1(t, func(c *Context) {
+		body, _ := io.ReadAll(c.Request.Body)
+		_ = c.Respond(200, "text/plain", append([]byte(c.Request.Method+" "), body...))
 	})
 	client, dials := stdClient(t)
 	for i := 0; i < 5; i++ {
@@ -308,9 +308,9 @@ func TestHTTP1ConformanceServerKeepAliveWithNetHTTP(t *testing.T) {
 }
 
 func TestHTTP1ConformanceServerPipelining(t *testing.T) {
-	addr := serveHTTP1(t, func(c *Context, r *stdhttp.Request) {
-		body, _ := io.ReadAll(r.Body)
-		if r.URL.Path == "/stream" {
+	addr := serveHTTP1(t, func(c *Context) {
+		body, _ := io.ReadAll(c.Request.Body)
+		if c.Request.URL.Path == "/stream" {
 			// A streamed response must end before the next one starts.
 			for i := 0; i < 3; i++ {
 				_, _ = fmt.Fprintf(c, "%s-%d;", strings.Repeat("p", writerBufferSize), i)
@@ -318,7 +318,7 @@ func TestHTTP1ConformanceServerPipelining(t *testing.T) {
 			}
 			return
 		}
-		_ = c.Respond(200, "text/plain", append([]byte(r.URL.Path), body...))
+		_ = c.Respond(200, "text/plain", append([]byte(c.Request.URL.Path), body...))
 	})
 	conn := dialRaw(t, addr)
 	conn.send("GET /a HTTP/1.1\r\nHost: x\r\n\r\n" +
@@ -346,7 +346,7 @@ func TestHTTP1ConformanceServerPipelining(t *testing.T) {
 }
 
 func TestHTTP1ConformanceServerClientClose(t *testing.T) {
-	addr := serveHTTP1(t, func(c *Context, r *stdhttp.Request) { _ = c.Respond(200, "", []byte("x")) })
+	addr := serveHTTP1(t, func(c *Context) { _ = c.Respond(200, "", []byte("x")) })
 	conn := dialRaw(t, addr)
 	conn.send("GET / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
 	resp, _ := conn.response("GET")
@@ -357,8 +357,8 @@ func TestHTTP1ConformanceServerClientClose(t *testing.T) {
 
 // A handler asking for Connection: close in its header ends the connection.
 func TestHTTP1ConformanceServerHandlerClose(t *testing.T) {
-	addr := serveHTTP1(t, func(c *Context, r *stdhttp.Request) {
-		if r.URL.Path == "/stream" {
+	addr := serveHTTP1(t, func(c *Context) {
+		if c.Request.URL.Path == "/stream" {
 			c.Header().Set("Connection", "close")
 			_, _ = c.WriteString("streamed")
 			return
@@ -376,11 +376,11 @@ func TestHTTP1ConformanceServerHandlerClose(t *testing.T) {
 }
 
 func TestHTTP1ConformanceServerChunkedRequestWithTrailers(t *testing.T) {
-	addr := serveHTTP1(t, func(c *Context, r *stdhttp.Request) {
-		body, _ := io.ReadAll(r.Body)
+	addr := serveHTTP1(t, func(c *Context) {
+		body, _ := io.ReadAll(c.Request.Body)
 		sum := sha256.Sum256(body)
-		_ = c.Respond(200, "text/plain", fmt.Appendf(nil, "%v %d %t %s", r.TransferEncoding, len(body),
-			hex.EncodeToString(sum[:]) == r.Trailer.Get("X-Sum"), r.Trailer.Get("X-Other")))
+		_ = c.Respond(200, "text/plain", fmt.Appendf(nil, "%v %d %t %s", c.Request.TransferEncoding, len(body),
+			hex.EncodeToString(sum[:]) == c.Request.Trailer.Get("X-Sum"), c.Request.Trailer.Get("X-Other")))
 	})
 	client, _ := stdClient(t)
 	payload := bytes.Repeat([]byte("chunk"), 50000)
@@ -406,8 +406,8 @@ func TestHTTP1ConformanceServerChunkedRequestWithTrailers(t *testing.T) {
 // A request framed both ways is read as chunked, and its connection is not
 // trusted with another request.
 func TestHTTP1ConformanceServerContentLengthAndChunked(t *testing.T) {
-	addr := serveHTTP1(t, func(c *Context, r *stdhttp.Request) {
-		body, _ := io.ReadAll(r.Body)
+	addr := serveHTTP1(t, func(c *Context) {
+		body, _ := io.ReadAll(c.Request.Body)
 		_ = c.Respond(200, "", body)
 	})
 	conn := dialRaw(t, addr)
@@ -421,12 +421,12 @@ func TestHTTP1ConformanceServerContentLengthAndChunked(t *testing.T) {
 
 func TestHTTP1ConformanceServerStreamedResponseWithTrailers(t *testing.T) {
 	release := make(chan struct{})
-	addr := serveHTTP1(t, func(c *Context, r *stdhttp.Request) {
+	addr := serveHTTP1(t, func(c *Context) {
 		c.Header().Set("Trailer", "X-Checksum")
 		c.Header().Set("Content-Type", "application/octet-stream")
 		_, _ = c.WriteString("first;")
 		c.Flush()
-		if r.URL.Query().Has("wait") {
+		if c.Request.URL.Query().Has("wait") {
 			select {
 			case <-release:
 			case <-time.After(10 * time.Second):
@@ -468,7 +468,7 @@ func TestHTTP1ConformanceServerStreamedResponseWithTrailers(t *testing.T) {
 }
 
 func TestHTTP1ConformanceServerResponseTrailer(t *testing.T) {
-	addr := serveHTTP1(t, func(c *Context, r *stdhttp.Request) {
+	addr := serveHTTP1(t, func(c *Context) {
 		_ = c.WriteResponse(Response{StatusCode: 200, Body: []byte("payload"),
 			Trailer: stdhttp.Header{"X-Digest": {"d1"}, "Content-Length": {"forbidden"}}})
 	})
@@ -489,8 +489,8 @@ func TestHTTP1ConformanceServerResponseTrailer(t *testing.T) {
 
 func TestHTTP1ConformanceServerWriterFraming(t *testing.T) {
 	writeErr := make(chan error, 1)
-	addr := serveHTTP1(t, func(c *Context, r *stdhttp.Request) {
-		switch r.URL.Path {
+	addr := serveHTTP1(t, func(c *Context) {
+		switch c.Request.URL.Path {
 		case "/small":
 			_, _ = c.WriteString("<html><body>small</body></html>")
 		case "/declared":
@@ -556,8 +556,8 @@ func TestHTTP1ConformanceServerWriterFraming(t *testing.T) {
 // repeating one its handler gave, and a HEAD response has the length of the
 // GET it stands for.
 func TestHTTP1ConformanceServerBodilessResponses(t *testing.T) {
-	addr := serveHTTP1(t, func(c *Context, r *stdhttp.Request) {
-		switch r.URL.Path {
+	addr := serveHTTP1(t, func(c *Context) {
+		switch c.Request.URL.Path {
 		case "/204":
 			_ = c.WriteResponse(Response{StatusCode: 204, Body: []byte("dropped")})
 		case "/304":
@@ -593,8 +593,8 @@ func TestHTTP1ConformanceServerBodilessResponses(t *testing.T) {
 }
 
 func TestHTTP1ConformanceServerExpectContinue(t *testing.T) {
-	addr := serveHTTP1(t, func(c *Context, r *stdhttp.Request) {
-		body, _ := io.ReadAll(r.Body)
+	addr := serveHTTP1(t, func(c *Context) {
+		body, _ := io.ReadAll(c.Request.Body)
 		_ = c.Respond(200, "", body)
 	})
 	client, _ := stdClient(t)
@@ -615,7 +615,7 @@ func TestHTTP1ConformanceServerExpectContinue(t *testing.T) {
 }
 
 func TestHTTP1ConformanceServerInterimResponses(t *testing.T) {
-	addr := serveHTTP1(t, func(c *Context, r *stdhttp.Request) {
+	addr := serveHTTP1(t, func(c *Context) {
 		c.Header().Set("Link", "</style.css>; rel=preload")
 		c.WriteHeader(stdhttp.StatusEarlyHints)
 		c.Header().Del("Link")
@@ -636,7 +636,7 @@ func TestHTTP1ConformanceServerInterimResponses(t *testing.T) {
 }
 
 func TestHTTP1ConformanceServerRejectsBadRequests(t *testing.T) {
-	addr := serveHTTP1(t, func(c *Context, r *stdhttp.Request) { _ = c.Respond(200, "", []byte("ok")) })
+	addr := serveHTTP1(t, func(c *Context) { _ = c.Respond(200, "", []byte("ok")) })
 	cases := []struct {
 		name, request string
 		status        int
@@ -674,8 +674,8 @@ func TestHTTP1ConformanceServerRejectsBadRequests(t *testing.T) {
 // Server: files, through net/http's own helpers and the sendfile path
 
 func fileHandler(path string) HandlerFunc {
-	return func(c *Context, r *stdhttp.Request) {
-		switch r.URL.Path {
+	return func(c *Context) {
+		switch c.Request.URL.Path {
 		case "/copy":
 			// io.Copy from an *os.File, with no length announced: chunked,
 			// each chunk sent from the file.
@@ -699,7 +699,7 @@ func fileHandler(path string) HandlerFunc {
 			c.Header().Set("Content-Length", strconv.Itoa(100000))
 			_, _ = io.CopyN(c, f, 100000)
 		default:
-			stdhttp.ServeFile(c, r, path)
+			stdhttp.ServeFile(c, c.Request, path)
 		}
 	}
 }
@@ -822,12 +822,12 @@ func TestHTTP1ConformanceServerWithCurl(t *testing.T) {
 	curl := requireCurl(t)
 	path, data := randomFile(t, 2<<20+99)
 	files := fileHandler(path)
-	addr := serveHTTP1(t, func(c *Context, r *stdhttp.Request) {
-		switch r.URL.Path {
+	addr := serveHTTP1(t, func(c *Context) {
+		switch c.Request.URL.Path {
 		case "/echo":
-			body, _ := io.ReadAll(r.Body)
+			body, _ := io.ReadAll(c.Request.Body)
 			sum := sha256.Sum256(body)
-			_ = c.Respond(200, "text/plain", fmt.Appendf(nil, "%s %v %d %x", r.Proto, r.TransferEncoding, len(body), sum))
+			_ = c.Respond(200, "text/plain", fmt.Appendf(nil, "%s %v %d %x", c.Request.Proto, c.Request.TransferEncoding, len(body), sum))
 		case "/stream":
 			c.Header().Set("Trailer", "X-Done")
 			for i := 0; i < 5; i++ {
@@ -836,7 +836,7 @@ func TestHTTP1ConformanceServerWithCurl(t *testing.T) {
 			}
 			c.Header().Set("X-Done", "yes")
 		default:
-			files(c, r)
+			files(c)
 		}
 	})
 	base := "http://" + addr
@@ -1162,16 +1162,16 @@ func TestHTTP1ConformanceClientHTTP10Responses(t *testing.T) {
 func TestHTTP1ConformanceFibClientAndServer(t *testing.T) {
 	path, data := randomFile(t, 1<<20+5)
 	files := fileHandler(path)
-	addr := serveHTTP1(t, func(c *Context, r *stdhttp.Request) {
-		if r.URL.Path == "/echo" {
-			body, _ := io.ReadAll(r.Body)
+	addr := serveHTTP1(t, func(c *Context) {
+		if c.Request.URL.Path == "/echo" {
+			body, _ := io.ReadAll(c.Request.Body)
 			c.Header().Set("Trailer", "X-Len")
-			_, _ = fmt.Fprintf(c, "%s %v %s ", r.Proto, r.TransferEncoding, r.Trailer.Get("X-Req"))
+			_, _ = fmt.Fprintf(c, "%s %v %s ", c.Request.Proto, c.Request.TransferEncoding, c.Request.Trailer.Get("X-Req"))
 			_, _ = c.Write(bytes.Repeat(body, 2000))
 			c.Header().Set("X-Len", strconv.Itoa(len(body)))
 			return
 		}
-		files(c, r)
+		files(c)
 	})
 	client := newTestClient(t, DefaultClientConfig())
 	req := mustRequest(t, "POST", "http://"+addr+"/echo", strings.NewReader("abc"))

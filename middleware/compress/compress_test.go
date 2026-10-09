@@ -20,8 +20,8 @@ import (
 var text = strings.Repeat("the quick brown fox jumps over the lazy dog\n", 500)
 
 func serveText(t *testing.T) string {
-	return mwtest.Serve(t, middleware.Chain(fibhttp.HandlerFunc(func(c *fibhttp.Context, r *stdhttp.Request) {
-		switch r.URL.Path {
+	return mwtest.Serve(t, middleware.Chain(fibhttp.HandlerFunc(func(c *fibhttp.Context) {
+		switch c.Request.URL.Path {
 		case "/writer":
 			// Long enough that HTTP/1 would stream it, were it not held.
 			c.Header().Set("Content-Type", "text/plain")

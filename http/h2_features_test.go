@@ -30,8 +30,8 @@ type pushHandler struct {
 	errs []error
 }
 
-func (h *pushHandler) ServeHTTP(c *Context, r *stdhttp.Request) {
-	switch r.URL.Path {
+func (h *pushHandler) ServeHTTP(c *Context) {
+	switch c.Request.URL.Path {
 	case "/index.html":
 		for _, target := range []string{"/style.css", "/app.js"} {
 			err := c.Push(target, &stdhttp.PushOptions{Header: stdhttp.Header{"Accept": {"*/*"}}})
@@ -48,7 +48,7 @@ func (h *pushHandler) ServeHTTP(c *Context, r *stdhttp.Request) {
 		}
 		fallthrough
 	default:
-		_ = c.Respond(200, "text/plain", []byte("pushed "+r.Method+" "+r.URL.Path+" "+r.Header.Get("Accept")))
+		_ = c.Respond(200, "text/plain", []byte("pushed "+c.Request.Method+" "+c.Request.URL.Path+" "+c.Request.Header.Get("Accept")))
 	}
 }
 
@@ -148,12 +148,12 @@ func TestPushOnHTTP1IsNotSupported(t *testing.T) {
 
 // earlyHints answers with 103 Early Hints before its response.
 func earlyHints() Handler {
-	return HandlerFunc(func(c *Context, r *stdhttp.Request) {
+	return HandlerFunc(func(c *Context) {
 		if err := c.WriteInterim(stdhttp.StatusEarlyHints, stdhttp.Header{"Link": {"</style.css>; rel=preload"}}); err != nil {
 			_ = c.Respond(500, "", []byte(err.Error()))
 			return
 		}
-		body, _ := io.ReadAll(r.Body)
+		body, _ := io.ReadAll(c.Request.Body)
 		_ = c.Respond(200, "text/plain", body)
 	})
 }
@@ -213,7 +213,7 @@ func TestInterimResponsesAndContinue(t *testing.T) {
 
 func TestInterimResponseRules(t *testing.T) {
 	results := make(chan []error, 1)
-	addr := serve(t, NewHandler(HandlerFunc(func(c *Context, r *stdhttp.Request) {
+	addr := serve(t, NewHandler(HandlerFunc(func(c *Context) {
 		var errs []error
 		errs = append(errs, c.WriteInterim(stdhttp.StatusSwitchingProtocols, nil))
 		// HTTP/1.0 knows nothing of interim responses.
@@ -298,8 +298,8 @@ func TestH2CUpgradeIgnoredWhenDisabled(t *testing.T) {
 // HTTP/2 sends GOAWAY, lets the open streams finish, and then closes.
 func TestH2ServerResponseCloseGoesAwayGracefully(t *testing.T) {
 	release := make(chan struct{})
-	addr := serve(t, NewHandler(HandlerFunc(func(c *Context, r *stdhttp.Request) {
-		switch r.URL.Path {
+	addr := serve(t, NewHandler(HandlerFunc(func(c *Context) {
+		switch c.Request.URL.Path {
 		case "/slow":
 			c.Retain()
 			go func() {
@@ -349,10 +349,10 @@ func TestRequestTLS(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	addr := serve(t, fibtls.NewServer(ConfigureTLS(serverConfig), NewHandler(HandlerFunc(func(c *Context, r *stdhttp.Request) {
+	addr := serve(t, fibtls.NewServer(ConfigureTLS(serverConfig), NewHandler(HandlerFunc(func(c *Context) {
 		proto := "none"
-		if r.TLS != nil {
-			proto = r.TLS.NegotiatedProtocol
+		if c.Request.TLS != nil {
+			proto = c.Request.TLS.NegotiatedProtocol
 		}
 		_ = c.Respond(200, "", []byte(proto))
 	}))))
@@ -372,8 +372,8 @@ func TestRequestTLS(t *testing.T) {
 		}
 	}
 	// And a cleartext request carries none.
-	plain := serve(t, NewHandler(HandlerFunc(func(c *Context, r *stdhttp.Request) {
-		_ = c.Respond(200, "", []byte(fmt.Sprint(r.TLS != nil)))
+	plain := serve(t, NewHandler(HandlerFunc(func(c *Context) {
+		_ = c.Respond(200, "", []byte(fmt.Sprint(c.Request.TLS != nil)))
 	})))
 	resp, err := stdhttp.Get("http://" + plain + "/")
 	if err != nil {

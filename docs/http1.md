@@ -14,7 +14,7 @@ usage, see the [HTTP section of the Go guide](guide.zh-CN.md#http-子-package)
 | --- | --- | --- |
 | Versions | HTTP/1.0 and HTTP/1.1 requests; answers in the request's version | Sends HTTP/1.1, or HTTP/1.0 when the request's `ProtoMinor` is 0 |
 | Connections | Keep-alive (HTTP/1.1 by default, HTTP/1.0 with `Connection: keep-alive`), `Connection: close` from either side, pipelining (responses in request order) | Keep-alive pool per host:port; an HTTP/1.0 connection is reused only if the request asked for keep-alive and the server agreed |
-| Request bodies | `Content-Length`, chunked with extensions and trailers (`Request.Trailer`); buffered whole by default, or streamed to the handler as they arrive with `StreamRequestBody` | `Content-Length`; chunked with `req.Trailer` when `ContentLength` is -1 |
+| Request bodies | `Content-Length`, chunked with extensions and trailers (`Request.Trailer`); buffered whole by default, or streamed to the handler as they arrive with `StreamRequestBody` | `Content-Length`; chunked with `c.Request.Trailer` when `ContentLength` is -1 |
 | Response bodies | `Content-Length`, chunked with trailers, close-delimited for HTTP/1.0 streams | `Content-Length`, chunked with trailers (`Response.Trailer`), close-delimited |
 | Streaming | Responses: `Context` is an `http.ResponseWriter`, `http.Flusher` and `io.ReaderFrom`, so `Write` + `Flush` stream the body as it is produced. Requests: with `StreamRequestBody` `Request.Body` is a `*BodyStream`, read without waiting or taken through `Context.OnBody` | Bodies are buffered whole before the callback |
 | Files | `Connection.SendFile` / `Context.ReadFrom`: `sendfile(2)` on Linux and macOS, chunked reads on Windows; `http.ServeFile`, `http.ServeContent` and `http.FileServer` work through `Context` (Range, multipart ranges, conditional requests) | — |
@@ -62,7 +62,7 @@ straight from `Request.Body` and use the callback only for one still on its
 way:
 
 ```go
-func(c *fibhttp.Context, r *http.Request) {
+func(c *fibhttp.Context) {
 	f, _ := os.Create("upload.bin")
 	c.OnBody(func(data []byte, fin bool, err error) {
 		if err != nil {         // the connection went, or the body failed
@@ -208,8 +208,8 @@ Nothing is lost across the handover: what `OnBody` is given begins where the
 last `Read` stopped.
 
 ```go
-func(c *fibhttp.Context, r *http.Request) {
-	n, err := r.Body.Read(buf)          // whatever is here
+func(c *fibhttp.Context) {
+	n, err := c.Request.Body.Read(buf)          // whatever is here
 	switch {
 	case errors.Is(err, io.EOF):        // that was all of it
 		answer(c)
@@ -285,7 +285,7 @@ make. A `Context` waiting for its next request reads as finished, so a stray
 This is the rule Fiber, Gin and Echo have for their contexts as well. A
 handler written for `net/http` that keeps the `*http.Request` after it
 returns, say in a goroutine it starts without a `Retain`, turns
-`ReuseRequests` off, or takes `r.Clone(ctx)` first.
+`ReuseRequests` off, or takes `c.Request.Clone(ctx)` first.
 
 Each option recycles its own object, so a handler that keeps only, say, the
 `Context` can recycle the rest. A request whose body streams, and one outside
@@ -296,7 +296,7 @@ their `Request`, `Header` and `URL` whatever the options say.
 
 `Context.Body()` returns the request body that arrived whole before the
 handler ran, as every body does that does not stream: the server's own buffer,
-where `io.ReadAll(r.Body)` copies it out through a buffer it grows a piece at
+where `io.ReadAll(c.Request.Body)` copies it out through a buffer it grows a piece at
 a time. The bytes are the handler's for as long as the body is, until the
 response is finished, and must be neither changed nor kept past that.
 `Respond` and `Write` copy what they are given, so an echo answers with
@@ -304,7 +304,7 @@ response is finished, and must be neither changed nor kept past that.
 streams, `Body` returns nil.
 
 `Context.Query(name)` returns the first value of a query parameter, decoded
-as `r.URL.Query().Get(name)` decodes it, without building the map `Query`
+as `c.Request.URL.Query().Get(name)` decodes it, without building the map `Query`
 builds on every call; a value that needs no decoding is a slice of the raw
 query and costs no allocation.
 
@@ -346,8 +346,8 @@ of the stream, once what was sent has gone, and `Close` ends it at once.
 
 ```go
 ws := websocket.NewHandler(wsHandler)
-handler := http.HandlerFunc(func(c *http.Context, r *stdhttp.Request) {
-	if r.URL.Path == "/ws" {
+handler := http.HandlerFunc(func(c *http.Context) {
+	if c.Request.URL.Path == "/ws" {
 		_, _ = ws.Upgrade(c, nil) // answers 400/403 itself when it fails
 		return
 	}

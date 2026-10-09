@@ -61,23 +61,23 @@ func TestServerReuseKeepsRequestsApart(t *testing.T) {
 func testServerReuse(t *testing.T, config Config) {
 	var retained sync.WaitGroup
 	t.Cleanup(retained.Wait)
-	addr := serve(t, NewHandlerWithConfig(config, HandlerFunc(func(c *Context, r *stdhttp.Request) {
-		n := strings.TrimPrefix(r.URL.Path, "/r")
-		body, _ := io.ReadAll(r.Body)
+	addr := serve(t, NewHandlerWithConfig(config, HandlerFunc(func(c *Context) {
+		n := strings.TrimPrefix(c.Request.URL.Path, "/r")
+		body, _ := io.ReadAll(c.Request.Body)
 		var problems []string
-		if got := r.Header.Get("X-N"); got != n {
+		if got := c.Request.Header.Get("X-N"); got != n {
 			problems = append(problems, "X-N "+got)
 		}
-		if _, ok := r.Header["X-Odd"]; ok != (len(n)%2 == 1) {
+		if _, ok := c.Request.Header["X-Odd"]; ok != (len(n)%2 == 1) {
 			problems = append(problems, "X-Odd")
 		}
-		if got := r.URL.Query().Get("n"); got != n {
+		if got := c.Request.URL.Query().Get("n"); got != n {
 			problems = append(problems, "query "+got)
 		}
 		if want := strings.Repeat(n, len(body)/max(len(n), 1)); string(body) != want {
 			problems = append(problems, "body")
 		}
-		reply := []byte(r.URL.Path + " " + strings.Join(problems, ","))
+		reply := []byte(c.Request.URL.Path + " " + strings.Join(problems, ","))
 		if len(n)%3 != 0 {
 			_ = c.Respond(stdhttp.StatusOK, "text/plain", reply)
 			return
@@ -123,10 +123,10 @@ func TestReuseWaitsForTheLastRelease(t *testing.T) {
 	config := DefaultConfig()
 	setReuseAll(&config)
 	result := make(chan string, 1)
-	addr := serve(t, NewHandlerWithConfig(config, HandlerFunc(func(c *Context, r *stdhttp.Request) {
-		if r.URL.Path != "/held" {
-			body, _ := io.ReadAll(r.Body)
-			_ = c.Respond(stdhttp.StatusOK, "text/plain", append([]byte(r.Header.Get("X-Id")+" "), body...))
+	addr := serve(t, NewHandlerWithConfig(config, HandlerFunc(func(c *Context) {
+		if c.Request.URL.Path != "/held" {
+			body, _ := io.ReadAll(c.Request.Body)
+			_ = c.Respond(stdhttp.StatusOK, "text/plain", append([]byte(c.Request.Header.Get("X-Id")+" "), body...))
 			return
 		}
 		c.Retain()
@@ -137,8 +137,8 @@ func TestReuseWaitsForTheLastRelease(t *testing.T) {
 			// Long enough for the other connection's requests to have been
 			// served with whatever this one's would have given back.
 			time.Sleep(200 * time.Millisecond)
-			body, err := io.ReadAll(r.Body)
-			result <- fmt.Sprintf("%s %s %s %s %v", r.URL.Path, r.URL.RawQuery, r.Header.Get("X-Id"), body, err)
+			body, err := io.ReadAll(c.Request.Body)
+			result <- fmt.Sprintf("%s %s %s %s %v", c.Request.URL.Path, c.Request.URL.RawQuery, c.Request.Header.Get("X-Id"), body, err)
 			c.Release()
 		}()
 		c.Conn.Close()
@@ -173,8 +173,8 @@ func TestRecycledHooksStayWithTheirRequest(t *testing.T) {
 	config := DefaultConfig()
 	var seq atomic.Int64
 	var ran sync.Map
-	addr := serve(t, NewHandlerWithConfig(config, HandlerFunc(func(c *Context, r *stdhttp.Request) {
-		path := r.URL.Path
+	addr := serve(t, NewHandlerWithConfig(config, HandlerFunc(func(c *Context) {
+		path := c.Request.URL.Path
 		switch path {
 		case "/tag":
 			c.OnHeader(func(_ int, h stdhttp.Header) { h.Set("X-Tag", "tag") })
@@ -267,11 +267,11 @@ func TestH2RecycledStreamsKeepRequestsApart(t *testing.T) {
 	describe := func(r *stdhttp.Request, body []byte) string {
 		return fmt.Sprintf("%s %s n=%s x=%s %s", r.Method, r.URL.Path, r.URL.Query().Get("n"), r.Header.Get("X-N"), body)
 	}
-	addr := serve(t, fibtls.NewServer(ConfigureTLS(serverConfig), NewHandler(HandlerFunc(func(c *Context, r *stdhttp.Request) {
-		body, _ := io.ReadAll(r.Body)
-		n := strings.TrimPrefix(r.URL.Path, "/r")
+	addr := serve(t, fibtls.NewServer(ConfigureTLS(serverConfig), NewHandler(HandlerFunc(func(c *Context) {
+		body, _ := io.ReadAll(c.Request.Body)
+		n := strings.TrimPrefix(c.Request.URL.Path, "/r")
 		if len(n)%2 == 0 {
-			_ = c.Respond(stdhttp.StatusOK, "text/plain", []byte(describe(r, body)))
+			_ = c.Respond(stdhttp.StatusOK, "text/plain", []byte(describe(c.Request, body)))
 			return
 		}
 		c.Retain()
@@ -279,12 +279,12 @@ func TestH2RecycledStreamsKeepRequestsApart(t *testing.T) {
 		go func() {
 			defer retained.Done()
 			time.Sleep(time.Millisecond)
-			want := describe(r, body)
+			want := describe(c.Request, body)
 			_ = c.Respond(stdhttp.StatusOK, "text/plain", []byte(want))
 			// Until its last Release the request is still this handler's,
 			// response written or not.
 			time.Sleep(time.Millisecond)
-			if got := describe(r, body); got != want {
+			if got := describe(c.Request, body); got != want {
 				t.Errorf("request changed under its handler before Release: %q, was %q", got, want)
 			}
 			c.Release()

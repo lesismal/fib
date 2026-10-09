@@ -630,6 +630,12 @@ func (c *Context) giveBack(returning bool) {
 			// to take it.
 			c.forget()
 		}
+		if returning && !c.wrote && (c.w == nil || c.w.status == 0) {
+			// The handler returned without answering, retained nothing and
+			// has no one to answer for it: as net/http does, that is an
+			// empty 200.
+			c.WriteHeader(200)
+		}
 		_ = c.Finish()
 		if !returning {
 			// Away from the connection's read round, nothing else will send

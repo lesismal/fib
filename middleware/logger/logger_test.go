@@ -37,7 +37,7 @@ func TestLogger(t *testing.T) {
 	handler := logger.New(logger.Config{
 		Format: "${status} ${method} ${url} ${protocol} ${bytesSent} ${reqHeader:X-Test} ${respHeader:X-Reply} ${queryParam:q} ${ip}\n",
 		Output: out,
-	})(fibhttp.HandlerFunc(func(c *fibhttp.Context, r *stdhttp.Request) {
+	})(fibhttp.HandlerFunc(func(c *fibhttp.Context) {
 		_ = c.WriteResponse(fibhttp.Response{
 			StatusCode: stdhttp.StatusCreated,
 			Header:     stdhttp.Header{"X-Reply": {"yes"}},
@@ -68,7 +68,7 @@ func TestLogger(t *testing.T) {
 func TestLoggerEscapes(t *testing.T) {
 	out := &syncBuffer{}
 	handler := logger.New(logger.Config{Format: "${path}\n", Output: out})(fibhttp.HandlerFunc(
-		func(c *fibhttp.Context, _ *stdhttp.Request) { _ = c.Respond(stdhttp.StatusOK, "", nil) }))
+		func(c *fibhttp.Context) { _ = c.Respond(stdhttp.StatusOK, "", nil) }))
 	url := mwtest.Serve(t, handler)
 	c := mwtest.Clients(t)[0]
 	c.Do(t, "GET", url+"/a%0Afake%20line", nil, "")

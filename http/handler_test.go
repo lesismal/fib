@@ -15,8 +15,8 @@ import (
 )
 
 func TestServerHandlerKeepAliveAndClose(t *testing.T) {
-	handler := NewHandler(HandlerFunc(func(c *Context, request *stdhttp.Request) {
-		_ = c.Respond(stdhttp.StatusOK, "text/plain", []byte(request.URL.Path))
+	handler := NewHandler(HandlerFunc(func(c *Context) {
+		_ = c.Respond(stdhttp.StatusOK, "text/plain", []byte(c.Request.URL.Path))
 	}))
 	config := fib.DefaultConfig()
 	config.Addr = "127.0.0.1:0"
@@ -84,8 +84,8 @@ func TestMarshalHeadResponse(t *testing.T) {
 
 // Requests carry the peer's address, as net/http's do.
 func TestServerHandlerSetsRemoteAddr(t *testing.T) {
-	handler := NewHandler(HandlerFunc(func(c *Context, request *stdhttp.Request) {
-		_ = c.Respond(stdhttp.StatusOK, "text/plain", []byte(request.RemoteAddr))
+	handler := NewHandler(HandlerFunc(func(c *Context) {
+		_ = c.Respond(stdhttp.StatusOK, "text/plain", []byte(c.Request.RemoteAddr))
 	}))
 	config := fib.DefaultConfig()
 	config.Addr = "127.0.0.1:0"

@@ -21,9 +21,9 @@ func timeoutConfig(header, read, idle time.Duration) Config {
 }
 
 // echoPath answers with the request's path once its body has been read.
-func echoPath(c *Context, r *stdhttp.Request) {
-	_, _ = io.Copy(io.Discard, r.Body)
-	_ = c.Respond(stdhttp.StatusOK, "text/plain", []byte(r.URL.Path))
+func echoPath(c *Context) {
+	_, _ = io.Copy(io.Discard, c.Request.Body)
+	_ = c.Respond(stdhttp.StatusOK, "text/plain", []byte(c.Request.URL.Path))
 }
 
 func TestServerReadHeaderTimeoutClosesASlowHeader(t *testing.T) {
@@ -66,8 +66,8 @@ func TestServerReadTimeoutClosesASlowStreamedBody(t *testing.T) {
 	config.StreamRequestBody = true
 	config.StreamRequestBodyThreshold = 1 << 10
 	failed := make(chan error, 1)
-	addr := serveStreamingServer(t, config, func(c *Context, r *stdhttp.Request) {
-		_, err := io.Copy(io.Discard, r.Body)
+	addr := serveStreamingServer(t, config, func(c *Context) {
+		_, err := io.Copy(io.Discard, c.Request.Body)
 		failed <- err
 	})
 	conn := dialRaw(t, addr)
@@ -90,7 +90,7 @@ func TestServerReadTimeoutClosesASlowStreamedBody(t *testing.T) {
 // still gets to answer.
 func TestServerReadTimeoutDoesNotCutOffAHandler(t *testing.T) {
 	addr := serveStreamingServer(t, timeoutConfig(0, 200*time.Millisecond, 0),
-		func(c *Context, r *stdhttp.Request) {
+		func(c *Context) {
 			time.Sleep(600 * time.Millisecond)
 			_ = c.Respond(stdhttp.StatusOK, "text/plain", []byte("slow but answered"))
 		})

@@ -11,7 +11,7 @@ import (
 	"github.com/lesismal/fib/middleware/mwtest"
 )
 
-var ok = fibhttp.HandlerFunc(func(c *fibhttp.Context, _ *stdhttp.Request) {
+var ok = fibhttp.HandlerFunc(func(c *fibhttp.Context) {
 	_ = c.Respond(stdhttp.StatusOK, "text/plain", []byte("ok"))
 })
 

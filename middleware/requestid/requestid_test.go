@@ -16,8 +16,8 @@ import (
 var uuidPattern = regexp.MustCompile(`^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$`)
 
 func TestRequestID(t *testing.T) {
-	url := mwtest.Serve(t, requestid.New()(fibhttp.HandlerFunc(func(c *fibhttp.Context, r *stdhttp.Request) {
-		_ = c.Respond(stdhttp.StatusOK, "text/plain", []byte(requestid.FromRequest(r)))
+	url := mwtest.Serve(t, requestid.New()(fibhttp.HandlerFunc(func(c *fibhttp.Context) {
+		_ = c.Respond(stdhttp.StatusOK, "text/plain", []byte(requestid.FromRequest(c.Request)))
 	})))
 	mwtest.Run(t, func(t *testing.T, c mwtest.Client) {
 		resp, body := c.Do(t, "GET", url, nil, "")

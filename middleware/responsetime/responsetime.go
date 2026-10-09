@@ -43,16 +43,16 @@ func New(config ...Config) middleware.Middleware {
 		cfg.Format = Milliseconds
 	}
 	return func(next fibhttp.Handler) fibhttp.Handler {
-		return fibhttp.HandlerFunc(func(c *fibhttp.Context, r *stdhttp.Request) {
-			if cfg.Next != nil && cfg.Next(c, r) {
-				next.ServeHTTP(c, r)
+		return fibhttp.HandlerFunc(func(c *fibhttp.Context) {
+			if cfg.Next != nil && cfg.Next(c) {
+				next.ServeHTTP(c)
 				return
 			}
 			start := time.Now()
 			c.OnHeader(func(_ int, h stdhttp.Header) {
 				h[header] = []string{cfg.Format(time.Since(start))}
 			})
-			next.ServeHTTP(c, r)
+			next.ServeHTTP(c)
 		})
 	}
 }

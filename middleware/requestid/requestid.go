@@ -48,25 +48,25 @@ func New(config ...Config) middleware.Middleware {
 		cfg.Generator = UUID
 	}
 	return func(next fibhttp.Handler) fibhttp.Handler {
-		return fibhttp.HandlerFunc(func(c *fibhttp.Context, r *stdhttp.Request) {
-			if cfg.Next != nil && cfg.Next(c, r) {
-				next.ServeHTTP(c, r)
+		return fibhttp.HandlerFunc(func(c *fibhttp.Context) {
+			if cfg.Next != nil && cfg.Next(c) {
+				next.ServeHTTP(c)
 				return
 			}
-			id := r.Header.Get(header)
+			id := c.Request.Header.Get(header)
 			if !valid(id) {
 				id = cfg.Generator()
-				if r.Header == nil {
-					r.Header = make(stdhttp.Header)
+				if c.Request.Header == nil {
+					c.Request.Header = make(stdhttp.Header)
 				}
-				r.Header[header] = []string{id}
+				c.Request.Header[header] = []string{id}
 			}
 			c.OnHeader(func(_ int, h stdhttp.Header) {
 				if _, set := h[header]; !set {
 					h[header] = []string{id}
 				}
 			})
-			next.ServeHTTP(c, r)
+			next.ServeHTTP(c)
 		})
 	}
 }

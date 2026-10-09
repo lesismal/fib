@@ -18,7 +18,7 @@ import (
 // the header, then each piece as it is written, then the end.
 func TestResponseStreamsAsItIsWritten(t *testing.T) {
 	next := make(chan struct{})
-	base := startServer(t, Config{}, func(c *fibhttp.Context, r *stdhttp.Request) {
+	base := startServer(t, Config{}, func(c *fibhttp.Context) {
 		_, _ = c.WriteString("first")
 		c.Flush()
 		<-next
@@ -42,8 +42,8 @@ func TestResponseStreamsAsItIsWritten(t *testing.T) {
 
 // A streamed response carries its trailers, and its declared length.
 func TestResponseStreamsTrailersAndLength(t *testing.T) {
-	base := startServer(t, Config{}, func(c *fibhttp.Context, r *stdhttp.Request) {
-		if r.URL.Path == "/declared" {
+	base := startServer(t, Config{}, func(c *fibhttp.Context) {
+		if c.Request.URL.Path == "/declared" {
 			c.Header().Set("Content-Length", "100000")
 			for range 10 {
 				_, _ = c.Write(bytes.Repeat([]byte("d"), 10000))
@@ -84,7 +84,7 @@ func TestResponseWaitsForTheClient(t *testing.T) {
 	const window = 16 << 10
 	var written atomic.Int64
 	done := make(chan error, 1)
-	base := startServer(t, Config{}, func(c *fibhttp.Context, r *stdhttp.Request) {
+	base := startServer(t, Config{}, func(c *fibhttp.Context) {
 		chunk := bytes.Repeat([]byte("w"), 16<<10)
 		for written.Load() < total {
 			if _, err := c.Write(chunk); err != nil {
@@ -140,7 +140,7 @@ func TestResponseWaitsForTheClient(t *testing.T) {
 // stream, its Write failing.
 func TestResponseWaitEndsWithTheStream(t *testing.T) {
 	results := make(chan error, 1)
-	base := startServer(t, Config{}, func(c *fibhttp.Context, r *stdhttp.Request) {
+	base := startServer(t, Config{}, func(c *fibhttp.Context) {
 		chunk := make([]byte, 16<<10)
 		for {
 			if _, err := c.Write(chunk); err != nil {
@@ -183,7 +183,7 @@ func TestResponseOnTheReaderDoesNotWait(t *testing.T) {
 	config := Config{}
 	config.StreamPool = fibhttp.StreamPoolConfig{Disable: true}
 	const total = 3 << 20
-	base := startServer(t, config, func(c *fibhttp.Context, r *stdhttp.Request) {
+	base := startServer(t, config, func(c *fibhttp.Context) {
 		chunk := bytes.Repeat([]byte("r"), 64<<10)
 		for range total / len(chunk) {
 			_, _ = c.Write(chunk)
@@ -204,8 +204,8 @@ func TestStreamFailureCancelsTheContext(t *testing.T) {
 	config := Config{StreamRequestBody: true}
 	cancelled := make(chan error, 8)
 	entered := make(chan string, 8)
-	base := startServer(t, config, func(c *fibhttp.Context, r *stdhttp.Request) {
-		if r.URL.Path == "/quick" {
+	base := startServer(t, config, func(c *fibhttp.Context) {
+		if c.Request.URL.Path == "/quick" {
 			c.OnCancel(func(err error) { cancelled <- err })
 			_ = c.Respond(stdhttp.StatusOK, "text/plain", []byte("done"))
 			return
@@ -215,17 +215,17 @@ func TestStreamFailureCancelsTheContext(t *testing.T) {
 			cancelled <- err
 			close(done)
 		})
-		if r.URL.Path == "/streaming" {
+		if c.Request.URL.Path == "/streaming" {
 			c.Flush()
 		}
-		entered <- r.URL.Path
+		entered <- c.Request.URL.Path
 		select {
 		case <-done:
 			if c.Err() == nil {
 				t.Error("Err is nil in a cancelled Context")
 			}
 		case <-time.After(5 * time.Second):
-			t.Errorf("%s: the handler was never told", r.URL.Path)
+			t.Errorf("%s: the handler was never told", c.Request.URL.Path)
 		}
 	})
 	expectCancel := func(how string) {

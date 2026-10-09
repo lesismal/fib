@@ -4,7 +4,6 @@ package http3
 
 import (
 	"bytes"
-	stdhttp "net/http"
 	"sync"
 	"testing"
 	"time"
@@ -133,7 +132,7 @@ func TestWebSocketOverExtendedConnect(t *testing.T) {
 		},
 		Close: func(_ *websocket.Connection, code uint16, _ string, _ error) { closed <- code },
 	})
-	base := startServer(t, Config{}, func(c *fibhttp.Context, r *stdhttp.Request) {
+	base := startServer(t, Config{}, func(c *fibhttp.Context) {
 		if _, err := ws.Upgrade(c, nil); err != nil {
 			t.Logf("upgrade: %v", err)
 		}

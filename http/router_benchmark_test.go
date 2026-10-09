@@ -3,7 +3,6 @@
 package http
 
 import (
-	stdhttp "net/http"
 	"net/http/httptest"
 	"testing"
 )
@@ -33,10 +32,10 @@ func benchRouter(b *testing.B, middlewares int) *Router {
 	r := NewRouter()
 	for range middlewares {
 		r.Use(func(next Handler) Handler {
-			return HandlerFunc(func(c *Context, req *stdhttp.Request) { next.ServeHTTP(c, req) })
+			return HandlerFunc(func(c *Context) { next.ServeHTTP(c) })
 		})
 	}
-	nop := func(*Context, *stdhttp.Request) {}
+	nop := func(*Context) {}
 	for _, route := range benchRoutes {
 		r.HandleFunc(route, nop)
 	}
@@ -50,11 +49,11 @@ func benchRouter(b *testing.B, middlewares int) *Router {
 func benchRoute(b *testing.B, r Handler, method, target string) {
 	req := httptest.NewRequest(method, target, nil)
 	c := &Context{Request: req}
-	r.ServeHTTP(c, req)
+	r.ServeHTTP(c)
 	b.ReportAllocs()
 	b.ResetTimer()
 	for b.Loop() {
-		r.ServeHTTP(c, req)
+		r.ServeHTTP(c)
 	}
 }
 
@@ -94,7 +93,7 @@ func BenchmarkRouterFreshContext(b *testing.B) {
 			b.ReportAllocs()
 			for b.Loop() {
 				c := &Context{Request: req}
-				r.ServeHTTP(c, req)
+				r.ServeHTTP(c)
 			}
 		})
 	}

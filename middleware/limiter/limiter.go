@@ -40,7 +40,7 @@ type Config struct {
 	Expiration time.Duration
 	// KeyGenerator tells clients apart; by their address by default, which
 	// behind a proxy is the proxy's.
-	KeyGenerator func(c *fibhttp.Context, r *stdhttp.Request) string
+	KeyGenerator func(c *fibhttp.Context) string
 	// LimitReached answers a request past the bound; 429 Too Many Requests
 	// by default. The Retry-After and X-RateLimit-* fields are set on its
 	// response whichever way it answers.
@@ -71,7 +71,7 @@ func New(config ...Config) middleware.Middleware {
 		cfg.Expiration = DefaultExpiration
 	}
 	if cfg.KeyGenerator == nil {
-		cfg.KeyGenerator = func(_ *fibhttp.Context, r *stdhttp.Request) string { return middleware.RemoteIP(r) }
+		cfg.KeyGenerator = func(c *fibhttp.Context) string { return middleware.RemoteIP(c.Request) }
 	}
 	if cfg.LimitReached == nil {
 		cfg.LimitReached = tooManyRequests
@@ -79,12 +79,12 @@ func New(config ...Config) middleware.Middleware {
 	limit := strconv.Itoa(cfg.Max)
 	store := newStore(cfg.Expiration.Nanoseconds(), cfg.SlidingWindow)
 	return func(next fibhttp.Handler) fibhttp.Handler {
-		return fibhttp.HandlerFunc(func(c *fibhttp.Context, r *stdhttp.Request) {
-			if cfg.Next != nil && cfg.Next(c, r) {
-				next.ServeHTTP(c, r)
+		return fibhttp.HandlerFunc(func(c *fibhttp.Context) {
+			if cfg.Next != nil && cfg.Next(c) {
+				next.ServeHTTP(c)
 				return
 			}
-			key := cfg.KeyGenerator(c, r)
+			key := cfg.KeyGenerator(c)
 			now := time.Now().UnixNano()
 			used, allowed, window, reset := store.take(key, now, cfg.Max)
 			if !cfg.DisableHeaders {
@@ -100,7 +100,7 @@ func New(config ...Config) middleware.Middleware {
 				})
 			}
 			if !allowed {
-				cfg.LimitReached(c, r)
+				cfg.LimitReached(c)
 				return
 			}
 			if cfg.SkipFailedRequests || cfg.SkipSuccessfulRequests {
@@ -111,12 +111,12 @@ func New(config ...Config) middleware.Middleware {
 					}
 				})
 			}
-			next.ServeHTTP(c, r)
+			next.ServeHTTP(c)
 		})
 	}
 }
 
-func tooManyRequests(c *fibhttp.Context, _ *stdhttp.Request) {
+func tooManyRequests(c *fibhttp.Context) {
 	status := stdhttp.StatusTooManyRequests
 	_ = c.Respond(status, "text/plain; charset=utf-8", []byte(stdhttp.StatusText(status)+"\n"))
 }

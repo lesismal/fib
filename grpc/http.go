@@ -49,27 +49,27 @@ import (
 // A request that is not a gRPC call is answered as grpc-go answers it: one
 // over HTTP/1 400, one not a POST 405 and one whose Content-Type is not
 // gRPC's 415.
-func (s *Server) ServeHTTP(c *fibhttp.Context, r *stdhttp.Request) {
+func (s *Server) ServeHTTP(c *fibhttp.Context) {
 	switch {
-	case r.ProtoMajor != 2:
+	case c.Request.ProtoMajor != 2:
 		_ = c.Respond(stdhttp.StatusBadRequest, "text/plain", []byte("gRPC requires HTTP/2"))
 		return
-	case r.Method != stdhttp.MethodPost:
+	case c.Request.Method != stdhttp.MethodPost:
 		_ = c.Respond(stdhttp.StatusMethodNotAllowed, "text/plain", []byte("invalid gRPC request method"))
 		return
 	}
-	subtype, ok := contentSubtype(r.Header.Get("Content-Type"))
+	subtype, ok := contentSubtype(c.Request.Header.Get("Content-Type"))
 	if !ok {
 		_ = c.Respond(stdhttp.StatusUnsupportedMediaType, "text/plain", []byte("invalid gRPC request content-type"))
 		return
 	}
-	hs := &httpStream{server: s, c: c, r: r, conn: c.Conn, method: r.URL.Path, codec: s.opts.codec,
+	hs := &httpStream{server: s, c: c, r: c.Request, conn: c.Conn, method: c.Request.URL.Path, codec: s.opts.codec,
 		whole: c.RequestBody() == nil, body: c.Body()}
 	if hs.codec == nil {
 		hs.codec = GetCodec(subtype)
 	}
 	var fail *status.Status
-	for key := range r.Header {
+	for key := range c.Request.Header {
 		if len(key) > 4 && strings.EqualFold(key[len(key)-4:], "-bin") {
 			// Binary metadata is decoded now, so that a malformed value
 			// fails the call rather than vanishing from its metadata.
@@ -84,7 +84,7 @@ func (s *Server) ServeHTTP(c *fibhttp.Context, r *stdhttp.Request) {
 	// client set goes on top of it.
 	hs.ctx = hs
 	cancel := context.CancelFunc(func() {})
-	if timeout, ok := decodeTimeout(r.Header.Get("Grpc-Timeout")); ok {
+	if timeout, ok := decodeTimeout(c.Request.Header.Get("Grpc-Timeout")); ok {
 		hs.ctx, cancel = context.WithTimeout(hs, timeout)
 	}
 	if !hs.whole {

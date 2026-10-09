@@ -34,8 +34,8 @@ func newTestFileCache(t *testing.T, watch bool) (*FileCache, string, string) {
 		_ = fc.Close()
 	}
 	t.Cleanup(func() { _ = fc.Close() })
-	addr := serveHTTP1(t, func(c *Context, r *stdhttp.Request) {
-		fc.ServeFile(c, r, strings.TrimPrefix(r.URL.Path, "/static/"))
+	addr := serveHTTP1(t, func(c *Context) {
+		fc.ServeFile(c, strings.TrimPrefix(c.Request.URL.Path, "/static/"))
 	})
 	return fc, dir, addr
 }
@@ -179,10 +179,10 @@ func TestFileCacheServesWithoutAllocating(t *testing.T) {
 	req, _ := stdhttp.NewRequest(stdhttp.MethodGet, "/a.css", nil)
 	req.Header.Set("Accept-Encoding", "br;q=1, gzip;q=0.8")
 	c := &Context{Request: req, external: discardStream{}}
-	fc.ServeFile(c, req, "a.css")
+	fc.ServeFile(c, "a.css")
 	allocs := testing.AllocsPerRun(100, func() {
 		*c = Context{Request: req, external: discardStream{}}
-		fc.ServeFile(c, req, "a.css")
+		fc.ServeFile(c, "a.css")
 	})
 	if allocs > 0 {
 		t.Fatalf("a cached file took %v allocations to serve", allocs)

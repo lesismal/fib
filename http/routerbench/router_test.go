@@ -30,7 +30,7 @@ type fibRouter struct{ r *fibhttp.Router }
 func newFib(param string) router {
 	r := fibhttp.NewRouter()
 	for _, route := range githubAPI {
-		r.MethodFunc(route.method, route.path, func(c *fibhttp.Context, _ *stdhttp.Request) {
+		r.MethodFunc(route.method, route.path, func(c *fibhttp.Context) {
 			if param != "" {
 				sink = c.Param(param)
 			}
@@ -38,7 +38,7 @@ func newFib(param string) router {
 	}
 	// The default 404 writes to the connection, which these Contexts have
 	// none of.
-	r.NotFound(func(*fibhttp.Context, *stdhttp.Request) {})
+	r.NotFound(func(*fibhttp.Context) {})
 	return fibRouter{r}
 }
 
@@ -46,7 +46,7 @@ func (f fibRouter) serve(method, target string) func() {
 	req := httptest.NewRequest(method, target, nil)
 	// One Context for every request, as a server recycling them gives.
 	c := &fibhttp.Context{Request: req}
-	return func() { f.r.ServeHTTP(c, req) }
+	return func() { f.r.ServeHTTP(c) }
 }
 
 type chiRouter struct{ r *chi.Mux }

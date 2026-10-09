@@ -279,6 +279,11 @@ func (c *Context) ReadFrom(src io.Reader) (int64, error) {
 	if !ok || c.holdsWhole() || !c.isHTTP1() || c.Request.Method == stdhttp.MethodHead || w.finished ||
 		w.status != 0 && !statusHasBody(w.status) || file.size < minSendFileSize ||
 		w.declared >= 0 && w.written+file.size > w.declared {
+		if w.status == 0 {
+			// As Write does even for nothing, and net/http's ReadFrom does
+			// before it copies: an empty src still begins the response.
+			c.WriteHeader(stdhttp.StatusOK)
+		}
 		buf := bufferpool.Get(copyBufferSize)
 		defer bufferpool.Put(buf)
 		return io.CopyBuffer(writerOnly{c}, src, buf)
@@ -518,8 +523,9 @@ func appendChunk(out, p []byte) []byte {
 // calls it when the last hold on the response goes, which for a handler that
 // retained nothing is its own return, as net/http ends a response then, so a
 // handler only calls it to end the response sooner. A response that was never
-// begun is left alone, since the handler may answer it later with
-// WriteResponse.
+// begun is left alone here, since the handler may answer it later with
+// WriteResponse; the server itself answers one with an empty 200 when the
+// handler returns holding nothing, as net/http does.
 func (c *Context) Finish() error {
 	w := c.w
 	if w == nil || w.status == 0 || w.finished || c.wrote {

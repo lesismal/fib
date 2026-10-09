@@ -149,17 +149,17 @@ func TestH2RetainedBodyOutlivesHandler(t *testing.T) {
 	released := make(chan error, 64)
 	config := DefaultConfig()
 	setReuse(&config, false)
-	addr := serve(t, NewHandlerWithConfig(config, HandlerFunc(func(c *Context, r *stdhttp.Request) {
+	addr := serve(t, NewHandlerWithConfig(config, HandlerFunc(func(c *Context) {
 		c.Retain()
 		go func() {
 			time.Sleep(10 * time.Millisecond)
-			body, err := io.ReadAll(r.Body)
+			body, err := io.ReadAll(c.Request.Body)
 			if err != nil {
 				body = []byte(err.Error())
 			}
 			_ = c.Respond(stdhttp.StatusOK, "application/octet-stream", body)
 			c.Release()
-			_, err = r.Body.Read(make([]byte, 1))
+			_, err = c.Request.Body.Read(make([]byte, 1))
 			released <- err
 		}()
 	})))

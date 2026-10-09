@@ -28,7 +28,7 @@ func newConcurrencyProbe(t *testing.T) *concurrencyProbe {
 	return p
 }
 
-func (p *concurrencyProbe) serve(c *fibhttp.Context, r *stdhttp.Request) {
+func (p *concurrencyProbe) serve(c *fibhttp.Context) {
 	p.mu.Lock()
 	p.running++
 	if p.running > p.peak {
@@ -39,7 +39,7 @@ func (p *concurrencyProbe) serve(c *fibhttp.Context, r *stdhttp.Request) {
 	p.mu.Lock()
 	p.running--
 	p.mu.Unlock()
-	_ = c.Respond(stdhttp.StatusOK, "text/plain", []byte(r.URL.Path))
+	_ = c.Respond(stdhttp.StatusOK, "text/plain", []byte(c.Request.URL.Path))
 }
 
 func (p *concurrencyProbe) free() {

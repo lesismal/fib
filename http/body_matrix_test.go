@@ -180,15 +180,15 @@ type matrixServe struct {
 	ended    bool
 }
 
-func matrixHandler(c *Context, r *stdhttp.Request) {
-	s := &matrixServe{c: c, r: r, digest: sha256.New()}
+func matrixHandler(c *Context) {
+	s := &matrixServe{c: c, r: c.Request, digest: sha256.New()}
 	s.report.Complete, s.report.Streamed = c.BodyComplete(), c.RequestBody() != nil
 	defer s.returned.Store(true)
-	switch strings.TrimPrefix(r.URL.Path, "/") {
+	switch strings.TrimPrefix(c.Request.URL.Path, "/") {
 	case "read":
 		buf := make([]byte, 16<<10)
 		for {
-			n, err := r.Body.Read(buf)
+			n, err := c.Request.Body.Read(buf)
 			s.add(buf[:n])
 			switch {
 			case err == nil:
@@ -210,7 +210,7 @@ func matrixHandler(c *Context, r *stdhttp.Request) {
 			s.onBody(true)
 			return
 		}
-		body, err := io.ReadAll(r.Body)
+		body, err := io.ReadAll(c.Request.Body)
 		s.add(body)
 		s.answer(err)
 	case "async":
@@ -702,8 +702,8 @@ func TestBodyMatrixAbort(t *testing.T) {
 		ran     = map[string]bool{}
 		endings = map[string][]error{}
 	)
-	handler := func(c *Context, r *stdhttp.Request) {
-		key := r.URL.Query().Get("key")
+	handler := func(c *Context) {
+		key := c.Request.URL.Query().Get("key")
 		mu.Lock()
 		ran[key] = true
 		mu.Unlock()
@@ -859,7 +859,7 @@ func TestBodyMatrixFlowControl(t *testing.T) {
 		err    error
 	}
 	done := make(chan outcome, 2)
-	handler := HandlerFunc(func(c *Context, r *stdhttp.Request) {
+	handler := HandlerFunc(func(c *Context) {
 		c.Retain()
 		go func() {
 			defer c.Release()
@@ -921,7 +921,7 @@ func TestOnBodyWaitsForTheHandlerOnHTTP2(t *testing.T) {
 	config.StreamRequestBody = true
 	registered := make(chan struct{})
 	early := make(chan bool, 1)
-	addr := serve(t, NewHandlerWithConfig(config, HandlerFunc(func(c *Context, r *stdhttp.Request) {
+	addr := serve(t, NewHandlerWithConfig(config, HandlerFunc(func(c *Context) {
 		var returned atomic.Bool
 		var got []byte
 		c.OnBody(func(data []byte, fin bool, err error) {

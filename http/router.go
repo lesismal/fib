@@ -13,7 +13,7 @@ import (
 
 // Router routes each request to the handler registered for its method and
 // path. Its API follows github.com/go-chi/chi's, but its handlers are this
-// package's, func(*Context, *http.Request), as chi's are net/http's:
+// package's, func(*Context), as chi's are net/http's:
 //
 //	r := fibhttp.NewRouter()
 //	r.Use(recover.New(), logger.New())
@@ -103,15 +103,15 @@ func (r *Router) init() *routeTree {
 
 // ServeHTTP routes the request. A router made by With, Group or Route
 // serves every route of the router it was made from.
-func (r *Router) ServeHTTP(c *Context, req *stdhttp.Request) {
+func (r *Router) ServeHTTP(c *Context) {
 	if r.tree == nil {
-		notFound(c, req)
+		notFound(c)
 		return
 	}
 	if t := r.tree; len(t.router.middlewares) == 0 {
-		t.dispatch(c, req)
+		t.dispatch(c)
 	} else {
-		t.handler.ServeHTTP(c, req)
+		t.handler.ServeHTTP(c)
 	}
 }
 
@@ -191,8 +191,8 @@ func (r *Router) addFallback() {
 			pattern:  pattern,
 			keys:     keys,
 			fallback: true,
-			handler:  chain(middlewares, HandlerFunc(func(c *Context, req *stdhttp.Request) { r.notFoundHandler().ServeHTTP(c, req) })),
-			alt:      chain(middlewares, HandlerFunc(func(c *Context, req *stdhttp.Request) { r.methodNotAllowedHandler().ServeHTTP(c, req) })),
+			handler:  chain(middlewares, HandlerFunc(func(c *Context) { r.notFoundHandler().ServeHTTP(c) })),
+			alt:      chain(middlewares, HandlerFunc(func(c *Context) { r.methodNotAllowedHandler().ServeHTTP(c) })),
 		})
 		r.tree.root.insert(segments).endpointsOf().fallback = ep
 	}
@@ -476,11 +476,11 @@ func (r *Router) methodNotAllowedHandler() Handler {
 
 var notFoundBody = []byte("404 page not found\n")
 
-func notFound(c *Context, _ *stdhttp.Request) {
+func notFound(c *Context) {
 	_ = c.Respond(stdhttp.StatusNotFound, "text/plain; charset=utf-8", notFoundBody)
 }
 
-func methodNotAllowed(c *Context, _ *stdhttp.Request) {
+func methodNotAllowed(c *Context) {
 	// The Allow field is in the header already, which Respond would not send.
 	c.Header().Set("Content-Type", "text/plain; charset=utf-8")
 	c.WriteHeader(stdhttp.StatusMethodNotAllowed)
@@ -489,10 +489,10 @@ func methodNotAllowed(c *Context, _ *stdhttp.Request) {
 
 // dispatch routes a request through the tree, inside the root router's
 // middleware.
-func (t *routeTree) dispatch(c *Context, req *stdhttp.Request) {
-	path := t.start(c, req)
+func (t *routeTree) dispatch(c *Context) {
+	path := t.start(c)
 	// start leaves c.route nil or the Context's own.
-	s := search{c: c, st: c.route, method: req.Method, index: methodIndex(req.Method)}
+	s := search{c: c, st: c.route, method: c.Request.Method, index: methodIndex(c.Request.Method)}
 	var base []string
 	if s.st != nil {
 		base = s.st.keys
@@ -500,10 +500,10 @@ func (t *routeTree) dispatch(c *Context, req *stdhttp.Request) {
 	if !t.root.find(&s, path) {
 		if s.allow != "" {
 			c.Header().Set("Allow", s.allow)
-			t.router.methodNotAllowedHandler().ServeHTTP(c, req)
+			t.router.methodNotAllowedHandler().ServeHTTP(c)
 			return
 		}
-		t.router.notFoundHandler().ServeHTTP(c, req)
+		t.router.notFoundHandler().ServeHTTP(c)
 		return
 	}
 	ep := s.ep
@@ -534,16 +534,16 @@ func (t *routeTree) dispatch(c *Context, req *stdhttp.Request) {
 		}
 		if t.pathValues {
 			for i, key := range st.keys {
-				req.SetPathValue(key, st.value(i))
+				c.Request.SetPathValue(key, st.value(i))
 			}
 		}
 	}
 	if ep.fallback && s.allow != "" {
 		c.Header().Set("Allow", s.allow)
-		ep.alt.ServeHTTP(c, req)
+		ep.alt.ServeHTTP(c)
 		return
 	}
-	ep.handler.ServeHTTP(c, req)
+	ep.handler.ServeHTTP(c)
 	if st != nil {
 		// A mounted handler that is no Router, nor reaches one, leaves the
 		// rest of the path untaken.
@@ -553,7 +553,7 @@ func (t *routeTree) dispatch(c *Context, req *stdhttp.Request) {
 
 // start returns the path to route: what a Mount left of it for this router,
 // or the request's own, for which it clears what routing it before left.
-func (t *routeTree) start(c *Context, req *stdhttp.Request) string {
+func (t *routeTree) start(c *Context) string {
 	st := c.route
 	if st != nil && st.shared {
 		// The route state the request before was served with is its
@@ -566,15 +566,15 @@ func (t *routeTree) start(c *Context, req *stdhttp.Request) string {
 		st.ep = nil
 		return st.rest
 	}
-	if req.URL == nil {
+	if c.Request.URL == nil {
 		if st != nil {
 			st.clear()
 		}
 		return ""
 	}
-	path, raw := req.URL.Path, req.URL.RawPath != ""
+	path, raw := c.Request.URL.Path, c.Request.URL.RawPath != ""
 	if raw {
-		path = req.URL.RawPath
+		path = c.Request.URL.RawPath
 	}
 	if st != nil {
 		st.clear()

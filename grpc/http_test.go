@@ -33,7 +33,7 @@ func httpRouter(impl *echoImpl, opts ...ServerOption) *fibhttp.Router {
 	s.RegisterService(&echoDesc, impl)
 	r := fibhttp.NewRouter()
 	r.Handle("/test.Echo/*", s)
-	r.Get("/", func(c *fibhttp.Context, _ *stdhttp.Request) {
+	r.Get("/", func(c *fibhttp.Context) {
 		_ = c.Respond(stdhttp.StatusOK, "text/plain", []byte("http"))
 	})
 	return r

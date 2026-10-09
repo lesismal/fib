@@ -46,10 +46,10 @@ func New(config ...Config) middleware.Middleware {
 	}
 	prefix := "/" + strings.Trim(cfg.Prefix, "/")
 	return func(next fibhttp.Handler) fibhttp.Handler {
-		return fibhttp.HandlerFunc(func(c *fibhttp.Context, r *stdhttp.Request) {
-			path := r.URL.Path
-			if cfg.Next != nil && cfg.Next(c, r) || !strings.HasPrefix(path, prefix) {
-				next.ServeHTTP(c, r)
+		return fibhttp.HandlerFunc(func(c *fibhttp.Context) {
+			path := c.Request.URL.Path
+			if cfg.Next != nil && cfg.Next(c) || !strings.HasPrefix(path, prefix) {
+				next.ServeHTTP(c)
 				return
 			}
 			var handler stdhttp.Handler
@@ -57,8 +57,8 @@ func New(config ...Config) middleware.Middleware {
 			case "":
 				// The index links to the profiles relative to itself.
 				target := prefix + "/"
-				if r.URL.RawQuery != "" {
-					target += "?" + r.URL.RawQuery
+				if c.Request.URL.RawQuery != "" {
+					target += "?" + c.Request.URL.RawQuery
 				}
 				_ = c.WriteResponse(fibhttp.Response{
 					StatusCode: stdhttp.StatusMovedPermanently,
@@ -79,19 +79,20 @@ func New(config ...Config) middleware.Middleware {
 				if name[0] != '/' {
 					// A path that only starts like the prefix, such as
 					// /debug/pprofile.
-					next.ServeHTTP(c, r)
+					next.ServeHTTP(c)
 					return
 				}
 				handler = pprof.Handler(strings.TrimPrefix(name, "/"))
 			}
-			serve(c, r, handler)
+			serve(c, handler)
 		})
 	}
 }
 
 // serve runs handler on the engine's handler pool and answers with what it
 // wrote.
-func serve(c *fibhttp.Context, r *stdhttp.Request, handler stdhttp.Handler) {
+func serve(c *fibhttp.Context, handler stdhttp.Handler) {
+	r := c.Request
 	ctx, cancel := context.WithCancel(r.Context())
 	c.Retain()
 	c.OnCancel(func(error) { cancel() })

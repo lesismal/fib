@@ -128,26 +128,26 @@ func New(config ...Config) middleware.Middleware {
 		maxAge = "0"
 	}
 	return func(next fibhttp.Handler) fibhttp.Handler {
-		return fibhttp.HandlerFunc(func(c *fibhttp.Context, r *stdhttp.Request) {
-			if cfg.Next != nil && cfg.Next(c, r) {
-				next.ServeHTTP(c, r)
+		return fibhttp.HandlerFunc(func(c *fibhttp.Context) {
+			if cfg.Next != nil && cfg.Next(c) {
+				next.ServeHTTP(c)
 				return
 			}
-			origin := r.Header.Get("Origin")
-			if r.Method == stdhttp.MethodOptions && r.Header.Get("Access-Control-Request-Method") != "" {
+			origin := c.Request.Header.Get("Origin")
+			if c.Request.Method == stdhttp.MethodOptions && c.Request.Header.Get("Access-Control-Request-Method") != "" {
 				h := stdhttp.Header{"Vary": {"Origin, Access-Control-Request-Method, Access-Control-Request-Headers"}}
 				if origin != "" && allowed(origin) {
 					h["Access-Control-Allow-Origin"] = []string{allowOrigin(origin)}
 					h["Access-Control-Allow-Methods"] = []string{methods}
 					if headers != "" {
 						h["Access-Control-Allow-Headers"] = []string{headers}
-					} else if asked := r.Header.Get("Access-Control-Request-Headers"); asked != "" {
+					} else if asked := c.Request.Header.Get("Access-Control-Request-Headers"); asked != "" {
 						h["Access-Control-Allow-Headers"] = []string{asked}
 					}
 					if cfg.AllowCredentials {
 						h["Access-Control-Allow-Credentials"] = []string{"true"}
 					}
-					if cfg.AllowPrivateNetwork && r.Header.Get("Access-Control-Request-Private-Network") == "true" {
+					if cfg.AllowPrivateNetwork && c.Request.Header.Get("Access-Control-Request-Private-Network") == "true" {
 						h["Access-Control-Allow-Private-Network"] = []string{"true"}
 					}
 					if maxAge != "" {
@@ -158,7 +158,7 @@ func New(config ...Config) middleware.Middleware {
 				return
 			}
 			if origin == "" && anyOrigin {
-				next.ServeHTTP(c, r)
+				next.ServeHTTP(c)
 				return
 			}
 			// A response to a request from a page elsewhere differs from one
@@ -179,7 +179,7 @@ func New(config ...Config) middleware.Middleware {
 					h["Access-Control-Expose-Headers"] = []string{expose}
 				}
 			})
-			next.ServeHTTP(c, r)
+			next.ServeHTTP(c)
 		})
 	}
 }

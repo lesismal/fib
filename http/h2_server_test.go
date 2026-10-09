@@ -55,17 +55,17 @@ func serve(t *testing.T, handler fib.Handler) string {
 
 // echoHandler answers with the request's protocol, method, path and body.
 func echoHandler() Handler {
-	return HandlerFunc(func(c *Context, r *stdhttp.Request) {
-		body, _ := io.ReadAll(r.Body)
-		header := stdhttp.Header{"Content-Type": {"text/plain"}, "X-Proto": {r.Proto}}
-		if cookie := r.Header.Get("Cookie"); cookie != "" {
+	return HandlerFunc(func(c *Context) {
+		body, _ := io.ReadAll(c.Request.Body)
+		header := stdhttp.Header{"Content-Type": {"text/plain"}, "X-Proto": {c.Request.Proto}}
+		if cookie := c.Request.Header.Get("Cookie"); cookie != "" {
 			header.Set("X-Cookie", cookie)
 		}
-		if r.Trailer != nil {
-			header.Set("X-Trailer", r.Trailer.Get("X-Sum"))
+		if c.Request.Trailer != nil {
+			header.Set("X-Trailer", c.Request.Trailer.Get("X-Sum"))
 		}
-		reply := fmt.Sprintf("%s %s %s", r.Method, r.URL.Path, body)
-		if n, err := strconv.Atoi(r.URL.Query().Get("size")); err == nil {
+		reply := fmt.Sprintf("%s %s %s", c.Request.Method, c.Request.URL.Path, body)
+		if n, err := strconv.Atoi(c.Request.URL.Query().Get("size")); err == nil {
 			reply = strings.Repeat("x", n)
 		}
 		_ = c.WriteResponse(Response{StatusCode: stdhttp.StatusOK, Header: header, Body: []byte(reply)})
@@ -460,8 +460,8 @@ func TestH2ServerResetsMalformedRequestAndRefusesExcessStreams(t *testing.T) {
 	config := DefaultConfig()
 	config.MaxConcurrentStreams = 1
 	release := make(chan struct{})
-	addr := serve(t, NewHandlerWithConfig(config, HandlerFunc(func(c *Context, r *stdhttp.Request) {
-		if r.URL.Path == "/slow" {
+	addr := serve(t, NewHandlerWithConfig(config, HandlerFunc(func(c *Context) {
+		if c.Request.URL.Path == "/slow" {
 			c.Retain()
 			go func() {
 				<-release
@@ -543,8 +543,8 @@ func TestH2ServerHeadLengthMatchesHTTP1(t *testing.T) {
 		t.Fatal(err)
 	}
 	modTime := time.Unix(1700000000, 0)
-	addr := serve(t, fibtls.NewServer(ConfigureTLS(serverConfig), NewHandler(HandlerFunc(func(c *Context, r *stdhttp.Request) {
-		switch r.URL.Path {
+	addr := serve(t, fibtls.NewServer(ConfigureTLS(serverConfig), NewHandler(HandlerFunc(func(c *Context) {
+		switch c.Request.URL.Path {
 		case "/write":
 			_, _ = c.Write(make([]byte, 1234))
 		case "/declared":
@@ -555,7 +555,7 @@ func TestH2ServerHeadLengthMatchesHTTP1(t *testing.T) {
 		case "/respond-declared":
 			_ = c.WriteResponse(Response{StatusCode: stdhttp.StatusOK, Header: stdhttp.Header{"Content-Length": {"9000"}}})
 		case "/serve-content":
-			stdhttp.ServeContent(c, r, "f.bin", modTime, bytes.NewReader(make([]byte, 4321)))
+			stdhttp.ServeContent(c, c.Request, "f.bin", modTime, bytes.NewReader(make([]byte, 4321)))
 		}
 	}))))
 	h1 := &stdhttp.Client{Timeout: 10 * time.Second, Transport: &stdhttp.Transport{
@@ -590,8 +590,8 @@ func TestH2ServerHeadLengthMatchesHTTP1(t *testing.T) {
 func TestH2ServerCancelsTheContextOfAResetStream(t *testing.T) {
 	cancelled := make(chan error, 4)
 	entered := make(chan struct{}, 4)
-	addr := serve(t, NewHandler(HandlerFunc(func(c *Context, r *stdhttp.Request) {
-		if r.URL.Path == "/quick" {
+	addr := serve(t, NewHandler(HandlerFunc(func(c *Context) {
+		if c.Request.URL.Path == "/quick" {
 			c.OnCancel(func(err error) { cancelled <- err })
 			_ = c.Respond(200, "text/plain", []byte("done"))
 			return

@@ -25,11 +25,11 @@ import (
 // TestRetainAnswersFromAnotherGoroutine is the plain case: the handler keeps
 // the response open, returns, and something else answers later.
 func TestRetainAnswersFromAnotherGoroutine(t *testing.T) {
-	addr := serveStreamingServer(t, DefaultConfig(), func(c *Context, r *stdhttp.Request) {
+	addr := serveStreamingServer(t, DefaultConfig(), func(c *Context) {
 		c.Retain()
 		go func() {
 			time.Sleep(50 * time.Millisecond)
-			_ = c.Respond(stdhttp.StatusOK, "text/plain", []byte("late "+r.URL.Path))
+			_ = c.Respond(stdhttp.StatusOK, "text/plain", []byte("late "+c.Request.URL.Path))
 			c.Release()
 		}()
 	})
@@ -44,18 +44,18 @@ func TestRetainAnswersFromAnotherGoroutine(t *testing.T) {
 // ones behind it waiting, so responses stay in request order.
 func TestRetainHoldsPipelinedRequests(t *testing.T) {
 	var order atomic.Int64
-	addr := serveStreamingServer(t, DefaultConfig(), func(c *Context, r *stdhttp.Request) {
-		if r.URL.Path == "/slow" {
+	addr := serveStreamingServer(t, DefaultConfig(), func(c *Context) {
+		if c.Request.URL.Path == "/slow" {
 			c.Retain()
 			go func() {
 				time.Sleep(150 * time.Millisecond)
 				_ = c.Respond(stdhttp.StatusOK, "text/plain",
-					fmt.Appendf(nil, "%d %s", order.Add(1), r.URL.Path))
+					fmt.Appendf(nil, "%d %s", order.Add(1), c.Request.URL.Path))
 				c.Release()
 			}()
 			return
 		}
-		_ = c.Respond(stdhttp.StatusOK, "text/plain", fmt.Appendf(nil, "%d %s", order.Add(1), r.URL.Path))
+		_ = c.Respond(stdhttp.StatusOK, "text/plain", fmt.Appendf(nil, "%d %s", order.Add(1), c.Request.URL.Path))
 	})
 	conn := dialRaw(t, addr)
 	conn.send("GET /slow HTTP/1.1\r\nHost: test\r\n\r\nGET /fast HTTP/1.1\r\nHost: test\r\n\r\n")
@@ -68,7 +68,7 @@ func TestRetainHoldsPipelinedRequests(t *testing.T) {
 
 // TestRetainNestedHolds checks the count rather than a flag.
 func TestRetainNestedHolds(t *testing.T) {
-	addr := serveStreamingServer(t, DefaultConfig(), func(c *Context, r *stdhttp.Request) {
+	addr := serveStreamingServer(t, DefaultConfig(), func(c *Context) {
 		c.Retain()
 		c.Retain()
 		_ = c.Respond(stdhttp.StatusOK, "text/plain", []byte("two holds"))
@@ -91,7 +91,7 @@ func TestOnBodyDeliversABufferedBodyWhole(t *testing.T) {
 		fin  bool
 	}
 	calls := make(chan call, 4)
-	addr := serveStreamingServer(t, DefaultConfig(), func(c *Context, r *stdhttp.Request) {
+	addr := serveStreamingServer(t, DefaultConfig(), func(c *Context) {
 		c.OnBody(func(data []byte, fin bool, err error) {
 			calls <- call{string(data), fin}
 			if err != nil || fin {
@@ -123,7 +123,7 @@ func TestOnBodyDeliversAStreamedBodyInPieces(t *testing.T) {
 	config := streamingConfig()
 	config.StreamRequestBodyBuffer = 32 << 10
 	pieces := make(chan int, 1)
-	addr := serveStreamingServer(t, config, func(c *Context, r *stdhttp.Request) {
+	addr := serveStreamingServer(t, config, func(c *Context) {
 		digest := sha256.New()
 		var total int64
 		var parts int
@@ -165,9 +165,9 @@ func TestOnBodyDeliversAStreamedBodyInPieces(t *testing.T) {
 // happened.
 func TestOnBodyReleasesAfterTheLastCallback(t *testing.T) {
 	var order atomic.Int64
-	addr := serveStreamingServer(t, streamingConfig(), func(c *Context, r *stdhttp.Request) {
-		if r.URL.Path != "/upload" {
-			_ = c.Respond(stdhttp.StatusOK, "text/plain", fmt.Appendf(nil, "%d %s", order.Add(1), r.URL.Path))
+	addr := serveStreamingServer(t, streamingConfig(), func(c *Context) {
+		if c.Request.URL.Path != "/upload" {
+			_ = c.Respond(stdhttp.StatusOK, "text/plain", fmt.Appendf(nil, "%d %s", order.Add(1), c.Request.URL.Path))
 			return
 		}
 		var total int64
@@ -197,7 +197,7 @@ func TestOnBodyReleasesAfterTheLastCallback(t *testing.T) {
 }
 
 func TestOnBodyChunkedWithTrailer(t *testing.T) {
-	addr := serveStreamingServer(t, streamingConfig(), func(c *Context, r *stdhttp.Request) {
+	addr := serveStreamingServer(t, streamingConfig(), func(c *Context) {
 		var got []byte
 		c.OnBody(func(data []byte, fin bool, err error) {
 			if err != nil {
@@ -206,7 +206,7 @@ func TestOnBodyChunkedWithTrailer(t *testing.T) {
 			got = append(got, data...)
 			if fin {
 				_ = c.Respond(stdhttp.StatusOK, "text/plain",
-					fmt.Appendf(nil, "%d %s", len(got), r.Trailer.Get("X-Checksum")))
+					fmt.Appendf(nil, "%d %s", len(got), c.Request.Trailer.Get("X-Checksum")))
 			}
 		})
 	})
@@ -231,14 +231,14 @@ func TestOnBodyChunkedWithTrailer(t *testing.T) {
 // of the upload is discarded.
 func TestOnBodyThenCloseAnswersAndDropsTheRest(t *testing.T) {
 	ended := make(chan error, 2)
-	addr := serveStreamingServer(t, streamingConfig(), func(c *Context, r *stdhttp.Request) {
+	addr := serveStreamingServer(t, streamingConfig(), func(c *Context) {
 		c.OnBody(func(data []byte, fin bool, err error) {
 			if fin || err != nil {
 				ended <- err
 			}
 		})
 		_ = c.Respond(stdhttp.StatusRequestEntityTooLarge, "text/plain", []byte("no thanks"))
-		_ = r.Body.Close()
+		_ = c.Request.Body.Close()
 	})
 	conn := dialRaw(t, addr)
 	conn.send(fmt.Sprintf("POST /big HTTP/1.1\r\nHost: test\r\nContent-Length: %d\r\n\r\n", 64<<20))
@@ -264,7 +264,7 @@ func TestOnBodyDoesNotCallBack(t *testing.T) {
 		data                       string
 	}
 	got := make(chan outcome, 1)
-	addr := serveStreamingServer(t, DefaultConfig(), func(c *Context, r *stdhttp.Request) {
+	addr := serveStreamingServer(t, DefaultConfig(), func(c *Context) {
 		var returned, called atomic.Bool
 		o := outcome{complete: c.BodyComplete()}
 		c.OnBody(func(data []byte, fin bool, err error) {
@@ -301,9 +301,9 @@ func TestOnBodyDoesNotCallBack(t *testing.T) {
 // request behind it served once it has.
 func TestBodyCompleteOnAStreamedBody(t *testing.T) {
 	incomplete := make(chan bool, 2)
-	addr := serveStreamingServer(t, immediateStreamingConfig(), func(c *Context, r *stdhttp.Request) {
-		if r.URL.Path != "/upload" {
-			_ = c.Respond(stdhttp.StatusOK, "text/plain", []byte(r.URL.Path))
+	addr := serveStreamingServer(t, immediateStreamingConfig(), func(c *Context) {
+		if c.Request.URL.Path != "/upload" {
+			_ = c.Respond(stdhttp.StatusOK, "text/plain", []byte(c.Request.URL.Path))
 			return
 		}
 		incomplete <- !c.BodyComplete()
@@ -343,7 +343,7 @@ func TestOnBodyAfterTheHandlerReturned(t *testing.T) {
 			if streamed {
 				config = streamingConfig()
 			}
-			addr := serveStreamingServer(t, config, func(c *Context, r *stdhttp.Request) {
+			addr := serveStreamingServer(t, config, func(c *Context) {
 				c.Retain()
 				go func() {
 					time.Sleep(20 * time.Millisecond)
@@ -382,7 +382,7 @@ func TestOnBodyReportsAClosedConnection(t *testing.T) {
 		calls int
 	}
 	done := make(chan outcome, 1)
-	addr := serveStreamingServer(t, immediateStreamingConfig(), func(c *Context, r *stdhttp.Request) {
+	addr := serveStreamingServer(t, immediateStreamingConfig(), func(c *Context) {
 		calls := 0
 		c.Retain()
 		c.OnBody(func(data []byte, fin bool, err error) {
@@ -426,7 +426,7 @@ func TestOnBodyReportsAClosedConnection(t *testing.T) {
 // reading the body at all.
 func TestOnCancelReportsAClosedConnection(t *testing.T) {
 	cancelled := make(chan error, 2)
-	addr := serveStreamingServer(t, DefaultConfig(), func(c *Context, r *stdhttp.Request) {
+	addr := serveStreamingServer(t, DefaultConfig(), func(c *Context) {
 		c.Retain()
 		c.OnCancel(func(err error) {
 			cancelled <- err
@@ -463,7 +463,7 @@ func TestOnCancelReportsAReadTimeout(t *testing.T) {
 	cancelled := make(chan error, 1)
 	config := streamingConfig()
 	config.ReadTimeout = 250 * time.Millisecond
-	addr := serveStreamingServer(t, config, func(c *Context, r *stdhttp.Request) {
+	addr := serveStreamingServer(t, config, func(c *Context) {
 		c.Retain()
 		c.OnCancel(func(err error) { cancelled <- err; c.Release() })
 		c.OnBody(func(data []byte, fin bool, err error) {})
@@ -489,7 +489,7 @@ func TestOnBodyReportsAnOversizedBody(t *testing.T) {
 	config := streamingConfig()
 	config.MaxStreamedBodyBytes = 64 << 10
 	failed := make(chan error, 1)
-	addr := serveStreamingServer(t, config, func(c *Context, r *stdhttp.Request) {
+	addr := serveStreamingServer(t, config, func(c *Context) {
 		c.OnBody(func(data []byte, fin bool, err error) {
 			if err != nil || fin {
 				failed <- err
@@ -520,8 +520,8 @@ func TestRetainAfterTheResponseIsWrittenDoesNothing(t *testing.T) {
 	// A recycled Context is not the handler's once its response is written.
 	config := DefaultConfig()
 	setReuse(&config, false)
-	addr := serveStreamingServer(t, config, func(c *Context, r *stdhttp.Request) {
-		_ = c.Respond(stdhttp.StatusOK, "text/plain", []byte(r.URL.Path))
+	addr := serveStreamingServer(t, config, func(c *Context) {
+		_ = c.Respond(stdhttp.StatusOK, "text/plain", []byte(c.Request.URL.Path))
 		go func() {
 			time.Sleep(20 * time.Millisecond)
 			// The response has been written by the handler's return by now.
@@ -558,7 +558,7 @@ func TestRetainStress(t *testing.T) {
 	)
 	config := streamingConfig()
 	config.StreamRequestBodyBuffer = 16 << 10
-	addr := serveStreamingServer(t, config, func(c *Context, r *stdhttp.Request) {
+	addr := serveStreamingServer(t, config, func(c *Context) {
 		// ended counts every request that reaches an end, and twice any that
 		// reaches one more than once.
 		var over atomic.Bool
@@ -569,7 +569,7 @@ func TestRetainStress(t *testing.T) {
 			}
 			ended.Add(1)
 		}
-		switch r.URL.Path {
+		switch c.Request.URL.Path {
 		case "/inline":
 			finish()
 			_ = c.Respond(stdhttp.StatusOK, "text/plain", []byte("inline"))
@@ -577,7 +577,7 @@ func TestRetainStress(t *testing.T) {
 			c.Retain()
 			c.OnCancel(func(error) { finish(); c.Release() })
 			go func() {
-				time.Sleep(time.Duration(len(r.Host)%5) * time.Millisecond)
+				time.Sleep(time.Duration(len(c.Request.Host)%5) * time.Millisecond)
 				if c.Err() == nil {
 					finish()
 					_ = c.Respond(stdhttp.StatusOK, "text/plain", []byte("async"))
@@ -754,7 +754,7 @@ func TestRetainOverHTTP2(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	handler := NewHandler(HandlerFunc(func(c *Context, r *stdhttp.Request) {
+	handler := NewHandler(HandlerFunc(func(c *Context) {
 		var got []byte
 		c.Retain()
 		c.OnBody(func(data []byte, fin bool, err error) {
@@ -767,7 +767,7 @@ func TestRetainOverHTTP2(t *testing.T) {
 				go func() {
 					time.Sleep(20 * time.Millisecond)
 					_ = c.Respond(stdhttp.StatusOK, "text/plain",
-						fmt.Appendf(nil, "%s %d", r.URL.Path, len(got)))
+						fmt.Appendf(nil, "%s %d", c.Request.URL.Path, len(got)))
 					c.Release()
 				}()
 			}

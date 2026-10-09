@@ -32,9 +32,9 @@ func upgradeServer(t *testing.T, config Config) (string, chan closeReport) {
 		},
 		Close: func(_ *Connection, code uint16, reason string, _ error) { closed <- closeReport{code, reason} },
 	})
-	handler := epollhttp.HandlerFunc(func(c *epollhttp.Context, r *stdhttp.Request) {
-		if r.URL.Path != "/ws" {
-			_ = c.Respond(stdhttp.StatusOK, "text/plain", []byte("plain "+r.Proto))
+	handler := epollhttp.HandlerFunc(func(c *epollhttp.Context) {
+		if c.Request.URL.Path != "/ws" {
+			_ = c.Respond(stdhttp.StatusOK, "text/plain", []byte("plain "+c.Request.Proto))
 			return
 		}
 		if _, err := ws.Upgrade(c, stdhttp.Header{"X-Upgraded": {"yes"}}); err != nil {

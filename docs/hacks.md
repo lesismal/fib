@@ -55,11 +55,14 @@ returned when the handler returns; take one more and the response does not finis
 `Release` it. The handler can then **return at once and give the worker back to the pool**, and
 answer when the result is ready.
 
+A handler that returns without writing anything **and without `Retain`** is answered with an empty `200`, as in
+`net/http`; the unanswered-response wait only exists while some `Retain` (or `OnBody`) is outstanding.
+
 ```go
-func(c *fibhttp.Context, r *http.Request) {
+func(c *fibhttp.Context) {
     c.Retain()                       // no automatic write-back when the handler returns
     go func() {                      // or hand it to your own pool / another reactor
-        result := slowQuery(r.URL.Query().Get("q")) // ← note: see "don't touch r" below
+        result := slowQuery(c.Request.URL.Query().Get("q")) // ← note: see "don't touch r" below
         _ = c.Respond(200, "application/json", result)
         c.Release()                  // count reaches zero → finish the response, hand it to the connection
     }()
@@ -85,7 +88,7 @@ decides who is last; write first, then `Release`. `Release` is the moment the re
 **the response must be written before the last `Release`**:
 
 ```go
-func(c *fibhttp.Context, r *http.Request) {
+func(c *fibhttp.Context) {
     var (
         mu      sync.Mutex
         parts   [3][]byte
@@ -165,7 +168,7 @@ httpConfig.StreamRequestBodyBuffer = 1 << 20   // stop reading the socket when t
 httpConfig.ReadTimeout = 0                     // see "slow clients" below
 
 handler := fibhttp.NewHandlerWithConfig(httpConfig, fibhttp.HandlerFunc(
-    func(c *fibhttp.Context, r *http.Request) {
+    func(c *fibhttp.Context) {
         f, _ := os.Create("upload.bin")
         c.OnBody(func(data []byte, fin bool, err error) {
             if err != nil {            // connection gone / over the limit / framing error: the last call
@@ -206,7 +209,7 @@ generator) is in [`examples/http/upload`](../examples/http/upload).
    client has started uploading, without reading a byte:
 
    ```go
-   if r.ContentLength > limit {
+   if c.Request.ContentLength > limit {
        _ = c.Respond(413, "text/plain", []byte("too large"))
        return                    // OnBody is never called, so the client never starts uploading
    }
@@ -283,7 +286,7 @@ handles it:
   the server back.
 
 ```go
-func(c *fibhttp.Context, r *http.Request) {
+func(c *fibhttp.Context) {
     ctx, cancel := context.WithCancel(context.Background())
     var once sync.Once
     done := func() { once.Do(c.Release) } // exactly one Release per Retain
@@ -444,12 +447,12 @@ high core count, **all cores share one heap**, and GC and heap locks become the 
 
 In practice:
 
-- **Don't hand `*http.Request`, `r.Header`, `r.URL`, `*Context` or slices of `Context.Body()` to
+- **Don't hand `*http.Request`, `c.Request.Header`, `c.Request.URL`, `*Context` or slices of `Context.Body()` to
   a goroutine that outlives the response**, unless you `Retain`ed and only `Release` after it is
   finished with them.
-- To keep something, copy it: `r.Clone(ctx)`, `r.Header.Clone()`, `append([]byte(nil), body...)`.
+- To keep something, copy it: `c.Request.Clone(ctx)`, `c.Request.Header.Clone()`, `append([]byte(nil), body...)`.
 - A handler written for `net/http` that still holds `*http.Request` after returning (for example
-  passed to a goroutine without `Retain`): turn off `ReuseRequests`, or `r.Clone(ctx)` first.
+  passed to a goroutine without `Retain`): turn off `ReuseRequests`, or `c.Request.Clone(ctx)` first.
 - Each option governs only its own object, so a handler that cares only about `Context` can keep
   reuse of the others.
 - A `Context` waiting for its next request is in the "finished" state: a stray `Retain` /
@@ -459,7 +462,7 @@ In practice:
 ```go
 // Using request data safely from a heavy async handler:
 c.Retain()
-q := c.Query("q")                       // zero copy: a substring of r.URL.RawQuery
+q := c.Query("q")                       // zero copy: a substring of c.Request.URL.RawQuery
 q = strings.Clone(q)                    // to take it out of the handler, copy it
 go func() {
     defer c.Release()
@@ -474,15 +477,15 @@ HTTP/3 reuses request streams as well; `http3.Config.DisableReuse` turns it off.
 ## 7. Zero-copy reads: `Context.Body` / `Context.Query`
 
 - `Context.Body()`: for a non-streamed body (fully read before the handler runs) it returns the
-  server's own buffer. `io.ReadAll(r.Body)` grows a buffer and copies again. These bytes **belong
+  server's own buffer. `io.ReadAll(c.Request.Body)` grows a buffer and copies again. These bytes **belong
   to the handler until the response ends; they must not be modified or kept**. `Respond` and
   `Write` copy what they are given, so an echo can be
   `c.Respond(200, "application/octet-stream", c.Body())`. It returns nil for a streamed body.
-- `Context.Query(name)`: decoded exactly like `r.URL.Query().Get(name)` but without building a
+- `Context.Query(name)`: decoded exactly like `c.Request.URL.Query().Get(name)` but without building a
   map; a value that needs no decoding is a substring of the raw query, with zero allocation.
 - The `Router` keeps its routing state on the `Context`, reused with it: routing a request
   allocates nothing; read parameters with `c.Param(name)` / `c.Params()` / `c.RoutePattern()`.
-  `SetPathValues(true)` makes `r.PathValue` work too, at the cost of one allocation per request
+  `SetPathValues(true)` makes `c.Request.PathValue` work too, at the cost of one allocation per request
   with parameters.
 - "Zero copy" here means **borrowing**: combine it with the lifetime rule of §6 and don't let it
   escape the handler.
@@ -553,7 +556,7 @@ _ = c.Flush()          // ← required: nothing else writes what a Cork holds
 
 On HTTP/1 `Context` implements `http.Flusher`: `fmt.Fprintf(c, ...)` + `c.Flush()` goes out
 immediately without waiting for the handler to return. SSE and large downloads work this way
-(`http.ServeFile(c, r, path)` uses `sendfile`).
+(`http.ServeFile(c, c.Request, path)` uses `sendfile`).
 
 **`SendFile` details**
 
@@ -692,7 +695,7 @@ client := fibhttp.NewClient(engine, fibhttp.DefaultClientConfig()) // reuses the
 
 ```go
 files, _ := fibhttp.NewFileCache(fibhttp.FileCacheConfig{Root: "/data/static", Precompressed: true})
-files.ServeFile(c, r, strings.TrimPrefix(r.URL.Path, "/static/"))
+files.ServeFile(c, strings.TrimPrefix(c.Request.URL.Path, "/static/"))
 ```
 
 - A file is read into memory on first request and then **follows the disk**: on Linux an inotify
@@ -705,7 +708,7 @@ files.ServeFile(c, r, strings.TrimPrefix(r.URL.Path, "/static/"))
   conditional and Range requests go to `net/http.ServeContent`.
 - Files larger than `MaxFileBytes` (1MB by default) are sent from disk every time through
   `SendFile`; the total is bounded by `MaxBytes` (64MB by default).
-- For plain `sendfile`: `http.ServeFile(c, r, path)` / `http.FileServer` (`Context` implements
+- For plain `sendfile`: `http.ServeFile(c, c.Request, path)` / `http.FileServer` (`Context` implements
   `io.ReaderFrom`, and regular files and a `*io.LimitedReader` wrapping one use `SendFile`).
 
 ---

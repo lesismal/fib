@@ -30,22 +30,22 @@ func main() {
 	// Middleware on the root router sees every request, 404s included.
 	r.Use(recover.New(), logger.New())
 
-	r.Get("/", func(c *fibhttp.Context, req *stdhttp.Request) {
+	r.Get("/", func(c *fibhttp.Context) {
 		reply(c, "index")
 	})
 	r.Route("/users", func(r *fibhttp.Router) {
 		// Only the requests under /users get a request ID.
 		r.Use(requestid.New())
-		r.Get("/", func(c *fibhttp.Context, req *stdhttp.Request) {
+		r.Get("/", func(c *fibhttp.Context) {
 			reply(c, "all users")
 		})
-		r.Get("/{id:[0-9]+}", func(c *fibhttp.Context, req *stdhttp.Request) {
+		r.Get("/{id:[0-9]+}", func(c *fibhttp.Context) {
 			reply(c, "user "+c.Param("id"))
 		})
-		r.Delete("/{id:[0-9]+}", func(c *fibhttp.Context, req *stdhttp.Request) {
+		r.Delete("/{id:[0-9]+}", func(c *fibhttp.Context) {
 			reply(c, "deleted user "+c.Param("id"))
 		})
-		r.Get("/{name}", func(c *fibhttp.Context, req *stdhttp.Request) {
+		r.Get("/{name}", func(c *fibhttp.Context) {
 			reply(c, "user named "+c.Param("name"))
 		})
 	})
@@ -64,7 +64,7 @@ func main() {
 // the pattern it is mounted at.
 func api() *fibhttp.Router {
 	r := fibhttp.NewRouter()
-	r.Get("/files/*", func(c *fibhttp.Context, req *stdhttp.Request) {
+	r.Get("/files/*", func(c *fibhttp.Context) {
 		reply(c, fmt.Sprintf("file %q of API %s, routed by %s", c.Param("*"), c.Param("version"), c.RoutePattern()))
 	})
 	return r

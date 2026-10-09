@@ -186,7 +186,7 @@ func NewHandlerWithConfig(config Config, handler fibhttp.Handler) *ServerHandler
 		config.MaxIdleTimeout = defaults.MaxIdleTimeout
 	}
 	if handler == nil {
-		handler = fibhttp.HandlerFunc(func(c *fibhttp.Context, _ *stdhttp.Request) {
+		handler = fibhttp.HandlerFunc(func(c *fibhttp.Context) {
 			_ = c.Respond(stdhttp.StatusNotFound, "text/plain; charset=utf-8", []byte("404 page not found\n"))
 		})
 	}

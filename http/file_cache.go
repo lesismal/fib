@@ -181,7 +181,8 @@ func (fc *FileCache) changed(name string) {
 
 // ServeFile answers r with the file name under the root, a slash-separated
 // path that may not leave it, or with 404 when there is no such file.
-func (fc *FileCache) ServeFile(c *Context, r *stdhttp.Request, name string) {
+func (fc *FileCache) ServeFile(c *Context, name string) {
+	r := c.Request
 	if !cleanName(name) {
 		name = strings.TrimPrefix(path.Clean("/"+name), "/")
 	}
@@ -219,7 +220,7 @@ func (fc *FileCache) ServeFile(c *Context, r *stdhttp.Request, name string) {
 	}
 	if file.data == nil {
 		// Too large to keep: served from the disk.
-		fc.serveFromDisk(c, r, name, file)
+		fc.serveFromDisk(c, name, file)
 		return
 	}
 	if (r.Method == stdhttp.MethodGet || r.Method == stdhttp.MethodHead) && !hasConditions(r) {
@@ -263,7 +264,8 @@ func hasConditions(r *stdhttp.Request) bool {
 
 // serveFromDisk serves a file too large to keep, as net/http.ServeContent
 // does, with the headers file carries.
-func (fc *FileCache) serveFromDisk(c *Context, r *stdhttp.Request, name string, file *cachedFile) {
+func (fc *FileCache) serveFromDisk(c *Context, name string, file *cachedFile) {
+	r := c.Request
 	f, err := os.Open(fc.path(file.name))
 	if err != nil {
 		c.Respond(stdhttp.StatusNotFound, "text/plain; charset=utf-8", []byte("404 page not found\n"))

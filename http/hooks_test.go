@@ -67,7 +67,7 @@ func TestResponseHooks(t *testing.T) {
 	var mu sync.Mutex
 	finished := map[string]finish{}
 	for _, withBody := range []bool{false, true} {
-		addr := serve(t, NewHandler(HandlerFunc(func(c *Context, r *stdhttp.Request) {
+		addr := serve(t, NewHandler(HandlerFunc(func(c *Context) {
 			var order []string
 			// Registered first, so run last: it sees what the others did.
 			c.OnHeader(func(status int, h stdhttp.Header) {
@@ -77,7 +77,7 @@ func TestResponseHooks(t *testing.T) {
 			})
 			c.OnFinish(func(status int, h stdhttp.Header, size int64) {
 				mu.Lock()
-				finished[r.URL.Path+" "+r.Proto] = finish{status, size}
+				finished[c.Request.URL.Path+" "+c.Request.Proto] = finish{status, size}
 				mu.Unlock()
 			})
 			if withBody {
@@ -91,7 +91,7 @@ func TestResponseHooks(t *testing.T) {
 				order = append(order, "inner")
 				h.Set("X-Inner", "1")
 			})
-			write[strings.TrimPrefix(r.URL.Path, "/")](c)
+			write[strings.TrimPrefix(c.Request.URL.Path, "/")](c)
 		})))
 		for _, client := range hookClients(t) {
 			for name := range write {
@@ -154,7 +154,7 @@ func TestResponseHooks(t *testing.T) {
 // TestResponseHookAfterBegin checks that a hook registered once the response
 // has been begun is not run, and does not stop it streaming.
 func TestResponseHookAfterBegin(t *testing.T) {
-	addr := serve(t, NewHandler(HandlerFunc(func(c *Context, r *stdhttp.Request) {
+	addr := serve(t, NewHandler(HandlerFunc(func(c *Context) {
 		c.WriteHeader(stdhttp.StatusOK)
 		c.OnHeader(func(_ int, h stdhttp.Header) { h.Set("X-Late", "1") })
 		c.OnResponse(func(response *Response) { response.Body = nil })

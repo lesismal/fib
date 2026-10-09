@@ -41,22 +41,22 @@ func Config(maxSize int64) fibhttp.Config {
 
 // Handler serves the endpoints, storing uploads in dir.
 func Handler(dir string) fibhttp.HandlerFunc {
-	return func(c *fibhttp.Context, r *http.Request) {
-		switch r.URL.Path {
+	return func(c *fibhttp.Context) {
+		switch c.Request.URL.Path {
 		case "/upload":
-			if allow(c, r, http.MethodPost, http.MethodPut) {
+			if allow(c, http.MethodPost, http.MethodPut) {
 				if path, ok := target(c, dir); ok {
-					c.SaveBody(path, logged(c, r))
+					c.SaveBody(path, logged(c))
 				}
 			}
 		case "/resume":
-			if allow(c, r, http.MethodPut, http.MethodPatch) {
+			if allow(c, http.MethodPut, http.MethodPatch) {
 				if path, ok := target(c, dir); ok {
-					c.SaveBodyResumable(path, logged(c, r))
+					c.SaveBodyResumable(path, logged(c))
 				}
 			}
 		case "/echo":
-			if allow(c, r, http.MethodPost) {
+			if allow(c, http.MethodPost) {
 				echo(c)
 			}
 		default:
@@ -66,9 +66,9 @@ func Handler(dir string) fibhttp.HandlerFunc {
 }
 
 // allow answers 405 unless the request's method is one of methods.
-func allow(c *fibhttp.Context, r *http.Request, methods ...string) bool {
+func allow(c *fibhttp.Context, methods ...string) bool {
 	for _, method := range methods {
-		if r.Method == method {
+		if c.Request.Method == method {
 			return true
 		}
 	}
@@ -89,13 +89,13 @@ func target(c *fibhttp.Context, dir string) (string, bool) {
 
 // logged is the done callback of the Save functions here: it logs how the
 // upload ended, and then answers it as they would by themselves.
-func logged(c *fibhttp.Context, r *http.Request) func(fibhttp.Saved, error) {
+func logged(c *fibhttp.Context) func(fibhttp.Saved, error) {
 	started := time.Now()
 	return func(saved fibhttp.Saved, err error) {
 		if err != nil {
-			log.Printf("%s %s %s: %d of %d bytes stored: %v", r.Proto, r.Method, r.URL.Path, saved.Size, saved.Total, err)
+			log.Printf("%s %s %s: %d of %d bytes stored: %v", c.Request.Proto, c.Request.Method, c.Request.URL.Path, saved.Size, saved.Total, err)
 		} else {
-			log.Printf("%s %s %s: %d bytes stored in %v, complete: %v", r.Proto, r.Method, r.URL.Path, saved.Size,
+			log.Printf("%s %s %s: %d bytes stored in %v, complete: %v", c.Request.Proto, c.Request.Method, c.Request.URL.Path, saved.Size,
 				time.Since(started).Round(time.Millisecond), saved.Complete)
 		}
 		_ = c.RespondSaved(saved, err)

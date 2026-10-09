@@ -461,7 +461,7 @@ keep-alive、流式响应、sendfile 零拷贝发送文件以及请求大小限�
 
 ```go
 handler := epollhttp.NewHandler(epollhttp.HandlerFunc(
-    func(c *epollhttp.Context, request *http.Request) {
+    func(c *epollhttp.Context) {
         _ = c.Respond(http.StatusOK, "text/plain; charset=utf-8", []byte("hello\n"))
     },
 ))
@@ -481,8 +481,8 @@ go run ./examples/http/nontls/server   # 另开终端：go run ./examples/http/n
 交给 `net/http` 的 `ServeFile`、`ServeContent`、`FileServer` 等函数：
 
 ```go
-func(c *fibhttp.Context, r *http.Request) {
-    switch r.URL.Path {
+func(c *fibhttp.Context) {
+    switch c.Request.URL.Path {
     case "/events":
         c.Header().Set("Trailer", "X-Count")
         for i := 0; i < 10; i++ {
@@ -491,7 +491,7 @@ func(c *fibhttp.Context, r *http.Request) {
         }
         c.Header().Set("X-Count", "10") // 作为 trailer 在 body 之后发送
     case "/download":
-        http.ServeFile(c, r, "big.iso") // Range、If-Modified-Since 等由 net/http 处理，文件走 sendfile
+        http.ServeFile(c, c.Request, "big.iso") // Range、If-Modified-Since 等由 net/http 处理，文件走 sendfile
     }
 }
 ```
@@ -524,7 +524,7 @@ func(c *fibhttp.Context, r *http.Request) {
 的 handler 什么都不用改——**外层负责结束响应并回写**。要稍后再回复就多占一个引用：
 
 ```go
-func(c *fibhttp.Context, r *http.Request) {
+func(c *fibhttp.Context) {
     c.Retain()                     // handler 返回后不自动回写
     go func() {
         result := doSomethingSlow()
@@ -545,7 +545,7 @@ func(c *fibhttp.Context, r *http.Request) {
 还在路上的才用 `OnBody` 异步接收：
 
 ```go
-func(c *fibhttp.Context, r *http.Request) {
+func(c *fibhttp.Context) {
     f, _ := os.Create("upload.bin")
     c.OnBody(func(data []byte, fin bool, err error) { // 自动 Retain
         if err != nil {                 // 连接断了 / body 出错
@@ -611,7 +611,7 @@ c.SaveBodyResumable(path, nil)
 ```go
 files, err := fibhttp.NewFileCache(fibhttp.FileCacheConfig{Root: "/data/static", Precompressed: true})
 // handler 里：
-files.ServeFile(c, r, strings.TrimPrefix(r.URL.Path, "/static/"))
+files.ServeFile(c, strings.TrimPrefix(c.Request.URL.Path, "/static/"))
 ```
 
 - 文件第一次被请求时读入内存，之后在它变化时重新读取。Linux 上对缓存文件所在目录加 inotify
@@ -665,11 +665,11 @@ config.MaxStreamedBodyBytes = 4 << 30       // 流式 body 的上限，0 表示�
 config.StreamRequestBodyBuffer = 512 << 10  // 未被读走的 body 攒到这么多就停止读 socket
 
 handler := fibhttp.NewHandlerWithConfig(config, fibhttp.HandlerFunc(
-    func(c *fibhttp.Context, r *http.Request) {
+    func(c *fibhttp.Context) {
         f, _ := os.Create("upload.bin")
         buf := make([]byte, 32*1024)
         for {
-            n, err := r.Body.Read(buf) // 只拿已经到的，不阻塞
+            n, err := c.Request.Body.Read(buf) // 只拿已经到的，不阻塞
             f.Write(buf[:n])
             if errors.Is(err, io.EOF) { // body 读完了
                 f.Close()
@@ -711,7 +711,7 @@ handler := fibhttp.NewHandlerWithConfig(config, fibhttp.HandlerFunc(
   `OnBody` 拿到的正好从上一次 `Read` 停下的地方开始。body 也可能在 handler 运行时就全
   到了（和 header 在同一次读里），那就一路读到 `io.EOF` 直接回复。
 - `Content-Length` 和 chunked（含 trailer，读完后在 `Request.Trailer` 里）都支持。想知道
-  是不是流式的，用 `r.Body.(*fibhttp.BodyStream)` 或 `Context.RequestBody()`（返回 nil
+  是不是流式的，用 `c.Request.Body.(*fibhttp.BodyStream)` 或 `Context.RequestBody()`（返回 nil
   表示 body 已经收全了）。
 - 小于阈值的 body 行为完全不变：收齐后交付，`io.ReadAll`、`json.Decoder` 照常用。
 - 背压：还没被读走的 body 攒到 `StreamRequestBodyBuffer`（默认 256KB）就调用
@@ -798,8 +798,8 @@ server, err := fib.Bind(config, fibtls.NewServer(tlsConfig, fibhttp.NewHandler(h
 请求的 handler 返回后才返回：
 
 ```go
-func(c *fibhttp.Context, r *http.Request) {
-    if r.URL.Path == "/index.html" {
+func(c *fibhttp.Context) {
+    if c.Request.URL.Path == "/index.html" {
         _ = c.Push("/style.css", nil) // 客户端不支持时返回 http.ErrNotSupported，忽略即可
     }
     _ = c.Respond(http.StatusOK, "text/html", page)
@@ -872,7 +872,7 @@ resp, err := client.Go(req).Wait() // Future：Wait 阻塞，Done() 可用于 se
   连接的保留。HTTP/1.1 连接同时只跑一个请求，不做 pipelining。
 - 支持 `Content-Length`、chunked（含 trailer）、以关闭连接为结束的 body，HEAD、
   204、304 不读 body，1xx 中间响应自动跳过。请求的 `ContentLength` 为 -1 时 body 以
-  chunked 发送，可以携带 `req.Trailer`。
+  chunked 发送，可以携带 `c.Request.Trailer`。
 - HTTP/1.0：把请求的 `Proto`、`ProtoMajor`、`ProtoMinor` 设为 `HTTP/1.0`、1、0，就会以
   HTTP/1.0 发送（body 用 `Content-Length`，不带 trailer）；请求带
   `Connection: keep-alive` 且服务端同意时连接才会复用。`MaxResponseHeaderBytes`、
@@ -885,7 +885,7 @@ resp, err := client.Go(req).Wait() // Future：Wait 阻塞，Done() 可用于 se
 - 回调可能在任意 goroutine 上执行：成功的响应在读取它的 worker 上回调，超时和取消在
   定时器 goroutine 上，连接失败在 `fib-client` 协程池上，`Do` 立即拒绝的请求在调用方
   goroutine 上。回调不要长时间阻塞。
-- `Do` 会在调用方 goroutine 里读完 `req.Body`。
+- `Do` 会在调用方 goroutine 里读完 `c.Request.Body`。
 - 先 `client.Close()` 再关闭 Engine：`Close` 让排队中的请求以 `ErrClientClosed` 失败，
   已发出的请求照常完成；直接关闭 Engine 不会通知 client，已发出的请求只能等超时。
 
@@ -893,7 +893,7 @@ resp, err := client.Go(req).Wait() // Future：Wait 阻塞，Done() 可用于 se
 
 `fibhttp.Router` 参照 [chi](https://github.com/go-chi/chi) 的 API 设计：chi 的 handler 是标准库的
 `http.Handler`，fib 的 Router 则保持 fib 自己的 `Handler` / `HandlerFunc` 格式
-`func(*fibhttp.Context, *http.Request)`。Router 本身就是 `Handler`，可以直接交给 `NewHandler`，
+`func(*fibhttp.Context)`（请求通过 `c.Request` 取）。Router 本身就是 `Handler`，可以直接交给 `NewHandler`，
 也可以 `Mount` 到另一个 Router 下：
 
 ```go
@@ -937,7 +937,7 @@ pattern 语法：
 - **取值**：`c.Param(name)` 取参数，`c.Params()` 遍历全部，`c.RoutePattern()` 返回命中的完整
   pattern（如 `/api/{version}/users/{id}`，适合作日志、指标的标签）。路径中有 `%2F` 之类的转义时
   按 `URL.RawPath` 路由，转义的 `/` 属于值而不是分隔符，`Param` 返回解码后的值。
-  `SetPathValues(true)` 让 `r.PathValue(name)` 也能取到值，便于复用为 `ServeMux` 写的 handler，
+  `SetPathValues(true)` 让 `c.Request.PathValue(name)` 也能取到值，便于复用为 `ServeMux` 写的 handler，
   代价是每个带参数的请求多一次分配。
 - **中间件作用范围**：根 Router 的 `Use` 包住整个路由过程；`Route` 子 Router 的中间件作用于其前缀
   下的路由以及该前缀下的 404/405；`With`、`Group` 的中间件只作用于通过它们注册的路由。中间件必须
@@ -1078,7 +1078,7 @@ resp, err := client.Go(req).Wait()
   MAX_STREAMS 限制，超出的请求排队，等服务端放开 stream 后自动发送。
 - 收到 GOAWAY 时，服务端未处理的请求和排队中的请求自动在新连接上发送；被服务端以
   H3_REQUEST_REJECTED 重置的请求同样重发一次。
-- 支持发送请求 trailer（`req.Trailer`，名字会在 `Trailer` 头里声明）和接收响应 trailer。
+- 支持发送请求 trailer（`c.Request.Trailer`，名字会在 `Trailer` 头里声明）和接收响应 trailer。
 - `Timeout`、请求的 context 取消只重置对应 stream（H3_REQUEST_CANCELLED），不影响
   同连接上的其他请求；`HandshakeTimeout`、`MaxIdleTimeout`、`IdleConnTimeout` 分别
   限制握手、QUIC 空闲超时和连接复用的空闲时间；`MaxResponseHeaderBytes`、
@@ -1181,8 +1181,8 @@ handler := websocket.HandlerFuncs{
 
 ```go
 ws := websocket.NewHandler(wsHandler)
-handler := http.HandlerFunc(func(c *http.Context, r *stdhttp.Request) {
-    if r.URL.Path == "/ws" {
+handler := http.HandlerFunc(func(c *http.Context) {
+    if c.Request.URL.Path == "/ws" {
         _, _ = ws.Upgrade(c, nil) // 握手不合法时自己回 400/403 并返回错误
         return
     }

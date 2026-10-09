@@ -188,13 +188,13 @@ standard `*http.Request` and `http.ResponseWriter`, so existing `net/http` handl
 ```go
 mux := http.NewServeMux()
 mux.HandleFunc("GET /hello/{name}", func(w http.ResponseWriter, r *http.Request) {
-	fmt.Fprintf(w, "hello %s over %s\n", r.PathValue("name"), r.Proto)
+	fmt.Fprintf(w, "hello %s over %s\n", c.Request.PathValue("name"), c.Request.Proto)
 })
 
 config := fib.DefaultConfig()
 config.Addr = "127.0.0.1:8080"
 engine, err := fib.Bind(config, fibhttp.NewHandler(fibhttp.HandlerFunc(
-	func(c *fibhttp.Context, r *http.Request) { mux.ServeHTTP(c, r) },
+	func(c *fibhttp.Context) { mux.ServeHTTP(c, c.Request) },
 )))
 if err != nil {
 	panic(err)

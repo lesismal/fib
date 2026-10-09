@@ -46,9 +46,9 @@ func main() {
 }
 
 func echo() fibhttp.HandlerFunc {
-	return func(c *fibhttp.Context, r *stdhttp.Request) {
-		body, _ := io.ReadAll(r.Body)
-		reply := fmt.Sprintf("%s %s %s %s", r.Proto, r.Method, r.URL.Path, body)
+	return func(c *fibhttp.Context) {
+		body, _ := io.ReadAll(c.Request.Body)
+		reply := fmt.Sprintf("%s %s %s %s", c.Request.Proto, c.Request.Method, c.Request.URL.Path, body)
 		if err := c.Respond(stdhttp.StatusOK, "text/plain; charset=utf-8", []byte(reply)); err != nil {
 			// The request went away before its answer did — an HTTP/2 client
 			// resetting one stream, or a peer that hung up. The connection

@@ -47,7 +47,7 @@ func benchmarkServer(b *testing.B, request []byte) {
 // registers one.
 func BenchmarkServerKeepAliveHooked(b *testing.B) {
 	benchmarkServerHandler(b, DefaultConfig(), []byte("GET /hello HTTP/1.1\r\nHost: localhost\r\nUser-Agent: bench\r\nAccept: */*\r\n\r\n"),
-		HandlerFunc(func(c *Context, r *stdhttp.Request) {
+		HandlerFunc(func(c *Context) {
 			c.OnResponse(func(*Response) {})
 			_ = c.Respond(stdhttp.StatusOK, "text/plain", benchReply)
 		}))
@@ -56,7 +56,7 @@ func BenchmarkServerKeepAliveHooked(b *testing.B) {
 var benchReply = []byte("hello")
 
 func benchmarkServerWith(b *testing.B, config Config, request []byte) {
-	benchmarkServerHandler(b, config, request, HandlerFunc(func(c *Context, r *stdhttp.Request) {
+	benchmarkServerHandler(b, config, request, HandlerFunc(func(c *Context) {
 		_ = c.Respond(stdhttp.StatusOK, "text/plain", benchReply)
 	}))
 }
@@ -138,7 +138,7 @@ func startBenchServer(b *testing.B, httpConfig Config, handler Handler) (stop fu
 func BenchmarkServerShortLived(b *testing.B) {
 	const perConnection = 10
 	request := []byte("GET /hello HTTP/1.1\r\nHost: localhost\r\nUser-Agent: bench\r\nAccept: */*\r\n\r\n")
-	server, addr := startBenchServer(b, DefaultConfig(), HandlerFunc(func(c *Context, r *stdhttp.Request) {
+	server, addr := startBenchServer(b, DefaultConfig(), HandlerFunc(func(c *Context) {
 		_ = c.Respond(stdhttp.StatusOK, "text/plain", benchReply)
 	}))
 	defer server()

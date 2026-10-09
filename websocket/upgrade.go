@@ -19,7 +19,7 @@ var errOriginRejected = errors.New("websocket: origin rejected")
 // plain HTTP requests alike, which Upgrade is called from the handler of:
 //
 //	ws := websocket.NewHandler(wsHandler)
-//	handler := http.HandlerFunc(func(c *http.Context, r *stdhttp.Request) {
+//	handler := http.HandlerFunc(func(c *http.Context) {
 //		if r.URL.Path == "/ws" {
 //			_, _ = ws.Upgrade(c, nil)
 //			return

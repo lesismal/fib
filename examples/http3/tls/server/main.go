@@ -73,11 +73,11 @@ func main() {
 }
 
 func echo(altSvc string) fibhttp.HandlerFunc {
-	return func(c *fibhttp.Context, r *stdhttp.Request) {
-		body, _ := io.ReadAll(r.Body)
-		reply := fmt.Sprintf("%s %s %s %s", r.Proto, r.Method, r.URL.Path, body)
+	return func(c *fibhttp.Context) {
+		body, _ := io.ReadAll(c.Request.Body)
+		reply := fmt.Sprintf("%s %s %s %s", c.Request.Proto, c.Request.Method, c.Request.URL.Path, body)
 		header := stdhttp.Header{"Content-Type": {"text/plain; charset=utf-8"}}
-		if r.ProtoMajor < 3 {
+		if c.Request.ProtoMajor < 3 {
 			header.Set("Alt-Svc", altSvc)
 		}
 		if err := c.WriteResponse(fibhttp.Response{StatusCode: stdhttp.StatusOK, Header: header, Body: []byte(reply)}); err != nil {

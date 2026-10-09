@@ -149,15 +149,15 @@ type h3Serve struct {
 	ended    bool
 }
 
-func h3MatrixHandler(c *fibhttp.Context, r *stdhttp.Request) {
-	s := &h3Serve{c: c, r: r, digest: sha256.New()}
+func h3MatrixHandler(c *fibhttp.Context) {
+	s := &h3Serve{c: c, r: c.Request, digest: sha256.New()}
 	s.report.Complete, s.report.Streamed = c.BodyComplete(), c.RequestBody() != nil
 	defer s.returned.Store(true)
-	switch strings.TrimPrefix(r.URL.Path, "/") {
+	switch strings.TrimPrefix(c.Request.URL.Path, "/") {
 	case "read":
 		buf := make([]byte, 16<<10)
 		for {
-			n, err := r.Body.Read(buf)
+			n, err := c.Request.Body.Read(buf)
 			s.add(buf[:n])
 			switch {
 			case err == nil:
@@ -179,7 +179,7 @@ func h3MatrixHandler(c *fibhttp.Context, r *stdhttp.Request) {
 			s.onBody(true)
 			return
 		}
-		body, err := io.ReadAll(r.Body)
+		body, err := io.ReadAll(c.Request.Body)
 		s.add(body)
 		s.answer(err)
 	case "async":
@@ -659,9 +659,9 @@ func TestBodyMatrixAbort(t *testing.T) {
 				ran     bool
 				endings []error
 			)
-			base := startServer(t, m.config(), func(c *fibhttp.Context, r *stdhttp.Request) {
-				if r.URL.Path != "/cut" {
-					h3MatrixHandler(c, r)
+			base := startServer(t, m.config(), func(c *fibhttp.Context) {
+				if c.Request.URL.Path != "/cut" {
+					h3MatrixHandler(c)
 					return
 				}
 				mu.Lock()
@@ -765,7 +765,7 @@ func TestBodyMatrixFlowControl(t *testing.T) {
 		err    error
 	}
 	done := make(chan outcome, 1)
-	base := startServer(t, Config{StreamRequestBody: true}, func(c *fibhttp.Context, r *stdhttp.Request) {
+	base := startServer(t, Config{StreamRequestBody: true}, func(c *fibhttp.Context) {
 		c.Retain()
 		go func() {
 			defer c.Release()
@@ -812,7 +812,7 @@ func TestBodyMatrixFlowControl(t *testing.T) {
 func TestOnBodyWaitsForTheHandler(t *testing.T) {
 	registered := make(chan struct{})
 	early := make(chan bool, 1)
-	base := startServer(t, Config{StreamRequestBody: true}, func(c *fibhttp.Context, r *stdhttp.Request) {
+	base := startServer(t, Config{StreamRequestBody: true}, func(c *fibhttp.Context) {
 		var returned atomic.Bool
 		var got []byte
 		c.OnBody(func(data []byte, fin bool, err error) {
@@ -850,7 +850,7 @@ func TestStreamRequestBodyHandlerWaitsForTheThreshold(t *testing.T) {
 	const threshold = 8 << 10
 	started := make(chan struct{})
 	base := startServer(t, Config{StreamRequestBody: true, StreamRequestBodyThreshold: threshold},
-		func(c *fibhttp.Context, r *stdhttp.Request) {
+		func(c *fibhttp.Context) {
 			close(started)
 			first, total := -1, 0
 			c.OnBody(func(data []byte, fin bool, err error) {

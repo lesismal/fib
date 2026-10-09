@@ -112,17 +112,17 @@ func New(config ...Config) middleware.Middleware {
 		buffers.Put(buf)
 	}
 	return func(next fibhttp.Handler) fibhttp.Handler {
-		return fibhttp.HandlerFunc(func(c *fibhttp.Context, r *stdhttp.Request) {
-			if cfg.Next != nil && cfg.Next(c, r) {
-				next.ServeHTTP(c, r)
+		return fibhttp.HandlerFunc(func(c *fibhttp.Context) {
+			if cfg.Next != nil && cfg.Next(c) {
+				next.ServeHTTP(c)
 				return
 			}
 			start := time.Now()
 			c.OnFinish(func(status int, header stdhttp.Header, size int64) {
 				now := time.Now()
-				write(&entry{r: r, status: status, header: header, size: size, latency: now.Sub(start), now: now})
+				write(&entry{r: c.Request, status: status, header: header, size: size, latency: now.Sub(start), now: now})
 			})
-			next.ServeHTTP(c, r)
+			next.ServeHTTP(c)
 		})
 	}
 }

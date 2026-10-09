@@ -18,12 +18,12 @@ import (
 // and the server has to carry the rest over to the next one. Every body has to
 // come back whole and in order.
 func TestServerPipelinedAcrossReads(t *testing.T) {
-	addr := serveHTTP1(t, func(c *Context, r *stdhttp.Request) {
-		body, err := io.ReadAll(r.Body)
+	addr := serveHTTP1(t, func(c *Context) {
+		body, err := io.ReadAll(c.Request.Body)
 		if err != nil {
-			t.Errorf("reading %s: %v", r.URL.Path, err)
+			t.Errorf("reading %s: %v", c.Request.URL.Path, err)
 		}
-		_ = c.Respond(200, "text/plain", append([]byte(r.URL.Path+":"), body...))
+		_ = c.Respond(200, "text/plain", append([]byte(c.Request.URL.Path+":"), body...))
 	})
 	conn := dialRaw(t, addr)
 	var stream bytes.Buffer
@@ -112,7 +112,7 @@ func TestWholeBodyReleased(t *testing.T) {
 }
 
 func TestResponseDate(t *testing.T) {
-	addr := serveHTTP1(t, func(c *Context, r *stdhttp.Request) {
+	addr := serveHTTP1(t, func(c *Context) {
 		_ = c.Respond(200, "text/plain", []byte("ok"))
 	})
 	conn := dialRaw(t, addr)

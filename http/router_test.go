@@ -23,7 +23,7 @@ type routed struct {
 type recorder struct{ last *routed }
 
 func (rec *recorder) handler(name string) HandlerFunc {
-	return func(c *Context, _ *stdhttp.Request) {
+	return func(c *Context) {
 		params := map[string]string{}
 		for k, v := range c.Params() {
 			params[k] = v
@@ -42,7 +42,7 @@ func (rec *recorder) routeOn(c *Context, h Handler, method, target string) *rout
 	rec.last = nil
 	req := httptest.NewRequest(method, target, nil)
 	c.Request = req
-	h.ServeHTTP(c, req)
+	h.ServeHTTP(c)
 	return rec.last
 }
 
@@ -52,8 +52,8 @@ func (rec *recorder) routeOn(c *Context, h Handler, method, target string) *rout
 func newTestRouter(rec *recorder) *Router {
 	r := NewRouter()
 	r.NotFound(rec.handler("404"))
-	r.MethodNotAllowed(func(c *Context, req *stdhttp.Request) {
-		rec.handler("405 "+c.Header().Get("Allow"))(c, req)
+	r.MethodNotAllowed(func(c *Context) {
+		rec.handler("405 " + c.Header().Get("Allow"))(c)
 	})
 	return r
 }
@@ -171,9 +171,9 @@ func TestRouterMiddleware(t *testing.T) {
 	var trace []string
 	mw := func(name string) func(Handler) Handler {
 		return func(next Handler) Handler {
-			return HandlerFunc(func(c *Context, r *stdhttp.Request) {
+			return HandlerFunc(func(c *Context) {
 				trace = append(trace, name)
-				next.ServeHTTP(c, r)
+				next.ServeHTTP(c)
 			})
 		}
 	}
@@ -239,9 +239,9 @@ func TestRouterMount(t *testing.T) {
 	rec := new(recorder)
 	sub := NewRouter()
 	sub.Use(func(next Handler) Handler {
-		return HandlerFunc(func(c *Context, r *stdhttp.Request) {
+		return HandlerFunc(func(c *Context) {
 			trace = append(trace, "sub")
-			next.ServeHTTP(c, r)
+			next.ServeHTTP(c)
 		})
 	})
 	sub.Get("/", rec.handler("sub-index"))
@@ -249,14 +249,14 @@ func TestRouterMount(t *testing.T) {
 
 	r := newTestRouter(rec)
 	r.Mount("/api/{version}/", sub)
-	r.Mount("/raw", HandlerFunc(func(c *Context, req *stdhttp.Request) {
-		rec.handler("raw")(c, req)
+	r.Mount("/raw", HandlerFunc(func(c *Context) {
+		rec.handler("raw")(c)
 	}))
 	// A Router inside other middleware still routes what the Mount left.
 	wrapped := NewRouter()
 	wrapped.Get("/{x}", rec.handler("wrapped"))
 	r.Mount("/wrapped", chain([]func(Handler) Handler{func(next Handler) Handler {
-		return HandlerFunc(func(c *Context, req *stdhttp.Request) { next.ServeHTTP(c, req) })
+		return HandlerFunc(func(c *Context) { next.ServeHTTP(c) })
 	}}, wrapped))
 
 	tests := []struct {
@@ -332,9 +332,9 @@ func TestRouterEscapedPath(t *testing.T) {
 	r := newTestRouter(rec)
 	r.SetPathValues(true)
 	var pathValue string
-	r.Get("/files/{name}/meta", func(c *Context, req *stdhttp.Request) {
-		pathValue = req.PathValue("name")
-		rec.handler("meta")(c, req)
+	r.Get("/files/{name}/meta", func(c *Context) {
+		pathValue = c.Request.PathValue("name")
+		rec.handler("meta")(c)
 	})
 	expectRoute(t, rec.route(r, "GET", "/files/a%2Fb/meta"), "meta", "name", "a/b")
 	if pathValue != "a/b" {
@@ -344,7 +344,7 @@ func TestRouterEscapedPath(t *testing.T) {
 }
 
 func TestRouterPanics(t *testing.T) {
-	h := func(*Context, *stdhttp.Request) {}
+	h := func(*Context) {}
 	tests := map[string]func(r *Router){
 		"no slash":        func(r *Router) { r.Get("users", h) },
 		"empty":           func(r *Router) { r.Get("", h) },
@@ -395,10 +395,10 @@ func TestRouterZeroValue(t *testing.T) {
 // recycled Contexts.
 func TestRouterServer(t *testing.T) {
 	r := NewRouter()
-	r.Get("/users/{id}", func(c *Context, req *stdhttp.Request) {
+	r.Get("/users/{id}", func(c *Context) {
 		_ = c.Respond(200, "text/plain", []byte("user "+c.Param("id")+" "+c.RoutePattern()))
 	})
-	r.Post("/users/{id}", func(c *Context, req *stdhttp.Request) {
+	r.Post("/users/{id}", func(c *Context) {
 		_, _ = c.Write([]byte("created " + c.Param("id")))
 	})
 	for _, reuse := range []bool{false, true} {

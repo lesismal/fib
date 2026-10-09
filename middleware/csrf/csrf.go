@@ -70,7 +70,7 @@ type Config struct {
 	TrustedOrigins []string
 	// ErrorHandler answers a request refused with err; 403 Forbidden by
 	// default.
-	ErrorHandler func(c *fibhttp.Context, r *stdhttp.Request, err error)
+	ErrorHandler func(c *fibhttp.Context, err error)
 }
 
 // tokenKey is where Token finds the token in a request's context.
@@ -119,16 +119,16 @@ func New(config ...Config) middleware.Middleware {
 		}
 	}
 	return func(next fibhttp.Handler) fibhttp.Handler {
-		return fibhttp.HandlerFunc(func(c *fibhttp.Context, r *stdhttp.Request) {
-			if cfg.Next != nil && cfg.Next(c, r) {
-				next.ServeHTTP(c, r)
+		return fibhttp.HandlerFunc(func(c *fibhttp.Context) {
+			if cfg.Next != nil && cfg.Next(c) {
+				next.ServeHTTP(c)
 				return
 			}
 			cookie := ""
-			if got, err := r.Cookie(cfg.CookieName); err == nil && validToken(got.Value) {
+			if got, err := c.Request.Cookie(cfg.CookieName); err == nil && validToken(got.Value) {
 				cookie = got.Value
 			}
-			switch r.Method {
+			switch c.Request.Method {
 			case stdhttp.MethodGet, stdhttp.MethodHead, stdhttp.MethodOptions, stdhttp.MethodTrace:
 				if cookie == "" {
 					cookie = newToken()
@@ -138,21 +138,22 @@ func New(config ...Config) middleware.Middleware {
 					})
 				}
 			default:
-				if err := origins.Check(r); err != nil {
-					cfg.ErrorHandler(c, r, err)
+				if err := origins.Check(c.Request); err != nil {
+					cfg.ErrorHandler(c, err)
 					return
 				}
-				sent := extract(r)
+				sent := extract(c.Request)
 				switch {
 				case cookie == "" || sent == "":
-					cfg.ErrorHandler(c, r, ErrTokenMissing)
+					cfg.ErrorHandler(c, ErrTokenMissing)
 					return
 				case subtle.ConstantTimeCompare([]byte(sent), []byte(cookie)) != 1:
-					cfg.ErrorHandler(c, r, ErrTokenInvalid)
+					cfg.ErrorHandler(c, ErrTokenInvalid)
 					return
 				}
 			}
-			next.ServeHTTP(c, r.WithContext(context.WithValue(r.Context(), tokenKey{}, cookie)))
+			c.Request = c.Request.WithContext(context.WithValue(c.Request.Context(), tokenKey{}, cookie))
+			next.ServeHTTP(c)
 		})
 	}
 }
@@ -218,7 +219,7 @@ func validToken(token string) bool {
 	return true
 }
 
-func forbidden(c *fibhttp.Context, _ *stdhttp.Request, _ error) {
+func forbidden(c *fibhttp.Context, _ error) {
 	status := stdhttp.StatusForbidden
 	_ = c.Respond(status, "text/plain; charset=utf-8", []byte(stdhttp.StatusText(status)+"\n"))
 }

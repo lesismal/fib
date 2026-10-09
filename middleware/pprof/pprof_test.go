@@ -13,7 +13,7 @@ import (
 )
 
 func TestPprof(t *testing.T) {
-	next := fibhttp.HandlerFunc(func(c *fibhttp.Context, _ *stdhttp.Request) {
+	next := fibhttp.HandlerFunc(func(c *fibhttp.Context) {
 		_ = c.Respond(stdhttp.StatusOK, "text/plain", []byte("app"))
 	})
 	for _, prefix := range []string{"", "/admin/pprof/"} {

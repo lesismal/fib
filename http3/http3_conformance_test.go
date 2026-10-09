@@ -60,24 +60,24 @@ func filler(n int) []byte {
 // conformanceHandler answers what the peer's handler answers, so that a
 // case reads the same whichever side serves it. The query decides the
 // response: status, size, echo, trailer, header, interim and delay.
-func conformanceHandler(c *fibhttp.Context, r *stdhttp.Request) {
-	query := r.URL.Query()
+func conformanceHandler(c *fibhttp.Context) {
+	query := c.Request.URL.Query()
 	if ms, _ := strconv.Atoi(query.Get("delay")); ms > 0 {
 		time.Sleep(time.Duration(ms) * time.Millisecond)
 	}
-	body, _ := io.ReadAll(r.Body)
+	body, _ := io.ReadAll(c.Request.Body)
 	header := stdhttp.Header{
-		"X-Method":    {r.Method},
-		"X-Path":      {r.URL.RequestURI()},
-		"X-Proto":     {r.Proto},
-		"X-Host":      {r.Host},
+		"X-Method":    {c.Request.Method},
+		"X-Path":      {c.Request.URL.RequestURI()},
+		"X-Proto":     {c.Request.Proto},
+		"X-Host":      {c.Request.Host},
 		"X-Body-Len":  {strconv.Itoa(len(body))},
 		"X-Body-Hash": {hashBody(body)},
 	}
-	for key, values := range r.Trailer {
+	for key, values := range c.Request.Trailer {
 		header["X-Req-Trailer-"+key] = values
 	}
-	for key, values := range r.Header {
+	for key, values := range c.Request.Header {
 		if strings.HasPrefix(key, "X-Echo-") {
 			header[key] = values
 		}

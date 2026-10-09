@@ -50,10 +50,10 @@
 `Release` 之前不会结束。于是 handler 可以 **立刻返回、把 worker 还给池**，结果出来再回复。
 
 ```go
-func(c *fibhttp.Context, r *http.Request) {
+func(c *fibhttp.Context) {
     c.Retain()                       // handler 返回后不自动回写
     go func() {                      // 或者提交给你自己的池 / 回调到别的 reactor
-        result := slowQuery(r.URL.Query().Get("q")) // ← 注意：见下面"别碰 r"
+        result := slowQuery(c.Request.URL.Query().Get("q")) // ← 注意：见下面"别碰 r"
         _ = c.Respond(200, "application/json", result)
         c.Release()                  // 引用归零 → 结束响应并交给连接
     }()
@@ -76,7 +76,7 @@ func(c *fibhttp.Context, r *http.Request) {
 写完再 `Release`；`Release` 才是响应结束的时刻，所以 **响应必须在最后一个 `Release` 之前写好**：
 
 ```go
-func(c *fibhttp.Context, r *http.Request) {
+func(c *fibhttp.Context) {
     var (
         mu      sync.Mutex
         parts   [3][]byte
@@ -148,7 +148,7 @@ httpConfig.StreamRequestBodyBuffer = 1 << 20   // 未被读走的 body 攒到这
 httpConfig.ReadTimeout = 0                     // 见下面"慢客户端"
 
 handler := fibhttp.NewHandlerWithConfig(httpConfig, fibhttp.HandlerFunc(
-    func(c *fibhttp.Context, r *http.Request) {
+    func(c *fibhttp.Context) {
         f, _ := os.Create("upload.bin")
         c.OnBody(func(data []byte, fin bool, err error) {
             if err != nil {            // 连接断了 / 超限 / 帧错误：最后一次回调
@@ -184,7 +184,7 @@ handler := fibhttp.NewHandlerWithConfig(httpConfig, fibhttp.HandlerFunc(
    `100 Continue`。所以可以在客户端还没开始传时就用 413/403 回绝，不用读一个字节：
 
    ```go
-   if r.ContentLength > limit {
+   if c.Request.ContentLength > limit {
        _ = c.Respond(413, "text/plain", []byte("too large"))
        return                    // 不调用 OnBody，客户端不会开始上传
    }
@@ -252,7 +252,7 @@ c.OnBody(func(data []byte, fin bool, err error) {
 - 通知在 Engine 的 handler 池上执行，不在事件循环上，拖不住服务端。
 
 ```go
-func(c *fibhttp.Context, r *http.Request) {
+func(c *fibhttp.Context) {
     ctx, cancel := context.WithCancel(context.Background())
     var once sync.Once
     done := func() { once.Do(c.Release) } // 每次 Retain 恰好对应一次 Release
@@ -386,11 +386,11 @@ pipelined 570 万 → 1500 万）。
 
 实践上：
 
-- **不要把 `*http.Request`、`r.Header`、`r.URL`、`*Context`、`Context.Body()` 的切片交给一个活得比
+- **不要把 `*http.Request`、`c.Request.Header`、`c.Request.URL`、`*Context`、`Context.Body()` 的切片交给一个活得比
   响应更久的 goroutine**，除非你 `Retain` 了并且在它用完之后才 `Release`。
-- 要保留就拷贝：`r.Clone(ctx)`、`r.Header.Clone()`、`append([]byte(nil), body...)`。
+- 要保留就拷贝：`c.Request.Clone(ctx)`、`c.Request.Header.Clone()`、`append([]byte(nil), body...)`。
 - 为 `net/http` 写的、返回后还持有 `*http.Request` 的 handler（例如丢给一个没 `Retain` 的
-  goroutine）：关掉 `ReuseRequests`，或者先 `r.Clone(ctx)`。
+  goroutine）：关掉 `ReuseRequests`，或者先 `c.Request.Clone(ctx)`。
 - 每个选项只管自己那个对象，所以只在乎 `Context` 的 handler 可以保留其余对象的复用。
 - 等待下一个请求的 `Context` 处于"已结束"状态：误调用的 `Retain`/`Release`/`Respond`
   是空操作，不会写坏别的请求——**但这也意味着 bug 会被静默吞掉**，在测试中请用
@@ -399,7 +399,7 @@ pipelined 570 万 → 1500 万）。
 ```go
 // 想让某个重 handler 安全地异步使用 request 里的数据：
 c.Retain()
-q := c.Query("q")                       // 零拷贝，是 r.URL.RawQuery 的子串
+q := c.Query("q")                       // 零拷贝，是 c.Request.URL.RawQuery 的子串
 q = strings.Clone(q)                    // 要跨出 handler，就拷贝
 go func() {
     defer c.Release()
@@ -414,13 +414,13 @@ HTTP/3 同样复用请求 stream，`http3.Config.DisableReuse` 关闭。
 ## 7. 零拷贝读：`Context.Body` / `Context.Query`
 
 - `Context.Body()`：非流式 body（handler 运行前已整体读完）直接返回 server 自己的 buffer。
-  `io.ReadAll(r.Body)` 要用逐步增长的 buffer 再拷贝一遍。这些字节**在响应结束之前归 handler 所有，
+  `io.ReadAll(c.Request.Body)` 要用逐步增长的 buffer 再拷贝一遍。这些字节**在响应结束之前归 handler 所有，
   不可修改，也不可保留**。`Respond`/`Write` 都会拷贝，所以 echo 可以直接
   `c.Respond(200, "application/octet-stream", c.Body())`。流式 body 时返回 nil。
-- `Context.Query(name)`：和 `r.URL.Query().Get(name)` 解码方式相同，但不构建 map；
+- `Context.Query(name)`：和 `c.Request.URL.Query().Get(name)` 解码方式相同，但不构建 map；
   不需要解码的值就是原始 query 的子串，零分配。
 - `Router` 的路由状态挂在 `Context` 上，随 Context 复用：路由一个请求零分配；`c.Param(name)` /
-  `c.Params()` / `c.RoutePattern()` 读取。`SetPathValues(true)` 让 `r.PathValue` 也可用，
+  `c.Params()` / `c.RoutePattern()` 读取。`SetPathValues(true)` 让 `c.Request.PathValue` 也可用，
   代价是每个带参数的请求多一次分配。
 - 这里的 "零拷贝" 是**借用**：和 §6 的生命周期规则叠加使用，别带出 handler 之外。
 
@@ -481,7 +481,7 @@ _ = c.Flush()          // ← 必须 Flush：没有别的东西会写 Cork 住�
 **流式响应要 `Flush`**
 
 HTTP/1 的 `Context` 实现 `http.Flusher`：`fmt.Fprintf(c, ...)` + `c.Flush()` 立即发出，
-不等 handler 返回。SSE 与大文件下载都是这样（`http.ServeFile(c, r, path)` 走 `sendfile`）。
+不等 handler 返回。SSE 与大文件下载都是这样（`http.ServeFile(c, c.Request, path)` 走 `sendfile`）。
 
 **`SendFile` 的细节**
 
@@ -597,7 +597,7 @@ client := fibhttp.NewClient(engine, fibhttp.DefaultClientConfig()) // 复用 ser
 
 ```go
 files, _ := fibhttp.NewFileCache(fibhttp.FileCacheConfig{Root: "/data/static", Precompressed: true})
-files.ServeFile(c, r, strings.TrimPrefix(r.URL.Path, "/static/"))
+files.ServeFile(c, strings.TrimPrefix(c.Request.URL.Path, "/static/"))
 ```
 
 - 首次请求读入内存，之后**跟随磁盘**：Linux 上 inotify watch 目录，创建/写入/`mv`/删除瞬间让条目失效，
@@ -606,7 +606,7 @@ files.ServeFile(c, r, strings.TrimPrefix(r.URL.Path, "/static/"))
   设置 `Content-Encoding` 与 `Vary`——**压缩的 CPU 在部署时花，不在请求时花**。
 - 不带条件、不带 Range 的 GET/HEAD 直接从内存写出，零分配；条件/Range 交给 `net/http.ServeContent`。
 - 大于 `MaxFileBytes`（默认 1MB）的文件每次从磁盘发，走 `SendFile`；总量受 `MaxBytes`（默认 64MB）限制。
-- 想要纯 `sendfile`：`http.ServeFile(c, r, path)` / `http.FileServer`（`Context` 实现了 `io.ReaderFrom`，
+- 想要纯 `sendfile`：`http.ServeFile(c, c.Request, path)` / `http.FileServer`（`Context` 实现了 `io.ReaderFrom`，
   普通文件和包着文件的 `*io.LimitedReader` 会走 `SendFile`）。
 
 ---

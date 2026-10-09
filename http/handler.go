@@ -22,12 +22,12 @@ import (
 )
 
 type Handler interface {
-	ServeHTTP(*Context, *stdhttp.Request)
+	ServeHTTP(*Context)
 }
 
-type HandlerFunc func(*Context, *stdhttp.Request)
+type HandlerFunc func(*Context)
 
-func (f HandlerFunc) ServeHTTP(c *Context, r *stdhttp.Request) { f(c, r) }
+func (f HandlerFunc) ServeHTTP(c *Context) { f(c) }
 
 type Response struct {
 	StatusCode int
@@ -478,7 +478,7 @@ func NewHandler(handler Handler) *ServerHandler {
 
 func NewHandlerWithConfig(config Config, handler Handler) *ServerHandler {
 	if handler == nil {
-		handler = HandlerFunc(func(c *Context, _ *stdhttp.Request) {
+		handler = HandlerFunc(func(c *Context) {
 			_ = c.Respond(stdhttp.StatusNotFound, "text/plain; charset=utf-8", []byte("404 page not found\n"))
 		})
 	}
@@ -911,7 +911,7 @@ func serveOnReader(handler Handler, context *Context) { serveRequestOn(handler, 
 
 func serveRequestOn(handler Handler, context *Context, reader bool) {
 	context.begin(false, reader)
-	handler.ServeHTTP(context, context.Request)
+	handler.ServeHTTP(context)
 	context.handled()
 	context.returned()
 }

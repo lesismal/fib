@@ -134,8 +134,8 @@ func TestConnectionFollowsRebindingClient(t *testing.T) {
 	fc.IOPollers = true
 	fc.IOPollerCount = 4
 	fc.ReusePort = true
-	url := startServerOn(t, fc, Config{}, func(c *fibhttp.Context, r *stdhttp.Request) {
-		_ = c.Respond(stdhttp.StatusOK, "text/plain", []byte(r.RemoteAddr))
+	url := startServerOn(t, fc, Config{}, func(c *fibhttp.Context) {
+		_ = c.Respond(stdhttp.StatusOK, "text/plain", []byte(c.Request.RemoteAddr))
 	})
 	port, err := strconv.Atoi(url[strings.LastIndexByte(url, ':')+1:])
 	if err != nil {

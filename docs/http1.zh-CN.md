@@ -13,7 +13,7 @@ HTTP/2、HTTP/3 各有单独的文档：[`http2.zh-CN.md`](http2.zh-CN.md)、
 | --- | --- | --- |
 | 版本 | 接受 HTTP/1.0 和 HTTP/1.1 请求，按请求的版本回复 | 发送 HTTP/1.1；请求的 `ProtoMinor` 为 0 时发送 HTTP/1.0 |
 | 连接 | keep-alive（HTTP/1.1 默认开启，HTTP/1.0 需 `Connection: keep-alive`）、任一方的 `Connection: close`、pipelining（按请求顺序回复） | 每个 host:port 一个 keep-alive 连接池；HTTP/1.0 连接只有在请求要求 keep-alive 且服务端同意时才复用 |
-| 请求 body | `Content-Length`、chunked（含 chunk 扩展和 trailer，`Request.Trailer`）；默认整体缓存，开启 `StreamRequestBody` 后边收边交给 handler | `Content-Length`；`ContentLength` 为 -1 时用 chunked，可带 `req.Trailer` |
+| 请求 body | `Content-Length`、chunked（含 chunk 扩展和 trailer，`Request.Trailer`）；默认整体缓存，开启 `StreamRequestBody` 后边收边交给 handler | `Content-Length`；`ContentLength` 为 -1 时用 chunked，可带 `c.Request.Trailer` |
 | 响应 body | `Content-Length`、chunked（含 trailer）、HTTP/1.0 流式响应以关闭连接结束 | `Content-Length`、chunked（含 trailer，`Response.Trailer`）、以关闭连接结束 |
 | 流式 | 响应：`Context` 实现了 `http.ResponseWriter`、`http.Flusher`、`io.ReaderFrom`，`Write` + `Flush` 边生成边发送。请求：开启 `StreamRequestBody` 后 `Request.Body` 是 `*BodyStream`，读取不阻塞，也可以用 `Context.OnBody` 接管 | body 完整缓存后再回调 |
 | 文件 | `Connection.SendFile` / `Context.ReadFrom`：Linux、macOS 用 `sendfile(2)`，Windows 分块读取；`http.ServeFile`、`http.ServeContent`、`http.FileServer` 可以直接通过 `Context` 使用（Range、多段 Range、条件请求） | — |
@@ -52,7 +52,7 @@ handler 的 `OnFrame` 按帧拿到消息是一个路子。`Context.BodyComplete(
 已经全部到达：body 已完整时可以直接从 `Request.Body` 读，只有还在路上时才用回调接收：
 
 ```go
-func(c *fibhttp.Context, r *http.Request) {
+func(c *fibhttp.Context) {
 	f, _ := os.Create("upload.bin")
 	c.OnBody(func(data []byte, fin bool, err error) {
 		if err != nil {         // 连接断了，或者 body 出错了
@@ -169,8 +169,8 @@ handler 来说就是它返回的时刻，`net/http` 也是在这个时刻关闭�
 拿到的正好从上一次 `Read` 停下的地方开始。
 
 ```go
-func(c *fibhttp.Context, r *http.Request) {
-	n, err := r.Body.Read(buf)          // 先拿已经到的
+func(c *fibhttp.Context) {
+	n, err := c.Request.Body.Read(buf)          // 先拿已经到的
 	switch {
 	case errors.Is(err, io.EOF):        // 就这么多，全了
 		answer(c)
@@ -223,7 +223,7 @@ HttpArena 的 HTTP/1 测试在 64 核上，不复用时 baseline 只有每秒 12
 
 Fiber、Gin、Echo 对各自的 context 也是这条规则。为 `net/http` 写的 handler 如果在返回后
 还持有 `*http.Request`（比如交给一个没有 `Retain` 的 goroutine），请关闭 `ReuseRequests`，
-或者先 `r.Clone(ctx)`。
+或者先 `c.Request.Clone(ctx)`。
 
 每个选项只管自己那个对象，所以比如只持有 `Context` 的 handler 可以复用其余对象。流式
 body 的请求，以及不在 server 自行解析范围内、改由 `net/http` 解析的请求，无论选项如何
@@ -232,12 +232,12 @@ body 的请求，以及不在 server 自行解析范围内、改由 `net/http` �
 ### 不拷贝地读取 body 与 query
 
 `Context.Body()` 返回 handler 运行前已整体读完的请求 body（不走流式的 body 都是如此），
-即 server 自己的 buffer；`io.ReadAll(r.Body)` 则要用一个逐步增长的 buffer 再拷贝一遍。
+即 server 自己的 buffer；`io.ReadAll(c.Request.Body)` 则要用一个逐步增长的 buffer 再拷贝一遍。
 这些字节在 body 有效期内（直到响应结束）属于 handler，不能修改，也不能保留到之后。
 `Respond` 和 `Write` 都会拷贝传入的数据，所以 echo 可以直接
 `c.Respond(200, "application/octet-stream", c.Body())`。流式 body 时 `Body` 返回 nil。
 
-`Context.Query(name)` 返回某个 query 参数的第一个值，解码方式与 `r.URL.Query().Get(name)`
+`Context.Query(name)` 返回某个 query 参数的第一个值，解码方式与 `c.Request.URL.Query().Get(name)`
 相同，但不像 `Query` 那样每次都构建 map；不需要解码的值直接是原始 query 的子串，零分配。
 
 ### 零拷贝发送文件

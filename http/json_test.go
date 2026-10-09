@@ -50,15 +50,15 @@ func TestContextJSON(t *testing.T) {
 		ID   int    `json:"id"`
 		Name string `json:"name"`
 	}
-	addr := serveHTTP1(t, func(c *Context, r *stdhttp.Request) {
-		if r.URL.Path == "/bad" {
+	addr := serveHTTP1(t, func(c *Context) {
+		if c.Request.URL.Path == "/bad" {
 			if err := c.JSON(stdhttp.StatusOK, math.Inf(1)); err == nil {
 				t.Error("JSON encoded +Inf")
 			}
 			_ = c.Respond(stdhttp.StatusInternalServerError, "text/plain", []byte("unencodable"))
 			return
 		}
-		n, _ := strconv.Atoi(strings.TrimPrefix(r.URL.Path, "/"))
+		n, _ := strconv.Atoi(strings.TrimPrefix(c.Request.URL.Path, "/"))
 		items := make([]item, n)
 		for i := range items {
 			items[i] = item{i, strings.Repeat("x", i%50)}
@@ -111,11 +111,11 @@ func TestContextJSON(t *testing.T) {
 // although HTTP/1 recycles the buffers they are encoded into, with a hook
 // that sees the body or without one.
 func TestContextJSONConcurrent(t *testing.T) {
-	addr := serveHTTP1(t, func(c *Context, r *stdhttp.Request) {
-		if strings.HasPrefix(r.URL.Path, "/1") {
+	addr := serveHTTP1(t, func(c *Context) {
+		if strings.HasPrefix(c.Request.URL.Path, "/1") {
 			c.OnResponse(func(response *Response) { response.Header.Set("X-Length", strconv.Itoa(len(response.Body))) })
 		}
-		_ = c.JSON(stdhttp.StatusOK, map[string]string{"path": r.URL.Path, "pad": strings.Repeat(r.URL.Path, 100)})
+		_ = c.JSON(stdhttp.StatusOK, map[string]string{"path": c.Request.URL.Path, "pad": strings.Repeat(c.Request.URL.Path, 100)})
 	})
 	client := &stdhttp.Client{Transport: &stdhttp.Transport{MaxIdleConnsPerHost: 16}}
 	defer client.CloseIdleConnections()
@@ -183,8 +183,8 @@ func TestContextJSONHeldByHTTP2FlowControl(t *testing.T) {
 	// cache of the pool, and the second would be handed the first's buffer
 	// if JSON gave it back while HTTP/2 still held it.
 	defer runtime.GOMAXPROCS(runtime.GOMAXPROCS(1))
-	addr := serve(t, NewHandler(HandlerFunc(func(c *Context, r *stdhttp.Request) {
-		_ = c.JSON(stdhttp.StatusOK, map[string]string{"v": strings.Repeat(r.URL.Path[1:], 500)})
+	addr := serve(t, NewHandler(HandlerFunc(func(c *Context) {
+		_ = c.JSON(stdhttp.StatusOK, map[string]string{"v": strings.Repeat(c.Request.URL.Path[1:], 500)})
 	})))
 	tc := dialH2(t, addr, [2]uint32{uint32(h2SettingInitialWindowSize), 10})
 	first := func(id uint32) {

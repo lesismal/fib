@@ -28,7 +28,7 @@ func newConcurrencyProbe(t *testing.T) *concurrencyProbe {
 	return p
 }
 
-func (p *concurrencyProbe) ServeHTTP(c *Context, r *stdhttp.Request) {
+func (p *concurrencyProbe) ServeHTTP(c *Context) {
 	p.mu.Lock()
 	p.running++
 	if p.running > p.peak {
@@ -39,7 +39,7 @@ func (p *concurrencyProbe) ServeHTTP(c *Context, r *stdhttp.Request) {
 	p.mu.Lock()
 	p.running--
 	p.mu.Unlock()
-	_ = c.Respond(stdhttp.StatusOK, "text/plain", []byte(r.URL.Path))
+	_ = c.Respond(stdhttp.StatusOK, "text/plain", []byte(c.Request.URL.Path))
 }
 
 func (p *concurrencyProbe) free() {
@@ -128,7 +128,7 @@ func TestH2StreamPoolConcurrency(t *testing.T) {
 // does: the engine is not there to do it, and the stream would otherwise wait
 // for a response that is never written.
 func TestH2StreamPoolHandlerPanic(t *testing.T) {
-	addr := serve(t, NewHandler(HandlerFunc(func(*Context, *stdhttp.Request) {
+	addr := serve(t, NewHandler(HandlerFunc(func(*Context) {
 		panic("handler gave up")
 	})))
 	tc := dialH2(t, addr)
@@ -196,8 +196,8 @@ func TestStreamPoolQueue(t *testing.T) {
 	pool := NewStreamPool(StreamPoolConfig{MaxConcurrentHandlers: 3})
 	stream := &recordingStream{done: make(chan struct{}, 8)}
 	release := make(chan struct{})
-	handler := HandlerFunc(func(c *Context, r *stdhttp.Request) {
-		if r.URL.Path != "/inline" {
+	handler := HandlerFunc(func(c *Context) {
+		if c.Request.URL.Path != "/inline" {
 			<-release
 		}
 		_ = c.Respond(stdhttp.StatusOK, "text/plain", nil)

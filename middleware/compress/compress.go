@@ -85,9 +85,9 @@ func New(config ...Config) middleware.Middleware {
 	}
 	pools := &writerPools{level: level}
 	return func(next fibhttp.Handler) fibhttp.Handler {
-		return fibhttp.HandlerFunc(func(c *fibhttp.Context, r *stdhttp.Request) {
-			if cfg.Next != nil && cfg.Next(c, r) {
-				next.ServeHTTP(c, r)
+		return fibhttp.HandlerFunc(func(c *fibhttp.Context) {
+			if cfg.Next != nil && cfg.Next(c) {
+				next.ServeHTTP(c)
 				return
 			}
 			c.OnResponse(func(response *fibhttp.Response) {
@@ -95,10 +95,10 @@ func New(config ...Config) middleware.Middleware {
 					return
 				}
 				middleware.AddVary(response.Header, "Accept-Encoding")
-				if r.Method == stdhttp.MethodHead {
+				if c.Request.Method == stdhttp.MethodHead {
 					return
 				}
-				encoding := negotiate(r.Header["Accept-Encoding"])
+				encoding := negotiate(c.Request.Header["Accept-Encoding"])
 				if encoding == "" {
 					return
 				}
@@ -113,7 +113,7 @@ func New(config ...Config) middleware.Middleware {
 					response.Header["Etag"] = []string{"W/" + tag}
 				}
 			})
-			next.ServeHTTP(c, r)
+			next.ServeHTTP(c)
 		})
 	}
 }

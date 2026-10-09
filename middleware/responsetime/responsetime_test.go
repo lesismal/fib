@@ -16,9 +16,9 @@ import (
 )
 
 func TestResponseTime(t *testing.T) {
-	url := mwtest.Serve(t, responsetime.New()(fibhttp.HandlerFunc(func(c *fibhttp.Context, r *stdhttp.Request) {
+	url := mwtest.Serve(t, responsetime.New()(fibhttp.HandlerFunc(func(c *fibhttp.Context) {
 		time.Sleep(5 * time.Millisecond)
-		if r.URL.Path == "/writer" {
+		if c.Request.URL.Path == "/writer" {
 			_, _ = io.WriteString(c, "ok")
 			return
 		}

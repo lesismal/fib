@@ -23,7 +23,7 @@ type Config struct {
 	// Handler answers a request whose handler panicked with recovered. By
 	// default it answers 500 Internal Server Error, unless the response has
 	// been begun already, which leaves nothing to answer with.
-	Handler func(c *fibhttp.Context, r *stdhttp.Request, recovered any)
+	Handler func(c *fibhttp.Context, recovered any)
 	// Log reports the panic, with the stack it was raised on unless
 	// DisableStackTrace is set. By default it goes to the standard logger;
 	// a function that does nothing silences it.
@@ -50,9 +50,9 @@ func New(config ...Config) middleware.Middleware {
 		cfg.Log = logPanic
 	}
 	return func(next fibhttp.Handler) fibhttp.Handler {
-		return fibhttp.HandlerFunc(func(c *fibhttp.Context, r *stdhttp.Request) {
-			if cfg.Next != nil && cfg.Next(c, r) {
-				next.ServeHTTP(c, r)
+		return fibhttp.HandlerFunc(func(c *fibhttp.Context) {
+			if cfg.Next != nil && cfg.Next(c) {
+				next.ServeHTTP(c)
 				return
 			}
 			defer func() {
@@ -61,7 +61,7 @@ func New(config ...Config) middleware.Middleware {
 					return
 				}
 				if recovered == stdhttp.ErrAbortHandler {
-					if r.ProtoMajor == 1 {
+					if c.Request.ProtoMajor == 1 {
 						_ = c.Conn.Close()
 						return
 					}
@@ -70,16 +70,16 @@ func New(config ...Config) middleware.Middleware {
 					if !cfg.DisableStackTrace {
 						stack = debug.Stack()
 					}
-					cfg.Log(r, recovered, stack)
+					cfg.Log(c.Request, recovered, stack)
 				}
-				cfg.Handler(c, r, recovered)
+				cfg.Handler(c, recovered)
 			}()
-			next.ServeHTTP(c, r)
+			next.ServeHTTP(c)
 		})
 	}
 }
 
-func internalError(c *fibhttp.Context, _ *stdhttp.Request, _ any) {
+func internalError(c *fibhttp.Context, _ any) {
 	status := stdhttp.StatusInternalServerError
 	_ = c.Respond(status, "text/plain; charset=utf-8", []byte(stdhttp.StatusText(status)+"\n"))
 }

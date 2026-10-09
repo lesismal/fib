@@ -104,14 +104,14 @@ func readBody(t *testing.T, resp *stdhttp.Response) string {
 	return string(body)
 }
 
-func echo(c *fibhttp.Context, r *stdhttp.Request) {
-	body, _ := io.ReadAll(r.Body)
-	header := stdhttp.Header{"X-Proto": {r.Proto}, "Content-Type": {"text/plain"}}
-	if r.TLS != nil {
-		header.Set("X-Alpn", r.TLS.NegotiatedProtocol)
+func echo(c *fibhttp.Context) {
+	body, _ := io.ReadAll(c.Request.Body)
+	header := stdhttp.Header{"X-Proto": {c.Request.Proto}, "Content-Type": {"text/plain"}}
+	if c.Request.TLS != nil {
+		header.Set("X-Alpn", c.Request.TLS.NegotiatedProtocol)
 	}
 	_ = c.WriteResponse(fibhttp.Response{StatusCode: stdhttp.StatusOK, Header: header,
-		Body: []byte(fmt.Sprintf("%s %s %s", r.Method, r.URL.RequestURI(), body))})
+		Body: []byte(fmt.Sprintf("%s %s %s", c.Request.Method, c.Request.URL.RequestURI(), body))})
 }
 
 func TestRequestResponse(t *testing.T) {
@@ -162,8 +162,8 @@ func TestManyConcurrentRequests(t *testing.T) {
 }
 
 func TestLargeBodies(t *testing.T) {
-	url := startServer(t, Config{MaxBodyBytes: 32 << 20}, func(c *fibhttp.Context, r *stdhttp.Request) {
-		body, _ := io.ReadAll(r.Body)
+	url := startServer(t, Config{MaxBodyBytes: 32 << 20}, func(c *fibhttp.Context) {
+		body, _ := io.ReadAll(c.Request.Body)
 		_ = c.Respond(stdhttp.StatusOK, "application/octet-stream", body)
 	})
 	client := newClient(t, nil)
@@ -198,8 +198,8 @@ func TestRequestTooLarge(t *testing.T) {
 }
 
 func TestHeadAndNoContent(t *testing.T) {
-	url := startServer(t, Config{}, func(c *fibhttp.Context, r *stdhttp.Request) {
-		if r.URL.Path == "/empty" {
+	url := startServer(t, Config{}, func(c *fibhttp.Context) {
+		if c.Request.URL.Path == "/empty" {
 			_ = c.WriteResponse(fibhttp.Response{StatusCode: stdhttp.StatusNoContent})
 			return
 		}
@@ -222,8 +222,8 @@ func TestHeadAndNoContent(t *testing.T) {
 // TestHeadLengthMatchesHTTP1 checks that HEAD reports the length HTTP/1.1
 // reports, however the handler answers it.
 func TestHeadLengthMatchesHTTP1(t *testing.T) {
-	url := startServer(t, Config{}, func(c *fibhttp.Context, r *stdhttp.Request) {
-		switch r.URL.Path {
+	url := startServer(t, Config{}, func(c *fibhttp.Context) {
+		switch c.Request.URL.Path {
 		case "/write":
 			_, _ = c.Write(make([]byte, 1234))
 		case "/declared":
@@ -232,7 +232,7 @@ func TestHeadLengthMatchesHTTP1(t *testing.T) {
 		case "/respond-declared":
 			_ = c.WriteResponse(fibhttp.Response{StatusCode: stdhttp.StatusOK, Header: stdhttp.Header{"Content-Length": {"9000"}}})
 		case "/serve-content":
-			stdhttp.ServeContent(c, r, "f.bin", time.Unix(1700000000, 0), bytes.NewReader(make([]byte, 4321)))
+			stdhttp.ServeContent(c, c.Request, "f.bin", time.Unix(1700000000, 0), bytes.NewReader(make([]byte, 4321)))
 		}
 	})
 	client := newClient(t, nil)
@@ -251,7 +251,7 @@ func TestHeadLengthMatchesHTTP1(t *testing.T) {
 }
 
 func TestInterimResponse(t *testing.T) {
-	url := startServer(t, Config{}, func(c *fibhttp.Context, r *stdhttp.Request) {
+	url := startServer(t, Config{}, func(c *fibhttp.Context) {
 		if err := c.WriteInterim(stdhttp.StatusEarlyHints, stdhttp.Header{"Link": {"</style.css>; rel=preload"}}); err != nil {
 			t.Error(err)
 		}
@@ -271,11 +271,11 @@ func TestInterimResponse(t *testing.T) {
 }
 
 func TestResponseHeaders(t *testing.T) {
-	url := startServer(t, Config{}, func(c *fibhttp.Context, r *stdhttp.Request) {
+	url := startServer(t, Config{}, func(c *fibhttp.Context) {
 		_ = c.WriteResponse(fibhttp.Response{StatusCode: stdhttp.StatusTeapot, Header: stdhttp.Header{
 			"Set-Cookie": {"a=1", "b=2"},
-			"X-Echo":     {r.Header.Get("X-Custom")},
-			"X-Cookie":   {r.Header.Get("Cookie")},
+			"X-Echo":     {c.Request.Header.Get("X-Custom")},
+			"X-Cookie":   {c.Request.Header.Get("Cookie")},
 			"Connection": {"close"},
 		}})
 	})
@@ -295,7 +295,7 @@ func TestResponseHeaders(t *testing.T) {
 }
 
 func TestAsyncHandler(t *testing.T) {
-	url := startServer(t, Config{}, func(c *fibhttp.Context, r *stdhttp.Request) {
+	url := startServer(t, Config{}, func(c *fibhttp.Context) {
 		c.Retain()
 		go func() {
 			time.Sleep(10 * time.Millisecond)
@@ -313,7 +313,7 @@ func TestAsyncHandler(t *testing.T) {
 func TestTimeoutAndCancel(t *testing.T) {
 	release := make(chan struct{})
 	t.Cleanup(func() { close(release) })
-	url := startServer(t, Config{}, func(c *fibhttp.Context, r *stdhttp.Request) {
+	url := startServer(t, Config{}, func(c *fibhttp.Context) {
 		c.Retain()
 		go func() {
 			<-release
@@ -341,11 +341,11 @@ func TestTimeoutAndCancel(t *testing.T) {
 func TestResponseCloseRetiresConnection(t *testing.T) {
 	var mu sync.Mutex
 	remotes := map[string]bool{}
-	url := startServer(t, Config{}, func(c *fibhttp.Context, r *stdhttp.Request) {
+	url := startServer(t, Config{}, func(c *fibhttp.Context) {
 		mu.Lock()
-		remotes[r.RemoteAddr] = true
+		remotes[c.Request.RemoteAddr] = true
 		mu.Unlock()
-		_ = c.WriteResponse(fibhttp.Response{StatusCode: stdhttp.StatusOK, Body: []byte("ok"), Close: r.URL.Path == "/close"})
+		_ = c.WriteResponse(fibhttp.Response{StatusCode: stdhttp.StatusOK, Body: []byte("ok"), Close: c.Request.URL.Path == "/close"})
 	})
 	client := newClient(t, nil)
 	for _, path := range []string{"/a", "/close", "/b"} {
@@ -395,8 +395,8 @@ func TestDialFailure(t *testing.T) {
 // with the whole response or writes the response through the ResponseWriter
 // methods.
 func TestResponseTrailers(t *testing.T) {
-	url := startServer(t, Config{}, func(c *fibhttp.Context, r *stdhttp.Request) {
-		if r.URL.Path == "/writer" {
+	url := startServer(t, Config{}, func(c *fibhttp.Context) {
+		if c.Request.URL.Path == "/writer" {
 			c.Header().Set("Trailer", "X-Sum")
 			_, _ = c.WriteString("written")
 			c.Header().Set("X-Sum", "w")

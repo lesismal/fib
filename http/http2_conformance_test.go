@@ -282,26 +282,26 @@ func (s *h2RawServer) goAway(last uint32, code H2ErrorCode) {
 // h2ConformanceHandler answers with what it received, so that a peer can
 // check the request reached it whole.
 func h2ConformanceHandler() Handler {
-	return HandlerFunc(func(c *Context, r *stdhttp.Request) {
-		body, _ := io.ReadAll(r.Body)
-		switch r.URL.Path {
+	return HandlerFunc(func(c *Context) {
+		body, _ := io.ReadAll(c.Request.Body)
+		switch c.Request.URL.Path {
 		case "/size":
-			n, _ := strconv.Atoi(r.URL.Query().Get("n"))
+			n, _ := strconv.Atoi(c.Request.URL.Query().Get("n"))
 			_ = c.Respond(200, "application/octet-stream", make([]byte, n))
 		case "/status":
-			n, _ := strconv.Atoi(r.URL.Query().Get("code"))
+			n, _ := strconv.Atoi(c.Request.URL.Query().Get("code"))
 			_ = c.Respond(n, "text/plain", nil)
 		case "/trailers":
 			c.Header().Set("Trailer", "X-Checksum")
 			_, _ = c.Write([]byte("body"))
 			c.Header().Set("X-Checksum", "42")
 		default:
-			header := stdhttp.Header{"Content-Type": {"text/plain"}, "X-Proto": {r.Proto}}
-			if r.Trailer.Get("X-Sum") != "" {
-				header.Set("X-Sum", r.Trailer.Get("X-Sum"))
+			header := stdhttp.Header{"Content-Type": {"text/plain"}, "X-Proto": {c.Request.Proto}}
+			if c.Request.Trailer.Get("X-Sum") != "" {
+				header.Set("X-Sum", c.Request.Trailer.Get("X-Sum"))
 			}
 			_ = c.WriteResponse(Response{StatusCode: 200, Header: header,
-				Body: fmt.Appendf(nil, "%s %s %d", r.Method, r.URL.RequestURI(), len(body))})
+				Body: fmt.Appendf(nil, "%s %s %d", c.Request.Method, c.Request.URL.RequestURI(), len(body))})
 		}
 	})
 }

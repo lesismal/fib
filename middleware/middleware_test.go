@@ -24,16 +24,16 @@ func TestChainOrder(t *testing.T) {
 	)
 	mark := func(name string) middleware.Middleware {
 		return func(next fibhttp.Handler) fibhttp.Handler {
-			return fibhttp.HandlerFunc(func(c *fibhttp.Context, r *stdhttp.Request) {
+			return fibhttp.HandlerFunc(func(c *fibhttp.Context) {
 				mu.Lock()
 				seen = append(seen, name)
 				mu.Unlock()
 				c.OnHeader(func(_ int, h stdhttp.Header) { h.Add("X-Seen", name) })
-				next.ServeHTTP(c, r)
+				next.ServeHTTP(c)
 			})
 		}
 	}
-	handler := middleware.Chain(fibhttp.HandlerFunc(func(c *fibhttp.Context, _ *stdhttp.Request) {
+	handler := middleware.Chain(fibhttp.HandlerFunc(func(c *fibhttp.Context) {
 		_ = c.Respond(stdhttp.StatusOK, "text/plain", []byte("ok"))
 	}), mark("a"), nil, mark("b"))
 	url := mwtest.Serve(t, handler)

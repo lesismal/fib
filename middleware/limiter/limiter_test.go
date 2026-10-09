@@ -13,9 +13,9 @@ import (
 	"github.com/lesismal/fib/middleware/mwtest"
 )
 
-func handler(c *fibhttp.Context, r *stdhttp.Request) {
+func handler(c *fibhttp.Context) {
 	status := stdhttp.StatusOK
-	if r.URL.Path == "/fail" {
+	if c.Request.URL.Path == "/fail" {
 		status = stdhttp.StatusBadRequest
 	}
 	_ = c.Respond(status, "text/plain", []byte("ok"))
@@ -23,7 +23,7 @@ func handler(c *fibhttp.Context, r *stdhttp.Request) {
 
 // byHeader keys each test's requests apart, so the protocols do not share a
 // count.
-func byHeader(_ *fibhttp.Context, r *stdhttp.Request) string { return r.Header.Get("X-Key") }
+func byHeader(c *fibhttp.Context) string { return c.Request.Header.Get("X-Key") }
 
 func TestLimiter(t *testing.T) {
 	url := mwtest.Serve(t, limiter.New(limiter.Config{Max: 3, Expiration: time.Hour, KeyGenerator: byHeader})(

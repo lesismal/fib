@@ -13,8 +13,8 @@ import (
 )
 
 func TestCSRF(t *testing.T) {
-	url := mwtest.Serve(t, csrf.New()(fibhttp.HandlerFunc(func(c *fibhttp.Context, r *stdhttp.Request) {
-		_ = c.Respond(stdhttp.StatusOK, "text/plain", []byte(csrf.Token(r)))
+	url := mwtest.Serve(t, csrf.New()(fibhttp.HandlerFunc(func(c *fibhttp.Context) {
+		_ = c.Respond(stdhttp.StatusOK, "text/plain", []byte(csrf.Token(c.Request)))
 	})))
 	mwtest.Run(t, func(t *testing.T, c mwtest.Client) {
 		resp, token := c.Do(t, "GET", url, nil, "")
@@ -61,8 +61,8 @@ func TestCSRF(t *testing.T) {
 
 func TestCSRFForm(t *testing.T) {
 	url := mwtest.Serve(t, csrf.New(csrf.Config{Lookup: "form:_csrf"})(fibhttp.HandlerFunc(
-		func(c *fibhttp.Context, r *stdhttp.Request) {
-			_ = c.Respond(stdhttp.StatusOK, "text/plain", []byte(r.PostFormValue("name")))
+		func(c *fibhttp.Context) {
+			_ = c.Respond(stdhttp.StatusOK, "text/plain", []byte(c.Request.PostFormValue("name")))
 		})))
 	c := mwtest.Clients(t)[0]
 	resp, _ := c.Do(t, "GET", url, nil, "")

@@ -12,8 +12,8 @@ import (
 )
 
 func TestETag(t *testing.T) {
-	url := mwtest.Serve(t, etag.New()(fibhttp.HandlerFunc(func(c *fibhttp.Context, r *stdhttp.Request) {
-		switch r.URL.Path {
+	url := mwtest.Serve(t, etag.New()(fibhttp.HandlerFunc(func(c *fibhttp.Context) {
+		switch c.Request.URL.Path {
 		case "/own":
 			c.Header().Set("ETag", `"v1"`)
 			_, _ = c.Write([]byte("mine"))

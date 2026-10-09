@@ -37,10 +37,10 @@ func New(config ...Config) middleware.Middleware {
 		cfg = config[0]
 	}
 	return func(next fibhttp.Handler) fibhttp.Handler {
-		return fibhttp.HandlerFunc(func(c *fibhttp.Context, r *stdhttp.Request) {
-			if cfg.Next != nil && cfg.Next(c, r) ||
-				r.Method != stdhttp.MethodGet && r.Method != stdhttp.MethodHead {
-				next.ServeHTTP(c, r)
+		return fibhttp.HandlerFunc(func(c *fibhttp.Context) {
+			if cfg.Next != nil && cfg.Next(c) ||
+				c.Request.Method != stdhttp.MethodGet && c.Request.Method != stdhttp.MethodHead {
+				next.ServeHTTP(c)
 				return
 			}
 			c.OnResponse(func(response *fibhttp.Response) {
@@ -58,11 +58,11 @@ func New(config ...Config) middleware.Middleware {
 					}
 					response.Header["Etag"] = []string{tag}
 				}
-				if match := r.Header["If-None-Match"]; len(match) > 0 && Matches(strings.Join(match, ","), tag) {
+				if match := c.Request.Header["If-None-Match"]; len(match) > 0 && Matches(strings.Join(match, ","), tag) {
 					NotModified(response)
 				}
 			})
-			next.ServeHTTP(c, r)
+			next.ServeHTTP(c)
 		})
 	}
 }

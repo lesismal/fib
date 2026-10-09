@@ -6,6 +6,7 @@ import (
 	"io"
 	stdhttp "net/http"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -67,10 +68,10 @@ func TestResponseWriterOverHTTP2(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	addr := serve(t, fibtls.NewServer(ConfigureTLS(serverConfig), NewHandler(HandlerFunc(func(c *Context, r *stdhttp.Request) {
-		switch r.URL.Path {
+	addr := serve(t, fibtls.NewServer(ConfigureTLS(serverConfig), NewHandler(HandlerFunc(func(c *Context) {
+		switch c.Request.URL.Path {
 		case "/file":
-			stdhttp.ServeFile(c, r, path)
+			stdhttp.ServeFile(c, c.Request, path)
 		case "/whole":
 			_ = c.WriteResponse(Response{StatusCode: 200, Body: []byte("whole"),
 				Trailer: stdhttp.Header{"X-Whole": {"w"}, "Host": {"forbidden"}}})
@@ -117,6 +118,65 @@ func TestResponseWriterOverHTTP2(t *testing.T) {
 	for i := 0; i < 3; i++ {
 		if resp, _ = get("/stream"); resp.Trailer.Get("X-Sum") != "done" {
 			t.Fatalf("stream %d: trailer %v", i, resp.Trailer)
+		}
+	}
+}
+
+// io.Copy of an empty file begins the response like an empty Write does,
+// rather than leaving it to be answered later.
+func TestResponseWriterEmptyCopyBeginsResponse(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "empty")
+	if err := os.WriteFile(path, nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	addr := serveHTTP1(t, func(c *Context) {
+		f, err := os.Open(path)
+		if err != nil {
+			c.WriteHeader(500)
+			return
+		}
+		defer f.Close()
+		_, _ = io.Copy(c, f)
+	})
+	client, _ := stdClient(t)
+	client.Timeout = 5 * time.Second
+	req, _ := stdhttp.NewRequest("GET", "http://"+addr+"/", nil)
+	resp, body := do(t, client, req)
+	if resp.StatusCode != 200 || body != "" {
+		t.Fatalf("status %d, body %q", resp.StatusCode, body)
+	}
+}
+
+// A handler that returns without writing and without retaining the request
+// is answered by the server with an empty 200, as net/http does; one that
+// retains it is left to answer later.
+func TestResponseWriterUnansweredHandlerGetsEmpty200(t *testing.T) {
+	handler := NewHandler(HandlerFunc(func(c *Context) {
+		if c.Request.URL.Path == "/later" {
+			c.Retain()
+			go func() {
+				time.Sleep(50 * time.Millisecond)
+				_ = c.Respond(202, "text/plain", []byte("later"))
+				c.Release()
+			}()
+		}
+	}))
+	for _, h2 := range []bool{false, true} {
+		addr := serve(t, handler)
+		client := netHTTPClient(t, false)
+		if !h2 {
+			client, _ = stdClient(t)
+		}
+		client.Timeout = 5 * time.Second
+		for path, want := range map[string]struct {
+			status int
+			body   string
+		}{"/": {200, ""}, "/later": {202, "later"}} {
+			req, _ := stdhttp.NewRequest("GET", "http://"+addr+path, nil)
+			resp, body := do(t, client, req)
+			if resp.StatusCode != want.status || body != want.body {
+				t.Fatalf("h2=%v %s: status %d, body %q", h2, path, resp.StatusCode, body)
+			}
 		}
 	}
 }

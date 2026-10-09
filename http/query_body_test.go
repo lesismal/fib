@@ -53,10 +53,10 @@ func TestContextQueryAllocatesNothing(t *testing.T) {
 // whole, however it was framed and whatever was read of it already, and
 // nothing for a body that streams.
 func TestContextBody(t *testing.T) {
-	handler := func(c *Context, r *stdhttp.Request) {
-		if r.URL.Query().Get("read") != "" {
+	handler := func(c *Context) {
+		if c.Request.URL.Query().Get("read") != "" {
 			// Read part of it first: Body is still all of it.
-			_, _ = io.ReadFull(r.Body, make([]byte, 3))
+			_, _ = io.ReadFull(c.Request.Body, make([]byte, 3))
 		}
 		body := c.Body()
 		if body == nil {
@@ -113,7 +113,7 @@ func TestContextBody(t *testing.T) {
 	t.Run("streamed", func(t *testing.T) {
 		config := DefaultConfig()
 		config.StreamRequestBody = true
-		addr := serveStreamingServer(t, config, func(c *Context, r *stdhttp.Request) {
+		addr := serveStreamingServer(t, config, func(c *Context) {
 			answer := "streams"
 			if c.Body() != nil {
 				answer = "whole"
@@ -140,10 +140,10 @@ func TestContextBody(t *testing.T) {
 func TestDeclaredBodyHeldWhole(t *testing.T) {
 	const size = 20000
 	firstPart := make(chan struct{})
-	addr := serveHTTP1(t, func(c *Context, r *stdhttp.Request) {
+	addr := serveHTTP1(t, func(c *Context) {
 		c.Header().Set("Content-Length", strconv.Itoa(size))
 		part := bytes.Repeat([]byte("x"), size/4)
-		if r.URL.Path == "/flush" {
+		if c.Request.URL.Path == "/flush" {
 			_, _ = c.Write(part)
 			c.Flush()
 			// The client reads the first part before the rest is written.

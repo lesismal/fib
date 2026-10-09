@@ -44,12 +44,12 @@ func servePollers(t *testing.T, name string, handler fib.Handler) string {
 func TestHTTP1RoundsRunOnWorkers(t *testing.T) {
 	entered := make(chan struct{}, 1)
 	release := make(chan struct{})
-	addr := servePollers(t, "http1-workers", NewHandler(HandlerFunc(func(c *Context, r *stdhttp.Request) {
-		if r.URL.Path == "/block" {
+	addr := servePollers(t, "http1-workers", NewHandler(HandlerFunc(func(c *Context) {
+		if c.Request.URL.Path == "/block" {
 			entered <- struct{}{}
 			<-release
 		}
-		_ = c.Respond(stdhttp.StatusOK, "text/plain", []byte(r.URL.Path))
+		_ = c.Respond(stdhttp.StatusOK, "text/plain", []byte(c.Request.URL.Path))
 	})))
 	blocked := dialRaw(t, addr)
 	blocked.send("GET /block HTTP/1.1\r\nHost: x\r\n\r\n")
@@ -77,9 +77,9 @@ func TestHandlerPoolIsTheStreamPool(t *testing.T) {
 		config.Name = name
 		config.Addr = "127.0.0.1:0"
 		config.IOPollers = pollers
-		server, err := fib.Bind(config, NewHandler(HandlerFunc(func(c *Context, r *stdhttp.Request) {
+		server, err := fib.Bind(config, NewHandler(HandlerFunc(func(c *Context) {
 			got <- c.Conn.Engine().HandlerPool().Name()
-			_ = c.Respond(stdhttp.StatusOK, "text/plain", []byte(r.Proto))
+			_ = c.Respond(stdhttp.StatusOK, "text/plain", []byte(c.Request.Proto))
 		})))
 		if err != nil {
 			t.Fatal(err)

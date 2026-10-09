@@ -8,7 +8,6 @@ import (
 	"errors"
 	"fmt"
 	"math/rand/v2"
-	stdhttp "net/http"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -161,7 +160,7 @@ func TestSaveBodyStoresALargeBody(t *testing.T) {
 	path := filepath.Join(dir, "big.bin")
 	results := make(chan result, 2)
 	streamedAtHandler := make(chan bool, 1)
-	addr := serveStreamingServer(t, uploadConfig(), func(c *Context, r *stdhttp.Request) {
+	addr := serveStreamingServer(t, uploadConfig(), func(c *Context) {
 		streamedAtHandler <- !c.BodyComplete()
 		c.SaveBody(path, collect(c, results, true))
 	})
@@ -194,7 +193,7 @@ func TestSaveBodyStoresALargeBody(t *testing.T) {
 // SaveBody stores it from there.
 func TestSaveBodyStoresABodyThatArrivedWhole(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "small.txt")
-	addr := serveStreamingServer(t, DefaultConfig(), func(c *Context, r *stdhttp.Request) {
+	addr := serveStreamingServer(t, DefaultConfig(), func(c *Context) {
 		c.SaveBody(path, nil)
 	})
 	conn := dialRaw(t, addr)
@@ -211,7 +210,7 @@ func TestSaveBodyStoresABodyThatArrivedWhole(t *testing.T) {
 func TestSaveBodyCannotCreateTheFile(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "missing", "dir", "f")
 	results := make(chan result, 1)
-	addr := serveStreamingServer(t, uploadConfig(), func(c *Context, r *stdhttp.Request) {
+	addr := serveStreamingServer(t, uploadConfig(), func(c *Context) {
 		c.SaveBody(path, collect(c, results, true))
 	})
 	conn := dialRaw(t, addr)
@@ -228,7 +227,7 @@ func TestSaveBodyCannotCreateTheFile(t *testing.T) {
 func TestSaveBodyConnectionLostMidBody(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "lost.bin")
 	results := make(chan result, 2)
-	addr := serveStreamingServer(t, uploadConfig(), func(c *Context, r *stdhttp.Request) {
+	addr := serveStreamingServer(t, uploadConfig(), func(c *Context) {
 		c.SaveBody(path, collect(c, results, true))
 	})
 	conn := dialRaw(t, addr)
@@ -260,7 +259,7 @@ func TestSaveBodyPastTheLimit(t *testing.T) {
 	config := uploadConfig()
 	config.MaxStreamedBodyBytes = 256 << 10
 	results := make(chan result, 2)
-	addr := serveStreamingServer(t, config, func(c *Context, r *stdhttp.Request) {
+	addr := serveStreamingServer(t, config, func(c *Context) {
 		c.SaveBody(path, collect(c, results, true))
 	})
 	conn := dialRaw(t, addr)
@@ -287,7 +286,7 @@ func TestSaveBodyWriteFails(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "w.bin")
 	faultOpens(t, false, func(f *faultyFile) { f.failWriteAt = 2 })
 	results := make(chan result, 2)
-	addr := serveStreamingServer(t, uploadConfig(), func(c *Context, r *stdhttp.Request) {
+	addr := serveStreamingServer(t, uploadConfig(), func(c *Context) {
 		c.SaveBody(path, collect(c, results, false))
 	})
 	conn := dialRaw(t, addr)
@@ -307,7 +306,7 @@ func TestSaveBodyCloseFails(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "c.bin")
 	faultOpens(t, false, func(f *faultyFile) { f.failClose = true })
 	results := make(chan result, 1)
-	addr := serveStreamingServer(t, uploadConfig(), func(c *Context, r *stdhttp.Request) {
+	addr := serveStreamingServer(t, uploadConfig(), func(c *Context) {
 		c.SaveBody(path, collect(c, results, true))
 	})
 	conn := dialRaw(t, addr)
@@ -325,7 +324,7 @@ func TestSaveBodyRenameFails(t *testing.T) {
 	swapFS(t)
 	uploadFS.rename = func(string, string) error { return errBoom }
 	results := make(chan result, 1)
-	addr := serveStreamingServer(t, uploadConfig(), func(c *Context, r *stdhttp.Request) {
+	addr := serveStreamingServer(t, uploadConfig(), func(c *Context) {
 		c.SaveBody(path, collect(c, results, true))
 	})
 	conn := dialRaw(t, addr)
@@ -354,9 +353,9 @@ func TestRespondSaved(t *testing.T) {
 		{"/large", Saved{}, ErrBodyTooLarge, 413, "", "too large"},
 		{"/other", Saved{}, errBoom, 500, "", "boom"},
 	}
-	addr := serveStreamingServer(t, DefaultConfig(), func(c *Context, r *stdhttp.Request) {
+	addr := serveStreamingServer(t, DefaultConfig(), func(c *Context) {
 		for _, tc := range cases {
-			if r.URL.Path == tc.path {
+			if c.Request.URL.Path == tc.path {
 				_ = c.RespondSaved(tc.saved, tc.err)
 			}
 		}
@@ -403,7 +402,7 @@ func TestParseContentRange(t *testing.T) {
 
 // resumableServer answers every request with SaveBodyResumable at path.
 func resumableServer(t *testing.T, path string, results chan<- result) string {
-	return serveStreamingServer(t, uploadConfig(), func(c *Context, r *stdhttp.Request) {
+	return serveStreamingServer(t, uploadConfig(), func(c *Context) {
 		c.SaveBodyResumable(path, collect(c, results, true))
 	})
 }
@@ -581,7 +580,7 @@ func TestSaveBodyResumableChunkPastTheLimit(t *testing.T) {
 	config := uploadConfig()
 	config.MaxStreamedBodyBytes = 128 << 10
 	results := make(chan result, 2)
-	addr := serveStreamingServer(t, config, func(c *Context, r *stdhttp.Request) {
+	addr := serveStreamingServer(t, config, func(c *Context) {
 		c.SaveBodyResumable(path, collect(c, results, true))
 	})
 	conn := dialRaw(t, addr)

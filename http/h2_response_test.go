@@ -36,7 +36,7 @@ func (tc *h2TestConn) readAcking(id uint32) *h2TestStream {
 // then each piece as it is flushed, then the trailers that end it.
 func TestH2ResponseStreamsAsItIsWritten(t *testing.T) {
 	next := make(chan struct{})
-	addr := serve(t, NewHandler(HandlerFunc(func(c *Context, r *stdhttp.Request) {
+	addr := serve(t, NewHandler(HandlerFunc(func(c *Context) {
 		c.Header().Set("Trailer", "X-Sum")
 		_, _ = c.WriteString("first")
 		c.Flush()
@@ -91,8 +91,8 @@ func TestH2ResponseStreamsAsItIsWritten(t *testing.T) {
 // declared one streams with its content-length, and one that falls short of
 // it is reset rather than ended.
 func TestH2ResponseHeldOrDeclared(t *testing.T) {
-	addr := serve(t, NewHandler(HandlerFunc(func(c *Context, r *stdhttp.Request) {
-		switch r.URL.Path {
+	addr := serve(t, NewHandler(HandlerFunc(func(c *Context) {
+		switch c.Request.URL.Path {
 		case "/short":
 			_, _ = c.WriteString("short")
 		case "/declared":
@@ -139,7 +139,7 @@ func TestH2ResponseWaitsForTheClientsWindow(t *testing.T) {
 	const total = 1 << 20
 	var written atomic.Int64
 	done := make(chan error, 1)
-	addr := serve(t, NewHandler(HandlerFunc(func(c *Context, r *stdhttp.Request) {
+	addr := serve(t, NewHandler(HandlerFunc(func(c *Context) {
 		chunk := bytes.Repeat([]byte("w"), 16<<10)
 		for written.Load() < total {
 			if _, err := c.Write(chunk); err != nil {
@@ -177,8 +177,8 @@ func TestH2ResponseWaitsForTheClientsWindow(t *testing.T) {
 // through OnCancel, as one that has not begun does.
 func TestH2ResponseWaitEndsWithTheStream(t *testing.T) {
 	results := make(chan error, 1)
-	addr := serve(t, NewHandler(HandlerFunc(func(c *Context, r *stdhttp.Request) {
-		if r.URL.Path == "/idle" {
+	addr := serve(t, NewHandler(HandlerFunc(func(c *Context) {
+		if c.Request.URL.Path == "/idle" {
 			cancelled := make(chan error, 1)
 			c.OnCancel(func(err error) { cancelled <- err })
 			c.Flush()
@@ -228,7 +228,7 @@ func TestH2ResponseOnTheReaderDoesNotWait(t *testing.T) {
 	config := DefaultConfig()
 	config.StreamPool = StreamPoolConfig{Disable: true}
 	const total = 300 << 10
-	addr := serve(t, NewHandlerWithConfig(config, HandlerFunc(func(c *Context, r *stdhttp.Request) {
+	addr := serve(t, NewHandlerWithConfig(config, HandlerFunc(func(c *Context) {
 		chunk := bytes.Repeat([]byte("r"), 10<<10)
 		for range total / len(chunk) {
 			_, _ = c.Write(chunk)
@@ -248,8 +248,8 @@ func TestH2ResponseStreamsConcurrently(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	addr := serve(t, fibtls.NewServer(ConfigureTLS(serverConfig), NewHandler(HandlerFunc(func(c *Context, r *stdhttp.Request) {
-		n := r.URL.Query().Get("n")
+	addr := serve(t, fibtls.NewServer(ConfigureTLS(serverConfig), NewHandler(HandlerFunc(func(c *Context) {
+		n := c.Request.URL.Query().Get("n")
 		c.Header().Set("Trailer", "X-N")
 		for i := range 20 {
 			_, _ = fmt.Fprintf(c, "%s:%d:%s|", n, i, strings.Repeat("p", 3000))
