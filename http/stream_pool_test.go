@@ -10,6 +10,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/lesismal/fib/bufferpool"
 )
 
 // concurrencyProbe holds every request it is given until the test releases
@@ -237,5 +239,73 @@ func TestStreamPoolQueue(t *testing.T) {
 	defer stream.mu.Unlock()
 	if len(stream.paths) != 3 || stream.paths[0] != "/inline" {
 		t.Fatalf("served %v", stream.paths)
+	}
+}
+
+// endingStream is a recordingStream that is told when its request ends.
+type endingStream struct {
+	recordingStream
+	ended chan struct{}
+}
+
+func (s *endingStream) RequestEnded() { close(s.ended) }
+
+// TestStreamPoolCancelWhileQueued cancels a request whose handler is still
+// waiting for a worker. The handler holds the request from when it was
+// queued, so the request is not ended under it, its body is not given back
+// and its StreamRequest is not handed to the protocol to recycle: the handler
+// runs, hears of the cancellation, and the request ends once it returns.
+func TestStreamPoolCancelWhileQueued(t *testing.T) {
+	pool := NewStreamPool(StreamPoolConfig{})
+	stream := &endingStream{recordingStream: recordingStream{done: make(chan struct{}, 1)}, ended: make(chan struct{})}
+	ran := make(chan error, 1)
+	handler := HandlerFunc(func(c *Context) {
+		select {
+		case <-stream.ended:
+			ran <- errors.New("the request ended before its handler ran")
+			return
+		default:
+		}
+		if len(c.Body()) != 4 {
+			ran <- fmt.Errorf("the handler found %d bytes of the body", len(c.Body()))
+			return
+		}
+		ran <- c.Err()
+	})
+	r := new(StreamRequest)
+	r.URL.Path = "/queued"
+	r.Request.URL = &r.URL
+	r.Request.Method = stdhttp.MethodPost
+	r.Request.Header = stdhttp.Header{}
+	c := r.Context(nil, stream, append(bufferpool.Get(4)[:0], "body"...))
+	var gate StreamGate
+	var batch StreamBatch
+	pool.Queue(&batch, &gate, nil, handler, r)
+	r.Cancel(os.ErrDeadlineExceeded)
+	deadline := time.Now().Add(5 * time.Second)
+	for c.Err() == nil {
+		if time.Now().After(deadline) {
+			t.Fatal("the cancellation never reached the request")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	select {
+	case <-stream.ended:
+		t.Fatal("the request ended while its handler was queued")
+	case <-time.After(20 * time.Millisecond):
+	}
+	pool.Submit(&batch)
+	select {
+	case err := <-ran:
+		if !errors.Is(err, os.ErrDeadlineExceeded) {
+			t.Fatalf("the handler saw %v, want the cancellation", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("the handler never ran")
+	}
+	select {
+	case <-stream.ended:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the request did not end once its handler returned")
 	}
 }
