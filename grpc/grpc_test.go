@@ -82,7 +82,7 @@ var echoDesc = ServiceDesc{
 
 type echoImpl struct {
 	// block, when set, is waited on by "block" calls, which report entering
-	// on entered.
+	// on entered, as "watch" calls do when it is set.
 	block   chan struct{}
 	entered chan struct{}
 	// ctxDone receives the error of a "watch" call's context once it ends.
@@ -101,6 +101,9 @@ func (e *echoImpl) Unary(ctx context.Context, in *Req) (*Rsp, error) {
 		<-ctx.Done()
 		return nil, ctx.Err()
 	case "watch":
+		if e.entered != nil {
+			e.entered <- struct{}{}
+		}
 		<-ctx.Done()
 		e.ctxDone <- ctx.Err()
 		return nil, ctx.Err()
@@ -422,7 +425,7 @@ func TestMetadata(t *testing.T) {
 }
 
 func TestDeadlineAndCancel(t *testing.T) {
-	impl := &echoImpl{ctxDone: make(chan error, 1)}
+	impl := &echoImpl{ctxDone: make(chan error, 1), entered: make(chan struct{}, 1)}
 	_, addr := startServer(t, impl)
 	_, c := dial(t, addr)
 	ctx, cancel := context.WithTimeout(testCtx(t), 100*time.Millisecond)
@@ -442,7 +445,14 @@ func TestDeadlineAndCancel(t *testing.T) {
 		_, err := c.Unary(ctx, &Req{Msg: "watch"})
 		done <- err
 	}()
-	time.Sleep(100 * time.Millisecond)
+	// The call is canceled once its handler runs: a reset that reaches the
+	// server before the request has, as one may on a loaded machine, ends
+	// the call without running the handler at all.
+	select {
+	case <-impl.entered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the handler never ran")
+	}
 	cancel()
 	if err := <-done; status.Code(err) != codes.Canceled {
 		t.Fatalf("canceled call = %v", err)

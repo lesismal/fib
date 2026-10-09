@@ -190,7 +190,7 @@ func TestServeHTTPMetadata(t *testing.T) {
 }
 
 func TestServeHTTPDeadlineAndCancel(t *testing.T) {
-	impl := &echoImpl{ctxDone: make(chan error, 1)}
+	impl := &echoImpl{ctxDone: make(chan error, 1), entered: make(chan struct{}, 1)}
 	_, c := dial(t, startHTTP(t, impl, fibhttp.DefaultConfig()))
 	ctx, cancel := context.WithTimeout(testCtx(t), 100*time.Millisecond)
 	defer cancel()
@@ -203,7 +203,12 @@ func TestServeHTTPDeadlineAndCancel(t *testing.T) {
 		_, err := c.Unary(ctx, &Req{Msg: "watch"})
 		done <- err
 	}()
-	time.Sleep(100 * time.Millisecond)
+	// Canceled once its handler runs, as in TestDeadlineAndCancel.
+	select {
+	case <-impl.entered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the handler never ran")
+	}
 	cancel()
 	if err := <-done; status.Code(err) != codes.Canceled {
 		t.Fatalf("canceled call = %v", err)
