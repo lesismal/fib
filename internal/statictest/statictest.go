@@ -1,3 +1,5 @@
+//go:build linux || darwin || windows
+
 // Package statictest is the static-file conformance suite the HTTP/1, HTTP/2
 // and HTTP/3 tests share: one set of files, one handler serving them four
 // ways, and the checks a client of any version must see pass.
