@@ -437,23 +437,40 @@ func (cc *ClientConn) newStream(ctx context.Context, desc *StreamDesc, method st
 		ci.peer.Addr = cs.s.t.conn.RemoteAddr()
 		ci.peer.LocalAddr = cs.s.t.conn.LocalAddr()
 	}
-	cs.stopCancel = context.AfterFunc(ctx, func() {
+	// The call may already have ended on the connection's goroutine: a
+	// server can answer with its status before this returns. Whichever of
+	// this and ended comes second stops the hook.
+	stop := context.AfterFunc(ctx, func() {
 		cs.cancel(status.FromContextError(ctx.Err()).Err())
 	})
+	cs.stopMu.Lock()
+	over := cs.over
+	if !over {
+		cs.stopCancel = stop
+	}
+	cs.stopMu.Unlock()
+	if over {
+		stop()
+	}
 	return cs, nil
 }
 
 // clientStream is the client's side of a call.
 type clientStream struct {
-	cc         *ClientConn
-	desc       *StreamDesc
-	ctx        context.Context
-	ci         callInfo
-	codec      Codec
-	sendComp   Compressor
-	recvComp   Compressor
-	s          *stream
+	cc       *ClientConn
+	desc     *StreamDesc
+	ctx      context.Context
+	ci       callInfo
+	codec    Codec
+	sendComp Compressor
+	recvComp Compressor
+	s        *stream
+
+	// stopMu guards stopCancel, which stops the hook that cancels the call
+	// with its context, and over, which says the call has ended.
+	stopMu     sync.Mutex
 	stopCancel func() bool
+	over       bool
 
 	// headerDone is closed once the header has arrived or the call has
 	// ended; done once the call has ended, with st its status.
@@ -608,8 +625,12 @@ func (cs *clientStream) onHeaders(fields []hpack.HeaderField, end bool) error {
 func (cs *clientStream) ended() {
 	cs.endOnce.Do(func() {
 		cs.headerOnce.Do(func() { close(cs.headerDone) })
-		if cs.stopCancel != nil {
-			cs.stopCancel()
+		cs.stopMu.Lock()
+		cs.over = true
+		stop := cs.stopCancel
+		cs.stopMu.Unlock()
+		if stop != nil {
+			stop()
 		}
 	})
 }
