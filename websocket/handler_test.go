@@ -341,21 +341,23 @@ func TestReadsPauseForPeerThatNeverReadsAndResumeWhenItDoes(t *testing.T) {
 	}
 
 	// Now drain. The replies leave, the queue falls back under the watermark,
-	// and the server has to resume reading what the peer already sent.
+	// and the server has to resume reading what the peer already sent. The
+	// peer reads until the test is done, through any quiet spell: one that
+	// gave up after a second of silence could stop draining while a loaded
+	// server was slow to send, and leave it paused on the peer's account.
+	var drained atomic.Int64
 	drainDone := make(chan struct{})
 	go func() {
 		defer close(drainDone)
 		buf := make([]byte, 32<<10)
 		for {
-			select {
-			case <-drainDone:
-				return
-			default:
-			}
 			if err := conn.SetReadDeadline(time.Now().Add(time.Second)); err != nil {
 				return
 			}
-			if _, err := reader.Read(buf); err != nil {
+			n, err := reader.Read(buf)
+			drained.Add(int64(n))
+			var netErr net.Error
+			if err != nil && !(errors.As(err, &netErr) && netErr.Timeout()) {
 				return
 			}
 		}
@@ -368,7 +370,8 @@ func TestReadsPauseForPeerThatNeverReadsAndResumeWhenItDoes(t *testing.T) {
 	conn.Close()
 	<-drainDone
 	if resumed := received.Load(); resumed == paused {
-		t.Fatalf("server read nothing more after the peer drained %d bytes of replies; the pause never lifted", paused)
+		t.Fatalf("server read nothing more after pausing at %d bytes, while the peer drained %d bytes of replies; the pause never lifted",
+			paused, drained.Load())
 	}
 }
 
