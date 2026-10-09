@@ -5,6 +5,7 @@ package uploadtest
 
 import (
 	"crypto/tls"
+	"encoding/binary"
 	"flag"
 	"io"
 	"math/rand/v2"
@@ -17,12 +18,14 @@ import (
 )
 
 // Bytes is n pseudo-random bytes, the same every time for the same seed.
+// ChaCha8 fills them in bulk: a byte at a time, the race detector makes the
+// largest bodies here take several seconds, which on a loaded CI runner is
+// time the tests that wait on a transfer do not have.
 func Bytes(n int, seed uint64) []byte {
+	var key [32]byte
+	binary.LittleEndian.PutUint64(key[:], seed)
 	b := make([]byte, n)
-	rng := rand.New(rand.NewPCG(seed, seed+1))
-	for i := range b {
-		b[i] = byte(rng.Uint32())
-	}
+	_, _ = rand.NewChaCha8(key).Read(b)
 	return b
 }
 

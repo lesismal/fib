@@ -144,6 +144,12 @@ func TestUploadResumeAndEchoOverHTTP3(t *testing.T) {
 // uploadCut starts a request with a large body and cancels it once the server
 // has begun storing it: the client abandons the request's stream, which ends
 // the body under the server's handler.
+//
+// The client holds the whole body before it sends any of it, so the body has
+// to be large enough to be still on its way when the cancel comes: 64 MiB is,
+// with a few MiB at most arrived on a fast machine. A larger one only costs
+// memory, which the race detector multiplies, on a CI runner that has the
+// other packages' tests running beside these.
 func uploadCut(t *testing.T, newClient func() *http3.Client, method, url string, header http.Header, body []byte, stored string) {
 	t.Helper()
 	client := newClient()
@@ -167,7 +173,7 @@ func uploadCut(t *testing.T, newClient func() *http3.Client, method, url string,
 
 func TestUploadCancelledMidBody(t *testing.T) {
 	base, dir, newClient := startServer(t, 0)
-	data := uploadtest.Bytes(256<<20, 2)
+	data := uploadtest.Bytes(64<<20, 2)
 	uploadCut(t, newClient, "POST", base+"/upload?name=cut.bin", nil, data, filepath.Join(dir, "cut.bin.part"))
 	// Nothing of it is kept, and the server serves the next client.
 	uploadtest.Eventually(t, "the partial file to be removed", func() bool { return len(uploadtest.Entries(dir)) == 0 })
@@ -180,7 +186,7 @@ func TestUploadCancelledMidBody(t *testing.T) {
 
 func TestResumeAfterACancelledChunk(t *testing.T) {
 	base, dir, newClient := startServer(t, 0)
-	total := 256 << 20
+	total := 64 << 20
 	data := uploadtest.Bytes(total, 3)
 	path := filepath.Join(dir, "cut.bin")
 	header := http.Header{"Content-Range": {fmt.Sprintf("bytes 0-%d/%d", total-1, total)}}
@@ -215,7 +221,7 @@ func TestEchoCancelledMidBody(t *testing.T) {
 	defer cancel()
 	failed := make(chan error, 1)
 	go func() {
-		_, _, err := trySendContext(ctx, client, "POST", base+"/echo", nil, uploadtest.Bytes(256<<20, 4))
+		_, _, err := trySendContext(ctx, client, "POST", base+"/echo", nil, uploadtest.Bytes(64<<20, 4))
 		failed <- err
 	}()
 	// An echo leaves no file to watch; give it time to be under way.
