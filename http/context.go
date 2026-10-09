@@ -528,10 +528,15 @@ func (c *Context) handled() {
 }
 
 // begin takes the hold that serving a request stands on, which the handler's
-// return gives back. conn says the connection has the request too, until
-// endRequestLocked is done with it, and reader that the handler runs on the
-// goroutine reading its multiplexed connection.
-func (c *Context) begin(conn, reader bool) {
+// return gives back, and reports whether the handler has it: taken now, or
+// before, when the request was handed to a pool. conn says the connection
+// has the request too, until endRequestLocked is done with it, and reader
+// that the handler runs on the goroutine reading its multiplexed connection.
+//
+// A request cancelled before anything held it has ended already: its body
+// has gone back and its Context may be serving another request, so its
+// handler must not run.
+func (c *Context) begin(conn, reader bool) bool {
 	add := ctxServed | ctxShare
 	if conn {
 		add |= ctxConn
@@ -541,11 +546,14 @@ func (c *Context) begin(conn, reader bool) {
 	}
 	for {
 		w := c.word.Load()
-		if ctxState(w) != ctxOpen || w&ctxServed != 0 {
-			return
+		if w&ctxServed != 0 {
+			return true
+		}
+		if ctxState(w) != ctxOpen {
+			return false
 		}
 		if c.word.CompareAndSwap(w, w|add) {
-			return
+			return true
 		}
 	}
 }

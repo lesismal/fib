@@ -910,7 +910,9 @@ func serveRequest(handler Handler, context *Context) { serveRequestOn(handler, c
 func serveOnReader(handler Handler, context *Context) { serveRequestOn(handler, context, true) }
 
 func serveRequestOn(handler Handler, context *Context, reader bool) {
-	context.begin(false, reader)
+	if !context.begin(false, reader) {
+		return
+	}
 	handler.ServeHTTP(context)
 	context.handled()
 	context.returned()

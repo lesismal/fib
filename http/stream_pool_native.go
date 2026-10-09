@@ -104,6 +104,12 @@ func (p *StreamPool) Serve(gate *StreamGate, conn *fib.Connection, handler Handl
 		serveOnReader(handler, &r.context)
 		return
 	}
+	// The handler holds the request from here rather than from when a worker
+	// runs it: a reset in between would otherwise find nothing holding the
+	// request and end it, giving its body back and its StreamRequest to the
+	// protocol to recycle, under a task still waiting to serve them. Held, a
+	// cancellation reaches the handler as it would one already running.
+	r.context.begin(false, false)
 	r.task = streamTask{gate: gate, conn: conn, handler: handler, context: &r.context}
 	p.submit(p.poolFor(gate, conn), &r.task)
 }
@@ -114,6 +120,7 @@ func (p *StreamPool) serveContext(gate *StreamGate, conn *fib.Connection, handle
 		serveOnReader(handler, c)
 		return
 	}
+	c.begin(false, false)
 	p.submit(p.poolFor(gate, conn), &streamTask{gate: gate, conn: conn, handler: handler, context: c})
 }
 
@@ -141,6 +148,7 @@ func (p *StreamPool) Queue(b *StreamBatch, gate *StreamGate, conn *fib.Connectio
 		serveOnReader(handler, &r.context)
 		return
 	}
+	r.context.begin(false, false)
 	r.task = streamTask{gate: gate, conn: conn, handler: handler, context: &r.context}
 	b.pool = p.poolFor(gate, conn)
 	b.tasks = append(b.tasks, &r.task)
