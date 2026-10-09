@@ -842,3 +842,56 @@ func TestOnBodyWaitsForTheHandler(t *testing.T) {
 		t.Fatal("the body reached its callback before the handler returned")
 	}
 }
+
+// TestStreamRequestBodyHandlerWaitsForTheThreshold checks that the handler of
+// a body past StreamRequestBodyThreshold is not called until that much of it
+// has arrived, and that it then has at least that much to read.
+func TestStreamRequestBodyHandlerWaitsForTheThreshold(t *testing.T) {
+	const threshold = 8 << 10
+	started := make(chan struct{})
+	base := startServer(t, Config{StreamRequestBody: true, StreamRequestBodyThreshold: threshold},
+		func(c *fibhttp.Context, r *stdhttp.Request) {
+			close(started)
+			first, total := -1, 0
+			c.OnBody(func(data []byte, fin bool, err error) {
+				if first < 0 {
+					first = len(data)
+				}
+				total += len(data)
+				if fin || err != nil {
+					_ = c.Respond(stdhttp.StatusOK, "text/plain", fmt.Appendf(nil, "%d %d %v", first, total, err))
+				}
+			})
+		})
+	w := dialH3Wire(t, nil, base)
+	s, err := w.qc.OpenStream()
+	if err != nil {
+		t.Fatal(err)
+	}
+	payload := bytes.Repeat([]byte("threshold "), 4<<10)
+	head, _ := h3Request{path: "/", framing: h3Length, body: payload}.frames()
+	data := func(b []byte) []byte { return append(appendFrameHeader(nil, frameData, len(b)), b...) }
+	if err := s.Write(append(head, data(payload[:threshold-1])...), false); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-started:
+		t.Fatal("the handler ran before the threshold of the body had arrived")
+	case <-time.After(500 * time.Millisecond):
+	}
+	if err := s.Write(data(payload[threshold-1:]), true); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-started:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the handler did not run once the threshold had arrived")
+	}
+	status, got := w.response(s.ID())
+	var first, total int
+	var rest string
+	if _, err := fmt.Sscanf(string(got), "%d %d %s", &first, &total, &rest); err != nil || status != stdhttp.StatusOK ||
+		first < threshold || total != len(payload) || rest != "<nil>" {
+		t.Fatalf("answered %d %q, want 200 with a first delivery of at least %d and %d in all", status, got, threshold, len(payload))
+	}
+}
