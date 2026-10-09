@@ -211,15 +211,14 @@ func (e *Engine) openUDPBeside(config Config, parent *Engine) error {
 	return nil
 }
 
-// stopListening shuts the engine's TCP listeners down, which stops them
-// taking connections without closing their descriptors. Where a platform does
-// not stop a listening socket this way, its listeners listen until closed.
+// stopListening stops the engine's TCP listeners taking connections without
+// giving up their descriptors; see stopListeningFD.
 func (e *Engine) stopListening() {
 	if !e.tcpListeners {
 		return
 	}
 	for _, fd := range e.listenFDs {
-		_ = syscall.Shutdown(fd, syscall.SHUT_RD)
+		stopListeningFD(fd)
 	}
 }
 
