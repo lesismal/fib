@@ -29,12 +29,16 @@ func TestAppendJSONEncodesAsMarshal(t *testing.T) {
 		}{"fib", nil, 3},
 		jsontext.Value(`{"raw":true}`),
 	}
+	// encoding/json/v2 writes a map's keys in no particular order unless
+	// asked to sort them, so two encodings of the same map need not agree;
+	// both sort here.
+	deterministic := json.Deterministic(true)
 	for _, v := range values {
-		want, err := json.Marshal(v)
+		want, err := json.Marshal(v, deterministic)
 		if err != nil {
 			t.Fatal(err)
 		}
-		got, err := appendJSON([]byte("prefix:"), v)
+		got, err := appendJSON([]byte("prefix:"), v, deterministic)
 		if err != nil || string(got) != "prefix:"+string(want) {
 			t.Errorf("appendJSON(%#v) = %q, %v; want %q", v, got, err, "prefix:"+string(want))
 		}
