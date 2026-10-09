@@ -32,8 +32,17 @@ jobs:
             echo "$unformatted"
             exit 1
           fi
+      # staticcheck reads the compiler's export data through x/tools, whose
+      # release can trail a Go patch release that changes that format (Go
+      # 1.27.2 did, past what staticcheck v0.8.1's x/tools could read), so it
+      # is built against the latest x/tools rather than the one it pins.
       - name: Install staticcheck
-        run: go install honnef.co/go/tools/cmd/staticcheck@latest
+        shell: bash
+        run: |
+          mkdir "$RUNNER_TEMP/staticcheck" && cd "$RUNNER_TEMP/staticcheck"
+          go mod init staticcheck-build
+          go get honnef.co/go/tools/cmd/staticcheck@latest golang.org/x/tools@latest
+          go install honnef.co/go/tools/cmd/staticcheck
       # The engine is split per OS, so vet and staticcheck run once per target.
       - name: go vet
         run: |
@@ -130,9 +139,13 @@ jobs:
         with:
           go-version: stable
           cache-dependency-path: go.mod
+      # No -race here: the test jobs run it, and under it every coverage
+      # counter is an atomic the race detector intercepts, which made a
+      # transfer test twenty times slower and ran it past its deadline.
+      # The counters stay atomic, as the tests count from many goroutines.
       - name: Test with coverage
         run: |
-          go test -race -count=1 -timeout 20m -covermode=atomic \
+          go test -count=1 -timeout 20m -covermode=atomic \
             -coverpkg=./... -coverprofile="$RUNNER_TEMP/cover.out" ./...
       - name: Summarize
         id: cover
