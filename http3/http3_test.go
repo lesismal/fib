@@ -326,9 +326,12 @@ func TestTimeoutAndCancel(t *testing.T) {
 	if !errors.Is(err, os.ErrDeadlineExceeded) {
 		t.Fatalf("timeout: %v", err)
 	}
+	// The cancel goes to a client without the short timeout: on a loaded
+	// machine the timer that cancels could fire after the timeout's, and the
+	// request would end with the wrong error.
 	ctx, cancel := context.WithCancel(context.Background())
 	req := mustRequest(t, stdhttp.MethodGet, url+"/slow", nil).WithContext(ctx)
-	f := client.Go(req)
+	f := newClient(t, nil).Go(req)
 	time.AfterFunc(50*time.Millisecond, cancel)
 	if _, err := f.Wait(); !errors.Is(err, context.Canceled) {
 		t.Fatalf("cancel: %v", err)
