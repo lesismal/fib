@@ -848,12 +848,51 @@ go engine.Run()
 client := fibhttp.NewClient(engine, fibhttp.DefaultClientConfig())
 
 req, _ := http.NewRequest("GET", "http://127.0.0.1:8080/hello", nil)
-client.Do(req, func(resp *http.Response, err error) {
-    // 响应、错误、超时或取消，恰好回调一次
+client.Do(req, func(resp *fibhttp.ClientResponse, err error) {
+    // 响应、错误、超时或取消，恰好回调一次。
+    // resp 内嵌 *http.Response：resp.StatusCode、resp.Header、resp.Body 直接可用。
 })
 
-resp, err := client.Go(req).Wait() // Future：Wait 阻塞，Done() 可用于 select
+resp, err := client.Go(req).Wait() // Future：返回完整缓冲的 *http.Response；Wait 阻塞，Done() 可用于 select
 ```
+
+**大 body 分段接收**（HTTP/1）：默认回调在响应完整收到之后才触发，body 全部在内存里，上限
+`MaxResponseBodyBytes`。打开 `ClientConfig.StreamResponseBody` 后，行为与 server 的
+`StreamRequestBody` 对称：
+
+```go
+config := fibhttp.DefaultClientConfig()
+config.StreamResponseBody = true
+config.StreamResponseBodyThreshold = 64 << 10 // 小于等于它的 body 仍然整收；0 表示响应头到齐就回调
+client := fibhttp.NewClient(engine, config)
+
+client.Do(req, func(resp *fibhttp.ClientResponse, err error) {
+    if err != nil {
+        return
+    }
+    // 响应头已到，body 还在路上；resp.BodyComplete() 可判断是否已完整。
+    resp.OnBody(func(data []byte, fin bool, err error) {
+        // 按顺序、串行调用；data 只在本次调用内有效；fin 为最后一次，err 表示 body 没能收完
+        file.Write(data)
+        if fin {
+            // resp.Trailer() 此时可用
+        }
+    })
+})
+```
+
+- 触发时机：`Content-Length` 大于 `StreamResponseBodyThreshold` 的 body 在响应头到齐、且收到
+  不少于阈值字节后回调；chunked 或以关闭连接为结束的 body 在累计收到超过阈值时回调，在此之前
+  就收完的仍然整收。关闭（默认）时 `OnBody` 一次性交付整个 body，`fin` 为 true。
+- `OnBody` 必须在回调内调用。回调返回时既没有 `OnBody` 也没有读过 `resp.Body`，剩余 body
+  会被读完丢弃（超过 256KB 则直接关闭连接），之后再调 `OnBody` 只会收到 `ErrResponseAbandoned`。
+- 背压：`fn` 是同步调用的，不返回就不会处理这条连接的后续数据；回调没有接管时，积压超过
+  `StreamResponseBodyBuffer`（默认 256KB）会 `HoldReads` 停止读 socket，由 TCP 流控挡住服务端。
+- 流式模式下 `resp.Body` 只读已到达的数据，没有数据且 body 未结束时返回 `ErrWouldBlock`，不会
+  阻塞 worker；`Body.Close` 不做任何事，放弃剩余 body 用 `resp.Close()`。
+- 流式 body 的上限是 `MaxStreamedBodyBytes`（0 为不限），不受 `MaxResponseBodyBytes` 约束；
+  `Timeout` 仍覆盖到 body 结束，长下载需要调大或设为 0。`Client.Go` 始终等完整响应。
+- 目前只有 HTTP/1 连接分段交付；HTTP/2 的响应仍然完整缓冲后回调（`OnBody` 一次交付）。
 
 - 支持 `http://` 和 `https://`；https 使用 `ClientConfig.TLSConfig`（nil 表示默认
   配置，未设置 ServerName 时取 URL 的 host）。其他 scheme 返回 `ErrUnsupportedScheme`。

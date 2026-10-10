@@ -120,7 +120,7 @@ the upstream callback with `c.Respond`, then `c.Release()`:
 
 ```go
 c.Retain()
-upstream.Do(req, func(resp *http.Response, err error) {
+upstream.Do(req, func(resp *fibhttp.ClientResponse, err error) {
     defer c.Release()
     if err != nil {
         _ = c.Respond(502, "text/plain", []byte(err.Error()))
@@ -414,7 +414,7 @@ gateway and aggregation services: N concurrent requests on a connection and not 
 ```go
 // The same code on h1, h2 and h3:
 c.Retain()
-upstream.Do(req, func(resp *http.Response, err error) { ...; c.Release() })
+upstream.Do(req, func(resp *fibhttp.ClientResponse, err error) { ...; c.Release() })
 ```
 
 **Other multiplex notes**

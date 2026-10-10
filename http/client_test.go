@@ -118,8 +118,11 @@ func TestClientDoCallbackAndPostBody(t *testing.T) {
 	done := make(chan struct{})
 	var resp *stdhttp.Response
 	var err error
-	client.Do(mustRequest(t, "POST", server.URL, strings.NewReader("payload")), func(r *stdhttp.Response, e error) {
-		resp, err = r, e
+	client.Do(mustRequest(t, "POST", server.URL, strings.NewReader("payload")), func(r *ClientResponse, e error) {
+		if r != nil {
+			resp = r.Response
+		}
+		err = e
 		close(done)
 	})
 	<-done

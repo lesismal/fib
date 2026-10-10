@@ -107,7 +107,7 @@ func(c *fibhttp.Context) {
 
 ```go
 c.Retain()
-upstream.Do(req, func(resp *http.Response, err error) {
+upstream.Do(req, func(resp *fibhttp.ClientResponse, err error) {
     defer c.Release()
     if err != nil {
         _ = c.Respond(502, "text/plain", []byte(err.Error()))
@@ -358,7 +358,7 @@ HTTP/2/3 上 `Retain` 只挂起这一个 stream，其它 stream 照常进出；�
 ```go
 // 不论 h1/h2/h3，写法一样：
 c.Retain()
-upstream.Do(req, func(resp *http.Response, err error) { ...; c.Release() })
+upstream.Do(req, func(resp *fibhttp.ClientResponse, err error) { ...; c.Release() })
 ```
 
 **其它 multiplex 相关**

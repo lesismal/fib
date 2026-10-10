@@ -3,7 +3,6 @@
 package http
 
 import (
-	"bytes"
 	"encoding/binary"
 	"errors"
 	"io"
@@ -737,7 +736,7 @@ func (hc *h2ClientConn) complete(st *h2ClientStream) {
 	hc.closeIfDoneLocked()
 	hc.mu.Unlock()
 	if len(st.body) > 0 {
-		resp.Body = io.NopCloser(bytes.NewReader(st.body))
+		resp.Body = &bufferedBody{data: st.body}
 	}
 	if resp.ContentLength < 0 && st.r.req.Method != stdhttp.MethodHead {
 		resp.ContentLength = int64(len(st.body))

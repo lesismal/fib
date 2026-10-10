@@ -55,9 +55,36 @@ type ClientConfig struct {
 	IdleConnTimeout time.Duration
 	// MaxResponseHeaderBytes and MaxResponseBodyBytes bound what one response
 	// may hold. The body is buffered whole before the callback runs, so the
-	// second is also the memory one response can take.
+	// second is also the memory one response can take. A body that streams
+	// (see StreamResponseBody) is bounded by MaxStreamedBodyBytes instead.
 	MaxResponseHeaderBytes int
 	MaxResponseBodyBytes   int64
+	// StreamResponseBody runs the callback of a response before its body has
+	// all arrived, on HTTP/1 connections: once the header has, for a body with
+	// a Content-Length, and once some of the body has, for a chunked one or
+	// one the server's close ends. The body is then taken inside the callback
+	// with ClientResponse.OnBody, which delivers it piece by piece, or read
+	// from ClientResponse.Body without waiting. A callback that does neither
+	// leaves the rest of the body to be thrown away. Off, the default, the
+	// callback runs once the response is complete and its Body holds all of
+	// it. Client.Go always waits for the whole response. HTTP/2 responses are
+	// still delivered whole.
+	StreamResponseBody bool
+	// StreamResponseBodyThreshold keeps the smaller bodies buffered whole when
+	// StreamResponseBody is set: only a body whose Content-Length is larger
+	// than this, or one without a length of which more than this has arrived,
+	// streams, and its callback is not run until that much of it has arrived.
+	// Zero streams every body as soon as its header has arrived. It has no
+	// effect without StreamResponseBody.
+	StreamResponseBodyThreshold int64
+	// MaxStreamedBodyBytes bounds a streamed body, which MaxResponseBodyBytes
+	// does not. Zero, the default, leaves a streamed body unbounded.
+	MaxStreamedBodyBytes int64
+	// StreamResponseBodyBuffer is how many bytes of a streamed body may wait
+	// for a reader before the connection stops reading its socket, so that a
+	// callback slower than the server is paid for by TCP flow control rather
+	// than by memory here. Zero means DefaultStreamResponseBodyBuffer.
+	StreamResponseBodyBuffer int
 	// TLSConfig is used for https:// requests. Nil means the defaults; either
 	// way a config naming no server gets the request's host. Unless it sets
 	// NextProtos itself, ALPN offers HTTP/2 and HTTP/1.1.
@@ -85,8 +112,9 @@ func DefaultClientConfig() ClientConfig {
 
 // Client sends HTTP/1.x and HTTP/2 requests over connections an engine dials
 // and serves, without blocking the caller. Responses are read by the engine's
-// workers and handed to a callback with their body already buffered, so a
-// callback never waits on the network.
+// workers and handed to a callback, by default with their body already
+// buffered, so a callback never waits on the network; see
+// ClientConfig.StreamResponseBody for handing it a large body as it arrives.
 //
 // A client keeps its connections alive between requests. An HTTP/1.1
 // connection carries one request at a time; it does not pipeline. A request
@@ -122,6 +150,9 @@ func NewClient(engine *fib.Engine, config ClientConfig) *Client {
 	if config.MaxResponseBodyBytes <= 0 {
 		config.MaxResponseBodyBytes = defaults.MaxResponseBodyBytes
 	}
+	if config.StreamResponseBodyBuffer <= 0 {
+		config.StreamResponseBodyBuffer = DefaultStreamResponseBodyBuffer
+	}
 	tlsConfig := config.TLSConfig
 	if !config.DisableHTTP2 && (tlsConfig == nil || len(tlsConfig.NextProtos) == 0) {
 		if tlsConfig == nil {
@@ -139,17 +170,25 @@ func NewClient(engine *fib.Engine, config ClientConfig) *Client {
 // req.Body, which must therefore not block for long.
 //
 // The response body is buffered whole and may be read after the callback
-// returns; closing it is optional. Cancelling req's context abandons the
-// request, as does the client's Timeout.
+// returns; closing it is optional. With ClientConfig.StreamResponseBody it
+// may instead still be arriving, and is taken with ClientResponse.OnBody
+// inside the callback. Cancelling req's context abandons the request, as does
+// the client's Timeout, which then also ends a body that is streaming.
 //
 // callback may run on any goroutine: an engine worker for a response, which
 // the callback then holds until it returns, a timer for a timeout or a
 // cancellation, the caller's own for a request Do rejects outright, or one of
 // its own for a connection that failed. It must not block the engine for long,
 // and when the engine runs handlers inline it runs on the event loop itself.
-func (c *Client) Do(req *stdhttp.Request, callback func(*stdhttp.Response, error)) {
+func (c *Client) Do(req *stdhttp.Request, callback func(*ClientResponse, error)) {
+	c.do(req, callback, false)
+}
+
+// do is Do, with whole set when the response must arrive whole whatever the
+// client's configuration says.
+func (c *Client) do(req *stdhttp.Request, callback func(*ClientResponse, error), whole bool) {
 	if callback == nil {
-		callback = func(*stdhttp.Response, error) {}
+		callback = func(*ClientResponse, error) {}
 	}
 	target, err := requestTarget(req)
 	if err != nil {
@@ -173,7 +212,7 @@ func (c *Client) Do(req *stdhttp.Request, callback func(*stdhttp.Response, error
 		callback(nil, err)
 		return
 	}
-	r := &clientRequest{req: req, data: data, body: body, callback: callback}
+	r := &clientRequest{req: req, data: data, body: body, callback: callback, whole: whole}
 	// Either hook can fire before it has been stored, so both are stored under
 	// the lock finish reads them under.
 	r.mu.Lock()
@@ -231,10 +270,13 @@ type Future struct {
 // Go sends req like Do and returns a Future for its outcome.
 func (c *Client) Go(req *stdhttp.Request) *Future {
 	f := &Future{done: make(chan struct{})}
-	c.Do(req, func(resp *stdhttp.Response, err error) {
-		f.resp, f.err = resp, err
+	c.do(req, func(resp *ClientResponse, err error) {
+		if resp != nil {
+			f.resp = resp.Response
+		}
+		f.err = err
 		close(f.done)
-	})
+	}, true)
 	return f
 }
 
@@ -435,6 +477,9 @@ func (c *Client) dial(h *hostPool) {
 	cc := &clientConn{client: c, host: h}
 	cc.parser.maxHeader = c.config.MaxResponseHeaderBytes
 	cc.parser.maxBody = c.config.MaxResponseBodyBytes
+	cc.parser.threshold = c.config.StreamResponseBodyThreshold
+	cc.parser.maxStreamed = c.config.MaxStreamedBodyBytes
+	cc.parser.sink = cc
 	done := func(_ *fib.Connection, err error) { c.dialed(cc, err) }
 	var err error
 	if h.target.secure {
@@ -641,8 +686,11 @@ type clientRequest struct {
 	// is what HTTP/2 sends after the header block.
 	data     []byte
 	body     []byte
-	callback func(*stdhttp.Response, error)
-	done     atomic.Bool
+	callback func(*ClientResponse, error)
+	// whole asks for the response to arrive whole even when the client would
+	// stream it.
+	whole bool
+	done  atomic.Bool
 	// retried records that the request has already been sent again once, after
 	// a reused connection turned out to be closed.
 	retried bool
@@ -656,11 +704,52 @@ type clientRequest struct {
 	conn        *clientConn
 	timer       *time.Timer
 	stopContext func() bool
+	// stream is the body stream of the response, once the callback has run on
+	// it, which fired says it has. Guarded by mu.
+	stream *respStream
+	fired  bool
 }
 
 // finish reports the outcome, once: whichever of response, failure, timeout
 // and cancellation comes first is the one the callback hears.
+//
+// A response that streams has its callback run by the stream, before it is
+// complete, and finish then only reports how it ended: an error goes to the
+// stream, and a completion is the stream's own to report.
 func (r *clientRequest) finish(resp *stdhttp.Response, err error) bool {
+	if !r.markDone() {
+		return false
+	}
+	r.mu.Lock()
+	stream, fired := r.stream, r.fired
+	r.mu.Unlock()
+	if fired {
+		if err != nil {
+			stream.fail(err)
+		}
+		return true
+	}
+	if err != nil {
+		r.callback(nil, err)
+		return true
+	}
+	cr := newWholeResponse(resp, r)
+	cr.mu.Lock()
+	cr.inCallback = true
+	cr.mu.Unlock()
+	r.callback(cr, nil)
+	cr.mu.Lock()
+	cr.inCallback = false
+	taken := cr.fn != nil
+	cr.mu.Unlock()
+	if taken {
+		cr.deliverWhole()
+	}
+	return true
+}
+
+// markDone settles the request, once, and stops what would abandon it.
+func (r *clientRequest) markDone() bool {
 	if !r.done.CompareAndSwap(false, true) {
 		return false
 	}
@@ -673,7 +762,18 @@ func (r *clientRequest) finish(resp *stdhttp.Response, err error) bool {
 	if stopContext != nil {
 		stopContext()
 	}
-	r.callback(resp, err)
+	return true
+}
+
+// begin records that the stream is about to run the callback. It reports false
+// if the request has been settled, in which case there is nothing to call.
+func (r *clientRequest) begin(s *respStream) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.done.Load() {
+		return false
+	}
+	r.stream, r.fired = s, true
 	return true
 }
 
@@ -748,6 +848,9 @@ type clientConn struct {
 	// settled records that the dial has been reported to the client, which
 	// for TLS happens once the handshake is done. Guarded by mu.
 	settled bool
+	// stream is the body stream of the response being read, if it streams. It
+	// is used only by the worker reading the connection.
+	stream *respStream
 	// h2 is set once the connection is known to speak HTTP/2, before it
 	// carries anything, and never changes after. streams counts the streams
 	// it carries or has been given, and maxStreams how many the server
@@ -781,6 +884,8 @@ func (cc *clientConn) send(r *clientRequest) {
 	cc.sent = true
 	cc.received = false
 	cc.parser.reset()
+	cc.parser.streamOK = cc.client.config.StreamResponseBody && !r.whole
+	cc.stream = nil
 	cc.mu.Unlock()
 	if !r.attach(cc) {
 		// Settled while it waited: give the connection to the next request.
@@ -854,12 +959,46 @@ func (cc *clientConn) OnData(conn *fib.Connection, data []byte) {
 	cc.current = nil
 	cc.mu.Unlock()
 	r.detach()
+	// Read before the connection is released: its next request resets it.
+	streamed := cc.parser.streamedDone
+	if cc.isClosed() {
+		// The callback of a streaming response gave up on it already.
+		reusable = false
+	}
 	if reusable {
 		cc.client.release(cc)
 	} else {
 		cc.discard()
 	}
-	r.finish(resp, nil)
+	if !streamed {
+		r.finish(resp, nil)
+	}
+}
+
+// bodyStart, bodyData and bodyEnd take a streamed body from the parser.
+func (cc *clientConn) bodyStart(head *stdhttp.Response) {
+	cc.mu.Lock()
+	r := cc.current
+	cc.mu.Unlock()
+	if r == nil {
+		return
+	}
+	cc.stream = newRespStream(cc, r, head)
+	cc.stream.start()
+}
+
+func (cc *clientConn) bodyData(data []byte) {
+	if s := cc.stream; s != nil {
+		s.data(data)
+	}
+}
+
+func (cc *clientConn) bodyEnd() {
+	s := cc.stream
+	cc.stream = nil
+	if s != nil {
+		s.end()
+	}
 }
 
 func (cc *clientConn) OnClose(_ *fib.Connection, err error) {
@@ -896,8 +1035,14 @@ func (cc *clientConn) OnClose(_ *fib.Connection, err error) {
 		return
 	}
 	r.detach()
-	if resp := cc.parser.finish(); resp != nil && (err == nil || err == io.EOF) {
-		sidepool.Go(func() { r.finish(resp, nil) })
+	if cc.parser.untilClose() && (err == nil || err == io.EOF) {
+		// The close ends the body. A streaming one tells its callback, which
+		// must not hold up the event loop OnClose may be on.
+		sidepool.Go(func() {
+			if resp := cc.parser.finish(); resp != nil && !cc.parser.streamedDone {
+				r.finish(resp, nil)
+			}
+		})
 		return
 	}
 	if retry && r.retryable() {
