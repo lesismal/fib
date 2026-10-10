@@ -65,6 +65,12 @@ type h2ClientStream struct {
 	declared    int64
 	recvWindow  int64
 	recvUnacked int64
+	// stream is set when the response body streams to its callback, and
+	// passed counts what has gone to it. A streamed stream's recvWindow and
+	// recvUnacked are guarded by the connection's mu instead, since the
+	// window is given back as the body is consumed, by whoever consumes it.
+	stream *respStream
+	passed int64
 	// The rest is guarded by the connection's mu.
 	received   bool
 	sendWindow int64
@@ -577,6 +583,9 @@ func (hc *h2ClientConn) handleData(f *h2Frame) error {
 	if st.resp == nil {
 		return &H2StreamError{StreamID: st.id, Code: H2ProtocolError}
 	}
+	if st.stream != nil {
+		return hc.handleStreamedData(st, f)
+	}
 	if length > st.recvWindow {
 		return &H2StreamError{StreamID: st.id, Code: H2FlowControlError}
 	}
@@ -600,6 +609,54 @@ func (hc *h2ClientConn) handleData(f *h2Frame) error {
 		hc.mu.Unlock()
 	}
 	return nil
+}
+
+// handleStreamedData passes the DATA of a streaming response to its stream.
+// The stream's window is not given back as the data arrives but as it is
+// consumed (see credit), so a consumer that falls behind slows the server
+// down to the window; padding, which no one consumes, is given back at once.
+func (hc *h2ClientConn) handleStreamedData(st *h2ClientStream, f *h2Frame) error {
+	length := int64(f.length)
+	hc.mu.Lock()
+	if length > st.recvWindow {
+		hc.mu.Unlock()
+		return &H2StreamError{StreamID: st.id, Code: H2FlowControlError}
+	}
+	st.recvWindow -= length
+	hc.mu.Unlock()
+	hc.credit(st, length-int64(len(f.payload)))
+	st.passed += int64(len(f.payload))
+	if limit := hc.client.config.MaxStreamedBodyBytes; limit > 0 && st.passed > limit {
+		hc.resetStream(st.id, H2Cancel, ErrResponseBodyTooLarge)
+		return nil
+	}
+	if len(f.payload) > 0 {
+		st.stream.data(f.payload)
+	}
+	if f.has(h2FlagEndStream) {
+		hc.complete(st)
+	}
+	return nil
+}
+
+// credit gives a streamed response's sender window for n bytes of its body
+// that have been consumed, in updates of at least half a window.
+func (hc *h2ClientConn) credit(st *h2ClientStream, n int64) {
+	if n <= 0 {
+		return
+	}
+	hc.mu.Lock()
+	defer hc.mu.Unlock()
+	if hc.streams[st.id] != st || hc.closed {
+		return
+	}
+	st.recvUnacked += n
+	if st.recvUnacked >= h2StreamWindow/2 {
+		increment := st.recvUnacked
+		st.recvWindow += increment
+		st.recvUnacked = 0
+		hc.sendLocked(h2AppendWindowUpdate(nil, st.id, uint32(increment)))
+	}
 }
 
 func (hc *h2ClientConn) handleHeaderBlock(id uint32, block []byte, endStream bool) error {
@@ -654,7 +711,14 @@ func (hc *h2ClientConn) handleHeaderBlock(id uint32, block []byte, endStream boo
 		}
 		return nil
 	}
-	if resp.ContentLength > hc.client.config.MaxResponseBodyBytes && bodyAllowed(st.r.req, resp.StatusCode) {
+	config := &hc.client.config
+	streams := config.StreamResponseBody && !st.r.whole && !endStream && bodyAllowed(st.r.req, resp.StatusCode) &&
+		!(resp.ContentLength >= 0 && resp.ContentLength <= max(config.StreamResponseBodyThreshold, 0))
+	limit := config.MaxResponseBodyBytes
+	if streams {
+		limit = config.MaxStreamedBodyBytes
+	}
+	if limit > 0 && resp.ContentLength > limit && bodyAllowed(st.r.req, resp.StatusCode) {
 		hc.resetStream(id, H2Cancel, ErrResponseBodyTooLarge)
 		return nil
 	}
@@ -662,6 +726,12 @@ func (hc *h2ClientConn) handleHeaderBlock(id uint32, block []byte, endStream boo
 	st.declared = resp.ContentLength
 	if endStream {
 		hc.complete(st)
+		return nil
+	}
+	if streams {
+		st.stream = newRespStream(hc.cc, st.r, resp)
+		st.stream.credit = func(n int64) { hc.credit(st, n) }
+		st.stream.start()
 	}
 	return nil
 }
@@ -718,7 +788,11 @@ func h2NewResponse(fields []hpack.HeaderField, req *stdhttp.Request) (*stdhttp.R
 // complete hands a finished response to its request.
 func (hc *h2ClientConn) complete(st *h2ClientStream) {
 	resp := st.resp
-	if bodyAllowed(st.r.req, resp.StatusCode) && st.declared >= 0 && st.declared != int64(len(st.body)) {
+	total := int64(len(st.body))
+	if st.stream != nil {
+		total = st.passed
+	}
+	if bodyAllowed(st.r.req, resp.StatusCode) && st.declared >= 0 && st.declared != total {
 		hc.resetStream(st.id, H2ProtocolError, errors.New("http2: response body length does not match Content-Length"))
 		return
 	}
@@ -735,6 +809,12 @@ func (hc *h2ClientConn) complete(st *h2ClientStream) {
 	}
 	hc.closeIfDoneLocked()
 	hc.mu.Unlock()
+	if st.stream != nil {
+		st.r.detach()
+		hc.client.streamDone(hc.cc)
+		st.stream.end()
+		return
+	}
 	if len(st.body) > 0 {
 		resp.Body = &bufferedBody{data: st.body}
 	}

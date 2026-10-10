@@ -208,6 +208,33 @@ type respStream struct {
 	held     bool
 	consumed int64
 	trailer  stdhttp.Header
+	// credit, when set, is how a body that cannot stop the connection's reads
+	// — an HTTP/2 stream — paces its sender instead: it is told how many
+	// bytes have left the stream's buffer, and gives the sender that much
+	// window. Body that arrives before the callback runs is credited at once,
+	// so that a threshold larger than the window cannot stall the stream, and
+	// preCredited counts what of buf has been credited already.
+	credit      func(n int64)
+	preCredited int64
+}
+
+// takeLocked accounts n bytes leaving buf, read, delivered or thrown away, and
+// returns how many of them the sender is still owed window for.
+func (s *respStream) takeLocked(n int) int64 {
+	if s.credit == nil {
+		return 0
+	}
+	c := int64(n)
+	d := min(c, s.preCredited)
+	s.preCredited -= d
+	return c - d
+}
+
+// give passes credit on to the sender. It must be called without s.mu held.
+func (s *respStream) give(n int64) {
+	if n > 0 && s.credit != nil {
+		s.credit(n)
+	}
 }
 
 func newRespStream(cc *clientConn, r *clientRequest, head *stdhttp.Response) *respStream {
@@ -247,9 +274,11 @@ func (s *respStream) afterCallback() {
 	s.inCallback = false
 	if s.fn == nil && !s.touched {
 		s.discarding = true
+		c := s.takeLocked(len(s.buf))
 		s.buf = nil
 		s.unholdLocked()
 		s.mu.Unlock()
+		s.give(c)
 		return
 	}
 	s.mu.Unlock()
@@ -270,6 +299,7 @@ func (s *respStream) data(b []byte) {
 		s.dropped += len(b)
 		over := s.dropped > discardAfterHandler
 		s.mu.Unlock()
+		s.give(int64(len(b)))
 		if over {
 			s.r.abort(ErrResponseAbandoned)
 		}
@@ -282,6 +312,7 @@ func (s *respStream) data(b []byte) {
 		s.consumed += int64(len(b))
 		s.mu.Unlock()
 		fn(b, false, nil)
+		s.give(int64(len(b)))
 		s.mu.Lock()
 		s.delivering = false
 		more := len(s.buf) > 0 || s.err != nil
@@ -292,11 +323,17 @@ func (s *respStream) data(b []byte) {
 		return
 	}
 	s.buf = append(s.buf, b...)
+	var early int64
+	if !s.fired && s.credit != nil {
+		early = int64(len(b))
+		s.preCredited += early
+	}
 	fire := !s.fired && int64(len(s.buf)) >= s.threshold
 	if !fire {
 		s.holdLocked()
 	}
 	s.mu.Unlock()
+	s.give(early)
 	if fire {
 		s.fire()
 	}
@@ -318,6 +355,10 @@ func (s *respStream) end() {
 			resp.Body = stdhttp.NoBody
 		} else {
 			resp.Body = &bufferedBody{data: body}
+		}
+		if s.credit != nil && resp.ContentLength < 0 && s.r.req.Method != stdhttp.MethodHead {
+			// What an HTTP/2 response that arrived whole reports.
+			resp.ContentLength = int64(len(body))
 		}
 		s.r.finish(resp, nil)
 		return
@@ -372,8 +413,10 @@ func (s *respStream) drain() {
 			data := s.buf
 			s.buf = nil
 			s.consumed += int64(len(data))
+			c := s.takeLocked(len(data))
 			s.mu.Unlock()
 			fn(data, false, nil)
+			s.give(c)
 			s.mu.Lock()
 			continue
 		case s.err != nil && !s.finSent:
@@ -400,6 +443,9 @@ func (s *respStream) drain() {
 // holdLocked stops the connection's reads while more waits for a reader than
 // the buffer allows, and starts them again once it has gone down by half.
 func (s *respStream) holdLocked() {
+	if s.credit != nil {
+		return
+	}
 	switch {
 	case !s.held && s.fired && !s.ended && s.err == nil && len(s.buf) > s.highWater:
 		s.held = true
@@ -444,11 +490,12 @@ type streamBody struct{ s *respStream }
 func (b *streamBody) Read(p []byte) (int, error) {
 	s := b.s
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	switch {
 	case s.fn != nil:
+		s.mu.Unlock()
 		return 0, ErrBodyTaken
 	case s.discarding:
+		s.mu.Unlock()
 		return 0, ErrResponseAbandoned
 	}
 	s.touched = true
@@ -456,9 +503,13 @@ func (b *streamBody) Read(p []byte) (int, error) {
 		n := copy(p, s.buf)
 		s.buf = s.buf[n:]
 		s.consumed += int64(n)
+		c := s.takeLocked(n)
 		s.holdLocked()
+		s.mu.Unlock()
+		s.give(c)
 		return n, nil
 	}
+	defer s.mu.Unlock()
 	switch {
 	case s.err != nil:
 		return 0, s.err

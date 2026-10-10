@@ -856,7 +856,7 @@ client.Do(req, func(resp *fibhttp.ClientResponse, err error) {
 resp, err := client.Go(req).Wait() // Future：返回完整缓冲的 *http.Response；Wait 阻塞，Done() 可用于 select
 ```
 
-**大 body 分段接收**（HTTP/1）：默认回调在响应完整收到之后才触发，body 全部在内存里，上限
+**大 body 分段接收**（HTTP/1 与 HTTP/2）：默认回调在响应完整收到之后才触发，body 全部在内存里，上限
 `MaxResponseBodyBytes`。打开 `ClientConfig.StreamResponseBody` 后，行为与 server 的
 `StreamRequestBody` 对称：
 
@@ -892,7 +892,9 @@ client.Do(req, func(resp *fibhttp.ClientResponse, err error) {
   阻塞 worker；`Body.Close` 不做任何事，放弃剩余 body 用 `resp.Close()`。
 - 流式 body 的上限是 `MaxStreamedBodyBytes`（0 为不限），不受 `MaxResponseBodyBytes` 约束；
   `Timeout` 仍覆盖到 body 结束，长下载需要调大或设为 0。`Client.Go` 始终等完整响应。
-- 目前只有 HTTP/1 连接分段交付；HTTP/2 的响应仍然完整缓冲后回调（`OnBody` 一次交付）。
+- HTTP/2：同一连接上多个 stream 各自流控。stream 的接收窗口（1MB）只在 body 被 `OnBody`/`Read`
+  消费之后才还给服务端，一个读得慢的 stream 只会让自己的发送方等待，不影响同连接上的其他请求；
+  阈值之前累积的 body 会立即还窗口，所以阈值可以大于 1MB。
 
 - 支持 `http://` 和 `https://`；https 使用 `ClientConfig.TLSConfig`（nil 表示默认
   配置，未设置 ServerName 时取 URL 的 host）。其他 scheme 返回 `ErrUnsupportedScheme`。

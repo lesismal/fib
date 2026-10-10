@@ -60,15 +60,18 @@ type ClientConfig struct {
 	MaxResponseHeaderBytes int
 	MaxResponseBodyBytes   int64
 	// StreamResponseBody runs the callback of a response before its body has
-	// all arrived, on HTTP/1 connections: once the header has, for a body with
-	// a Content-Length, and once some of the body has, for a chunked one or
-	// one the server's close ends. The body is then taken inside the callback
+	// all arrived, on HTTP/1 and HTTP/2 connections: once the header has, for
+	// a body with a Content-Length, and once some of the body has, for one
+	// without a length (chunked, or ended by the server's close, or an HTTP/2
+	// body that declares none). The body is then taken inside the callback
 	// with ClientResponse.OnBody, which delivers it piece by piece, or read
 	// from ClientResponse.Body without waiting. A callback that does neither
 	// leaves the rest of the body to be thrown away. Off, the default, the
 	// callback runs once the response is complete and its Body holds all of
-	// it. Client.Go always waits for the whole response. HTTP/2 responses are
-	// still delivered whole.
+	// it. Client.Go always waits for the whole response. HTTP/1 holds the
+	// connection's reads while a body waits for a reader; HTTP/2 gives a
+	// stream's window back only as its body is consumed, so a stalled reader
+	// never holds up the other streams on the connection.
 	StreamResponseBody bool
 	// StreamResponseBodyThreshold keeps the smaller bodies buffered whole when
 	// StreamResponseBody is set: only a body whose Content-Length is larger
@@ -83,7 +86,8 @@ type ClientConfig struct {
 	// StreamResponseBodyBuffer is how many bytes of a streamed body may wait
 	// for a reader before the connection stops reading its socket, so that a
 	// callback slower than the server is paid for by TCP flow control rather
-	// than by memory here. Zero means DefaultStreamResponseBodyBuffer.
+	// than by memory here. Zero means DefaultStreamResponseBodyBuffer. HTTP/2
+	// is bounded by the stream window (1MB) instead.
 	StreamResponseBodyBuffer int
 	// TLSConfig is used for https:// requests. Nil means the defaults; either
 	// way a config naming no server gets the request's host. Unless it sets
