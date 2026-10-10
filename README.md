@@ -274,6 +274,9 @@ go run ./examples/websocket/nontls/server
 go run ./examples/http3/tls/server
 go run ./examples/arpc/server
 go run ./examples/grpc/server
+go run ./examples/gateway/upstream     # a reverse proxy / gateway for HTTP/1.1, HTTP/2, HTTP/3 and WebSocket:
+go run ./examples/gateway/server       # upstream, gateway and client, all callback-based (see its server's doc comment)
+go run ./examples/gateway/client
 ```
 
 Each server directory has a matching `client` next to it.

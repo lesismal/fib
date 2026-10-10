@@ -1350,6 +1350,7 @@ examples/
 ├── udp/        nontls/{server,client}  127.0.0.1:9001
 ├── http/       nontls/{server,client}  127.0.0.1:8080    tls/{server,client}  127.0.0.1:8443 (HTTPS)
 ├── http3/                                                tls/{server,client}  127.0.0.1:8445 (UDP)
+├── gateway/    upstream 127.0.0.1:9000 / 9443    server 127.0.0.1:8081 / 8446 (HTTP/3 在同端口 UDP)    client
 └── websocket/  nontls/{server,client}  127.0.0.1:8081    tls/{server,client}  127.0.0.1:8444 (wss)
 ```
 
@@ -1386,6 +1387,19 @@ go run ./examples/tcp/tls/client -n 10
   `examples/http2/upload`（TLS，`HTTP2Only`，用 `net/http` 客户端流式发送）和 `examples/http3/upload`（QUIC，
   用 fib 的 HTTP/3 客户端——它把每个请求的 body 整个读进内存，所以大文件用 `-mode resume` 分块发送）。
   body 的接收不论走哪个协议都是 `OnBody`，背压分别来自 TCP、HTTP/2 流控窗口和 QUIC 流控。
+- `examples/gateway` 是一个反向代理 / 网关：下游同时接 HTTP/1.1、HTTP/2、HTTP/3 和 WebSocket
+  （HTTPS 与 HTTP/3 共用一个端口号，另有明文端口），按路径前缀转发到 `http://`（HTTP/1.1）、
+  `https://`（ALPN 选 HTTP/2）或 `h3://`（HTTP/3）的上游。三个程序依次运行：
+  `go run ./examples/gateway/upstream`、`go run ./examples/gateway/server`、`go run ./examples/gateway/client`，
+  client 会用三种协议各请求一遍三种上游（echo、大文件下载、带 trailer 的慢速流）并走 ws:// 与 wss:// 回显。
+  全程没有阻塞的读写：请求 body 用 `Context.OnBody` 收，上游请求用 `Client.Do` 发，上游响应用
+  `ClientResponse.OnBody` 边收边写回下游（大下载内存恒定，两边中较慢的一方给另一方施加背压），WebSocket 用
+  `Dialer.Dial` 的回调接上游、两端各自的 `OnMessage` 互相转发。核心在 `examples/gateway/server/proxy`，
+  `server/main_test.go` 把 3×3 协议矩阵、大上传、取消传播、超时/502/404、上游中途失败、WebSocket 关闭码转发都测了一遍。
+  取舍与限制：上游请求的 body 是整体发送的（`Client.Do` 不支持流式请求体），所以网关先把请求体收齐，
+  上限 `-max-request-body`；`Context.Upgrade` 只能在 handler 返回前调用，所以 WebSocket 先升级下游再异步拨号上游，
+  上游不可达时用关闭码 1014 通知客户端，而不是 HTTP 502；HTTP/2 与 HTTP/3 下游的 `Write` 在窗口用尽时会等待客户端，
+  这个等待发生在上游连接的 worker 上，上限是 64KB。
 - `examples/http/router` 演示 Router：带参数与正则的路由、带自己中间件的 `Route`、`Mount`
   的子 Router，以及 404/405，`go run ./examples/http/router` 后用文件头注释里的 curl 命令访问。
 

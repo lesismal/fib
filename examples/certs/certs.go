@@ -29,6 +29,11 @@ import (
 // where a client looks for it.
 var DefaultCertFile = filepath.Join(os.TempDir(), "fib-example-cert.pem")
 
+// GatewayCertFile is where the gateway example's server puts its own
+// certificate, apart from DefaultCertFile, which the upstream it forwards to
+// uses: the gateway trusts that one and its clients trust this one.
+var GatewayCertFile = filepath.Join(os.TempDir(), "fib-gateway-cert.pem")
+
 // ServerFlags are the flags a TLS example server takes.
 type ServerFlags struct {
 	certFile, keyFile, certOut *string
@@ -39,10 +44,16 @@ func RegisterServerFlags() ServerFlags { return ServerFlagsOn(flag.CommandLine) 
 
 // ServerFlagsOn adds -cert, -key and -cert-out to flags.
 func ServerFlagsOn(flags *flag.FlagSet) ServerFlags {
+	return ServerFlagsWithOut(flags, DefaultCertFile)
+}
+
+// ServerFlagsWithOut is ServerFlagsOn with certOut as the default for
+// -cert-out.
+func ServerFlagsWithOut(flags *flag.FlagSet, certOut string) ServerFlags {
 	return ServerFlags{
 		certFile: flags.String("cert", "", "PEM certificate to serve; empty issues a self-signed one"),
 		keyFile:  flags.String("key", "", "PEM private key for -cert"),
-		certOut:  flags.String("cert-out", DefaultCertFile, "where to write a self-signed certificate for clients to trust"),
+		certOut:  flags.String("cert-out", certOut, "where to write a self-signed certificate for clients to trust"),
 	}
 }
 
@@ -81,8 +92,13 @@ func RegisterClientFlags() ClientFlags { return ClientFlagsOn(flag.CommandLine) 
 
 // ClientFlagsOn adds -ca and -insecure to flags.
 func ClientFlagsOn(flags *flag.FlagSet) ClientFlags {
+	return ClientFlagsWithCA(flags, DefaultCertFile)
+}
+
+// ClientFlagsWithCA is ClientFlagsOn with caFile as the default for -ca.
+func ClientFlagsWithCA(flags *flag.FlagSet, caFile string) ClientFlags {
 	return ClientFlags{
-		caFile:   flags.String("ca", DefaultCertFile, "PEM certificate to trust; empty trusts the system roots"),
+		caFile:   flags.String("ca", caFile, "PEM certificate to trust; empty trusts the system roots"),
 		insecure: flags.Bool("insecure", false, "skip verifying the server's certificate"),
 	}
 }

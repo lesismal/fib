@@ -263,6 +263,9 @@ go run ./examples/websocket/nontls/server
 go run ./examples/arpc/server
 go run ./examples/grpc/server
 go run ./examples/http3/tls/server
+go run ./examples/gateway/upstream    # 反向代理 / 网关：HTTP/1.1、HTTP/2、HTTP/3、WebSocket，全部异步回调
+go run ./examples/gateway/server      # 依次启动 upstream、gateway、client（见 server 的文件头注释）
+go run ./examples/gateway/client
 ```
 
 每个 server 目录旁边都有对应的 `client`。
