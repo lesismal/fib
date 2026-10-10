@@ -130,6 +130,8 @@ func newLab(t *testing.T, options labOptions) *lab {
 	if err != nil {
 		t.Fatal(err)
 	}
+	// The gateway's and the clients' dials handshake without a worker.
+	clientTLS.MinVersion = tls.VersionTLS13
 	l := &lab{tlsConfig: clientTLS, canceled: make(chan string, 16)}
 
 	upPort, upPlain := freePort(t), freePort(t)

@@ -95,6 +95,10 @@ func main() {
 	if err != nil {
 		example.Fatal(err)
 	}
+	// TLS 1.3 alone lets the dials to the upstreams handshake without a
+	// worker apiece: see package tls. An upstream that only speaks TLS 1.2
+	// needs this line removed.
+	upstreamTLS.MinVersion = tls.VersionTLS13
 	_, port, err := net.SplitHostPort(*addr)
 	if err != nil {
 		example.Fatal(err)

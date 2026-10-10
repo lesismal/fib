@@ -7,6 +7,7 @@ import (
 	"bytes"
 	"crypto/rand"
 	"crypto/sha1"
+	"crypto/tls"
 	"encoding/base64"
 	"encoding/binary"
 	"errors"
@@ -538,4 +539,48 @@ func TestClientDeliversFramesToFrameHandler(t *testing.T) {
 			t.Fatalf("timed out waiting for %q", want.Payload)
 		}
 	}
+}
+
+// A dialer whose Config asks for TLS 1.3 alone handshakes without a worker,
+// and wss:// works over it.
+func TestClientEchoesOverTLS13(t *testing.T) {
+	serverTLS, clientTLS, err := tlstest.Configs()
+	if err != nil {
+		t.Fatal(err)
+	}
+	clientTLS.MinVersion = tls.VersionTLS13
+	engineConfig := fib.DefaultConfig()
+	engineConfig.Addr = "127.0.0.1:0"
+	server, err := fib.Bind(engineConfig, fibtls.NewServer(serverTLS, NewHandler(echoServerHandler())))
+	if err != nil {
+		t.Fatal(err)
+	}
+	addr, err := server.LocalAddr()
+	if err != nil {
+		t.Fatal(err)
+	}
+	runDone := make(chan error, 1)
+	go func() { runDone <- server.Run() }()
+	t.Cleanup(func() {
+		server.Stop()
+		<-runDone
+		_ = server.Close()
+	})
+	dialerConfig := DefaultDialerConfig()
+	dialerConfig.TLSConfig = clientTLS
+	recorder := newClientRecorder()
+	url := fmt.Sprintf("wss://localhost:%d/ws", addr.Port)
+	conn, _, err := NewDialer(startClientEngine(t), dialerConfig).Go(url, nil, recorder.handler()).Wait()
+	if err != nil {
+		t.Fatal(err)
+	}
+	payload := make([]byte, 300<<10)
+	_, _ = rand.Read(payload)
+	if err := conn.WriteBinary(payload); err != nil {
+		t.Fatal(err)
+	}
+	if event := recorder.next(t); event.Opcode != Binary || !bytes.Equal(event.Payload, payload) {
+		t.Fatalf("echo came back as %d bytes", len(event.Payload))
+	}
+	_ = conn.Close(CloseNormal, "bye")
 }

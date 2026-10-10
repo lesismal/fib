@@ -423,6 +423,16 @@ err = fibtls.Dial(engine, "tcp", "example.com:443", 3*time.Second, tlsConfig, ha
   Engine 的，也不是 handler 用的，所以握手不会排在喂它数据的那些连接的工作后面，Engine
   的 worker 提交握手也不会等自己的队列。之后的记录由 worker 在 `OnData` 中非阻塞解密，
   跨多轮读到达的记录会被正确拼接。
+- **客户端的握手也可以完全不占协程**：`tls.Config` 的 `MinVersion` 设为 `tls.VersionTLS13`（并且不用客户端证书、
+  会话恢复、ECH）时，`Dial` / `NewClient` 不走 `crypto/tls`，而是用 `tls/client13.go` 里的 TLS 1.3 客户端握手
+  状态机：由 `OnData` 把收到的字节喂给它，它返回要回的字节和是否完成，**从不等待**。对端迟迟不回应、或者根本不回应
+  的握手只占连接的内存和一个定时器，没有 goroutine，几千个握手同时在途也不增加协程数；超时由
+  `HandshakeTimeout`（默认 10 秒）关闭连接。它支持 AES-GCM 套件、X25519 / P-256 / P-384、HelloRetryRequest、ALPN、SNI、
+  按 `RootCAs` / `InsecureSkipVerify` 校验服务端证书并验证 CertificateVerify（ECDSA、RSA-PSS、Ed25519）、
+  `VerifyPeerCertificate` / `VerifyConnection`、`KeyLogWriter`，服务端要求客户端证书时回一个空 Certificate；握手结束后
+  的记录层与上面一样。**只提供 TLS 1.3**：服务端只会 TLS 1.2 时握手失败（这条连接不能退回 `crypto/tls`），所以默认
+  配置（`MinVersion` 为 0）和允许 TLS 1.2 的配置仍走 `crypto/tls`。服务端一侧的握手也仍由 `crypto/tls` 完成。
+  `http.Client`、`websocket.Dialer` 的 `TLSConfig` 设成 `MinVersion: tls.VersionTLS13` 即可使用。
 - 密文直接从本轮读到的缓冲交给 `crypto/tls`，每次只交一条记录：`crypto/tls` 为每条连接
   保留一个只增不减的输入缓冲，一次交给它整轮流水线数据，这个缓冲就会涨到一轮的大小
   并一直留着。2 万连接、1 KiB 消息、每次写 10 条的 TLS 1.3 流水线压测中，服务端内存由

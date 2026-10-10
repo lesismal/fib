@@ -15,6 +15,7 @@ import (
 	"io"
 	"net"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -63,6 +64,14 @@ func (wouldBlockError) Temporary() bool { return true }
 // connections whose reads feed it, and an engine worker that opens a
 // connection never waits on its own queue. Records after that are decrypted
 // in OnData like any other input, straight from the bytes the round read.
+//
+// A client whose Config asks for TLS 1.3 alone (MinVersion TLS13, and nothing
+// else that is beyond client13.go: client certificates, session resumption,
+// encrypted client hello) takes no worker for its handshake at all. It is a
+// state machine that OnData drives with the bytes that arrive and that never
+// waits, so a peer that is slow to answer, or that never answers, costs the
+// connection's memory and a timer, and no goroutine; thousands of handshakes
+// can be in flight at once. Other Configs keep to crypto/tls, as do servers.
 //
 // Once a handshake settles on an AES-GCM suite of TLS 1.3 or 1.2, or an
 // AES-CBC suite of TLS 1.2 or 1.1, the connection's records are protected by
@@ -146,6 +155,10 @@ func (h *Handler) config() (*stdtls.Config, *registry) {
 func (h *Handler) OnOpen(c *fib.Connection) {
 	t := &layer{c: c, client: h.Client, handshaking: true, settling: true}
 	t.cond.L = &t.mu
+	if h.Client && nativeClient(h.Config) {
+		h.openNative(c, t)
+		return
+	}
 	config, reg := h.config()
 	if reg != nil {
 		t.capture = &capture{client: h.Client, reg: reg}
@@ -171,6 +184,40 @@ func (h *Handler) OnOpen(c *fib.Connection) {
 	}
 }
 
+// nativeStarted, set by tests, is told of each handshake that runs without a
+// worker.
+var nativeStarted func()
+
+// openNative begins a handshake that runs without a worker: the ClientHello
+// goes out now, and OnData carries the handshake on from there.
+func (h *Handler) openNative(c *fib.Connection, t *layer) {
+	if nativeStarted != nil {
+		nativeStarted()
+	}
+	hs, err := newClientHS(h.Config)
+	c.SetLayer(t)
+	h.inner().OnOpen(c)
+	if err != nil {
+		c.CloseWithError(err)
+		return
+	}
+	timeout := h.HandshakeTimeout
+	if timeout == 0 {
+		timeout = DefaultHandshakeTimeout
+	}
+	if timeout > 0 {
+		t.hsTimer = time.AfterFunc(timeout, func() {
+			if t.native.Load() != nil {
+				c.CloseWithError(errHandshakeTimeout)
+			}
+		})
+	}
+	t.native.Store(hs)
+	if err := c.SendRaw(hs.hello()); err != nil {
+		c.CloseWithError(err)
+	}
+}
+
 func (h *Handler) OnData(c *fib.Connection, data []byte) {
 	if t, ok := c.Layer().(*layer); ok {
 		t.feed(h.inner(), data)
@@ -184,10 +231,18 @@ func (h *Handler) OnPriorityData(c *fib.Connection, data []byte) {
 }
 
 func (h *Handler) OnClose(c *fib.Connection, err error) {
-	if t, ok := c.Layer().(*layer); ok && !t.closing(err) {
-		// The handshake's worker reports the close, once it has delivered
-		// what arrived with the handshake.
-		return
+	if t, ok := c.Layer().(*layer); ok {
+		if t.abortNative() {
+			// A handshake without a worker that did not finish: there is
+			// no plaintext to deliver first, and no worker to report it.
+			h.inner().OnClose(c, err)
+			return
+		}
+		if !t.closing(err) {
+			// The handshake's worker reports the close, once it has delivered
+			// what arrived with the handshake.
+			return
+		}
 	}
 	h.inner().OnClose(c, err)
 }
@@ -251,6 +306,15 @@ type layer struct {
 	closed      bool
 	closeHeld   bool
 	closeErr    error
+
+	// native is the handshake of a client that runs without a worker, until it
+	// completes or fails; see client13.go. nbuf holds the start of a record
+	// that has not arrived whole, and hsTimer the handshake's timeout. The
+	// state machine itself is only touched by OnData, under readMu.
+	native  atomic.Pointer[clientHS]
+	nbuf    []byte
+	hsTimer *time.Timer
+	nfailed bool
 
 	// readMu makes whoever decrypts, the handshake's worker for the bytes
 	// that arrived with the handshake or a worker afterwards, the only one
@@ -351,6 +415,10 @@ func (t *layer) settle(handler fib.Handler) {
 func (t *layer) feed(handler fib.Handler, data []byte) {
 	t.readMu.Lock()
 	defer t.readMu.Unlock()
+	if hs := t.native.Load(); hs != nil {
+		t.feedNative(handler, hs, data)
+		return
+	}
 	t.mu.Lock()
 	if t.closed {
 		t.mu.Unlock()
@@ -680,4 +748,142 @@ func ConnectionState(c *fib.Connection) (stdtls.ConnectionState, bool) {
 		return stdtls.ConnectionState{}, false
 	}
 	return t.connectionState(), true
+}
+
+// feedNative carries a handshake that runs without a worker on with the bytes
+// a round read. The handshake never waits: whatever does not make a whole
+// record is kept until the next round, and when it completes the bytes behind
+// the Finished go the way every later round's do.
+func (t *layer) feedNative(handler fib.Handler, hs *clientHS, data []byte) {
+	if t.nfailed || t.isClosed() {
+		return
+	}
+	buf := data
+	if len(t.nbuf) > 0 {
+		t.nbuf = bufferpool.Append(t.nbuf, data)
+		buf = t.nbuf
+	}
+	consumed, out, done, herr := hs.process(buf)
+	if len(out) > 0 {
+		if err := t.c.SendRaw(out); err != nil {
+			t.nativeFailed(hs, nil, err)
+			return
+		}
+	}
+	if herr != nil {
+		t.nativeFailed(hs, herr, herr.err)
+		return
+	}
+	rest := buf[consumed:]
+	if !done {
+		if len(t.nbuf) > 0 {
+			t.nbuf = t.nbuf[:copy(t.nbuf, rest)]
+		} else if len(rest) > 0 {
+			t.nbuf = bufferpool.Append(nil, rest)
+		}
+		return
+	}
+	t.completeNative(handler, hs, rest)
+}
+
+// nativeFailed ends a handshake that failed: the peer is told why, if it is
+// not the one that said so, and the connection closes with the reason, which
+// reaches the wrapped handler's OnClose.
+func (t *layer) nativeFailed(hs *clientHS, herr *hsError, err error) {
+	t.nfailed = true
+	bufferpool.Put(t.nbuf)
+	t.nbuf = nil
+	t.wmu.Lock()
+	t.failed = true
+	for i, held := range t.pending {
+		bufferpool.Put(held)
+		t.pending[i] = nil
+	}
+	t.pending = nil
+	t.wmu.Unlock()
+	if herr != nil && herr.alert != 0 {
+		if record := hs.alertRecord(herr.alert); record != nil {
+			_ = t.c.SendRaw(record)
+			_ = t.c.Flush()
+		}
+	}
+	t.c.CloseWithError(err)
+}
+
+// completeNative finishes a handshake that ran without a worker: the
+// connection takes the keys it ended with, what was sent meanwhile goes out
+// under them, the wrapped handler learns what was negotiated, and the bytes
+// that arrived behind the Finished are delivered. The caller holds readMu.
+func (t *layer) completeNative(handler fib.Handler, hs *clientHS, rest []byte) {
+	t.native.Store(nil)
+	if t.hsTimer != nil {
+		t.hsTimer.Stop()
+		t.hsTimer = nil
+	}
+	state := hs.connectionState()
+	t.state = &state
+	t.rx, t.tx = hs.rx, hs.tx
+
+	t.wmu.Lock()
+	pending, closeAfterSend := t.pending, t.closeAfterSend
+	t.pending = nil
+	var err error
+	for i, held := range pending {
+		if err == nil {
+			err = t.writeLocked(held, nil)
+		}
+		bufferpool.Put(held)
+		pending[i] = nil
+	}
+	if err != nil {
+		t.failed = true
+	} else {
+		t.ready = true
+		if closeAfterSend {
+			t.closeNotifyLocked()
+		}
+	}
+	t.wmu.Unlock()
+
+	if err == nil {
+		// Before any plaintext reaches OnData, so that a handler can pick its
+		// protocol from what ALPN chose.
+		if h, ok := handler.(HandshakeHandler); ok {
+			h.OnHandshake(t.c, state)
+		}
+	}
+	t.mu.Lock()
+	t.handshaking = false
+	if err == nil && len(rest) > 0 {
+		// rest may lie in nbuf, which goes back to the pool after this.
+		t.in = bufferpool.Append(t.in, rest)
+	}
+	t.mu.Unlock()
+	bufferpool.Put(t.nbuf)
+	t.nbuf = nil
+	if err != nil {
+		t.settle(handler)
+		t.c.CloseWithError(err)
+		return
+	}
+	t.drainLocked(handler)
+	t.settle(handler)
+}
+
+// abortNative gives up a handshake without a worker that has not completed,
+// because the connection closed, and reports whether there was one.
+func (t *layer) abortNative() bool {
+	hs := t.native.Swap(nil)
+	if hs == nil {
+		return false
+	}
+	if t.hsTimer != nil {
+		t.hsTimer.Stop()
+	}
+	t.mu.Lock()
+	t.closed = true
+	t.settling = false
+	t.handshaking = false
+	t.mu.Unlock()
+	return true
 }

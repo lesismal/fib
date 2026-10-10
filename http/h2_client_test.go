@@ -199,3 +199,31 @@ func TestClientHTTP2ToFibServer(t *testing.T) {
 		}
 	}
 }
+
+// A client whose Config asks for TLS 1.3 alone handshakes without a worker;
+// requests work over it on HTTP/2 and on HTTP/1.1.
+func TestClientTLS13HandshakesWithoutWorker(t *testing.T) {
+	ts, _, tlsConfig := newH2TestServer(t, func(w stdhttp.ResponseWriter, r *stdhttp.Request) {
+		fmt.Fprintf(w, "%s %s", r.Proto, r.URL.Path)
+	})
+	tlsConfig.MinVersion = stdtls.VersionTLS13
+	for _, tc := range []struct {
+		name string
+		h1   bool
+		want string
+	}{{"h2", false, "HTTP/2.0 /x"}, {"h1", true, "HTTP/1.1 /x"}} {
+		t.Run(tc.name, func(t *testing.T) {
+			config := DefaultClientConfig()
+			config.TLSConfig = tlsConfig
+			config.DisableHTTP2 = tc.h1
+			client := newTestClient(t, config)
+			resp, err := client.Go(mustRequest(t, stdhttp.MethodGet, ts.URL+"/x", nil)).Wait()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got := readBody(t, resp); got != tc.want {
+				t.Fatalf("got %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
