@@ -856,7 +856,7 @@ client.Do(req, func(resp *fibhttp.ClientResponse, err error) {
 resp, err := client.Go(req).Wait() // Future：返回完整缓冲的 *http.Response；Wait 阻塞，Done() 可用于 select
 ```
 
-**大 body 分段接收**（HTTP/1 与 HTTP/2）：默认回调在响应完整收到之后才触发，body 全部在内存里，上限
+**大 body 分段接收**（HTTP/1、HTTP/2 与 HTTP/3）：默认回调在响应完整收到之后才触发，body 全部在内存里，上限
 `MaxResponseBodyBytes`。打开 `ClientConfig.StreamResponseBody` 后，行为与 server 的
 `StreamRequestBody` 对称：
 
@@ -1109,9 +1109,15 @@ HTTP/3 的一致性测试（与 quic-go 客户端、服务端的双向互通，�
 ```go
 client := http3.NewClient(engine, http3.DefaultClientConfig()) // engine 可以是任意运行中的 Engine
 req, _ := http.NewRequest("GET", "https://example.com/", nil)
-client.Do(req, func(resp *http.Response, err error) { /* 恰好回调一次 */ })
+client.Do(req, func(resp *fibhttp.ClientResponse, err error) { /* 恰好回调一次 */ })
 resp, err := client.Go(req).Wait()
 ```
+
+`http3.Client` 的回调和 `http.Client` 一样是 `*fibhttp.ClientResponse`，同样支持大 body 分段接收：
+`http3.ClientConfig` 有 `StreamResponseBody`、`StreamResponseBodyThreshold`、`MaxStreamedBodyBytes`
+（用法见上面“异步 HTTP client”一节）。开启后 stream 的 QUIC 流控窗口（默认 1MB）只在 body 被
+`OnBody`/`Read` 消费之后才还给服务端，读得慢的 stream 只会让自己的发送方等待；阈值之前累积的 body
+会立即还窗口，阈值可以大于窗口。没有 `StreamResponseBodyBuffer`，因为背压靠流控窗口而不是停读 socket。
 
 - 只支持 `https://`（端口默认 443），其他 scheme 返回 `ErrUnsupportedScheme`。
   `ClientConfig.TLSConfig` 未设置 ServerName 时取 URL 的 host，ALPN 固定为 `h3`。

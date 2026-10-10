@@ -69,7 +69,7 @@ type h2ClientStream struct {
 	// passed counts what has gone to it. A streamed stream's recvWindow and
 	// recvUnacked are guarded by the connection's mu instead, since the
 	// window is given back as the body is consumed, by whoever consumes it.
-	stream *respStream
+	stream *ResponseStream
 	passed int64
 	// The rest is guarded by the connection's mu.
 	received   bool
@@ -631,7 +631,7 @@ func (hc *h2ClientConn) handleStreamedData(st *h2ClientStream, f *h2Frame) error
 		return nil
 	}
 	if len(f.payload) > 0 {
-		st.stream.data(f.payload)
+		st.stream.Data(f.payload)
 	}
 	if f.has(h2FlagEndStream) {
 		hc.complete(st)
@@ -729,9 +729,8 @@ func (hc *h2ClientConn) handleHeaderBlock(id uint32, block []byte, endStream boo
 		return nil
 	}
 	if streams {
-		st.stream = newRespStream(hc.cc, st.r, resp)
-		st.stream.credit = func(n int64) { hc.credit(st, n) }
-		st.stream.start()
+		st.stream = newClientStream(hc.cc, st.r, resp, func(n int64) { hc.credit(st, n) })
+		st.stream.Start()
 	}
 	return nil
 }
@@ -812,7 +811,7 @@ func (hc *h2ClientConn) complete(st *h2ClientStream) {
 	if st.stream != nil {
 		st.r.detach()
 		hc.client.streamDone(hc.cc)
-		st.stream.end()
+		st.stream.End()
 		return
 	}
 	if len(st.body) > 0 {

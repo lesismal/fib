@@ -710,7 +710,7 @@ type clientRequest struct {
 	stopContext func() bool
 	// stream is the body stream of the response, once the callback has run on
 	// it, which fired says it has. Guarded by mu.
-	stream *respStream
+	stream *ResponseStream
 	fired  bool
 }
 
@@ -729,7 +729,7 @@ func (r *clientRequest) finish(resp *stdhttp.Response, err error) bool {
 	r.mu.Unlock()
 	if fired {
 		if err != nil {
-			stream.fail(err)
+			stream.Fail(err)
 		}
 		return true
 	}
@@ -737,18 +737,7 @@ func (r *clientRequest) finish(resp *stdhttp.Response, err error) bool {
 		r.callback(nil, err)
 		return true
 	}
-	cr := newWholeResponse(resp, r)
-	cr.mu.Lock()
-	cr.inCallback = true
-	cr.mu.Unlock()
-	r.callback(cr, nil)
-	cr.mu.Lock()
-	cr.inCallback = false
-	taken := cr.fn != nil
-	cr.mu.Unlock()
-	if taken {
-		cr.deliverWhole()
-	}
+	DeliverResponse(resp, r.abort, r.callback)
 	return true
 }
 
@@ -771,7 +760,7 @@ func (r *clientRequest) markDone() bool {
 
 // begin records that the stream is about to run the callback. It reports false
 // if the request has been settled, in which case there is nothing to call.
-func (r *clientRequest) begin(s *respStream) bool {
+func (r *clientRequest) begin(s *ResponseStream) bool {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if r.done.Load() {
@@ -854,7 +843,7 @@ type clientConn struct {
 	settled bool
 	// stream is the body stream of the response being read, if it streams. It
 	// is used only by the worker reading the connection.
-	stream *respStream
+	stream *ResponseStream
 	// h2 is set once the connection is known to speak HTTP/2, before it
 	// carries anything, and never changes after. streams counts the streams
 	// it carries or has been given, and maxStreams how many the server
@@ -979,6 +968,28 @@ func (cc *clientConn) OnData(conn *fib.Connection, data []byte) {
 	}
 }
 
+// newClientStream returns the stream of r's response, whose body is arriving
+// on cc. A transport that paces its sender by window passes credit; otherwise
+// the connection's reads are held.
+func newClientStream(cc *clientConn, r *clientRequest, head *stdhttp.Response, credit func(int64)) *ResponseStream {
+	config := &cc.client.config
+	hooks := StreamHooks{
+		Begin:    r.begin,
+		Callback: func(cr *ClientResponse) { r.callback(cr, nil) },
+		Whole:    func(resp *stdhttp.Response) { r.finish(resp, nil) },
+		Done:     r.markDone,
+		Abort:    r.abort,
+		Credit:   credit,
+	}
+	if credit == nil {
+		hooks.Hold = cc.conn.HoldReads
+	}
+	return NewResponseStream(head, r.req, StreamOptions{
+		Threshold: config.StreamResponseBodyThreshold,
+		Buffer:    config.StreamResponseBodyBuffer,
+	}, hooks)
+}
+
 // bodyStart, bodyData and bodyEnd take a streamed body from the parser.
 func (cc *clientConn) bodyStart(head *stdhttp.Response) {
 	cc.mu.Lock()
@@ -987,13 +998,13 @@ func (cc *clientConn) bodyStart(head *stdhttp.Response) {
 	if r == nil {
 		return
 	}
-	cc.stream = newRespStream(cc, r, head)
-	cc.stream.start()
+	cc.stream = newClientStream(cc, r, head, nil)
+	cc.stream.Start()
 }
 
 func (cc *clientConn) bodyData(data []byte) {
 	if s := cc.stream; s != nil {
-		s.data(data)
+		s.Data(data)
 	}
 }
 
@@ -1001,7 +1012,7 @@ func (cc *clientConn) bodyEnd() {
 	s := cc.stream
 	cc.stream = nil
 	if s != nil {
-		s.end()
+		s.End()
 	}
 }
 

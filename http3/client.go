@@ -20,6 +20,7 @@ import (
 
 	fib "github.com/lesismal/fib"
 	"github.com/lesismal/fib/bufferpool"
+	fibhttp "github.com/lesismal/fib/http"
 	"github.com/lesismal/fib/http3/qpack"
 	"github.com/lesismal/fib/http3/quic"
 )
@@ -57,9 +58,32 @@ type ClientConfig struct {
 	MaxIdleTimeout time.Duration
 	// MaxResponseHeaderBytes and MaxResponseBodyBytes bound what one
 	// response may hold. The body is buffered whole before the callback
-	// runs, so the second is also the memory one response can take.
+	// runs, so the second is also the memory one response can take. A body
+	// that streams (see StreamResponseBody) is bounded by
+	// MaxStreamedBodyBytes instead.
 	MaxResponseHeaderBytes int
 	MaxResponseBodyBytes   int64
+	// StreamResponseBody runs the callback of a response before its body has
+	// all arrived, as http.ClientConfig.StreamResponseBody does for HTTP/1
+	// and HTTP/2: once the header has, for a body with a content-length,
+	// and once some of the body has, for one without. The body is then
+	// taken inside the callback with ClientResponse.OnBody, which delivers
+	// it piece by piece, or read from Body without waiting. A callback that
+	// does neither leaves the rest of the body to be thrown away. Off, the
+	// default, the callback runs once the response is complete. Client.Go
+	// always waits for the whole response. The stream's flow control is
+	// given back to the server only as the body is consumed, so a reader
+	// that falls behind slows its own stream down, and no other.
+	StreamResponseBody bool
+	// StreamResponseBodyThreshold keeps the smaller bodies buffered whole
+	// when StreamResponseBody is set: only a body whose content-length is
+	// larger than this, or one without a length, streams, and its callback
+	// is not run until that much of it has arrived. Zero streams every body
+	// as soon as its header has arrived.
+	StreamResponseBodyThreshold int64
+	// MaxStreamedBodyBytes bounds a streamed body, which MaxResponseBodyBytes
+	// does not. Zero, the default, leaves a streamed body unbounded.
+	MaxStreamedBodyBytes int64
 	// TLSConfig is used for every connection. Nil means the defaults;
 	// either way a config naming no server gets the request's host, and
 	// ALPN offers "h3".
@@ -81,8 +105,9 @@ func DefaultClientConfig() ClientConfig {
 }
 
 // Client sends HTTP/3 requests over connections an engine dials, without
-// blocking the caller: the response goes to a callback, its body already
-// buffered, once it has arrived.
+// blocking the caller: the response goes to a callback, by default with its
+// body already buffered once it has arrived; see
+// ClientConfig.StreamResponseBody for handing it a large body as it arrives.
 //
 // A client keeps one connection per host and port and sends every request
 // to it on a stream of its own, as many at a time as the server allows;
@@ -134,9 +159,20 @@ func NewClient(engine *fib.Engine, config ClientConfig) *Client {
 // callback may run on any goroutine: an engine worker, a timer, or the
 // caller's own for a request Do rejects outright. It must not block for
 // long.
-func (c *Client) Do(req *stdhttp.Request, callback func(*stdhttp.Response, error)) {
+//
+// The callback gets a *fibhttp.ClientResponse, which embeds the net/http
+// response and, with ClientConfig.StreamResponseBody, takes a large body as it
+// arrives with OnBody; see package http's ClientResponse. The Timeout then also
+// ends a body that is streaming.
+func (c *Client) Do(req *stdhttp.Request, callback func(*fibhttp.ClientResponse, error)) {
+	c.do(req, callback, false)
+}
+
+// do is Do, with whole set when the response must arrive whole whatever the
+// client's configuration says.
+func (c *Client) do(req *stdhttp.Request, callback func(*fibhttp.ClientResponse, error), whole bool) {
 	if callback == nil {
-		callback = func(*stdhttp.Response, error) {}
+		callback = func(*fibhttp.ClientResponse, error) {}
 	}
 	if req.URL == nil || req.URL.Scheme != "https" {
 		callback(nil, ErrUnsupportedScheme)
@@ -153,7 +189,7 @@ func (c *Client) Do(req *stdhttp.Request, callback func(*stdhttp.Response, error
 		}
 		req.Body = io.NopCloser(bytes.NewReader(body))
 	}
-	r := &clientRequest{req: req, body: body, callback: callback}
+	r := &clientRequest{req: req, body: body, callback: callback, whole: whole}
 	fields, trailer, err := requestFields(req, len(body))
 	if err != nil {
 		callback(nil, err)
@@ -182,10 +218,13 @@ type Future struct {
 // Go sends req like Do and returns a Future for its outcome.
 func (c *Client) Go(req *stdhttp.Request) *Future {
 	f := &Future{done: make(chan struct{})}
-	c.Do(req, func(resp *stdhttp.Response, err error) {
-		f.resp, f.err = resp, err
+	c.do(req, func(resp *fibhttp.ClientResponse, err error) {
+		if resp != nil {
+			f.resp = resp.Response
+		}
+		f.err = err
 		close(f.done)
-	})
+	}, true)
 	return f
 }
 
@@ -282,23 +321,55 @@ type clientRequest struct {
 	fields []qpack.HeaderField
 	// trailer is the trailer section that ends the request, if it has one.
 	trailer  []qpack.HeaderField
-	callback func(*stdhttp.Response, error)
+	callback func(*fibhttp.ClientResponse, error)
+	// whole asks for the response to arrive whole even when the client would
+	// stream it.
+	whole bool
 
 	mu          sync.Mutex
 	done        bool
 	timer       *time.Timer
 	stopContext func() bool
 	stream      *clientStream
+	// body is the stream of the response, once its callback has run on it,
+	// which fired says it has.
+	respBody *fibhttp.ResponseStream
+	fired    bool
 	// retried is set once the request has been sent again, which happens
 	// at most once.
 	retried bool
 }
 
 // finish calls the callback, unless it has been called already.
+//
+// A response that streams has its callback run by the stream, before it is
+// complete, and finish then only reports how it ended: an error goes to the
+// stream, and a completion is the stream's own to report.
 func (r *clientRequest) finish(resp *stdhttp.Response, err error) bool {
+	if !r.markDone() {
+		return false
+	}
 	r.mu.Lock()
+	body, fired := r.respBody, r.fired
+	r.mu.Unlock()
+	switch {
+	case fired:
+		if err != nil {
+			body.Fail(err)
+		}
+	case err != nil:
+		r.callback(nil, err)
+	default:
+		fibhttp.DeliverResponse(resp, r.abort, r.callback)
+	}
+	return true
+}
+
+// markDone settles the request, once, and stops what would abandon it.
+func (r *clientRequest) markDone() bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
 	if r.done {
-		r.mu.Unlock()
 		return false
 	}
 	r.done = true
@@ -309,8 +380,18 @@ func (r *clientRequest) finish(resp *stdhttp.Response, err error) bool {
 		r.stopContext()
 	}
 	r.stream = nil
-	r.mu.Unlock()
-	r.callback(resp, err)
+	return true
+}
+
+// begin records that the stream is about to run the callback. It reports false
+// if the request has been settled, in which case there is nothing to call.
+func (r *clientRequest) begin(s *fibhttp.ResponseStream) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.done {
+		return false
+	}
+	r.respBody, r.fired = s, true
 	return true
 }
 
@@ -590,6 +671,12 @@ func (cc *clientConn) startWaiting() {
 		}
 		cc.waiting = cc.waiting[1:]
 		st := &clientStream{cc: cc, s: s, r: r, parser: frameParser{maxFrame: uint64(cc.client.config.MaxResponseHeaderBytes)}}
+		if cc.client.config.StreamResponseBody && !r.whole {
+			// The stream's flow control is given back from here, so that a
+			// body that streams paces the server; see clientStream.feed.
+			s.HoldCredit()
+			st.paced = true
+		}
 		s.Context = st
 		cc.streams[s.ID()] = st
 		if cc.idleTimer != nil {
@@ -760,6 +847,15 @@ type clientStream struct {
 	// trailers is set once the trailer section has arrived.
 	trailers bool
 	done     bool
+	// paced says the stream holds its flow control back, to give it as the
+	// body is consumed: by Credit for a body that streams, and in feed for
+	// whatever else a delivery carried. stream is set when the body streams
+	// to the callback, passed counts what has gone to it, and fedBody how
+	// much of the delivery in progress did.
+	paced   bool
+	stream  *fibhttp.ResponseStream
+	passed  int64
+	fedBody int
 }
 
 // send writes the request: HEADERS, the body in one DATA frame, and the
@@ -797,7 +893,14 @@ func (st *clientStream) feed(data []byte, fin bool) {
 	if st.done {
 		return
 	}
-	if err := st.parser.feed(data, st.onData, st.onFrame); err != nil {
+	st.fedBody = 0
+	err := st.parser.feed(data, st.onData, st.onFrame)
+	if st.paced {
+		// What of this delivery is not body that streams is given back now;
+		// the body is, as the callback consumes it.
+		st.s.Credit(len(data) - st.fedBody)
+	}
+	if err != nil {
 		var ce *connError
 		// A field section that does not decode leaves the peer's encoder
 		// and this side's decoder out of step, so it ends the connection
@@ -825,6 +928,16 @@ func (st *clientStream) onData(chunk []byte) error {
 	}
 	if st.resp == nil || st.trailers {
 		return connErr(ErrCodeFrameUnexpected, "DATA before HEADERS or after trailers")
+	}
+	if st.stream != nil {
+		st.passed += int64(len(chunk))
+		if limit := st.cc.client.config.MaxStreamedBodyBytes; limit > 0 && st.passed > limit {
+			st.fail(errBodyTooLarge)
+			return nil
+		}
+		st.fedBody += len(chunk)
+		st.stream.Data(chunk)
+		return nil
 	}
 	if int64(len(st.body)+len(chunk)) > st.cc.client.config.MaxResponseBodyBytes {
 		st.fail(errBodyTooLarge)
@@ -879,6 +992,27 @@ func (st *clientStream) onFrame(typ uint64, payload []byte) error {
 	}
 	// A nil response is an interim one, which only precedes the answer.
 	st.resp = resp
+	config := &st.cc.client.config
+	if resp != nil && st.paced && bodyAllowed(st.r.req, resp.StatusCode) &&
+		!(resp.ContentLength >= 0 && resp.ContentLength <= max(config.StreamResponseBodyThreshold, 0)) {
+		if limit := config.MaxStreamedBodyBytes; limit > 0 && resp.ContentLength > limit {
+			st.fail(errBodyTooLarge)
+			return nil
+		}
+		st.cc.mu.Lock()
+		resp.TLS = st.cc.tlsState
+		st.cc.mu.Unlock()
+		r := st.r
+		st.stream = fibhttp.NewResponseStream(resp, r.req, fibhttp.StreamOptions{Threshold: config.StreamResponseBodyThreshold}, fibhttp.StreamHooks{
+			Begin:    r.begin,
+			Callback: func(cr *fibhttp.ClientResponse) { r.callback(cr, nil) },
+			Whole:    func(resp *stdhttp.Response) { r.finish(resp, nil) },
+			Done:     r.markDone,
+			Abort:    r.abort,
+			Credit:   func(n int64) { st.s.Credit(int(n)) },
+		})
+		st.stream.Start()
+	}
 	return nil
 }
 
@@ -890,6 +1024,15 @@ func (st *clientStream) complete() {
 		st.fail(errors.New("http3: response ended before its header"))
 		return
 	}
+	if st.stream != nil {
+		if resp.ContentLength >= 0 && resp.ContentLength != st.passed {
+			st.fail(errors.New("http3: response body length does not match Content-Length"))
+			return
+		}
+		st.cc.streamDone(st)
+		st.stream.End()
+		return
+	}
 	if bodyAllowed(st.r.req, resp.StatusCode) {
 		if resp.ContentLength >= 0 && resp.ContentLength != int64(len(st.body)) {
 			st.fail(errors.New("http3: response body length does not match Content-Length"))
@@ -897,9 +1040,7 @@ func (st *clientStream) complete() {
 		}
 		resp.ContentLength = int64(len(st.body))
 	}
-	if len(st.body) > 0 {
-		resp.Body = io.NopCloser(bytes.NewReader(st.body))
-	}
+	resp.Body = fibhttp.NewBufferedBody(st.body)
 	st.body = nil
 	st.cc.mu.Lock()
 	resp.TLS = st.cc.tlsState

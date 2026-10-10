@@ -47,16 +47,40 @@ type ClientResponse struct {
 	delivered  bool
 	// s is the stream of a response whose body was still arriving when the
 	// callback ran, and nil for one that arrived whole.
-	s *respStream
-	// r is the request it answers.
-	r *clientRequest
+	s *ResponseStream
+	// abort gives the response up; see Close.
+	abort func(error)
 }
 
-// newWholeResponse wraps a response whose body has arrived.
-func newWholeResponse(resp *stdhttp.Response, r *clientRequest) *ClientResponse {
-	cr := &ClientResponse{Response: resp, r: r}
+// NewBufferedBody returns the Body for a response that arrived whole, which
+// DeliverResponse can hand to OnBody without copying it. The body does not
+// copy data either.
+func NewBufferedBody(data []byte) io.ReadCloser {
+	if len(data) == 0 {
+		return stdhttp.NoBody
+	}
+	return &bufferedBody{data: data}
+}
+
+// DeliverResponse runs callback with resp, a response whose body has arrived
+// whole, as a ClientResponse that OnBody serves once callback returns. abort
+// is what ClientResponse.Close does: it fails the request and abandons the
+// exchange. It is for the clients of other transports, such as package http3,
+// to deliver their responses the way this package's Client does.
+func DeliverResponse(resp *stdhttp.Response, abort func(error), callback func(*ClientResponse, error)) {
+	cr := &ClientResponse{Response: resp, abort: abort}
 	cr.whole, _ = resp.Body.(*bufferedBody)
-	return cr
+	cr.mu.Lock()
+	cr.inCallback = true
+	cr.mu.Unlock()
+	callback(cr, nil)
+	cr.mu.Lock()
+	cr.inCallback = false
+	taken := cr.fn != nil
+	cr.mu.Unlock()
+	if taken {
+		cr.deliverWhole()
+	}
 }
 
 // OnBody delivers the response's body to fn, piece by piece as it arrives.
@@ -157,8 +181,8 @@ func (c *ClientResponse) Consumed() int64 {
 // is closed and OnBody's function, if it has one, hears ErrResponseAbandoned.
 // It does nothing once the body has all arrived.
 func (c *ClientResponse) Close() {
-	if c.r != nil {
-		c.r.abort(ErrResponseAbandoned)
+	if c.abort != nil {
+		c.abort(ErrResponseAbandoned)
 	}
 }
 
@@ -179,12 +203,59 @@ func (b *bufferedBody) Read(p []byte) (int, error) {
 
 func (b *bufferedBody) Close() error { return nil }
 
-// respStream carries the body of a response that streams, from the worker that
+// StreamHooks ties a ResponseStream to the request it answers, which is the
+// transport's own.
+type StreamHooks struct {
+	// Begin is called just before the callback runs, with the stream, which
+	// the request is to tell of a later failure by Fail. It reports false if
+	// the request has already ended, and then nothing is called.
+	Begin func(*ResponseStream) bool
+	// Callback runs the callback with the response.
+	Callback func(*ClientResponse)
+	// Whole is called with the response if its body ended before Begin, so
+	// that it is delivered as one that arrived whole: with DeliverResponse.
+	Whole func(*stdhttp.Response)
+	// Done settles the request once a response that streamed has ended. It
+	// reports false if the request had ended already.
+	Done func() bool
+	// Abort fails the request with err and abandons the exchange.
+	Abort func(err error)
+	// Hold stops or resumes the transport's reading, for a transport that
+	// can stop reading just this response, by holding the connection's.
+	// Transports that pace the sender by flow control instead leave it nil
+	// and set Credit.
+	Hold func(hold bool)
+	// Credit is told how many bytes of body have left the stream's buffer,
+	// and gives the sender that much window. Body that arrives before the
+	// callback runs is credited at once, so that a threshold larger than the
+	// window cannot stall the sender. It may be called from any goroutine,
+	// but never while the stream holds a lock the transport's Data and Fail
+	// calls hold.
+	Credit func(n int64)
+}
+
+// StreamOptions are the limits on a ResponseStream, from the client's
+// configuration.
+type StreamOptions struct {
+	// Threshold is how much body to collect before running the callback.
+	Threshold int64
+	// Buffer is how many bytes may wait for a reader before Hold stops
+	// reads; zero means DefaultStreamResponseBodyBuffer.
+	Buffer int
+}
+
+// ResponseStream carries the body of a response that streams, from the worker that
 // reads the connection to whoever takes it: OnBody's function, or Read.
-type respStream struct {
-	cc *clientConn
-	r  *clientRequest
-	cr *ClientResponse
+//
+// It is for clients: package http's own, and those of other transports, which
+// build one for a response whose body is still arriving, call Start, then Data
+// for each piece of the body, in order, and End when it is complete or Fail
+// when it will not be. Everything it needs of the request it answers comes
+// through StreamHooks.
+type ResponseStream struct {
+	hooks StreamHooks
+	req   *stdhttp.Request
+	cr    *ClientResponse
 	// threshold is how much body to collect before running the callback, and
 	// highWater how much may wait unread, after that, before reads stop.
 	threshold int64
@@ -208,20 +279,15 @@ type respStream struct {
 	held     bool
 	consumed int64
 	trailer  stdhttp.Header
-	// credit, when set, is how a body that cannot stop the connection's reads
-	// — an HTTP/2 stream — paces its sender instead: it is told how many
-	// bytes have left the stream's buffer, and gives the sender that much
-	// window. Body that arrives before the callback runs is credited at once,
-	// so that a threshold larger than the window cannot stall the stream, and
-	// preCredited counts what of buf has been credited already.
-	credit      func(n int64)
+	// preCredited counts what of buf has been credited already, when
+	// hooks.Credit paces the sender.
 	preCredited int64
 }
 
 // takeLocked accounts n bytes leaving buf, read, delivered or thrown away, and
 // returns how many of them the sender is still owed window for.
-func (s *respStream) takeLocked(n int) int64 {
-	if s.credit == nil {
+func (s *ResponseStream) takeLocked(n int) int64 {
+	if s.hooks.Credit == nil {
 		return 0
 	}
 	c := int64(n)
@@ -231,45 +297,46 @@ func (s *respStream) takeLocked(n int) int64 {
 }
 
 // give passes credit on to the sender. It must be called without s.mu held.
-func (s *respStream) give(n int64) {
-	if n > 0 && s.credit != nil {
-		s.credit(n)
+func (s *ResponseStream) give(n int64) {
+	if n > 0 && s.hooks.Credit != nil {
+		s.hooks.Credit(n)
 	}
 }
 
-func newRespStream(cc *clientConn, r *clientRequest, head *stdhttp.Response) *respStream {
-	config := &cc.client.config
-	s := &respStream{cc: cc, r: r, threshold: config.StreamResponseBodyThreshold, highWater: config.StreamResponseBodyBuffer}
+// NewResponseStream returns the stream for a response, head, whose body is
+// still arriving, to the request req. head.Body is replaced.
+func NewResponseStream(head *stdhttp.Response, req *stdhttp.Request, options StreamOptions, hooks StreamHooks) *ResponseStream {
+	s := &ResponseStream{hooks: hooks, req: req, threshold: options.Threshold, highWater: options.Buffer}
 	if s.highWater <= 0 {
 		s.highWater = DefaultStreamResponseBodyBuffer
 	}
-	s.cr = &ClientResponse{Response: head, s: s, r: r}
+	s.cr = &ClientResponse{Response: head, s: s, abort: hooks.Abort}
 	head.Body = &streamBody{s: s}
 	return s
 }
 
-// start runs the callback at once if no body need be collected first.
-func (s *respStream) start() {
+// Start runs the callback at once if no body need be collected first.
+func (s *ResponseStream) Start() {
 	if s.threshold <= 0 {
 		s.fire()
 	}
 }
 
-// fire runs the callback, on the worker that reads the connection.
-func (s *respStream) fire() {
-	if !s.r.begin(s) {
+// fire runs the callback, on the goroutine that delivers the body.
+func (s *ResponseStream) fire() {
+	if !s.hooks.Begin(s) {
 		return
 	}
 	s.mu.Lock()
 	s.fired, s.inCallback = true, true
 	s.mu.Unlock()
-	s.r.callback(s.cr, nil)
+	s.hooks.Callback(s.cr)
 	s.afterCallback()
 }
 
 // afterCallback throws the body away if the callback left it with no one, and
 // otherwise hands over what it has.
-func (s *respStream) afterCallback() {
+func (s *ResponseStream) afterCallback() {
 	s.mu.Lock()
 	s.inCallback = false
 	if s.fn == nil && !s.touched {
@@ -289,7 +356,7 @@ func (s *respStream) afterCallback() {
 }
 
 // data takes a piece of the body from the worker that read it.
-func (s *respStream) data(b []byte) {
+func (s *ResponseStream) Data(b []byte) {
 	s.mu.Lock()
 	if s.err != nil || s.ended {
 		s.mu.Unlock()
@@ -301,7 +368,7 @@ func (s *respStream) data(b []byte) {
 		s.mu.Unlock()
 		s.give(int64(len(b)))
 		if over {
-			s.r.abort(ErrResponseAbandoned)
+			s.hooks.Abort(ErrResponseAbandoned)
 		}
 		return
 	}
@@ -324,7 +391,7 @@ func (s *respStream) data(b []byte) {
 	}
 	s.buf = append(s.buf, b...)
 	var early int64
-	if !s.fired && s.credit != nil {
+	if !s.fired && s.hooks.Credit != nil {
 		early = int64(len(b))
 		s.preCredited += early
 	}
@@ -341,7 +408,7 @@ func (s *respStream) data(b []byte) {
 
 // end is told that all of the body has arrived. A response that never ran its
 // callback does so now, as one that arrived whole.
-func (s *respStream) end() {
+func (s *ResponseStream) End() {
 	s.mu.Lock()
 	s.ended = true
 	s.trailer = s.cr.Response.Trailer
@@ -356,21 +423,21 @@ func (s *respStream) end() {
 		} else {
 			resp.Body = &bufferedBody{data: body}
 		}
-		if s.credit != nil && resp.ContentLength < 0 && s.r.req.Method != stdhttp.MethodHead {
+		if s.hooks.Credit != nil && resp.ContentLength < 0 && s.req.Method != stdhttp.MethodHead {
 			// What an HTTP/2 response that arrived whole reports.
 			resp.ContentLength = int64(len(body))
 		}
-		s.r.finish(resp, nil)
+		s.hooks.Whole(resp)
 		return
 	}
 	s.mu.Unlock()
-	if s.r.markDone() {
+	if s.hooks.Done() {
 		s.drain()
 	}
 }
 
 // fail ends the body with err, which fn hears of and Read reports.
-func (s *respStream) fail(err error) {
+func (s *ResponseStream) Fail(err error) {
 	s.mu.Lock()
 	if s.err == nil && !s.finSent {
 		s.err = err
@@ -381,7 +448,7 @@ func (s *respStream) fail(err error) {
 	s.drain()
 }
 
-func (s *respStream) setFn(fn BodyFunc) {
+func (s *ResponseStream) setFn(fn BodyFunc) {
 	s.mu.Lock()
 	if s.discarding {
 		s.mu.Unlock()
@@ -399,7 +466,7 @@ func (s *respStream) setFn(fn BodyFunc) {
 // drain hands fn what has arrived, then the end, one call at a time. Whoever
 // finds nobody inside fn does it, and the one inside fn carries on with
 // whatever arrives meanwhile.
-func (s *respStream) drain() {
+func (s *ResponseStream) drain() {
 	s.mu.Lock()
 	if s.delivering || s.inCallback || s.fn == nil {
 		s.mu.Unlock()
@@ -440,42 +507,42 @@ func (s *respStream) drain() {
 	s.mu.Unlock()
 }
 
-// holdLocked stops the connection's reads while more waits for a reader than
+// holdLocked stops the transport's reads while more waits for a reader than
 // the buffer allows, and starts them again once it has gone down by half.
-func (s *respStream) holdLocked() {
-	if s.credit != nil {
+func (s *ResponseStream) holdLocked() {
+	if s.hooks.Hold == nil {
 		return
 	}
 	switch {
 	case !s.held && s.fired && !s.ended && s.err == nil && len(s.buf) > s.highWater:
 		s.held = true
-		s.cc.conn.HoldReads(true)
+		s.hooks.Hold(true)
 	case s.held && len(s.buf) <= s.highWater/2:
 		s.held = false
-		s.cc.conn.HoldReads(false)
+		s.hooks.Hold(false)
 	}
 }
 
-func (s *respStream) unholdLocked() {
+func (s *ResponseStream) unholdLocked() {
 	if s.held {
 		s.held = false
-		s.cc.conn.HoldReads(false)
+		s.hooks.Hold(false)
 	}
 }
 
-func (s *respStream) complete() bool {
+func (s *ResponseStream) complete() bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.ended
 }
 
-func (s *respStream) trailerFields() stdhttp.Header {
+func (s *ResponseStream) trailerFields() stdhttp.Header {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.trailer
 }
 
-func (s *respStream) consumedBytes() int64 {
+func (s *ResponseStream) consumedBytes() int64 {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.consumed
@@ -485,7 +552,7 @@ func (s *respStream) consumedBytes() int64 {
 // arrived and never waits for more: with nothing to read and the body not
 // over, it returns ErrWouldBlock, and the data is better taken with OnBody.
 // Closing it does nothing; ClientResponse.Close gives the response up.
-type streamBody struct{ s *respStream }
+type streamBody struct{ s *ResponseStream }
 
 func (b *streamBody) Read(p []byte) (int, error) {
 	s := b.s
