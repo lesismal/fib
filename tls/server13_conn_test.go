@@ -34,13 +34,15 @@ func greeter(greeting string) fib.Handler {
 	}
 }
 
-// Clients of TLS 1.3 are served without a worker, clients that offer no TLS
-// 1.3 by crypto/tls, and both get what the server sent as soon as it opened.
+// Clients of TLS 1.3 and 1.2 are served without a worker, clients that offer
+// neither by crypto/tls, and all get what the server sent as soon as it opened.
 func TestNativeServerServesStandardClients(t *testing.T) {
 	started := countNative(t)
 	fellBack := countFallbacks(t)
 	serverConfig, clientConfig := tlsConfigs(t)
 	serverConfig.NextProtos = []string{"fib-test"}
+	// TLS 1.1 is allowed, so that there are clients crypto/tls has to serve.
+	serverConfig.MinVersion = stdtls.VersionTLS11
 	_, addr := startEchoServer(t, fib.DefaultConfig(), NewServer(serverConfig, greeter("welcome;")))
 
 	const each = 8
@@ -80,12 +82,13 @@ func TestNativeServerServesStandardClients(t *testing.T) {
 	}
 	run(stdtls.VersionTLS13, each)
 	run(stdtls.VersionTLS12, each)
+	run(stdtls.VersionTLS11, each)
 	wg.Wait()
-	if n := started.Load(); n != 2*each {
-		t.Fatalf("%d handshakes began without a worker, want %d", n, 2*each)
+	if n := started.Load(); n != 3*each {
+		t.Fatalf("%d handshakes began without a worker, want %d", n, 3*each)
 	}
 	if n := fellBack.Load(); n != each {
-		t.Fatalf("%d handed to crypto/tls, want the %d TLS 1.2 clients", n, each)
+		t.Fatalf("%d handed to crypto/tls, want the %d TLS 1.1 clients", n, each)
 	}
 }
 
@@ -107,13 +110,14 @@ func (c slowConn) Write(p []byte) (int, error) {
 	return len(p), nil
 }
 
-// A hello that arrives a byte at a time is waited for, and a TLS 1.2 one that
-// does is replayed to crypto/tls whole.
+// A hello that arrives a byte at a time is waited for, and one for a client
+// that crypto/tls has to serve is replayed to it whole.
 func TestNativeServerWaitsForSlowHellos(t *testing.T) {
 	fellBack := countFallbacks(t)
 	serverConfig, clientConfig := tlsConfigs(t)
+	serverConfig.MinVersion = stdtls.VersionTLS11
 	_, addr := startEchoServer(t, fib.DefaultConfig(), NewServer(serverConfig, echoHandler()))
-	for _, version := range []uint16{stdtls.VersionTLS13, stdtls.VersionTLS12} {
+	for _, version := range []uint16{stdtls.VersionTLS13, stdtls.VersionTLS12, stdtls.VersionTLS11} {
 		raw, err := net.Dial("tcp", addr)
 		if err != nil {
 			t.Fatal(err)
@@ -135,7 +139,7 @@ func TestNativeServerWaitsForSlowHellos(t *testing.T) {
 		conn.Close()
 	}
 	if n := fellBack.Load(); n != 1 {
-		t.Fatalf("%d handed to crypto/tls, want 1", n)
+		t.Fatalf("%d handed to crypto/tls, want the TLS 1.1 client", n)
 	}
 }
 

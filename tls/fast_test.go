@@ -118,7 +118,8 @@ func TestTakeOverResumes(t *testing.T) {
 		version  uint16
 		blocking bool
 	}{
-		{"TLS 1.2", stdtls.VersionTLS12, true},
+		{"TLS 1.2 with crypto/tls", stdtls.VersionTLS12, true},
+		{"TLS 1.2 without a worker", stdtls.VersionTLS12, false},
 		{"TLS 1.3 without a worker", stdtls.VersionTLS13, false},
 		{"TLS 1.3 with crypto/tls", stdtls.VersionTLS13, true},
 	} {
@@ -141,7 +142,8 @@ func TestTakeOverResumes(t *testing.T) {
 				// The echo also has the client read the ticket, which a TLS
 				// 1.3 server sends after the handshake.
 				echo(t, conn, 100)
-				if got, want := taken(<-layers), i == 0 || version == stdtls.VersionTLS13; got != want {
+				// crypto/tls leaves nothing to take over after a TLS 1.2 resumption.
+				if got, want := taken(<-layers), i == 0 || version == stdtls.VersionTLS13 || !tc.blocking; got != want {
 					t.Fatalf("connection %d taken over: %v, want %v", i, got, want)
 				}
 				if resumed := conn.ConnectionState().DidResume; resumed != (i == 1) {

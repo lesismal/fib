@@ -74,10 +74,11 @@ func (wouldBlockError) Temporary() bool { return true }
 // that arrive and that never waits, so a peer that is slow to answer, or that
 // never answers, costs the connection's memory and a timer, and no goroutine;
 // thousands of handshakes can be in flight at once. A server serves TLS 1.3
-// that way and hands the clients it cannot serve (TLS 1.2 only, 0-RTT, a
-// hello that does not parse) to crypto/tls, before it has sent anything, so
-// they see no difference; it issues its own session tickets, sealed under a
-// key of the Handler's. Other Configs keep to crypto/tls.
+// and 1.2 that way and hands the clients it cannot serve (older versions,
+// 0-RTT, suites or groups it does not implement, a hello that does not parse)
+// to crypto/tls, before it has sent anything, so they see no difference; it
+// issues its own session tickets, sealed under a key of the Handler's. Other
+// Configs keep to crypto/tls.
 //
 // Once a crypto/tls handshake settles on an AES-GCM suite of TLS 1.3 or 1.2, or
 // an AES-CBC suite of TLS 1.2 or 1.1, the connection's records are protected by

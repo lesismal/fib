@@ -432,15 +432,18 @@ err = fibtls.Dial(engine, "tcp", "example.com:443", 3*time.Second, tlsConfig, ha
     ALPN、SNI、扩展主密钥、降级检测、按 `RootCAs` / `InsecureSkipVerify` 校验服务端证书并验证签名（ECDSA、RSA-PSS、
     RSA PKCS#1、Ed25519）、`VerifyPeerCertificate` / `VerifyConnection`、`KeyLogWriter`、`Config.CipherSuites`，服务端要求
     客户端证书时回一个空 Certificate。`MinVersion` 设成 TLS 1.0 / 1.1 的配置仍走 `crypto/tls`。
-  - **服务端**（`tls/server13.go`）：`Config` 自带 `Certificates`、不要求客户端认证、没有 `GetCertificate` /
-    `GetConfigForClient`（它们要的 `ClientHelloInfo` 只有 `crypto/tls` 能构造）时，TLS 1.3 的握手走状态机。服务端先读完
-    ClientHello 再决定：只会 TLS 1.2 的客户端、要 0-RTT 的、没有 AES-GCM 套件或没有共同曲线的、ClientHello 解析不了的，
-    **在服务端什么都还没发之前**把已收到的字节原样交给 `crypto/tls`，客户端看不出区别。证书按 `ServerName` 在
-    `Certificates` 里选（`SupportsCertificate`），签名方案按客户端的顺序选，ALPN 的选择和 `crypto/tls` 一致（包括
-    HTTP/1.1 客户端连 h2 服务端的特例），支持 HelloRetryRequest、OCSP / SCT、`VerifyConnection`、`KeyLogWriter`。
-    会话恢复是自己的：握手后发 NewSessionTicket，票据用 `Handler` 的密钥（每天轮换，保留 7 天；设了
-    `Config.SessionTicketKey` 就用它，多个进程可以共享）封装，无状态；`SessionTicketsDisabled` 关闭。`crypto/tls` 签发的
-    票据它不认，客户端会做一次完整握手。
+  - **服务端**（`tls/server13.go`、`tls/server12.go`）：`Config` 自带 `Certificates`、不要求客户端认证、没有 `GetCertificate` /
+    `GetConfigForClient`（它们要的 `ClientHelloInfo` 只有 `crypto/tls` 能构造）时，TLS 1.3 和 TLS 1.2 的握手都走状态机。
+    服务端先读完 ClientHello 再决定：客户端不提供 `Config` 范围内的 TLS 1.3 / 1.2（比如只有 TLS 1.0 / 1.1，而 `MinVersion` 允许）、
+    要 0-RTT 的、没有 AES-GCM 套件（TLS 1.3）或没有 ECDHE 套件 / 证书能签的签名方案 / 共同曲线（TLS 1.2）的、ClientHello
+    解析不了的，**在服务端什么都还没发之前**把已收到的字节原样交给 `crypto/tls`，客户端看不出区别。证书按 `ServerName`
+    在 `Certificates` 里选（`SupportsCertificate`），ALPN 的选择和 `crypto/tls` 一致（包括 HTTP/1.1 客户端连 h2 服务端的特例），
+    支持 HelloRetryRequest（1.3）、扩展主密钥、安全重协商标记、降级标记（服务端也支持 1.3 时，1.2 的 ServerHello 随机数结尾带
+    `DOWNGRD\x01`）、OCSP / SCT、`CipherSuites`（1.2）、`VerifyConnection`、`KeyLogWriter`。TLS 1.2 只用 ECDHE（AES-GCM、
+    AES-CBC），不支持 RSA 密钥交换（`crypto/tls` 默认也不再提供）。
+    会话恢复是自己的：TLS 1.3 发 NewSessionTicket（PSK 恢复），TLS 1.2 发 RFC 5077 的票据（恢复时是缩短的握手），票据用
+    `Handler` 的密钥（每天轮换，保留 7 天；设了 `Config.SessionTicketKey` 就用它，多个进程可以共享）封装，无状态；
+    `SessionTicketsDisabled` 关闭。`crypto/tls` 签发的票据它不认，客户端会做一次完整握手。
   - 握手结束后的记录层和上面一样。签名（RSA 约 1 ms）在引擎 worker 上做，`crypto/tls` 路径里是在握手协程上做。
   - 握手吞吐与 `crypto/tls` 路径相当（本机回环、ECDSA P-256、标准库客户端并发握手：每次约 105-124 µs 对 114 µs，客户端一侧
     占大头），省下的是等待对端的那些协程。

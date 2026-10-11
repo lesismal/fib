@@ -382,7 +382,11 @@ func TestServerFallsBackForClientsItDoesNotServe(t *testing.T) {
 		want  string
 	}{
 		{"TLS 1.3", helloOf(t, pool, nil, nil), "serve"},
-		{"TLS 1.2 only", helloOf(t, pool, func(c *stdtls.Config) { c.MaxVersion = stdtls.VersionTLS12 }, nil), "fallback"},
+		{"TLS 1.2 only", helloOf(t, pool, func(c *stdtls.Config) { c.MaxVersion = stdtls.VersionTLS12 }, nil), "serve"},
+		{"TLS 1.2 without an ECDHE suite", helloOf(t, pool, func(c *stdtls.Config) { c.MaxVersion = stdtls.VersionTLS12 },
+			func(h *clientHS) { h.suites12 = []uint16{stdtls.TLS_RSA_WITH_AES_128_GCM_SHA256} }), "fallback"},
+		{"TLS 1.2 with an RSA suite for an ECDSA certificate", helloOf(t, pool, func(c *stdtls.Config) { c.MaxVersion = stdtls.VersionTLS12 },
+			func(h *clientHS) { h.suites12 = []uint16{stdtls.TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256} }), "fallback"},
 		{"no AES-GCM suite", helloOf(t, pool, nil, func(h *clientHS) { h.suites = []uint16{stdtls.TLS_CHACHA20_POLY1305_SHA256} }), "fallback"},
 		{"no group in common", helloOf(t, pool, func(c *stdtls.Config) { c.CurvePreferences = []stdtls.CurveID{stdtls.CurveP384} }, nil), "fallback"},
 		{"not a handshake", []byte("GET / HTTP/1.1\r\n\r\n"), "fallback"},
@@ -427,7 +431,9 @@ func TestNativeServerQualification(t *testing.T) {
 		{"no certificates", &stdtls.Config{}, false},
 		{"a certificate", &stdtls.Config{Certificates: certs}, true},
 		{"TLS 1.3 only", &stdtls.Config{Certificates: certs, MinVersion: stdtls.VersionTLS13}, true},
-		{"capped at 1.2", &stdtls.Config{Certificates: certs, MaxVersion: stdtls.VersionTLS12}, false},
+		{"capped at 1.2", &stdtls.Config{Certificates: certs, MaxVersion: stdtls.VersionTLS12}, true},
+		{"capped at 1.1", &stdtls.Config{Certificates: certs, MaxVersion: stdtls.VersionTLS11}, false},
+		{"TLS 1.2 only", &stdtls.Config{Certificates: certs, MinVersion: stdtls.VersionTLS12, MaxVersion: stdtls.VersionTLS12}, true},
 		{"GetCertificate", &stdtls.Config{Certificates: certs, GetCertificate: func(*stdtls.ClientHelloInfo) (*stdtls.Certificate, error) { return nil, nil }}, false},
 		{"GetConfigForClient", &stdtls.Config{Certificates: certs, GetConfigForClient: func(*stdtls.ClientHelloInfo) (*stdtls.Config, error) { return nil, nil }}, false},
 		{"client certificates", &stdtls.Config{Certificates: certs, ClientAuth: stdtls.RequestClientCert}, false},

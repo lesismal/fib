@@ -123,20 +123,12 @@ type ticketState struct {
 	server  string
 }
 
-// seal makes the ticket for s.
-func (t *ticketKeys) seal(s ticketState, now time.Time) ([]byte, bool) {
+// sealRaw seals plain under the current key.
+func (t *ticketKeys) sealRaw(plain []byte, now time.Time) ([]byte, bool) {
 	k := t.current(now)
 	if k == nil {
 		return nil, false
 	}
-	plain := []byte{1}
-	plain = binary.BigEndian.AppendUint16(plain, s.suite)
-	plain = binary.BigEndian.AppendUint64(plain, uint64(s.created.Unix()))
-	plain = binary.BigEndian.AppendUint32(plain, s.ageAdd)
-	plain = append(plain, byte(len(s.psk)))
-	plain = append(plain, s.psk...)
-	plain = binary.BigEndian.AppendUint16(plain, uint16(len(s.server)))
-	plain = append(plain, s.server...)
 	nonce := make([]byte, k.aead.NonceSize())
 	if _, err := rand.Read(nonce); err != nil {
 		return nil, false
@@ -145,19 +137,90 @@ func (t *ticketKeys) seal(s ticketState, now time.Time) ([]byte, bool) {
 	return k.aead.Seal(ticket, nonce, plain, k.name[:]), true
 }
 
-// open reads a ticket back. It reports false for one that is not ours, was
-// altered, or has outlived its lifetime.
-func (t *ticketKeys) open(ticket []byte, now time.Time) (ticketState, bool) {
+// openRaw opens a ticket sealed by sealRaw, or reports false for one that is
+// not ours or was altered.
+func (t *ticketKeys) openRaw(ticket []byte) ([]byte, bool) {
 	if len(ticket) < ticketNameLen {
-		return ticketState{}, false
+		return nil, false
 	}
 	k := t.find(ticket[:ticketNameLen])
 	if k == nil || len(ticket) < ticketNameLen+k.aead.NonceSize()+k.aead.Overhead() {
-		return ticketState{}, false
+		return nil, false
 	}
 	rest := ticket[ticketNameLen:]
 	plain, err := k.aead.Open(nil, rest[:k.aead.NonceSize()], rest[k.aead.NonceSize():], ticket[:ticketNameLen])
-	if err != nil || len(plain) < 1+2+8+4+1 || plain[0] != 1 {
+	return plain, err == nil
+}
+
+// seal makes the ticket for s, a TLS 1.3 session.
+func (t *ticketKeys) seal(s ticketState, now time.Time) ([]byte, bool) {
+	plain := []byte{1}
+	plain = binary.BigEndian.AppendUint16(plain, s.suite)
+	plain = binary.BigEndian.AppendUint64(plain, uint64(s.created.Unix()))
+	plain = binary.BigEndian.AppendUint32(plain, s.ageAdd)
+	plain = append(plain, byte(len(s.psk)))
+	plain = append(plain, s.psk...)
+	plain = binary.BigEndian.AppendUint16(plain, uint16(len(s.server)))
+	plain = append(plain, s.server...)
+	return t.sealRaw(plain, now)
+}
+
+// ticketState12 is what a TLS 1.2 ticket holds (RFC 5077): the session's
+// master secret, and what must match for it to be used again.
+type ticketState12 struct {
+	suite   uint16
+	created time.Time
+	master  []byte
+	ems     bool
+	server  string
+}
+
+func (t *ticketKeys) seal12(s ticketState12, now time.Time) ([]byte, bool) {
+	plain := []byte{2}
+	plain = binary.BigEndian.AppendUint16(plain, s.suite)
+	plain = binary.BigEndian.AppendUint64(plain, uint64(s.created.Unix()))
+	ems := byte(0)
+	if s.ems {
+		ems = 1
+	}
+	plain = append(plain, ems, byte(len(s.master)))
+	plain = append(plain, s.master...)
+	plain = binary.BigEndian.AppendUint16(plain, uint16(len(s.server)))
+	plain = append(plain, s.server...)
+	return t.sealRaw(plain, now)
+}
+
+func (t *ticketKeys) open12(ticket []byte, now time.Time) (ticketState12, bool) {
+	plain, ok := t.openRaw(ticket)
+	if !ok || len(plain) < 1+2+8+1+1 || plain[0] != 2 {
+		return ticketState12{}, false
+	}
+	var s ticketState12
+	s.suite = binary.BigEndian.Uint16(plain[1:])
+	s.created = time.Unix(int64(binary.BigEndian.Uint64(plain[3:])), 0)
+	s.ems = plain[11] == 1
+	n := int(plain[12])
+	plain = plain[13:]
+	if len(plain) < n+2 {
+		return ticketState12{}, false
+	}
+	s.master, plain = plain[:n], plain[n:]
+	m := int(binary.BigEndian.Uint16(plain))
+	if len(plain) != 2+m {
+		return ticketState12{}, false
+	}
+	s.server = string(plain[2:])
+	if age := now.Sub(s.created); age < -time.Minute || age > ticketLifetime {
+		return ticketState12{}, false
+	}
+	return s, true
+}
+
+// open reads a TLS 1.3 ticket back. It reports false for one that is not
+// ours, was altered, or has outlived its lifetime.
+func (t *ticketKeys) open(ticket []byte, now time.Time) (ticketState, bool) {
+	plain, ok := t.openRaw(ticket)
+	if !ok || len(plain) < 1+2+8+4+1 || plain[0] != 1 {
 		return ticketState{}, false
 	}
 	var s ticketState
