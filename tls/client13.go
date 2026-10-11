@@ -261,7 +261,7 @@ type clientHS struct {
 	state  hsState
 
 	random    [32]byte
-	sessionID [32]byte
+	sessionID []byte
 	groups    []stdtls.CurveID
 	group     stdtls.CurveID
 	key       *ecdh.PrivateKey
@@ -318,14 +318,25 @@ type clientHS struct {
 	skxCurve       stdtls.CurveID
 	skxPub         []byte
 	clientFinished []byte
+
+	// quic is set for a QUIC handshake, which delivers its messages and
+	// secrets as events instead of records.
+	quic       *quicCtx
+	peerParams []byte
 }
 
 // newClientHS prepares a handshake with config, which nativeClient qualified.
-func newClientHS(config *stdtls.Config) (*clientHS, error) {
+func newClientHS(config *stdtls.Config) (*clientHS, error) { return newClientHSFor(config, nil) }
+
+// newClientHSFor is newClientHS for a handshake that is QUIC's if q is not nil
+// (RFC 9001): TLS 1.3 alone, with no compatibility mode, any of its three
+// suites since TLS protects no records there, and the transport parameters in
+// an extension.
+func newClientHSFor(config *stdtls.Config, q *quicCtx) (*clientHS, error) {
 	if config.ServerName == "" && !config.InsecureSkipVerify {
 		return nil, errors.New("tls: either ServerName or InsecureSkipVerify must be specified in the tls.Config")
 	}
-	h := &clientHS{config: config, suites: clientSuites13, suites12: suites12(config), versions: clientVersions(config)}
+	h := &clientHS{config: config, suites: clientSuites13, suites12: suites12(config), versions: clientVersions(config), quic: q}
 	if len(h.suites12) == 0 {
 		// Only TLS 1.3 is left to offer.
 		h.versions = slices.DeleteFunc(slices.Clone(h.versions), func(v uint16) bool { return v == stdtls.VersionTLS12 })
@@ -337,10 +348,15 @@ func newClientHS(config *stdtls.Config) (*clientHS, error) {
 	if _, err := io.ReadFull(rnd, h.random[:]); err != nil {
 		return nil, err
 	}
-	// Echoed by the server, and a non-empty one asks it to behave like
-	// TLS 1.2 to middleboxes (RFC 8446 appendix D.4).
-	if _, err := io.ReadFull(rnd, h.sessionID[:]); err != nil {
-		return nil, err
+	if q != nil {
+		h.suites, h.suites12, h.versions = quicSuites, nil, []uint16{stdtls.VersionTLS13}
+	} else {
+		// Echoed by the server, and a non-empty one asks it to behave like
+		// TLS 1.2 to middleboxes (RFC 8446 appendix D.4).
+		h.sessionID = make([]byte, 32)
+		if _, err := io.ReadFull(rnd, h.sessionID); err != nil {
+			return nil, err
+		}
 	}
 	h.groups = handshakeCurves
 	if len(config.CurvePreferences) != 0 {
@@ -419,7 +435,7 @@ func (h *clientHS) clientHello() []byte {
 	b.u24(0) // length, set below
 	b.u16(0x0303)
 	b.raw(h.random[:])
-	b.vec8(func(b *builder) { b.raw(h.sessionID[:]) })
+	b.vec8(func(b *builder) { b.raw(h.sessionID) })
 	b.vec16(func(b *builder) {
 		if h.offers(stdtls.VersionTLS13) {
 			for _, id := range h.suites {
@@ -498,6 +514,10 @@ func (h *clientHS) clientHello() []byte {
 					b.vec16(func(b *builder) { b.raw(h.key.PublicKey().Bytes()) })
 				})
 			})
+		}
+		if h.quic != nil {
+			b.u16(extQUICParams)
+			b.vec16(func(b *builder) { b.raw(h.quic.localParams) })
 		}
 		if h.cookie != nil {
 			b.u16(extCookie)
@@ -825,7 +845,7 @@ func (h *clientHS) serverHello13(msg []byte, version uint16, random, sessionID [
 	if version != 0x0303 {
 		return fail(alertProtocolVersion, "server selected a protocol this client does not offer")
 	}
-	if !bytes.Equal(sessionID, h.sessionID[:]) {
+	if !bytes.Equal(sessionID, h.sessionID) {
 		return fail(alertIllegalParameter, "server did not echo the session ID")
 	}
 	var (
@@ -866,7 +886,7 @@ func (h *clientHS) serverHello13(msg []byte, version uint16, random, sessionID [
 	if !slices.Contains(h.suites, cipherSuite) {
 		return fail(alertIllegalParameter, "server selected a cipher suite that was not offered")
 	}
-	s, ok := lookupSuite(stdtls.VersionTLS13, cipherSuite)
+	s, ok := h.suite13(cipherSuite)
 	if !ok {
 		return fail(alertIllegalParameter, "unsupported cipher suite")
 	}
@@ -895,6 +915,15 @@ func (h *clientHS) serverHello13(msg []byte, version uint16, random, sessionID [
 	h.transcript = append(h.transcript, msg...)
 	h.flightEnd = true
 	return h.handshakeKeys(shared, out)
+}
+
+// suite13 looks up a TLS 1.3 suite: those the record layer protects, or, for
+// QUIC, any of the three, since only their hash is needed.
+func (h *clientHS) suite13(id uint16) (suite, bool) {
+	if h.quic != nil {
+		return quicSuite(id)
+	}
+	return lookupSuite(stdtls.VersionTLS13, id)
 }
 
 // helloRetryRequest answers a server that wants another group, or to see a
@@ -930,6 +959,10 @@ func (h *clientHS) helloRetryRequest(msg []byte, cipherSuite uint16, s suite, se
 	h.transcript = append(h.transcript, msg...)
 	second := h.clientHello()
 	h.transcript = append(h.transcript, second...)
+	if h.quic != nil {
+		h.quic.write(stdtls.QUICEncryptionLevelInitial, second)
+		return nil
+	}
 	h.sendCCS(out)
 	*out = appendRecord(*out, recordTypeHandshake, 0x0303, second)
 	return nil
@@ -938,7 +971,7 @@ func (h *clientHS) helloRetryRequest(msg []byte, cipherSuite uint16, s suite, se
 // sendCCS sends the change_cipher_spec that makes a TLS 1.3 handshake look
 // like a resumed TLS 1.2 one to a middlebox, once.
 func (h *clientHS) sendCCS(out *[]byte) {
-	if !h.sentCCS {
+	if !h.sentCCS && h.quic == nil {
 		h.sentCCS = true
 		*out = append(*out, recordTypeChangeCipherSpec, 3, 3, 0, 1, 1)
 	}
@@ -994,14 +1027,20 @@ func (h *clientHS) handshakeKeys(shared []byte, out *[]byte) *hsError {
 	if h.master, err = hkdf.Extract(f, zeros, derived); err != nil {
 		return fail(alertInternalError, "%v", err)
 	}
+	h.keyLog("CLIENT_HANDSHAKE_TRAFFIC_SECRET", h.clientHS)
+	h.keyLog("SERVER_HANDSHAKE_TRAFFIC_SECRET", h.serverHS)
+	if h.quic != nil {
+		h.quic.setWrite(stdtls.QUICEncryptionLevelHandshake, h.suiteID, h.clientHS)
+		h.quic.setRead(stdtls.QUICEncryptionLevelHandshake, h.suiteID, h.serverHS)
+		h.state = hsExpectEncryptedExtensions
+		return nil
+	}
 	if h.rx, err = newKeys13(h.suite.keyLen, f, h.serverHS); err != nil {
 		return fail(alertInternalError, "%v", err)
 	}
 	if h.tx, err = newKeys13(h.suite.keyLen, f, h.clientHS); err != nil {
 		return fail(alertInternalError, "%v", err)
 	}
-	h.keyLog("CLIENT_HANDSHAKE_TRAFFIC_SECRET", h.clientHS)
-	h.keyLog("SERVER_HANDSHAKE_TRAFFIC_SECRET", h.serverHS)
 	h.sendCCS(out)
 	h.rxOn, h.txOn = true, true
 	h.state = hsExpectEncryptedExtensions
@@ -1043,6 +1082,19 @@ func (h *clientHS) encryptedExtensions(msg []byte) *hsError {
 			}
 			h.protocol = string(name)
 		}
+		if typ == extQUICParams && h.quic != nil {
+			h.peerParams = bytes.Clone(data)
+		}
+	}
+	if h.quic != nil {
+		// RFC 9001 sections 8.1 and 8.2.
+		if h.protocol == "" && len(h.config.NextProtos) > 0 {
+			return fail(alertNoApplicationProtocol, "server did not select an ALPN protocol")
+		}
+		if h.peerParams == nil {
+			return fail(alertMissingExtension, "server did not send a quic_transport_parameters extension")
+		}
+		h.quic.peer(h.peerParams)
 	}
 	h.transcript = append(h.transcript, msg...)
 	h.state = hsExpectCertificateOrRequest
@@ -1233,6 +1285,9 @@ func (h *clientHS) finished(msg []byte, out *[]byte) *hsError {
 	exporter, err := deriveSecret(f, h.master, "exp master", t)
 	if err != nil {
 		return fail(alertInternalError, "%v", err)
+	}
+	if h.quic != nil {
+		return h.finishQUIC(exporter)
 	}
 
 	var flight []byte

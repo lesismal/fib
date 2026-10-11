@@ -172,6 +172,11 @@ type serverHS struct {
 	tickets *ticketKeys
 	psk     []byte
 	resumed bool
+
+	// quic is set for a QUIC handshake, which delivers its messages and
+	// secrets as events instead of records (RFC 9001).
+	quic       *quicCtx
+	peerParams []byte
 }
 
 func (h *serverHS) now() time.Time {
@@ -184,8 +189,17 @@ func (h *serverHS) now() time.Time {
 // newServerHS prepares a handshake with config, which nativeServer qualified,
 // for the connection conn.
 func newServerHS(config *stdtls.Config, conn net.Conn, tickets *ticketKeys) *serverHS {
-	h := &serverHS{config: config, conn: conn, tickets: tickets}
+	return newServerHSFor(config, conn, tickets, nil)
+}
+
+// newServerHSFor is newServerHS for a handshake that is QUIC's if q is not nil:
+// TLS 1.3 alone.
+func newServerHSFor(config *stdtls.Config, conn net.Conn, tickets *ticketKeys, q *quicCtx) *serverHS {
+	h := &serverHS{config: config, conn: conn, tickets: tickets, quic: q}
 	h.allow13, h.allow12 = serverVersions(config)
+	if q != nil {
+		h.allow13, h.allow12 = true, false
+	}
 	h.groups = handshakeCurves
 	if len(config.CurvePreferences) != 0 {
 		h.groups = nil
@@ -416,7 +430,51 @@ func (h *serverHS) choose(ch *clientHelloMsg) uint16 {
 }
 
 // serves reports whether this handshake can serve ch.
-func (h *serverHS) serves(ch *clientHelloMsg) bool { return h.choose(ch) != 0 }
+func (h *serverHS) serves(ch *clientHelloMsg) bool {
+	if h.quic != nil {
+		return h.servesQUIC(ch)
+	}
+	return h.choose(ch) != 0
+}
+
+// servesQUIC is serves for QUIC, whose ClientHello must offer TLS 1.3 and
+// nothing older, an application protocol the server has, and its transport
+// parameters. A client that does not is answered by crypto/tls, which has the
+// alerts for it.
+func (h *serverHS) servesQUIC(ch *clientHelloMsg) bool {
+	if !slices.Contains(ch.versions, stdtls.VersionTLS13) || !slices.Contains(ch.compression, 0) || len(ch.sessionID) != 0 {
+		return false
+	}
+	for _, v := range ch.versions {
+		if v < stdtls.VersionTLS13 {
+			return false
+		}
+	}
+	if _, ok := ch.exts[extQUICParams]; !ok {
+		return false
+	}
+	if len(h.config.NextProtos) > 0 && !slices.ContainsFunc(ch.protos, func(p string) bool { return slices.Contains(h.config.NextProtos, p) }) {
+		return false
+	}
+	if !slices.ContainsFunc(ch.suites, func(id uint16) bool { _, ok := quicSuite(id); return ok }) {
+		return false
+	}
+	for _, g := range h.groups {
+		if slices.Contains(ch.groups, g) {
+			return true
+		}
+	}
+	return false
+}
+
+// suite13 looks up a TLS 1.3 suite: those the record layer protects, or, for
+// QUIC, any of the three, since only their hash is needed.
+func (h *serverHS) suite13(id uint16) (suite, bool) {
+	if h.quic != nil {
+		return quicSuite(id)
+	}
+	return lookupSuite(stdtls.VersionTLS13, id)
+}
 
 // peek reads the ClientHello at the start of in without consuming anything,
 // and decides whether to serve the connection.
@@ -603,6 +661,13 @@ func (h *serverHS) clientHello(msg []byte, out *[]byte) *hsError {
 			!slices.Equal(ch.suites, first.suites) {
 			return fail(alertIllegalParameter, "the second ClientHello differs from the first")
 		}
+	} else if h.quic != nil {
+		if !h.servesQUIC(ch) {
+			return fail(alertProtocolVersion, "client offers no handshake this server serves over QUIC")
+		}
+		h.version = stdtls.VersionTLS13
+		h.peerParams = bytes.Clone(ch.exts[extQUICParams])
+		h.quic.peer(h.peerParams)
 	} else {
 		switch h.choose(ch) {
 		case stdtls.VersionTLS12:
@@ -616,14 +681,19 @@ func (h *serverHS) clientHello(msg []byte, out *[]byte) *hsError {
 	}
 	h.ch = ch
 	if h.state == srvAwaitHello {
-		// Server preference among the AES-GCM suites.
-		for _, id := range []uint16{stdtls.TLS_AES_128_GCM_SHA256, stdtls.TLS_AES_256_GCM_SHA384} {
-			if slices.Contains(ch.suites, id) {
+		// Server preference among the AES-GCM suites; for QUIC, where nothing
+		// but the hash depends on the suite, the client's among the three.
+		preferred := []uint16{stdtls.TLS_AES_128_GCM_SHA256, stdtls.TLS_AES_256_GCM_SHA384}
+		if h.quic != nil {
+			preferred = ch.suites
+		}
+		for _, id := range preferred {
+			if _, ok := h.suite13(id); ok && slices.Contains(ch.suites, id) {
 				h.suiteID = id
 				break
 			}
 		}
-		h.suite, _ = lookupSuite(stdtls.VersionTLS13, h.suiteID)
+		h.suite, _ = h.suite13(h.suiteID)
 	}
 	// The transcript before this message, which a PSK binder covers with the
 	// message up to the binders.
@@ -706,7 +776,7 @@ func (h *serverHS) resume(ch *clientHelloMsg, prior []byte) (psk []byte, index i
 		if !found || state.server != ch.serverName {
 			continue
 		}
-		if s, valid := lookupSuite(stdtls.VersionTLS13, state.suite); !valid || s.hash().Size() != f().Size() {
+		if s, valid := h.suite13(state.suite); !valid || s.hash().Size() != f().Size() {
 			continue
 		}
 		early, err := hkdf.Extract(f, state.psk, nil)
@@ -860,8 +930,12 @@ func (h *serverHS) helloRetryRequest(group stdtls.CurveID, out *[]byte) *hsError
 	first := hashBytes(h.suite.hash, h.transcript)
 	h.transcript = append([]byte{hsMessageHash, 0, 0, byte(len(first))}, first...)
 	h.transcript = append(h.transcript, msg...)
-	*out = appendRecord(*out, recordTypeHandshake, 0x0303, msg)
-	h.sendCCS(out)
+	if h.quic != nil {
+		h.quic.write(stdtls.QUICEncryptionLevelInitial, msg)
+	} else {
+		*out = appendRecord(*out, recordTypeHandshake, 0x0303, msg)
+		h.sendCCS(out)
+	}
 	h.retried = true
 	h.state = srvAwaitHello2
 	return nil
@@ -915,8 +989,12 @@ func (h *serverHS) flight(key *ecdh.PrivateKey, shared []byte, pskIndex int, out
 	hello := b.b
 	hello[1], hello[2], hello[3] = byte((len(hello)-4)>>16), byte((len(hello)-4)>>8), byte(len(hello)-4)
 	h.transcript = append(h.transcript, hello...)
-	*out = appendRecord(*out, recordTypeHandshake, 0x0303, hello)
-	h.sendCCS(out)
+	if h.quic != nil {
+		h.quic.write(stdtls.QUICEncryptionLevelInitial, hello)
+	} else {
+		*out = appendRecord(*out, recordTypeHandshake, 0x0303, hello)
+		h.sendCCS(out)
+	}
 
 	// Key schedule to the handshake traffic secrets (RFC 8446 section 7.1).
 	zeros := make([]byte, f().Size())
@@ -949,19 +1027,28 @@ func (h *serverHS) flight(key *ecdh.PrivateKey, shared []byte, pskIndex int, out
 	if h.master, err = hkdf.Extract(f, zeros, derived); err != nil {
 		return fail(alertInternalError, "%v", err)
 	}
-	if h.rx, err = newKeys13(h.suite.keyLen, f, h.clientHS); err != nil {
-		return fail(alertInternalError, "%v", err)
-	}
-	if h.tx, err = newKeys13(h.suite.keyLen, f, h.serverHS); err != nil {
-		return fail(alertInternalError, "%v", err)
-	}
 	h.keyLog("CLIENT_HANDSHAKE_TRAFFIC_SECRET", h.clientHS)
 	h.keyLog("SERVER_HANDSHAKE_TRAFFIC_SECRET", h.serverHS)
-	h.rxOn, h.txOn = true, true
+	if h.quic != nil {
+		h.quic.setWrite(stdtls.QUICEncryptionLevelHandshake, h.suiteID, h.serverHS)
+		h.quic.setRead(stdtls.QUICEncryptionLevelHandshake, h.suiteID, h.clientHS)
+	} else {
+		if h.rx, err = newKeys13(h.suite.keyLen, f, h.clientHS); err != nil {
+			return fail(alertInternalError, "%v", err)
+		}
+		if h.tx, err = newKeys13(h.suite.keyLen, f, h.serverHS); err != nil {
+			return fail(alertInternalError, "%v", err)
+		}
+		h.rxOn, h.txOn = true, true
+	}
 
 	var sealed []byte
 	send := func(msg []byte) *hsError {
 		h.transcript = append(h.transcript, msg...)
+		if h.quic != nil {
+			h.quic.write(stdtls.QUICEncryptionLevelHandshake, msg)
+			return nil
+		}
 		// A message longer than a record is split across records.
 		for len(msg) > 0 {
 			n := min(len(msg), maxPlaintext)
@@ -984,6 +1071,10 @@ func (h *serverHS) flight(key *ecdh.PrivateKey, shared []byte, pskIndex int, out
 			b.vec16(func(b *builder) {
 				b.vec16(func(b *builder) { b.vec8(func(b *builder) { b.raw([]byte(h.protocol)) }) })
 			})
+		}
+		if h.quic != nil {
+			b.u16(extQUICParams)
+			b.vec16(func(b *builder) { b.raw(h.quic.localParams) })
 		}
 	})
 	eem := ee.b
@@ -1066,7 +1157,9 @@ func (h *serverHS) flight(key *ecdh.PrivateKey, shared []byte, pskIndex int, out
 	if herr := send(append([]byte{hsFinished, 0, 0, byte(len(verify))}, verify...)); herr != nil {
 		return herr
 	}
-	*out = append(*out, sealed...)
+	if h.quic == nil {
+		*out = append(*out, sealed...)
+	}
 
 	// Application secrets cover the transcript through the server's Finished.
 	t = h.transcriptHash()
@@ -1083,6 +1176,13 @@ func (h *serverHS) flight(key *ecdh.PrivateKey, shared []byte, pskIndex int, out
 	h.keyLog("CLIENT_TRAFFIC_SECRET_0", h.appClient)
 	h.keyLog("SERVER_TRAFFIC_SECRET_0", h.appServer)
 	h.keyLog("EXPORTER_SECRET", exporter)
+	if h.quic != nil {
+		// The server writes under its application keys from here; the
+		// client's Finished is still read under its handshake keys.
+		h.quic.setWrite(stdtls.QUICEncryptionLevelApplication, h.suiteID, h.appServer)
+		h.state = srvAwaitFinished
+		return nil
+	}
 	if h.appRx, err = newKeys13(h.suite.keyLen, f, h.appClient); err != nil {
 		return fail(alertInternalError, "%v", err)
 	}
@@ -1136,9 +1236,13 @@ func (h *serverHS) finished(msg []byte, out *[]byte) *hsError {
 		return fail(alertDecryptError, "invalid client finished hash")
 	}
 	h.transcript = append(h.transcript, msg...)
-	h.rx = h.appRx
-	if herr := h.sendTicket(out); herr != nil {
-		return herr
+	if h.quic != nil {
+		h.quic.setRead(stdtls.QUICEncryptionLevelApplication, h.suiteID, h.appClient)
+	} else {
+		h.rx = h.appRx
+		if herr := h.sendTicket(out); herr != nil {
+			return herr
+		}
 	}
 	if verify := h.config.VerifyConnection; verify != nil {
 		if err := verify(h.connectionState()); err != nil {
@@ -1146,6 +1250,9 @@ func (h *serverHS) finished(msg []byte, out *[]byte) *hsError {
 		}
 	}
 	h.state = srvDone
+	if h.quic != nil {
+		h.quic.done()
+	}
 	return nil
 }
 
@@ -1153,29 +1260,44 @@ func (h *serverHS) finished(msg []byte, out *[]byte) *hsError {
 // 4.6.1), under the keys the connection goes on with, if the Config allows
 // tickets and the client said it can use them.
 func (h *serverHS) sendTicket(out *[]byte) *hsError {
+	msg, herr := h.ticketMessage()
+	if herr != nil || msg == nil {
+		return herr
+	}
+	sealed, err := h.tx.seal(*out, recordTypeHandshake, msg, nil)
+	if err != nil {
+		return fail(alertInternalError, "%v", err)
+	}
+	*out = sealed
+	return nil
+}
+
+// ticketMessage builds the NewSessionTicket for the session, or returns nil if
+// the Config disables tickets or the client cannot use them.
+func (h *serverHS) ticketMessage() ([]byte, *hsError) {
 	if h.tickets == nil || !slices.Contains(h.ch.pskModes, 1) {
-		return nil
+		return nil, nil
 	}
 	f := h.suite.hash
 	resumption, err := deriveSecret(f, h.master, "res master", h.transcriptHash())
 	if err != nil {
-		return fail(alertInternalError, "%v", err)
+		return nil, fail(alertInternalError, "%v", err)
 	}
 	nonce := []byte{0}
 	psk, err := expandLabelContext(f, resumption, "resumption", nonce, f().Size())
 	if err != nil {
-		return fail(alertInternalError, "%v", err)
+		return nil, fail(alertInternalError, "%v", err)
 	}
 	var ageAdd [4]byte
 	if _, err := io.ReadFull(h.rander(), ageAdd[:]); err != nil {
-		return fail(alertInternalError, "%v", err)
+		return nil, fail(alertInternalError, "%v", err)
 	}
 	now := h.now()
 	ticket, ok := h.tickets.seal(ticketState{
 		suite: h.suiteID, created: now, ageAdd: binary.BigEndian.Uint32(ageAdd[:]), psk: psk, server: h.ch.serverName,
 	}, now)
 	if !ok {
-		return nil
+		return nil, nil
 	}
 	var b builder
 	b.u8(hsNewSessionTicket)
@@ -1187,12 +1309,7 @@ func (h *serverHS) sendTicket(out *[]byte) *hsError {
 	b.vec16(func(b *builder) {})
 	msg := b.b
 	msg[1], msg[2], msg[3] = byte((len(msg)-4)>>16), byte((len(msg)-4)>>8), byte(len(msg)-4)
-	sealed, err := h.tx.seal(*out, recordTypeHandshake, msg, nil)
-	if err != nil {
-		return fail(alertInternalError, "%v", err)
-	}
-	*out = sealed
-	return nil
+	return msg, nil
 }
 
 func (h *serverHS) connectionState() stdtls.ConnectionState {

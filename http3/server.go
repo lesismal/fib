@@ -38,6 +38,7 @@ import (
 	fibhttp "github.com/lesismal/fib/http"
 	"github.com/lesismal/fib/http3/qpack"
 	"github.com/lesismal/fib/http3/quic"
+	fibtls "github.com/lesismal/fib/tls"
 )
 
 // NextProto is the ALPN protocol ID of HTTP/3.
@@ -45,6 +46,11 @@ const NextProto = "h3"
 
 // Config configures a server.
 type Config struct {
+	// BlockingTLSHandshake runs the TLS handshake of every connection through
+	// crypto/tls's QUICConn, which parks a goroutine in it for as long as it
+	// waits for the client. By default the handshake is a state machine that
+	// takes none, where the TLSConfig allows it (see package tls).
+	BlockingTLSHandshake bool
 	// TLSConfig is required, with the server's certificates. HTTP/3 needs
 	// TLS 1.3 and the "h3" ALPN protocol, which the handler sees to.
 	TLSConfig *tls.Config
@@ -193,6 +199,7 @@ func NewHandlerWithConfig(config Config, handler fibhttp.Handler) *ServerHandler
 	h := &ServerHandler{handler: handler, config: config, resetKey: quic.NewResetKey(),
 		streams: fibhttp.NewStreamPool(config.StreamPool), routes: make(map[string]*quic.Conn)}
 	h.quic = quic.Config{
+		NewTLS:             h.newTLS(config.BlockingTLSHandshake),
 		TLSConfig:          ConfigureTLS(config.TLSConfig),
 		MaxIdleTimeout:     config.MaxIdleTimeout,
 		MaxIncomingStreams: config.MaxConcurrentStreams,
@@ -1206,3 +1213,21 @@ var (
 	_ fibhttp.Stream           = (*requestStream)(nil)
 	_ fibhttp.ResponseStreamer = (*requestStream)(nil)
 )
+
+// newTLS is how a connection's TLS handshake is made: by this module's state
+// machine where it can, which is the default, and otherwise by crypto/tls. The
+// connections share the keys their session tickets are sealed under.
+func (h *ServerHandler) newTLS(blocking bool) func(bool, *tls.Config) quic.TLSConn {
+	if blocking {
+		return nil
+	}
+	var once sync.Once
+	var server *fibtls.QUICServer
+	return func(_ bool, config *tls.Config) quic.TLSConn {
+		once.Do(func() { server = fibtls.NewQUICServer(config) })
+		if server == nil {
+			return nil
+		}
+		return server.NewConn()
+	}
+}

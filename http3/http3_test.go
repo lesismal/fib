@@ -417,3 +417,23 @@ func TestResponseTrailers(t *testing.T) {
 		}
 	}
 }
+
+// BlockingTLSHandshake changes how the handshake runs, on either end, and
+// nothing else: the same requests work for every pairing of the two.
+func TestBlockingTLSHandshake(t *testing.T) {
+	for _, serverBlocking := range []bool{false, true} {
+		url := startServer(t, Config{BlockingTLSHandshake: serverBlocking}, func(c *fibhttp.Context) {
+			_ = c.Respond(stdhttp.StatusOK, "text/plain", []byte("hello "+c.Request.URL.Path))
+		})
+		for _, clientBlocking := range []bool{false, true} {
+			client := newClient(t, func(config *ClientConfig) { config.BlockingTLSHandshake = clientBlocking })
+			resp, err := client.Go(mustRequest(t, stdhttp.MethodGet, url+"/x", nil)).Wait()
+			if err != nil {
+				t.Fatalf("server blocking %v, client blocking %v: %v", serverBlocking, clientBlocking, err)
+			}
+			if got := readBody(t, resp); got != "hello /x" {
+				t.Fatalf("server blocking %v, client blocking %v: body %q", serverBlocking, clientBlocking, got)
+			}
+		}
+	}
+}

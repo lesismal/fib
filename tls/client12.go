@@ -37,7 +37,7 @@ func (h *clientHS) serverHello12(msg []byte, random, sessionID []byte, cipherSui
 	if !ok {
 		return fail(alertIllegalParameter, "unsupported cipher suite")
 	}
-	if bytes.Equal(sessionID, h.sessionID[:]) {
+	if bytes.Equal(sessionID, h.sessionID) {
 		// The ID is made up, only there for TLS 1.3 middleboxes, so a server
 		// that resumes it is confused.
 		return fail(alertIllegalParameter, "server resumed a session this client does not have")

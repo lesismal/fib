@@ -87,8 +87,26 @@ type PathHandler interface {
 	OnPathChange(c *Conn)
 }
 
+// TLSConn is the TLS 1.3 handshake of a connection, as crypto/tls's QUICConn
+// offers it (see there for what the methods do). *tls.QUICConn is one; so is
+// the handshake of package fib/tls, which takes no goroutine to wait for the
+// peer in.
+type TLSConn interface {
+	Start(ctx context.Context) error
+	HandleData(level tls.QUICEncryptionLevel, data []byte) error
+	NextEvent() tls.QUICEvent
+	SetTransportParameters(params []byte)
+	SendSessionTicket(opts tls.QUICSessionTicketOptions) error
+	ConnectionState() tls.ConnectionState
+	Close() error
+}
+
 // Config sets up a connection. Zero values take the defaults.
 type Config struct {
+	// NewTLS, if set, makes the TLS handshake of a connection, for a client
+	// or a server, from the TLSConfig. It may return nil, and then
+	// crypto/tls's QUICConn is used, as it is when NewTLS is not set.
+	NewTLS func(client bool, config *tls.Config) TLSConn
 	// TLSConfig is required. Its NextProtos are the ALPN offer, which QUIC
 	// requires to be agreed.
 	TLSConfig *tls.Config
@@ -201,7 +219,7 @@ type Conn struct {
 	handler  Handler
 	config   Config
 	isClient bool
-	tls      *tls.QUICConn
+	tls      TLSConn
 	// tlsState is the TLS state, kept once a server has let tls go (see
 	// releaseTLS).
 	tlsState *tls.ConnectionState
@@ -434,6 +452,19 @@ func newConn(pc PacketConn, remote net.Addr, config Config, handler Handler, isC
 	return c
 }
 
+// newTLS makes the connection's TLS handshake.
+func (c *Conn) newTLS() TLSConn {
+	if c.config.NewTLS != nil {
+		if t := c.config.NewTLS(c.isClient, c.config.TLSConfig); t != nil {
+			return t
+		}
+	}
+	if c.isClient {
+		return tls.QUICClient(&tls.QUICConfig{TLSConfig: c.config.TLSConfig})
+	}
+	return tls.QUICServer(&tls.QUICConfig{TLSConfig: c.config.TLSConfig})
+}
+
 // Dial starts the client side of a connection, sending its first packets
 // through pc. Datagrams from the server go to HandleDatagram.
 func Dial(pc PacketConn, remote net.Addr, config Config, handler Handler) (*Conn, error) {
@@ -444,7 +475,7 @@ func Dial(pc PacketConn, remote net.Addr, config Config, handler Handler) (*Conn
 	c.odcid = randomCID()
 	c.dcid = c.odcid
 	c.spaces[spaceInitial].tx, c.spaces[spaceInitial].rx = initialKeys(c.odcid, true)
-	c.tls = tls.QUICClient(&tls.QUICConfig{TLSConfig: c.config.TLSConfig})
+	c.tls = c.newTLS()
 	c.tls.SetTransportParameters(c.local.encode())
 	c.mu.Lock()
 	err := c.tls.Start(context.Background())
@@ -480,7 +511,9 @@ func Accept(pc PacketConn, remote net.Addr, config Config, handler Handler, data
 		c.local.statelessResetToken = config.ResetKey.token(c.scid)
 	}
 	c.spaces[spaceInitial].tx, c.spaces[spaceInitial].rx = initialKeys(c.odcid, false)
-	c.tls = tls.QUICServer(&tls.QUICConfig{TLSConfig: c.config.TLSConfig})
+	c.tls = c.newTLS()
+	// A server could wait to be asked, but its parameters are known already.
+	c.tls.SetTransportParameters(c.local.encode())
 	c.mu.Lock()
 	if err := c.tls.Start(context.Background()); err != nil {
 		c.mu.Unlock()

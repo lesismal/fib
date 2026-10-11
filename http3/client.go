@@ -23,6 +23,7 @@ import (
 	fibhttp "github.com/lesismal/fib/http"
 	"github.com/lesismal/fib/http3/qpack"
 	"github.com/lesismal/fib/http3/quic"
+	fibtls "github.com/lesismal/fib/tls"
 )
 
 var (
@@ -84,6 +85,11 @@ type ClientConfig struct {
 	// MaxStreamedBodyBytes bounds a streamed body, which MaxResponseBodyBytes
 	// does not. Zero, the default, leaves a streamed body unbounded.
 	MaxStreamedBodyBytes int64
+	// BlockingTLSHandshake runs the TLS handshake of every connection through
+	// crypto/tls's QUICConn, which parks a goroutine in it for as long as it
+	// waits for the server. By default the handshake is a state machine that
+	// takes none, where the TLSConfig allows it (see package tls).
+	BlockingTLSHandshake bool
 	// TLSConfig is used for every connection. Nil means the defaults;
 	// either way a config naming no server gets the request's host, and
 	// ALPN offers "h3".
@@ -542,6 +548,20 @@ type clientConn struct {
 	idleTimer *time.Timer
 }
 
+// newTLS is how a connection's TLS handshake is made: by this module's state
+// machine where it can, which is the default, and otherwise by crypto/tls.
+func (c *Client) newTLS() func(bool, *tls.Config) quic.TLSConn {
+	if c.config.BlockingTLSHandshake {
+		return nil
+	}
+	return func(_ bool, config *tls.Config) quic.TLSConn {
+		if conn := fibtls.NewQUICClient(config); conn != nil {
+			return conn
+		}
+		return nil
+	}
+}
+
 func (cc *clientConn) dial() {
 	c := cc.client
 	err := c.engine.DialWithHandler("udp", cc.addr, c.config.DialTimeout, clientPath{cc}, func(fc *fib.Connection, err error) {
@@ -556,6 +576,7 @@ func (cc *clientConn) dial() {
 		}
 		config := quic.Config{
 			TLSConfig:        tlsConfig,
+			NewTLS:           c.newTLS(),
 			MaxIdleTimeout:   c.config.MaxIdleTimeout,
 			HandshakeTimeout: c.config.HandshakeTimeout,
 			// The server's control and QPACK streams, and room to spare.

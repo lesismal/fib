@@ -78,7 +78,8 @@ func (wouldBlockError) Temporary() bool { return true }
 // 0-RTT, suites or groups it does not implement, a hello that does not parse)
 // to crypto/tls, before it has sent anything, so they see no difference; it
 // issues its own session tickets, sealed under a key of the Handler's. Other
-// Configs keep to crypto/tls.
+// Configs keep to crypto/tls. The TLS handshake of a QUIC connection (quic.go)
+// is the same state machines, with its messages and secrets as events.
 //
 // Once a crypto/tls handshake settles on an AES-GCM suite of TLS 1.3 or 1.2, or
 // an AES-CBC suite of TLS 1.2 or 1.1, the connection's records are protected by
