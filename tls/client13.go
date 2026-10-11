@@ -26,8 +26,9 @@ import (
 	"time"
 )
 
-// The TLS 1.3 client handshake as a state machine, for a connection that
-// must not park a goroutine on it.
+// The TLS client handshake as a state machine, for a connection that must not
+// park a goroutine on it. This file has the machinery both versions share and
+// TLS 1.3 (RFC 8446); client12.go has TLS 1.2 (RFC 5246).
 //
 // crypto/tls can only run a handshake as a blocking call that reads the peer
 // and writes to it, and cannot be resumed once a read has failed, so a
@@ -37,8 +38,9 @@ import (
 // waiting. Nothing is held between calls but the handshake's own state, and no
 // goroutine is spent on a peer that is slow to answer, or that never does.
 //
-// It implements the client side of RFC 8446 for what a client of this
-// package's record layer needs: the AES-GCM suites, X25519, P-256 and P-384
+// It implements the client side of RFC 8446 and RFC 5246 for what a client of
+// this package's record layer needs: the AES-GCM suites of TLS 1.3, and the
+// ECDHE suites of TLS 1.2 that use AES-GCM or AES-CBC; X25519, P-256 and P-384
 // key exchange, a HelloRetryRequest, ALPN, SNI, the server's certificate
 // verified against Config.RootCAs (or not, with InsecureSkipVerify) and its
 // signature checked, and an empty Certificate for a server that asks for
@@ -54,6 +56,10 @@ const (
 	hsCertificate         = 11
 	hsCertificateRequest  = 13
 	hsCertificateVerify   = 15
+	hsNewSessionTicket    = 4
+	hsServerKeyExchange   = 12
+	hsServerHelloDone     = 14
+	hsClientKeyExchange   = 16
 	hsFinished            = 20
 	hsMessageHash         = 254
 
@@ -61,7 +67,12 @@ const (
 	extSupportedGroups   = 10
 	extSignatureAlgs     = 13
 	extALPN              = 16
+	extECPointFormats    = 11
+	extExtendedMasterSec = 23
+	extSessionTicket     = 35
+	extStatusRequest     = 5
 	extPreSharedKey      = 41
+	extRenegotiationInfo = 0xff01
 	extSupportedVersions = 43
 	extCookie            = 44
 	extKeyShare          = 51
@@ -80,11 +91,28 @@ const (
 	maxHandshakeMessage = 65536
 )
 
-// clientHelloSuites are the suites a client of the record layer offers.
-var clientHelloSuites = []uint16{stdtls.TLS_AES_128_GCM_SHA256, stdtls.TLS_AES_256_GCM_SHA384}
+// clientSuites13 are the TLS 1.3 suites a client of the record layer offers.
+var clientSuites13 = []uint16{stdtls.TLS_AES_128_GCM_SHA256, stdtls.TLS_AES_256_GCM_SHA384}
+
+// clientSuites12 are the TLS 1.2 suites it offers: the ECDHE ones the record
+// layer protects, AES-GCM first. Key exchange by RSA is not offered, as
+// crypto/tls no longer does by default.
+var clientSuites12 = []uint16{
+	stdtls.TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,
+	stdtls.TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,
+	stdtls.TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384,
+	stdtls.TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384,
+	stdtls.TLS_ECDHE_ECDSA_WITH_AES_128_CBC_SHA,
+	stdtls.TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA,
+	stdtls.TLS_ECDHE_ECDSA_WITH_AES_256_CBC_SHA,
+	stdtls.TLS_ECDHE_RSA_WITH_AES_256_CBC_SHA,
+	stdtls.TLS_ECDHE_ECDSA_WITH_AES_128_CBC_SHA256,
+	stdtls.TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA256,
+}
 
 // clientSignatureAlgs are the signature schemes a server's CertificateVerify
-// may use, in the order they are offered.
+// may use in TLS 1.3, in the order they are offered. TLS 1.2 also takes the
+// PKCS #1 ones, in clientSignatureAlgs12.
 var clientSignatureAlgs = []uint16{
 	0x0403, // ecdsa_secp256r1_sha256
 	0x0804, // rsa_pss_rsae_sha256
@@ -93,6 +121,19 @@ var clientSignatureAlgs = []uint16{
 	0x0807, // ed25519
 	0x0503, // ecdsa_secp384r1_sha384
 	0x0603, // ecdsa_secp521r1_sha512
+}
+
+var clientSignatureAlgs12 = []uint16{
+	0x0403, // ecdsa_secp256r1_sha256
+	0x0804, // rsa_pss_rsae_sha256
+	0x0401, // rsa_pkcs1_sha256
+	0x0503, // ecdsa_secp384r1_sha384
+	0x0805, // rsa_pss_rsae_sha384
+	0x0501, // rsa_pkcs1_sha384
+	0x0806, // rsa_pss_rsae_sha512
+	0x0601, // rsa_pkcs1_sha512
+	0x0603, // ecdsa_secp521r1_sha512
+	0x0807, // ed25519
 }
 
 // handshakeCurves are the key exchange groups, in the order they are offered
@@ -111,20 +152,63 @@ func curveOf(id stdtls.CurveID) ecdh.Curve {
 	return nil
 }
 
+// clientVersions are the protocol versions a handshake with config offers,
+// newest first: the ones within the Config's range that clientHS can speak.
+// None means the Config is for crypto/tls: it wants a version below TLS 1.2.
+func clientVersions(config *stdtls.Config) []uint16 {
+	lowest, highest := config.MinVersion, config.MaxVersion
+	if lowest == 0 {
+		lowest = stdtls.VersionTLS12
+	}
+	if highest == 0 {
+		highest = stdtls.VersionTLS13
+	}
+	if lowest < stdtls.VersionTLS12 {
+		return nil
+	}
+	var versions []uint16
+	for _, v := range []uint16{stdtls.VersionTLS13, stdtls.VersionTLS12} {
+		if v >= lowest && v <= highest {
+			versions = append(versions, v)
+		}
+	}
+	return versions
+}
+
+// suites12 are the TLS 1.2 suites a handshake with config offers: those of
+// clientSuites12 that Config.CipherSuites allows, if it lists any.
+func suites12(config *stdtls.Config) []uint16 {
+	if len(config.CipherSuites) == 0 {
+		return clientSuites12
+	}
+	var out []uint16
+	for _, id := range clientSuites12 {
+		if slices.Contains(config.CipherSuites, id) {
+			out = append(out, id)
+		}
+	}
+	return out
+}
+
 // nativeClient reports whether a client handshake with config can be run by
-// clientHS, which offers TLS 1.3 alone: only a Config that wants no lower
-// version qualifies, since a server that answers with a lower one cannot be
-// continued with, and is not retried on this connection. The Config must not
-// ask for what clientHS does not do either: client certificates, session
-// resumption, encrypted client hello, renegotiation, or a set of groups it
-// cannot offer.
+// clientHS, which speaks TLS 1.3 and 1.2: the Config must not want a lower
+// version, since a server that answers with one cannot be continued with, and
+// is not retried on this connection. It must not ask for what clientHS does
+// not do either: client certificates, session resumption, encrypted client
+// hello, renegotiation, a set of groups or suites it cannot offer.
 func nativeClient(config *stdtls.Config) bool {
-	if config == nil || config.MinVersion != stdtls.VersionTLS13 ||
-		config.MaxVersion != 0 && config.MaxVersion < stdtls.VersionTLS13 {
+	if config == nil || config.Renegotiation != stdtls.RenegotiateNever {
 		return false
 	}
 	if len(config.Certificates) != 0 || config.GetClientCertificate != nil || config.ClientSessionCache != nil ||
-		config.EncryptedClientHelloConfigList != nil || config.Renegotiation != stdtls.RenegotiateNever {
+		config.EncryptedClientHelloConfigList != nil {
+		return false
+	}
+	versions := clientVersions(config)
+	if len(versions) == 0 {
+		return false
+	}
+	if len(versions) == 1 && versions[0] == stdtls.VersionTLS12 && len(suites12(config)) == 0 {
 		return false
 	}
 	if len(config.CurvePreferences) != 0 {
@@ -161,6 +245,13 @@ const (
 	hsExpectCertificate
 	hsExpectCertificateVerify
 	hsExpectFinished
+	// TLS 1.2
+	hs12ExpectCertificate
+	hs12ExpectServerKeyExchange
+	hs12ExpectCertificateRequestOrDone
+	hs12ExpectServerHelloDone
+	hs12ExpectCCS
+	hs12ExpectFinished
 	hsDone
 )
 
@@ -175,8 +266,13 @@ type clientHS struct {
 	group     stdtls.CurveID
 	key       *ecdh.PrivateKey
 	cookie    []byte
-	// suites are the suites offered, which tests narrow.
-	suites []uint16
+	// versions are the versions offered, newest first, and suites and
+	// suites12 the TLS 1.3 and TLS 1.2 suites, which tests narrow.
+	versions []uint16
+	suites   []uint16
+	suites12 []uint16
+	// version is the one the server chose, once it has.
+	version uint16
 
 	// retried says a HelloRetryRequest has been answered, sentCCS that the
 	// change_cipher_spec of RFC 8446 appendix D.4 has been sent.
@@ -189,6 +285,13 @@ type clientHS struct {
 	transcript []byte
 	hsBuf      []byte
 	ccsSeen    int
+	// rxOn and txOn say the records read and written are protected, which
+	// is so from the ServerHello and the keys that follow it in TLS 1.3, and
+	// from each side's change_cipher_spec in TLS 1.2. flightEnd says the
+	// message just handled ended a flight, so that nothing may follow it in
+	// the same record: the keys change, or it is our turn.
+	rxOn, txOn bool
+	flightEnd  bool
 
 	suiteID uint16
 	suite   suite
@@ -206,6 +309,15 @@ type clientHS struct {
 	reqCtx    []byte
 	appClient []byte
 	appServer []byte
+
+	// TLS 1.2: the server's random, whether the master secret is the
+	// extended one, the server's key exchange parameters, and our Finished,
+	// which is the connection's tls-unique.
+	serverRandom   [32]byte
+	ems            bool
+	skxCurve       stdtls.CurveID
+	skxPub         []byte
+	clientFinished []byte
 }
 
 // newClientHS prepares a handshake with config, which nativeClient qualified.
@@ -213,7 +325,11 @@ func newClientHS(config *stdtls.Config) (*clientHS, error) {
 	if config.ServerName == "" && !config.InsecureSkipVerify {
 		return nil, errors.New("tls: either ServerName or InsecureSkipVerify must be specified in the tls.Config")
 	}
-	h := &clientHS{config: config, suites: clientHelloSuites}
+	h := &clientHS{config: config, suites: clientSuites13, suites12: suites12(config), versions: clientVersions(config)}
+	if len(h.suites12) == 0 {
+		// Only TLS 1.3 is left to offer.
+		h.versions = slices.DeleteFunc(slices.Clone(h.versions), func(v uint16) bool { return v == stdtls.VersionTLS12 })
+	}
 	rnd := config.Rand
 	if rnd == nil {
 		rnd = rand.Reader
@@ -240,6 +356,9 @@ func newClientHS(config *stdtls.Config) (*clientHS, error) {
 	}
 	return h, nil
 }
+
+// offers reports whether the handshake offers version.
+func (h *clientHS) offers(version uint16) bool { return slices.Contains(h.versions, version) }
 
 func (h *clientHS) rander() io.Reader {
 	if h.config.Rand != nil {
@@ -275,6 +394,7 @@ type builder struct{ b []byte }
 func (b *builder) u8(v uint8)   { b.b = append(b.b, v) }
 func (b *builder) u16(v uint16) { b.b = binary.BigEndian.AppendUint16(b.b, v) }
 func (b *builder) u24(v int)    { b.b = append(b.b, byte(v>>16), byte(v>>8), byte(v)) }
+func (b *builder) u32(v uint32) { b.b = binary.BigEndian.AppendUint32(b.b, v) }
 func (b *builder) raw(p []byte) { b.b = append(b.b, p...) }
 
 // vec16 appends a field of up to 65535 bytes, whose contents fn writes.
@@ -301,8 +421,15 @@ func (h *clientHS) clientHello() []byte {
 	b.raw(h.random[:])
 	b.vec8(func(b *builder) { b.raw(h.sessionID[:]) })
 	b.vec16(func(b *builder) {
-		for _, id := range h.suites {
-			b.u16(id)
+		if h.offers(stdtls.VersionTLS13) {
+			for _, id := range h.suites {
+				b.u16(id)
+			}
+		}
+		if h.offers(stdtls.VersionTLS12) {
+			for _, id := range h.suites12 {
+				b.u16(id)
+			}
 		}
 	})
 	b.vec8(func(b *builder) { b.u8(0) }) // compression: null
@@ -327,7 +454,11 @@ func (h *clientHS) clientHello() []byte {
 		b.u16(extSignatureAlgs)
 		b.vec16(func(b *builder) {
 			b.vec16(func(b *builder) {
-				for _, alg := range clientSignatureAlgs {
+				algs := clientSignatureAlgs
+				if h.offers(stdtls.VersionTLS12) {
+					algs = clientSignatureAlgs12
+				}
+				for _, alg := range algs {
 					b.u16(alg)
 				}
 			})
@@ -342,15 +473,32 @@ func (h *clientHS) clientHello() []byte {
 				})
 			})
 		}
-		b.u16(extSupportedVersions)
-		b.vec16(func(b *builder) { b.vec8(func(b *builder) { b.u16(stdtls.VersionTLS13) }) })
-		b.u16(extKeyShare)
-		b.vec16(func(b *builder) {
+		if h.offers(stdtls.VersionTLS12) {
+			// uncompressed points only, which is all that is parsed
+			b.u16(extECPointFormats)
+			b.vec16(func(b *builder) { b.vec8(func(b *builder) { b.u8(0) }) })
+			b.u16(extExtendedMasterSec)
+			b.vec16(func(b *builder) {})
+			b.u16(extRenegotiationInfo)
+			b.vec16(func(b *builder) { b.vec8(func(b *builder) {}) })
+		}
+		if h.offers(stdtls.VersionTLS13) {
+			b.u16(extSupportedVersions)
 			b.vec16(func(b *builder) {
-				b.u16(uint16(h.group))
-				b.vec16(func(b *builder) { b.raw(h.key.PublicKey().Bytes()) })
+				b.vec8(func(b *builder) {
+					for _, v := range h.versions {
+						b.u16(v)
+					}
+				})
 			})
-		})
+			b.u16(extKeyShare)
+			b.vec16(func(b *builder) {
+				b.vec16(func(b *builder) {
+					b.u16(uint16(h.group))
+					b.vec16(func(b *builder) { b.raw(h.key.PublicKey().Bytes()) })
+				})
+			})
+		}
 		if h.cookie != nil {
 			b.u16(extCookie)
 			b.vec16(func(b *builder) { b.vec16(func(b *builder) { b.raw(h.cookie) }) })
@@ -413,6 +561,13 @@ func (r *reader) u16() uint16 {
 	return 0
 }
 
+func (r *reader) u32() uint32 {
+	if p := r.take(4); p != nil {
+		return binary.BigEndian.Uint32(p)
+	}
+	return 0
+}
+
 func (r *reader) u24() int {
 	if p := r.take(3); p != nil {
 		return int(p[0])<<16 | int(p[1])<<8 | int(p[2])
@@ -437,7 +592,11 @@ func (h *clientHS) process(in []byte) (consumed int, out []byte, done bool, err 
 	for h.state != hsDone && len(in)-consumed >= recordHeaderLen {
 		rec := in[consumed:]
 		length := int(rec[3])<<8 | int(rec[4])
-		if length > maxCiphertext13 {
+		limit := maxCiphertext13
+		if h.version == stdtls.VersionTLS12 {
+			limit = maxCiphertext12
+		}
+		if length > limit {
 			return consumed, out, false, fail(alertRecordOverflow, "oversized record")
 		}
 		if len(rec) < recordHeaderLen+length {
@@ -458,8 +617,12 @@ func (h *clientHS) record(record []byte, out *[]byte) *hsError {
 	if record[1] != 3 {
 		return fail(alertProtocolVersion, "unsupported record version %#x%02x", record[1], record[2])
 	}
+	tls12 := h.version == stdtls.VersionTLS12
 	switch typ {
 	case recordTypeChangeCipherSpec:
+		if tls12 {
+			return h.serverChangeCipherSpec(body)
+		}
 		// Sent by a server for middleboxes, and ignored (RFC 8446 section 5).
 		h.ccsSeen++
 		if len(body) != 1 || body[0] != 1 || h.ccsSeen > 2 {
@@ -467,18 +630,38 @@ func (h *clientHS) record(record []byte, out *[]byte) *hsError {
 		}
 		return nil
 	case recordTypeAlert:
-		if h.rx != nil {
+		if h.rxOn && tls12 {
+			inner, plain, alert, ok := h.rx.open(record)
+			if !ok {
+				return fail(alert, "bad record")
+			}
+			if inner != recordTypeAlert {
+				return fail(alertUnexpectedMessage, "unexpected record type")
+			}
+			return remoteAlert(plain)
+		}
+		if h.rxOn {
 			return fail(alertUnexpectedMessage, "unprotected alert after ServerHello")
 		}
 		return remoteAlert(body)
 	case recordTypeHandshake:
-		if h.rx != nil {
+		if h.rxOn && tls12 {
+			inner, plain, alert, ok := h.rx.open(record)
+			if !ok {
+				return fail(alert, "bad record")
+			}
+			if inner != recordTypeHandshake {
+				return fail(alertUnexpectedMessage, "unexpected record type")
+			}
+			return h.handshakeData(plain, out)
+		}
+		if h.rxOn {
 			return fail(alertUnexpectedMessage, "unprotected handshake record after ServerHello")
 		}
 		return h.handshakeData(body, out)
 	case recordTypeApplicationData:
-		if h.rx == nil {
-			return fail(alertUnexpectedMessage, "protected record before ServerHello")
+		if !h.rxOn || tls12 {
+			return fail(alertUnexpectedMessage, "protected record before it is expected")
 		}
 		inner, plain, alert, ok := h.rx.open(record)
 		if !ok {
@@ -499,6 +682,9 @@ func remoteAlert(body []byte) *hsError {
 	if len(body) != 2 {
 		return fail(alertDecodeError, "malformed alert")
 	}
+	if body[0] == alertLevelWarning && body[1] == alertCloseNotify {
+		return &hsError{err: io.ErrUnexpectedEOF}
+	}
 	return &hsError{err: &net.OpError{Op: "remote error", Err: stdtls.AlertError(body[1])}}
 }
 
@@ -515,14 +701,14 @@ func (h *clientHS) handshakeData(data []byte, out *[]byte) *hsError {
 			break
 		}
 		msg := h.hsBuf[:size:size]
-		wasServerHello := h.state == hsExpectServerHello
+		h.flightEnd = false
 		if herr := h.message(msg, out); herr != nil {
 			return herr
 		}
 		h.hsBuf = h.hsBuf[size:]
-		if (wasServerHello || h.state == hsDone) && len(h.hsBuf) != 0 {
-			// Keys change after the ServerHello and the Finished, so no
-			// message may run across the change.
+		if h.flightEnd && len(h.hsBuf) != 0 {
+			// Keys change after a flight, or it is our turn, so no message
+			// may run across the end.
 			return fail(alertUnexpectedMessage, "handshake data after the last message of a flight")
 		}
 	}
@@ -546,6 +732,21 @@ func (h *clientHS) message(msg []byte, out *[]byte) *hsError {
 		return h.certificateVerify(msg)
 	case h.state == hsExpectFinished && typ == hsFinished:
 		return h.finished(msg, out)
+	case h.state == hs12ExpectCertificate && typ == hsCertificate:
+		return h.certificate12(msg)
+	case h.state == hs12ExpectServerKeyExchange && typ == hsServerKeyExchange:
+		return h.serverKeyExchange(msg)
+	case h.state == hs12ExpectCertificateRequestOrDone && typ == hsCertificateRequest:
+		return h.certificateRequest12(msg)
+	case (h.state == hs12ExpectCertificateRequestOrDone || h.state == hs12ExpectServerHelloDone) && typ == hsServerHelloDone:
+		return h.serverHelloDone(msg, out)
+	case h.state == hs12ExpectCCS && typ == hsNewSessionTicket:
+		// A server that sends a ticket nobody asked for; there is no
+		// resumption to use it for.
+		h.transcript = append(h.transcript, msg...)
+		return nil
+	case h.state == hs12ExpectFinished && typ == hsFinished:
+		return h.finished12(msg)
 	}
 	return fail(alertUnexpectedMessage, "unexpected handshake message %d", msg[0])
 }
@@ -563,8 +764,29 @@ func hashBytes(f func() hash.Hash, b []byte) []byte {
 	return d.Sum(nil)
 }
 
+// parseExtensions splits an extension block, refusing one extension twice.
+func parseExtensions(block []byte) (map[uint16][]byte, *hsError) {
+	r := newReader(block)
+	exts := map[uint16][]byte{}
+	for r.ok && len(r.b) > 0 {
+		typ := r.u16()
+		data := r.vec16()
+		if !r.ok {
+			break
+		}
+		if _, dup := exts[typ]; dup {
+			return nil, fail(alertIllegalParameter, "duplicate extension %d", typ)
+		}
+		exts[typ] = data
+	}
+	if !r.ok {
+		return nil, fail(alertDecodeError, "malformed extensions")
+	}
+	return exts, nil
+}
+
 // serverHello handles the ServerHello, or a HelloRetryRequest, which has its
-// shape.
+// shape, and with it the choice of version.
 func (h *clientHS) serverHello(msg []byte, out *[]byte) *hsError {
 	r := newReader(msg[4:])
 	version := r.u16()
@@ -576,40 +798,48 @@ func (h *clientHS) serverHello(msg []byte, out *[]byte) *hsError {
 	if !r.empty() {
 		return fail(alertDecodeError, "malformed ServerHello")
 	}
+	exts, herr := parseExtensions(extensions)
+	if herr != nil {
+		return herr
+	}
+	if compression != 0 {
+		return fail(alertIllegalParameter, "server selected compression")
+	}
+	hrr := bytes.Equal(random, helloRetryRandom[:])
+	if data, ok := exts[extSupportedVersions]; ok {
+		d := newReader(data)
+		if v := d.u16(); !d.empty() || v != stdtls.VersionTLS13 || !h.offers(stdtls.VersionTLS13) {
+			return fail(alertProtocolVersion, "server selected a version this client does not offer")
+		}
+		return h.serverHello13(msg, version, random, sessionID, cipherSuite, hrr, exts, out)
+	}
+	if hrr || version != stdtls.VersionTLS12 || !h.offers(stdtls.VersionTLS12) {
+		return fail(alertProtocolVersion, "server does not support a version this client offers")
+	}
+	return h.serverHello12(msg, random, sessionID, cipherSuite, exts)
+}
+
+// serverHello13 handles a TLS 1.3 ServerHello, or HelloRetryRequest.
+func (h *clientHS) serverHello13(msg []byte, version uint16, random, sessionID []byte, cipherSuite uint16, hrr bool,
+	exts map[uint16][]byte, out *[]byte) *hsError {
 	if version != 0x0303 {
 		return fail(alertProtocolVersion, "server selected a protocol this client does not offer")
 	}
 	if !bytes.Equal(sessionID, h.sessionID[:]) {
 		return fail(alertIllegalParameter, "server did not echo the session ID")
 	}
-	if compression != 0 {
-		return fail(alertIllegalParameter, "server selected compression")
-	}
 	var (
-		selected       uint16
-		share          []byte
-		cookie         []byte
-		supported      bool
-		versionOK      bool
-		haveShare      bool
-		haveSelected   bool
-		haveCookie     bool
-		seen           = map[uint16]bool{}
-		hrr            = bytes.Equal(random, helloRetryRandom[:])
-		extensionsData = newReader(extensions)
+		selected     uint16
+		share        []byte
+		cookie       []byte
+		haveShare    bool
+		haveSelected bool
+		haveCookie   bool
 	)
-	for extensionsData.ok && len(extensionsData.b) > 0 {
-		typ := extensionsData.u16()
-		data := extensionsData.vec16()
-		if !extensionsData.ok || seen[typ] {
-			return fail(alertDecodeError, "malformed ServerHello extensions")
-		}
-		seen[typ] = true
+	for typ, data := range exts {
 		d := newReader(data)
 		switch typ {
 		case extSupportedVersions:
-			supported = true
-			versionOK = d.u16() == stdtls.VersionTLS13 && d.empty()
 		case extKeyShare:
 			if hrr {
 				selected = d.u16()
@@ -620,6 +850,9 @@ func (h *clientHS) serverHello(msg []byte, out *[]byte) *hsError {
 				haveShare = d.empty()
 			}
 		case extCookie:
+			if !hrr {
+				return fail(alertUnsupportedExtension, "cookie in a ServerHello")
+			}
 			cookie = d.vec16()
 			haveCookie = d.empty() && len(cookie) > 0
 		default:
@@ -630,12 +863,6 @@ func (h *clientHS) serverHello(msg []byte, out *[]byte) *hsError {
 			return fail(alertDecodeError, "malformed ServerHello extension")
 		}
 	}
-	if !extensionsData.ok {
-		return fail(alertDecodeError, "malformed ServerHello extensions")
-	}
-	if !supported || !versionOK {
-		return fail(alertProtocolVersion, "server does not support TLS 1.3")
-	}
 	if !slices.Contains(h.suites, cipherSuite) {
 		return fail(alertIllegalParameter, "server selected a cipher suite that was not offered")
 	}
@@ -644,7 +871,9 @@ func (h *clientHS) serverHello(msg []byte, out *[]byte) *hsError {
 		return fail(alertIllegalParameter, "unsupported cipher suite")
 	}
 	if hrr {
-		return h.helloRetryRequest(msg, cipherSuite, s, selected, haveSelected, seen[extKeyShare], cookie, haveCookie, out)
+		_, shareExt := exts[extKeyShare]
+		h.flightEnd = true
+		return h.helloRetryRequest(msg, cipherSuite, s, selected, haveSelected, shareExt, cookie, haveCookie, out)
 	}
 	if h.retried && cipherSuite != h.suiteID {
 		return fail(alertIllegalParameter, "server changed its cipher suite after a HelloRetryRequest")
@@ -662,7 +891,9 @@ func (h *clientHS) serverHello(msg []byte, out *[]byte) *hsError {
 	if err != nil {
 		return fail(alertIllegalParameter, "key exchange failed: %v", err)
 	}
+	h.version = stdtls.VersionTLS13
 	h.transcript = append(h.transcript, msg...)
+	h.flightEnd = true
 	return h.handshakeKeys(shared, out)
 }
 
@@ -772,6 +1003,7 @@ func (h *clientHS) handshakeKeys(shared []byte, out *[]byte) *hsError {
 	h.keyLog("CLIENT_HANDSHAKE_TRAFFIC_SECRET", h.clientHS)
 	h.keyLog("SERVER_HANDSHAKE_TRAFFIC_SECRET", h.serverHS)
 	h.sendCCS(out)
+	h.rxOn, h.txOn = true, true
 	h.state = hsExpectEncryptedExtensions
 	return nil
 }
@@ -837,12 +1069,27 @@ func (h *clientHS) certificate(msg []byte) *hsError {
 	if !r.empty() || !list.ok || len(ctx) != 0 {
 		return fail(alertDecodeError, "malformed Certificate")
 	}
+	var ders [][]byte
 	for len(list.b) > 0 {
 		der := list.vec24()
 		extensions := list.vec16()
 		if !list.ok || len(der) == 0 || extensions == nil {
 			return fail(alertDecodeError, "malformed Certificate")
 		}
+		ders = append(ders, der)
+	}
+	if herr := h.acceptCertificates(ders); herr != nil {
+		return herr
+	}
+	h.transcript = append(h.transcript, msg...)
+	h.state = hsExpectCertificateVerify
+	return nil
+}
+
+// acceptCertificates parses the server's chain, verifies it unless the Config
+// says not to, and gives VerifyPeerCertificate its say.
+func (h *clientHS) acceptCertificates(ders [][]byte) *hsError {
+	for _, der := range ders {
 		cert, err := x509.ParseCertificate(der)
 		if err != nil {
 			return fail(alertBadCertificate, "failed to parse certificate from server: %v", err)
@@ -878,8 +1125,6 @@ func (h *clientHS) certificate(msg []byte) *hsError {
 			return &hsError{alert: alertBadCertificate, err: err}
 		}
 	}
-	h.transcript = append(h.transcript, msg...)
-	h.state = hsExpectCertificateVerify
 	return nil
 }
 
@@ -887,11 +1132,11 @@ func (h *clientHS) certificate(msg []byte) *hsError {
 // for Ed25519, which signs the message itself.
 func signatureHash(alg uint16) (crypto.Hash, bool) {
 	switch alg {
-	case 0x0403, 0x0804:
+	case 0x0403, 0x0804, 0x0401:
 		return crypto.SHA256, true
-	case 0x0503, 0x0805:
+	case 0x0503, 0x0805, 0x0501:
 		return crypto.SHA384, true
-	case 0x0603, 0x0806:
+	case 0x0603, 0x0806, 0x0601:
 		return crypto.SHA512, true
 	case 0x0807:
 		return 0, true
@@ -1031,13 +1276,14 @@ func (h *clientHS) finished(msg []byte, out *[]byte) *hsError {
 		}
 	}
 	h.state = hsDone
+	h.flightEnd = true
 	return nil
 }
 
 // connectionState is what ConnectionState reports for the connection.
 func (h *clientHS) connectionState() stdtls.ConnectionState {
 	return stdtls.ConnectionState{
-		Version:                    stdtls.VersionTLS13,
+		Version:                    h.version,
 		HandshakeComplete:          true,
 		CipherSuite:                h.suiteID,
 		NegotiatedProtocol:         h.protocol,
@@ -1045,14 +1291,31 @@ func (h *clientHS) connectionState() stdtls.ConnectionState {
 		ServerName:                 h.config.ServerName,
 		PeerCertificates:           h.certs,
 		VerifiedChains:             h.chains,
+		TLSUnique:                  h.clientFinished,
 	}
 }
+
+func (h *clientHS) recordKeys() (rx, tx *recordKeys) { return h.rx, h.tx }
+
+// nativeHandshake is a handshake that runs without a worker, client or
+// server: what the layer needs of it.
+type nativeHandshake interface {
+	process(in []byte) (consumed int, out []byte, done bool, err *hsError)
+	alertRecord(alert uint8) []byte
+	connectionState() stdtls.ConnectionState
+	recordKeys() (rx, tx *recordKeys)
+}
+
+var (
+	_ nativeHandshake = (*clientHS)(nil)
+	_ nativeHandshake = (*serverHS)(nil)
+)
 
 // alertRecord is the record that tells the peer the handshake has failed with
 // alert: under our keys once there are any.
 func (h *clientHS) alertRecord(alert uint8) []byte {
 	body := []byte{alertLevelError, alert}
-	if h.tx == nil || h.state == hsDone {
+	if !h.txOn || h.state == hsDone {
 		return appendRecord(nil, recordTypeAlert, 0x0303, body)
 	}
 	record, err := h.tx.seal(nil, recordTypeAlert, body, nil)

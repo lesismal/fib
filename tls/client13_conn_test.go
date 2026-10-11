@@ -160,23 +160,33 @@ func TestNativeDialAgainstStandardServer(t *testing.T) {
 	}
 }
 
-// A Config that allows TLS 1.2 keeps to crypto/tls.
-func TestDefaultConfigKeepsToCryptoTLS(t *testing.T) {
-	started := countNative(t)
-	serverConfig, clientConfig := tlsConfigs(t)
-	addr := stdEchoServer(t, serverConfig, "")
-	client, _ := startEchoServer(t, fib.DefaultConfig(), nil)
-	h := newCollector()
-	clientConfig.ServerName = ""
-	err := Dial(client, "tcp", addr, 5*time.Second, clientConfig, h, func(c *fib.Connection, err error) {
-		_ = c.Send([]byte("ping"))
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	h.waitFor(t, 4)
-	if n := started.Load(); n != 0 {
-		t.Fatalf("%d handshakes ran without a worker for a Config that allows TLS 1.2", n)
+// A Config that allows a version below TLS 1.2 keeps to crypto/tls, and the
+// default Config does not.
+func TestConfigsThatKeepToCryptoTLS(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		version uint16
+		native  int64
+	}{{"default", 0, 1}, {"TLS 1.1 allowed", stdtls.VersionTLS11, 0}} {
+		t.Run(tc.name, func(t *testing.T) {
+			started := countNative(t)
+			serverConfig, clientConfig := tlsConfigs(t)
+			clientConfig.MinVersion = tc.version
+			addr := stdEchoServer(t, serverConfig, "")
+			client, _ := startEchoServer(t, fib.DefaultConfig(), nil)
+			h := newCollector()
+			clientConfig.ServerName = ""
+			err := Dial(client, "tcp", addr, 5*time.Second, clientConfig, h, func(c *fib.Connection, err error) {
+				_ = c.Send([]byte("ping"))
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			h.waitFor(t, 4)
+			if n := started.Load(); n != tc.native {
+				t.Fatalf("%d handshakes ran without a worker, want %d", n, tc.native)
+			}
+		})
 	}
 }
 
@@ -211,7 +221,7 @@ func TestNativeDialAgainstEngineServer(t *testing.T) {
 		}(byte(i))
 	}
 	wg.Wait()
-	if n := started.Load(); n != conns {
+	if n := started.Load(); n != 2*conns {
 		t.Fatalf("%d handshakes ran without a worker, want %d", n, conns)
 	}
 }

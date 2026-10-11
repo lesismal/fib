@@ -65,22 +65,28 @@ func (wouldBlockError) Temporary() bool { return true }
 // connection never waits on its own queue. Records after that are decrypted
 // in OnData like any other input, straight from the bytes the round read.
 //
-// A client whose Config asks for TLS 1.3 alone (MinVersion TLS13, and nothing
-// else that is beyond client13.go: client certificates, session resumption,
-// encrypted client hello) takes no worker for its handshake at all. It is a
-// state machine that OnData drives with the bytes that arrive and that never
-// waits, so a peer that is slow to answer, or that never answers, costs the
-// connection's memory and a timer, and no goroutine; thousands of handshakes
-// can be in flight at once. Other Configs keep to crypto/tls, as do servers.
+// Handshakes can also run without a worker at all. A client whose Config
+// allows nothing below TLS 1.2 (the default) and asks for nothing beyond
+// client13.go and client12.go (client certificates, session resumption,
+// encrypted client hello), and a server whose Config holds its certificates
+// and asks for no client authentication (nativeServer), take no worker for
+// their handshake. It is a state machine that OnData drives with the bytes
+// that arrive and that never waits, so a peer that is slow to answer, or that
+// never answers, costs the connection's memory and a timer, and no goroutine;
+// thousands of handshakes can be in flight at once. A server serves TLS 1.3
+// that way and hands the clients it cannot serve (TLS 1.2 only, 0-RTT, a
+// hello that does not parse) to crypto/tls, before it has sent anything, so
+// they see no difference; it issues its own session tickets, sealed under a
+// key of the Handler's. Other Configs keep to crypto/tls.
 //
-// Once a handshake settles on an AES-GCM suite of TLS 1.3 or 1.2, or an
-// AES-CBC suite of TLS 1.2 or 1.1, the connection's records are protected by
-// this package rather than by
-// crypto/tls, which is then done with; the keys come from crypto/tls through
-// Config.KeyLogWriter. For that the Handler clones Config the first time it
-// is used and runs its handshakes with the clone, whose KeyLogWriter still
-// passes every line on to Config's own; changes made to Config after that
-// are not seen, as crypto/tls asks of a Config in use anyway.
+// Once a crypto/tls handshake settles on an AES-GCM suite of TLS 1.3 or 1.2, or
+// an AES-CBC suite of TLS 1.2 or 1.1, the connection's records are protected by
+// this package rather than by crypto/tls, which is then done with; the keys
+// come from crypto/tls through Config.KeyLogWriter. For that the Handler
+// clones Config the first time it is used and runs its handshakes with the
+// clone, whose KeyLogWriter still passes every line on to Config's own;
+// changes made to Config after that are not seen, as crypto/tls asks of a
+// Config in use anyway.
 type Handler struct {
 	Config  *stdtls.Config
 	Handler fib.Handler
@@ -96,6 +102,9 @@ type Handler struct {
 	fastOnce   sync.Once
 	fastConfig *stdtls.Config
 	fastReg    *registry
+	// tickets are the keys server handshakes without a worker use.
+	ticketOnce sync.Once
+	tickets    *ticketKeys
 }
 
 // NewServer returns a handler that serves TLS with config in front of
@@ -153,12 +162,25 @@ func (h *Handler) config() (*stdtls.Config, *registry) {
 }
 
 func (h *Handler) OnOpen(c *fib.Connection) {
-	t := &layer{c: c, client: h.Client, handshaking: true, settling: true}
+	t := &layer{c: c, client: h.Client, handshaking: true, settling: true, owner: h}
 	t.cond.L = &t.mu
-	if h.Client && nativeClient(h.Config) {
+	switch {
+	case h.Client && nativeClient(h.Config):
 		h.openNative(c, t)
-		return
+	case !h.Client && nativeServer(h.Config):
+		h.openNative(c, t)
+	default:
+		c.SetLayer(t)
+		h.inner().OnOpen(c)
+		h.startBlocking(t, nil)
 	}
+}
+
+// startBlocking runs the handshake with crypto/tls on a worker of the
+// handshake pool. initial is what the peer has sent already, which a server
+// that began without a worker and then found it could not serve the client
+// hands over; crypto/tls reads it as if it had been there all along.
+func (h *Handler) startBlocking(t *layer, initial []byte) {
 	config, reg := h.config()
 	if reg != nil {
 		t.capture = &capture{client: h.Client, reg: reg}
@@ -168,8 +190,12 @@ func (h *Handler) OnOpen(c *fib.Connection) {
 	} else {
 		t.conn = stdtls.Server(t, config)
 	}
-	c.SetLayer(t)
-	h.inner().OnOpen(c)
+	if len(initial) > 0 {
+		t.mu.Lock()
+		t.in = initial
+		t.inHead = 0
+		t.mu.Unlock()
+	}
 	timeout := h.HandshakeTimeout
 	if timeout == 0 {
 		timeout = DefaultHandshakeTimeout
@@ -180,27 +206,52 @@ func (h *Handler) OnOpen(c *fib.Connection) {
 		t.handshaking = false
 		t.mu.Unlock()
 		t.settle(inner)
-		c.CloseWithError(errNoHandshakeWorker)
+		t.c.CloseWithError(errNoHandshakeWorker)
 	}
 }
+
+// ticketKeys are the keys the Handler's server handshakes that run without a
+// worker seal their session tickets under, made the first time they are
+// needed, or nil if the Config disables tickets.
+func (h *Handler) ticketKeys() *ticketKeys {
+	h.ticketOnce.Do(func() { h.tickets = newTicketKeys(h.Config) })
+	return h.tickets
+}
+
+// nativeBox holds a handshake that runs without a worker.
+type nativeBox struct{ hs nativeHandshake }
 
 // nativeStarted, set by tests, is told of each handshake that runs without a
 // worker.
 var nativeStarted func()
 
-// openNative begins a handshake that runs without a worker: the ClientHello
-// goes out now, and OnData carries the handshake on from there.
+// nativeFellBack, set by tests, is told of each server handshake that began
+// without a worker and was handed to crypto/tls.
+var nativeFellBack func()
+
+// openNative begins a handshake that runs without a worker. A client's
+// ClientHello goes out now; a server waits for the peer's. OnData carries the
+// handshake on from there.
 func (h *Handler) openNative(c *fib.Connection, t *layer) {
 	if nativeStarted != nil {
 		nativeStarted()
 	}
-	hs, err := newClientHS(h.Config)
+	var hs nativeHandshake
+	var hello []byte
+	if h.Client {
+		chs, err := newClientHS(h.Config)
+		if err != nil {
+			c.SetLayer(t)
+			h.inner().OnOpen(c)
+			c.CloseWithError(err)
+			return
+		}
+		hs, hello = chs, chs.hello()
+	} else {
+		hs = newServerHS(h.Config, c, h.ticketKeys())
+	}
 	c.SetLayer(t)
 	h.inner().OnOpen(c)
-	if err != nil {
-		c.CloseWithError(err)
-		return
-	}
 	timeout := h.HandshakeTimeout
 	if timeout == 0 {
 		timeout = DefaultHandshakeTimeout
@@ -212,9 +263,11 @@ func (h *Handler) openNative(c *fib.Connection, t *layer) {
 			}
 		})
 	}
-	t.native.Store(hs)
-	if err := c.SendRaw(hs.hello()); err != nil {
-		c.CloseWithError(err)
+	t.native.Store(&nativeBox{hs})
+	if hello != nil {
+		if err := c.SendRaw(hello); err != nil {
+			c.CloseWithError(err)
+		}
 	}
 }
 
@@ -311,7 +364,8 @@ type layer struct {
 	// completes or fails; see client13.go. nbuf holds the start of a record
 	// that has not arrived whole, and hsTimer the handshake's timeout. The
 	// state machine itself is only touched by OnData, under readMu.
-	native  atomic.Pointer[clientHS]
+	native  atomic.Pointer[nativeBox]
+	owner   *Handler
 	nbuf    []byte
 	hsTimer *time.Timer
 	nfailed bool
@@ -415,8 +469,8 @@ func (t *layer) settle(handler fib.Handler) {
 func (t *layer) feed(handler fib.Handler, data []byte) {
 	t.readMu.Lock()
 	defer t.readMu.Unlock()
-	if hs := t.native.Load(); hs != nil {
-		t.feedNative(handler, hs, data)
+	if box := t.native.Load(); box != nil {
+		t.feedNative(handler, box.hs, data)
 		return
 	}
 	t.mu.Lock()
@@ -754,7 +808,7 @@ func ConnectionState(c *fib.Connection) (stdtls.ConnectionState, bool) {
 // a round read. The handshake never waits: whatever does not make a whole
 // record is kept until the next round, and when it completes the bytes behind
 // the Finished go the way every later round's do.
-func (t *layer) feedNative(handler fib.Handler, hs *clientHS, data []byte) {
+func (t *layer) feedNative(handler fib.Handler, hs nativeHandshake, data []byte) {
 	if t.nfailed || t.isClosed() {
 		return
 	}
@@ -764,6 +818,10 @@ func (t *layer) feedNative(handler fib.Handler, hs *clientHS, data []byte) {
 		buf = t.nbuf
 	}
 	consumed, out, done, herr := hs.process(buf)
+	if herr == errFallback {
+		t.fallbackBlocking(buf)
+		return
+	}
 	if len(out) > 0 {
 		if err := t.c.SendRaw(out); err != nil {
 			t.nativeFailed(hs, nil, err)
@@ -789,7 +847,7 @@ func (t *layer) feedNative(handler fib.Handler, hs *clientHS, data []byte) {
 // nativeFailed ends a handshake that failed: the peer is told why, if it is
 // not the one that said so, and the connection closes with the reason, which
 // reaches the wrapped handler's OnClose.
-func (t *layer) nativeFailed(hs *clientHS, herr *hsError, err error) {
+func (t *layer) nativeFailed(hs nativeHandshake, herr *hsError, err error) {
 	t.nfailed = true
 	bufferpool.Put(t.nbuf)
 	t.nbuf = nil
@@ -814,7 +872,7 @@ func (t *layer) nativeFailed(hs *clientHS, herr *hsError, err error) {
 // connection takes the keys it ended with, what was sent meanwhile goes out
 // under them, the wrapped handler learns what was negotiated, and the bytes
 // that arrived behind the Finished are delivered. The caller holds readMu.
-func (t *layer) completeNative(handler fib.Handler, hs *clientHS, rest []byte) {
+func (t *layer) completeNative(handler fib.Handler, hs nativeHandshake, rest []byte) {
 	t.native.Store(nil)
 	if t.hsTimer != nil {
 		t.hsTimer.Stop()
@@ -822,7 +880,7 @@ func (t *layer) completeNative(handler fib.Handler, hs *clientHS, rest []byte) {
 	}
 	state := hs.connectionState()
 	t.state = &state
-	t.rx, t.tx = hs.rx, hs.tx
+	t.rx, t.tx = hs.recordKeys()
 
 	t.wmu.Lock()
 	pending, closeAfterSend := t.pending, t.closeAfterSend
@@ -886,4 +944,22 @@ func (t *layer) abortNative() bool {
 	t.handshaking = false
 	t.mu.Unlock()
 	return true
+}
+
+// fallbackBlocking hands a connection whose server handshake could not be run
+// without a worker to crypto/tls. Nothing has been sent, and nothing consumed,
+// so crypto/tls is given everything received so far.
+func (t *layer) fallbackBlocking(received []byte) {
+	if nativeFellBack != nil {
+		nativeFellBack()
+	}
+	t.native.Store(nil)
+	if t.hsTimer != nil {
+		t.hsTimer.Stop()
+		t.hsTimer = nil
+	}
+	initial := bufferpool.Append(nil, received)
+	bufferpool.Put(t.nbuf)
+	t.nbuf = nil
+	t.owner.startBlocking(t, initial)
 }

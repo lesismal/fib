@@ -339,6 +339,12 @@ func TestRequestBodyTooLarge(t *testing.T) {
 	for _, client := range l.clients {
 		t.Run(client.name, func(t *testing.T) {
 			r := get(t, client.doer, request(t, "POST", l.url("/h1/upload"), pattern(2<<20)))
+			if r.err != nil && client.name == "HTTP/1.1" {
+				// The gateway answers as soon as it sees the length and closes
+				// the connection, while this client is still writing the body
+				// to it, so the client may be reset before it reads the answer.
+				return
+			}
 			if r.err != nil || r.status != stdhttp.StatusRequestEntityTooLarge {
 				t.Fatalf("err %v, status %d", r.err, r.status)
 			}

@@ -314,7 +314,7 @@ poller 数量（`Config.IOPollers`、`IOPollerCount`）取决于 CPU 数：4 核
 | 协议 | 事件循环 | engine worker | 其他池 |
 | --- | --- | --- | --- |
 | TCP | 就绪、accept | 读、`OnData`、写 | — |
-| TLS | — | 解密、加密、内层 handler | `fib-tls-handshake`（握手） |
+| TLS | — | 解密、加密、内层 handler | `fib-tls-handshake`（由 `crypto/tls` 跑的握手，其余握手不占 worker） |
 | HTTP/1.x | — | 解析、handler、响应：一轮完成、一次写 | — |
 | HTTP/2 | — | 分帧、HPACK 解码 | `<Name>-streams` 执行 handler、HPACK 编码和写 |
 | HTTP/3 | 批量读 UDP、按对端分拣数据报 | QUIC 包、TLS 1.3、QPACK | `<Name>-streams`（handler） |

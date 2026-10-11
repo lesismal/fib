@@ -113,9 +113,21 @@ func TestTakeOverBySuite(t *testing.T) {
 // counted it, or the client's first record would not have authenticated. A
 // TLS 1.2 resumption logs no secret, and stays with crypto/tls.
 func TestTakeOverResumes(t *testing.T) {
-	for _, version := range []uint16{stdtls.VersionTLS12, stdtls.VersionTLS13} {
-		t.Run(stdtls.VersionName(version), func(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		version  uint16
+		blocking bool
+	}{
+		{"TLS 1.2", stdtls.VersionTLS12, true},
+		{"TLS 1.3 without a worker", stdtls.VersionTLS13, false},
+		{"TLS 1.3 with crypto/tls", stdtls.VersionTLS13, true},
+	} {
+		version := tc.version
+		t.Run(tc.name, func(t *testing.T) {
 			serverConfig, clientConfig := tlsConfigs(t)
+			if tc.blocking {
+				forceCryptoTLS(serverConfig)
+			}
 			clientConfig.MaxVersion = version
 			clientConfig.ClientSessionCache = stdtls.NewLRUClientSessionCache(4)
 			layers := make(layerOf, 2)
@@ -140,6 +152,12 @@ func TestTakeOverResumes(t *testing.T) {
 		})
 	}
 }
+
+// forceCryptoTLS makes a server Config one that handshakes through crypto/tls
+// and not without a worker, so that the takeover from crypto/tls is what a
+// test exercises: it asks for a client certificate if one is offered, which
+// the clients here never offer.
+func forceCryptoTLS(config *stdtls.Config) { config.ClientAuth = stdtls.VerifyClientCertIfGiven }
 
 // requestKeyUpdate has a taken-over connection update its keys and ask its
 // peer to update theirs, as crypto/tls has no call for.
@@ -441,6 +459,7 @@ func TestTakeOverReleasesConn(t *testing.T) {
 	defer func() { droppedConn = nil }()
 	for _, version := range []uint16{stdtls.VersionTLS12, stdtls.VersionTLS13} {
 		serverConfig, clientConfig := tlsConfigs(t)
+		forceCryptoTLS(serverConfig)
 		clientConfig.MaxVersion = version
 		layers := make(layerOf, 1)
 		_, addr := startEchoServer(t, fib.DefaultConfig(), NewServer(serverConfig, layers.handler()))

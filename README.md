@@ -332,7 +332,7 @@ two, and connections are spread over them by fd. A poller parks in Go's own netp
 | Protocol | Loop | Engine workers | Other pools |
 | --- | --- | --- | --- |
 | TCP | readiness, accept | read, `OnData`, write | — |
-| TLS | — | decrypt, encrypt, inner handler | `fib-tls-handshake` (handshakes) |
+| TLS | — | decrypt, encrypt, inner handler | `fib-tls-handshake` (handshakes that crypto/tls runs; others take no worker) |
 | HTTP/1.x | — | parse, handler, response: one round, one write | — |
 | HTTP/2 | — | framing, HPACK decoding | `<Name>-streams` runs handlers, HPACK encoding and writes |
 | HTTP/3 | reads UDP in batches, sorts datagrams by peer | QUIC packets, TLS 1.3, QPACK | `<Name>-streams` (handlers) |

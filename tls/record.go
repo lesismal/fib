@@ -379,9 +379,12 @@ func (k *recordKeys) sealAt(buf []byte, start int, typ byte) ([]byte, error) {
 		header[0] = recordTypeApplicationData
 		k.nonce = k.iv
 		seqXOR(&k.nonce, k.seq)
-		buf = append(buf, typ)
+		// The header is complete before the type is appended, which moves buf
+		// to a new array if it is full, and leaves header behind in the old
+		// one: the record's additional data is read from buf, after.
 		bodyLen := n + 1 + gcmTagLen
 		header[3], header[4] = byte(bodyLen>>8), byte(bodyLen)
+		buf = append(buf, typ)
 		buf = k.aead.Seal(buf[:plainStart], k.nonce[:], buf[plainStart:], buf[start:start+recordHeaderLen])
 	default:
 		copy(k.nonce[:4], k.iv[:4])

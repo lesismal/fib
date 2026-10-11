@@ -52,6 +52,32 @@ func issueCert(t *testing.T, key crypto.Signer) (stdtls.Certificate, *x509.CertP
 	return stdtls.Certificate{Certificate: [][]byte{der}, PrivateKey: key}, pool
 }
 
+// issueCertFor is issueCert for a certificate that names host, and returns
+// the certificate parsed as well.
+func issueCertFor(t *testing.T, key crypto.Signer, host string) (stdtls.Certificate, *x509.Certificate) {
+	t.Helper()
+	template := &x509.Certificate{
+		SerialNumber:          big.NewInt(time.Now().UnixNano()),
+		Subject:               pkix.Name{CommonName: host},
+		NotBefore:             time.Now().Add(-time.Hour),
+		NotAfter:              time.Now().Add(time.Hour),
+		KeyUsage:              x509.KeyUsageDigitalSignature | x509.KeyUsageCertSign,
+		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+		BasicConstraintsValid: true,
+		IsCA:                  true,
+		DNSNames:              []string{host},
+	}
+	der, err := x509.CreateCertificate(rand.Reader, template, template, key.Public(), key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cert, err := x509.ParseCertificate(der)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return stdtls.Certificate{Certificate: [][]byte{der}, PrivateKey: key}, cert
+}
+
 func keyOf(t *testing.T, kind string) crypto.Signer {
 	t.Helper()
 	switch kind {
@@ -405,10 +431,11 @@ func TestNativeClientQualification(t *testing.T) {
 		want   bool
 	}{
 		{"nil", nil, false},
-		{"default", &stdtls.Config{}, false},
-		{"TLS 1.2 allowed", &stdtls.Config{MinVersion: stdtls.VersionTLS12}, false},
+		{"default", &stdtls.Config{}, true},
+		{"TLS 1.2 allowed", &stdtls.Config{MinVersion: stdtls.VersionTLS12}, true},
+		{"TLS 1.1 allowed", &stdtls.Config{MinVersion: stdtls.VersionTLS11}, false},
 		{"TLS 1.3 only", &stdtls.Config{MinVersion: stdtls.VersionTLS13}, true},
-		{"capped below 1.3", &stdtls.Config{MinVersion: stdtls.VersionTLS13, MaxVersion: stdtls.VersionTLS12}, false},
+		{"capped below the minimum", &stdtls.Config{MinVersion: stdtls.VersionTLS13, MaxVersion: stdtls.VersionTLS12}, false},
 		{"client certificates", &stdtls.Config{MinVersion: stdtls.VersionTLS13, Certificates: []stdtls.Certificate{{}}}, false},
 		{"session cache", &stdtls.Config{MinVersion: stdtls.VersionTLS13, ClientSessionCache: stdtls.NewLRUClientSessionCache(1)}, false},
 		{"known curves", &stdtls.Config{MinVersion: stdtls.VersionTLS13, CurvePreferences: []stdtls.CurveID{stdtls.CurveP256}}, true},
@@ -416,6 +443,27 @@ func TestNativeClientQualification(t *testing.T) {
 	} {
 		if got := nativeClient(tc.config); got != tc.want {
 			t.Errorf("%s: %v, want %v", tc.name, got, tc.want)
+		}
+	}
+}
+
+// seal appends to a buffer that may be full, which moves it: the record's
+// header, and so its additional data, must be written before that.
+func TestSealIntoFullBuffer(t *testing.T) {
+	s, _ := lookupSuite(stdtls.VersionTLS13, stdtls.TLS_AES_128_GCM_SHA256)
+	secret := bytes.Repeat([]byte{7}, 32)
+	for n := 1; n < 700; n++ {
+		a, _ := newKeys13(s.keyLen, s.hash, secret)
+		b, _ := newKeys13(s.keyLen, s.hash, secret)
+		plain := bytes.Repeat([]byte{1}, n)
+		// A buffer with exactly the room the plaintext needs and no more.
+		dst := make([]byte, 0, 5+n)
+		record, err := a.seal(dst, recordTypeHandshake, plain, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if typ, got, alert, ok := b.open(record); !ok || typ != recordTypeHandshake || !bytes.Equal(got, plain) {
+			t.Fatalf("%d bytes: ok %v alert %d", n, ok, alert)
 		}
 	}
 }
