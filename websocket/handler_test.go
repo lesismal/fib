@@ -8,6 +8,7 @@ import (
 	"crypto/sha1"
 	"encoding/base64"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	stdhttp "net/http"
@@ -269,12 +270,18 @@ func TestReadsPauseForPeerThatNeverReadsAndResumeWhenItDoes(t *testing.T) {
 		maxWrite = 64 << 20
 	)
 	var received atomic.Int64
+	// What the server saw go wrong, for a failure to explain itself.
+	var serverSaw atomic.Value
 	handler := NewHandler(HandlerFuncs{
 		Message: func(c *Connection, opcode Opcode, payload []byte) {
 			received.Add(int64(len(payload)))
 			if err := c.WriteMessage(opcode, payload); err != nil {
+				serverSaw.CompareAndSwap(nil, "write failed: "+err.Error())
 				_ = c.Close(CloseInternalError, "write failed")
 			}
+		},
+		Close: func(_ *Connection, code uint16, reason string, err error) {
+			serverSaw.CompareAndSwap(nil, fmt.Sprintf("closed: code %d, reason %q, error %v", code, reason, err))
 		},
 	})
 	config := fib.DefaultConfig()
@@ -324,7 +331,8 @@ func TestReadsPauseForPeerThatNeverReadsAndResumeWhenItDoes(t *testing.T) {
 		t.Fatalf("after %d bytes: %v", written, writeErr)
 	}
 	if !blocked {
-		t.Fatalf("wrote %d bytes without ever blocking: the server never stopped reading", written)
+		t.Fatalf("wrote %d bytes without ever blocking: the server never stopped reading (it read %d, and saw: %v)",
+			written, received.Load(), serverSaw.Load())
 	}
 	if received.Load() == 0 {
 		t.Fatal("the server read nothing at all; the test never exercised the pause")
