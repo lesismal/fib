@@ -584,3 +584,47 @@ func TestClientEchoesOverTLS13(t *testing.T) {
 	}
 	_ = conn.Close(CloseNormal, "bye")
 }
+
+// BlockingTLSHandshake changes how the handshake runs and nothing else.
+func TestClientEchoesOverTLSEitherHandshake(t *testing.T) {
+	serverTLS, clientTLS, err := tlstest.Configs()
+	if err != nil {
+		t.Fatal(err)
+	}
+	engineConfig := fib.DefaultConfig()
+	engineConfig.Addr = "127.0.0.1:0"
+	server, err := fib.Bind(engineConfig, fibtls.NewServer(serverTLS, NewHandler(echoServerHandler())))
+	if err != nil {
+		t.Fatal(err)
+	}
+	addr, err := server.LocalAddr()
+	if err != nil {
+		t.Fatal(err)
+	}
+	runDone := make(chan error, 1)
+	go func() { runDone <- server.Run() }()
+	t.Cleanup(func() {
+		server.Stop()
+		<-runDone
+		_ = server.Close()
+	})
+	for _, blocking := range []bool{false, true} {
+		dialerConfig := DefaultDialerConfig()
+		dialerConfig.TLSConfig = clientTLS
+		dialerConfig.BlockingTLSHandshake = blocking
+		recorder := newClientRecorder()
+		url := fmt.Sprintf("wss://localhost:%d/ws", addr.Port)
+		conn, _, err := NewDialer(startClientEngine(t), dialerConfig).Go(url, nil, recorder.handler()).Wait()
+		if err != nil {
+			t.Fatalf("blocking=%v: %v", blocking, err)
+		}
+		payload := []byte("hello")
+		if err := conn.WriteBinary(payload); err != nil {
+			t.Fatal(err)
+		}
+		if event := recorder.next(t); event.Opcode != Binary || !bytes.Equal(event.Payload, payload) {
+			t.Fatalf("blocking=%v: echo came back as %q", blocking, event.Payload)
+		}
+		_ = conn.Close(CloseNormal, "bye")
+	}
+}

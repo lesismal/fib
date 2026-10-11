@@ -97,6 +97,12 @@ type Handler struct {
 	// HandshakeTimeout bounds the handshake. Zero means
 	// DefaultHandshakeTimeout and a negative value means no bound.
 	HandshakeTimeout time.Duration
+	// Blocking runs every handshake through crypto/tls on a worker of the
+	// handshake pool, even where it could run without one. By default a
+	// handshake that can run without a worker does; this is the switch to the
+	// other, for a Config that behaves differently under the state machines
+	// than under crypto/tls, or to compare the two.
+	Blocking bool
 
 	// fastConfig is the clone of Config handshakes run with where the
 	// connection may leave crypto/tls afterwards; see fast.go.
@@ -128,6 +134,22 @@ func NewClient(config *stdtls.Config, handler fib.Handler) *Handler {
 // fib.Engine.Dial; the handshake follows, and what done sends waits for it.
 func Dial(engine *fib.Engine, network, addr string, timeout time.Duration, config *stdtls.Config,
 	handler fib.Handler, done func(*fib.Connection, error)) error {
+	return DialWithOptions(engine, network, addr, timeout, config, DialOptions{}, handler, done)
+}
+
+// DialOptions are the choices a dial has beyond Dial's.
+type DialOptions struct {
+	// Blocking runs the handshake through crypto/tls on a worker of the
+	// handshake pool; see Handler.Blocking. The default is to handshake
+	// without a worker where the Config allows it.
+	Blocking bool
+	// HandshakeTimeout bounds the handshake; see Handler.HandshakeTimeout.
+	HandshakeTimeout time.Duration
+}
+
+// DialWithOptions is Dial with options.
+func DialWithOptions(engine *fib.Engine, network, addr string, timeout time.Duration, config *stdtls.Config,
+	options DialOptions, handler fib.Handler, done func(*fib.Connection, error)) error {
 	if config == nil {
 		config = &stdtls.Config{}
 	}
@@ -142,7 +164,9 @@ func Dial(engine *fib.Engine, network, addr string, timeout time.Duration, confi
 	if handler == nil {
 		handler = engine.Handler()
 	}
-	return engine.DialWithHandler(network, addr, timeout, NewClient(config, handler), done)
+	client := NewClient(config, handler)
+	client.Blocking, client.HandshakeTimeout = options.Blocking, options.HandshakeTimeout
+	return engine.DialWithHandler(network, addr, timeout, client, done)
 }
 
 func (h *Handler) inner() fib.Handler {
@@ -166,9 +190,9 @@ func (h *Handler) OnOpen(c *fib.Connection) {
 	t := &layer{c: c, client: h.Client, handshaking: true, settling: true, owner: h}
 	t.cond.L = &t.mu
 	switch {
-	case h.Client && nativeClient(h.Config):
+	case !h.Blocking && h.Client && nativeClient(h.Config):
 		h.openNative(c, t)
-	case !h.Client && nativeServer(h.Config):
+	case !h.Blocking && !h.Client && nativeServer(h.Config):
 		h.openNative(c, t)
 	default:
 		c.SetLayer(t)

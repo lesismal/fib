@@ -54,6 +54,12 @@ type DialerConfig struct {
 	// EnableCompression offers the server permessage-deflate (RFC 7692). If
 	// the server accepts, messages are sent compressed and may arrive so.
 	EnableCompression bool
+	// BlockingTLSHandshake runs the TLS handshakes of wss:// connections
+	// through crypto/tls on a worker of the handshake pool, each waiting there
+	// for its peer. By default they run as state machines that take no
+	// goroutine while they wait, where the TLSConfig allows it (see package
+	// tls); this is the switch back, and what to compare the two with.
+	BlockingTLSHandshake bool
 	// TLSConfig is used for wss:// URLs. Nil means the defaults; either way a
 	// config naming no server gets the URL's host.
 	TLSConfig *tls.Config
@@ -137,7 +143,8 @@ func (d *Dialer) Dial(rawURL string, header stdhttp.Header, handler Handler,
 		_ = conn.SendOwned(cc.request)
 	}
 	if secure {
-		err = fibtls.Dial(d.engine, "tcp", addr, d.config.HandshakeTimeout, d.config.TLSConfig, cc, connected)
+		err = fibtls.DialWithOptions(d.engine, "tcp", addr, d.config.HandshakeTimeout, d.config.TLSConfig,
+			fibtls.DialOptions{Blocking: d.config.BlockingTLSHandshake}, cc, connected)
 	} else {
 		err = d.engine.DialWithHandler("tcp", addr, d.config.HandshakeTimeout, cc, connected)
 	}

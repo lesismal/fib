@@ -407,3 +407,41 @@ func TestNativeCloseAfterSend(t *testing.T) {
 		t.Fatal("never closed")
 	}
 }
+
+// Blocking sends the handshake through crypto/tls, on a dial and on a server.
+func TestBlockingOption(t *testing.T) {
+	for _, blocking := range []bool{false, true} {
+		name := "state machines"
+		if blocking {
+			name = "crypto/tls"
+		}
+		t.Run(name, func(t *testing.T) {
+			started := countNative(t)
+			serverConfig, clientConfig := tlsConfigs(t)
+			server := NewServer(serverConfig, echoHandler())
+			server.Blocking = blocking
+			_, addr := startEchoServer(t, fib.DefaultConfig(), server)
+			client, _ := startEchoServer(t, fib.DefaultConfig(), nil)
+			h := newCollector()
+			err := DialWithOptions(client, "tcp", addr, 5*time.Second, clientConfig, DialOptions{Blocking: blocking}, h,
+				func(c *fib.Connection, err error) {
+					if err == nil {
+						_ = c.Send([]byte("ping"))
+					}
+				})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got := h.waitFor(t, 4); string(got) != "ping" {
+				t.Fatalf("echo %q", got)
+			}
+			want := int64(2)
+			if blocking {
+				want = 0
+			}
+			if n := started.Load(); n != want {
+				t.Fatalf("%d handshakes ran without a worker, want %d", n, want)
+			}
+		})
+	}
+}

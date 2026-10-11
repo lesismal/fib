@@ -227,3 +227,33 @@ func TestClientTLS13HandshakesWithoutWorker(t *testing.T) {
 		})
 	}
 }
+
+// BlockingTLSHandshake changes how the handshake runs and nothing else: the
+// same requests work either way, on HTTP/2 and on HTTP/1.1.
+func TestClientBlockingTLSHandshake(t *testing.T) {
+	ts, _, tlsConfig := newH2TestServer(t, func(w stdhttp.ResponseWriter, r *stdhttp.Request) {
+		fmt.Fprintf(w, "%s %s", r.Proto, r.URL.Path)
+	})
+	for _, blocking := range []bool{false, true} {
+		for _, h1 := range []bool{false, true} {
+			t.Run(fmt.Sprintf("blocking=%v/http1=%v", blocking, h1), func(t *testing.T) {
+				config := DefaultClientConfig()
+				config.TLSConfig = tlsConfig
+				config.BlockingTLSHandshake = blocking
+				config.DisableHTTP2 = h1
+				client := newTestClient(t, config)
+				want := "HTTP/2.0 /x"
+				if h1 {
+					want = "HTTP/1.1 /x"
+				}
+				resp, err := client.Go(mustRequest(t, stdhttp.MethodGet, ts.URL+"/x", nil)).Wait()
+				if err != nil {
+					t.Fatal(err)
+				}
+				if got := readBody(t, resp); got != want {
+					t.Fatalf("got %q, want %q", got, want)
+				}
+			})
+		}
+	}
+}

@@ -93,6 +93,12 @@ type ClientConfig struct {
 	// way a config naming no server gets the request's host. Unless it sets
 	// NextProtos itself, ALPN offers HTTP/2 and HTTP/1.1.
 	TLSConfig *tls.Config
+	// BlockingTLSHandshake runs the TLS handshakes of https:// connections
+	// through crypto/tls on a worker of the handshake pool, each waiting there
+	// for its peer. By default they run as state machines that take no
+	// goroutine while they wait, where the TLSConfig allows it (see package
+	// tls); this is the switch back, and what to compare the two with.
+	BlockingTLSHandshake bool
 	// DisableHTTP2 keeps https:// requests on HTTP/1.1. Otherwise they speak
 	// HTTP/2 to any server that chooses it through ALPN.
 	DisableHTTP2 bool
@@ -494,7 +500,8 @@ func (c *Client) dial(h *hostPool) {
 				c.dialed(cc, err)
 			}
 		}
-		err = fibtls.Dial(c.engine, "tcp", h.target.addr, c.config.DialTimeout, c.tlsConfig, cc, done)
+		err = fibtls.DialWithOptions(c.engine, "tcp", h.target.addr, c.config.DialTimeout, c.tlsConfig,
+			fibtls.DialOptions{Blocking: c.config.BlockingTLSHandshake}, cc, done)
 	} else {
 		if c.config.UnencryptedHTTP2 {
 			done = func(_ *fib.Connection, err error) {

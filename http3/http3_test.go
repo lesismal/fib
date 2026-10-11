@@ -21,7 +21,7 @@ import (
 	"github.com/lesismal/fib/tlstest"
 )
 
-func runEngine(t *testing.T, engine *fib.Engine) {
+func runEngine(t testing.TB, engine *fib.Engine) {
 	t.Helper()
 	runDone := make(chan error, 1)
 	go func() { runDone <- engine.Run() }()
@@ -36,13 +36,13 @@ func runEngine(t *testing.T, engine *fib.Engine) {
 
 // startServer serves handler over HTTP/3 on a UDP port of its own and
 // returns the base URL.
-func startServer(t *testing.T, config Config, handler fibhttp.HandlerFunc) string {
+func startServer(t testing.TB, config Config, handler fibhttp.HandlerFunc) string {
 	t.Helper()
 	return startServerOn(t, fib.DefaultConfig(), config, handler)
 }
 
 // startServerOn is startServer on an engine configured as fc.
-func startServerOn(t *testing.T, fc fib.Config, config Config, handler fibhttp.HandlerFunc) string {
+func startServerOn(t testing.TB, fc fib.Config, config Config, handler fibhttp.HandlerFunc) string {
 	t.Helper()
 	serverTLS, _, err := tlstest.Configs()
 	if err != nil {
@@ -63,7 +63,7 @@ func startServerOn(t *testing.T, fc fib.Config, config Config, handler fibhttp.H
 	return fmt.Sprintf("https://localhost:%d", addr.Port)
 }
 
-func newClient(t *testing.T, configure func(*ClientConfig)) *Client {
+func newClient(t testing.TB, configure func(*ClientConfig)) *Client {
 	t.Helper()
 	_, clientTLS, err := tlstest.Configs()
 	if err != nil {
@@ -86,7 +86,7 @@ func newClient(t *testing.T, configure func(*ClientConfig)) *Client {
 	return client
 }
 
-func mustRequest(t *testing.T, method, url string, body io.Reader) *stdhttp.Request {
+func mustRequest(t testing.TB, method, url string, body io.Reader) *stdhttp.Request {
 	t.Helper()
 	req, err := stdhttp.NewRequest(method, url, body)
 	if err != nil {
@@ -95,7 +95,7 @@ func mustRequest(t *testing.T, method, url string, body io.Reader) *stdhttp.Requ
 	return req
 }
 
-func readBody(t *testing.T, resp *stdhttp.Response) string {
+func readBody(t testing.TB, resp *stdhttp.Response) string {
 	t.Helper()
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {

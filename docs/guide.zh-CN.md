@@ -444,6 +444,14 @@ err = fibtls.Dial(engine, "tcp", "example.com:443", 3*time.Second, tlsConfig, ha
     会话恢复是自己的：TLS 1.3 发 NewSessionTicket（PSK 恢复），TLS 1.2 发 RFC 5077 的票据（恢复时是缩短的握手），票据用
     `Handler` 的密钥（每天轮换，保留 7 天；设了 `Config.SessionTicketKey` 就用它，多个进程可以共享）封装，无状态；
     `SessionTicketsDisabled` 关闭。`crypto/tls` 签发的票据它不认，客户端会做一次完整握手。
+  - **开关**：`http.ClientConfig.BlockingTLSHandshake`、`websocket.DialerConfig.BlockingTLSHandshake`（以及 `tls.Handler.Blocking`、
+    `tls.DialOptions.Blocking`）设为 true 时，握手改走 `crypto/tls`、占握手池里的一个协程，默认（false）走状态机。对比压测见
+    `http` 包的 `BenchmarkClientNewConnection`（每个请求一条新连接，含 HTTP/2 与 HTTP/1.1）和
+    `BenchmarkClientStalledHandshakes`（对端不回应时每个握手占的协程数）；`http3` 包有同名的两个基准。HTTP/3 没有这个开关：
+    QUIC 的握手由 `crypto/tls` 的 `QUICConn` 在它自己的协程里跑，每个握手占一个协程（实测 1.0/握手），状态机客户端为 0。
+    本机回环、net/http 服务端的一次实测：新连接请求每次 HTTP/1.1 约 147 µs 对 177 µs（状态机 / `crypto/tls`），HTTP/2 约
+    165-178 µs 对 184 µs，HTTP/3 约 72-87 µs；对端不回应时 400 个握手额外占的协程：状态机 0，`crypto/tls` 约 1/握手
+    （握手池增长较慢时会更少，多出来的在队列里等）。
   - 握手结束后的记录层和上面一样。签名（RSA 约 1 ms）在引擎 worker 上做，`crypto/tls` 路径里是在握手协程上做。
   - 握手吞吐与 `crypto/tls` 路径相当（本机回环、ECDSA P-256、标准库客户端并发握手：每次约 105-124 µs 对 114 µs，客户端一侧
     占大头），省下的是等待对端的那些协程。
