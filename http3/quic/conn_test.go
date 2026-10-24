@@ -180,6 +180,9 @@ type pairOpts struct {
 	wrapServer func(*testHandler) Handler
 	// pipes, if set, is told the ends of the path before anything is sent.
 	pipes func(client, server *pipeEnd)
+	// retry, if set, has the server answer an Initial without a token of
+	// the key's with a Retry, and check the tokens of the others with it.
+	retry *TokenKey
 }
 
 func newTestPairOpts(t *testing.T, loss float64, configure func(client, server *Config), opts pairOpts) *testPair {
@@ -196,6 +199,7 @@ func newTestPairOpts(t *testing.T, loss float64, configure func(client, server *
 	if configure != nil {
 		configure(&cc, &sc)
 	}
+	sc.TokenKey = opts.retry
 	// On a path that loses datagrams the first flights can be lost several
 	// times over before either side has a round-trip time, and each probe
 	// timeout until then is twice the last, starting from a second: at one
@@ -232,6 +236,8 @@ func newTestPairOpts(t *testing.T, loss float64, configure func(client, server *
 				if p.server == nil {
 					if p.stray != nil {
 						p.stray(d)
+					} else if k := opts.retry; k != nil && IsInitial(d) && k.Check(d, addr) == TokenMissing {
+						_ = p.serverEnd.Send(k.Retry(d, addr))
 					} else if IsInitial(d) {
 						p.server = Accept(p.serverEnd, addr, sc, serverHandler, d)
 					}

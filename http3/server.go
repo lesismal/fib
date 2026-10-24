@@ -108,6 +108,29 @@ type Config struct {
 	// packet; a connection that has not finished it by then is closed. Zero
 	// means the QUIC default, 10 seconds.
 	HandshakeTimeout time.Duration
+	// MaxHandshakes bounds the QUIC handshakes the server has under way at
+	// once, from a client's first Initial to the end of its handshake: past
+	// it, a new client's Initial is dropped, and the client sends it again
+	// later. RetryHandshakes is how many may be under way before a new
+	// client is first asked, with a Retry, to prove that the address it
+	// sends from is its own (RFC 9000 section 8.1.2). That costs the client
+	// a round trip, but spares the server the TLS work, and the state, of an
+	// Initial whose source address is forged, which a flood of them would
+	// otherwise have it spend on each until MaxHandshakes turned everyone
+	// away. Below zero, RetryHandshakes asks every client. Zero means
+	// DefaultMaxHandshakes and DefaultRetryHandshakes.
+	MaxHandshakes   int
+	RetryHandshakes int
+	// StatelessResetKey, if set, is the key the server's stateless reset
+	// tokens are made with (RFC 9000 section 10.3). A packet for a
+	// connection the server does not have is answered with a stateless
+	// reset, which ends the client's side of it at once rather than when it
+	// times out; the client believes one only from a server that knew its
+	// connection. By default each handler has a random key of its own, so
+	// the connections a server had before it restarted, or that another
+	// server behind the same address has, time out instead: a key kept
+	// across restarts, and shared by such servers, has them reset.
+	StatelessResetKey *quic.ResetKey
 	// IdleTimeout bounds how long a connection may carry no request: once it
 	// has had none open for this long, it is retired as on shutdown, with
 	// GOAWAY, and closed once that has gone, as http.Config.IdleTimeout does
@@ -178,6 +201,14 @@ type Config struct {
 	DisableReuse bool
 }
 
+// The handshakes a server has under way at once by default, past which
+// it asks new clients to prove their addresses with a Retry, and drops
+// their Initials; see Config.MaxHandshakes.
+const (
+	DefaultMaxHandshakes   = 4096
+	DefaultRetryHandshakes = 1024
+)
+
 // DefaultConfig returns the defaults, which are what zero values in a Config
 // mean too.
 func DefaultConfig() Config {
@@ -186,6 +217,8 @@ func DefaultConfig() Config {
 		MaxBodyBytes:         16 << 20,
 		MaxConcurrentStreams: 100,
 		MaxIdleTimeout:       30 * time.Second,
+		MaxHandshakes:        DefaultMaxHandshakes,
+		RetryHandshakes:      DefaultRetryHandshakes,
 		// A connection goes once it has been quiet for MaxIdleTimeout, so
 		// the body is the one read a client can stall for good.
 		ReadBodyTimeout:   fibhttp.DefaultReadBodyTimeout,
@@ -227,6 +260,11 @@ type ServerHandler struct {
 	config   Config
 	quic     quic.Config
 	resetKey quic.ResetKey
+	// tokenKey makes the tokens of the server's Retry packets, and checks
+	// them, and handshakes counts the handshakes under way; see
+	// Config.MaxHandshakes.
+	tokenKey   *quic.TokenKey
+	handshakes atomic.Int64
 	// streams runs request handlers away from the goroutine that reads
 	// their connection, or is nil when they run on it.
 	streams *fibhttp.StreamPool
@@ -259,13 +297,22 @@ func NewHandlerWithConfig(config Config, handler fibhttp.Handler) *ServerHandler
 	if config.MaxIdleTimeout <= 0 {
 		config.MaxIdleTimeout = defaults.MaxIdleTimeout
 	}
+	if config.MaxHandshakes <= 0 {
+		config.MaxHandshakes = defaults.MaxHandshakes
+	}
+	if config.RetryHandshakes == 0 {
+		config.RetryHandshakes = defaults.RetryHandshakes
+	}
 	if handler == nil {
 		handler = fibhttp.HandlerFunc(func(c *fibhttp.Context) {
 			_ = c.Respond(stdhttp.StatusNotFound, "text/plain; charset=utf-8", []byte("404 page not found\n"))
 		})
 	}
-	h := &ServerHandler{handler: handler, config: config, resetKey: quic.NewResetKey(),
+	h := &ServerHandler{handler: handler, config: config, resetKey: quic.NewResetKey(), tokenKey: quic.NewTokenKey(),
 		streams: fibhttp.NewStreamPool(config.StreamPool), routes: make(map[string]*quic.Conn)}
+	if config.StatelessResetKey != nil {
+		h.resetKey = *config.StatelessResetKey
+	}
 	h.quic = quic.Config{
 		NewTLS:             h.newTLS(config.BlockingTLSHandshake),
 		TLSConfig:          ConfigureTLS(config.TLSConfig),
@@ -276,7 +323,10 @@ func NewHandlerWithConfig(config Config, handler fibhttp.Handler) *ServerHandler
 		// extensions it may try.
 		MaxIncomingUniStreams: 16,
 		ResetKey:              &h.resetKey,
-		MaxDatagramSize:       config.MaxDatagramSize,
+		// A client that had a Retry is let in with its token however few
+		// handshakes are under way by the time it comes back.
+		TokenKey:        h.tokenKey,
+		MaxDatagramSize: config.MaxDatagramSize,
 		// fib hands each datagram over as a buffer of its own from the
 		// pool, which QUIC gives back once it has done with it.
 		RecycleDatagrams: true,
@@ -371,8 +421,37 @@ func (h *ServerHandler) pathFor(peer *udpPeer, cid, data []byte) *peerPath {
 		peer.closeIfUnused()
 		return nil
 	}
+	if !h.admit(c, data) {
+		peer.closeIfUnused()
+		return nil
+	}
 	h.accept(peer, data)
 	return nil
+}
+
+// admit reports whether a client's Initial in data, from c's address, may
+// start a connection, given the handshakes under way: past MaxHandshakes it
+// may not, and past RetryHandshakes, one without a token from the server's
+// Retry is answered with a Retry instead (see Config.MaxHandshakes).
+func (h *ServerHandler) admit(c *fib.Connection, data []byte) bool {
+	n := h.handshakes.Load()
+	if n >= int64(h.config.MaxHandshakes) {
+		return false
+	}
+	retry := h.config.RetryHandshakes
+	if retry >= 0 && n < int64(retry) {
+		return true
+	}
+	addr := c.RemoteAddr()
+	if h.tokenKey.Check(data, addr) != quic.TokenMissing {
+		// A good token is let in, and one that is not good is told so by
+		// Accept.
+		return true
+	}
+	if packet := h.tokenKey.Retry(data, addr); packet != nil {
+		_ = c.Send(packet)
+	}
+	return false
 }
 
 // accept starts the connection a client's Initial in data begins, on a path
@@ -383,16 +462,20 @@ func (h *ServerHandler) accept(peer *udpPeer, data []byte) {
 	if addr := c.RemoteAddr(); addr != nil {
 		sc.remoteAddr = addr.String()
 	}
+	h.handshakes.Add(1)
+	sc.handshaking.Store(true)
 	// A client's GOAWAY names a push ID; nothing here promises pushes, so
 	// only the checks the control stream makes matter.
 	sc.peer.onGoAway = func(uint64) error { return nil }
 	path := peer.reserve()
 	if path == nil {
 		// Closing since pathFor looked; see there.
+		sc.handshakeOver()
 		return
 	}
 	qc := quic.Accept(path, c.RemoteAddr(), h.quic, sc, data)
 	if qc == nil {
+		sc.handshakeOver()
 		peer.release(path)
 		return
 	}
@@ -729,6 +812,9 @@ type serverConn struct {
 	// retiring says the engine's shutdown has had retire run, which it does
 	// once however often it is told; see ServerHandler.OnShutdown.
 	retiring atomic.Bool
+	// handshaking says the connection counts among its handler's handshakes
+	// under way; see handshakeOver.
+	handshaking atomic.Bool
 	// idleTimer retires the connection once it has carried no request for
 	// Config.IdleTimeout: idleSince is when the last one ended, or the
 	// connection started, and lastRequest when the latest request stream
@@ -740,9 +826,18 @@ type serverConn struct {
 }
 
 func (sc *serverConn) OnHandshake(qc *quic.Conn) {
+	sc.handshakeOver()
 	state := qc.ConnectionState()
 	sc.tlsState = &state
 	sc.start(qc)
+}
+
+// handshakeOver takes the connection off its handler's handshakes under
+// way, once: its handshake is over, or the connection is.
+func (sc *serverConn) handshakeOver() {
+	if sc.handshaking.CompareAndSwap(true, false) {
+		sc.h.handshakes.Add(-1)
+	}
 }
 
 // OnEarlyData starts the connection ahead of its handshake, for the requests
@@ -936,6 +1031,7 @@ func (sc *serverConn) OnCallsDone(*quic.Conn) {
 }
 
 func (sc *serverConn) OnClose(qc *quic.Conn, _ error) {
+	sc.handshakeOver()
 	sc.h.removeRoute(qc)
 	sc.mu.Lock()
 	streams := sc.streams

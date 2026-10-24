@@ -143,6 +143,11 @@ type Config struct {
 	ConnReceiveWindow   uint64
 	// ResetKey, on a server, lets its peers recognize stateless resets.
 	ResetKey *ResetKey
+	// TokenKey, on a server, checks the token of a client Initial that
+	// answers the server's Retry (see TokenKey.Retry): Accept takes a good
+	// one as proof of the client's address, and answers one it made that
+	// is not good with INVALID_TOKEN. Without it, a token is ignored.
+	TokenKey *TokenKey
 	// ExcessiveLoadCode is the application error code a connection closes
 	// with once its peer has made it do more work without asking for
 	// anything than it allows: PING after PING, say, or streams opened and
@@ -578,16 +583,42 @@ func Dial(pc PacketConn, remote net.Addr, config Config, handler Handler) (*Conn
 // Accept starts the server side of a connection from the client's first
 // datagram, which IsInitial has approved. It returns nil if the datagram
 // does not start a connection after all.
+//
+// A datagram whose token Config.TokenKey made for the client, in a Retry
+// that it answers, starts a connection whose client address is known to be
+// its own; one whose token the key made but is not good is answered with
+// INVALID_TOKEN, and starts none.
 func Accept(pc PacketConn, remote net.Addr, config Config, handler Handler, datagram []byte) *Conn {
 	h, err := parseHeader(datagram, cidLen)
 	if err != nil || h.typ != packetInitial || len(h.dcid) < 8 || config.TLSConfig == nil {
 		return nil
 	}
+	odcid := h.dcid
+	retried := false
+	if k := config.TokenKey; k != nil && len(h.token) > 0 {
+		status, first := k.check(h.token, remote, h.dcid)
+		switch status {
+		case TokenInvalid:
+			sendInvalidToken(pc, h)
+			return nil
+		case TokenValid:
+			odcid, retried = first, true
+		}
+	}
 	c := newConn(pc, remote, config, handler, false)
+	// The client's Initial and 0-RTT packets go to h.dcid, under keys of
+	// it, which after a Retry is the connection ID the Retry named.
 	c.odcid = bytes.Clone(h.dcid)
 	c.dcid = bytes.Clone(h.scid)
 	c.peerCIDs[0] = peerCID{cid: c.dcid}
-	c.local.originalDCID, c.local.hasOriginalDCID = c.odcid, true
+	c.local.originalDCID, c.local.hasOriginalDCID = bytes.Clone(odcid), true
+	if retried {
+		// The client's address is its own, so the amplification limit no
+		// longer applies (RFC 9000 section 8.1.2), and it checks that the
+		// Retry it had came from this server.
+		c.addressValidated = true
+		c.local.retrySCID, c.local.hasRetrySCID = c.odcid, true
+	}
 	c.local.disableMigration = true
 	if config.ResetKey != nil {
 		c.local.statelessResetToken = config.ResetKey.token(c.scid)
@@ -1328,9 +1359,10 @@ func (c *Conn) handlePacket(pkt []byte, h header, now time.Time) bool {
 		c.dcid = bytes.Clone(h.scid)
 		c.peerCIDs[0] = peerCID{cid: c.dcid}
 	}
-	if !c.isClient && space == spaceHandshake && !c.addressValidated {
+	if !c.isClient && space == spaceHandshake && !c.spaces[spaceInitial].discarded {
 		// Only the client could have produced a Handshake packet, so its
-		// address is its own (RFC 9000 section 8.1).
+		// address is its own (RFC 9000 section 8.1), if a Retry has not
+		// shown it already.
 		c.addressValidated = true
 		c.discardSpace(spaceInitial)
 	}
