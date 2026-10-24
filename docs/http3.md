@@ -17,7 +17,7 @@ from scratch. The TLS 1.3 handshake is the standard library's
 
 | Area | Content |
 | --- | --- |
-| QUIC | Version 1; Initial, Handshake and 1-RTT packet number spaces; AES-128-GCM, AES-256-GCM and ChaCha20-Poly1305 packet and header protection; key updates in both directions (started here when a key reaches its AEAD limit, and answered when the peer starts one) and a limit on decryption failures; Retry, sent by the server under load and handled by the client; Version Negotiation; stateless reset; RFC 9002 loss detection, PTO and NewReno congestion control; the server's 3x amplification limit; connection- and stream-level flow control in both directions; MAX_STREAMS; idle timeout and optional keep-alive |
+| QUIC | Version 1; Initial, Handshake and 1-RTT packet number spaces; AES-128-GCM, AES-256-GCM and ChaCha20-Poly1305 packet and header protection; key updates in both directions (started here when a key reaches its AEAD limit, and answered when the peer starts one) and a limit on decryption failures; Retry, sent by the server under load and handled by the client; Version Negotiation; stateless reset; RFC 9002 loss detection, PTO and persistent congestion; CUBIC (RFC 9438, the default) or NewReno congestion control, with pacing and app-limited detection; the server's 3x amplification limit; connection- and stream-level flow control in both directions; MAX_STREAMS; idle timeout and optional keep-alive |
 | Server | Shares one `Handler` and `Context` with HTTP/1 and HTTP/2; 1xx interim responses, automatic 100 Continue, request and response trailers, graceful `Response.Close` via GOAWAY, 413/431/417, malformed requests (including an `:authority` and `Host` that disagree) reset with H3_MESSAGE_ERROR, protocol errors closing the connection with RFC 9114 and RFC 9204 codes, `Request.TLS`, an `AltSvc` helper, extended CONNECT (RFC 9220) switched to a tunnel with `Context.Upgrade`, which is how `websocket.ServerHandler.Upgrade` serves WebSocket over HTTP/3 |
 | Client | Asynchronous `Do`/`Go`; one multiplexed connection per host:port; honors MAX_STREAMS and queues the rest; cancellation resets only its own stream; requests the server marks as unprocessed (GOAWAY, H3_REQUEST_REJECTED) are retried on a new connection; request and response trailers; a peer that breaks the protocol ends the connection with its error code |
 | Resumption and 0-RTT | Session tickets, resumption, and 0-RTT early data, for the server (`Config.EarlyData`) and the client (`ClientConfig.EarlyData`); see [0-RTT](#0-rtt) |
@@ -214,9 +214,12 @@ exposed through `http3.Config` or `http3.ClientConfig`:
   [Planned improvements](#1-correctness-and-hardening).
 - **BLOCKED frames**: DATA_BLOCKED, STREAM_DATA_BLOCKED and STREAMS_BLOCKED are
   never sent.
-- **Congestion control**: NewReno only, with no pacing, no app-limited
-  detection and no persistent congestion. A datagram the send buffer has no room
-  for (`EAGAIN`) is dropped and treated as lost.
+- **Congestion control**: CUBIC (RFC 9438) by default, NewReno with
+  `quic.Config.CongestionControl`; no BBR, HyStart++ or ECN. Sending is paced at
+  1.25 congestion windows a smoothed RTT. A round of datagrams the send buffer
+  has no room for (`EAGAIN`, or `ENOBUFS` on macOS) is kept and sent again a
+  millisecond later, before anything new: the engine says when a UDP socket can
+  be read, but not when a full one can be written again.
 - **The peer's `SETTINGS_MAX_FIELD_SECTION_SIZE`** is parsed but not checked
   when sending.
 - **Priorities**: the `priority` header and PRIORITY_UPDATE frames are ignored;
@@ -333,15 +336,28 @@ Done:
 
 ### 2. Performance (medium)
 
-- **Pacing**: send evenly according to the congestion window and RTT, and stop
-  the round on `EAGAIN` instead of letting datagrams drop. Measured: 20 MiB each
-  way takes about 7s under 5% random loss versus about 0.3s over lossless
-  loopback; under loss, throughput is bound mainly by this and by NewReno.
+- **Pacing, congestion control, loss recovery's data structures**: done.
+  Sending is paced at 1.25 congestion windows a smoothed RTT, with a burst of
+  the initial window or 2ms of the rate (RFC 9002 section 7.7), the timer going
+  on with what pacing holds back; a round the socket refuses with `EAGAIN` is
+  kept and sent again rather than lost (`fib.Connection.SendDatagrams` says how
+  much of a batch went). CUBIC (RFC 9438) is the default, NewReno selectable in
+  `quic.Config.CongestionControl`; the window grows only while in use (RFC 9002
+  section 7.8), and persistent congestion (section 7.6) collapses it. Sent
+  packets are a ring indexed by packet number, so an ACK frame costs what it
+  newly acknowledges and loss detection looks only up to the largest
+  acknowledged; the timer is set again only for a sooner deadline.
+  Measured on the benchmark host (`TestLossyTransfer`, 20 MiB each way over an
+  in-memory path, three rounds): under 5% random loss 1.2-1.7s before, 0.40s,
+  0.43s and 1.06s after; lossless 235-275ms before, 82-92ms after. fit's
+  fixed-h3 went from 1658k to 1773k requests a second (+7%), static-h3 was
+  unchanged (1175k, 1165k).
 - **PMTU discovery (DPLPMTUD, RFC 8899)**: Ethernet paths usually carry about
   1450-byte datagrams, which would cut per-packet header and AEAD overhead.
   Until then, `Config.MaxDatagramSize` sets a larger size by hand.
-- **Congestion control**: add CUBIC or BBR, app-limited detection and persistent
-  congestion.
+- **Congestion control**: BBR, HyStart++ and ECN are still to do; so is a
+  writability event for UDP sockets, which would resume a round the socket
+  refused as soon as it has room, rather than a millisecond later.
 - **Batched I/O**: the engine reads with `recvmmsg` on Linux and `recvmsg_x`
   on macOS, and a round of sending with more than one datagram leaves with
   `sendmmsg` or `sendmsg_x` (`fib.Connection.SendBatch`), on the server's
@@ -354,8 +370,6 @@ Done:
   engine, into a pooled buffer, and in the HTTP/3 frame parser only a frame
   split across pieces and the request body. A request still allocates its
   QUIC stream; its request stream and header are recycled (see above).
-- **Data structures**: sent packets live in a slice, so ACK processing and loss
-  detection scan linearly; every round of sending resets a `time.Timer`.
 - **ACK frequency**: implement the ACK_FREQUENCY extension to send fewer ACKs
   under heavy traffic.
 - **ChaCha20-Poly1305** is pure Go and slower than assembly. Machines with AES

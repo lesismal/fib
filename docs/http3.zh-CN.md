@@ -15,7 +15,7 @@
 
 | 方向 | 内容 |
 | --- | --- |
-| QUIC | version 1；Initial、Handshake、1-RTT 三个包号空间；AES-128-GCM、AES-256-GCM、ChaCha20-Poly1305 包保护与头部保护；双向 key update（本端按 AEAD 使用上限主动发起，也响应对端发起）与解密失败次数上限；服务端负载高时发送 Retry，客户端处理 Retry；Version Negotiation；stateless reset；RFC 9002 丢包检测、PTO 与 NewReno 拥塞控制；服务端 3 倍放大限制；连接级与 stream 级双向流控；MAX_STREAMS；空闲超时与可选 keep-alive |
+| QUIC | version 1；Initial、Handshake、1-RTT 三个包号空间；AES-128-GCM、AES-256-GCM、ChaCha20-Poly1305 包保护与头部保护；双向 key update（本端按 AEAD 使用上限主动发起，也响应对端发起）与解密失败次数上限；服务端负载高时发送 Retry，客户端处理 Retry；Version Negotiation；stateless reset；RFC 9002 丢包检测、PTO 与持续拥塞判定；CUBIC（RFC 9438，默认）或 NewReno 拥塞控制，带 pacing 和应用受限判断；服务端 3 倍放大限制；连接级与 stream 级双向流控；MAX_STREAMS；空闲超时与可选 keep-alive |
 | 服务端 | 与 HTTP/1、HTTP/2 共用同一个 `Handler` 和 `Context`；1xx 中间响应、自动 100 Continue、请求与响应 trailer、`Response.Close` 通过 GOAWAY 优雅关闭、413/431/417、非法请求（含 `:authority` 与 `Host` 不一致）以 H3_MESSAGE_ERROR 重置、协议错误按 RFC 9114 / RFC 9204 错误码关闭连接、`Request.TLS`、`AltSvc` 辅助函数、Extended CONNECT（RFC 9220）经 `Context.Upgrade` 切换为隧道，`websocket.ServerHandler.Upgrade` 即借此提供 WebSocket over HTTP/3 |
 | 客户端 | 异步 `Do`/`Go`；每个 host:port 一条连接、多路复用；遵守 MAX_STREAMS 并排队；取消只重置单个 stream；GOAWAY 与 H3_REQUEST_REJECTED 的请求自动在新连接上重发；请求与响应 trailer；对端违反协议时按错误码关闭连接 |
 | 一致性 | 与 quic-go 客户端、服务端双向互通，以及用手写帧构造的协议错误用例，都在 CI 中运行 |
@@ -160,9 +160,10 @@
   连接以 H3_EXCESSIVE_LOAD 关闭，见[待优化项](#1-正确性与安全加固)。
 - **BLOCKED 类帧**：受流控限制时不发送 DATA_BLOCKED、STREAM_DATA_BLOCKED、
   STREAMS_BLOCKED。
-- **拥塞控制**：只有 NewReno，没有 pacing，没有判断应用受限（app-limited），也没有
-  持续拥塞（persistent congestion）判定。发送缓冲区满（`EAGAIN`）时数据报直接丢弃，
-  按丢包处理。
+- **拥塞控制**：默认 CUBIC（RFC 9438），可用 `quic.Config.CongestionControl` 改为
+  NewReno；没有 BBR、HyStart++ 和 ECN。发送按每个平滑 RTT 1.25 个拥塞窗口的速率 pacing。
+  发送缓冲区满（`EAGAIN`，macOS 上是 `ENOBUFS`）时，这一轮剩下的数据报保留下来，1 毫秒
+  后先于新数据重发：Engine 会通知 UDP socket 可读，但不会通知写满的 socket 何时又可写。
 - **对端的 `SETTINGS_MAX_FIELD_SECTION_SIZE`**：能解析，但发送时不检查。
 - **优先级**：`priority` 头和 PRIORITY_UPDATE 帧都被忽略，待发送的 stream 轮流发送。
 - **ECN**：不设置也不上报 ECN 标记。ACK_ECN 帧能解析，但其中的计数被忽略。
@@ -244,12 +245,21 @@
 
 ### 2. 性能（中）
 
-- **pacing**：按拥塞窗口和 RTT 均匀发送，并在 `EAGAIN` 时停止本轮发送，而不是让数据报
-  被丢弃。实测 5% 随机丢包下 20 MiB 双向传输约 7 秒，本机回环无丢包约 0.3 秒，丢包场景下
-  吞吐主要受这一项和 NewReno 限制。
+- **pacing、拥塞控制、丢包恢复的数据结构**：已完成。发送按每个平滑 RTT 1.25 个拥塞窗口
+  的速率 pacing，突发上限为初始窗口与 2 毫秒发送量中的较大者（RFC 9002 7.7 节），pacing
+  压住的部分由定时器接着发；socket 以 `EAGAIN` 拒收的一轮数据报保留下来重发，而不是丢掉
+  （`fib.Connection.SendDatagrams` 报告一批里发出了几个）。默认 CUBIC（RFC 9438），可在
+  `quic.Config.CongestionControl` 选 NewReno；窗口只在被用满时增长（RFC 9002 7.8 节），
+  持续拥塞（7.6 节）时降到最小窗口。已发送的包按包号存进环形队列，一个 ACK 帧的开销只与
+  它新确认的包相关，丢包检测只看到最大已确认包为止；定时器只在截止时间提前时才重设。
+  在基准机上实测（`TestLossyTransfer`，经内存路径双向各 20 MiB，三轮）：5% 随机丢包下
+  改动前 1.2-1.7 秒，改动后 0.40、0.43、1.06 秒；无丢包时改动前 235-275 毫秒，改动后
+  82-92 毫秒。fit 的 fixed-h3 从每秒 165.8 万请求提高到 177.3 万（+7%），static-h3 不变
+  （117.5 万、116.5 万）。
 - **PMTU 探测（DPLPMTUD，RFC 8899）**：以太网上通常可以用到约 1450 字节的数据报，每个
   包的头部和 AEAD 标签开销会降低。在此之前可以用 `Config.MaxDatagramSize` 手动调大。
-- **拥塞控制**：增加 CUBIC 或 BBR，判断应用受限，实现持续拥塞判定。
+- **拥塞控制**：BBR、HyStart++ 和 ECN 尚未实现；UDP socket 的可写事件也没有，有了它，
+  被 socket 拒收的一轮可以在有空间时立刻续发，而不是等 1 毫秒。
 - **批量收发**：Engine 在 Linux 上用 `recvmmsg`、macOS 上用 `recvmsg_x` 批量读取；一轮
   发送多于一个数据报时用 `sendmmsg` 或 `sendmsg_x` 一次发出（`fib.Connection.SendBatch`），服务端
   和客户端的连接都是如此。
@@ -258,8 +268,6 @@
 - **减少复制与分配**：发送时 `Write` 复制一次（复制进缓冲池里的缓冲区）、组包时再复制
   一次；接收时 Engine 复制一次（复制进缓冲池里的缓冲区），HTTP/3 帧解析器只复制跨片段的帧
   和请求 body。每个请求仍要分配它的 QUIC stream；请求 stream 和 header 会被复用（见上文）。
-- **数据结构**：已发送的包存在切片里，ACK 处理和丢包检测都是线性扫描；每轮发送都会重置
-  一次 `time.Timer`。
 - **ACK 频率**：大流量时可以实现 ACK_FREQUENCY 扩展，减少 ACK 数量。
 - **ChaCha20-Poly1305**：目前是纯 Go 实现，比汇编实现慢。在有 AES 硬件加速的机器上会
   优先协商 AES-GCM，通常不是瓶颈。
