@@ -303,10 +303,12 @@ Done:
   peer, past a burst of 1000 refilled at 100 a second as in HTTP/2:
   - abandons streams while they are open, with RESET_STREAM or STOP_SENDING,
     or makes the server reset them for malformed requests, each stream counted
-    once (HTTP/3's form of Rapid Reset, CVE-2023-44487);
+    once (HTTP/3's form of Rapid Reset, CVE-2023-44487); only a server counts
+    these, and not the RESET_STREAM that answers its own STOP_SENDING;
   - sends frames that ask for work and carry nothing: a packet with nothing
     but PING, PATH_CHALLENGE, MAX_DATA, MAX_STREAM_DATA and MAX_STREAMS that
-    raise no limit, DATA_BLOCKED, STREAM_DATA_BLOCKED and STREAMS_BLOCKED,
+    raise no limit, DATA_BLOCKED, STREAM_DATA_BLOCKED and STREAMS_BLOCKED
+    that report no new limit (a sender says so once per limit it reaches),
     a STREAM frame with no data that ends nothing, and NEW_CONNECTION_ID for a
     connection ID already retired.
 

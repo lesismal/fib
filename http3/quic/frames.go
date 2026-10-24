@@ -274,15 +274,30 @@ func (c *Conn) handleFrames(space int, payload []byte, now time.Time) (bool, err
 				err = c.glitch()
 			}
 		case typ == frameDataBlocked:
-			r.varint()
-			err = c.glitch()
+			if at := r.varint(); !r.bad {
+				err = c.blockedAt(&c.dataBlockedAt, at, c.recvMaxData)
+			}
 		case typ == frameStreamDataBlocked:
-			r.varint()
-			r.varint()
-			err = c.glitch()
+			id, at := r.varint(), r.varint()
+			if r.bad {
+				break
+			}
+			s, e := c.peerStream(id, true)
+			if e != nil || s == nil {
+				err = e
+				break
+			}
+			err = c.blockedAt(&s.blockedAt, at, s.recvMax)
 		case typ == frameStreamsBlockedBidi || typ == frameStreamsBlockedUni:
-			r.varint()
-			err = c.glitch()
+			at := r.varint()
+			if r.bad {
+				break
+			}
+			if typ == frameStreamsBlockedBidi {
+				err = c.blockedAt(&c.streamsBlockedAt[0], at, c.maxBidi)
+			} else {
+				err = c.blockedAt(&c.streamsBlockedAt[1], at, c.maxUni)
+			}
 		case typ == frameNewConnectionID:
 			err = c.handleNewConnectionID(&r)
 		case typ == frameRetireConnectionID:

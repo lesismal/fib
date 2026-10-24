@@ -222,10 +222,11 @@
 - **控制帧与 reset 洪泛**：对端有下列行为、超过突发 1000 次（每秒恢复 100 次，与 HTTP/2
   相同）时，QUIC 连接关闭，HTTP/3 下错误码为 H3_EXCESSIVE_LOAD（`quic.Config.ExcessiveLoadCode`）：
   - 在 stream 仍打开时用 RESET_STREAM 或 STOP_SENDING 放弃它，或发送畸形请求让服务端
-    重置它，每个 stream 只计一次（HTTP/3 版的 Rapid Reset，CVE-2023-44487）；
+    重置它，每个 stream 只计一次（HTTP/3 版的 Rapid Reset，CVE-2023-44487）；只有服务端计数，
+    回应服务端自己 STOP_SENDING 的 RESET_STREAM 也不计；
   - 发送要求本端做事却不带任何内容的帧：只有 PING 的包、PATH_CHALLENGE、没有提高上限的
-    MAX_DATA、MAX_STREAM_DATA 和 MAX_STREAMS、DATA_BLOCKED、STREAM_DATA_BLOCKED 和
-    STREAMS_BLOCKED、没有数据也不结束 stream 的 STREAM 帧，以及针对已退役 connection ID
+    MAX_DATA、MAX_STREAM_DATA 和 MAX_STREAMS、没有报告新上限的 DATA_BLOCKED、
+    STREAM_DATA_BLOCKED 和 STREAMS_BLOCKED（发送方每到一个新上限只报告一次）、没有数据也不结束 stream 的 STREAM 帧，以及针对已退役 connection ID
     的 NEW_CONNECTION_ID。
 
   和确认了新包的 ACK 一起发来的 PING 不计数：只发 ACK 的一端（比如在下载的客户端）会不时

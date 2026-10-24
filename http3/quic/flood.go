@@ -13,19 +13,34 @@ import "time"
 // opening a stream and abandoning it at once costs this side the stream and
 // whatever the application started for it, but costs the peer nothing, and
 // the stream no longer counts against the limit on streams open at once (as
-// HTTP/2's Rapid Reset, CVE-2023-44487, does).
+// HTTP/2's Rapid Reset, CVE-2023-44487, does). Only a server counts them: a
+// client's streams are its own requests, and a server resetting them, or
+// asking it to stop sending as it may for every upload it answers before
+// the body ends, costs the client nothing it did not ask for, as the HTTP/2
+// client in package http counts no resets either. Nor does a server count
+// the RESET_STREAM that answers a STOP_SENDING of its own, which it asked
+// for.
 //
 // Glitches count the frames that ask for work and carry nothing: a packet
 // that elicits an acknowledgement with nothing but PING, unless an
 // acknowledgement in it acknowledged something new, as the acknowledgements
 // a busy receiver bundles a PING with do; PATH_CHALLENGE, which is
 // answered; MAX_DATA, MAX_STREAM_DATA and MAX_STREAMS that raise no limit;
-// DATA_BLOCKED, STREAM_DATA_BLOCKED and STREAMS_BLOCKED; a STREAM frame
-// with no data that ends nothing; and NEW_CONNECTION_ID for a connection ID
-// already retired, which is answered with RETIRE_CONNECTION_ID. Frames that
-// cost no more than their bytes to read, and those a peer may send in
-// flight for a stream that has ended, such as MAX_STREAM_DATA or
-// RESET_STREAM for one this side has forgotten, are not counted.
+// DATA_BLOCKED, STREAM_DATA_BLOCKED and STREAMS_BLOCKED that report no new
+// limit; a STREAM frame with no data that ends nothing; and
+// NEW_CONNECTION_ID for a connection ID already retired, which is answered
+// with RETIRE_CONNECTION_ID. Frames that cost no more than their bytes to
+// read, and those a peer may send in flight for a stream that has ended,
+// such as MAX_STREAM_DATA or RESET_STREAM for one this side has forgotten,
+// are not counted.
+//
+// A sender blocked by flow control says so once for each limit it reaches
+// (RFC 9000 section 4.1), and one uploading fast against small windows
+// reaches a new limit as often as the windows are raised, which can be far
+// more than the glitch rate: a BLOCKED frame for a limit above the last one
+// it reported, up to the one this side gave, is not counted. One that
+// repeats a limit, as one sent again after a loss does, or that reports one
+// this side never gave, is.
 const (
 	floodResetBurst  = 1000
 	floodResetRate   = 100
@@ -77,11 +92,11 @@ func (c *Conn) glitch() error {
 	return c.floodErr("too many frames that ask for nothing")
 }
 
-// resetCounted counts a stream abandoned while it was open, once however
-// often it is, and reports the error to close the connection with once
+// resetCounted counts a stream a server's peer abandoned while it was open,
+// once however often it is, and reports the error to close the connection with once
 // there have been too many. Callers hold c.mu.
 func (c *Conn) resetCounted(s *Stream) error {
-	if s.floodCounted {
+	if c.isClient || s.floodCounted {
 		return nil
 	}
 	s.floodCounted = true
@@ -89,4 +104,17 @@ func (c *Conn) resetCounted(s *Stream) error {
 		return nil
 	}
 	return c.floodErr("too many streams reset")
+}
+
+// blockedAt counts a BLOCKED frame that reports the limit at, with *last
+// the highest one the peer reported before for the same thing and given
+// what this side has allowed: one for a new limit is a sender saying once
+// that it has reached it, and only the others count as glitches. Callers
+// hold c.mu.
+func (c *Conn) blockedAt(last *uint64, at, given uint64) error {
+	if at > *last && at <= given {
+		*last = at
+		return nil
+	}
+	return c.glitch()
 }

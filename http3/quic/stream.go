@@ -66,8 +66,10 @@ type Stream struct {
 	queued bool
 	done   bool
 	// floodCounted says the stream has counted against the resets the peer
-	// may cause (see flood.go).
+	// may cause, and blockedAt is the highest limit the peer said it was
+	// blocked at on the stream (see flood.go).
 	floodCounted bool
+	blockedAt    uint64
 	// released is set once the application is done with the stream, and
 	// its handler calls stop (see WriteFinal). Only the goroutine making
 	// them uses it.
@@ -604,8 +606,11 @@ func (s *Stream) onResetStream(code, finalSize uint64) error {
 	if s.recvDone || s.peerReset {
 		return nil
 	}
-	if err := c.resetCounted(s); err != nil {
-		return err
+	if !s.stopSent {
+		// A reset that answers this side's STOP_SENDING is what it asked for.
+		if err := c.resetCounted(s); err != nil {
+			return err
+		}
 	}
 	s.peerReset = true
 	s.maxDataPending = false

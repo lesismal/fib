@@ -313,6 +313,11 @@ type Conn struct {
 	// before, which a PING bundled with it does not count against glitches.
 	glitches, resets floodBudget
 	ackedNew         bool
+	// dataBlockedAt and streamsBlockedAt, for bidirectional and then
+	// unidirectional streams, are the highest limits the peer has said it
+	// was blocked at, which a BLOCKED frame for a new one goes above.
+	dataBlockedAt    uint64
+	streamsBlockedAt [2]uint64
 
 	rtt          rttStats
 	cc           newReno

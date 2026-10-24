@@ -89,6 +89,14 @@ func TestFloodGlitchesCounted(t *testing.T) {
 				}
 			},
 			payload: func(int) []byte { return newCIDFrame(1, 0, []byte("cid-one!")) }},
+		{name: "DATA_BLOCKED above the limit given", counted: true,
+			payload: func(int) []byte { return frame(frameDataBlocked, 1<<40) }},
+		{name: "DATA_BLOCKED at new limits",
+			payload: func(i int) []byte { return frame(frameDataBlocked, i+1) }},
+		{name: "STREAM_DATA_BLOCKED at new limits",
+			payload: func(i int) []byte { return frame(frameStreamDataBlocked, 0, i+1) }},
+		{name: "STREAMS_BLOCKED at new limits",
+			payload: func(i int) []byte { return frame(frameStreamsBlockedBidi, i+1) }},
 		{name: "PING with a STREAM frame",
 			payload: func(i int) []byte {
 				return append(frame(framePing), frame(frameStream|0x06, 0, i, 1, "x")...)
@@ -221,4 +229,47 @@ func TestFloodResetsForPeerErrors(t *testing.T) {
 	}
 	sendRawFrames(p, frames)
 	waitPeerClose(t, p.clientH, floodCode)
+}
+
+// TestFloodClientTakesResets checks that a client is not held to the reset
+// budget: a server that resets every stream the client opens, past the
+// burst, as one answering each upload before its body ends may, leaves the
+// client's connection open. The client's RESET_STREAM in answer to each
+// STOP_SENDING does not count against the server's budget either.
+func TestFloodClientTakesResets(t *testing.T) {
+	p := floodPair(t)
+	n := floodResetBurst + 10
+	p.serverH.onData = func(s *Stream, data []byte, fin bool) {
+		if s.ID() >= uint64(4*n) {
+			_ = s.Write(data, fin)
+			return
+		}
+		s.StopSending(1)
+		s.Reset(1)
+	}
+	for i := 0; i < n; i++ {
+		s, err := p.client.OpenStream()
+		if err != nil {
+			t.Fatal(err)
+		}
+		_ = s.Write([]byte("x"), false)
+	}
+	for i := 0; i < n; i++ {
+		select {
+		case <-p.clientH.reset:
+		case err := <-p.clientH.closed:
+			t.Fatalf("closed after %d resets: %v", i, err)
+		case <-time.After(20 * time.Second):
+			t.Fatalf("%d of %d streams reset", i, n)
+		}
+	}
+	s, err := p.client.OpenStream()
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = s.Write([]byte("still there"), true)
+	waitFinished(t, p.clientH, s.ID())
+	if got := string(p.clientH.received(s.ID())); got != "still there" {
+		t.Fatalf("echoed %q", got)
+	}
 }
