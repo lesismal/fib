@@ -246,7 +246,9 @@ type h3Wire struct {
 	mu        sync.Mutex
 	qc        *quic.Conn
 	handshake chan struct{}
-	streams   map[uint64]*h3WireStream
+	// closed gets why the connection ended.
+	closed  chan error
+	streams map[uint64]*h3WireStream
 }
 
 type h3WireStream struct {
@@ -321,7 +323,12 @@ func (h h3WireHandler) OnStreamReset(s *quic.Stream, _ uint64) {
 }
 func (h h3WireHandler) OnStopSending(*quic.Stream, uint64) {}
 func (h h3WireHandler) OnStreamsAvailable(*quic.Conn)      {}
-func (h h3WireHandler) OnClose(*quic.Conn, error)          {}
+func (h h3WireHandler) OnClose(_ *quic.Conn, err error) {
+	select {
+	case h.w.closed <- err:
+	default:
+	}
+}
 
 func (st *h3WireStream) notifyLocked() {
 	close(st.changed)
@@ -406,7 +413,7 @@ func dialH3WireWith(t *testing.T, engine *fib.Engine, base string, config quic.C
 	if engine == nil {
 		engine = newH3ClientEngine(t)
 	}
-	w := &h3Wire{t: t, handshake: make(chan struct{}), streams: map[uint64]*h3WireStream{}}
+	w := &h3Wire{t: t, handshake: make(chan struct{}), closed: make(chan error, 1), streams: map[uint64]*h3WireStream{}}
 	dialed := make(chan error, 1)
 	err = engine.DialWithHandler("udp", "127.0.0.1:"+u.Port(), time.Second, w, func(fc *fib.Connection, err error) {
 		if err != nil {

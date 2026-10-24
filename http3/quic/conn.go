@@ -143,6 +143,12 @@ type Config struct {
 	ConnReceiveWindow   uint64
 	// ResetKey, on a server, lets its peers recognize stateless resets.
 	ResetKey *ResetKey
+	// ExcessiveLoadCode is the application error code a connection closes
+	// with once its peer has made it do more work without asking for
+	// anything than it allows: PING after PING, say, or streams opened and
+	// reset at once (see flood.go). HTTP/3 has H3_EXCESSIVE_LOAD for it.
+	// Zero closes it with the transport error PROTOCOL_VIOLATION instead.
+	ExcessiveLoadCode uint64
 	// MaxDatagramSize is the largest datagram sent once the handshake is
 	// over, if the peer's max_udp_payload_size allows it. Default 1200, the
 	// size every path carries; more saves packets, and the syscalls that
@@ -296,6 +302,12 @@ type Conn struct {
 	// decryptFailures counts packets that failed authentication, which the
 	// AEAD's integrity limit bounds.
 	decryptFailures uint64
+	// glitches and resets are what the peer may make the connection do
+	// without asking for anything (see flood.go), and ackedNew says whether
+	// the packet being handled acknowledged something not acknowledged
+	// before, which a PING bundled with it does not count against glitches.
+	glitches, resets floodBudget
+	ackedNew         bool
 
 	rtt          rttStats
 	cc           newReno

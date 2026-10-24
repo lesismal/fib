@@ -65,6 +65,9 @@ type Stream struct {
 
 	queued bool
 	done   bool
+	// floodCounted says the stream has counted against the resets the peer
+	// may cause (see flood.go).
+	floodCounted bool
 	// released is set once the application is done with the stream, and
 	// its handler calls stop (see WriteFinal). Only the goroutine making
 	// them uses it.
@@ -241,6 +244,27 @@ func (s *Stream) resetLocked(code uint64) {
 	s.send = sendBuffer{base: s.send.next, next: s.send.next}
 	s.conn.queueStream(s)
 	s.conn.wakeWritersLocked()
+}
+
+// ResetForPeerError abandons both sides of the stream with code, as
+// StopSending and Reset do, for an error the peer made on it, such as a
+// malformed request. The stream then counts against the resets the peer may
+// cause, as one it abandoned itself does (see flood.go): a peer that has
+// this side reset stream after stream for it ends up closing the
+// connection.
+func (s *Stream) ResetForPeerError(code uint64) {
+	c := s.conn
+	c.mu.Lock()
+	if !c.closed {
+		s.stopSendingLocked(code)
+		s.resetLocked(code)
+		if err := c.resetCounted(s); err != nil {
+			c.closeLocked(err)
+		}
+		c.wantFlush = true
+	}
+	c.mu.Unlock()
+	c.dispatch()
 }
 
 // StopSending asks the peer to stop sending, with code, and discards what
@@ -580,6 +604,9 @@ func (s *Stream) onResetStream(code, finalSize uint64) error {
 	if s.recvDone || s.peerReset {
 		return nil
 	}
+	if err := c.resetCounted(s); err != nil {
+		return err
+	}
 	s.peerReset = true
 	s.maxDataPending = false
 	s.recv = recvBuffer{offset: s.recv.offset}
@@ -590,13 +617,17 @@ func (s *Stream) onResetStream(code, finalSize uint64) error {
 	return nil
 }
 
-func (s *Stream) onStopSending(code uint64) {
+func (s *Stream) onStopSending(code uint64) error {
 	c := s.conn
 	if s.reset || s.finAcked {
-		return
+		return nil
+	}
+	if err := c.resetCounted(s); err != nil {
+		return err
 	}
 	s.resetLocked(code)
 	c.events = append(c.events, event{kind: evStopSending, stream: s, code: code})
+	return nil
 }
 
 // recvFinished reports whether the receiving side needs nothing more.

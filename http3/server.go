@@ -281,6 +281,9 @@ func NewHandlerWithConfig(config Config, handler fibhttp.Handler) *ServerHandler
 		// pool, which QUIC gives back once it has done with it.
 		RecycleDatagrams: true,
 		EarlyData:        config.EarlyData,
+		// A client that floods the connection with PING, resets and the
+		// like is told it was too much (RFC 9114 section 8.1).
+		ExcessiveLoadCode: uint64(ErrCodeExcessiveLoad),
 	}
 	return h
 }
@@ -1600,7 +1603,9 @@ func (rs *requestStream) abortWith(code ErrorCode, err error) {
 	if readStopped {
 		rs.unref()
 	}
-	abortStream(rs.s, code)
+	// The client's error, which counts against the streams it may have the
+	// server reset, as Rapid Reset's do.
+	rs.s.ResetForPeerError(uint64(code))
 	if rs.req != nil {
 		rs.sc.untrack(rs)
 	}

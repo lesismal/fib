@@ -227,6 +227,7 @@ func (c *Conn) onAckReceived(space int, ranges []pnRange, ackDelay time.Duration
 	if len(acked) == 0 {
 		return nil
 	}
+	c.ackedNew = true
 	defer func() {
 		for _, p := range acked {
 			c.releaseSent(p)

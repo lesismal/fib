@@ -122,6 +122,11 @@ func (c *Conn) handleFrames(space int, payload []byte, now time.Time) (bool, err
 	r := reader{b: payload}
 	ackEliciting := false
 	c.nonProbing = false
+	// pinged says the packet has a PING, and asked that it has another frame
+	// that elicits an acknowledgement; dataRaised that MAX_DATA let more be
+	// sent, which the streams waiting for it learn of once, after the last.
+	pinged, asked, dataRaised := false, false, false
+	c.ackedNew = false
 	for len(r.b) > 0 && !c.closed {
 		typ := r.varint()
 		if r.bad {
@@ -135,6 +140,7 @@ func (c *Conn) handleFrames(space int, payload []byte, now time.Time) (bool, err
 		if typ != framePadding && typ != frameAck && typ != frameAckECN &&
 			typ != frameConnectionClose && typ != frameConnectionCloseApp {
 			ackEliciting = true
+			asked = asked || typ != framePing
 		}
 		// Initial and Handshake packets carry only the handshake itself.
 		if space != spaceApp {
@@ -159,6 +165,7 @@ func (c *Conn) handleFrames(space int, payload []byte, now time.Time) (bool, err
 				r.b = r.b[1:]
 			}
 		case typ == framePing:
+			pinged = true
 		case typ == frameAck || typ == frameAckECN:
 			err = c.handleAckFrame(space, &r, typ == frameAckECN, now)
 		case typ == frameResetStream:
@@ -182,7 +189,7 @@ func (c *Conn) handleFrames(space int, payload []byte, now time.Time) (bool, err
 				err = e
 				break
 			}
-			s.onStopSending(code)
+			err = s.onStopSending(code)
 		case typ == frameCrypto:
 			off := r.varint()
 			data := r.bytes(r.varint())
@@ -221,15 +228,18 @@ func (c *Conn) handleFrames(space int, payload []byte, now time.Time) (bool, err
 			if c.curEarly {
 				s.early.Store(true)
 			}
+			if len(data) == 0 && typ&0x01 == 0 {
+				if err = c.glitch(); err != nil {
+					break
+				}
+			}
 			err = s.onStreamFrame(off, data, typ&0x01 != 0)
 		case typ == frameMaxData:
 			if max := r.varint(); max > c.peerMaxData {
 				c.peerMaxData = max
-				for _, s := range c.streams {
-					if s.sendable() {
-						c.queueStream(s)
-					}
-				}
+				dataRaised = true
+			} else if !r.bad {
+				err = c.glitch()
 			}
 		case typ == frameMaxStreamData:
 			id, max := r.varint(), r.varint()
@@ -244,6 +254,8 @@ func (c *Conn) handleFrames(space int, payload []byte, now time.Time) (bool, err
 			if max > s.sendMax {
 				s.sendMax = max
 				c.queueStream(s)
+			} else if !s.reset && !s.finQueued {
+				err = c.glitch()
 			}
 		case typ == frameMaxStreamsBidi || typ == frameMaxStreamsUni:
 			max := r.varint()
@@ -258,14 +270,19 @@ func (c *Conn) handleFrames(space int, payload []byte, now time.Time) (bool, err
 			if max > *limit {
 				*limit = max
 				c.events = append(c.events, event{kind: evStreamsAvailable})
+			} else if !r.bad {
+				err = c.glitch()
 			}
 		case typ == frameDataBlocked:
 			r.varint()
+			err = c.glitch()
 		case typ == frameStreamDataBlocked:
 			r.varint()
 			r.varint()
+			err = c.glitch()
 		case typ == frameStreamsBlockedBidi || typ == frameStreamsBlockedUni:
 			r.varint()
+			err = c.glitch()
 		case typ == frameNewConnectionID:
 			err = c.handleNewConnectionID(&r)
 		case typ == frameRetireConnectionID:
@@ -275,6 +292,7 @@ func (c *Conn) handleFrames(space int, payload []byte, now time.Time) (bool, err
 		case typ == framePathChallenge:
 			if data := r.bytes(8); !r.bad {
 				c.queuePathResponse([8]byte(data))
+				err = c.glitch()
 			}
 		case typ == framePathResponse:
 			// A response on any path validates the path it answers (RFC
@@ -310,6 +328,19 @@ func (c *Conn) handleFrames(space int, payload []byte, now time.Time) (bool, err
 		}
 		if r.bad {
 			return false, transportErr(errFrameEncoding, "malformed frame")
+		}
+	}
+	if dataRaised {
+		for _, s := range c.streams {
+			if s.sendable() {
+				c.queueStream(s)
+			}
+		}
+	}
+	if pinged && !asked && !c.ackedNew && !c.closed {
+		// A PING alone asks for an acknowledgement and nothing else.
+		if err := c.glitch(); err != nil {
+			return false, err
 		}
 	}
 	return ackEliciting, nil
@@ -386,7 +417,7 @@ func (c *Conn) handleNewConnectionID(r *reader) error {
 	}
 	if seq < c.retiredPrior {
 		c.retireCIDs = append(c.retireCIDs, seq)
-		return nil
+		return c.glitch()
 	}
 	if old, ok := c.peerCIDs[seq]; ok {
 		if !bytes.Equal(old.cid, cid) {
