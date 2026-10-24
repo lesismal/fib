@@ -387,8 +387,12 @@ func TestHandshakeAndEcho(t *testing.T) {
 	}
 }
 
-func testTransfer(t *testing.T, loss float64, size int) {
-	p := newTestPair(t, loss, nil)
+func testTransfer(t *testing.T, loss float64, size int) { testTransferWith(t, loss, size, nil) }
+
+// testTransferWith is testTransfer with the pair's configs set up by
+// configure.
+func testTransferWith(t *testing.T, loss float64, size int, configure func(client, server *Config)) {
+	p := newTestPair(t, loss, configure)
 	p.serverH.onData = func(s *Stream, data []byte, fin bool) {
 		_ = s.Write(data, fin)
 	}
@@ -422,6 +426,12 @@ func TestTransfer(t *testing.T) { testTransfer(t, 0, 2<<20) }
 
 func TestTransferWithLoss(t *testing.T) { testTransfer(t, 0.05, 256<<10) }
 
+func TestTransferWithLossNewReno(t *testing.T) {
+	testTransferWith(t, 0.05, 256<<10, func(client, server *Config) {
+		client.CongestionControl, server.CongestionControl = NewReno, NewReno
+	})
+}
+
 // TestLossyTransfer is the measurement of throughput under loss: 20 MiB each
 // way, at 5% random loss and without. It is a load test, which runs only on
 // the benchmark host, and only when FIB_QUIC_LOSSY is set.
@@ -429,8 +439,13 @@ func TestLossyTransfer(t *testing.T) {
 	if os.Getenv("FIB_QUIC_LOSSY") == "" {
 		t.Skip("a load test: set FIB_QUIC_LOSSY on the benchmark host")
 	}
-	for _, loss := range []float64{0, 0.05} {
-		testTransfer(t, loss, 5<<20)
+	for _, algo := range []CongestionControl{CUBIC, NewReno} {
+		for _, loss := range []float64{0, 0.05} {
+			t.Logf("%v:", algo)
+			testTransferWith(t, loss, 5<<20, func(client, server *Config) {
+				client.CongestionControl, server.CongestionControl = algo, algo
+			})
+		}
 	}
 }
 

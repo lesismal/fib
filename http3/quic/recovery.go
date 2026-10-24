@@ -4,8 +4,7 @@ import (
 	"time"
 )
 
-// Loss detection and congestion control follow RFC 9002, with NewReno for
-// the congestion controller.
+// Loss detection follows RFC 9002; congestion control is in congestion.go.
 
 const (
 	packetThreshold  = 3
@@ -98,6 +97,9 @@ func (c *Conn) releaseSent(p *sentPacket) {
 type rttStats struct {
 	latest, smoothed, rttvar, min time.Duration
 	hasSample                     bool
+	// firstAt is when the first sample was taken: lost packets sent before
+	// it say nothing of persistent congestion (RFC 9002 section 7.6.2).
+	firstAt time.Time
 }
 
 func newRTTStats() rttStats {
@@ -129,39 +131,6 @@ func (r *rttStats) update(latest, ackDelay time.Duration) {
 // pto is the probe timeout before backoff, without the peer's ack delay.
 func (r *rttStats) pto() time.Duration {
 	return r.smoothed + max(4*r.rttvar, timerGranularity)
-}
-
-// newReno is the congestion controller of RFC 9002 section 7.
-type newReno struct {
-	cwnd, ssthresh, bytesInFlight uint64
-	recoveryStart                 time.Time
-}
-
-func newNewReno() newReno {
-	return newReno{cwnd: initialCongestionWindow, ssthresh: ^uint64(0)}
-}
-
-func (cc *newReno) canSend() bool { return cc.bytesInFlight+maxDatagram <= cc.cwnd }
-
-func (cc *newReno) onAcked(p *sentPacket) {
-	cc.bytesInFlight -= uint64(p.size)
-	if !p.time.After(cc.recoveryStart) {
-		return
-	}
-	if cc.cwnd < cc.ssthresh {
-		cc.cwnd += uint64(p.size)
-	} else {
-		cc.cwnd += maxDatagram * uint64(p.size) / cc.cwnd
-	}
-}
-
-func (cc *newReno) onCongestion(sent, now time.Time) {
-	if !sent.After(cc.recoveryStart) {
-		return
-	}
-	cc.recoveryStart = now
-	cc.ssthresh = max(cc.cwnd/2, minCongestionWindow)
-	cc.cwnd = cc.ssthresh
 }
 
 // peerMaxAckDelay is how long the peer may hold back an acknowledgement.
@@ -247,15 +216,21 @@ func (c *Conn) onAckReceived(space int, ranges []pnRange, ackDelay time.Duration
 		} else if c.handshakeConfirmed {
 			ackDelay = min(ackDelay, c.peerMaxAckDelay())
 		}
+		if !c.rtt.hasSample {
+			c.rtt.firstAt = now
+		}
 		c.rtt.update(now.Sub(newest.time), ackDelay)
 	}
+	// Whether the window was in use is a matter of what was in flight
+	// before this acknowledgement, and before what it shows lost.
+	limited := c.cc.limited(c.cc.bytesInFlight, c.paced)
 	c.detectLost(space, now)
 	for _, p := range acked {
 		if p.ackEliciting {
 			s.ackElicitingInFlight--
 		}
 		if p.inFlight {
-			c.cc.onAcked(p)
+			c.cc.onAcked(p, now, c.rtt.smoothed, limited)
 		}
 		for i := range p.frames {
 			c.frameAcked(space, &p.frames[i])
@@ -347,7 +322,43 @@ func (c *Conn) detectLost(space int, now time.Time) {
 	}
 	if !latest.IsZero() {
 		c.cc.onCongestion(latest, now)
+		if c.persistentCongestion(lost) {
+			c.cc.onPersistentCongestion()
+		}
 	}
+}
+
+// persistentCongestion reports whether packets just declared lost, in
+// packet number order, establish persistent congestion (RFC 9002 section
+// 7.6): two ack-eliciting ones sent further apart than three probe timeouts
+// without backoff, both after the first round-trip sample, with every packet
+// numbered between them lost as well. A packet number missing between two
+// lost ones was acknowledged, or declared lost before; either ends the run,
+// so that an acknowledgement in between is never missed.
+func (c *Conn) persistentCongestion(lost []*sentPacket) bool {
+	if !c.rtt.hasSample {
+		return false
+	}
+	span := (c.rtt.smoothed + max(4*c.rtt.rttvar, timerGranularity) + c.peerMaxAckDelay()) * persistentCongestionThreshold
+	var first *sentPacket
+	for i, p := range lost {
+		if i > 0 && p.pn != lost[i-1].pn+1 {
+			first = nil
+		}
+		if !p.ackEliciting {
+			continue
+		}
+		if p.time.Before(c.rtt.firstAt) {
+			first = nil
+			continue
+		}
+		if first == nil {
+			first = p
+		} else if p.time.Sub(first.time) > span {
+			return true
+		}
+	}
+	return false
 }
 
 func (c *Conn) frameAcked(space int, f *sentFrame) {

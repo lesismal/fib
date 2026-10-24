@@ -50,7 +50,7 @@ func (c *Conn) migrateLocked(now time.Time, first int) {
 		// flight on the old path stay counted until they are acknowledged
 		// or lost.
 		c.rtt = newRTTStats()
-		c.cc.cwnd, c.cc.ssthresh, c.cc.recoveryStart = initialCongestionWindow, ^uint64(0), now
+		c.cc.resetPath(now)
 	}
 	c.pc, c.remote = pc, remote
 	c.pathValidated = false
