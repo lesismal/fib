@@ -2,8 +2,10 @@ package hpack
 
 import (
 	"encoding/hex"
+	"fmt"
 	"math/rand"
 	"reflect"
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -226,4 +228,66 @@ func BenchmarkDecodeRepeatedHuffman(b *testing.B) {
 	for b.Loop() {
 		_ = d.Decode(block, func(HeaderField) error { return nil })
 	}
+}
+
+// benchResponse is the header a typical response carries: a status, the
+// content headers, a date, a server and a few fields of the application's.
+var benchResponse = []HeaderField{
+	{":status", "200"}, {"content-type", "application/json; charset=utf-8"},
+	{"content-length", "1234"}, {"date", "Sat, 24 Oct 2026 12:00:00 GMT"},
+	{"server", "fib"}, {"cache-control", "no-cache"}, {"vary", "accept-encoding"},
+	{"x-frame-options", "DENY"}, {"x-content-type-options", "nosniff"},
+}
+
+func benchEncode(b *testing.B, fields func(i int) []HeaderField) {
+	e := NewEncoder()
+	var block []byte
+	b.ReportAllocs()
+	i := 0
+	for b.Loop() {
+		block = e.Begin(block[:0])
+		for _, f := range fields(i) {
+			block = e.AppendField(block, f.Name, f.Value, false)
+		}
+		i++
+	}
+}
+
+// BenchmarkEncodeResponseRepeated encodes the same response header again and
+// again, which after the first block is all indexed.
+func BenchmarkEncodeResponseRepeated(b *testing.B) {
+	benchEncode(b, func(int) []HeaderField { return benchResponse })
+}
+
+// BenchmarkEncodeResponseVaried encodes the typical response header with a
+// content-length taken from a few hundred sizes and a date that moves on now
+// and then, so the table fills with lengths and evicts the oldest.
+func BenchmarkEncodeResponseVaried(b *testing.B) {
+	var lengths, dates []string
+	for i := range 300 {
+		lengths = append(lengths, strconv.Itoa(100+i*37))
+	}
+	for i := range 60 {
+		dates = append(dates, fmt.Sprintf("Sat, 24 Oct 2026 12:00:%02d GMT", i))
+	}
+	fields := append([]HeaderField(nil), benchResponse...)
+	benchEncode(b, func(i int) []HeaderField {
+		fields[2].Value = lengths[(i*7)%len(lengths)]
+		fields[3].Value = dates[(i/1000)%len(dates)]
+		return fields
+	})
+}
+
+// BenchmarkEncodeDistinct encodes fields that never repeat while they are in
+// the table, so every one is added and the full table evicts on every add.
+func BenchmarkEncodeDistinct(b *testing.B) {
+	var blocks [][]HeaderField
+	for i := range 64 {
+		var fields []HeaderField
+		for j := range 8 {
+			fields = append(fields, HeaderField{fmt.Sprintf("x-custom-%d", j), fmt.Sprintf("value-%d-%d", i, j)})
+		}
+		blocks = append(blocks, fields)
+	}
+	benchEncode(b, func(i int) []HeaderField { return blocks[i%len(blocks)] })
 }
