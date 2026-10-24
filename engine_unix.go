@@ -153,24 +153,25 @@ func (c *Connection) sysSendDatagram(data []byte) error {
 	}
 }
 
-// sysSendDatagrams sends datagrams, none of them empty, in batches. Callers
-// hold c.mu.
-func (c *Connection) sysSendDatagrams(datagrams [][]byte) error {
+// sysSendDatagrams sends datagrams, none of them empty, in batches, and
+// reports how many it sent. Callers hold c.mu.
+func (c *Connection) sysSendDatagrams(datagrams [][]byte) (int, error) {
 	fd, to := c.FD(), syscall.Sockaddr(nil)
 	if l := c.udp.listener; l != nil {
 		fd, to = l.fd, c.udp.sa
 	}
-	for len(datagrams) > 0 {
-		n, err := udpbatch.Send(fd, to, datagrams)
+	sent := 0
+	for sent < len(datagrams) {
+		n, err := udpbatch.Send(fd, to, datagrams[sent:])
 		if err == syscall.EINTR {
 			continue
 		}
 		if err != nil {
-			return err
+			return sent, err
 		}
-		datagrams = datagrams[n:]
+		sent += n
 	}
-	return nil
+	return sent, nil
 }
 
 func (e *Engine) open(config Config, bindings []Binding) error {

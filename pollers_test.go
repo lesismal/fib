@@ -671,7 +671,8 @@ func TestUDPBurstFromManyPeers(t *testing.T) {
 
 // SendBatch sends each datagram whole, in order, to the peer's address from
 // a listener and on a dialed socket alike, batched or, where the kernel
-// refuses batches, one at a time.
+// refuses batches, one at a time; SendDatagrams does too, and says it sent
+// them all.
 func TestUDPSendBatch(t *testing.T) {
 	for _, single := range []bool{false, true} {
 		t.Run(fmt.Sprintf("single=%v", single), func(t *testing.T) {
@@ -730,8 +731,8 @@ func TestUDPSendBatch(t *testing.T) {
 				t.FailNow()
 			}
 			defer client.Close()
-			if err := client.SendBatch(batch); err != nil {
-				t.Fatal(err)
+			if n, err := client.SendDatagrams(batch); err != nil || n != len(batch) {
+				t.Fatalf("SendDatagrams sent %d of %d: %v", n, len(batch), err)
 			}
 			_ = sink.SetReadDeadline(time.Now().Add(5 * time.Second))
 			for i := range batch {

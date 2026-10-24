@@ -8,6 +8,7 @@ import (
 	"fmt"
 	mrand "math/rand/v2"
 	"net"
+	"os"
 	"slices"
 	"sync"
 	"sync/atomic"
@@ -393,6 +394,7 @@ func testTransfer(t *testing.T, loss float64, size int) {
 	}
 	payload := make([]byte, size)
 	_, _ = rand.Read(payload)
+	start := time.Now()
 	var streams []*Stream
 	for i := 0; i < 4; i++ {
 		s, err := p.client.OpenStream()
@@ -410,11 +412,27 @@ func testTransfer(t *testing.T, loss float64, size int) {
 			t.Fatalf("stream %d: got %d bytes, want %d", s.ID(), len(got), len(payload))
 		}
 	}
+	elapsed := time.Since(start)
+	total := float64(len(streams)*size) / (1 << 20)
+	t.Logf("%.0f%% loss: %.1f MiB each way in %v, %.1f MiB/s", loss*100, total, elapsed.Round(time.Millisecond),
+		total/elapsed.Seconds())
 }
 
 func TestTransfer(t *testing.T) { testTransfer(t, 0, 2<<20) }
 
 func TestTransferWithLoss(t *testing.T) { testTransfer(t, 0.05, 256<<10) }
+
+// TestLossyTransfer is the measurement of throughput under loss: 20 MiB each
+// way, at 5% random loss and without. It is a load test, which runs only on
+// the benchmark host, and only when FIB_QUIC_LOSSY is set.
+func TestLossyTransfer(t *testing.T) {
+	if os.Getenv("FIB_QUIC_LOSSY") == "" {
+		t.Skip("a load test: set FIB_QUIC_LOSSY on the benchmark host")
+	}
+	for _, loss := range []float64{0, 0.05} {
+		testTransfer(t, loss, 5<<20)
+	}
+}
 
 func TestHandshakeWithLoss(t *testing.T) {
 	for i := 0; i < 5; i++ {

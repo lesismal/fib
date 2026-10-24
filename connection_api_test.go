@@ -219,7 +219,8 @@ func TestSendFileOfADirectoryFails(t *testing.T) {
 }
 
 // SendBatch on a stream sends each datagram as a Send would, in order, and
-// fails as Send does once the connection is closed.
+// fails as Send does once the connection is closed, and SendDatagrams then
+// says it sent none.
 func TestSendBatchOnAStream(t *testing.T) {
 	c, client := acceptOne(t, "tcp", HandlerFuncs{})
 	if err := c.SendBatch([][]byte{[]byte("one,"), []byte("two")}); err != nil {
@@ -231,6 +232,9 @@ func TestSendBatchOnAStream(t *testing.T) {
 	_ = c.Close()
 	if err := c.SendBatch([][]byte{[]byte("x")}); err == nil {
 		t.Fatal("SendBatch on a closed connection succeeded")
+	}
+	if n, err := c.SendDatagrams([][]byte{[]byte("x")}); err == nil || n != 0 {
+		t.Fatalf("SendDatagrams on a closed connection sent %d: %v", n, err)
 	}
 }
 

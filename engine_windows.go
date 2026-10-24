@@ -192,14 +192,15 @@ func (c *Connection) peerSockaddr() (syscall.Sockaddr, error) { return syscall.G
 func (c *Connection) sockname() (syscall.Sockaddr, error) { return syscall.Getsockname(c.socket()) }
 
 // sysSendDatagrams sends datagrams one at a time, Windows having no batched
-// send that sendmmsg would be. Callers hold c.mu.
-func (c *Connection) sysSendDatagrams(datagrams [][]byte) error {
-	for _, d := range datagrams {
+// send that sendmmsg would be, and reports how many it sent. Callers hold
+// c.mu.
+func (c *Connection) sysSendDatagrams(datagrams [][]byte) (int, error) {
+	for i, d := range datagrams {
 		if err := c.sysSendDatagram(d); err != nil {
-			return err
+			return i, err
 		}
 	}
-	return nil
+	return len(datagrams), nil
 }
 
 // sysSendDatagram sends one datagram without waiting. Callers hold c.mu.

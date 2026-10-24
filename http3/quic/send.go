@@ -101,10 +101,14 @@ const maxRoundDatagrams = 64
 // sendRoundLocked builds what there is to send and the limits allow, as much
 // of it as a round's buffer holds, sets the timer for what comes next, and
 // sends the datagrams with the lock released. It leaves wantFlush set when it
-// stopped for want of room rather than of something to send. Callers are the
-// sending goroutine (see flush) and hold c.mu, which they hold again when it
-// returns.
+// stopped for want of room rather than of something to send. A round that
+// stops for pacing, or finds the socket full, leaves sendAt set instead, for
+// the timer to go on with. Callers are the sending goroutine (see flush) and
+// hold c.mu, which they hold again when it returns.
 func (c *Conn) sendRoundLocked() {
+	if c.blocked != nil && !c.sendBlockedLocked() {
+		return
+	}
 	// One buffer for the round: datagrams from its start, and at its end a
 	// slot for each space to build its packet's payload in, since the
 	// packets of a datagram are all chosen before any of them is sealed.
@@ -115,6 +119,8 @@ func (c *Conn) sendRoundLocked() {
 	n := 0
 	now := c.now()
 	c.maybeUpdateKeys()
+	c.paced = false
+	c.sendAt = time.Time{}
 	for !c.closed {
 		if n == len(lens) || cap(buf)-len(buf) < c.maxDatagram {
 			c.wantFlush = true
@@ -133,6 +139,9 @@ func (c *Conn) sendRoundLocked() {
 		n++
 	}
 	c.flushDeadline = time.Time{}
+	if c.paced && !c.wantFlush && c.sendableLocked() {
+		c.sendAt = c.paceNext(now)
+	}
 	if !c.closed {
 		c.setLossDetectionTimer(now)
 		c.armTimerLocked(now)
@@ -142,10 +151,57 @@ func (c *Conn) sendRoundLocked() {
 		// meanwhile may move the connection to another.
 		pc := c.pc
 		c.mu.Unlock()
-		sendDatagrams(pc, buf, lens[:n])
+		sent, err := sendDatagrams(pc, buf, lens[:n])
 		c.mu.Lock()
+		if sent < n && wouldBlock(err) && !c.closed {
+			c.keepBlockedLocked(mem, sent, n)
+			return
+		}
 	}
 	bufferpool.Put(mem)
+}
+
+// keepBlockedLocked keeps the datagrams of a round from the sent-th of n on,
+// which the socket had no room for, to send again once the timer says to.
+// The packets in them were counted as sent when they were built, and are
+// sent late rather than lost. Callers are the sending goroutine and hold
+// c.mu.
+func (c *Conn) keepBlockedLocked(mem []byte, sent, n int) {
+	off := c.blockedOff
+	for _, l := range c.roundLens[:sent] {
+		off += int(l)
+	}
+	copy(c.roundLens[:], c.roundLens[sent:n])
+	c.blocked, c.blockedOff, c.blockedN = mem, off, n-sent
+	// More waiting to be built waits too: the timer sends it once the
+	// socket has taken what it refused.
+	c.wantFlush = false
+	now := c.now()
+	c.sendAt = now.Add(blockedRetry)
+	c.armTimerLocked(now)
+}
+
+// sendBlockedLocked sends again what a round left for a full socket, and
+// reports whether the socket took all of it. Callers are the sending
+// goroutine and hold c.mu.
+func (c *Conn) sendBlockedLocked() bool {
+	mem, n := c.blocked, c.blockedN
+	c.blocked = nil
+	if c.closed {
+		bufferpool.Put(mem)
+		return false
+	}
+	pc := c.pc
+	c.mu.Unlock()
+	sent, err := sendDatagrams(pc, mem[c.blockedOff:], c.roundLens[:n])
+	c.mu.Lock()
+	if sent < n && wouldBlock(err) && !c.closed {
+		c.keepBlockedLocked(mem, sent, n)
+		return false
+	}
+	c.blockedOff, c.blockedN = 0, 0
+	bufferpool.Put(mem)
+	return !c.closed
 }
 
 // roundDatagrams are the slices a batched send lists a round's datagrams in:
@@ -155,23 +211,37 @@ func (c *Conn) sendRoundLocked() {
 var roundDatagrams = sync.Pool{New: func() any { return new([maxRoundDatagrams][]byte) }}
 
 // sendDatagrams sends the datagrams laid one after another in buf through
-// pc, with one call when the path takes several at once. Callers are the
-// sending goroutine, without c.mu.
-func sendDatagrams(pc PacketConn, buf []byte, lens []uint16) {
-	if b, ok := pc.(BatchSender); ok && len(lens) > 1 {
-		datagrams := roundDatagrams.Get().(*[maxRoundDatagrams][]byte)
-		for i, n := range lens {
-			datagrams[i], buf = buf[:n], buf[n:]
+// pc, with one call when the path takes several at once, and reports how
+// many went: those before the one that failed, or all of them when the path
+// cannot tell, since they are then as good as lost. Callers are the sending
+// goroutine, without c.mu.
+func sendDatagrams(pc PacketConn, buf []byte, lens []uint16) (int, error) {
+	if len(lens) > 1 {
+		ds, counted := pc.(DatagramsSender)
+		b, batched := pc.(BatchSender)
+		if counted || batched {
+			datagrams := roundDatagrams.Get().(*[maxRoundDatagrams][]byte)
+			for i, n := range lens {
+				datagrams[i], buf = buf[:n], buf[n:]
+			}
+			sent, err := len(lens), error(nil)
+			if counted {
+				sent, err = ds.SendDatagrams(datagrams[:len(lens)])
+			} else {
+				err = b.SendBatch(datagrams[:len(lens)])
+			}
+			clear(datagrams[:len(lens)])
+			roundDatagrams.Put(datagrams)
+			return sent, err
 		}
-		_ = b.SendBatch(datagrams[:len(lens)])
-		clear(datagrams[:len(lens)])
-		roundDatagrams.Put(datagrams)
-		return
 	}
-	for _, n := range lens {
-		_ = pc.Send(buf[:n])
+	for i, n := range lens {
+		if err := pc.Send(buf[:n]); err != nil && wouldBlock(err) {
+			return i, err
+		}
 		buf = buf[n:]
 	}
+	return len(lens), nil
 }
 
 // appendDatagram appends one datagram to out, with a packet from each space
@@ -198,6 +268,10 @@ func (c *Conn) appendDatagram(out, scratch []byte, now time.Time) []byte {
 		limit = min(limit, budget)
 	}
 	congestionOK := c.cc.canSend()
+	if congestionOK && !c.paceAllows(now) {
+		congestionOK = false
+		c.paced = true
+	}
 	var plans [numSpaces]packetPlan
 	n, size := 0, 0
 	for space := range c.spaces {
@@ -242,6 +316,9 @@ func (c *Conn) appendDatagram(out, scratch []byte, now time.Time) []byte {
 		p.sp.time = now
 		p.sp.size = c.packetSize(p)
 		p.sp.inFlight = p.sp.ackEliciting || p.padded
+		if p.sp.inFlight {
+			c.paceBudget -= p.sp.size
+		}
 		c.onPacketSent(p.space, p.sp)
 	}
 	return out

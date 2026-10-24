@@ -25,6 +25,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/lesismal/fib/bufferpool"
 	"github.com/lesismal/fib/sidepool"
 )
 
@@ -41,6 +42,16 @@ const (
 // must not keep them once it returns.
 type BatchSender interface {
 	SendBatch(datagrams [][]byte) error
+}
+
+// DatagramsSender is a PacketConn that sends several datagrams with one call
+// and reports how many of them it sent, all of them unless it fails. A
+// connection that sends through one keeps the datagrams a full socket had no
+// room for, and sends them again shortly, where a send that fails otherwise
+// leaves them lost. It must not keep them once it returns. fib.Connection
+// is one.
+type DatagramsSender interface {
+	SendDatagrams(datagrams [][]byte) (int, error)
 }
 
 // PacketConn sends a connection's datagrams to its peer.
@@ -453,6 +464,20 @@ type Conn struct {
 	// one after another in its buffer, which only the sending goroutine uses
 	// (see flush).
 	roundLens [maxRoundDatagrams]uint16
+	// blocked is the buffer of a round whose datagrams the socket had no
+	// room for, kept to send again: blockedN of them, from blockedOff on,
+	// their lengths at the start of roundLens. Only the sending goroutine
+	// uses them.
+	blocked    []byte
+	blockedOff int
+	blockedN   int
+	// Pacing (see pacer.go): the budget, in bytes, as it was at paceLast;
+	// paced says the round stopped for want of it; sendAt is when a round
+	// that stopped for pacing or for a full socket goes on.
+	paceBudget int
+	paceLast   time.Time
+	paced      bool
+	sendAt     time.Time
 
 	// freeSent are sent packet records to reuse, and ackedScratch and
 	// lostScratch the arrays acknowledgement and loss detection list theirs
@@ -1874,6 +1899,10 @@ func (c *Conn) terminateLocked(err error) {
 	if c.timer != nil {
 		c.timer.Stop()
 	}
+	if c.blocked != nil && !c.sending {
+		bufferpool.Put(c.blocked)
+		c.blocked = nil
+	}
 	c.wakeWritersLocked()
 	for _, s := range c.streams {
 		s.done = true
@@ -1901,6 +1930,7 @@ func (c *Conn) armTimerLocked(now time.Time) {
 	}
 	earliest(c.lossDeadline)
 	earliest(c.flushDeadline)
+	earliest(c.sendAt)
 	earliest(c.pathDeadline)
 	earliest(c.closeDeadline)
 	if s := &c.spaces[spaceApp]; s.ackPending && !s.ackNow {
@@ -1975,6 +2005,12 @@ func (c *Conn) onTimer() {
 			due = true
 		}
 		if s := &c.spaces[spaceApp]; s.ackPending && !s.ackDeadline.IsZero() && !now.Before(s.ackDeadline) {
+			due = true
+		}
+		if !c.sendAt.IsZero() && !now.Before(c.sendAt) {
+			// Pacing has a datagram's worth again, or the socket that was
+			// full may have room.
+			c.sendAt = time.Time{}
 			due = true
 		}
 		if due {

@@ -1685,6 +1685,16 @@ func (c *Connection) sendDatagram(data []byte) error {
 // those before it were sent. On a connection that is not UDP it Sends each
 // in turn.
 func (c *Connection) SendBatch(datagrams [][]byte) error {
+	_, err := c.SendDatagrams(datagrams)
+	return err
+}
+
+// SendDatagrams is SendBatch, reporting how many of the datagrams were sent:
+// all of them when the error is nil, and those before the one that failed
+// otherwise. A sender that meets a full socket, which reports EAGAIN (or
+// ENOBUFS, on macOS), can then keep the rest to send again later rather than
+// lose them.
+func (c *Connection) SendDatagrams(datagrams [][]byte) (int, error) {
 	batch := c.udp != nil
 	for _, d := range datagrams {
 		// Send sends nothing for an empty datagram, where a batch would
@@ -1692,23 +1702,23 @@ func (c *Connection) SendBatch(datagrams [][]byte) error {
 		batch = batch && len(d) > 0
 	}
 	if !batch {
-		for _, d := range datagrams {
+		for i, d := range datagrams {
 			if err := c.Send(d); err != nil {
-				return err
+				return i, err
 			}
 		}
-		return nil
+		return len(datagrams), nil
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if c.closing || c.closed || c.closeAfterSend {
-		return syscall.EPIPE
+		return 0, syscall.EPIPE
 	}
-	err := c.sysSendDatagrams(datagrams)
-	if err == nil {
+	n, err := c.sysSendDatagrams(datagrams)
+	if n > 0 {
 		c.udp.lastActive.Store(time.Now().UnixNano())
 	}
-	return err
+	return n, err
 }
 
 // sendDatagramParts sends two parts as one datagram.

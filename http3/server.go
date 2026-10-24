@@ -782,10 +782,12 @@ type peerPath struct {
 
 func (p *peerPath) Send(datagram []byte) error { return p.peer.c.Send(datagram) }
 
-// SendBatch makes the path a quic.BatchSender, so that a round of datagrams
-// goes out with one system call where the address's fib.Connection can.
-func (p *peerPath) SendBatch(datagrams [][]byte) error {
-	return p.peer.c.SendBatch(datagrams)
+// SendDatagrams makes the path a quic.DatagramsSender, so that a round of
+// datagrams goes out with one system call where the address's
+// fib.Connection can, and those a full socket refuses are sent again rather
+// than lost.
+func (p *peerPath) SendDatagrams(datagrams [][]byte) (int, error) {
+	return p.peer.c.SendDatagrams(datagrams)
 }
 
 // Close lets the connection's use of the address go; the address's
@@ -803,7 +805,8 @@ var (
 	_ fib.EngineCloseHandler = clientPath{}
 	_ quic.CallsDoneHandler  = (*serverConn)(nil)
 	_ quic.PathHandler       = (*serverConn)(nil)
-	_ quic.BatchSender       = (*peerPath)(nil)
+	_ quic.DatagramsSender   = (*peerPath)(nil)
+	_ quic.DatagramsSender   = (*fib.Connection)(nil)
 )
 
 // serverConn is one client's HTTP/3 connection.
