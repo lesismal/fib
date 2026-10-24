@@ -35,6 +35,11 @@ type dynamicTable struct {
 	entries []HeaderField
 	size    int
 	maxSize int
+	// first is how many entries have been evicted, modulo 256, which the
+	// index uses to tell its entries apart.
+	first uint8
+	// index, which only an encoder keeps, finds entries by name and value.
+	index *fieldIndex
 }
 
 func (t *dynamicTable) get(index int) (HeaderField, bool) {
@@ -66,6 +71,10 @@ func (t *dynamicTable) evict() {
 	if n == 0 {
 		return
 	}
+	if t.index != nil {
+		t.unindex(n)
+	}
+	t.first += uint8(n)
 	copy(t.entries, t.entries[n:])
 	for i := len(t.entries) - n; i < len(t.entries); i++ {
 		t.entries[i] = HeaderField{}
@@ -386,17 +395,33 @@ func (e *Encoder) AppendField(dst []byte, name, value string, sensitive bool) []
 	if i, ok := staticNameIndex[name]; ok {
 		nameIndex = i
 	}
-	for i := len(e.table.entries) - 1; i >= 0; i-- {
-		f := e.table.entries[i]
-		if f.Name != name {
-			continue
-		}
-		index := len(staticTable) + len(e.table.entries) - i
-		if f.Value == value {
-			return appendInt(dst, 0x80, 7, uint64(index))
+	t := &e.table
+	var nameHash, pairHash uint64
+	hashed := len(t.entries) > indexFrom
+	if hashed {
+		nameHash = hashName(name)
+		pairHash = hashPair(nameHash, value)
+		if p := t.find(&t.index.pairs, pairHash, name, value, true); p >= 0 {
+			return appendInt(dst, 0x80, 7, uint64(len(staticTable)+len(t.entries)-p))
 		}
 		if nameIndex == 0 {
-			nameIndex = index
+			if p := t.find(&t.index.names, nameHash, name, "", false); p >= 0 {
+				nameIndex = len(staticTable) + len(t.entries) - p
+			}
+		}
+	} else {
+		for i := len(t.entries) - 1; i >= 0; i-- {
+			f := t.entries[i]
+			if f.Name != name {
+				continue
+			}
+			index := len(staticTable) + len(t.entries) - i
+			if f.Value == value {
+				return appendInt(dst, 0x80, 7, uint64(index))
+			}
+			if nameIndex == 0 {
+				nameIndex = index
+			}
 		}
 	}
 	// Index what is likely to repeat. Values that are secret or large would
@@ -408,7 +433,7 @@ func (e *Encoder) AppendField(dst []byte, name, value string, sensitive bool) []
 		dst = appendInt(dst, 0x00, 4, uint64(nameIndex))
 	} else {
 		dst = appendInt(dst, 0x40, 6, uint64(nameIndex))
-		e.table.add(f)
+		t.addIndexed(f, nameHash, pairHash, hashed)
 	}
 	if nameIndex == 0 {
 		dst = appendString(dst, name)

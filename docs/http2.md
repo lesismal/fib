@@ -264,8 +264,9 @@ concurrency.
 ### 4. Performance (medium)
 
 - **HPACK Huffman decoding** is done: it takes four bits a step from a table.
-- **HPACK encoder** searches the dynamic table linearly; an index would help
-  (the static table is already a map).
+- **HPACK encoder dynamic-table index** is done: past 16 entries it finds a
+  field through a hash index of names and name-value pairs instead of
+  searching the table.
 - **Allocations**: streams whose body streams, and pushed streams, still
   allocate theirs; a `static-h2` response copies its body into the handler's
   buffer, the frames and the TLS record in turn.

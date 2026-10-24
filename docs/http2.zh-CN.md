@@ -201,7 +201,7 @@ CI 的 `Fuzz the parsers` job 每个目标跑 20 秒。还缺的是压测（例�
 ### 4. 性能（中）
 
 - **HPACK Huffman 解码**：已完成，按查表每步解码 4 bit。
-- **HPACK 编码器**：动态表按线性查找，可以加索引；静态表查找已经是 map。
+- **HPACK 编码器动态表索引**：已完成，动态表超过 16 项后按名字和名字-值的哈希索引查找，不再逐项搜索。
 - **内存分配**：body 流式交付的 stream 和 push 的 stream 仍各自分配；`static-h2` 的响应 body
   依次拷贝进 handler 的 buffer、帧和 TLS record。
 - **基准测试**：补充 HTTP/2 的 benchmark（单连接多路复用吞吐、HPACK 编解码），
