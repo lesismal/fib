@@ -556,6 +556,22 @@ func (h *ServerHandler) OnClose(c *fib.Connection, err error) {
 	}
 }
 
+// OnEngineClose tells the clients of the connections that send on the
+// address that the server is going, with CONNECTION_CLOSE and H3_NO_ERROR,
+// as Engine.Close is about to end them: they would otherwise go on sending
+// to it until they timed out. A connection's requests end with it, as
+// those of an HTTP/2 connection the engine closes do; Engine.Shutdown is
+// the graceful way.
+func (h *ServerHandler) OnEngineClose(c *fib.Connection) {
+	peer, ok := c.Attachment().(*udpPeer)
+	if !ok {
+		return
+	}
+	for _, qc := range peer.sending() {
+		qc.Close(uint64(ErrCodeNoError), "server closed")
+	}
+}
+
 // OnShutdown ends the connections on the address as the engine shuts down;
 // see fib.Engine.Shutdown. Each HTTP/3 connection sends GOAWAY, finishes the
 // requests it has, and closes once its streams have; the address's
@@ -736,6 +752,20 @@ func (p *udpPeer) shutdown() []*quic.Conn {
 	return conns
 }
 
+// sending returns the connections that send on the address.
+func (p *udpPeer) sending() []*quic.Conn {
+	p.mu.Lock()
+	paths := slices.Clone(p.paths)
+	p.mu.Unlock()
+	var conns []*quic.Conn
+	for _, path := range paths {
+		if path.qc != nil && path.qc.SendsOn(path) {
+			conns = append(conns, path.qc)
+		}
+	}
+	return conns
+}
+
 func (p *udpPeer) isClosing() bool {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -767,11 +797,13 @@ func (p *peerPath) Close() error {
 }
 
 var (
-	_ fib.DatagramsHandler  = (*ServerHandler)(nil)
-	_ fib.ShutdownHandler   = (*ServerHandler)(nil)
-	_ quic.CallsDoneHandler = (*serverConn)(nil)
-	_ quic.PathHandler      = (*serverConn)(nil)
-	_ quic.BatchSender      = (*peerPath)(nil)
+	_ fib.DatagramsHandler   = (*ServerHandler)(nil)
+	_ fib.ShutdownHandler    = (*ServerHandler)(nil)
+	_ fib.EngineCloseHandler = (*ServerHandler)(nil)
+	_ fib.EngineCloseHandler = clientPath{}
+	_ quic.CallsDoneHandler  = (*serverConn)(nil)
+	_ quic.PathHandler       = (*serverConn)(nil)
+	_ quic.BatchSender       = (*peerPath)(nil)
 )
 
 // serverConn is one client's HTTP/3 connection.

@@ -97,6 +97,23 @@ type ShutdownHandler interface {
 	OnShutdown(*Connection)
 }
 
+// EngineCloseHandler is a Handler of UDP connections told that Engine.Close
+// is about to end one, while it can still send: a datagram protocol has no
+// end of a stream that tells its peer it has gone, as a TCP connection's
+// does, so this is its cue to say so itself, as QUIC does with
+// CONNECTION_CLOSE. Without it the peer finds out only once it has given up
+// waiting. OnEngineClose runs on the goroutine that called Close, once for
+// each UDP connection the engine has open, its listeners' peers and those it
+// dialed, before OnClose. A round of the connection may be running OnData
+// at the same time, so it must not block, nor take a lock that a handler in
+// OnData may hold for long. Engine.Stop leaves connections open, and calls
+// it for none until Close; the portable backend, whose Stop closes the
+// sockets, calls it for none.
+type EngineCloseHandler interface {
+	Handler
+	OnEngineClose(*Connection)
+}
+
 // HandlerFuncs allows callers to implement only the callbacks they need.
 type HandlerFuncs struct {
 	Open         func(*Connection)

@@ -835,6 +835,17 @@ func (p clientPath) OnDatagrams(_ *fib.Connection, datagrams [][]byte) {
 	}
 }
 
+// OnEngineClose tells the server that the connection is going, with
+// CONNECTION_CLOSE and H3_NO_ERROR, as Engine.Close is about to end it.
+func (p clientPath) OnEngineClose(*fib.Connection) {
+	p.cc.mu.Lock()
+	qc := p.cc.qc
+	p.cc.mu.Unlock()
+	if qc != nil {
+		qc.Close(uint64(ErrCodeNoError), "client closed")
+	}
+}
+
 func (p clientPath) OnClose(_ *fib.Connection, err error) {
 	p.cc.mu.Lock()
 	qc := p.cc.qc

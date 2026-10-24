@@ -1115,6 +1115,17 @@ func (e *Engine) cutConnection(c *Connection) {
 		// Close fails the dial, once no round runs.
 		return
 	}
+	if c.udp != nil {
+		// SetHandler replaces the handler under c.mu.
+		c.mu.Lock()
+		h, ok := c.handler.(EngineCloseHandler)
+		closed := c.closed
+		c.mu.Unlock()
+		if ok && !closed {
+			// Sends still go, so the handler can tell the peer.
+			h.OnEngineClose(c)
+		}
+	}
 	c.mu.Lock()
 	if c.closed {
 		c.mu.Unlock()
