@@ -220,17 +220,29 @@ GOAWAY(ENHANCE_YOUR_CALM) when its client:
 
 - resets streams while they are open, or makes the server reset them with
   stream errors, past a burst of 1000 refilled at 100 a second (Rapid Reset,
-  CVE-2023-44487);
+  CVE-2023-44487), which `Config.StreamResetBurst` and `StreamResetRate` set;
 - sends PING, SETTINGS (after the first), or DATA and CONTINUATION frames that
-  are empty without ending anything, past the same budget, which bounds the
-  acknowledgements the server queues too;
-- sends one header block in more than 1000 CONTINUATION frames, or takes
-  longer than `ReadHeaderTimeout` (`ReadTimeout` when it is not set) to finish
-  one.
+  are empty without ending anything, past a budget of the same size, which
+  bounds the acknowledgements the server queues too, and which
+  `Config.ControlFrameBurst` and `ControlFrameRate` set;
+- sends one header block in more than 1000 CONTINUATION frames
+  (`Config.MaxContinuationFrames`), or takes longer than `ReadHeaderTimeout`
+  (`ReadTimeout` when it is not set) to finish one.
 
 PRIORITY frames, and WINDOW_UPDATE or RST_STREAM frames for a stream that has
 ended, cost no more than their bytes and are not counted, since a client may
-send them in flight. The budgets are not configurable yet.
+send them in flight. Each limit left at zero takes the default above
+(`DefaultStreamResetBurst` and the like), and one set below zero is lifted. A
+gRPC client cancels a call by resetting its stream, and deadlines or hedged
+calls cancel many at once, so a server or proxy in front of busy gRPC clients
+may need a higher reset rate than the default.
+
+The client holds a server to the same control-frame budget and CONTINUATION
+bound, with the defaults: a server that floods it with PING or SETTINGS
+frames, each of which the client acknowledges, or with empty DATA or
+CONTINUATION frames, has its connection ended with GOAWAY(ENHANCE_YOUR_CALM),
+and the requests on it fail with that `*H2ConnError`. A server resetting the
+client's streams costs the client nothing, so it has no reset budget.
 
 ### 2. Conformance testing
 

@@ -439,6 +439,11 @@ upstream.Do(req, func(resp *fibhttp.ClientResponse, err error) { ...; c.Release(
 
 - `Config.MaxConcurrentStreams` (default 250) caps streams per connection; extra streams get
   `REFUSED_STREAM`.
+- `Config.StreamResetBurst`/`StreamResetRate` (default 1000, 100/s) bound streams a client resets
+  while open (Rapid Reset), `ControlFrameBurst`/`ControlFrameRate` the PING, SETTINGS and empty
+  frames it sends, and `MaxContinuationFrames` (default 1000) one header block's frames; past
+  them the connection ends with GOAWAY(ENHANCE_YOUR_CALM). Below zero lifts a limit. A proxy in
+  front of gRPC clients, which cancel calls by resetting streams, may need a higher reset rate.
 - Responses go out in the stream's own DATA frames and respect the peer's window; a body that
   does not fit the window is held until `WINDOW_UPDATE`.
 - 1xx interim responses: `c.WriteInterim(103, hdr)` sends Early Hints, which is the better choice

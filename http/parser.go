@@ -206,6 +206,37 @@ type Config struct {
 	// MaxConcurrentStreams is how many requests an HTTP/2 client may have
 	// open on one connection. Zero means DefaultMaxConcurrentStreams.
 	MaxConcurrentStreams uint32
+	// StreamResetBurst and StreamResetRate bound the HTTP/2 streams a client
+	// may reset while they are still open, or have the server reset for a
+	// stream error it made: a bucket of StreamResetBurst resets, refilled at
+	// StreamResetRate a second, past which the connection ends with
+	// GOAWAY(ENHANCE_YOUR_CALM). A stream opened and reset at once costs the
+	// server the stream and its handler and the client nothing, and no
+	// longer counts against MaxConcurrentStreams, which is the Rapid Reset
+	// attack (CVE-2023-44487). Zero means DefaultStreamResetBurst and
+	// DefaultStreamResetRate; either below zero, no limit. A gRPC client
+	// cancels a call by resetting its stream, and a deadline or a hedged
+	// call cancels many, so a server or a proxy in front of busy gRPC
+	// clients may need a higher rate than the default.
+	StreamResetBurst int
+	StreamResetRate  int
+	// ControlFrameBurst and ControlFrameRate bound the HTTP/2 frames a
+	// client may send that ask for work and carry no request: PING and
+	// SETTINGS (after the first), each of which the server acknowledges, and
+	// DATA and CONTINUATION frames that are empty without ending anything. A
+	// bucket of ControlFrameBurst of them, refilled at ControlFrameRate a
+	// second, past which the connection ends with GOAWAY(ENHANCE_YOUR_CALM)
+	// (CVE-2019-9512, CVE-2019-9515, CVE-2019-9518, CVE-2024-27316). Zero
+	// means DefaultControlFrameBurst and DefaultControlFrameRate; either
+	// below zero, no limit.
+	ControlFrameBurst int
+	ControlFrameRate  int
+	// MaxContinuationFrames bounds the CONTINUATION frames one HTTP/2 header
+	// block may arrive in, whatever their size, alongside MaxHeaderBytes,
+	// which bounds its bytes, and ReadHeaderTimeout, which bounds how long
+	// it may take. Zero means DefaultMaxContinuationFrames; below zero, no
+	// limit.
+	MaxContinuationFrames int
 	// StreamPool runs HTTP/2 request handlers on a pool of their own, so
 	// that the requests a client has open on one connection are served
 	// concurrently rather than one after another on the goroutine that

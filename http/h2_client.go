@@ -37,14 +37,24 @@ type h2ClientConn struct {
 	client *Client
 
 	// The read side is only touched by the worker running OnData.
-	in            []byte
-	gotSettings   bool
+	in          []byte
+	gotSettings bool
+	// settingsSeen says the server's first SETTINGS, which its preface
+	// requires and so is no glitch, has been handled.
+	settingsSeen  bool
 	dec           *hpack.Decoder
 	contStream    uint32
 	contEndStream bool
 	contBlock     []byte
-	recvWindow    int64
-	recvUnacked   int64
+	// contFrames counts the CONTINUATION frames of the header block still
+	// arriving, which DefaultMaxContinuationFrames bounds.
+	contFrames  int
+	recvWindow  int64
+	recvUnacked int64
+	// glitches bounds the frames a server may send that ask for work and
+	// carry no response, as the server's own budget does its client's; see
+	// DefaultControlFrameBurst.
+	glitches h2Budget
 
 	// mu guards the write side and the streams. Frames are sent while holding
 	// it, so header blocks leave in the order the encoder produced them.
@@ -113,6 +123,7 @@ func (cc *clientConn) startH2() {
 		peerMaxFrame: h2DefaultMaxFrameSize,
 		peerWindow:   h2DefaultWindow,
 		sendWindow:   h2DefaultWindow,
+		glitches:     h2NewBudget(0, 0, DefaultControlFrameBurst, DefaultControlFrameRate),
 	}
 	hc.room.L = &hc.mu
 	cc.maxStreams = h2InitialMaxStreams
@@ -526,8 +537,14 @@ func (hc *h2ClientConn) handleFrame(f *h2Frame) error {
 			if len(block) > hc.client.config.MaxResponseHeaderBytes {
 				return h2ConnErr(H2EnhanceYourCalm, "header block too large")
 			}
+			if len(block) == 0 {
+				if err := hc.glitch(); err != nil {
+					return err
+				}
+			}
 			hc.contStream, hc.contEndStream = f.streamID, f.has(h2FlagEndStream)
 			hc.contBlock = bufferpool.Append(hc.contBlock[:0], block)
+			hc.contFrames = 0
 			return nil
 		}
 		return hc.handleHeaderBlock(f.streamID, block, f.has(h2FlagEndStream))
@@ -539,7 +556,14 @@ func (hc *h2ClientConn) handleFrame(f *h2Frame) error {
 		if len(hc.contBlock) > hc.client.config.MaxResponseHeaderBytes {
 			return h2ConnErr(H2EnhanceYourCalm, "header block too large")
 		}
+		hc.contFrames++
+		if hc.contFrames > DefaultMaxContinuationFrames {
+			return h2ConnErr(H2EnhanceYourCalm, "header block in too many frames")
+		}
 		if !f.has(h2FlagEndHeaders) {
+			if len(f.payload) == 0 {
+				return hc.glitch()
+			}
 			return nil
 		}
 		id := hc.contStream
@@ -569,6 +593,9 @@ func (hc *h2ClientConn) handleFrame(f *h2Frame) error {
 			return h2ConnErr(H2ProtocolError, "malformed PING")
 		}
 		if !f.has(h2FlagAck) {
+			if err := hc.glitch(); err != nil {
+				return err
+			}
 			out := h2AppendFrameHeader(nil, h2FramePing, h2FlagAck, 0, 8)
 			hc.mu.Lock()
 			hc.sendLocked(append(out, f.payload...))
@@ -597,6 +624,12 @@ func (hc *h2ClientConn) handleSettings(f *h2Frame) error {
 		}
 		return nil
 	}
+	if hc.settingsSeen {
+		if err := hc.glitch(); err != nil {
+			return err
+		}
+	}
+	hc.settingsSeen = true
 	maxStreams := -1
 	hc.mu.Lock()
 	err := h2ParseSettings(f.payload, func(id h2SettingID, value uint32) error {
@@ -702,6 +735,11 @@ func (hc *h2ClientConn) handleGoAway(lastID uint32) {
 func (hc *h2ClientConn) handleData(f *h2Frame) error {
 	if f.streamID == 0 {
 		return h2ConnErr(H2ProtocolError, "DATA on stream 0")
+	}
+	if len(f.payload) == 0 && !f.has(h2FlagEndStream) {
+		if err := hc.glitch(); err != nil {
+			return err
+		}
 	}
 	length := int64(f.length)
 	if length > hc.recvWindow {

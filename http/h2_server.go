@@ -101,8 +101,11 @@ type h2ServerConn struct {
 	contFrames int
 	contTimer  *time.Timer
 	contGen    atomic.Uint32
+	// maxContFrames is how many CONTINUATION frames a header block may
+	// arrive in; see Config.MaxContinuationFrames.
+	maxContFrames int
 	// resets and glitches bound what the client may have the server do
-	// without asking for anything; see h2ResetBurst.
+	// without asking for anything; see DefaultStreamResetBurst.
 	resets   h2Budget
 	glitches h2Budget
 	// maxClientID is the highest stream the client has opened.
@@ -286,6 +289,12 @@ func newH2ServerConn(h *ServerHandler, c *fib.Connection, remoteAddr string) *h2
 		flushPool:    handlerPool(c),
 		reuseStreams: h.config.ReuseRequests && h.config.ReuseURLs && h.config.ReuseContexts,
 		reuseHeaders: h.config.ReuseHeaders,
+		maxContFrames: h2MaxContinuations(h.config.MaxContinuationFrames,
+			DefaultMaxContinuationFrames),
+		resets: h2NewBudget(h.config.StreamResetBurst, h.config.StreamResetRate,
+			DefaultStreamResetBurst, DefaultStreamResetRate),
+		glitches: h2NewBudget(h.config.ControlFrameBurst, h.config.ControlFrameRate,
+			DefaultControlFrameBurst, DefaultControlFrameRate),
 	}
 	sc.flusher.sc = sc
 	sc.gate.ownFlush = true
@@ -852,7 +861,7 @@ func (sc *h2ServerConn) handleContinuation(f *h2Frame) error {
 		return h2ConnErr(H2EnhanceYourCalm, "header block too large")
 	}
 	sc.contFrames++
-	if sc.contFrames > h2MaxContinuations {
+	if sc.contFrames > sc.maxContFrames {
 		return h2ConnErr(H2EnhanceYourCalm, "header block in too many frames")
 	}
 	if !f.has(h2FlagEndHeaders) {

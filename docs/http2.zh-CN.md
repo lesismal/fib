@@ -168,14 +168,22 @@ h2spec 只会说 HTTP/2，所以跑它时服务端要设置 `Config.HTTP2Only`�
 服务端以 GOAWAY(ENHANCE_YOUR_CALM) 结束连接：
 
 - 重置仍打开的 stream，或用 stream 错误让服务端重置它们，超过突发 1000 个、每秒补充 100 个的额度
-  （Rapid Reset，CVE-2023-44487）；
-- 发送 PING、SETTINGS（第一个除外），或者既为空又不结束任何东西的 DATA、CONTINUATION 帧，超过同样的
-  额度，这也限制了服务端排队等待发送的 ACK；
-- 一个 header block 用了超过 1000 个 CONTINUATION 帧，或者超过 `ReadHeaderTimeout`（未设置时为
-  `ReadTimeout`）仍未结束。
+  （Rapid Reset，CVE-2023-44487），由 `Config.StreamResetBurst` 和 `StreamResetRate` 设置；
+- 发送 PING、SETTINGS（第一个除外），或者既为空又不结束任何东西的 DATA、CONTINUATION 帧，超过同样
+  大小的额度，这也限制了服务端排队等待发送的 ACK，由 `Config.ControlFrameBurst` 和
+  `ControlFrameRate` 设置；
+- 一个 header block 用了超过 1000 个 CONTINUATION 帧（`Config.MaxContinuationFrames`），或者超过
+  `ReadHeaderTimeout`（未设置时为 `ReadTimeout`）仍未结束。
 
 PRIORITY 帧，以及针对已结束 stream 的 WINDOW_UPDATE、RST_STREAM 帧，处理代价不超过读取它们的字节，
-客户端也可能在途中发出，因此不计入。这些额度目前不可配置。
+客户端也可能在途中发出，因此不计入。每项限制为零时取上面的默认值（`DefaultStreamResetBurst` 等），
+小于零则不限制。gRPC 客户端通过重置 stream 取消调用，超时或对冲请求会一次取消很多，所以面向繁忙
+gRPC 客户端的服务端或代理可能需要比默认值更高的重置速率。
+
+客户端以同样的控制帧额度和 CONTINUATION 上限约束服务端，使用默认值：服务端用 PING 或 SETTINGS 帧
+（客户端都要回 ACK），或者空的 DATA、CONTINUATION 帧泛洪时，客户端以 GOAWAY(ENHANCE_YOUR_CALM)
+结束连接，其上的请求以该 `*H2ConnError` 失败。服务端重置客户端的 stream 不会让客户端付出代价，
+因此客户端没有重置额度。
 
 ### 2. 协议一致性测试
 

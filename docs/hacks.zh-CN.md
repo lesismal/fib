@@ -379,6 +379,11 @@ upstream.Do(req, func(resp *fibhttp.ClientResponse, err error) { ...; c.Release(
 **其它 multiplex 相关**
 
 - `Config.MaxConcurrentStreams`（默认 250）限制单连接 stream 数，超出的被 `REFUSED_STREAM`。
+- `Config.StreamResetBurst`/`StreamResetRate`（默认 1000、每秒 100）限制客户端重置仍打开 stream
+  的数量（Rapid Reset），`ControlFrameBurst`/`ControlFrameRate` 限制 PING、SETTINGS 和空帧，
+  `MaxContinuationFrames`（默认 1000）限制一个 header block 的帧数；超出时以
+  GOAWAY(ENHANCE_YOUR_CALM) 结束连接。小于零取消限制。面向 gRPC 客户端（通过重置 stream 取消调用）
+  的代理可能需要更高的重置速率。
 - 响应写在 stream 自己的 DATA 帧里，遵守对端窗口；窗口不够的 body 暂存，等 `WINDOW_UPDATE`。
 - 1xx 中间响应：`c.WriteInterim(103, hdr)` 发 Early Hints，比 server push 更值得用
   （主流浏览器已关闭 push）。

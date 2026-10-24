@@ -901,7 +901,10 @@ server, err := fib.New(config, fib.Binding{Addr: ":443", Handler: fibtls.NewServ
   RST_STREAM 拒绝，协议错误用 GOAWAY 关闭连接）。
 - `Config.MaxConcurrentStreams` 限制单连接并发 stream 数（默认 250，超出的 stream 被
   REFUSED_STREAM 拒绝）；`MaxHeaderBytes`、`MaxBodyBytes` 同样作用于 HTTP/2，超限时
-  返回 431/413。`Config.DisableHTTP2` 关闭 HTTP/2，只服务 HTTP/1；`Config.HTTP2Only`
+  返回 431/413。`Config.StreamResetBurst`/`StreamResetRate`、`ControlFrameBurst`/
+  `ControlFrameRate` 和 `MaxContinuationFrames` 限制客户端重置 stream、发送控制帧和
+  CONTINUATION 帧的数量（见 [HTTP/2 文档](http2.zh-CN.md) § 1），超出时以
+  GOAWAY(ENHANCE_YOUR_CALM) 结束连接。`Config.DisableHTTP2` 关闭 HTTP/2，只服务 HTTP/1；`Config.HTTP2Only`
   相反，只服务 HTTP/2：连接不以 HTTP/2 preface 开头时用 GOAWAY 结束，而不是按 HTTP/1
   回复。ALPN 协商出 `h2` 的 TLS 连接一定按 HTTP/2 处理，不再嗅探。
 - 通过 TLS 到达的请求（HTTP/1 和 HTTP/2）都会设置 `Request.TLS`，可以读取 ALPN 结果、
