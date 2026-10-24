@@ -17,7 +17,7 @@ from scratch. The TLS 1.3 handshake is the standard library's
 
 | Area | Content |
 | --- | --- |
-| QUIC | Version 1; Initial, Handshake and 1-RTT packet number spaces; AES-128-GCM, AES-256-GCM and ChaCha20-Poly1305 packet and header protection; key updates in both directions (started here when a key reaches its AEAD limit, and answered when the peer starts one) and a limit on decryption failures; Retry on the client; Version Negotiation; stateless reset; RFC 9002 loss detection, PTO and NewReno congestion control; the server's 3x amplification limit; connection- and stream-level flow control in both directions; MAX_STREAMS; idle timeout and optional keep-alive |
+| QUIC | Version 1; Initial, Handshake and 1-RTT packet number spaces; AES-128-GCM, AES-256-GCM and ChaCha20-Poly1305 packet and header protection; key updates in both directions (started here when a key reaches its AEAD limit, and answered when the peer starts one) and a limit on decryption failures; Retry, sent by the server under load and handled by the client; Version Negotiation; stateless reset; RFC 9002 loss detection, PTO and NewReno congestion control; the server's 3x amplification limit; connection- and stream-level flow control in both directions; MAX_STREAMS; idle timeout and optional keep-alive |
 | Server | Shares one `Handler` and `Context` with HTTP/1 and HTTP/2; 1xx interim responses, automatic 100 Continue, request and response trailers, graceful `Response.Close` via GOAWAY, 413/431/417, malformed requests (including an `:authority` and `Host` that disagree) reset with H3_MESSAGE_ERROR, protocol errors closing the connection with RFC 9114 and RFC 9204 codes, `Request.TLS`, an `AltSvc` helper, extended CONNECT (RFC 9220) switched to a tunnel with `Context.Upgrade`, which is how `websocket.ServerHandler.Upgrade` serves WebSocket over HTTP/3 |
 | Client | Asynchronous `Do`/`Go`; one multiplexed connection per host:port; honors MAX_STREAMS and queues the rest; cancellation resets only its own stream; requests the server marks as unprocessed (GOAWAY, H3_REQUEST_REJECTED) are retried on a new connection; request and response trailers; a peer that breaks the protocol ends the connection with its error code |
 | Resumption and 0-RTT | Session tickets, resumption, and 0-RTT early data, for the server (`Config.EarlyData`) and the client (`ClientConfig.EarlyData`); see [0-RTT](#0-rtt) |
@@ -191,20 +191,27 @@ exposed through `http3.Config` or `http3.ClientConfig`:
 
 ### Protocol details
 
-- **Closing**: after sending CONNECTION_CLOSE the connection is released at
-  once, without the 3×PTO closing period of RFC 9000 §10.2 and without repeating
-  CONNECTION_CLOSE for packets that arrive later. Receiving CONNECTION_CLOSE
-  also releases at once, with no draining period. If the close is lost, the peer
-  ends only on a stateless reset or idle timeout.
+- **Closing**: a connection that sends CONNECTION_CLOSE keeps a closing
+  period of three probe timeouts, at least a second and at most its idle
+  timeout (RFC 9000 §10.2.1), in which it answers what still arrives with the
+  CONNECTION_CLOSE again, at the 1st, 2nd, 4th, 8th and so on of them.
+  Receiving CONNECTION_CLOSE releases the connection at once, with no draining
+  period. `Engine.Close` sends CONNECTION_CLOSE (H3_NO_ERROR) on every
+  connection, the server's and the client's, before it ends them;
+  `Engine.Stop` leaves them open until then.
 - **Key updates**: this side starts one once a key has protected as many
   packets as RFC 9001 §6.6 allows (about 2^23 for AES-GCM), and answers the
   peer's; past the integrity limit on failed decryptions the connection ends
   with AEAD_LIMIT_REACHED. What it does not do is rotate keys on a timer or
   on request.
-- **Stateless reset**: the reset key is random per `ServerHandler` and not
-  configurable. After a server restart the key changes, so clients cannot
-  recognize resets for connections from before it. Only clients recognize
-  stateless resets.
+- **Stateless reset**: the reset key is random per `ServerHandler` unless
+  `Config.StatelessResetKey` sets one; with a random key, clients cannot
+  recognize the resets a restarted server sends for connections from before
+  it. Only clients recognize stateless resets.
+- **Floods**: what a peer can make a connection do without asking for
+  anything is bounded, past a burst of 1000 refilled at 100 a second, after
+  which the connection closes with H3_EXCESSIVE_LOAD; see
+  [Planned improvements](#1-correctness-and-hardening).
 - **BLOCKED frames**: DATA_BLOCKED, STREAM_DATA_BLOCKED and STREAMS_BLOCKED are
   never sent.
 - **Congestion control**: NewReno only, with no pacing, no app-limited
@@ -277,7 +284,7 @@ uses, resumes and sends early data through the same QUIC code.
 | Active connection migration | A client moving on purpose has to use a fresh Connection ID on its new path, so the server would have to issue and route several per connection, and retire them. A NAT rebinding, which keeps the Connection ID, is followed (see above). |
 | QPACK dynamic table | Both sides advertise a capacity of 0: no head-of-line blocking from blocked streams, silent encoder and decoder streams, and no extra state or memory. The cost is that repeated headers are sent in full every time. |
 | Server push | No major browser enables HTTP/3 push. The client sends no MAX_PUSH_ID, and `Context.Push` returns `http.ErrNotSupported`. Use 103 Early Hints (`WriteInterim`) for preloading. |
-| Server-sent Retry / NEW_TOKEN | Address validation relies on the handshake and the 3x amplification limit, which spares issuing and checking tokens. The client handles a Retry from a server but ignores NEW_TOKEN. |
+| NEW_TOKEN | The server sends Retry under load (see [Planned improvements](#1-correctness-and-hardening)), but no NEW_TOKEN, so a client's next connection is validated afresh: by its handshake and the 3x amplification limit, or by another Retry. The client ignores NEW_TOKEN. |
 | QUIC v2 (RFC 9369) and other versions | Version 1 is enough in practice. The client fails on Version Negotiation. |
 | DATAGRAM (RFC 9221), WebTransport | They need APIs for streaming or unreliable datagrams, which the current handler model lacks. A DATAGRAM frame from the peer is an unknown frame and closes the connection with FRAME_ENCODING_ERROR. |
 | RFC 9218 extensible priorities | With whole bodies, scheduling gains little. |
@@ -287,16 +294,40 @@ uses, resumes and sends early data through the same QUIC code.
 
 In order of priority.
 
-### 1. Correctness and hardening (high)
+### 1. Correctness and hardening
 
-- **Control frame and reset floods**: there is no rate limit on PING, MAX_*
-  frames, or streams opened and reset over and over (as in HTTP/2 Rapid Reset).
-- **Handshake cost**: the server neither sends Retry nor limits concurrent
-  handshakes, so a flood of Initials from spoofed addresses can burn CPU on TLS.
-  Consider enabling Retry under load.
-- **Closing and draining states**: implement the 3×PTO closing period and
-  CONNECTION_CLOSE retransmission; allow a fixed stateless reset key; send
-  CONNECTION_CLOSE on `Engine.Stop`/`Close` too.
+Done:
+
+- **Control frame and reset floods**: a QUIC connection closes, with
+  H3_EXCESSIVE_LOAD under HTTP/3 (`quic.Config.ExcessiveLoadCode`), when its
+  peer, past a burst of 1000 refilled at 100 a second as in HTTP/2:
+  - abandons streams while they are open, with RESET_STREAM or STOP_SENDING,
+    or makes the server reset them for malformed requests, each stream counted
+    once (HTTP/3's form of Rapid Reset, CVE-2023-44487);
+  - sends frames that ask for work and carry nothing: a packet with nothing
+    but PING, PATH_CHALLENGE, MAX_DATA, MAX_STREAM_DATA and MAX_STREAMS that
+    raise no limit, DATA_BLOCKED, STREAM_DATA_BLOCKED and STREAMS_BLOCKED,
+    a STREAM frame with no data that ends nothing, and NEW_CONNECTION_ID for a
+    connection ID already retired.
+
+  A PING bundled with an acknowledgement of something new is not counted,
+  since a receiver that only acknowledges, as a client downloading does, sends
+  one now and then to have its acknowledgements acknowledged; nor are frames a
+  peer may send in flight for a stream that has ended. HTTP/3's own frames
+  cost no more than their bytes, since flow control is QUIC's, and are not
+  counted. The budgets are not configurable yet.
+- **Handshake cost**: past `Config.RetryHandshakes` handshakes under way
+  (1024 by default; below zero, always), a new client is first sent a Retry,
+  whose token proves its address before the server does any TLS work or keeps
+  any state for it; past `Config.MaxHandshakes` (4096) its Initial is dropped.
+  A token that is not good, from another address or more than 10 seconds old,
+  is answered with INVALID_TOKEN. The tokens' key is random to each handler,
+  so a Retry from one server is not good at another behind the same address.
+- **Closing and draining states**: the 3×PTO closing period, with
+  CONNECTION_CLOSE sent again to what arrives in it; a fixed stateless reset
+  key (`Config.StatelessResetKey`); CONNECTION_CLOSE on `Engine.Close`, which
+  `Engine.Stop` leaves the connections open for (see
+  [Protocol details](#protocol-details)).
 
 ### 2. Performance (medium)
 
@@ -387,5 +418,5 @@ skip; CI sets `FIB_REQUIRE_H3_INTEROP=1`, which turns a skip into a failure.
 | The body matrix's raw QUIC client (`http3/body_matrix_test.go`), against the fib server | Request bodies every way they can come: no body, a content-length, DATA with no length, a trailer and `Expect: 100-continue`, small and large, the stream written whole or in pieces with pauses, taken by the handler by reading, through OnBody, as `BodyComplete` decides or from another goroutine, with the server reading bodies whole, streaming them all and streaming past a threshold; also a stream reset mid-body, the body limits, the stream window pacing a slow handler, and OnBody holding the body back until the handler returns |
 | quiche, in a container (`http3/quicheinterop/run.sh`) | Both directions with both handshakes: 300 connections and 30 000 echoes, multiplexed streams, session resumption, 0-RTT in both directions (a GET goes in the first flight, a POST in early data is answered 425 and sent again, a server without early data is not sent any), certificate verification through `RootCAs` |
 | quic-go and fib, for early data (`http3/early_data_test.go`) | quic-go's client resuming and sending GET_0RTT to the fib server, the fib client sending early requests to quic-go's server, a server that does not accept it, a ticket used twice, and a 425 |
-| Two QUIC connections over an in-memory path | Handshake, transfers under 5% and 20% loss, stream limits, resets, application close, idle timeout, keep-alive, stateless reset, key updates (with the AEAD limits lowered) and the decryption failure limit |
+| Two QUIC connections over an in-memory path | Handshake, transfers under 5% and 20% loss, stream limits, resets, application close, idle timeout, keep-alive, stateless reset, key updates (with the AEAD limits lowered), the decryption failure limit, Retry and its tokens, and the flood limits |
 | Fuzzing (`go test -fuzz`) | The parsers that take untrusted bytes: the HTTP/3 frame parser, building requests from fields, QPACK decoding and its round trip, QUIC packet headers, transport parameters and 1-RTT frame handling |

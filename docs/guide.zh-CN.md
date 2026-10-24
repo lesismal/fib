@@ -208,6 +208,9 @@ server.Close()
 片刻内结束时（没有被数据库、sleep 等拖住的 handler 都是如此），这些在 `Close`
 返回前就已释放，否则在最后一个 handler 返回时释放。因此 `Shutdown` 超时后调用
 `Close`，总耗时不会超出 `ctx` 的期限太多，不会被最慢的 handler 拖住。
+UDP 连接没有能让对端看到的流结束：handler 实现 `fib.EngineCloseHandler` 时，`Close`
+在切断每个 UDP 连接（监听 socket 的 peer 和 Dial 出的连接）之前、仍能发送时调用
+`OnEngineClose`，HTTP/3 借此给对端发送 CONNECTION_CLOSE。`Stop` 不关闭连接，也不调用它。
 
 引擎分不清连接是在处理请求还是空闲，这由连接上的协议决定：handler 实现
 `fib.ShutdownHandler` 时，停机期间引擎在事件循环上对每个未关闭的连接调用

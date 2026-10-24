@@ -15,7 +15,7 @@
 
 | 方向 | 内容 |
 | --- | --- |
-| QUIC | version 1；Initial、Handshake、1-RTT 三个包号空间；AES-128-GCM、AES-256-GCM、ChaCha20-Poly1305 包保护与头部保护；双向 key update（本端按 AEAD 使用上限主动发起，也响应对端发起）与解密失败次数上限；客户端处理 Retry；Version Negotiation；stateless reset；RFC 9002 丢包检测、PTO 与 NewReno 拥塞控制；服务端 3 倍放大限制；连接级与 stream 级双向流控；MAX_STREAMS；空闲超时与可选 keep-alive |
+| QUIC | version 1；Initial、Handshake、1-RTT 三个包号空间；AES-128-GCM、AES-256-GCM、ChaCha20-Poly1305 包保护与头部保护；双向 key update（本端按 AEAD 使用上限主动发起，也响应对端发起）与解密失败次数上限；服务端负载高时发送 Retry，客户端处理 Retry；Version Negotiation；stateless reset；RFC 9002 丢包检测、PTO 与 NewReno 拥塞控制；服务端 3 倍放大限制；连接级与 stream 级双向流控；MAX_STREAMS；空闲超时与可选 keep-alive |
 | 服务端 | 与 HTTP/1、HTTP/2 共用同一个 `Handler` 和 `Context`；1xx 中间响应、自动 100 Continue、请求与响应 trailer、`Response.Close` 通过 GOAWAY 优雅关闭、413/431/417、非法请求（含 `:authority` 与 `Host` 不一致）以 H3_MESSAGE_ERROR 重置、协议错误按 RFC 9114 / RFC 9204 错误码关闭连接、`Request.TLS`、`AltSvc` 辅助函数、Extended CONNECT（RFC 9220）经 `Context.Upgrade` 切换为隧道，`websocket.ServerHandler.Upgrade` 即借此提供 WebSocket over HTTP/3 |
 | 客户端 | 异步 `Do`/`Go`；每个 host:port 一条连接、多路复用；遵守 MAX_STREAMS 并排队；取消只重置单个 stream；GOAWAY 与 H3_REQUEST_REJECTED 的请求自动在新连接上重发；请求与响应 trailer；对端违反协议时按错误码关闭连接 |
 | 一致性 | 与 quic-go 客户端、服务端双向互通，以及用手写帧构造的协议错误用例，都在 CI 中运行 |
@@ -145,15 +145,19 @@
 
 ### 协议细节
 
-- **关闭**：发出 CONNECTION_CLOSE 后立即释放连接，没有 RFC 9000 §10.2 的 3×PTO
-  closing 期，也不会对之后到达的包重发 CONNECTION_CLOSE；收到对端的 CONNECTION_CLOSE
-  时同样立即释放，没有 draining 期。如果关闭包丢失，对端要等 stateless reset 或空闲
-  超时才会结束。
+- **关闭**：发出 CONNECTION_CLOSE 的连接保留一段 closing 期（RFC 9000 §10.2.1），长度为
+  3 个 PTO，至少 1 秒、至多空闲超时；其间对之后到达的包重发 CONNECTION_CLOSE，在第 1、2、
+  4、8……个包时各发一次。收到对端的 CONNECTION_CLOSE 时立即释放，没有 draining 期。
+  `Engine.Close` 在结束连接之前给每个连接（服务端的和客户端的）发送 CONNECTION_CLOSE
+  （H3_NO_ERROR）；`Engine.Stop` 让连接保持打开，直到 `Close`。
 - **密钥更新**：本端在一把密钥保护的包数达到 RFC 9001 §6.6 的上限（AES-GCM 约 2^23 个
   包）时主动发起 key update，也响应对端发起的更新；解密失败次数超过完整性上限时以
   AEAD_LIMIT_REACHED 关闭连接。不做的是按时间或按需要更换密钥。
-- **Stateless reset**：reset key 由每个 `ServerHandler` 随机生成，不能配置。服务端重启后
-  key 变了，客户端认不出服务端对重启前的连接发出的 reset。只有客户端会识别 stateless reset。
+- **Stateless reset**：reset key 由每个 `ServerHandler` 随机生成，`Config.StatelessResetKey`
+  可以指定固定的 key；用随机 key 时，服务端重启后客户端认不出它对重启前的连接发出的 reset。
+  只有客户端会识别 stateless reset。
+- **洪泛**：对端不请求任何东西就能让连接做的事有上限，突发 1000 次、每秒恢复 100 次，超过后
+  连接以 H3_EXCESSIVE_LOAD 关闭，见[待优化项](#1-正确性与安全加固)。
 - **BLOCKED 类帧**：受流控限制时不发送 DATA_BLOCKED、STREAM_DATA_BLOCKED、
   STREAMS_BLOCKED。
 - **拥塞控制**：只有 NewReno，没有 pacing，没有判断应用受限（app-limited），也没有
@@ -201,7 +205,7 @@
 | 主动连接迁移 | 客户端主动迁移时要在新路径上用新的 Connection ID，服务端就得为每个连接签发、路由并退役多个 CID。保留 Connection ID 的 NAT 重绑定会被跟随（见上）。 |
 | QPACK 动态表 | 两端都声明容量为 0：不会出现 blocked stream 造成的队头阻塞，编码器流和解码器流都没有内容，也没有额外的状态和内存。代价是重复出现的 header 每次都要完整发送。 |
 | Server push | 主流浏览器都不启用 HTTP/3 push。客户端不发 MAX_PUSH_ID，`Context.Push` 返回 `http.ErrNotSupported`。预加载推荐用 103 Early Hints（`WriteInterim`）。 |
-| 服务端发送 Retry / NEW_TOKEN | 地址验证只靠握手本身和 3 倍放大限制，省去令牌的签发与校验。客户端能处理服务端发来的 Retry，但会忽略 NEW_TOKEN。 |
+| NEW_TOKEN | 服务端在负载高时发送 Retry（见[待优化项](#1-正确性与安全加固)），但不发 NEW_TOKEN，所以客户端的下一个连接要重新验证地址：靠握手本身和 3 倍放大限制，或再一次 Retry。客户端会忽略 NEW_TOKEN。 |
 | QUIC v2（RFC 9369）等其他版本 | 部署上 version 1 已足够。客户端收到 Version Negotiation 时直接失败。 |
 | DATAGRAM（RFC 9221）、WebTransport | 依赖流式 stream 或不可靠数据报的 API，当前 handler 模型不支持。对端发来的 DATAGRAM 帧会被当作未知帧，连接以 FRAME_ENCODING_ERROR 关闭。 |
 | RFC 9218 可扩展优先级 | 在“body 整体缓存”的模型下，调度收益有限。 |
@@ -211,14 +215,31 @@
 
 按优先级排列。
 
-### 1. 正确性与安全加固（高）
+### 1. 正确性与安全加固
 
-- **控制帧与 reset 洪泛**：没有对 PING、MAX_* 等帧，以及 stream 的反复打开和重置做速率
-  限制（类似 HTTP/2 的 Rapid Reset）。
-- **握手资源消耗**：服务端不发 Retry，也不限制同时进行的握手数量，伪造源地址的 Initial
-  洪泛可以消耗 CPU（每个都要做 TLS 运算）。可以考虑在负载高时启用 Retry。
-- **closing / draining 状态**：实现 3×PTO 的 closing 期和 CONNECTION_CLOSE 重发；允许
-  配置固定的 stateless reset key；`Engine.Stop`/`Close` 时也给连接发送 CONNECTION_CLOSE。
+已完成：
+
+- **控制帧与 reset 洪泛**：对端有下列行为、超过突发 1000 次（每秒恢复 100 次，与 HTTP/2
+  相同）时，QUIC 连接关闭，HTTP/3 下错误码为 H3_EXCESSIVE_LOAD（`quic.Config.ExcessiveLoadCode`）：
+  - 在 stream 仍打开时用 RESET_STREAM 或 STOP_SENDING 放弃它，或发送畸形请求让服务端
+    重置它，每个 stream 只计一次（HTTP/3 版的 Rapid Reset，CVE-2023-44487）；
+  - 发送要求本端做事却不带任何内容的帧：只有 PING 的包、PATH_CHALLENGE、没有提高上限的
+    MAX_DATA、MAX_STREAM_DATA 和 MAX_STREAMS、DATA_BLOCKED、STREAM_DATA_BLOCKED 和
+    STREAMS_BLOCKED、没有数据也不结束 stream 的 STREAM 帧，以及针对已退役 connection ID
+    的 NEW_CONNECTION_ID。
+
+  和确认了新包的 ACK 一起发来的 PING 不计数：只发 ACK 的一端（比如在下载的客户端）会不时
+  捎带一个 PING，让对端确认它的 ACK；对端可能在 stream 结束后仍在途中的帧也不计数。
+  HTTP/3 自己的帧只花解析字节的开销（流控在 QUIC 层），不计数。这些预算暂时不能配置。
+- **握手资源消耗**：进行中的握手超过 `Config.RetryHandshakes`（默认 1024；小于 0 表示
+  总是）时，新客户端先收到 Retry，它带回的令牌证明了源地址之后，服务端才做 TLS 运算、
+  保存状态；超过 `Config.MaxHandshakes`（默认 4096）时新客户端的 Initial 被丢弃。
+  不合格的令牌（来自别的地址，或已超过 10 秒）以 INVALID_TOKEN 回应。令牌的 key 由每个
+  handler 随机生成，所以同一地址后面的另一台服务端不认这台发出的 Retry。
+- **closing / draining 状态**：3×PTO 的 closing 期，其间对到达的包重发
+  CONNECTION_CLOSE；可配置固定的 stateless reset key（`Config.StatelessResetKey`）；
+  `Engine.Close` 时给连接发送 CONNECTION_CLOSE，`Engine.Stop` 让连接保持打开到那时（见
+  [协议细节](#协议细节)）。
 
 ### 2. 性能（中）
 
@@ -288,5 +309,5 @@ job 在 Linux、macOS、Windows 上运行。
 | 测试内置的手写 HTTP/3 客户端（零依赖，对 fib 服务端） | 正常实现不会发的东西：HEADERS 之前的 DATA、不以 SETTINGS 开头的控制流、第二条控制流、缺少伪头部的请求、引用 QPACK 动态表、CANCEL_PUSH、调低的 MAX_PUSH_ID、抬高的 GOAWAY、QPACK 插入指令、`:authority` 与 `Host` 不一致、两者都缺失 |
 | body 矩阵的手写 QUIC 客户端（`http3/body_matrix_test.go`，对 fib 服务端） | 请求 body 的各种到达方式：无 body、带 content-length、不带长度的 DATA、带 trailer、`Expect: 100-continue`，小和大，stream 一次写完或分片间隔写，handler 直接读、用 OnBody、按 `BodyComplete` 二选一、或在别的 goroutine 里接收，服务端整体缓存、全部流式、超过阈值才流式；另有 body 发到一半 reset、body 上限、stream 窗口对慢 handler 的限速，以及 OnBody 在 handler 返回前不交付 body |
 | 测试内置的手写 HTTP/3 服务端（零依赖，对 fib 客户端） | 客户端的协议纠错：服务端发来的 MAX_PUSH_ID、CANCEL_PUSH、GOAWAY 指向非请求流、抬高的 GOAWAY、QPACK 插入指令、引用动态表的响应 |
-| 内存管道上的 QUIC 两端 | 握手、5% 与 20% 丢包下的传输、stream 数限制、reset、应用关闭、空闲超时、keep-alive、stateless reset、密钥更新（调低 AEAD 上限触发）、解密失败上限 |
+| 内存管道上的 QUIC 两端 | 握手、5% 与 20% 丢包下的传输、stream 数限制、reset、应用关闭、空闲超时、keep-alive、stateless reset、密钥更新（调低 AEAD 上限触发）、解密失败上限、Retry 及其令牌、洪泛限制 |
 | fuzz（`go test -fuzz`） | 面向不可信输入的解析：HTTP/3 帧解析器、从字段构造请求、QPACK 解码与编解码往返、QUIC 包头、传输参数、1-RTT 帧处理 |
