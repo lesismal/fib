@@ -144,7 +144,7 @@ func (c *Conn) peerMaxAckDelay() time.Duration {
 // onPacketSent records a packet as it leaves.
 func (c *Conn) onPacketSent(space int, p *sentPacket) {
 	s := &c.spaces[space]
-	s.sent = append(s.sent, p)
+	s.sent.push(p)
 	if p.ackEliciting {
 		s.lastAckElicitingSent = p.time
 		s.ackElicitingInFlight++
@@ -176,23 +176,19 @@ func (c *Conn) onAckReceived(space int, ranges []pnRange, ackDelay time.Duration
 	if int64(largest) > s.largestAcked {
 		s.largestAcked = int64(largest)
 	}
+	// The ranges, smallest first, go only through the slots of packets
+	// still waiting: what an ACK frame says again of packets acknowledged
+	// before costs nothing.
 	acked := c.ackedScratch[:0]
-	kept := s.sent[:0]
-	ri := len(ranges) - 1
-	for _, p := range s.sent {
-		for ri >= 0 && ranges[ri].hi < p.pn {
-			ri--
+	for i := len(ranges) - 1; i >= 0; i-- {
+		lo, hi := max(ranges[i].lo, s.sent.base), min(ranges[i].hi+1, s.sent.end())
+		for pn := lo; pn < hi; pn++ {
+			if p := s.sent.take(pn); p != nil {
+				acked = append(acked, p)
+			}
 		}
-		if ri >= 0 && ranges[ri].lo <= p.pn {
-			acked = append(acked, p)
-			continue
-		}
-		kept = append(kept, p)
 	}
-	for i := len(kept); i < len(s.sent); i++ {
-		s.sent[i] = nil
-	}
-	s.sent = kept
+	s.sent.trim()
 	if len(acked) == 0 {
 		return nil
 	}
@@ -277,26 +273,25 @@ func (c *Conn) detectLost(space int, now time.Time) {
 	}
 	lossDelay := max(9*max(c.rtt.latest, c.rtt.smoothed)/8, timerGranularity)
 	lostSendTime := now.Add(-lossDelay)
+	// Only packets up to the largest acknowledged can be lost, and only
+	// those are looked at.
 	lost := c.lostScratch[:0]
-	kept := s.sent[:0]
-	for _, p := range s.sent {
-		if p.pn > uint64(s.largestAcked) {
-			kept = append(kept, p)
+	q := &s.sent
+	end := min(uint64(s.largestAcked)+1, q.end())
+	for pn := q.base; pn < end; pn++ {
+		p := *q.slot(pn)
+		if p == nil {
 			continue
 		}
 		if !p.time.After(lostSendTime) || uint64(s.largestAcked) >= p.pn+packetThreshold {
-			lost = append(lost, p)
+			lost = append(lost, q.take(pn))
 			continue
 		}
 		if t := p.time.Add(lossDelay); s.lossTime.IsZero() || t.Before(s.lossTime) {
 			s.lossTime = t
 		}
-		kept = append(kept, p)
 	}
-	for i := len(kept); i < len(s.sent); i++ {
-		s.sent[i] = nil
-	}
-	s.sent = kept
+	q.trim()
 	if len(lost) == 0 {
 		return
 	}
@@ -520,17 +515,16 @@ func (c *Conn) probe(space int) {
 		}
 	}
 	n := 0
-	for _, p := range s.sent {
+	s.sent.each(s.sent.end(), func(p *sentPacket) bool {
 		if !p.ackEliciting {
-			continue
+			return true
 		}
 		for i := range p.frames {
 			c.frameLost(space, &p.frames[i])
 		}
-		if n++; space == spaceApp && n == maxProbes {
-			break
-		}
-	}
+		n++
+		return space != spaceApp || n < maxProbes
+	})
 }
 
 // discardSpace drops a space's keys and what it had in flight, once the
@@ -540,11 +534,12 @@ func (c *Conn) discardSpace(space int) {
 	if s.discarded {
 		return
 	}
-	for _, p := range s.sent {
+	s.sent.each(s.sent.end(), func(p *sentPacket) bool {
 		if p.inFlight {
 			c.cc.bytesInFlight -= uint64(p.size)
 		}
-	}
+		return true
+	})
 	*s = pnSpace{discarded: true, largestAcked: s.largestAcked}
 	c.ptoCount = 0
 }
@@ -555,12 +550,12 @@ func (c *Conn) discardSpace(space int) {
 // sent again. Callers hold c.mu.
 func (c *Conn) resendEarlyLocked() {
 	s := &c.spaces[spaceApp]
-	kept := s.sent[:0]
-	for _, p := range s.sent {
-		if !p.early {
-			kept = append(kept, p)
+	for pn := s.sent.base; pn < s.sent.end(); pn++ {
+		p := *s.sent.slot(pn)
+		if p == nil || !p.early {
 			continue
 		}
+		s.sent.take(pn)
 		if p.ackEliciting {
 			s.ackElicitingInFlight--
 		}
@@ -572,9 +567,6 @@ func (c *Conn) resendEarlyLocked() {
 		}
 		c.releaseSent(p)
 	}
-	for i := len(kept); i < len(s.sent); i++ {
-		s.sent[i] = nil
-	}
-	s.sent = kept
+	s.sent.trim()
 	c.wantFlush = true
 }

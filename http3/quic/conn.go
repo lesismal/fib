@@ -229,7 +229,7 @@ type pnSpace struct {
 	// Sending.
 	nextPN               uint64
 	largestAcked         int64
-	sent                 []*sentPacket
+	sent                 sentQueue
 	ackElicitingInFlight int
 	lossTime             time.Time
 	lastAckElicitingSent time.Time
@@ -1790,15 +1790,16 @@ func (c *Conn) handleRetry(pkt []byte, h header) {
 	s := &c.spaces[spaceInitial]
 	s.tx, s.rx = initialKeys(c.dcid, true)
 	// Everything sent so far is sent again under the new keys.
-	for _, p := range s.sent {
+	s.sent.each(s.sent.end(), func(p *sentPacket) bool {
 		if p.inFlight {
 			c.cc.bytesInFlight -= uint64(p.size)
 		}
 		if p.ackEliciting {
 			s.ackElicitingInFlight--
 		}
-	}
-	s.sent = nil
+		return true
+	})
+	s.sent.reset()
 	s.cryptoSend.onLost(0, s.cryptoSend.next)
 	c.ptoCount = 0
 	if c.earlyTx != nil {
@@ -1917,7 +1918,7 @@ func (c *Conn) terminateLocked(err error) {
 }
 
 // armTimerLocked sets the connection's one timer for the earliest thing
-// that has to happen.
+// that has to happen, unless it is set for sooner already.
 func (c *Conn) armTimerLocked(now time.Time) {
 	if c.closed {
 		return
@@ -1942,7 +1943,11 @@ func (c *Conn) armTimerLocked(now time.Time) {
 	if c.config.KeepAlivePeriod > 0 && c.handshakeComplete {
 		earliest(c.keepAliveAt())
 	}
-	if c.timer != nil && deadline.Equal(c.timerAt) {
+	if c.timer != nil && !c.timerAt.IsZero() && !deadline.Before(c.timerAt) {
+		// The timer fires at or before the deadline as it is: one that
+		// fires early finds nothing due and is set again then (see
+		// onTimer), which costs less than setting it again for every round
+		// of sending, each of which moves the probe timeout on.
 		return
 	}
 	c.timerAt = deadline

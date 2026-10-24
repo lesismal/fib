@@ -148,7 +148,7 @@ func TestFloodPingWithNewAck(t *testing.T) {
 	s := &c.spaces[spaceApp]
 	now := time.Now()
 	for i := 0; i < floodGlitchBurst+10; i++ {
-		s.sent = append(s.sent, &sentPacket{pn: s.nextPN, time: now})
+		s.sent.push(&sentPacket{pn: s.nextPN, time: now})
 		ack := frame(frameAck, s.nextPN, 0, 0, 0)
 		s.nextPN++
 		if _, err := c.handleFrames(spaceApp, append(ack, framePing), now); err != nil {

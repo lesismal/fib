@@ -361,13 +361,15 @@ func TestRetireConnectionIDSentAndResent(t *testing.T) {
 		t.Fatalf("still retiring %v", c.retireCIDs)
 	}
 	var retire *sentFrame
-	for _, p := range c.spaces[spaceApp].sent {
+	app := &c.spaces[spaceApp]
+	app.sent.each(app.sent.end(), func(p *sentPacket) bool {
 		for i := range p.frames {
 			if p.frames[i].kind == sfRetireCID {
 				retire = &p.frames[i]
 			}
 		}
-	}
+		return true
+	})
 	if retire == nil {
 		t.Fatal("no RETIRE_CONNECTION_ID sent")
 	}

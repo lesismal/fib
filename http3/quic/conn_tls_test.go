@@ -404,11 +404,13 @@ func retryPacket(c *Conn, scid []byte, token string) []byte {
 func TestRetry(t *testing.T) {
 	c, sink, _ := dialSink(t, nil)
 	c.mu.Lock()
-	sentBefore := len(c.spaces[spaceInitial].sent)
+	sentBefore := c.spaces[spaceInitial].sent.len()
 	c.earlyTx, _ = initialKeys([]byte("early-keys"), true)
 	app := &c.spaces[spaceApp]
 	app.nextPN = 2
-	app.sent = []*sentPacket{{pn: 0}, {pn: 1, early: true, ackEliciting: true, inFlight: true, size: 100}}
+	app.sent.reset()
+	app.sent.push(&sentPacket{pn: 0})
+	app.sent.push(&sentPacket{pn: 1, early: true, ackEliciting: true, inFlight: true, size: 100})
 	app.ackElicitingInFlight = 1
 	c.cc.bytesInFlight += 100
 	c.mu.Unlock()
@@ -438,8 +440,8 @@ func TestRetry(t *testing.T) {
 	if string(c.dcid) != "server-1" || string(c.token) != "token" {
 		t.Fatalf("dcid %q, token %q", c.dcid, c.token)
 	}
-	if len(app.sent) != 1 || app.sent[0].pn != 0 || app.ackElicitingInFlight != 0 {
-		t.Fatalf("%d 1-RTT packets in flight, %d ack-eliciting", len(app.sent), app.ackElicitingInFlight)
+	if app.sent.len() != 1 || app.sent.take(0) == nil || app.ackElicitingInFlight != 0 {
+		t.Fatalf("%d 1-RTT packets in flight, %d ack-eliciting", app.sent.len(), app.ackElicitingInFlight)
 	}
 	if sink.count() == before {
 		t.Fatal("the Initial was not sent again")
