@@ -61,11 +61,13 @@ func TestGate(t *testing.T) {
 		t.Fatal("the wait did not open the gate")
 	}
 
-	// Shut first: the body never goes, and Shut keeps saying it was held.
+	// Shut first: the body never goes, and Shut keeps saying it was held, the
+	// second call too.
 	opened.Store(0)
 	g = NewGate(open)
 	g.Start(10 * time.Millisecond)
-	if !g.Shut() || !g.Shut() {
+	first, again := g.Shut(), g.Shut()
+	if !first || !again {
 		t.Fatal("Shut on a waiting gate did not report the body held")
 	}
 	g.Open()
