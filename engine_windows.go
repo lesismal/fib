@@ -211,7 +211,7 @@ func (c *Connection) sysSendDatagrams(datagrams [][]byte) (int, error) {
 // WSASendto of the two buffers: Winsock gathers what a message lists, so
 // nothing is joined first. Callers hold c.mu.
 func (c *Connection) sysSendDatagramParts(first, second []byte) error {
-	bufs := [2]syscall.WSABuf{syscall.WSABuf(first), syscall.WSABuf(second)}
+	bufs := [2]syscall.WSABuf{sys.WSABuf(first), sys.WSABuf(second)}
 	var n uint32
 	var err error
 	if l := c.udp.listener; l != nil {
