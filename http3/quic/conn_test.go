@@ -409,6 +409,37 @@ func TestHandshakeAndEcho(t *testing.T) {
 	}
 }
 
+// A stream that arrives whole in one frame, as most requests do, reaches
+// the handler in one call, its data with the end, rather than a call for
+// the data and another for the end.
+func TestEndArrivesWithTheData(t *testing.T) {
+	p := newTestPair(t, 0, nil)
+	type call struct {
+		data string
+		fin  bool
+	}
+	var mu sync.Mutex
+	var calls []call
+	p.serverH.onData = func(s *Stream, data []byte, fin bool) {
+		mu.Lock()
+		calls = append(calls, call{string(data), fin})
+		mu.Unlock()
+	}
+	s, err := p.client.OpenStream()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Write([]byte("hello, quic"), true); err != nil {
+		t.Fatal(err)
+	}
+	waitFinished(t, p.serverH, s.ID())
+	mu.Lock()
+	defer mu.Unlock()
+	if len(calls) != 1 || calls[0] != (call{"hello, quic", true}) {
+		t.Fatalf("calls %+v", calls)
+	}
+}
+
 func testTransfer(t *testing.T, loss float64, size int) { testTransferWith(t, loss, size, nil) }
 
 // testTransferWith is testTransfer with the pair's configs set up by

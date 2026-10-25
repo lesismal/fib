@@ -533,20 +533,28 @@ func (s *Stream) onStreamFrame(off uint64, data []byte, fin bool) error {
 		}
 		return nil
 	}
-	if chunk := s.recv.take(off, data); chunk != nil {
-		s.deliver(chunk, false)
-	}
+	// The last chunk is held back a step, so that the end of the stream,
+	// when this frame completes it, goes with it rather than in a call of
+	// its own: most requests arrive whole in one frame, and the handler
+	// then hears of each in one call instead of a call for the data and
+	// another, which finds nothing more to do, for the end.
+	last := s.recv.take(off, data)
 	for {
 		chunk := s.recv.pop()
 		if chunk == nil {
 			break
 		}
-		s.deliver(chunk, false)
+		if last != nil {
+			s.deliver(last, false)
+		}
+		last = chunk
 	}
 	if s.recvFin >= 0 && s.recv.offset == uint64(s.recvFin) && !s.recvDone {
 		s.recvDone = true
-		s.deliver(nil, true)
+		s.deliver(last, true)
 		c.maybeFinish(s)
+	} else if last != nil {
+		s.deliver(last, false)
 	}
 	return nil
 }
