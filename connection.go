@@ -145,6 +145,12 @@ type Connection struct {
 	// the socket before it shuts the write side. Guarded by mu.
 	writeShut        bool
 	shutWritePending bool
+	// writeLimit is what SetWriteQueueLimit chose for this connection:
+	// writeLimitSet says it did, and then writeLimit is the limit, zero or
+	// less meaning none, rather than Config.MaxWriteQueueBytes. Guarded by
+	// mu.
+	writeLimit    int64
+	writeLimitSet bool
 	// lingerFor is how long a CloseAfterSendLinger goes on reading once its
 	// output has gone; see lingerLocked. Guarded by mu.
 	lingerFor time.Duration
@@ -990,7 +996,11 @@ func (c *Connection) send(data []byte, mode sendMode) error {
 	}
 	if mode == sendCopy && c.corked {
 		c.queueCorkedLocked(data, nil)
+		over := c.sendQueueOverLocked()
 		c.mu.Unlock()
+		if over {
+			return c.closeOverSendQueue()
+		}
 		return nil
 	}
 	sent := 0
@@ -1042,8 +1052,12 @@ func (c *Connection) send(data []byte, mode sendMode) error {
 	if direct {
 		armErr = c.awaitWritableLocked()
 	}
+	over := c.sendQueueOverLocked()
 	refresh := !c.corked && c.settlePauseLocked(false)
 	c.mu.Unlock()
+	if over {
+		return c.closeOverSendQueue()
+	}
 	if armErr != nil {
 		c.closeWithError(armErr)
 		return armErr
@@ -1078,7 +1092,11 @@ func (c *Connection) SendParts(first, second []byte) error {
 	}
 	if c.corked {
 		c.queueCorkedLocked(first, second)
+		over := c.sendQueueOverLocked()
 		c.mu.Unlock()
+		if over {
+			return c.closeOverSendQueue()
+		}
 		return nil
 	}
 	sent := 0
@@ -1114,8 +1132,12 @@ func (c *Connection) SendParts(first, second []byte) error {
 	if direct {
 		armErr = c.awaitWritableLocked()
 	}
+	over := c.sendQueueOverLocked()
 	refresh := !c.corked && c.settlePauseLocked(false)
 	c.mu.Unlock()
+	if over {
+		return c.closeOverSendQueue()
+	}
 	if armErr != nil {
 		c.closeWithError(armErr)
 		return armErr
@@ -1717,6 +1739,62 @@ func (c *Connection) SetWriteBackpressure(on bool) {
 		return
 	}
 	c.engine.request(command{kind: commandRefresh, connection: c})
+}
+
+// SetWriteQueueLimit caps the bytes this connection may have queued for its
+// socket, as Config.MaxWriteQueueBytes does for every connection: a send that
+// takes the queue past the limit closes the connection with
+// ErrSendQueueFull and reports it, rather than letting a peer that never
+// reads grow the queue without bound. Bytes a corked round has queued count,
+// and so do the sealed bytes a layer such as TLS leaves behind; a file
+// SendFile has queued but not read does not. A limit of zero or less removes
+// the cap, and a negative one restores the engine's, which is
+// Config.MaxWriteQueueBytes. It may be called from any goroutine, and takes
+// effect from the next send.
+func (c *Connection) SetWriteQueueLimit(limit int64) {
+	c.mu.Lock()
+	c.writeLimitSet, c.writeLimit = limit >= 0, max(limit, 0)
+	c.mu.Unlock()
+}
+
+// WriteQueueLimit reports the limit SetWriteQueueLimit set, or
+// Config.MaxWriteQueueBytes when none was, and zero when there is none.
+func (c *Connection) WriteQueueLimit() int64 {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.writeQueueLimitLocked()
+}
+
+// writeQueueLimitLocked is WriteQueueLimit, for callers that hold c.mu.
+func (c *Connection) writeQueueLimitLocked() int64 {
+	if c.writeLimitSet {
+		return c.writeLimit
+	}
+	if c.engine == nil {
+		return 0
+	}
+	return c.engine.writeQueueLimit
+}
+
+// sendQueueOverLocked reports whether what is queued for the socket is past
+// the connection's limit. It counts the bytes waiting from memory, whether
+// queued outright or under a cork, and not a file SendFile has queued but not
+// read, which the peer's reading of the socket paces anyway. Callers hold
+// c.mu.
+func (c *Connection) sendQueueOverLocked() bool {
+	limit := c.writeQueueLimitLocked()
+	if limit <= 0 {
+		return false
+	}
+	return c.pendingBytes.Load()+c.corkedBytes > limit
+}
+
+// closeOverSendQueue closes a connection whose send queue a send just took
+// past its limit, and reports the error that closes it. It is called after
+// c.mu is released.
+func (c *Connection) closeOverSendQueue() error {
+	c.closeWithError(ErrSendQueueFull)
+	return ErrSendQueueFull
 }
 
 // readShouldStop reports whether this round should stop reading: either queued
@@ -2626,6 +2704,9 @@ func (c *Connection) stageSealedLocked(item *sendItem) error {
 	s.advance(int64(want))
 	c.moveFileLocked(int64(want))
 	c.addPending(int64(len(sealed)))
+	if c.sendQueueOverLocked() {
+		return ErrSendQueueFull
+	}
 	return nil
 }
 
@@ -2669,7 +2750,11 @@ func (c *Connection) SendRawRecord(typ uint8, data []byte) error {
 	data = bufferpool.Append(nil, data)
 	c.pushLocked(sendItem{data: data, record: typ})
 	c.addPending(int64(len(data)))
+	over := c.sendQueueOverLocked()
 	c.mu.Unlock()
+	if over {
+		return c.closeOverSendQueue()
+	}
 	if !direct {
 		return nil
 	}

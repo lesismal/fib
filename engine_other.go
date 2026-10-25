@@ -586,7 +586,12 @@ type Config struct {
 	PollBatchSize            int
 	ReadBufferSize           int
 	WriteBufferHighWatermark int
-	UseWritev                bool
+	// MaxWriteQueueBytes caps a connection's send queue, as it does on the
+	// other backends; see the native Config's field. This backend writes each
+	// send before it returns, so it never holds a queue for the limit to
+	// bound, and accepts the field only so that one config serves both.
+	MaxWriteQueueBytes int64
+	UseWritev          bool
 	// CoalesceWrites batches the replies a read round produces. This backend
 	// reads and writes through the net package, which has no read rounds to
 	// batch, and ignores it.
@@ -673,11 +678,16 @@ type Connection struct {
 	readShut, writeShut bool
 	// lingerFor is what CloseAfterSendLinger asked for, and lingering marks
 	// the linger under way, which drops what arrives. Guarded by mu.
-	lingerFor  time.Duration
-	lingering  bool
-	writeMu    sync.Mutex
-	attachment atomic.Pointer[connectionAttachment]
-	layer      Layer
+	lingerFor time.Duration
+	lingering bool
+	writeMu   sync.Mutex
+	// writeLimit is what SetWriteQueueLimit chose, and writeLimitSet that it
+	// did; see the native Connection's. This backend has no send queue for it
+	// to cap.
+	writeLimit    int64
+	writeLimitSet bool
+	attachment    atomic.Pointer[connectionAttachment]
+	layer         Layer
 	// udp marks a connection that exchanges datagrams: a peer of a UDP
 	// listener, whose conn is a udpPeerConn, or a dialed UDP socket.
 	udp bool
@@ -928,6 +938,31 @@ func (c *Connection) SendOwned(data []byte) error { return c.Send(data) }
 // SendShared is equivalent to Send on the synchronous portable backend, which
 // never keeps data past the call.
 func (c *Connection) SendShared(data []byte) error { return c.Send(data) }
+
+// SetWriteQueueLimit caps a connection's send queue, as it does on the other
+// backends, where a send past the limit closes the connection with
+// ErrSendQueueFull. This backend writes each send before it returns and never
+// holds a queue, so the limit never applies; it is accepted, and reported by
+// WriteQueueLimit, so that one program serves both.
+func (c *Connection) SetWriteQueueLimit(limit int64) {
+	c.mu.Lock()
+	c.writeLimitSet, c.writeLimit = limit >= 0, max(limit, 0)
+	c.mu.Unlock()
+}
+
+// WriteQueueLimit reports the limit SetWriteQueueLimit set, or
+// Config.MaxWriteQueueBytes when none was, and zero when there is none.
+func (c *Connection) WriteQueueLimit() int64 {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.writeLimitSet {
+		return c.writeLimit
+	}
+	if c.engine == nil {
+		return 0
+	}
+	return c.engine.bindConfig.MaxWriteQueueBytes
+}
 
 func (c *Connection) SendParts(first, second []byte) error {
 	if l := c.layer; l != nil {

@@ -138,9 +138,12 @@ type Engine struct {
 	writeLowWatermark  int
 	maxPendingBytes    int64
 	budgetResumeBytes  int64
-	sendBufferSize     int
-	handler            Handler
-	stopping           atomic.Bool
+	// writeQueueLimit is Config.MaxWriteQueueBytes, which a connection's
+	// SetWriteQueueLimit can override; see Connection.sendQueueOverLocked.
+	writeQueueLimit int64
+	sendBufferSize  int
+	handler         Handler
+	stopping        atomic.Bool
 	// draining says Shutdown has begun: the listeners have stopped, no UDP
 	// peer is opened, and the connections are left to finish.
 	draining atomic.Bool
@@ -309,6 +312,7 @@ func newEngine(config Config, bindings []Binding) (*Engine, error) {
 		writeLowWatermark: config.WriteBufferHighWatermark / 4,
 		maxPendingBytes:   config.MaxPendingBytes,
 		budgetResumeBytes: config.MaxPendingBytes / 4,
+		writeQueueLimit:   config.MaxWriteQueueBytes,
 		// An outbound buffer is sized to one read round's replies, not to the
 		// write watermark. The watermark bounds the bytes a connection may
 		// have pending; it does not bound the capacity of the buffer holding
@@ -361,7 +365,7 @@ func (e *Engine) openPollers(config Config) error {
 			socketSyscalls: e.socketSyscalls, coalesceWrites: e.coalesceWrites,
 			writeHighWatermark: e.writeHighWatermark,
 			writeLowWatermark:  e.writeLowWatermark, maxPendingBytes: e.maxPendingBytes,
-			budgetResumeBytes: e.budgetResumeBytes, sendBufferSize: e.sendBufferSize,
+			budgetResumeBytes: e.budgetResumeBytes, writeQueueLimit: e.writeQueueLimit, sendBufferSize: e.sendBufferSize,
 			udpIdleTimeout: e.udpIdleTimeout, pendingTotal: e.pendingTotal, accepted: e.accepted, handler: e.handler,
 			taskPool: e.taskPool, releaseTaskPool: func() {},
 			readBufferSize: e.readBufferSize}
@@ -1226,7 +1230,18 @@ type Config struct {
 	// which is what DefaultConfig sets: only the per-connection watermark
 	// applies unless a deployment opts into this one.
 	MaxPendingBytes int64
-	UseWritev       bool
+	// MaxWriteQueueBytes caps, per connection, the bytes queued for the
+	// socket that the socket has not taken: what Send, SendParts and a layer
+	// such as TLS leave behind, not a file SendFile has queued unread. A send
+	// that takes the queue past it closes the connection with
+	// ErrSendQueueFull, and reports that error, rather than letting a peer
+	// that never reads grow the queue without bound. It is the bound a
+	// broadcast to many connections wants, since WriteBufferHighWatermark
+	// only pauses reads and MaxPendingBytes bounds the server's total rather
+	// than one peer's queue. Zero, the default, means no limit. A connection
+	// can set its own with Connection.SetWriteQueueLimit.
+	MaxWriteQueueBytes int64
+	UseWritev          bool
 	// MaxConns caps the connections the engine's bindings have accepted and
 	// not yet closed, all of them together: one accepted past it is closed
 	// at once, before any handler hears of it, and counted in

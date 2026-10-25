@@ -384,6 +384,12 @@ type File interface {
 // sends are datagrams rather than a stream a file could be copied into.
 var ErrSendFileDatagram = errors.New("fib: SendFile needs a stream connection")
 
+// ErrSendQueueFull is what a send returns when it would take the connection's
+// send queue past Config.MaxWriteQueueBytes, or the limit
+// Connection.SetWriteQueueLimit set. The connection is closed with it, rather
+// than the queue growing without bound for a peer that never reads.
+var ErrSendQueueFull = errors.New("fib: connection send queue full")
+
 // sendFileChunk is how much of a file one read stages when the file cannot go
 // to the socket directly: through a layer, or on a platform without sendfile.
 // It is a whole number of TLS records' plaintext, so that a file the tls
