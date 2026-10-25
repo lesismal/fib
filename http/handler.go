@@ -1495,6 +1495,19 @@ func (h *ServerHandler) OnShutdown(c *fib.Connection) {
 	}
 }
 
+// OnEngineClose tells the client of an HTTP/2 connection that the server is
+// going, with GOAWAY, as Engine.Close is about to end the connection; see
+// fib.EngineCloseHandler. An HTTP/1 connection needs nothing: the end of its
+// stream is the end of it, and a tunnel's protocol hears through its own
+// handler. It runs on the goroutine that called Close, which must not wait,
+// so the GOAWAY takes no lock of the connection and is written where it is
+// built; see h2ServerConn.engineClose.
+func (h *ServerHandler) OnEngineClose(c *fib.Connection) {
+	if state, ok := c.Attachment().(*h2ServerConn); ok {
+		state.engineClose()
+	}
+}
+
 // idleForShutdown reports whether an HTTP/1 connection is between requests,
 // and if it is marks it spent, so that a request arriving before it closes is
 // not begun. A parser that is held is busy: it is held while a request is
@@ -1713,4 +1726,7 @@ func validHeaderValue(value string) bool {
 	return true
 }
 
-var _ fib.Handler = (*ServerHandler)(nil)
+var (
+	_ fib.Handler            = (*ServerHandler)(nil)
+	_ fib.EngineCloseHandler = (*ServerHandler)(nil)
+)

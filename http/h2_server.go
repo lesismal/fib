@@ -144,8 +144,10 @@ type h2ServerConn struct {
 	// start the wait again.
 	closeScheduled bool
 	// lastStreamID is the highest client stream accepted, which GOAWAY
-	// reports as the last one this side will process.
-	lastStreamID uint32
+	// reports as the last one this side will process. It is atomic because
+	// Engine.Close reads it without the lock, which a handler may hold; see
+	// engineClose.
+	lastStreamID atomic.Uint32
 	// idleTimer ends the connection with GOAWAY once it has carried no
 	// stream for Config.IdleTimeout, and idleSince is when the last one
 	// ended; see armIdleLocked. Nil without an IdleTimeout.
@@ -386,7 +388,7 @@ func (sc *h2ServerConn) idleExpired() {
 		return
 	}
 	sc.goAway = true
-	sc.sendLocked(h2AppendGoAway(nil, sc.lastStreamID, H2NoError, ""))
+	sc.sendLocked(h2AppendGoAway(nil, sc.lastStreamID.Load(), H2NoError, ""))
 	sc.closeFinishedLocked()
 }
 
@@ -515,7 +517,7 @@ func (sc *h2ServerConn) fail(err *H2ConnError) {
 		sc.mu.Unlock()
 		return
 	}
-	sc.sendLocked(h2AppendGoAway(nil, sc.lastStreamID, err.Code, err.Reason))
+	sc.sendLocked(h2AppendGoAway(nil, sc.lastStreamID.Load(), err.Code, err.Reason))
 	sc.closed = true
 	sc.goAway = true
 	sc.failBodiesLocked(err)
@@ -548,7 +550,7 @@ func (sc *h2ServerConn) retire() {
 	sc.mu.Lock()
 	if !sc.closed && !sc.goAway {
 		sc.goAway = true
-		sc.sendLocked(h2AppendGoAway(nil, sc.lastStreamID, H2NoError, ""))
+		sc.sendLocked(h2AppendGoAway(nil, sc.lastStreamID.Load(), H2NoError, ""))
 	}
 	for _, st := range sc.streams {
 		if st.tunnel != nil {
@@ -561,6 +563,24 @@ func (sc *h2ServerConn) retire() {
 	for _, feed := range tunnels {
 		feed.Shutdown()
 	}
+}
+
+// engineClose sends GOAWAY as Engine.Close is about to end the connection:
+// the client would otherwise find a reset where the server could have told
+// it that it is going. Close has stopped the loops already, so nothing would
+// write a frame left queued; this one goes out here, and nothing waits for
+// it. The connection's lock may be held by a handler writing a response, and
+// Close must not wait for one, so none is taken: the last stream is atomic,
+// and the frame is one non-blocking write. A socket that cannot take it, as
+// one already backed up by a slow client may not, leaves it queued for the
+// cut to drop, as before; Engine.Shutdown is the graceful path.
+func (sc *h2ServerConn) engineClose() {
+	// The connection itself refuses the send if it has already gone.
+	_ = sc.conn.SendOwned(h2AppendGoAway(nil, sc.lastStreamID.Load(), H2NoError, ""))
+	// Send writes what the socket takes at once; a connection corked by a
+	// response being framed would otherwise hold it, and this flushes it,
+	// without waiting for the socket.
+	_ = sc.conn.Flush()
 }
 
 // shutdown is the connection closing underneath.
@@ -986,7 +1006,7 @@ func (sc *h2ServerConn) handleHeaderBlock(id uint32, block []byte, endStream boo
 	}
 	st = sc.newStream(id)
 	sc.streams[id] = st
-	sc.lastStreamID = id
+	sc.lastStreamID.Store(id)
 	sc.busyLocked()
 	sc.mu.Unlock()
 
@@ -1737,7 +1757,7 @@ func (st *h2ServerStream) respond(req *stdhttp.Request, response Response) error
 		// Close retires it gracefully: nothing new is taken, what is open
 		// finishes, and then the connection closes.
 		sc.goAway = true
-		out = h2AppendGoAway(out, sc.lastStreamID, H2NoError, "")
+		out = h2AppendGoAway(out, sc.lastStreamID.Load(), H2NoError, "")
 	}
 	sc.sendPooledLocked(out)
 	sc.finishStreamLocked(st)

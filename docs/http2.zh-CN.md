@@ -103,20 +103,27 @@
 
 ### 协议细节
 
-- **优先级**：PRIORITY 帧和 HEADERS 中的优先级字段会被校验后忽略；多个 stream
-  同时有待发送数据时，发送顺序由内部 map 的遍历顺序决定，没有公平性或权重保证。
-- **对端的 `SETTINGS_MAX_HEADER_LIST_SIZE`**：本端会声明自己的上限，但发送时不检查
-  对端声明的上限。
-- **优雅关闭时的 TCP RST**：GOAWAY 后连接在所有 stream 完成时关闭，但不会先半关闭、
-  排空对端仍在发送的数据；如果此时 socket 中还有未读数据，内核会发送 RST。
-- **引擎停止**：`Engine.Shutdown` 会发送 GOAWAY，并在连接的 stream 都完成后关闭连接；
-  但单独调用 `Engine.Stop`/`Close` 时仍不发送 GOAWAY，连接被直接关闭，客户端看到的是
-  连接中断而不是优雅关闭。
+- **优先级**：PRIORITY 帧和 HEADERS 中的优先级字段会被校验后忽略；被连接窗口压住
+  数据的 stream 按开始等待的顺序逐个帧轮流发送，因此一个大文件下载不会饿死同一连接上
+  的其它响应；没有权重，前面没有其它 stream 等待时仍然立即发送。
+- **对端的 `SETTINGS_MAX_HEADER_LIST_SIZE`**：双向都会遵守对端声明的上限。响应头或
+  trailer 超限时重置该 stream 而不是照发，中间响应或 push 请求的头部超限则不发；客户端
+  对头部超限的请求在开 stream 之前就直接失败，流式 body 的 trailer 超限时重置该 stream。
+- **引擎停止**：`Engine.Shutdown` 会发送 GOAWAY，并在连接的 stream 都完成后关闭连接。
+  `Engine.Stop` 本身不关闭连接；`Engine.Close` 在切断每个 HTTP/2 连接之前，用一次非阻塞
+  写发出 GOAWAY：socket 还收得下时对端就能知道服务端要走了，但已经有大量输出排队的
+  连接仍可能在 GOAWAY 还排在队列里时被切断。优雅关闭仍然要用 `Engine.Shutdown`。
+- **关闭时的 TCP RST**：服务端自己结束的连接（空闲、响应的 `Close`、停机、对端 GOAWAY
+  或连接错误）在 GOAWAY 之后会半关闭写方向并排空客户端仍在发送的数据，最多
+  `lingerTimeout`（500ms），客户端因此能读到 GOAWAY 而不是 RST。`Engine.Close` 切断的
+  连接不会 linger，其中仍有未读输入的可能被 RST。
 - **空闲与保活**：服务端在连接 `Config.IdleTimeout`（未设时用 `ReadTimeout`；`DefaultConfig`
-  中为 2 分钟）内没有任何流时发出 GOAWAY `NO_ERROR` 并关闭，但不发送 PING 保活。客户端的
-  PING 健康检查见[客户端](#客户端)。
-- **SETTINGS 确认超时**：不检测对端是否在合理时间内确认了本端的 SETTINGS
-  （SETTINGS_TIMEOUT）。
+  中为 2 分钟）内没有任何流时发出 GOAWAY `NO_ERROR` 并关闭。设置 `Config.PingInterval`
+  后，连接超过一个间隔没有发送任何数据时服务端会发 PING，`Config.PingTimeout` 内没有
+  任何回应则关闭连接；默认不发 PING。客户端的 PING 健康检查见[客户端](#客户端)。
+- **SETTINGS 确认超时**：客户端未在 `Config.SettingsTimeout`（默认 10 秒）内确认服务端的
+  SETTINGS 时，服务端以 GOAWAY(SETTINGS_TIMEOUT) 结束连接。客户端不会以同样方式给
+  服务端计时。
 
 ### 客户端
 
@@ -224,8 +231,6 @@ CI 的 `Fuzz the parsers` job 每个目标跑 20 秒。还缺的是压测（例�
 
 - 把接收窗口大小、最大帧大小、HPACK 表大小、客户端初始并发数做成配置项；可选根据
   BDP 动态调整窗口。
-- 发送侧对多个待发送 stream 做轮询或按权重调度，保证公平。
-- 发送时遵守对端的 `SETTINGS_MAX_HEADER_LIST_SIZE`。
-- 服务端：PING 保活；GOAWAY 后半关闭并排空输入，避免 RST。
+- 发送侧按权重调度待发送的 stream（轮询已实现）。
 - 客户端：SETTINGS 确认超时检测。（PING 健康检查、按负载选择连接、等待 100-continue
   已完成，见[客户端](#客户端)。）

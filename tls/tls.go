@@ -410,6 +410,17 @@ func (h *Handler) OnShutdown(c *fib.Connection) {
 	}
 }
 
+// OnEngineClose passes word that Engine.Close is about to end the connection
+// on to the wrapped handler, when it takes it, so that the protocol inside
+// the TLS stream can write its last frame first, as an HTTP/2 server does
+// with GOAWAY; see fib.EngineCloseHandler. What the handler sends here is
+// encrypted by the layer as anything else it sends is.
+func (h *Handler) OnEngineClose(c *fib.Connection) {
+	if inner, ok := h.inner().(fib.EngineCloseHandler); ok {
+		inner.OnEngineClose(c)
+	}
+}
+
 func (h *Handler) OnClose(c *fib.Connection, err error) {
 	if t, ok := c.Layer().(*layer); ok {
 		// Once the layer has closed, which closing marks, no Send holds

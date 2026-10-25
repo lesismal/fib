@@ -136,26 +136,40 @@ These are constants today and cannot be configured:
 ### Protocol details
 
 - **Priority**: PRIORITY frames and the priority fields in HEADERS are validated
-  and ignored. When several streams have data waiting, the order they are sent
-  in follows the iteration order of an internal map, with no fairness or
-  weighting.
-- **The peer's `SETTINGS_MAX_HEADER_LIST_SIZE`**: this side advertises its own
-  limit but does not check the peer's when sending.
-- **TCP RST on graceful close**: after GOAWAY the connection closes once every
-  stream has finished, but it does not half-close and drain what the peer is
-  still sending first; if unread data is left in the socket, the kernel sends a
-  RST.
+  and ignored. Streams whose bytes the connection's window holds back take
+  turns a frame at a time, in the order they began to wait, so a large
+  download does not starve the other responses on its connection; there is no
+  weighting, and a stream with nothing ahead of it sends at once.
+- **The peer's `SETTINGS_MAX_HEADER_LIST_SIZE`**: both sides keep within the
+  limit the peer announces. A response header or trailer that would not fit
+  resets its stream rather than going out, an interim response or a pushed
+  request's header that would not fit is left out, and the client fails a
+  request whose header is too large before it opens a stream, and resets one
+  whose streamed body's trailer turns out to be.
 - **Engine shutdown**: `Engine.Shutdown` sends GOAWAY and closes each
-  connection once its streams have finished, but `Engine.Stop`/`Close` on
-  their own still close HTTP/2 connections outright, and clients see a broken
-  connection rather than a graceful close.
+  connection once its streams have finished. `Engine.Stop` on its own leaves
+  connections open, and `Engine.Close` writes GOAWAY on each HTTP/2
+  connection before it cuts it, in one non-blocking write: the peer learns
+  that the server is going where the socket can take the frame, while a
+  connection already backed up with output may still be cut with it queued.
+  `Engine.Shutdown` remains the graceful path.
+- **TCP RST on close**: a connection the server retires itself (idle, a
+  response's `Close`, a shutdown, a peer's GOAWAY or a connection error)
+  half-closes after its GOAWAY and drains what the client is still sending,
+  for `lingerTimeout` (500ms) at most, so the client reads the GOAWAY rather
+  than a reset. A connection `Engine.Close` cuts does not linger, and one
+  with unread input may still be reset.
 - **Idle and keep-alive**: the server retires a connection that has carried
   no stream for `Config.IdleTimeout` (`ReadTimeout` when it is not set; 2
-  minutes in `DefaultConfig`) with GOAWAY `NO_ERROR`, but sends no PING
-  keep-alives. The client's PING health check is described under
-  [Client](#client).
-- **SETTINGS acknowledgement timeout**: nothing checks that the peer
-  acknowledges this side's SETTINGS in reasonable time (SETTINGS_TIMEOUT).
+  minutes in `DefaultConfig`) with GOAWAY `NO_ERROR`. With
+  `Config.PingInterval` it also pings a connection that has sent nothing for
+  an interval, and closes one that answers nothing within
+  `Config.PingTimeout`; the default sends no PING. The client's PING health
+  check is described under [Client](#client).
+- **SETTINGS acknowledgement timeout**: the server ends a connection with
+  GOAWAY(SETTINGS_TIMEOUT) when the client has not acknowledged its SETTINGS
+  within `Config.SettingsTimeout` (10 seconds by default). The client does not
+  time a server out the same way.
 
 ### Client
 
@@ -301,11 +315,8 @@ concurrency.
 - Make the receive windows, maximum frame size, HPACK table size and the
   client's initial stream allowance configurable; optionally size windows from
   the bandwidth-delay product.
-- Schedule streams with pending data round-robin or by weight, for fairness.
-- Honour the peer's `SETTINGS_MAX_HEADER_LIST_SIZE` when sending.
-- Server: PING keep-alive; half-close and drain
-  input after GOAWAY to avoid RST.
-- Client: a SETTINGS acknowledgement timeout. (PING health checks,
+- Schedule streams with pending data by weight; round-robin is done.
+- Client: a SETTINGS acknowledgement timeout of its own. (PING health checks,
   least-loaded connection selection and waiting for 100-continue are done; see
   [Client](#client).)
 - Support sending request trailers.
