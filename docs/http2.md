@@ -420,4 +420,8 @@ concurrency.
 
 ### 5. Request trailers (low)
 
-- Support sending request trailers.
+- Done: the client sends request trailers, both for a body sent whole and for
+  one that streams (`Request.Trailer`, the values as they stand when the body
+  has been read), and the server hands them to the handler in
+  `Request.Trailer`, as for a chunked HTTP/1 request. See
+  [Client](#client).

@@ -309,4 +309,6 @@ CI 的 `Fuzz the parsers` job 每个目标跑 20 秒。还缺的是压测（例�
 
 ### 5. 请求 trailer（低）
 
-- 支持发送请求 trailer。
+- 已完成：客户端会发送请求 trailer，body 整体发送和流式发送都是（`Request.Trailer`，
+  取 body 读完时的值），服务端把它交给 handler 的 `Request.Trailer`，与 HTTP/1 的 chunked
+  请求一样。见[客户端](#客户端)。
