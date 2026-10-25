@@ -753,6 +753,9 @@ files.ServeFile(c, strings.TrimPrefix(c.Request.URL.Path, "/static/"))
 - Datagrams come from `bufferpool`; give them back with `bufferpool.Put` when done and no longer
   referenced. **The slice holding them must not be kept after `OnDatagrams` returns.**
 - **`SendBatch`:** `sendmmsg` on Linux, `sendmsg_x` on macOS, one system call for a batch.
+- **`SetDontFragment`:** datagrams go whole or not at all (DF over IPv4, no host fragmentation over
+  IPv6), which path MTU discovery needs; on a listener's peer it sets the shared socket. HTTP/3
+  turns it on itself; other UDP uses keep fragmentation.
 - UDP sends never queue: if the socket has no room the datagram is **dropped** and an error is
   returned, and the connection stays open; UDP does not take part in the write watermark.
 - On Linux with `ReusePort`, each poller binds its own `SO_REUSEPORT` UDP socket and reads it

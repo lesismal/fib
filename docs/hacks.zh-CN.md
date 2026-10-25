@@ -645,6 +645,9 @@ files.ServeFile(c, strings.TrimPrefix(c.Request.URL.Path, "/static/"))
 - 数据报来自 `bufferpool`，用完且不再引用时 `bufferpool.Put` 还回去。**装它们的切片不能在
   `OnDatagrams` 返回后持有**。
 - **`SendBatch`**：Linux 用 `sendmmsg`、macOS 用 `sendmsg_x`，一次系统调用发一批。
+- **`SetDontFragment`**：数据报要么完整送达要么丢弃（IPv4 设 DF，IPv6 本机不分片），路径 MTU
+  探测需要它；对监听 socket 的对端设置时作用于共享的 socket。HTTP/3 自己会开启，其他 UDP
+  用法默认仍允许分片。
 - UDP 发送从不排队：socket 没空间就**丢包**并返回错误，连接保持打开；UDP 不参与写水位。
 - Linux 上设置 `ReusePort` 时，每个 poller 自己绑定一个 `SO_REUSEPORT` UDP socket 自己读，
   内核按四元组哈希把数据报交给其中一个，没有惊群；同一对端永远落在同一个 poller 上。

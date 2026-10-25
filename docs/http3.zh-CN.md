@@ -35,7 +35,7 @@
   最新的包（包号大于之前所有的包，并且带有探测帧以外的帧）后，服务端改向新地址发送，发送量
   不超过从新地址收到的 3 倍，同时发 PATH_CHALLENGE 验证新地址，客户端回应后关闭旧路径
   （RFC 9000 §9.3）。客户端没有按时回应就退回旧路径；旧路径上再来更新的包也会把连接拉回去。
-  除非只是端口变了，拥塞控制和 RTT 从头开始；新路径验证完成前数据报降到 1200 字节。迁移之后
+  除非只是端口变了，拥塞控制和 RTT 从头开始；新路径验证完成前数据报降到 1200 字节，验证后重新做路径 MTU 探测。迁移之后
   的请求，`Request.RemoteAddr` 是新地址。
 - Linux 上开启 `Config.IOPollers` 和 `ReusePort` 时，新地址可能落到另一个 poller 的
   socket 上；QUIC 连接可以从任意 goroutine 接收数据报，所以连接会跟过去。
@@ -133,7 +133,7 @@
 
 | 参数 | 值 |
 | --- | --- |
-| 数据报大小 | 1200 字节，不做 PMTU 探测；已知网络能承载更大数据报时，服务端可以用 `Config.MaxDatagramSize` 调大，最多 1452 |
+| 数据报大小 | 1200 字节，直到路径 MTU 探测找到更大的（见[协议细节](#协议细节)），最多 1452；已知网络能承载更大数据报时，服务端可以用 `Config.MaxDatagramSize` 从更大的值开始 |
 | 每个 stream 的接收窗口 | 1MB，消费一半后补充 |
 | 连接的接收窗口 | 16MB，消费一半后补充 |
 | 对端可以打开的单向 stream 数 | 16 |
@@ -164,6 +164,16 @@
   NewReno；没有 BBR、HyStart++ 和 ECN。发送按每个平滑 RTT 1.25 个拥塞窗口的速率 pacing。
   发送缓冲区满（`EAGAIN`，macOS 上是 `ENOBUFS`）时，这一轮剩下的数据报保留下来，1 毫秒
   后先于新数据重发：Engine 会通知 UDP socket 可读，但不会通知写满的 socket 何时又可写。
+- **路径 MTU 探测**（DPLPMTUD，RFC 8899；RFC 9000 §14.3），两端默认开启：握手确认后连接
+  发一个探测包——用 PADDING 填到 1452 字节（`MaxProbeDatagramSize`，且不超过对端的
+  `max_udp_payload_size`）的 PING——被确认后就按这个大小发送数据报。同一大小的探测包丢 3 次，
+  就在下面的区间二分查找，精确到 20 字节以内，10 分钟后再从上限试一次。探测包丢失不算拥塞。
+  只在 Engine 的 UDP socket 能设成不分片时进行（`fib.Connection.SetDontFragment`：Linux 用
+  `IP_PMTUDISC_PROBE`，macOS、FreeBSD、Windows 都支持，其他 BSD 只有 IPv6），因为被分片的
+  探测包证明不了什么；`Config` 和 `ClientConfig` 的 `DisablePathMTUDiscovery` 关闭它。黑洞检测：
+  发送大于 1200 字节数据报的连接，在 3 个更大的包丢失、而它们之后发出的大包一个都没被确认时，或者
+  连续 3 次 PTO 时，退回 1200 字节，1 分钟后重新探测；用 `MaxDatagramSize` 设的大小也是如此。
+  拥塞窗口仍按 1200 字节的数据报计算。
 - **对端的 `SETTINGS_MAX_FIELD_SECTION_SIZE`**：能解析，但发送时不检查。
 - **优先级**：`priority` 头和 PRIORITY_UPDATE 帧都被忽略，待发送的 stream 轮流发送。
 - **ECN**：不设置也不上报 ECN 标记。ACK_ECN 帧能解析，但其中的计数被忽略。
@@ -262,8 +272,9 @@
   改动前 1.2-1.7 秒，改动后 0.40、0.43、1.06 秒；无丢包时改动前 235-275 毫秒，改动后
   82-92 毫秒。fit 的 fixed-h3 从每秒 165.8 万请求提高到 177.3 万（+7%），static-h3 不变
   （117.5 万、116.5 万）。
-- **PMTU 探测（DPLPMTUD，RFC 8899）**：以太网上通常可以用到约 1450 字节的数据报，每个
-  包的头部和 AEAD 标签开销会降低。在此之前可以用 `Config.MaxDatagramSize` 手动调大。
+- **PMTU 探测（DPLPMTUD，RFC 8899）**：已完成，带黑洞检测（见[协议细节](#协议细节)）。
+  还没做的是探测 1452 字节以上（巨型帧，或 IPv4 上的 1472），这需要更大的发送缓冲区；
+  以及按探测到的大小计算拥塞窗口。
 - **拥塞控制**：BBR、HyStart++ 和 ECN 尚未实现；UDP socket 的可写事件也没有，有了它，
   被 socket 拒收的一轮可以在有空间时立刻续发，而不是等 1 毫秒。
 - **批量收发**：Engine 在 Linux 上用 `recvmmsg`、macOS 上用 `recvmsg_x` 批量读取；一轮

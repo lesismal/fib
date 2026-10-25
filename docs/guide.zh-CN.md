@@ -438,6 +438,11 @@ addr, _ := server.LocalUDPAddr()
 - 发送直接写 socket，从不排队：socket 没有空间时这个数据报被丢弃，`Send` 返回错误，
   连接保持打开。因此 UDP 连接不参与写水位和背压。`SendBatch` 按顺序发送多个数据报，
   Linux 上用 `sendmmsg`、macOS 上用 `sendmsg_x`，一次系统调用发出一批。
+- `SetDontFragment` 让连接发出的数据报不被分片（IPv4 设 DF 位，IPv6 本机不分片）：超过路径
+  MTU 的数据报在途中被丢弃，超过网卡 MTU 的直接返回 `EMSGSIZE`。监听 socket 的对端共用监听
+  socket，所以对它的所有对端都生效。Linux 上用 `IP_PMTUDISC_PROBE`，不理会内核从 ICMP 学到的
+  路径 MTU；macOS、FreeBSD、Windows 支持 IPv4 和 IPv6，其他 BSD 只支持 IPv6。默认不开启（分片
+  对其他 UDP 用法更好），HTTP/3 的路径 MTU 探测会自己开启。
 - Windows 上监听 socket 用 overlapped `WSARecvFrom`、拨号 socket 用带缓冲区的
   overlapped `WSARecv` 接收，并关闭 `SIO_UDP_CONNRESET`，以免某个对端的 ICMP
   端口不可达导致整个监听 socket 的接收失败。兼容后端用 `net.ListenUDP` 实现同样的语义。
@@ -1234,8 +1239,11 @@ QUIC 层的实现要点：
   包数达到 RFC 9001 §6.6 的上限时主动发起，也响应对端发起的更新，解密失败次数超过
   完整性上限时关闭连接；客户端支持 Retry。支持 0-RTT（默认关闭，`quic.Config.EarlyData`）。
 - 丢包检测与拥塞控制按 RFC 9002 实现：ACK 阈值和时间阈值判定丢包、PTO 探测、
-  NewReno 拥塞控制；服务端在验证客户端地址前遵守 3 倍放大限制。发出的数据报固定为
-  1200 字节（所有 IPv6 路径都能承载的大小），因此不需要 PMTU 探测。
+  NewReno 拥塞控制；服务端在验证客户端地址前遵守 3 倍放大限制。数据报从 1200 字节
+  （所有 IPv6 路径都能承载的大小）开始，握手确认后做路径 MTU 探测（RFC 8899），以太网上
+  通常升到 1452 字节；更大的包持续丢失时退回 1200 字节（黑洞检测）。探测要求 UDP socket
+  不分片，由 `fib.Connection.SetDontFragment` 设置；`DisablePathMTUDiscovery` 关闭探测，
+  `MaxProbeDatagramSize` 设上限。
 - 流控：遵守对端的连接级和 stream 级限制；接收方向每个 stream 窗口 1MB、连接窗口
   16MB，按消费量自动补充；并发 stream 数用 MAX_STREAMS 动态放开。
 - QPACK 两端都声明动态表容量为 0：编码只用静态表和字面量（字面量在更短时使用
@@ -1247,9 +1255,9 @@ QUIC 层的实现要点：
 
 HTTP/3 的一致性测试（与 quic-go 客户端、服务端的双向互通，以及用手写帧构造的协议错误
 用例，CI 中在三个平台运行；quic-go 放在 `http3/interop` 这个独立 module 里，fib 本身
-不增加依赖）、当前的限制（只跟随 NAT 重绑定、不支持主动迁移、固定 1200 字节数据报、关闭时
+不增加依赖）、当前的限制（只跟随 NAT 重绑定、不支持主动迁移、关闭时
 没有 closing/draining 期等）、0-RTT 的做法与防重放、有意未实现的功能及原因（QPACK 动态表、server push
-等），以及待优化项（安全加固、pacing、PMTU 探测、拥塞控制、批量收发等）见
+等），以及待优化项（拥塞控制、批量收发等）见
 [`docs/http3.zh-CN.md`](http3.zh-CN.md)。
 
 ### 异步 HTTP/3 client

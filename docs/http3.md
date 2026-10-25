@@ -44,7 +44,8 @@ Behavior users need to be aware of.
   (RFC 9000 §9.3). A client that does not answer in time is taken back to
   the path it left, and a later packet on the old path takes it back too.
   Congestion control and RTT start over unless only the port changed, and
-  datagrams drop to 1200 bytes until the new path is validated. Requests
+  datagrams drop to 1200 bytes until the new path is validated, after which
+  path MTU discovery searches it afresh. Requests
   after the move report the new address in `Request.RemoteAddr`.
 - Under `Config.IOPollers` with `ReusePort` on Linux, the new address may
   fall to another poller's socket; the connection follows it there, since a
@@ -179,7 +180,7 @@ exposed through `http3.Config` or `http3.ClientConfig`:
 
 | Parameter | Value |
 | --- | --- |
-| Datagram size | 1200 bytes, no PMTU discovery; a server can raise it up to 1452 with `Config.MaxDatagramSize` on a network known to carry that |
+| Datagram size | 1200 bytes until path MTU discovery finds more (see [Protocol details](#protocol-details)), at most 1452; a server can start higher with `Config.MaxDatagramSize` on a network known to carry that |
 | Per-stream receive window | 1MB, replenished when half is consumed |
 | Connection receive window | 16MB, replenished when half is consumed |
 | Unidirectional streams the peer may open | 16 |
@@ -220,6 +221,22 @@ exposed through `http3.Config` or `http3.ClientConfig`:
   has no room for (`EAGAIN`, or `ENOBUFS` on macOS) is kept and sent again a
   millisecond later, before anything new: the engine says when a UDP socket can
   be read, but not when a full one can be written again.
+- **Path MTU discovery** (DPLPMTUD, RFC 8899; RFC 9000 §14.3), on by default
+  at both ends: once the handshake is confirmed a connection sends a probe, a
+  PING padded to 1452 bytes (`MaxProbeDatagramSize`, and no more than the
+  peer's `max_udp_payload_size`), and sends datagrams that large once it is
+  acknowledged. A probe lost three times has the sizes below searched by
+  halves, to within 20 bytes, and from the top again ten minutes later. Lost
+  probes do not count as congestion. It runs only where the engine's UDP
+  socket can be set not to fragment (`fib.Connection.SetDontFragment`: Linux
+  with `IP_PMTUDISC_PROBE`, macOS, FreeBSD and Windows; IPv6 only on the other
+  BSDs), since a fragmented probe proves nothing; `DisablePathMTUDiscovery`
+  in `Config` and `ClientConfig` turns it off. Black holes: a connection
+  sending more than 1200 bytes goes back to 1200 when three larger packets
+  are lost with none sent after them acknowledged, or after three probe
+  timeouts in a row, and searches again a minute later; this holds for a size
+  set with `MaxDatagramSize` too. The congestion window is still counted in
+  1200-byte datagrams.
 - **The peer's `SETTINGS_MAX_FIELD_SECTION_SIZE`** is parsed but not checked
   when sending.
 - **Priorities**: the `priority` header and PRIORITY_UPDATE frames are ignored;
@@ -362,9 +379,10 @@ Done:
   0.43s and 1.06s after; lossless 235-275ms before, 82-92ms after. fit's
   fixed-h3 went from 1658k to 1773k requests a second (+7%), static-h3 was
   unchanged (1175k, 1165k).
-- **PMTU discovery (DPLPMTUD, RFC 8899)**: Ethernet paths usually carry about
-  1450-byte datagrams, which would cut per-packet header and AEAD overhead.
-  Until then, `Config.MaxDatagramSize` sets a larger size by hand.
+- **PMTU discovery (DPLPMTUD, RFC 8899)**: done, with black hole detection
+  (see [Protocol details](#protocol-details)). Still open: searching above
+  1452 bytes (jumbo frames, or 1472 over IPv4), which needs larger send
+  buffers, and counting the congestion window in the discovered size.
 - **Congestion control**: BBR, HyStart++ and ECN are still to do; so is a
   writability event for UDP sockets, which would resume a round the socket
   refused as soon as it has room, rather than a millisecond later.
