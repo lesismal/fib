@@ -243,9 +243,11 @@ These are still constants:
 - **Congestion control**: CUBIC (RFC 9438) by default, NewReno with
   `quic.Config.CongestionControl`; no BBR, HyStart++ or ECN. Sending is paced at
   1.25 congestion windows a smoothed RTT. A round of datagrams the send buffer
-  has no room for (`EAGAIN`, or `ENOBUFS` on macOS) is kept and sent again a
-  millisecond later, before anything new: the engine says when a UDP socket can
-  be read, but not when a full one can be written again.
+  has no room for (`EAGAIN`) is kept, and the engine says when the socket has
+  room again (`fib.Connection.NotifyWritable`), so it goes then, before anything
+  new; where nothing can say that — Windows' completion ports, the portable
+  backend, or `ENOBUFS`, which macOS reports for a full socket and Linux for a
+  full device queue — a millisecond timer tries again.
 - **Path MTU discovery** (DPLPMTUD, RFC 8899; RFC 9000 §14.3), on by default
   at both ends: once the handshake is confirmed a connection sends a probe, a
   PING padded to 1452 bytes (`MaxProbeDatagramSize`, and no more than the
@@ -398,8 +400,9 @@ Done:
   Sending is paced at 1.25 congestion windows a smoothed RTT, with a burst of
   the initial window or 2ms of the rate (RFC 9002 section 7.7), the timer going
   on with what pacing holds back; a round the socket refuses with `EAGAIN` is
-  kept and sent again rather than lost (`fib.Connection.SendDatagrams` says how
-  much of a batch went). CUBIC (RFC 9438) is the default, NewReno selectable in
+  kept and sent again as soon as the engine says the socket has room, rather
+  than lost (`fib.Connection.SendDatagrams` says how much of a batch went).
+  CUBIC (RFC 9438) is the default, NewReno selectable in
   `quic.Config.CongestionControl`; the window grows only while in use (RFC 9002
   section 7.8), and persistent congestion (section 7.6) collapses it. Sent
   packets are a ring indexed by packet number, so an ACK frame costs what it
@@ -414,16 +417,18 @@ Done:
   (see [Protocol details](#protocol-details)). Still open: searching above
   1452 bytes (jumbo frames, or 1472 over IPv4), which needs larger send
   buffers, and counting the congestion window in the discovered size.
-- **Congestion control**: BBR, HyStart++ and ECN are still to do; so is a
-  writability event for UDP sockets, which would resume a round the socket
-  refused as soon as it has room, rather than a millisecond later.
+- **Congestion control**: BBR, HyStart++ and ECN are still to do.
 - **Batched I/O**: the engine reads with `recvmmsg` on Linux and `recvmsg_x`
   on macOS, and a round of sending with more than one datagram leaves with
   `sendmmsg` or `sendmsg_x` (`fib.Connection.SendBatch`), on the server's
   connections as on the client's. On Linux a run of
   datagrams of one size in a batch goes as one message segmented with GSO
   (`UDP_SEGMENT`), which took static-h3 on an 8-CPU server from 40k to 77k
-  requests a second. GRO, the receiving side, is still to do.
+  requests a second. On the receiving side the Linux socket sets `UDP_GRO`: a
+  run of datagrams the kernel coalesced arrives as one read, which the engine
+  splits again by the size the read's control message gives, so a burst costs
+  one receive rather than one a datagram; a kernel without `UDP_GRO`, and the
+  other systems, read a datagram at a time.
 - **Fewer copies and allocations**: sending copies once in `Write`, into a
   pooled buffer, and again when packets are built; receiving copies in the
   engine, into a pooled buffer, and in the HTTP/3 frame parser only a frame

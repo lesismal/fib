@@ -14,7 +14,8 @@
   multiplex 27.0 万请求/s 对 loop 读取的 28.9 万，开 ReusePort 时 echo 34.9 万对 37.2 万，
   内存还多约 15%。
 - 每个 connection 有 FIFO 事件队列；同一 connection 串行执行，不同 connection 动态负载均衡。
-- ET 读写均排空到 `EAGAIN`；仅发送队列非空时关注 `EPOLLOUT`。
+- ET 读写均排空到 `EAGAIN`；仅发送队列非空时关注 `EPOLLOUT`。UDP socket 上有发送方在
+  `Connection.NotifyWritable` 里等可写时也关注 `EPOLLOUT`，可写后立刻撤销（见 UDP 一节）。
 - 每轮事件处理先 flush 发送队列，再读 OOB，再读普通数据；发送队列仍有数据时跳过读取，并把可读状态保留到下一轮，待可写事件清空队列后再读，既限制用户态缓冲又不会漏读。
 - 读 buffer 由 `bufferpool` 子 package 按字节对齐的尺寸档复用（见下），大小通过
   `Config.ReadBufferSize` 设置，默认 16 KiB。
@@ -434,10 +435,18 @@ addr, _ := server.LocalUDPAddr()
 - UDP socket 由 event loop 自己读取（level-triggered，每轮每个 socket 最多读
   256 个数据报；Linux 上用 `recvmmsg`、macOS 上用 `recvmsg_x` 一次读一批，最多 32 个，
   一批没读满就说明 socket 已空），按对端地址分发到各连接的队列，再由 worker 依次调用 `OnData`；
-  每条连接最多排队 1024 个数据报，超出的直接丢弃，和内核接收缓冲满时一样。
+  每条连接最多排队 1024 个数据报，超出的直接丢弃，和内核接收缓冲满时一样。Linux 上 UDP
+  socket 打开 `UDP_GRO`，内核把连续的同尺寸数据报合并成一次读取，Engine 按读取带的
+  `UDP_GRO` 控制消息里的每段大小再拆成单个数据报交给 handler，一串数据报因此只花一次
+  接收；内核不支持 `UDP_GRO` 时（setsockopt 失败）就照常一次读一个，其它系统不做合并。
 - 发送直接写 socket，从不排队：socket 没有空间时这个数据报被丢弃，`Send` 返回错误，
   连接保持打开。因此 UDP 连接不参与写水位和背压。`SendBatch` 按顺序发送多个数据报，
-  Linux 上用 `sendmmsg`、macOS 上用 `sendmsg_x`，一次系统调用发出一批。
+  Linux 上用 `sendmmsg`、macOS 上用 `sendmsg_x`，一次系统调用发出一批。不想丢掉被拒数据报的
+  发送方（QUIC 就是）可以调用 `Connection.NotifyWritable(fn)`：socket 写满（`EAGAIN`）后
+  事件循环重新关注它的 `EPOLLOUT`/`EVFILT_WRITE`，一旦可写就在另一个 goroutine 上调用
+  `fn`，让它立刻续发；socket 关闭或 Engine 停止时也会调用。Windows 的完成端口、portable
+  后端不能播报可写，`NotifyWritable` 返回 false，调用方自己定时重试；`ENOBUFS`（macOS 的
+  写满、Linux 的设备队列满）也不在可写通知之列。
 - `SetDontFragment` 让连接发出的数据报不被分片（IPv4 设 DF 位，IPv6 本机不分片）：超过路径
   MTU 的数据报在途中被丢弃，超过网卡 MTU 的直接返回 `EMSGSIZE`。监听 socket 的对端共用监听
   socket，所以对它的所有对端都生效。Linux 上用 `IP_PMTUDISC_PROBE`，不理会内核从 ICMP 学到的

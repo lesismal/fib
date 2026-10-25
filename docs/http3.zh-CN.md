@@ -179,8 +179,10 @@
   提高后丢弃。
 - **拥塞控制**：默认 CUBIC（RFC 9438），可用 `quic.Config.CongestionControl` 改为
   NewReno；没有 BBR、HyStart++ 和 ECN。发送按每个平滑 RTT 1.25 个拥塞窗口的速率 pacing。
-  发送缓冲区满（`EAGAIN`，macOS 上是 `ENOBUFS`）时，这一轮剩下的数据报保留下来，1 毫秒
-  后先于新数据重发：Engine 会通知 UDP socket 可读，但不会通知写满的 socket 何时又可写。
+  发送缓冲区满（`EAGAIN`）时，这一轮剩下的数据报保留下来，Engine 在 socket 又可写时
+  （`fib.Connection.NotifyWritable`）通知发送方，于是它先于新数据立刻续发；无法通知时
+  ——Windows 的完成端口、portable 后端，以及 macOS 对写满的 socket 报的 `ENOBUFS` 和
+  Linux 对设备队列满报的 `ENOBUFS`——仍由 1 毫秒的定时器重试。
 - **路径 MTU 探测**（DPLPMTUD，RFC 8899；RFC 9000 §14.3），两端默认开启：握手确认后连接
   发一个探测包——用 PADDING 填到 1452 字节（`MaxProbeDatagramSize`，且不超过对端的
   `max_udp_payload_size`）的 PING——被确认后就按这个大小发送数据报。同一大小的探测包丢 3 次，
@@ -283,11 +285,11 @@
 
 - **pacing、拥塞控制、丢包恢复的数据结构**：已完成。发送按每个平滑 RTT 1.25 个拥塞窗口
   的速率 pacing，突发上限为初始窗口与 2 毫秒发送量中的较大者（RFC 9002 7.7 节），pacing
-  压住的部分由定时器接着发；socket 以 `EAGAIN` 拒收的一轮数据报保留下来重发，而不是丢掉
-  （`fib.Connection.SendDatagrams` 报告一批里发出了几个）。默认 CUBIC（RFC 9438），可在
-  `quic.Config.CongestionControl` 选 NewReno；窗口只在被用满时增长（RFC 9002 7.8 节），
-  持续拥塞（7.6 节）时降到最小窗口。已发送的包按包号存进环形队列，一个 ACK 帧的开销只与
-  它新确认的包相关，丢包检测只看到最大已确认包为止；定时器只在截止时间提前时才重设。
+  压住的部分由定时器接着发；socket 以 `EAGAIN` 拒收的一轮数据报保留下来，等 Engine 通知
+  socket 可写时立刻重发，而不是丢掉（`fib.Connection.SendDatagrams` 报告一批里发出了
+  几个）。默认 CUBIC（RFC 9438），可在 `quic.Config.CongestionControl` 选 NewReno；
+  窗口只在被用满时增长（RFC 9002 7.8 节），持续拥塞（7.6 节）时降到最小窗口。已发送的包
+  按包号存进环形队列，一个 ACK 帧的开销只与它新确认的包相关，丢包检测只看到最大已确认包为止；定时器只在截止时间提前时才重设。
   在基准机上实测（`TestLossyTransfer`，经内存路径双向各 20 MiB，三轮）：5% 随机丢包下
   改动前 1.2-1.7 秒，改动后 0.40、0.43、1.06 秒；无丢包时改动前 235-275 毫秒，改动后
   82-92 毫秒。fit 的 fixed-h3 从每秒 165.8 万请求提高到 177.3 万（+7%），static-h3 不变
@@ -295,13 +297,15 @@
 - **PMTU 探测（DPLPMTUD，RFC 8899）**：已完成，带黑洞检测（见[协议细节](#协议细节)）。
   还没做的是探测 1452 字节以上（巨型帧，或 IPv4 上的 1472），这需要更大的发送缓冲区；
   以及按探测到的大小计算拥塞窗口。
-- **拥塞控制**：BBR、HyStart++ 和 ECN 尚未实现；UDP socket 的可写事件也没有，有了它，
-  被 socket 拒收的一轮可以在有空间时立刻续发，而不是等 1 毫秒。
+- **拥塞控制**：BBR、HyStart++ 和 ECN 尚未实现。
 - **批量收发**：Engine 在 Linux 上用 `recvmmsg`、macOS 上用 `recvmsg_x` 批量读取；一轮
   发送多于一个数据报时用 `sendmmsg` 或 `sendmsg_x` 一次发出（`fib.Connection.SendBatch`），服务端
   和客户端的连接都是如此。
   Linux 上一批里大小相同的连续数据报用 GSO（`UDP_SEGMENT`）作为一条消息交给内核分段，8 个 CPU
-  的服务端上 static-h3 从每秒 4 万请求提高到 7.7 万。接收方向的 GRO 尚未实现。
+  的服务端上 static-h3 从每秒 4 万请求提高到 7.7 万。接收方向在 Linux 上打开 `UDP_GRO`：
+  内核合并的一串数据报作为一次读取返回，Engine 按控制消息给出的大小再拆回单个数据报，
+  一串数据报因此只花一次接收而不是每个一次系统调用。内核不支持 `UDP_GRO` 时以及其他系统上
+  仍然一次读一个数据报。
 - **减少复制与分配**：发送时 `Write` 复制一次（复制进缓冲池里的缓冲区）、组包时再复制
   一次；接收时 Engine 复制一次（复制进缓冲池里的缓冲区），HTTP/3 帧解析器只复制跨片段的帧
   和请求 body。每个请求仍要分配它的 QUIC stream；请求 stream 和 header 会被复用（见上文）。
