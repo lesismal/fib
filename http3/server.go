@@ -16,7 +16,8 @@
 // therefore not supported, and the server says so to its clients.
 //
 // Browsers find an HTTP/3 server through the Alt-Svc header of a response
-// over HTTP/1 or HTTP/2; AltSvc builds its value.
+// over HTTP/1 or HTTP/2; AltSvc builds its value, and AltSvcClient follows it
+// from a Go client, falling back to TCP when the QUIC attempt fails.
 package http3
 
 import (

@@ -267,7 +267,7 @@ func NewClient(engine *fib.Engine, config ClientConfig) *Client {
 // arrives with OnBody; see package http's ClientResponse. The Timeout then also
 // ends a body that is streaming.
 func (c *Client) Do(req *stdhttp.Request, callback func(*fibhttp.ClientResponse, error)) {
-	c.do(req, callback, false)
+	c.do(req, callback, false, altTarget{})
 }
 
 // Start is Do, and returns a Call that abandons the request, for a caller
@@ -276,7 +276,7 @@ func (c *Client) Do(req *stdhttp.Request, callback func(*fibhttp.ClientResponse,
 // costs a few allocations a request, and a Call costs none. A context that
 // can be cancelled is still watched as Do watches it.
 func (c *Client) Start(req *stdhttp.Request, callback func(*fibhttp.ClientResponse, error)) Call {
-	return Call{r: c.do(req, callback, false)}
+	return Call{r: c.do(req, callback, false, altTarget{})}
 }
 
 // Call is a request Start sent, for abandoning it while it is in flight.
@@ -303,7 +303,7 @@ func (c Call) Cancel(err error) {
 // do is Do, with whole set when the response must arrive whole whatever the
 // client's configuration says. It returns the request, or nil for one it
 // rejected outright.
-func (c *Client) do(req *stdhttp.Request, callback func(*fibhttp.ClientResponse, error), whole bool) *clientRequest {
+func (c *Client) do(req *stdhttp.Request, callback func(*fibhttp.ClientResponse, error), whole bool, alt altTarget) *clientRequest {
 	if callback == nil {
 		callback = func(*fibhttp.ClientResponse, error) {}
 	}
@@ -337,7 +337,7 @@ func (c *Client) do(req *stdhttp.Request, callback func(*fibhttp.ClientResponse,
 	if upload == nil {
 		length = int64(len(body))
 	}
-	r := &clientRequest{req: req, body: body, upload: upload, declared: length, callback: callback, whole: whole,
+	r := &clientRequest{req: req, body: body, upload: upload, declared: length, callback: callback, whole: whole, alt: alt,
 		expect: c.config.ExpectContinueTimeout > 0 && reqbody.ExpectsContinue(req, len(body) > 0 || upload != nil)}
 	fields, trailer, err := requestFields(req, length)
 	if err != nil {
@@ -379,7 +379,7 @@ func (c *Client) Go(req *stdhttp.Request) *Future {
 		}
 		f.err = err
 		close(f.done)
-	}, true)
+	}, true, altTarget{})
 	return f
 }
 
@@ -428,6 +428,22 @@ func (c *Client) Close() {
 	}
 }
 
+// altTarget is where an alternative service sends a request: the address to
+// dial, and the name its certificate has to carry, which is the origin's.
+type altTarget struct {
+	addr, serverName string
+}
+
+// connKey is where r goes: its alternative service when it has one, whose
+// certificate is verified for the origin's name, and its own host:port and
+// name otherwise.
+func (r *clientRequest) connKey() (addr, serverName string) {
+	if r.alt.addr != "" {
+		return r.alt.addr, r.alt.serverName
+	}
+	return connKey(r.req)
+}
+
 // connKey is the connection a request goes to: its address, and the name
 // the server's certificate has to carry.
 func connKey(req *stdhttp.Request) (addr, serverName string) {
@@ -441,7 +457,7 @@ func connKey(req *stdhttp.Request) (addr, serverName string) {
 
 // enqueue queues r on its host's connection, dialing one if there is none.
 func (c *Client) enqueue(r *clientRequest) {
-	addr, serverName := connKey(r.req)
+	addr, serverName := r.connKey()
 	c.mu.Lock()
 	if c.closed {
 		c.mu.Unlock()
@@ -496,6 +512,10 @@ type clientRequest struct {
 	// ClientConfig.ExpectContinueTimeout).
 	whole  bool
 	expect bool
+	// alt, when set, is an alternative service to dial instead of the
+	// request's own host:port, whose name the certificate is verified for;
+	// see AltSvcClient. The request's :authority stays its own.
+	alt altTarget
 
 	mu          sync.Mutex
 	done        bool
