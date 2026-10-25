@@ -34,6 +34,8 @@ Setting `Config.EarlyData` turns that on for the HTTP/1 server, and for the
 `tls.Handler` it is wrapped in, through `tls.EarlyDataOptIn`. The TLS layer
 accepts a ticket's early data once, bounds it to `tls.Handler.MaxEarlyData`
 (16KiB by default), and skips what it does not accept, as it does for HTTP/3.
+It needs the handshake that runs without a worker: with
+`tls.Handler.Blocking`, `crypto/tls` does the handshake and takes none.
 
 A request that arrives this way carries `Early-Data: 1` (RFC 8470) and is
 served only if its method is GET, HEAD, OPTIONS or TRACE: those change

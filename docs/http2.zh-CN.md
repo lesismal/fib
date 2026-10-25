@@ -27,8 +27,8 @@
 HEADERS 这样到达的 stream 带 `Early-Data: 1`（RFC 8470），只有 GET、HEAD、OPTIONS、TRACE 方法才从它服务。
 其他方法只在该 stream 上回 425 Too Early，连接和其他 stream 照常，和 HTTP/3 一致；`Config.EarlyDataUnsafe`
 让所有方法都交给 handler，由它自己检查这个头。TLS 层一张票据只接受一次 early data，总量以
-`tls.Handler.MaxEarlyData` 为限，重放到不了这一层。客户端不发送 HTTP/2 early data：帧格式取决于是 ALPN 选出的
-协议，而它要到握手结束才知道。
+`tls.Handler.MaxEarlyData` 为限，重放到不了这一层。它需要不占协程的握手：`tls.Handler.Blocking` 下由
+`crypto/tls` 做，不接受 early data。客户端不发送 HTTP/2 early data：帧格式取决于是 ALPN 选出的协议，而它要到握手结束才知道。
 
 ## 当前限制
 

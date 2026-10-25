@@ -99,7 +99,9 @@ type Config struct {
 	// TLS handler this server is wrapped in, so setting it here is enough;
 	// see tls.Handler.EarlyData. The TLS layer accepts a ticket's early data
 	// once, and bounds it to MaxEarlyData and to the ticket's age, as it
-	// does for HTTP/3's QUIC connections.
+	// does for HTTP/3's QUIC connections. Early data needs the handshake
+	// that runs without a worker: with tls.Handler.Blocking, crypto/tls does
+	// it and takes none.
 	EarlyData bool
 	// EarlyDataUnsafe serves every method in early data, which then is up to
 	// the handler to guard against replays, by the Early-Data header. It has

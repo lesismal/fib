@@ -30,7 +30,7 @@ HTTP/2、HTTP/3 各有单独的文档：[`http2.zh-CN.md`](http2.zh-CN.md)、
 恢复 TLS 1.3 会话的客户端可以把头几个请求随第一个飞行一起发出（RFC 8446 第 2.3 节），比握手早一个往返。
 `Config.EarlyData` 打开 HTTP/1 服务端的这个能力，也通过 `tls.EarlyDataOptIn` 打开包装它的 `tls.Handler`。
 TLS 层一张票据只接受一次 early data，总量以 `tls.Handler.MaxEarlyData`（默认 16KiB）为限，不接受的部分按
-RFC 8446 4.2.10 跳过，和 HTTP/3 一样。
+RFC 8446 4.2.10 跳过，和 HTTP/3 一样。它需要不占协程的握手：`tls.Handler.Blocking` 下握手由 `crypto/tls` 做，不接受 early data。
 
 这样到达的请求带 `Early-Data: 1`（RFC 8470），只有方法是 GET、HEAD、OPTIONS、TRACE 时才服务：这些方法
 不改变任何东西，而重放其他方法可能改变。其他方法回 425 Too Early 并关闭连接，客户端在握手结束后重发；

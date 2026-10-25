@@ -35,9 +35,10 @@ HEAD, OPTIONS or TRACE method is served from it. Any other method is answered
 carrying on, as HTTP/3 does; `Config.EarlyDataUnsafe` serves every method and
 leaves the check to the handler. The TLS layer accepts a ticket's early data
 once and bounds it to `tls.Handler.MaxEarlyData`, so a replay is turned away
-before it reaches the server. The client does not send HTTP/2 early data: the
-framing depends on the protocol ALPN picks, which it learns only when the
-handshake is over.
+before it reaches the server. It needs the handshake that runs without a
+worker: with `tls.Handler.Blocking`, `crypto/tls` does it and takes none. The
+client does not send HTTP/2 early data: the framing depends on the protocol
+ALPN picks, which it learns only when the handshake is over.
 
 ## Current limitations
 
