@@ -502,9 +502,10 @@ func (e *Engine) udpListenerAt(fd int) *udpListener {
 // rest to the next round.
 //
 // It reads in batches, and stops at a batch that comes back short, which
-// says the socket is empty, rather than at a read that finds nothing. avail
-// is how many bytes of datagrams the poller reported waiting, or -1 where it
-// does not say. Where it says, the round reads the first datagram with an
+// says the socket is empty, rather than at a read that finds nothing. A read
+// the kernel coalesced with GRO holds several datagrams, which are queued one
+// at a time. avail is how many bytes of datagrams the poller reported
+// waiting, or -1 where it does not say. Where it says, the round reads the first datagram with an
 // ordinary receive, since most rounds find just the one and a batch of one
 // costs more, batches only when the count says several are left after it
 // (see nextRead), and stops once it has had that many bytes. What arrived
@@ -525,15 +526,18 @@ func (e *Engine) readUDPListener(l *udpListener, avail int, ready []*Connection)
 		}
 		now := time.Now().UnixNano()
 		for i := 0; i < n; i++ {
-			data := b.Datagram(i)
-			avail -= len(data)
-			if c := e.udpPeer(l, b.Addr(i)); c != nil {
-				if r := e.deliverDatagram(c, data, now); r != nil {
-					ready = append(ready, r)
+			segs, addr := b.Segments(i), b.Addr(i)
+			for j := 0; j < segs; j++ {
+				data := b.Segment(i, j)
+				avail -= len(data)
+				if c := e.udpPeer(l, addr); c != nil {
+					if r := e.deliverDatagram(c, data, now); r != nil {
+						ready = append(ready, r)
+					}
 				}
+				read++
 			}
 		}
-		read += n
 		last = len(b.Datagram(n - 1))
 		if empty || counted && avail <= 0 {
 			return ready
@@ -588,13 +592,15 @@ func (e *Engine) readUDPConnection(c *Connection, avail int, ready []*Connection
 		}
 		now := time.Now().UnixNano()
 		for i := 0; i < n; i++ {
-			data := b.Datagram(i)
-			avail -= len(data)
-			if r := e.deliverDatagram(c, data, now); r != nil {
-				ready = append(ready, r)
+			for j, segs := 0, b.Segments(i); j < segs; j++ {
+				data := b.Segment(i, j)
+				avail -= len(data)
+				if r := e.deliverDatagram(c, data, now); r != nil {
+					ready = append(ready, r)
+				}
+				read++
 			}
 		}
-		read += n
 		last = len(b.Datagram(n - 1))
 		if empty || counted && avail <= 0 {
 			return ready
@@ -1214,6 +1220,9 @@ func (e *Engine) connectDatagram(d *dialRequest) (c *Connection, connected bool,
 		syscall.Close(fd)
 		return nil, false, err
 	}
+	// See listener.bindUDPSocket: a dialed socket has its runs of datagrams
+	// coalesced too, which the loop splits again.
+	udpbatch.EnableGRO(fd)
 	token := e.newToken(fd)
 	c = &Connection{engine: e, handler: d.handler, dialing: d, dialed: true,
 		udp: &udpState{udpPlatform: udpPlatform{writable: &udpWaiters{}},

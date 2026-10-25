@@ -7,6 +7,11 @@ import (
 	"unsafe"
 )
 
+// batchOne is unset: recvmsg_x of one costs more than an ordinary receive,
+// and nothing coalesces a run of datagrams into one read, so a read of one
+// datagram has nothing to split.
+const batchOne = false
+
 // sysRecvmsgX is recvmsg_x, macOS's batched recvmsg. It is not in the SDK's
 // public headers, but the kernel has had it since macOS 10.11 and its
 // counterpart sendmsg_x, and other QUIC stacks, quinn's among them, read

@@ -9,6 +9,7 @@ import (
 
 	"github.com/lesismal/fib/internal/netaddr"
 	"github.com/lesismal/fib/internal/sys"
+	"github.com/lesismal/fib/internal/udpbatch"
 )
 
 // Options is what of Config the sockets are opened by.
@@ -137,6 +138,10 @@ func listenSocket(o Options, family int, bound syscall.Sockaddr, listen, reusePo
 		syscall.Close(fd)
 		return -1, err
 	}
+	// A UDP socket has the kernel coalesce the runs of datagrams it receives,
+	// which the engine splits again by the size each read reports; see
+	// udpbatch.Batch.Segments. A kernel that cannot reads one at a time.
+	udpbatch.EnableGRO(fd)
 	return fd, nil
 }
 
@@ -200,5 +205,9 @@ func bindUDPSocket(o Options, family int, bound syscall.Sockaddr) (int, error) {
 		syscall.Close(fd)
 		return -1, err
 	}
+	// A UDP socket has the kernel coalesce the runs of datagrams it receives,
+	// which the engine splits again by the size each read reports; see
+	// udpbatch.Batch.Segments. A kernel that cannot reads one at a time.
+	udpbatch.EnableGRO(fd)
 	return fd, nil
 }

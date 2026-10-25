@@ -17,7 +17,8 @@ type batchHeader struct {
 	len uint32
 }
 
-// recvBatch reads up to n datagrams with recvmmsg.
+// recvBatch reads up to n of the socket's reads with recvmmsg, each with the
+// control message a coalesced run of datagrams comes with; see groSegments.
 func (b *Batch) recvBatch(fd, n int) (int, error) {
 	for i := 0; i < n; i++ {
 		h := &b.hdrs[i].hdr
@@ -25,6 +26,10 @@ func (b *Batch) recvBatch(fd, n int) (int, error) {
 		h.Namelen = syscall.SizeofSockaddrAny
 		h.Iov = &b.iovs[i]
 		h.Iovlen = 1
+		// The kernel sets the length to what it wrote, so each call is
+		// offered the whole buffer again.
+		h.Control = &b.ctl[i][0]
+		h.SetControllen(gsoControlLen)
 	}
 	got, _, errno := syscall.Syscall6(syscall.SYS_RECVMMSG, uintptr(fd),
 		uintptr(unsafe.Pointer(&b.hdrs[0])), uintptr(n), 0, 0, 0)
@@ -33,8 +38,56 @@ func (b *Batch) recvBatch(fd, n int) (int, error) {
 	}
 	for i := 0; i < int(got); i++ {
 		b.lens[i] = int(b.hdrs[i].len)
+		b.groSegments(i)
 	}
 	return int(got), nil
+}
+
+// batchOne is set: Linux reads even a single datagram through the batched
+// call, since only it takes the control message that says a read holds a
+// coalesced run of them (see groSegments), and a batch of one costs little
+// there.
+const batchOne = true
+
+// udpGRO (UDP_GRO, Linux 4.18) has the kernel coalesce a run of same-size
+// datagrams arriving on a socket into one read, whose control message gives
+// the size of each of them but the last; see Batch.Segments.
+const udpGRO = 104
+
+// EnableGRO has fd's datagrams coalesced as the kernel receives them, and
+// reports whether it can. A kernel without UDP_GRO, or one that refuses the
+// option, reads them one at a time, as the batch reports them.
+func EnableGRO(fd int) bool {
+	return syscall.SetsockoptInt(fd, solUDP, udpGRO, 1) == nil
+}
+
+// groSegments reads the run the i-th read of the last batch holds from its
+// control messages, if it has one. UDP_GRO reports the size of each datagram
+// of the run but the last, which is what the read leaves (see Segment).
+func (b *Batch) groSegments(i int) {
+	b.gso[i] = 0
+	ctl := b.ctl[i][:int(b.hdrs[i].hdr.Controllen)]
+	for off := 0; off+syscall.CmsgLen(0) <= len(ctl); {
+		h := (*syscall.Cmsghdr)(unsafe.Pointer(&ctl[off]))
+		l := int(h.Len)
+		if l < syscall.CmsgLen(0) || l > len(ctl)-off {
+			return
+		}
+		if h.Level == solUDP && h.Type == udpGRO {
+			// The kernel writes an int, which is 32 bits here.
+			if l >= syscall.CmsgLen(4) {
+				if size := int(*(*uint32)(unsafe.Pointer(&ctl[off+syscall.CmsgLen(0)]))); size > 0 && size < b.lens[i] {
+					b.gso[i] = size
+				}
+			}
+			return
+		}
+		step := syscall.CmsgSpace(l - syscall.CmsgLen(0))
+		if step <= 0 {
+			return
+		}
+		off += step
+	}
 }
 
 // UDP_SEGMENT (generic segmentation offload for UDP, Linux 4.18): a message
