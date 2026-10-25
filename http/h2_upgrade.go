@@ -71,7 +71,7 @@ func (h *ServerHandler) upgradeH2C(c *fib.Connection, parser *Parser, request *s
 	request.Header.Del("Upgrade")
 	request.Header.Del("Http2-Settings")
 	request.Proto, request.ProtoMajor, request.ProtoMinor = "HTTP/2.0", 2, 0
-	st := &h2ServerStream{sc: sc, id: 1, req: request, recvWindow: h2StreamWindow, declared: -1, remoteDone: true}
+	st := &h2ServerStream{sc: sc, id: 1, req: request, recvWindow: sc.local.streamWindow, declared: -1, remoteDone: true}
 	sc.maxClientID = 1
 	sc.mu.Lock()
 	st.sendWindow = sc.peerWindow

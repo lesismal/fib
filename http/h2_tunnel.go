@@ -146,7 +146,7 @@ func (sc *h2ServerConn) handleTunnelData(st *h2ServerStream, f *h2Frame) error {
 // creditTunnelLocked gives back the window a tunnel's stream has taken, half
 // a window at a time.
 func (sc *h2ServerConn) creditTunnelLocked(st *h2ServerStream) {
-	if st.recvUnacked < h2StreamWindow/2 {
+	if st.recvUnacked < sc.local.streamWindow/2 {
 		return
 	}
 	sc.sendLocked(h2AppendWindowUpdate(nil, st.id, uint32(st.recvUnacked)))

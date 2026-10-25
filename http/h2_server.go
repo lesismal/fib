@@ -32,13 +32,10 @@ import (
 // h2ServerConn. The handler sees each stream as an ordinary request.
 
 const (
-	// h2StreamWindow is the receive window each stream is granted, and
-	// h2ConnWindow the one the whole connection is, by servers and clients
-	// alike. A body buffered whole is bounded by the body limits, and the
-	// windows only pace the peer; a streamed body is bounded by its stream's
-	// window, which is given back only as the handler consumes the body.
-	h2StreamWindow = 1 << 20
-	h2ConnWindow   = 1 << 24
+	// h2StreamWindow and h2ConnWindow are the windows a connection grants
+	// when HTTP2Config leaves them at their defaults.
+	h2StreamWindow = DefaultH2StreamWindow
+	h2ConnWindow   = DefaultH2ConnWindow
 	// DefaultMaxConcurrentStreams is how many requests a client may have open
 	// on one connection when Config leaves MaxConcurrentStreams at zero.
 	DefaultMaxConcurrentStreams = 250
@@ -114,6 +111,8 @@ type h2ServerConn struct {
 	// WINDOW_UPDATE, and recvUnacked what it sent since the last one.
 	recvWindow  int64
 	recvUnacked int64
+	// local is what the server lets the client send; see HTTP2Config.
+	local h2Local
 
 	// mu guards the write side and the streams, which writers and the reader
 	// share. Frames are sent while holding it, so header blocks leave in the
@@ -298,17 +297,21 @@ func newH2ServerConn(h *ServerHandler, c *fib.Connection, remoteAddr string) *h2
 	if maxStreams == 0 {
 		maxStreams = DefaultMaxConcurrentStreams
 	}
-	dec := hpack.NewDecoder(hpack.DefaultTableSize)
+	local := h.config.HTTP2.local()
+	dec := local.newDecoder()
 	dec.MaxStringLength = h.config.MaxHeaderBytes
+	enc := hpack.NewEncoder()
+	local.encoderLimit(enc)
 	sc := &h2ServerConn{
 		handler:           h,
 		conn:              c,
 		remoteAddr:        remoteAddr,
 		maxStreams:        maxStreams,
 		dec:               dec,
-		recvWindow:        h2ConnWindow,
+		recvWindow:        local.connWindow,
+		local:             local,
 		streams:           make(map[uint32]*h2ServerStream),
-		enc:               hpack.NewEncoder(),
+		enc:               enc,
 		peerMaxFrame:      h2DefaultMaxFrameSize,
 		peerWindow:        h2DefaultWindow,
 		sendWindow:        h2DefaultWindow,
@@ -334,14 +337,12 @@ func newH2ServerConn(h *ServerHandler, c *fib.Connection, remoteAddr string) *h2
 // start sends the server's connection preface: its SETTINGS, and a window
 // update raising the connection's receive window past the default.
 func (sc *h2ServerConn) start() {
-	out := h2AppendSettings(nil,
+	out := sc.local.preface(nil,
 		[2]uint32{uint32(h2SettingMaxConcurrentStreams), sc.maxStreams},
-		[2]uint32{uint32(h2SettingInitialWindowSize), h2StreamWindow},
 		[2]uint32{uint32(h2SettingMaxHeaderListSize), uint32(sc.handler.config.MaxHeaderBytes)},
 		[2]uint32{uint32(h2SettingEnablePush), 0},
 		[2]uint32{uint32(h2SettingEnableConnectProtocol), 1},
 	)
-	out = h2AppendWindowUpdate(out, 0, h2ConnWindow-h2DefaultWindow)
 	sc.mu.Lock()
 	sc.sendLocked(out)
 	// A connection that opens and then asks for nothing is idle, and bounded
@@ -454,7 +455,7 @@ func (sc *h2ServerConn) feed(data []byte) {
 		offset = len(h2Preface)
 	}
 	for {
-		f, n, err := h2ReadFrame(sc.in[offset:], h2DefaultMaxFrameSize)
+		f, n, err := h2ReadFrame(sc.in[offset:], sc.local.maxFrame)
 		if err == nil && n > 0 {
 			offset += n
 			err = sc.handleFrame(&f)
@@ -645,6 +646,8 @@ func (sc *h2ServerConn) handleFrame(f *h2Frame) error {
 			sc.mu.Lock()
 			sc.sendLocked(out)
 			sc.mu.Unlock()
+		} else if isBDPAck(f.payload) {
+			sc.bdpAck()
 		}
 		return nil
 	case h2FrameGoAway:
@@ -678,6 +681,7 @@ func (sc *h2ServerConn) handleSettings(f *h2Frame) error {
 		sc.mu.Lock()
 		sc.settingsAckedLocked()
 		sc.mu.Unlock()
+		sc.local.settingsAck(sc.dec)
 		return nil
 	}
 	if sc.settingsSeen {
@@ -698,13 +702,32 @@ func (sc *h2ServerConn) handleSettings(f *h2Frame) error {
 	return nil
 }
 
+// bdpAck ends a measurement of the bandwidth-delay product, and grows the
+// windows when it says the client is held back by them; see
+// HTTP2Config.AdaptiveWindow. What the client may send grows from here,
+// before it hears of it, since it cannot send more until it has.
+func (sc *h2ServerConn) bdpAck() {
+	window := sc.local.bdp.ack()
+	if window == 0 {
+		return
+	}
+	sc.mu.Lock()
+	defer sc.mu.Unlock()
+	out, streamDelta, connDelta := sc.local.grow(window)
+	for _, st := range sc.streams {
+		st.recvWindow += streamDelta
+	}
+	sc.recvWindow += connDelta
+	sc.sendLocked(out)
+}
+
 // applySettingsLocked applies the client's settings, from a SETTINGS frame
 // or from the HTTP2-Settings header of an h2c upgrade.
 func (sc *h2ServerConn) applySettingsLocked(payload []byte) error {
 	return h2ParseSettings(payload, func(id h2SettingID, value uint32) error {
 		switch id {
 		case h2SettingHeaderTableSize:
-			sc.enc.SetMaxTableSize(int(min(value, hpack.DefaultTableSize)))
+			sc.enc.SetMaxTableSize(int(min(value, hpack.MaxEncoderTableSize)))
 		case h2SettingEnablePush:
 			if value > 1 {
 				return h2ConnErr(H2ProtocolError, "ENABLE_PUSH %d", value)
@@ -823,10 +846,13 @@ func (sc *h2ServerConn) handleData(f *h2Frame) error {
 	sc.recvWindow -= length
 	sc.recvUnacked += length
 	var out []byte
-	if sc.recvUnacked >= h2ConnWindow/2 {
+	if sc.recvUnacked >= sc.local.connWindow/2 {
 		out = h2AppendWindowUpdate(out, 0, uint32(sc.recvUnacked))
 		sc.recvWindow += sc.recvUnacked
 		sc.recvUnacked = 0
+	}
+	if b := sc.local.bdp; b != nil {
+		out = append(out, b.data(length)...)
 	}
 	sc.mu.Lock()
 	idle := sc.idleLocked(f.streamID)
@@ -878,7 +904,7 @@ func (sc *h2ServerConn) handleData(f *h2Frame) error {
 	if f.has(h2FlagEndStream) {
 		return sc.finishRequest(st)
 	}
-	if st.recvUnacked >= h2StreamWindow/2 {
+	if st.recvUnacked >= sc.local.streamWindow/2 {
 		increment := st.recvUnacked
 		st.recvWindow += increment
 		st.recvUnacked = 0
@@ -1370,7 +1396,7 @@ func (sc *h2ServerConn) creditBody(st *h2ServerStream, n int) {
 	skip := min(int64(n), st.creditSkip)
 	st.creditSkip -= skip
 	st.recvUnacked += int64(n) - skip
-	if st.remoteDone || sc.closed || sc.streams[st.id] != st || st.recvUnacked < h2StreamWindow/2 {
+	if st.remoteDone || sc.closed || sc.streams[st.id] != st || st.recvUnacked < sc.local.streamWindow/2 {
 		return
 	}
 	sc.sendLocked(h2AppendWindowUpdate(nil, st.id, uint32(st.recvUnacked)))
@@ -1961,7 +1987,7 @@ func (sc *h2ServerConn) newStream(id uint32) *h2ServerStream {
 		st = new(h2ServerStream)
 	}
 	st.sc, st.id, st.declared = sc, id, -1
-	st.recvWindow, st.sendWindow = h2StreamWindow, sc.peerWindow
+	st.recvWindow, st.sendWindow = sc.local.streamWindow, sc.peerWindow
 	st.refs.Store(1)
 	return st
 }

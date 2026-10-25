@@ -41,10 +41,6 @@ var errStreamGone = errors.New("http2: stream closed")
 // that was dialed for h2c, hands its traffic to an h2ClientConn, which runs
 // each request as a stream of its own.
 
-// h2InitialMaxStreams is how many streams a connection is given before the
-// server's SETTINGS says how many it allows.
-const h2InitialMaxStreams = 100
-
 type h2ClientConn struct {
 	cc     *clientConn
 	client *Client
@@ -64,6 +60,8 @@ type h2ClientConn struct {
 	contFrames  int
 	recvWindow  int64
 	recvUnacked int64
+	// local is what the client lets the server send; see HTTP2Config.
+	local h2Local
 	// glitches bounds the frames a server may send that ask for work and
 	// carry no response, as the server's own budget does its client's; see
 	// DefaultControlFrameBurst.
@@ -142,15 +140,19 @@ type h2ClientStream struct {
 // and sends the client's connection preface.
 func (cc *clientConn) startH2() {
 	config := cc.client.config
-	dec := hpack.NewDecoder(hpack.DefaultTableSize)
+	local := config.HTTP2.local()
+	dec := local.newDecoder()
 	dec.MaxStringLength = config.MaxResponseHeaderBytes
+	enc := hpack.NewEncoder()
+	local.encoderLimit(enc)
 	hc := &h2ClientConn{
 		cc:                cc,
 		client:            cc.client,
 		dec:               dec,
-		recvWindow:        h2ConnWindow,
+		recvWindow:        local.connWindow,
+		local:             local,
 		streams:           make(map[uint32]*h2ClientStream),
-		enc:               hpack.NewEncoder(),
+		enc:               enc,
 		nextID:            1,
 		peerMaxFrame:      h2DefaultMaxFrameSize,
 		peerWindow:        h2DefaultWindow,
@@ -166,15 +168,13 @@ func (cc *clientConn) startH2() {
 		hc.health = time.AfterFunc(config.ReadIdleTimeout, hc.checkHealth)
 		hc.mu.Unlock()
 	}
-	cc.maxStreams = h2InitialMaxStreams
+	cc.maxStreams = config.HTTP2.initialMaxStreams()
 	cc.h2 = hc
 	out := append([]byte(nil), h2Preface...)
-	out = h2AppendSettings(out,
+	out = hc.local.preface(out,
 		[2]uint32{uint32(h2SettingEnablePush), 0},
-		[2]uint32{uint32(h2SettingInitialWindowSize), h2StreamWindow},
 		[2]uint32{uint32(h2SettingMaxHeaderListSize), uint32(config.MaxResponseHeaderBytes)},
 	)
-	out = h2AppendWindowUpdate(out, 0, h2ConnWindow-h2DefaultWindow)
 	_ = cc.conn.SendOwned(out)
 }
 
@@ -273,7 +273,7 @@ func (hc *h2ClientConn) send(r *clientRequest) {
 	id := hc.nextID
 	hc.nextID += 2
 	r.streamID = id
-	st := &h2ClientStream{id: id, r: r, declared: -1, recvWindow: h2StreamWindow, sendWindow: hc.peerWindow}
+	st := &h2ClientStream{id: id, r: r, declared: -1, recvWindow: hc.local.streamWindow, sendWindow: hc.peerWindow}
 	hc.streams[id] = st
 	block := hc.enc.Begin(nil)
 	for i := 0; i < len(fields); i += 2 {
@@ -626,7 +626,7 @@ func (hc *h2ClientConn) feed(data []byte) {
 	hc.in = bufferpool.Append(hc.in, data)
 	offset := 0
 	for {
-		f, n, err := h2ReadFrame(hc.in[offset:], h2DefaultMaxFrameSize)
+		f, n, err := h2ReadFrame(hc.in[offset:], hc.local.maxFrame)
 		if err == nil && n > 0 {
 			offset += n
 			err = hc.handleFrame(&f)
@@ -753,6 +753,8 @@ func (hc *h2ClientConn) handleFrame(f *h2Frame) error {
 			hc.mu.Lock()
 			hc.sendLocked(append(out, f.payload...))
 			hc.mu.Unlock()
+		} else if isBDPAck(f.payload) {
+			hc.bdpAck()
 		}
 		return nil
 	case h2FrameGoAway:
@@ -775,6 +777,7 @@ func (hc *h2ClientConn) handleSettings(f *h2Frame) error {
 		if len(f.payload) != 0 {
 			return h2ConnErr(H2FrameSizeError, "SETTINGS ack with payload")
 		}
+		hc.local.settingsAck(hc.dec)
 		return nil
 	}
 	if hc.settingsSeen {
@@ -788,7 +791,7 @@ func (hc *h2ClientConn) handleSettings(f *h2Frame) error {
 	err := h2ParseSettings(f.payload, func(id h2SettingID, value uint32) error {
 		switch id {
 		case h2SettingHeaderTableSize:
-			hc.enc.SetMaxTableSize(int(min(value, hpack.DefaultTableSize)))
+			hc.enc.SetMaxTableSize(int(min(value, hpack.MaxEncoderTableSize)))
 		case h2SettingEnablePush:
 			if value > 1 {
 				return h2ConnErr(H2ProtocolError, "ENABLE_PUSH %d", value)
@@ -834,6 +837,24 @@ func (hc *h2ClientConn) handleSettings(f *h2Frame) error {
 		c.carryOut(h, work, dials)
 	}
 	return nil
+}
+
+// bdpAck ends a measurement of the bandwidth-delay product, and grows the
+// windows when it says the server is held back by them; see
+// HTTP2Config.AdaptiveWindow.
+func (hc *h2ClientConn) bdpAck() {
+	window := hc.local.bdp.ack()
+	if window == 0 {
+		return
+	}
+	hc.mu.Lock()
+	defer hc.mu.Unlock()
+	out, streamDelta, connDelta := hc.local.grow(window)
+	for _, st := range hc.streams {
+		st.recvWindow += streamDelta
+	}
+	hc.recvWindow += connDelta
+	hc.sendLocked(out)
 }
 
 func (hc *h2ClientConn) handleWindowUpdate(f *h2Frame) error {
@@ -904,10 +925,13 @@ func (hc *h2ClientConn) handleData(f *h2Frame) error {
 	hc.recvWindow -= length
 	hc.recvUnacked += length
 	var out []byte
-	if hc.recvUnacked >= h2ConnWindow/2 {
+	if hc.recvUnacked >= hc.local.connWindow/2 {
 		out = h2AppendWindowUpdate(out, 0, uint32(hc.recvUnacked))
 		hc.recvWindow += hc.recvUnacked
 		hc.recvUnacked = 0
+	}
+	if b := hc.local.bdp; b != nil {
+		out = append(out, b.data(length)...)
 	}
 	hc.mu.Lock()
 	st := hc.streams[f.streamID]
@@ -940,7 +964,7 @@ func (hc *h2ClientConn) handleData(f *h2Frame) error {
 		hc.complete(st)
 		return nil
 	}
-	if st.recvUnacked >= h2StreamWindow/2 {
+	if st.recvUnacked >= hc.local.streamWindow/2 {
 		increment := st.recvUnacked
 		st.recvWindow += increment
 		st.recvUnacked = 0
@@ -991,7 +1015,7 @@ func (hc *h2ClientConn) credit(st *h2ClientStream, n int64) {
 		return
 	}
 	st.recvUnacked += n
-	if st.recvUnacked >= h2StreamWindow/2 {
+	if st.recvUnacked >= hc.local.streamWindow/2 {
 		increment := st.recvUnacked
 		st.recvWindow += increment
 		st.recvUnacked = 0

@@ -160,7 +160,7 @@ type ClientConfig struct {
 	// for a reader before the connection stops reading its socket, so that a
 	// callback slower than the server is paid for by TCP flow control rather
 	// than by memory here. Zero means DefaultStreamResponseBodyBuffer. HTTP/2
-	// is bounded by the stream window (1MB) instead.
+	// is bounded by the stream window instead (see HTTP2Config.StreamWindow).
 	StreamResponseBodyBuffer int
 	// TLSConfig is used for https:// requests. Nil means the defaults; either
 	// way a config naming no server gets the request's host. Unless it sets
@@ -179,6 +179,13 @@ type ClientConfig struct {
 	// (h2c), for servers known to speak it. It is off by default, since an
 	// HTTP/1-only server cannot answer it.
 	UnencryptedHTTP2 bool
+	// HTTP2 is what an HTTP/2 connection lets its server send: the
+	// flow-control windows it grants, the largest frame it reads, its HPACK
+	// table, and whether the windows grow to the connection's
+	// bandwidth-delay product, and how many streams it opens before the
+	// server says how many it allows. Its zero value is the defaults; see
+	// HTTP2Config.
+	HTTP2 HTTP2Config
 }
 
 func DefaultClientConfig() ClientConfig {

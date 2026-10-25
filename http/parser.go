@@ -256,6 +256,12 @@ type Config struct {
 	// DefaultPingTimeout.
 	PingInterval time.Duration
 	PingTimeout  time.Duration
+	// HTTP2 is what an HTTP/2 connection lets its client send: the
+	// flow-control windows it grants, the largest frame it reads, its HPACK
+	// table, and whether the windows grow to the connection's
+	// bandwidth-delay product. Its zero value is the defaults; see
+	// HTTP2Config.
+	HTTP2 HTTP2Config
 	// StreamPool runs HTTP/2 request handlers on a pool of their own, so
 	// that the requests a client has open on one connection are served
 	// concurrently rather than one after another on the goroutine that
