@@ -420,7 +420,7 @@ func (c *Conn) framesWaiting(space int) bool {
 	}
 	return space == spaceApp && (len(c.sendQueue) > 0 || c.handshakeDonePending || c.challengePending || c.maxDataPending ||
 		c.maxStreamsBidiPending || c.maxStreamsUniPending || len(c.pathResponses) > 0 ||
-		len(c.retireCIDs) > 0 || c.pingPending)
+		len(c.retireCIDs) > 0 || c.blockedPending() || c.pingPending)
 }
 
 // appendFrames adds a space's ack-eliciting frames, up to max bytes of
@@ -473,6 +473,7 @@ func (c *Conn) appendControlFrames(b []byte, max int, sp *sentPacket) []byte {
 		c.pathResponses = c.pathResponses[1:]
 		sp.ackEliciting = true
 	}
+	b = c.appendBlocked(b, max, sp)
 	for len(c.retireCIDs) > 0 && fits(1+VarintLen(c.retireCIDs[0])) {
 		seq := c.retireCIDs[0]
 		c.retireCIDs = c.retireCIDs[1:]

@@ -67,7 +67,7 @@ func (c *Conn) run(e *event) {
 		t, pc, prev := c.tls, c.pc, c.prevPC
 		c.prevPC = nil
 		closing := time.Duration(0)
-		if c.closePacket != nil {
+		if !c.closingUntil.IsZero() {
 			closing = c.closingUntil.Sub(c.now())
 		}
 		c.mu.Unlock()
@@ -81,7 +81,9 @@ func (c *Conn) run(e *event) {
 		if closing > 0 {
 			// This side closed: its paths stay open for the closing period,
 			// to send the close again to what still arrives (see
-			// answerClosingLocked), and close once it is over.
+			// answerClosingLocked), and close once it is over. A connection
+			// the peer closed keeps them for its draining period as well,
+			// sending nothing on them.
 			time.AfterFunc(closing, func() { c.endClosing(paths) })
 		} else {
 			closePaths(paths)

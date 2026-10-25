@@ -389,6 +389,11 @@ type Conn struct {
 	// was blocked at, which a BLOCKED frame for a new one goes above.
 	dataBlockedAt    uint64
 	streamsBlockedAt [2]uint64
+	// dataBlocked and streamsBlocked, for bidirectional and then
+	// unidirectional streams, are the BLOCKED frames this side reports the
+	// peer's limits in (see blocked.go).
+	dataBlocked    blockedReport
+	streamsBlocked [2]blockedReport
 
 	rtt          rttStats
 	cc           congestion
@@ -469,6 +474,8 @@ type Conn struct {
 	// have been lost, and the peer, which goes on probing, would otherwise
 	// hold on to the connection until it idled out. closingSeen counts what
 	// arrived meanwhile, the close going again at each power of two of it.
+	// A connection the peer closed has closingUntil set, without a
+	// closePacket, for the draining period (RFC 9000 section 10.2.2).
 	closePacket  []byte
 	closingUntil time.Time
 	closingSeen  int
@@ -960,7 +967,19 @@ func (c *Conn) OpenUniStream() (*Stream, error) { return c.openStream(false) }
 
 func (c *Conn) openStream(bidi bool) (*Stream, error) {
 	c.mu.Lock()
-	defer c.mu.Unlock()
+	s, err := c.openStreamLocked(bidi)
+	if err == ErrStreamLimit && c.blockedPending() {
+		// The peer hears that this side wants more.
+		c.wantFlush = true
+		c.mu.Unlock()
+		c.dispatch()
+		return nil, err
+	}
+	c.mu.Unlock()
+	return s, err
+}
+
+func (c *Conn) openStreamLocked(bidi bool) (*Stream, error) {
 	if c.closed {
 		return nil, ErrClosed
 	}
@@ -972,12 +991,14 @@ func (c *Conn) openStream(bidi bool) (*Stream, error) {
 	var id uint64
 	if bidi {
 		if c.openedBidi >= c.peerMaxBidi {
+			c.streamsBlocked[0].block(c.peerMaxBidi)
 			return nil, ErrStreamLimit
 		}
 		id = c.openedBidi << 2
 		c.openedBidi++
 	} else {
 		if c.openedUni >= c.peerMaxUni {
+			c.streamsBlocked[1].block(c.peerMaxUni)
 			return nil, ErrStreamLimit
 		}
 		id = c.openedUni<<2 | 2

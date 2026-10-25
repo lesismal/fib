@@ -30,6 +30,10 @@ const (
 	sfHandshakeDone
 	sfRetireCID
 	sfPathChallenge
+	sfDataBlocked
+	sfStreamDataBlocked
+	sfStreamsBlockedBidi
+	sfStreamsBlockedUni
 )
 
 type sentFrame struct {
@@ -409,6 +413,14 @@ func (c *Conn) frameLost(space int, f *sentFrame) {
 		c.handshakeDonePending = true
 	case sfRetireCID:
 		c.retireCIDs = append(c.retireCIDs, f.off)
+	case sfDataBlocked:
+		c.dataBlocked.lost(f.off, c.peerMaxData)
+	case sfStreamsBlockedBidi:
+		c.streamsBlocked[0].lost(f.off, c.peerMaxBidi)
+	case sfStreamsBlockedUni:
+		c.streamsBlocked[1].lost(f.off, c.peerMaxUni)
+	case sfStreamDataBlocked:
+		f.stream.onBlockedLost(f.off)
 	case sfPathChallenge:
 		// The challenge of the path being validated goes again, whichever
 		// path the lost one was for.

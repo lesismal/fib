@@ -44,6 +44,12 @@ func appendStopSending(b []byte, id, code uint64) []byte {
 	return AppendVarint(b, code)
 }
 
+func appendStreamDataBlocked(b []byte, id, at uint64) []byte {
+	b = append(b, frameStreamDataBlocked)
+	b = AppendVarint(b, id)
+	return AppendVarint(b, at)
+}
+
 func appendMaxStreamData(b []byte, id, max uint64) []byte {
 	b = append(b, frameMaxStreamData)
 	b = AppendVarint(b, id)
@@ -324,6 +330,12 @@ func (c *Conn) handleFrames(space int, payload []byte, now time.Time) (bool, err
 			if r.bad {
 				break
 			}
+			// The peer is closing, and this side drains: it sends nothing
+			// more, but keeps its paths for a while, so that what the peer
+			// still has in flight is taken in silence rather than answered
+			// with a stateless reset, or taken for a new connection (RFC
+			// 9000 section 10.2.2).
+			c.closingUntil = now.Add(c.closingPeriod())
 			if typ == frameConnectionClose {
 				c.terminateLocked(&TransportError{Code: code, Reason: string(reason), Remote: true})
 			} else {

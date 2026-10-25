@@ -70,6 +70,9 @@ type Stream struct {
 	// blocked at on the stream (see flood.go).
 	floodCounted bool
 	blockedAt    uint64
+	// blocked is the STREAM_DATA_BLOCKED frame this side reports the peer's
+	// limit on the stream in (see blocked.go).
+	blocked blockedReport
 	// released is set once the application is done with the stream, and
 	// its handler calls stop (see WriteFinal). Only the goroutine making
 	// them uses it.
@@ -307,6 +310,9 @@ func (s *Stream) sendable() bool {
 	if s.stopPending || s.maxDataPending || s.resetPending {
 		return true
 	}
+	if s.blocked.pending && !s.reset && s.hasSend {
+		return true
+	}
 	if s.reset || !s.hasSend {
 		return false
 	}
@@ -320,7 +326,7 @@ func (s *Stream) sendable() bool {
 }
 
 // appendFrames adds the stream's frames to a packet payload, up to max.
-func (s *Stream) appendFrames(b []byte, max int, p *sentPacket) []byte {
+func (s *Stream) appendFrames(b []byte, max int, p *sentPacket) (out []byte) {
 	c := s.conn
 	if s.stopPending {
 		if f := appendStopSending(nil, s.id, s.stopCode); len(b)+len(f) <= max {
@@ -347,6 +353,26 @@ func (s *Stream) appendFrames(b []byte, max int, p *sentPacket) []byte {
 		return b
 	}
 	idLen := VarintLen(s.id)
+	// Whatever the data left the packet, a stream that has more to send and
+	// no credit for it says what holds it back.
+	defer func() {
+		if s.send.next < s.send.end() && s.sendCredit() == 0 {
+			s.noteBlocked()
+		}
+		r := &s.blocked
+		if r.pending && (r.at != s.sendMax || s.send.next >= s.send.end()) {
+			// The peer raised the limit, or there is nothing left to send:
+			// the frame would report a limit that no longer holds.
+			r.pending = false
+		}
+		if r.pending {
+			if f := appendStreamDataBlocked(nil, s.id, r.at); len(out)+len(f) <= max {
+				out = append(out, f...)
+				r.pending = false
+				p.add(sentFrame{kind: sfStreamDataBlocked, stream: s, off: r.at})
+			}
+		}
+	}()
 	for s.send.hasLost() {
 		off := s.send.lost[0].off
 		avail := max - len(b) - 1 - idLen - VarintLen(off) - 2
@@ -437,6 +463,14 @@ func (s *Stream) onMaxDataLost() {
 	if !s.recvDone && !s.done && s.recvFin < 0 {
 		s.maxDataPending = true
 		s.conn.queueStream(s)
+	}
+}
+
+func (s *Stream) onBlockedLost(at uint64) {
+	if !s.reset && !s.done {
+		if s.blocked.lost(at, s.sendMax); s.blocked.pending {
+			s.conn.queueStream(s)
+		}
 	}
 }
 

@@ -126,3 +126,45 @@ func TestClosingAnswersSparinglyThenEnds(t *testing.T) {
 		t.Fatal("the close is still kept to answer with after the closing period")
 	}
 }
+
+// A connection whose peer closed it drains: it sends nothing more, and keeps
+// its path for the draining period rather than letting it go at once.
+func TestDrainingAfterPeerClose(t *testing.T) {
+	p := newTestPair(t, 0, nil)
+	sends := watchSends(p.clientEnd)
+	p.serverConn(t).Close(0x33, "bye")
+	select {
+	case err := <-p.clientH.closed:
+		var ae *ApplicationError
+		if !errors.As(err, &ae) || ae.Code != 0x33 || !ae.Remote {
+			t.Fatalf("closed with %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("client not closed")
+	}
+	before := len(sends())
+	closedAt := time.Now()
+	// What the server still has in flight arrives at a draining client,
+	// which answers none of it.
+	for i := 0; i < 5; i++ {
+		p.client.HandleDatagram(append([]byte{0x40}, p.client.scid...))
+	}
+	time.Sleep(50 * time.Millisecond)
+	if n := len(sends()); n != before {
+		t.Fatalf("a draining client sent %d datagrams", n-before)
+	}
+	p.clientEnd.mu.Lock()
+	early := p.clientEnd.closed
+	p.clientEnd.mu.Unlock()
+	if early {
+		t.Fatal("path closed at once")
+	}
+	waitFor(t, "path closed", func() bool {
+		p.clientEnd.mu.Lock()
+		defer p.clientEnd.mu.Unlock()
+		return p.clientEnd.closed
+	})
+	if d := time.Since(closedAt); d < minClosingPeriod/2 {
+		t.Fatalf("path closed after %v", d)
+	}
+}
