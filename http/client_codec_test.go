@@ -470,6 +470,9 @@ func TestReadWhole(t *testing.T) {
 	}{
 		{"hello", 5}, {"hello", 3}, {"hello", 9}, {"hello", 0}, {"hello", -1}, {"", 4},
 		{strings.Repeat("x", 4096), 4096}, {strings.Repeat("x", 4097), 4096},
+		// A declared length far past the body is the peer's word, not a
+		// buffer to take before any of it has arrived.
+		{"hello", 1 << 40}, {"hello", 1<<40 + 1}, {strings.Repeat("x", 1<<20+1), 1 << 40},
 	} {
 		got, err := readWhole(iotest.OneByteReader(strings.NewReader(tc.body)), tc.declared)
 		if err != nil || string(got) != tc.body {

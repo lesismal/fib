@@ -489,13 +489,20 @@ func (c *Client) do(req *stdhttp.Request, callback func(*ClientResponse, error),
 	return r
 }
 
+// maxReadWhole is the largest length readWhole takes a body's word for. A
+// body this long takes a single buffer of its declared size; a longer one,
+// whose length the caller has not yet shown to be true, is grown as it is
+// read, as io.ReadAll grows it, so that a length far past the body cannot
+// claim the memory before any of it arrives.
+const maxReadWhole = 1 << 20
+
 // readWhole reads a body that is not streamed, of length declared when that
 // is positive: into one buffer of that size rather than one grown as it is
 // read, as io.ReadAll would, and then whatever follows past it, so that a
 // body longer or shorter than declared is read as io.ReadAll reads it, for
 // the framing to refuse or send as it would have.
 func readWhole(rc io.Reader, declared int64) ([]byte, error) {
-	if declared <= 0 {
+	if declared <= 0 || declared > maxReadWhole {
 		return io.ReadAll(rc)
 	}
 	buf := make([]byte, declared)
