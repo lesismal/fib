@@ -97,9 +97,14 @@ func NewPusher(limit int) *Pusher {
 	return p
 }
 
-// Write queues a copy of b to be sent, and never waits. It reports
+// Write sends b, or queues a copy of it to be sent, and never waits. It reports
 // ErrPushClosed after Close or CloseWithError, and ErrPushStopped once the
 // request is over.
+//
+// b goes to the sink straight away, with no copy, when nothing written before
+// it is waiting, no other goroutine is sending, and the sink has room, which
+// is how a body whose transport keeps up goes: copied only where it has to
+// wait.
 func (p *Pusher) Write(b []byte) (int, error) {
 	p.mu.Lock()
 	switch {
@@ -113,15 +118,67 @@ func (p *Pusher) Write(b []byte) (int, error) {
 		p.mu.Unlock()
 		return 0, nil
 	}
-	piece := bufferpool.Get(len(b))[:len(b)]
-	copy(piece, b)
-	p.queue = append(p.queue, piece)
-	p.queued += len(b)
 	p.total += int64(len(b))
+	if sink := p.sink; sink != nil && len(p.queue) == 0 && !p.pumping && !p.ended {
+		// This goroutine pumps, as Kick would, for as long as it takes to
+		// send b; a Kick meanwhile is left to it.
+		p.pumping = true
+		p.again = false
+		p.mu.Unlock()
+		sent := p.sendNow(sink, b)
+		p.mu.Lock()
+		if !sent {
+			// The sink has no room, and kicks the body once it has.
+			p.enqueueLocked(b)
+		}
+		p.pumpLocked()
+		return len(b), nil
+	}
+	p.enqueueLocked(b)
 	p.readable.Broadcast()
 	p.mu.Unlock()
 	p.Kick()
 	return len(b), nil
+}
+
+// enqueueLocked queues a copy of b, taken from package bufferpool.
+func (p *Pusher) enqueueLocked(b []byte) {
+	piece := bufferpool.Get(len(b))[:len(b)]
+	copy(piece, b)
+	p.queue = append(p.queue, piece)
+	p.queued += len(b)
+}
+
+// sendNow sends b, which nothing waits ahead of, through sink when it has room,
+// and reports whether b is done with: sent, or not wanted any more. Only the
+// goroutine that set pumping calls it.
+func (p *Pusher) sendNow(sink Sink, b []byte) bool {
+	if !sink.Room() {
+		return false
+	}
+	p.mu.Lock()
+	if p.stopped != nil || p.ended {
+		p.mu.Unlock()
+		return true
+	}
+	p.sent += int64(len(b))
+	p.taken = true
+	over := p.declared >= 0 && p.sent > p.declared
+	if over {
+		p.ended = true
+	}
+	p.mu.Unlock()
+	if over {
+		sink.Fail(fmt.Errorf("http: ContentLength=%d with Body length at least %d", p.declared, p.sent))
+		return true
+	}
+	if err := sink.Send(b); err != nil {
+		// The transport failed, which it reports.
+		p.mu.Lock()
+		p.ended = true
+		p.mu.Unlock()
+	}
+	return true
 }
 
 // Close ends the body once what has been written is sent. It always
@@ -255,7 +312,15 @@ func (p *Pusher) Kick() {
 		return
 	}
 	p.pumping = true
-	for {
+	p.again = true
+	p.pumpLocked()
+}
+
+// pumpLocked pumps for as long as another goroutine asks for one more look,
+// and then lets go of pumping and of p.mu, which the caller holds, having set
+// pumping.
+func (p *Pusher) pumpLocked() {
+	for p.again {
 		p.again = false
 		sink := p.sink
 		if sink == nil || p.ended || p.stopped != nil {
@@ -264,9 +329,6 @@ func (p *Pusher) Kick() {
 		p.mu.Unlock()
 		p.pump(sink)
 		p.mu.Lock()
-		if !p.again {
-			break
-		}
 	}
 	p.pumping = false
 	p.mu.Unlock()

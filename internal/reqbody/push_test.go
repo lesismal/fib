@@ -403,6 +403,68 @@ func TestPusherFailsWithQueue(t *testing.T) {
 	}
 }
 
+// ptrSink checks whether Send is handed the producer's own bytes or a copy.
+type ptrSink struct {
+	fakeSink
+	sent [][]byte
+}
+
+func (s *ptrSink) Send(p []byte) error {
+	s.mu.Lock()
+	s.sent = append(s.sent, p)
+	s.mu.Unlock()
+	return s.fakeSink.Send(p)
+}
+
+// A piece nothing waits ahead of goes to a sink with room as it is, with no
+// copy; one the sink has no room for is copied, and the producer may reuse
+// its buffer at once.
+func TestPusherWriteSendsWithoutCopy(t *testing.T) {
+	p := NewPusher(0)
+	sink := &ptrSink{fakeSink: fakeSink{room: true}}
+	if err := p.Attach(sink, 8); err != nil {
+		t.Fatal(err)
+	}
+	b := []byte("abcd")
+	_, _ = p.Write(b)
+	if len(sink.sent) != 1 || &sink.sent[0][0] != &b[0] {
+		t.Fatalf("sent %d pieces; the first was a copy", len(sink.sent))
+	}
+	if p.Buffered() != 0 {
+		t.Fatalf("buffered %d", p.Buffered())
+	}
+
+	sink.mu.Lock()
+	sink.room = false
+	sink.mu.Unlock()
+	_, _ = p.Write(b)
+	copy(b, "zzzz")
+	if p.Buffered() != 4 {
+		t.Fatalf("buffered %d without room", p.Buffered())
+	}
+	sink.open(p)
+	if got, _, _, _ := sink.state(); got != "abcdabcd" {
+		t.Fatalf("sent %q", got)
+	}
+
+	// Past the declared length, sent straight away or not, the sink fails.
+	_, _ = p.Write([]byte("x"))
+	if _, _, failed, _ := sink.state(); failed == nil {
+		t.Fatal("a body past its length did not fail")
+	}
+}
+
+func TestPusherWriteAllocsNothingWithRoom(t *testing.T) {
+	p := NewPusher(0)
+	if err := p.Attach(discardSink{}, -1); err != nil {
+		t.Fatal(err)
+	}
+	b := make([]byte, 64<<10)
+	if allocs := testing.AllocsPerRun(100, func() { _, _ = p.Write(b) }); allocs != 0 {
+		t.Fatalf("%.1f allocations a Write", allocs)
+	}
+}
+
 // discardSink always has room and keeps nothing.
 type discardSink struct{}
 

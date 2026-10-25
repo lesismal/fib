@@ -112,9 +112,16 @@ type BodyStream struct {
 	conn *fib.Connection
 	mu   sync.Mutex
 	// buf holds body bytes that have arrived and not been read, from read
-	// onwards. Bytes before read have been handed out already.
-	buf  []byte
-	read int
+	// onwards. Bytes before read have been handed out already. spare is a
+	// buffer that drain handed a sink and got back after buf had been
+	// replaced, kept for buf's next turn. Both come from package bufferpool,
+	// and go back to it once the body is done with them: a body that streams
+	// through a sink while more of it arrives would otherwise make a buffer,
+	// grow it a copy at a time and leave it to the collector, for every
+	// handing on.
+	buf   []byte
+	read  int
+	spare []byte
 	// remaining counts down a Content-Length body; chunked leaves it at -1
 	// and decoder frames the body instead.
 	remaining int64
@@ -322,7 +329,7 @@ func (s *BodyStream) drain(worker bool) {
 			s.mu.Unlock()
 			return
 		}
-		pending := s.buf[s.read:]
+		full, pending := s.buf, s.buf[s.read:]
 		s.buf, s.read = nil, 0
 		s.releaseLocked()
 		var fin bool
@@ -346,15 +353,45 @@ func (s *BodyStream) drain(worker bool) {
 		sink(pending, fin, err, worker)
 		s.credited(len(pending))
 
-		if len(pending) > 0 {
+		if cap(full) > 0 || fin {
 			s.mu.Lock()
-			if s.buf == nil && !s.abandoned {
-				// The buffer is the stream's again, for what arrives next.
-				s.buf = pending[:0]
-			}
+			s.recycleLocked(full, fin)
 			s.mu.Unlock()
 		}
 	}
+}
+
+// recycleLocked takes back buf, a buffer drain handed the sink, which is done
+// with it: it becomes the stream's buffer again, for what arrives next, or
+// its spare when another has taken its place meanwhile. Once the sink has had
+// its last call, or the body is abandoned, nothing more is buffered, and buf
+// goes back to the pool with the stream's own.
+func (s *BodyStream) recycleLocked(buf []byte, last bool) {
+	switch {
+	case last || s.abandoned:
+		bufferpool.Put(buf)
+		if s.read == len(s.buf) {
+			bufferpool.Put(s.buf)
+			s.buf, s.read = nil, 0
+		}
+		bufferpool.Put(s.spare)
+		s.spare = nil
+	case s.buf == nil:
+		s.buf = buf[:0]
+	case s.spare == nil:
+		s.spare = buf[:0]
+	default:
+		bufferpool.Put(buf)
+	}
+}
+
+// appendLocked buffers data after what is waiting already, in the spare
+// buffer when the stream has none, growing it through the pool.
+func (s *BodyStream) appendLocked(data []byte) {
+	if s.buf == nil && s.spare != nil {
+		s.buf, s.spare = s.spare, nil
+	}
+	s.buf = bufferpool.Append(s.buf, data)
 }
 
 func newBodyStream(conn *fib.Connection, request *stdhttp.Request, config Config, decoder *chunkedDecoder, wantContinue bool) *BodyStream {
@@ -657,10 +694,14 @@ func (s *BodyStream) grantContinue() {
 func (s *BodyStream) compactLocked() {
 	if s.read == len(s.buf) {
 		// The buffer is kept whatever it grew to: a body never buffers more
-		// than the watermark plus one read, and it is thrown away with the
-		// request anyway, so re-allocating it every time it empties would
-		// only cost an allocation per read round.
+		// than the watermark plus one read, so taking a new one every time it
+		// empties would only cost a trip to the pool per read round. Once the
+		// body has all been read, it goes back.
 		s.buf, s.read = s.buf[:0], 0
+		if s.ended || s.err != nil {
+			bufferpool.Put(s.buf)
+			s.buf = nil
+		}
 	}
 	if s.held && len(s.buf)-s.read <= s.highWater/2 {
 		s.releaseLocked()
@@ -671,7 +712,9 @@ func (s *BodyStream) compactLocked() {
 // that was.
 func (s *BodyStream) dropLocked() int {
 	n := len(s.buf) - s.read
-	s.buf, s.read = nil, 0
+	bufferpool.Put(s.buf)
+	bufferpool.Put(s.spare)
+	s.buf, s.read, s.spare = nil, 0, nil
 	return n
 }
 
@@ -698,7 +741,7 @@ func (s *BodyStream) push(data []byte) {
 	// A sink that is busy on another goroutine takes this once it is done
 	// with what it has; until then it is buffered, and bounded, as it is for
 	// a reader.
-	s.buf = append(s.buf, data...)
+	s.appendLocked(data)
 	if !s.held && len(s.buf)-s.read >= s.highWater {
 		s.held = true
 		s.holdReads(true)
