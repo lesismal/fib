@@ -494,7 +494,7 @@ func TestTakeOverReleasesConn(t *testing.T) {
 
 // suiteConfigs are configs that settle on version and, unless it is zero,
 // suite: the server offers every suite the tests pick from.
-func suiteConfigs(t *testing.T, version, suite uint16) (server, client *stdtls.Config) {
+func suiteConfigs(t testing.TB, version, suite uint16) (server, client *stdtls.Config) {
 	t.Helper()
 	server, client = tlsConfigs(t)
 	server.MinVersion = stdtls.VersionTLS10

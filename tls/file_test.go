@@ -18,7 +18,7 @@ import (
 	fib "github.com/lesismal/fib"
 )
 
-func writeFile(t *testing.T, size int) (*os.File, []byte) {
+func writeFile(t testing.TB, size int) (*os.File, []byte) {
 	t.Helper()
 	data := make([]byte, size)
 	rand.New(rand.NewSource(int64(size))).Read(data)
@@ -37,7 +37,7 @@ func writeFile(t *testing.T, size int) (*os.File, []byte) {
 // fileServer serves TLS, settling on version and suite, with the kernel's TLS
 // or without, and hands the test each connection's layer once its handshake
 // is done; onData, if set, runs on each read.
-func fileServer(t *testing.T, kernel bool, version, suite uint16, onData func(*fib.Connection, []byte)) (layerOf, *stdtls.Config, string) {
+func fileServer(t testing.TB, kernel bool, version, suite uint16, onData func(*fib.Connection, []byte)) (layerOf, *stdtls.Config, string) {
 	t.Helper()
 	serverConfig, clientConfig := suiteConfigs(t, version, suite)
 	layers := make(layerOf, 4)
@@ -47,7 +47,7 @@ func fileServer(t *testing.T, kernel bool, version, suite uint16, onData func(*f
 	return layers, clientConfig, addr
 }
 
-func dialFileServer(t *testing.T, addr string, config *stdtls.Config) *stdtls.Conn {
+func dialFileServer(t testing.TB, addr string, config *stdtls.Config) *stdtls.Conn {
 	conn, _ := dialRecording(t, addr, config)
 	return conn
 }
@@ -83,7 +83,7 @@ func (c *recordingConn) lastRecordType() byte {
 	return typ
 }
 
-func dialRecording(t *testing.T, addr string, config *stdtls.Config) (*stdtls.Conn, *recordingConn) {
+func dialRecording(t testing.TB, addr string, config *stdtls.Config) (*stdtls.Conn, *recordingConn) {
 	t.Helper()
 	raw, err := net.Dial("tcp", addr)
 	if err != nil {

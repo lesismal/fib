@@ -18,7 +18,7 @@ import (
 	"github.com/lesismal/fib/tlstest"
 )
 
-func tlsConfigs(t *testing.T) (server, client *stdtls.Config) {
+func tlsConfigs(t testing.TB) (server, client *stdtls.Config) {
 	t.Helper()
 	server, client, err := tlstest.Configs()
 	if err != nil {
