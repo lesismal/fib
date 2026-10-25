@@ -994,6 +994,12 @@ func TestHTTP1ConformanceServerHTTPSChaCha20WithCurl(t *testing.T) {
 	if out, _ := exec.Command(curl, "--help", "all").Output(); !strings.Contains(string(out), "--tls13-ciphers") {
 		t.Skip("curl has no --tls13-ciphers")
 	}
+	// Windows' curl goes by Schannel, which takes the suites from the system
+	// and answers a server's ChaCha20-only offer with SEC_E_ILLEGAL_MESSAGE, so
+	// the suite is not curl's to choose there as the flag above suggests.
+	if out, _ := exec.Command(curl, "--version").Output(); strings.Contains(string(out), "Schannel") {
+		t.Skip("curl goes by Schannel, which does not choose the suite")
+	}
 	path, data := randomFile(t, 2<<20+77)
 	for _, tc := range []struct {
 		name    string
