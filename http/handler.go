@@ -15,6 +15,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+	"unsafe"
 
 	fib "github.com/lesismal/fib"
 	"github.com/lesismal/fib/bufferpool"
@@ -32,7 +33,11 @@ func (f HandlerFunc) ServeHTTP(c *Context) { f(c) }
 type Response struct {
 	StatusCode int
 	Header     stdhttp.Header
-	Body       []byte
+	// Body is the response body. HTTP/1 copies what the socket does not take
+	// at once, but HTTP/2 and HTTP/3 keep the slice itself and frame it as
+	// the peer's windows let them, so it must not be changed until the
+	// response is finished, which can be after WriteResponse returns.
+	Body []byte
 	// Trailer is sent after the body. HTTP/1.1 carries it by sending the
 	// body chunked, and announces its names in a Trailer header; HTTP/2 and
 	// HTTP/3 send it as a trailing header block. An HTTP/1.0 client, and a
@@ -237,6 +242,21 @@ func (r *StreamRequest) bind(conn *fib.Connection, body []byte) *Context {
 	r.Request.Body, r.Request.ContentLength = &r.body, int64(len(body))
 	c.whole = &r.body
 	return c
+}
+
+// BodyWithin reports whether p is the body the request r holds arrived with,
+// or a part of it: bytes in the server's buffer for that request, which it
+// takes back once the response is finished. A sender that goes on reading them
+// past that, as one framing a whole response does until the peer has
+// acknowledged it, must copy them instead.
+func (r *StreamRequest) BodyWithin(p []byte) bool {
+	b := r.body.data
+	if len(p) == 0 || len(p) > len(b) {
+		return false
+	}
+	lo := uintptr(unsafe.Pointer(unsafe.SliceData(b)))
+	p0 := uintptr(unsafe.Pointer(unsafe.SliceData(p)))
+	return p0 >= lo && p0+uintptr(len(p)) <= lo+uintptr(len(b))
 }
 
 // Recycle readies r for another request, once nothing can reach the one it

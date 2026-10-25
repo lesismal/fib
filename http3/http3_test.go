@@ -391,20 +391,31 @@ func TestDialFailure(t *testing.T) {
 
 // Trailers go out as a trailing HEADERS frame, whether the handler gives them
 // with the whole response or writes the response through the ResponseWriter
-// methods.
+// methods. A whole body above the size that is copied with its frames is kept
+// where the handler put it, and its trailer behind it, so both paths are here.
 func TestResponseTrailers(t *testing.T) {
+	large := bytes.Repeat([]byte("large"), 2048)
 	url := startServer(t, Config{}, func(c *fibhttp.Context) {
-		if c.Request.URL.Path == "/writer" {
+		switch c.Request.URL.Path {
+		case "/writer":
 			c.Header().Set("Trailer", "X-Sum")
 			_, _ = c.WriteString("written")
 			c.Header().Set("X-Sum", "w")
+			return
+		case "/large":
+			_ = c.WriteResponse(fibhttp.Response{StatusCode: 200, Body: large,
+				Trailer: stdhttp.Header{"X-Sum": {"l"}}})
 			return
 		}
 		_ = c.WriteResponse(fibhttp.Response{StatusCode: 200, Body: []byte("whole"),
 			Trailer: stdhttp.Header{"X-Sum": {"s"}, "Content-Length": {"forbidden"}}})
 	})
 	client := newClient(t, nil)
-	for path, want := range map[string][2]string{"/whole": {"whole", "s"}, "/writer": {"written", "w"}} {
+	for path, want := range map[string][2]string{
+		"/whole":  {"whole", "s"},
+		"/writer": {"written", "w"},
+		"/large":  {string(large), "l"},
+	} {
 		resp, err := client.Go(mustRequest(t, "GET", url+path, nil)).Wait()
 		if err != nil {
 			t.Fatal(err)

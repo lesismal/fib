@@ -165,8 +165,14 @@ func TestSendBuffer(t *testing.T) {
 		t.Fatalf("%d %q", off, data)
 	}
 	b.onAck(0, 4)
-	if b.base != 7 || string(b.buf) != "789" {
-		t.Fatalf("base %d buf %q", b.base, b.buf)
+	if b.base != 7 || b.end() != 10 {
+		t.Fatalf("base %d end %d", b.base, b.end())
+	}
+	if off, data := b.popNew(10); off != 10 || data != nil {
+		t.Fatalf("%d %q after the acknowledgement", off, data)
+	}
+	if len(b.pieces) != 1 || string(b.pieces[0].data) != "789" {
+		t.Fatalf("%d runs", len(b.pieces))
 	}
 }
 

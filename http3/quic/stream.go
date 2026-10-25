@@ -104,9 +104,36 @@ func (s *Stream) Write(p []byte, fin bool) error { return s.write(p, fin, false)
 
 // WriteOwned is Write for p that is a buffer from package bufferpool, which
 // the stream takes over, whether or not the write succeeds, rather than copy:
-// the caller must not use p afterwards. A stream with nothing waiting to be
-// sent keeps p as it is until it has been acknowledged.
+// the caller must not use p afterwards. The stream keeps p as it is, as it
+// does every owned write after it, until the peer has acknowledged it.
 func (s *Stream) WriteOwned(p []byte, fin bool) error { return s.write(p, fin, true) }
+
+// Part is one run of a message a stream sends with WriteParts or
+// WriteFinalParts. Data is the run, and Owned says it is a buffer from package
+// bufferpool that the stream takes over, as WriteOwned does, rather than a
+// slice the caller keeps.
+type Part struct {
+	Data  []byte
+	Owned bool
+}
+
+// WriteParts queues a message made of the parts, in order, without joining
+// them, and with fin set ends the sending side after it. An owned part goes
+// back to the pool once the peer has acknowledged it; a part that is not owned
+// is kept as it is until then, so it must not be changed in the meantime. It
+// is how a message whose body is the caller's, with header frames the stream's
+// own, costs the memory of the body once rather than twice.
+func (s *Stream) WriteParts(parts []Part, fin bool) error {
+	c := s.conn
+	c.mu.Lock()
+	err := s.writePartsLocked(parts, fin)
+	if err == nil {
+		c.wantFlush = true
+	}
+	c.mu.Unlock()
+	c.dispatch()
+	return err
+}
 
 // WriteFinal is WriteOwned for the last of what the stream sends, which ends
 // its sending side, and it tells the connection that the application is done
@@ -121,6 +148,28 @@ func (s *Stream) WriteFinal(p []byte, expected bool) error {
 	c := s.conn
 	c.mu.Lock()
 	err := s.writeLocked(p, true, true)
+	if err == nil {
+		c.wantFlush = true
+	}
+	c.events = append(c.events, event{kind: evRelease, stream: s})
+	if expected && c.awaited > 0 {
+		c.awaited--
+	}
+	c.mu.Unlock()
+	c.dispatch()
+	return err
+}
+
+// WriteFinalParts is WriteFinal for a last message made of several parts,
+// which are sent without being joined, as WriteParts sends them: the stream
+// takes over the owned ones and keeps the others as they are until the peer
+// has acknowledged them, so those must not be changed until then. The
+// connection is told the application is done with the stream, as WriteFinal
+// tells it.
+func (s *Stream) WriteFinalParts(parts []Part, expected bool) error {
+	c := s.conn
+	c.mu.Lock()
+	err := s.writePartsLocked(parts, true)
 	if err == nil {
 		c.wantFlush = true
 	}
@@ -158,6 +207,25 @@ func (s *Stream) writeLocked(p []byte, fin, owned bool) error {
 	} else {
 		s.send.write(p)
 	}
+	if fin {
+		s.finQueued = true
+		s.finalSize = s.send.end()
+	}
+	s.conn.queueStream(s)
+	return nil
+}
+
+func (s *Stream) writePartsLocked(parts []Part, fin bool) error {
+	switch {
+	case s.conn.closed, !s.hasSend || s.finQueued || s.reset:
+		for _, p := range parts {
+			if p.Owned {
+				bufferpool.Put(p.Data)
+			}
+		}
+		return ErrClosed
+	}
+	s.send.writeParts(parts)
 	if fin {
 		s.finQueued = true
 		s.finalSize = s.send.end()
@@ -246,7 +314,7 @@ func (s *Stream) resetLocked(code uint64) {
 	// The final size is what the peer may have seen, however little of it
 	// arrived.
 	s.finalSize = s.send.next
-	s.send = sendBuffer{base: s.send.next, next: s.send.next}
+	s.send.release()
 	s.conn.queueStream(s)
 	s.conn.wakeWritersLocked()
 }

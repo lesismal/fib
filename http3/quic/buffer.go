@@ -32,17 +32,40 @@ func addSpan(spans []span, s span) []span {
 	return append(spans[:i+1], spans[j:]...)
 }
 
+// sendPiece is a run of a send buffer's bytes: the bytes from off on that it
+// holds still, and mem, the buffer from the pool they are in, if they are the
+// pool's. A run the caller handed over is kept as it is, so mem is nil for it
+// and it is the caller's to keep until the peer has acknowledged it.
+type sendPiece struct {
+	off  uint64
+	data []byte
+	mem  []byte
+}
+
 // sendBuffer holds what a stream, or a packet number space's CRYPTO stream,
 // has been given to send, until the peer acknowledges it.
+//
+// It is a list of runs rather than one buffer, so that a message the caller
+// gave whole is kept as it is, rather than copied into a buffer of the send
+// buffer's own: see writeParts. What is copied in grows in a buffer from the
+// pool, as one buffer does, and goes back to the pool once acknowledged. What
+// is sent is copied into packets as they are built, so a run holds nothing
+// but the bytes the peer has yet to acknowledge.
 type sendBuffer struct {
-	// buf holds the bytes from offset base on; everything before base has
-	// been acknowledged. It is a window of mem, an array from the buffer
-	// pool, which goes back to it once everything written is acknowledged:
-	// what is sent is copied into packets as they are built, so nothing
-	// else holds on to it.
+	// base is the offset of the first byte the peer has yet to acknowledge,
+	// everything before it having been acknowledged, and size is how many
+	// bytes from base on the buffer holds.
 	base uint64
-	buf  []byte
-	mem  []byte
+	size uint64
+	// pieces holds those bytes, in order: pieces[0] holds the bytes from base
+	// on, and each later one continues where the one before it ends. The
+	// first few are kept in spare, which the stream carries with it, so that
+	// a message of a part or two allocates nothing for them.
+	pieces []sendPiece
+	spare  [2]sendPiece
+	// cur is the piece next is in, so that what is sent in order does not
+	// search the pieces again. onAck keeps it right as pieces go.
+	cur int
 	// next is the offset of the first byte never sent.
 	next uint64
 	// lost are sent ranges to send again, and acked the acknowledged ones
@@ -51,29 +74,77 @@ type sendBuffer struct {
 	acked []span
 }
 
-func (b *sendBuffer) end() uint64 { return b.base + uint64(len(b.buf)) }
+func (b *sendBuffer) end() uint64 { return b.base + b.size }
 
-func (b *sendBuffer) write(p []byte) {
-	if len(b.buf)+len(p) > cap(b.buf) {
-		grown := bufferpool.Get(len(b.buf) + len(p))[:len(b.buf)]
-		copy(grown, b.buf)
-		bufferpool.Put(b.mem)
-		b.mem, b.buf = grown, grown
+// add appends a run to the buffer, in the room the stream carries before it
+// takes to the heap for one.
+func (b *sendBuffer) add(p sendPiece) {
+	if b.pieces == nil {
+		b.pieces = b.spare[:0]
 	}
-	b.buf = append(b.buf, p...)
+	b.pieces = append(b.pieces, p)
 }
 
-// adopt appends p, a buffer from the pool that the send buffer takes over:
-// kept as the buffer itself when nothing else is waiting in it, which saves
-// the copy, and copied and given back otherwise.
+// write copies p in, as one buffer of the send buffer's own: into the spare
+// room of the last run where it is the pool's, in a larger buffer where that
+// is not enough, so that a stream written in many small pieces does not keep
+// a buffer for each.
+func (b *sendBuffer) write(p []byte) {
+	if len(p) == 0 {
+		return
+	}
+	if i := len(b.pieces) - 1; i >= 0 && b.pieces[i].mem != nil {
+		t := &b.pieces[i]
+		if len(t.data)+len(p) <= cap(t.data) {
+			t.data = append(t.data, p...)
+			b.size += uint64(len(p))
+			return
+		}
+		grown := bufferpool.Get(len(t.data) + len(p))[:len(t.data)]
+		copy(grown, t.data)
+		bufferpool.Put(t.mem)
+		t.data, t.mem = append(grown, p...), grown
+		b.size += uint64(len(p))
+		return
+	}
+	mem := bufferpool.Get(len(p))[:len(p)]
+	copy(mem, p)
+	b.add(sendPiece{off: b.end(), data: mem, mem: mem})
+	b.size += uint64(len(p))
+}
+
+// adopt appends p, a buffer from the pool that the send buffer takes over, to
+// what it holds: kept as the buffer itself, which saves the copy, whether or
+// not something else is waiting in it.
 func (b *sendBuffer) adopt(p []byte) {
-	if len(b.buf) > 0 || len(p) == 0 {
-		b.write(p)
+	if len(p) == 0 {
 		bufferpool.Put(p)
 		return
 	}
-	bufferpool.Put(b.mem)
-	b.mem, b.buf = p, p
+	b.add(sendPiece{off: b.end(), data: p, mem: p})
+	b.size += uint64(len(p))
+}
+
+// writeParts appends parts, in order, as the send buffer's own runs rather
+// than copying them into one: a message given whole, its header and its body
+// as separate parts, costs the memory of the body once and not twice. An
+// owned part goes back to the pool once acknowledged; one that is not is the
+// caller's until then, and must not be changed in the meantime.
+func (b *sendBuffer) writeParts(parts []Part) {
+	for _, p := range parts {
+		if len(p.Data) == 0 {
+			if p.Owned {
+				bufferpool.Put(p.Data)
+			}
+			continue
+		}
+		piece := sendPiece{off: b.end(), data: p.Data}
+		if p.Owned {
+			piece.mem = p.Data
+		}
+		b.add(piece)
+		b.size += uint64(len(p.Data))
+	}
 }
 
 // hasLost reports whether some sent data needs sending again.
@@ -84,29 +155,73 @@ func (b *sendBuffer) hasLost() bool {
 	return len(b.lost) > 0
 }
 
+// runAt returns the bytes of the run holding off, from off on, which end
+// where that run does: a frame is built from one run, so that what it holds
+// is never joined first.
+func (b *sendBuffer) runAt(off uint64) []byte {
+	for i := range b.pieces {
+		p := &b.pieces[i]
+		if end := p.off + uint64(len(p.data)); end > off {
+			return p.data[off-p.off : end-p.off]
+		}
+	}
+	return nil
+}
+
 // popLost takes up to n bytes of the first lost range.
 func (b *sendBuffer) popLost(n uint64) (uint64, []byte) {
-	if !b.hasLost() || n == 0 {
+	if n == 0 {
 		return 0, nil
 	}
-	s := &b.lost[0]
-	s.off = max(s.off, b.base)
-	off := s.off
-	end := min(s.end, off+n)
-	data := b.buf[off-b.base : end-b.base]
-	s.off = end
-	if s.off >= s.end {
-		b.lost = b.lost[1:]
+	for b.hasLost() {
+		s := &b.lost[0]
+		s.off = max(s.off, b.base)
+		off := s.off
+		data := b.runAt(off)
+		if len(data) == 0 {
+			// Nothing kept there: the range is not sent again.
+			s.off = s.end
+		} else {
+			if uint64(len(data)) > n {
+				data = data[:n]
+			}
+			if end := s.end - off; uint64(len(data)) > end {
+				data = data[:end]
+			}
+			s.off = off + uint64(len(data))
+			if len(data) > 0 {
+				if s.off >= s.end {
+					b.lost = b.lost[1:]
+				}
+				return off, data
+			}
+		}
+		if s.off >= s.end {
+			b.lost = b.lost[1:]
+		}
 	}
-	return off, data
+	return 0, nil
 }
 
 // popNew takes up to n bytes never sent before.
 func (b *sendBuffer) popNew(n uint64) (uint64, []byte) {
 	off := b.next
-	end := min(b.end(), off+n)
-	b.next = end
-	return off, b.buf[off-b.base : end-b.base]
+	if off >= b.end() || n == 0 {
+		return off, nil
+	}
+	for b.cur < len(b.pieces) && b.pieces[b.cur].off+uint64(len(b.pieces[b.cur].data)) <= off {
+		b.cur++
+	}
+	if b.cur == len(b.pieces) {
+		return off, nil
+	}
+	p := &b.pieces[b.cur]
+	data := p.data[off-p.off:]
+	if uint64(len(data)) > n {
+		data = data[:n]
+	}
+	b.next = off + uint64(len(data))
+	return off, data
 }
 
 // onAck records that [off, off+n) arrived, and lets go of what now needs no
@@ -125,16 +240,62 @@ func (b *sendBuffer) onAck(off, n uint64) {
 		newBase = b.acked[0].end
 		b.acked = b.acked[1:]
 	}
+	if newBase > b.end() {
+		newBase = b.end()
+	}
 	if newBase <= b.base {
 		return
 	}
-	b.buf = b.buf[newBase-b.base:]
-	b.base = newBase
-	if len(b.buf) == 0 {
-		// Let the array go rather than grow it from its tail forever.
-		bufferpool.Put(b.mem)
-		b.mem, b.buf = nil, nil
+	b.dropTo(newBase)
+}
+
+// dropTo lets go of the bytes before off: each run they take is dropped, and
+// the run they end in is cut, its buffer kept for the pool.
+func (b *sendBuffer) dropTo(off uint64) {
+	drop := 0
+	for drop < len(b.pieces) {
+		p := &b.pieces[drop]
+		end := p.off + uint64(len(p.data))
+		if end > off {
+			break
+		}
+		if p.mem != nil {
+			bufferpool.Put(p.mem)
+		}
+		p.data, p.mem = nil, nil
+		drop++
 	}
+	b.pieces = b.pieces[drop:]
+	b.cur = max(b.cur-drop, 0)
+	if len(b.pieces) > 0 && b.pieces[0].off < off {
+		p := &b.pieces[0]
+		p.data = p.data[off-p.off:]
+		p.off = off
+	}
+	b.size -= min(off-b.base, b.size)
+	b.base = off
+	if len(b.pieces) == 0 {
+		// Let the list go rather than grow it from its tail forever.
+		b.pieces = b.spare[:0]
+		b.cur = 0
+	}
+}
+
+// release gives back what the pool holds of the buffer, for a stream that is
+// reset or done with: nothing in it is sent again.
+func (b *sendBuffer) release() {
+	for i := range b.pieces {
+		if b.pieces[i].mem != nil {
+			bufferpool.Put(b.pieces[i].mem)
+		}
+		b.pieces[i] = sendPiece{}
+	}
+	b.pieces, b.size = b.spare[:0], 0
+	// The peer may have seen what was sent: the final size is where next got
+	// to, and nothing from there on is held.
+	b.base = b.next
+	b.cur = 0
+	b.lost, b.acked = nil, nil
 }
 
 // onLost queues [off, off+n) to be sent again, if it is still wanted.
@@ -148,7 +309,7 @@ func (b *sendBuffer) onLost(off, n uint64) {
 }
 
 // allAcked reports whether everything written has been acknowledged.
-func (b *sendBuffer) allAcked() bool { return len(b.buf) == 0 }
+func (b *sendBuffer) allAcked() bool { return len(b.pieces) == 0 }
 
 // segment is received data waiting for what comes before it.
 type segment struct {

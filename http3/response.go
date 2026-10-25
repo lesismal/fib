@@ -24,6 +24,13 @@ import (
 // this size, so that the wait comes before more is copied in.
 const maxUnsentOutput = 64 << 10
 
+// maxDataChunk is how much body a DATA frame's buffer holds: the wait above,
+// less room for the frame's own header. The buffer is then exactly the pool's
+// 64KiB class rather than the next one up, which the frame header alone would
+// have taken it past: the class is a power of two, so 64KiB of body would cost
+// 128KiB.
+const maxDataChunk = maxUnsentOutput - 16
+
 // BeginResponse sends the header of a response whose body follows through
 // WriteBody, leaving the stream open for it.
 func (rs *requestStream) BeginResponse(req *stdhttp.Request, status int, header stdhttp.Header) error {
@@ -94,10 +101,7 @@ func (rs *requestStream) WriteBody(p []byte, wait bool) error {
 				return rs.closedErr()
 			}
 		}
-		n := len(p)
-		if wait {
-			n = min(n, maxUnsentOutput)
-		}
+		n := min(len(p), maxDataChunk)
 		out := bufferpool.Get(n + 16)[:0]
 		out = appendFrameHeader(out, frameData, n)
 		out = append(out, p[:n]...)
