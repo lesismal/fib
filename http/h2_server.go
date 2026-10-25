@@ -254,6 +254,12 @@ type h2ServerStream struct {
 	// the windows to let its pending bytes go. Guarded by the connection's
 	// mu.
 	queued bool
+	// weight is how many frames the stream may send when its turn at the
+	// connection's window comes, 1 unless its request asked for more with
+	// RFC 9218's priority header; turn is how many of them its current turn
+	// has left, and 0 starts a new one. Both are guarded by the connection's
+	// mu; see flushLocked.
+	weight, turn uint8
 	// timedOut marks a stream reset because its response outlasted
 	// Config.WriteTimeout, which writing to it then reports.
 	timedOut   bool
@@ -1049,6 +1055,7 @@ func (sc *h2ServerConn) handleHeaderBlock(id uint32, block []byte, endStream boo
 		return &H2StreamError{StreamID: id, Code: H2RefusedStream}
 	}
 	st = sc.newStream(id)
+	st.weight = h2PriorityWeight(fields)
 	sc.streams[id] = st
 	sc.lastStreamID.Store(id)
 	sc.busyLocked()
@@ -2038,6 +2045,7 @@ func (sc *h2ServerConn) newStream(id uint32) *h2ServerStream {
 	}
 	st.sc, st.id, st.declared = sc, id, -1
 	st.recvWindow, st.sendWindow = sc.local.streamWindow, sc.peerWindow
+	st.weight, st.turn = 1, 0
 	st.refs.Store(1)
 	return st
 }
@@ -2088,6 +2096,7 @@ func (st *h2ServerStream) recycle() {
 	st.body, st.declared, st.recvWindow, st.recvUnacked = nil, 0, 0, 0
 	st.feed, st.creditSkip = nil, 0
 	st.remoteDone, st.responded, st.trailer, st.localDone, st.reset, st.queued = false, false, nil, false, false, false
+	st.weight, st.turn = 0, 0
 	st.timedOut, st.writeTimer = false, nil
 	st.sendWindow, st.pending, st.out, st.tunnel = 0, nil, nil, nil
 	st.pooled, st.nextDead, st.headerFromPool = false, nil, nil
@@ -2119,37 +2128,81 @@ func (sc *h2ServerConn) finishStreamLocked(st *h2ServerStream) {
 }
 
 // flushLocked sends what response bodies the windows now allow, the streams
-// waiting for them taking turns a frame at a time, in the order they began
-// to wait: a window update that lets less go than they all have pending is
-// shared between them, rather than taken by whichever stream comes first, so
-// that one large response cannot hold up the others on its connection. A
-// stream that has had its turn and still has bytes pending waits behind the
-// others again, and one its own window keeps back gives its turn up.
+// waiting for them taking turns at the connection's window in the order they
+// began to wait: a window update that lets less go than they all have pending
+// is shared between them, rather than taken by whichever stream comes first,
+// so that one large response cannot hold up the others on its connection. A
+// stream sends up to its weight in frames a turn, one by default, which is
+// the frame a turn this server has always given; a stream that asked for more
+// with RFC 9218's priority header, or one that gave the queue nothing to do
+// while the others were held back, sends that many before it goes behind them
+// again, so that a heavier stream gets a larger share even of a window the
+// peer grants a frame at a time. A turn the connection's window cuts short is
+// taken up again when more of the window comes, keeping the stream's place,
+// since the window, not fairness, is what stopped it. A stream its own window
+// keeps back gives its turn up, and comes round again behind the others.
 func (sc *h2ServerConn) flushLocked(out []byte) []byte {
 	// stalled counts the turns in a row that sent nothing: once every
 	// stream waiting has had one, only their own windows can let more go.
 	stalled := 0
 	for sc.sendWindow > 0 && stalled < len(sc.sendQueue)-sc.sendHead {
 		st := sc.sendQueue[sc.sendHead]
-		sc.sendQueue[sc.sendHead] = nil
-		sc.sendHead++
-		st.queued = false
 		if len(st.pending) == 0 {
+			// It ended while it waited its turn.
+			sc.sendQueue[sc.sendHead] = nil
+			sc.sendHead++
+			st.queued, st.turn = false, 0
 			continue
+		}
+		if st.turn == 0 {
+			st.turn = st.weight
 		}
 		before := len(st.pending)
-		// Queues st again, behind the others, if any of it is left.
 		out = sc.flushStreamUpToLocked(out, st, int64(sc.peerMaxFrame))
 		if len(st.pending) == before {
+			// Its own window holds it back, so its turn goes to the rest of
+			// the queue, and it starts afresh when its window opens.
 			stalled++
+			sc.yieldLocked(st)
 			continue
 		}
+		st.turn--
 		stalled = 0
 		st.wakeWritersLocked()
-		sc.finishStreamLocked(st)
+		if len(st.pending) == 0 {
+			sc.sendQueue[sc.sendHead] = nil
+			sc.sendHead++
+			st.queued, st.turn = false, 0
+			sc.finishStreamLocked(st)
+			continue
+		}
+		if st.turn > 0 && st.sendWindow > 0 {
+			// More of its turn, and both windows let it go on. A turn the
+			// connection's window has cut short keeps its place, and the
+			// frames left of it, until more of the window comes.
+			if sc.sendWindow <= 0 {
+				break
+			}
+			continue
+		}
+		// Its turn is over, or its own window is: behind the others.
+		sc.yieldLocked(st)
+		if sc.sendWindow <= 0 {
+			break
+		}
 	}
 	sc.compactQueueLocked()
 	return out
+}
+
+// yieldLocked gives up st's place at the head of the send queue: its turn is
+// over, so it goes behind the streams waiting there, and starts afresh when
+// it comes round again. Callers hold sc.mu.
+func (sc *h2ServerConn) yieldLocked(st *h2ServerStream) {
+	sc.sendQueue[sc.sendHead] = nil
+	sc.sendHead++
+	st.queued, st.turn = false, 0
+	sc.enqueueLocked(st)
 }
 
 // enqueueLocked puts st at the back of the streams waiting for the windows,
@@ -2165,6 +2218,7 @@ func (sc *h2ServerConn) enqueueLocked(st *h2ServerStream) {
 // dequeueLocked takes st out of the streams waiting for the windows, as it
 // is forgotten: a recycled stream must not be found there.
 func (sc *h2ServerConn) dequeueLocked(st *h2ServerStream) {
+	st.turn = 0
 	if !st.queued {
 		return
 	}
@@ -2195,14 +2249,19 @@ func (sc *h2ServerConn) compactQueueLocked() {
 }
 
 // flushStreamLocked frames as much of st's pending bytes as the windows let
-// go now.
+// go now, and queues st for its next turn at the windows if any are left; see
+// flushLocked.
 func (sc *h2ServerConn) flushStreamLocked(out []byte, st *h2ServerStream) []byte {
-	return sc.flushStreamUpToLocked(out, st, math.MaxInt64)
+	out = sc.flushStreamUpToLocked(out, st, math.MaxInt64)
+	if len(st.pending) > 0 {
+		sc.enqueueLocked(st)
+	}
+	return out
 }
 
 // flushStreamUpToLocked frames up to quota of st's pending bytes, as far as
-// the windows let them go, and queues st for its next turn at the windows if
-// any are left; see flushLocked.
+// the windows let them go. It leaves st where it is in the send queue, which
+// flushLocked and flushStreamLocked decide.
 func (sc *h2ServerConn) flushStreamUpToLocked(out []byte, st *h2ServerStream, quota int64) []byte {
 	for len(st.pending) > 0 {
 		n := int64(len(st.pending))
@@ -2238,9 +2297,6 @@ func (sc *h2ServerConn) flushStreamUpToLocked(out []byte, st *h2ServerStream, qu
 		if last {
 			out = sc.endStreamLocked(out, st)
 		}
-	}
-	if len(st.pending) > 0 {
-		sc.enqueueLocked(st)
 	}
 	return out
 }

@@ -9,8 +9,9 @@ import (
 	"github.com/lesismal/fib/internal/outputwait"
 )
 
-// DefaultSettingsTimeout is Config.SettingsTimeout's default. The server's
-// PING timeout shares DefaultPingTimeout, the client's.
+// DefaultSettingsTimeout is Config.SettingsTimeout's default, and
+// ClientConfig.SettingsTimeout's. The server's PING timeout shares
+// DefaultPingTimeout, the client's.
 const DefaultSettingsTimeout = 10 * time.Second
 
 // ErrH2PingTimeout is what the streams of an HTTP/2 connection fail with,
@@ -27,6 +28,20 @@ var h2PingPayload = [8]byte{'f', 'i', 'b', 'p', 'i', 'n', 'g', 0}
 // SETTINGS, or zero for as long as it likes.
 func (h *ServerHandler) settingsTimeout() time.Duration {
 	switch d := h.config.SettingsTimeout; {
+	case d < 0:
+		return 0
+	case d == 0:
+		return DefaultSettingsTimeout
+	default:
+		return d
+	}
+}
+
+// settingsTimeout is how long a server has to acknowledge the client's
+// SETTINGS, or zero for as long as it likes. It mirrors the server's, and
+// shares its default.
+func (c *ClientConfig) settingsTimeout() time.Duration {
+	switch d := c.SettingsTimeout; {
 	case d < 0:
 		return 0
 	case d == 0:

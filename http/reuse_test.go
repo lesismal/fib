@@ -245,7 +245,7 @@ func TestH2StreamRecycleResetsEveryField(t *testing.T) {
 	}
 	check(reflect.TypeFor[h2ServerStream](), "sc", "id", "req", "pushed", "body", "declared", "recvWindow",
 		"recvUnacked", "feed", "creditSkip", "remoteDone", "responded", "trailer", "localDone", "reset", "queued",
-		"timedOut", "writeTimer", "sendWindow", "pending", "out", "tunnel", "block", "values", "pooled", "refs", "nextDead", "headerFromPool")
+		"weight", "turn", "timedOut", "writeTimer", "sendWindow", "pending", "out", "tunnel", "block", "values", "pooled", "refs", "nextDead", "headerFromPool")
 	check(reflect.TypeFor[StreamRequest](), "Request", "URL", "context", "body", "task")
 	if size := reflect.TypeFor[h2ServerStream]().Size(); size > 1024 && reflect.TypeFor[uintptr]().Size() == 8 {
 		t.Fatalf("an h2ServerStream takes %d bytes, past the 1024-byte size class", size)

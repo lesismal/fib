@@ -29,6 +29,11 @@ import (
 // ClientConfig.PingTimeout.
 var ErrPingTimeout = errors.New("http2: connection lost: no answer to PING within PingTimeout")
 
+// ErrSettingsTimeout is what the requests on an HTTP/2 connection get when
+// the server did not acknowledge the client's opening SETTINGS within
+// ClientConfig.SettingsTimeout, the connection then being taken for wedged.
+var ErrSettingsTimeout = errors.New("http2: connection lost: server did not acknowledge SETTINGS within SettingsTimeout")
+
 // DefaultPingTimeout is ClientConfig.PingTimeout's zero, and
 // Config.PingTimeout's.
 const DefaultPingTimeout = 15 * time.Second
@@ -88,6 +93,11 @@ type h2ClientConn struct {
 	// failed is the error this side ended the connection with, which the
 	// requests still on it then report.
 	failed error
+	// settingsTimer ends the connection unless the server acknowledges the
+	// client's opening SETTINGS in time, and settingsAcked says it has; see
+	// armSettingsTimeout. Both are guarded by mu.
+	settingsTimer *time.Timer
+	settingsAcked bool
 
 	// The health check, with ClientConfig.ReadIdleTimeout set, which
 	// checking says: lastRead is when the server was last heard from, in
@@ -168,6 +178,7 @@ func (cc *clientConn) startH2() {
 		hc.health = time.AfterFunc(config.ReadIdleTimeout, hc.checkHealth)
 		hc.mu.Unlock()
 	}
+	hc.armSettingsTimeout()
 	cc.maxStreams = config.HTTP2.initialMaxStreams()
 	cc.h2 = hc
 	out := append([]byte(nil), h2Preface...)
@@ -226,6 +237,58 @@ func (hc *h2ClientConn) checkHealth() {
 	out := h2AppendFrameHeader(nil, h2FramePing, 0, 0, len(healthPing))
 	hc.sendLocked(append(out, healthPing[:]...))
 	hc.health.Reset(time.Duration(pingTimeout))
+	hc.mu.Unlock()
+}
+
+// armSettingsTimeout starts the timer that ends the connection unless the
+// server acknowledges the client's opening SETTINGS in time; see
+// ClientConfig.SettingsTimeout.
+func (hc *h2ClientConn) armSettingsTimeout() {
+	d := hc.client.config.settingsTimeout()
+	if d <= 0 {
+		return
+	}
+	hc.mu.Lock()
+	if !hc.settingsAcked {
+		hc.settingsTimer = time.AfterFunc(d, hc.settingsExpired)
+	}
+	hc.mu.Unlock()
+}
+
+// settingsExpired ends a connection whose server has not acknowledged the
+// client's SETTINGS in time (RFC 9113 section 6.5.3), which the client cannot
+// tell from one that has stopped reading its input: the requests on it fail
+// with ErrSettingsTimeout, or go again on another when the server answered
+// nothing of them and they are safe to repeat (see shutdown). An
+// acknowledgement that arrived as the timer fired leaves the connection
+// alone. The connection is closed at once, as one whose PING went unanswered
+// is: a server that has not read the SETTINGS may never read a GOAWAY either.
+func (hc *h2ClientConn) settingsExpired() {
+	hc.mu.Lock()
+	if hc.closed || hc.settingsAcked {
+		hc.mu.Unlock()
+		return
+	}
+	hc.settingsTimer = nil
+	hc.goAway = true
+	if hc.failed == nil {
+		hc.failed = ErrSettingsTimeout
+	}
+	hc.mu.Unlock()
+	hc.client.retire(hc.cc)
+	hc.cc.conn.Close()
+}
+
+// acknowledgeSettings records the server's acknowledgement of the client's
+// opening SETTINGS, which stops the timer that would otherwise end the
+// connection; see armSettingsTimeout.
+func (hc *h2ClientConn) acknowledgeSettings() {
+	hc.mu.Lock()
+	hc.settingsAcked = true
+	if hc.settingsTimer != nil {
+		hc.settingsTimer.Stop()
+		hc.settingsTimer = nil
+	}
 	hc.mu.Unlock()
 }
 
@@ -565,6 +628,10 @@ func (hc *h2ClientConn) shutdown(err error) {
 	if hc.health != nil {
 		hc.health.Stop()
 	}
+	if hc.settingsTimer != nil {
+		hc.settingsTimer.Stop()
+		hc.settingsTimer = nil
+	}
 	if hc.failed != nil {
 		err = hc.failed
 	}
@@ -778,6 +845,7 @@ func (hc *h2ClientConn) handleSettings(f *h2Frame) error {
 			return h2ConnErr(H2FrameSizeError, "SETTINGS ack with payload")
 		}
 		hc.local.settingsAck(hc.dec)
+		hc.acknowledgeSettings()
 		return nil
 	}
 	if hc.settingsSeen {

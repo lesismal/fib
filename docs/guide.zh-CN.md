@@ -950,6 +950,10 @@ server, err := fib.New(config, fib.Binding{Addr: ":443", Handler: fibtls.NewServ
   ```
 
   各字段的默认值、取值范围与代价见 [HTTP/2 文档](http2.zh-CN.md#可配置参数)。
+- 发送调度：被连接窗口压住的多个响应按开始等待的顺序轮流发送，默认每个 stream 每轮
+  1 帧；请求带 RFC 9218 的 `priority` 头时按紧急度加权，紧急度 0/1/2 分别每轮 8/4/2 帧，
+  默认紧急度 3 及更不紧急的仍是 1 帧。增量提示 `i` 与 PRIORITY_UPDATE 帧不支持（响应
+  body 整体缓存，重排没有意义），RFC 7540 的优先级树也不实现。
 - 实现了 HPACK（含 Huffman 与动态表）、CONTINUATION、trailer、多个 cookie 字段合并、
   PING、SETTINGS、RST_STREAM、GOAWAY，以及 RFC 9113 的请求合法性校验（非法请求用
   RST_STREAM 拒绝，协议错误用 GOAWAY 关闭连接）。
@@ -1085,7 +1089,10 @@ client.Do(req, func(resp *fibhttp.ClientResponse, err error) {
   REFUSED_STREAM 时，服务端未处理的请求会自动在新连接上重发。设置
   `ClientConfig.ReadIdleTimeout` 后，HTTP/2 连接在这么久没收到数据时发 PING，
   `PingTimeout`（默认 15 秒）内仍无任何回应就认为连接已静默断开、关闭它，请求以
-  `ErrPingTimeout` 失败（满足重发条件的则在新连接上重发）；默认不开启。设置了 `Request.Trailer`
+  `ErrPingTimeout` 失败（满足重发条件的则在新连接上重发）；默认不开启。
+  `ClientConfig.SettingsTimeout`（默认 10 秒）内服务端仍未确认客户端 SETTINGS 时，
+  连接被当作卡死关闭，请求以 `ErrSettingsTimeout` 失败（满足重发条件的则在新连接上重发）。
+  设置了 `Request.Trailer`
   的请求，trailer 会在 body 之后用单独的 HEADERS 帧发送（HTTP/1 上则是 chunked 的
   trailer）。
 - 每个 host:port 维护连接池：keep-alive 复用，`MaxConnsPerHost` 限制同时打开或正在

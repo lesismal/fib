@@ -15,8 +15,8 @@ The implementation lives in [`http`](../http) (`h2_*.go`) and the
 
 | Side | Features |
 | --- | --- |
-| Server | TLS + ALPN (h2), cleartext with prior knowledge (h2c), HTTP/1.1 `Upgrade: h2c`; multiplexing, flow control in both directions, HPACK (Huffman and dynamic table), CONTINUATION, trailers, server push, 1xx interim responses, automatic 100 Continue, graceful GOAWAY on `Response.Close`, `Request.TLS`, extended CONNECT (RFC 8441) switched to a tunnel with `Context.Upgrade`, which is how `websocket.ServerHandler.Upgrade` serves WebSocket over HTTP/2 |
-| Client | h2 over https through ALPN, cleartext prior knowledge with `UnencryptedHTTP2`; multiplexing on one connection, honouring the server's `MAX_CONCURRENT_STREAMS`, cancellation that resets only its own stream, automatic retry after GOAWAY / REFUSED_STREAM; new streams on the least-loaded connection; `Expect: 100-continue` waits for the 100; optional PING health check |
+| Server | TLS + ALPN (h2), cleartext with prior knowledge (h2c), HTTP/1.1 `Upgrade: h2c`; multiplexing, flow control in both directions, HPACK (Huffman and dynamic table), CONTINUATION, trailers, server push, 1xx interim responses, automatic 100 Continue, graceful GOAWAY on `Response.Close`, `Request.TLS`, extended CONNECT (RFC 8441) switched to a tunnel with `Context.Upgrade`, which is how `websocket.ServerHandler.Upgrade` serves WebSocket over HTTP/2; RFC 9218 urgency weights for response scheduling |
+| Client | h2 over https through ALPN, cleartext prior knowledge with `UnencryptedHTTP2`; multiplexing on one connection, honouring the server's `MAX_CONCURRENT_STREAMS`, cancellation that resets only its own stream, automatic retry after GOAWAY / REFUSED_STREAM; new streams on the least-loaded connection; `Expect: 100-continue` waits for the 100; optional PING health check and SETTINGS acknowledgement timeout |
 | Conformance | h2spec: 145 of 145 cases, over h2c and TLS |
 | Interop | Go `net/http` client and server (TLS and h2c); curl (nghttp2) over h2, h2c and Upgrade |
 
@@ -175,11 +175,21 @@ the table what either side's HPACK encoder may keep between header blocks.
 
 ### Protocol details
 
-- **Priority**: PRIORITY frames and the priority fields in HEADERS are validated
-  and ignored. Streams whose bytes the connection's window holds back take
-  turns a frame at a time, in the order they began to wait, so a large
-  download does not starve the other responses on its connection; there is no
-  weighting, and a stream with nothing ahead of it sends at once.
+- **Priority**: PRIORITY frames and the priority fields in HEADERS are
+  validated and ignored, and the priority tree of RFC 7540 is not implemented:
+  RFC 9113 deprecates it. A request's RFC 9218 `priority` header is honoured
+  instead: its urgency (`u`, 0 to 7, 3 by default) sets how many frames the
+  response may send when its turn at the connection's window comes, 8 for
+  urgency 0, 4 for urgency 1, 2 for urgency 2, and the single frame a turn
+  every stream gets for the default urgency 3 and every less urgent one, so a
+  client that sends no priority, or the default urgency, sees the round robin
+  unchanged. The incremental hint (`i`) is ignored, since a response body is
+  buffered whole before it is sent, and PRIORITY_UPDATE is not implemented.
+  The turns stay in the order the streams began to wait, and no stream is
+  starved: every waiting stream gets its turn, and one the connection's
+  window cuts short keeps its place, and the frames left of its turn, until
+  more of the window comes. A stream its own window holds back gives its turn
+  up, and a stream with nothing ahead of it sends at once.
 - **The peer's `SETTINGS_MAX_HEADER_LIST_SIZE`**: both sides keep within the
   limit the peer announces. A response header or trailer that would not fit
   resets its stream rather than going out, an interim response or a pushed
@@ -208,8 +218,11 @@ the table what either side's HPACK encoder may keep between header blocks.
   check is described under [Client](#client).
 - **SETTINGS acknowledgement timeout**: the server ends a connection with
   GOAWAY(SETTINGS_TIMEOUT) when the client has not acknowledged its SETTINGS
-  within `Config.SettingsTimeout` (10 seconds by default). The client does not
-  time a server out the same way.
+  within `Config.SettingsTimeout` (10 seconds by default). The client times a
+  server out the same way, with `ClientConfig.SettingsTimeout`: a server that
+  has not acknowledged the client's SETTINGS by then has its connection
+  closed, and the requests on it fail with `ErrSettingsTimeout`, or go again
+  on another connection by the retry rule below.
 
 ### Client
 
@@ -231,6 +244,14 @@ the table what either side's HPACK encoder may keep between header blocks.
   requests fail with `ErrPingTimeout`, or go again on another connection by
   the rule below. Names and defaults are x/net/http2's; `ReadIdleTimeout`'s
   zero, the default, leaves the check off.
+- **SETTINGS timeout**: with `ClientConfig.SettingsTimeout` (10 seconds by
+  default; below zero, no limit) a connection whose server does not
+  acknowledge the client's SETTINGS in time is taken for wedged and closed,
+  and its requests fail with `ErrSettingsTimeout`, or go again on another
+  connection by the retry rule below. This finds a server that has stopped
+  processing what it reads, which the PING health check cannot: that one only
+  looks at a connection that went quiet, and this server's socket may still
+  take what is written to it.
 - **Retries**: a request whose connection breaks after any of its response
   has arrived fails with the connection's error and is not sent again,
   whatever its method. This is deliberate, and what `net/http` and
@@ -259,7 +280,7 @@ the table what either side's HPACK encoder may keep between header blocks.
 | Feature | Reason |
 | --- | --- |
 | Receiving server push in the client | Chrome and Firefox have removed push, and Go's `net/http` client never supported it. The client sends `ENABLE_PUSH=0`; the server's push support remains for clients that still want it. For preloading, 103 Early Hints (`Context.WriteInterim`) is the recommended replacement. |
-| RFC 9218 extensible priorities (`priority` header, PRIORITY_UPDATE) | With bodies buffered whole, scheduling has little to gain. The RFC 7540 priority tree is deprecated by RFC 9113 and is not implemented either. |
+| RFC 9218's incremental hint and PRIORITY_UPDATE | The `priority` header's urgency is used for send scheduling (see [Protocol details](#protocol-details)); `i` has nothing to reorder while a response body is buffered whole, and the update frame is not implemented. The RFC 7540 priority tree is deprecated by RFC 9113 and is not implemented either. |
 | `Upgrade: h2c` initiated by the client | RFC 9113 deprecates this upgrade; cleartext HTTP/2 uses prior knowledge (`UnencryptedHTTP2`). The server still accepts the upgrade for compatibility with curl and others. |
 | `Upgrade: h2c` over TLS | The RFCs allow switching protocols over TLS only through ALPN. |
 | 1xx interim responses to HTTP/1.0 requests | HTTP/1.0 clients do not understand 1xx; `WriteInterim` returns `http.ErrNotSupported`. |
@@ -397,10 +418,6 @@ concurrency.
   or record; cutting the rest needs a vectored send the protocol layer does
   not have.
 
-### 5. Scheduling (low)
+### 5. Request trailers (low)
 
-- Schedule streams with pending data by weight; round-robin is done.
-- Client: a SETTINGS acknowledgement timeout of its own. (PING health checks,
-  least-loaded connection selection and waiting for 100-continue are done; see
-  [Client](#client).)
 - Support sending request trailers.

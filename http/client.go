@@ -84,6 +84,19 @@ type ClientConfig struct {
 	// its Timeout or ResponseHeaderTimeout bounds.
 	ReadIdleTimeout time.Duration
 	PingTimeout     time.Duration
+	// SettingsTimeout bounds how long an HTTP/2 server may take to
+	// acknowledge the SETTINGS the client opens the connection with, which
+	// it has to before the client can count on the windows and the frame
+	// size those SETTINGS announce (RFC 9113 section 6.5.3): past it the
+	// connection is taken for wedged, closed, and its requests fail with
+	// ErrSettingsTimeout, or are sent again on another connection when the
+	// server had answered nothing of them and they are safe to repeat. This
+	// finds a server that has gone quiet before it has read anything, which
+	// TCP alone may not for many minutes. Zero means
+	// DefaultSettingsTimeout, 10 seconds, as Config.SettingsTimeout does for
+	// the server's side; below zero, no limit. HTTP/1 connections are not
+	// checked.
+	SettingsTimeout time.Duration
 	// DialTimeout bounds one connect. Zero leaves it to the operating system.
 	DialTimeout time.Duration
 	// Dial opens the client's connections, in place of the engine's

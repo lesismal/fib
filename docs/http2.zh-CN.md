@@ -13,8 +13,8 @@
 
 | 方向 | 内容 |
 | --- | --- |
-| 服务端 | TLS + ALPN（h2）、明文 prior knowledge（h2c）、HTTP/1.1 `Upgrade: h2c`；多路复用、双向流控、HPACK（含 Huffman、动态表）、CONTINUATION、trailer、server push、1xx 中间响应、自动 100 Continue、`Response.Close` 优雅 GOAWAY、`Request.TLS`、Extended CONNECT（RFC 8441）经 `Context.Upgrade` 切换为隧道，`websocket.ServerHandler.Upgrade` 即借此提供 WebSocket over HTTP/2 |
-| 客户端 | https 经 ALPN 协商 h2、`UnencryptedHTTP2` 明文 prior knowledge；单连接多路复用、遵守服务端 `MAX_CONCURRENT_STREAMS`、取消只重置单个 stream、GOAWAY / REFUSED_STREAM 自动重发；新 stream 交给负载最低的连接；`Expect: 100-continue` 等待 100；可选的 PING 健康检查 |
+| 服务端 | TLS + ALPN（h2）、明文 prior knowledge（h2c）、HTTP/1.1 `Upgrade: h2c`；多路复用、双向流控、HPACK（含 Huffman、动态表）、CONTINUATION、trailer、server push、1xx 中间响应、自动 100 Continue、`Response.Close` 优雅 GOAWAY、`Request.TLS`、Extended CONNECT（RFC 8441）经 `Context.Upgrade` 切换为隧道，`websocket.ServerHandler.Upgrade` 即借此提供 WebSocket over HTTP/2；响应调度支持 RFC 9218 紧急度权重 |
+| 客户端 | https 经 ALPN 协商 h2、`UnencryptedHTTP2` 明文 prior knowledge；单连接多路复用、遵守服务端 `MAX_CONCURRENT_STREAMS`、取消只重置单个 stream、GOAWAY / REFUSED_STREAM 自动重发；新 stream 交给负载最低的连接；`Expect: 100-continue` 等待 100；可选的 PING 健康检查与 SETTINGS 确认超时 |
 | 一致性 | h2spec：145 项全部通过，h2c 与 TLS 两种方式 |
 | 互通验证 | Go `net/http` 客户端与服务端（TLS 与 h2c）、curl（nghttp2）的 h2 / h2c / Upgrade |
 
@@ -134,9 +134,15 @@ header block 之间能保留多少。
 
 ### 协议细节
 
-- **优先级**：PRIORITY 帧和 HEADERS 中的优先级字段会被校验后忽略；被连接窗口压住
-  数据的 stream 按开始等待的顺序逐个帧轮流发送，因此一个大文件下载不会饿死同一连接上
-  的其它响应；没有权重，前面没有其它 stream 等待时仍然立即发送。
+- **优先级**：PRIORITY 帧和 HEADERS 中的优先级字段会被校验后忽略，RFC 7540 的优先级树
+  也没有实现（RFC 9113 已废弃它）。改为支持请求的 RFC 9218 `priority` 头：它的紧急度
+  （`u`，0 到 7，默认 3）决定该 stream 轮到连接窗口时一次可以发多少帧——紧急度 0 为 8 帧，
+  1 为 4 帧，2 为 2 帧，默认紧急度 3 及更不紧急的都是每轮 1 帧，也就是每个 stream 原本就
+  有的轮询，因此不发 priority、或只写了默认紧急度的客户端行为完全不变。增量提示（`i`）
+  被忽略，因为响应 body 是整体缓存后才发送的；PRIORITY_UPDATE 也没有实现。轮转顺序仍是
+  各 stream 开始等待的先后，也不会饿死任何 stream：每个等待的 stream 都能轮到，被连接窗口
+  在一轮中途截断的会保留位置和这一轮剩余的帧数，等窗口补充后继续；被自己的窗口挡住的则
+  让出这一轮。前面没有其它 stream 等待时仍然立即发送。
 - **对端的 `SETTINGS_MAX_HEADER_LIST_SIZE`**：双向都会遵守对端声明的上限。响应头或
   trailer 超限时重置该 stream 而不是照发，中间响应或 push 请求的头部超限则不发；客户端
   对头部超限的请求在开 stream 之前就直接失败，流式 body 的 trailer 超限时重置该 stream。
@@ -153,8 +159,10 @@ header block 之间能保留多少。
   后，连接超过一个间隔没有发送任何数据时服务端会发 PING，`Config.PingTimeout` 内没有
   任何回应则关闭连接；默认不发 PING。客户端的 PING 健康检查见[客户端](#客户端)。
 - **SETTINGS 确认超时**：客户端未在 `Config.SettingsTimeout`（默认 10 秒）内确认服务端的
-  SETTINGS 时，服务端以 GOAWAY(SETTINGS_TIMEOUT) 结束连接。客户端不会以同样方式给
-  服务端计时。
+  SETTINGS 时，服务端以 GOAWAY(SETTINGS_TIMEOUT) 结束连接。客户端也以
+  `ClientConfig.SettingsTimeout` 给服务端计时：到期仍未确认客户端 SETTINGS 时，客户端
+  关闭该连接，其上的请求以 `ErrSettingsTimeout` 失败，或按下面的重发规则在另一条连接上
+  重发。
 
 ### 客户端
 
@@ -168,6 +176,11 @@ header block 之间能保留多少。
   数据就发一个 PING；之后 `PingTimeout`（默认 15 秒）内什么都没收到（ACK 或其他帧都算）
   就认为连接已死并关闭。上面的请求以 `ErrPingTimeout` 失败，或按下面的规则在另一条连接上
   重发。参数名和默认值与 x/net/http2 相同；`ReadIdleTimeout` 为零（默认）时不检查。
+- **SETTINGS 超时**：`ClientConfig.SettingsTimeout`（默认 10 秒；小于零不限制）到期而
+  服务端仍未确认客户端 SETTINGS 时，连接被当作卡死并关闭，其上的请求以
+  `ErrSettingsTimeout` 失败，或按下面的重发规则在另一条连接上重发。这能发现已经不再处理
+  读入数据的服务端，而 PING 健康检查发现不了：后者只看安静下来的连接，这种服务端的
+  socket 可能仍在接收写入。
 - **重发**：已收到部分响应后连接断开的请求以连接的错误失败，不论方法都不重发。这是有意的，
   与 `net/http`、x/net/http2 一致：服务端已经开始回应，说明已经处理了请求，重发 POST 会
   执行两次；即使方法幂等，流式响应的回调可能已经把部分 body 交出去了，第二个响应无法接上，
@@ -186,7 +199,7 @@ header block 之间能保留多少。
 | 功能 | 原因 |
 | --- | --- |
 | 客户端接收 server push | Chrome、Firefox 已移除 push，Go 的 `net/http` 客户端也从未支持。客户端在 SETTINGS 中声明 `ENABLE_PUSH=0`，服务端 push 能力保留给仍然需要它的客户端。预加载推荐用 103 Early Hints（`Context.WriteInterim`）。 |
-| RFC 9218 可扩展优先级（`priority` 头、PRIORITY_UPDATE） | 在当前“body 整体缓存”的模型下，调度收益有限；RFC 7540 的优先级树已被 RFC 9113 废弃，同样不实现。 |
+| RFC 9218 的增量提示与 PRIORITY_UPDATE | `priority` 头的紧急度已用于发送调度（见[协议细节](#协议细节)）；响应 body 整体缓存时 `i` 没有可重排的内容，PRIORITY_UPDATE 帧不实现。RFC 7540 的优先级树已被 RFC 9113 废弃，同样不实现。 |
 | 客户端发起 `Upgrade: h2c` | RFC 9113 已废弃这种升级方式；需要明文 HTTP/2 的场景使用 prior knowledge（`UnencryptedHTTP2`）。服务端仍然接受升级，以兼容 curl 等客户端。 |
 | TLS 连接上的 `Upgrade: h2c` | RFC 规定 TLS 上只能通过 ALPN 切换协议。 |
 | HTTP/1.0 请求的 1xx 中间响应 | HTTP/1.0 客户端不认识 1xx，`WriteInterim` 返回 `http.ErrNotSupported`。 |
@@ -294,8 +307,6 @@ CI 的 `Fuzz the parsers` job 每个目标跑 20 秒。还缺的是压测（例�
   以及 TLS 上的响应仍要先拷进帧，再拷进连接或 record，要再减少需要协议层支持分散写
   （vectored send），当前没有。
 
-### 5. 调度（低）
+### 5. 请求 trailer（低）
 
-- 发送侧按权重调度待发送的 stream（轮询已实现）。
-- 客户端：SETTINGS 确认超时检测。（PING 健康检查、按负载选择连接、等待 100-continue
-  已完成，见[客户端](#客户端)。）
+- 支持发送请求 trailer。
