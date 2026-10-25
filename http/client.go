@@ -1635,8 +1635,16 @@ func (cc *clientConn) send(r *clientRequest) {
 	}
 	// A failed send closes the connection, and OnClose then settles r. The
 	// response may arrive while Send is still copying what the socket did
-	// not take, so data is held across it.
-	held := r.holdData()
+	// not take, so data is held across it, as sendHeld holds it: a framing
+	// that went back between the look and the hold is one the response has
+	// answered, and there is nothing left to send.
+	held := false
+	if r.dataRefs.Load() > 0 {
+		if !r.holdData() {
+			return
+		}
+		held = true
+	}
 	sent := cc.conn.Send(head) == nil
 	if held {
 		r.releaseData()
