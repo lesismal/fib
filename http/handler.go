@@ -935,6 +935,62 @@ func (h *ServerHandler) OnData(c *fib.Connection, data []byte) {
 	h.drive(c, parser, data)
 }
 
+// EarlyDataEnabled reports Config.EarlyData, which turns early data on for the
+// TLS handler this server is wrapped in; see tls.EarlyDataOptIn.
+func (h *ServerHandler) EarlyDataEnabled() bool { return h.config.EarlyData }
+
+// OnEarlyData serves what a client sent with its first flight, before its TLS
+// handshake was over: 0-RTT data (RFC 8446 section 2.3), whose requests carry
+// Early-Data (RFC 8470) and are held to the safe methods unless
+// Config.EarlyDataUnsafe says otherwise. It is how Config.EarlyData reaches
+// the TLS layer, which accepts a ticket's early data once and bounds how much
+// of it there is, as it does for HTTP/3's QUIC connections.
+func (h *ServerHandler) OnEarlyData(c *fib.Connection, data []byte) {
+	if state, ok := c.Attachment().(*h2ServerConn); ok {
+		// The h2 connection is built out of the preface in this data, and
+		// the streams it opens here are 0-RTT ones.
+		state.early = true
+		state.feed(data)
+		state.early = false
+		return
+	}
+	parser, ok := c.Attachment().(*Parser)
+	if !ok {
+		parser = h.attachParser(c)
+	}
+	parser.mu.Lock()
+	parser.earlyPending += int64(len(data))
+	parser.mu.Unlock()
+	h.drive(c, parser, data)
+}
+
+// refuseEarly answers a request that arrived as early data and may not be
+// served from it: 425 Too Early tells the client to send it again once its
+// handshake is over (RFC 8470 section 5.2). The connection ends with the
+// response, as an HTTP/1 connection that has answered 425 is not left to
+// carry the client's later requests: the client dials afresh, and this time
+// the request is 1-RTT.
+func (h *ServerHandler) refuseEarly(c *fib.Connection, parser *Parser, request *stdhttp.Request) {
+	parser.spent = true
+	context := &Context{Conn: c, Request: request, ends: endClosing}
+	_ = context.WriteResponse(Response{
+		StatusCode: stdhttp.StatusTooEarly,
+		Header:     stdhttp.Header{"Content-Type": {"text/plain; charset=utf-8"}},
+		Body:       []byte(stdhttp.StatusText(stdhttp.StatusTooEarly) + "\n"),
+		Close:      true,
+	})
+}
+
+// safeMethod says whether a request with method can be served from early
+// data, which may be replayed: the methods that change nothing.
+func safeMethod(method string) bool {
+	switch method {
+	case stdhttp.MethodGet, stdhttp.MethodHead, stdhttp.MethodOptions, stdhttp.MethodTrace:
+		return true
+	}
+	return false
+}
+
 // drive turns whatever the connection has into requests and serves them,
 // handlers and all: nothing a handler does here waits on the peer, so the
 // connection's worker carries a request from its first byte to its response
@@ -1010,6 +1066,9 @@ func (h *ServerHandler) drive(c *fib.Connection, parser *Parser, data []byte) {
 		}
 		var request *stdhttp.Request
 		var complete bool
+		// Whether the request begins in early data is known before parsing
+		// it, which consumes the bytes that tell it; see OnEarlyData.
+		fromEarly := parser.earlyPending > 0
 		request, complete, err = parser.feedBorrowed(data)
 		if err != nil || !complete {
 			break
@@ -1019,6 +1078,15 @@ func (h *ServerHandler) drive(c *fib.Connection, parser *Parser, data []byte) {
 		if status := checkRequest(request); status != 0 {
 			err = requestError(status)
 			break
+		}
+		if fromEarly {
+			// Sent before the handshake was over, and possibly a replay
+			// (RFC 8470): only what changes nothing is served from it.
+			request.Header.Set("Early-Data", "1")
+			if !h.config.EarlyDataUnsafe && !safeMethod(request.Method) {
+				h.refuseEarly(c, parser, request)
+				return
+			}
 		}
 		if settings, ok := h.h2cUpgrade(c, request); ok && parser.stream == nil {
 			h.upgradeH2C(c, parser, request, settings)
@@ -1351,9 +1419,13 @@ func (h *ServerHandler) startH2(c *fib.Connection, parser *Parser, state *stdtls
 	c.SetAttachment(sc)
 	sc.start()
 	// feed copies what it is given into the connection's own buffer, so the
-	// parser's goes back to the pool rather than to the collector.
+	// parser's goes back to the pool rather than to the collector. The streams
+	// the preface and the frames behind it open are 0-RTT ones when those
+	// bytes arrived as early data.
 	buffered := parser.TakeBuffered()
+	sc.early = parser.earlyPending > 0
 	sc.feed(buffered)
+	sc.early = false
 	bufferpool.Put(buffered)
 }
 

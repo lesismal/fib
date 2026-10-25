@@ -87,6 +87,24 @@ type Config struct {
 	// counts it.
 	MaxHeaderBytes int
 	MaxBodyBytes   int64
+	// EarlyData lets clients that resume a TLS session send requests in
+	// their first flight, 0-RTT data (RFC 8446 section 2.3), which saves
+	// them a round trip. Such data is not protected against replay: an
+	// attacker who recorded it can send it again. A request that arrives in
+	// it carries "Early-Data: 1" (RFC 8470), and only a safe method (GET,
+	// HEAD, OPTIONS, TRACE) is served; anything else is answered 425 Too
+	// Early, and an HTTP/1 connection is closed so that the client sends the
+	// request again once its handshake is over; HTTP/2 answers that stream
+	// alone and its connection carries on, as HTTP/3 does. Off by default. It turns early data on for the
+	// TLS handler this server is wrapped in, so setting it here is enough;
+	// see tls.Handler.EarlyData. The TLS layer accepts a ticket's early data
+	// once, and bounds it to MaxEarlyData and to the ticket's age, as it
+	// does for HTTP/3's QUIC connections.
+	EarlyData bool
+	// EarlyDataUnsafe serves every method in early data, which then is up to
+	// the handler to guard against replays, by the Early-Data header. It has
+	// no effect without EarlyData.
+	EarlyDataUnsafe bool
 	// StreamRequestBody hands a request to its handler as soon as its body
 	// has begun, on HTTP/1 and HTTP/2 alike: once its header has arrived,
 	// for a body with a Content-Length, and once some of it has, for a
@@ -727,6 +745,11 @@ func (p *Parser) discard() {
 }
 
 func (p *Parser) consume(n int) {
+	if n := int64(n); n > 0 && p.earlyPending > 0 {
+		// What is consumed from the front comes off the early data first: it
+		// arrived first; see serverState.earlyPending.
+		p.earlyPending -= min(n, p.earlyPending)
+	}
 	if n == len(p.buffer) {
 		// Nothing is left, so the array goes back to the pool rather than
 		// staying with a connection that may say nothing more for a while.

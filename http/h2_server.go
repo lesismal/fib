@@ -107,6 +107,11 @@ type h2ServerConn struct {
 	glitches h2Budget
 	// maxClientID is the highest stream the client has opened.
 	maxClientID uint32
+	// early says the frames the reader is handling arrived as TLS early
+	// data, 0-RTT: a stream opened then is one, and only a safe method is
+	// served from it; see Config.EarlyData. It is set for the duration of
+	// one feed, and only the reader touches it.
+	early bool
 	// recvWindow is what the client may still send before the next
 	// WINDOW_UPDATE, and recvUnacked what it sent since the last one.
 	recvWindow  int64
@@ -221,6 +226,11 @@ type h2ServerStream struct {
 	sc  *h2ServerConn
 	id  uint32
 	req *stdhttp.Request
+	// early marks a request whose header arrived as TLS early data, 0-RTT,
+	// so that it carries Early-Data (RFC 8470) and only a safe method is
+	// served; see Config.EarlyData. It never changes after the stream is
+	// created.
+	early bool
 	// pushed marks a stream this side promised, which carries a response
 	// only; the request it answers came in PUSH_PROMISE.
 	pushed bool
@@ -1058,6 +1068,18 @@ func (sc *h2ServerConn) handleHeaderBlock(id uint32, block []byte, endStream boo
 		return &H2StreamError{StreamID: id, Code: H2ProtocolError}
 	}
 	st.req = req
+	if st.early {
+		// Sent before the handshake was over, and possibly a replay
+		// (RFC 8470): only what changes nothing is served from it. The
+		// stream is answered 425 rather than reset, so the client hears why
+		// and sends the request again once the handshake is over; its
+		// connection, and the other streams on it, carry on.
+		req.Header.Set("Early-Data", "1")
+		if !sc.handler.config.EarlyDataUnsafe && !safeMethod(req.Method) {
+			sc.reject(st, stdhttp.StatusTooEarly)
+			return nil
+		}
+	}
 	if _, ok := req.Header[":protocol"]; (ok || req.Method == stdhttp.MethodConnect) && !endStream {
 		// A CONNECT, extended or to a host and port: its handler runs now,
 		// and may switch the stream to a tunnel. What arrives meanwhile
@@ -2020,6 +2042,7 @@ func (sc *h2ServerConn) newStream(id uint32) *h2ServerStream {
 		st = new(h2ServerStream)
 	}
 	st.sc, st.id, st.declared = sc, id, -1
+	st.early = sc.early
 	st.recvWindow, st.sendWindow = sc.local.streamWindow, sc.peerWindow
 	st.refs.Store(1)
 	return st
@@ -2068,6 +2091,7 @@ func (st *h2ServerStream) recycle() {
 	st.block.Recycle()
 	st.values = [h2RequestValues]string{}
 	st.sc, st.id, st.req, st.pushed = nil, 0, nil, false
+	st.early = false
 	st.body, st.declared, st.recvWindow, st.recvUnacked = nil, 0, 0, 0
 	st.feed, st.creditSkip = nil, 0
 	st.remoteDone, st.responded, st.trailer, st.localDone, st.reset, st.queued = false, false, nil, false, false, false

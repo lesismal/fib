@@ -172,6 +172,26 @@ type ClientConfig struct {
 	// goroutine while they wait, where the TLSConfig allows it (see package
 	// tls); this is the switch back, and what to compare the two with.
 	BlockingTLSHandshake bool
+	// EarlyData sends a request that is safe to repeat, one with a GET, HEAD,
+	// OPTIONS or TRACE method and no body, as 0-RTT data when the client has
+	// a session to resume from the server it connects to: it leaves with the
+	// first flight, a round trip before the handshake is over (RFC 8446
+	// section 2.3). 0-RTT data is not protected against replay, and a server
+	// may answer it 425 Too Early (RFC 8470), in which case the request is
+	// sent again once the handshake is over. The session comes from
+	// SessionCache, and only a connection that cannot become HTTP/2 sends
+	// early data: one offering "h2" in TLSConfig.NextProtos waits for the
+	// handshake, since the protocol, and with it the framing of what would go
+	// early, is not known before then. Set DisableHTTP2, or a NextProtos
+	// without "h2", for HTTP/1.1 0-RTT. It does nothing with
+	// BlockingTLSHandshake, whose crypto/tls sessions are the TLSConfig's.
+	EarlyData bool
+	// SessionCache holds the TLS sessions connections resume from, and the
+	// tickets of those that end up in it. With EarlyData and none given, the
+	// client keeps a cache of its own. It is used by this module's TLS
+	// handshake; with BlockingTLSHandshake, or a TLSConfig that sets
+	// ClientSessionCache, the sessions are the TLSConfig's.
+	SessionCache fibtls.QUICSessionCache
 	// DisableHTTP2 keeps https:// requests on HTTP/1.1. Otherwise they speak
 	// HTTP/2 to any server that chooses it through ALPN.
 	DisableHTTP2 bool
@@ -226,9 +246,12 @@ type Client struct {
 	config ClientConfig
 	// tlsConfig is config.TLSConfig with the client's ALPN offer.
 	tlsConfig *tls.Config
-	mu        sync.Mutex
-	hosts     map[hostTarget]*hostPool
-	closed    bool
+	// sessions holds the TLS sessions 0-RTT resumes from; see
+	// ClientConfig.SessionCache.
+	sessions fibtls.QUICSessionCache
+	mu       sync.Mutex
+	hosts    map[hostTarget]*hostPool
+	closed   bool
 }
 
 // NewClient returns a client that dials through engine. Zero limits in config
@@ -256,7 +279,12 @@ func NewClient(engine *fib.Engine, config ClientConfig) *Client {
 		}
 		tlsConfig.NextProtos = []string{"h2", "http/1.1"}
 	}
-	return &Client{engine: engine, config: config, tlsConfig: tlsConfig, hosts: make(map[hostTarget]*hostPool)}
+	sessions := config.SessionCache
+	if sessions == nil && config.EarlyData {
+		sessions = fibtls.NewQUICSessionCache(64)
+	}
+	return &Client{engine: engine, config: config, tlsConfig: tlsConfig, sessions: sessions,
+		hosts: make(map[hostTarget]*hostPool)}
 }
 
 // Do sends req and calls callback exactly once with its response or the
@@ -868,7 +896,8 @@ func (c *Client) dial(h *hostPool) {
 			}
 		}
 		err = fibtls.DialWithOptions(c.engine, "tcp", h.target.addr, c.config.DialTimeout, c.tlsConfig,
-			fibtls.DialOptions{Blocking: c.config.BlockingTLSHandshake, Dial: c.config.Dial}, cc, done)
+			fibtls.DialOptions{Blocking: c.config.BlockingTLSHandshake, Dial: c.config.Dial,
+				SessionCache: c.sessions, EarlyData: c.config.EarlyData}, cc, done)
 	} else {
 		if c.config.UnencryptedHTTP2 {
 			done = func(_ *fib.Connection, err error) {
@@ -920,6 +949,11 @@ func (c *Client) dialed(cc *clientConn, err error) {
 	}
 	if err == nil {
 		c.mu.Unlock()
+		if cc.inFlight() {
+			// Its first request went as early data and is still being
+			// answered; the response's release hands the connection on.
+			return
+		}
 		c.release(cc)
 		return
 	}
@@ -1140,6 +1174,11 @@ type clientRequest struct {
 	// retried records that the request has already been sent again once, after
 	// a reused connection turned out to be closed.
 	retried bool
+	// early records that the request was handed to a connection whose TLS
+	// handshake was still going on, so that it may have gone as 0-RTT data
+	// and a 425 answers a replayable request that is worth sending again;
+	// see ClientConfig.EarlyData.
+	early bool
 	// streamID is the HTTP/2 stream carrying the request, guarded by that
 	// connection's lock.
 	streamID uint32
@@ -1370,6 +1409,23 @@ func (r *clientRequest) retryable() bool {
 	return false
 }
 
+// canSendEarly reports whether the request may be sent as 0-RTT data, which
+// may be replayed (RFC 8446 section 2.3): a method that changes nothing, no
+// body, and not a protocol switch.
+func (r *clientRequest) canSendEarly() bool {
+	if r.tunnel != nil {
+		return false
+	}
+	if r.req.Body != nil && r.req.Body != stdhttp.NoBody || r.req.ContentLength > 0 {
+		return false
+	}
+	switch r.req.Method {
+	case "", stdhttp.MethodGet, stdhttp.MethodHead, stdhttp.MethodOptions, stdhttp.MethodTrace:
+		return true
+	}
+	return false
+}
+
 // clientConn is one connection the client dialed. It is the connection's
 // handler, so everything the engine reports about it arrives here.
 type clientConn struct {
@@ -1448,6 +1504,7 @@ func (cc *clientConn) send(r *clientRequest) {
 	}
 	cc.current = r
 	cc.gate = gate
+	r.early = fibtls.Handshaking(cc.conn)
 	cc.reused = cc.sent
 	cc.sent = true
 	cc.received = false
@@ -1456,10 +1513,17 @@ func (cc *clientConn) send(r *clientRequest) {
 	cc.stream = nil
 	cc.mu.Unlock()
 	if !r.attach(cc) {
-		// Settled while it waited: give the connection to the next request.
+		// Settled while it waited: give the connection to the next request,
+		// unless its handshake is still going on, in which case nothing may
+		// go out early but a request that is safe to repeat: the connection
+		// is dropped, and the request that was to carry it dials another.
 		cc.mu.Lock()
 		cc.current = nil
 		cc.mu.Unlock()
+		if fibtls.Handshaking(cc.conn) {
+			cc.discard()
+			return
+		}
 		cc.client.release(cc)
 		return
 	}
@@ -1587,7 +1651,47 @@ func (cc *clientConn) discard() {
 	cc.conn.Close()
 }
 
-func (cc *clientConn) OnOpen(conn *fib.Connection) { cc.conn = conn }
+func (cc *clientConn) OnOpen(conn *fib.Connection) {
+	cc.conn = conn
+	c := cc.client
+	// A connection that cannot become HTTP/2 may go to work before its
+	// handshake is over: what it sends then is 0-RTT data when the session
+	// it resumes allows it; see ClientConfig.EarlyData.
+	if c.config.EarlyData && fibtls.Handshaking(conn) && !c.mayMultiplex(cc.host.target) {
+		c.sendEarly(cc)
+	}
+}
+
+// sendEarly gives a connection whose TLS handshake is still going on the
+// request that has waited longest, when that request may be sent as 0-RTT
+// data. Its callback hears the outcome as any request's does; a server that
+// turns the early data away has it sent again once the handshake is over,
+// and one that answers 425 has it sent again too.
+func (c *Client) sendEarly(cc *clientConn) {
+	h := cc.host
+	c.mu.Lock()
+	if len(h.waiting) == 0 {
+		c.mu.Unlock()
+		return
+	}
+	r := h.waiting[0]
+	if r.done.Load() || !r.canSendEarly() {
+		c.mu.Unlock()
+		return
+	}
+	h.popLocked()
+	c.mu.Unlock()
+	cc.send(r)
+}
+
+// inFlight reports whether a request is being sent or answered on cc, which
+// a connection whose first request went as early data already has when its
+// handshake completes.
+func (cc *clientConn) inFlight() bool {
+	cc.mu.Lock()
+	defer cc.mu.Unlock()
+	return cc.current != nil || cc.uploading != nil
+}
 
 func (cc *clientConn) OnPriorityData(*fib.Connection, []byte) {}
 
@@ -1649,6 +1753,21 @@ func (cc *clientConn) OnData(conn *fib.Connection, data []byte) {
 	cc.parser.continued = false
 	if resp == nil {
 		cc.endDeferred()
+		return
+	}
+	if resp.StatusCode == stdhttp.StatusTooEarly && r.early && r.retryable() {
+		// The server will not answer what it took as early data, which may
+		// be a replay (RFC 8470 section 5.2): a request that is safe to
+		// repeat is sent again, and the connection, which the server has
+		// done with, is dropped.
+		r.retried = true
+		cc.mu.Lock()
+		cc.current = nil
+		cc.mu.Unlock()
+		r.detach()
+		cc.discard()
+		cc.endDeferred()
+		cc.client.enqueue(cc.host.target, r, true)
 		return
 	}
 	if r.tunnel != nil && resp.StatusCode == stdhttp.StatusSwitchingProtocols {

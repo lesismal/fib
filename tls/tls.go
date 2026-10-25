@@ -119,7 +119,10 @@ type Handler struct {
 	// server answers before the handshake is over. Early data is not forward
 	// secret and can be replayed: a ticket carries it once, but a server that
 	// did not issue the ticket cannot know, and the handler must serve only
-	// what is safe to repeat. Off by default.
+	// what is safe to repeat. Off by default. An EarlyDataHandler that
+	// implements EarlyDataOptIn turns it on for itself, as the HTTP server
+	// handler does with http.Config.EarlyData, so that a server configured
+	// at the protocol layer needs no second switch here.
 	EarlyData bool
 	// MaxEarlyData is the most early data a client may send on a ticket. Zero
 	// means 16 KiB.
@@ -226,6 +229,17 @@ func (h *Handler) inner() fib.Handler {
 		return fib.HandlerFuncs{}
 	}
 	return h.Handler
+}
+
+// takesEarlyData reports whether a server handshake should take early data:
+// Handler.EarlyData says so, and so does the wrapped handler when it is an
+// EarlyDataOptIn that wants it; see EarlyDataOptIn.
+func (h *Handler) takesEarlyData() bool {
+	if h.EarlyData {
+		return true
+	}
+	opt, ok := h.inner().(EarlyDataOptIn)
+	return ok && opt.EarlyDataEnabled()
 }
 
 // config is the Config handshakes run with, and the registry of the
@@ -343,7 +357,7 @@ func (h *Handler) openNative(c *fib.Connection, t *layer) {
 	} else {
 		shs := newServerHS(h.Config, c, h.ticketKeys())
 		shs.pick.async = t.async(h.inner())
-		if _, ok := h.inner().(EarlyDataHandler); ok && h.EarlyData {
+		if _, ok := h.inner().(EarlyDataHandler); ok && h.takesEarlyData() {
 			shs.tcpEarly, shs.maxEarly = true, cmpOr(h.MaxEarlyData, 16<<10)
 		}
 		hs = shs
@@ -450,6 +464,16 @@ func (h *Handler) OnClose(c *fib.Connection, err error) {
 // as soon as the server's side of the handshake is.
 type EarlyDataHandler interface {
 	OnEarlyData(*fib.Connection, []byte)
+}
+
+// EarlyDataOptIn is an EarlyDataHandler that turns early data on for itself,
+// where Handler.EarlyData left it off: a protocol layer with its own switch
+// for it, such as the HTTP server's Config.EarlyData, does not then need the
+// server to set both. Early data is taken when either says so; a handler that
+// implements both must serve only what is safe to repeat, as with
+// Handler.EarlyData.
+type EarlyDataOptIn interface {
+	EarlyDataEnabled() bool
 }
 
 // earlyServer is what a server handshake that takes early data gives the

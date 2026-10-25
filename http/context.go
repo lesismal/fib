@@ -35,6 +35,15 @@ type serverState struct {
 	// without a byte from its client, in Unix nanoseconds, or zero; see
 	// ServerHandler.OnShutdown. Guarded by the parser's mu.
 	quietSince int64
+	// earlyPending is how many bytes of the parser's input, from the front of
+	// what it has not parsed, arrived as TLS early data, 0-RTT (RFC 8446
+	// section 2.3): a request that begins while it is positive is one, and
+	// carries Early-Data, with only a safe method served; see
+	// Config.EarlyData. Early data is a prefix of the connection's
+	// application data, so a count tells a request pipelined behind a
+	// retained one apart from what arrives once the handshake is over.
+	// Guarded by the parser's mu.
+	earlyPending int64
 }
 
 func (p *Parser) resetServerState() {
@@ -42,6 +51,7 @@ func (p *Parser) resetServerState() {
 	p.writeDeadline = time.Time{}
 	p.bodyDeadline, p.bodyArmed = nil, false
 	p.quietSince = 0
+	p.earlyPending = 0
 }
 
 // bodyDeadline is a deadline a handler set with SetReadDeadline for the rest
