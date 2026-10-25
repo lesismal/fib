@@ -400,6 +400,29 @@ func TestClientCodecAllocs(t *testing.T) {
 	}
 }
 
+// A request framed by fastRequest takes its buffer from the pool and gives it
+// back, so a request that goes that way allocates nothing of its own once the
+// pool has a buffer of its size: the request-side counterpart of the
+// response head's test above.
+func TestMarshalRequestAllocations(t *testing.T) {
+	req, _ := requestCases[0].request()
+	data, pooled, err := marshalRequest(req, nil)
+	if err != nil || !pooled {
+		t.Fatalf("the request is not fastRequest's: %v", err)
+	}
+	bufferpool.Put(data)
+	allocs := testing.AllocsPerRun(100, func() {
+		out, pooled, err := marshalRequest(req, nil)
+		if err != nil || !pooled {
+			t.Fatalf("marshalRequest: %v, pooled %v", err, pooled)
+		}
+		bufferpool.Put(out)
+	})
+	if allocs > 1 {
+		t.Fatalf("%.1f allocations a request, want the pool's buffer", allocs)
+	}
+}
+
 func BenchmarkMarshalRequest(b *testing.B) {
 	req, _ := requestCases[0].request()
 	b.Run("fib", func(b *testing.B) {
