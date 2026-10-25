@@ -644,7 +644,7 @@ func TestHTTP1ConformanceServerRejectsBadRequests(t *testing.T) {
 	}{
 		{"missing host", "GET / HTTP/1.1\r\n\r\n", 400},
 		{"two hosts", "GET / HTTP/1.1\r\nHost: a\r\nHost: b\r\n\r\n", 400},
-		{"unknown transfer coding", "POST / HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: gzip, chunked\r\n\r\n", 501},
+		{"unknown transfer coding", "POST / HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: br, chunked\r\n\r\n", 501},
 		{"bad chunk size", "POST / HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\nzz\r\n", 400},
 		{"bad content length", "POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 1, 2\r\n\r\n", 400},
 		{"bad request line", "GET\r\n\r\n", 400},
@@ -1191,7 +1191,7 @@ func TestHTTP1ConformanceClientMalformedResponses(t *testing.T) {
 		want           error
 	}{
 		{"short body", "HTTP/1.1 200 OK\r\nContent-Length: 10\r\n\r\nshort", io.ErrUnexpectedEOF},
-		{"unknown transfer coding", "HTTP/1.1 200 OK\r\nTransfer-Encoding: gzip\r\n\r\nxx", ErrMalformedResponse},
+		{"unknown transfer coding", "HTTP/1.1 200 OK\r\nTransfer-Encoding: br, chunked\r\n\r\n0\r\n\r\n", ErrMalformedResponse},
 		{"bad chunk", "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\nzz\r\n", ErrMalformedResponse},
 		{"bad status line", "HTTP/1.1 abc\r\n\r\n", ErrMalformedResponse},
 		{"truncated chunks", "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nab", io.ErrUnexpectedEOF},

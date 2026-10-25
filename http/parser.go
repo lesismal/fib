@@ -386,6 +386,9 @@ type frameInfo struct {
 	end       int
 	headerEnd int
 	chunked   bool
+	// coding is the transfer coding the chunked body was sent in besides
+	// chunked, if any, which the body is decoded from.
+	coding transferCoding
 	// stream marks a body too big to wait for: the request is complete at
 	// headerEnd and the body that follows is delivered as it arrives.
 	stream bool
@@ -495,6 +498,9 @@ func (p *Parser) feedOne() (*stdhttp.Request, bool, error) {
 		}
 		wantContinue := !frame.continued && req.ProtoAtLeast(1, 1) && strings.EqualFold(req.Header.Get("Expect"), "100-continue")
 		p.stream = newBodyStream(p.conn, req, p.config, decoder, wantContinue)
+		if frame.coding != "" {
+			p.stream.coding = newCodingDecoder(frame.coding)
+		}
 		p.live.Store(p.stream)
 		req.Body = p.stream
 		p.block = frame.block
@@ -534,6 +540,18 @@ func (p *Parser) feedOne() (*stdhttp.Request, bool, error) {
 		}
 		body.fill(p.buffer[frame.headerEnd:frame.end])
 		req.Body = body
+	}
+	if frame.coding != "" {
+		// What the chunks carried is the coded body; MaxBodyBytes bounds
+		// what it decodes to as well.
+		body := req.Body.(*wholeBody)
+		decoded, err := decodeWhole(frame.coding, body.data, p.config.MaxBodyBytes, ErrBodyTooLarge, ErrMalformed)
+		body.release()
+		if err != nil {
+			p.discard()
+			return nil, false, err
+		}
+		*body = wholeBody{data: decoded, pooled: true}
 	}
 	p.consume(frame.end)
 	p.requestEnded()
@@ -725,12 +743,28 @@ func (p *Parser) frameLength() (frameInfo, bool, error) {
 		return frameInfo{}, false, ErrHeaderTooLarge
 	}
 	req, block, err := parseRequestHead(p.buffer[:headerEnd], p.config.reuse())
-	if err != nil {
-		if strings.Contains(err.Error(), "unsupported transfer encoding") {
-			// net/http refuses transfer codings other than chunked, without
-			// an error type to tell that from a malformed request.
-			return frameInfo{}, false, ErrUnsupportedTransferEncoding
+	var coding transferCoding
+	if err != nil && transferEncodingError(err) {
+		// net/http takes chunked alone; a coding besides it is taken out
+		// of the head here, and decoded as the body is (see
+		// splitTransferCodings).
+		var rewritten []byte
+		var list []string
+		rewritten, coding, list, err = splitTransferCodings(p.buffer[:headerEnd], true)
+		switch {
+		case err != nil && errors.Is(err, ErrUnsupportedTransferEncoding):
+			return frameInfo{}, false, err
+		case err != nil:
+		case rewritten == nil:
+			err = ErrUnsupportedTransferEncoding
+		default:
+			req, block, err = parseRequestHead(rewritten, p.config.reuse())
+			if err == nil {
+				req.TransferEncoding = list
+			}
 		}
+	}
+	if err != nil {
 		return frameInfo{}, false, fmt.Errorf("%w: %v", ErrMalformed, err)
 	}
 	if block == nil {
@@ -757,7 +791,7 @@ func (p *Parser) frameLength() (frameInfo, bool, error) {
 		return frameInfo{}, false, fmt.Errorf("%w: Transfer-Encoding in an HTTP/1.0 request", ErrMalformed)
 	}
 	if len(req.TransferEncoding) != 0 {
-		if len(req.TransferEncoding) != 1 || !strings.EqualFold(req.TransferEncoding[0], "chunked") {
+		if coding == "" && (len(req.TransferEncoding) != 1 || !strings.EqualFold(req.TransferEncoding[0], "chunked")) {
 			return frameInfo{}, false, ErrUnsupportedTransferEncoding
 		}
 		if hasHeaderField(p.buffer[:headerEnd], "content-length") {
@@ -771,19 +805,19 @@ func (p *Parser) frameLength() (frameInfo, bool, error) {
 			// More has been sent than this server is willing to hold, and a
 			// chunked body never says how much more is coming. Hand the
 			// request over and decode the rest as it arrives.
-			return frameInfo{end: headerEnd, headerEnd: headerEnd, chunked: true, stream: true, request: req, block: block}, true, nil
+			return frameInfo{end: headerEnd, headerEnd: headerEnd, chunked: true, coding: coding, stream: true, request: req, block: block}, true, nil
 		}
 		end, complete, err := chunkedEnd(p.buffer, headerEnd, p.config.MaxHeaderBytes, p.config.MaxBodyBytes)
 		if err == nil && !complete {
 			p.expectContinue(req)
 		}
 		if err != nil || !complete {
-			return frameInfo{end: end, headerEnd: headerEnd, chunked: true, request: req, block: block}, complete, err
+			return frameInfo{end: end, headerEnd: headerEnd, chunked: true, coding: coding, request: req, block: block}, complete, err
 		}
 		if int64(end-headerEnd) > p.config.MaxBodyBytes+int64(p.config.MaxHeaderBytes) {
 			return frameInfo{}, false, ErrBodyTooLarge
 		}
-		return frameInfo{end: end, headerEnd: headerEnd, chunked: true, request: req, block: block}, true, nil
+		return frameInfo{end: end, headerEnd: headerEnd, chunked: true, coding: coding, request: req, block: block}, true, nil
 	}
 	if req.ContentLength < 0 {
 		return frameInfo{end: headerEnd, headerEnd: headerEnd, request: req, block: block}, true, nil

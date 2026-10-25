@@ -188,6 +188,18 @@ type BodyStream struct {
 	// handler runs too, and is handed on there.
 	offload bool
 	owner   *fib.Connection
+	// coding decodes a body sent in a transfer coding besides chunked
+	// (see splitTransferCodings): buf holds the coded body, which is decoded
+	// only as it is read or handed to the sink, so that what it inflates to
+	// never waits here, and the coded bytes pace the peer as any body's do.
+	// inflated counts what it decoded to, which limit bounds as it bounds
+	// total; codingDone says it has ended, and codingFailed that decoding
+	// failed, with err. piece is what it is decoded into for the sink.
+	coding       *codingDecoder
+	inflated     int64
+	codingDone   bool
+	codingFailed bool
+	piece        []byte
 }
 
 // setSink hands the body to fn as it arrives rather than buffering it for
@@ -298,6 +310,10 @@ func (s *BodyStream) owedLocked() bool {
 // any hold on the connection's reads go to it together: what paces the peer
 // from here is the sink itself.
 func (s *BodyStream) drain(worker bool) {
+	if s.coding != nil {
+		s.drainCoded(worker)
+		return
+	}
 	for {
 		s.mu.Lock()
 		sink := s.sink
@@ -377,6 +393,9 @@ func (s *BodyStream) Read(p []byte) (int, error) {
 		s.mu.Unlock()
 		return 0, ErrBodyAbandoned
 	}
+	if s.coding != nil {
+		return s.readCodedLocked(p)
+	}
 	if s.read < len(s.buf) {
 		n := copy(p, s.buf[s.read:])
 		s.read += n
@@ -396,6 +415,111 @@ func (s *BodyStream) Read(p []byte) (int, error) {
 		return 0, s.err
 	}
 	return 0, ErrWouldBlock
+}
+
+// readCodedLocked is Read for a coded body, which it decodes from what is
+// buffered into p. s.mu is held, and released.
+func (s *BodyStream) readCodedLocked(p []byte) (int, error) {
+	taken := 0
+	defer func() { s.credited(taken) }()
+	for !s.abandoned && !s.codingFailed {
+		pending := s.buf[s.read:]
+		final := s.ended
+		if len(pending) == 0 && (!final || s.codingDone) {
+			break
+		}
+		n, used, err := s.decodeLocked(p, pending, final)
+		taken += used
+		s.compactLocked()
+		if err != nil || n > 0 {
+			s.mu.Unlock()
+			return n, err
+		}
+		if used == 0 && !s.codingDone {
+			break
+		}
+	}
+	defer s.mu.Unlock()
+	switch {
+	case s.abandoned:
+		return 0, ErrBodyAbandoned
+	case s.codingFailed:
+		return 0, s.err
+	case s.ended:
+		s.publishTrailerLocked()
+		return 0, io.EOF
+	case s.err != nil:
+		return 0, s.err
+	}
+	return 0, ErrWouldBlock
+}
+
+// decodeLocked decodes what of pending, the coded body buffered from read,
+// fits into dst, and takes what it used off the buffer. final says the body
+// has all arrived. A body that decodes past the limit, or fails to decode,
+// fails, as a body that arrives past it or misframed does. s.mu is held.
+func (s *BodyStream) decodeLocked(dst, pending []byte, final bool) (n, used int, err error) {
+	n, used, done, err := s.coding.decode(dst, pending, final)
+	s.read += used
+	s.codingDone = final && done
+	s.inflated += int64(n)
+	switch {
+	case err != nil:
+		err = fmt.Errorf("%w: transfer coding: %v", ErrMalformed, err)
+	case s.limit >= 0 && s.inflated > s.limit:
+		err = ErrBodyTooLarge
+	default:
+		return n, used, nil
+	}
+	s.codingFailed = true
+	if s.err == nil {
+		s.err = err
+	}
+	s.releaseLocked()
+	return 0, used, err
+}
+
+// drainCoded is drain for a coded body: what is buffered is decoded a piece at
+// a time, each handed to the sink before the next is decoded, so that a hold
+// the sink takes stops the decoding too.
+func (s *BodyStream) drainCoded(worker bool) {
+	for {
+		s.mu.Lock()
+		sink := s.sink
+		if sink == nil || !s.owedLocked() {
+			s.sinkBusy = false
+			s.mu.Unlock()
+			return
+		}
+		pending := s.buf[s.read:]
+		final := s.ended && s.err == nil
+		if !s.codingFailed && !s.abandoned && (len(pending) > 0 || final && !s.codingDone) {
+			if s.piece == nil {
+				s.piece = make([]byte, codingPiece)
+			}
+			n, used, err := s.decodeLocked(s.piece, pending, final)
+			s.compactLocked()
+			s.mu.Unlock()
+			s.credited(used)
+			if err == nil && n > 0 {
+				sink(s.piece[:n], false, nil, worker)
+			}
+			continue
+		}
+		// Nothing is left to decode: the body has ended, or never will.
+		err := s.err
+		if s.abandoned && !s.ended && err == nil {
+			err = ErrBodyAbandoned
+		}
+		s.buf, s.read = nil, 0
+		s.delivered = true
+		if err == nil {
+			s.publishTrailerLocked()
+		}
+		s.releaseLocked()
+		s.mu.Unlock()
+		sink(nil, true, err, worker)
+	}
 }
 
 // Close gives up the rest of the body. The connection consumes and drops what
@@ -493,6 +617,10 @@ func (s *BodyStream) Trailer() stdhttp.Header {
 func (s *BodyStream) Consumed() int64 {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.coding != nil {
+		// What it decoded to, which is what Read and the sink have had.
+		return s.inflated
+	}
 	return s.total
 }
 
@@ -557,7 +685,7 @@ func (s *BodyStream) push(data []byte) {
 		s.credited(len(data))
 		return
 	}
-	if sink := s.sink; sink != nil && !s.sinkBusy && !s.sinkHeld && !s.offload && s.read == len(s.buf) {
+	if sink := s.sink; sink != nil && s.coding == nil && !s.sinkBusy && !s.sinkHeld && !s.offload && s.read == len(s.buf) {
 		// Nothing is waiting ahead of data, so it goes to the sink straight
 		// from the connection's buffer.
 		s.sinkBusy = true
@@ -758,7 +886,7 @@ func (s *BodyStream) limitTo(n int64) bool {
 	if s.limit < 0 || n < s.limit {
 		s.limit = n
 	}
-	return s.total > n
+	return s.total > n || s.inflated > n
 }
 
 // streamLimit is a body's limit from a configured one, where zero or less
