@@ -1693,8 +1693,9 @@ go run ./tcp/tls/client -n 10
   `ClientResponse.OnBody` 边收边写回下游（大下载内存恒定，两边中较慢的一方给另一方施加背压），WebSocket 用
   `Dialer.Dial` 的回调接上游、两端各自的 `OnMessage` 互相转发。核心在 [`fib-examples/gateway/server/proxy`](https://github.com/lesismal/fib-examples/tree/main/gateway/server/proxy)，
   `server/main_test.go` 把 3×3 协议矩阵、大上传、取消传播、超时/502/404、上游中途失败、WebSocket 关闭码转发都测了一遍。
-  取舍与限制：上游请求的 body 是整体发送的（`Client.Do` 不支持流式请求体），所以网关先把请求体收齐，
-  上限 `-max-request-body`；`Context.Upgrade` 只能在 handler 返回前调用，所以 WebSocket 先升级下游再异步拨号上游，
+  取舍与限制：网关这个例子里上游请求的 body 是先收齐再发的（上限 `-max-request-body`），
+  因为它的下游 body 要校验长度；`Client.Do` 本身支持流式请求体，把 `req.Body` 交给它、不设
+  `ContentLength` 就会边读边发（HTTP/1、HTTP/2、HTTP/3 都支持）；`Context.Upgrade` 只能在 handler 返回前调用，所以 WebSocket 先升级下游再异步拨号上游，
   上游不可达时用关闭码 1014 通知客户端，而不是 HTTP 502；HTTP/2 与 HTTP/3 下游的 `Write` 在窗口用尽时会等待客户端，
   这个等待发生在上游连接的 worker 上，上限是 64KB。
 - [`fib-examples/http/router`](https://github.com/lesismal/fib-examples/tree/main/http/router) 演示 Router：带参数与正则的路由、带自己中间件的 `Route`、`Mount`

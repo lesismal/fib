@@ -108,7 +108,8 @@
   的客户端最多领先一个窗口（1MB）。流式 body 的上限是 `MaxStreamedBodyBytes` 而不是
   `MaxBodyBytes`；`Expect: 100-continue` 要等 handler 第一次要 body 时才回复 100。
 - 交给 `WriteResponse` 或 `Respond` 的响应通过 `Response.Body []byte` 一次性给出；客户端
-  同样把响应 body 完整缓存后再回调。`Context` 的 `http.ResponseWriter` 方法可以使用（含
+  默认把响应 body 完整缓存后再回调，设置 `ClientConfig.StreamResponseBody` 后大 body 边到边
+  交给回调。`Context` 的 `http.ResponseWriter` 方法可以使用（含
   trailer），并与 HTTP/1、HTTP/2 一样流式输出：不超过 4KB（或设置了不超过 64KB 的
   `Content-Length`）且没有 `Flush` 的响应在 handler 返回后整体发送，更长的或 `Flush` 过的
   响应边写边发——header 单独一个 HEADERS 帧，body 用 DATA 帧，trailer 跟在后面——因此
@@ -360,9 +361,10 @@
 
 ### 3. 流式 body 与 handler 模型（中）
 
-- 与 HTTP/2 相同：提供流式的响应写出。流式请求 body 已经实现，接收窗口随 handler 的
-  消费补充。双向流式是实现 WebTransport 的前提；Extended CONNECT 已通过
-  `Context.Upgrade` 实现。
+- 已完成：流式请求 body（接收窗口随 handler 的消费补充）和流式响应写出（handler 写多少
+  就发多少）。
+- 双向流式是 WebTransport 的前提；Extended CONNECT 已通过 `Context.Upgrade` 实现，但
+  handler 模型还没有同时操作两个方向的 API。
 
 ### 4. 可配置性（低）
 

@@ -146,8 +146,9 @@ request that arrives whole in one packet, as most do, costs none.
   `MaxBodyBytes`, and `Expect: 100-continue` is answered only once the handler
   asks for the body.
 - A response given to `WriteResponse` or `Respond` is given at once as
-  `Response.Body []byte`; the client buffers the whole response body before
-  the callback. `Context`'s `http.ResponseWriter` methods work, trailers
+  `Response.Body []byte`; the client buffers a response body whole by default,
+  and hands a large one to the callback as it arrives with
+  `ClientConfig.StreamResponseBody`. `Context`'s `http.ResponseWriter` methods work, trailers
   included, and stream as on HTTP/1 and HTTP/2: a response no longer than 4KB
   (or with a `Content-Length` of at most 64KB) that is not flushed is sent
   whole when the handler returns, and a longer or flushed one goes out as it
@@ -521,10 +522,12 @@ Done:
 
 ### 3. Streaming bodies and the handler model (medium)
 
-- As for HTTP/2: streaming response writes. Streamed request bodies are done,
-  with the receive window given back as the handler consumes the body.
-  Bidirectional streaming is what WebTransport needs; extended CONNECT has
-  it through `Context.Upgrade`.
+- Done: streamed request bodies, with the receive window given back as the
+  handler consumes the body, and streamed responses, written as the handler
+  produces them.
+- Bidirectional streaming is what WebTransport needs; extended CONNECT has it
+  through `Context.Upgrade`, but the handler model has no APIs for the two
+  directions at once.
 
 ### 4. Configurability (low)
 
