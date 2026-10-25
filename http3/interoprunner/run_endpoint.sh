@@ -10,6 +10,15 @@ set -u
 # is nothing to set up.
 if [ -x /setup.sh ] && getent hosts sim >/dev/null 2>&1; then
     /setup.sh || echo "run_endpoint: /setup.sh failed; carrying on" >&2
+    # The simulator forwards nothing until it is up, which is later than the
+    # endpoints start: a client that dials before then has its first flight
+    # dropped before it reaches the capture, and the runner's long RTT
+    # testcase, which counts ClientHellos, sees one where it wants two. The
+    # other endpoints wait for the simulator's port before a client dials.
+    if [ "${ROLE:-}" = client ] && [ -x /wait-for-it.sh ]; then
+        /wait-for-it.sh sim:57832 -s -t 30 ||
+            echo "run_endpoint: the simulator did not come up within 30s; carrying on" >&2
+    fi
 fi
 
 for dir in "${DOWNLOADS:-/downloads}" "${LOGS:-/logs}" "${QLOGDIR:-}"; do
