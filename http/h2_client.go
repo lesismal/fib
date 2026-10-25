@@ -29,7 +29,8 @@ import (
 // ClientConfig.PingTimeout.
 var ErrPingTimeout = errors.New("http2: connection lost: no answer to PING within PingTimeout")
 
-// DefaultPingTimeout is ClientConfig.PingTimeout's zero.
+// DefaultPingTimeout is ClientConfig.PingTimeout's zero, and
+// Config.PingTimeout's.
 const DefaultPingTimeout = 15 * time.Second
 
 // errStreamGone is what sending a streamed request body gets once its stream

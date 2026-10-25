@@ -196,6 +196,10 @@ type h2TestConn struct {
 	// GOAWAY read, so that a connection that ends under a test says how.
 	opened time.Time
 	goAway string
+	// holdSettingsAck keeps the connection from acknowledging the server's
+	// SETTINGS, which it otherwise does as it reads them, as a client must
+	// within the server's SettingsTimeout.
+	holdSettingsAck bool
 }
 
 // h2TestStream is what a stream has received: its final response header,
@@ -334,6 +338,11 @@ func (tc *h2TestConn) readRaw() h2Frame {
 		if n > 0 {
 			f.payload = append([]byte(nil), f.payload...)
 			tc.in = tc.in[n:]
+			if f.typ == h2FrameSettings && !f.has(h2FlagAck) && !tc.holdSettingsAck {
+				// The server may have closed already; a test that cares
+				// finds out from what it reads.
+				_, _ = tc.c.Write(h2AppendFrameHeader(nil, h2FrameSettings, h2FlagAck, 0, 0))
+			}
 			if f.typ == h2FrameGoAway && len(f.payload) >= 8 {
 				tc.goAway = fmt.Sprintf("GOAWAY last stream %d code %v after %v",
 					binary.BigEndian.Uint32(f.payload)&0x7fffffff, H2ErrorCode(binary.BigEndian.Uint32(f.payload[4:])),

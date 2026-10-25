@@ -237,6 +237,25 @@ type Config struct {
 	// it may take. Zero means DefaultMaxContinuationFrames; below zero, no
 	// limit.
 	MaxContinuationFrames int
+	// SettingsTimeout bounds how long an HTTP/2 client may take to
+	// acknowledge the SETTINGS the server opens the connection with, which
+	// it has to before the server can count on them (RFC 9113 section
+	// 6.5.3): past it the connection ends with GOAWAY(SETTINGS_TIMEOUT).
+	// Zero means DefaultSettingsTimeout; below zero, no limit.
+	SettingsTimeout time.Duration
+	// PingInterval has the server check that an HTTP/2 client is still
+	// there: once a connection has sent nothing for PingInterval, which the
+	// server notices between one and two intervals after, the server sends
+	// a PING, and if nothing at all arrives within PingTimeout after it, the
+	// PING's acknowledgement included, the connection is closed, failing
+	// its streams with ErrH2PingTimeout. It finds a client that went away
+	// without a word, as a machine that lost power or a NAT that forgot the
+	// connection does, which TCP alone may not for many minutes, and the
+	// PINGs keep such a NAT from forgetting the connection in the first
+	// place. Zero, the default, sends no PING. PingTimeout of zero means
+	// DefaultPingTimeout.
+	PingInterval time.Duration
+	PingTimeout  time.Duration
 	// StreamPool runs HTTP/2 request handlers on a pool of their own, so
 	// that the requests a client has open on one connection are served
 	// concurrently rather than one after another on the goroutine that

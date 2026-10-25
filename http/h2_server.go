@@ -151,6 +151,20 @@ type h2ServerConn struct {
 	// ended; see armIdleLocked. Nil without an IdleTimeout.
 	idleTimer *time.Timer
 	idleSince time.Time
+	// settingsTimer ends the connection unless the client acknowledges the
+	// server's SETTINGS in time, and settingsAcked says it has; see
+	// armLivenessLocked. pingTimer checks on a client that has gone quiet,
+	// reads counts what the connection has read, pingReads what it had at
+	// the timer's last look, pingPending how much output it had queued
+	// then, and pingOut says a PING is waiting for an answer; see pingTick.
+	// All guarded by mu but reads, which the reader counts as it goes.
+	settingsTimer *time.Timer
+	settingsAcked bool
+	pingTimer     *time.Timer
+	reads         atomic.Uint32
+	pingReads     uint32
+	pingPending   int64
+	pingOut       bool
 	// readTimers holds the timers that fail a stream's body once the
 	// deadline its handler set with SetReadDeadline has passed, made with
 	// the first of them; see setReadDeadline. The stream has no room for one
@@ -331,6 +345,7 @@ func (sc *h2ServerConn) start() {
 	// A connection that opens and then asks for nothing is idle, and bounded
 	// like any other idle connection, as on HTTP/1.
 	sc.armIdleLocked()
+	sc.armLivenessLocked()
 	sc.mu.Unlock()
 }
 
@@ -421,6 +436,7 @@ func (sc *h2ServerConn) scheduleFlush() {
 // feed takes bytes from the connection, preface included, and handles every
 // complete frame among them.
 func (sc *h2ServerConn) feed(data []byte) {
+	sc.reads.Add(1)
 	sc.recycleDead()
 	sc.in = bufferpool.Append(sc.in, data)
 	offset := 0
@@ -552,6 +568,7 @@ func (sc *h2ServerConn) shutdown() {
 	sc.mu.Lock()
 	sc.closed = true
 	sc.busyLocked()
+	sc.stopLivenessLocked()
 	sc.failBodiesLocked(net.ErrClosed)
 	clear(sc.streams)
 	sc.mu.Unlock()
@@ -638,6 +655,9 @@ func (sc *h2ServerConn) handleSettings(f *h2Frame) error {
 		if len(f.payload) != 0 {
 			return h2ConnErr(H2FrameSizeError, "SETTINGS ack with payload")
 		}
+		sc.mu.Lock()
+		sc.settingsAckedLocked()
+		sc.mu.Unlock()
 		return nil
 	}
 	if sc.settingsSeen {
