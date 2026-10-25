@@ -46,6 +46,13 @@ func TestSendSharedQueuesTheCallersArray(t *testing.T) {
 	want := bytes.Clone(shared)
 	tail := []byte("tail")
 	for _, c := range conns {
+		// What the socket takes at once would never be queued, so the send
+		// buffer is kept far below the array: a host tuned for throughput
+		// can otherwise swallow the whole of it in the kernel and the
+		// queueing this test is about never happens.
+		if err := c.SetWriteBuffer(1 << 20); err != nil {
+			t.Fatal(err)
+		}
 		if err := c.SendShared(shared); err != nil {
 			t.Fatal(err)
 		}

@@ -97,6 +97,13 @@ func TestSendFileRawSealsAsTheSocketDrains(t *testing.T) {
 	}
 	defer f.Close()
 	c, client := connectOne(t, HandlerFuncs{})
+	// The test is about what the file's queueing costs while the peer reads
+	// nothing, so the send buffer is kept far below the file: a host tuned
+	// for throughput can otherwise take most of the file in the kernel at
+	// once.
+	if err := c.SetWriteBuffer(1 << 20); err != nil {
+		t.Fatal(err)
+	}
 	sealer := &frameSealer{}
 	const offset = 1000
 	count := int64(size - offset - 77)
