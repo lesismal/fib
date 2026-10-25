@@ -1504,7 +1504,11 @@ func (cc *clientConn) send(r *clientRequest) {
 	}
 	cc.current = r
 	cc.gate = gate
-	r.early = fibtls.Handshaking(cc.conn)
+	if cc.conn != nil {
+		// A connection a test builds by hand may have none; a real one always
+		// does, set in OnOpen.
+		r.early = fibtls.Handshaking(cc.conn)
+	}
 	cc.reused = cc.sent
 	cc.sent = true
 	cc.received = false
@@ -1520,7 +1524,7 @@ func (cc *clientConn) send(r *clientRequest) {
 		cc.mu.Lock()
 		cc.current = nil
 		cc.mu.Unlock()
-		if fibtls.Handshaking(cc.conn) {
+		if cc.conn != nil && fibtls.Handshaking(cc.conn) {
 			cc.discard()
 			return
 		}
