@@ -61,8 +61,9 @@ func (c *Conn) paceNext(now time.Time) time.Time {
 }
 
 // blockedRetry is how long a round of sending that found the socket full
-// waits before it tries again: the engine says when a socket can be read,
-// but not when a full one can be written again.
+// waits before it tries again when nothing will say the socket has room:
+// a path that is no WritableNotifier, or cannot tell on its system, and a
+// full queue past the socket, which ENOBUFS reports (see awaitRoomLocked).
 const blockedRetry = time.Millisecond
 
 // wouldBlock reports whether a send failed only because the socket had no

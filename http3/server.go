@@ -825,6 +825,10 @@ func (p *peerPath) SendDatagrams(datagrams [][]byte) (int, error) {
 // not at all.
 func (p *peerPath) SetDontFragment() error { return p.peer.c.SetDontFragment() }
 
+// NotifyWritable makes the path a quic.WritableNotifier, so that datagrams
+// a full socket refused go out as soon as it has room.
+func (p *peerPath) NotifyWritable(fn func()) bool { return p.peer.c.NotifyWritable(fn) }
+
 // Close lets the connection's use of the address go; the address's
 // fib.Connection stays for the client's next connection, until it is idle
 // (see udpPeer).
@@ -845,6 +849,8 @@ var (
 	_ quic.DatagramsSender     = (*fib.Connection)(nil)
 	_ quic.DontFragmenter      = (*peerPath)(nil)
 	_ quic.DontFragmenter      = (*fib.Connection)(nil)
+	_ quic.WritableNotifier    = (*peerPath)(nil)
+	_ quic.WritableNotifier    = (*fib.Connection)(nil)
 )
 
 // serverConn is one client's HTTP/3 connection.

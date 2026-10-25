@@ -55,6 +55,16 @@ type DatagramsSender interface {
 	SendDatagrams(datagrams [][]byte) (int, error)
 }
 
+// WritableNotifier is a PacketConn that can say when a socket that refused
+// a send for want of room, with EAGAIN, has room again: NotifyWritable
+// arranges for fn to run, on another goroutine, once it has, and reports
+// whether it will. A connection that sends through one sends what the socket
+// refused as soon as it has room, rather than try again on a timer.
+// fib.Connection is one, on the systems whose event loops can tell.
+type WritableNotifier interface {
+	NotifyWritable(fn func()) bool
+}
+
 // PacketConn sends a connection's datagrams to its peer.
 type PacketConn interface {
 	// Send sends one datagram. It must not keep the datagram once it
@@ -563,6 +573,11 @@ type Conn struct {
 	blocked    []byte
 	blockedOff int
 	blockedN   int
+	// awaitingRoom says the path will run onRoom once the socket that
+	// refused the blocked datagrams has room; see awaitRoomLocked. onRoom
+	// is roomAvailable, made once rather than for every wait.
+	awaitingRoom bool
+	onRoom       func()
 	// Pacing (see pacer.go): the budget, in bytes, as it was at paceLast;
 	// paced says the round stopped for want of it; sendAt is when a round
 	// that stopped for pacing or for a full socket goes on.

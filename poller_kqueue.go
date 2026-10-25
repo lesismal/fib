@@ -99,7 +99,11 @@ func (e *Engine) runLoop() error {
 			fd := int(ev.Ident)
 			c := e.connectionAt(fd)
 			if c == nil {
-				if ev.Filter == syscall.EVFILT_READ {
+				if ev.Filter == syscall.EVFILT_WRITE {
+					if l := e.udpListenerAt(fd); l != nil {
+						e.udpWritable(l, nil)
+					}
+				} else if ev.Filter == syscall.EVFILT_READ {
 					if l := e.udpListenerAt(fd); l != nil {
 						// Reading opens and closes no descriptor, so it
 						// need not wait for the batch to end.
@@ -113,7 +117,11 @@ func (e *Engine) runLoop() error {
 				continue
 			}
 			if c.udp != nil {
-				ready = e.readUDPConnection(c, int(ev.Data), ready)
+				if ev.Filter == syscall.EVFILT_WRITE {
+					e.udpWritable(nil, c)
+				} else {
+					ready = e.readUDPConnection(c, int(ev.Data), ready)
+				}
 				continue
 			}
 			if c.dialing != nil {
@@ -237,6 +245,19 @@ func (e *Engine) watchListener(l streamListener) error {
 // openBackend.
 func (e *Engine) watchUDP(fd int) error {
 	change := [1]syscall.Kevent_t{newKevent(fd, syscall.EVFILT_READ, syscall.EV_ADD)}
+	_, err := syscall.Kevent(e.kq, change[:], nil, nil)
+	return err
+}
+
+// watchWritable has the loop hear once that a UDP socket has room, with a
+// one-shot write filter, which a socket that has room already fires at once;
+// see udpWaiters. The filter deletes itself as it fires, so there is nothing
+// to undo. Callers hold the socket's udpWaiters lock.
+func (e *Engine) watchWritable(fd int, _ uint64, _, on bool) error {
+	if !on {
+		return nil
+	}
+	change := [1]syscall.Kevent_t{newKevent(fd, syscall.EVFILT_WRITE, syscall.EV_ADD|syscall.EV_ONESHOT)}
 	_, err := syscall.Kevent(e.kq, change[:], nil, nil)
 	return err
 }

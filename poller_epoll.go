@@ -107,12 +107,22 @@ func (e *Engine) runLoop() error {
 				e.drainCommands()
 			case udpKind:
 				if l := e.udpListenerAt(int(uint32(token))); l != nil {
-					ready = e.readUDPListener(l, -1, ready)
+					if events[i].Events&syscall.EPOLLOUT != 0 {
+						e.udpWritable(l, nil)
+					}
+					if events[i].Events&udpReadEvents != 0 {
+						ready = e.readUDPListener(l, -1, ready)
+					}
 				}
 			default:
 				if c := e.connectionFor(token); c != nil {
 					if c.udp != nil {
-						ready = e.readUDPConnection(c, -1, ready)
+						if events[i].Events&syscall.EPOLLOUT != 0 {
+							e.udpWritable(nil, c)
+						}
+						if events[i].Events&udpReadEvents != 0 {
+							ready = e.readUDPConnection(c, -1, ready)
+						}
 						continue
 					}
 					if c.dialing != nil {
@@ -355,11 +365,34 @@ func (e *Engine) watchListener(l streamListener) error {
 	return err
 }
 
+// udpReadEvents are what make the loop read a UDP socket: the datagrams it
+// holds, and an error or hangup it reports, which a read passes on. A socket
+// watched for room as well reports EPOLLOUT on every round for as long as it
+// has any, and one whose event is only that holds no datagram to read.
+const udpReadEvents = syscall.EPOLLIN | syscall.EPOLLERR | syscall.EPOLLHUP
+
 // watchUDP has the loop read a UDP socket's datagrams. UDP sockets are
 // level-triggered, so the loop can stop reading one after its share of a
 // round and still hear about the rest.
 func (e *Engine) watchUDP(fd int) error {
 	return e.addFD(fd, udpToken(fd), uint32(syscall.EPOLLIN))
+}
+
+// watchWritable has the loop watch a UDP socket for room as well as for
+// datagrams, or, with on false, for datagrams alone again, as watchUDP, or
+// registerDatagram for a dialed one, has it; see udpWaiters. The socket is
+// level-triggered, so one that has room already reports it at once. Callers
+// hold the socket's udpWaiters lock.
+func (e *Engine) watchWritable(fd int, token uint64, dialed, on bool) error {
+	events := uint32(syscall.EPOLLIN)
+	if dialed {
+		events |= syscall.EPOLLERR
+	}
+	if on {
+		events |= syscall.EPOLLOUT
+	}
+	ev := syscall.EpollEvent{Events: events, Fd: int32(token), Pad: int32(token >> 32)}
+	return syscall.EpollCtl(e.epollFD, syscall.EPOLL_CTL_MOD, fd, &ev)
 }
 
 // unwatch has the loop stop waiting on a listener or a UDP socket, which

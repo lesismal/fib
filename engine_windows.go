@@ -207,15 +207,30 @@ func (c *Connection) sysSendDatagrams(datagrams [][]byte) (int, error) {
 	return len(datagrams), nil
 }
 
-// sysSendDatagram sends one datagram without waiting. Callers hold c.mu.
+// sysSendDatagram sends one datagram without waiting. A socket with no room
+// reports EAGAIN, as it does on the other systems, rather than Winsock's
+// WSAEWOULDBLOCK, so that a sender that keeps what a full socket refused,
+// as QUIC does, knows it here too. Callers hold c.mu.
 func (c *Connection) sysSendDatagram(data []byte) error {
 	bufs := [1]syscall.WSABuf{sys.WSABuf(data)}
 	var n uint32
+	var err error
 	if l := c.udp.listener; l != nil {
-		return syscall.WSASendto(l.fd, &bufs[0], 1, &n, 0, c.udp.sa, nil, nil)
+		err = syscall.WSASendto(l.fd, &bufs[0], 1, &n, 0, c.udp.sa, nil, nil)
+	} else {
+		err = syscall.WSASend(c.socket(), &bufs[0], 1, &n, 0, nil, nil)
 	}
-	return syscall.WSASend(c.socket(), &bufs[0], 1, &n, 0, nil, nil)
+	if sys.IsWouldBlock(err) {
+		return syscall.EAGAIN
+	}
+	return err
 }
+
+// notifyWritable reports false: a completion port says when an operation
+// posted on a socket completes, not when a socket has room, and a UDP send
+// posted to find out would be a datagram sent. A sender that found the
+// socket full tries again on a timer.
+func (c *Connection) notifyWritable(func()) bool { return false }
 
 // FD returns the connection's socket handle, or -1 once it is closed. A UDP
 // peer has no socket of its own and always reports -1.

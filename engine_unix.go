@@ -18,6 +18,7 @@ import (
 	"github.com/lesismal/fib/internal/netaddr"
 	"github.com/lesismal/fib/internal/sys"
 	"github.com/lesismal/fib/internal/udpbatch"
+	"github.com/lesismal/fib/sidepool"
 )
 
 // pollersSupported says Config.IOPollers applies: the readiness backends
@@ -120,11 +121,112 @@ type connPlatform struct {
 // token returns the token the connection is registered with.
 func (c *Connection) token() uint64 { return uint64(uint32(c.fd.Load())) | uint64(c.gen)<<32 }
 
-// udpPlatform is empty here: a dialed UDP connection reads its own descriptor
-// and a peer sends through its listener's.
-type udpPlatform struct{}
+// udpPlatform is, for a dialed UDP connection, which reads and sends on its
+// own descriptor, the senders waiting for that descriptor to have room; a
+// peer sends through its listener's, and waits with the listener's.
+type udpPlatform struct{ writable *udpWaiters }
 
-type udpListenerPlatform struct{ fd int }
+type udpListenerPlatform struct {
+	fd       int
+	writable udpWaiters
+}
+
+// udpWaiters are the senders waiting in NotifyWritable for a UDP socket that
+// was full to have room. While any of them waits, the socket's loop watches
+// it for room as well as for datagrams; the first time it finds room it
+// stops watching for it and posts every waiter. Watching all the time would
+// wake the loop on every wait, since a socket is writable for as long as it
+// has room, which it nearly always has.
+type udpWaiters struct {
+	mu sync.Mutex
+	// armed says the loop is watching the socket for room.
+	armed bool
+	// closed says the socket is closed, and nothing waits on it again.
+	closed bool
+	fns    []func()
+	// woken counts the times the loop found room. For tests.
+	woken int
+}
+
+// wait adds fn to the waiters and has the loop watch fd, whose token is
+// token, for room unless it does already, and reports whether it does.
+func (w *udpWaiters) wait(e *Engine, fd int, token uint64, dialed bool, fn func()) bool {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.closed || fd < 0 || e.stopping.Load() {
+		return false
+	}
+	if !w.armed {
+		if e.watchWritable(fd, token, dialed, true) != nil {
+			return false
+		}
+		w.armed = true
+	}
+	w.fns = append(w.fns, fn)
+	return true
+}
+
+// ready stops the loop watching fd for room, which it has, and posts the
+// waiters. Callers run on the event loop.
+func (w *udpWaiters) ready(e *Engine, fd int, token uint64, dialed bool) {
+	w.mu.Lock()
+	w.woken++
+	if w.armed {
+		w.armed = false
+		_ = e.watchWritable(fd, token, dialed, false)
+	}
+	fns := w.fns
+	w.fns = nil
+	w.mu.Unlock()
+	for _, fn := range fns {
+		sidepool.Post(fn)
+	}
+}
+
+// closeFD closes fd, the socket the waiters wait on, and posts them: a
+// sender has nothing to wait for on a closed socket, and finds it closed
+// when it sends again. Holding the lock keeps a sender from watching the
+// descriptor once it is closed, when it may already belong to another
+// socket.
+func (w *udpWaiters) closeFD(fd int) error {
+	w.mu.Lock()
+	w.closed = true
+	fns := w.fns
+	w.fns = nil
+	err := syscall.Close(fd)
+	w.mu.Unlock()
+	for _, fn := range fns {
+		sidepool.Post(fn)
+	}
+	return err
+}
+
+// closeSocket closes a UDP listener's socket; see udpWaiters.closeFD.
+func (l *udpListener) closeSocket() error { return l.writable.closeFD(l.fd) }
+
+// notifyWritable is NotifyWritable on a backend that tells when a socket
+// has room.
+func (c *Connection) notifyWritable(fn func()) bool {
+	if l := c.udp.listener; l != nil {
+		return l.writable.wait(c.engine, l.fd, udpToken(l.fd), false, fn)
+	}
+	w := c.udp.writable
+	if w == nil {
+		return false
+	}
+	// A descriptor read before detach closes it is one wait finds closed.
+	return w.wait(c.engine, c.FD(), c.token(), true, fn)
+}
+
+// udpWritable has the waiters of a UDP socket the poller found room on go
+// on: a listener's, or a dialed connection's. Callers run on the event loop.
+func (e *Engine) udpWritable(l *udpListener, c *Connection) {
+	if l != nil {
+		l.writable.ready(e, l.fd, udpToken(l.fd), false)
+	} else if w := c.udp.writable; w != nil {
+		w.ready(e, c.FD(), c.token(), true)
+	}
+}
 
 // FD returns the connection's descriptor, or -1 once it is closed. A UDP peer
 // has no descriptor of its own and always reports -1.
@@ -356,7 +458,7 @@ func (e *Engine) closeListeners() {
 	}
 	e.listeners = nil
 	for _, l := range e.udpListeners {
-		syscall.Close(l.fd)
+		l.closeSocket()
 	}
 	e.udpListeners = nil
 	e.removeUnixPaths()
@@ -764,7 +866,11 @@ func (e *Engine) detach(c *Connection) {
 	if c.flags.has(flagRawExposed) {
 		e.unregister(fd)
 	}
-	_ = syscall.Close(fd)
+	if c.udp != nil && c.udp.writable != nil {
+		_ = c.udp.writable.closeFD(fd)
+	} else {
+		_ = syscall.Close(fd)
+	}
 	if c.bindingID != 0 {
 		e.accepted.leave()
 	}
@@ -878,7 +984,7 @@ func (e *Engine) release() error {
 		}
 	}
 	for _, l := range e.udpListeners {
-		if err := syscall.Close(l.fd); err != nil && closeErr == nil {
+		if err := l.closeSocket(); err != nil && closeErr == nil {
 			closeErr = err
 		}
 	}
@@ -1110,7 +1216,8 @@ func (e *Engine) connectDatagram(d *dialRequest) (c *Connection, connected bool,
 	}
 	token := e.newToken(fd)
 	c = &Connection{engine: e, handler: d.handler, dialing: d, dialed: true,
-		udp: &udpState{raddr: &net.UDPAddr{IP: d.raddr.IP, Port: d.raddr.Port, Zone: d.raddr.Zone}}}
+		udp: &udpState{udpPlatform: udpPlatform{writable: &udpWaiters{}},
+			raddr: &net.UDPAddr{IP: d.raddr.IP, Port: d.raddr.Port, Zone: d.raddr.Zone}}}
 	c.gen = uint32(token >> 32)
 	c.fd.Store(int32(fd))
 	if err = e.registerDatagram(fd, token); err != nil {

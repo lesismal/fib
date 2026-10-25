@@ -840,6 +840,10 @@ func (c *Connection) HoldReads(hold bool) {
 // before it returns, so nothing is ever left queued to wait for.
 func (c *Connection) NotifyOutput(int64, func(error)) bool { return false }
 
+// NotifyWritable reports false on the portable backend, whose UDP sends go
+// through package net, which waits for room itself.
+func (c *Connection) NotifyWritable(func()) bool { return false }
+
 // SetWriteBackpressure does nothing on the portable backend, whose reads
 // never pause for the connection's own backlog.
 func (c *Connection) SetWriteBackpressure(bool) {}

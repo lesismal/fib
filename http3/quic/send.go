@@ -2,7 +2,9 @@ package quic
 
 import (
 	"encoding/binary"
+	"errors"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/lesismal/fib/bufferpool"
@@ -167,7 +169,7 @@ func (c *Conn) sendRoundLocked() {
 		sent, err := sendDatagrams(pc, buf, lens[:n])
 		c.mu.Lock()
 		if sent < n && wouldBlock(err) && !c.closed {
-			c.keepBlockedLocked(mem, sent, n)
+			c.keepBlockedLocked(pc, mem, sent, n, err)
 			return
 		}
 	}
@@ -175,23 +177,66 @@ func (c *Conn) sendRoundLocked() {
 }
 
 // keepBlockedLocked keeps the datagrams of a round from the sent-th of n on,
-// which the socket had no room for, to send again once the timer says to.
-// The packets in them were counted as sent when they were built, and are
-// sent late rather than lost. Callers are the sending goroutine and hold
-// c.mu.
-func (c *Conn) keepBlockedLocked(mem []byte, sent, n int) {
+// which the socket pc sends on had no room for, refusing them with err, to
+// send again once it has room, or the timer says to. The packets in them
+// were counted as sent when they were built, and are sent late rather than
+// lost. Callers are the sending goroutine and hold c.mu.
+func (c *Conn) keepBlockedLocked(pc PacketConn, mem []byte, sent, n int, err error) {
 	off := c.blockedOff
 	for _, l := range c.roundLens[:sent] {
 		off += int(l)
 	}
 	copy(c.roundLens[:], c.roundLens[sent:n])
 	c.blocked, c.blockedOff, c.blockedN = mem, off, n-sent
-	// More waiting to be built waits too: the timer sends it once the
-	// socket has taken what it refused.
+	// More waiting to be built waits too: it is sent once the socket has
+	// taken what it refused.
 	c.wantFlush = false
+	if c.awaitRoomLocked(pc, err) {
+		return
+	}
 	now := c.now()
 	c.sendAt = now.Add(blockedRetry)
 	c.armTimerLocked(now)
+}
+
+// awaitRoomLocked has pc say when its socket, which refused a round with
+// err, has room again, and reports whether it will, or does already for an
+// earlier round. It can for EAGAIN, a socket whose buffer is full and which
+// the event loop can watch for room, where pc is a WritableNotifier; ENOBUFS
+// says a queue past the socket is full, which no event announces room in,
+// and leaves the round to the timer. Callers are the sending goroutine and
+// hold c.mu.
+func (c *Conn) awaitRoomLocked(pc PacketConn, err error) bool {
+	if !errors.Is(err, syscall.EAGAIN) {
+		return false
+	}
+	if c.awaitingRoom {
+		return true
+	}
+	n, ok := pc.(WritableNotifier)
+	if !ok {
+		return false
+	}
+	if c.onRoom == nil {
+		c.onRoom = c.roomAvailable
+	}
+	if !n.NotifyWritable(c.onRoom) {
+		return false
+	}
+	c.awaitingRoom = true
+	return true
+}
+
+// roomAvailable sends what a full socket refused, now that it has room, as
+// the timer would have, whether or not the handler is being called.
+func (c *Conn) roomAvailable() {
+	c.mu.Lock()
+	c.awaitingRoom = false
+	if c.blocked != nil && !c.closed {
+		c.wantFlush = true
+		c.sendLocked()
+	}
+	c.mu.Unlock()
 }
 
 // sendBlockedLocked sends again what a round left for a full socket, and
@@ -209,7 +254,7 @@ func (c *Conn) sendBlockedLocked() bool {
 	sent, err := sendDatagrams(pc, mem[c.blockedOff:], c.roundLens[:n])
 	c.mu.Lock()
 	if sent < n && wouldBlock(err) && !c.closed {
-		c.keepBlockedLocked(mem, sent, n)
+		c.keepBlockedLocked(pc, mem, sent, n, err)
 		return false
 	}
 	c.blockedOff, c.blockedN = 0, 0

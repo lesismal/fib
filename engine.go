@@ -1721,6 +1721,29 @@ func (c *Connection) SendDatagrams(datagrams [][]byte) (int, error) {
 	return n, err
 }
 
+// NotifyWritable is for a sender that found a UDP socket full: after a send
+// on c reported EAGAIN, it arranges for fn to run, on another goroutine, once
+// the socket has room again, or once it is closed, and reports true, so that
+// the sender can keep what the socket refused and send it then rather than
+// try again on a timer. fn runs once for each call that reported true. It
+// may find the socket full again, by the time it runs, as a burst of other
+// senders on a listener's socket fills it, and the sender then asks again.
+// It reports false, and fn never runs, where there is nothing to wait for:
+// on a connection that is not UDP, or is closed, or whose engine is
+// stopping, and on Windows and the portable backend, which cannot tell when
+// a UDP socket has room. ENOBUFS, which macOS reports for a full UDP socket
+// and Linux for a full device queue, is not a full socket that room would
+// be announced for: a sender that meets it tries again after a while.
+func (c *Connection) NotifyWritable(fn func()) bool {
+	if c.udp == nil {
+		return false
+	}
+	c.mu.Lock()
+	closed := c.closing || c.closed
+	c.mu.Unlock()
+	return !closed && c.notifyWritable(fn)
+}
+
 // sendDatagramParts sends two parts as one datagram.
 func (c *Connection) sendDatagramParts(first, second []byte) error {
 	if len(second) == 0 {

@@ -29,7 +29,7 @@ type placement struct {
 func (p placement) close() {
 	switch {
 	case p.udp != nil:
-		syscall.Close(p.udp.fd)
+		p.udp.closeSocket()
 	case !p.stream.shared || p.loop.parent == nil:
 		syscall.Close(p.stream.fd)
 	}
@@ -432,7 +432,7 @@ func (e *Engine) detachBinding(i int, keepUDP bool) bool {
 		for _, c := range l.peers {
 			e.closeConnection(c, net.ErrClosed, true)
 		}
-		syscall.Close(l.fd)
+		l.closeSocket()
 	}
 	return found
 }

@@ -232,3 +232,119 @@ func TestBlockedSendResumes(t *testing.T) {
 		}
 	}
 }
+
+// notifyingPC is a countingPC that says when its socket has room: it keeps
+// the fn NotifyWritable is given, for the test to run, and refuses batches
+// with err.
+type notifyingPC struct {
+	countingPC
+	err      error
+	supports bool
+	fns      []func()
+}
+
+func (p *notifyingPC) SendDatagrams(ds [][]byte) (int, error) {
+	n, err := p.countingPC.SendDatagrams(ds)
+	if err != nil {
+		err = p.err
+	}
+	return n, err
+}
+
+func (p *notifyingPC) NotifyWritable(fn func()) bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if !p.supports {
+		return false
+	}
+	p.fns = append(p.fns, fn)
+	return true
+}
+
+func (p *notifyingPC) takeFns() []func() {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	fns := p.fns
+	p.fns = nil
+	return fns
+}
+
+// Datagrams a full socket refuses with EAGAIN wait for a path that can say
+// so to say the socket has room, and go then, rather than on the timer; a
+// path that cannot say, or ENOBUFS, which no room is announced for, leaves
+// them to the timer.
+func TestBlockedSendAwaitsRoom(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		err      error
+		supports bool
+		awaits   bool
+	}{
+		{"EAGAIN", syscall.EAGAIN, true, true},
+		{"ENOBUFS", syscall.ENOBUFS, true, false},
+		{"unsupported", syscall.EAGAIN, false, false},
+	} {
+		c := frameConn(t)
+		pc := &notifyingPC{err: tc.err, supports: tc.supports}
+		pc.batchRefuseAt = 3
+		c.mu.Lock()
+		c.pc = pc
+		c.mu.Unlock()
+		s, err := c.OpenStream()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := s.Write(make([]byte, 8000), true); err != nil {
+			t.Fatal(err)
+		}
+		c.mu.Lock()
+		blocked, sendAt, awaiting := c.blocked != nil, c.sendAt, c.awaitingRoom
+		built := c.spaces[spaceApp].nextPN
+		c.mu.Unlock()
+		if !blocked || awaiting != tc.awaits || sendAt.IsZero() == !tc.awaits {
+			t.Fatalf("%s: refused round kept %v, awaiting room %v, sendAt %v", tc.name, blocked, awaiting, sendAt)
+		}
+		if !tc.awaits {
+			deadline := time.Now().Add(5 * time.Second)
+			for n, _ := pc.sent(); uint64(n) < built; n, _ = pc.sent() {
+				if time.Now().After(deadline) {
+					t.Fatalf("%s: the timer sent %d datagrams of %d built", tc.name, n, built)
+				}
+				time.Sleep(time.Millisecond)
+			}
+			continue
+		}
+		// Nothing goes until the socket says it has room, however long
+		// that is.
+		time.Sleep(20 * blockedRetry)
+		if n, _ := pc.sent(); n != 3 {
+			t.Fatalf("%s: %d datagrams sent before the socket had room", tc.name, n)
+		}
+		// Refused again, the round waits again, asking once.
+		pc.mu.Lock()
+		pc.batchRefuseAt = 1
+		pc.mu.Unlock()
+		fns := pc.takeFns()
+		if len(fns) != 1 {
+			t.Fatalf("%s: asked %d times to hear of room", tc.name, len(fns))
+		}
+		fns[0]()
+		if n, _ := pc.sent(); n != 4 {
+			t.Fatalf("%s: %d datagrams sent once the socket took one more", tc.name, n)
+		}
+		fns = pc.takeFns()
+		if len(fns) != 1 {
+			t.Fatalf("%s: asked %d times to hear of room again", tc.name, len(fns))
+		}
+		fns[0]()
+		if n, _ := pc.sent(); uint64(n) != built {
+			t.Fatalf("%s: %d datagrams sent of %d built once the socket had room", tc.name, n, built)
+		}
+		c.mu.Lock()
+		blocked, awaiting = c.blocked != nil, c.awaitingRoom
+		c.mu.Unlock()
+		if blocked || awaiting {
+			t.Fatalf("%s: still blocked %v, awaiting room %v", tc.name, blocked, awaiting)
+		}
+	}
+}
