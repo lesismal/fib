@@ -53,19 +53,34 @@ func appendFieldLinear(e *Encoder, dst []byte, name, value string, sensitive boo
 // fields repeat often, mix static names with others, and include large ones
 // and nearly empty ones that fill the table with as many entries as it
 // holds; the table size changes between blocks, so entries are evicted all
-// the time.
+// the time. It runs with the default limit on the table and with one that
+// lets the table hold thousands of entries, past what the index's entry
+// numbers wrap at, and grow past the size its index was made for.
 func TestIndexMatchesLinearSearch(t *testing.T) {
+	for _, limit := range []int{DefaultTableSize, 1 << 17} {
+		t.Run(strconv.Itoa(limit), func(t *testing.T) { testIndexMatchesLinearSearch(t, limit) })
+	}
+}
+
+func testIndexMatchesLinearSearch(t *testing.T, limit int) {
 	names := []string{"", ":path", "content-length", "content-type", "date", "server",
 		"x-a", "x-b", "x-request-id", "set-cookie", "cookie", "vary"}
 	values := []string{"", "0", "1", "/", "gzip", "text/html", "no-cache", "fib"}
-	sizes := []int{0, 31, 32, 64, 100, 256, 1000, 2048, 4000, DefaultTableSize, 1 << 20}
+	sizes := []int{0, 31, 32, 64, 100, 256, 1000, 2048, 4000, DefaultTableSize, 1 << 15, 1 << 17, 1 << 20}
 	most := 0
-	for seed := range uint64(20) {
+	seeds, blocks := uint64(20), 1000
+	if limit > DefaultTableSize {
+		// The linear search is slow over a large table.
+		seeds, blocks = 4, 400
+	}
+	for seed := range seeds {
 		r := rand.New(rand.NewPCG(seed, 7))
 		indexed, linear := NewEncoder(), NewEncoder()
-		d := NewDecoder(DefaultTableSize)
+		indexed.SetTableSizeLimit(limit)
+		linear.SetTableSizeLimit(limit)
+		d := NewDecoder(limit)
 		var a, b []byte
-		for range 1000 {
+		for range blocks {
 			if r.IntN(20) == 0 {
 				n := sizes[r.IntN(len(sizes))]
 				indexed.SetMaxTableSize(n)
@@ -75,12 +90,12 @@ func TestIndexMatchesLinearSearch(t *testing.T) {
 			var want []HeaderField
 			n, tiny := r.IntN(16), r.IntN(10) == 0
 			if tiny {
-				n = 200
+				n = max(200, limit/20)
 			}
 			for range n {
 				f := HeaderField{names[r.IntN(len(names))], values[r.IntN(len(values))]}
 				if tiny {
-					f = HeaderField{"", strconv.Itoa(r.IntN(1000))}
+					f = HeaderField{"", strconv.Itoa(r.IntN(100000))}
 				}
 				switch r.IntN(8) {
 				case 0:
@@ -115,7 +130,84 @@ func TestIndexMatchesLinearSearch(t *testing.T) {
 			t.Fatal("the linear encoder made an index")
 		}
 	}
-	if most < 100 {
+	if most < min(limit/40, 300) {
 		t.Fatalf("the table held at most %d entries", most)
+	}
+}
+
+// TestEncoderTableSizeLimit checks that an encoder uses a larger table than
+// the default only when both its limit and the peer allow it, announces each
+// change of size at the start of the next block, and that a decoder allowed
+// as much decodes what it sends.
+func TestEncoderTableSizeLimit(t *testing.T) {
+	e := NewEncoder()
+	d := NewDecoder(1 << 16)
+	e.SetMaxTableSize(1 << 16)
+	if e.table.maxSize != DefaultTableSize {
+		t.Fatalf("table %d before a limit above the default", e.table.maxSize)
+	}
+	e.SetTableSizeLimit(1 << 15)
+	if e.table.maxSize != 1<<15 {
+		t.Fatalf("table %d with a limit of 32768 and an allowance of 65536", e.table.maxSize)
+	}
+	// Enough distinct fields that the default table could not keep them.
+	var block []byte
+	for round := range 2 {
+		block = e.Begin(block[:0])
+		if round == 0 && (len(block) == 0 || block[0]&0xe0 != 0x20) {
+			t.Fatal("the first block does not announce the larger table")
+		}
+		for i := range 300 {
+			block = e.AppendField(block, "x-field-"+strconv.Itoa(i), "value-"+strconv.Itoa(i), false)
+		}
+		got := decodeAll(t, d, block)
+		if len(got) != 300 || got[299] != (HeaderField{"x-field-299", "value-299"}) {
+			t.Fatalf("round %d decoded %d fields, last %v", round, len(got), got[len(got)-1])
+		}
+	}
+	// The second round found every field in the table.
+	if len(block) > 3*300 {
+		t.Fatalf("second block %d bytes for 300 indexed fields", len(block))
+	}
+	// The peer allowing less shrinks the table below the limit.
+	e.SetMaxTableSize(100)
+	if e.table.maxSize != 100 {
+		t.Fatalf("table %d with an allowance of 100", e.table.maxSize)
+	}
+	// A limit below the default shrinks a table the peer allows more of.
+	f := NewEncoder()
+	f.SetTableSizeLimit(0)
+	block = f.Begin(nil)
+	block = f.AppendField(block, "x-a", "b", false)
+	g := NewDecoder(DefaultTableSize)
+	decodeAll(t, g, block)
+	if len(g.table.entries) != 0 || g.table.maxSize != 0 {
+		t.Fatalf("decoder table %d entries of at most %d bytes", len(g.table.entries), g.table.maxSize)
+	}
+	if e.SetTableSizeLimit(1 << 30); e.limit != MaxEncoderTableSize {
+		t.Fatalf("limit %d", e.limit)
+	}
+}
+
+// TestDecoderAllowedMaxSize checks that once the allowance drops below the
+// peer's table, the peer's next block has to begin by shrinking the table.
+func TestDecoderAllowedMaxSize(t *testing.T) {
+	e, d := NewEncoder(), NewDecoder(DefaultTableSize)
+	block := e.AppendField(e.Begin(nil), "x-a", "b", false)
+	decodeAll(t, d, block)
+	d.SetAllowedMaxSize(100)
+	plain := e.AppendField(e.Begin(nil), "x-a", "b", false)
+	if err := d.Decode(plain, func(HeaderField) error { return nil }); err != ErrInvalidSizeUpdate {
+		t.Fatalf("block without the update: %v", err)
+	}
+	e.SetMaxTableSize(100)
+	shrunk := e.AppendField(e.Begin(nil), "x-a", "b", false)
+	if got := decodeAll(t, d, shrunk); len(got) != 1 || d.mustShrink {
+		t.Fatalf("decoded %v, mustShrink %v", got, d.mustShrink)
+	}
+	// An allowance at or above the table's size asks nothing of the peer.
+	d.SetAllowedMaxSize(200)
+	if d.mustShrink {
+		t.Fatal("a larger allowance requires an update")
 	}
 }

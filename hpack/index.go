@@ -2,32 +2,45 @@ package hpack
 
 import "hash/maphash"
 
-// An encoder's dynamic table never holds more than this many entries: the
-// encoder caps the table at the default size, and an entry counts at least 32
-// bytes against it.
-const maxIndexedEntries = DefaultTableSize / 32
-
-// indexSlots is the size of each hash table of a fieldIndex, twice the
-// entries it has to hold, so a probe soon meets an empty slot.
-const indexSlots = 2 * maxIndexedEntries
+// MaxEncoderTableSize is the largest dynamic table an Encoder uses, whatever
+// SetTableSizeLimit and the peer allow: an entry counts at least 32 bytes
+// against the table, so it holds fewer entries than its index tells apart.
+const MaxEncoderTableSize = 1 << 20
 
 // A slot of a fieldIndex is empty when zero. Otherwise its top bit is set, the
-// next seven bits are the top of the key's hash, to skip most entries with
-// another key without comparing strings, and the low byte is the number of
-// entries added before this one, modulo 256, which tells the table's entries
-// apart since it holds fewer than that.
+// next fifteen bits are the top of the key's hash, to skip most entries with
+// another key without comparing strings, and the low sixteen bits are the
+// number of entries added before this one, modulo 65536, which tells the
+// table's entries apart since it holds fewer than that.
 const (
-	slotUsed = 0x8000
-	slotTag  = 0xff00
+	slotUsed = 0x80000000
+	slotTag  = 0xffff0000
 )
 
 // fieldIndex finds the newest entry of an encoder's dynamic table with a name
 // and value, and the newest with a name, without searching the table. It is
 // two hash tables with linear probing, one per key, holding a slot for each
-// distinct key in the table.
+// distinct key in the table. Each has a power of two slots, at least twice
+// the entries the table can hold at the size it was made for, so that a probe
+// soon meets an empty slot; a table allowed to grow past that is indexed
+// afresh.
 type fieldIndex struct {
-	pairs, names [indexSlots]uint16
+	pairs, names []uint32
+	mask         uint
 }
+
+// newFieldIndex returns an index for a table of up to maxSize bytes.
+func newFieldIndex(maxSize int) *fieldIndex {
+	n := 32
+	for n < 2*(maxSize/32) {
+		n *= 2
+	}
+	slots := make([]uint32, 2*n)
+	return &fieldIndex{pairs: slots[:n:n], names: slots[n:], mask: uint(n - 1)}
+}
+
+// fits reports whether the index has room for a table of maxSize bytes.
+func (x *fieldIndex) fits(maxSize int) bool { return len(x.pairs) >= 2*(maxSize/32) }
 
 var indexSeed = maphash.MakeSeed()
 
@@ -38,19 +51,19 @@ func hashPair(nameHash uint64, value string) uint64 {
 	return nameHash ^ maphash.String(indexSeed, value)*0x9e3779b97f4a7c15
 }
 
-func slotOf(h uint64, id uint8) uint16 {
-	return slotUsed | uint16(h>>57)<<8 | uint16(id)
+func slotOf(h uint64, id uint16) uint32 {
+	return slotUsed | uint32(h>>49)<<16 | uint32(id)
 }
 
 // slotPos is the position in entries of the entry a slot refers to.
-func (t *dynamicTable) slotPos(s uint16) int { return int(uint8(s) - t.first) }
+func (t *dynamicTable) slotPos(s uint32) int { return int(uint16(s) - t.first) }
 
 // find returns the position in entries of the newest entry with the key h
 // hashes, the name alone or with value when pair is set, or -1.
-func (t *dynamicTable) find(slots *[indexSlots]uint16, h uint64, name, value string, pair bool) int {
-	tag := slotOf(h, 0)
+func (t *dynamicTable) find(slots []uint32, h uint64, name, value string, pair bool) int {
+	tag, mask := slotOf(h, 0), t.index.mask
 	for i := uint(h); ; i++ {
-		s := slots[i%indexSlots]
+		s := slots[i&mask]
 		if s == 0 {
 			return -1
 		}
@@ -66,11 +79,11 @@ func (t *dynamicTable) find(slots *[indexSlots]uint16, h uint64, name, value str
 
 // link points the key h hashes at the entry at position p, the newest, in
 // place of an older entry with the key if there is one.
-func (t *dynamicTable) link(slots *[indexSlots]uint16, h uint64, p int, pair bool) {
-	tag := slotOf(h, 0)
+func (t *dynamicTable) link(slots []uint32, h uint64, p int, pair bool) {
+	tag, mask := slotOf(h, 0), t.index.mask
 	f := t.entries[p]
 	for i := uint(h); ; i++ {
-		s := &slots[i%indexSlots]
+		s := &slots[i&mask]
 		if *s != 0 {
 			if *s&slotTag != tag {
 				continue
@@ -79,7 +92,7 @@ func (t *dynamicTable) link(slots *[indexSlots]uint16, h uint64, p int, pair boo
 				continue
 			}
 		}
-		*s = slotOf(h, t.first+uint8(p))
+		*s = slotOf(h, t.first+uint16(p))
 		return
 	}
 }
@@ -88,9 +101,10 @@ func (t *dynamicTable) link(slots *[indexSlots]uint16, h uint64, p int, pair boo
 // p, which is leaving the table. A newer entry with the same key has taken
 // the slot over otherwise. The slots after the one emptied move back into it
 // as linear probing requires, which takes their keys' hashes again.
-func (t *dynamicTable) unlink(slots *[indexSlots]uint16, h uint64, p int, pair bool) {
-	hole := uint(h) % indexSlots
-	for ; ; hole = (hole + 1) % indexSlots {
+func (t *dynamicTable) unlink(slots []uint32, h uint64, p int, pair bool) {
+	mask := t.index.mask
+	hole := uint(h) & mask
+	for ; ; hole = (hole + 1) & mask {
 		s := slots[hole]
 		if s == 0 {
 			return
@@ -99,13 +113,13 @@ func (t *dynamicTable) unlink(slots *[indexSlots]uint16, h uint64, p int, pair b
 			break
 		}
 	}
-	for j := (hole + 1) % indexSlots; slots[j] != 0; j = (j + 1) % indexSlots {
+	for j := (hole + 1) & mask; slots[j] != 0; j = (j + 1) & mask {
 		f := t.entries[t.slotPos(slots[j])]
 		home := hashName(f.Name)
 		if pair {
 			home = hashPair(home, f.Value)
 		}
-		if (j-uint(home))%indexSlots >= (j-hole)%indexSlots {
+		if (j-uint(home))&mask >= (j-hole)&mask {
 			slots[hole] = slots[j]
 			hole = j
 		}
@@ -121,7 +135,8 @@ const indexFrom = 16
 // addIndexed adds f to an encoder's table and to its index. hashed says
 // whether the name and pair hashes are given; they are taken here when the
 // index needs them. The index is made when the table first grows past
-// indexFrom entries, so an encoder whose table stays small goes without.
+// indexFrom entries, so an encoder whose table stays small goes without, and
+// made again when the table has been allowed to outgrow it.
 func (t *dynamicTable) addIndexed(f HeaderField, nameHash, pairHash uint64, hashed bool) {
 	t.size += f.size()
 	t.entries = append(t.entries, f)
@@ -132,14 +147,14 @@ func (t *dynamicTable) addIndexed(f HeaderField, nameHash, pairHash uint64, hash
 			pairHash = hashPair(nameHash, f.Value)
 		}
 		p := len(t.entries) - 1
-		t.link(&t.index.names, nameHash, p, false)
-		t.link(&t.index.pairs, pairHash, p, true)
+		t.link(t.index.names, nameHash, p, false)
+		t.link(t.index.pairs, pairHash, p, true)
 	case len(t.entries) > indexFrom:
-		t.index = new(fieldIndex)
+		t.index = newFieldIndex(t.maxSize)
 		for p, g := range t.entries {
 			h := hashName(g.Name)
-			t.link(&t.index.names, h, p, false)
-			t.link(&t.index.pairs, hashPair(h, g.Value), p, true)
+			t.link(t.index.names, h, p, false)
+			t.link(t.index.pairs, hashPair(h, g.Value), p, true)
 		}
 	}
 	t.evict()
@@ -150,7 +165,7 @@ func (t *dynamicTable) unindex(n int) {
 	for p := range n {
 		f := t.entries[p]
 		h := hashName(f.Name)
-		t.unlink(&t.index.names, h, p, false)
-		t.unlink(&t.index.pairs, hashPair(h, f.Value), p, true)
+		t.unlink(t.index.names, h, p, false)
+		t.unlink(t.index.pairs, hashPair(h, f.Value), p, true)
 	}
 }

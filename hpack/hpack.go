@@ -35,9 +35,9 @@ type dynamicTable struct {
 	entries []HeaderField
 	size    int
 	maxSize int
-	// first is how many entries have been evicted, modulo 256, which the
+	// first is how many entries have been evicted, modulo 65536, which the
 	// index uses to tell its entries apart.
-	first uint8
+	first uint16
 	// index, which only an encoder keeps, finds entries by name and value.
 	index *fieldIndex
 }
@@ -58,6 +58,11 @@ func (t *dynamicTable) add(f HeaderField) {
 func (t *dynamicTable) setMaxSize(n int) {
 	t.maxSize = n
 	t.evict()
+	if t.index != nil && !t.index.fits(n) {
+		// Made for a smaller table; the next entry added indexes the table
+		// afresh, at the size it may now grow to.
+		t.index = nil
+	}
 }
 
 // evict drops the oldest entries until the table fits. An entry larger than
@@ -74,7 +79,7 @@ func (t *dynamicTable) evict() {
 	if t.index != nil {
 		t.unindex(n)
 	}
-	t.first += uint8(n)
+	t.first += uint16(n)
 	copy(t.entries, t.entries[n:])
 	for i := len(t.entries) - n; i < len(t.entries); i++ {
 		t.entries[i] = HeaderField{}
@@ -102,8 +107,11 @@ type Decoder struct {
 	table dynamicTable
 	// allowedMaxSize is the table size this side advertised in
 	// SETTINGS_HEADER_TABLE_SIZE; the peer may shrink its use below it but
-	// never grow past it.
+	// never grow past it. mustShrink says the allowance has dropped below
+	// the size the peer's table was last set to, so that its next block has
+	// to begin by shrinking the table to fit; see SetAllowedMaxSize.
 	allowedMaxSize int
+	mustShrink     bool
 	// MaxStringLength bounds one name or value. Zero means no bound beyond
 	// the block's own length.
 	MaxStringLength int
@@ -142,12 +150,27 @@ func NewDecoder(maxTableSize int) *Decoder {
 	return d
 }
 
+// SetAllowedMaxSize changes the table size the peer is allowed, once it has
+// acknowledged the SETTINGS_HEADER_TABLE_SIZE that says so. An allowance
+// below the size the peer's table was last set to has the peer's next block
+// begin with a dynamic table size update that fits it, as RFC 7541 section
+// 4.2 requires of the peer's encoder; a block that does not is an error.
+func (d *Decoder) SetAllowedMaxSize(n int) {
+	d.allowedMaxSize = n
+	if d.table.maxSize > n {
+		d.mustShrink = true
+	}
+}
+
 // Decode decodes one complete header block, calling emit for each field in
 // order. The dynamic table is updated as the block says, so every block a
 // peer sends has to go through Decode, in order, even one whose fields are
 // then ignored.
 func (d *Decoder) Decode(block []byte, emit func(HeaderField) error) error {
 	start := true
+	if d.mustShrink && (len(block) == 0 || block[0]&0xe0 != 0x20) {
+		return ErrInvalidSizeUpdate
+	}
 	for len(block) > 0 {
 		b := block[0]
 		switch {
@@ -190,6 +213,7 @@ func (d *Decoder) Decode(block []byte, emit func(HeaderField) error) error {
 			}
 			block = rest
 			d.table.setMaxSize(int(size))
+			d.mustShrink = false
 			continue
 		default:
 			// Literal without indexing (0000) or never indexed (0001).
@@ -347,21 +371,37 @@ type Encoder struct {
 	// which RFC 7541 section 4.2 requires announcing too.
 	pendingSize bool
 	minPending  int
+	// limit is the largest table the encoder uses, whatever the peer
+	// allows; see SetTableSizeLimit. allowed is what the peer allows.
+	limit   int
+	allowed int
 }
 
 // NewEncoder returns an encoder with the default table size.
 func NewEncoder() *Encoder {
-	e := &Encoder{}
+	e := &Encoder{limit: DefaultTableSize, allowed: DefaultTableSize}
 	e.table.maxSize = DefaultTableSize
 	return e
 }
 
+// SetTableSizeLimit sets the largest dynamic table the encoder uses, at most
+// MaxEncoderTableSize, which is DefaultTableSize until it is called: the
+// table, which the peer's decoder keeps a copy of, is never larger than both
+// this and the peer's SETTINGS_HEADER_TABLE_SIZE. A limit larger than the
+// default lets an encoder whose peer allows more keep more of the fields it
+// sends; one smaller shrinks the table, which the next block announces.
+func (e *Encoder) SetTableSizeLimit(n int) {
+	e.limit = min(max(n, 0), MaxEncoderTableSize)
+	e.SetMaxTableSize(e.allowed)
+}
+
 // SetMaxTableSize applies the peer's SETTINGS_HEADER_TABLE_SIZE. The encoder
-// never uses more than the default table size, so a larger allowance changes
-// nothing.
+// never uses more than its limit (see SetTableSizeLimit), the default table
+// size unless set, so a larger allowance changes nothing beyond it.
 func (e *Encoder) SetMaxTableSize(n int) {
-	if n > DefaultTableSize {
-		n = DefaultTableSize
+	e.allowed = n
+	if n > e.limit {
+		n = e.limit
 	}
 	if n == e.table.maxSize {
 		return
@@ -397,15 +437,15 @@ func (e *Encoder) AppendField(dst []byte, name, value string, sensitive bool) []
 	}
 	t := &e.table
 	var nameHash, pairHash uint64
-	hashed := len(t.entries) > indexFrom
+	hashed := t.index != nil && len(t.entries) > indexFrom
 	if hashed {
 		nameHash = hashName(name)
 		pairHash = hashPair(nameHash, value)
-		if p := t.find(&t.index.pairs, pairHash, name, value, true); p >= 0 {
+		if p := t.find(t.index.pairs, pairHash, name, value, true); p >= 0 {
 			return appendInt(dst, 0x80, 7, uint64(len(staticTable)+len(t.entries)-p))
 		}
 		if nameIndex == 0 {
-			if p := t.find(&t.index.names, nameHash, name, "", false); p >= 0 {
+			if p := t.find(t.index.names, nameHash, name, "", false); p >= 0 {
 				nameIndex = len(staticTable) + len(t.entries) - p
 			}
 		}
