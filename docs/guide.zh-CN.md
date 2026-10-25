@@ -1207,11 +1207,19 @@ server, err := fib.New(fib.DefaultConfig(),
 - Engine 按对端地址区分 UDP 连接，每个发来 QUIC Initial 的地址对应一个 QUIC 连接，挂在
   该地址的 `fib.Connection` 上。NAT 重绑定后，新地址来的包按 Connection ID 找到原来的
   连接，经过路径验证后连接改到新地址上（见 [`docs/http3.zh-CN.md`](http3.zh-CN.md)）；
-  主动迁移不支持，服务端在传输参数里声明 `disable_active_migration`。Connection ID
+  主动迁移不支持，服务端在传输参数里声明 `disable_active_migration`；握手后服务端还会
+  用 NEW_CONNECTION_ID 签发几个 Connection ID（客户端退役一个就补一个），并为每个建好
+  路由，客户端换地址时换用新 CID 也能找到原连接。Connection ID
   也不认识的短包头包会收到 stateless reset，让对端立即结束而不是等超时；不认识的 QUIC
   版本收到 Version Negotiation。
 - QUIC 的空闲超时（`MaxIdleTimeout`，默认 30 秒）应小于 Engine 的
   `Config.UDPIdleTimeout`（默认 60 秒），否则 Engine 会先把静默的对端连接关掉。
+- `Config.Transport`（客户端是 `ClientConfig.Transport`，类型 `http3.TransportConfig`）设置
+  QUIC 层的参数：keep-alive 间隔、stream 与连接的接收窗口、对端可开的单向 stream 数、
+  ACK 最大延迟、洪泛额度（`StreamResetBurst`/`Rate`、`ControlFrameBurst`/`Rate`）、按时间
+  更新密钥的间隔和签发给对端的 Connection ID 数。
+- 发送时遵守对端 SETTINGS 里的 `SETTINGS_MAX_FIELD_SECTION_SIZE`：超过的响应头写入失败、
+  超过的 trailer 重置 stream，客户端超过的请求直接失败。
 - Handler 不用改：请求的 `Proto` 为 `HTTP/3.0`，`Request.TLS` 带有 TLS 状态，用
   `Context.Respond`/`WriteResponse` 回复，响应被编成该 stream 的 HEADERS/DATA 帧；
   可以在其他 goroutine 中异步回复。`WriteInterim` 支持 1xx 中间响应（如 103 Early
@@ -1236,7 +1244,8 @@ QUIC 层的实现要点：
 - 包保护支持 TLS 1.3 的三种套件：AES-128-GCM、AES-256-GCM 和
   ChaCha20-Poly1305（标准库没有导出 ChaCha20-Poly1305，本库按 RFC 8439 自行实现，
   并用 RFC 9001 附录的测试向量校验）；密钥更新（key update）双向支持：一把密钥保护的
-  包数达到 RFC 9001 §6.6 的上限时主动发起，也响应对端发起的更新，解密失败次数超过
+  包数达到 RFC 9001 §6.6 的上限时（或设置了 `KeyUpdateInterval` 时按时间）主动发起，
+  也响应对端发起的更新，解密失败次数超过
   完整性上限时关闭连接；客户端支持 Retry。支持 0-RTT（默认关闭，`quic.Config.EarlyData`）。
 - 丢包检测与拥塞控制按 RFC 9002 实现：ACK 阈值和时间阈值判定丢包、PTO 探测、
   NewReno 拥塞控制；服务端在验证客户端地址前遵守 3 倍放大限制。数据报从 1200 字节
@@ -1244,8 +1253,10 @@ QUIC 层的实现要点：
   通常升到 1452 字节；更大的包持续丢失时退回 1200 字节（黑洞检测）。探测要求 UDP socket
   不分片，由 `fib.Connection.SetDontFragment` 设置；`DisablePathMTUDiscovery` 关闭探测，
   `MaxProbeDatagramSize` 设上限。
-- 流控：遵守对端的连接级和 stream 级限制；接收方向每个 stream 窗口 1MB、连接窗口
-  16MB，按消费量自动补充；并发 stream 数用 MAX_STREAMS 动态放开。
+- 流控：遵守对端的连接级和 stream 级限制，被挡住时每个新上限发一次 DATA_BLOCKED、
+  STREAM_DATA_BLOCKED 或 STREAMS_BLOCKED；接收方向默认每个 stream 窗口 1MB、连接窗口
+  16MB（`TransportConfig` 可调），按消费量自动补充；并发 stream 数用 MAX_STREAMS 动态放开。
+- 关闭：本端关闭后有 closing 期，对端关闭后有同样长的 draining 期（不再发送，但保留路径）。
 - QPACK 两端都声明动态表容量为 0：编码只用静态表和字面量（字面量在更短时使用
   Huffman 编码），解码拒绝任何动态表引用，因此编码器流和解码器流无需内容。
 - 已与 quic-go 做双向互通测试（包括 5% 随机丢包下的 20MB 双向传输），客户端也验证过
@@ -1255,9 +1266,8 @@ QUIC 层的实现要点：
 
 HTTP/3 的一致性测试（与 quic-go 客户端、服务端的双向互通，以及用手写帧构造的协议错误
 用例，CI 中在三个平台运行；quic-go 放在 `http3/interop` 这个独立 module 里，fib 本身
-不增加依赖）、当前的限制（只跟随 NAT 重绑定、不支持主动迁移、关闭时
-没有 closing/draining 期等）、0-RTT 的做法与防重放、有意未实现的功能及原因（QPACK 动态表、server push
-等），以及待优化项（拥塞控制、批量收发等）见
+不增加依赖）、当前的限制（只跟随 NAT 重绑定、不支持主动迁移等）、0-RTT 的做法与防重放、
+有意未实现的功能及原因（QPACK 动态表、server push 等），以及待优化项（拥塞控制、批量收发等）见
 [`docs/http3.zh-CN.md`](http3.zh-CN.md)。
 
 ### 异步 HTTP/3 client

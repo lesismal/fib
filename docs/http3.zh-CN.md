@@ -15,7 +15,7 @@
 
 | 方向 | 内容 |
 | --- | --- |
-| QUIC | version 1；Initial、Handshake、1-RTT 三个包号空间；AES-128-GCM、AES-256-GCM、ChaCha20-Poly1305 包保护与头部保护；双向 key update（本端按 AEAD 使用上限主动发起，也响应对端发起）与解密失败次数上限；服务端负载高时发送 Retry，客户端处理 Retry；Version Negotiation；stateless reset；RFC 9002 丢包检测、PTO 与持续拥塞判定；CUBIC（RFC 9438，默认）或 NewReno 拥塞控制，带 pacing 和应用受限判断；服务端 3 倍放大限制；连接级与 stream 级双向流控；MAX_STREAMS；空闲超时与可选 keep-alive |
+| QUIC | version 1；Initial、Handshake、1-RTT 三个包号空间；AES-128-GCM、AES-256-GCM、ChaCha20-Poly1305 包保护与头部保护；双向 key update（本端按 AEAD 使用上限或可选的时间间隔主动发起，也响应对端发起）与解密失败次数上限；服务端负载高时发送 Retry，客户端处理 Retry；Version Negotiation；stateless reset；RFC 9002 丢包检测、PTO 与持续拥塞判定；CUBIC（RFC 9438，默认）或 NewReno 拥塞控制，带 pacing 和应用受限判断；服务端 3 倍放大限制；连接级与 stream 级双向流控及 BLOCKED 帧；MAX_STREAMS；用 NEW_CONNECTION_ID 签发、可退役的 Connection ID；draining 期；空闲超时与可选 keep-alive |
 | 服务端 | 与 HTTP/1、HTTP/2 共用同一个 `Handler` 和 `Context`；1xx 中间响应、自动 100 Continue、请求与响应 trailer、`Response.Close` 通过 GOAWAY 优雅关闭、413/431/417、非法请求（含 `:authority` 与 `Host` 不一致）以 H3_MESSAGE_ERROR 重置、协议错误按 RFC 9114 / RFC 9204 错误码关闭连接、`Request.TLS`、`AltSvc` 辅助函数、Extended CONNECT（RFC 9220）经 `Context.Upgrade` 切换为隧道，`websocket.ServerHandler.Upgrade` 即借此提供 WebSocket over HTTP/3 |
 | 客户端 | 异步 `Do`/`Go`；每个 host:port 一条连接、多路复用；遵守 MAX_STREAMS 并排队；取消只重置单个 stream；GOAWAY 与 H3_REQUEST_REJECTED 的请求自动在新连接上重发；`Expect: 100-continue` 等待 100；请求与响应 trailer；对端违反协议时按错误码关闭连接 |
 | 一致性 | 与 quic-go 客户端、服务端双向互通，以及用手写帧构造的协议错误用例，都在 CI 中运行 |
@@ -39,12 +39,15 @@
   的请求，`Request.RemoteAddr` 是新地址。
 - Linux 上开启 `Config.IOPollers` 和 `ReusePort` 时，新地址可能落到另一个 poller 的
   socket 上；QUIC 连接可以从任意 goroutine 接收数据报，所以连接会跟过去。
-- 服务端仍然声明 `disable_active_migration`，除握手时的 Connection ID 外不再签发新的：
-  客户端主动迁移需要在新路径上用新的 Connection ID，所以不能主动迁移，但它的 NAT 可以换地址。
-- 本端只使用握手时的一个 Connection ID，从不发送 NEW_CONNECTION_ID。对端提供的
-  CID 会被记录，也会遵守 retire_prior_to，但本端不主动轮换 CID。PATH_CHALLENGE 在连接
-  当前发送的路径上回复，待发送的回复最多保留最近 4 个（RFC 9000 §8.2.2 只要求回复最新的
-  挑战）；preferred_address 被忽略。
+- 握手确认后，两端用 NEW_CONNECTION_ID 签发握手之外的 Connection ID，数量取对端
+  `active_connection_id_limit` 与 `TransportConfig.ActiveConnectionIDs`（默认 4）中的较小者；
+  对端用 RETIRE_CONNECTION_ID 退役一个，就补签一个（RFC 9000 §5.1）。服务端在把新 CID
+  发给客户端之前就为它建好路由，所以客户端换地址时顺带换成新 CID（这样旁观者无法把新旧
+  路径关联起来），也会像 NAT 重绑定一样被跟随。连接结束时这些路由一并删除。
+- 服务端仍然声明 `disable_active_migration`：PATH_CHALLENGE 在连接当前发送的路径上回复，
+  待发送的回复最多保留最近 4 个（RFC 9000 §8.2.2 只要求回复最新的挑战），客户端主动探测
+  自选的新路径时收不到回复。它的 NAT 可以换地址。对端提供的 CID 会被记录，也会遵守
+  retire_prior_to，但本端一直向手上那一个发送；preferred_address 被忽略。
 
 ### 与 Engine 的配合
 
@@ -128,38 +131,52 @@
 
 ### 固定参数
 
-以下参数目前是常量，或者只在内部的 `quic.Config` 中存在，没有通过 `http3.Config` 或
-`http3.ClientConfig` 暴露：
+`Config.Transport` 和 `ClientConfig.Transport`（类型为 `http3.TransportConfig`）设置服务端或
+客户端下 QUIC 连接的行为：
+
+| 参数 | 默认值 | 字段 |
+| --- | --- | --- |
+| 每个 stream 的接收窗口 | 1MB，消费一半后补充 | `StreamReceiveWindow` |
+| 连接的接收窗口 | 16MB，消费一半后补充 | `ConnReceiveWindow` |
+| 对端可以打开的单向 stream 数 | 16 | `MaxIncomingUniStreams` |
+| ACK 最多延迟多久（`max_ack_delay`） | 25ms；此外每 2 个需要确认的包立即回一次 ACK | `MaxAckDelay` |
+| keep-alive | 不发：什么都不传的连接空闲 `MaxIdleTimeout`（30 秒）后关闭，下一个请求重新握手 | `KeepAlivePeriod` |
+| 洪泛额度 | 突发 1000，每秒恢复 100（见[协议细节](#协议细节)） | `StreamResetBurst`、`StreamResetRate`、`ControlFrameBurst`、`ControlFrameRate` |
+| 按时间更新密钥 | 不做：密钥在 AEAD 的包数上限时更新 | `KeyUpdateInterval` |
+| 签发给对端的 Connection ID 数 | 4，以对端允许的为限 | `ActiveConnectionIDs` |
+
+以下参数仍是常量：
 
 | 参数 | 值 |
 | --- | --- |
 | 数据报大小 | 1200 字节，直到路径 MTU 探测找到更大的（见[协议细节](#协议细节)），最多 1452；已知网络能承载更大数据报时，服务端可以用 `Config.MaxDatagramSize` 从更大的值开始 |
-| 每个 stream 的接收窗口 | 1MB，消费一半后补充 |
-| 连接的接收窗口 | 16MB，消费一半后补充 |
-| 对端可以打开的单向 stream 数 | 16 |
 | 客户端声明的双向 stream 上限 | 1（服务端不能打开请求 stream） |
 | QPACK 动态表容量 | 0 |
-| ACK 策略 | 每 2 个需要确认的包回一次 ACK，或最多延迟 25ms |
 | 可记住的已接收包号区间 | 32 个，更早的包被当作重复包丢弃 |
-| keep-alive | 客户端默认不发，空闲 30 秒后连接关闭，下一个请求重新握手 |
 
 ### 协议细节
 
 - **关闭**：发出 CONNECTION_CLOSE 的连接保留一段 closing 期（RFC 9000 §10.2.1），长度为
   3 个 PTO，至少 1 秒、至多空闲超时；其间对之后到达的包重发 CONNECTION_CLOSE，在第 1、2、
-  4、8……个包时各发一次。收到对端的 CONNECTION_CLOSE 时立即释放，没有 draining 期。
+  4、8……个包时各发一次。收到对端 CONNECTION_CLOSE 的连接进入同样长的 draining 期（RFC 9000
+  §10.2.2）：不再发送任何东西，但保留路径，对端仍在途中的包被静默吸收，而不是回一个
+  stateless reset 或被当成新连接。
   `Engine.Close` 在结束连接之前给每个连接（服务端的和客户端的）发送 CONNECTION_CLOSE
   （H3_NO_ERROR）；`Engine.Stop` 让连接保持打开，直到 `Close`。
 - **密钥更新**：本端在一把密钥保护的包数达到 RFC 9001 §6.6 的上限（AES-GCM 约 2^23 个
   包）时主动发起 key update，也响应对端发起的更新；解密失败次数超过完整性上限时以
-  AEAD_LIMIT_REACHED 关闭连接。不做的是按时间或按需要更换密钥。
+  AEAD_LIMIT_REACHED 关闭连接。`TransportConfig.KeyUpdateInterval` 还可以让发送密钥用满
+  这段时间后更新；更新仍要等对端确认过当前密钥的包，所以空闲的连接不会更新。不支持按需更新。
 - **Stateless reset**：reset key 由每个 `ServerHandler` 随机生成，`Config.StatelessResetKey`
   可以指定固定的 key；用随机 key 时，服务端重启后客户端认不出它对重启前的连接发出的 reset。
   只有客户端会识别 stateless reset。
-- **洪泛**：对端不请求任何东西就能让连接做的事有上限，突发 1000 次、每秒恢复 100 次，超过后
-  连接以 H3_EXCESSIVE_LOAD 关闭，见[待优化项](#1-正确性与安全加固)。
-- **BLOCKED 类帧**：受流控限制时不发送 DATA_BLOCKED、STREAM_DATA_BLOCKED、
-  STREAMS_BLOCKED。
+- **洪泛**：对端不请求任何东西就能让连接做的事有上限，默认突发 1000 次、每秒恢复 100 次
+  （`TransportConfig.StreamResetBurst`/`StreamResetRate` 与 `ControlFrameBurst`/`ControlFrameRate`，
+  小于 0 不限制），超过后连接以 H3_EXCESSIVE_LOAD 关闭，见[待优化项](#1-正确性与安全加固)。
+- **BLOCKED 类帧**：有数据要发却被对端流控挡住时，每碰到一个新上限报告一次：连接级用
+  DATA_BLOCKED，stream 级用 STREAM_DATA_BLOCKED，想开新 stream 而对端还不允许时用
+  STREAMS_BLOCKED（RFC 9000 §4.1）；丢失的只在该上限仍然有效时重发，还没发出的在上限被
+  提高后丢弃。
 - **拥塞控制**：默认 CUBIC（RFC 9438），可用 `quic.Config.CongestionControl` 改为
   NewReno；没有 BBR、HyStart++ 和 ECN。发送按每个平滑 RTT 1.25 个拥塞窗口的速率 pacing。
   发送缓冲区满（`EAGAIN`，macOS 上是 `ENOBUFS`）时，这一轮剩下的数据报保留下来，1 毫秒
@@ -174,7 +191,10 @@
   发送大于 1200 字节数据报的连接，在 3 个更大的包丢失、而它们之后发出的大包一个都没被确认时，或者
   连续 3 次 PTO 时，退回 1200 字节，1 分钟后重新探测；用 `MaxDatagramSize` 设的大小也是如此。
   拥塞窗口仍按 1200 字节的数据报计算。
-- **对端的 `SETTINGS_MAX_FIELD_SECTION_SIZE`**：能解析，但发送时不检查。
+- **对端的 `SETTINGS_MAX_FIELD_SECTION_SIZE`**：对端 SETTINGS 到达后发送时遵守，按
+  RFC 9114 §4.2.2 计算每个字段。服务端的响应头、1xx 或 trailer 超过时写入失败，handler 可以
+  改用别的回应；body 已发出后才超限的 trailer 改为重置 stream，免得客户端把 body 当成完整的。
+  客户端请求的头或 trailer 超过时请求直接失败，不发送。
 - **优先级**：`priority` 头和 PRIORITY_UPDATE 帧都被忽略，待发送的 stream 轮流发送。
 - **ECN**：不设置也不上报 ECN 标记。ACK_ECN 帧能解析，但其中的计数被忽略。
 
@@ -219,7 +239,7 @@
 
 | 功能 | 原因 |
 | --- | --- |
-| 主动连接迁移 | 客户端主动迁移时要在新路径上用新的 Connection ID，服务端就得为每个连接签发、路由并退役多个 CID。保留 Connection ID 的 NAT 重绑定会被跟随（见上）。 |
+| 主动连接迁移 | 服务端已为每个连接签发并路由多个 Connection ID，但 PATH_CHALLENGE 在当前发送的路径上回复，而不是挑战到达的路径，客户端迁移前探测新路径无法完成验证；新路径上也仍向客户端的第一个 Connection ID 发送。NAT 重绑定（无论客户端是否换了 CID）会被跟随（见上）。 |
 | QPACK 动态表 | 两端都声明容量为 0：不会出现 blocked stream 造成的队头阻塞，编码器流和解码器流都没有内容，也没有额外的状态和内存。代价是重复出现的 header 每次都要完整发送。 |
 | Server push | 主流浏览器都不启用 HTTP/3 push。客户端不发 MAX_PUSH_ID，`Context.Push` 返回 `http.ErrNotSupported`。预加载推荐用 103 Early Hints（`WriteInterim`）。 |
 | NEW_TOKEN | 服务端在负载高时发送 Retry（见[待优化项](#1-正确性与安全加固)），但不发 NEW_TOKEN，所以客户端的下一个连接要重新验证地址：靠握手本身和 3 倍放大限制，或再一次 Retry。客户端会忽略 NEW_TOKEN。 |
@@ -248,16 +268,16 @@
 
   和确认了新包的 ACK 一起发来的 PING 不计数：只发 ACK 的一端（比如在下载的客户端）会不时
   捎带一个 PING，让对端确认它的 ACK；对端可能在 stream 结束后仍在途中的帧也不计数。
-  HTTP/3 自己的帧只花解析字节的开销（流控在 QUIC 层），不计数。这些预算暂时不能配置。
+  HTTP/3 自己的帧只花解析字节的开销（流控在 QUIC 层），不计数。这些预算在 `TransportConfig` 中设置。
 - **握手资源消耗**：进行中的握手超过 `Config.RetryHandshakes`（默认 1024；小于 0 表示
   总是）时，新客户端先收到 Retry，它带回的令牌证明了源地址之后，服务端才做 TLS 运算、
   保存状态；超过 `Config.MaxHandshakes`（默认 4096）时新客户端的 Initial 被丢弃。
   不合格的令牌（来自别的地址，或已超过 10 秒）以 INVALID_TOKEN 回应。令牌的 key 由每个
   handler 随机生成，所以同一地址后面的另一台服务端不认这台发出的 Retry。
 - **closing / draining 状态**：3×PTO 的 closing 期，其间对到达的包重发
-  CONNECTION_CLOSE；可配置固定的 stateless reset key（`Config.StatelessResetKey`）；
-  `Engine.Close` 时给连接发送 CONNECTION_CLOSE，`Engine.Stop` 让连接保持打开到那时（见
-  [协议细节](#协议细节)）。
+  CONNECTION_CLOSE；收到对端 CONNECTION_CLOSE 后同样长的 draining 期，期间不发送；
+  可配置固定的 stateless reset key（`Config.StatelessResetKey`）；`Engine.Close` 时给连接
+  发送 CONNECTION_CLOSE，`Engine.Stop` 让连接保持打开到那时（见[协议细节](#协议细节)）。
 
 ### 2. 性能（中）
 
@@ -299,10 +319,9 @@
 
 ### 4. 可配置性（低）
 
-- 在 `http3.Config` 和 `http3.ClientConfig` 中暴露 keep-alive、接收窗口、单向 stream
-  上限等参数。
-- 发送时遵守对端的 `SETTINGS_MAX_FIELD_SECTION_SIZE`。
-- 支持发送请求 trailer。
+- 已完成：keep-alive、接收窗口、单向 stream 上限、ACK 延迟、洪泛额度、按时间更新密钥和签发的
+  Connection ID 数可在 `Config.Transport` 和 `ClientConfig.Transport` 中设置；发送时遵守对端的
+  `SETTINGS_MAX_FIELD_SECTION_SIZE`；客户端可以发送请求 trailer（body 整体发送或流式发送都可以）。
 - 客户端：根据 `Alt-Svc` 自动选择 HTTP/3，并在 UDP 不通时回退到 TCP。
 
 ### 5. 测试覆盖（低）
@@ -335,5 +354,5 @@ job 在 Linux、macOS、Windows 上运行。
 | 测试内置的手写 HTTP/3 客户端（零依赖，对 fib 服务端） | 正常实现不会发的东西：HEADERS 之前的 DATA、不以 SETTINGS 开头的控制流、第二条控制流、缺少伪头部的请求、引用 QPACK 动态表、CANCEL_PUSH、调低的 MAX_PUSH_ID、抬高的 GOAWAY、QPACK 插入指令、`:authority` 与 `Host` 不一致、两者都缺失 |
 | body 矩阵的手写 QUIC 客户端（`http3/body_matrix_test.go`，对 fib 服务端） | 请求 body 的各种到达方式：无 body、带 content-length、不带长度的 DATA、带 trailer、`Expect: 100-continue`，小和大，stream 一次写完或分片间隔写，handler 直接读、用 OnBody、按 `BodyComplete` 二选一、或在别的 goroutine 里接收，服务端整体缓存、全部流式、超过阈值才流式；另有 body 发到一半 reset、body 上限、stream 窗口对慢 handler 的限速，以及 OnBody 在 handler 返回前不交付 body |
 | 测试内置的手写 HTTP/3 服务端（零依赖，对 fib 客户端） | 客户端的协议纠错：服务端发来的 MAX_PUSH_ID、CANCEL_PUSH、GOAWAY 指向非请求流、抬高的 GOAWAY、QPACK 插入指令、引用动态表的响应 |
-| 内存管道上的 QUIC 两端 | 握手、5% 与 20% 丢包下的传输、stream 数限制、reset、应用关闭、空闲超时、keep-alive、stateless reset、密钥更新（调低 AEAD 上限触发）、解密失败上限、Retry 及其令牌、洪泛限制 |
+| 内存管道上的 QUIC 两端 | 握手、5% 与 20% 丢包下的传输、stream 数限制、reset、应用关闭、空闲超时、keep-alive、stateless reset、密钥更新（调低 AEAD 上限触发）、解密失败上限、Retry 及其令牌、洪泛限制及其配置、BLOCKED 帧、draining、Connection ID 的签发、路由与退役 |
 | fuzz（`go test -fuzz`） | 面向不可信输入的解析：HTTP/3 帧解析器、从字段构造请求、QPACK 解码与编解码往返、QUIC 包头、传输参数、1-RTT 帧处理 |

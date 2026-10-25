@@ -17,7 +17,7 @@ from scratch. The TLS 1.3 handshake is the standard library's
 
 | Area | Content |
 | --- | --- |
-| QUIC | Version 1; Initial, Handshake and 1-RTT packet number spaces; AES-128-GCM, AES-256-GCM and ChaCha20-Poly1305 packet and header protection; key updates in both directions (started here when a key reaches its AEAD limit, and answered when the peer starts one) and a limit on decryption failures; Retry, sent by the server under load and handled by the client; Version Negotiation; stateless reset; RFC 9002 loss detection, PTO and persistent congestion; CUBIC (RFC 9438, the default) or NewReno congestion control, with pacing and app-limited detection; the server's 3x amplification limit; connection- and stream-level flow control in both directions; MAX_STREAMS; idle timeout and optional keep-alive |
+| QUIC | Version 1; Initial, Handshake and 1-RTT packet number spaces; AES-128-GCM, AES-256-GCM and ChaCha20-Poly1305 packet and header protection; key updates in both directions (started here when a key reaches its AEAD limit, or optionally after a time, and answered when the peer starts one) and a limit on decryption failures; Retry, sent by the server under load and handled by the client; Version Negotiation; stateless reset; RFC 9002 loss detection, PTO and persistent congestion; CUBIC (RFC 9438, the default) or NewReno congestion control, with pacing and app-limited detection; the server's 3x amplification limit; connection- and stream-level flow control in both directions, with BLOCKED frames; MAX_STREAMS; Connection IDs issued with NEW_CONNECTION_ID and retired; a draining period; idle timeout and optional keep-alive |
 | Server | Shares one `Handler` and `Context` with HTTP/1 and HTTP/2; 1xx interim responses, automatic 100 Continue, request and response trailers, graceful `Response.Close` via GOAWAY, 413/431/417, malformed requests (including an `:authority` and `Host` that disagree) reset with H3_MESSAGE_ERROR, protocol errors closing the connection with RFC 9114 and RFC 9204 codes, `Request.TLS`, an `AltSvc` helper, extended CONNECT (RFC 9220) switched to a tunnel with `Context.Upgrade`, which is how `websocket.ServerHandler.Upgrade` serves WebSocket over HTTP/3 |
 | Client | Asynchronous `Do`/`Go`; one multiplexed connection per host:port; honors MAX_STREAMS and queues the rest; cancellation resets only its own stream; requests the server marks as unprocessed (GOAWAY, H3_REQUEST_REJECTED) are retried on a new connection; `Expect: 100-continue` waits for the 100; request and response trailers; a peer that breaks the protocol ends the connection with its error code |
 | Resumption and 0-RTT | Session tickets, resumption, and 0-RTT early data, for the server (`Config.EarlyData`) and the client (`ClientConfig.EarlyData`); see [0-RTT](#0-rtt) |
@@ -50,14 +50,21 @@ Behavior users need to be aware of.
 - Under `Config.IOPollers` with `ReusePort` on Linux, the new address may
   fall to another poller's socket; the connection follows it there, since a
   QUIC connection takes datagrams from any goroutine.
-- The server still advertises `disable_active_migration`, and issues no
-  Connection IDs beyond the handshake's: a client may not move on purpose,
-  which would take a fresh Connection ID for the new path. Its NAT may.
-- Only the Connection ID from the handshake is used; NEW_CONNECTION_ID is never
-  sent. CIDs the peer offers are recorded and retire_prior_to is honored, but
-  this side never rotates CIDs. PATH_CHALLENGE is answered, on the path the
-  connection sends on, and at most the 4 latest answers wait to go out
-  (RFC 9000 §8.2.2 asks only that the latest challenge be answered);
+- Once the handshake is confirmed, each side issues Connection IDs beyond the
+  handshake's with NEW_CONNECTION_ID, as many as the peer's
+  `active_connection_id_limit` allows up to `TransportConfig.ActiveConnectionIDs`
+  (4 by default), and issues another for each one the peer retires with
+  RETIRE_CONNECTION_ID (RFC 9000 §5.1). The server routes every one of them to
+  its connection, before the client is sent it, so a client that switches to a
+  fresh Connection ID as its address changes, which keeps the change from
+  being linked to the old path, is followed as a NAT rebinding is. The routes
+  go with the connection.
+- The server still advertises `disable_active_migration`: it answers
+  PATH_CHALLENGE on the path the connection sends on, and at most the 4 latest
+  answers wait to go out (RFC 9000 §8.2.2 asks only that the latest challenge
+  be answered), so a client probing a path of its own choosing would not hear
+  the answer. Its NAT may move it. CIDs the peer offers are recorded and
+  retire_prior_to is honored, but this side keeps sending to the one it has;
   preferred_address is ignored.
 
 ### Working with the engine
@@ -175,20 +182,28 @@ request that arrives whole in one packet, as most do, costs none.
 
 ### Fixed parameters
 
-These are constants, or exist only in `quic.Config` without being
-exposed through `http3.Config` or `http3.ClientConfig`:
+`Config.Transport` and `ClientConfig.Transport` (an `http3.TransportConfig`)
+set how the QUIC connections under a server or a client behave:
+
+| Parameter | Default | Field |
+| --- | --- | --- |
+| Per-stream receive window | 1MB, replenished when half is consumed | `StreamReceiveWindow` |
+| Connection receive window | 16MB, replenished when half is consumed | `ConnReceiveWindow` |
+| Unidirectional streams the peer may open | 16 | `MaxIncomingUniStreams` |
+| Longest an acknowledgement is held back (`max_ack_delay`) | 25ms; otherwise every 2 ack-eliciting packets are acknowledged at once | `MaxAckDelay` |
+| Keep-alive | Off: a connection that carries nothing closes after `MaxIdleTimeout` (30s) and the next request handshakes again | `KeepAlivePeriod` |
+| Flood budgets | Bursts of 1000, refilled at 100 a second (see [Protocol details](#protocol-details)) | `StreamResetBurst`, `StreamResetRate`, `ControlFrameBurst`, `ControlFrameRate` |
+| Key updates by time | Off: keys are updated at the AEAD's packet limit | `KeyUpdateInterval` |
+| Connection IDs issued to the peer | 4, as far as the peer allows | `ActiveConnectionIDs` |
+
+These are still constants:
 
 | Parameter | Value |
 | --- | --- |
 | Datagram size | 1200 bytes until path MTU discovery finds more (see [Protocol details](#protocol-details)), at most 1452; a server can start higher with `Config.MaxDatagramSize` on a network known to carry that |
-| Per-stream receive window | 1MB, replenished when half is consumed |
-| Connection receive window | 16MB, replenished when half is consumed |
-| Unidirectional streams the peer may open | 16 |
 | Bidirectional stream limit the client advertises | 1 (servers may not open request streams) |
 | QPACK dynamic table capacity | 0 |
-| ACK policy | Every 2 ack-eliciting packets, or after at most 25ms |
 | Received packet number ranges remembered | 32; older packets are treated as duplicates |
-| Keep-alive | Off on the client by default; the connection closes after 30s idle and the next request handshakes again |
 
 ### Protocol details
 
@@ -196,25 +211,35 @@ exposed through `http3.Config` or `http3.ClientConfig`:
   period of three probe timeouts, at least a second and at most its idle
   timeout (RFC 9000 §10.2.1), in which it answers what still arrives with the
   CONNECTION_CLOSE again, at the 1st, 2nd, 4th, 8th and so on of them.
-  Receiving CONNECTION_CLOSE releases the connection at once, with no draining
-  period. `Engine.Close` sends CONNECTION_CLOSE (H3_NO_ERROR) on every
-  connection, the server's and the client's, before it ends them;
-  `Engine.Stop` leaves them open until then.
+  A connection that receives CONNECTION_CLOSE drains for as long (RFC 9000
+  §10.2.2): it sends nothing more, but keeps its path, so that what the peer
+  still has in flight is taken in silence rather than answered with a
+  stateless reset or taken for a new connection. `Engine.Close` sends
+  CONNECTION_CLOSE (H3_NO_ERROR) on every connection, the server's and the
+  client's, before it ends them; `Engine.Stop` leaves them open until then.
 - **Key updates**: this side starts one once a key has protected as many
   packets as RFC 9001 §6.6 allows (about 2^23 for AES-GCM), and answers the
   peer's; past the integrity limit on failed decryptions the connection ends
-  with AEAD_LIMIT_REACHED. What it does not do is rotate keys on a timer or
-  on request.
+  with AEAD_LIMIT_REACHED. `TransportConfig.KeyUpdateInterval` also updates
+  the sending keys once they have been in use that long; an update still
+  waits for the peer to acknowledge a packet of the current keys, so an idle
+  connection does not update. There is no update on request.
 - **Stateless reset**: the reset key is random per `ServerHandler` unless
   `Config.StatelessResetKey` sets one; with a random key, clients cannot
   recognize the resets a restarted server sends for connections from before
   it. Only clients recognize stateless resets.
 - **Floods**: what a peer can make a connection do without asking for
-  anything is bounded, past a burst of 1000 refilled at 100 a second, after
+  anything is bounded, past a burst of 1000 refilled at 100 a second by
+  default (`TransportConfig.StreamResetBurst`/`StreamResetRate` and
+  `ControlFrameBurst`/`ControlFrameRate`, below zero for no limit), after
   which the connection closes with H3_EXCESSIVE_LOAD; see
   [Planned improvements](#1-correctness-and-hardening).
-- **BLOCKED frames**: DATA_BLOCKED, STREAM_DATA_BLOCKED and STREAMS_BLOCKED are
-  never sent.
+- **BLOCKED frames**: a side with data to send that the peer's flow control
+  holds back says so once for each limit it reaches, with DATA_BLOCKED for the
+  connection's, STREAM_DATA_BLOCKED for a stream's, and STREAMS_BLOCKED when it
+  wants a stream the peer does not allow yet (RFC 9000 §4.1); a lost one goes
+  again only while its limit holds, and one waiting to go is dropped once the
+  peer raises the limit.
 - **Congestion control**: CUBIC (RFC 9438) by default, NewReno with
   `quic.Config.CongestionControl`; no BBR, HyStart++ or ECN. Sending is paced at
   1.25 congestion windows a smoothed RTT. A round of datagrams the send buffer
@@ -237,8 +262,13 @@ exposed through `http3.Config` or `http3.ClientConfig`:
   timeouts in a row, and searches again a minute later; this holds for a size
   set with `MaxDatagramSize` too. The congestion window is still counted in
   1200-byte datagrams.
-- **The peer's `SETTINGS_MAX_FIELD_SECTION_SIZE`** is parsed but not checked
-  when sending.
+- **The peer's `SETTINGS_MAX_FIELD_SECTION_SIZE`** is honored once its SETTINGS
+  have arrived, each field counted as RFC 9114 §4.2.2 counts it: a response
+  header, interim response or trailer of the server's that is larger fails
+  its write, so the handler can answer otherwise, and a trailer behind a body
+  already sent resets the stream instead, so that the client cannot take the
+  body for whole; a request of the client's whose header or trailer is larger
+  fails without being sent.
 - **Priorities**: the `priority` header and PRIORITY_UPDATE frames are ignored;
   streams with data to send take turns.
 - **ECN**: ECN marks are neither set nor reported. ACK_ECN frames are parsed,
@@ -311,7 +341,7 @@ uses, resumes and sends early data through the same QUIC code.
 
 | Feature | Reason |
 | --- | --- |
-| Active connection migration | A client moving on purpose has to use a fresh Connection ID on its new path, so the server would have to issue and route several per connection, and retire them. A NAT rebinding, which keeps the Connection ID, is followed (see above). |
+| Active connection migration | The server issues and routes several Connection IDs per connection, but answers PATH_CHALLENGE on the path it sends on, not the one the challenge came from, so a client probing a new path before it moves would not validate it; it also keeps sending to the client's first Connection ID on the new path. A NAT rebinding is followed, with the client's Connection ID changed or not (see above). |
 | QPACK dynamic table | Both sides advertise a capacity of 0: no head-of-line blocking from blocked streams, silent encoder and decoder streams, and no extra state or memory. The cost is that repeated headers are sent in full every time. |
 | Server push | No major browser enables HTTP/3 push. The client sends no MAX_PUSH_ID, and `Context.Push` returns `http.ErrNotSupported`. Use 103 Early Hints (`WriteInterim`) for preloading. |
 | NEW_TOKEN | The server sends Retry under load (see [Planned improvements](#1-correctness-and-hardening)), but no NEW_TOKEN, so a client's next connection is validated afresh: by its handshake and the 3x amplification limit, or by another Retry. The client ignores NEW_TOKEN. |
@@ -347,7 +377,7 @@ Done:
   one now and then to have its acknowledgements acknowledged; nor are frames a
   peer may send in flight for a stream that has ended. HTTP/3's own frames
   cost no more than their bytes, since flow control is QUIC's, and are not
-  counted. The budgets are not configurable yet.
+  counted. The budgets are set in `TransportConfig`.
 - **Handshake cost**: past `Config.RetryHandshakes` handshakes under way
   (1024 by default; below zero, always), a new client is first sent a Retry,
   whose token proves its address before the server does any TLS work or keeps
@@ -356,7 +386,8 @@ Done:
   is answered with INVALID_TOKEN. The tokens' key is random to each handler,
   so a Retry from one server is not good at another behind the same address.
 - **Closing and draining states**: the 3×PTO closing period, with
-  CONNECTION_CLOSE sent again to what arrives in it; a fixed stateless reset
+  CONNECTION_CLOSE sent again to what arrives in it, and as long a draining
+  period after the peer's CONNECTION_CLOSE, sending nothing; a fixed stateless reset
   key (`Config.StatelessResetKey`); CONNECTION_CLOSE on `Engine.Close`, which
   `Engine.Stop` leaves the connections open for (see
   [Protocol details](#protocol-details)).
@@ -414,10 +445,12 @@ Done:
 
 ### 4. Configurability (low)
 
-- Expose keep-alive, receive windows and the unidirectional stream limit in
-  `http3.Config` and `http3.ClientConfig`.
-- Honor the peer's `SETTINGS_MAX_FIELD_SECTION_SIZE` when sending.
-- Send request trailers.
+- Done: keep-alive, receive windows, the unidirectional stream limit, the
+  acknowledgement delay, the flood budgets, key updates by time and the
+  Connection IDs issued are set in `Config.Transport` and
+  `ClientConfig.Transport`; the peer's `SETTINGS_MAX_FIELD_SECTION_SIZE` is
+  honored when sending; the client sends request trailers, behind a body sent
+  whole or streamed.
 - Client: pick HTTP/3 automatically from `Alt-Svc`, and fall back to TCP when
   UDP is blocked.
 
@@ -462,5 +495,5 @@ skip; CI sets `FIB_REQUIRE_H3_INTEROP=1`, which turns a skip into a failure.
 | The body matrix's raw QUIC client (`http3/body_matrix_test.go`), against the fib server | Request bodies every way they can come: no body, a content-length, DATA with no length, a trailer and `Expect: 100-continue`, small and large, the stream written whole or in pieces with pauses, taken by the handler by reading, through OnBody, as `BodyComplete` decides or from another goroutine, with the server reading bodies whole, streaming them all and streaming past a threshold; also a stream reset mid-body, the body limits, the stream window pacing a slow handler, and OnBody holding the body back until the handler returns |
 | quiche, in a container (`http3/quicheinterop/run.sh`) | Both directions with both handshakes: 300 connections and 30 000 echoes, multiplexed streams, session resumption, 0-RTT in both directions (a GET goes in the first flight, a POST in early data is answered 425 and sent again, a server without early data is not sent any), certificate verification through `RootCAs` |
 | quic-go and fib, for early data (`http3/early_data_test.go`) | quic-go's client resuming and sending GET_0RTT to the fib server, the fib client sending early requests to quic-go's server, a server that does not accept it, a ticket used twice, and a 425 |
-| Two QUIC connections over an in-memory path | Handshake, transfers under 5% and 20% loss, stream limits, resets, application close, idle timeout, keep-alive, stateless reset, key updates (with the AEAD limits lowered), the decryption failure limit, Retry and its tokens, and the flood limits |
+| Two QUIC connections over an in-memory path | Handshake, transfers under 5% and 20% loss, stream limits, resets, application close, idle timeout, keep-alive, stateless reset, key updates (with the AEAD limits lowered), the decryption failure limit, Retry and its tokens, the flood limits and their settings, BLOCKED frames, draining, and Connection IDs issued, routed and retired |
 | Fuzzing (`go test -fuzz`) | The parsers that take untrusted bytes: the HTTP/3 frame parser, building requests from fields, QPACK decoding and its round trip, QUIC packet headers, transport parameters and 1-RTT frame handling |
