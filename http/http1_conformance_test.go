@@ -1058,6 +1058,47 @@ func sha256Of(b []byte) []byte {
 	return sum[:]
 }
 
+// A fib client that offers ChaCha20-Poly1305 alone, over TLS 1.3, settles on it
+// against a fib server that would otherwise prefer AES-GCM, which is the client
+// side of what curl does in the test above: ClientConfig.TLS13CipherSuites is
+// what its handshake offers, and the server follows its client's preference.
+func TestHTTP1ConformanceClientHTTPSChaCha20Only(t *testing.T) {
+	serverConfig, clientConfig, err := tlstest.Configs()
+	if err != nil {
+		t.Fatal(err)
+	}
+	serverConfig.MinVersion = tls.VersionTLS13
+	states := make(chan tls.ConnectionState, 1)
+	handler := HandlerFunc(func(c *Context) {
+		if state, ok := fibtls.ConnectionState(c.Conn); ok {
+			select {
+			case states <- state:
+			default:
+			}
+		}
+		_ = c.Respond(stdhttp.StatusOK, "text/plain; charset=utf-8", []byte("chacha20\n"))
+	})
+	addr := serve(t, fibtls.NewServer(serverConfig, NewHandlerWithConfig(DefaultConfig(), handler)))
+
+	config := DefaultClientConfig()
+	config.DisableHTTP2 = true
+	config.TLSConfig = clientConfig
+	config.TLS13CipherSuites = []uint16{tls.TLS_CHACHA20_POLY1305_SHA256}
+	client := newTestClient(t, config)
+	resp, err := client.Go(mustRequest(t, "GET", "https://"+addr+"/chacha20", nil)).Wait()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if body := readBody(t, resp); body != "chacha20\n" {
+		t.Fatalf("body %q", body)
+	}
+	state := <-states
+	if state.Version != tls.VersionTLS13 || state.CipherSuite != tls.TLS_CHACHA20_POLY1305_SHA256 {
+		t.Fatalf("the server settled on suite %#04x version %#04x, want %#04x %#04x",
+			state.CipherSuite, state.Version, tls.TLS_CHACHA20_POLY1305_SHA256, tls.VersionTLS13)
+	}
+}
+
 // ---------------------------------------------------------------------------
 // Client
 

@@ -308,6 +308,15 @@ These are still constants:
   crypto/tls's (`BlockingTLSHandshake`, or a TLSConfig only crypto/tls serves).
   Only the requests that are safe to repeat go as 0-RTT data; see
   [0-RTT](#0-rtt).
+- `ClientConfig.TLS13CipherSuites` is what the ClientHello offers, by ID, in
+  the order to prefer them; empty keeps the default order, AES-GCM first where
+  the CPU computes it in hardware and ChaCha20-Poly1305 first where it does not,
+  as crypto/tls orders them. A TLS 1.3 server settles on one of the suites its
+  client offered, so a list of one narrows what the connection uses: the
+  runner's `chacha20` testcase is `[]uint16{tls.TLS_CHACHA20_POLY1305_SHA256}`.
+  There is no server switch, since a TLS 1.3 server proposes no suite of its
+  own, and a handshake crypto/tls runs chooses its own, since crypto/tls has no
+  field for TLS 1.3's suites.
 
 ### 0-RTT
 
@@ -619,7 +628,7 @@ quic-go, because it pulls the simulator and peer images and needs tshark).
 
 | Peer | What it checks |
 | --- | --- |
-| The QUIC Interop Runner's fib endpoint (`http3/interoprunner`), against quic-go's endpoint | Both roles, both directions: HTTP/3 and the HTTP/0.9-over-QUIC cases — handshake, transfer, Retry, resumption, 0-RTT, key update, multiplexing, loss, IPv6, NAT rebinding and long RTT. fib's missing ECN, QUIC v2, cipher-suite restriction and `preferred_address` make those cases exit 127, which the runner reports as unsupported; the two cases that do not pass (the server under address rebinding and the client under long RTT) are listed in that README with the reason. |
+| The QUIC Interop Runner's fib endpoint (`http3/interoprunner`), against quic-go's endpoint | Both roles, both directions: HTTP/3 and the HTTP/0.9-over-QUIC cases — handshake, transfer, Retry, resumption, 0-RTT, key update, multiplexing, loss, IPv6, NAT rebinding and long RTT. fib's missing ECN, QUIC v2 and `preferred_address` make those cases exit 127, which the runner reports as unsupported; the two cases that do not pass (the server under address rebinding and the client under long RTT) are listed in that README with the reason. `chacha20` passes in both directions: the client offers ChaCha20-Poly1305 alone through `http3.ClientConfig.TLS13CipherSuites`, and the server takes it. |
 | quic-go's HTTP/3 client, against the fib server | GET/POST/PUT/HEAD, request and response headers, several cookies and Set-Cookies, 4 MiB uploads and downloads checked by hash, 50 concurrent requests on one connection, 204, response trailers, request trailers, 103 Early Hints, 100-continue, 417, 413, 431, status codes |
 | quic-go's HTTP/3 server, against the fib client | The same ground from the other side, and: the connection still serves after a timeout, a request in flight finishes when the server retires the connection with GOAWAY, a server that validates the address with Retry, and a certificate the client does not trust |
 | The suite's own hand-written HTTP/3 client (no dependency), against the fib server | What a sound implementation never sends: DATA before HEADERS, a control stream that does not start with SETTINGS, a second control stream, a request missing a pseudo-header, a reference to the QPACK dynamic table, CANCEL_PUSH, a lowered MAX_PUSH_ID, a raised GOAWAY, a QPACK insertion, an `:authority` and `Host` that disagree, and neither of them |

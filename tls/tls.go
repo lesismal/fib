@@ -14,6 +14,7 @@ import (
 	"errors"
 	"io"
 	"net"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -111,6 +112,18 @@ type Handler struct {
 	// other, for a Config that behaves differently under the state machines
 	// than under crypto/tls, or to compare the two.
 	Blocking bool
+	// TLS13CipherSuites are the TLS 1.3 cipher suites a client handshake
+	// offers, by ID, in the order to prefer them: a ClientHello's first suite
+	// is the one the client would rather have, and a server that follows its
+	// client's preference, as crypto/tls does, takes it. Empty is the default
+	// order, AES-GCM first where the CPU computes it in hardware and
+	// ChaCha20-Poly1305 first where it does not, which is crypto/tls's. A
+	// server handshake ignores it: a TLS 1.3 server settles on one of the
+	// suites its client offered, which its own preference among them picks.
+	// So does a handshake crypto/tls runs (see Blocking, or a Config this
+	// package cannot serve), since crypto/tls has no field for the suites of
+	// TLS 1.3. TLS 1.2's come from Config.CipherSuites, before and after.
+	TLS13CipherSuites []uint16
 	// EarlyData lets a server take the early data (0-RTT) of clients that
 	// resume a session (RFC 8446 section 2.3), which it can do where the
 	// handshake runs without a worker and the wrapped handler is an
@@ -188,6 +201,8 @@ type DialOptions struct {
 	// SessionCache and EarlyData are Handler's.
 	SessionCache QUICSessionCache
 	EarlyData    bool
+	// TLS13CipherSuites is Handler's.
+	TLS13CipherSuites []uint16
 	// Dial opens the connection the handshake runs over, in place of
 	// engine.DialWithHandler, with the same arguments and the same contract;
 	// a socks.Dialer's Dial reaches the server through a proxy. Nil dials
@@ -218,6 +233,7 @@ func DialWithOptions(engine *fib.Engine, network, addr string, timeout time.Dura
 	client := NewClient(config, handler)
 	client.Blocking, client.HandshakeTimeout = options.Blocking, options.HandshakeTimeout
 	client.SessionCache, client.EarlyData = options.SessionCache, options.EarlyData
+	client.TLS13CipherSuites = options.TLS13CipherSuites
 	if options.Dial != nil {
 		return options.Dial(engine, network, addr, timeout, client, done)
 	}
@@ -339,6 +355,11 @@ func (h *Handler) openNative(c *fib.Connection, t *layer) {
 			t.settle(h.inner())
 			c.CloseWithError(err)
 			return
+		}
+		if len(h.TLS13CipherSuites) > 0 {
+			// Offered in this order, in place of the default the ClientHello
+			// would have.
+			chs.suites = slices.Clone(h.TLS13CipherSuites)
 		}
 		if h.SessionCache != nil {
 			chs.sessions = h.SessionCache

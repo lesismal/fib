@@ -549,6 +549,14 @@ err = fibtls.Dial(engine, "tcp", "example.com:443", 3*time.Second, tlsConfig, ha
     `crypto/tls` 的 `ClientSessionState` 里的密钥只有它自己读得到）：ClientHello 带 psk_key_exchange_modes 和 pre_shared_key
     （HelloRetryRequest 之后重算 binder），票据被服务端拒绝时回退成完整握手，服务端不接受 early data 时发出 `QUICRejectedEarlyData`
     事件；恢复的连接没有证书可验，`PeerCertificates` 用会话里保存的。详见 [`docs/http3.zh-CN.md`](http3.zh-CN.md) 的 0-RTT 一节。
+  - **TLS 1.3 套件顺序**：`tls.Handler.TLS13CipherSuites`（以及 `tls.DialOptions.TLS13CipherSuites`、
+    `http.ClientConfig.TLS13CipherSuites`、`http3.ClientConfig.TLS13CipherSuites`）按给定顺序、只提供列出的 TLS 1.3 套件；QUIC 的握手也可以
+    直接设 `tls.QUICConn.SetCipherSuites`。为空时是默认顺序：CPU 有 AES-GCM 硬件加速时 AES-GCM 在前，否则 ChaCha20-Poly1305 在前
+    （和 `crypto/tls` 一致），不设置时 ClientHello 与以前逐字节相同。TLS 1.3 服务端从客户端提供的套件里选，所以列一个就是限定这条连接用的套件；
+    服务端没有开关（和 `crypto/tls` 一样跟随客户端的偏好），走 `crypto/tls` 的握手（`Blocking`，或本库服务不了的 `Config`）也自己选套件，
+    因为 `crypto/tls` 没有 TLS 1.3 套件的字段。TLS 1.2 的套件仍由 `Config.CipherSuites` 决定，选中 TLS 1.3 的 ChaCha20-Poly1305
+    连接同样由本库的记录层保护（见下文）。`http3` 的 QUIC Interop Runner `chacha20` 客户端用例靠它让 ClientHello 只提供
+    ChaCha20-Poly1305，服务端的 `chacha20` 用例本来就能通过。
   - **开关**：`http.ClientConfig.BlockingTLSHandshake`、`websocket.DialerConfig.BlockingTLSHandshake`、`http3.ClientConfig.BlockingTLSHandshake`、
     `http3.Config.BlockingTLSHandshake`（以及 `tls.Handler.Blocking`、`tls.DialOptions.Blocking`）设为 true 时，握手改走 `crypto/tls`
     （TCP 上占握手池里的一个协程，QUIC 上占 `QUICConn` 内部的一个协程），默认（false）走状态机。对比压测见 `http` 包的

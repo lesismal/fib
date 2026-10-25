@@ -13,12 +13,14 @@ import (
 	"time"
 
 	"github.com/lesismal/fib/http3/quic"
+	fibtls "github.com/lesismal/fib/tls"
 )
 
 // fetchRaw runs the client side of the runner's HTTP/0.9 testcases: fib's
 // QUIC transport, with a request line sent on each stream and the file read
-// off it. The testcases differ in how many connections they use and whether
-// they resume one, not in the protocol.
+// off it. The testcases differ in how many connections they use, whether they
+// resume one and, for chacha20, which cipher suite the ClientHello offers, not
+// in the protocol.
 func fetchRaw(testcase string, urls []*url.URL) error {
 	host, port := urls[0].Hostname(), urls[0].Port()
 	if port == "" {
@@ -34,6 +36,11 @@ func fetchRaw(testcase string, urls []*url.URL) error {
 		// The test wants a key update during the first megabyte; 100ms of
 		// sending is well inside it at the runner's 10Mbps.
 		opts.keyUpdateInterval = 100 * time.Millisecond
+	}
+	if testcase == "chacha20" {
+		// The runner checks that the client's ClientHello offers
+		// ChaCha20-Poly1305 and nothing else.
+		opts.suites = []uint16{tls.TLS_CHACHA20_POLY1305_SHA256}
 	}
 
 	switch testcase {
@@ -184,6 +191,9 @@ type dialOptions struct {
 	early             bool
 	keyUpdateInterval time.Duration
 	sessionCache      tls.ClientSessionCache
+	// suites, when set, is the ClientHello's TLS 1.3 cipher suites; see
+	// fetchRaw's chacha20 case.
+	suites []uint16
 }
 
 func dialRaw(opts dialOptions) (*rawDownloader, error) {
@@ -217,6 +227,19 @@ func dialRaw(opts dialOptions) (*rawDownloader, error) {
 		ConnReceiveWindow:   1 << 20,
 		EarlyData:           opts.early,
 		KeyUpdateInterval:   opts.keyUpdateInterval,
+	}
+	if opts.suites != nil {
+		// crypto/tls offers the TLS 1.3 suites itself and cannot be told to
+		// offer one alone, so this connection's handshake is fib's, whose
+		// ClientHello the options narrow.
+		config.NewTLS = func(_ bool, cryptoConfig *tls.Config) quic.TLSConn {
+			conn := fibtls.NewQUICClient(cryptoConfig)
+			if conn == nil {
+				return nil
+			}
+			conn.SetCipherSuites(opts.suites)
+			return conn
+		}
 	}
 	d := &rawDownloader{
 		dir:       downloadsDir(),

@@ -221,6 +221,11 @@
 - 会话从 `ClientConfig.SessionCache` 恢复（本库的握手），握手走 `crypto/tls`（`BlockingTLSHandshake`，或 `TLSConfig` 只有
   `crypto/tls` 能服务）时从 `TLSConfig.ClientSessionCache` 恢复。只有重发也无妨的请求会作为 0-RTT 数据发出，见
   [0-RTT](#0-rtt)。
+- `ClientConfig.TLS13CipherSuites` 决定 ClientHello 提供哪些 TLS 1.3 套件、按什么顺序，按套件 ID 列出；为空时是默认顺序，
+  CPU 有 AES-GCM 硬件加速时 AES-GCM 在前，否则 ChaCha20-Poly1305 在前，和 `crypto/tls` 一致。TLS 1.3 服务端从客户端提供的
+  套件里选，所以只列一个就是限定这条连接用哪个：runner 的 `chacha20` 用例就是
+  `[]uint16{tls.TLS_CHACHA20_POLY1305_SHA256}`。服务端没有对应的开关，因为 TLS 1.3 服务端不自己提出套件；走 `crypto/tls`
+  的握手自己选套件，`crypto/tls` 没有 TLS 1.3 套件的字段。
 
 ### 0-RTT
 
@@ -435,7 +440,7 @@ CI 里有两个 job：`HTTP/3 interop endpoint image`（阻塞：构建镜像并
 
 | 对端 | 验证内容 |
 | --- | --- |
-| QUIC Interop Runner 的 fib 端点（`http3/interoprunner`，对 quic-go 端点） | 双向、两种角色：HTTP/3，以及 HTTP/0.9-over-QUIC 的握手、传输、Retry、会话恢复、0-RTT、密钥更新、多路复用、丢包、IPv6、NAT 重绑定和长 RTT。fib 没有 ECN、QUIC v2、TLS 1.3 套件限制和 `preferred_address`，这些用例以 127 退出，runner 会如实记为“不支持”；没有通过的两个（服务端在地址重绑定下、客户端在长 RTT 下）在那个 README 里单独列出并说明原因。 |
+| QUIC Interop Runner 的 fib 端点（`http3/interoprunner`，对 quic-go 端点） | 双向、两种角色：HTTP/3，以及 HTTP/0.9-over-QUIC 的握手、传输、Retry、会话恢复、0-RTT、密钥更新、多路复用、丢包、IPv6、NAT 重绑定和长 RTT。fib 没有 ECN、QUIC v2 和 `preferred_address`，这些用例以 127 退出，runner 会如实记为“不支持”；没有通过的两个（服务端在地址重绑定下、客户端在长 RTT 下）在那个 README 里单独列出并说明原因。`chacha20` 双向都通过：客户端用 `http3.ClientConfig.TLS13CipherSuites` 只提供 ChaCha20-Poly1305，服务端接受它。 |
 | quic-go 的 HTTP/3 客户端（对 fib 服务端） | GET/POST/PUT/HEAD、请求与响应头、多个 Cookie 与 Set-Cookie、4 MiB 上传与下载（按哈希校验）、单连接 50 个并发请求、204、响应 trailer、请求 trailer、103 Early Hints、100-continue、417、413、431、各种状态码 |
 | quic-go 的 HTTP/3 服务端（对 fib 客户端） | 同样的矩阵反过来验证，另加：超时后连接仍可用、服务端优雅关闭（GOAWAY）时在途请求正常完成、服务端用 Retry 验证源地址、证书不受信任时拒绝连接 |
 | 测试内置的手写 HTTP/3 客户端（零依赖，对 fib 服务端） | 正常实现不会发的东西：HEADERS 之前的 DATA、不以 SETTINGS 开头的控制流、第二条控制流、缺少伪头部的请求、引用 QPACK 动态表、CANCEL_PUSH、调低的 MAX_PUSH_ID、抬高的 GOAWAY、QPACK 插入指令、`:authority` 与 `Host` 不一致、两者都缺失 |

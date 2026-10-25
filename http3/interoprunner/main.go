@@ -141,10 +141,8 @@ func runClient(testcase string, urls []*url.URL) error {
 	switch testcase {
 	case "http3":
 		return fetchH3(urls)
-	case "handshake", "transfer", "retry", "resumption", "zerortt", "multiconnect", "keyupdate":
+	case "handshake", "transfer", "retry", "resumption", "zerortt", "multiconnect", "keyupdate", "chacha20":
 		return fetchRaw(testcase, urls)
-	case "chacha20":
-		return unsupported(testcase, "TLS 1.3 selects the cipher suite, and crypto/tls offers AES-128-GCM before ChaCha20-Poly1305, so fib's ClientHello cannot offer ChaCha20 alone")
 	case "ecn":
 		return unsupported(testcase, "fib does not mark or validate ECN")
 	case "v2":

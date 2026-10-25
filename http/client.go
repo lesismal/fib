@@ -185,6 +185,16 @@ type ClientConfig struct {
 	// goroutine while they wait, where the TLSConfig allows it (see package
 	// tls); this is the switch back, and what to compare the two with.
 	BlockingTLSHandshake bool
+	// TLS13CipherSuites are the TLS 1.3 cipher suites this package's handshake
+	// offers, by ID, in the order to prefer them; empty keeps the default
+	// order, AES-GCM first where the CPU computes it in hardware and
+	// ChaCha20-Poly1305 first where it does not. A server that follows its
+	// client's preference, as crypto/tls does, then takes the first one it can
+	// use, so a list of one narrows what the connection settles on. A handshake
+	// crypto/tls runs (see BlockingTLSHandshake) chooses its own TLS 1.3
+	// suites, since its Config has no field for them; TLS 1.2's come from
+	// TLSConfig.CipherSuites as before.
+	TLS13CipherSuites []uint16
 	// EarlyData sends a request that is safe to repeat, one with a GET, HEAD,
 	// OPTIONS or TRACE method and no body, as 0-RTT data when the client has
 	// a session to resume from the server it connects to: it leaves with the
@@ -910,7 +920,8 @@ func (c *Client) dial(h *hostPool) {
 		}
 		err = fibtls.DialWithOptions(c.engine, "tcp", h.target.addr, c.config.DialTimeout, c.tlsConfig,
 			fibtls.DialOptions{Blocking: c.config.BlockingTLSHandshake, Dial: c.config.Dial,
-				SessionCache: c.sessions, EarlyData: c.config.EarlyData}, cc, done)
+				SessionCache: c.sessions, EarlyData: c.config.EarlyData,
+				TLS13CipherSuites: c.config.TLS13CipherSuites}, cc, done)
 	} else {
 		if c.config.UnencryptedHTTP2 {
 			done = func(_ *fib.Connection, err error) {

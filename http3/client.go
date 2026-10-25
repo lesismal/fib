@@ -107,6 +107,16 @@ type ClientConfig struct {
 	// waits for the server. By default the handshake is a state machine that
 	// takes none, where the TLSConfig allows it (see package tls).
 	BlockingTLSHandshake bool
+	// TLS13CipherSuites are the TLS 1.3 cipher suites this module's handshake
+	// offers, by ID, in the order to prefer them; empty keeps the default
+	// order, AES-GCM first where the CPU computes it in hardware and
+	// ChaCha20-Poly1305 first where it does not. A ClientHello offering
+	// ChaCha20-Poly1305 alone, which the QUIC Interop Runner's chacha20
+	// testcase asks of a client, is []uint16{tls.TLS_CHACHA20_POLY1305_SHA256}.
+	// A handshake crypto/tls runs (BlockingTLSHandshake, or a TLSConfig only
+	// crypto/tls serves) chooses its own TLS 1.3 suites, since crypto/tls has
+	// no field for them.
+	TLS13CipherSuites []uint16
 	// EarlyData sends the requests that are safe to repeat, those with a
 	// GET, HEAD, OPTIONS or TRACE method and no body, as 0-RTT data when the
 	// client has a session to resume from the server it connects to: they
@@ -808,10 +818,12 @@ func (c *Client) newTLS() func(bool, *tls.Config) quic.TLSConn {
 		return nil
 	}
 	return func(_ bool, config *tls.Config) quic.TLSConn {
-		if conn := fibtls.NewQUICClientWithSessions(config, c.sessions); conn != nil {
-			return conn
+		conn := fibtls.NewQUICClientWithSessions(config, c.sessions)
+		if conn == nil {
+			return nil
 		}
-		return nil
+		conn.SetCipherSuites(c.config.TLS13CipherSuites)
+		return conn
 	}
 }
 

@@ -349,6 +349,21 @@ func (c *QUICConn) SetTransportParameters(params []byte) {
 	}
 }
 
+// SetCipherSuites narrows the TLS 1.3 cipher suites a client's ClientHello
+// offers, in the order to prefer them, by ID; it must be called before Start.
+// Empty keeps the default order, AES-GCM first where the CPU computes it in
+// hardware and ChaCha20-Poly1305 first where it does not, as crypto/tls orders
+// them, which is what a server that follows its client's preference takes. A
+// server handshake ignores it: a TLS 1.3 server settles on one of the suites
+// its client offered.
+func (c *QUICConn) SetCipherSuites(suites []uint16) {
+	if len(suites) == 0 {
+		c.suites = nil
+		return
+	}
+	c.suites = slices.Clone(suites)
+}
+
 // Start begins the handshake: a client's first flight is then to be read from
 // NextEvent. It is called with the transport parameters set.
 func (c *QUICConn) Start(ctx context.Context) error {

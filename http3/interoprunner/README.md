@@ -90,7 +90,7 @@ more than their own testcase.
 | `handshake` | ✓ | ✓ | HTTP/0.9 over QUIC |
 | `transfer` | ✓ | ✓ | three files, parallel streams; the client's receive windows are small so fib has to grow them |
 | `longrtt` | ✓ | ✗ | the transfer succeeds; the check also wants two ClientHellos under a 750 ms RTT, and fib's PTO does not send the second within the capture (quic-go's client does, which is why the server direction passes) |
-| `chacha20` | ✓ | unsupported | TLS 1.3 picks the suite, and `crypto/tls` offers AES-128-GCM before ChaCha20-Poly1305, so fib's ClientHello cannot offer ChaCha20 alone; as a server fib accepts a client that offers only it |
+| `chacha20` | ✓ | ✓ | the client's ClientHello offers ChaCha20-Poly1305 alone, through fib's own TLS handshake and `tls.QUICConn.SetCipherSuites`: `crypto/tls` picks the TLS 1.3 suites itself and cannot be told to offer one, so the endpoint's client runs fib's handshake for this testcase. As a server fib accepts a client that offers only it |
 | `multiplexing` | ✓ | ✓ | ~2000 files over one connection; the server allows 200 streams at once and raises the limit as they finish |
 | `retry` | ✓ | ✓ | the server sends a Retry with a token, then accepts it |
 | `resumption` | ✓ | ✓ | session ticket, second connection resumes |
@@ -113,9 +113,9 @@ more than their own testcase.
 
 The marks above are what the endpoint's two roles do, not what the testcase
 checks in every direction: `keyupdate` is server-side `transfer`, and the
-client of `rebind-*` and `connectionmigration` is `transfer`. The client
-side of `chacha20`, and both sides of `ecn`, `v2` and `versionnegotiation`,
-exit 127, which the runner records as unsupported rather than failed.
+client of `rebind-*` and `connectionmigration` is `transfer`. Both sides of
+`ecn`, `v2` and `versionnegotiation` exit 127, which the runner records as
+unsupported rather than failed.
 
 The server endpoint also sends a `NEW_TOKEN` frame after every handshake
 (RFC 9000 section 8.1.3), which no testcase looks for: the runner's clients
@@ -141,11 +141,27 @@ Ubuntu 24.04's package, cannot follow the migrated connection and makes
   `rebind-port`, `transferloss`, `amplificationlimit`, `longrtt`,
   `blackhole`, `handshakeloss`. Failed: `rebind-addr`.
 - `fib` client, `quic-go` server — passed: `http3`, `handshake`, `transfer`,
-  `retry`, `resumption`, `zerortt`, `keyupdate`, `multiplexing`, `ipv6`,
-  `rebind-port`, `rebind-addr`, `transferloss`, `amplificationlimit`,
+  `retry`, `resumption`, `zerortt`, `chacha20`, `keyupdate`, `multiplexing`,
+  `ipv6`, `rebind-port`, `rebind-addr`, `transferloss`, `amplificationlimit`,
   `blackhole`, `handshakeloss`. Failed: `longrtt`.
 - Both roles exit 127 for `ecn`, `v2` and the server side of
   `connectionmigration`; the runner reports those as unsupported.
+
+`chacha20` was rerun on 2026-10-26, once the client could offer
+ChaCha20-Poly1305 alone:
+
+```sh
+DIRECTION=client TESTCASES=chacha20 ./run-runner.sh   # passed
+DIRECTION=server TESTCASES=chacha20 ./run-runner.sh   # passed
+```
+
+The client direction is the new one: the runner reads the capture and finds
+the ClientHello offering `0x1303` and nothing else. The regression set
+`TESTCASES=http3,handshake,transfer,retry,resumption,zerortt` passed in both
+directions in the same session, except one fib-server `handshake` run whose
+capture the simulator lost (`Expected exactly one version. Got []`; both
+containers exited 0 and the transfer itself succeeded) — `handshake` passed on
+two clean re-runs.
 
 `local-test.sh` runs `http3`, `handshake`, `transfer`, `retry`,
 `resumption`, `zerortt` and `multiconnect` with fib on both sides; all pass.
