@@ -124,6 +124,13 @@ type Handler struct {
 	// MaxEarlyData is the most early data a client may send on a ticket. Zero
 	// means 16 KiB.
 	MaxEarlyData uint32
+	// NoKernelTLS keeps the sealing of every record in this package. By
+	// default, on Linux, a connection that sends a file with SendFile, over
+	// an AES-GCM suite of TLS 1.3 or 1.2, hands the sealing of what it sends
+	// from then on to the kernel's TLS, when the kernel has it, so that the
+	// file goes from the page cache to the socket by sendfile; see
+	// Connection.SendFile in package fib.
+	NoKernelTLS bool
 	// SessionCache, on a client, is where tickets go and sessions come from,
 	// for client handshakes that run without a worker: a connection then
 	// resumes the session of one before it. With EarlyData also set, what is
@@ -537,7 +544,23 @@ type layer struct {
 	// held is the plaintext sent while the connection is corked, sealed
 	// into one record when the cork comes off; see holdLocked. It is wmu's.
 	held []byte
+	// ktls is where the connection stands with the kernel's TLS, which the
+	// first file it sends may hand its sealing to (see kernelSealsLocked),
+	// and rekeyOwed a KeyUpdate the peer asked for that the kernel has not
+	// sent yet. Both are wmu's.
+	ktls      uint8
+	rekeyOwed bool
 }
+
+// The states of layer.ktls.
+const (
+	// ktlsUntried: this package seals, and the next file may change that.
+	ktlsUntried uint8 = iota
+	// ktlsOn: the kernel seals every record sent from here on.
+	ktlsOn
+	// ktlsOff: this package seals, and goes on doing so.
+	ktlsOff
+)
 
 func (t *layer) handshake(handler fib.Handler, timeout time.Duration) {
 	ctx := context.Background()

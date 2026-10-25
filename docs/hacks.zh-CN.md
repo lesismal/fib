@@ -508,7 +508,10 @@ HTTP/1 的 `Context` 实现 `http.Flusher`：`fmt.Fprintf(c, ...)` + `c.Flush()`
 
 - 连接复制文件描述符，`f` 可以立刻关闭。
 - 文件比声明的短会关连接（对端在等那些字节）。
-- TLS 连接无法零拷贝：`SendFile` 返回前读出整段并加密，整段排队在内存里。
+- TLS 上：Linux 有内核 TLS 且套件为 AES-GCM 时，第一个文件就把加密交给内核，文件走 `sendfile(2)`；
+  其他情况随 socket 排空每次读取并加密 64KB，内存都有上界。只有留在 `crypto/tls` 上的连接
+  （ChaCha20-Poly1305）会在返回前读出整段经 layer 发送。见 [HTTP/1](http1.zh-CN.md#零拷贝发送文件)。
+- Windows 上用 `TransmitFile` 发送。
 - 小于 16KB 的范围在 HTTP 里直接拷贝，比多一次系统调用更省。
 
 ---

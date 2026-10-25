@@ -16,7 +16,7 @@ HTTP/2、HTTP/3 各有单独的文档：[`http2.zh-CN.md`](http2.zh-CN.md)、
 | 请求 body | `Content-Length`、chunked（含 chunk 扩展和 trailer，`Request.Trailer`）；默认整体缓存，开启 `StreamRequestBody` 后边收边交给 handler | `Content-Length`；`ContentLength` 为 -1 时用 chunked，可带 `c.Request.Trailer` |
 | 响应 body | `Content-Length`、chunked（含 trailer）、HTTP/1.0 流式响应以关闭连接结束 | `Content-Length`、chunked（含 trailer，`Response.Trailer`）、以关闭连接结束 |
 | 流式 | 响应：`Context` 实现了 `http.ResponseWriter`、`http.Flusher`、`io.ReaderFrom`，`Write` + `Flush` 边生成边发送。请求：开启 `StreamRequestBody` 后 `Request.Body` 是 `*BodyStream`，读取不阻塞，也可以用 `Context.OnBody` 接管 | body 完整缓存后再回调 |
-| 文件 | `Connection.SendFile` / `Context.ReadFrom`：Linux、macOS 用 `sendfile(2)`，Windows 分块读取；`http.ServeFile`、`http.ServeContent`、`http.FileServer` 可以直接通过 `Context` 使用（Range、多段 Range、条件请求） | — |
+| 文件 | `Connection.SendFile` / `Context.ReadFrom` / `Context.SendFile`：Linux、macOS 用 `sendfile(2)`，Windows 用 `TransmitFile`；TLS 上 Linux 用内核 TLS 加 `sendfile(2)`，其他情况随 socket 排空逐块加密；`http.ServeFile`、`http.ServeContent`、`http.FileServer` 可以直接通过 `Context` 使用（Range、多段 Range、条件请求） | — |
 | 超时 | `ReadHeaderTimeout`、`ReadTimeout`、`IdleTimeout`，回退规则与 `net/http.Server` 相同，另有 `ReadBodyTimeout` | 每个请求的 `Timeout` |
 | 1xx 中间响应 | `WriteInterim` 或 `WriteHeader(1xx)`，自动 `100 Continue` | 自动跳过 |
 | 无 body 的响应 | HEAD（保留 GET 的长度）；204、1xx 不带 `Content-Length`；304 只带 handler 自己给的 `Content-Length` | HEAD、204、304 不读 body |
@@ -303,6 +303,30 @@ HTTP/1 客户端像 server 读请求、写响应那样，自己写请求头、�
 `sendfile(2)` 从文件直接发到 socket；socket 写满时剩余部分等待下一次可写事件，所以文件
 只按对端的接收速度读取。Linux 上可以用 `strace -e sendfile` 观察到，例如
 `sendfile(10, 12, [0] => [2673856], 3145851) = 2673856`，socket 排空后再发送剩余部分。
+Windows 上用 overlapped 的 `TransmitFile` 发送，等排在它前面的数据发完再投递，它的完成
+通知就相当于可写事件；被拒绝的 socket（Unix socket）改为逐块读取。Windows 客户端版本
+全系统同时最多执行两个 `TransmitFile`，其余排队，Go 的 `net` 包同样如此；服务器版本没有
+这个限制。
+
+TLS 上（`tls.NewServer` 或 `tls.Dial`，握手完成、连接的记录由 fib 自己的记录层保护之后：
+TLS 1.3 或 1.2 的 AES-GCM，TLS 1.2 或 1.1 的 AES-CBC）：
+
+- **Linux 有内核 TLS 时**，连接在 AES-GCM 套件上发送的第一个文件会把此后所有发送的加密
+  交给内核（`TCP_ULP` "tls" 与 `TLS_TX`，带上流量密钥、IV 和下一个序列号），文件经
+  `sendfile(2)` 从页缓存发出、由内核加密。切换只在用户态加密的数据都已离开队列时进行
+  （`Connection.ControlIdle`）；在其他时刻发送的文件仍按下面的方式在用户态加密，下一个
+  文件再尝试切换。切换之后发送的是交给内核加密的明文，`close_notify` 等 alert 以各自类型
+  的记录发出（`Connection.SendRawRecord`）。对端要求的 KeyUpdate 在下一次队列为空时经由
+  内核发出，内核随后换用下一代密钥；不能换密钥的内核（6.14 之前的 Linux）则改为关闭连接。
+  读取仍在用户态。内核没有 `tls` 模块、或进程无权加载时只记录一次，之后不再尝试。
+  `tls.Handler.NoKernelTLS` 关闭这一切换。
+- **其他情况**（macOS、BSD、Windows、AES-CBC 套件，或关闭了、缺少内核 TLS）连接把文件
+  排进队列，由 flush 随 socket 排空每次读取 64KB，封装成四条满的记录（`fib.FileSealer`）
+  再写出。文件入队时就为它预留好要占用的序列号，之后的发送立刻在其后加密，线上顺序保持
+  不变。无论文件多大都只占一个加密块的内存；对端读得慢时与明文 `sendfile` 一样被拖住：
+  剩余部分留在文件里，计入积压，`NotifyOutput`、`OnWritable` 和写超时都能看到。
+
+无论哪种方式，文件比声明的范围短都会关闭连接，因为已经向对端承诺了整个范围。
 
 `Context.ReadFrom` 对普通文件、以及包着文件的 `*io.LimitedReader`（`http.ServeContent`
 传入的就是它）使用 `SendFile`。小于 16KB 的范围直接拷贝，因为这比多出的系统调用更省。
@@ -321,8 +345,9 @@ HTTP/1 客户端像 server 读请求、写响应那样，自己写请求头、�
   `ErrWouldBlock` 而不是等对端；剩下的部分用 `OnBody` 接管。
 - **写入不阻塞**：handler 写得比对端读得快时，差额排队在内存中（连接的读取会暂停，但
   handler 本身不会被阻塞）。`SendFile` 发送的文件例外：它只随 socket 的排空读取。
-- **TLS 无法使用 sendfile**：TLS 连接上 `SendFile` 在返回前读出并加密整段文件，整段
-  都会排队在内存中。
+- **fib 记录层未实现的套件**（ChaCha20-Poly1305 以及其他让连接留在 `crypto/tls` 上的
+  套件）无法随排空发送文件：在那里 `Connection.SendFile` 在返回前读出并加密整段文件，
+  整段都会排队在内存中；`Context.SendFile` 会先问 `Connection.QueuesFiles`，改为分块读取。
 - **HTTP/2 和 HTTP/3** 同样接受这些 `ResponseWriter` 调用，并以同样的方式用 DATA 帧
   流式输出；在那里，超过客户端流控的写入会等待客户端（见各自的文档）。
 - **不解码 chunked 以外的 transfer coding**（gzip、deflate、compress）：这样的请求返回
@@ -333,8 +358,8 @@ HTTP/1 客户端像 server 读请求、写响应那样，自己写请求头、�
 
 ## 待优化
 
-- TLS 上按 socket 排空进度读取并加密文件；Linux 上用 kTLS 实现真正的 HTTPS 零拷贝。
-- Windows 上使用 `TransmitFile`。
+- 留在 `crypto/tls` 上的连接（ChaCha20-Poly1305 套件）随 socket 排空发送文件，这需要
+  fib 自己的记录层实现这些套件。
 
 ## 一致性测试
 
@@ -344,7 +369,8 @@ HTTP/1 客户端像 server 读请求、写响应那样，自己写请求头、�
 - **fib 服务端**对 Go `net/http` 客户端、原始 TCP 连接（用来发送 `net/http` 不会发出的
   请求：带或不带 keep-alive 的 HTTP/1.0、pipelining、格式错误或帧格式冲突的请求、chunk
   扩展），以及 **curl**（`--http1.0`、keep-alive 复用、chunked 上传、sendfile 路径的
-  下载、Range、原始 chunked trailer）。
+  下载、Range、原始 chunked trailer，以及 HTTPS 下载 `ServeFile`、`io.Copy` 和
+  `Context.SendFile`，同一连接和各自一个连接，有内核 TLS 和没有内核 TLS）。
 - **fib 客户端**对 Go `net/http` 服务端（`httptest`）和原始服务端（HTTP/1.0 keep-alive
   和以关闭连接结束的响应、格式错误的响应）。
 - **fib 客户端对 fib 服务端**，包括 HTTP/1.0 和 sendfile。
@@ -382,12 +408,18 @@ HTTP/1 客户端像 server 读请求、写响应那样，自己写请求头、�
   回调里写的响应确实发出。另外还有：各协议上 body 发到一半被切断、body 上限落在哪、
   HTTP/2 和 HTTP/3 上流控窗口对慢 handler 的限速。
 - `sendfile_test.go` 在 TCP 和 Unix socket 上检查 `Connection.SendFile`：在 handler
-  中和其他 goroutine 中调用、对端读得慢、文件比声明的范围短。
+  中和其他 goroutine 中调用、对端读得慢、文件比声明的范围短；`sendfile_sealed_test.go`
+  检查随排空加密的文件（对端不读时内存不超过一块、与前后发送的顺序、文件过短）和
+  `ControlIdle`；`sendfile_windows_test.go` 检查 `TransmitFile`、文件过短和拒绝它的 socket。
+- `tls/file_test.go` 用 `crypto/tls` 客户端检查 TLS 上的 `SendFile`，覆盖 TLS 1.3、
+  TLS 1.2 的 AES-GCM 与 AES-CBC，有内核 TLS 和没有内核 TLS：在 handler 内外调用、前后的
+  发送、对端读得慢并检查堆、文件过短、之后的 `close_notify`、留在 `crypto/tls` 上的连接，
+  以及经内核 TLS 的 KeyUpdate。
 
 对端只有标准库和 curl 可执行文件，Go module 不增加任何依赖。CI 中单独的
 **HTTP/1.x conformance** job 在 Linux、macOS、Windows 上运行这些测试，并设置
 `FIB_REQUIRE_CURL=1`：缺少 curl 时直接失败而不是跳过 curl 用例。本地运行：
 
 ```sh
-go test -race -run 'TestHTTP1Conformance|TestSendFile|TestSendableFileOf|TestResponseWriter|TestStreamRequestBody|TestChunkedDecoder|TestHoldReads|TestServerRead|TestServerIdle|TestServerTimeout|TestServerWithoutTimeouts|TestReadDeadline|TestWriteDeadline|TestZeroDeadline|TestConnectionAddresses|TestRetain|TestOnBody|TestBodyComplete|TestBodyMatrix|TestOnCancel' -v . ./http/ ./http3/
+go test -race -run 'TestHTTP1Conformance|TestSendFile|TestSendableFileOf|TestResponseWriter|TestStreamRequestBody|TestChunkedDecoder|TestHoldReads|TestServerRead|TestServerIdle|TestServerTimeout|TestServerWithoutTimeouts|TestReadDeadline|TestWriteDeadline|TestZeroDeadline|TestConnectionAddresses|TestRetain|TestOnBody|TestBodyComplete|TestBodyMatrix|TestOnCancel|TestTransmitFile|TestControlIdle|TestKernelTLS' -v . ./http/ ./http3/ ./tls/
 ```

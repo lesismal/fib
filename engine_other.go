@@ -1092,6 +1092,42 @@ func (c *Connection) SendFile(f File, offset, count int64) error {
 	return sendFileCopy(c, f, offset, count, c.Send)
 }
 
+// SendFileRaw is SendFile below any layer, with each chunk passed through
+// sealer, when there is one, on its way. It writes synchronously too.
+func (c *Connection) SendFileRaw(f File, offset, count int64, sealer FileSealer) error {
+	if err := checkSendFileRange(offset, count); err != nil {
+		return err
+	}
+	if c.udp {
+		return ErrSendFileDatagram
+	}
+	if sealer == nil {
+		return sendFileCopy(c, f, offset, count, c.sendRaw)
+	}
+	return sendFileCopy(c, f, offset, count, func(b []byte) error {
+		sealed, err := sealer.Seal(nil, b)
+		if err != nil {
+			return err
+		}
+		return c.sendRaw(sealed)
+	})
+}
+
+// QueuesFiles reports whether the connection has no layer, whose SendFile
+// this backend has write the range without one; the range is written before
+// SendFile returns either way.
+func (c *Connection) QueuesFiles() bool { return !c.udp && c.layer == nil }
+
+// ControlIdle runs nothing and reports false: this backend's socket is the
+// net.Conn it wraps, whose writes it cannot hold back.
+func (c *Connection) ControlIdle(func(fd uintptr) error) (bool, error) { return false, nil }
+
+// SendRawRecord fails: there is no kernel TLS here.
+func (c *Connection) SendRawRecord(uint8, []byte) error { return errNoKernelRecords }
+
+// errNoKernelRecords is what SendRawRecord reports where it cannot send.
+var errNoKernelRecords = errors.New("fib: no kernel TLS records here")
+
 // The methods below are net.TCPConn's, beyond those net.Conn already asks
 // for. This backend hands each to the net.Conn it wraps, and one that the
 // wrapped connection does not have, such as a TCP option on a Unix or UDP

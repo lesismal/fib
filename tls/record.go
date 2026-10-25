@@ -132,9 +132,10 @@ type recordKeys struct {
 	version [2]byte
 	seq     uint64
 
-	// The AES-GCM suites': the AEAD, and TLS 1.3's per-record nonce base or
-	// TLS 1.2's four-byte salt.
+	// The AES-GCM suites': the AEAD, its key, which the kernel's TLS takes
+	// over, and TLS 1.3's per-record nonce base or TLS 1.2's four-byte salt.
 	aead cipher.AEAD
+	key  []byte
 	iv   [12]byte
 	// secret, hash and keyLen derive the next generation of TLS 1.3 keys,
 	// when the peer updates its own or asks for ours to be.
@@ -149,6 +150,9 @@ type recordKeys struct {
 	dec    cbcMode
 	mac    hash.Hash
 	macLen int
+	// newMAC makes another record MAC under the same key, for a copy of the
+	// keys that seals apart from these; see fileKeys.
+	newMAC func() hash.Hash
 
 	// nonce, ad, header and macSum are scratch space, which the interfaces
 	// they pass through would otherwise move to the heap on every record.
@@ -183,7 +187,7 @@ func newKeys13(keyLen int, h func() hash.Hash, secret []byte) (*recordKeys, erro
 	if err != nil {
 		return nil, err
 	}
-	k := &recordKeys{mode: modeGCM13, version: [2]byte{3, 3}, aead: aead, secret: secret, hash: h, keyLen: keyLen}
+	k := &recordKeys{mode: modeGCM13, version: [2]byte{3, 3}, aead: aead, key: key, secret: secret, hash: h, keyLen: keyLen}
 	copy(k.iv[:], iv)
 	return k, nil
 }
@@ -245,7 +249,7 @@ func newKeysFromMaster(version uint16, s suite, master, clientRandom, serverRand
 			if err != nil {
 				return nil, err
 			}
-			k.aead = aead
+			k.aead, k.key = aead, key
 			copy(k.iv[:4], salt)
 			return k, nil
 		}
@@ -254,6 +258,7 @@ func newKeysFromMaster(version uint16, s suite, master, clientRandom, serverRand
 			return nil, err
 		}
 		k.block, k.mac, k.macLen = b, hmac.New(s.mac, macKey), s.macLen
+		k.newMAC = func() hash.Hash { return hmac.New(s.mac, macKey) }
 		return k, nil
 	}
 	if client, err = half(clientMAC, clientKey, clientSalt); err != nil {
@@ -335,6 +340,20 @@ func (k *recordKeys) maxBody() int {
 		return maxCiphertext13
 	}
 	return maxCiphertext12
+}
+
+// fileKeys is a copy of k for sealing a file's records apart from k, from
+// sequence number seq on: it shares k's AEAD or block cipher, which seal
+// without changing, and has a CBC mode and record MAC of its own, which do
+// change as they seal.
+func (k *recordKeys) fileKeys(seq uint64) *recordKeys {
+	f := *k
+	f.seq = seq
+	f.enc, f.dec = nil, nil
+	if k.newMAC != nil {
+		f.mac = k.newMAC()
+	}
+	return &f
 }
 
 // seal appends a record of typ carrying a followed by b, at most maxPlaintext

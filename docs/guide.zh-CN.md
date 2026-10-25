@@ -326,8 +326,8 @@ UDP 连接上不生效（数据报已经被事件循环读走了）。`http` pac
 ### SendFile 零拷贝发送
 
 `Connection.SendFile(f, offset, count)` 把文件的一段排进发送队列，与前后的 `Send` 保持
-顺序。Linux 和 macOS 上由 `sendfile(2)` 直接从文件发到 socket，数据不经过用户态；
-Windows 上按 socket 的发送进度每次读取一块再发送。无论哪种方式，文件都是随对端的接收
+顺序。Linux 和 macOS 上由 `sendfile(2)`、Windows 上由 `TransmitFile` 直接从文件发到
+socket，数据不经过用户态。无论哪种方式，文件都是随对端的接收
 进度读取的，大文件也不会占用更多内存：
 
 ```go
@@ -337,8 +337,10 @@ _ = c.SendFile(f, 0, size) // 连接使用自己复制的描述符，f 可以立
 f.Close()
 ```
 
-- 带 layer 的连接（如 TLS）需要先加密，无法零拷贝：`SendFile` 会在返回前读出这段文件
-  并经 layer 发送。UDP 连接返回 `ErrSendFileDatagram`。
+- 带 layer 的连接交给 layer：TLS（`fib.FileLayer`）在 Linux 有内核 TLS 时把加密交给内核、
+  文件仍走 `sendfile(2)`，否则随 socket 排空逐块读取并加密，内存有上界。不能承载文件的
+  layer（例如留在 `crypto/tls` 上的连接）会在返回前读出这段文件并经 layer 发送。UDP 连接
+  返回 `ErrSendFileDatagram`。
 - 文件比声明的范围短时会关闭连接，因为对端已经在等这些字节。
 - `OnData` 里的发送会被暂存（cork），在 handler 返回后合并成一次写入；需要在 handler
   运行期间就把已发送的数据交给 socket 时（例如流式响应），调用 `Connection.Flush()`。

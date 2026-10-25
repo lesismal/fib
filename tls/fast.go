@@ -572,6 +572,10 @@ func (t *layer) handlePostHandshake(data []byte) bool {
 func (t *layer) updateWriteKeys() bool {
 	t.wmu.Lock()
 	defer t.wmu.Unlock()
+	if t.ktls == ktlsOn {
+		t.rekeyOwed = true
+		return t.kernelRekeyLocked() == nil
+	}
 	if err := t.sealSendLocked(recordTypeHandshake, []byte{typeKeyUpdate, 0, 0, 1, 0}, nil); err != nil {
 		t.c.CloseWithError(err)
 		return false
@@ -669,8 +673,12 @@ func (t *layer) dropHeld() {
 	t.wmu.Unlock()
 }
 
-// sealSendWith is sealSendLocked under the keys given.
+// sealSendWith is sealSendLocked under the keys given, or hands the record
+// to the kernel to seal where it has taken the sealing over.
 func (t *layer) sealSendWith(keys *recordKeys, typ byte, first, second []byte) error {
+	if t.ktls == ktlsOn {
+		return t.kernelSendLocked(typ, first, second)
+	}
 	n := len(first) + len(second)
 	records := max(1, (n+maxPlaintext-1)/maxPlaintext)
 	if keys.seq > ^uint64(0)-uint64(records) {

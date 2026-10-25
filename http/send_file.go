@@ -29,15 +29,16 @@ const sendFileQueuePiece = 256 << 10
 // done, once and on another goroutine, when all of it has been handed to the
 // connection or the stream, or with the error that stopped it. It is how a
 // handler serves a file of any size without a worker held up by either: on
-// an HTTP/1 connection without a layer, such as TLS, the range goes from the
-// file to the socket by sendfile(2), as Connection.SendFile sends it, paced
-// by the socket, and what of it is still queued counts against the
-// response's limit as written bytes do, so WriteNoWait and OnWritable see a
-// client that has stopped reading it; elsewhere it is read a piece at a time
-// on a pool of its own
-// for the disk, package sidepool's File, and each piece is written with
-// WriteNoWait, the next read waiting for OnWritable once the response is
-// above its limit.
+// an HTTP/1 connection whose Connection.QueuesFiles, plain or over TLS, the
+// range is queued as Connection.SendFile queues it, paced by the socket: it
+// goes from the file to the socket by sendfile(2) or TransmitFile, or, over
+// TLS, by sendfile with the kernel's TLS sealing it on Linux and read and
+// sealed a chunk at a time as the socket takes it elsewhere; what of it is
+// still queued counts against the response's limit as written bytes do, so
+// WriteNoWait and OnWritable see a client that has stopped reading it.
+// Elsewhere it is read a piece at a time on a pool of its own for the disk,
+// package sidepool's File, and each piece is written with WriteNoWait, the
+// next read waiting for OnWritable once the response is above its limit.
 //
 // The header is the one the handler set through Header, with a
 // Content-Length of n added when it sets none and the response has not
@@ -99,7 +100,7 @@ func (c *Context) SendFileStall(f *os.File, offset, n int64, stall time.Duration
 		sidepool.Go(func() { s.finish(err) })
 		return
 	}
-	if c.isHTTP1() && !c.holdsWhole() && c.Conn.Layer() == nil && w.err == nil && n >= minSendFileSize &&
+	if c.isHTTP1() && !c.holdsWhole() && c.Conn.QueuesFiles() && w.err == nil && n >= minSendFileSize &&
 		(w.declared < 0 || w.written+n <= w.declared) {
 		if stall <= 0 {
 			err := c.sendFileHTTP1(f, offset, n)
@@ -112,8 +113,8 @@ func (c *Context) SendFileStall(f *os.File, offset, n int64, stall time.Duration
 	sidepool.File().Go(s.pump)
 }
 
-// sendFileHTTP1 is SendFile on an HTTP/1 connection the file can go to the
-// socket from without passing through a layer.
+// sendFileHTTP1 is SendFile on an HTTP/1 connection that queues the file,
+// to be read as the socket takes it.
 func (c *Context) sendFileHTTP1(f *os.File, offset, n int64) error {
 	w := c.w
 	if !w.committed {

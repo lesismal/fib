@@ -17,7 +17,7 @@ usage, see the [HTTP section of the Go guide](guide.zh-CN.md#http-子-package)
 | Request bodies | `Content-Length`, chunked with extensions and trailers (`Request.Trailer`); buffered whole by default, or streamed to the handler as they arrive with `StreamRequestBody` | `Content-Length`; chunked with `c.Request.Trailer` when `ContentLength` is -1 |
 | Response bodies | `Content-Length`, chunked with trailers, close-delimited for HTTP/1.0 streams | `Content-Length`, chunked with trailers (`Response.Trailer`), close-delimited |
 | Streaming | Responses: `Context` is an `http.ResponseWriter`, `http.Flusher` and `io.ReaderFrom`, so `Write` + `Flush` stream the body as it is produced. Requests: with `StreamRequestBody` `Request.Body` is a `*BodyStream`, read without waiting or taken through `Context.OnBody` | Bodies are buffered whole before the callback |
-| Files | `Connection.SendFile` / `Context.ReadFrom`: `sendfile(2)` on Linux and macOS, chunked reads on Windows; `http.ServeFile`, `http.ServeContent` and `http.FileServer` work through `Context` (Range, multipart ranges, conditional requests) | — |
+| Files | `Connection.SendFile` / `Context.ReadFrom` / `Context.SendFile`: `sendfile(2)` on Linux and macOS, `TransmitFile` on Windows; over TLS, `sendfile(2)` with kernel TLS on Linux, otherwise sealed a chunk at a time as the socket drains; `http.ServeFile`, `http.ServeContent` and `http.FileServer` work through `Context` (Range, multipart ranges, conditional requests) | — |
 | Timeouts | `ReadHeaderTimeout`, `ReadTimeout` and `IdleTimeout`, as `net/http.Server` resolves them, plus `ReadBodyTimeout` | Per-request `Timeout` |
 | Interim responses | 1xx through `WriteInterim` or `WriteHeader(1xx)`, automatic `100 Continue` | 1xx skipped |
 | Bodiless responses | HEAD (length of the GET kept), 204 and 1xx without `Content-Length`, 304 only with the handler's own `Content-Length` | HEAD, 204, 304 read no body |
@@ -405,7 +405,44 @@ file to the socket by `sendfile(2)`; when the socket is full, the rest waits
 for the next write edge, so the file is read only as fast as the peer
 consumes it. On Linux this can be seen with
 `strace -e sendfile`, for example `sendfile(10, 12, [0] => [2673856], 3145851) = 2673856`
-followed by the remainder once the socket drains.
+followed by the remainder once the socket drains. On Windows the range goes
+by an overlapped `TransmitFile`, posted once what is queued ahead of it has
+gone, whose completion plays the write edge; a socket it refuses (a Unix
+socket) has the file read a chunk at a time instead. Client editions of
+Windows run at most two `TransmitFile` calls at once system-wide and queue the
+rest, as they do for Go's `net` package; server editions have no such limit.
+
+Over TLS (`tls.NewServer` or `tls.Dial`, once the handshake is done and the
+connection's records are protected by fib's own record layer: AES-GCM over
+TLS 1.3 or 1.2, AES-CBC over TLS 1.2 or 1.1):
+
+- **On Linux with kernel TLS**, the first file a connection sends over an
+  AES-GCM suite hands the sealing of everything it sends from then on to the
+  kernel (`TCP_ULP` "tls" and `TLS_TX`, with the traffic key, IV and next
+  sequence number), and the file goes by `sendfile(2)` from the page cache,
+  encrypted in the kernel. The switch is made only at a moment when nothing
+  sealed in user space is still queued (`Connection.ControlIdle`); a file sent
+  at another moment is sealed in user space as below, and the next one tries
+  again. Afterwards sends are written as plaintext the kernel seals, and
+  alerts such as `close_notify` go as records of their own type
+  (`Connection.SendRawRecord`). A KeyUpdate the peer asks for is sent through
+  the kernel at the next moment nothing is queued, and the kernel moves to the
+  next keys behind it; a kernel that cannot take new keys (Linux before 6.14)
+  ends the connection instead. Reading stays in user space. A kernel without
+  the `tls` module, or one the process may not load, is noted once and
+  never asked again. `tls.Handler.NoKernelTLS` turns the switch off.
+- **Otherwise** (macOS, the BSDs, Windows, AES-CBC suites, or kernel TLS off or
+  missing) the connection queues the file and its flush reads it 64KB at a
+  time as the socket drains, seals each chunk into four full records
+  (`fib.FileSealer`), and writes them. The records the file will take are set
+  aside in the sequence when it is queued, so whatever is sent after it is
+  sealed at once behind them and the order on the wire is kept. A file costs
+  one sealed chunk of memory however large it is, and a slow reader holds it
+  up exactly as plain `sendfile` does: the rest stays in the file, counted in
+  the backlog for `NotifyOutput`, `OnWritable` and the write deadline.
+
+A file shorter than its range closes the connection in every case, since the
+peer was promised the whole range.
 
 `Context.ReadFrom` uses it for regular files and for an `*io.LimitedReader`
 over one (what `http.ServeContent` passes). Ranges under 16KB are copied
@@ -465,8 +502,12 @@ handler := http.HandlerFunc(func(c *http.Context) {
   queues the difference in memory (reads on the connection pause, but the
   handler is not held back). Files sent with `SendFile` are the exception:
   they are read only as the socket drains.
-- **TLS cannot use sendfile.** Over TLS, `SendFile` reads the range and
-  encrypts it before returning, so the whole range is queued in memory.
+- **Suites fib's record layer does not implement** (ChaCha20-Poly1305 and
+  the others that keep a connection on `crypto/tls`) cannot carry a file as it
+  drains: there `Connection.SendFile` reads the range and encrypts it before
+  returning, so the whole range is queued in memory, and `Context.SendFile`,
+  which asks `Connection.QueuesFiles` first, reads it a piece at a time
+  instead.
 - **HTTP/2 and HTTP/3** accept the same `ResponseWriter` calls and stream the
   same way, in DATA frames; there a write that outruns the client's flow
   control does wait for it (see their documents).
@@ -480,9 +521,9 @@ handler := http.HandlerFunc(func(c *http.Context) {
 
 ## Planned improvements
 
-- Lazily encrypted file sending over TLS, reading the file only as the socket
-  drains, and kTLS on Linux for true zero-copy HTTPS.
-- `TransmitFile` on Windows.
+- File sending that drains with the socket on connections that stay on
+  `crypto/tls` (ChaCha20-Poly1305 suites), which needs those suites in fib's
+  own record layer.
 
 ## Conformance tests
 
@@ -494,7 +535,9 @@ are not fib:
   requests `net/http` never sends: HTTP/1.0 with and without keep-alive,
   pipelined requests, malformed and conflicting framing, chunk extensions),
   and **curl** (`--http1.0`, keep-alive reuse, chunked upload, downloads of the
-  sendfile path, ranges, raw chunked trailers).
+  sendfile path, ranges, raw chunked trailers, and HTTPS downloads of
+  `ServeFile`, `io.Copy` and `Context.SendFile`, on one connection and on one
+  each, with kernel TLS and without).
 - **fib client** against Go's `net/http` server (`httptest`) and raw servers
   (HTTP/1.0 keep-alive and close-delimited responses, malformed responses).
 - **fib client against fib server**, including HTTP/1.0 and sendfile.
@@ -552,7 +595,16 @@ are not fib:
   flow-control windows pacing a slow handler on HTTP/2 and HTTP/3.
 - `sendfile_test.go` checks `Connection.SendFile` over TCP and Unix
   sockets, from the handler and from other goroutines, with a slow reader, and
-  a file shorter than its range.
+  a file shorter than its range; `sendfile_sealed_test.go` checks a file
+  sealed as the socket drains (memory bounded to a chunk with the peer reading
+  nothing, order with sends around it, a short file) and `ControlIdle`, and
+  `sendfile_windows_test.go` checks `TransmitFile`, a short file and a socket
+  that refuses it.
+- `tls/file_test.go` checks `SendFile` over TLS against `crypto/tls` clients,
+  for TLS 1.3, AES-GCM and AES-CBC over TLS 1.2, with kernel TLS and without:
+  from the handler and outside it, sends before and after, a slow reader with
+  the heap checked, a short file, `close_notify` after it, a connection left
+  on `crypto/tls`, and a KeyUpdate through kernel TLS.
 
 The peers are the standard library and the curl binary, so the Go module takes
 no new dependency. CI runs the suite as its own job, **HTTP/1.x conformance**,
@@ -560,5 +612,5 @@ on Linux, macOS and Windows with `FIB_REQUIRE_CURL=1`, which makes a missing
 curl fail the job instead of skipping those cases. To run it locally:
 
 ```sh
-go test -race -run 'TestHTTP1Conformance|TestSendFile|TestSendableFileOf|TestResponseWriter|TestStreamRequestBody|TestChunkedDecoder|TestHoldReads|TestServerRead|TestServerIdle|TestServerTimeout|TestServerWithoutTimeouts|TestReadDeadline|TestWriteDeadline|TestZeroDeadline|TestConnectionAddresses|TestRetain|TestOnBody|TestBodyComplete|TestBodyMatrix|TestOnCancel' -v . ./http/ ./http3/
+go test -race -run 'TestHTTP1Conformance|TestSendFile|TestSendableFileOf|TestResponseWriter|TestStreamRequestBody|TestChunkedDecoder|TestHoldReads|TestServerRead|TestServerIdle|TestServerTimeout|TestServerWithoutTimeouts|TestReadDeadline|TestWriteDeadline|TestZeroDeadline|TestConnectionAddresses|TestRetain|TestOnBody|TestBodyComplete|TestBodyMatrix|TestOnCancel|TestTransmitFile|TestControlIdle|TestKernelTLS' -v . ./http/ ./http3/ ./tls/
 ```

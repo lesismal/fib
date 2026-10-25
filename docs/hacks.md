@@ -586,8 +586,12 @@ immediately without waiting for the handler to return. SSE and large downloads w
 
 - The connection duplicates the file descriptor, so `f` may be closed immediately.
 - A file shorter than declared closes the connection (the peer is waiting for those bytes).
-- TLS connections cannot be zero copy: `SendFile` reads the whole range and encrypts it before
-  returning, and all of it is queued in memory.
+- Over TLS, on Linux with kernel TLS and an AES-GCM suite, the first file hands sealing to the
+  kernel and goes by `sendfile(2)`; otherwise it is read and sealed 64KB at a time as the socket
+  drains, so memory stays bounded either way. Only connections left on `crypto/tls`
+  (ChaCha20-Poly1305) read the whole range through the layer before returning. See
+  [HTTP/1](http1.md#zero-copy-file-sending).
+- On Windows the range goes by `TransmitFile`.
 - Ranges under 16KB are copied directly in HTTP, which is cheaper than an extra system call.
 
 ---

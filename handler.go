@@ -183,6 +183,44 @@ type CorkHolder interface {
 	ReleaseCorked()
 }
 
+// FileLayer is a Layer that carries a file SendFile sends as the socket takes
+// it, rather than having the whole range read and handed to Send before
+// SendFile returns: the tls package seals a file's records as the socket
+// drains, or has the kernel seal them, where it can, and the file go by
+// sendfile.
+//
+// SendFile calls CanSendFile first, and SendFile only if it reports true;
+// otherwise the range is read and handed to Send. Context.SendFile in package
+// http asks through Connection.QueuesFiles, before it begins a response.
+type FileLayer interface {
+	Layer
+	// CanSendFile reports whether SendFile can carry a file now. Once it
+	// has reported true, it reports false only for a connection that has
+	// failed or is closing, where SendFile fails anyway.
+	CanSendFile() bool
+	// SendFile sends count bytes of f from offset, after whatever was sent
+	// through the layer before it and ahead of whatever is sent after, and
+	// hands the range to the connection through SendFileRaw. count is above
+	// zero.
+	SendFile(f File, offset, count int64) error
+}
+
+// FileSealer transforms a file's bytes as SendFileRaw reads them for the
+// socket: a chunk at a time, each read once the socket has taken the one
+// before, so a file costs a chunk's memory however large it is.
+//
+// The connection calls Seal from its flush, under its own lock, in the
+// file's order, and never twice at once: Seal must not send on the
+// connection, nor wait.
+type FileSealer interface {
+	// Seal appends to dst what plain, the next bytes of the file, become on
+	// the wire, and returns the extended slice.
+	Seal(dst, plain []byte) ([]byte, error)
+	// SealedLen bounds what Seal makes of n bytes, which the connection
+	// sizes the buffer it seals into by.
+	SealedLen(n int) int
+}
+
 // CloseWithError closes the connection, as Close does, and hands err to
 // OnClose. A layer uses it to report why its protocol ended the connection,
 // such as a failed handshake. Only the first close's error is reported.
@@ -346,6 +384,8 @@ var ErrSendFileDatagram = errors.New("fib: SendFile needs a stream connection")
 
 // sendFileChunk is how much of a file one read stages when the file cannot go
 // to the socket directly: through a layer, or on a platform without sendfile.
+// It is a whole number of TLS records' plaintext, so that a file the tls
+// package seals is cut into full records but for the last.
 const sendFileChunk = 64 << 10
 
 func checkSendFileRange(offset, count int64) error {
@@ -357,8 +397,7 @@ func checkSendFileRange(offset, count int64) error {
 
 // sendFileCopy sends count bytes of f from offset by reading them and handing
 // each chunk to send, which must copy it. It is the fallback for connections
-// whose bytes are transformed on the way out, as TLS does, and for the
-// portable backend. A file that fails part way, such as one shorter than the
+// with a layer that cannot carry a file, and for the portable backend. A file that fails part way, such as one shorter than the
 // range, leaves the peer short of bytes it was promised, so the connection is
 // closed; one that fails before anything was sent leaves it as it was.
 func sendFileCopy(c *Connection, f File, offset, count int64, send func([]byte) error) error {

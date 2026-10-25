@@ -1,4 +1,4 @@
-//go:build linux || darwin || dragonfly || freebsd || netbsd || openbsd
+//go:build linux || darwin || dragonfly || freebsd || netbsd || openbsd || windows
 
 package fib
 
@@ -18,7 +18,7 @@ import (
 func TestSendFileCountsInBacklog(t *testing.T) {
 	const size = 32 << 20
 	path, data := writeTestFile(t, size)
-	c, client := acceptOne(t, "tcp", HandlerFuncs{})
+	c, client := connectOne(t, HandlerFuncs{})
 	f, err := os.Open(path)
 	if err != nil {
 		t.Fatal(err)
@@ -67,7 +67,7 @@ func TestSendFileWriteDeadline(t *testing.T) {
 	const size = 32 << 20
 	path, _ := writeTestFile(t, size)
 	closed := make(chan error, 1)
-	c, _ := acceptOne(t, "tcp", HandlerFuncs{Close: func(_ *Connection, err error) { closed <- err }})
+	c, _ := connectOne(t, HandlerFuncs{Close: func(_ *Connection, err error) { closed <- err }})
 	f, err := os.Open(path)
 	if err != nil {
 		t.Fatal(err)

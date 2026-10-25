@@ -170,6 +170,10 @@ type connPlatform struct {
 	// inFlight keeps the arrays an overlapped send is reading from reachable
 	// until it completes, even if the connection drops its queue meanwhile.
 	inFlight [maxWritevItems][]byte
+	// transmitting is how much of the file at the head of the queue the
+	// TransmitFile in flight was asked for, or zero while what is in flight
+	// is a send from memory. Guarded by mu.
+	transmitting int64
 	// failure is the error a failed zero-byte read reported, which socketError
 	// hands on when the worker asks why the connection broke.
 	failure error
@@ -782,10 +786,18 @@ func (e *Engine) completeWrite(c *Connection, n int, err error) *Connection {
 	c.mu.Lock()
 	c.writeInFlight = false
 	clear(c.inFlight[:])
+	transmitted := c.transmitting
+	c.transmitting = 0
 	if c.closed {
 		c.mu.Unlock()
 		e.forget(c)
 		return nil
+	}
+	if err == nil && transmitted > 0 && int64(n) < transmitted {
+		// TransmitFile ends at the end of the file without an error, and
+		// the file has turned out shorter than the range the peer was
+		// promised.
+		err = io.ErrUnexpectedEOF
 	}
 	if err != nil {
 		c.mu.Unlock()
@@ -793,7 +805,11 @@ func (e *Engine) completeWrite(c *Connection, n int, err error) *Connection {
 		return nil
 	}
 	if n > 0 {
-		c.subPending(int64(n))
+		if transmitted > 0 {
+			c.fileSentLocked(int64(n))
+		} else {
+			c.subPending(int64(n))
+		}
 		c.consumeLocked(n)
 	}
 	c.traceLocked("write done n=%d", n)
@@ -1034,6 +1050,13 @@ func (c *Connection) awaitWritableLocked() error {
 	for i := c.sendHead; i < len(c.sends) && count < len(bufs); i++ {
 		item := &c.sends[i]
 		if item.file != nil {
+			if c.transmitsLocked(item) {
+				if count == 0 {
+					return c.transmitFileLocked(item)
+				}
+				// The file goes once what is ahead of it has.
+				break
+			}
 			if stageErr = c.stageLocked(item); stageErr != nil {
 				break
 			}
@@ -1301,9 +1324,11 @@ func (e *Engine) completeConnect(c *Connection, err error) {
 }
 
 // fileSegment is the part of a file SendFile has yet to send, read through
-// the connection's own duplicate of the caller's handle. Windows has no
-// sendfile for an overlapped socket the engine could use, so the file is read
-// a chunk at a time, each chunk once the socket has taken the one before.
+// the connection's own duplicate of the caller's handle. TransmitFile sends it
+// from the file, a call at a time, each posted once the socket has taken what
+// is ahead of it. A file that is sealed on its way, as TLS seals it, or one
+// TransmitFile refuses, as it does for a Unix socket, is read a chunk at a
+// time instead, each chunk once the socket has taken the one before.
 type fileSegment struct {
 	// file owns the duplicate handle. A connection that closes while an
 	// overlapped send still holds a chunk closes it at once, and leaves only
@@ -1312,7 +1337,70 @@ type fileSegment struct {
 	offset    int64
 	remaining int64
 	chunk     []byte
+	// noTransmit records that TransmitFile refused the segment, which is
+	// read a chunk at a time from then on.
+	noTransmit bool
+	// sealer, when set, transforms the file on its way, a chunk at a time
+	// sealed into sealed; see stageSealedLocked.
+	sealer FileSealer
+	sealed []byte
 }
+
+// readAt reads the file at off.
+func (s *fileSegment) readAt(p []byte, off int64) (int, error) { return s.file.ReadAt(p, off) }
+
+// newSealBuffer is the buffer a sealed segment seals its chunks into. It is
+// left to the garbage collector rather than given back to the pool, since an
+// overlapped send may still be reading it when the segment ends.
+func newSealBuffer(n int) []byte { return make([]byte, n) }
+
+// maxTransmitFile bounds one TransmitFile call, below the 2GB it takes.
+const maxTransmitFile = 1 << 30
+
+// transmitsLocked reports whether the file item goes by TransmitFile: one
+// sent as it is, over TCP, that TransmitFile has not refused, with no chunk of
+// it staged. Callers hold c.mu.
+func (c *Connection) transmitsLocked(item *sendItem) bool {
+	s := item.file
+	return s.sealer == nil && !s.noTransmit && item.data == nil && !c.flags.has(flagUnix)
+}
+
+// transmitFileLocked posts a TransmitFile for what is left of the file item at
+// the head of the queue, or as much of it as one call takes. Its completion is
+// the write edge, as an overlapped send's is. A socket TransmitFile refuses
+// has the file read a chunk at a time instead. Callers hold c.mu.
+func (c *Connection) transmitFileLocked(item *sendItem) error {
+	s := item.file
+	n := min(s.remaining, maxTransmitFile)
+	c.writeOp.ov = syscall.Overlapped{Offset: uint32(s.offset), OffsetHigh: uint32(s.offset >> 32)}
+	c.writeInFlight = true
+	c.transmitting = n
+	c.outstanding.Add(1)
+	c.traceLocked("post transmit n=%d", n)
+	err := transmitFile(c.socket(), syscall.Handle(s.file.Fd()), uint32(n), 0, &c.writeOp.ov, nil, 0)
+	if err == nil || err == syscall.ERROR_IO_PENDING {
+		return nil
+	}
+	c.writeInFlight = false
+	c.transmitting = 0
+	c.outstanding.Add(-1)
+	if err == wsaEOPNOTSUPP || err == sys.WSAEINVAL || err == errorNotSupported || err == errorInvalidParameter {
+		s.noTransmit = true
+		return c.awaitWritableLocked()
+	}
+	return err
+}
+
+// transmitFile is syscall.TransmitFile, which a test replaces to have it
+// refuse a socket.
+var transmitFile = syscall.TransmitFile
+
+// What TransmitFile reports for a socket or a file it does not send.
+const (
+	wsaEOPNOTSUPP         = syscall.Errno(10045)
+	errorNotSupported     = syscall.Errno(50)
+	errorInvalidParameter = syscall.Errno(87)
+)
 
 func newFileSegment(f File, offset, count int64) (*fileSegment, error) {
 	rc, err := f.SyscallConn()
@@ -1353,6 +1441,9 @@ func (c *Connection) stageLocked(item *sendItem) error {
 		return nil
 	}
 	s := item.file
+	if s.sealer != nil {
+		return c.stageSealedLocked(item)
+	}
 	if s.chunk == nil {
 		s.chunk = make([]byte, min(s.remaining, sendFileChunk))
 	}
@@ -1373,8 +1464,13 @@ func (c *Connection) stageLocked(item *sendItem) error {
 
 // sysSendFileLocked sends what it can of the file item at the head of the
 // queue, from a chunk staged in memory, which counts as pending like any
-// other queued bytes. Callers hold c.mu.
+// other queued bytes. A file that goes by TransmitFile, which is overlapped,
+// is reported as a full socket, so that the flush hands it to
+// awaitWritableLocked to post. Callers hold c.mu.
 func (c *Connection) sysSendFileLocked(item *sendItem) (n, attempted int, fromFile bool, err error) {
+	if c.transmitsLocked(item) {
+		return 0, 0, true, sys.WSAEWOULDBLOCK
+	}
 	if err = c.stageLocked(item); err != nil {
 		return 0, 0, false, err
 	}

@@ -4,6 +4,7 @@ package fib
 
 import (
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"io"
 	"math/bits"
@@ -31,11 +32,17 @@ import (
 //
 // file, when set, makes the item a stretch of a file, which SendFile queued.
 // Where the file goes to the socket by sendfile, data stays nil; otherwise data
-// is the chunk of it read so far and not yet sent.
+// is the chunk of it read so far, sealed where the file has a FileSealer, and
+// not yet sent.
+//
+// record, when set, makes data one TLS record of that type for the kernel to
+// seal, which SendRawRecord queued: it is written on its own, with the type
+// beside it.
 type sendItem struct {
 	data   []byte
 	offset int
 	pooled bool
+	record uint8
 	file   *fileSegment
 }
 
@@ -563,6 +570,8 @@ func (c *Connection) resetQueueLocked() {
 func (c *Connection) releaseItemLocked(item *sendItem) {
 	if item.pooled {
 		c.engine.releaseSendBuffer(item.data)
+	} else if item.record != 0 {
+		bufferpool.Put(item.data)
 	}
 	if item.file != nil {
 		if left := item.file.remaining; left > 0 {
@@ -1894,6 +1903,10 @@ func (c *Connection) flushLocked() error {
 		pending := len(c.sends) - c.sendHead
 		if head := &c.sends[c.sendHead]; head.file != nil {
 			n, attempted, fromFile, err = c.sysSendFileLocked(head)
+		} else if head.record != 0 {
+			data := head.data[head.offset:]
+			attempted = len(data)
+			n, err = c.sysSendRecord(head.record, data)
 		} else if c.engine.useWritev && pending > 1 {
 			count := pending
 			if count > maxWritevItems {
@@ -1903,9 +1916,9 @@ func (c *Connection) flushLocked() error {
 			buffers := batch[:count]
 			for i := 0; i < count; i++ {
 				item := &c.sends[c.sendHead+i]
-				if item.file != nil {
-					// A file is sent on its own once everything before it
-					// has gone.
+				if item.file != nil || item.record != 0 {
+					// A file, or a record of the kernel's, is sent on its
+					// own once everything before it has gone.
 					buffers = buffers[:i]
 					break
 				}
@@ -2470,9 +2483,10 @@ func (c *Connection) stopDeadlinesLocked() {
 // SendFile sends count bytes of f, starting at offset, after whatever was
 // sent before it and ahead of whatever is sent after. On Linux, macOS,
 // FreeBSD and DragonFly the bytes go from the file to the socket by
-// sendfile(2), without passing through user space; on Windows, NetBSD and
-// OpenBSD they are read a chunk at a time as the socket takes them. Either way the file is read only as the peer keeps up,
-// so a large file costs no more memory than a small one.
+// sendfile(2), and on Windows by TransmitFile, without passing through user
+// space; on NetBSD and OpenBSD they are read a chunk at a time as the socket
+// takes them. Either way the file is read only as the peer keeps up, so a
+// large file costs no more memory than a small one.
 //
 // What is left of the range to send counts in the connection's backlog as
 // NotifyOutput, a writer waiting for output to drain and the write deadline
@@ -2485,9 +2499,12 @@ func (c *Connection) stopDeadlinesLocked() {
 // whole range: a file that turns out shorter closes the connection, since the
 // peer was promised count bytes.
 //
-// A connection with a layer, such as TLS, cannot hand the file to the kernel,
-// since the layer has to transform its bytes: the range is read and sent
-// through the layer before SendFile returns.
+// A connection with a layer, such as TLS, hands the file to the layer when it
+// is a FileLayer that can carry it, as the tls package's is once its
+// handshake is done: the file is then read, a chunk at a time, as the socket
+// takes it and sealed on the way, or goes by sendfile with the kernel sealing
+// it. Through any other layer the range is read and sent through the layer
+// before SendFile returns.
 func (c *Connection) SendFile(f File, offset, count int64) error {
 	if err := checkSendFileRange(offset, count); err != nil {
 		return err
@@ -2499,12 +2516,57 @@ func (c *Connection) SendFile(f File, offset, count int64) error {
 		return nil
 	}
 	if l := c.layer; l != nil {
+		if fl, ok := l.(FileLayer); ok && fl.CanSendFile() {
+			return fl.SendFile(f, offset, count)
+		}
 		return sendFileCopy(c, f, offset, count, func(b []byte) error { return l.Send(b, nil) })
 	}
+	return c.sendFile(f, offset, count, nil)
+}
+
+// SendFileRaw is SendFile below any layer: count bytes of f from offset go to
+// the socket as they are, by sendfile where the platform has it, or, with a
+// sealer, a chunk at a time as the socket takes them, each read and passed
+// through sealer on the way. A FileLayer hands its files on this way. What is
+// left of the range counts in the backlog as SendFile's does: as file until
+// a chunk is read, and then as the sealed bytes it became.
+func (c *Connection) SendFileRaw(f File, offset, count int64, sealer FileSealer) error {
+	if err := checkSendFileRange(offset, count); err != nil {
+		return err
+	}
+	if c.udp != nil {
+		return ErrSendFileDatagram
+	}
+	if count == 0 {
+		return nil
+	}
+	return c.sendFile(f, offset, count, sealer)
+}
+
+// QueuesFiles reports whether SendFile queues a file, to be read as the
+// socket takes it, rather than reading all of it before it returns, as it
+// does through a layer that cannot carry a file. A caller that has a file of
+// any size to send, and can pace the reading of it itself, asks first.
+func (c *Connection) QueuesFiles() bool {
+	if c.udp != nil {
+		return false
+	}
+	l := c.layer
+	if l == nil {
+		return true
+	}
+	fl, ok := l.(FileLayer)
+	return ok && fl.CanSendFile()
+}
+
+// sendFile queues count bytes of f from offset, with sealer if it has one,
+// and writes what it can of them at once if nothing is ahead of them.
+func (c *Connection) sendFile(f File, offset, count int64, sealer FileSealer) error {
 	seg, err := newFileSegment(f, offset, count)
 	if err != nil {
 		return err
 	}
+	seg.sealer = sealer
 	c.mu.Lock()
 	if c.closing || c.closed || c.closeAfterSend || c.writeShut {
 		c.mu.Unlock()
@@ -2527,6 +2589,99 @@ func (c *Connection) SendFile(f File, offset, count int64) error {
 	}
 	return nil
 }
+
+// stageSealedLocked reads the next chunk of the sealed file item, unless one
+// is already waiting in its data, and seals it into the segment's buffer,
+// which becomes the item's data. The chunk moves from what is left of the
+// file to what is in memory, counted in pendingBytes as the bytes it sealed
+// into. Callers hold c.mu.
+func (c *Connection) stageSealedLocked(item *sendItem) error {
+	if item.data != nil {
+		return nil
+	}
+	s := item.file
+	want := int(min(s.remaining, sendFileChunk))
+	plain := bufferpool.Get(want)
+	defer bufferpool.Put(plain)
+	read := 0
+	for read < want {
+		n, err := s.readAt(plain[read:want], s.offset+int64(read))
+		read += n
+		if n == 0 || err != nil && read < want {
+			if err == nil || err == io.EOF {
+				err = io.ErrUnexpectedEOF
+			}
+			return err
+		}
+	}
+	if s.sealed == nil {
+		s.sealed = newSealBuffer(s.sealer.SealedLen(want))
+	}
+	sealed, err := s.sealer.Seal(s.sealed[:0], plain[:want])
+	if err != nil {
+		return err
+	}
+	s.sealed = sealed
+	item.data, item.offset = sealed, 0
+	s.advance(int64(want))
+	c.moveFileLocked(int64(want))
+	c.addPending(int64(len(sealed)))
+	return nil
+}
+
+// ControlIdle runs fn on the connection's socket, below any layer, if nothing
+// sent is still queued or being written, and reports whether it ran it: so
+// that fn changes how the socket sends, as switching it to the kernel's TLS
+// does, between two writes and none in progress. Nothing is written to the
+// socket until fn returns. It reports false on a connection that is closing.
+func (c *Connection) ControlIdle(fn func(fd uintptr) error) (bool, error) {
+	if c.udp != nil {
+		return false, nil
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.closing || c.closed || c.flushing || c.writeBusyLocked() || c.sendHead != len(c.sends) ||
+		c.queuedLocked() != 0 {
+		return false, nil
+	}
+	return true, fn(uintptr(c.rawSocket()))
+}
+
+// SendRawRecord sends data below any layer as one TLS record of type typ
+// that the kernel seals, after whatever was sent before it and ahead of
+// whatever is sent after: for a layer that has handed the socket's sealing to
+// the kernel's TLS, through ControlIdle, which then makes every other send a
+// record of application data. It copies data, as SendRaw does. Where the
+// kernel has no TLS it fails.
+func (c *Connection) SendRawRecord(typ uint8, data []byte) error {
+	if !kernelRecords || c.udp != nil || typ == 0 {
+		return errNoKernelRecords
+	}
+	if len(data) == 0 {
+		return nil
+	}
+	c.mu.Lock()
+	if c.closing || c.closed || c.closeAfterSend || c.writeShut {
+		c.mu.Unlock()
+		return syscall.EPIPE
+	}
+	direct := c.canWriteDirectlyLocked()
+	data = bufferpool.Append(nil, data)
+	c.pushLocked(sendItem{data: data, record: typ})
+	c.addPending(int64(len(data)))
+	c.mu.Unlock()
+	if !direct {
+		return nil
+	}
+	if err := c.flushOutput(); err != nil {
+		c.closeWithError(err)
+		return err
+	}
+	return nil
+}
+
+// errNoKernelRecords is what SendRawRecord reports where it cannot send.
+var errNoKernelRecords = errors.New("fib: no kernel TLS records here")
 
 // Read takes what the socket has without waiting for the peer, and reports
 // ErrWouldBlock when it has nothing. It is for a handler that wants to read

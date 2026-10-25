@@ -1175,7 +1175,29 @@ type fileSegment struct {
 	// macOS does for anything but a TCP socket, after which the segment is
 	// copied through it instead.
 	copyBuf []byte
+	// sealer, when set, transforms the file on its way, as TLS does, so that
+	// it is read and sealed a chunk at a time into sealed rather than sent by
+	// sendfile; see stageSealedLocked.
+	sealer FileSealer
+	sealed []byte
 }
+
+// readAt reads the file at off, below its own position, which the caller's
+// descriptor shares.
+func (s *fileSegment) readAt(p []byte, off int64) (int, error) {
+	for {
+		n, err := syscall.Pread(s.fd, p, off)
+		if err == syscall.EINTR {
+			continue
+		}
+		return max(n, 0), err
+	}
+}
+
+// newSealBuffer is the buffer a sealed segment seals its chunks into: one
+// from the pool, which the segment gives back as it ends, since every write
+// here is done with its bytes by the time it returns.
+func newSealBuffer(n int) []byte { return bufferpool.Get(n) }
 
 func newFileSegment(f File, offset, count int64) (*fileSegment, error) {
 	rc, err := f.SyscallConn()
@@ -1214,7 +1236,8 @@ func (s *fileSegment) close() {
 	// A copy through this segment is a synchronous write, so nothing is
 	// reading the staging buffer by the time the segment ends.
 	bufferpool.Put(s.copyBuf)
-	s.copyBuf = nil
+	bufferpool.Put(s.sealed)
+	s.copyBuf, s.sealed = nil, nil
 }
 
 // sysSendFileLocked sends what it can of the file item at the head of the
@@ -1222,6 +1245,14 @@ func (s *fileSegment) close() {
 // rather than from memory. Callers hold c.mu.
 func (c *Connection) sysSendFileLocked(item *sendItem) (n, attempted int, fromFile bool, err error) {
 	s := item.file
+	if s.sealer != nil {
+		if err = c.stageSealedLocked(item); err != nil {
+			return 0, 0, false, err
+		}
+		data := item.data[item.offset:]
+		n, err = c.sysWrite(data)
+		return max(n, 0), len(data), false, err
+	}
 	attempted = int(min(s.remaining, maxSendFileCall))
 	if s.copyBuf == nil {
 		for {

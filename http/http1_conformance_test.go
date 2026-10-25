@@ -13,6 +13,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
+	"crypto/tls"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -703,6 +704,16 @@ func fileHandler(path string) HandlerFunc {
 			_, _ = f.Seek(1000, io.SeekStart)
 			c.Header().Set("Content-Length", strconv.Itoa(100000))
 			_, _ = io.CopyN(c, f, 100000)
+		case "/sendfile":
+			// Context.SendFile, from the handler's goroutine, with the
+			// response finished from another once all of it is queued.
+			f, err := os.Open(path)
+			if err != nil {
+				c.WriteHeader(500)
+				return
+			}
+			info, _ := f.Stat()
+			c.SendFile(f, 0, info.Size(), func(error) { f.Close() })
 		default:
 			stdhttp.ServeFile(c, c.Request, path)
 		}
@@ -772,19 +783,37 @@ func TestHTTP1ConformanceServerFiles(t *testing.T) {
 	}
 }
 
-// Over TLS the file cannot go to the socket directly, and is read and
-// encrypted instead.
+// Over TLS the file goes by sendfile with the kernel's TLS sealing it, where
+// Linux has it, and is read and sealed a chunk at a time as the socket takes
+// it otherwise, or with the kernel's TLS turned off.
 func TestHTTP1ConformanceServerFilesOverTLS(t *testing.T) {
-	path, data := randomFile(t, 1<<20+7)
+	for _, kernel := range []bool{true, false} {
+		t.Run(fmt.Sprintf("kernel-tls=%v", kernel), func(t *testing.T) {
+			testHTTP1FilesOverTLS(t, kernel)
+		})
+	}
+}
+
+// serveHTTPS serves handler over HTTP/1 and TLS, with the kernel's TLS or
+// without, and returns its address and a client config that trusts it.
+func serveHTTPS(t *testing.T, kernel bool, handler HandlerFunc) (string, *tls.Config) {
+	t.Helper()
 	serverConfig, clientConfig, err := tlstest.Configs()
 	if err != nil {
 		t.Fatal(err)
 	}
 	config := DefaultConfig()
 	config.DisableHTTP2 = true
-	addr := serve(t, fibtls.NewServer(serverConfig, NewHandlerWithConfig(config, fileHandler(path))))
+	h := fibtls.NewServer(serverConfig, NewHandlerWithConfig(config, handler))
+	h.NoKernelTLS = !kernel
+	return serve(t, h), clientConfig
+}
+
+func testHTTP1FilesOverTLS(t *testing.T, kernel bool) {
+	path, data := randomFile(t, 1<<20+7)
+	addr, clientConfig := serveHTTPS(t, kernel, fileHandler(path))
 	client := &stdhttp.Client{Timeout: 20 * time.Second, Transport: &stdhttp.Transport{TLSClientConfig: clientConfig}}
-	for _, target := range []string{"/file", "/copy"} {
+	for _, target := range []string{"/file", "/copy", "/sendfile", "/file", "/sendfile"} {
 		req, _ := stdhttp.NewRequest("GET", "https://"+addr+target, nil)
 		resp, body := do(t, client, req)
 		want := string(data)
@@ -904,6 +933,55 @@ func TestHTTP1ConformanceServerWithCurl(t *testing.T) {
 			t.Fatalf("raw output ends %q", out[max(len(out)-40, 0):])
 		}
 	})
+}
+
+// curl downloads files over HTTPS, as ServeFile and Context.SendFile send
+// them, on one connection and on one each: by sendfile with the kernel's TLS
+// sealing them, where Linux has it, and sealed here otherwise.
+func TestHTTP1ConformanceServerHTTPSDownloadWithCurl(t *testing.T) {
+	curl := requireCurl(t)
+	path, data := randomFile(t, 3<<20+77)
+	for _, kernel := range []bool{true, false} {
+		t.Run(fmt.Sprintf("kernel-tls=%v", kernel), func(t *testing.T) {
+			addr, _ := serveHTTPS(t, kernel, fileHandler(path))
+			base := "https://" + addr
+			dir := t.TempDir()
+			var args []string
+			var outputs []string
+			for i, target := range []string{"/file", "/sendfile", "/copy", "/sendfile"} {
+				dst := filepath.Join(dir, fmt.Sprintf("download%d", i))
+				args = append(args, "--output", dst, base+target)
+				outputs = append(outputs, dst)
+			}
+			// One connection for all four, then one for each.
+			runCurl(t, curl, append([]string{"--insecure", "--http1.1"}, args...)...)
+			check := func() {
+				for i, dst := range outputs {
+					got, err := os.ReadFile(dst)
+					if err != nil {
+						t.Fatal(err)
+					}
+					want := data
+					if i == 2 {
+						want = append([]byte("prefix:"), data...)
+					}
+					if !bytes.Equal(got, want) {
+						t.Fatalf("%s: %d bytes differ from the file", args[2*i+2], len(got))
+					}
+					os.Remove(dst)
+				}
+			}
+			check()
+			for i := 0; i < len(args); i += 3 {
+				runCurl(t, curl, "--insecure", "--http1.1", args[i], args[i+1], args[i+2])
+			}
+			check()
+			out, _ := runCurl(t, curl, "--insecure", "--http1.1", "--range", "70000-70009", base+"/file")
+			if out != string(data[70000:70010]) {
+				t.Fatal("range differs from the file")
+			}
+		})
+	}
 }
 
 func sha256Of(b []byte) []byte {
