@@ -14,14 +14,14 @@ usage, see the [HTTP section of the Go guide](guide.zh-CN.md#http-子-package)
 | --- | --- | --- |
 | Versions | HTTP/1.0 and HTTP/1.1 requests; answers in the request's version | Sends HTTP/1.1, or HTTP/1.0 when the request's `ProtoMinor` is 0 |
 | Connections | Keep-alive (HTTP/1.1 by default, HTTP/1.0 with `Connection: keep-alive`), `Connection: close` from either side, pipelining (responses in request order) | Keep-alive pool per host:port; an HTTP/1.0 connection is reused only if the request asked for keep-alive and the server agreed |
-| Request bodies | `Content-Length`, chunked with extensions and trailers (`Request.Trailer`); buffered whole by default, or streamed to the handler as they arrive with `StreamRequestBody` | `Content-Length`; chunked with `c.Request.Trailer` when `ContentLength` is -1 |
-| Response bodies | `Content-Length`, chunked with trailers, close-delimited for HTTP/1.0 streams | `Content-Length`, chunked with trailers (`Response.Trailer`), close-delimited |
+| Request bodies | `Content-Length`, chunked with extensions and trailers (`Request.Trailer`); a body sent in gzip, x-gzip or deflate on top of chunked; buffered whole by default, or streamed to the handler as they arrive with `StreamRequestBody` | `Content-Length`; chunked with `c.Request.Trailer` when `ContentLength` is -1 |
+| Response bodies | `Content-Length`, chunked with trailers, close-delimited for HTTP/1.0 streams | `Content-Length`, chunked with trailers (`Response.Trailer`), close-delimited, and a body sent in gzip, x-gzip or deflate |
 | Streaming | Responses: `Context` is an `http.ResponseWriter`, `http.Flusher` and `io.ReaderFrom`, so `Write` + `Flush` stream the body as it is produced. Requests: with `StreamRequestBody` `Request.Body` is a `*BodyStream`, read without waiting or taken through `Context.OnBody` | Bodies are buffered whole before the callback |
 | Files | `Connection.SendFile` / `Context.ReadFrom` / `Context.SendFile`: `sendfile(2)` on Linux and macOS, `TransmitFile` on Windows; over TLS, `sendfile(2)` with kernel TLS on Linux, otherwise sealed a chunk at a time as the socket drains; `http.ServeFile`, `http.ServeContent` and `http.FileServer` work through `Context` (Range, multipart ranges, conditional requests) | — |
 | Timeouts | `ReadHeaderTimeout`, `ReadTimeout` and `IdleTimeout`, as `net/http.Server` resolves them, plus `ReadBodyTimeout` | Per-request `Timeout` |
 | Interim responses | 1xx through `WriteInterim` or `WriteHeader(1xx)`, automatic `100 Continue` | 1xx skipped |
 | Bodiless responses | HEAD (length of the GET kept), 204 and 1xx without `Content-Length`, 304 only with the handler's own `Content-Length` | HEAD, 204, 304 read no body |
-| Validation | 400 for a missing or repeated `Host` in HTTP/1.1, for `Transfer-Encoding` in HTTP/1.0 and for malformed messages; 501 for transfer codings other than chunked; 417 for unknown expectations; 413/431 for limits | Malformed responses, unknown transfer codings and short bodies fail the request |
+| Validation | 400 for a missing or repeated `Host` in HTTP/1.1, for `Transfer-Encoding` in HTTP/1.0 and for malformed messages; 501 for a transfer coding it does not decode (`compress`, `br`, or more than one besides chunked); 417 for unknown expectations; 413/431 for limits | Malformed responses, transfer codings the client does not decode and short bodies fail the request |
 | Framing conflicts | `Content-Length` together with chunked: read as chunked, connection closed after the response | — |
 | Headers | `Date` added unless the handler set one; the framing headers the server writes replace the handler's | — |
 
@@ -40,6 +40,34 @@ server picks the framing:
 `Flush` sends the header and whatever is held back and hands it to the socket
 at once; without it the engine batches a read round's output until the
 handler returns (see `Connection.Flush`).
+
+### Transfer codings
+
+Chunked is not the only transfer coding decoded (RFC 9112 section 7). A body
+sent in gzip, its old name x-gzip, or deflate, on top of chunked, is decoded
+on both sides, server and client. What HTTP calls deflate is zlib; some
+senders have always sent raw DEFLATE under that name, and it is told apart
+from a zlib header as browsers do. A request has to end its codings with
+chunked, which frames it; a response that ends with another coding is
+delimited by the connection's close.
+
+A coded body is decoded as it is read, or as it is taken through `OnBody`,
+never ahead of the reader: what waits in memory is the coded body, which
+paces the peer as any body does. `MaxBodyBytes`, `MaxStreamedBodyBytes` and
+`MaxResponseBodyBytes` therefore bound what a body decodes to as well as what
+arrives, so a small body that inflates past its limit fails with
+`ErrBodyTooLarge` (a streamed request), `413` (a buffered one) or
+`ErrResponseBodyTooLarge` (a response), rather than being buffered. A body
+that does not decode fails too: a buffered request with 400, a streamed one
+through `ErrMalformed` in its body, and a response with
+`ErrMalformedResponse`. `Content-Encoding` is the caller's, as it is with
+`net/http`: the transfer coding is removed, and the representation the header
+names is handed over unchanged.
+
+`compress` (LZW) is refused, and so are `br` and more than one coding besides
+chunked: `compress/lzw` stops at 12-bit codes where `compress(1)` grows them
+to 16, so it cannot decode a stream past its first few kilobytes. A request
+naming one gets 501; a response naming one fails.
 
 ### Holding a response open, and body callbacks
 
@@ -376,7 +404,9 @@ sets `Close` or carries an `httptrace` trace, a host that needs cleaning, a
 method that is not a token, a response header folded over lines, an announced
 trailer, more than one `Content-Length`) goes through `net/http` as before. A
 whole chunked body without a trailer is decoded by the client too, refusing
-what `net/http`'s chunked reader refuses. Writing a proxied request takes one
+what `net/http`'s chunked reader refuses, and a body sent in gzip or deflate
+on top of chunked is decoded as it is read or buffered (see
+[Transfer codings](#transfer-codings)). Writing a proxied request takes one
 allocation and reading a plain response head five, against eight and thirteen
 through `net/http`.
 
@@ -492,6 +522,16 @@ handler := http.HandlerFunc(func(c *http.Context) {
 })
 ```
 
+`Context.Connect(header, handler)` is `Upgrade` for a classic `CONNECT
+host:port` (RFC 9110 section 9.3.6): over HTTP/1.x it answers 200 and the
+whole connection becomes the tunnel, and over HTTP/2 and HTTP/3 only the
+request's stream does, under its flow control. `Request.Host` names the
+target, and reaching it is the handler's. `ConnectProxy` is a handler that
+does that for you: it dials `Request.Host`, accepts the tunnel, relays both
+ways with backpressure, and can bound the queue, the idle time, and who may
+connect at all (see its documentation). Its `Next` serves everything that is
+not such a CONNECT.
+
 ## Current limitations
 
 - **Request bodies are buffered whole by default.** A request is handed to the
@@ -523,19 +563,26 @@ handler := http.HandlerFunc(func(c *http.Context) {
 - **HTTP/2 and HTTP/3** accept the same `ResponseWriter` calls and stream the
   same way, in DATA frames; there a write that outruns the client's flow
   control does wait for it (see their documents).
-- **No transfer codings besides chunked** (gzip, deflate, compress) are
-  decoded; such requests get 501, such responses fail.
+- **Transfer codings**: gzip, x-gzip and deflate are decoded, as described
+  under [Transfer codings](#transfer-codings); `compress` and `br` are not,
+  and neither is more than one coding besides chunked.
 - **`Upgrade` is up to the handler**, apart from h2c: `Context.Upgrade`
   answers 101 and hands the connection to a `TunnelHandler`, which is how
   `websocket.ServerHandler.Upgrade` serves WebSocket from an HTTP handler (see
   [Switching protocols](#switching-protocols)). A classic `CONNECT` to a host
-  and port reaches the handler but cannot become a tunnel.
+  and port is a tunnel too: `Context.Connect` answers 200 and hands it over,
+  and `ConnectProxy` dials the target and relays both ways. The fib client
+  has no API for opening a `CONNECT` tunnel itself.
 
 ## Planned improvements
 
 - File sending that drains with the socket on connections that stay on
   `crypto/tls` (ChaCha20-Poly1305 suites), which needs those suites in fib's
   own record layer.
+- A `compress` (LZW) transfer coding decoder. `compress/lzw` reads the
+  12-bit-code variants of GIF, TIFF and PDF, while `compress(1)` grows codes
+  to 16 bits, so it cannot decode one of those streams past its first few
+  kilobytes; the coding is refused until there is a decoder of its own.
 
 ## Conformance tests
 

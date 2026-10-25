@@ -13,14 +13,14 @@ HTTP/2、HTTP/3 各有单独的文档：[`http2.zh-CN.md`](http2.zh-CN.md)、
 | --- | --- | --- |
 | 版本 | 接受 HTTP/1.0 和 HTTP/1.1 请求，按请求的版本回复 | 发送 HTTP/1.1；请求的 `ProtoMinor` 为 0 时发送 HTTP/1.0 |
 | 连接 | keep-alive（HTTP/1.1 默认开启，HTTP/1.0 需 `Connection: keep-alive`）、任一方的 `Connection: close`、pipelining（按请求顺序回复） | 每个 host:port 一个 keep-alive 连接池；HTTP/1.0 连接只有在请求要求 keep-alive 且服务端同意时才复用 |
-| 请求 body | `Content-Length`、chunked（含 chunk 扩展和 trailer，`Request.Trailer`）；默认整体缓存，开启 `StreamRequestBody` 后边收边交给 handler | `Content-Length`；`ContentLength` 为 -1 时用 chunked，可带 `c.Request.Trailer` |
-| 响应 body | `Content-Length`、chunked（含 trailer）、HTTP/1.0 流式响应以关闭连接结束 | `Content-Length`、chunked（含 trailer，`Response.Trailer`）、以关闭连接结束 |
+| 请求 body | `Content-Length`、chunked（含 chunk 扩展和 trailer，`Request.Trailer`）、chunked 之上再用 gzip、x-gzip 或 deflate 编码的 body；默认整体缓存，开启 `StreamRequestBody` 后边收边交给 handler | `Content-Length`；`ContentLength` 为 -1 时用 chunked，可带 `c.Request.Trailer` |
+| 响应 body | `Content-Length`、chunked（含 trailer）、HTTP/1.0 流式响应以关闭连接结束 | `Content-Length`、chunked（含 trailer，`Response.Trailer`）、以关闭连接结束，以及 gzip、x-gzip、deflate 编码的 body |
 | 流式 | 响应：`Context` 实现了 `http.ResponseWriter`、`http.Flusher`、`io.ReaderFrom`，`Write` + `Flush` 边生成边发送。请求：开启 `StreamRequestBody` 后 `Request.Body` 是 `*BodyStream`，读取不阻塞，也可以用 `Context.OnBody` 接管 | body 完整缓存后再回调 |
 | 文件 | `Connection.SendFile` / `Context.ReadFrom` / `Context.SendFile`：Linux、macOS 用 `sendfile(2)`，Windows 用 `TransmitFile`；TLS 上 Linux 用内核 TLS 加 `sendfile(2)`，其他情况随 socket 排空逐块加密；`http.ServeFile`、`http.ServeContent`、`http.FileServer` 可以直接通过 `Context` 使用（Range、多段 Range、条件请求） | — |
 | 超时 | `ReadHeaderTimeout`、`ReadTimeout`、`IdleTimeout`，回退规则与 `net/http.Server` 相同，另有 `ReadBodyTimeout` | 每个请求的 `Timeout` |
 | 1xx 中间响应 | `WriteInterim` 或 `WriteHeader(1xx)`，自动 `100 Continue` | 自动跳过 |
 | 无 body 的响应 | HEAD（保留 GET 的长度）；204、1xx 不带 `Content-Length`；304 只带 handler 自己给的 `Content-Length` | HEAD、204、304 不读 body |
-| 校验 | HTTP/1.1 缺少或重复 `Host`、HTTP/1.0 带 `Transfer-Encoding`、报文格式错误时返回 400；chunked 以外的 transfer coding 返回 501；无法满足的 `Expect` 返回 417；超限返回 413/431 | 格式错误的响应、未知 transfer coding、body 不完整都会让请求失败 |
+| 校验 | HTTP/1.1 缺少或重复 `Host`、HTTP/1.0 带 `Transfer-Encoding`、报文格式错误时返回 400；不支持的 transfer coding（`compress`、`br`，或 chunked 之外的多个 coding）返回 501；无法满足的 `Expect` 返回 417；超限返回 413/431 | 格式错误的响应、客户端不支持的 transfer coding、body 不完整都会让请求失败 |
 | 帧格式冲突 | 同时有 `Content-Length` 和 chunked：按 chunked 读取，回复后关闭连接 | — |
 | 头部 | handler 未设置时自动添加 `Date`；服务端写的帧格式相关头会替换 handler 设置的同名头 | — |
 
@@ -36,6 +36,35 @@ handler 用 `Write`/`WriteHeader` 而不是 `WriteResponse` 写响应时，服�
 
 `Flush` 发送响应头和缓存的数据，并立即交给 socket；不调用时，engine 会把一轮读取中
 产生的输出合并，等 handler 返回后一次写出（见 `Connection.Flush`）。
+
+### Transfer coding
+
+chunked 不是唯一会被解码的 transfer coding（RFC 9112 第 7 节）。chunked 之上再加 gzip、
+它的旧名字 x-gzip、或 deflate 编码的 body，在服务端和客户端都会被解码。HTTP 里的 deflate
+本意是 zlib；有些发送方一直在这个名字下发裸 DEFLATE，这里和浏览器一样按头部区分。请求的
+coding 必须以 chunked 结尾，由它定界；响应若以其他 coding 结尾，则以关闭连接定界。
+
+编码过的 body 随读取、或随 `OnBody` 的交付才解码，不会跑到读取者前面：内存里等待的始终是
+编码后的 body，它和普通 body 一样给对端施加背压。所以 `MaxBodyBytes`、
+`MaxStreamedBodyBytes`、`MaxResponseBodyBytes` 既约束收到的字节，也约束解码后的字节：
+一个很小的 body 解压后超过上限时，流式请求得到 `ErrBodyTooLarge`、整体缓存的请求回复 413、
+响应得到 `ErrResponseBodyTooLarge`，而不会先把它缓冲下来。解不开的 body 同样失败：整体缓存
+的请求回复 400，流式请求的 body 返回 `ErrMalformed`，响应返回 `ErrMalformedResponse`。
+`Content-Encoding` 归调用方处理，与 `net/http` 一致：只去掉 transfer coding，头部所指的
+表示原样交出。
+
+`compress`（LZW）不解码，`br` 和 chunked 之外的多个 coding 也不解码：`compress/lzw` 的
+code 最大 12 位，而 `compress(1)` 会增长到 16 位，解不了流的开头几 KB 之后的部分。请求
+带这些 coding 返回 501，响应带这些 coding 则失败。
+
+### CONNECT 隧道
+
+`Context.Connect(header, handler)` 接受传统的 `CONNECT host:port`（RFC 9110 第 9.3.6 节）：
+HTTP/1.x 上先回 200，然后把整条连接交给 `TunnelHandler`；HTTP/2 和 HTTP/3 上只切换请求
+自己的 stream，受该 stream 的流控约束。目标地址在 `Request.Host`，如何连到目标由 handler
+负责。`ConnectProxy` 是现成的实现：拨号 `Request.Host`、用 `Connect` 接受隧道、双向转发并
+带背压，还可以限制排队字节、空闲超时和谁可以连接；不是这种 CONNECT 的请求交给它的 `Next`。
+注意 fib 客户端没有发起 CONNECT 隧道的 API。
 
 ### 保持响应不结束，以及 body 回调
 
@@ -282,7 +311,8 @@ HTTP/1 客户端像 server 读请求、写响应那样，自己写请求头、�
 写出和读到的内容与 `net/http` 逐字节、逐字段相同，由对照 `net/http` 的测试和模糊测试检查；常见形式
 之外的（设置了 `Close` 或带 `httptrace` 跟踪的请求、需要清理的 host、不是 token 的方法、跨行折叠的
 响应头字段、声明了 trailer、多个 `Content-Length`）仍像以前一样交给 `net/http`。没有 trailer 的整个
-分块 body 也由客户端解码，`net/http` 的分块读取器拒绝的，它同样拒绝。写一个代理请求只分配一次，
+分块 body 也由客户端解码，`net/http` 的分块读取器拒绝的，它同样拒绝；chunked 之上再用
+gzip 或 deflate 编码的 body 也一并解码（见 [Transfer coding](#transfer-coding)）。写一个代理请求只分配一次，
 读一个普通响应头五次，经 `net/http` 分别是八次和十三次。
 
 ### 客户端与 `Expect: 100-continue`
@@ -359,16 +389,23 @@ TLS 1.3 或 1.2 的 AES-GCM，TLS 1.2 或 1.1 的 AES-CBC）：
   整段都会排队在内存中；`Context.SendFile` 会先问 `Connection.QueuesFiles`，改为分块读取。
 - **HTTP/2 和 HTTP/3** 同样接受这些 `ResponseWriter` 调用，并以同样的方式用 DATA 帧
   流式输出；在那里，超过客户端流控的写入会等待客户端（见各自的文档）。
-- **不解码 chunked 以外的 transfer coding**（gzip、deflate、compress）：这样的请求返回
-  501，这样的响应会失败。
+- **transfer coding**：gzip、x-gzip、deflate 会被解码，见
+  [Transfer coding](#transfer-coding)；`compress`、`br` 以及 chunked 之外的多个 coding
+  不解码。解码后的长度同样受 `MaxBodyBytes`、`MaxStreamedBodyBytes`、`MaxResponseBodyBytes`
+  限制。
 - **除 h2c 外，`Upgrade` 由 handler 处理**：`Context.Upgrade` 回复 101 并把连接交给
   `TunnelHandler`，`websocket.ServerHandler.Upgrade` 就是这样在 HTTP handler 里提供
-  WebSocket 的。指向 host:port 的传统 `CONNECT` 请求会交给 handler，但无法建立隧道。
+  WebSocket 的。指向 host:port 的传统 `CONNECT` 也是隧道：`Context.Connect` 回复 200 后
+  交给 `TunnelHandler`，`ConnectProxy` 负责拨号目标并双向转发；fib 客户端没有主动发起
+  CONNECT 隧道的 API。
 
 ## 待优化
 
 - 留在 `crypto/tls` 上的连接（ChaCha20-Poly1305 套件）随 socket 排空发送文件，这需要
   fib 自己的记录层实现这些套件。
+- `compress`（LZW）transfer coding 的解码器。`compress/lzw` 读的是 GIF、TIFF、PDF 那种
+  12 位 code 的变体，而 `compress(1)` 的 code 会增长到 16 位，所以它解不了这类流开头几 KB
+  之后的部分；在有自研解码器之前，这个 coding 会被拒绝。
 
 ## 一致性测试
 

@@ -589,8 +589,9 @@ err = fibtls.Dial(engine, "tcp", "example.com:443", 3*time.Second, tlsConfig, ha
 ## HTTP 子 package
 
 `http` package 在原始连接之上提供 HTTP/1.0、HTTP/1.1 和 HTTP/2 的增量解析和响应
-处理，支持 TCP 分包/粘包、流水线请求、`Content-Length`、chunked body、trailer、
-keep-alive、流式响应、sendfile 零拷贝发送文件以及请求大小限制：
+处理，支持 TCP 分包/粘包、流水线请求、`Content-Length`、chunked body、chunked 之上的
+gzip/deflate transfer coding、trailer、keep-alive、流式响应、CONNECT 隧道、sendfile
+零拷贝发送文件以及请求大小限制：
 
 ```go
 handler := epollhttp.NewHandler(epollhttp.HandlerFunc(
@@ -644,12 +645,21 @@ func(c *fibhttp.Context) {
   `ErrResponseWritten`。
 - HTTP/2 和 HTTP/3 上这些方法同样可用，但响应会先缓存，handler 返回后整体发送。
 
-服务端还会：为 HTTP/1.1 缺少 `Host` 或有多个 `Host` 的请求返回 400；不支持的
-`Transfer-Encoding` 返回 501；无法满足的 `Expect` 返回 417；同时带 `Content-Length`
-和 chunked 的请求按 chunked 处理并在响应后关闭连接；HTTP/1.0 请求带
-`Transfer-Encoding` 时返回 400；204 和 1xx 响应不带 `Content-Length`；自动添加 `Date`。
-完整的 HTTP/1.x 支持情况、限制和一致性测试见
+服务端还会：为 HTTP/1.1 缺少 `Host` 或有多个 `Host` 的请求返回 400；
+`Transfer-Encoding` 里 chunked 之上的 gzip、x-gzip、deflate 会被解码（deflate 同时接受
+zlib 和裸 DEFLATE，解码后的长度同样受 `MaxBodyBytes` / `MaxStreamedBodyBytes` 限制），
+`compress`、`br` 以及 chunked 之外的多个 coding 返回 501；无法满足的 `Expect` 返回 417；
+同时带 `Content-Length` 和 chunked 的请求按 chunked 处理并在响应后关闭连接；HTTP/1.0
+请求带 `Transfer-Encoding` 时返回 400；204 和 1xx 响应不带 `Content-Length`；自动添加
+`Date`。完整的 HTTP/1.x 支持情况、限制和一致性测试见
 [`docs/http1.zh-CN.md`](http1.zh-CN.md)。
+
+传统 `CONNECT host:port` 由 `Context.Connect` 接受：HTTP/1.x 上回 200 后整条连接交给
+`TunnelHandler`，HTTP/2、HTTP/3 上只切换该请求自己的 stream；扩展 CONNECT
+（`:protocol`）仍由 `Context.Upgrade` 处理。`ConnectProxy` 是可直接用的 CONNECT 代理
+handler：它拨号 `Request.Host`、接受隧道、双向转发并带背压和可选的排队上限、空闲超时与
+鉴权；不是这类 CONNECT 的请求交给 `ConnectProxyConfig.Next`。fib 客户端没有主动发起
+CONNECT 隧道的 API。
 
 ### 异步响应与 body 回调（Retain / Release / OnBody）
 
