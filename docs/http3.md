@@ -41,8 +41,13 @@ Behavior users need to be aware of.
   every one before it, with a frame other than a probing one), the server
   sends there, at most three times what arrived there, validates the address
   with PATH_CHALLENGE, and closes the old path once the client answers
-  (RFC 9000 §9.3). A client that does not answer in time is taken back to
-  the path it left, and a later packet on the old path takes it back too.
+  (RFC 9000 §9.3). The challenge is in the first packet the server sends to
+  the new address even when the congestion window, still the old path's and
+  full of its packets in flight, has no room for it: it goes as a probe
+  timeout's packets do, since what the peer has to hear first on the address
+  it moved to is the challenge. A client that does not answer in time is
+  taken back to the path it left, and a later packet on the old path takes it
+  back too.
   Congestion control and RTT start over unless only the port changed, and
   datagrams drop to 1200 bytes until the new path is validated, after which
   path MTU discovery searches it afresh. Requests
@@ -637,7 +642,7 @@ quic-go, because it pulls the simulator and peer images and needs tshark).
 
 | Peer | What it checks |
 | --- | --- |
-| The QUIC Interop Runner's fib endpoint (`http3/interoprunner`), against quic-go's endpoint | Both roles, both directions: HTTP/3 and the HTTP/0.9-over-QUIC cases — handshake, transfer, Retry, resumption, 0-RTT, key update, multiplexing, loss, IPv6, NAT rebinding and long RTT. fib's missing ECN, QUIC v2 and `preferred_address` make those cases exit 127, which the runner reports as unsupported; the two cases that do not pass (the server under address rebinding and the client under long RTT) are listed in that README with the reason. `chacha20` passes in both directions: the client offers ChaCha20-Poly1305 alone through `http3.ClientConfig.TLS13CipherSuites`, and the server takes it. |
+| The QUIC Interop Runner's fib endpoint (`http3/interoprunner`), against quic-go's endpoint | Both roles, both directions: HTTP/3 and the HTTP/0.9-over-QUIC cases — handshake, transfer, Retry, resumption, 0-RTT, key update, multiplexing, loss, IPv6, NAT rebinding and long RTT. fib's missing ECN, QUIC v2 and `preferred_address` make those cases exit 127, which the runner reports as unsupported; every other case passes, including the server under address rebinding and the client under long RTT, which that README explains. `chacha20` passes in both directions: the client offers ChaCha20-Poly1305 alone through `http3.ClientConfig.TLS13CipherSuites`, and the server takes it. |
 | quic-go's HTTP/3 client, against the fib server | GET/POST/PUT/HEAD, request and response headers, several cookies and Set-Cookies, 4 MiB uploads and downloads checked by hash, 50 concurrent requests on one connection, 204, response trailers, request trailers, 103 Early Hints, 100-continue, 417, 413, 431, status codes |
 | quic-go's HTTP/3 server, against the fib client | The same ground from the other side, and: the connection still serves after a timeout, a request in flight finishes when the server retires the connection with GOAWAY, a server that validates the address with Retry, and a certificate the client does not trust |
 | The suite's own hand-written HTTP/3 client (no dependency), against the fib server | What a sound implementation never sends: DATA before HEADERS, a control stream that does not start with SETTINGS, a second control stream, a request missing a pseudo-header, a reference to the QPACK dynamic table, CANCEL_PUSH, a lowered MAX_PUSH_ID, a raised GOAWAY, a QPACK insertion, an `:authority` and `Host` that disagree, and neither of them |

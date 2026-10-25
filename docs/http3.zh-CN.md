@@ -34,7 +34,10 @@
   它所属的连接，这样 NAT 重绑定后客户端的连接不会断：新地址来的包通过认证、而且证明是客户端
   最新的包（包号大于之前所有的包，并且带有探测帧以外的帧）后，服务端改向新地址发送，发送量
   不超过从新地址收到的 3 倍，同时发 PATH_CHALLENGE 验证新地址，客户端回应后关闭旧路径
-  （RFC 9000 §9.3）。客户端没有按时回应就退回旧路径；旧路径上再来更新的包也会把连接拉回去。
+  （RFC 9000 §9.3）。即使拥塞窗口还是旧路径的、还被旧路径在途的包占满，新路径的
+  PATH_CHALLENGE 也一定会随服务端发往新地址的第一个包发出：它像 PTO 探测包一样不受拥塞
+  窗口限制，因为对端在这个新地址上首先要听到的就是这个挑战。客户端没有按时回应就退回旧路径；
+  旧路径上再来更新的包也会把连接拉回去。
   除非只是端口变了，拥塞控制和 RTT 从头开始；新路径验证完成前数据报降到 1200 字节，验证后重新做路径 MTU 探测。迁移之后
   的请求，`Request.RemoteAddr` 是新地址。
 - Linux 上开启 `Config.IOPollers` 和 `ReusePort` 时，新地址可能落到另一个 poller 的
@@ -445,7 +448,7 @@ CI 里有两个 job：`HTTP/3 interop endpoint image`（阻塞：构建镜像并
 
 | 对端 | 验证内容 |
 | --- | --- |
-| QUIC Interop Runner 的 fib 端点（`http3/interoprunner`，对 quic-go 端点） | 双向、两种角色：HTTP/3，以及 HTTP/0.9-over-QUIC 的握手、传输、Retry、会话恢复、0-RTT、密钥更新、多路复用、丢包、IPv6、NAT 重绑定和长 RTT。fib 没有 ECN、QUIC v2 和 `preferred_address`，这些用例以 127 退出，runner 会如实记为“不支持”；没有通过的两个（服务端在地址重绑定下、客户端在长 RTT 下）在那个 README 里单独列出并说明原因。`chacha20` 双向都通过：客户端用 `http3.ClientConfig.TLS13CipherSuites` 只提供 ChaCha20-Poly1305，服务端接受它。 |
+| QUIC Interop Runner 的 fib 端点（`http3/interoprunner`，对 quic-go 端点） | 双向、两种角色：HTTP/3，以及 HTTP/0.9-over-QUIC 的握手、传输、Retry、会话恢复、0-RTT、密钥更新、多路复用、丢包、IPv6、NAT 重绑定和长 RTT。fib 没有 ECN、QUIC v2 和 `preferred_address`，这些用例以 127 退出，runner 会如实记为“不支持”；其余用例全部通过，包括服务端在地址重绑定下、客户端在长 RTT 下这两个，原因见那个 README。`chacha20` 双向都通过：客户端用 `http3.ClientConfig.TLS13CipherSuites` 只提供 ChaCha20-Poly1305，服务端接受它。 |
 | quic-go 的 HTTP/3 客户端（对 fib 服务端） | GET/POST/PUT/HEAD、请求与响应头、多个 Cookie 与 Set-Cookie、4 MiB 上传与下载（按哈希校验）、单连接 50 个并发请求、204、响应 trailer、请求 trailer、103 Early Hints、100-continue、417、413、431、各种状态码 |
 | quic-go 的 HTTP/3 服务端（对 fib 客户端） | 同样的矩阵反过来验证，另加：超时后连接仍可用、服务端优雅关闭（GOAWAY）时在途请求正常完成、服务端用 Retry 验证源地址、证书不受信任时拒绝连接 |
 | 测试内置的手写 HTTP/3 客户端（零依赖，对 fib 服务端） | 正常实现不会发的东西：HEADERS 之前的 DATA、不以 SETTINGS 开头的控制流、第二条控制流、缺少伪头部的请求、引用 QPACK 动态表、CANCEL_PUSH、调低的 MAX_PUSH_ID、抬高的 GOAWAY、QPACK 插入指令、`:authority` 与 `Host` 不一致、两者都缺失 |

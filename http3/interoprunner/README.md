@@ -80,7 +80,7 @@ docker network, as `local-test.sh` does.
 "Supported" means the endpoint implements the testcase; the marks are the
 result against quic-go's published endpoint image
 (`martenseemann/quic-go-interop:latest`, commit `d961427`) on Linux with
-Docker 29.1.3 and tshark 4.6.6, on 2026-10-25. The runner names a testcase
+Docker 29.1.3 and tshark 4.6.6, on 2026-10-26. The runner names a testcase
 to a role through `TestCase.testname`: most of its matrix reaches the server
 as `transfer`, `handshake` or `multiconnect`, which is why those names cover
 more than their own testcase.
@@ -89,7 +89,7 @@ more than their own testcase.
 | --- | --- | --- | --- |
 | `handshake` | ✓ | ✓ | HTTP/0.9 over QUIC |
 | `transfer` | ✓ | ✓ | three files, parallel streams; the client's receive windows are small so fib has to grow them |
-| `longrtt` | ✓ | ✗ | the transfer succeeds; the check also wants two ClientHellos under a 750 ms RTT, and fib's PTO does not send the second within the capture (quic-go's client does, which is why the server direction passes) |
+| `longrtt` | ✓ | ✓ | the transfer succeeds under a 750 ms one-way RTT, and the client's Initial goes again on its probe timeout: with no RTT sample that is RFC 9002's initial PTO, about a second, inside the capture |
 | `chacha20` | ✓ | ✓ | the client's ClientHello offers ChaCha20-Poly1305 alone, through fib's own TLS handshake and `tls.QUICConn.SetCipherSuites`: `crypto/tls` picks the TLS 1.3 suites itself and cannot be told to offer one, so the endpoint's client runs fib's handshake for this testcase. As a server fib accepts a client that offers only it |
 | `multiplexing` | ✓ | ✓ | ~2000 files over one connection; the server allows 200 streams at once and raises the limit as they finish |
 | `retry` | ✓ | ✓ | the server sends a Retry with a token, then accepts it |
@@ -107,7 +107,7 @@ more than their own testcase.
 | `ipv6` | ✓ | ✓ | the client resolves `server6`; the server listens on both families |
 | `v2` | unsupported | unsupported | fib speaks QUIC version 1 only |
 | `rebind-port` | ✓ | ✓ | the server follows the NAT rebinding and answers with its own PATH_CHALLENGE |
-| `rebind-addr` | ✗ | ✓ | the server answers the client's PATH_CHALLENGE with a PATH_RESPONSE but does not send a PATH_CHALLENGE of its own until it migrates; the runner requires one in the first packet on the new path |
+| `rebind-addr` | ✓ | ✓ | the server follows the rebinding and its PATH_CHALLENGE is in the first packet it sends to the new address, even though the congestion window the old path filled has no room for it |
 | `connectionmigration` | unsupported | not run | the server has no `preferred_address` to offer; quic-go's server exits 127 for it too, so the pair is unsupported. The client's role is `transfer`, and fib cannot perform the active migration the check wants |
 | `versionnegotiation` | unsupported | unsupported | disabled by the runner; fib's client cannot start with a reserved version |
 
@@ -138,12 +138,12 @@ Ubuntu 24.04's package, cannot follow the migrated connection and makes
 
 - `fib` server, `quic-go` client — passed: `http3`, `handshake`, `transfer`,
   `retry`, `resumption`, `zerortt`, `chacha20`, `multiplexing`, `ipv6`,
-  `rebind-port`, `transferloss`, `amplificationlimit`, `longrtt`,
-  `blackhole`, `handshakeloss`. Failed: `rebind-addr`.
+  `rebind-port`, `rebind-addr`, `transferloss`, `amplificationlimit`,
+  `longrtt`, `blackhole`, `handshakeloss`.
 - `fib` client, `quic-go` server — passed: `http3`, `handshake`, `transfer`,
   `retry`, `resumption`, `zerortt`, `chacha20`, `keyupdate`, `multiplexing`,
-  `ipv6`, `rebind-port`, `rebind-addr`, `transferloss`, `amplificationlimit`,
-  `blackhole`, `handshakeloss`. Failed: `longrtt`.
+  `ipv6`, `rebind-port`, `rebind-addr`, `longrtt`, `transferloss`,
+  `amplificationlimit`, `blackhole`, `handshakeloss`.
 - Both roles exit 127 for `ecn`, `v2` and the server side of
   `connectionmigration`; the runner reports those as unsupported.
 
@@ -162,6 +162,53 @@ directions in the same session, except one fib-server `handshake` run whose
 capture the simulator lost (`Expected exactly one version. Got []`; both
 containers exited 0 and the transfer itself succeeded) — `handshake` passed on
 two clean re-runs.
+
+`rebind-addr` and `longrtt` were the last two that did not pass, and they were
+rerun, with the rest of the matrix, on 2026-10-26:
+
+```sh
+TESTCASES=rebind-addr DIRECTION=server ./run-runner.sh          # passed
+TESTCASES=longrtt DIRECTION=client ./run-runner.sh              # passed
+TESTCASES=longrtt,rebind-addr DIRECTION=both ./run-runner.sh    # passed both ways
+TESTCASES=http3,handshake,transfer,retry,resumption,zerortt,multiplexing,\
+rebind-port,transferloss,blackhole,handshakeloss DIRECTION=both ./run-runner.sh
+                                                                # passed both ways
+```
+
+What each one needed is below.
+
+- `rebind-addr` failed because the PATH_CHALLENGE waited behind the
+  congestion window. A rebinding to another host starts the new path with a
+  fresh window while the old path's packets are still counted in flight, so
+  `buildPacket` would not put an ack-eliciting frame in a packet; an
+  acknowledgement that came due still went out alone, and that ACK-only
+  packet was the first one on the new address. The challenge is now armed as
+  a probe when validation starts (`http3/quic/path.go`), so it goes out with
+  that acknowledgement, past the window, the way a probe timeout's packets
+  do. The runner's failure showed the first packet on the new path as a
+  short header with 26 bytes of ACK and nothing else.
+- `longrtt` was not a probe-timeout bug: the client does send its Initial
+  again. With no RTT sample the probe timeout is RFC 9002's initial one, a
+  second, and a client that nothing answers sends the whole ClientHello
+  again at +999 ms, in a test pair and on the wire alike. What the client
+  did not do was wait for the simulator. The runner starts a client as soon
+  as its container is up, and the simulator only forwards — and only
+  captures — once its scenario is loaded, which is later; the first flight
+  was dropped before the capture began and the copy on the timer was the
+  first ClientHello in it. Because fib's ClientHello is 1520 bytes (a
+  post-quantum key share) it spans two Initial packets, and tshark dissects
+  the ClientHello in the second one, so the runner counted one. The
+  entrypoint now waits for the simulator's port before a client dials
+  (`http3/interoprunner/run_endpoint.sh`), as the reference endpoints do,
+  which puts the first flight in the capture; the test then passes on
+  repeated runs.
+
+The evidence, from captures taken around the runs: the client's first
+Initials (packet numbers 0 and 1) appear on the host's docker bridges at
++2.6 s of the run, while the simulator's capture starts about 0.5 s later,
+so the simulator's own trace begins with packet numbers 2 and 3; against
+quic-go's client, which waits for the simulator, the first flight is in the
+trace and its three repeats are marked as retransmissions.
 
 `local-test.sh` runs `http3`, `handshake`, `transfer`, `retry`,
 `resumption`, `zerortt` and `multiconnect` with fib on both sides; all pass.
