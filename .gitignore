@@ -1,3 +1,2 @@
-# Go build and temp caches that local sessions point GOCACHE/GOTMPDIR at
-/.claude/gocache*/
-/.claude/gotmp*/
+# Local Claude Code session data (covers gocache*/gotmp* used by GOCACHE/GOTMPDIR)
+/.claude/
