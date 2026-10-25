@@ -15,7 +15,7 @@
 
 | 方向 | 内容 |
 | --- | --- |
-| QUIC | version 1；Initial、Handshake、1-RTT 三个包号空间；AES-128-GCM、AES-256-GCM、ChaCha20-Poly1305 包保护与头部保护；双向 key update（本端按 AEAD 使用上限或可选的时间间隔主动发起，也响应对端发起）与解密失败次数上限；服务端负载高时发送 Retry，客户端处理 Retry；Version Negotiation；stateless reset；RFC 9002 丢包检测、PTO 与持续拥塞判定；CUBIC（RFC 9438，默认）或 NewReno 拥塞控制，带 pacing 和应用受限判断；服务端 3 倍放大限制；连接级与 stream 级双向流控及 BLOCKED 帧；MAX_STREAMS；用 NEW_CONNECTION_ID 签发、可退役的 Connection ID；draining 期；空闲超时与可选 keep-alive |
+| QUIC | version 1；Initial、Handshake、1-RTT 三个包号空间；AES-128-GCM、AES-256-GCM、ChaCha20-Poly1305 包保护与头部保护；双向 key update（本端按 AEAD 使用上限或可选的时间间隔主动发起，也响应对端发起）与解密失败次数上限；服务端负载高时发送 Retry，客户端处理 Retry；Version Negotiation；stateless reset；RFC 9002 丢包检测、PTO 与持续拥塞判定；CUBIC（RFC 9438，默认）或 NewReno 拥塞控制，带 pacing 和应用受限判断；HyStart++（RFC 9406），初始慢启动在 RTT 上升时提前退出；ACK_FREQUENCY（draft-ietf-quic-ack-frequency），大流量传输时协商使用；服务端 3 倍放大限制；连接级与 stream 级双向流控及 BLOCKED 帧；MAX_STREAMS；用 NEW_CONNECTION_ID 签发、可退役的 Connection ID；draining 期；空闲超时与可选 keep-alive |
 | 服务端 | 与 HTTP/1、HTTP/2 共用同一个 `Handler` 和 `Context`；1xx 中间响应、自动 100 Continue、请求与响应 trailer、`Response.Close` 通过 GOAWAY 优雅关闭、413/431/417、非法请求（含 `:authority` 与 `Host` 不一致）以 H3_MESSAGE_ERROR 重置、协议错误按 RFC 9114 / RFC 9204 错误码关闭连接、`Request.TLS`、`AltSvc` 辅助函数、Extended CONNECT（RFC 9220）经 `Context.Upgrade` 切换为隧道，`websocket.ServerHandler.Upgrade` 即借此提供 WebSocket over HTTP/3 |
 | 客户端 | 异步 `Do`/`Go`；每个 host:port 一条连接、多路复用；遵守 MAX_STREAMS 并排队；取消只重置单个 stream；GOAWAY 与 H3_REQUEST_REJECTED 的请求自动在新连接上重发；`Expect: 100-continue` 等待 100；请求与响应 trailer；对端违反协议时按错误码关闭连接；`AltSvcClient` 把它和 `http.Client` 组合起来按 `Alt-Svc`（RFC 7838）切换，并在失败时回退 TCP |
 | 一致性 | 与 quic-go 客户端、服务端双向互通，以及用手写帧构造的协议错误用例，都在 CI 中运行 |
@@ -178,7 +178,8 @@
   STREAMS_BLOCKED（RFC 9000 §4.1）；丢失的只在该上限仍然有效时重发，还没发出的在上限被
   提高后丢弃。
 - **拥塞控制**：默认 CUBIC（RFC 9438），可用 `quic.Config.CongestionControl` 改为
-  NewReno；没有 BBR、HyStart++ 和 ECN。发送按每个平滑 RTT 1.25 个拥塞窗口的速率 pacing。
+  NewReno，两者都在初始慢启动里用 HyStart++ 判断 RTT 上升而提前退出；没有 BBR 和 ECN。
+  发送按每个平滑 RTT 1.25 个拥塞窗口的速率 pacing。
   发送缓冲区满（`EAGAIN`）时，这一轮剩下的数据报保留下来，Engine 在 socket 又可写时
   （`fib.Connection.NotifyWritable`）通知发送方，于是它先于新数据立刻续发；无法通知时
   ——Windows 的完成端口、portable 后端，以及 macOS 对写满的 socket 报的 `ENOBUFS` 和
@@ -300,7 +301,17 @@
 - **PMTU 探测（DPLPMTUD，RFC 8899）**：已完成，带黑洞检测（见[协议细节](#协议细节)）。
   还没做的是探测 1452 字节以上（巨型帧，或 IPv4 上的 1472），这需要更大的发送缓冲区；
   以及按探测到的大小计算拥塞窗口。
-- **拥塞控制**：BBR、HyStart++ 和 ECN 尚未实现。
+- **HyStart++**（RFC 9406）：已完成，用于初始慢启动。每轮记下本轮与上一轮的最小 RTT，
+  本轮比上一轮高出八分之一（下限 4 毫秒、上限 16 毫秒）时离开慢启动，进入保守阶段，
+  窗口按慢启动的四分之一增长；RTT 回落说明那只是抖动，回到慢启动；保守阶段最多 5 轮，
+  之后把当前窗口作为阈值进入拥塞避免。出现丢包后不再使用它：此后由丢包恢复得到的阈值
+  决定退出点。RTT 平稳的路径上（内存管道、loopback）4 毫秒的下限让它根本不会触发，
+  所以它的行为由单元测试覆盖，不体现在下面的数字里。
+- **BBR** 经过评估后有意未实现：它换的是对路径的模型而不只是窗口，靠每轮投递量估计带宽、
+  算出 pacing 速率，还有自己的 startup、drain、probe-bw 阶段；要做得可靠，得把已发送包
+  的记录扩展到每轮的投递率采样，并与 RFC 9002 的丢包恢复、持续拥塞判定协调起来，改动
+  很大，而且除了内存管道这里没有可靠的验证手段。半成品会比没有更糟。
+- **ECN** 尚未实现。
 - **批量收发**：Engine 在 Linux 上用 `recvmmsg`、macOS 上用 `recvmsg_x` 批量读取；一轮
   发送多于一个数据报时用 `sendmmsg` 或 `sendmsg_x` 一次发出（`fib.Connection.SendBatch`），服务端
   和客户端的连接都是如此。
@@ -311,12 +322,41 @@
   仍然一次读一个数据报。
 - **减少复制与分配**：发送时 `Write` 复制一次（复制进缓冲池里的缓冲区）、组包时再复制
   一次；接收时 Engine 复制一次（复制进缓冲池里的缓冲区），HTTP/3 帧解析器只复制跨片段的帧
-  和请求 body。每个请求仍要分配它的 QUIC stream；请求 stream 和 header 会被复用（见上文）。
-- **ACK 频率**：大流量时可以实现 ACK_FREQUENCY 扩展，减少 ACK 数量。
-- **ChaCha20-Poly1305**：目前是纯 Go 实现，比汇编实现慢。在有 AES 硬件加速的机器上会
-  优先协商 AES-GCM，通常不是瓶颈。
-- **基准测试**：补充 QUIC 与 HTTP/3 的 benchmark（单连接吞吐、并发请求、丢包下的吞吐），
-  用 pprof 指导优化。
+  和请求 body。HTTP/3 的响应本来就用 `WriteOwned` 送入，所以只付第二次复制；第一次需要
+  Engine 用多个缓冲区拼一个数据报（iovec 的改动，属于别的工作流）。包保护已经不再
+  分配：ChaCha20-Poly1305 的认证器原来每个包一次堆分配，现在是值类型。QUIC stream 有意
+  不做池化：`*Stream` 会交给应用，生命周期由应用决定，重用会把「stream 结束后继续使用」
+  变成破坏另一条 stream。开、关一条 stream 8 次分配，内存管道上一个请求 11-12 次；请求
+  stream 和 header 会被复用（见上文）。
+- **ACK 频率**：ACK_FREQUENCY 扩展（draft-ietf-quic-ack-frequency）已完成。两端都在传输
+  参数里声明 `min_ack_delay`；对端声明了的一端在已发送 32 KiB 之后请求对端每 10 个
+  ack-eliciting 包确认一次（容忍 2 个包的乱序），且最迟不超过平滑 RTT 的四分之一，这样
+  窗口小于阈值时一个 RTT 内也能拿到几次反馈。发生丢包后本端会再请求一次（序号更大的
+  第二个帧，每个 RTT 至多一次），改回默认的每两个包确认一次，直到连接结束：丢包后窗口
+  往往小到填不满阈值，而丢包恢复依赖确认。对端没声明这个扩展就不发这个帧；对端忽略它
+  也只是照旧确认，因为请求只是建议，本端没有任何行为依赖它。接收端采用序号最大的请求，
+  收到 IMMEDIATE_ACK 立即确认。在共享的基准机上取六次样本（两轮交替）的中位数：
+  64 KiB 传输在噪声范围内（中位数从 567 到 533 MiB/s，较安静的第一轮从 582 到
+  692 MiB/s），1 MiB 从 714 到 877 MiB/s，4 MiB 从 882 到 1350 MiB/s，HTTP/3 上传从
+  369 到 589 MiB/s，小请求从 6018 到 5780 纳秒，并发请求从 4876 到 3672 纳秒；1% 丢包
+  下从 19.0 升到 20.0 MiB/s，5% 丢包下从 4.4 升到 7.2 MiB/s。确认变少会让丢包恢复
+  略慢一点（丢包后的更新让它不至于更差），而确认自己的包也少了一批，同样少被丢掉。
+- **ChaCha20-Poly1305**：标准库没有导出 ChaCha20-Poly1305 AEAD（`crypto/hpke` 里有一个，
+  但隔着 internal 包和标准库内部的 `golang.org/x/crypto` 副本，标准库之外的模块 import
+  不到；`crypto/cipher` 也没有），所以是本库自己的实现。现在在纯 Go 范围内写得更快：
+  块函数的 16 个字放在变量里而不是数组里，密钥流按 8 字节一次异或，认证器就地初始化、
+  不再每个包分配一次。实测 1200 字节的包 seal 从 355 到 548 MiB/s、open 从 358 到
+  551 MiB/s，16 KiB 从 398 到 682 MiB/s，一次头部保护的块函数从 141 到 78 纳秒。
+  汇编（AVX2/NEON）还能更快，但那是分架构、常量时间容易写错的一大块代码，而只有没有
+  AES 硬件的机器才会优先协商这个套件，所以没有写。这条路径现在有端到端测试：
+  `TestChaCha20Poly1305Handshake` 在带 `GODEBUG=cpu.aes=off` 的子进程里跑握手
+  （crypto/tls 于是优先 ChaCha20），确认两端都用它保护包和头部、数据双向都能通过。
+- **基准测试**：已完成，都是普通的 `go test -bench` 目标。`http3/quic` 里有内存管道上
+  64 KiB、1 MiB、4 MiB 的单连接传输，单个与按 CPU 数并发的请求，1% 与 5% 丢包下的传输，
+  开、关一条 stream，以及 ChaCha20-Poly1305 的 seal、open 和头部保护；`http3` 里有
+  64 KiB 与 1 MiB 的响应 body、上传、小请求和并发请求，走 loopback 的 UDP socket，
+  包含 Engine 和 HTTP/3 组包。上面的数字就是它们在基准机上的中位数：本轮改动前后各取
+  六个样本，两轮交替测量。
 
 ### 3. 流式 body 与 handler 模型（中）
 
@@ -335,8 +375,6 @@
 
 一致性测试已完成，见[一致性测试](#一致性测试)。还没有端到端验证的是：
 
-- ChaCha20-Poly1305 在真实握手中被协商的情况：测试机和 CI 机器都有 AES 硬件，握手总是
-  选 AES-GCM，这条路径只有 RFC 9001 的测试向量覆盖。
 - 0-RTT 与 quiche、quic-go 之外更多服务端的互通，以及共享票据密钥的多台服务端之间的重放（票据登记表是每个进程一份）。
 - 压测才能暴露的并发问题。帧解析、请求构造、QPACK 解码、QUIC 包头、传输参数和帧处理
   都有 fuzz 目标，CI 的 `Fuzz the parsers` job 每个目标跑 20 秒。

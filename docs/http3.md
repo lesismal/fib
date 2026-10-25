@@ -17,7 +17,7 @@ from scratch. The TLS 1.3 handshake is the standard library's
 
 | Area | Content |
 | --- | --- |
-| QUIC | Version 1; Initial, Handshake and 1-RTT packet number spaces; AES-128-GCM, AES-256-GCM and ChaCha20-Poly1305 packet and header protection; key updates in both directions (started here when a key reaches its AEAD limit, or optionally after a time, and answered when the peer starts one) and a limit on decryption failures; Retry, sent by the server under load and handled by the client; Version Negotiation; stateless reset; RFC 9002 loss detection, PTO and persistent congestion; CUBIC (RFC 9438, the default) or NewReno congestion control, with pacing and app-limited detection; the server's 3x amplification limit; connection- and stream-level flow control in both directions, with BLOCKED frames; MAX_STREAMS; Connection IDs issued with NEW_CONNECTION_ID and retired; a draining period; idle timeout and optional keep-alive |
+| QUIC | Version 1; Initial, Handshake and 1-RTT packet number spaces; AES-128-GCM, AES-256-GCM and ChaCha20-Poly1305 packet and header protection; key updates in both directions (started here when a key reaches its AEAD limit, or optionally after a time, and answered when the peer starts one) and a limit on decryption failures; Retry, sent by the server under load and handled by the client; Version Negotiation; stateless reset; RFC 9002 loss detection, PTO and persistent congestion; CUBIC (RFC 9438, the default) or NewReno congestion control, with pacing and app-limited detection; HyStart++ (RFC 9406), which leaves the initial slow start on a rise in the round-trip time; ACK_FREQUENCY (draft-ietf-quic-ack-frequency), which a bulk transfer asks for; the server's 3x amplification limit; connection- and stream-level flow control in both directions, with BLOCKED frames; MAX_STREAMS; Connection IDs issued with NEW_CONNECTION_ID and retired; a draining period; idle timeout and optional keep-alive |
 | Server | Shares one `Handler` and `Context` with HTTP/1 and HTTP/2; 1xx interim responses, automatic 100 Continue, request and response trailers, graceful `Response.Close` via GOAWAY, 413/431/417, malformed requests (including an `:authority` and `Host` that disagree) reset with H3_MESSAGE_ERROR, protocol errors closing the connection with RFC 9114 and RFC 9204 codes, `Request.TLS`, an `AltSvc` helper, extended CONNECT (RFC 9220) switched to a tunnel with `Context.Upgrade`, which is how `websocket.ServerHandler.Upgrade` serves WebSocket over HTTP/3 |
 | Client | Asynchronous `Do`/`Go`; one multiplexed connection per host:port; honors MAX_STREAMS and queues the rest; cancellation resets only its own stream; requests the server marks as unprocessed (GOAWAY, H3_REQUEST_REJECTED) are retried on a new connection; `Expect: 100-continue` waits for the 100; request and response trailers; a peer that breaks the protocol ends the connection with its error code; `AltSvcClient` composes it with an `http.Client` to follow `Alt-Svc` (RFC 7838) and fall back to TCP |
 | Resumption and 0-RTT | Session tickets, resumption, and 0-RTT early data, for the server (`Config.EarlyData`) and the client (`ClientConfig.EarlyData`); see [0-RTT](#0-rtt) |
@@ -241,7 +241,8 @@ These are still constants:
   again only while its limit holds, and one waiting to go is dropped once the
   peer raises the limit.
 - **Congestion control**: CUBIC (RFC 9438) by default, NewReno with
-  `quic.Config.CongestionControl`; no BBR, HyStart++ or ECN. Sending is paced at
+  `quic.Config.CongestionControl`, both with HyStart++ leaving the initial slow
+  start on a rise in the round trip; no BBR or ECN. Sending is paced at
   1.25 congestion windows a smoothed RTT. A round of datagrams the send buffer
   has no room for (`EAGAIN`) is kept, and the engine says when the socket has
   room again (`fib.Connection.NotifyWritable`), so it goes then, before anything
@@ -422,7 +423,27 @@ Done:
   (see [Protocol details](#protocol-details)). Still open: searching above
   1452 bytes (jumbo frames, or 1472 over IPv4), which needs larger send
   buffers, and counting the congestion window in the discovered size.
-- **Congestion control**: BBR, HyStart++ and ECN are still to do.
+- **HyStart++** (RFC 9406): done, and on for the initial slow start. Each
+  round it keeps the minimum round trip of the round and of the one before,
+  and when the current round's has risen over the last one's by an eighth of
+  it (at least 4ms, at most 16ms) it leaves slow start for a conservative
+  phase, which grows by a quarter of what slow start would; if the round trip
+  comes back down the phase was premature and slow start resumes, and after
+  five rounds the window becomes the threshold and congestion avoidance
+  begins. A loss ends it: from then on loss recovery's threshold is the exit
+  point. On a path whose round trip does not rise the 4ms floor means it does
+  not fire at all, which is the case on the in-memory and loopback paths the
+  benchmarks use, so its behaviour is covered by unit tests rather than by
+  the numbers below.
+- **BBR** was evaluated and is deliberately not implemented: it is a different
+  model of the path rather than a different window, with a bandwidth estimate
+  and pacing rate from per-round delivery samples and its own startup, drain
+  and probe-bw phases. Doing it soundly means extending the sent-packet
+  bookkeeping to delivery-rate samples per round and reconciling that with
+  RFC 9002 loss recovery and persistent congestion, which is a large change
+  with no way to test it here beyond the in-memory path; a half
+  implementation would be worse than none.
+- **ECN** is still to do.
 - **Batched I/O**: the engine reads with `recvmmsg` on Linux and `recvmsg_x`
   on macOS, and a round of sending with more than one datagram leaves with
   `sendmmsg` or `sendmsg_x` (`fib.Connection.SendBatch`), on the server's
@@ -437,14 +458,66 @@ Done:
 - **Fewer copies and allocations**: sending copies once in `Write`, into a
   pooled buffer, and again when packets are built; receiving copies in the
   engine, into a pooled buffer, and in the HTTP/3 frame parser only a frame
-  split across pieces and the request body. A request still allocates its
-  QUIC stream; its request stream and header are recycled (see above).
-- **ACK frequency**: implement the ACK_FREQUENCY extension to send fewer ACKs
-  under heavy traffic.
-- **ChaCha20-Poly1305** is pure Go and slower than assembly. Machines with AES
-  hardware negotiate AES-GCM first, so it is rarely the bottleneck.
-- **Benchmarks**: add QUIC and HTTP/3 benchmarks (single-connection throughput,
-  concurrent requests, throughput under loss) and profile with pprof.
+  split across pieces and the request body. An HTTP/3 response goes in with
+  `WriteOwned`, so it pays only the second copy; the first would need the
+  engine to send a packet built from several buffers (iovec changes, which are
+  another workstream's). Packet protection allocates nothing now: the
+  ChaCha20-Poly1305 authenticator was one heap allocation per packet and is a
+  value. QUIC streams are deliberately not pooled: a `*Stream` is handed to
+  the application and its lifetime is the application's, so reusing one would
+  turn a use after the stream is done into corruption of another stream. A
+  stream opened and closed costs 8 allocations, a request over the in-memory
+  path 11 or 12, and the HTTP/3 request stream and header are recycled (see
+  above).
+- **ACK frequency**: the ACK_FREQUENCY extension
+  (draft-ietf-quic-ack-frequency) is done. Both ends advertise `min_ack_delay`
+  in their transport parameters; a connection whose peer advertises it asks,
+  after 32 KiB sent, for an acknowledgement every tenth ack-eliciting packet,
+  tolerating a gap of two, and no later than a quarter of the smoothed round
+  trip, so that a window smaller than the threshold still gets feedback
+  several times a round trip. A loss makes it ask again, at most once a round
+  trip, for an acknowledgement every other packet, which is the default, until
+  the connection ends: a window that a loss has just shrunk is too small to
+  fill the threshold, and loss recovery depends on the acknowledgements. A
+  peer that does not advertise the extension is never sent the frame, and one
+  that ignores it simply keeps acknowledging as before, since the request is
+  advice and nothing depends on it. The receiver applies the most recent
+  request and answers an IMMEDIATE_ACK at once. On the shared benchmark host, medians of six samples taken in two
+  alternating rounds, a 64 KiB transfer stayed within the run-to-run noise
+  (567 to 533 MiB/s in the medians, 582 to 692 MiB/s in the quieter first
+  round), 1 MiB went from 714 to 877 MiB/s and 4 MiB from 882 to 1350 MiB/s,
+  an HTTP/3 upload from 369 to 589 MiB/s, small requests from 6018 to 5780 ns
+  and concurrent ones from 4876 to 3672 ns; at 1% loss the throughput was
+  20.0 against 19.0 MiB/s and at 5% loss 7.2 against 4.4 MiB/s. Fewer
+  acknowledgements cost loss recovery a little, which the request after a loss
+  keeps from being worse, and they leave fewer of their own packets to be
+  lost.
+- **ChaCha20-Poly1305** is the library's own, since the standard library
+  exports no ChaCha20-Poly1305 AEAD: `crypto/hpke` wraps one, but through
+  internal packages and a vendored `golang.org/x/crypto` that a module outside
+  the standard library cannot import, and `crypto/cipher` has none. It is now
+  written for speed in pure Go: the block's sixteen words live in variables
+  rather than an array, a block's key stream is XORed eight bytes at a time,
+  and the authenticator is set up in place instead of being allocated for
+  every packet. A 1200-byte packet's seal went from 355 to 548 MiB/s and its
+  open from 358 to 551 MiB/s, a 16 KiB plaintext from 398 to 682 MiB/s, and
+  one header protection block from 141 to 78 ns. Assembly (AVX2 or NEON) would
+  be faster still, but it is a large per-architecture piece whose constant
+  time is easy to get wrong, for a suite that only machines without AES
+  hardware negotiate first, so it is not written. The path is covered end to
+  end now: `TestChaCha20Poly1305Handshake` runs the handshake in a child
+  process with `GODEBUG=cpu.aes=off`, where crypto/tls prefers ChaCha20, and
+  checks that both ends protect packets and headers with it and that data
+  crosses both ways.
+- **Benchmarks**: done, as plain `go test -bench` targets. `http3/quic` has
+  bulk transfers of 64 KiB, 1 MiB and 4 MiB over the in-memory path, requests
+  one at a time and from as many goroutines as processors, transfers at 1% and
+  5% loss, a stream opened and closed, and ChaCha20-Poly1305's seal, open and
+  header protection; `http3` has a 64 KiB and a 1 MiB response body, an
+  upload, small requests and concurrent requests over a UDP socket on the
+  loopback interface, which include the engine and the framing. The numbers
+  above are their medians on the benchmark host, before and after the changes
+  of this round, six samples each in two alternating rounds.
 
 ### 3. Streaming bodies and the handler model (medium)
 
@@ -468,9 +541,6 @@ Done:
 The conformance suite is done; see [Conformance tests](#conformance-tests).
 What is still not covered end to end:
 
-- ChaCha20-Poly1305 negotiated in a real handshake: the development machine
-  and the CI runners have AES hardware, so handshakes always pick AES-GCM, and
-  only RFC 9001's test vectors cover that path.
 - 0-RTT against more servers than quiche and quic-go, and replays across
   servers that share ticket keys (the register of tickets is per process).
 - The concurrency problems only load testing shows. Frame parsing, building

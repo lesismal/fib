@@ -1287,13 +1287,19 @@ server, err := fib.New(fib.DefaultConfig(),
 QUIC 层的实现要点：
 
 - 包保护支持 TLS 1.3 的三种套件：AES-128-GCM、AES-256-GCM 和
-  ChaCha20-Poly1305（标准库没有导出 ChaCha20-Poly1305，本库按 RFC 8439 自行实现，
-  并用 RFC 9001 附录的测试向量校验）；密钥更新（key update）双向支持：一把密钥保护的
+  ChaCha20-Poly1305（标准库没有导出 ChaCha20-Poly1305 AEAD，本库按 RFC 8439 自行实现，
+  用 RFC 9001 附录的测试向量校验，并在带 `GODEBUG=cpu.aes=off` 的子进程里做端到端
+  握手测试；块函数与认证器都针对纯 Go 调过，1200 字节的包 seal 约 548 MiB/s）；
+  密钥更新（key update）双向支持：一把密钥保护的
   包数达到 RFC 9001 §6.6 的上限时（或设置了 `KeyUpdateInterval` 时按时间）主动发起，
   也响应对端发起的更新，解密失败次数超过
   完整性上限时关闭连接；客户端支持 Retry。支持 0-RTT（默认关闭，`quic.Config.EarlyData`）。
-- 丢包检测与拥塞控制按 RFC 9002 实现：ACK 阈值和时间阈值判定丢包、PTO 探测、
-  NewReno 拥塞控制；服务端在验证客户端地址前遵守 3 倍放大限制。数据报从 1200 字节
+- 丢包检测与拥塞控制按 RFC 9002 实现：ACK 阈值和时间阈值判定丢包、PTO 探测；默认
+  CUBIC（RFC 9438），可用 `quic.Config.CongestionControl` 选 NewReno，两者都在初始
+  慢启动里用 HyStart++（RFC 9406）判断 RTT 上升而提前退出；发送按每个平滑 RTT 1.25 个
+  拥塞窗口 pacing；大流量传输时用 ACK_FREQUENCY 扩展（draft-ietf-quic-ack-frequency）
+  请对端减少确认，丢包后自动改回频繁确认。服务端在验证客户端地址前遵守 3 倍放大限制。
+  数据报从 1200 字节
   （所有 IPv6 路径都能承载的大小）开始，握手确认后做路径 MTU 探测（RFC 8899），以太网上
   通常升到 1452 字节；更大的包持续丢失时退回 1200 字节（黑洞检测）。探测要求 UDP socket
   不分片，由 `fib.Connection.SetDontFragment` 设置；`DisablePathMTUDiscovery` 关闭探测，
