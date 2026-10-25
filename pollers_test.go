@@ -1359,6 +1359,11 @@ func TestCloseWriteAfterQueuedOutput(t *testing.T) {
 // sent and then the end of the stream, where a plain close with input unread
 // would reset the connection; the connection closes once the linger runs out,
 // with no error, though the peer never stops.
+//
+// The linger is 2 seconds, not the instant the peer's end needs, because the
+// 4 MiB have to go out inside it: under the coverage job's instrumentation the
+// same window is several times slower, and with 300ms a run of this test read
+// a third of the payload before the connection closed as its linger said.
 func TestCloseAfterSendLinger(t *testing.T) {
 	payload := bytes.Repeat([]byte("0123456789abcdef"), 1<<18) // 4MB, more than the socket takes
 	closed := make(chan error, 1)
@@ -1369,7 +1374,7 @@ func TestCloseAfterSendLinger(t *testing.T) {
 				if err := c.Send(payload); err != nil {
 					t.Error(err)
 				}
-				c.CloseAfterSendLinger(300 * time.Millisecond)
+				c.CloseAfterSendLinger(2 * time.Second)
 			})
 		},
 		Close: func(_ *Connection, err error) { closed <- err },
