@@ -9,7 +9,6 @@ import (
 	"fmt"
 	"io"
 	stdhttp "net/http"
-	"strings"
 
 	"github.com/lesismal/fib/bufferpool"
 )
@@ -71,6 +70,18 @@ type responseParser struct {
 	// continued records that a 100 (Continue) response has been skipped,
 	// for the client to send a body it held back for it.
 	continued bool
+	// coding decodes a body sent in a transfer coding besides chunked (see
+	// splitTransferCodings); codingDec is its decoder and piece what it
+	// decodes into for the sink. codings is the Transfer-Encoding as it was
+	// listed, which the response reports as net/http reports chunked, and
+	// inflated counts what the body decoded to, which maxBody or maxStreamed
+	// bounds as they bound what arrived.
+	coding     transferCoding
+	codingDec  *codingDecoder
+	codings    []string
+	inflated   int64
+	codingDone bool
+	piece      []byte
 }
 
 // bodySink is where a streamed response body goes: start once its header is
@@ -91,8 +102,13 @@ func (p *responseParser) reset() {
 	p.streaming, p.started, p.streamedDone = false, false, false
 	p.continued = false
 	p.remaining, p.passed = 0, 0
+	p.coding, p.codingDec, p.codings = "", nil, nil
+	p.inflated, p.codingDone = 0, false
 	if cap(p.scratch) > maxRetainedBuffer {
 		p.scratch = nil
+	}
+	if cap(p.piece) > maxRetainedBuffer {
+		p.piece = nil
 	}
 }
 
@@ -160,15 +176,27 @@ func (p *responseParser) feed(data []byte, req *stdhttp.Request) (*stdhttp.Respo
 
 // finish is called when the server closes the connection. A body delimited by
 // the close is complete at that point; anything else is cut short, and finish
-// returns nil.
-func (p *responseParser) finish() *stdhttp.Response {
+// returns nothing. A coded body is decoded here when it was buffered whole,
+// and checked for a complete coded stream when it was not.
+func (p *responseParser) finish() (*stdhttp.Response, error) {
 	if !p.untilClose() {
-		return nil
+		return nil, nil
 	}
 	if p.streaming {
-		return p.endStream(nil)
+		if err := p.finishCoding(); err != nil {
+			return nil, err
+		}
+		return p.endStream(nil), nil
 	}
-	return p.complete(len(p.buffer), p.buffer[p.headerEnd:])
+	body := p.buffer[p.headerEnd:]
+	if p.coding == "" {
+		return p.complete(len(p.buffer), body), nil
+	}
+	decoded, err := decodeWhole(p.coding, body, p.maxBody, ErrResponseBodyTooLarge, ErrMalformedResponse)
+	if err != nil {
+		return nil, err
+	}
+	return p.completeOwned(len(p.buffer), decoded), nil
 }
 
 // untilClose reports whether the response in progress ends when the server
@@ -207,14 +235,17 @@ func (p *responseParser) feedStream() (*stdhttp.Response, error) {
 		if err != nil {
 			return nil, clientParseError(err)
 		}
-		if len(out) > 0 {
-			if err := p.pass(out); err != nil {
+		if len(out) > 0 || done {
+			if err := p.passBody(out, done); err != nil {
 				return nil, err
 			}
 		}
 		p.consume(used)
 		if !done {
 			return nil, nil
+		}
+		if err := p.finishCoding(); err != nil {
+			return nil, err
 		}
 		fields, err := parseTrailer(trailer)
 		if err != nil {
@@ -223,13 +254,61 @@ func (p *responseParser) feedStream() (*stdhttp.Response, error) {
 		return p.endStream(fields), nil
 	default:
 		if len(p.buffer) > 0 {
-			if err := p.pass(p.buffer); err != nil {
+			if err := p.passBody(p.buffer, false); err != nil {
 				return nil, err
 			}
 			p.consume(len(p.buffer))
 		}
 		return nil, nil
 	}
+}
+
+// passBody gives the sink a piece of the body, decoding it first when it
+// arrived in a transfer coding. final says it is the last of the coded body.
+func (p *responseParser) passBody(data []byte, final bool) error {
+	if p.coding == "" {
+		if len(data) == 0 {
+			return nil
+		}
+		return p.pass(data)
+	}
+	for {
+		n, used, done, err := p.codingDec.decode(p.piece, data, final)
+		data = data[used:]
+		p.inflated += int64(n)
+		p.codingDone = done
+		if n > 0 {
+			if err := p.pass(p.piece[:n]); err != nil {
+				return err
+			}
+		}
+		switch {
+		case err != nil:
+			return fmt.Errorf("%w: %s transfer coding: %v", ErrMalformedResponse, p.coding, err)
+		case p.maxStreamed > 0 && p.inflated > p.maxStreamed:
+			return ErrResponseBodyTooLarge
+		case done:
+			return nil
+		case n == 0 && used == 0:
+			// The rest of the coded body has not arrived.
+			return nil
+		}
+	}
+}
+
+// finishCoding checks that a coded body that streams has ended in a complete
+// coded stream, as its framing or the connection's close said it had.
+func (p *responseParser) finishCoding() error {
+	if p.coding == "" || p.codingDone {
+		return nil
+	}
+	if err := p.passBody(nil, true); err != nil {
+		return err
+	}
+	if !p.codingDone {
+		return fmt.Errorf("%w: %s transfer coding: %v", ErrMalformedResponse, p.coding, io.ErrUnexpectedEOF)
+	}
+	return nil
 }
 
 // pass gives the sink a piece of the body, within the limit on streamed ones.
@@ -273,10 +352,31 @@ func (p *responseParser) parseHead(req *stdhttp.Request) (bool, error) {
 	if headerEnd > p.maxHeader {
 		return false, ErrResponseHeaderTooLarge
 	}
-	head, ok := parseResponseHead(p.buffer[:headerEnd], req)
+	// net/http's readers take chunked alone, so a head sent in another
+	// transfer coding is rewritten for them here, and the body decoded from
+	// it (see splitTransferCodings). An HTTP/1.0 response's Transfer-Encoding
+	// is left to net/http, which ignores it, as a 1.0 message has none.
+	raw := p.buffer[:headerEnd]
+	var coding transferCoding
+	var codings []string
+	chunked := false
+	if len(raw) < 8 || string(raw[:8]) != "HTTP/1.0" {
+		if _, ok := transferEncodingFields(raw); ok && !plainChunked(raw) {
+			rewritten, c, list, err := splitTransferCodings(raw, false)
+			if err != nil {
+				if errors.Is(err, ErrUnsupportedTransferEncoding) {
+					return false, fmt.Errorf("%w: unsupported transfer coding", ErrMalformedResponse)
+				}
+				return false, fmt.Errorf("%w: %v", ErrMalformedResponse, err)
+			}
+			coding, codings, raw = c, list, rewritten
+			chunked = list[len(list)-1] == "chunked"
+		}
+	}
+	head, ok := parseResponseHead(raw, req)
 	if !ok {
 		var err error
-		head, err = stdhttp.ReadResponse(bufio.NewReader(bytes.NewReader(p.buffer[:headerEnd])), req)
+		head, err = stdhttp.ReadResponse(bufio.NewReader(bytes.NewReader(raw)), req)
 		if err != nil {
 			return false, fmt.Errorf("%w: %v", ErrMalformedResponse, err)
 		}
@@ -287,19 +387,32 @@ func (p *responseParser) parseHead(req *stdhttp.Request) (bool, error) {
 		p.consume(headerEnd)
 		return true, nil
 	}
+	if codings != nil {
+		// The codings as they were listed, where net/http would report the
+		// chunked one alone.
+		head.TransferEncoding = codings
+		p.codings = codings
+	}
 	p.head, p.headerEnd = head, headerEnd
 	switch {
 	case !bodyAllowed(req, head.StatusCode):
 		p.framing = framingNone
+	case codings != nil && chunked:
+		p.framing = framingChunked
+	case codings != nil:
+		// Without chunked last, a response's body ends with the connection
+		// (RFC 9112 section 6.3).
+		p.framing = framingUntilClose
 	case len(head.TransferEncoding) != 0:
-		if len(head.TransferEncoding) != 1 || !strings.EqualFold(head.TransferEncoding[0], "chunked") {
-			return false, fmt.Errorf("%w: unsupported transfer encoding %q", ErrMalformedResponse, head.TransferEncoding)
-		}
 		p.framing = framingChunked
 	case head.ContentLength >= 0:
 		p.framing = framingLength
 	default:
 		p.framing = framingUntilClose
+	}
+	if coding != "" {
+		p.coding, p.codingDec = coding, newCodingDecoder(coding)
+		p.piece = make([]byte, codingPiece)
 	}
 	p.streaming = p.sink != nil && p.streamOK && p.framing != framingNone &&
 		!(p.framing == framingLength && head.ContentLength <= max(p.threshold, 0))
@@ -330,24 +443,56 @@ func bodyAllowed(req *stdhttp.Request, status int) bool {
 // any other goes through net/http's own decoder, so that its trailer lands
 // where callers expect it and what it refuses is refused. The body needs no
 // limit here: chunkedEnd has framed it and refused one that decodes past
-// maxBody.
+// maxBody. A body sent in another transfer coding is decoded from what the
+// chunks carry, within maxBody.
 func (p *responseParser) completeChunked(end int, req *stdhttp.Request) (*stdhttp.Response, error) {
-	if p.head.Trailer == nil {
-		if body, ok := decodeChunks(p.scratch[:0], p.buffer[p.headerEnd:end]); ok {
-			p.scratch = body
+	if p.codings != nil {
+		// The head was rewritten for net/http's reader, which reads chunked
+		// alone, so the framing is decoded here instead, as the streamed path
+		// does; the trailer lands where callers expect it either way.
+		body, used, trailerBlock, done, err := (&chunkedDecoder{maxTrailer: p.maxHeader}).decode(
+			p.scratch[:0], p.buffer[p.headerEnd:end])
+		p.scratch = body
+		if err == nil && (!done || p.headerEnd+used != end) {
+			err = fmt.Errorf("%w: chunked body not framed as it was scanned", ErrMalformed)
+		}
+		if err != nil {
+			return nil, clientParseError(err)
+		}
+		fields, err := parseTrailer(trailerBlock)
+		if err != nil {
+			return nil, clientParseError(err)
+		}
+		if fields != nil {
+			p.head.Trailer = fields
+		}
+		if p.coding == "" {
 			return p.complete(end, body), nil
 		}
+		decoded, err := decodeWhole(p.coding, body, p.maxBody, ErrResponseBodyTooLarge, ErrMalformedResponse)
+		if err != nil {
+			return nil, err
+		}
+		return p.completeOwned(end, decoded), nil
 	}
 	var body []byte
-	full, err := stdhttp.ReadResponse(bufio.NewReader(bytes.NewReader(p.buffer[:end])), req)
-	if err == nil {
-		body, err = io.ReadAll(full.Body)
-		_ = full.Body.Close()
+	if p.head.Trailer == nil {
+		if decoded, ok := decodeChunks(p.scratch[:0], p.buffer[p.headerEnd:end]); ok {
+			p.scratch = decoded
+			body = decoded
+		}
 	}
-	if err != nil {
-		return nil, fmt.Errorf("%w: %v", ErrMalformedResponse, err)
+	if body == nil {
+		full, err := stdhttp.ReadResponse(bufio.NewReader(bytes.NewReader(p.buffer[:end])), req)
+		if err == nil {
+			body, err = io.ReadAll(full.Body)
+			_ = full.Body.Close()
+		}
+		if err != nil {
+			return nil, fmt.Errorf("%w: %v", ErrMalformedResponse, err)
+		}
+		p.head = full
 	}
-	p.head = full
 	return p.complete(end, body), nil
 }
 
@@ -360,6 +505,20 @@ func (p *responseParser) complete(end int, body []byte) *stdhttp.Response {
 		resp.Body = stdhttp.NoBody
 	} else {
 		resp.Body = &bufferedBody{data: append([]byte(nil), body...)}
+	}
+	p.head = nil
+	p.consume(end)
+	return resp
+}
+
+// completeOwned is complete for a body the parser owns and hands over as it
+// is: the caller gets the array itself, not a copy of it.
+func (p *responseParser) completeOwned(end int, body []byte) *stdhttp.Response {
+	resp := p.head
+	if len(body) == 0 {
+		resp.Body = stdhttp.NoBody
+	} else {
+		resp.Body = &bufferedBody{data: body}
 	}
 	p.head = nil
 	p.consume(end)

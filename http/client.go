@@ -1832,7 +1832,12 @@ func (cc *clientConn) OnClose(_ *fib.Connection, err error) {
 		// The close ends the body. A streaming one tells its callback, which
 		// must not hold up the event loop OnClose may be on.
 		sidepool.Go(func() {
-			if resp := cc.parser.finish(); resp != nil && !cc.parser.streamedDone {
+			resp, err := cc.parser.finish()
+			if err != nil {
+				r.finish(nil, err)
+				return
+			}
+			if resp != nil && !cc.parser.streamedDone {
 				r.finish(resp, nil)
 			}
 		})

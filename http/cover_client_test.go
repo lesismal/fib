@@ -888,7 +888,7 @@ func TestCvCliResponseParserErrors(t *testing.T) {
 		{"content length too large", false, "HTTP/1.1 200 OK\r\nContent-Length: 17\r\n\r\n", ErrResponseBodyTooLarge, ""},
 		{"until close too large", false, "HTTP/1.0 200 OK\r\n\r\n" + strings.Repeat("b", 17), ErrResponseBodyTooLarge, ""},
 		{"chunk size net/http refuses", false, "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n 1\r\nb\r\n0\r\n\r\n", ErrMalformedResponse, ""},
-		{"unsupported transfer encoding", false, "HTTP/1.1 200 OK\r\nTransfer-Encoding: gzip\r\n\r\n", ErrMalformedResponse, "transfer encoding"},
+		{"unsupported transfer coding", false, "HTTP/1.1 200 OK\r\nTransfer-Encoding: br\r\n\r\n", ErrMalformedResponse, "transfer coding"},
 		{"streamed bad chunk size", true, "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\nzz\r\n", ErrMalformedResponse, ""},
 		{"streamed bad trailer", true, "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n0\r\nno colon here\r\n\r\n", ErrMalformedResponse, ""},
 		{"streamed until close too large", true, "HTTP/1.0 200 OK\r\n\r\n" + strings.Repeat("b", 9), ErrResponseBodyTooLarge, ""},
@@ -905,8 +905,8 @@ func TestCvCliResponseParserErrors(t *testing.T) {
 
 	// finish on a response that is not ended by the close has nothing.
 	p := &responseParser{maxHeader: 64, maxBody: 16}
-	if p.finish() != nil {
-		t.Fatal("finish without a response")
+	if resp, err := p.finish(); resp != nil || err != nil {
+		t.Fatalf("finish without a response: %v, %v", resp, err)
 	}
 	// A large decode buffer is let go between responses.
 	p.scratch = make([]byte, maxRetainedBuffer+1)
