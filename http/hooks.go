@@ -179,9 +179,12 @@ func (c *Context) OnBodyFilter(fn func(status int, header stdhttp.Header) BodyFi
 // is cancelled meanwhile, WriteNoWait reports above, and OnWritable runs
 // once the held body has gone after resume. Flush does nothing while the
 // header is held. A request whose client goes meanwhile ends as any other
-// does, and its resume sends nothing. fn is not run for the response of
-// Upgrade or Connect, which go at once. Registering it once the response has
-// been begun does nothing.
+// does, and its resume sends nothing. On Windows an HTTP/1 handler's
+// client is heard going only once the connection's round ends (see
+// fib.HangupHandler), so a Write waiting in that round returns only once
+// the hook resumes. fn is not run for the response of Upgrade or Connect,
+// which go at once. Registering it once the response has been begun does
+// nothing.
 func (c *Context) OnHeaderAsync(fn func(status int, header stdhttp.Header, resume func(error))) {
 	if fn != nil && !c.begun() {
 		c.addHook(responseHook{})
