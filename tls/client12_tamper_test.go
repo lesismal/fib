@@ -132,9 +132,9 @@ func TestClientRefusesBadServerHello12(t *testing.T) {
 			return f
 		}, alertIllegalParameter},
 		{"an offered suite the record layer lacks", func(h *clientHS) {
-			h.suites12 = append(slices.Clone(h.suites12), stdtls.TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256)
+			h.suites12 = append(slices.Clone(h.suites12), stdtls.TLS_ECDHE_RSA_WITH_3DES_EDE_CBC_SHA)
 		}, func(f helloFields, _ *clientHS) helloFields {
-			f.suite = stdtls.TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256
+			f.suite = stdtls.TLS_ECDHE_RSA_WITH_3DES_EDE_CBC_SHA
 			return f
 		}, alertIllegalParameter},
 		{"the made-up session ID resumed", nil, func(f helloFields, h *clientHS) helloFields { f.session = h.sessionID; return f }, alertIllegalParameter},

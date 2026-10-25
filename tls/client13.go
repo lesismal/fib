@@ -35,13 +35,13 @@ import (
 // goroutine is spent on a peer that is slow to answer, or that never does.
 //
 // It implements the client side of RFC 8446 and RFC 5246 for what a client of
-// this package's record layer needs: the AES-GCM suites of TLS 1.3, and the
-// ECDHE suites of TLS 1.2 that use AES-GCM or AES-CBC; X25519, P-256 and P-384
-// key exchange, a HelloRetryRequest, ALPN, SNI, the server's certificate
-// verified against Config.RootCAs (or not, with InsecureSkipVerify) and its
-// signature checked, and for a server that asks for one, the client's own
-// certificate, from Config.Certificates or GetClientCertificate (auth.go), or
-// none. What it leaves out stays with crypto/tls, which a Config selects by
+// this package's record layer needs: the AES-GCM and ChaCha20-Poly1305 suites
+// of TLS 1.3, and the ECDHE suites of TLS 1.2 that use them or AES-CBC; X25519,
+// P-256 and P-384 key exchange, a HelloRetryRequest, ALPN, SNI, the server's
+// certificate verified against Config.RootCAs (or not, with InsecureSkipVerify)
+// and its signature checked, and for a server that asks for one, the client's
+// own certificate, from Config.Certificates or GetClientCertificate (auth.go),
+// or none. What it leaves out stays with crypto/tls, which a Config selects by
 // not qualifying; see nativeClient. The record layer keys it ends with are the
 // ones fast.go would have taken over from crypto/tls, so an established
 // connection is the same either way.
@@ -91,17 +91,18 @@ const (
 	maxHandshakeMessage = 65536
 )
 
-// clientSuites13 are the TLS 1.3 suites a client of the record layer offers.
-var clientSuites13 = []uint16{stdtls.TLS_AES_128_GCM_SHA256, stdtls.TLS_AES_256_GCM_SHA384}
-
 // clientSuites12 are the TLS 1.2 suites it offers: the ECDHE ones the record
-// layer protects, AES-GCM first. Key exchange by RSA is not offered, as
-// crypto/tls no longer does by default.
+// layer protects, AEADs first, in the order crypto/tls offers them where the
+// CPU has AES-GCM. Key exchange by RSA is not offered, as crypto/tls no longer
+// does by default. clientSuites12NoAES puts ChaCha20-Poly1305 first, for a CPU
+// without AES-GCM.
 var clientSuites12 = []uint16{
 	stdtls.TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,
 	stdtls.TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,
 	stdtls.TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384,
 	stdtls.TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384,
+	stdtls.TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256,
+	stdtls.TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256,
 	stdtls.TLS_ECDHE_ECDSA_WITH_AES_128_CBC_SHA,
 	stdtls.TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA,
 	stdtls.TLS_ECDHE_ECDSA_WITH_AES_256_CBC_SHA,
@@ -109,6 +110,8 @@ var clientSuites12 = []uint16{
 	stdtls.TLS_ECDHE_ECDSA_WITH_AES_128_CBC_SHA256,
 	stdtls.TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA256,
 }
+
+var clientSuites12NoAES = chachaFirst(clientSuites12, func(id uint16) uint16 { return id })
 
 // clientSignatureAlgs are the signature schemes a server's CertificateVerify
 // may use in TLS 1.3, in the order they are offered. TLS 1.2 also takes the
@@ -176,13 +179,18 @@ func clientVersions(config *stdtls.Config) []uint16 {
 }
 
 // suites12 are the TLS 1.2 suites a handshake with config offers: those of
-// clientSuites12 that Config.CipherSuites allows, if it lists any.
+// clientSuites12, or clientSuites12NoAES where the CPU has no AES-GCM, that
+// Config.CipherSuites allows, if it lists any.
 func suites12(config *stdtls.Config) []uint16 {
+	offered := clientSuites12
+	if !aesGCMHardware {
+		offered = clientSuites12NoAES
+	}
 	if len(config.CipherSuites) == 0 {
-		return clientSuites12
+		return offered
 	}
 	var out []uint16
-	for _, id := range clientSuites12 {
+	for _, id := range offered {
 		if slices.Contains(config.CipherSuites, id) {
 			out = append(out, id)
 		}
@@ -378,7 +386,7 @@ func newClientHSFor(config *stdtls.Config, q *quicCtx) (*clientHS, error) {
 	if config.ServerName == "" && !config.InsecureSkipVerify {
 		return nil, errors.New("tls: either ServerName or InsecureSkipVerify must be specified in the tls.Config")
 	}
-	h := &clientHS{config: config, suites: clientSuites13, suites12: suites12(config), versions: clientVersions(config), quic: q}
+	h := &clientHS{config: config, suites: suites13(false), suites12: suites12(config), versions: clientVersions(config), quic: q}
 	if len(h.suites12) == 0 {
 		// Only TLS 1.3 is left to offer.
 		h.versions = slices.DeleteFunc(slices.Clone(h.versions), func(v uint16) bool { return v == stdtls.VersionTLS12 })
@@ -446,7 +454,7 @@ func (h *clientHS) hello() []byte {
 			h.earlyActive = false
 			return rec
 		}
-		if h.earlyTx, err = newKeys13(h.suite13Of(h.session.suite).keyLen, h.sessionHash(), secret); err != nil {
+		if h.earlyTx, err = newKeys13(h.suite13Of(h.session.suite), h.sessionHash(), secret); err != nil {
 			h.earlyActive = false
 			return rec
 		}
@@ -1252,10 +1260,10 @@ func (h *clientHS) handshakeKeys(shared []byte, out *[]byte) *hsError {
 		h.state = hsExpectEncryptedExtensions
 		return nil
 	}
-	if h.rx, err = newKeys13(h.suite.keyLen, f, h.serverHS); err != nil {
+	if h.rx, err = newKeys13(h.suite, f, h.serverHS); err != nil {
 		return fail(alertInternalError, "%v", err)
 	}
-	if h.tx, err = newKeys13(h.suite.keyLen, f, h.clientHS); err != nil {
+	if h.tx, err = newKeys13(h.suite, f, h.clientHS); err != nil {
 		return fail(alertInternalError, "%v", err)
 	}
 	h.sendCCS(out)
@@ -1640,10 +1648,10 @@ func (h *clientHS) finish13(out *[]byte) *hsError {
 		}
 	}
 
-	if h.rx, err = newKeys13(h.suite.keyLen, f, h.appServer); err != nil {
+	if h.rx, err = newKeys13(h.suite, f, h.appServer); err != nil {
 		return fail(alertInternalError, "%v", err)
 	}
-	if h.tx, err = newKeys13(h.suite.keyLen, f, h.appClient); err != nil {
+	if h.tx, err = newKeys13(h.suite, f, h.appClient); err != nil {
 		return fail(alertInternalError, "%v", err)
 	}
 	h.keyLog("CLIENT_TRAFFIC_SECRET_0", h.appClient)

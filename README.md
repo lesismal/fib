@@ -504,9 +504,9 @@ have the full picture, with one diagram per protocol.
   first, and at most one wake-up is sent per hop rather than one per task. See
   [Taskpool](#taskpool).
 - **TLS without crypto/tls on the hot path.** After crypto/tls finishes the handshake, fib takes
-  over the AES-GCM (TLS 1.3/1.2) and AES-CBC (TLS 1.2/1.1) record layers, and decrypts records in
-  place in the round's read buffer. ChaCha20, renegotiation and TLS 1.2 resumption stay on
-  crypto/tls.
+  over the AES-GCM and ChaCha20-Poly1305 (TLS 1.3/1.2) and AES-CBC (TLS 1.2/1.1) record layers,
+  and decrypts records in place in the round's read buffer. Renegotiation and TLS 1.2 resumption
+  stay on crypto/tls.
 - **Protocol stacks written for this model.** HTTP/2, HPACK, QUIC, QPACK and WebSocket are
   implemented in fib. They are fed straight from the round's read buffer rather than through a
   blocking `net.Conn`, and the WebSocket parser consumes pipelined frames in place. The Router

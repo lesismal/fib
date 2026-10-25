@@ -14,10 +14,10 @@ import (
 	"github.com/lesismal/fib/bufferpool"
 )
 
-// Once crypto/tls has completed a handshake that settled on an AES-GCM suite
-// of TLS 1.3 or 1.2, or an AES-CBC suite of TLS 1.2 or 1.1, the connection
-// leaves it: the layer protects the connection's records itself, with
-// record.go, and drops the crypto/tls Conn.
+// Once crypto/tls has completed a handshake that settled on an AES-GCM or
+// ChaCha20-Poly1305 suite of TLS 1.3 or 1.2, or an AES-CBC suite of TLS 1.2 or
+// 1.1, the connection leaves it: the layer protects the connection's records
+// itself, with record.go, and drops the crypto/tls Conn.
 //
 // crypto/tls does everything a record passes through one at a time and
 // behind copies: the layer hands it ciphertext, it decrypts into a buffer of
@@ -281,10 +281,10 @@ func (t *layer) takeOver() bool {
 		if clientSecret == nil || serverSecret == nil {
 			return false
 		}
-		if client, err = newKeys13(s.keyLen, s.hash, clientSecret); err != nil {
+		if client, err = newKeys13(s, s.hash, clientSecret); err != nil {
 			return false
 		}
-		if server, err = newKeys13(s.keyLen, s.hash, serverSecret); err != nil {
+		if server, err = newKeys13(s, s.hash, serverSecret); err != nil {
 			return false
 		}
 	} else {

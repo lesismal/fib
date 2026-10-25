@@ -165,7 +165,7 @@ func newFlight13(t *testing.T, cli *clientHS, config *stdtls.Config) *flight13 {
 
 // keys are the server's handshake keys, from the first record on.
 func (f *flight13) keys() *recordKeys {
-	k, _ := newKeys13(f.srv.suite.keyLen, f.srv.suite.hash, f.srv.serverHS)
+	k, _ := newKeys13(f.srv.suite, f.srv.suite.hash, f.srv.serverHS)
 	return k
 }
 
@@ -279,9 +279,11 @@ func TestClientRefusesBadServerHello(t *testing.T) {
 		{"pre_shared_key with no session offered", nil, func(f helloFields, _ *clientHS) helloFields { return f.with(extPreSharedKey, []byte{0, 0}) }, alertUnsupportedExtension},
 		{"an unknown extension", nil, func(f helloFields, _ *clientHS) helloFields { return f.with(0x1234, nil) }, alertUnsupportedExtension},
 		{"a malformed key share", nil, func(f helloFields, _ *clientHS) helloFields { return f.with(extKeyShare, []byte{0, 0x1d, 0}) }, alertDecodeError},
-		{"a suite not offered", nil, func(f helloFields, _ *clientHS) helloFields { f.suite = stdtls.TLS_CHACHA20_POLY1305_SHA256; return f }, alertIllegalParameter},
-		{"an offered suite the record layer lacks", func(h *clientHS) { h.suites = append(slices.Clone(h.suites), stdtls.TLS_CHACHA20_POLY1305_SHA256) },
-			func(f helloFields, _ *clientHS) helloFields { f.suite = stdtls.TLS_CHACHA20_POLY1305_SHA256; return f }, alertIllegalParameter},
+		// TLS_AES_128_CCM_SHA256 (RFC 8446 appendix B.4), which this client
+		// does not offer and the record layer has no AEAD for.
+		{"a suite not offered", nil, func(f helloFields, _ *clientHS) helloFields { f.suite = 0x1304; return f }, alertIllegalParameter},
+		{"an offered suite the record layer lacks", func(h *clientHS) { h.suites = append(slices.Clone(h.suites), 0x1304) },
+			func(f helloFields, _ *clientHS) helloFields { f.suite = 0x1304; return f }, alertIllegalParameter},
 		{"a share of another group", nil, func(f helloFields, _ *clientHS) helloFields {
 			return f.with(extKeyShare, keyShare(stdtls.CurveP256, make([]byte, 65)))
 		}, alertIllegalParameter},

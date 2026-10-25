@@ -590,10 +590,10 @@ func TestCovFastKeyErrors(t *testing.T) {
 		t.Fatal("a 17-byte AES key was taken")
 	}
 	secret := bytes.Repeat([]byte{9}, sha256.Size)
-	if _, err := newKeys13(17, sha256.New, secret); err == nil {
+	if _, err := newKeys13(suite{keyLen: 17, hash: sha256.New}, sha256.New, secret); err == nil {
 		t.Fatal("TLS 1.3 keys of 17 bytes were made")
 	}
-	if _, err := newKeys13(255*sha256.Size+1, sha256.New, secret); err == nil {
+	if _, err := newKeys13(suite{keyLen: 255*sha256.Size + 1, hash: sha256.New}, sha256.New, secret); err == nil {
 		t.Fatal("TLS 1.3 keys longer than HKDF expands were made")
 	}
 	master, random := bytes.Repeat([]byte{1}, 48), bytes.Repeat([]byte{2}, 32)

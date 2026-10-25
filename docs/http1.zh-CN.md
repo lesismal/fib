@@ -363,7 +363,7 @@ Windows 上用 overlapped 的 `TransmitFile` 发送，等排在它前面的数�
 这个限制。
 
 TLS 上（`tls.NewServer` 或 `tls.Dial`，握手完成、连接的记录由 fib 自己的记录层保护之后：
-TLS 1.3 或 1.2 的 AES-GCM，TLS 1.2 或 1.1 的 AES-CBC）：
+TLS 1.3 或 1.2 的 AES-GCM、ChaCha20-Poly1305，TLS 1.2 或 1.1 的 AES-CBC）：
 
 - **Linux 有内核 TLS 时**，连接在 AES-GCM 套件上发送的第一个文件会把此后所有发送的加密
   交给内核（`TCP_ULP` "tls" 与 `TLS_TX`，带上流量密钥、IV 和下一个序列号），文件经
@@ -374,7 +374,8 @@ TLS 1.3 或 1.2 的 AES-GCM，TLS 1.2 或 1.1 的 AES-CBC）：
   内核发出，内核随后换用下一代密钥；不能换密钥的内核（6.14 之前的 Linux）则改为关闭连接。
   读取仍在用户态。内核没有 `tls` 模块、或进程无权加载时只记录一次，之后不再尝试。
   `tls.Handler.NoKernelTLS` 关闭这一切换。
-- **其他情况**（macOS、BSD、Windows、AES-CBC 套件，或关闭了、缺少内核 TLS）连接把文件
+- **其他情况**（macOS、BSD、Windows、ChaCha20-Poly1305 与 AES-CBC 套件，或关闭了、缺少
+  内核 TLS）连接把文件
   排进队列，由 flush 随 socket 排空每次读取 64KB，封装成四条满的记录（`fib.FileSealer`）
   再写出。文件入队时就为它预留好要占用的序列号，之后的发送立刻在其后加密，线上顺序保持
   不变。无论文件多大都只占一个加密块的内存；对端读得慢时与明文 `sendfile` 一样被拖住：
@@ -401,9 +402,10 @@ TLS 1.3 或 1.2 的 AES-GCM，TLS 1.2 或 1.1 的 AES-CBC）：
   `ErrWouldBlock` 而不是等对端；剩下的部分用 `OnBody` 接管。
 - **写入不阻塞**：handler 写得比对端读得快时，差额排队在内存中（连接的读取会暂停，但
   handler 本身不会被阻塞）。`SendFile` 发送的文件例外：它只随 socket 的排空读取。
-- **fib 记录层未实现的套件**（ChaCha20-Poly1305 以及其他让连接留在 `crypto/tls` 上的
-  套件）无法随排空发送文件：在那里 `Connection.SendFile` 在返回前读出并加密整段文件，
-  整段都会排队在内存中；`Context.SendFile` 会先问 `Connection.QueuesFiles`，改为分块读取。
+- **留在 `crypto/tls` 上的连接**（TLS 1.0、fib 记录层不接管的套件或配置、以及 TLS 1.2
+  的会话恢复）无法随排空发送文件：在那里 `Connection.SendFile` 在返回前读出并加密整段
+  文件，整段都会排队在内存中；`Context.SendFile` 会先问 `Connection.QueuesFiles`，改为
+  分块读取。
 - **HTTP/2 和 HTTP/3** 同样接受这些 `ResponseWriter` 调用，并以同样的方式用 DATA 帧
   流式输出；在那里，超过客户端流控的写入会等待客户端（见各自的文档）。
 - **transfer coding**：gzip、x-gzip、deflate 会被解码，见
@@ -418,8 +420,6 @@ TLS 1.3 或 1.2 的 AES-GCM，TLS 1.2 或 1.1 的 AES-CBC）：
 
 ## 待优化
 
-- 留在 `crypto/tls` 上的连接（ChaCha20-Poly1305 套件）随 socket 排空发送文件，这需要
-  fib 自己的记录层实现这些套件。
 - `compress`（LZW）transfer coding 的解码器。`compress/lzw` 读的是 GIF、TIFF、PDF 那种
   12 位 code 的变体，而 `compress(1)` 的 code 会增长到 16 位，所以它解不了这类流开头几 KB
   之后的部分；在有自研解码器之前，这个 coding 会被拒绝。
@@ -433,7 +433,8 @@ TLS 1.3 或 1.2 的 AES-GCM，TLS 1.2 或 1.1 的 AES-CBC）：
   请求：带或不带 keep-alive 的 HTTP/1.0、pipelining、格式错误或帧格式冲突的请求、chunk
   扩展），以及 **curl**（`--http1.0`、keep-alive 复用、chunked 上传、sendfile 路径的
   下载、Range、原始 chunked trailer，以及 HTTPS 下载 `ServeFile`、`io.Copy` 和
-  `Context.SendFile`，同一连接和各自一个连接，有内核 TLS 和没有内核 TLS）。
+  `Context.SendFile`，同一连接和各自一个连接，有内核 TLS 和没有内核 TLS，还有 TLS 1.3
+  和 1.2 的 ChaCha20-Poly1305：服务端会检查自己已接管这条连接、能随 socket 排空发送文件）。
 - **fib 客户端**对 Go `net/http` 服务端（`httptest`）和原始服务端（HTTP/1.0 keep-alive
   和以关闭连接结束的响应、格式错误的响应）。
 - **fib 客户端对 fib 服务端**，包括 HTTP/1.0 和 sendfile。
@@ -475,9 +476,10 @@ TLS 1.3 或 1.2 的 AES-GCM，TLS 1.2 或 1.1 的 AES-CBC）：
   检查随排空加密的文件（对端不读时内存不超过一块、与前后发送的顺序、文件过短）和
   `ControlIdle`；`sendfile_windows_test.go` 检查 `TransmitFile`、文件过短和拒绝它的 socket。
 - `tls/file_test.go` 用 `crypto/tls` 客户端检查 TLS 上的 `SendFile`，覆盖 TLS 1.3、
-  TLS 1.2 的 AES-GCM 与 AES-CBC，有内核 TLS 和没有内核 TLS：在 handler 内外调用、前后的
-  发送、对端读得慢并检查堆、文件过短、之后的 `close_notify`、留在 `crypto/tls` 上的连接，
-  以及经内核 TLS 的 KeyUpdate。
+  TLS 1.2 的 AES-GCM、ChaCha20-Poly1305 与 AES-CBC，有内核 TLS 和没有内核 TLS：在 handler
+  内外调用、前后的发送、对端读得慢并检查堆、文件过短、之后的 `close_notify`、留在
+  `crypto/tls` 上的连接，以及经内核 TLS 的 KeyUpdate；由 crypto/tls 自己选到
+  ChaCha20-Poly1305 的用例在带 `GODEBUG=cpu.aes=off` 的子进程里跑。
 
 对端只有标准库和 curl 可执行文件，Go module 不增加任何依赖。CI 中单独的
 **HTTP/1.x conformance** job 在 Linux、macOS、Windows 上运行这些测试，并设置

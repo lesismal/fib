@@ -498,7 +498,7 @@ err = fibtls.Dial(engine, "tcp", "example.com:443", 3*time.Second, tlsConfig, ha
   握手同时在途也不增加协程数；超时由 `HandshakeTimeout`（默认 10 秒）关闭连接。
   - **客户端**（`tls/client13.go`、`tls/client12.go`）：`tls.Config` 的最低版本不低于 TLS 1.2（`MinVersion` 为 0 就是）且不用
     `crypto/tls` 的会话恢复（`ClientSessionCache`）、ECH 时默认走这条路径。同一个 ClientHello 同时提供 TLS 1.3 和 1.2，由服务端选；
-    支持 TLS 1.3 的 AES-GCM 套件和 TLS 1.2 的 ECDHE + AES-GCM / AES-CBC 套件、X25519 / P-256 / P-384、HelloRetryRequest、
+    支持 TLS 1.3 的 AES-GCM 与 ChaCha20-Poly1305 套件和 TLS 1.2 的 ECDHE + AES-GCM / ChaCha20-Poly1305 / AES-CBC 套件、X25519 / P-256 / P-384、HelloRetryRequest、
     ALPN、SNI、扩展主密钥、降级检测、按 `RootCAs` / `InsecureSkipVerify` 校验服务端证书并验证签名（ECDSA、RSA-PSS、
     RSA PKCS#1、Ed25519）、`VerifyPeerCertificate` / `VerifyConnection`、`KeyLogWriter`、`Config.CipherSuites`。服务端要求
     客户端证书时，和 `crypto/tls` 一样出示 `GetClientCertificate` 返回的证书，或 `Certificates` 里第一张符合服务端 CA 列表和签名方案的证书
@@ -511,14 +511,14 @@ err = fibtls.Dial(engine, "tcp", "example.com:443", 3*time.Second, tlsConfig, ha
     `VerifyPeerCertificate`）也在状态机里做，结果和 `crypto/tls` 一致，`ConnectionState` 带 `PeerCertificates` / `VerifiedChains`，
     客户端证书随会话票据保存，恢复的会话同样带上。
     服务端先读完 ClientHello 再决定：客户端不提供 `Config` 范围内的 TLS 1.3 / 1.2（比如只有 TLS 1.0 / 1.1，而 `MinVersion` 允许）、
-    没有 AES-GCM 套件（TLS 1.3）或没有 ECDHE 套件 / 证书能签的签名方案 / 共同曲线（TLS 1.2）的、ClientHello
+    没有记录层能保护的套件（TLS 1.3）或没有 ECDHE 套件 / 证书能签的签名方案 / 共同曲线（TLS 1.2）的、ClientHello
     解析不了的，**在服务端什么都还没发之前**把已收到的字节原样交给 `crypto/tls`，客户端看不出区别。证书按 `crypto/tls` 的规则选：有 `GetCertificate`
     时先问它，否则按 `ServerName` 在 `Certificates` 里选（`SupportsCertificate`）。`GetCertificate` / `GetClientCertificate`
     可能阻塞（autocert 第一次签发要访问 ACME），所以不在驱动握手的协程（engine 的 loop / worker、QUIC 连接的数据处理）上调用，而是交给
     握手池的一个 worker，回调返回后由这个 worker 接着推进状态机；worker 只在回调期间被占用，不像 `crypto/tls` 那样占满整个握手。ALPN 的选择和 `crypto/tls` 一致（包括 HTTP/1.1 客户端连 h2 服务端的特例），
     支持 HelloRetryRequest（1.3）、扩展主密钥、安全重协商标记、降级标记（服务端也支持 1.3 时，1.2 的 ServerHello 随机数结尾带
     `DOWNGRD\x01`）、OCSP / SCT、`CipherSuites`（1.2）、`VerifyConnection`、`KeyLogWriter`。TLS 1.2 只用 ECDHE（AES-GCM、
-    AES-CBC），不支持 RSA 密钥交换（`crypto/tls` 默认也不再提供）。
+    ChaCha20-Poly1305、AES-CBC），不支持 RSA 密钥交换（`crypto/tls` 默认也不再提供）。
     **TCP 上的 0-RTT**（RFC 8446 2.3，默认关闭）：服务端设 `Handler.EarlyData`、被包装的 handler 实现 `EarlyDataHandler` 时，票据带
     `early_data` 扩展（`MaxEarlyData`，默认 16 KiB），收到带 early data 的 ClientHello 就导出早期密钥、在 EncryptedExtensions 里确认，
     随后到达的 early data 记录一到就交给 `OnEarlyData`（在 `OnHandshake` 之后、任何 `OnData` 之前），服务端发完自己的 Finished 之后、
@@ -564,15 +564,15 @@ err = fibtls.Dial(engine, "tcp", "example.com:443", 3*time.Second, tlsConfig, ha
   保留一个只增不减的输入缓冲，一次交给它整轮流水线数据，这个缓冲就会涨到一轮的大小
   并一直留着。2 万连接、1 KiB 消息、每次写 10 条的 TLS 1.3 流水线压测中，服务端内存由
   约 880 MB 降到约 490 MB。
-- 握手由 `crypto/tls` 完成；协商出 TLS 1.3、TLS 1.2 的 AES-GCM 套件，或 TLS 1.2、TLS 1.1 的
-  AES-CBC 套件时，握手之后的记录由
+- 握手由 `crypto/tls` 完成；协商出 TLS 1.3、TLS 1.2 的 AES-GCM 或 ChaCha20-Poly1305 套件，
+  或 TLS 1.2、TLS 1.1 的 AES-CBC 套件时，握手之后的记录由
   本 package 自己的记录层处理，`crypto/tls` 的 `Conn` 随即丢弃：密文在本轮读到的缓冲里原地
   解密、明文直接交给 `OnData`，发送时一次加密进缓冲再交给连接，连接之后只保留两个方向的
   密钥。密钥通过公开的 `Config.KeyLogWriter` 取得（`Handler` 为此克隆一份 Config，原有的
   `KeyLogWriter` 照常收到每一行），握手结束时两个方向的序号，用握手期间 `crypto/tls` 收发的
   记录逐条试解密来确定。TLS 1.3 的 KeyUpdate、alert、close_notify 都由记录层处理；CBC 记录
   的填充和 MAC 按 `crypto/tls` 的做法在常数时间内一并校验，以防 Lucky13 一类的填充预言攻击。
-  其他情况留在 `crypto/tls`：ChaCha20 套件和 TLS 1.0，服务端 Config 设置了
+  其他情况留在 `crypto/tls`：TLS 1.0 和记录层没有的套件，服务端 Config 设置了
   `GetConfigForClient`，客户端 Config 设置了 `ClientSessionCache` 或开启了重协商，以及 TLS 1.2、
   1.1 的会话恢复（这时 `crypto/tls` 不输出密钥）。3 个 CPU、2 万连接、1 KiB 消息的压测中，echo 吞吐不变，每次
   echo 的服务端 CPU 下降约 20%；TLS 1.3 的内存在 echo 阶段由约 360 MB 降到约 260 MB，流水线
@@ -1295,7 +1295,8 @@ QUIC 层的实现要点：
 
 - 包保护支持 TLS 1.3 的三种套件：AES-128-GCM、AES-256-GCM 和
   ChaCha20-Poly1305（标准库没有导出 ChaCha20-Poly1305 AEAD，本库按 RFC 8439 自行实现，
-  用 RFC 9001 附录的测试向量校验，并在带 `GODEBUG=cpu.aes=off` 的子进程里做端到端
+  放在 `internal/chacha20poly1305`，QUIC 的包保护与头部保护和 TLS 的记录层共用；用
+  RFC 9001 附录的测试向量校验，并在带 `GODEBUG=cpu.aes=off` 的子进程里做端到端
   握手测试；块函数与认证器都针对纯 Go 调过，1200 字节的包 seal 约 548 MiB/s）；
   密钥更新（key update）双向支持：一把密钥保护的
   包数达到 RFC 9001 §6.6 的上限时（或设置了 `KeyUpdateInterval` 时按时间）主动发起，

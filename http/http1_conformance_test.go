@@ -984,6 +984,69 @@ func TestHTTP1ConformanceServerHTTPSDownloadWithCurl(t *testing.T) {
 	}
 }
 
+// curl downloads a file over ChaCha20-Poly1305, in TLS 1.3 and 1.2. fib's
+// record layer protects the suite now, so the server takes the connection over
+// and sends the file as the socket drains, which a connection left on crypto/tls
+// could not do: the handler checks both. TLS 1.2 is what the server offers curl,
+// and TLS 1.3 is forced by curl, since a server cannot restrict those suites.
+func TestHTTP1ConformanceServerHTTPSChaCha20WithCurl(t *testing.T) {
+	curl := requireCurl(t)
+	if out, _ := exec.Command(curl, "--help", "all").Output(); !strings.Contains(string(out), "--tls13-ciphers") {
+		t.Skip("curl has no --tls13-ciphers")
+	}
+	path, data := randomFile(t, 2<<20+77)
+	for _, tc := range []struct {
+		name    string
+		version uint16
+		suite   uint16
+		args    []string
+	}{
+		{"TLS13", tls.VersionTLS13, tls.TLS_CHACHA20_POLY1305_SHA256,
+			[]string{"--tls13-ciphers", "TLS_CHACHA20_POLY1305_SHA256", "--tls-max", "1.3"}},
+		{"TLS12", tls.VersionTLS12, tls.TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256, nil},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			serverConfig, _, err := tlstest.Configs()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if tc.version == tls.VersionTLS12 {
+				// Only the suite curl is to settle on, so that it does.
+				serverConfig.MaxVersion = tls.VersionTLS12
+				serverConfig.CipherSuites = []uint16{tc.suite}
+			}
+			config := DefaultConfig()
+			config.DisableHTTP2 = true
+			files := fileHandler(path)
+			handler := HandlerFunc(func(c *Context) {
+				if !c.Conn.QueuesFiles() {
+					t.Error("the connection cannot carry a file as it drains")
+				}
+				state, ok := fibtls.ConnectionState(c.Conn)
+				if !ok || state.Version != tc.version || state.CipherSuite != tc.suite {
+					t.Errorf("ConnectionState %v: version %#04x suite %#04x, want %#04x %#04x",
+						ok, state.Version, state.CipherSuite, tc.version, tc.suite)
+				}
+				files(c)
+			})
+			addr := serve(t, fibtls.NewServer(serverConfig, NewHandlerWithConfig(config, handler)))
+			dst := filepath.Join(t.TempDir(), "download")
+			args := append([]string{"--insecure", "--http1.1", "--verbose", "--output", dst}, tc.args...)
+			_, stderr := runCurl(t, curl, append(args, "https://"+addr+"/file")...)
+			if !strings.Contains(stderr, "CHACHA20") {
+				t.Fatalf("curl did not settle on ChaCha20-Poly1305:\n%s", stderr)
+			}
+			got, err := os.ReadFile(dst)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !bytes.Equal(got, data) {
+				t.Fatalf("%d bytes differ from the file", len(got))
+			}
+		})
+	}
+}
+
 func sha256Of(b []byte) []byte {
 	sum := sha256.Sum256(b)
 	return sum[:]

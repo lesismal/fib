@@ -479,8 +479,8 @@ Windows run at most two `TransmitFile` calls at once system-wide and queue the
 rest, as they do for Go's `net` package; server editions have no such limit.
 
 Over TLS (`tls.NewServer` or `tls.Dial`, once the handshake is done and the
-connection's records are protected by fib's own record layer: AES-GCM over
-TLS 1.3 or 1.2, AES-CBC over TLS 1.2 or 1.1):
+connection's records are protected by fib's own record layer: AES-GCM or
+ChaCha20-Poly1305 over TLS 1.3 or 1.2, AES-CBC over TLS 1.2 or 1.1):
 
 - **On Linux with kernel TLS**, the first file a connection sends over an
   AES-GCM suite hands the sealing of everything it sends from then on to the
@@ -497,15 +497,16 @@ TLS 1.3 or 1.2, AES-CBC over TLS 1.2 or 1.1):
   ends the connection instead. Reading stays in user space. A kernel without
   the `tls` module, or one the process may not load, is noted once and
   never asked again. `tls.Handler.NoKernelTLS` turns the switch off.
-- **Otherwise** (macOS, the BSDs, Windows, AES-CBC suites, or kernel TLS off or
-  missing) the connection queues the file and its flush reads it 64KB at a
-  time as the socket drains, seals each chunk into four full records
-  (`fib.FileSealer`), and writes them. The records the file will take are set
-  aside in the sequence when it is queued, so whatever is sent after it is
-  sealed at once behind them and the order on the wire is kept. A file costs
-  one sealed chunk of memory however large it is, and a slow reader holds it
-  up exactly as plain `sendfile` does: the rest stays in the file, counted in
-  the backlog for `NotifyOutput`, `OnWritable` and the write deadline.
+- **Otherwise** (macOS, the BSDs, Windows, ChaCha20-Poly1305 and AES-CBC
+  suites, or kernel TLS off or missing) the connection queues the file and its
+  flush reads it 64KB at a time as the socket drains, seals each chunk into
+  four full records (`fib.FileSealer`), and writes them. The records the file
+  will take are set aside in the sequence when it is queued, so whatever is
+  sent after it is sealed at once behind them and the order on the wire is
+  kept. A file costs one sealed chunk of memory however large it is, and a
+  slow reader holds it up exactly as plain `sendfile` does: the rest stays in
+  the file, counted in the backlog for `NotifyOutput`, `OnWritable` and the
+  write deadline.
 
 A file shorter than its range closes the connection in every case, since the
 peer was promised the whole range.
@@ -580,12 +581,12 @@ not such a CONNECT.
   queues the difference in memory (reads on the connection pause, but the
   handler is not held back). Files sent with `SendFile` are the exception:
   they are read only as the socket drains.
-- **Suites fib's record layer does not implement** (ChaCha20-Poly1305 and
-  the others that keep a connection on `crypto/tls`) cannot carry a file as it
-  drains: there `Connection.SendFile` reads the range and encrypts it before
-  returning, so the whole range is queued in memory, and `Context.SendFile`,
-  which asks `Connection.QueuesFiles` first, reads it a piece at a time
-  instead.
+- **Connections that stay on `crypto/tls`** (TLS 1.0, a suite or a
+  configuration fib's record layer does not take over, and TLS 1.2 resumption)
+  cannot carry a file as it drains: there `Connection.SendFile` reads the range
+  and encrypts it before returning, so the whole range is queued in memory, and
+  `Context.SendFile`, which asks `Connection.QueuesFiles` first, reads it a
+  piece at a time instead.
 - **HTTP/2 and HTTP/3** accept the same `ResponseWriter` calls and stream the
   same way, in DATA frames; there a write that outruns the client's flow
   control does wait for it (see their documents).
@@ -602,9 +603,6 @@ not such a CONNECT.
 
 ## Planned improvements
 
-- File sending that drains with the socket on connections that stay on
-  `crypto/tls` (ChaCha20-Poly1305 suites), which needs those suites in fib's
-  own record layer.
 - A `compress` (LZW) transfer coding decoder. `compress/lzw` reads the
   12-bit-code variants of GIF, TIFF and PDF, while `compress(1)` grows codes
   to 16 bits, so it cannot decode one of those streams past its first few
@@ -622,7 +620,9 @@ are not fib:
   and **curl** (`--http1.0`, keep-alive reuse, chunked upload, downloads of the
   sendfile path, ranges, raw chunked trailers, and HTTPS downloads of
   `ServeFile`, `io.Copy` and `Context.SendFile`, on one connection and on one
-  each, with kernel TLS and without).
+  each, with kernel TLS and without, and over ChaCha20-Poly1305 in TLS 1.3 and
+  1.2, where the server checks that it took the connection over and can send
+  the file as the socket drains).
 - **fib client** against Go's `net/http` server (`httptest`) and raw servers
   (HTTP/1.0 keep-alive and close-delimited responses, malformed responses).
 - **fib client against fib server**, including HTTP/1.0 and sendfile.
@@ -686,10 +686,12 @@ are not fib:
   `sendfile_windows_test.go` checks `TransmitFile`, a short file and a socket
   that refuses it.
 - `tls/file_test.go` checks `SendFile` over TLS against `crypto/tls` clients,
-  for TLS 1.3, AES-GCM and AES-CBC over TLS 1.2, with kernel TLS and without:
-  from the handler and outside it, sends before and after, a slow reader with
-  the heap checked, a short file, `close_notify` after it, a connection left
-  on `crypto/tls`, and a KeyUpdate through kernel TLS.
+  for TLS 1.3, AES-GCM, ChaCha20-Poly1305 and AES-CBC over TLS 1.2, with kernel
+  TLS and without: from the handler and outside it, sends before and after, a
+  slow reader with the heap checked, a short file, `close_notify` after it, a
+  connection left on `crypto/tls`, and a KeyUpdate through kernel TLS. The
+  ChaCha20-Poly1305 cases where crypto/tls picks the suite itself run in a
+  child process with `GODEBUG=cpu.aes=off`.
 
 The peers are the standard library and the curl binary, so the Go module takes
 no new dependency. CI runs the suite as its own job, **HTTP/1.x conformance**,

@@ -166,7 +166,7 @@ func covConnLayer(c *fib.Connection, owner *Handler) *layer {
 
 func covConnKeys(t *testing.T) *recordKeys {
 	t.Helper()
-	k, err := newKeys13(16, sha256.New, bytes.Repeat([]byte{7}, 32))
+	k, err := newKeys13(suite{keyLen: 16, hash: sha256.New}, sha256.New, bytes.Repeat([]byte{7}, 32))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -407,19 +407,21 @@ func TestCovConnBlockingCloseAfterSendInOpen(t *testing.T) {
 	}
 }
 
-// A suite crypto/tls keeps protecting (ChaCha20-Poly1305): SendParts joins its
-// parts into one record, and CloseAfterSend after the handshake has crypto/tls
-// send close_notify.
+// A connection crypto/tls keeps, because the Config has GetConfigForClient and
+// its own Config would log the keys instead (see fastConfig): SendParts joins
+// its parts into one record, and CloseAfterSend after the handshake has
+// crypto/tls send close_notify.
 func TestCovConnCryptoTLSRecords(t *testing.T) {
 	serverConfig, clientConfig := tlsConfigs(t)
 	chacha := []uint16{stdtls.TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305}
 	serverConfig.MaxVersion, serverConfig.CipherSuites = stdtls.VersionTLS12, chacha
 	clientConfig.MaxVersion, clientConfig.CipherSuites = stdtls.VersionTLS12, chacha
+	serverConfig.GetConfigForClient = func(*stdtls.ClientHelloInfo) (*stdtls.Config, error) { return nil, nil }
 	states := make(chan stdtls.ConnectionState, 1)
 	r := newCovConnRecorder()
 	r.onData = func(c *fib.Connection, b []byte) {
 		if l := c.Layer().(*layer); l.tx != nil {
-			t.Error("the connection took a ChaCha20 suite over from crypto/tls")
+			t.Error("the connection took a suite over from crypto/tls")
 		}
 		if err := c.Layer().(*layer).Send(nil, nil); err != nil {
 			t.Errorf("an empty send: %v", err)

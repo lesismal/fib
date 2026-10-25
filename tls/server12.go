@@ -25,17 +25,24 @@ import (
 // scheme the key signs with. Key exchange by RSA, which crypto/tls no longer
 // offers by default either, and the rest stay with crypto/tls.
 
-// serverSuites12 are the TLS 1.2 suites in the server's order of preference,
-// as crypto/tls ranks the ones the record layer protects, and whether each
-// signs with an ECDSA (or Ed25519) key and not an RSA one.
-var serverSuites12 = []struct {
+// suite12 is a TLS 1.2 suite the server offers and whether it signs with an
+// ECDSA (or Ed25519) key and not an RSA one.
+type suite12 struct {
 	id    uint16
 	ecdsa bool
-}{
+}
+
+// serverSuites12 are the TLS 1.2 suites in the server's order of preference,
+// as crypto/tls ranks the ones the record layer protects where the CPU has
+// AES-GCM: AEADs first. serverSuites12NoAES puts ChaCha20-Poly1305 first, for a
+// CPU without AES-GCM.
+var serverSuites12 = []suite12{
 	{stdtls.TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256, true},
 	{stdtls.TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256, false},
 	{stdtls.TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384, true},
 	{stdtls.TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384, false},
+	{stdtls.TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256, true},
+	{stdtls.TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256, false},
 	{stdtls.TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA, false},
 	{stdtls.TLS_ECDHE_ECDSA_WITH_AES_128_CBC_SHA, true},
 	{stdtls.TLS_ECDHE_RSA_WITH_AES_256_CBC_SHA, false},
@@ -43,6 +50,8 @@ var serverSuites12 = []struct {
 	{stdtls.TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA256, false},
 	{stdtls.TLS_ECDHE_ECDSA_WITH_AES_128_CBC_SHA256, true},
 }
+
+var serverSuites12NoAES = chachaFirst(serverSuites12, func(s suite12) uint16 { return s.id })
 
 // plan12 is what a TLS 1.2 handshake with a client will use.
 type plan12 struct {
@@ -84,7 +93,11 @@ func (h *serverHS) plan12(ch *clientHelloMsg) (*plan12, *hsError) {
 		return nil, nil
 	}
 	p := &plan12{cert: cert, alg: alg}
-	for _, s := range serverSuites12 {
+	preferred := serverSuites12
+	if !aesGCMHardware || !peerPrefersAESGCM(ch.suites) {
+		preferred = serverSuites12NoAES
+	}
+	for _, s := range preferred {
 		if s.ecdsa != ecdsaKey || !slices.Contains(ch.suites, s.id) || !h.allowsSuite12(s.id) {
 			continue
 		}

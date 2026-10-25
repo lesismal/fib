@@ -346,8 +346,10 @@
   但隔着 internal 包和标准库内部的 `golang.org/x/crypto` 副本，标准库之外的模块 import
   不到；`crypto/cipher` 也没有），所以是本库自己的实现。现在在纯 Go 范围内写得更快：
   块函数的 16 个字放在变量里而不是数组里，密钥流按 8 字节一次异或，认证器就地初始化、
-  不再每个包分配一次。实测 1200 字节的包 seal 从 355 到 548 MiB/s、open 从 358 到
-  551 MiB/s，16 KiB 从 398 到 682 MiB/s，一次头部保护的块函数从 141 到 78 纳秒。
+  不再每个包分配一次。实现放在 `internal/chacha20poly1305`，TLS 记录层保护
+  TLS_CHACHA20_POLY1305_SHA256 和 RFC 7905 套件也用它。实测 1200 字节的包 seal 从 355
+  到 548 MiB/s、open 从 358 到 551 MiB/s，16 KiB 从 398 到 682 MiB/s，一次头部保护的
+  块函数从 141 到 78 纳秒。
   汇编（AVX2/NEON）还能更快，但那是分架构、常量时间容易写错的一大块代码，而只有没有
   AES 硬件的机器才会优先协商这个套件，所以没有写。这条路径现在有端到端测试：
   `TestChaCha20Poly1305Handshake` 在带 `GODEBUG=cpu.aes=off` 的子进程里跑握手

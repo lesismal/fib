@@ -388,7 +388,10 @@ func TestServerFallsBackForClientsItDoesNotServe(t *testing.T) {
 			func(h *clientHS) { h.suites12 = []uint16{stdtls.TLS_RSA_WITH_AES_128_GCM_SHA256} }), "fallback"},
 		{"TLS 1.2 with an RSA suite for an ECDSA certificate", helloOf(t, pool, func(c *stdtls.Config) { c.MaxVersion = stdtls.VersionTLS12 },
 			func(h *clientHS) { h.suites12 = []uint16{stdtls.TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256} }), "fallback"},
-		{"no AES-GCM suite", helloOf(t, pool, nil, func(h *clientHS) { h.suites = []uint16{stdtls.TLS_CHACHA20_POLY1305_SHA256} }), "fallback"},
+		{"ChaCha20-Poly1305 only", helloOf(t, pool, nil, func(h *clientHS) { h.suites = []uint16{stdtls.TLS_CHACHA20_POLY1305_SHA256} }), "serve"},
+		// TLS_AES_128_CCM_SHA256 (RFC 8446 appendix B.4), which the record
+		// layer has no AEAD for.
+		{"no suite the record layer has", helloOf(t, pool, nil, func(h *clientHS) { h.suites = []uint16{0x1304} }), "fallback"},
 		{"no group in common", helloOf(t, pool, func(c *stdtls.Config) { c.CurvePreferences = []stdtls.CurveID{stdtls.CurveP384} }, nil), "fallback"},
 		{"not a handshake", []byte("GET / HTTP/1.1\r\n\r\n"), "fallback"},
 		{"an SSLv2 hello", []byte{0x80, 0x1c, 0x01, 0x03, 0x01, 0, 0, 0, 0, 0, 0, 0}, "fallback"},

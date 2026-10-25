@@ -155,7 +155,7 @@ func s13AfterFlight(t *testing.T, config *stdtls.Config, pool *x509.CertPool) (*
 	if herr != nil || consumed != len(hello) || done || len(out) == 0 || srv.state != srvAwaitFinished {
 		t.Fatalf("server: consumed %d of %d, done %v, state %d, %v", consumed, len(hello), done, srv.state, herr)
 	}
-	keys, err := newKeys13(srv.suite.keyLen, srv.suite.hash, srv.clientHS)
+	keys, err := newKeys13(srv.suite, srv.suite.hash, srv.clientHS)
 	if err != nil {
 		t.Fatal(err)
 	}

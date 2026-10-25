@@ -9,8 +9,10 @@ import (
 	"math/rand"
 	"net"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -125,6 +127,7 @@ var fileSuites = []struct {
 	{"TLS13", stdtls.VersionTLS13, 0},
 	{"TLS12-AES128-GCM", stdtls.VersionTLS12, stdtls.TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256},
 	{"TLS12-AES256-GCM", stdtls.VersionTLS12, stdtls.TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384},
+	{"TLS12-CHACHA20", stdtls.VersionTLS12, stdtls.TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256},
 	{"TLS12-AES128-CBC", stdtls.VersionTLS12, stdtls.TLS_ECDHE_ECDSA_WITH_AES_128_CBC_SHA256},
 }
 
@@ -201,47 +204,66 @@ func TestSendFileOverTLS(t *testing.T) {
 
 // A file sent to a client that reads nothing yet takes no more memory than a
 // chunk sealed, the rest of it waiting in the file, and reaches the client
-// whole once it reads, slowly at first.
+// whole once it reads, slowly at first: over AES-GCM, sealed on the layer's own
+// record layer or, where the kernel has TLS, in the kernel, and over
+// ChaCha20-Poly1305, which the kernel's TLS has no suite for and only the
+// layer seals, so that draining it is what the suite being on the layer buys.
 func TestSendFileOverTLSSlowReader(t *testing.T) {
 	const size = 48 << 20
 	f, data := writeFile(t, size)
-	for _, kernel := range []bool{true, false} {
-		t.Run(map[bool]string{true: "kernel", false: "userland"}[kernel], func(t *testing.T) {
-			layers, config, addr := fileServer(t, kernel, stdtls.VersionTLS13, 0, nil)
+	for _, tc := range []struct {
+		name           string
+		version, suite uint16
+		kernel         bool
+	}{
+		{"TLS13/kernel", stdtls.VersionTLS13, 0, true},
+		{"TLS13/userland", stdtls.VersionTLS13, 0, false},
+		{"TLS12-CHACHA20/kernel", stdtls.VersionTLS12, stdtls.TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256, true},
+		{"TLS12-CHACHA20/userland", stdtls.VersionTLS12, stdtls.TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			layers, config, addr := fileServer(t, tc.kernel, tc.version, tc.suite, nil)
 			conn := dialFileServer(t, addr, config)
-			l := <-layers
-			var before, after runtime.MemStats
-			runtime.GC()
-			runtime.ReadMemStats(&before)
-			if err := l.c.SendFile(f, 0, size); err != nil {
-				t.Fatal(err)
-			}
-			time.Sleep(200 * time.Millisecond)
-			runtime.GC()
-			runtime.ReadMemStats(&after)
-			if grown := int64(after.HeapInuse) - int64(before.HeapInuse); grown > 8<<20 {
-				t.Fatalf("the heap grew by %d bytes with a %d-byte file unread", grown, size)
-			}
-			got := make([]byte, size)
-			// Slowly at first, a little at a time.
-			read := 0
-			for i := 0; i < 50; i++ {
-				n, err := conn.Read(got[read:min(read+4096, size)])
-				if err != nil {
-					t.Fatal(err)
-				}
-				read += n
-				time.Sleep(2 * time.Millisecond)
-			}
-			if _, err := io.ReadFull(conn, got[read:]); err != nil {
-				t.Fatal(err)
-			}
-			if !bytes.Equal(got, data) {
-				t.Fatal("the client read other bytes than the file's")
-			}
-			wantKernel(t, l, kernel)
+			slowReaderFile(t, <-layers, conn, f, data, size, tc.kernel)
 		})
 	}
+}
+
+// slowReaderFile sends a file of size bytes over l to a client that reads
+// nothing for a moment, checks that the heap does not hold it, and then reads
+// it all back through conn, slowly at first.
+func slowReaderFile(t *testing.T, l *layer, conn net.Conn, f *os.File, data []byte, size int, kernel bool) {
+	t.Helper()
+	var before, after runtime.MemStats
+	runtime.GC()
+	runtime.ReadMemStats(&before)
+	if err := l.c.SendFile(f, 0, int64(size)); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(200 * time.Millisecond)
+	runtime.GC()
+	runtime.ReadMemStats(&after)
+	if grown := int64(after.HeapInuse) - int64(before.HeapInuse); grown > 8<<20 {
+		t.Fatalf("the heap grew by %d bytes with a %d-byte file unread", grown, size)
+	}
+	got := make([]byte, size)
+	// Slowly at first, a little at a time.
+	read := 0
+	for i := 0; i < 50; i++ {
+		n, err := conn.Read(got[read:min(read+4096, size)])
+		if err != nil {
+			t.Fatal(err)
+		}
+		read += n
+		time.Sleep(2 * time.Millisecond)
+	}
+	if _, err := io.ReadFull(conn, got[read:]); err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, data) {
+		t.Fatal("the client read other bytes than the file's")
+	}
+	wantKernel(t, l, kernel)
 }
 
 // A file shorter than its range ends the connection, after what it had, and
@@ -265,13 +287,19 @@ func TestSendFileOverTLSShortFile(t *testing.T) {
 	}
 }
 
-// A connection that stays with crypto/tls, over a suite this package does not
-// seal, cannot carry a file, and SendFile reads it through the layer instead.
+// A connection that stays with crypto/tls, because its Config has
+// GetConfigForClient and the handshake logs its keys to a Config of its own,
+// cannot carry a file, and SendFile reads it through the layer instead.
 func TestSendFileThroughCryptoTLS(t *testing.T) {
 	const size = 200<<10 + 1
 	f, data := writeFile(t, size)
-	layers, config, addr := fileServer(t, true, stdtls.VersionTLS12, stdtls.TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256, nil)
-	conn := dialFileServer(t, addr, config)
+	serverConfig, clientConfig := suiteConfigs(t, stdtls.VersionTLS12, stdtls.TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256)
+	serverConfig.GetConfigForClient = func(*stdtls.ClientHelloInfo) (*stdtls.Config, error) { return nil, nil }
+	layers := make(layerOf, 4)
+	h := NewServer(serverConfig, &settledHandler{layers: layers})
+	h.NoKernelTLS = true
+	_, addr := startEchoServer(t, fib.DefaultConfig(), h)
+	conn := dialFileServer(t, addr, clientConfig)
 	l := <-layers
 	if l.CanSendFile() || l.c.QueuesFiles() {
 		t.Fatal("a connection on crypto/tls says it can carry a file")
@@ -333,5 +361,94 @@ func TestKernelTLSKeyUpdate(t *testing.T) {
 		if _, err := io.ReadFull(conn, back); err != nil || !bytes.Equal(back, msg) {
 			t.Fatalf("after the key update: %v", err)
 		}
+	}
+}
+
+// A connection whose handshake runs through crypto/tls and settles on
+// ChaCha20-Poly1305 leaves it for the layer as the AES-GCM ones do, and a file
+// sent over it drains with the socket: the heap does not hold the file while
+// the peer reads nothing. crypto/tls picks its TLS 1.3 suites from whether the
+// CPU has AES-GCM instructions, once at startup, so the test runs itself again
+// with GODEBUG=cpu.aes=off for the TLS 1.3 case, where both ends prefer
+// ChaCha20; the TLS 1.2 case only has to be offered the suite.
+func TestSendFileOverTLSChaCha20(t *testing.T) {
+	if os.Getenv("FIB_TLS_CHACHA20") == "1" {
+		testSendFileOverTLSChaCha20(t)
+		return
+	}
+	cmd := exec.Command(os.Args[0], "-test.run=^TestSendFileOverTLSChaCha20$", "-test.v")
+	// cpu.aes=off goes with whatever else GODEBUG was set to, since a second
+	// GODEBUG variable in the environment is not what the child reads.
+	env := os.Environ()
+	for i, kv := range env {
+		if strings.HasPrefix(kv, "GODEBUG=") {
+			env[i] += ",cpu.aes=off"
+			break
+		}
+		if i == len(env)-1 {
+			env = append(env, "GODEBUG=cpu.aes=off")
+		}
+	}
+	if len(env) == 0 {
+		env = append(env, "GODEBUG=cpu.aes=off")
+	}
+	cmd.Env = append(env, "FIB_TLS_CHACHA20=1")
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("the file over ChaCha20-Poly1305 failed: %v\n%s", err, out)
+	}
+}
+
+// testSendFileOverTLSChaCha20 is the body of TestSendFileOverTLSChaCha20, which
+// the child process runs.
+func testSendFileOverTLSChaCha20(t *testing.T) {
+	const size = 48 << 20
+	f, data := writeFile(t, size)
+	for _, tc := range []struct {
+		name    string
+		version uint16
+		suite   uint16
+	}{
+		{"TLS13", stdtls.VersionTLS13, 0},
+		{"TLS12", stdtls.VersionTLS12, stdtls.TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			serverConfig, clientConfig := suiteConfigs(t, tc.version, tc.suite)
+			layers := make(layerOf, 4)
+			h := NewServer(serverConfig, &settledHandler{layers: layers})
+			// Through crypto/tls, where such a connection stayed before the
+			// record layer had the suite.
+			h.Blocking = true
+			_, addr := startEchoServer(t, fib.DefaultConfig(), h)
+			conn := dialFileServer(t, addr, clientConfig)
+			l := <-layers
+			want := stdtls.TLS_CHACHA20_POLY1305_SHA256
+			if tc.suite != 0 {
+				want = tc.suite
+			}
+			if state := conn.ConnectionState(); state.CipherSuite != want {
+				t.Fatalf("the client settled on %#04x, want %#04x", state.CipherSuite, want)
+			}
+			if !taken(l) {
+				t.Fatal("the connection stayed on crypto/tls")
+			}
+			if !l.CanSendFile() || !l.c.QueuesFiles() {
+				t.Fatal("the connection cannot carry a file as it drains")
+			}
+			slowReaderFile(t, l, conn, f, data, size, true)
+			if tc.version == stdtls.VersionTLS13 {
+				// A KeyUpdate derives the next generation of ChaCha20 keys,
+				// and what follows is sealed and opened under them, the
+				// client's own under its next keys too.
+				requestKeyUpdate(t, l)
+				msg := bytes.Repeat([]byte("k"), 4000)
+				if err := l.c.Send(msg); err != nil {
+					t.Fatal(err)
+				}
+				back := make([]byte, len(msg))
+				if _, err := io.ReadFull(conn, back); err != nil || !bytes.Equal(back, msg) {
+					t.Fatalf("after the key update: %v", err)
+				}
+			}
+		})
 	}
 }

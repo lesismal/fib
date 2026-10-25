@@ -120,8 +120,8 @@ func recordPair(t *testing.T, version, id uint16) (seal, open *recordKeys) {
 	}
 	if version == stdtls.VersionTLS13 {
 		secret := bytes.Repeat([]byte{9}, s.hash().Size())
-		seal, _ = newKeys13(s.keyLen, s.hash, secret)
-		open, _ = newKeys13(s.keyLen, s.hash, secret)
+		seal, _ = newKeys13(s, s.hash, secret)
+		open, _ = newKeys13(s, s.hash, secret)
 		return seal, open
 	}
 	master, cr, sr := bytes.Repeat([]byte{1}, 48), bytes.Repeat([]byte{2}, 32), bytes.Repeat([]byte{3}, 32)

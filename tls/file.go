@@ -26,6 +26,8 @@ import (
 // it can be sealed at once behind them, and each chunk is sealed under them
 // as it is read. Its chunks are a whole number of records' plaintext, so every
 // record but the last is full and the count is known from the length alone.
+// ChaCha20-Poly1305 is always sealed here, the kernel's TLS having no suite
+// for it.
 
 // kernelTLSMissing records that the kernel has no TLS to give, or will not
 // give it to this process, so that no connection asks again.

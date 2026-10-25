@@ -592,9 +592,10 @@ immediately without waiting for the handler to return. SSE and large downloads w
 - The connection duplicates the file descriptor, so `f` may be closed immediately.
 - A file shorter than declared closes the connection (the peer is waiting for those bytes).
 - Over TLS, on Linux with kernel TLS and an AES-GCM suite, the first file hands sealing to the
-  kernel and goes by `sendfile(2)`; otherwise it is read and sealed 64KB at a time as the socket
-  drains, so memory stays bounded either way. Only connections left on `crypto/tls`
-  (ChaCha20-Poly1305) read the whole range through the layer before returning. See
+  kernel and goes by `sendfile(2)`; otherwise, including over ChaCha20-Poly1305, it is read and
+  sealed 64KB at a time as the socket drains, so memory stays bounded either way. Only
+  connections left on `crypto/tls` (TLS 1.0, and the suites and configurations the record layer
+  does not take over) read the whole range through the layer before returning. See
   [HTTP/1](http1.md#zero-copy-file-sending).
 - On Windows the range goes by `TransmitFile`.
 - Ranges under 16KB are copied directly in HTTP, which is cheaper than an extra system call.

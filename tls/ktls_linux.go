@@ -29,10 +29,10 @@ const (
 )
 
 // kernelTLSFits reports whether the kernel's TLS can take over sealing under
-// k: AES-GCM, of TLS 1.3 or 1.2.
+// k: AES-GCM, of TLS 1.3 or 1.2. It has no ChaCha20-Poly1305, which must stay
+// sealed here.
 func kernelTLSFits(k *recordKeys) bool {
-	return !kernelTLSMissing.Load() && (k.mode == modeGCM13 || k.mode == modeGCM12) &&
-		(len(k.key) == 16 || len(k.key) == 32)
+	return !kernelTLSMissing.Load() && k.kernelAESGCM() && (len(k.key) == 16 || len(k.key) == 32)
 }
 
 // startKernelTLS hands the sealing of what is sent on fd to the kernel, under

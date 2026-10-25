@@ -87,10 +87,28 @@ func sClient(t *testing.T, openssl, addr string, args []string, lines string) st
 	return out.String()
 }
 
+// TestServerTakesEarlyDataFromOpenSSL has OpenSSL's s_client send early data
+// over TLS 1.3 in both of the suites this package protects: AES-GCM's, and
+// ChaCha20-Poly1305's, whose early keys are its AEAD's.
 func TestServerTakesEarlyDataFromOpenSSL(t *testing.T) {
 	openssl := opensslClient(t)
+	for _, tc := range []struct {
+		name string
+		args []string
+	}{
+		{"AES-GCM", nil},
+		{"ChaCha20-Poly1305", []string{"-ciphersuites", "TLS_CHACHA20_POLY1305_SHA256"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			testServerTakesEarlyDataFromOpenSSL(t, openssl, tc.args)
+		})
+	}
+}
+
+func testServerTakesEarlyDataFromOpenSSL(t *testing.T, openssl string, suiteArgs []string) {
 	serverConfig, _ := tlsConfigs(t)
 	serverConfig.MinVersion = 0
+	args := func(more ...string) []string { return append(append([]string{}, suiteArgs...), more...) }
 	for _, tc := range []struct {
 		name  string
 		early bool
@@ -101,7 +119,7 @@ func TestServerTakesEarlyDataFromOpenSSL(t *testing.T) {
 			_, addr := startEchoServer(t, fib.DefaultConfig(), handler)
 			dir := t.TempDir()
 			session := filepath.Join(dir, "session")
-			first := sClient(t, openssl, addr, []string{"-sess_out", session}, "first\n")
+			first := sClient(t, openssl, addr, args("-sess_out", session), "first\n")
 			if !strings.Contains(first, "data:first") {
 				t.Fatalf("first connection: %s", first)
 			}
@@ -109,7 +127,7 @@ func TestServerTakesEarlyDataFromOpenSSL(t *testing.T) {
 			if err := os.WriteFile(earlyFile, []byte("zero-rtt\n"), 0o600); err != nil {
 				t.Fatal(err)
 			}
-			second := sClient(t, openssl, addr, []string{"-sess_in", session, "-early_data", earlyFile}, "second\n")
+			second := sClient(t, openssl, addr, args("-sess_in", session, "-early_data", earlyFile), "second\n")
 			t.Log(second)
 			if !strings.Contains(second, "Reused, TLSv1.3") {
 				t.Fatalf("the session was not resumed: %s", second)
@@ -129,7 +147,7 @@ func TestServerTakesEarlyDataFromOpenSSL(t *testing.T) {
 			}
 			// The same session again, as a replay of the first would be: the
 			// handshake resumes, and the early data is turned away.
-			replay := sClient(t, openssl, addr, []string{"-sess_in", session, "-early_data", earlyFile}, "third\n")
+			replay := sClient(t, openssl, addr, args("-sess_in", session, "-early_data", earlyFile), "third\n")
 			if !strings.Contains(replay, "Early data was rejected") || strings.Contains(replay, "early:zero-rtt") {
 				t.Fatalf("a replay: %s", replay)
 			}
@@ -186,7 +204,29 @@ func resumingClient(t *testing.T, engine *fib.Engine, addr string, config *stdtl
 	}
 }
 
+// TestClientSendsEarlyData has two engines send early data to each other in
+// both TLS 1.3 suites the record layer protects: the early keys are derived as
+// the traffic keys are, and are the suite's AEAD's.
 func TestClientSendsEarlyData(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		chacha bool
+	}{
+		{"AES-GCM", false},
+		{"ChaCha20-Poly1305", true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if tc.chacha {
+				old := aesGCMHardware
+				defer func() { aesGCMHardware = old }()
+				aesGCMHardware = false
+			}
+			testClientSendsEarlyData(t)
+		})
+	}
+}
+
+func testClientSendsEarlyData(t *testing.T) {
 	serverConfig, clientConfig := tlsConfigs(t)
 	clientConfig.MinVersion = stdtls.VersionTLS13
 	for _, tc := range []struct {
@@ -243,8 +283,31 @@ func TestClientSendsEarlyData(t *testing.T) {
 }
 
 // TestClientEarlyDataToOpenSSL sends early data to OpenSSL's s_server.
+// TestClientEarlyDataToOpenSSL sends early data to OpenSSL's s_server in both
+// TLS 1.3 suites this package protects, so that both its AEADs' early keys are
+// checked against a peer that is not this package.
 func TestClientEarlyDataToOpenSSL(t *testing.T) {
 	openssl := opensslClient(t)
+	for _, tc := range []struct {
+		name   string
+		args   []string
+		chacha bool
+	}{
+		{"AES-GCM", nil, false},
+		{"ChaCha20-Poly1305", []string{"-ciphersuites", "TLS_CHACHA20_POLY1305_SHA256"}, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if tc.chacha {
+				old := aesGCMHardware
+				defer func() { aesGCMHardware = old }()
+				aesGCMHardware = false
+			}
+			testClientEarlyDataToOpenSSL(t, openssl, tc.args)
+		})
+	}
+}
+
+func testClientEarlyDataToOpenSSL(t *testing.T, openssl string, suiteArgs []string) {
 	serverConfig, clientConfig := tlsConfigs(t)
 	clientConfig.MinVersion = stdtls.VersionTLS13
 	cert := serverConfig.Certificates[0]
@@ -267,8 +330,8 @@ func TestClientEarlyDataToOpenSSL(t *testing.T) {
 	addr := l.Addr().String()
 	_, port, _ := net.SplitHostPort(addr)
 	l.Close()
-	cmd := exec.Command(openssl, "s_server", "-accept", port, "-cert", certFile, "-key", keyFile, "-tls1_3",
-		"-early_data", "-no_anti_replay", "-num_tickets", "1", "-naccept", "2", "-ign_eof")
+	cmd := exec.Command(openssl, append([]string{"s_server", "-accept", port, "-cert", certFile, "-key", keyFile, "-tls1_3",
+		"-early_data", "-no_anti_replay", "-num_tickets", "1", "-naccept", "2", "-ign_eof"}, suiteArgs...)...)
 	var out lockedBuffer
 	cmd.Stdout, cmd.Stderr = &out, &out
 	stdin, _ := cmd.StdinPipe()

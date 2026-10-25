@@ -17,13 +17,15 @@ import (
 	"hash"
 
 	"github.com/lesismal/fib/bufferpool"
+	"github.com/lesismal/fib/internal/chacha20poly1305"
 )
 
 // The record layer an established connection runs on once it leaves
 // crypto/tls; see fast.go. It protects records with AES-GCM, for TLS 1.3 (RFC
-// 8446 section 5) and TLS 1.2 (RFC 5288), and with AES-CBC and HMAC, for TLS
-// 1.2 and 1.1 (RFC 5246 and 4346 section 6.2.3.2), each record carrying its
-// own IV. Other suites and versions stay with crypto/tls.
+// 8446 section 5) and TLS 1.2 (RFC 5288), with ChaCha20-Poly1305, for TLS 1.3
+// (RFC 8446 section 5.1) and TLS 1.2 (RFC 7905), and with AES-CBC and HMAC, for
+// TLS 1.2 and 1.1 (RFC 5246 and 4346 section 6.2.3.2), the CBC ones each
+// carrying their own IV. Other suites and versions stay with crypto/tls.
 
 const (
 	recordHeaderLen = 5
@@ -65,6 +67,10 @@ type mode uint8
 const (
 	modeGCM13 mode = iota
 	modeGCM12
+	// modeChaCha12 is TLS 1.2's ChaCha20-Poly1305 (RFC 7905): like TLS 1.3, it
+	// carries no explicit nonce in its records, the whole nonce being the key
+	// block's 12-byte salt XORed with the sequence number.
+	modeChaCha12
 	modeCBC
 )
 
@@ -74,9 +80,34 @@ type suite struct {
 	keyLen int
 	// hash is TLS 1.3's HKDF hash, and TLS 1.2's PRF hash.
 	hash func() hash.Hash
+	// newAEAD makes the suite's AEAD from its key. Nil is AES-GCM, which every
+	// suite before ChaCha20-Poly1305 uses.
+	newAEAD func(key []byte) (cipher.AEAD, error)
 	// mac and macLen are a CBC suite's record MAC.
 	mac    func() hash.Hash
 	macLen int
+}
+
+// aead builds the suite's AEAD from its key.
+func (s suite) aead(key []byte) (cipher.AEAD, error) {
+	if s.newAEAD != nil {
+		return s.newAEAD(key)
+	}
+	return newGCM(key)
+}
+
+// saltLen is how much of the TLS 1.2 key block is each direction's fixed IV:
+// four bytes for AES-GCM (RFC 5288), and twelve for ChaCha20-Poly1305, whose
+// records carry no explicit nonce (RFC 7905). CBC suites have none; their
+// records carry an IV.
+func (s suite) saltLen() int {
+	switch s.mode {
+	case modeGCM12:
+		return 4
+	case modeChaCha12:
+		return 12
+	}
+	return 0
 }
 
 // lookupSuite reports the suite with id under version, or false for one the
@@ -89,6 +120,8 @@ func lookupSuite(version, id uint16) (suite, bool) {
 			return suite{mode: modeGCM13, keyLen: 16, hash: sha256.New}, true
 		case stdtls.TLS_AES_256_GCM_SHA384:
 			return suite{mode: modeGCM13, keyLen: 32, hash: sha512.New384}, true
+		case stdtls.TLS_CHACHA20_POLY1305_SHA256:
+			return suite{mode: modeGCM13, keyLen: 32, hash: sha256.New, newAEAD: chacha20poly1305.New}, true
 		}
 	case stdtls.VersionTLS12:
 		switch id {
@@ -98,6 +131,8 @@ func lookupSuite(version, id uint16) (suite, bool) {
 		case stdtls.TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384, stdtls.TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384,
 			stdtls.TLS_RSA_WITH_AES_256_GCM_SHA384:
 			return suite{mode: modeGCM12, keyLen: 32, hash: sha512.New384}, true
+		case stdtls.TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256, stdtls.TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256:
+			return suite{mode: modeChaCha12, keyLen: 32, hash: sha256.New, newAEAD: chacha20poly1305.New}, true
 		case stdtls.TLS_ECDHE_ECDSA_WITH_AES_128_CBC_SHA256, stdtls.TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA256,
 			stdtls.TLS_RSA_WITH_AES_128_CBC_SHA256:
 			return suite{mode: modeCBC, keyLen: 16, hash: sha256.New, mac: sha256.New, macLen: sha256.Size}, true
@@ -132,11 +167,14 @@ type recordKeys struct {
 	version [2]byte
 	seq     uint64
 
-	// The AES-GCM suites': the AEAD, its key, which the kernel's TLS takes
-	// over, and TLS 1.3's per-record nonce base or TLS 1.2's four-byte salt.
-	aead cipher.AEAD
-	key  []byte
-	iv   [12]byte
+	// The AES-GCM and ChaCha20-Poly1305 suites': the AEAD, its key, which the
+	// kernel's TLS takes over, and TLS 1.3's per-record nonce base or TLS
+	// 1.2's fixed IV, which a ChaCha20 record's whole nonce is. newAEAD makes
+	// the next generation's, a suite's own AEAD again.
+	aead    cipher.AEAD
+	key     []byte
+	iv      [12]byte
+	newAEAD func([]byte) (cipher.AEAD, error)
 	// secret, hash and keyLen derive the next generation of TLS 1.3 keys,
 	// when the peer updates its own or asks for ours to be.
 	secret []byte
@@ -165,6 +203,12 @@ type recordKeys struct {
 // tls13 reports whether the keys are TLS 1.3's.
 func (k *recordKeys) tls13() bool { return k.mode == modeGCM13 }
 
+// kernelAESGCM reports whether these are the keys of an AES-GCM suite, the
+// only ones the kernel's TLS can seal with: it has no ChaCha20-Poly1305.
+func (k *recordKeys) kernelAESGCM() bool {
+	return k.newAEAD == nil && (k.mode == modeGCM13 || k.mode == modeGCM12)
+}
+
 func newGCM(key []byte) (cipher.AEAD, error) {
 	block, err := aes.NewCipher(key)
 	if err != nil {
@@ -173,9 +217,12 @@ func newGCM(key []byte) (cipher.AEAD, error) {
 	return cipher.NewGCM(block)
 }
 
-// newKeys13 derives the keys of a TLS 1.3 traffic secret.
-func newKeys13(keyLen int, h func() hash.Hash, secret []byte) (*recordKeys, error) {
-	key, err := expandLabel(h, secret, "key", keyLen)
+// newKeys13 derives the keys of a TLS 1.3 traffic secret under suite s, whose
+// HKDF hash is h: its key, its per-record nonce base, and its AEAD. h and s
+// are apart because a client's early data is covered by the hash of the suite
+// the session was made with, which the server has yet to accept.
+func newKeys13(s suite, h func() hash.Hash, secret []byte) (*recordKeys, error) {
+	key, err := expandLabel(h, secret, "key", s.keyLen)
 	if err != nil {
 		return nil, err
 	}
@@ -183,11 +230,12 @@ func newKeys13(keyLen int, h func() hash.Hash, secret []byte) (*recordKeys, erro
 	if err != nil {
 		return nil, err
 	}
-	aead, err := newGCM(key)
+	aead, err := s.aead(key)
 	if err != nil {
 		return nil, err
 	}
-	k := &recordKeys{mode: modeGCM13, version: [2]byte{3, 3}, aead: aead, key: key, secret: secret, hash: h, keyLen: keyLen}
+	k := &recordKeys{mode: modeGCM13, version: [2]byte{3, 3}, aead: aead, key: key, newAEAD: s.newAEAD,
+		secret: secret, hash: h, keyLen: s.keyLen}
 	copy(k.iv[:], iv)
 	return k, nil
 }
@@ -199,7 +247,7 @@ func (k *recordKeys) next() (*recordKeys, error) {
 	if err != nil {
 		return nil, err
 	}
-	return newKeys13(k.keyLen, k.hash, secret)
+	return newKeys13(suite{keyLen: k.keyLen, hash: k.hash, newAEAD: k.newAEAD}, k.hash, secret)
 }
 
 // expandLabel is HKDF-Expand-Label (RFC 8446 section 7.1) with an empty
@@ -222,10 +270,7 @@ func expandLabel(h func() hash.Hash, secret []byte, label string, length int) ([
 func newKeysFromMaster(version uint16, s suite, master, clientRandom, serverRandom []byte) (client, server *recordKeys, err error) {
 	seed := make([]byte, 0, 64)
 	seed = append(append(seed, serverRandom...), clientRandom...)
-	saltLen := 0
-	if s.mode == modeGCM12 {
-		saltLen = 4
-	}
+	saltLen := s.saltLen()
 	n := 2*s.macLen + 2*s.keyLen + 2*saltLen
 	var block []byte
 	if version == stdtls.VersionTLS11 {
@@ -244,13 +289,13 @@ func newKeysFromMaster(version uint16, s suite, master, clientRandom, serverRand
 	}
 	half := func(macKey, key, salt []byte) (*recordKeys, error) {
 		k := &recordKeys{mode: s.mode, version: recordVersion}
-		if s.mode == modeGCM12 {
-			aead, err := newGCM(key)
+		if s.mode == modeGCM12 || s.mode == modeChaCha12 {
+			aead, err := s.aead(key)
 			if err != nil {
 				return nil, err
 			}
 			k.aead, k.key = aead, key
-			copy(k.iv[:4], salt)
+			copy(k.iv[:], salt)
 			return k, nil
 		}
 		b, err := aes.NewCipher(key)
@@ -310,7 +355,7 @@ func pHash(h func() hash.Hash, secret, seed []byte, length int) []byte {
 // 1.2 GCM record's explicit nonce or a CBC record's IV.
 func (k *recordKeys) prefixLen() int {
 	switch k.mode {
-	case modeGCM13:
+	case modeGCM13, modeChaCha12:
 		return recordHeaderLen
 	case modeGCM12:
 		return recordHeaderLen + explicitNonceLen
@@ -319,12 +364,13 @@ func (k *recordKeys) prefixLen() int {
 }
 
 // suffixLen is the most sealing adds after a record's plaintext: TLS 1.3's
-// inner content type and the tag, or a CBC record's MAC and padding.
+// inner content type and the tag, an AEAD's tag, or a CBC record's MAC and
+// padding.
 func (k *recordKeys) suffixLen() int {
 	switch k.mode {
 	case modeGCM13:
 		return 1 + gcmTagLen
-	case modeGCM12:
+	case modeGCM12, modeChaCha12:
 		return gcmTagLen
 	}
 	return k.macLen + cbcBlockLen
@@ -405,6 +451,16 @@ func (k *recordKeys) sealAt(buf []byte, start int, typ byte) ([]byte, error) {
 		header[3], header[4] = byte(bodyLen>>8), byte(bodyLen)
 		buf = append(buf, typ)
 		buf = k.aead.Seal(buf[:plainStart], k.nonce[:], buf[plainStart:], buf[start:start+recordHeaderLen])
+	case modeChaCha12:
+		// Like TLS 1.3, the whole nonce is the key block's salt XORed with the
+		// sequence number, and the record carries no explicit part of it; the
+		// record type stays the outer one, and is authenticated as sent.
+		k.nonce = k.iv
+		seqXOR(&k.nonce, k.seq)
+		bodyLen := n + gcmTagLen
+		header[3], header[4] = byte(bodyLen>>8), byte(bodyLen)
+		ad := k.additionalData(typ, n)
+		buf = k.aead.Seal(buf[:plainStart], k.nonce[:], buf[plainStart:], ad)
 	default:
 		copy(k.nonce[:4], k.iv[:4])
 		binary.BigEndian.PutUint64(k.nonce[4:], k.seq)
@@ -482,6 +538,22 @@ func (k *recordKeys) open(record []byte) (typ byte, plaintext []byte, alert uint
 		return plain[i], plain[:i], 0, true
 	case modeCBC:
 		return k.openCBC(header, body)
+	case modeChaCha12:
+		if len(body) < gcmTagLen {
+			return 0, nil, alertBadRecordMAC, false
+		}
+		k.nonce = k.iv
+		seqXOR(&k.nonce, k.seq)
+		ad := k.additionalData(header[0], len(body)-gcmTagLen)
+		plain, err := k.aead.Open(body[:0], k.nonce[:], body, ad)
+		if err != nil {
+			return 0, nil, alertBadRecordMAC, false
+		}
+		k.seq++
+		if len(plain) > maxPlaintext {
+			return 0, nil, alertRecordOverflow, false
+		}
+		return header[0], plain, 0, true
 	}
 	if len(body) < explicitNonceLen+gcmTagLen {
 		return 0, nil, alertBadRecordMAC, false

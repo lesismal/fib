@@ -461,8 +461,8 @@ func TestSealIntoFullBuffer(t *testing.T) {
 	s, _ := lookupSuite(stdtls.VersionTLS13, stdtls.TLS_AES_128_GCM_SHA256)
 	secret := bytes.Repeat([]byte{7}, 32)
 	for n := 1; n < 700; n++ {
-		a, _ := newKeys13(s.keyLen, s.hash, secret)
-		b, _ := newKeys13(s.keyLen, s.hash, secret)
+		a, _ := newKeys13(s, s.hash, secret)
+		b, _ := newKeys13(s, s.hash, secret)
 		plain := bytes.Repeat([]byte{1}, n)
 		// A buffer with exactly the room the plaintext needs and no more.
 		dst := make([]byte, 0, 5+n)

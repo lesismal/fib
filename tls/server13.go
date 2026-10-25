@@ -463,7 +463,7 @@ func (h *serverHS) choose(ch *clientHelloMsg) (uint16, *hsError) {
 		if !slices.Contains(ch.compression, 0) {
 			return 0, nil
 		}
-		if !slices.Contains(ch.suites, stdtls.TLS_AES_128_GCM_SHA256) && !slices.Contains(ch.suites, stdtls.TLS_AES_256_GCM_SHA384) {
+		if !slices.ContainsFunc(ch.suites, func(id uint16) bool { _, ok := h.suite13(id); return ok }) {
 			return 0, nil
 		}
 		for _, g := range h.groups {
@@ -817,9 +817,12 @@ func (h *serverHS) clientHello(msg []byte, out *[]byte) *hsError {
 	}
 	h.ch = ch
 	if h.state == srvAwaitHello {
-		// Server preference among the AES-GCM suites; for QUIC, where nothing
-		// but the hash depends on the suite, the client's among the three.
-		preferred := []uint16{stdtls.TLS_AES_128_GCM_SHA256, stdtls.TLS_AES_256_GCM_SHA384}
+		// The suites the record layer protects, in the server's order of
+		// preference: AES-GCM first where the CPU has it, and ChaCha20-Poly1305
+		// first where it has not or the client puts it first, as crypto/tls
+		// orders them. For QUIC, where nothing but the hash depends on the
+		// suite, the client's among the three.
+		preferred := suites13(!peerPrefersAESGCM(ch.suites))
 		if h.quic != nil {
 			preferred = ch.suites
 		}
@@ -1219,7 +1222,7 @@ func (h *serverHS) flight(key *ecdh.PrivateKey, shared []byte, pskIndex int, out
 		h.keyLog("CLIENT_EARLY_TRAFFIC_SECRET", secret)
 		if h.quic != nil {
 			h.quic.setRead(stdtls.QUICEncryptionLevelEarly, h.suiteID, secret)
-		} else if h.earlyRx, err = newKeys13(h.suite.keyLen, f, secret); err != nil {
+		} else if h.earlyRx, err = newKeys13(h.suite, f, secret); err != nil {
 			return fail(alertInternalError, "%v", err)
 		}
 	}
@@ -1250,10 +1253,10 @@ func (h *serverHS) flight(key *ecdh.PrivateKey, shared []byte, pskIndex int, out
 		h.quic.setWrite(stdtls.QUICEncryptionLevelHandshake, h.suiteID, h.serverHS)
 		h.quic.setRead(stdtls.QUICEncryptionLevelHandshake, h.suiteID, h.clientHS)
 	} else {
-		if h.rx, err = newKeys13(h.suite.keyLen, f, h.clientHS); err != nil {
+		if h.rx, err = newKeys13(h.suite, f, h.clientHS); err != nil {
 			return fail(alertInternalError, "%v", err)
 		}
-		if h.tx, err = newKeys13(h.suite.keyLen, f, h.serverHS); err != nil {
+		if h.tx, err = newKeys13(h.suite, f, h.serverHS); err != nil {
 			return fail(alertInternalError, "%v", err)
 		}
 		h.rxOn, h.txOn = true, true
@@ -1404,12 +1407,12 @@ func (h *serverHS) flight(key *ecdh.PrivateKey, shared []byte, pskIndex int, out
 		h.state = h.clientFlightState()
 		return nil
 	}
-	if h.appRx, err = newKeys13(h.suite.keyLen, f, h.appClient); err != nil {
+	if h.appRx, err = newKeys13(h.suite, f, h.appClient); err != nil {
 		return fail(alertInternalError, "%v", err)
 	}
 	// What the server writes from here on is under its application keys; the
 	// client's Finished is still read under its handshake keys.
-	if h.tx, err = newKeys13(h.suite.keyLen, f, h.appServer); err != nil {
+	if h.tx, err = newKeys13(h.suite, f, h.appServer); err != nil {
 		return fail(alertInternalError, "%v", err)
 	}
 	h.state = h.clientFlightState()

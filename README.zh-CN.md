@@ -471,9 +471,9 @@ poller 数量（`Config.IOPollers`、`IOPollerCount`）取决于 CPU 数：4 核
 - **感知调度器的 worker 池。** 默认 taskpool 把任务放进当前 P 所属分片的无锁环形队列；空闲 worker
   停在 LIFO 栈上，最热的先被唤醒；每一跳最多唤醒一个，而不是每个任务唤醒一个。见
   [Taskpool](#taskpool)。
-- **热路径上不经过 crypto/tls。** crypto/tls 完成握手后，fib 接管 AES-GCM（TLS 1.3/1.2）和
-  AES-CBC（TLS 1.2/1.1）记录层，直接在本轮读 buffer 上原地解密。ChaCha20、重协商和 TLS 1.2 会话
-  恢复仍走 crypto/tls。
+- **热路径上不经过 crypto/tls。** crypto/tls 完成握手后，fib 接管 AES-GCM、ChaCha20-Poly1305
+  （TLS 1.3/1.2）和 AES-CBC（TLS 1.2/1.1）记录层，直接在本轮读 buffer 上原地解密。重协商和
+  TLS 1.2 会话恢复仍走 crypto/tls。
 - **为这个模型而写的协议栈。** HTTP/2、HPACK、QUIC、QPACK、WebSocket 都由 fib 自己实现，直接从
   本轮读 buffer 取数据，而不是经过阻塞的 `net.Conn`；WebSocket 解析器原地消费 pipeline 的帧。
   Router 每个请求零分配。

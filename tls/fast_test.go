@@ -62,8 +62,7 @@ func echo(t *testing.T, conn net.Conn, sizes ...int) {
 }
 
 // Every version and suite a standard client can pick gets its echoes back,
-// across record boundaries, and the AES-GCM ones on the layer's own record
-// layer.
+// across record boundaries, and the AEAD one on the layer's own record layer.
 func TestTakeOverBySuite(t *testing.T) {
 	cases := []struct {
 		name    string
@@ -74,7 +73,7 @@ func TestTakeOverBySuite(t *testing.T) {
 		{"TLS13", stdtls.VersionTLS13, 0, true},
 		{"TLS12-AES128-GCM", stdtls.VersionTLS12, stdtls.TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256, true},
 		{"TLS12-AES256-GCM", stdtls.VersionTLS12, stdtls.TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384, true},
-		{"TLS12-CHACHA20", stdtls.VersionTLS12, stdtls.TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256, false},
+		{"TLS12-CHACHA20", stdtls.VersionTLS12, stdtls.TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256, true},
 		{"TLS12-AES128-CBC", stdtls.VersionTLS12, stdtls.TLS_ECDHE_ECDSA_WITH_AES_128_CBC_SHA, true},
 		{"TLS12-AES128-CBC-SHA256", stdtls.VersionTLS12, stdtls.TLS_ECDHE_ECDSA_WITH_AES_128_CBC_SHA256, true},
 		{"TLS11-AES128-CBC", stdtls.VersionTLS11, stdtls.TLS_ECDHE_ECDSA_WITH_AES_128_CBC_SHA, true},

@@ -500,7 +500,9 @@ Done:
   written for speed in pure Go: the block's sixteen words live in variables
   rather than an array, a block's key stream is XORed eight bytes at a time,
   and the authenticator is set up in place instead of being allocated for
-  every packet. A 1200-byte packet's seal went from 355 to 548 MiB/s and its
+  every packet. It lives in `internal/chacha20poly1305`, which the TLS record
+  layer protects its TLS_CHACHA20_POLY1305_SHA256 and RFC 7905 suites with
+  too. A 1200-byte packet's seal went from 355 to 548 MiB/s and its
   open from 358 to 551 MiB/s, a 16 KiB plaintext from 398 to 682 MiB/s, and
   one header protection block from 141 to 78 ns. Assembly (AVX2 or NEON) would
   be faster still, but it is a large per-architecture piece whose constant
