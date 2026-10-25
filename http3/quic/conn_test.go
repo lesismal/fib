@@ -176,7 +176,7 @@ var errTestOver = errors.New("test over")
 
 // newTestPair connects a client and a server over a pipe. The server starts
 // on the first datagram that reaches it, as a fib server does.
-func newTestPair(t *testing.T, loss float64, configure func(client, server *Config)) *testPair {
+func newTestPair(t testing.TB, loss float64, configure func(client, server *Config)) *testPair {
 	t.Helper()
 	return newTestPairWith(t, loss, configure, nil)
 }
@@ -184,7 +184,7 @@ func newTestPair(t *testing.T, loss float64, configure func(client, server *Conf
 // newTestPairWith is newTestPair for a test that has something to do with the
 // client as soon as it is dialed, before the handshake can have got anywhere:
 // afterDial runs then.
-func newTestPairWith(t *testing.T, loss float64, configure func(client, server *Config), afterDial func(*Conn)) *testPair {
+func newTestPairWith(t testing.TB, loss float64, configure func(client, server *Config), afterDial func(*Conn)) *testPair {
 	t.Helper()
 	return newTestPairOpts(t, loss, configure, pairOpts{afterDial: afterDial})
 }
@@ -194,8 +194,9 @@ type pairOpts struct {
 	// afterDial runs with the client as soon as it is dialed.
 	afterDial func(*Conn)
 	// wrapServer, if set, gives the server a handler built around the pair's
-	// own.
+	// own; wrapClient does the same for the client's.
 	wrapServer func(*testHandler) Handler
+	wrapClient func(*testHandler) Handler
 	// pipes, if set, is told the ends of the path before anything is sent.
 	pipes func(client, server *pipeEnd)
 	// retry, if set, has the server answer an Initial without a token of
@@ -203,7 +204,7 @@ type pairOpts struct {
 	retry *TokenKey
 }
 
-func newTestPairOpts(t *testing.T, loss float64, configure func(client, server *Config), opts pairOpts) *testPair {
+func newTestPairOpts(t testing.TB, loss float64, configure func(client, server *Config), opts pairOpts) *testPair {
 	t.Helper()
 	afterDial := opts.afterDial
 	serverTLS, clientTLS, err := tlstest.Configs()
@@ -239,6 +240,10 @@ func newTestPairOpts(t *testing.T, loss float64, configure func(client, server *
 	var serverHandler Handler = p.serverH
 	if opts.wrapServer != nil {
 		serverHandler = opts.wrapServer(p.serverH)
+	}
+	var clientHandler Handler = p.clientH
+	if opts.wrapClient != nil {
+		clientHandler = opts.wrapClient(p.clientH)
 	}
 	if opts.pipes != nil {
 		opts.pipes(p.clientEnd, p.serverEnd)
@@ -298,7 +303,7 @@ func newTestPairOpts(t *testing.T, loss float64, configure func(client, server *
 			}
 		}
 	}()
-	p.client, err = Dial(p.clientEnd, addr, cc, p.clientH)
+	p.client, err = Dial(p.clientEnd, addr, cc, clientHandler)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -339,7 +344,7 @@ func newTestPairOpts(t *testing.T, loss float64, configure func(client, server *
 	return p
 }
 
-func waitFinished(t *testing.T, h *testHandler, id uint64) {
+func waitFinished(t testing.TB, h *testHandler, id uint64) {
 	t.Helper()
 	timeout := time.After(20 * time.Second)
 	for !h.finSet[id] {
