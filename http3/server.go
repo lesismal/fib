@@ -177,10 +177,24 @@ type Config struct {
 	// Zero means no limit.
 	WriteTimeout time.Duration
 	// MaxDatagramSize is the largest UDP payload the server sends once a
-	// connection's handshake is over, if the client allows it. Zero means
-	// 1200 bytes, which every path carries; a network known to carry more
-	// saves packets with more, up to 1452.
+	// connection's handshake is over, if the client allows it, until path
+	// MTU discovery finds the path carries more. Zero means 1200 bytes,
+	// which every path carries; a network known to carry more saves packets
+	// with more, up to 1452. A connection whose larger datagrams stop
+	// getting through goes back to 1200.
 	MaxDatagramSize int
+	// DisablePathMTUDiscovery turns path MTU discovery (RFC 8899) off. With
+	// it on, the default, each connection probes for the largest datagram
+	// its path carries once the handshake is confirmed, up to
+	// MaxProbeDatagramSize and what the client allows, and sends datagrams
+	// of that size. The engine's UDP socket is set not to fragment the
+	// datagrams it sends (see fib.Connection.SetDontFragment), which
+	// discovery needs; where it cannot be, there is no discovery.
+	DisablePathMTUDiscovery bool
+	// MaxProbeDatagramSize is the largest UDP payload path MTU discovery
+	// looks for. Zero means 1452, and so does more: what an Ethernet MTU of
+	// 1500 bytes leaves for UDP over IPv6.
+	MaxProbeDatagramSize int
 	// StreamPool runs request handlers on a pool of their own, so that the
 	// requests a client has open on one QUIC connection are served
 	// concurrently rather than one after another on the goroutine that
@@ -325,8 +339,10 @@ func NewHandlerWithConfig(config Config, handler fibhttp.Handler) *ServerHandler
 		ResetKey:              &h.resetKey,
 		// A client that had a Retry is let in with its token however few
 		// handshakes are under way by the time it comes back.
-		TokenKey:        h.tokenKey,
-		MaxDatagramSize: config.MaxDatagramSize,
+		TokenKey:                h.tokenKey,
+		MaxDatagramSize:         config.MaxDatagramSize,
+		DisablePathMTUDiscovery: config.DisablePathMTUDiscovery,
+		MaxProbeDatagramSize:    config.MaxProbeDatagramSize,
 		// fib hands each datagram over as a buffer of its own from the
 		// pool, which QUIC gives back once it has done with it.
 		RecycleDatagrams: true,
@@ -790,6 +806,11 @@ func (p *peerPath) SendDatagrams(datagrams [][]byte) (int, error) {
 	return p.peer.c.SendDatagrams(datagrams)
 }
 
+// SetDontFragment makes the path a quic.DontFragmenter, which path MTU
+// discovery needs: the datagrams of the address's socket are sent whole or
+// not at all.
+func (p *peerPath) SetDontFragment() error { return p.peer.c.SetDontFragment() }
+
 // Close lets the connection's use of the address go; the address's
 // fib.Connection stays for the client's next connection, until it is idle
 // (see udpPeer).
@@ -807,6 +828,8 @@ var (
 	_ quic.PathHandler       = (*serverConn)(nil)
 	_ quic.DatagramsSender   = (*peerPath)(nil)
 	_ quic.DatagramsSender   = (*fib.Connection)(nil)
+	_ quic.DontFragmenter    = (*peerPath)(nil)
+	_ quic.DontFragmenter    = (*fib.Connection)(nil)
 )
 
 // serverConn is one client's HTTP/3 connection.

@@ -116,6 +116,18 @@ type ClientConfig struct {
 	// request is sent again once the handshake is over. The session comes from
 	// SessionCache.
 	EarlyData bool
+	// DisablePathMTUDiscovery turns path MTU discovery (RFC 8899) off. With
+	// it on, the default, each connection probes for the largest datagram
+	// its path carries once the handshake is confirmed, up to
+	// MaxProbeDatagramSize and what the server allows, and sends datagrams
+	// of that size rather than 1200 bytes. The connection's UDP socket is
+	// set not to fragment the datagrams it sends, which discovery needs;
+	// where it cannot be, there is no discovery.
+	DisablePathMTUDiscovery bool
+	// MaxProbeDatagramSize is the largest UDP payload path MTU discovery
+	// looks for. Zero means 1452, and so does more: what an Ethernet MTU of
+	// 1500 bytes leaves for UDP over IPv6.
+	MaxProbeDatagramSize int
 	// SessionCache holds the sessions connections resume from, and the
 	// tickets of those that end up in it. With EarlyData and none given, the
 	// client keeps a cache of its own. It is used by this module's TLS
@@ -783,6 +795,9 @@ func (cc *clientConn) dial() {
 			NewTLS:           c.newTLS(),
 			MaxIdleTimeout:   c.config.MaxIdleTimeout,
 			HandshakeTimeout: c.config.HandshakeTimeout,
+			// The client sends 1200 bytes until discovery finds more.
+			DisablePathMTUDiscovery: c.config.DisablePathMTUDiscovery,
+			MaxProbeDatagramSize:    c.config.MaxProbeDatagramSize,
 			// The server's control and QPACK streams, and room to spare.
 			MaxIncomingUniStreams: 16,
 			// Servers may not open request streams; one is the least QUIC
