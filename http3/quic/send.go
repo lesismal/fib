@@ -83,7 +83,12 @@ func (c *Conn) sealPlan(out []byte, p *packetPlan) []byte {
 	for i := p.pnLen - 1; i >= 0; i-- {
 		out = append(out, byte(p.pn>>(8*i)))
 	}
-	out = append(out, p.payload...)
+	if rest := out[len(out):cap(out)]; len(p.payload) > 0 && len(rest) > 0 && &rest[0] == &p.payload[0] {
+		// Built in place (see appendDatagram).
+		out = out[:len(out)+len(p.payload)]
+	} else {
+		out = append(out, p.payload...)
+	}
 	if cap(out)-len(out) < aeadOverhead {
 		grown := make([]byte, len(out), len(out)+aeadOverhead+maxDatagram)
 		copy(grown, out)
@@ -345,6 +350,13 @@ func (c *Conn) appendDatagram(out, scratch []byte, now time.Time) []byte {
 			continue
 		}
 		slot := scratch[space*maxDatagramLimit : space*maxDatagramLimit : (space+1)*maxDatagramLimit]
+		if n == 0 && space == spaceApp && !early {
+			// A 1-RTT packet that starts its datagram, as nearly every one
+			// does once the handshake is over, has its payload built where
+			// sealPlan puts it, past its header, rather than copied there.
+			at := len(out) + c.headerLen(space, pnLen(s.nextPN, s.largestAcked), false)
+			slot = out[at:at:cap(out)]
+		}
 		plan, ok := c.buildPacket(space, limit-size, congestionOK || s.probes > 0, now, slot, early)
 		if !ok {
 			continue
