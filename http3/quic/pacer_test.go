@@ -9,8 +9,8 @@ import (
 )
 
 // The pacing budget fills at 1.25 congestion windows a smoothed round trip,
-// up to the larger of the initial window and two milliseconds of it, and a
-// round that has spent it waits for a datagram's worth, a millisecond at
+// up to the larger of the initial window and two minPacingDelay of it, and a
+// round that has spent it waits for a datagram's worth, minPacingDelay at
 // least (RFC 9002 section 7.7).
 func TestPacingRate(t *testing.T) {
 	c := frameConn(t)
@@ -20,9 +20,11 @@ func TestPacingRate(t *testing.T) {
 	if !c.paceAllows(now) || c.paceBudget != 0 {
 		t.Fatalf("paced before a round-trip sample, budget %d", c.paceBudget)
 	}
-	c.rtt.hasSample, c.rtt.smoothed = true, 100*time.Millisecond
+	// A second's round trip: 150KB a second, and a burst of the initial
+	// window, which is more than two minPacingDelay of it.
+	c.rtt.hasSample, c.rtt.smoothed = true, time.Second
 	c.cc.cwnd = 100 * maxDatagram
-	if got, want := c.pacingRate(), 1.25*100*maxDatagram/0.1; got != want {
+	if got, want := c.pacingRate(), 1.25*100*maxDatagram; got != want {
 		t.Fatalf("rate %v bytes a second, want %v", got, want)
 	}
 	if !c.paceAllows(now) || c.paceBudget != maxBurstPackets*maxDatagram {
@@ -32,24 +34,33 @@ func TestPacingRate(t *testing.T) {
 	if c.paceAllows(now) {
 		t.Fatal("a spent budget allowed a datagram")
 	}
-	// 1200 bytes at 1.5 MB a second take 800µs, which waits a millisecond.
-	if d := c.paceNext(now).Sub(now); d != minPacingDelay {
-		t.Fatalf("next send in %v", d)
+	// 1200 bytes at 150KB a second take 8ms.
+	if d, want := c.paceNext(now).Sub(now), max(8*time.Millisecond, minPacingDelay); d != want {
+		t.Fatalf("next send in %v, want %v", d, want)
 	}
-	if c.paceAllows(now.Add(400 * time.Microsecond)) {
+	if c.paceAllows(now.Add(4 * time.Millisecond)) {
 		t.Fatalf("a budget of %d allowed a datagram", c.paceBudget)
 	}
-	if !c.paceAllows(now.Add(time.Millisecond)) || c.paceBudget != 1500 {
-		t.Fatalf("budget %d a millisecond later, want 1500", c.paceBudget)
+	if !c.paceAllows(now.Add(10*time.Millisecond)) || c.paceBudget < 1499 || c.paceBudget > 1500 {
+		t.Fatalf("budget %d 10ms on, want 1500", c.paceBudget)
 	}
 	if !c.paceAllows(now.Add(time.Hour)) || c.paceBudget != maxBurstPackets*maxDatagram {
 		t.Fatalf("budget %d after an idle hour, want the burst", c.paceBudget)
 	}
-	// A fast path's burst is two milliseconds of its rate.
-	c.rtt.smoothed = time.Millisecond
-	c.paceLast = time.Time{}
-	if !c.paceAllows(now) || c.paceBudget != int(2*c.pacingRate()/1000) {
-		t.Fatalf("burst %d on a fast path, want %v", c.paceBudget, 2*c.pacingRate()/1000)
+	// A round trip shorter than minPacingDelay paces as minPacingDelay, a
+	// burst of 2.5 windows that holds nothing back; one of zero, which a
+	// coarse clock measures on a fast path, too, rather than at an infinite
+	// rate whose budget would wrap around and never send again.
+	for _, rtt := range []time.Duration{minPacingDelay / 2, 0} {
+		c.rtt.smoothed = rtt
+		c.paceLast = time.Time{}
+		if !c.paceAllows(now) || c.paceBudget != 250*maxDatagram {
+			t.Fatalf("burst %d with a round trip of %v, want %d", c.paceBudget, rtt, 250*maxDatagram)
+		}
+		c.paceBudget = 0
+		if !c.paceAllows(now.Add(time.Second)) || c.paceBudget != 250*maxDatagram {
+			t.Fatalf("budget %d a second on with a round trip of %v", c.paceBudget, rtt)
+		}
 	}
 }
 
@@ -117,8 +128,8 @@ func TestPacingSpreadsRound(t *testing.T) {
 	pc := &recordPC{}
 	c.mu.Lock()
 	c.pc = pc
-	c.rtt.hasSample, c.rtt.smoothed, c.rtt.min = true, 20*time.Millisecond, 20*time.Millisecond
-	c.cc.cwnd = 200_000
+	c.rtt.hasSample, c.rtt.smoothed, c.rtt.min = true, 200*time.Millisecond, 200*time.Millisecond
+	c.cc.cwnd = 100_000
 	c.mu.Unlock()
 	s, err := c.OpenStream()
 	if err != nil {
@@ -152,8 +163,8 @@ func TestPacingSpreadsRound(t *testing.T) {
 	pc.mu.Lock()
 	spread := pc.times[len(pc.times)-1].Sub(pc.times[0])
 	pc.mu.Unlock()
-	// At 12.5MB a second, the 35KB past a burst of 25KB take almost three
-	// milliseconds, and the timer waits a millisecond at least.
+	// At 625KB a second, the 40KB or more past a burst of 12KB (20KB on
+	// Windows) take 65ms or more.
 	if spread < minPacingDelay {
 		t.Fatalf("60KiB left within %v", spread)
 	}

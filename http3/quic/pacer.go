@@ -19,20 +19,20 @@ import (
 //
 // Until the first round-trip sample there is nothing to pace by, and the
 // first flight is the initial window anyway; probes and acknowledgements are
-// not held back.
+// not held back. A round trip shorter than minPacingDelay paces as one of
+// minPacingDelay, which the burst covers more than twice over: pacing there
+// would hold nothing back, and one of zero, which a coarse clock measures
+// on a fast path, would make the rate infinite.
 const (
 	// pacingGain is N of RFC 9002 section 7.7, in quarters.
 	pacingGain = 5
 	// maxBurstPackets is the least burst pacing allows: the initial window.
 	maxBurstPackets = 10
-	// minPacingDelay is the shortest wait for the budget: a timer set any
-	// closer would fire late anyway, and the burst covers twice it.
-	minPacingDelay = time.Millisecond
 )
 
 // pacingRate is what pacing allows, in bytes a second.
 func (c *Conn) pacingRate() float64 {
-	return float64(c.cc.cwnd) * pacingGain / 4 / c.rtt.smoothed.Seconds()
+	return float64(c.cc.cwnd) * pacingGain / 4 / max(c.rtt.smoothed, minPacingDelay).Seconds()
 }
 
 // paceAllows fills the pacing budget for the time since it was last
@@ -67,7 +67,8 @@ const blockedRetry = time.Millisecond
 
 // wouldBlock reports whether a send failed only because the socket had no
 // room: EAGAIN, or ENOBUFS, which macOS answers for a full UDP socket and
-// Linux for a full device queue.
+// Linux for a full device queue, or their Windows counterparts (see
+// socketFull).
 func wouldBlock(err error) bool {
-	return errors.Is(err, syscall.EAGAIN) || errors.Is(err, syscall.ENOBUFS)
+	return errors.Is(err, syscall.EAGAIN) || errors.Is(err, syscall.ENOBUFS) || socketFull(err)
 }
