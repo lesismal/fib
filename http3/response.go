@@ -35,6 +35,15 @@ func (rs *requestStream) BeginResponse(req *stdhttp.Request, status int, header 
 	if err := checkHeader(header); err != nil {
 		return err
 	}
+	if max, limited := rs.fieldLimit(); limited {
+		size := uint64(statusSize) + headerSize(header, func(name string) bool { return name == "content-length" })
+		if n := declaredLength(header); n >= 0 && status != stdhttp.StatusNoContent && status != stdhttp.StatusNotModified {
+			size += lengthSize(n)
+		}
+		if size > max {
+			return errFieldSectionTooLarge
+		}
+	}
 	rs.mu.Lock()
 	switch {
 	case rs.responded:
@@ -126,6 +135,7 @@ func (rs *requestStream) NotifyWritable(fn func(error)) bool {
 // short of its content-length, since ending it would leave the client a body
 // it cannot tell from a whole one.
 func (rs *requestStream) EndResponse(trailer stdhttp.Header, complete bool) error {
+	var err error
 	rs.mu.Lock()
 	if rs.closed || !rs.streaming {
 		err := rs.closedErrLocked()
@@ -134,6 +144,12 @@ func (rs *requestStream) EndResponse(trailer stdhttp.Header, complete bool) erro
 	}
 	rs.streaming = false
 	remoteDone := rs.remoteDone
+	if max, limited := rs.fieldLimit(); complete && limited && trailerSize(trailer) > max {
+		// The client would refuse the trailers, and a response without them
+		// would pass for whole: the stream is reset instead.
+		complete = false
+		err = errFieldSectionTooLarge
+	}
 	if !complete {
 		rs.closed = true
 	}
@@ -142,7 +158,6 @@ func (rs *requestStream) EndResponse(trailer stdhttp.Header, complete bool) erro
 	if stopped {
 		rs.unref()
 	}
-	var err error
 	if complete {
 		var out []byte
 		if len(trailer) > 0 {
@@ -166,7 +181,10 @@ func (rs *requestStream) EndResponse(trailer stdhttp.Header, complete bool) erro
 	if rs.req != nil {
 		rs.sc.untrack(rs)
 	}
-	if err != nil {
+	switch {
+	case err == errFieldSectionTooLarge:
+		return err
+	case err != nil:
 		return errStreamClosed
 	}
 	return nil
@@ -180,4 +198,13 @@ func declaredLength(header stdhttp.Header) int64 {
 		}
 	}
 	return -1
+}
+
+// fieldLimit is the client's limit on a field section; see
+// peerStreams.fieldLimit.
+func (rs *requestStream) fieldLimit() (uint64, bool) {
+	if rs.sc == nil {
+		return 0, false
+	}
+	return rs.sc.peer.fieldLimit()
 }

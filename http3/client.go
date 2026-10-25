@@ -138,6 +138,11 @@ type ClientConfig struct {
 	// either way a config naming no server gets the request's host, and
 	// ALPN offers "h3".
 	TLSConfig *tls.Config
+	// Transport is how the client's QUIC connections behave, beyond what
+	// the fields above set; see TransportConfig. Its KeepAlivePeriod keeps
+	// a connection with no request open past MaxIdleTimeout, until
+	// IdleConnTimeout closes it.
+	Transport TransportConfig
 }
 
 // DefaultClientConfig returns the defaults, which zero limits in a
@@ -798,8 +803,6 @@ func (cc *clientConn) dial() {
 			// The client sends 1200 bytes until discovery finds more.
 			DisablePathMTUDiscovery: c.config.DisablePathMTUDiscovery,
 			MaxProbeDatagramSize:    c.config.MaxProbeDatagramSize,
-			// The server's control and QPACK streams, and room to spare.
-			MaxIncomingUniStreams: 16,
 			// Servers may not open request streams; one is the least QUIC
 			// allows advertising that means it.
 			MaxIncomingStreams: 1,
@@ -808,6 +811,7 @@ func (cc *clientConn) dial() {
 			RecycleDatagrams: true,
 			EarlyData:        c.config.EarlyData,
 		}
+		c.config.Transport.apply(&config)
 		cc.mu.Lock()
 		cc.fc = fc
 		qc, err := quic.Dial(fc, fc.RemoteAddr(), config, cc)
@@ -1185,6 +1189,11 @@ type clientStream struct {
 // rest left to sendBody.
 func (st *clientStream) send() {
 	r := st.r
+	if max, limited := st.cc.peer.fieldLimit(); limited && (fieldsSize(r.fields) > max || fieldsSize(r.trailer) > max) {
+		// The server would refuse it.
+		st.fail(errFieldSectionTooLarge)
+		return
+	}
 	if r.upload != nil || r.expect {
 		block := bufferpool.Append(nil, qpack.Prefix)
 		for _, f := range r.fields {
@@ -1303,7 +1312,12 @@ func (st *clientStream) sendBody() {
 	if err == nil {
 		var out []byte
 		// The trailer's values are those of when the body has been read.
-		if _, trailer, terr := requestFields(r.req, -1); terr == nil && len(trailer) > 0 {
+		_, trailer, terr := requestFields(r.req, -1)
+		if max, limited := st.cc.peer.fieldLimit(); terr == nil && limited && fieldsSize(trailer) > max {
+			terr = errFieldSectionTooLarge
+			err = &reqbody.BodyError{Err: terr}
+		}
+		if terr == nil && len(trailer) > 0 {
 			block := bufferpool.Append(nil, qpack.Prefix)
 			for _, f := range trailer {
 				block = qpack.AppendField(block, f.Name, f.Value, sensitive(f.Name))
@@ -1311,9 +1325,11 @@ func (st *clientStream) sendBody() {
 			out = appendHeadersFrame(bufferpool.Get(len(block) + 16)[:0], block)
 			bufferpool.Put(block)
 		}
-		if out != nil {
+		switch {
+		case err != nil:
+		case out != nil:
 			err = st.s.WriteOwned(out, true)
-		} else {
+		default:
 			err = st.s.Write(nil, true)
 		}
 	}

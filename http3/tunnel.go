@@ -69,6 +69,12 @@ func (rs *requestStream) Upgrade(req *stdhttp.Request, protocol string, header s
 	if err := checkHeader(header); err != nil {
 		return nil, err
 	}
+	if max, limited := rs.fieldLimit(); limited {
+		size := uint64(statusSize) + headerSize(header, func(name string) bool { return name == "content-length" })
+		if size > max {
+			return nil, errFieldSectionTooLarge
+		}
+	}
 	rs.mu.Lock()
 	switch {
 	case rs.responded:

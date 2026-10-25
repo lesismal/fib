@@ -4,6 +4,10 @@ package http3
 
 import (
 	"errors"
+	stdhttp "net/http"
+	"strconv"
+	"strings"
+	"sync/atomic"
 
 	"github.com/lesismal/fib/http3/qpack"
 	"github.com/lesismal/fib/http3/quic"
@@ -22,9 +26,12 @@ type peerStreams struct {
 	// peer may send on its control stream.
 	isClient bool
 	// settings is whether the peer's SETTINGS have arrived, and
-	// maxFieldSection what they allow a field section to weigh.
+	// maxFieldSection what they allow a field section to weigh, once
+	// fieldLimited says they set a limit; those two are read by whatever
+	// goroutine sends a field section (see fieldsFit).
 	settings        bool
-	maxFieldSection uint64
+	maxFieldSection atomic.Uint64
+	fieldLimited    atomic.Bool
 	// goneAway is whether a GOAWAY has arrived and with what identifier;
 	// the peer may only lower it (RFC 9114 section 5.2).
 	goneAway bool
@@ -195,8 +202,11 @@ func (u *uniStream) controlFrame(typ uint64, payload []byte) error {
 			return connErr(ErrCodeMissingSettings, "control stream does not start with SETTINGS")
 		}
 		p.settings = true
-		maxField, err := parseSettings(payload)
-		p.maxFieldSection = maxField
+		maxField, limited, err := parseSettings(payload)
+		if limited {
+			p.maxFieldSection.Store(maxField)
+			p.fieldLimited.Store(true)
+		}
 		return err
 	}
 	switch typ {
@@ -246,6 +256,74 @@ func (u *uniStream) controlFrame(typ uint64, payload []byte) error {
 		}
 	}
 	return nil
+}
+
+// errFieldSectionTooLarge is what sending a header or trailer section fails
+// with when it weighs more than the peer's SETTINGS_MAX_FIELD_SECTION_SIZE
+// allows: the peer would refuse it (RFC 9114 section 4.2.2), so it is not
+// sent.
+var errFieldSectionTooLarge = errors.New("http3: field section larger than the peer's SETTINGS_MAX_FIELD_SECTION_SIZE")
+
+// fieldLimit is the weight, counted as fieldSize counts it, that the peer's
+// SETTINGS allow a field section, and whether they set a limit: a section
+// sent before they arrive is not held to one.
+func (p *peerStreams) fieldLimit() (uint64, bool) {
+	if !p.fieldLimited.Load() {
+		return 0, false
+	}
+	return p.maxFieldSection.Load(), true
+}
+
+// statusSize is the weight of a response's :status field.
+const statusSize = len(":status") + 3 + 32
+
+// lengthSize is the weight of a content-length field of n.
+func lengthSize(n int64) uint64 {
+	var digits [20]byte
+	return fieldSize("content-length", string(strconv.AppendInt(digits[:0], n, 10)))
+}
+
+// fieldSize is what a field weighs against SETTINGS_MAX_FIELD_SECTION_SIZE:
+// its name and value uncompressed, and 32 more (RFC 9114 section 4.2.2).
+func fieldSize(name, value string) uint64 { return uint64(len(name)+len(value)) + 32 }
+
+// headerSize is the weight of the fields appendHeader sends of header.
+func headerSize(header stdhttp.Header, skip func(string) bool) uint64 {
+	var n uint64
+	for key, values := range header {
+		name := lowerKey(key)
+		if connectionHeaders[name] || skip != nil && skip(name) {
+			continue
+		}
+		for _, value := range values {
+			n += fieldSize(name, value)
+		}
+	}
+	return n
+}
+
+// trailerSize is the weight of the fields appendTrailer sends of trailer.
+func trailerSize(trailer stdhttp.Header) uint64 {
+	var n uint64
+	for key, values := range trailer {
+		name := strings.ToLower(key)
+		if !validTrailer(name, values) {
+			continue
+		}
+		for _, value := range values {
+			n += fieldSize(name, value)
+		}
+	}
+	return n
+}
+
+// fieldsSize is the weight of a list of fields.
+func fieldsSize(fields []qpack.HeaderField) uint64 {
+	var n uint64
+	for _, f := range fields {
+		n += fieldSize(f.Name, f.Value)
+	}
+	return n
 }
 
 // closeWith ends a QUIC connection with the code an error calls for.

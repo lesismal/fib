@@ -218,12 +218,12 @@ func TestParseSettingsErrors(t *testing.T) {
 		"HTTP/2 setting":       {[]byte{0x02, 0x00}, ErrCodeSettingsError},
 	}
 	for name, c := range cases {
-		if _, err := parseSettings(c.payload); connErrCode(err) != c.code {
+		if _, _, err := parseSettings(c.payload); connErrCode(err) != c.code {
 			t.Errorf("%s: %v, want %v", name, err, c.code)
 		}
 	}
 	// An unknown setting is ignored (RFC 9114 section 7.2.4.1).
-	if max, err := parseSettings([]byte{0x21, 0x05, 0x06, 0x40, 0x80}); err != nil || max != 128 {
+	if max, limited, err := parseSettings([]byte{0x21, 0x05, 0x06, 0x40, 0x80}); err != nil || max != 128 || !limited {
 		t.Fatalf("got %d, %v", max, err)
 	}
 }

@@ -143,34 +143,33 @@ func appendSettings(b []byte, settings ...[2]uint64) []byte {
 }
 
 // parseSettings checks a SETTINGS frame and returns the peer's
-// MAX_FIELD_SECTION_SIZE, or zero for no limit.
-func parseSettings(payload []byte) (uint64, error) {
+// MAX_FIELD_SECTION_SIZE, with limited set, if it sets one.
+func parseSettings(payload []byte) (maxField uint64, limited bool, err error) {
 	seen := make(map[uint64]bool)
-	var maxField uint64
 	for len(payload) > 0 {
 		id, n := quic.ReadVarint(payload)
 		if n == 0 {
-			return 0, connErr(ErrCodeFrameError, "truncated SETTINGS")
+			return 0, false, connErr(ErrCodeFrameError, "truncated SETTINGS")
 		}
 		payload = payload[n:]
 		value, n := quic.ReadVarint(payload)
 		if n == 0 {
-			return 0, connErr(ErrCodeFrameError, "truncated SETTINGS")
+			return 0, false, connErr(ErrCodeFrameError, "truncated SETTINGS")
 		}
 		payload = payload[n:]
 		if seen[id] {
-			return 0, connErr(ErrCodeSettingsError, "duplicate setting")
+			return 0, false, connErr(ErrCodeSettingsError, "duplicate setting")
 		}
 		seen[id] = true
 		switch id {
 		case 0x02, 0x03, 0x04, 0x05:
 			// HTTP/2 settings that HTTP/3 reserves.
-			return 0, connErr(ErrCodeSettingsError, "HTTP/2 setting in HTTP/3")
+			return 0, false, connErr(ErrCodeSettingsError, "HTTP/2 setting in HTTP/3")
 		case settingMaxFieldSectionSize:
-			maxField = value
+			maxField, limited = value, true
 		}
 	}
-	return maxField, nil
+	return maxField, limited, nil
 }
 
 // frameParser splits a stream into frames. DATA payloads are handed on as

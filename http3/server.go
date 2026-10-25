@@ -195,6 +195,9 @@ type Config struct {
 	// looks for. Zero means 1452, and so does more: what an Ethernet MTU of
 	// 1500 bytes leaves for UDP over IPv6.
 	MaxProbeDatagramSize int
+	// Transport is how the QUIC connections under the server behave, beyond
+	// what the fields above set; see TransportConfig.
+	Transport TransportConfig
 	// StreamPool runs request handlers on a pool of their own, so that the
 	// requests a client has open on one QUIC connection are served
 	// concurrently rather than one after another on the goroutine that
@@ -333,10 +336,7 @@ func NewHandlerWithConfig(config Config, handler fibhttp.Handler) *ServerHandler
 		MaxIdleTimeout:     config.MaxIdleTimeout,
 		HandshakeTimeout:   config.HandshakeTimeout,
 		MaxIncomingStreams: config.MaxConcurrentStreams,
-		// The client's control and QPACK streams, with room to spare for
-		// extensions it may try.
-		MaxIncomingUniStreams: 16,
-		ResetKey:              &h.resetKey,
+		ResetKey:           &h.resetKey,
 		// A client that had a Retry is let in with its token however few
 		// handshakes are under way by the time it comes back.
 		TokenKey:                h.tokenKey,
@@ -351,6 +351,7 @@ func NewHandlerWithConfig(config Config, handler fibhttp.Handler) *ServerHandler
 		// like is told it was too much (RFC 9114 section 8.1).
 		ExcessiveLoadCode: uint64(ErrCodeExcessiveLoad),
 	}
+	config.Transport.apply(&h.quic)
 	return h
 }
 
@@ -1864,6 +1865,15 @@ func (rs *requestStream) WriteResponse(req *stdhttp.Request, response fibhttp.Re
 	if err := checkHeader(response.Header); err != nil {
 		return err
 	}
+	if max, limited := rs.fieldLimit(); limited {
+		size := uint64(statusSize) + headerSize(response.Header, func(name string) bool { return name == "content-length" })
+		if status != stdhttp.StatusNoContent && status != stdhttp.StatusNotModified {
+			size += lengthSize(responseLength(req, response))
+		}
+		if size > max || bodyAllowed(req, status) && trailerSize(response.Trailer) > max {
+			return errFieldSectionTooLarge
+		}
+	}
 	rs.mu.Lock()
 	switch {
 	case rs.responded:
@@ -2267,6 +2277,9 @@ func (rs *requestStream) writeDone() {
 func (rs *requestStream) WriteInterim(status int, header stdhttp.Header) error {
 	if err := checkHeader(header); err != nil {
 		return err
+	}
+	if max, limited := rs.fieldLimit(); limited && uint64(statusSize)+headerSize(header, nil) > max {
+		return errFieldSectionTooLarge
 	}
 	rs.mu.Lock()
 	switch {

@@ -36,7 +36,14 @@ func (s *pushSink) End() error {
 	st := s.st
 	var err error
 	// The trailer's values are those of when the body has ended.
-	if _, trailer, terr := trailerFields(s.push.Trailer(st.r.req.Trailer)); terr == nil && len(trailer) > 0 {
+	_, trailer, terr := trailerFields(s.push.Trailer(st.r.req.Trailer))
+	if max, limited := st.cc.peer.fieldLimit(); terr == nil && limited && fieldsSize(trailer) > max {
+		// The server would refuse the trailer, and a stream that ends
+		// without it would pass for whole: the request fails instead.
+		s.Fail(errFieldSectionTooLarge)
+		return errFieldSectionTooLarge
+	}
+	if terr == nil && len(trailer) > 0 {
 		block := bufferpool.Append(nil, qpack.Prefix)
 		for _, f := range trailer {
 			block = qpack.AppendField(block, f.Name, f.Value, sensitive(f.Name))
