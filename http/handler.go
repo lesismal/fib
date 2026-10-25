@@ -544,6 +544,12 @@ func (c *Context) writeResponse(response Response) error {
 				return nil
 			}
 		}
+		if c.Request.Method != stdhttp.MethodHead && hooks.splitAsync() {
+			// An asynchronous filter sends it from its done.
+			response = hooks.response
+			hooks.response = Response{}
+			return c.holdBodyWhole(hooks, response)
+		}
 		err := hooks.filterWhole(&hooks.response, c.Request.Method == stdhttp.MethodHead)
 		response = hooks.response
 		hooks.response = Response{}

@@ -261,8 +261,16 @@ func (c *Context) resumeWhole(a *asyncHeader, err error) {
 			fn(response.StatusCode, response.Header, c.resumer(a, at))
 			return
 		}
-		if err = hooks.filterWhole(response, c.Request.Method == stdhttp.MethodHead); err == nil {
-			err = c.sendHeld(response, hooks)
+		head := c.Request.Method == stdhttp.MethodHead
+		switch {
+		case !head && hooks.splitAsync():
+			// An asynchronous filter sends it from its done, retained
+			// for it.
+			err = c.holdBodyWhole(hooks, *response)
+		default:
+			if err = hooks.filterWhole(response, head); err == nil {
+				err = c.sendHeld(response, hooks)
+			}
 		}
 	}
 	a.whole, a.active = nil, false

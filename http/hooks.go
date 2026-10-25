@@ -26,6 +26,9 @@ type responseHooks struct {
 	// async holds the response while an OnHeaderAsync hook decides its
 	// header, or is nil when none is registered; see asyncHeader.
 	async *asyncHeader
+	// body is the state of a body that goes through an asynchronous filter,
+	// or nil when no OnBodyFilterAsync hook is registered; see asyncBody.
+	body *asyncBody
 }
 
 // responseHook is one registered callback; exactly one of its fields is set,

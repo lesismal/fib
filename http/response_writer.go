@@ -197,6 +197,9 @@ func (c *Context) settleHeader() {
 			} else {
 				// The length declared is the body's before the filters.
 				delete(w.sent, "Content-Length")
+				if w.hooks.splitAsync() {
+					w.hooks.body.on.Store(true)
+				}
 			}
 		}
 	}
@@ -229,6 +232,10 @@ func (c *Context) Write(p []byte) (int, error) {
 		return 0, ErrResponseWritten
 	}
 	w := c.writer()
+	if b := w.asyncBody(); b != nil {
+		n, _, err := c.writeAsync(b, p, true)
+		return n, err
+	}
 	if w.err != nil {
 		return 0, w.err
 	}
@@ -255,6 +262,10 @@ func (c *Context) Write(p []byte) (int, error) {
 // writeBody is Write once the header is settled.
 func (c *Context) writeBody(p []byte) (int, error) {
 	w := c.w
+	if b := w.asyncBody(); b != nil {
+		n, _, err := c.writeAsync(b, p, true)
+		return n, err
+	}
 	if w.filtered() && !w.finished && len(p) > 0 {
 		out, err := w.hooks.filter(p)
 		if err != nil {
@@ -269,7 +280,11 @@ func (c *Context) writeBody(p []byte) (int, error) {
 }
 
 // filtered reports whether the body goes through OnBodyFilter's filters.
-func (w *responseWriter) filtered() bool { return w.hooks != nil && w.hooks.filters != nil }
+// A body that goes through an asynchronous filter is too, whether or not
+// synchronous filters come before it.
+func (w *responseWriter) filtered() bool {
+	return w.hooks != nil && (w.hooks.filters != nil || w.hooks.body != nil && w.hooks.body.on.Load())
+}
 
 // write is Write for p as it is sent, after any filters.
 func (c *Context) write(p []byte) (int, error) {
@@ -340,6 +355,10 @@ func (c *Context) WriteNoWait(p []byte) (above bool, err error) {
 		return false, ErrResponseWritten
 	}
 	w := c.writer()
+	if b := w.asyncBody(); b != nil {
+		_, above, err := c.writeAsync(b, p, false)
+		return above, err
+	}
 	if w.err != nil {
 		return false, w.err
 	}
@@ -360,6 +379,10 @@ func (c *Context) WriteNoWait(p []byte) (above bool, err error) {
 // writeNoWait is WriteNoWait once the header is settled.
 func (c *Context) writeNoWait(p []byte) (above bool, err error) {
 	w := c.w
+	if b := w.asyncBody(); b != nil {
+		_, above, err := c.writeAsync(b, p, false)
+		return above, err
+	}
 	if c.external != nil && !c.holdsWhole() {
 		if _, ok := c.external.(ResponseNotifier); !ok {
 			_, err := c.writeBody(p)
@@ -378,6 +401,18 @@ func (c *Context) writeNoWait(p []byte) (above bool, err error) {
 	if w.filtered() && len(p) > 0 {
 		if p, err = w.hooks.filter(p); err != nil {
 			return false, w.fail(err)
+		}
+	}
+	return c.sendNoWait(p)
+}
+
+// sendNoWait is writeNoWait for p as it is sent, after any filters.
+func (c *Context) sendNoWait(p []byte) (above bool, err error) {
+	w := c.w
+	if c.external != nil && !c.holdsWhole() {
+		if _, ok := c.external.(ResponseNotifier); !ok {
+			_, err := c.write(p)
+			return false, err
 		}
 	}
 	if c.Request.Method == stdhttp.MethodHead || len(p) == 0 || c.holdsWhole() ||
@@ -432,6 +467,9 @@ func (c *Context) OnWritable(fn func(error)) bool {
 		return false
 	}
 	if a := c.w.asyncHeader(); a != nil && a.deferWritable(fn) {
+		return true
+	}
+	if b := c.w.asyncBody(); b != nil && b.writableAsync(fn) {
 		return true
 	}
 	return c.onWritable(fn)
@@ -502,6 +540,9 @@ func (c *Context) FlushError() error {
 		if w.err != nil {
 			return w.err
 		}
+	}
+	if b := w.asyncBody(); b != nil {
+		return c.flushAsync(b)
 	}
 	if w.filtered() {
 		held, err := w.hooks.endFilters(true)
@@ -781,7 +822,7 @@ func (c *Context) commit(final bool) error {
 		}
 	case w.declared >= 0:
 		head.contentLength = w.declared
-	case final && (len(w.trailers) == 0 && !hasPrefixedTrailers(w.header) || !http11):
+	case final && (len(w.trailers) == 0 && !hasPrefixedTrailers(w.header) && len(w.filterTrailer()) == 0 || !http11):
 		if req.Method != stdhttp.MethodHead || w.written > 0 {
 			head.contentLength = w.written
 		}
@@ -939,6 +980,9 @@ func (c *Context) finishResponse() error {
 	if w.status == 0 || w.finished || c.wrote {
 		return nil
 	}
+	if b := w.asyncBody(); b != nil && c.finishAsync(b) {
+		return nil
+	}
 	var err error
 	if w.filtered() && w.err == nil {
 		// What the filters hold back goes before the end of the body.
@@ -1070,6 +1114,13 @@ func (w *responseWriter) sniff() {
 // trailer gathers the trailers the handler set: values for the names its
 // header announced, and keys it prefixed with http.TrailerPrefix.
 func (w *responseWriter) trailer() stdhttp.Header {
+	if t := w.filterTrailer(); t != nil {
+		// What an asynchronous filter's last call left it.
+		if len(t) == 0 {
+			return nil
+		}
+		return t
+	}
 	var trailer stdhttp.Header
 	add := func(key string, values []string) {
 		if trailer == nil {

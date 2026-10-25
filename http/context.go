@@ -222,6 +222,13 @@ func (c *Context) ended() {
 		abortFilters(w.hooks.filters, err)
 		w.hooks.filters = nil
 	}
+	if w := c.w; w != nil && w.hooks != nil && w.hooks.body != nil {
+		err := w.err
+		if err == nil {
+			err = errBodyUnended
+		}
+		w.hooks.abortAsync(err)
+	}
 	if h := c.cancel.Load(); h != nil && h.stop != nil {
 		stop := h.stop
 		h.stop = nil
@@ -974,6 +981,14 @@ func (c *Context) giveBack(returning bool) {
 				continue
 			}
 			c.answerHeld(a, returning)
+			return
+		}
+		// So is one whose body an asynchronous filter has still to end.
+		if b := c.pendingBody(); b != nil {
+			if !c.word.CompareAndSwap(w, next+1) {
+				continue
+			}
+			c.answerBody(b)
 			return
 		}
 		// A release from inside a body callback cannot carry the connection

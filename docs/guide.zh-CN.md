@@ -1230,6 +1230,12 @@ server, err := fib.New(config, fib.Binding{Addr: ":8080", Handler: fibhttp.NewHa
   可以先返回；整体发送的响应连同 body 的副本原样暂存，流式响应最多暂存 64 KB，超过时 `Write` 等待、
   `WriteNoWait` 报告超限、`OnWritable` 在恢复并排空后回调。`resume(nil)` 按 fn 留下的样子发出响应头，
   `resume(err)` 让响应失败（HTTP/1 关闭连接，HTTP/2、HTTP/3 重置流）。`Upgrade`、`Connect` 的响应不经过它。
+- `OnBodyFilterAsync(fn)`：同 `OnBodyFilter`，但 fn 返回的 `AsyncBodyFilter` 的 `FilterAsync(p, end,
+  trailer, done)` 可以在别的池上处理，`done(out, err)` 可以来自任何 goroutine。一次只有一个调用；期间写入的
+  body 最多暂存 64 KB，交给下一次调用，超过时 `Write` 等待、`WriteNoWait` 报告超限、`OnWritable` 在暂存的部分
+  经过过滤器并被客户端取走后回调；过滤器的输出同样按客户端的速度发送。`Finish` 把 body 的结束交给最后一次
+  调用（`end` 为 true），它还拿到可修改的 trailer；期间响应被持有。整体发送的响应在一次调用里过滤。
+  `done` 带错误时响应失败。过滤器实现 `BodyAborter` 时，响应没结束 body 就结束会调用它的 `Abort`。
 - `OnFinish(fn)`：响应交给连接之后调用，带状态码、header 和 body 长度。
 
 只关心状态码的统计不必每个请求都注册 `OnFinish`：handler 返回后，`Status()` 不为 0 且
