@@ -30,6 +30,7 @@ const (
 	sfHandshakeDone
 	sfRetireCID
 	sfPathChallenge
+	sfNewCID
 	sfDataBlocked
 	sfStreamDataBlocked
 	sfStreamsBlockedBidi
@@ -413,6 +414,8 @@ func (c *Conn) frameLost(space int, f *sentFrame) {
 		c.handshakeDonePending = true
 	case sfRetireCID:
 		c.retireCIDs = append(c.retireCIDs, f.off)
+	case sfNewCID:
+		c.newCIDLost(f.off)
 	case sfDataBlocked:
 		c.dataBlocked.lost(f.off, c.peerMaxData)
 	case sfStreamsBlockedBidi:

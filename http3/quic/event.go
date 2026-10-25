@@ -27,6 +27,11 @@ const (
 	// goroutine that makes the calls, once the application is done with it
 	// (see Stream.WriteFinal).
 	evRelease
+	// evIssueCID issues a connection ID, telling ConnectionIDHandler's
+	// OnConnectionID first, and evRetireCID tells it of one, in data, the
+	// peer retired.
+	evIssueCID
+	evRetireCID
 )
 
 // event is a handler call waiting for dispatch. It is a value rather than a
@@ -95,5 +100,11 @@ func (c *Conn) run(e *event) {
 	case evRelease:
 		e.stream.Context = nil
 		e.stream.released = true
+	case evIssueCID:
+		c.issueCID()
+	case evRetireCID:
+		if h, ok := c.handler.(ConnectionIDHandler); ok {
+			h.OnConnectionID(c, e.data, false)
+		}
 	}
 }

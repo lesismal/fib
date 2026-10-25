@@ -512,16 +512,29 @@ func (h *ServerHandler) route(datagram []byte) *quic.Conn {
 	return qc
 }
 
+// addRoute routes the connection IDs qc owns to it: the one of its handshake
+// as it is accepted, and those it issues later as it issues them (see
+// serverConn.OnConnectionID).
 func (h *ServerHandler) addRoute(qc *quic.Conn) {
 	h.routesMu.Lock()
-	h.routes[string(qc.LocalCID())] = qc
+	for _, cid := range qc.LocalCIDs() {
+		h.routes[string(cid)] = qc
+	}
 	h.routesMu.Unlock()
 }
 
-func (h *ServerHandler) removeRoute(qc *quic.Conn) {
+// removeRoute forgets the routes of qc's connection IDs, or of cid alone, one
+// its client retired, when it is not nil.
+func (h *ServerHandler) removeRoute(qc *quic.Conn, cid []byte) {
+	cids := [][]byte{cid}
+	if cid == nil {
+		cids = qc.LocalCIDs()
+	}
 	h.routesMu.Lock()
-	if h.routes[string(qc.LocalCID())] == qc {
-		delete(h.routes, string(qc.LocalCID()))
+	for _, cid := range cids {
+		if h.routes[string(cid)] == qc {
+			delete(h.routes, string(cid))
+		}
 	}
 	h.routesMu.Unlock()
 }
@@ -820,16 +833,17 @@ func (p *peerPath) Close() error {
 }
 
 var (
-	_ fib.DatagramsHandler   = (*ServerHandler)(nil)
-	_ fib.ShutdownHandler    = (*ServerHandler)(nil)
-	_ fib.EngineCloseHandler = (*ServerHandler)(nil)
-	_ fib.EngineCloseHandler = clientPath{}
-	_ quic.CallsDoneHandler  = (*serverConn)(nil)
-	_ quic.PathHandler       = (*serverConn)(nil)
-	_ quic.DatagramsSender   = (*peerPath)(nil)
-	_ quic.DatagramsSender   = (*fib.Connection)(nil)
-	_ quic.DontFragmenter    = (*peerPath)(nil)
-	_ quic.DontFragmenter    = (*fib.Connection)(nil)
+	_ fib.DatagramsHandler     = (*ServerHandler)(nil)
+	_ fib.ShutdownHandler      = (*ServerHandler)(nil)
+	_ fib.EngineCloseHandler   = (*ServerHandler)(nil)
+	_ fib.EngineCloseHandler   = clientPath{}
+	_ quic.CallsDoneHandler    = (*serverConn)(nil)
+	_ quic.PathHandler         = (*serverConn)(nil)
+	_ quic.ConnectionIDHandler = (*serverConn)(nil)
+	_ quic.DatagramsSender     = (*peerPath)(nil)
+	_ quic.DatagramsSender     = (*fib.Connection)(nil)
+	_ quic.DontFragmenter      = (*peerPath)(nil)
+	_ quic.DontFragmenter      = (*fib.Connection)(nil)
 )
 
 // serverConn is one client's HTTP/3 connection.
@@ -1081,6 +1095,19 @@ func (sc *serverConn) OnStopSending(s *quic.Stream, _ uint64) {
 
 func (sc *serverConn) OnStreamsAvailable(*quic.Conn) {}
 
+// OnConnectionID routes a connection ID the connection issues to its client,
+// before the client has it, and forgets one the client retired: a client
+// may send to any it has, as it does to a new one when its address changes.
+func (sc *serverConn) OnConnectionID(qc *quic.Conn, cid []byte, active bool) {
+	if active {
+		sc.h.routesMu.Lock()
+		sc.h.routes[string(cid)] = qc
+		sc.h.routesMu.Unlock()
+		return
+	}
+	sc.h.removeRoute(qc, cid)
+}
+
 // OnCallsDone hands the requests that arrived whole during the run of calls
 // to the handler pool, together.
 func (sc *serverConn) OnCallsDone(*quic.Conn) {
@@ -1090,7 +1117,7 @@ func (sc *serverConn) OnCallsDone(*quic.Conn) {
 
 func (sc *serverConn) OnClose(qc *quic.Conn, _ error) {
 	sc.handshakeOver()
-	sc.h.removeRoute(qc)
+	sc.h.removeRoute(qc, nil)
 	sc.mu.Lock()
 	streams := sc.streams
 	sc.streams = nil

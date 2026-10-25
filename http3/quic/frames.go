@@ -44,16 +44,16 @@ func appendStopSending(b []byte, id, code uint64) []byte {
 	return AppendVarint(b, code)
 }
 
-func appendStreamDataBlocked(b []byte, id, at uint64) []byte {
-	b = append(b, frameStreamDataBlocked)
-	b = AppendVarint(b, id)
-	return AppendVarint(b, at)
-}
-
 func appendMaxStreamData(b []byte, id, max uint64) []byte {
 	b = append(b, frameMaxStreamData)
 	b = AppendVarint(b, id)
 	return AppendVarint(b, max)
+}
+
+func appendStreamDataBlocked(b []byte, id, at uint64) []byte {
+	b = append(b, frameStreamDataBlocked)
+	b = AppendVarint(b, id)
+	return AppendVarint(b, at)
 }
 
 func appendResetStream(b []byte, id, code, finalSize uint64) []byte {
@@ -307,9 +307,9 @@ func (c *Conn) handleFrames(space int, payload []byte, now time.Time) (bool, err
 		case typ == frameNewConnectionID:
 			err = c.handleNewConnectionID(&r)
 		case typ == frameRetireConnectionID:
-			// Only the one connection ID was ever issued, and the peer
-			// keeps using it.
-			r.varint()
+			if seq := r.varint(); !r.bad {
+				err = c.handleRetireCID(seq, c.rxDCID)
+			}
 		case typ == framePathChallenge:
 			if data := r.bytes(8); !r.bad {
 				c.queuePathResponse([8]byte(data))

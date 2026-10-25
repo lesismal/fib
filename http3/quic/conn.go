@@ -23,6 +23,7 @@ import (
 	"math/bits"
 	"net"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/lesismal/fib/bufferpool"
@@ -194,6 +195,14 @@ type Config struct {
 	// for the peer to have acknowledged a packet of the current keys, so
 	// a connection that sends nothing does not update.
 	KeyUpdateInterval time.Duration
+	// ActiveConnectionIDs is how many connection IDs this side has issued
+	// to its peer at once, the one of the handshake among them, as many as
+	// the peer's active_connection_id_limit allows: the peer may move to
+	// any of them, and retires one to be given another (RFC 9000 section
+	// 5.1). A server finds the connection of a packet that arrives from an
+	// address it does not know by them, which LocalCIDs lists. Default 4;
+	// 1 issues none beyond the handshake's.
+	ActiveConnectionIDs int
 	// CongestionControl is the congestion controller: CUBIC, the default,
 	// or NewReno.
 	CongestionControl CongestionControl
@@ -270,6 +279,10 @@ func (config Config) withDefaults() Config {
 		config.MaxAckDelay = DefaultMaxAckDelay
 	}
 	config.MaxAckDelay = min(max(config.MaxAckDelay, time.Millisecond), maxAckDelayLimit).Truncate(time.Millisecond)
+	if config.ActiveConnectionIDs <= 0 {
+		config.ActiveConnectionIDs = DefaultActiveConnectionIDs
+	}
+	config.ActiveConnectionIDs = min(config.ActiveConnectionIDs, maxActiveConnectionIDs)
 	return config
 }
 
@@ -338,6 +351,18 @@ type Conn struct {
 	retireCIDs   []uint64
 	// peerResetToken lets a client recognize a stateless reset.
 	peerResetToken []byte
+	// The connection IDs this side has issued (see cid.go): localCIDs, the
+	// handshake's first, nextCIDSeq the sequence number of the next,
+	// cidsIssuing how many are on their way to the handler, cidsPending
+	// whether a NEW_CONNECTION_ID waits to be sent, and owned what Owns
+	// reads without the lock. rxDCID is the connection ID of the packet
+	// being handled.
+	localCIDs   []localCID
+	nextCIDSeq  uint64
+	cidsIssuing int
+	cidsPending bool
+	owned       atomic.Pointer[[][]byte]
+	rxDCID      []byte
 
 	spaces             [numSpaces]pnSpace
 	handshakeComplete  bool
@@ -640,6 +665,9 @@ func newConn(pc PacketConn, remote net.Addr, config Config, handler Handler, isC
 	c.local.maxStreamsUni = config.MaxIncomingUniStreams
 	c.local.maxAckDelay = config.MaxAckDelay
 	c.local.initialSCID, c.local.hasInitialSCID = c.scid, true
+	c.localCIDs = []localCID{{seq: 0, cid: c.scid}}
+	c.nextCIDSeq = 1
+	c.publishCIDsLocked()
 	return c
 }
 
@@ -764,12 +792,18 @@ func (c *Conn) LocalCID() []byte { return c.scid }
 func (c *Conn) Handler() Handler { return c.handler }
 
 // Owns reports whether packets sent to the connection ID cid are this
-// connection's: cid is its own, or, on a server, the one the client chose
-// for its first packets, which its Initial and 0-RTT packets go to until it
-// has the server's. A server whose clients run several connections from one
-// address tells their packets apart by it.
+// connection's: cid is one of its own (see LocalCIDs), or, on a server, the
+// one the client chose for its first packets, which its Initial and 0-RTT
+// packets go to until it has the server's. A server whose clients run
+// several connections from one address tells their packets apart by it. It
+// is safe to call from any goroutine.
 func (c *Conn) Owns(cid []byte) bool {
-	return bytes.Equal(cid, c.scid) || !c.isClient && bytes.Equal(cid, c.odcid)
+	for _, own := range c.LocalCIDs() {
+		if bytes.Equal(cid, own) {
+			return true
+		}
+	}
+	return !c.isClient && bytes.Equal(cid, c.odcid)
 }
 
 // SendsOn reports whether pc is the path the connection sends on.
@@ -1499,6 +1533,7 @@ func (c *Conn) handlePacket(pkt []byte, h header, now time.Time) bool {
 	// The calls the packet's frames queue start here, which is where a
 	// move to the path it came on goes (see migrateLocked).
 	firstEvent := len(c.events)
+	c.rxDCID = h.dcid
 	c.curEarly = early
 	ackEliciting, err := c.handleFrames(space, payload, now)
 	c.curEarly = false
@@ -1844,6 +1879,7 @@ func (c *Conn) confirmHandshake() {
 	c.handshakeConfirmed = true
 	c.discardSpace(spaceHandshake)
 	c.startMTUDiscoveryLocked(c.now())
+	c.issueCIDsLocked()
 }
 
 func (c *Conn) handleVersionNegotiation(d []byte) {
