@@ -141,12 +141,19 @@ func TestH2ServerPrefaceInPieces(t *testing.T) {
 	}
 	t.Cleanup(func() { c.Close() })
 	tc := newH2TestConn(t, c)
+	// The server's SETTINGS arrives before the client has sent its preface
+	// whole, and an acknowledgement now would land in the middle of it; it
+	// goes with the rest instead.
+	tc.holdSettingsAck = true
 	tc.write([]byte(h2Preface[:10]))
 	// The server's SETTINGS says it has taken the first piece.
 	if f := tc.readRaw(); f.typ != h2FrameSettings {
 		t.Fatalf("first frame %v, want SETTINGS", f.typ)
 	}
-	tc.write(append([]byte(h2Preface[10:]), h2AppendSettings(nil)...))
+	tc.holdSettingsAck = false
+	tail := append([]byte(h2Preface[10:]), h2AppendSettings(nil)...)
+	tail = append(tail, h2AppendFrameHeader(nil, h2FrameSettings, h2FlagAck, 0, 0)...)
+	tc.write(tail)
 	tc.headers(1, true, get("/pieces")...)
 	if _, body := tc.response(1); string(body) != "GET /pieces " {
 		t.Fatalf("body %q", body)

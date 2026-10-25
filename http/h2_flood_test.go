@@ -136,6 +136,11 @@ func TestH2ServerBoundsASlowHeaderBlock(t *testing.T) {
 	config.ReadHeaderTimeout = 200 * time.Millisecond
 	addr := serve(t, NewHandlerWithConfig(config, echoHandler()))
 	tc := dialH2(t, addr)
+	// The server's SETTINGS is read while the header block is open, and an
+	// acknowledgement would interleave with the block's CONTINUATION frames,
+	// which the server rightly refuses; the block's own timeout ends the
+	// connection long before the acknowledgement would be due.
+	tc.holdSettingsAck = true
 	tc.write(append(h2AppendFrameHeader(nil, h2FrameHeaders, 0, 1, 1), 0))
 	done := make(chan struct{})
 	defer close(done)
