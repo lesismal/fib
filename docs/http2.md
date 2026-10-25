@@ -38,10 +38,10 @@ Behaviour to be aware of when using it.
   on HTTP/1 (see [`http1.md`](http1.md#streaming-request-bodies)). The stream's
   receive window is then given back only as the handler consumes the body, so
   a client uploading faster than the handler takes it is paced by HTTP/2 flow
-  control, one window (1MB) at most ahead, while the connection's other
-  streams carry on. `MaxStreamedBodyBytes` bounds such a body in place of
-  `MaxBodyBytes`, and `Expect: 100-continue` is answered only once the handler
-  asks for the body.
+  control, one window (`HTTP2Config.StreamWindow`, 1MB by default) at most
+  ahead, while the connection's other streams carry on.
+  `MaxStreamedBodyBytes` bounds such a body in place of `MaxBodyBytes`, and
+  `Expect: 100-continue` is answered only once the handler asks for the body.
 - A response given to `WriteResponse` or `Respond` is given all at once as
   `Response.Body []byte`. The client buffers the whole response body before
   its callback.
@@ -67,8 +67,8 @@ Behaviour to be aware of when using it.
   (`Server.ServeHTTP`), besides its own HTTP/2 transport.
 - Memory bound: on the server, one connection can hold up to about
   `MaxConcurrentStreams × MaxBodyBytes` (250 × 16MB by default) of bodies read
-  whole, and a window (1MB) per streamed body; on the client,
-  one response is bounded by `MaxResponseBodyBytes`.
+  whole, and a stream window per streamed body; on the client, one response is
+  bounded by `MaxResponseBodyBytes`.
 - A `CONNECT` request is parsed and handed to the handler, but no tunnel can be
   established (there is no bidirectional streaming channel).
 
@@ -112,8 +112,10 @@ Behaviour to be aware of when using it.
   is recycled once its response is finished and its handler has returned and
   released every `Retain`, under `Config.ReuseRequests` and its siblings, which
   are on by default, as an HTTP/1 request's objects are: a handler must not keep
-  them past that (see the HTTP/1 notes). Streams whose body streams, pushed
-  streams and extended CONNECT tunnels are not recycled. On 64 CPUs these two
+  them past that (see the HTTP/1 notes). Streams whose body streams and
+  extended CONNECT tunnels are not recycled: their body callbacks can outlive
+  the response, which a recycled stream cannot carry. A pushed stream is
+  recycled too, its `Request`, `URL` and `Context` with it. On 64 CPUs these
   took HttpArena's baseline-h2c from 3.9M requests a second to 18.5M.
 
 ### No direct writes to the connection
@@ -121,17 +123,38 @@ Behaviour to be aware of when using it.
 - Do not call `Context.Conn.Send` or similar on an HTTP/2 connection: raw bytes
   break the framing. All output must go through `Context`.
 
-### Fixed parameters
+### Configurable parameters
 
-These are constants today and cannot be configured:
+`Config.HTTP2` sets what a server's connections let their clients send, and
+`ClientConfig.HTTP2` the same for a client's connections. Both are
+`http.HTTP2Config`, whose zero value is the defaults in the table below.
 
-| Parameter | Value |
-| --- | --- |
-| Receive window per stream | 1MB, replenished after half is consumed |
-| Receive window per connection | 16MB, replenished after half is consumed |
-| Advertised `SETTINGS_MAX_FRAME_SIZE` | 16384 |
-| HPACK dynamic table | 4096 bytes (the encoder never uses more than 4096) |
-| Concurrent streams the client assumes before the server's SETTINGS arrive | 100 |
+| Field | Default | What it sets |
+| --- | --- | --- |
+| `StreamWindow` | 1MB | `SETTINGS_INITIAL_WINDOW_SIZE`: the receive window each stream is granted, given back after half is consumed. A streamed body is bounded by it; raising it lets one stream move more per round trip. Kept between 65535 and 2^31-1. |
+| `ConnWindow` | 16MB | The connection's receive window, shared by its streams, given back after half is consumed. Kept between 65535 and 2^31-1. |
+| `MaxFrameSize` | 16384 | The advertised `SETTINGS_MAX_FRAME_SIZE`: the largest frame payload the peer may send. A larger one lets a body arrive in fewer frames, for as much more memory per read. Kept between 16384 and 2^24-1. What this side sends is still framed to what the peer allows. |
+| `HeaderTableSize` | 4096 | The HPACK dynamic table each direction may use: the size this side advertises in `SETTINGS_HEADER_TABLE_SIZE` and the most its encoder uses when the peer allows that much. Negative turns the table off. The encoder caps it at `hpack.MaxEncoderTableSize` (1MB). |
+| `AdaptiveWindow` | off | Grow the windows to the connection's bandwidth-delay product, as gRPC does, by measuring DATA between a PING and its acknowledgement and doubling a window that the peer fills within a round trip. The PINGs are at least 25ms apart, the windows never shrink, and the stream window is bounded by `MaxAdaptiveWindow`. |
+| `MaxAdaptiveWindow` | 16MB | The bound on the stream window `AdaptiveWindow` grows. |
+| `InitialMaxStreams` | 100 | How many streams a client opens on a new connection before the server's `SETTINGS_MAX_CONCURRENT_STREAMS` arrives. Ignored by a server. |
+
+```go
+config := fibhttp.DefaultConfig()
+config.HTTP2 = fibhttp.HTTP2Config{
+    StreamWindow:    4 << 20,  // a long, high-latency download moves 4MB per round trip
+    ConnWindow:      32 << 20,
+    MaxFrameSize:    32 << 10, // fewer frames per body, more memory per read
+    HeaderTableSize: 16 << 10, // more of a repeated header kept per connection
+    AdaptiveWindow:  true,     // or let the connection measure its own path
+}
+server, err := fib.New(fibConfig, fib.Binding{Addr: ":443", Handler: fibhttp.NewHandlerWithConfig(config, handler)})
+```
+
+A client sets the same fields in `fibhttp.ClientConfig.HTTP2`, which describe
+what its server may send to it. The windows are the flow control that a
+streamed body is bounded by, the frame size what a peer may send at once, and
+the table what either side's HPACK encoder may keep between header blocks.
 
 ### Protocol details
 
@@ -245,6 +268,43 @@ h2spec is run against a server with `Config.HTTP2Only` set, since it speaks
 nothing but HTTP/2: a sniffing server would answer its deliberately invalid
 preface with an HTTP/1 response, which h2spec cannot read.
 
+## Benchmarks
+
+`go test ./http -run '^$' -bench '^BenchmarkH2Server' -benchmem -count 5`
+drives one connection with 100 requests in flight, each answered as it ends
+with a new one, as h2load does. One op is one request; client and server
+share the process, so compare runs with each other rather than with a load
+generator's numbers. The host is a shared 16-thread Ryzen 7 7800X3D, whose
+load moved ns/op by a few percent between runs; the allocation counts are
+exact, and only the two changes below moved time outside that noise. The
+`hpack` package has its own encode and decode benchmarks.
+
+| Benchmark | ns/op | B/op | allocs/op |
+| --- | --- | --- | --- |
+| GET | 2230 | 10 | 0 |
+| POST | 3136 | 145 | 2 |
+| Static 1KB | 2480 | 9 | 0 |
+| Static 16KB | 5630 | 28 | 0 |
+| Static 64KB | 15503 | 126 | 0 |
+| Static TLS 1KB | 3026 | 12 | 0 |
+| Static TLS 16KB | 9191 | 53 | 1 |
+| Static TLS 64KB | 22612 | 131 | 1 |
+| Streamed POST | 5976 | 6425 | 13 |
+| Push | 5032 | 233 | 4 |
+
+Pushed-stream recycling took `Push` from 8 allocations and 1954 bytes a
+request to 4 and 233, and its time from 5364 to 5032 ns/op (medians of four
+interleaved runs against main). The one-frame send path
+took POST from 3452 to 3226 ns/op and static 16KB from 5833 to 5519 in an
+A/B of the branch with and without it (medians of three interleaved pairs);
+the 64KB bodies, which take several frames, did not move outside noise, and
+neither did TLS, where the layer seals what it is handed into one record
+anyway. A profiler run over these shows the send path waiting on the socket
+(syscalls, and AES-GCM over TLS) far more than it copies: memmove was 2.5% of
+the samples, which is why the copy removed below is worth a few percent.
+The client and the test harness account for most of the remaining
+allocations (the task pool's ring, timers, and the benchmark's own reads).
+
 ## Planned improvements
 
 In order of priority.
@@ -303,18 +363,25 @@ concurrency.
 - **HPACK Huffman decoding** is done: it takes four bits a step from a table.
 - **HPACK encoder dynamic-table index** is done: past 16 entries it finds a
   field through a hash index of names and name-value pairs instead of
-  searching the table.
-- **Allocations**: streams whose body streams, and pushed streams, still
-  allocate theirs; a `static-h2` response copies its body into the handler's
-  buffer, the frames and the TLS record in turn.
-- **Benchmarks**: add HTTP/2 benchmarks (multiplexed throughput on one
-  connection, HPACK encode/decode) and let pprof guide optimisation.
+  searching the table, and the table grows to what `HeaderTableSize` and the
+  peer allow.
+- **Benchmarks** are done: `http/h2_benchmark_test.go` drives one connection
+  with 100 requests in flight, as h2load does, over h2c and TLS, for GET,
+  POST, static bodies of 1KB, 16KB and 64KB, streamed uploads and server push;
+  `hpack` has encode and decode benchmarks. See
+  [Benchmarks](#benchmarks) above.
+- **Pushed streams** are done: a pushed stream and the `Request`, `URL` and
+  `Context` it holds come from the same recycling as a client's stream's. A
+  stream whose body streams still allocates, since its callbacks can outlive
+  the response.
+- **Copies on the send path** are cut for a whole response whose body fits
+  one frame over h2c: it is copied once rather than twice. A larger body, and
+  one over TLS, is still copied into the frames and then into the connection
+  or record; cutting the rest needs a vectored send the protocol layer does
+  not have.
 
-### 5. Configurability and scheduling (low)
+### 5. Scheduling (low)
 
-- Make the receive windows, maximum frame size, HPACK table size and the
-  client's initial stream allowance configurable; optionally size windows from
-  the bandwidth-delay product.
 - Schedule streams with pending data by weight; round-robin is done.
 - Client: a SETTINGS acknowledgement timeout of its own. (PING health checks,
   least-loaded connection selection and waiting for 100-continue are done; see

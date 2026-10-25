@@ -32,7 +32,7 @@
   `Request.Body`（不阻塞的 `*BodyStream`）读，或用 `Context.OnBody` 接收，和 HTTP/1 完全
   一样（见 [`http1.zh-CN.md`](http1.zh-CN.md#流式请求-body)）。这时 stream 的接收窗口只在
   handler 消费了 body 之后才补充，上传快于 handler 处理的客户端由 HTTP/2 流控限速，最多
-  领先一个窗口（1MB），同一连接上的其它 stream 不受影响。流式 body 的上限是
+  领先一个窗口（`HTTP2Config.StreamWindow`，默认 1MB），同一连接上的其它 stream 不受影响。流式 body 的上限是
   `MaxStreamedBodyBytes` 而不是 `MaxBodyBytes`；`Expect: 100-continue` 要等 handler
   第一次要 body 时才回复 100。
 - 交给 `WriteResponse` 或 `Respond` 的响应通过 `Response.Body []byte` 一次性给出；客户端
@@ -52,7 +52,8 @@
 - [`grpc`](../grpc) 包通过这一机制（`Server.ServeHTTP`）提供 gRPC（含 streaming），它也有
   自己的 HTTP/2 传输层。
 - 内存上限：服务端单连接最坏约为 `MaxConcurrentStreams × MaxBodyBytes`
-  （默认 250 × 16MB）；客户端单个响应受 `MaxResponseBodyBytes` 限制。
+  （默认 250 × 16MB），外加每个流式 body 一个 stream 窗口；客户端单个响应受
+  `MaxResponseBodyBytes` 限制。
 - `CONNECT` 请求能被解析并交给 handler，但无法建立隧道（没有双向流式通道）。
 
 ### handler 在协程池上执行
@@ -81,25 +82,45 @@
 - stream 连同它持有的 `*http.Request`、`Header`、`URL`、`*Context`，在响应完成、handler
   返回并释放所有 `Retain` 之后被复用，受 `Config.ReuseRequests` 等选项控制（默认开启），规则与
   HTTP/1 请求对象相同：handler 不能在那之后继续持有它们（见 HTTP/1 文档）。body 流式交付的
-  stream、push 的 stream、extended CONNECT 隧道不复用。64 核上这两项把 HttpArena 的
-  baseline-h2c 从每秒 390 万请求提到 1850 万。
+  stream 和 extended CONNECT 隧道不复用：它们的 body 回调可能在响应结束之后才发生，复用的
+  stream 无法承载。push 的 stream 也复用，连同它的 `Request`、`URL` 和 `Context`。64 核上
+  这两项把 HttpArena 的 baseline-h2c 从每秒 390 万请求提到 1850 万。
 
 ### 不能向连接直接写字节
 
 - HTTP/2 连接上不要调用 `Context.Conn.Send` 等方法直接写数据，否则会破坏帧结构；
   所有输出都必须经过 `Context`。
 
-### 固定参数
+### 可配置参数
 
-以下参数目前是常量，不能配置：
+`Config.HTTP2` 设置服务端连接允许客户端发送什么，`ClientConfig.HTTP2` 对客户端连接做同样
+的事。两者都是 `http.HTTP2Config`，零值即下表中的默认值。
 
-| 参数 | 值 |
-| --- | --- |
-| 每个 stream 的接收窗口 | 1MB，消费一半后补充 |
-| 连接的接收窗口 | 16MB，消费一半后补充 |
-| 本端 `SETTINGS_MAX_FRAME_SIZE` | 16384 |
-| HPACK 动态表 | 4096 字节（编码器不会使用超过 4096 的表） |
-| 客户端在收到服务端 SETTINGS 前假定的并发 stream 数 | 100 |
+| 字段 | 默认值 | 含义 |
+| --- | --- | --- |
+| `StreamWindow` | 1MB | `SETTINGS_INITIAL_WINDOW_SIZE`：每个 stream 的接收窗口，消费一半后补充。流式 body 受它限制；调大能让单个 stream 每个往返多传一些。取值限制在 65535 到 2^31-1。 |
+| `ConnWindow` | 16MB | 整个连接的接收窗口，由所有 stream 共享，消费一半后补充。取值限制在 65535 到 2^31-1。 |
+| `MaxFrameSize` | 16384 | 声明给对端的 `SETTINGS_MAX_FRAME_SIZE`：对端可发送的最大帧负载。调大后同样的 body 用更少的帧，但每次读取可能占用更多内存。取值限制在 16384 到 2^24-1。本端发送时仍按对端允许的大小分帧。 |
+| `HeaderTableSize` | 4096 | 双向使用的 HPACK 动态表大小：本端在 `SETTINGS_HEADER_TABLE_SIZE` 中声明的值，也是对端允许时本端编码器使用的上限。设为负数关闭动态表。编码器上限为 `hpack.MaxEncoderTableSize`（1MB）。 |
+| `AdaptiveWindow` | 关闭 | 像 gRPC 那样把窗口涨到连接的带宽时延积：统计一个 PING 到其确认之间到达的 DATA，若对端在一个往返里填满了窗口，就把窗口翻倍。PING 至少间隔 25ms，窗口只增不减，stream 窗口受 `MaxAdaptiveWindow` 限制。 |
+| `MaxAdaptiveWindow` | 16MB | `AdaptiveWindow` 可涨到的 stream 窗口上限。 |
+| `InitialMaxStreams` | 100 | 客户端在收到服务端 `SETTINGS_MAX_CONCURRENT_STREAMS` 之前，在新连接上假定可并发的 stream 数。服务端忽略。 |
+
+```go
+config := fibhttp.DefaultConfig()
+config.HTTP2 = fibhttp.HTTP2Config{
+    StreamWindow:    4 << 20,  // 高延迟长链路上一次往返传 4MB
+    ConnWindow:      32 << 20,
+    MaxFrameSize:    32 << 10, // body 帧更少，每次读取内存更多
+    HeaderTableSize: 16 << 10, // 每个连接保留更多重复出现的头
+    AdaptiveWindow:  true,     // 或者让连接自己测量路径
+}
+server, err := fib.New(fibConfig, fib.Binding{Addr: ":443", Handler: fibhttp.NewHandlerWithConfig(config, handler)})
+```
+
+客户端在 `fibhttp.ClientConfig.HTTP2` 中设置同样的字段，含义是它允许服务端向它发送什么。
+窗口是流式 body 受制的流控，帧大小是对端一次能发送多少，动态表是两侧 HPACK 编码器在
+header block 之间能保留多少。
 
 ### 协议细节
 
@@ -178,6 +199,37 @@
 h2spec 只会说 HTTP/2，所以跑它时服务端要设置 `Config.HTTP2Only`：否则协议嗅探的
 服务端会把它故意发送的非法 preface 当作 HTTP/1 请求回复，h2spec 读不懂这个回复。
 
+## 基准测试
+
+`go test ./http -run '^$' -bench '^BenchmarkH2Server' -benchmem -count 5`，在单连接上
+保持 100 个请求并发，每个请求结束就补一个新的，和 h2load 一样。一次 op 是一个请求；
+客户端与服务端在同一进程内，因此适合互相对比，不要与压测工具的结果直接比较。测试机是
+共享的 16 线程 Ryzen 7 7800X3D，负载会让 ns/op 在不同次运行间浮动几个百分点；分配次数
+是准确的，只有下面两项改动带来的时间变化超出了这个噪声。`hpack` 有自己的编码、解码
+benchmark。
+
+| Benchmark | ns/op | B/op | allocs/op |
+| --- | --- | --- | --- |
+| GET | 2230 | 10 | 0 |
+| POST | 3136 | 145 | 2 |
+| Static 1KB | 2480 | 9 | 0 |
+| Static 16KB | 5630 | 28 | 0 |
+| Static 64KB | 15503 | 126 | 0 |
+| Static TLS 1KB | 3026 | 12 | 0 |
+| Static TLS 16KB | 9191 | 53 | 1 |
+| Static TLS 64KB | 22612 | 131 | 1 |
+| Streamed POST | 5976 | 6425 | 13 |
+| Push | 5032 | 233 | 4 |
+
+push stream 复用把 `Push` 从每个请求 8 次分配、1954 字节降到 4 次、233 字节，时间从
+5364 ns/op 降到 5032（与 main 交替跑四次取中位数）。单帧发送路径让 POST 从
+3452 ns/op 降到 3226、静态 16KB 从 5833 降到 5519（同一分支开/关该路径交替跑三次取
+中位数）；需要多帧的 64KB body 在噪声内没有变化，TLS 也没有，因为 TLS layer 本来就会把
+交给它的数据一次封进一个 record。对这几个 benchmark 做 pprof 显示发送路径主要等在
+socket 上（系统调用，TLS 上还有 AES-GCM），拷贝占比不大：memmove 只占采样 2.5%，这也是
+去掉一次拷贝只值几个百分点的原因。其余分配主要来自客户端和测试框架（task pool 的环形
+队列、定时器，以及 benchmark 自己的读取）。
+
 ## 待优化项
 
 按优先级排列。
@@ -221,16 +273,19 @@ CI 的 `Fuzz the parsers` job 每个目标跑 20 秒。还缺的是压测（例�
 ### 4. 性能（中）
 
 - **HPACK Huffman 解码**：已完成，按查表每步解码 4 bit。
-- **HPACK 编码器动态表索引**：已完成，动态表超过 16 项后按名字和名字-值的哈希索引查找，不再逐项搜索。
-- **内存分配**：body 流式交付的 stream 和 push 的 stream 仍各自分配；`static-h2` 的响应 body
-  依次拷贝进 handler 的 buffer、帧和 TLS record。
-- **基准测试**：补充 HTTP/2 的 benchmark（单连接多路复用吞吐、HPACK 编解码），
-  用 pprof 指导优化。
+- **HPACK 编码器动态表索引**：已完成，动态表超过 16 项后按名字和名字-值的哈希索引查找，不再逐项搜索；
+  表也可以长到 `HeaderTableSize` 与对端允许的范围。
+- **基准测试**：已完成。`http/h2_benchmark_test.go` 像 h2load 一样在单连接上保持 100 个请求并发，
+  覆盖 h2c 与 TLS、GET、POST、1KB/16KB/64KB 静态 body、流式上传和 server push；`hpack` 有编码与
+  解码 benchmark。数字见下文[基准测试](#基准测试)。
+- **push 的 stream**：已完成，和服务端 client stream 一样复用，连同它持有的 `Request`、`URL` 和
+  `Context`。body 流式交付的 stream 仍然分配，因为它的回调可能在响应结束之后发生。
+- **发送路径的拷贝**：h2c 上 body 能装进一帧的整体响应已经从两次拷贝降到一次；更大的 body
+  以及 TLS 上的响应仍要先拷进帧，再拷进连接或 record，要再减少需要协议层支持分散写
+  （vectored send），当前没有。
 
-### 5. 可配置性与调度（低）
+### 5. 调度（低）
 
-- 把接收窗口大小、最大帧大小、HPACK 表大小、客户端初始并发数做成配置项；可选根据
-  BDP 动态调整窗口。
 - 发送侧按权重调度待发送的 stream（轮询已实现）。
 - 客户端：SETTINGS 确认超时检测。（PING 健康检查、按负载选择连接、等待 100-continue
   已完成，见[客户端](#客户端)。）

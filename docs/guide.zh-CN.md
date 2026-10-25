@@ -927,7 +927,23 @@ server, err := fib.New(config, fib.Binding{Addr: ":443", Handler: fibtls.NewServ
 - `Response.Close` 在 HTTP/2 上优雅关闭连接：发送 GOAWAY(NO_ERROR)，不再接受新
   stream，已在处理的 stream 完成后再关闭连接。
 - 流控：遵守对端的连接级与 stream 级窗口，窗口不足的响应 body 暂存，等 WINDOW_UPDATE
-  后继续发送；接收方向每个 stream 窗口 1MB、连接窗口 16MB，按消费量自动补充。
+  后继续发送；接收方向默认每个 stream 窗口 1MB、连接窗口 16MB，按消费量自动补充。这些
+  参数以及本端声明的最大帧大小、HPACK 动态表、客户端在收到服务端 SETTINGS 前假定的并发
+  数，都通过 `Config.HTTP2`（`http.HTTP2Config`）配置；客户端的 `ClientConfig.HTTP2` 同理，
+  含义是它允许服务端向它发送什么：
+
+  ```go
+  config := fibhttp.DefaultConfig()
+  config.HTTP2 = fibhttp.HTTP2Config{
+      StreamWindow:    4 << 20,  // 高延迟长链路上一次往返多传一些
+      ConnWindow:      32 << 20,
+      MaxFrameSize:    32 << 10, // 帧更少，每次读取内存更多
+      HeaderTableSize: 16 << 10, // 每个连接保留更多重复的头
+      AdaptiveWindow:  true,     // 或者按 BDP 自动涨窗口
+  }
+  ```
+
+  各字段的默认值、取值范围与代价见 [HTTP/2 文档](http2.zh-CN.md#可配置参数)。
 - 实现了 HPACK（含 Huffman 与动态表）、CONTINUATION、trailer、多个 cookie 字段合并、
   PING、SETTINGS、RST_STREAM、GOAWAY，以及 RFC 9113 的请求合法性校验（非法请求用
   RST_STREAM 拒绝，协议错误用 GOAWAY 关闭连接）。
@@ -984,8 +1000,8 @@ _ = c.Respond(http.StatusOK, "text/html", page)
 #### 一致性与限制
 
 HTTP/2 的一致性测试（h2spec 145 项全部通过，另有与 `net/http`、curl 的互通测试和原始
-帧测试，CI 中运行）、当前的限制（body 整体缓存、固定的窗口参数等）、
-有意未实现的功能及原因、以及待优化项见
+帧测试，CI 中运行）、当前的限制（body 整体缓存等）、
+有意未实现的功能及原因、基准测试数字以及待优化项见
 [`docs/http2.zh-CN.md`](http2.zh-CN.md)。
 
 ### 异步 HTTP client
