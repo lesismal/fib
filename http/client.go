@@ -720,13 +720,7 @@ func (c *Client) dispatchLocked(h *hostPool) (work []assignment, dials int) {
 			h.popLocked()
 			continue
 		}
-		var cc *clientConn
-		for _, m := range h.h2 {
-			if m.streams < m.maxStreams {
-				cc = m
-				break
-			}
-		}
+		cc := leastLoadedLocked(h.h2)
 		if cc != nil {
 			cc.streams++
 		} else if n := len(h.idle); n > 0 {
@@ -757,6 +751,30 @@ func (c *Client) dispatchLocked(h *hostPool) (work []assignment, dials int) {
 		h.waiting = nil
 	}
 	return work, dials
+}
+
+// leastLoadedLocked picks the HTTP/2 connection to open the next stream on:
+// the one with the most of its streams to spare, so that a host's requests
+// spread over the connections it has rather than piling onto the first until
+// the server's limit, where a connection slowed by its socket, or by large
+// bodies holding its window, would carry most of them while the next sat
+// nearly idle. Room is counted against what each connection's server
+// allows, which may differ, and a tie goes to the earlier connection, so a
+// lone connection is the one used as before. A second connection is only
+// dialed once every one is full, so spreading over them costs nothing while
+// one suffices; once there are several, they all stay in use while the
+// requests keep them busy, and close once the host goes quiet for
+// IdleConnTimeout. It returns nil when none has room. Callers hold
+// Client.mu.
+func leastLoadedLocked(conns []*clientConn) *clientConn {
+	var best *clientConn
+	room := 0
+	for _, m := range conns {
+		if spare := m.maxStreams - m.streams; spare > room {
+			best, room = m, spare
+		}
+	}
+	return best
 }
 
 // mayMultiplex reports whether a connection to target might speak HTTP/2.
