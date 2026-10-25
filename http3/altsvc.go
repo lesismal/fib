@@ -8,6 +8,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	fibhttp "github.com/lesismal/fib/http"
@@ -191,6 +192,10 @@ func (a *AltSvcClient) start(req *stdhttp.Request, callback func(*fibhttp.Client
 		return
 	}
 	if entry, ok := a.route(req); ok {
+		// A request the h3 client rejects outright calls the callback before
+		// do returns, so the fallback has to be able to say it took the
+		// request over before the h3 client's Call is what a Cancel reaches.
+		var fellBack atomic.Bool
 		c := a.h3.do(req, func(resp *fibhttp.ClientResponse, err error) {
 			if resp == nil && err != nil && (call == nil || !call.ended()) {
 				// The QUIC attempt failed, so this origin goes back to TCP for
@@ -205,6 +210,7 @@ func (a *AltSvcClient) start(req *stdhttp.Request, callback func(*fibhttp.Client
 				}
 				a.mu.Unlock()
 				if a.fallback(req) {
+					fellBack.Store(true)
 					a.doTCP(req, callback, whole, call)
 					return
 				}
@@ -212,7 +218,7 @@ func (a *AltSvcClient) start(req *stdhttp.Request, callback func(*fibhttp.Client
 			a.delivered(req, resp)
 			callback(resp, err)
 		}, whole, altTarget{addr: entry.addr, serverName: entry.serverName})
-		if call != nil {
+		if call != nil && !fellBack.Load() {
 			call.hold(func(err error) { Call{r: c}.Cancel(err) })
 		}
 		return
