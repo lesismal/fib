@@ -81,23 +81,6 @@ func (st *h2ServerStream) push(parent *stdhttp.Request, target string, opts *std
 	if err = h2CheckHeader(header); err != nil {
 		return err
 	}
-	req := &stdhttp.Request{
-		Method:     method,
-		URL:        u,
-		Proto:      "HTTP/2.0",
-		ProtoMajor: 2,
-		Header:     make(stdhttp.Header, len(header)),
-		Host:       authority,
-		RemoteAddr: sc.remoteAddr,
-		RequestURI: path,
-		TLS:        sc.tlsState,
-		Body:       stdhttp.NoBody,
-	}
-	for key, values := range header {
-		key = textproto.CanonicalMIMEHeaderKey(key)
-		req.Header[key] = append(req.Header[key], values...)
-	}
-
 	sc.mu.Lock()
 	switch {
 	case !sc.pushEnabled:
@@ -126,16 +109,53 @@ func (st *h2ServerStream) push(parent *stdhttp.Request, target string, opts *std
 	block = sc.enc.AppendField(block, ":authority", authority, false)
 	block = sc.enc.AppendField(block, ":path", path, false)
 	block = sc.appendHeaderLocked(block, header)
-	promised := &h2ServerStream{sc: sc, id: id, req: req, pushed: true, remoteDone: true, sendWindow: sc.peerWindow}
+	promised := sc.newStream(id)
+	promised.pushed, promised.remoteDone = true, true
+	// The Context that serves it takes a reference of its own before the
+	// promise is sent, so that a client resetting the stream straight away
+	// leaves it to the handler rather than recycling it under the handler.
+	promised.refs.Add(1)
 	sc.streams[id] = promised
 	sc.pushedStreams++
 	sc.busyLocked()
 	sc.sendLocked(h2AppendPushPromise(nil, st.id, id, block, sc.peerMaxFrame))
 	sc.mu.Unlock()
+
+	// The promised request is the stream's own, as a client's request is, so
+	// that a recycled stream hands its Request, URL and Context to the next
+	// push rather than allocating others.
+	req := &promised.block.Request
+	*req = stdhttp.Request{
+		Method:     method,
+		Proto:      "HTTP/2.0",
+		ProtoMajor: 2,
+		Host:       authority,
+		RemoteAddr: sc.remoteAddr,
+		RequestURI: path,
+		TLS:        sc.tlsState,
+		Body:       stdhttp.NoBody,
+	}
+	promised.block.URL = *u
+	req.URL = &promised.block.URL
+	switch {
+	case promised.pooled && sc.reuseHeaders:
+		pooled := headerPool.Get().(*pooledHeader)
+		promised.headerFromPool = pooled
+		req.Header = pooled.header
+	default:
+		req.Header = make(stdhttp.Header, len(header))
+	}
+	for key, values := range header {
+		key = textproto.CanonicalMIMEHeaderKey(key)
+		req.Header[key] = append(req.Header[key], values...)
+	}
+	promised.req = req
+	c := promised.block.bind(sc.conn, nil)
+	c.stream = promised
 	sc.armWriteTimeout(promised)
 
 	// Its handler runs here, on the goroutine of the one pushing it, which
 	// may be the one reading the connection.
-	serveRequestOn(sc.handler.handler, &Context{Conn: sc.conn, Request: req, stream: promised}, reader)
+	serveRequestOn(sc.handler.handler, c, reader)
 	return nil
 }
