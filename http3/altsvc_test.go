@@ -246,7 +246,6 @@ func TestAltSvcClientFallsBackToTCP(t *testing.T) {
 	} else {
 		_ = readBody(t, resp)
 	}
-	start := time.Now()
 	resp, err := client.Go(mustRequest(t, stdhttp.MethodGet, tcpURL+"/second", nil)).Wait()
 	if err != nil {
 		t.Fatal(err)
@@ -257,7 +256,17 @@ func TestAltSvcClientFallsBackToTCP(t *testing.T) {
 	if tcpSeen.Load() != 2 {
 		t.Fatalf("the TCP server saw %d requests, want 2", tcpSeen.Load())
 	}
-	// The next request is on TCP straight away: the origin is backed off.
+	// The origin is left on TCP for a while, rather than each request trying
+	// the handshake again.
+	client.mu.Lock()
+	backedOff := false
+	for _, e := range client.alts {
+		backedOff = backedOff || e.retryAt.After(time.Now())
+	}
+	client.mu.Unlock()
+	if !backedOff {
+		t.Fatal("the failed origin was not backed off")
+	}
 	resp, err = client.Go(mustRequest(t, stdhttp.MethodGet, tcpURL+"/third", nil)).Wait()
 	if err != nil {
 		t.Fatal(err)
@@ -265,8 +274,5 @@ func TestAltSvcClientFallsBackToTCP(t *testing.T) {
 	_ = readBody(t, resp)
 	if tcpSeen.Load() != 3 {
 		t.Fatalf("the TCP server saw %d requests, want 3", tcpSeen.Load())
-	}
-	if elapsed := time.Since(start); elapsed > time.Second {
-		t.Fatalf("the requests after the failure took %v; the origin was not backed off", elapsed)
 	}
 }
