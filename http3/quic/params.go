@@ -24,6 +24,10 @@ const (
 	paramActiveCIDLimit        = 0x0e
 	paramInitialSCID           = 0x0f
 	paramRetrySCID             = 0x10
+	// paramMinAckDelay advertises support of the ACK_FREQUENCY extension
+	// (draft-ietf-quic-ack-frequency section 3); it is in microseconds,
+	// unlike max_ack_delay.
+	paramMinAckDelay = 0xff04de1b
 )
 
 // transportParams are what each side tells the other about itself during the
@@ -48,6 +52,12 @@ type transportParams struct {
 	maxAckDelay         time.Duration
 	disableMigration    bool
 	activeCIDLimit      uint64
+	// minAckDelay is how soon this side is willing to acknowledge when a
+	// peer asks it to wait, and hasMinAckDelay that it said so, which is
+	// what allows the peer to send ACK_FREQUENCY and IMMEDIATE_ACK at all
+	// (draft-ietf-quic-ack-frequency section 3).
+	minAckDelay    time.Duration
+	hasMinAckDelay bool
 }
 
 // DefaultMaxAckDelay is Config.MaxAckDelay's default, which is also what a
@@ -112,6 +122,7 @@ func (p *transportParams) encode() []byte {
 	if p.hasRetrySCID {
 		b = appendParamBytes(b, paramRetrySCID, p.retrySCID)
 	}
+	b = appendParamVarint(b, paramMinAckDelay, uint64(p.minAckDelay/time.Microsecond))
 	return b
 }
 
@@ -196,6 +207,12 @@ func parseParams(b []byte, isClient bool) (transportParams, error) {
 			p.initialSCID, p.hasInitialSCID = bytes.Clone(v), true
 		case paramRetrySCID:
 			p.retrySCID, p.hasRetrySCID, serverOnly = bytes.Clone(v), true, true
+		case paramMinAckDelay:
+			us := intValue()
+			if us > uint64((1<<14)*time.Millisecond/time.Microsecond) {
+				vr.bad = true
+			}
+			p.minAckDelay, p.hasMinAckDelay = time.Duration(us)*time.Microsecond, true
 		}
 		if vr.bad {
 			return p, transportErr(errTransportParameter, "invalid transport parameter")
@@ -203,6 +220,9 @@ func parseParams(b []byte, isClient bool) (transportParams, error) {
 		if serverOnly && !isClient {
 			return p, transportErr(errTransportParameter, "server-only transport parameter from a client")
 		}
+	}
+	if p.hasMinAckDelay && p.minAckDelay > p.maxAckDelay {
+		return p, transportErr(errTransportParameter, "min_ack_delay above max_ack_delay")
 	}
 	return p, nil
 }

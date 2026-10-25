@@ -35,6 +35,7 @@ const (
 	sfStreamDataBlocked
 	sfStreamsBlockedBidi
 	sfStreamsBlockedUni
+	sfAckFrequency
 )
 
 type sentFrame struct {
@@ -165,6 +166,17 @@ func (c *Conn) onPacketSent(space int, p *sentPacket) {
 	}
 	if space == spaceApp {
 		c.txPhasePackets++
+		if c.bytesSent > ackFrequencyBulk && !c.ackFreqRequested && c.peerParams != nil && c.peerParams.hasMinAckDelay {
+			// A bulk transfer, at which point asking the peer to
+			// acknowledge less often saves a round of ACK-only datagrams
+			// without delaying the feedback of a request (see
+			// ackFrequencyBulk). A peer that did not offer the extension
+			// is left alone, as is one that ignores the request.
+			c.ackFreqRequested, c.ackFreqPending = true, true
+			c.ackFreqSeq++
+			c.ackFreqDelay = c.ackFrequencyDelay()
+			c.ackFreqAsking, c.ackFreqAt = ackFrequencyThreshold, p.time
+		}
 	}
 	if space == spaceHandshake && c.isClient && !c.spaces[spaceInitial].discarded {
 		// A client stops using Initial packets once it sends a Handshake
@@ -213,6 +225,7 @@ func (c *Conn) onAckReceived(space int, ranges []pnRange, ackDelay time.Duration
 		eliciting = eliciting || p.ackEliciting
 		oneRTT = oneRTT || !p.early
 	}
+	sampled := false
 	if newest.pn == largest && eliciting {
 		if space == spaceInitial {
 			ackDelay = 0
@@ -223,6 +236,7 @@ func (c *Conn) onAckReceived(space int, ranges []pnRange, ackDelay time.Duration
 			c.rtt.firstAt = now
 		}
 		c.rtt.update(now.Sub(newest.time), ackDelay)
+		sampled = true
 	}
 	// Whether the window was in use is a matter of what was in flight
 	// before this acknowledgement, and before what it shows lost.
@@ -236,6 +250,12 @@ func (c *Conn) onAckReceived(space int, ranges []pnRange, ackDelay time.Duration
 		}
 	}
 	c.detectLost(space, now)
+	if space == spaceApp {
+		// HyStart++ judges the round trip of what the peer acknowledges
+		// here, after any loss this acknowledgement shows has set the
+		// threshold it would exit slow start at.
+		c.cc.hystartAck(c.rtt.latest, sampled, largest, s.nextPN)
+	}
 	for _, p := range acked {
 		if p.ackEliciting {
 			s.ackElicitingInFlight--
@@ -345,6 +365,7 @@ func (c *Conn) detectLost(space int, now time.Time) {
 		if c.persistentCongestion(lost) {
 			c.cc.onPersistentCongestion()
 		}
+		c.askForAcks(now)
 	}
 }
 
@@ -428,6 +449,10 @@ func (c *Conn) frameLost(space int, f *sentFrame) {
 		// The challenge of the path being validated goes again, whichever
 		// path the lost one was for.
 		c.challengePending = !c.pathValidated
+	case sfAckFrequency:
+		// The peer may not have the request, so it goes again with the
+		// same sequence number, which a peer that had it ignores.
+		c.ackFreqPending = true
 	}
 }
 

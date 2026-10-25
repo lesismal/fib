@@ -335,6 +335,45 @@ const maxBufferedPackets = 16
 // maxCryptoBuffer bounds out-of-order handshake data.
 const maxCryptoBuffer = 64 << 10
 
+// ackFrequency is the peer's request for how often this side acknowledges
+// (draft-ietf-quic-ack-frequency section 4): the sequence number of the most
+// recent one taken, its ack-eliciting threshold, the maximum delay it allows,
+// and the reordering it tolerates before an acknowledgement is due at once.
+// valid is whether a request has been taken at all.
+type ackFrequency struct {
+	valid      bool
+	seq        uint64
+	threshold  uint64
+	maxDelay   time.Duration
+	reordering uint64
+}
+
+// How this side asks its peer to acknowledge less often during a bulk
+// transfer (draft-ietf-quic-ack-frequency).
+const (
+	// ackFrequencyThreshold is the number of ack-eliciting packets after
+	// which the peer sends an acknowledgement: ten, the initial window's
+	// worth, the most the draft suggests a sender ask for until the window
+	// is larger.
+	ackFrequencyThreshold = 10
+	// ackFrequencyLossThreshold is what a connection that has lost a packet
+	// asks for instead: the default of RFC 9000, an acknowledgement every
+	// other packet, since a window that a loss has just shrunk can be too
+	// small to fill the threshold, and loss recovery depends on the
+	// acknowledgements (draft-ietf-quic-ack-frequency section 8.1).
+	ackFrequencyLossThreshold = 1
+	// ackFrequencyReordering is the gap the peer may let a packet stay
+	// missing for before acknowledging out of order: one less than the
+	// packet threshold at which this side declares a loss (RFC 9002
+	// section 6.1.1), so that a loss is still found as soon as it can be.
+	ackFrequencyReordering = packetThreshold - 1
+	// ackFrequencyBulk is how much this side sends before asking the peer
+	// to acknowledge less often. A request or a response of a few packets
+	// keeps the acknowledgements that keep loss detection quick: the
+	// request is for bulk transfers.
+	ackFrequencyBulk = 32 << 10
+)
+
 // Conn is one QUIC connection.
 type Conn struct {
 	mu       sync.Mutex
@@ -419,6 +458,20 @@ type Conn struct {
 	// before, which a PING bundled with it does not count against glitches.
 	glitches, resets floodBudget
 	ackedNew         bool
+	// ackFreq is what the peer asked of this side's acknowledgements, and
+	// ackFreqRequested and ackFreqPending what this side asked of the
+	// peer's: whether it has, and whether the frame is still to go out,
+	// with ackFreqSeq its sequence number (draft-ietf-quic-ack-frequency).
+	ackFreq          ackFrequency
+	ackFreqRequested bool
+	ackFreqPending   bool
+	ackFreqSeq       uint64
+	ackFreqDelay     time.Duration
+	// ackFreqAsking is the threshold the last request asked for, and
+	// ackFreqAt when it was queued, which bounds how often a loss may ask
+	// for another.
+	ackFreqAsking uint64
+	ackFreqAt     time.Time
 	// dataBlockedAt and streamsBlockedAt, for bidirectional and then
 	// unidirectional streams, are the highest limits the peer has said it
 	// was blocked at, which a BLOCKED frame for a new one goes above.
@@ -1570,16 +1623,75 @@ func (c *Conn) handlePacket(pkt []byte, h header, now time.Time) bool {
 		s.largestRecvTime = now
 	}
 	if ackEliciting {
-		s.ackPending = true
-		s.unackedEliciting++
-		switch {
-		case space != spaceApp || s.unackedEliciting >= 2 || int64(pn) != largest+1:
-			s.ackNow = true
-		case s.ackDeadline.IsZero():
-			s.ackDeadline = now.Add(c.local.maxAckDelay)
-		}
+		c.ackElicitingPacket(space, uint64(pn), largest, now)
 	}
 	return true
+}
+
+// ackElicitingPacket notes an ack-eliciting packet and decides whether it
+// calls for an acknowledgement now or by when, by the peer's request if it
+// made one and by RFC 9000 section 13.2.1 otherwise.
+func (c *Conn) ackElicitingPacket(space int, pn uint64, largest int64, now time.Time) {
+	s := &c.spaces[space]
+	s.ackPending = true
+	s.unackedEliciting++
+	if space != spaceApp {
+		s.ackNow = true
+		return
+	}
+	// Every other ack-eliciting packet, any reordering, and the delay this
+	// side advertised, until the peer asks for something else.
+	threshold, reordering, delay := uint64(1), uint64(1), c.local.maxAckDelay
+	if c.ackFreq.valid {
+		threshold, reordering, delay = c.ackFreq.threshold, c.ackFreq.reordering, c.ackFreq.maxDelay
+	}
+	switch {
+	case s.ackNow:
+		// Due already: an acknowledgement more often than the peer asked
+		// for is always allowed.
+	case uint64(s.unackedEliciting) > threshold:
+		s.ackNow = true
+	case int64(pn) != largest+1 && reordering != 0:
+		// A gap, which the peer hears about at once unless it asked for
+		// reordering to be tolerated. The larger thresholds of the draft
+		// would wait for the gap to reach them; an acknowledgement sooner
+		// is allowed, and keeps loss detection at this side's packet
+		// threshold.
+		s.ackNow = true
+	case delay <= 0:
+		s.ackNow = true
+	case s.ackDeadline.IsZero():
+		s.ackDeadline = now.Add(delay)
+	}
+}
+
+// askForAcks limits how often this side asks its peer to acknowledge, once a
+// loss has shown that a window smaller than the threshold may be all it can
+// keep in flight: the peer is asked to acknowledge every other packet again,
+// at most once a round trip (draft-ietf-quic-ack-frequency section 8.1).
+// Callers hold c.mu.
+func (c *Conn) askForAcks(now time.Time) {
+	if !c.ackFreqRequested || c.ackFreqAsking <= ackFrequencyLossThreshold {
+		return
+	}
+	if now.Sub(c.ackFreqAt) < max(c.rtt.smoothed, time.Millisecond) {
+		return
+	}
+	c.ackFreqSeq++
+	c.ackFreqAsking = ackFrequencyLossThreshold
+	c.ackFreqPending, c.ackFreqAt = true, now
+}
+
+// ackFrequencyDelay is the maximum acknowledgement delay to ask a peer for
+// in a bulk transfer: a quarter of the smoothed round trip, so that a
+// congestion window too small to fill the threshold still gets feedback
+// several times a round trip, and no less than the min_ack_delay the peer
+// advertised (draft-ietf-quic-ack-frequency sections 3 and 8.1).
+func (c *Conn) ackFrequencyDelay() time.Duration {
+	if c.peerParams == nil {
+		return 0
+	}
+	return max(min(c.peerParams.maxAckDelay, c.rtt.smoothed/4), c.peerParams.minAckDelay)
 }
 
 // queueEarly sees to the calls an early packet queued, from firstEvent on:

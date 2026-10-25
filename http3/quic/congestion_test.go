@@ -242,3 +242,157 @@ func TestCongestionControlConfig(t *testing.T) {
 		}
 	}
 }
+
+// hsStart is a connection in the initial slow start, with HyStart++'s state
+// set as a test needs it.
+func hsStart() congestion {
+	cc := newCongestion(CUBIC)
+	cc.cwnd, cc.ssthresh = segs(10), ^uint64(0)
+	cc.hy = hystart{started: true, roundEnd: 1000}
+	return cc
+}
+
+// hsSample gives HyStart++ one round trip sample, with the round kept open:
+// the largest packet acknowledged is well below the round's end.
+func hsSample(cc *congestion, rtt time.Duration) {
+	cc.hystartAck(rtt, true, 1, 2000)
+}
+
+// hystartThreshold is the last round's minimum round trip over the divisor,
+// between 4 and 16 milliseconds (RFC 9406 section 4.3).
+func TestHyStartThreshold(t *testing.T) {
+	for _, tc := range []struct{ last, want time.Duration }{
+		{time.Millisecond, 4 * time.Millisecond},
+		{16 * time.Millisecond, 4 * time.Millisecond},
+		{40 * time.Millisecond, 5 * time.Millisecond},
+		{100 * time.Millisecond, 12500 * time.Microsecond},
+		{time.Second, 16 * time.Millisecond},
+	} {
+		if got := hystartThreshold(tc.last); got != tc.want {
+			t.Errorf("threshold of a %v round trip = %v, want %v", tc.last, got, tc.want)
+		}
+	}
+}
+
+// A round's samples are judged against the minimum round trip of the round
+// before, and only once the round has enough of them: fewer do not end slow
+// start however slow they are, and a rise under the threshold does not
+// either.
+func TestHyStartNeedsEnoughSamplesAndADelay(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		last    time.Duration
+		samples int
+		sample  time.Duration
+		want    bool
+	}{
+		{"a delay, with the samples", 10 * time.Millisecond, hystartSamples, 15 * time.Millisecond, true},
+		{"too few samples", 10 * time.Millisecond, hystartSamples - 1, time.Second, false},
+		{"a delay under the threshold", 10 * time.Millisecond, hystartSamples, 13999 * time.Microsecond, false},
+		{"a delay at the threshold", 10 * time.Millisecond, hystartSamples, 14 * time.Millisecond, true},
+	} {
+		cc := hsStart()
+		cc.hy.lastMin = tc.last
+		for i := 0; i < tc.samples; i++ {
+			hsSample(&cc, tc.sample)
+		}
+		if got := cc.hy.inCSS; got != tc.want {
+			t.Errorf("%s: conservative phase %v, want %v", tc.name, got, tc.want)
+		}
+		if tc.want && (!cc.hy.inCSS || cc.hy.baseline != tc.sample || cc.hy.cssRounds != 1) {
+			t.Errorf("%s: baseline %v, rounds %d", tc.name, cc.hy.baseline, cc.hy.cssRounds)
+		}
+	}
+}
+
+// A round ends when the packet it was sent up to is acknowledged: the round
+// minimum becomes the last round's, and the samples start over (RFC 9406
+// section 4.2).
+func TestHyStartRoundEnd(t *testing.T) {
+	cc := hsStart()
+	cc.hy.roundEnd = 10
+	for i := 0; i < hystartSamples; i++ {
+		hsSample(&cc, 10*time.Millisecond)
+	}
+	if cc.hy.samples != hystartSamples || cc.hy.lastMin != 0 {
+		t.Fatalf("before the round ended: samples %d, last minimum %v", cc.hy.samples, cc.hy.lastMin)
+	}
+	// The packet the round was sent up to, with the next round's packets
+	// already sent.
+	cc.hystartAck(10*time.Millisecond, true, 10, 20)
+	if cc.hy.lastMin != 10*time.Millisecond || cc.hy.samples != 1 || cc.hy.roundEnd != 19 {
+		t.Fatalf("after the round ended: last minimum %v, samples %d, round end %d",
+			cc.hy.lastMin, cc.hy.samples, cc.hy.roundEnd)
+	}
+}
+
+// The conservative phase grows by a quarter of the bytes slow start would,
+// keeping the fraction of a byte not yet added rather than losing it or
+// adding it twice.
+func TestHyStartConservativeGrowth(t *testing.T) {
+	cc := hsStart()
+	cc.hy.inCSS = true
+	before := cc.cwnd
+	for i := 0; i < 2; i++ {
+		cc.bytesInFlight += 1002
+		cc.onAcked(&sentPacket{size: 1002, time: time.Now()}, time.Now(), time.Millisecond, true)
+	}
+	if got := cc.cwnd - before; got != 501 {
+		t.Fatalf("two 1002-byte acknowledgements grew the window by %d, want 501", got)
+	}
+}
+
+// A round whose minimum round trip is back under the baseline means the
+// delay was jitter, not a full path: slow start resumes, and grows by whole
+// packets again.
+func TestHyStartResumesSlowStart(t *testing.T) {
+	cc := hsStart()
+	cc.hy.inCSS, cc.hy.cssRounds, cc.hy.baseline = true, 2, 15*time.Millisecond
+	for i := 0; i < hystartSamples; i++ {
+		hsSample(&cc, 10*time.Millisecond)
+	}
+	if cc.hy.inCSS || cc.hy.baseline != 0 {
+		t.Fatalf("slow start did not resume: inCSS %v, baseline %v", cc.hy.inCSS, cc.hy.baseline)
+	}
+	before := cc.cwnd
+	cc.bytesInFlight += maxDatagram
+	cc.onAcked(&sentPacket{size: maxDatagram, time: time.Now()}, time.Now(), time.Millisecond, true)
+	if got := cc.cwnd - before; got != maxDatagram {
+		t.Fatalf("slow start grew by %d, want a whole packet's %d", got, maxDatagram)
+	}
+}
+
+// The conservative phase lasts at most five rounds, the one it began in
+// included, and then the window is the threshold: congestion avoidance, with
+// CUBIC's curve starting at the window as its plateau.
+func TestHyStartExitsAfterFiveRounds(t *testing.T) {
+	cc := hsStart()
+	cc.hy.roundEnd, cc.hy.lastMin, cc.hy.curMin = 10, 10*time.Millisecond, 15*time.Millisecond
+	cc.hy.inCSS, cc.hy.cssRounds, cc.hy.baseline, cc.hy.samples = true, hystartRounds, 15*time.Millisecond, hystartSamples
+	// The round it began in ended, and that is one more than it allows.
+	cc.hystartAck(15*time.Millisecond, true, 10, 20)
+	if cc.hy.inCSS {
+		t.Fatalf("the conservative phase went on for %d rounds", cc.hy.cssRounds)
+	}
+	if cc.ssthresh != cc.cwnd {
+		t.Fatalf("threshold %d, window %d: congestion avoidance did not begin", cc.ssthresh, cc.cwnd)
+	}
+	if cc.wMax != float64(cc.cwnd) {
+		t.Fatalf("CUBIC's plateau %v, want the window %d", cc.wMax, cc.cwnd)
+	}
+}
+
+// A loss sets the threshold, and HyStart++ has no part after it: loss
+// recovery's threshold is the exit point then (RFC 9406 section 4.3).
+func TestHyStartOffAfterLoss(t *testing.T) {
+	cc := hsStart()
+	cc.onCongestion(time.Now().Add(-time.Millisecond), time.Now())
+	roundEnd, lastMin := cc.hy.roundEnd, cc.hy.lastMin
+	for i := 0; i < 2*hystartSamples; i++ {
+		hsSample(&cc, 100*time.Millisecond)
+	}
+	if cc.hy.inCSS || cc.hy.roundEnd != roundEnd || cc.hy.lastMin != lastMin {
+		t.Fatalf("HyStart++ went on after a loss: inCSS %v, round end %d, last minimum %v",
+			cc.hy.inCSS, cc.hy.roundEnd, cc.hy.lastMin)
+	}
+}

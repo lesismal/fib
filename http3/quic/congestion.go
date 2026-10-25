@@ -48,7 +48,40 @@ const (
 	// datagrams, before the sender counts as not using it: a round's last
 	// datagram, or what pacing holds back, leave a little.
 	maxBurstLimited = 3
+	// HyStart++'s constants (RFC 9406 section 4.3): the samples a round
+	// needs before its delay is judged, what fraction of a round trip's
+	// increase counts as the delay rising, the bounds of that fraction, how
+	// much of the bytes acknowledged the conservative phase adds, and how
+	// many rounds it lasts.
+	hystartSamples       = 8
+	hystartDivisor       = 8
+	hystartGrowthDivisor = 4
+	hystartRounds        = 5
+	// The delay increase that says the path is full is a fraction of the
+	// last round's minimum round trip, between these bounds.
+	hystartMinThresh = 4 * time.Millisecond
+	hystartMaxThresh = 16 * time.Millisecond
 )
+
+// hystart is HyStart++'s state (RFC 9406): the minimum round trip of the
+// round in progress and of the one before it, and how many samples the round
+// has, for the delay increase that means slow start has filled the path;
+// roundEnd is the largest packet number sent when the round began, and the
+// round ends when it is acknowledged; inCSS says the conservative phase is
+// on, cssRounds how many rounds of it have gone, and baseline, with cssGrown
+// the fraction of a byte its growth has not yet added, what it is measured
+// against.
+type hystart struct {
+	started   bool
+	roundEnd  uint64
+	curMin    time.Duration
+	lastMin   time.Duration
+	samples   int
+	inCSS     bool
+	cssRounds int
+	baseline  time.Duration
+	grown     float64
+}
 
 // congestion is the connection's congestion controller: the window, with
 // slow start and the recovery period (RFC 9002 section 7) common to both
@@ -58,6 +91,10 @@ type congestion struct {
 	algo                          CongestionControl
 	cwnd, ssthresh, bytesInFlight uint64
 	recoveryStart                 time.Time
+
+	// hy is HyStart++'s state for the initial slow start, where the window
+	// doubles a round trip, and it is only used then (RFC 9406).
+	hy hystart
 
 	// CUBIC's state (RFC 9438 section 4): wMax is the window the last loss
 	// came at, less after fast convergence; cwndPrior the window right
@@ -98,6 +135,86 @@ func (cc *congestion) limited(prior uint64, paced bool) bool {
 	return cc.cwnd < cc.ssthresh && prior > cc.cwnd/2
 }
 
+// hystartAck is HyStart++'s bookkeeping for one acknowledgement (RFC 9406
+// section 4.2), called once per ACK frame that acknowledges something new in
+// the application space. It ends a round when the packet it was sent up to
+// is acknowledged, keeps the round's minimum round trip, and looks for the
+// delay increase that means slow start has filled the path: rather than
+// enter congestion avoidance at once, it then enters the conservative phase,
+// whose growth is a quarter of slow start's, and leaves it either for slow
+// start again, if the delay goes back down, or for congestion avoidance once
+// the phase has had its rounds.
+func (cc *congestion) hystartAck(rtt time.Duration, sampled bool, largest, nextPN uint64) {
+	// Only the initial slow start uses it: after a loss the threshold loss
+	// recovery discovered is the better exit point (RFC 9406 section 4.3).
+	if cc.ssthresh != ^uint64(0) || cc.cwnd >= cc.ssthresh || nextPN == 0 {
+		return
+	}
+	h := &cc.hy
+	if !h.started {
+		h.started, h.roundEnd = true, nextPN-1
+	}
+	if largest >= h.roundEnd {
+		h.lastMin, h.curMin, h.samples = h.curMin, 0, 0
+		h.roundEnd = nextPN - 1
+		if h.inCSS {
+			// The round CSS began in counts towards its limit, even if it
+			// began in the middle of one (RFC 9406 section 4.2).
+			h.cssRounds++
+			if h.cssRounds > hystartRounds {
+				cc.hystartExit()
+				return
+			}
+		}
+	}
+	if !sampled {
+		return
+	}
+	if h.curMin == 0 || rtt < h.curMin {
+		h.curMin = rtt
+	}
+	h.samples++
+	if h.samples < hystartSamples {
+		return
+	}
+	if h.inCSS {
+		if h.baseline != 0 && h.curMin < h.baseline {
+			// The delay was jitter rather than a full path, so the exit was
+			// premature: slow start again, and the delay may be judged
+			// again.
+			h.inCSS, h.baseline = false, 0
+		}
+		return
+	}
+	if h.lastMin == 0 {
+		return
+	}
+	if h.curMin >= h.lastMin+hystartThreshold(h.lastMin) {
+		h.inCSS, h.cssRounds, h.baseline, h.grown = true, 1, h.curMin, 0
+	}
+}
+
+// hystartThreshold is how much a round's minimum round trip has to rise over
+// the last round's for HyStart++ to call the path full: a fraction of it,
+// between the bounds of RFC 9406 section 4.3.
+func hystartThreshold(lastMin time.Duration) time.Duration {
+	return max(hystartMinThresh, min(lastMin/hystartDivisor, hystartMaxThresh))
+}
+
+// hystartExit ends the initial slow start from HyStart++'s conservative
+// phase without a loss: the window becomes the threshold, and CUBIC's curve
+// starts at it, as the plateau.
+func (cc *congestion) hystartExit() {
+	cc.hy.inCSS = false
+	cc.ssthresh = cc.cwnd
+	if cc.algo == NewReno {
+		return
+	}
+	cwnd := float64(cc.cwnd)
+	cc.wMax, cc.cwndPrior, cc.wEst = cwnd, cwnd, cwnd
+	cc.k, cc.epoch, cc.grown = 0, time.Time{}, 0
+}
+
 // onAcked takes a packet in flight off the count, and grows the window if
 // the packet was sent after the last recovery period began and the window
 // was in use; rtt is the smoothed round-trip time.
@@ -114,6 +231,16 @@ func (cc *congestion) onAcked(p *sentPacket, now time.Time, rtt time.Duration, l
 		return
 	}
 	if cc.cwnd < cc.ssthresh {
+		if cc.hy.inCSS {
+			// The conservative phase grows by a quarter of the bytes
+			// acknowledged, with the fraction kept until it makes a byte
+			// (RFC 9406 section 4.2).
+			cc.hy.grown += float64(p.size) / hystartGrowthDivisor
+			whole := math.Floor(cc.hy.grown)
+			cc.cwnd += uint64(whole)
+			cc.hy.grown -= whole
+			return
+		}
 		cc.cwnd += uint64(p.size)
 		return
 	}

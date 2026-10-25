@@ -31,6 +31,11 @@ const (
 	frameConnectionClose    = 0x1c
 	frameConnectionCloseApp = 0x1d
 	frameHandshakeDone      = 0x1e
+	// frameAckFrequency and frameImmediateAck are the ACK_FREQUENCY
+	// extension's (draft-ietf-quic-ack-frequency sections 4 and 5). They
+	// are allowed in 1-RTT packets only.
+	frameAckFrequency = 0xaf
+	frameImmediateAck = 0x1f
 )
 
 func (p *sentPacket) add(f sentFrame) {
@@ -158,9 +163,12 @@ func (c *Conn) handleFrames(space int, payload []byte, now time.Time) (bool, err
 		}
 		if c.curEarly {
 			// 0-RTT packets carry no acknowledgements, handshake data, or
-			// frames that answer the server (RFC 9000 section 12.4).
+			// frames that answer the server (RFC 9000 section 12.4), nor
+			// the acknowledgement frequency extension, whose negotiation
+			// is not remembered (draft-ietf-quic-ack-frequency section 3).
 			switch typ {
-			case frameAck, frameAckECN, frameCrypto, frameNewToken, framePathResponse, frameRetireConnectionID, frameHandshakeDone:
+			case frameAck, frameAckECN, frameCrypto, frameNewToken, framePathResponse, frameRetireConnectionID, frameHandshakeDone,
+				frameAckFrequency, frameImmediateAck:
 				return false, &TransportError{Code: errProtocolViolation, Reason: "frame not allowed in 0-RTT packets"}
 			}
 		}
@@ -304,6 +312,13 @@ func (c *Conn) handleFrames(space int, payload []byte, now time.Time) (bool, err
 			} else {
 				err = c.blockedAt(&c.streamsBlockedAt[1], at, c.maxUni)
 			}
+		case typ == frameAckFrequency:
+			err = c.handleAckFrequency(&r)
+		case typ == frameImmediateAck:
+			// The peer wants the acknowledgement now rather than at the end
+			// of the delay it asked for (draft-ietf-quic-ack-frequency
+			// section 5).
+			c.spaces[spaceApp].ackNow = true
 		case typ == frameNewConnectionID:
 			err = c.handleNewConnectionID(&r)
 		case typ == frameRetireConnectionID:
@@ -409,6 +424,31 @@ func (c *Conn) handleAckFrame(space int, r *reader, ecn bool, now time.Time) err
 	}
 	ackDelay := time.Duration(delay<<exp) * time.Microsecond
 	return c.onAckReceived(space, ranges, ackDelay, now)
+}
+
+// handleAckFrequency takes the peer's request for how often this side
+// acknowledges (draft-ietf-quic-ack-frequency section 4): an acknowledgement
+// after its threshold of ack-eliciting packets, or its maximum delay, and
+// how much reordering it tolerates before one is due at once. A request
+// older than the last one taken is ignored, since the frames may arrive out
+// of order.
+func (c *Conn) handleAckFrequency(r *reader) error {
+	seq, threshold, delay, reordering := r.varint(), r.varint(), r.varint(), r.varint()
+	if r.bad {
+		return transportErr(errFrameEncoding, "malformed ACK_FREQUENCY")
+	}
+	if c.ackFreq.valid && seq <= c.ackFreq.seq {
+		return nil
+	}
+	// The requested delay is in microseconds, and must be a value
+	// max_ack_delay could take, and no smaller than the min_ack_delay this
+	// side advertised (section 4).
+	if delay >= uint64((1<<14)*time.Millisecond/time.Microsecond) || time.Duration(delay)*time.Microsecond < c.local.minAckDelay {
+		return transportErr(errProtocolViolation, "ACK_FREQUENCY with an invalid max ack delay")
+	}
+	c.ackFreq = ackFrequency{valid: true, seq: seq, threshold: threshold,
+		maxDelay: time.Duration(delay) * time.Microsecond, reordering: reordering}
+	return nil
 }
 
 // maxPathResponses bounds the PATH_RESPONSE frames waiting to be sent.

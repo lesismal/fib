@@ -465,7 +465,7 @@ func (c *Conn) framesWaiting(space int) bool {
 	}
 	return space == spaceApp && (len(c.sendQueue) > 0 || c.handshakeDonePending || c.challengePending || c.maxDataPending ||
 		c.maxStreamsBidiPending || c.maxStreamsUniPending || len(c.pathResponses) > 0 ||
-		len(c.retireCIDs) > 0 || c.cidsPending || c.blockedPending() || c.pingPending)
+		len(c.retireCIDs) > 0 || c.cidsPending || c.blockedPending() || c.pingPending || c.ackFreqPending)
 }
 
 // appendFrames adds a space's ack-eliciting frames, up to max bytes of
@@ -531,6 +531,29 @@ func (c *Conn) appendControlFrames(b []byte, max int, sp *sentPacket) []byte {
 		b = append(b, framePing)
 		c.pingPending = false
 		sp.ackEliciting = true
+	}
+	if c.ackFreqPending && c.peerParams != nil && c.peerParams.hasMinAckDelay {
+		// The peer is asked to wait no longer than it already allows, so
+		// the probe timeout goes on using its own max_ack_delay: a shorter
+		// one must not shorten it before the request is acknowledged, and
+		// keeping the longer one afterwards only makes a probe later
+		// (draft-ietf-quic-ack-frequency section 7).
+		delay := uint64(c.ackFreqDelay / time.Microsecond)
+		threshold := c.ackFreqAsking
+		if threshold == 0 {
+			threshold = 1
+		}
+		n := VarintLen(uint64(frameAckFrequency)) + VarintLen(c.ackFreqSeq) + VarintLen(threshold) +
+			VarintLen(delay) + VarintLen(ackFrequencyReordering)
+		if fits(n) {
+			b = AppendVarint(b, frameAckFrequency)
+			b = AppendVarint(b, c.ackFreqSeq)
+			b = AppendVarint(b, threshold)
+			b = AppendVarint(b, delay)
+			b = AppendVarint(b, ackFrequencyReordering)
+			c.ackFreqPending = false
+			sp.add(sentFrame{kind: sfAckFrequency})
+		}
 	}
 	return b
 }
