@@ -61,6 +61,15 @@ type ClientConfig struct {
 	// ErrResponseHeaderTimeout. Zero means no limit beyond Timeout. The two
 	// share one timer per request.
 	ResponseHeaderTimeout time.Duration
+	// ExpectContinueTimeout is how long a request with a body and
+	// "Expect: 100-continue" waits for the server's 100 (Continue) before
+	// sending the body anyway, once its header has been sent, as net/http's
+	// Transport.ExpectContinueTimeout does. A final response that comes first
+	// is the answer, and the body is not sent at all: an HTTP/1 connection,
+	// which then cannot tell where the next request starts, is closed, and an
+	// HTTP/2 stream reset once the response is complete. Zero sends the body
+	// with the header, without waiting, as before.
+	ExpectContinueTimeout time.Duration
 	// DialTimeout bounds one connect. Zero leaves it to the operating system.
 	DialTimeout time.Duration
 	// Dial opens the client's connections, in place of the engine's
@@ -161,6 +170,7 @@ type ClientConfig struct {
 func DefaultClientConfig() ClientConfig {
 	return ClientConfig{
 		Timeout:                30 * time.Second,
+		ExpectContinueTimeout:  time.Second,
 		DialTimeout:            10 * time.Second,
 		MaxConnsPerHost:        64,
 		MaxIdleConnsPerHost:    16,
@@ -243,6 +253,10 @@ func NewClient(engine *fib.Engine, config ClientConfig) *Client {
 // ContentLength, fails the request. A body that has been sent, wholly or in
 // part, can only be sent again, as a request that a closed connection or the
 // server turned away is, through req.GetBody; without it such a request fails.
+// A request with a body and "Expect: 100-continue" sends its header first and
+// its body once the server answers 100 (Continue), or once
+// ClientConfig.ExpectContinueTimeout has passed; a final response before
+// either means the body is not sent at all.
 //
 // The response body is buffered whole and may be read after the callback
 // returns; closing it is optional. With ClientConfig.StreamResponseBody it
@@ -362,6 +376,15 @@ func (c *Client) do(req *stdhttp.Request, callback func(*ClientResponse, error),
 	}
 	r := &clientRequest{req: req, data: data, body: body, upload: upload, declared: declared, chunked: chunked,
 		callback: callback, whole: whole, tunnel: tunnel, headerWait: c.config.ResponseHeaderTimeout}
+	r.headLen = len(data)
+	if c.config.ExpectContinueTimeout > 0 && reqbody.ExpectsContinue(req, len(body) > 0 || upload != nil) {
+		r.expect = true
+		// HTTP/1 frames a body read whole by its Content-Length, so it is
+		// what ends data, and the header is what comes before it.
+		if upload == nil && bytes.HasSuffix(data, body) {
+			r.headLen = len(data) - len(body)
+		}
+	}
 	// Either hook can fire before it has been stored, so both are stored under
 	// the lock finish reads them under.
 	r.mu.Lock()
@@ -1064,6 +1087,12 @@ type clientRequest struct {
 	upload   *reqbody.Source
 	declared int64
 	chunked  bool
+	// expect says the request asked for 100-continue, and has a body to hold
+	// back until the server answers it (see ClientConfig.
+	// ExpectContinueTimeout). headLen is how much of data is the header,
+	// which goes first: all of it, but for a body read whole.
+	expect   bool
+	headLen  int
 	callback func(*ClientResponse, error)
 	// whole asks for the response to arrive whole even when the client would
 	// stream it. tunnel is StartUpgrade's handler, for a 101 to switch the
@@ -1331,10 +1360,12 @@ type clientConn struct {
 	// unfit to carry another.
 	current   *clientRequest
 	uploading *clientRequest
-	sent      bool
-	reused    bool
-	received  bool
-	closed    bool
+	// gate holds back the body of current, which expects 100-continue.
+	gate     *reqbody.Gate
+	sent     bool
+	reused   bool
+	received bool
+	closed   bool
 	// idleUntil is when the connection, idle, is to close, and zero while it
 	// is not idle; idleTimer, made the first time it goes idle, fires then or
 	// earlier, and idlePending says it is set (see idleLocked). Guarded by
@@ -1370,6 +1401,12 @@ func (cc *clientConn) send(r *clientRequest) {
 		cc.h2.send(r)
 		return
 	}
+	head := r.data
+	var gate *reqbody.Gate
+	if r.expect && (r.upload != nil || r.headLen < len(r.data)) {
+		head = r.data[:r.headLen]
+		gate = reqbody.NewGate(func() { cc.sendHeld(r) })
+	}
 	cc.mu.Lock()
 	if cc.closed {
 		cc.mu.Unlock()
@@ -1377,6 +1414,7 @@ func (cc *clientConn) send(r *clientRequest) {
 		return
 	}
 	cc.current = r
+	cc.gate = gate
 	cc.reused = cc.sent
 	cc.sent = true
 	cc.received = false
@@ -1398,21 +1436,50 @@ func (cc *clientConn) send(r *clientRequest) {
 		cc.mu.Unlock()
 	}
 	// A failed send closes the connection, and OnClose then settles r.
-	sent := cc.conn.Send(r.data) == nil
-	if sent && r.upload == nil {
-		r.requestSent()
+	if cc.conn.Send(head) != nil {
+		return
 	}
-	if sent && r.upload != nil {
-		if push := r.upload.Pusher(); push != nil {
-			// A pushed body is sent as it is written and as the connection
-			// drains, with nothing waiting for either.
-			attachPush(r, push, &h1Sink{cc: cc, r: r, push: push})
-			return
-		}
-		// The body is read by a goroutine of its own, since a Read may wait
-		// as long as the body's producer likes, and so may the sending, for
-		// the server; neither may hold up a worker or a pool.
-		go cc.sendBody(r)
+	switch {
+	case gate != nil:
+		// The body waits for the server's 100, or for the wait to run out.
+		gate.Start(cc.client.config.ExpectContinueTimeout)
+	case r.upload == nil:
+		r.requestSent()
+	default:
+		cc.startUpload(r)
+	}
+}
+
+// startUpload starts sending the body of r, which streams.
+func (cc *clientConn) startUpload(r *clientRequest) {
+	if push := r.upload.Pusher(); push != nil {
+		// A pushed body is sent as it is written and as the connection
+		// drains, with nothing waiting for either.
+		attachPush(r, push, &h1Sink{cc: cc, r: r, push: push})
+		return
+	}
+	// The body is read by a goroutine of its own, since a Read may wait
+	// as long as the body's producer likes, and so may the sending, for
+	// the server; neither may hold up a worker or a pool.
+	go cc.sendBody(r)
+}
+
+// sendHeld sends the body that r's gate held back, once the server has
+// answered 100 (Continue) or the wait has run out, unless the connection has
+// gone on without r meanwhile.
+func (cc *clientConn) sendHeld(r *clientRequest) {
+	cc.mu.Lock()
+	live := cc.current == r && !cc.closed
+	cc.mu.Unlock()
+	if !live {
+		return
+	}
+	if r.upload != nil {
+		cc.startUpload(r)
+		return
+	}
+	if cc.conn.Send(r.data[r.headLen:]) == nil {
+		r.requestSent()
 	}
 }
 
@@ -1480,7 +1547,10 @@ func (cc *clientConn) discard() {
 	cc.closed = true
 	cc.current = nil
 	cc.uploading = nil
+	gate := cc.gate
+	cc.gate = nil
 	cc.mu.Unlock()
+	gate.Shut()
 	cc.conn.Close()
 }
 
@@ -1508,6 +1578,7 @@ func (cc *clientConn) OnData(conn *fib.Connection, data []byte) {
 	}
 	cc.mu.Lock()
 	r := cc.current
+	gate := cc.gate
 	closed := cc.closed
 	cc.received = true
 	cc.mu.Unlock()
@@ -1532,9 +1603,17 @@ func (cc *clientConn) OnData(conn *fib.Connection, data []byte) {
 		r.finish(nil, err)
 		return
 	}
+	// A final response is the answer whether or not the body has gone, and
+	// one that comes before the body has is the server turning it down; a
+	// 100 before any is the server asking for it.
+	held := false
 	if resp != nil || cc.parser.head != nil {
 		r.headerArrived()
+		held = gate.Shut()
+	} else if cc.parser.continued {
+		gate.Open()
 	}
+	cc.parser.continued = false
 	if resp == nil {
 		cc.endDeferred()
 		return
@@ -1551,6 +1630,12 @@ func (cc *clientConn) OnData(conn *fib.Connection, data []byte) {
 		(r.req.ProtoAtLeast(1, 1) || headerHasToken(r.req.Header, "Connection", "keep-alive"))
 	cc.mu.Lock()
 	cc.current = nil
+	cc.gate = nil
+	if held {
+		// The header went without the body it announced, which the server
+		// would take the next request for.
+		reusable = false
+	}
 	if cc.uploading == r {
 		// The server answered before the body had all gone: it does not want
 		// the rest, and the connection, part way through the body, cannot

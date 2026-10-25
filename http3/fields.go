@@ -296,6 +296,17 @@ func trailerFrom(fields []qpack.HeaderField) (stdhttp.Header, error) {
 	return trailer, nil
 }
 
+// isContinue reports whether an interim response's fields are a
+// 100 (Continue)'s.
+func isContinue(fields []qpack.HeaderField) bool {
+	for _, f := range fields {
+		if f.Name == ":status" {
+			return f.Value == "100"
+		}
+	}
+	return false
+}
+
 // newResponse builds a response from its fields. It returns nil for an
 // interim response.
 func newResponse(fields []qpack.HeaderField, req *stdhttp.Request) (*stdhttp.Response, error) {

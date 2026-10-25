@@ -104,6 +104,8 @@ type h2ClientStream struct {
 	// trailer holds the request's trailer fields, as name and value pairs,
 	// which go out in a HEADERS frame once the body has.
 	trailer []string
+	// gate holds back the body of a request that expects 100-continue.
+	gate *reqbody.Gate
 }
 
 // startH2 turns the connection over to HTTP/2 before it carries anything,
@@ -183,29 +185,68 @@ func (hc *h2ClientConn) send(r *clientRequest) {
 		block = hc.enc.AppendField(block, name, fields[i+1], name == "authorization" || name == "cookie")
 	}
 	st.trailer = trailer
+	st.streaming = r.upload != nil
 	// The stream ends with the body, or with the trailers when there are any.
 	out := h2AppendHeaderBlock(nil, id, block, len(r.body) == 0 && len(trailer) == 0 && r.upload == nil, hc.peerMaxFrame)
+	if r.expect {
+		// The body waits for the server's 100, or for the wait to run out.
+		st.gate = reqbody.NewGate(func() { hc.sendHeld(st) })
+	} else {
+		out = hc.startBodyLocked(out, st)
+	}
+	hc.sendLocked(out)
+	hc.mu.Unlock()
+	if st.gate != nil {
+		st.gate.Start(hc.client.config.ExpectContinueTimeout)
+		return
+	}
+	hc.startUpload(st)
+}
+
+// startBodyLocked appends to out what follows the request's header block
+// straight away: its body as far as the windows allow, or its trailers, or
+// nothing, for a request that has ended or whose body streams.
+func (hc *h2ClientConn) startBodyLocked(out []byte, st *h2ClientStream) []byte {
+	r := st.r
 	switch {
 	case r.upload != nil:
-		st.streaming = true
 	case len(r.body) > 0:
 		st.pending = r.body
 		out = hc.flushStreamLocked(out, st)
-	case len(trailer) > 0:
+	case len(st.trailer) > 0:
 		out = hc.appendTrailerLocked(out, st)
 	default:
 		st.endLocalLocked()
 	}
-	hc.sendLocked(out)
-	hc.mu.Unlock()
-	if r.upload != nil {
-		if push := r.upload.Pusher(); push != nil {
-			attachPush(r, push, &h2Sink{hc: hc, st: st, push: push})
-			return
-		}
-		// See clientConn.send for why a goroutine of its own.
-		go hc.sendBody(st)
+	return out
+}
+
+// startUpload starts sending the body of st's request, if it streams.
+func (hc *h2ClientConn) startUpload(st *h2ClientStream) {
+	r := st.r
+	if r.upload == nil {
+		return
 	}
+	if push := r.upload.Pusher(); push != nil {
+		attachPush(r, push, &h2Sink{hc: hc, st: st, push: push})
+		return
+	}
+	// See clientConn.send for why a goroutine of its own.
+	go hc.sendBody(st)
+}
+
+// sendHeld sends the body that st's gate held back, once the server has
+// answered 100 (Continue) or the wait has run out, unless the stream has
+// ended meanwhile.
+func (hc *h2ClientConn) sendHeld(st *h2ClientStream) {
+	hc.mu.Lock()
+	if !hc.liveLocked(st) {
+		hc.mu.Unlock()
+		return
+	}
+	hc.sendLocked(hc.startBodyLocked(nil, st))
+	hc.mu.Unlock()
+	hc.startUpload(st)
 }
 
 // endLocalLocked records that st's request has all been handed to the
@@ -408,6 +449,7 @@ func (hc *h2ClientConn) cancel(r *clientRequest) {
 	hc.closeIfDoneLocked()
 	hc.room.Broadcast()
 	hc.mu.Unlock()
+	st.gate.Shut()
 	hc.client.streamDone(hc.cc)
 }
 
@@ -430,6 +472,7 @@ func (hc *h2ClientConn) shutdown(err error) {
 		err = io.ErrUnexpectedEOF
 	}
 	for _, st := range streams {
+		st.gate.Shut()
 		r := st.r
 		r.detach()
 		if !st.received && r.retryable() {
@@ -726,6 +769,7 @@ func (hc *h2ClientConn) handleGoAway(lastID uint32) {
 	hc.mu.Unlock()
 	hc.client.retire(hc.cc)
 	for _, st := range unprocessed {
+		st.gate.Shut()
 		st.r.detach()
 		hc.client.streamDone(hc.cc)
 		hc.client.enqueue(hc.cc.host.target, st.r, true)
@@ -893,8 +937,14 @@ func (hc *h2ClientConn) handleHeaderBlock(id uint32, block []byte, endStream boo
 		if endStream {
 			return &H2StreamError{StreamID: id, Code: H2ProtocolError}
 		}
+		if h2IsContinue(fields) {
+			st.gate.Open()
+		}
 		return nil
 	}
+	// The answer has come, and a body still held back is not wanted: the
+	// stream is reset once the response is complete (see complete).
+	st.gate.Shut()
 	st.r.headerArrived()
 	config := &hc.client.config
 	streams := config.StreamResponseBody && !st.r.whole && !endStream && bodyAllowed(st.r.req, resp.StatusCode) &&
@@ -918,6 +968,17 @@ func (hc *h2ClientConn) handleHeaderBlock(id uint32, block []byte, endStream boo
 		st.stream.Start()
 	}
 	return nil
+}
+
+// h2IsContinue reports whether an interim response's fields are a
+// 100 (Continue)'s.
+func h2IsContinue(fields []hpack.HeaderField) bool {
+	for _, f := range fields {
+		if f.Name == ":status" {
+			return f.Value == "100"
+		}
+	}
+	return false
 }
 
 // h2NewResponse builds a response from its header fields. It returns nil for
@@ -1036,6 +1097,7 @@ func (hc *h2ClientConn) endStream(id uint32, retry bool, err error) {
 	if st == nil {
 		return
 	}
+	st.gate.Shut()
 	st.r.detach()
 	hc.client.streamDone(hc.cc)
 	if retry {

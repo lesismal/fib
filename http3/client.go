@@ -52,6 +52,14 @@ type ClientConfig struct {
 	// the QUIC handshake is bounded by HandshakeTimeout.
 	DialTimeout      time.Duration
 	HandshakeTimeout time.Duration
+	// ExpectContinueTimeout is how long a request with a body and
+	// "Expect: 100-continue" waits for the server's 100 (Continue) before
+	// sending the body anyway, once its HEADERS have been sent, as
+	// http.ClientConfig.ExpectContinueTimeout does. A final response that
+	// comes first is the answer: the body is not sent, and the stream's
+	// sending side is reset once the response is complete. Zero sends the
+	// body with the HEADERS, without waiting.
+	ExpectContinueTimeout time.Duration
 	// IdleConnTimeout closes a connection that has carried no request for
 	// this long. Zero keeps it until the server or the QUIC idle timeout
 	// closes it.
@@ -127,6 +135,7 @@ func DefaultClientConfig() ClientConfig {
 		Timeout:                30 * time.Second,
 		DialTimeout:            10 * time.Second,
 		HandshakeTimeout:       10 * time.Second,
+		ExpectContinueTimeout:  time.Second,
 		IdleConnTimeout:        90 * time.Second,
 		MaxIdleTimeout:         30 * time.Second,
 		MaxResponseHeaderBytes: 1 << 20,
@@ -227,6 +236,10 @@ func NewClient(engine *fib.Engine, config ClientConfig) *Client {
 // fails the request. Such a body is never sent as 0-RTT data, and a request
 // that has to go again, after the server turned it away unprocessed, can
 // only send it again through req.GetBody; without it the request fails.
+// A request with a body and "Expect: 100-continue" sends its header first and
+// its body once the server answers 100 (Continue), or once
+// ClientConfig.ExpectContinueTimeout has passed; a final response before
+// either means the body is not sent at all.
 //
 // callback may run on any goroutine: an engine worker, a timer, or the
 // caller's own for a request Do rejects outright. It must not block for
@@ -307,7 +320,8 @@ func (c *Client) do(req *stdhttp.Request, callback func(*fibhttp.ClientResponse,
 	if upload == nil {
 		length = int64(len(body))
 	}
-	r := &clientRequest{req: req, body: body, upload: upload, declared: length, callback: callback, whole: whole}
+	r := &clientRequest{req: req, body: body, upload: upload, declared: length, callback: callback, whole: whole,
+		expect: c.config.ExpectContinueTimeout > 0 && reqbody.ExpectsContinue(req, len(body) > 0 || upload != nil)}
 	fields, trailer, err := requestFields(req, length)
 	if err != nil {
 		if upload != nil {
@@ -460,8 +474,11 @@ type clientRequest struct {
 	trailer  []qpack.HeaderField
 	callback func(*fibhttp.ClientResponse, error)
 	// whole asks for the response to arrive whole even when the client would
-	// stream it.
-	whole bool
+	// stream it. expect says it asked for 100-continue, and has a body to
+	// hold back until the server answers (see
+	// ClientConfig.ExpectContinueTimeout).
+	whole  bool
+	expect bool
 
 	mu          sync.Mutex
 	done        bool
@@ -1144,6 +1161,8 @@ type clientStream struct {
 	fedBody int
 	// uploading says the request's body, which streams, is still being sent.
 	uploading atomic.Bool
+	// gate holds back the body of a request that expects 100-continue.
+	gate *reqbody.Gate
 }
 
 // send writes the request: HEADERS, the body in one DATA frame, and the
@@ -1151,32 +1170,28 @@ type clientStream struct {
 // rest left to sendBody.
 func (st *clientStream) send() {
 	r := st.r
-	if r.upload != nil {
+	if r.upload != nil || r.expect {
 		block := bufferpool.Append(nil, qpack.Prefix)
 		for _, f := range r.fields {
 			block = qpack.AppendField(block, f.Name, f.Value, sensitive(f.Name))
 		}
 		out := appendHeadersFrame(bufferpool.Get(len(block) + 16)[:0], block)
 		bufferpool.Put(block)
+		if r.expect {
+			// The body waits for the server's 100, or for the wait to run
+			// out; the gate is in place before the HEADERS can be answered.
+			st.gate = reqbody.NewGate(st.sendHeld)
+		}
 		if err := st.s.WriteOwned(out, false); err != nil {
+			st.gate.Shut()
 			st.fail(err)
 			return
 		}
-		st.uploading.Store(true)
-		if push := r.upload.Pusher(); push != nil {
-			// A pushed body is sent as it is written and as the stream's
-			// flow control lets it, with nothing waiting for either.
-			if err := push.Attach(&pushSink{st: st, push: push}, r.declared); err != nil {
-				st.uploading.Store(false)
-				r.abort(err)
-			}
+		if st.gate != nil {
+			st.gate.Start(st.cc.client.config.ExpectContinueTimeout)
 			return
 		}
-		// The body is read by a goroutine of its own, since a Read may wait
-		// as long as the body's producer likes, and so may the sending, for
-		// the server; neither may hold up a worker, a pool, or the goroutine
-		// that hands the connection its datagrams.
-		go st.sendBody()
+		st.startUpload()
 		return
 	}
 	// The stream copies what it is written, so every buffer built here goes
@@ -1188,6 +1203,17 @@ func (st *clientStream) send() {
 	out := bufferpool.Get(len(block) + len(r.body) + 16)[:0]
 	out = appendHeadersFrame(out, block)
 	bufferpool.Put(block)
+	out = st.appendBody(out)
+	if err := st.s.Write(out, true); err != nil {
+		st.fail(err)
+	}
+	bufferpool.Put(out)
+}
+
+// appendBody appends a body read whole, in one DATA frame, and the trailers,
+// if any.
+func (st *clientStream) appendBody(out []byte) []byte {
+	r := st.r
 	if len(r.body) > 0 {
 		out = appendFrameHeader(out, frameData, len(r.body))
 		out = append(out, r.body...)
@@ -1200,9 +1226,42 @@ func (st *clientStream) send() {
 		out = appendHeadersFrame(out, trailer)
 		bufferpool.Put(trailer)
 	}
-	if err := st.s.Write(out, true); err != nil {
-		st.fail(err)
+	return out
+}
+
+// startUpload starts sending the body of the stream's request, which
+// streams.
+func (st *clientStream) startUpload() {
+	r := st.r
+	st.uploading.Store(true)
+	if push := r.upload.Pusher(); push != nil {
+		// A pushed body is sent as it is written and as the stream's
+		// flow control lets it, with nothing waiting for either.
+		if err := push.Attach(&pushSink{st: st, push: push}, r.declared); err != nil {
+			st.uploading.Store(false)
+			r.abort(err)
+		}
+		return
 	}
+	// The body is read by a goroutine of its own, since a Read may wait
+	// as long as the body's producer likes, and so may the sending, for
+	// the server; neither may hold up a worker, a pool, or the goroutine
+	// that hands the connection its datagrams.
+	go st.sendBody()
+}
+
+// sendHeld sends the body that the gate held back, once the server has
+// answered 100 (Continue) or the wait has run out. It may run on a timer's
+// goroutine, so it touches nothing of the stream's but its QUIC stream, whose
+// writes fail once the stream or its connection has ended, which is reported
+// where it ended.
+func (st *clientStream) sendHeld() {
+	if st.r.upload != nil {
+		st.startUpload()
+		return
+	}
+	out := st.appendBody(bufferpool.Get(len(st.r.body) + 16)[:0])
+	_ = st.s.Write(out, true)
 	bufferpool.Put(out)
 }
 
@@ -1358,6 +1417,15 @@ func (st *clientStream) onFrame(typ uint64, payload []byte) error {
 		st.fail(fmt.Errorf("http3: malformed response: %w", err))
 		return nil
 	}
+	if resp == nil {
+		if isContinue(fields) {
+			st.gate.Open()
+		}
+	} else {
+		// The answer has come, and a body still held back is not wanted:
+		// the sending side is reset once the response is complete.
+		st.gate.Shut()
+	}
 	if resp != nil && st.early && resp.StatusCode == stdhttp.StatusTooEarly {
 		// The server will not answer what it took as early data, which may be
 		// a replay: the request goes again once the handshake is over
@@ -1401,6 +1469,7 @@ func (st *clientStream) onFrame(typ uint64, payload []byte) error {
 // queues the request to go again, at the head of the line, and not as early
 // data.
 func (st *clientStream) tooEarly() {
+	st.gate.Shut()
 	st.done = true
 	st.body = nil
 	abortStream(st.s, ErrCodeRequestCancelled)
@@ -1422,7 +1491,7 @@ func (st *clientStream) tooEarly() {
 // complete hands a finished response to its request.
 func (st *clientStream) complete() {
 	st.done = true
-	if st.uploading.Load() {
+	if st.gate.Shut() || st.uploading.Load() {
 		// The server answered before the body had all gone, so it does not
 		// want the rest: the sending stops (RFC 9114 section 4.1).
 		st.s.Reset(uint64(ErrCodeRequestCancelled))
@@ -1459,6 +1528,7 @@ func (st *clientStream) complete() {
 
 // fail ends the request with err and abandons the stream.
 func (st *clientStream) fail(err error) {
+	st.gate.Shut()
 	st.done = true
 	st.body = nil
 	abortStream(st.s, ErrCodeRequestCancelled)
@@ -1468,6 +1538,7 @@ func (st *clientStream) fail(err error) {
 
 // cancel abandons the stream of a request that has already failed.
 func (st *clientStream) cancel() {
+	st.gate.Shut()
 	abortStream(st.s, ErrCodeRequestCancelled)
 	st.cc.streamDone(st)
 }
@@ -1480,6 +1551,7 @@ func (st *clientStream) reset(code ErrorCode) {
 	}
 	st.done = true
 	st.body = nil
+	st.gate.Shut()
 	st.cc.streamDone(st)
 	err := &StreamError{Code: code, Remote: true}
 	if code == ErrCodeRequestRejected {

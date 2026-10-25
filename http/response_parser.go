@@ -68,6 +68,9 @@ type responseParser struct {
 	dec          chunkedDecoder
 	scratch      []byte
 	streamedDone bool
+	// continued records that a 100 (Continue) response has been skipped,
+	// for the client to send a body it held back for it.
+	continued bool
 }
 
 // bodySink is where a streamed response body goes: start once its header is
@@ -86,6 +89,7 @@ func (p *responseParser) reset() {
 	p.head = nil
 	p.headerEnd = 0
 	p.streaming, p.started, p.streamedDone = false, false, false
+	p.continued = false
 	p.remaining, p.passed = 0, 0
 	if cap(p.scratch) > maxRetainedBuffer {
 		p.scratch = nil
@@ -279,6 +283,7 @@ func (p *responseParser) parseHead(req *stdhttp.Request) (bool, error) {
 		_ = head.Body.Close()
 	}
 	if head.StatusCode >= 100 && head.StatusCode < 200 && head.StatusCode != stdhttp.StatusSwitchingProtocols {
+		p.continued = p.continued || head.StatusCode == stdhttp.StatusContinue
 		p.consume(headerEnd)
 		return true, nil
 	}
