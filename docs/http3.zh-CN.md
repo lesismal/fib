@@ -117,7 +117,10 @@
   里等待流控或拥塞控制，`Write` 就会等待，直到部分发出或 stream 结束；连接在接收数据报的
   协程上运行的 handler 从不等待，它写的内容留在 stream 里等待发送。
 - 内存上限：服务端单连接最坏约为 `MaxConcurrentStreams × MaxBodyBytes`（默认
-  100 × 16MB），客户端单个响应受 `MaxResponseBodyBytes` 限制。
+  100 × 16MB），客户端单个响应受 `MaxResponseBodyBytes` 限制。整体响应会拷进一块
+  QUIC 帧缓冲并保留到对端确认，因此一个卡住的 stream 要占 body 大小按 2 的幂向上取整
+  （8MiB 变 16MiB），上界约为 `MaxConcurrentStreams` 乘以这个值。用 `Write` 和
+  `Flush` 流式发送只需 64KiB；见[压测](loadtest.zh-CN.md)。
 - 请求完整后按 `Config.StreamPool` 的描述交给 engine 的 handler 协程池（与 HTTP/2 server
   相同：同名 engine 的 `<Name>-streams`，不与 engine 的协程池共用），因此同一连接上客户端并发发起的多个请求是并发处理的，阻塞的 handler 只拖累它
   自己。`StreamPool.MaxConcurrentHandlers` 限制单个连接同时处理的请求数 N，其中第 N 个在
@@ -391,8 +394,10 @@
 一致性测试已完成，见[一致性测试](#一致性测试)。还没有端到端验证的是：
 
 - 0-RTT 与 quiche、quic-go 之外更多服务端的互通，以及共享票据密钥的多台服务端之间的重放（票据登记表是每个进程一份）。
-- 压测才能暴露的并发问题。帧解析、请求构造、QPACK 解码、QUIC 包头、传输参数和帧处理
-  都有 fuzz 目标，CI 的 `Fuzz the parsers` job 每个目标跑 20 秒。
+- 压测才能暴露的并发问题：已由[压测](loadtest.zh-CN.md)覆盖，fib 两端对每种配置
+  压 30 秒，没有请求失败、reset 或 GOAWAY。它暴露了上面整体响应的内存代价；带丢包的
+  路径和长时间 soak 仍未覆盖。帧解析、请求构造、QPACK 解码、QUIC 包头、传输参数和帧
+  处理都有 fuzz 目标，CI 的 `Fuzz the parsers` job 每个目标跑 20 秒。
 - QPACK 动态表、服务端推送、DATAGRAM 和 ECN 都未实现，无法测试；
   [QUIC Interop Runner](#quic-interop-runner) 端点会把 ECN 用例如实报成“不支持”，
   而不是让它悄悄通过。
@@ -448,3 +453,12 @@ CI 里有两个 job：`HTTP/3 interop endpoint image`（阻塞：构建镜像并
 | 测试内置的手写 HTTP/3 服务端（零依赖，对 fib 客户端） | 客户端的协议纠错：服务端发来的 MAX_PUSH_ID、CANCEL_PUSH、GOAWAY 指向非请求流、抬高的 GOAWAY、QPACK 插入指令、引用动态表的响应 |
 | 内存管道上的 QUIC 两端 | 握手、5% 与 20% 丢包下的传输、stream 数限制、reset、应用关闭、空闲超时、keep-alive、stateless reset、密钥更新（调低 AEAD 上限触发）、解密失败上限、Retry 及其令牌、洪泛限制及其配置、BLOCKED 帧、draining、Connection ID 的签发、路由与退役 |
 | fuzz（`go test -fuzz`） | 面向不可信输入的解析：HTTP/3 帧解析器、从字段构造请求、QPACK 解码与编解码往返、QUIC 包头、传输参数、1-RTT 帧处理 |
+
+## 压测
+
+`benchmark/loadtest` 用 fib 自己的客户端压 fib 的 HTTP/3 服务端，每种配置 30 秒：
+4 条连接各 128 个 stream 时 897,233 req/s，32 x 16 时 689,402，单连接 256 个 stream
+时 373,362；没有请求失败、reset 或 GOAWAY；p99 分别为 1.56ms、2.90ms、1.34ms。同一
+次压测里 h2c 在 64 x 8 时达到 2,836,822，HTTP/3 的峰值低于它，而且更多 QUIC 连接
+得不偿失。唯一的内存限制来自不读的客户端：每个整体响应会按 2 的幂分档占一块缓冲，直到
+对端确认。方法、与 HTTP/1、HTTP/2 的对比和内存测量见[压测](loadtest.zh-CN.md)。

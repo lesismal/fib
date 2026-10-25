@@ -699,6 +699,7 @@ CI 每次 push 都在 Linux、macOS、Windows 上运行 [`taskpool/benchmark`](t
   HoldReads、Cork、对象复用等非标准库式用法与坑
 - [HTTP/1.x](docs/http1.zh-CN.md)、[HTTP/2](docs/http2.zh-CN.md)、[HTTP/3](docs/http3.zh-CN.md)：
   支持范围、限制和一致性测试
+- [压测](docs/loadtest.zh-CN.md)：`benchmark/loadtest` 压测、结果，以及整体响应发给慢客户端时的内存代价
 
 ## 构建与测试
 

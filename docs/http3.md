@@ -161,7 +161,12 @@ request that arrives whole in one packet, as most do, costs none.
   in the stream instead.
 - Memory bounds: a server connection can hold up to about
   `MaxConcurrentStreams × MaxBodyBytes` (100 × 16MB by default); a single
-  client response is bounded by `MaxResponseBodyBytes`.
+  client response is bounded by `MaxResponseBodyBytes`. A whole response is
+  copied into one QUIC frame buffer and held until the peer acknowledges it,
+  so a stalled stream costs the body rounded up to a power of two (8MiB takes
+  16MiB), and `MaxConcurrentStreams` times that is the bound. Streaming the
+  body through `Write` and `Flush` keeps it to 64KiB instead; see
+  [Load testing](loadtest.md).
 - A request that is complete goes to the engine's handler pool, as
   `Config.StreamPool` describes — the engine name's `<Name>-streams` pool,
   never an engine's; the HTTP/2 server uses the same — so the requests one client
@@ -568,10 +573,14 @@ What is still not covered end to end:
 
 - 0-RTT against more servers than quiche and quic-go, and replays across
   servers that share ticket keys (the register of tickets is per process).
-- The concurrency problems only load testing shows. Frame parsing, building
-  requests, QPACK decoding, QUIC packet headers, transport parameters and
-  frame handling all have fuzz targets, which the `Fuzz the parsers` CI job
-  runs for 20 seconds each.
+- The concurrency problems only load testing shows: checked by the campaign
+  in [Load testing](loadtest.md), which drove HTTP/3 for 30 seconds per
+  configuration with fib on both ends and no failed request, reset or GOAWAY.
+  It exposed the whole-response memory cost above; a lossy path and a long
+  soak are still not covered. Frame parsing, building requests, QPACK
+  decoding, QUIC packet headers, transport parameters and frame handling all
+  have fuzz targets, which the `Fuzz the parsers` CI job runs for 20 seconds
+  each.
 - QPACK's dynamic table, server push, DATAGRAM and ECN are not
   implemented, so no test can cover them. The [QUIC Interop
   Runner](#quic-interop-runner) endpoint reports the ECN testcase as
@@ -638,3 +647,15 @@ quic-go, because it pulls the simulator and peer images and needs tshark).
 | quic-go and fib, for early data (`http3/early_data_test.go`) | quic-go's client resuming and sending GET_0RTT to the fib server, the fib client sending early requests to quic-go's server, a server that does not accept it, a ticket used twice, and a 425 |
 | Two QUIC connections over an in-memory path | Handshake, transfers under 5% and 20% loss, stream limits, resets, application close, idle timeout, keep-alive, stateless reset, key updates (with the AEAD limits lowered), the decryption failure limit, Retry and its tokens, the flood limits and their settings, BLOCKED frames, draining, and Connection IDs issued, routed and retired |
 | Fuzzing (`go test -fuzz`) | The parsers that take untrusted bytes: the HTTP/3 frame parser, building requests from fields, QPACK decoding and its round trip, QUIC packet headers, transport parameters and 1-RTT frame handling |
+
+## Load testing
+
+`benchmark/loadtest` drove fib's HTTP/3 server with fib's own client for 30
+seconds per configuration: 897,233 requests a second at 4 connections with
+128 streams each, 689,402 at 32 x 16 and 373,362 on one connection with 256
+streams, with no failed request, reset or GOAWAY; p99 was 1.56ms, 2.90ms and
+1.34ms. HTTP/3 peaked below h2c's 2,836,822 at 64 x 8 in the same campaign,
+and more QUIC connections cost more than they bought. Stalled readers are the
+one memory limit: every whole response is held in a power-of-two buffer until
+acknowledged. The method, the comparison with HTTP/1 and HTTP/2, and the
+memory measurements are in [Load testing](loadtest.md).

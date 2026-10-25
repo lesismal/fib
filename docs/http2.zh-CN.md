@@ -63,7 +63,8 @@ HEADERS 这样到达的 stream 带 `Early-Data: 1`（RFC 8470），只有 GET、
   自己的 HTTP/2 传输层。
 - 内存上限：服务端单连接最坏约为 `MaxConcurrentStreams × MaxBodyBytes`
   （默认 250 × 16MB），外加每个流式 body 一个 stream 窗口；客户端单个响应受
-  `MaxResponseBodyBytes` 限制。
+  `MaxResponseBodyBytes` 限制。整体响应保留 handler 的 body，只把窗口允许的帧排队，
+  因此不读的客户端大约只占一个 stream 窗口，而不是 body 本身；见[压测](loadtest.zh-CN.md)。
 - `CONNECT` 请求能被解析并交给 handler，但无法建立隧道（没有双向流式通道）。
 
 ### handler 在协程池上执行
@@ -253,6 +254,15 @@ socket 上（系统调用，TLS 上还有 AES-GCM），拷贝占比不大：memm
 去掉一次拷贝只值几个百分点的原因。其余分配主要来自客户端和测试框架（task pool 的环形
 队列、定时器，以及 benchmark 自己的读取）。
 
+## 压测
+
+`benchmark/loadtest` 每次压 30 秒，覆盖 4 条连接 512 个 stream 与 64 条连接 512 个
+stream，并在快速负载旁加一组慢读、一组完全不读的客户端。三轮交替的中位数：h2c 在
+4 x 128 时 1,199,024 req/s、64 x 8 时 2,836,822；HTTP/2 over TLS 为 1,092,137 和
+2,404,461；没有请求失败、出错或超时。HTTP/2 随连接数扩展，不读的客户端大约只占一个
+stream 窗口，而不是响应 body。方法、HTTP/3 对比和整体响应路径的内存代价见
+[压测](loadtest.zh-CN.md)。
+
 ## 待优化项
 
 按优先级排列。
@@ -284,8 +294,10 @@ gRPC 客户端的服务端或代理可能需要比默认值更高的重置速率
 
 已完成，见[一致性测试](#一致性测试)。HTTP/1 请求解析、HTTP/2 帧读取和 HPACK
 编解码都有 fuzz 目标（`http/fuzz_test.go`、`hpack/fuzz_test.go`），
-CI 的 `Fuzz the parsers` job 每个目标跑 20 秒。还缺的是压测（例如 h2load）才能暴露的
-并发问题。
+CI 的 `Fuzz the parsers` job 每个目标跑 20 秒。压测也做了：[压测](loadtest.zh-CN.md)
+用 h2load 和 fib 的 HTTP/3 客户端对每种配置压 30 秒，总计十亿多个请求，没有请求失败、
+reset 风暴或 GOAWAY。它暴露出来的是整体响应发给不读的客户端时的内存代价，HTTP/1 和
+HTTP/3 比 HTTP/2 明显。更长时间的 soak 和带丢包的网络路径仍未覆盖。
 
 ### 3. 流式 body 与 handler 模型（中）
 

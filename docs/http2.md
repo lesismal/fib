@@ -85,7 +85,10 @@ Behaviour to be aware of when using it.
 - Memory bound: on the server, one connection can hold up to about
   `MaxConcurrentStreams × MaxBodyBytes` (250 × 16MB by default) of bodies read
   whole, and a stream window per streamed body; on the client, one response is
-  bounded by `MaxResponseBodyBytes`.
+  bounded by `MaxResponseBodyBytes`. A whole response is kept as the
+  handler's body, with only the frames the windows admit queued, so a stalled
+  reader costs about one stream window rather than the body; see
+  [Load testing](loadtest.md).
 - A `CONNECT` request is parsed and handed to the handler, but no tunnel can be
   established (there is no bidirectional streaming channel).
 
@@ -343,6 +346,18 @@ the samples, which is why the copy removed below is worth a few percent.
 The client and the test harness account for most of the remaining
 allocations (the task pool's ring, timers, and the benchmark's own reads).
 
+## Load testing
+
+`benchmark/loadtest` drives the server for 30 seconds at a time with 512
+streams over four connections and with 512 streams over 64 connections, and
+runs a slow and a stalled subset beside the fast load. Medians of three
+interleaved rounds: h2c 1,199,024 requests a second at 4 x 128 and 2,836,822
+at 64 x 8; HTTP/2 over TLS 1,092,137 and 2,404,461; no request failed, errored
+or timed out. HTTP/2 scales with connection count, and a stalled reader costs
+it about one stream window rather than the response body. The method, the
+HTTP/3 comparison and the memory cost of the whole-body paths are in
+[Load testing](loadtest.md).
+
 ## Planned improvements
 
 In order of priority.
@@ -384,9 +399,13 @@ client's streams costs the client nothing, so it has no reset budget.
 Done: see [Conformance testing](#conformance-testing). Parsing HTTP/1
 requests, reading HTTP/2 frames and coding HPACK all have fuzz targets
 (`http/fuzz_test.go` and `hpack/fuzz_test.go`), which the
-`Fuzz the parsers` CI job runs for 20 seconds each. What is still missing is a
-load-oriented check (h2load, for example) to catch what only shows up under
-concurrency.
+`Fuzz the parsers` CI job runs for 20 seconds each. The load-oriented check
+is done as well: the campaign in [Load testing](loadtest.md) drove h2load and
+fib's HTTP/3 client for 30 seconds per configuration, over a billion requests
+in all, without a failed request, a reset storm or a GOAWAY. What it did
+expose is the memory cost of a whole response to a stalled reader, on HTTP/1
+and HTTP/3 more than on HTTP/2. A longer soak and a lossy network path are
+still open.
 
 ### 3. Streaming bodies and the handler model (medium)
 
