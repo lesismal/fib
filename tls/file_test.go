@@ -376,6 +376,12 @@ func TestSendFileOverTLSChaCha20(t *testing.T) {
 		testSendFileOverTLSChaCha20(t)
 		return
 	}
+	if runtime.GOOS == "windows" {
+		// Windows keeps AES on with GODEBUG=cpu.aes=off: both ends settle on
+		// TLS_AES_128_GCM_SHA256 there, so the suite is not this test's to
+		// force as it is here. The other platforms run it.
+		t.Skip("Windows does not turn AES off for crypto/tls with GODEBUG=cpu.aes=off")
+	}
 	cmd := exec.Command(os.Args[0], "-test.run=^TestSendFileOverTLSChaCha20$", "-test.v")
 	// cpu.aes=off goes with whatever else GODEBUG was set to, since a second
 	// GODEBUG variable in the environment is not what the child reads.
