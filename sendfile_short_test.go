@@ -4,6 +4,7 @@ package fib
 
 import (
 	"bytes"
+	"errors"
 	"io"
 	"math/rand"
 	"os"
@@ -53,5 +54,39 @@ func TestSendFileShortCountWithRoomLeft(t *testing.T) {
 	}
 	if !bytes.Equal(got, data) {
 		t.Fatal("the peer read other bytes than the file's")
+	}
+}
+
+// A file shorter than its range sends what the file has before the connection
+// closes, and closes with io.ErrUnexpectedEOF: the peer is promised the whole
+// range, so the short count is an error only once the bytes before it have
+// gone. It is the Unix counterpart of TestTransmitFileShortFile, where the
+// range TransmitFile is asked for is kept within the file and the rest read as
+// it is here.
+func TestSendFileShortFile(t *testing.T) {
+	const size = 1 << 20
+	path, data := writeTestFile(t, size)
+	f, err := os.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	closed := make(chan error, 1)
+	c, client := acceptOne(t, "tcp", HandlerFuncs{Close: func(_ *Connection, err error) { closed <- err }})
+	if err := c.SendFile(f, 0, size+100); err != nil {
+		t.Fatal(err)
+	}
+	_ = client.SetReadDeadline(time.Now().Add(10 * time.Second))
+	got, _ := io.ReadAll(client)
+	if !bytes.Equal(got, data) {
+		t.Fatalf("the peer read %d bytes, or they differ", len(got))
+	}
+	select {
+	case err := <-closed:
+		if !errors.Is(err, io.ErrUnexpectedEOF) {
+			t.Fatalf("closed with %v, want %v", err, io.ErrUnexpectedEOF)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("the connection stayed open")
 	}
 }

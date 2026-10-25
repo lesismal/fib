@@ -808,10 +808,10 @@ func (e *Engine) completeWrite(c *Connection, n int, err error) *Connection {
 		e.forget(c)
 		return nil
 	}
-	if err == nil && transmitted > 0 && int64(n) < transmitted {
-		// TransmitFile ends at the end of the file without an error, and
-		// the file has turned out shorter than the range the peer was
-		// promised.
+	if transmitted > 0 && int64(n) < transmitted && (err == nil || err == syscall.ERROR_HANDLE_EOF) {
+		// TransmitFile ends at the end of the file without an error, or,
+		// asked past it, with one: either way the file has turned out
+		// shorter than the range the peer was promised.
 		err = io.ErrUnexpectedEOF
 	}
 	if err != nil {
@@ -1351,7 +1351,13 @@ type fileSegment struct {
 	file      *os.File
 	offset    int64
 	remaining int64
-	chunk     []byte
+	// size is how long the file was when the segment was made, or -1 when
+	// that could not be learned. TransmitFile is never asked for a byte past
+	// it: Windows ends such a request with an end-of-file error, which stops
+	// it short of the file's own end, so what remains past it is read
+	// instead; see transmitFileLocked.
+	size  int64
+	chunk []byte
 	// noTransmit records that TransmitFile refused the segment, which is
 	// read a chunk at a time from then on.
 	noTransmit bool
@@ -1381,12 +1387,27 @@ func (c *Connection) transmitsLocked(item *sendItem) bool {
 }
 
 // transmitFileLocked posts a TransmitFile for what is left of the file item at
-// the head of the queue, or as much of it as one call takes. Its completion is
-// the write edge, as an overlapped send's is. A socket TransmitFile refuses
-// has the file read a chunk at a time instead. Callers hold c.mu.
+// the head of the queue, or as much of it as one call takes, and never past the
+// end of the file. Its completion is the write edge, as an overlapped send's
+// is. A socket TransmitFile refuses, or a range the file does not hold, has the
+// file read a chunk at a time instead. Callers hold c.mu.
 func (c *Connection) transmitFileLocked(item *sendItem) error {
 	s := item.file
 	n := min(s.remaining, maxTransmitFile)
+	if s.size >= 0 {
+		n = min(n, s.size-s.offset)
+	}
+	if n <= 0 {
+		// What is left of the range is past the end of the file. Asking
+		// TransmitFile for it ends the request with an end-of-file error,
+		// which stops it short of the file's own end and closes the
+		// connection with that error: the peer is short of bytes the file
+		// did have. Reading the file instead finds the end, and the short
+		// range is reported once what the file holds has gone, as the
+		// platforms whose sendfile stops there report it.
+		s.noTransmit = true
+		return c.awaitWritableLocked()
+	}
 	c.writeOp.ov = syscall.Overlapped{Offset: uint32(s.offset), OffsetHigh: uint32(s.offset >> 32)}
 	c.writeInFlight = true
 	c.transmitting = n
@@ -1399,6 +1420,11 @@ func (c *Connection) transmitFileLocked(item *sendItem) error {
 	c.writeInFlight = false
 	c.transmitting = 0
 	c.outstanding.Add(-1)
+	if err == syscall.ERROR_HANDLE_EOF {
+		// The file ends before what was asked for of it, which is the short
+		// range that Windows reports as the end of the file.
+		return io.ErrUnexpectedEOF
+	}
 	if err == wsaEOPNOTSUPP || err == sys.WSAEINVAL || err == errorNotSupported || err == errorInvalidParameter {
 		s.noTransmit = true
 		return c.awaitWritableLocked()
@@ -1434,7 +1460,13 @@ func newFileSegment(f File, offset, count int64) (*fileSegment, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &fileSegment{file: os.NewFile(uintptr(dup), ""), offset: offset, remaining: count}, nil
+	seg := &fileSegment{file: os.NewFile(uintptr(dup), ""), offset: offset, remaining: count, size: -1}
+	// A file whose size cannot be learned still goes by TransmitFile, and
+	// falls back to chunked reads for one it cannot send.
+	if info, statErr := seg.file.Stat(); statErr == nil {
+		seg.size = info.Size()
+	}
+	return seg, nil
 }
 
 func (s *fileSegment) advance(n int64) {
