@@ -6,6 +6,7 @@ import (
 	"crypto/tls"
 	"os"
 	"os/exec"
+	"runtime"
 	"strings"
 	"testing"
 )
@@ -26,6 +27,12 @@ func TestChaCha20Poly1305Handshake(t *testing.T) {
 	if os.Getenv("FIB_QUIC_CHACHA20") == "1" {
 		testChaCha20Handshake(t)
 		return
+	}
+	if runtime.GOOS == "windows" {
+		// Windows keeps AES on with GODEBUG=cpu.aes=off: its TLS settles on
+		// TLS_AES_128_GCM_SHA256 either way, so the suite is not this test's to
+		// force there as it is here. The other platforms run it.
+		t.Skip("Windows does not turn AES off for crypto/tls with GODEBUG=cpu.aes=off")
 	}
 	cmd := exec.Command(os.Args[0], "-test.run=^TestChaCha20Poly1305Handshake$", "-test.v")
 	// cpu.aes=off goes with whatever else GODEBUG was set to, since a second
