@@ -146,6 +146,9 @@ type testPair struct {
 	serverMu             sync.Mutex
 	// stray gets what reaches the server while it has no connection.
 	stray func(d []byte)
+	// drained hears that the server has taken drainServer's sentinel, and
+	// with it everything the client sent ahead of it.
+	drained chan struct{}
 	// bursts has the server take what has piled up for it with one
 	// HandleDatagrams, as a fib server does, rather than a datagram a call.
 	bursts atomic.Bool
@@ -234,7 +237,7 @@ func newTestPairOpts(t testing.TB, loss float64, configure func(client, server *
 			}
 		}
 	}
-	p := &testPair{clientH: newTestHandler(), serverH: newTestHandler(), done: make(chan struct{})}
+	p := &testPair{clientH: newTestHandler(), serverH: newTestHandler(), done: make(chan struct{}), drained: make(chan struct{}, 1)}
 	p.clientEnd, p.serverEnd = newPipe()
 	p.clientEnd.loss, p.serverEnd.loss = loss, loss
 	var serverHandler Handler = p.serverH
@@ -255,6 +258,10 @@ func newTestPairOpts(t testing.TB, loss float64, configure func(client, server *
 		for {
 			select {
 			case d := <-p.serverEnd.queue:
+				if bytes.Equal(d, drainDatagram) {
+					p.drained <- struct{}{}
+					continue
+				}
 				p.serverMu.Lock()
 				if p.server == nil {
 					if p.stray != nil {
@@ -385,6 +392,28 @@ func waitQuiet(t *testing.T, p *testPair) {
 		}
 	}
 	t.Fatal("the handshake's last packets still waiting for acknowledgement")
+}
+
+// drainDatagram is a datagram no connection makes: drainServer sends it to
+// have the server report that it has taken everything sent before it.
+var drainDatagram = []byte("test: the server has taken what came before")
+
+// drainServer waits until the server has taken every datagram the client
+// sent before it: the server's goroutine takes them from the pipe in order,
+// so its taking the sentinel after them means they have all been handled. A
+// test that changes what the server does with what reaches it, as
+// TestStatelessReset does when it forgets the connection, has to know that
+// the client has nothing of its own still on the way: that would get the new
+// answer instead of what the test sends after. The pair must not be
+// gathering or bursting datagrams, which take the sentinel with them.
+func (p *testPair) drainServer(t *testing.T) {
+	t.Helper()
+	_ = p.clientEnd.Send(drainDatagram)
+	select {
+	case <-p.drained:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the server did not take the drain datagram")
+	}
 }
 
 func TestHandshakeAndEcho(t *testing.T) {
@@ -593,6 +622,14 @@ func TestKeepAlive(t *testing.T) {
 func TestStatelessReset(t *testing.T) {
 	key := NewResetKey()
 	p := newTestPair(t, 0, func(_, server *Config) { server.ResetKey = &key })
+	// The end of the handshake leaves datagrams on their way, an
+	// acknowledgement of the server's last packet among them. The forgotten
+	// server would answer one of those with the reset too, and the client,
+	// closed by it before the stream below, could not open one: let both
+	// ends go quiet, and the server take all the client sent, so that what
+	// the test sends is the next datagram it answers.
+	waitQuiet(t, p)
+	p.drainServer(t)
 	// The server forgets the connection; what the client sends next is
 	// answered with a stateless reset.
 	p.serverMu.Lock()
