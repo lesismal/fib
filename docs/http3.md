@@ -166,12 +166,16 @@ request that arrives whole in one packet, as most do, costs none.
   in the stream instead.
 - Memory bounds: a server connection can hold up to about
   `MaxConcurrentStreams × MaxBodyBytes` (100 × 16MB by default); a single
-  client response is bounded by `MaxResponseBodyBytes`. A whole response is
-  copied into one QUIC frame buffer and held until the peer acknowledges it,
-  so a stalled stream costs the body rounded up to a power of two (8MiB takes
-  16MiB), and `MaxConcurrentStreams` times that is the bound. Streaming the
-  body through `Write` and `Flush` keeps it to 64KiB instead; see
-  [Load testing](loadtest.md).
+  client response is bounded by `MaxResponseBodyBytes`. A whole response keeps
+  the handler's body as it is and frames it as the peer's windows, and then
+  its acknowledgements, let it go, as HTTP/2 does, so a stalled stream costs
+  its window of frames rather than the body: 16 stalled responses of 8MiB cost
+  19MiB of live heap against the 275MiB they cost when the body was copied
+  into one power-of-two buffer (see [Load testing](loadtest.md)). A body of
+  4KiB or less is still copied into the buffer its frames are built in, and a
+  larger one must not be changed once `Respond` or `WriteResponse` returns;
+  `fibhttp.Response.Body` says what that asks of the handler. Streaming the
+  body through `Write` and `Flush` keeps what waits to 64KiB instead.
 - A request that is complete goes to the engine's handler pool, as
   `Config.StreamPool` describes — the engine name's `<Name>-streams` pool,
   never an engine's; the HTTP/2 server uses the same — so the requests one client
@@ -495,20 +499,24 @@ Done:
   splits again by the size the read's control message gives, so a burst costs
   one receive rather than one a datagram; a kernel without `UDP_GRO`, and the
   other systems, read a datagram at a time.
-- **Fewer copies and allocations**: sending copies once in `Write`, into a
-  pooled buffer, and again when packets are built; receiving copies in the
-  engine, into a pooled buffer, and in the HTTP/3 frame parser only a frame
-  split across pieces and the request body. An HTTP/3 response goes in with
-  `WriteOwned`, so it pays only the second copy; the first would need the
-  engine to send a packet built from several buffers (iovec changes, which are
-  another workstream's). Packet protection allocates nothing now: the
+- **Fewer copies and allocations**: a response given whole is kept where the
+  handler put it (above 4KiB) and framed from there, so the body is copied
+  once, into the packets, which the AEAD needs; a streamed one is copied into
+  its DATA frame's buffer as well, which is what the stream's send buffer is
+  for. What is sent is copied into packets as they are built, and each packet
+  is built where it is sent, its payload behind the room its header takes, so
+  sealing a datagram copies nothing. Receiving copies in the engine, into a
+  pooled buffer, and in the HTTP/3 frame parser only a frame split across
+  pieces and the request body. A response of 4KiB or less is copied into one
+  buffer with its frames, since parts cost more than the copy for one that
+  small. Packet protection allocates nothing now: the
   ChaCha20-Poly1305 authenticator was one heap allocation per packet and is a
   value. QUIC streams are deliberately not pooled: a `*Stream` is handed to
   the application and its lifetime is the application's, so reusing one would
   turn a use after the stream is done into corruption of another stream. A
   stream opened and closed costs 8 allocations, a request over the in-memory
-  path 11 or 12, and the HTTP/3 request stream and header are recycled (see
-  above).
+  path 12 or 13 (one more where the response is given as several parts, see
+  above), and the HTTP/3 request stream and header are recycled (see above).
 - **ACK frequency**: the ACK_FREQUENCY extension
   (draft-ietf-quic-ack-frequency) is done. Both ends advertise `min_ack_delay`
   in their transport parameters; a connection whose peer advertises it asks,
@@ -669,7 +677,9 @@ seconds per configuration: 897,233 requests a second at 4 connections with
 128 streams each, 689,402 at 32 x 16 and 373,362 on one connection with 256
 streams, with no failed request, reset or GOAWAY; p99 was 1.56ms, 2.90ms and
 1.34ms. HTTP/3 peaked below h2c's 2,836,822 at 64 x 8 in the same campaign,
-and more QUIC connections cost more than they bought. Stalled readers are the
-one memory limit: every whole response is held in a power-of-two buffer until
-acknowledged. The method, the comparison with HTTP/1 and HTTP/2, and the
-memory measurements are in [Load testing](loadtest.md).
+and more QUIC connections cost more than they bought. Stalled readers were the
+one memory limit the campaign found: every whole response was held in a
+power-of-two buffer until acknowledged. That is fixed — the body is kept as
+the handler gave it, and 16 stalled responses of 8MiB now cost 19MiB of live
+heap instead of 275MiB. The method, the comparison with HTTP/1 and HTTP/2, and
+the memory measurements are in [Load testing](loadtest.md).

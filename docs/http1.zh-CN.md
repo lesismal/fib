@@ -52,6 +52,15 @@ handler 用 `Write`/`WriteHeader` 而不是 `WriteResponse` 写响应时，服�
 `Flush` 发送响应头和缓存的数据，并立即交给 socket；不调用时，engine 会把一轮读取中
 产生的输出合并，等 handler 返回后一次写出（见 `Connection.Flush`）。
 
+### 整体给出的响应
+
+`WriteResponse` 和 `Respond` 用 `Connection.SendParts` 把响应头和 body 一起交给
+socket，让它在一次写里吃下两部分。socket 一次没吃下的部分会拷进缓冲池里的一块缓冲，
+直到吃完；这就是不读的大响应读者所付的内存代价（测量见[压测](loadtest.zh-CN.md)），
+也是 `Config.MaxWriteQueueBytes` 限制的东西。因此 `WriteResponse` 返回后 body 又归
+handler 所有。HTTP/2 与 HTTP/3 会把 body 留到发出或对端确认为止并从那里装帧，所以在
+那两种协议上 handler 在响应结束前不能修改它；见 `fibhttp.Response.Body`。
+
 ### Transfer coding
 
 chunked 不是唯一会被解码的 transfer coding（RFC 9112 第 7 节）。chunked 之上再加 gzip、

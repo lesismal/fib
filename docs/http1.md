@@ -65,6 +65,18 @@ server picks the framing:
 at once; without it the engine batches a read round's output until the
 handler returns (see `Connection.Flush`).
 
+### A response given whole
+
+`WriteResponse` and `Respond` send the head and the body with
+`Connection.SendParts`, which asks the socket to take both in one write. What
+the socket does not take at once is copied into a buffer from the pool and
+kept until it does, which is the memory a stalled reader of a large whole
+response costs ([Load testing](loadtest.md) has the measurements), and what
+`Config.MaxWriteQueueBytes` bounds. The body is therefore the handler's again
+once `WriteResponse` returns. HTTP/2 and HTTP/3 keep it until it has been sent
+or acknowledged and frame it from there, so there a handler must not change it
+until the response is finished; see `fibhttp.Response.Body`.
+
 ### Transfer codings
 
 Chunked is not the only transfer coding decoded (RFC 9112 section 7). A body

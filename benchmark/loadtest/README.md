@@ -78,6 +78,27 @@ not report that number (`h2load` has no percentiles).
 python3 benchmark/loadtest/report.py <out>
 ```
 
+## A stalled reader on its own
+
+`stallmem.sh` measures what the load campaign's `slow-*` cases hold open for
+30 seconds: one fresh server, N responses of 8MiB never read, and the live
+heap and RSS from `/stats?gc=1` while they are still open.
+
+```sh
+./benchmark/loadtest/stallmem.sh --proto h3 --streams 1,4,16 --rounds 3
+```
+
+`--bin DIR` runs a `server` and `stall` already built instead of building
+them, so a run before a change and a run after it can be interleaved against
+the same clients:
+
+```sh
+./benchmark/loadtest/stallmem.sh --bin /tmp/before --streams 1,4,16 --out /tmp/sm-before-1
+./benchmark/loadtest/stallmem.sh --bin /tmp/after  --streams 1,4,16 --out /tmp/sm-after-1
+```
+
+It writes one row per measurement to `<out>/stallmem.tsv`.
+
 ## Cases
 
 | Name | Load | What it shows |

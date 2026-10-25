@@ -41,6 +41,7 @@ python3 benchmark/loadtest/report.py /tmp/fib-loadtest/<time>
 | `benchmark/loadtest/server` | 一个进程同时提供 HTTP/1 与 h2c（TCP）、HTTP/1 与 HTTP/2 over TLS（另一个 TCP 端口）、HTTP/3（UDP），共用一个 handler。`/plain` 返回 `ok\n`；`/big?n=N` 返回 N 字节的缓存 body；`/upload` 读 POST body；`/stream?n=N&chunk=C&delayus=D` 分片写 body；`/stats` 返回进程的 goroutine、描述符、RSS、堆和引擎计数，`?gc=1` 先做一次 GC，`?reset=1` 重置计数 |
 | `benchmark/loadtest/h3load` | 用 fib 自己的客户端持续压 HTTP/3：每个 client 一条 QUIC 连接，全局固定并发请求数，每个请求有超时；结束时输出吞吐、p50/p90/p99、每秒完成数和错误样本 |
 | `benchmark/loadtest/stall` | 请求 `/big?n=8388608`，读完响应头后要么慢速读（`-delay`），要么完全不读（`-stall`），每个 stream 一条连接。它和快速负载一起跑，用来压背压、流控和清理路径 |
+| `benchmark/loadtest/stallmem.sh` | 单独测卡住的读者：起一个全新服务端，保持 N 个 `--body` 字节的响应不读，在它们还开着时从 `/stats?gc=1` 读活堆和 RSS。`--bin DIR` 接收已经构建好的 `server` 和 `stall`，这样改动前后可以用同一批客户端交替测量 |
 | `benchmark/loadtest/run.sh` | 压测主脚本：构建上面三个程序，把服务端绑在前一半 CPU、压测端绑在后一半，每个用例起新服务端，最后汇总 |
 
 HTTP/1 与 HTTP/2 由 `h2load` 1.59.0 驱动：HTTP/1 用 `--h1`，h2c 用 prior
@@ -53,7 +54,10 @@ knowledge，HTTP/2 over TLS 用 ALPN。HTTP/3 用 `h3load`，因为发行版里�
 socket buffer 16MiB；服务端绑 CPU 0-7，压测端绑 8-15。每个用例起一个新服务端进程，
 预热 3 秒后测 30 秒；六个 A/B 配置交替跑三轮，表中取中位数。机器上还有别的工作流在
 跑，压测开始前看过 load average；另一个 workstream 的一个三秒 `http3.test` 与
-HTTP/3 的第一轮重叠，所以那一轮的 req/s 是逐轮表里偏低的一次。
+HTTP/3 的第一轮重叠，所以那一轮的 req/s 是逐轮表里偏低的一次。卡住读者在 HTTP/3
+改动前后的数据是用 `stallmem.sh` 在同一台机器上逐轮交替测的，机器负载的变化会同时
+作用在两边；用于对比快速用例的两次完整压测相隔约一小时，那时机器的 load average
+是 10-17，比上面那次压测更高，所以两次的 req/s 整体都偏低。
 
 HTTP/1 与 HTTP/2 的请求和响应都很小（`/plain`，3 字节），因此这些数字是请求速率，
 不是带宽。`h2load` 只报告单请求耗时（request time）的最小、平均、最大和标准差，不报
@@ -123,7 +127,7 @@ TLS 握手，全部完成，没有失败，描述符峰值 533，RSS 45-52MiB，
 | slow-h3 | 4 x 128 | 273,167 | 37MiB（空闲超时之后） | 97.4MiB | 78.4MiB |
 
 HTTP/3 这一行是 30 秒空闲超时关掉卡住的连接之后的数据。stream 还开着时，对一个新
-服务端测 16 个卡住的 8MiB 响应，代价是：
+服务端（压测程序的 `/big` body 已缓存）测，代价是：
 
 | 协议 | 卡住的 stream | 活堆 | RSS |
 | --- | --- | --- | --- |
@@ -132,6 +136,16 @@ HTTP/3 这一行是 30 秒空闲超时关掉卡住的连接之后的数据。str
 | h3 | 1 | 32MiB | 31MiB |
 | h3 | 4 | 81MiB | 79MiB |
 | h3 | 16 | 275MiB | 260MiB |
+
+HTTP/3 这几行是发送路径改动之前的数据；改动之后用 `stallmem.sh` 测（改动前后各三轮、
+交替进行、取中位数，服务端和卡住的客户端钉在机器的不同半边），低得多。两行里
+body 都是压测服务端缓存的那一份，所以不管多少 stream 持有，它只有一份 8MiB：
+
+| 卡住的 stream | 改动前：活堆 | 改动前：RSS | 现在：活堆 | 现在：RSS |
+| --- | --- | --- | --- | --- |
+| 1 | 32MiB | 29MiB | 16MiB | 21MiB |
+| 4 | 83MiB | 78MiB | 19MiB | 46MiB |
+| 16 | 275MiB | 209MiB | 19MiB | 113MiB |
 
 差别在三条发送路径如何持有整体响应：
 
@@ -143,10 +157,17 @@ HTTP/3 这一行是 30 秒空闲超时关掉卡住的连接之后的数据。str
   `queueLocked` 把剩下的拷进池里的一块缓冲，直到 socket 吃下为止。卡住的连接因此
   持有一份 body 拷贝，并按 2 的幂大小分档。对端消失后拷贝会释放，但进程 RSS 要等
   运行时复用才会降。
-- **HTTP/3** 把响应的 HEADERS 和整个 body 构造成一块帧缓冲，用 `WriteFinal` 交给
-  QUIC stream，后者一直保留到对端确认。`bufferpool` 按 2 的幂分档，8MiB 的 body
-  要占 16MiB 缓冲：16 个卡住的 stream 就是 16 x 16MiB，再加一份缓存 body 8MiB，
-  即上表的 275MiB 活堆。这条路径没有单响应的队列上限。
+- **HTTP/3** 过去把响应的 HEADERS 和整个 body 构造成一块帧缓冲，用 `WriteFinal`
+  交给 QUIC stream，后者一直保留到对端确认。`bufferpool` 按 2 的幂分档，8MiB 的
+  body 要占 16MiB 缓冲：16 个卡住的 stream 就是 16 x 16MiB，再加一份缓存 body
+  8MiB，即上表的 275MiB 活堆。这条路径过去没有单响应的队列上限。
+- **HTTP/3 现在**和 HTTP/2 一样，把 body 留在 handler 给它的地方，按对端窗口、再按
+  对端确认逐步装帧：stream 以若干 run 持有响应（`quic.Stream.WriteFinalParts`），
+  卡住的 stream 因此只占流控窗口允许的那些帧，每个约五分之一 MiB，而不是一个比
+  body 还大的池缓冲。body 只剩装进 packet 的那一次拷贝，这是 AEAD 需要的。4KiB
+  及以下的 body 仍然拷进构造帧的那块缓冲，因为这么小的 body 分成多个部分比拷贝
+  更贵。这对 handler 的要求见 [HTTP/3](http3.zh-CN.md) 和 `fibhttp.Response.Body`：
+  更大的 body 在对端确认之前不能修改。
 
 这是部署上的限制，不是错误结果：对端没有被 reset，快速负载照常跑。规划时值得注意：
 
@@ -156,8 +177,10 @@ HTTP/3 这一行是 30 秒空闲超时关掉卡住的连接之后的数据。str
   限制，而不是由 body 大小决定。
 - 用 `Config.MaxWriteQueueBytes` 关掉不读的 HTTP/1 连接，用
   `Config.MaxPendingBytes` 限制整个服务端的待发输出。两者默认都不限。
-- 整体返回大 body 的 HTTP/3 服务端应调低 `MaxConcurrentStreams`。上界大致是
-  `MaxConcurrentStreams` 乘以 body 按 2 的幂向上取整，再加缓存的 body。
+- 整体响应不再让 HTTP/3 服务端的内存由 body 大小决定：卡住的 stream 只持有对端
+  窗口允许的部分，因此上界大致是 `MaxConcurrentStreams` 乘以 stream 窗口，再加
+  handler 自己保留的那些 body。HTTP/1 仍然拷贝 socket 没吃下的部分，上面那条建议
+  对它仍然适用。
 - QUIC 的 30 秒空闲超时会关掉没有包流动的连接。本次压测里卡住的 HTTP/3 客户端报的
   就是 `quic: idle timeout`，不是 reset 或 GOAWAY；持续消费的慢客户端会发送窗口
   更新，连接不会因空闲被关。
@@ -175,6 +198,33 @@ RSS 漂移更像分配器高水位而不是确定的增长；在下结论之前�
 失败、reset 风暴、GOAWAY 风暴、卡死的连接，也没有描述符或 goroutine 泄漏。唯一暴露
 出来的是慢客户端下整体响应的内存代价，它是整体响应发送路径和 buffer 分档的性质，
 不是一行代码的缺陷；上面已经连同缓解办法一起记录。
+
+这个限制后来只对 HTTP/3 做了修复：QUIC stream 现在把 handler 的 body 原样留着，
+发送路径也把每个 packet 直接建在它要发出去的位置，因此响应和 datagram 都不再被
+拼成一整块拷贝。HTTP/1 与 HTTP/2 保持原样。改动之后又跑了一遍整轮压测，用例、三轮
+交替和读数方式都相同：两次的 load average 都是 10-17，第二次机器更闲，所以三个协议
+的快速用例都偏高，包括代码没动的 HTTP/1 和 HTTP/2。因此快速用例不是两个版本的对比；
+能对比的是上面那些交替跑出来的卡住读者数据。这次压测能说明的是两次都没有失败，慢客户端
+用例与之前相当：
+
+| 用例 | 改动前 req/s | 现在 req/s | 改动前 p99 | 现在 p99 | 改动前 RSS after | 现在 RSS after |
+| --- | --- | --- | --- | --- | --- | --- |
+| h1-16c | 300,350 | 418,320 | - | - | 23MiB | 22MiB |
+| h1-256c | 499,671 | 828,433 | - | - | 27MiB | 23MiB |
+| h2c-4x128 | 1,102,394 | 1,207,983 | - | - | 39MiB | 37MiB |
+| h2-4x128 | 992,534 | 1,131,507 | - | - | 48MiB | 45MiB |
+| h3-4x128 | 539,183 | 947,026 | 3.16ms | 1.37ms | 41MiB | 40MiB |
+| h3-32x16 | 659,866 | 705,770 | 3.36ms | 2.50ms | 43MiB | 44MiB |
+| h3-1x256 | 333,445 | 337,569 | 1.72ms | 1.29ms | 38MiB | 34MiB |
+| slow-h1 | 418,834 | 417,694 | - | - | 43MiB | 43MiB |
+| slow-h2c | 1,217,853 | 1,209,984 | - | - | 73MiB | 53MiB |
+| slow-h3 | 1,005,391 | 980,328 | 1.28ms | 1.32ms | 94MiB | 63MiB |
+
+两个没有改动的慢客户端用例 req/s 基本持平，而它们的 RSS 在两次之间的变化和 HTTP/3
+的差不多：单个 30 秒用例里卡住读者的代价噪声很大，所以内存要看上面那组交替测量。
+HTTP/3 的慢客户端用例两次都持有同样的 67MB 响应，快速负载保住了 98% 的速率，p99 不变，
+以错误结束的卡住客户端从 8 个降到 1 个：它们在不发任何包之后被 QUIC 空闲超时关掉，
+时间点落在用例快结束时。
 
 ## 这次压测的局限
 

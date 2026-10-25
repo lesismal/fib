@@ -46,6 +46,7 @@ blocking jobs stay deterministic. Run `--mode smoke` on a test host instead.
 | `benchmark/loadtest/server` | one process serving HTTP/1 and h2c on one TCP port, HTTP/1 and HTTP/2 over TLS on another, and HTTP/3 on a UDP port, all through the same handler. `/plain` answers `ok\n`; `/big?n=N` answers N bytes of a cached body; `/upload` reads a POST body; `/stream?n=N&chunk=C&delayus=D` writes a body in pieces; `/stats` returns the process's goroutines, descriptors, RSS, heap and the engine's counters, with `?gc=1` forcing a collection and `?reset=1` restarting the counters |
 | `benchmark/loadtest/h3load` | a sustained HTTP/3 driver on fib's own client: one QUIC connection per client, a fixed number of requests in flight in total, a per-request timeout, and throughput, p50/p90/p99, per-second completions and error samples when the measurement ends |
 | `benchmark/loadtest/stall` | a client that requests `/big?n=8388608`, reads the response header and then either reads it slowly (`-delay`) or stops reading it altogether (`-stall`), one connection per stream. It is run beside the fast load to exercise backpressure, flow control and cleanup |
+| `benchmark/loadtest/stallmem.sh` | the stalled-reader case on its own: starts a fresh server, holds N responses of `--body` bytes open without reading them, and records the live heap and RSS from `/stats?gc=1` while they are still open. `--bin DIR` takes a `server` and `stall` already built, so a run before a change and a run after it can be interleaved against the same clients |
 | `benchmark/loadtest/run.sh` | the campaign: builds the three, pins the server to the first half of the CPUs and the load generator to the second half, starts a fresh server per case, and summarises each case |
 
 HTTP/1 and HTTP/2 are driven by `h2load` 1.59.0: `--h1` for HTTP/1,
@@ -57,7 +58,12 @@ QUIC.
 
 The host is the shared 16-thread Ryzen 7 7800X3D used for the package
 benchmarks, with Go 1.27.3, Linux socket buffers of 16MiB, and the server on
-CPUs 0-7 and the load generator on 8-15. Each case starts a fresh server
+CPUs 0-7 and the load generator on 8-15. The stalled-reader measurements
+before and after the HTTP/3 change were interleaved round by round on that
+host with `stallmem.sh`, so that a change in its load moved both sides
+together; the two full campaigns compared for the fast cases were run an hour
+apart, and the host's load average was 10-17 then, higher than for the
+campaign above, which is why their request rates are lower throughout. Each case starts a fresh server
 process; the measurement runs for 30 seconds after a 3-second warm-up, and
 the six A/B configurations are repeated three times, interleaved, with the
 median reported. Other workstreams share the host; the load average was
@@ -151,7 +157,7 @@ failing:
 
 Those HTTP/3 figures are after the stalled connections were closed by the
 30-second idle timeout. Measured while the streams were still open, against
-a fresh server, 16 stalled 8MiB responses cost:
+a fresh server with the campaign's `/big` body cached, the responses cost:
 
 | Protocol | Stalled streams | Live heap | RSS |
 | --- | --- | --- | --- |
@@ -160,6 +166,18 @@ a fresh server, 16 stalled 8MiB responses cost:
 | h3 | 1 | 32MiB | 31MiB |
 | h3 | 4 | 81MiB | 79MiB |
 | h3 | 16 | 275MiB | 260MiB |
+
+The HTTP/3 figures are the ones before the send path was changed; the two
+after it, measured with `stallmem.sh` (three interleaved rounds of each
+server, medians, server and stalled clients on separate halves of the host),
+are much lower. The body is the test server's cached one in both rows, so it
+is a single 8MiB copy however many streams hold it:
+
+| Stalled streams | Before: live heap | Before: RSS | Now: live heap | Now: RSS |
+| --- | --- | --- | --- | --- |
+| 1 | 32MiB | 29MiB | 16MiB | 21MiB |
+| 4 | 83MiB | 78MiB | 19MiB | 46MiB |
+| 16 | 275MiB | 209MiB | 19MiB | 113MiB |
 
 The difference is in how each send path holds a whole response:
 
@@ -175,12 +193,23 @@ The difference is in how each send path holds a whole response:
   holds a copy of the body, rounded to a power-of-two class. The copy is
   released when the peer goes, but the process's RSS stays high until the
   runtime reuses it.
-- **HTTP/3** builds the response's HEADERS and its whole body into one frame
-  buffer and gives it to the QUIC stream with `WriteFinal`, which keeps it
-  until the peer acknowledges it. `bufferpool` classes are powers of two, so
-  an 8MiB body takes a 16MiB buffer: 16 stalled streams cost 16 x 16MiB plus
-  the one cached 8MiB body, which is the 275MiB of live heap above. There is
+- **HTTP/3** built the response's HEADERS and its whole body into one frame
+  buffer and gave it to the QUIC stream with `WriteFinal`, which kept it
+  until the peer acknowledged it. `bufferpool` classes are powers of two, so
+  an 8MiB body took a 16MiB buffer: 16 stalled streams cost 16 x 16MiB plus
+  the one cached 8MiB body, which is the 275MiB of live heap above. There was
   no per-response queue cap on this path.
+- **HTTP/3 now** keeps the body where the handler put it, as HTTP/2 does, and
+  frames it as the peer's windows, and then its acknowledgements, let it go:
+  the stream holds the response as runs (`quic.Stream.WriteFinalParts`), so
+  what a stalled stream costs is the frames the flow-control window admits,
+  about a fifth of a MiB each, rather than a pool buffer larger than the body.
+  The only copy of the body left is the one into the packets, which the AEAD
+  needs. A body of 4KiB or less is still copied into the buffer its frames are
+  built in, since a message of several parts costs more than the copy for one
+  that small. See [HTTP/3](http3.md) and `fibhttp.Response.Body` for what that
+  asks of the handler: a larger body must not be changed until the peer has
+  acknowledged it.
 
 This is a deployment limit rather than a wrong answer: the peers are
 well-behaved enough not to be reset, and the fast load carries on. It is
@@ -194,9 +223,11 @@ worth planning for:
 - Set `Config.MaxWriteQueueBytes` to close an HTTP/1 connection whose peer
   will not read, and `Config.MaxPendingBytes` to bound the server's queued
   output as a whole. Both default to unlimited.
-- Lower `MaxConcurrentStreams` on an HTTP/3 server that answers large bodies
-  whole. The bound is roughly `MaxConcurrentStreams` times the body size
-  rounded up to a power of two, plus the cached bodies.
+- A whole response no longer bounds an HTTP/3 server by its body: what a
+  stalled stream holds is what the peer's windows let through, so
+  `MaxConcurrentStreams` times the stream window, plus the bodies the handlers
+  themselves keep, is the bound. HTTP/1 still copies what its socket does not
+  take, so the advice above is for it.
 - The 30-second QUIC idle timeout closes a connection whose stalled stream
   keeps no packets flowing. That is what the campaign's stalled HTTP/3
   clients reported, as `quic: idle timeout`, not as a reset or a GOAWAY; a
@@ -215,13 +246,46 @@ descriptor or goroutine leak appeared. The HTTP/3 RSS drift is allocator
 high-water rather than proven growth; a longer soak is still worth running
 before calling the HTTP/3 heap flat.
 
-No production code was changed for this campaign. Nothing in it was a
-concurrency bug that a small, isolated fix would remove: the campaign found
-no failed request, reset storm, GOAWAY storm, stuck connection or
-descriptor/goroutine leak. The memory cost of whole responses to slow
-readers is the one limit it exposed, and it is a property of the whole-body
-send paths and the buffer classes, not a one-line defect; it is documented
-above with the mitigations.
+The campaign changed no production code. Nothing in it was a concurrency bug
+that a small, isolated fix would remove: it found no failed request, reset
+storm, GOAWAY storm, stuck connection or descriptor/goroutine leak. The memory
+cost of whole responses to slow readers is the one limit it exposed, and it
+was a property of the whole-body send paths and the buffer classes, not a
+one-line defect.
+
+That limit was then fixed for HTTP/3, and only for HTTP/3: the QUIC stream now
+keeps the handler's body as it is, and its send path builds every packet where
+it is sent, so neither the response nor a datagram is copied together. HTTP/1
+and HTTP/2 are as they were. The campaign was then run again, with the same
+cases, three interleaved rounds and the same reading of the host: its load
+average was 10-17 both times, and it was quieter for the second run, so every
+protocol's fast cases are up, HTTP/1's and HTTP/2's included, although their
+code did not change. The fast cases are therefore not a comparison of the two
+revisions; the stalled-reader numbers above, interleaved against the same
+clients, are. What the campaign does say is that nothing failed in either run
+and that the slow-reader cases are as they were:
+
+| Case | req/s before | req/s now | p99 before | p99 now | RSS after, before | RSS after, now |
+| --- | --- | --- | --- | --- | --- | --- |
+| h1-16c | 300,350 | 418,320 | - | - | 23MiB | 22MiB |
+| h1-256c | 499,671 | 828,433 | - | - | 27MiB | 23MiB |
+| h2c-4x128 | 1,102,394 | 1,207,983 | - | - | 39MiB | 37MiB |
+| h2-4x128 | 992,534 | 1,131,507 | - | - | 48MiB | 45MiB |
+| h3-4x128 | 539,183 | 947,026 | 3.16ms | 1.37ms | 41MiB | 40MiB |
+| h3-32x16 | 659,866 | 705,770 | 3.36ms | 2.50ms | 43MiB | 44MiB |
+| h3-1x256 | 333,445 | 337,569 | 1.72ms | 1.29ms | 38MiB | 34MiB |
+| slow-h1 | 418,834 | 417,694 | - | - | 43MiB | 43MiB |
+| slow-h2c | 1,217,853 | 1,209,984 | - | - | 73MiB | 53MiB |
+| slow-h3 | 1,005,391 | 980,328 | 1.28ms | 1.32ms | 94MiB | 63MiB |
+
+The two slow cases that did not change are flat in request rate, and their
+RSS moved by as much between runs as HTTP/3's did: a stalled reader's cost is
+noisy in a single 30-second case, which is why the memory measurement above
+is the interleaved one. The HTTP/3 slow case held the same 67MB of responses
+open in both runs, its fast load kept 98% of its rate, its p99 was unchanged,
+and the stalled clients that ended with an error fell from 8 to 1: their
+connections are closed by the QUIC idle timeout once they let nothing flow,
+which lands near the end of the case.
 
 ## Limits of the campaign
 

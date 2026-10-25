@@ -120,10 +120,13 @@
   里等待流控或拥塞控制，`Write` 就会等待，直到部分发出或 stream 结束；连接在接收数据报的
   协程上运行的 handler 从不等待，它写的内容留在 stream 里等待发送。
 - 内存上限：服务端单连接最坏约为 `MaxConcurrentStreams × MaxBodyBytes`（默认
-  100 × 16MB），客户端单个响应受 `MaxResponseBodyBytes` 限制。整体响应会拷进一块
-  QUIC 帧缓冲并保留到对端确认，因此一个卡住的 stream 要占 body 大小按 2 的幂向上取整
-  （8MiB 变 16MiB），上界约为 `MaxConcurrentStreams` 乘以这个值。用 `Write` 和
-  `Flush` 流式发送只需 64KiB；见[压测](loadtest.zh-CN.md)。
+  100 × 16MB），客户端单个响应受 `MaxResponseBodyBytes` 限制。整体响应和 HTTP/2 一样
+  把 handler 的 body 原样留着，按对端窗口、再按对端确认逐步装帧，因此一个卡住的 stream
+  占的是它窗口内的那些帧，而不是 body 本身：16 个卡住的 8MiB 响应占 19MiB 活堆，
+  而过去把 body 拷进一块 2 的幂缓冲时要占 275MiB（见[压测](loadtest.zh-CN.md)）。
+  4KiB 及以下的 body 仍然拷进构造帧的那块缓冲；更大的 body 在 `Respond` 或
+  `WriteResponse` 返回之后不能修改，对 handler 的要求见 `fibhttp.Response.Body`。
+  用 `Write` 和 `Flush` 流式发送只需 64KiB。
 - 请求完整后按 `Config.StreamPool` 的描述交给 engine 的 handler 协程池（与 HTTP/2 server
   相同：同名 engine 的 `<Name>-streams`，不与 engine 的协程池共用），因此同一连接上客户端并发发起的多个请求是并发处理的，阻塞的 handler 只拖累它
   自己。`StreamPool.MaxConcurrentHandlers` 限制单个连接同时处理的请求数 N，其中第 N 个在
@@ -342,13 +345,16 @@
   内核合并的一串数据报作为一次读取返回，Engine 按控制消息给出的大小再拆回单个数据报，
   一串数据报因此只花一次接收而不是每个一次系统调用。内核不支持 `UDP_GRO` 时以及其他系统上
   仍然一次读一个数据报。
-- **减少复制与分配**：发送时 `Write` 复制一次（复制进缓冲池里的缓冲区）、组包时再复制
-  一次；接收时 Engine 复制一次（复制进缓冲池里的缓冲区），HTTP/3 帧解析器只复制跨片段的帧
-  和请求 body。HTTP/3 的响应本来就用 `WriteOwned` 送入，所以只付第二次复制；第一次需要
-  Engine 用多个缓冲区拼一个数据报（iovec 的改动，属于别的工作流）。包保护已经不再
-  分配：ChaCha20-Poly1305 的认证器原来每个包一次堆分配，现在是值类型。QUIC stream 有意
+- **减少复制与分配**：整体给出的响应（超过 4KiB）留在 handler 放它的地方，直接从那里
+  装帧，因此 body 只复制一次——装进 packet 的那次，AEAD 需要它；流式给出的响应还会复制
+  进 DATA 帧的缓冲，那正是 stream 自己发送缓冲的用途。要发的内容在组包时复制进 packet，
+  而每个 packet 直接建在它要发出去的位置（payload 跟在 header 占的位置之后），所以封包
+  不再复制任何东西。接收时 Engine 复制一次（复制进缓冲池里的缓冲区），HTTP/3 帧解析器
+  只复制跨片段的帧和请求 body。4KiB 及以下的响应仍然连同帧一起拷进一块缓冲，因为这么
+  小的 body 分成多段比拷贝更贵。包保护已经不再分配：ChaCha20-Poly1305 的认证器原来每个包一次堆分配，现在是值类型。QUIC stream 有意
   不做池化：`*Stream` 会交给应用，生命周期由应用决定，重用会把「stream 结束后继续使用」
-  变成破坏另一条 stream。开、关一条 stream 8 次分配，内存管道上一个请求 11-12 次；请求
+  变成破坏另一条 stream。开、关一条 stream 8 次分配，内存管道上一个请求 12-13 次（整体
+  响应分成多段时多一次，见上）；请求
   stream 和 header 会被复用（见上文）。
 - **ACK 频率**：ACK_FREQUENCY 扩展（draft-ietf-quic-ack-frequency）已完成。两端都在传输
   参数里声明 `min_ack_delay`；对端声明了的一端在已发送 32 KiB 之后请求对端每 10 个
@@ -402,7 +408,7 @@
 
 - 0-RTT 与 quiche、quic-go 之外更多服务端的互通，以及共享票据密钥的多台服务端之间的重放（票据登记表是每个进程一份）。
 - 压测才能暴露的并发问题：已由[压测](loadtest.zh-CN.md)覆盖，fib 两端对每种配置
-  压 30 秒，没有请求失败、reset 或 GOAWAY。它暴露了上面整体响应的内存代价；带丢包的
+  压 30 秒，没有请求失败、reset 或 GOAWAY。它暴露了上面整体响应的内存代价（已修复）；带丢包的
   路径和长时间 soak 仍未覆盖。帧解析、请求构造、QPACK 解码、QUIC 包头、传输参数和帧
   处理都有 fuzz 目标，CI 的 `Fuzz the parsers` job 每个目标跑 20 秒。
 - QPACK 动态表、服务端推送、DATAGRAM 和 ECN 都未实现，无法测试；
@@ -467,5 +473,7 @@ CI 里有两个 job：`HTTP/3 interop endpoint image`（阻塞：构建镜像并
 4 条连接各 128 个 stream 时 897,233 req/s，32 x 16 时 689,402，单连接 256 个 stream
 时 373,362；没有请求失败、reset 或 GOAWAY；p99 分别为 1.56ms、2.90ms、1.34ms。同一
 次压测里 h2c 在 64 x 8 时达到 2,836,822，HTTP/3 的峰值低于它，而且更多 QUIC 连接
-得不偿失。唯一的内存限制来自不读的客户端：每个整体响应会按 2 的幂分档占一块缓冲，直到
-对端确认。方法、与 HTTP/1、HTTP/2 的对比和内存测量见[压测](loadtest.zh-CN.md)。
+得不偿失。这次压测发现的唯一内存限制来自不读的客户端：每个整体响应会按 2 的幂分档占
+一块缓冲，直到对端确认。这个问题已经修好——body 原样留在 handler 给它的地方，16 个
+卡住的 8MiB 响应现在占 19MiB 活堆，而不是 275MiB。方法、与 HTTP/1、HTTP/2 的对比和
+内存测量见[压测](loadtest.zh-CN.md)。
