@@ -280,7 +280,7 @@ func TestCqAmplificationLimit(t *testing.T) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.addressValidated, c.bytesRecv = false, 10
-	if out := c.appendDatagram(nil, nil, time.Now()); len(out) != 0 {
+	if out := c.appendDatagram(nil, time.Now()); len(out) != 0 {
 		t.Fatalf("sent %d bytes", len(out))
 	}
 }

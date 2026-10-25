@@ -295,12 +295,17 @@ func TestBuffersIgnoreNothing(t *testing.T) {
 	if off, data := b.popLost(0); off != 0 || data != nil {
 		t.Fatalf("%d %q with no room", off, data)
 	}
-	// Owned data adopted after other data is copied in behind it.
+	// Owned data adopted after other data is kept behind it as it is, and
+	// both go once the peer has acknowledged them.
 	owned := bufferpool.Get(4)
 	copy(owned, "4567")
 	b.adopt(owned)
-	if string(b.buf) != "01234567" {
-		t.Fatalf("buffer %q", b.buf)
+	if off, data := b.popNew(4); off != 4 || string(data) != "4567" {
+		t.Fatalf("%d %q after the data written", off, data)
+	}
+	b.onAck(0, 8)
+	if !b.allAcked() || len(b.pieces) != 0 {
+		t.Fatalf("%d pieces of %d bytes after the acknowledgement", len(b.pieces), b.size)
 	}
 }
 
@@ -321,10 +326,13 @@ func TestSealPlanGrows(t *testing.T) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	s := &c.spaces[spaceApp]
-	plan := packetPlan{space: spaceApp, pn: s.nextPN, pnLen: 1, payload: []byte{framePing, 0, 0, 0}, sp: &sentPacket{}}
+	headerLen := c.headerLen(spaceApp, 1, false)
+	payload := []byte{framePing, 0, 0, 0}
 	// Room for the packet but not its tag.
-	out := c.sealPlan(make([]byte, 0, c.packetSize(&plan)-aeadOverhead), &plan)
-	if len(out) != c.packetSize(&plan) {
+	out := make([]byte, headerLen, headerLen+len(payload)+aeadOverhead-1)
+	out = append(out, payload...)
+	plan := packetPlan{space: spaceApp, pn: s.nextPN, pnLen: 1, payload: out[headerLen:], sp: &sentPacket{}}
+	if out = c.sealPlan(out, &plan); len(out) != c.packetSize(&plan) {
 		t.Fatalf("sealed %d bytes, want %d", len(out), c.packetSize(&plan))
 	}
 	// Without peer parameters the peer is taken to hold acknowledgements

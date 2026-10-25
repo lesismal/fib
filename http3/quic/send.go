@@ -13,9 +13,12 @@ import (
 // packetPlan is a packet whose frames are chosen but which is not yet
 // sealed, so that the last packet of a datagram can still be padded.
 type packetPlan struct {
-	space   int
-	pn      uint64
-	pnLen   int
+	space int
+	pn    uint64
+	pnLen int
+	// start is where the packet begins in the datagram being built, whose
+	// header's room the payload was built behind; see appendDatagram.
+	start   int
 	payload []byte
 	sp      *sentPacket
 	// padded says the payload has PADDING, which makes the packet count as
@@ -44,21 +47,35 @@ func (c *Conn) packetSize(p *packetPlan) int {
 	return c.headerLen(p.space, p.pnLen, p.early) + len(p.payload) + aeadOverhead
 }
 
-// sealPlan appends the sealed packet to out.
+// sealPlan seals the packet p, whose payload was built where it goes in out,
+// from the end of the room its header was given on, and returns out as it was
+// with the sealed packet: header, payload and tag, the header protected last.
 func (c *Conn) sealPlan(out []byte, p *packetPlan) []byte {
-	start := len(out)
+	start := p.start
 	s := &c.spaces[p.space]
 	tx := s.tx
 	if p.early {
 		tx = c.earlyTx
 	}
+	// The packet is the header's room, the payload already in place behind
+	// it, and the tag, which goes after the payload and takes room the round
+	// has, unless it was built with less room than that.
+	headerLen := c.headerLen(p.space, p.pnLen, p.early)
+	if end := start + headerLen + len(p.payload); cap(out) < end+aeadOverhead {
+		grown := make([]byte, end, end+aeadOverhead+maxDatagram)
+		copy(grown, out)
+		out = grown
+	} else {
+		out = out[:end]
+	}
+	hdr := out[start:start]
 	if p.space == spaceApp && !p.early {
 		first := byte(0x40) | byte(p.pnLen-1)
 		if c.txGen&1 == 1 {
 			first |= 0x04
 		}
-		out = append(out, first)
-		out = append(out, c.dcid...)
+		hdr = append(hdr, first)
+		hdr = append(hdr, c.dcid...)
 	} else {
 		typ := byte(packetInitial)
 		if p.space == spaceHandshake {
@@ -67,32 +84,21 @@ func (c *Conn) sealPlan(out []byte, p *packetPlan) []byte {
 		if p.early {
 			typ = packet0RTT
 		}
-		out = append(out, 0xc0|typ<<4|byte(p.pnLen-1))
-		out = binary.BigEndian.AppendUint32(out, Version1)
-		out = append(out, byte(len(c.dcid)))
-		out = append(out, c.dcid...)
-		out = append(out, byte(len(c.scid)))
-		out = append(out, c.scid...)
+		hdr = append(hdr, 0xc0|typ<<4|byte(p.pnLen-1))
+		hdr = binary.BigEndian.AppendUint32(hdr, Version1)
+		hdr = append(hdr, byte(len(c.dcid)))
+		hdr = append(hdr, c.dcid...)
+		hdr = append(hdr, byte(len(c.scid)))
+		hdr = append(hdr, c.scid...)
 		if p.space == spaceInitial {
-			out = AppendVarint(out, uint64(len(c.token)))
-			out = append(out, c.token...)
+			hdr = AppendVarint(hdr, uint64(len(c.token)))
+			hdr = append(hdr, c.token...)
 		}
-		out = appendVarint2(out, uint64(p.pnLen+len(p.payload)+aeadOverhead))
+		hdr = appendVarint2(hdr, uint64(p.pnLen+len(p.payload)+aeadOverhead))
 	}
-	pnOffset := len(out) - start
+	pnOffset := len(hdr)
 	for i := p.pnLen - 1; i >= 0; i-- {
-		out = append(out, byte(p.pn>>(8*i)))
-	}
-	if rest := out[len(out):cap(out)]; len(p.payload) > 0 && len(rest) > 0 && &rest[0] == &p.payload[0] {
-		// Built in place (see appendDatagram).
-		out = out[:len(out)+len(p.payload)]
-	} else {
-		out = append(out, p.payload...)
-	}
-	if cap(out)-len(out) < aeadOverhead {
-		grown := make([]byte, len(out), len(out)+aeadOverhead+maxDatagram)
-		copy(grown, out)
-		out = grown
+		hdr = append(hdr, byte(p.pn>>(8*i)))
 	}
 	sealed := tx.seal(out[start:], pnOffset, p.pnLen, p.pn)
 	return out[:start+len(sealed)]
@@ -102,8 +108,8 @@ func (c *Conn) sealPlan(out []byte, p *packetPlan) []byte {
 // room for a burst of full packets, and one of the buffer pool's classes. A
 // round is one batched send, which with UDP GSO is one buffer the kernel
 // cuts into datagrams, and costs about the same however many it holds: 64
-// KiB, less the scratch of the payloads, holds 42 datagrams of 1452 bytes,
-// as many as one GSO send takes (see udpbatch), where 32 KiB held 19.
+// KiB holds 45 datagrams of 1452 bytes, as many as one GSO send takes (see
+// udpbatch), where 32 KiB held 19.
 const sendBufferSize = 64 << 10
 
 // maxRoundDatagrams bounds the datagrams a round of sending sends.
@@ -120,12 +126,12 @@ func (c *Conn) sendRoundLocked() {
 	if c.blocked != nil && !c.sendBlockedLocked() {
 		return
 	}
-	// One buffer for the round: datagrams from its start, and at its end a
-	// slot for each space to build its packet's payload in, since the
-	// packets of a datagram are all chosen before any of them is sealed.
+	// One buffer for the round, which each datagram is built in where it
+	// goes: the packets of a datagram are all chosen before any of them is
+	// sealed, so each builds its payload behind the room its header takes,
+	// and sealPlan writes the header in front of it.
 	mem := bufferpool.Get(sendBufferSize)
-	scratch := mem[sendBufferSize-numSpaces*maxDatagramLimit:]
-	buf := mem[: 0 : sendBufferSize-numSpaces*maxDatagramLimit]
+	buf := mem[:0:sendBufferSize]
 	lens := &c.roundLens
 	n := 0
 	now := c.now()
@@ -143,7 +149,7 @@ func (c *Conn) sendRoundLocked() {
 			// interface's MTU does, refuses nothing after it. What else
 			// there is goes in the next round.
 			start := len(buf)
-			buf = c.appendMTUProbe(buf, scratch, size, now)
+			buf = c.appendMTUProbe(buf, size, now)
 			c.bytesSent += uint64(len(buf) - start)
 			lens[n] = uint16(len(buf) - start)
 			n++
@@ -151,7 +157,7 @@ func (c *Conn) sendRoundLocked() {
 			break
 		}
 		start := len(buf)
-		buf = c.appendDatagram(buf, scratch, now)
+		buf = c.appendDatagram(buf, now)
 		if len(buf) == start {
 			break
 		}
@@ -313,9 +319,10 @@ func sendDatagrams(pc PacketConn, buf []byte, lens []uint16) (int, error) {
 
 // appendDatagram appends one datagram to out, with a packet from each space
 // that has something to send, and returns out as it was when none has. out
-// has room for c.maxDatagram more bytes, and scratch for numSpaces payloads of
-// maxDatagramLimit bytes.
-func (c *Conn) appendDatagram(out, scratch []byte, now time.Time) []byte {
+// has room for c.maxDatagram more bytes. Each packet's payload is built where
+// the packet goes, behind the room its header takes, so that sealing it takes
+// no copy.
+func (c *Conn) appendDatagram(out []byte, now time.Time) []byte {
 	limit := c.maxDatagram
 	if !c.isClient && !c.addressValidated {
 		// Until the client's address is proven, a server sends at most
@@ -349,21 +356,26 @@ func (c *Conn) appendDatagram(out, scratch []byte, now time.Time) []byte {
 		if s.tx == nil && !early || s.discarded {
 			continue
 		}
-		slot := scratch[space*maxDatagramLimit : space*maxDatagramLimit : (space+1)*maxDatagramLimit]
-		if n == 0 && space == spaceApp && !early {
-			// A 1-RTT packet that starts its datagram, as nearly every one
-			// does once the handshake is over, has its payload built where
-			// sealPlan puts it, past its header, rather than copied there.
-			at := len(out) + c.headerLen(space, pnLen(s.nextPN, s.largestAcked), false)
-			slot = out[at:at:cap(out)]
+		// The payload goes where the packet does: past the room its header
+		// takes, which sealPlan fills once every packet of the datagram has
+		// been chosen. A header with nowhere to go, as a long Initial's token
+		// may leave the round, waits for the next one.
+		at := len(out) + c.headerLen(space, pnLen(s.nextPN, s.largestAcked), early)
+		if at > cap(out) {
+			break
 		}
-		plan, ok := c.buildPacket(space, limit-size, congestionOK || s.probes > 0, now, slot, early)
+		plan, ok := c.buildPacket(space, limit-size, congestionOK || s.probes > 0, now, out[at:at:cap(out)], early)
 		if !ok {
 			continue
 		}
+		plan.start = len(out)
 		plans[n] = plan
 		n++
 		size += c.packetSize(&plan)
+		// The packet's room is its header's, its payload's and its tag's, so
+		// that the packet built after it starts past the tag, which sealing
+		// writes last.
+		out = out[:at+len(plan.payload)+aeadOverhead]
 	}
 	if n == 0 {
 		return out
@@ -399,10 +411,10 @@ func (c *Conn) appendDatagram(out, scratch []byte, now time.Time) []byte {
 }
 
 // buildPacket chooses the frames for a packet in space of at most room
-// bytes, building its payload in scratch, which has room for all of it.
+// bytes, building its payload in slot, which has room for all of it.
 // mayElicit says whether congestion control allows ack-eliciting frames;
 // without them, only an acknowledgement that is due goes out.
-func (c *Conn) buildPacket(space, room int, mayElicit bool, now time.Time, scratch []byte, early bool) (packetPlan, bool) {
+func (c *Conn) buildPacket(space, room int, mayElicit bool, now time.Time, slot []byte, early bool) (packetPlan, bool) {
 	s := &c.spaces[space]
 	pn := s.nextPN
 	pl := pnLen(pn, s.largestAcked)
@@ -423,7 +435,7 @@ func (c *Conn) buildPacket(space, room int, mayElicit bool, now time.Time, scrat
 	}
 	sp := c.newSentPacket(pn)
 	sp.early = early
-	payload := scratch[:0]
+	payload := slot[:0]
 	withAck := false
 	// A handshake packet carries the acknowledgement again even when it has
 	// already been sent: the datagram that had it may be the one that was

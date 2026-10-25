@@ -14,9 +14,9 @@ const floodCode = 0x107
 func sendRaw(p *testPair, payload []byte) {
 	c := p.client
 	c.mu.Lock()
-	plan := packetPlan{space: spaceApp, pn: c.spaces[spaceApp].nextPN, pnLen: 4, payload: payload, sp: &sentPacket{}}
+	pn := c.spaces[spaceApp].nextPN
 	c.spaces[spaceApp].nextPN++
-	d := c.sealPlan(nil, &plan)
+	d := sealPayload(c, spaceApp, 4, pn, payload)
 	c.mu.Unlock()
 	_ = p.clientEnd.Send(d)
 }

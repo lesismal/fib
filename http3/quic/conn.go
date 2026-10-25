@@ -2148,6 +2148,49 @@ func (c *Conn) sendClose(err error) {
 	var plans []packetPlan
 	size := 0
 	padInitial := false
+	// The room the packets take, tags included, and the payload of each built
+	// where it goes, as a round of sending builds its own.
+	out := make([]byte, 0, max(c.closeRoom(err), minInitialDatagram))
+	for space := range c.spaces {
+		s := &c.spaces[space]
+		if s.tx == nil || s.discarded {
+			continue
+		}
+		if space == spaceApp && !c.handshakeComplete {
+			continue
+		}
+		n := pnLen(s.nextPN, s.largestAcked)
+		at := len(out) + c.headerLen(space, n, false)
+		payload := appendConnectionClose(out[at:at], err, space == spaceApp)
+		plan := packetPlan{space: space, pn: s.nextPN, pnLen: n, start: len(out), payload: payload, sp: &sentPacket{pn: s.nextPN}}
+		s.nextPN++
+		if space == spaceInitial && c.isClient {
+			padInitial = true
+		}
+		plans = append(plans, plan)
+		size += c.packetSize(&plan)
+		out = out[:at+len(payload)+aeadOverhead]
+	}
+	if len(plans) == 0 {
+		return
+	}
+	if padInitial && size < minInitialDatagram {
+		last := &plans[len(plans)-1]
+		last.payload = append(last.payload, make([]byte, minInitialDatagram-size)...)
+	}
+	out = out[:0]
+	for i := range plans {
+		out = c.sealPlan(out, &plans[i])
+	}
+	_ = c.pc.Send(out)
+	c.closePacket = out
+	c.closingUntil = c.now().Add(c.closingPeriod())
+}
+
+// closeRoom is what the CONNECTION_CLOSE packets of sendClose take together,
+// headers and tags included: room for one in every space the peer may read.
+func (c *Conn) closeRoom(err error) int {
+	n := 0
 	for space := range c.spaces {
 		s := &c.spaces[space]
 		if s.tx == nil || s.discarded {
@@ -2157,29 +2200,9 @@ func (c *Conn) sendClose(err error) {
 			continue
 		}
 		payload := appendConnectionClose(nil, err, space == spaceApp)
-		n := pnLen(s.nextPN, s.largestAcked)
-		plan := packetPlan{space: space, pn: s.nextPN, pnLen: n, payload: payload, sp: &sentPacket{pn: s.nextPN}}
-		s.nextPN++
-		if space == spaceInitial && c.isClient {
-			padInitial = true
-		}
-		plans = append(plans, plan)
-		size += c.packetSize(&plan)
+		n += c.headerLen(space, pnLen(s.nextPN, s.largestAcked), false) + len(payload) + aeadOverhead
 	}
-	if len(plans) == 0 {
-		return
-	}
-	if padInitial && size < minInitialDatagram {
-		last := &plans[len(plans)-1]
-		last.payload = append(last.payload, make([]byte, minInitialDatagram-size)...)
-	}
-	out := make([]byte, 0, max(size, minInitialDatagram))
-	for i := range plans {
-		out = c.sealPlan(out, &plans[i])
-	}
-	_ = c.pc.Send(out)
-	c.closePacket = out
-	c.closingUntil = c.now().Add(c.closingPeriod())
+	return n
 }
 
 // minClosingPeriod is the shortest the closing period lasts. Three probe

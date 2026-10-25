@@ -147,20 +147,23 @@ func (c *Conn) mtuProbeTimer() time.Time {
 }
 
 // appendMTUProbe appends a probe of size bytes to out, which has room for
-// it: a 1-RTT packet of a PING and PADDING, built in scratch. Callers hold
+// it: a 1-RTT packet of a PING and PADDING, built where it goes. Callers hold
 // c.mu.
-func (c *Conn) appendMTUProbe(out, scratch []byte, size int, now time.Time) []byte {
+func (c *Conn) appendMTUProbe(out []byte, size int, now time.Time) []byte {
 	s := &c.spaces[spaceApp]
 	pn := s.nextPN
 	pl := pnLen(pn, s.largestAcked)
-	payload := scratch[:size-c.headerLen(spaceApp, pl, false)-aeadOverhead]
+	start := len(out)
+	at := start + c.headerLen(spaceApp, pl, false)
+	payload := out[at : at+size-c.headerLen(spaceApp, pl, false)-aeadOverhead]
 	payload[0] = framePing
 	clear(payload[1:])
 	sp := c.newSentPacket(pn)
 	sp.ackEliciting = true
 	sp.mtuProbe = true
 	s.nextPN++
-	plan := packetPlan{space: spaceApp, pn: pn, pnLen: pl, payload: payload, sp: sp, padded: true}
+	plan := packetPlan{space: spaceApp, pn: pn, pnLen: pl, start: start, payload: payload, sp: sp, padded: true}
+	out = out[:at+len(payload)]
 	out = c.sealPlan(out, &plan)
 	sp.time = now
 	sp.size = c.packetSize(&plan)

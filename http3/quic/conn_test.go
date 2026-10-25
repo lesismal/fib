@@ -713,9 +713,9 @@ func TestPathChallengeFlood(t *testing.T) {
 	}
 	c := p.client
 	c.mu.Lock()
-	plan := packetPlan{space: spaceApp, pn: c.spaces[spaceApp].nextPN, pnLen: 4, payload: payload, sp: &sentPacket{}}
+	pn := c.spaces[spaceApp].nextPN
 	c.spaces[spaceApp].nextPN++
-	d := c.sealPlan(nil, &plan)
+	d := sealPayload(c, spaceApp, 4, pn, payload)
 	c.mu.Unlock()
 	_ = p.clientEnd.Send(d)
 	p.serverH.onData = func(s *Stream, data []byte, fin bool) { _ = s.Write(data, fin) }
