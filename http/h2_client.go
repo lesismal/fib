@@ -6,6 +6,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"io"
+	"math"
 	stdhttp "net/http"
 	"net/textproto"
 	"slices"
@@ -76,8 +77,12 @@ type h2ClientConn struct {
 	peerMaxFrame int
 	peerWindow   int64
 	sendWindow   int64
-	goAway       bool
-	closed       bool
+	// peerMaxHeaderList is the largest header list the server said it would
+	// take, with SETTINGS_MAX_HEADER_LIST_SIZE, or math.MaxInt64 for no
+	// limit, which is what it is until the server says otherwise.
+	peerMaxHeaderList int64
+	goAway            bool
+	closed            bool
 	// room wakes the senders of streamed request bodies waiting for their
 	// stream's body to leave, or for the stream to end. Its lock is mu.
 	room sync.Cond
@@ -139,17 +144,18 @@ func (cc *clientConn) startH2() {
 	dec := hpack.NewDecoder(hpack.DefaultTableSize)
 	dec.MaxStringLength = config.MaxResponseHeaderBytes
 	hc := &h2ClientConn{
-		cc:           cc,
-		client:       cc.client,
-		dec:          dec,
-		recvWindow:   h2ConnWindow,
-		streams:      make(map[uint32]*h2ClientStream),
-		enc:          hpack.NewEncoder(),
-		nextID:       1,
-		peerMaxFrame: h2DefaultMaxFrameSize,
-		peerWindow:   h2DefaultWindow,
-		sendWindow:   h2DefaultWindow,
-		glitches:     h2NewBudget(0, 0, DefaultControlFrameBurst, DefaultControlFrameRate),
+		cc:                cc,
+		client:            cc.client,
+		dec:               dec,
+		recvWindow:        h2ConnWindow,
+		streams:           make(map[uint32]*h2ClientStream),
+		enc:               hpack.NewEncoder(),
+		nextID:            1,
+		peerMaxFrame:      h2DefaultMaxFrameSize,
+		peerWindow:        h2DefaultWindow,
+		sendWindow:        h2DefaultWindow,
+		peerMaxHeaderList: math.MaxInt64,
+		glitches:          h2NewBudget(0, 0, DefaultControlFrameBurst, DefaultControlFrameRate),
 	}
 	hc.room.L = &hc.mu
 	if config.ReadIdleTimeout > 0 {
@@ -248,6 +254,13 @@ func (hc *h2ClientConn) send(r *clientRequest) {
 		// A switch of protocols takes a connection of its own, which a
 		// multiplexed one is not.
 		err = ErrNotUpgradable
+	}
+	if err == nil && hc.peerMaxHeaderList < math.MaxInt64 &&
+		(h2PairsSize(fields) > hc.peerMaxHeaderList || h2PairsSize(trailer) > hc.peerMaxHeaderList) {
+		// The server said it would not take a header, or a trailer, this
+		// large: the request fails here rather than costing a stream, the
+		// bytes and room in the HPACK table for a certain refusal.
+		err = errH2HeaderListTooLarge
 	}
 	if err != nil {
 		hc.mu.Unlock()
@@ -380,6 +393,14 @@ func (hc *h2ClientConn) sendBody(st *h2ClientStream) {
 			st.streaming = false
 			// The trailer's values are those of when the body has been read.
 			st.trailer = h2TrailerFields(r.req.Trailer)
+			if h2PairsSize(st.trailer) > hc.peerMaxHeaderList {
+				// The body has gone; a request without its trailer would
+				// read as whole, which it is not.
+				st.trailer = nil
+				hc.mu.Unlock()
+				r.abort(errH2HeaderListTooLarge)
+				return
+			}
 			var out []byte
 			if len(st.trailer) > 0 {
 				out = hc.appendTrailerLocked(nil, st)
@@ -790,6 +811,8 @@ func (hc *h2ClientConn) handleSettings(f *h2Frame) error {
 				return h2ConnErr(H2ProtocolError, "MAX_FRAME_SIZE %d", value)
 			}
 			hc.peerMaxFrame = int(value)
+		case h2SettingMaxHeaderListSize:
+			hc.peerMaxHeaderList = int64(value)
 		}
 		return nil
 	})

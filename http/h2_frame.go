@@ -2,6 +2,7 @@ package http
 
 import (
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"net/textproto"
 	"strings"
@@ -361,4 +362,25 @@ func h2ValidHeaderValue(value string) bool {
 		return false
 	}
 	return true
+}
+
+// errH2HeaderListTooLarge is what sending a header block reports when the
+// peer said, with SETTINGS_MAX_HEADER_LIST_SIZE, that it would not take one
+// that large.
+var errH2HeaderListTooLarge = errors.New("http2: header list larger than the peer's SETTINGS_MAX_HEADER_LIST_SIZE")
+
+// h2FieldSize is what one field counts toward the size of a header list as
+// SETTINGS_MAX_HEADER_LIST_SIZE measures it (RFC 9113 section 6.5.2): its
+// name and value, uncompressed, and 32 bytes for each field.
+func h2FieldSize(name, value string) int64 {
+	return int64(len(name)+len(value)) + 32
+}
+
+// h2PairsSize is the size of a header list given as name and value pairs.
+func h2PairsSize(fields []string) int64 {
+	var size int64
+	for i := 0; i+1 < len(fields); i += 2 {
+		size += h2FieldSize(fields[i], fields[i+1])
+	}
+	return size
 }

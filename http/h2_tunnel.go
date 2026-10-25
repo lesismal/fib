@@ -190,6 +190,9 @@ func (st *h2ServerStream) upgrade(req *stdhttp.Request, protocol string, header 
 	if st.responded {
 		return nil, ErrResponseWritten
 	}
+	if sc.limitsHeaderListLocked() && h2FieldSize(":status", "200")+h2HeaderSize(header) > sc.peerMaxHeaderList {
+		return nil, sc.refuseHeaderLocked(st)
+	}
 	st.responded, st.tunnel.upgraded = true, true
 	block := sc.enc.Begin(sc.headerBlock[:0])
 	block = sc.enc.AppendField(block, ":status", "200", false)

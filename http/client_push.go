@@ -174,13 +174,21 @@ func (s *h2Sink) Send(p []byte) error {
 func (s *h2Sink) End() error {
 	hc, st := s.hc, s.st
 	hc.mu.Lock()
-	defer hc.mu.Unlock()
 	if !hc.liveLocked(st) {
+		hc.mu.Unlock()
 		return errStreamGone
 	}
 	st.streaming = false
 	// The trailer's values are those of when the body has ended.
 	st.trailer = h2TrailerFields(s.push.Trailer(st.r.req.Trailer))
+	if h2PairsSize(st.trailer) > hc.peerMaxHeaderList {
+		// As in h2ClientConn.sendBody: the request is not whole without it.
+		st.trailer = nil
+		hc.mu.Unlock()
+		st.r.abort(errH2HeaderListTooLarge)
+		return errH2HeaderListTooLarge
+	}
+	defer hc.mu.Unlock()
 	var out []byte
 	if len(st.trailer) > 0 {
 		out = hc.appendTrailerLocked(nil, st)

@@ -123,7 +123,11 @@ type h2ServerConn struct {
 	enc          *hpack.Encoder
 	peerMaxFrame int
 	peerWindow   int64
-	sendWindow   int64
+	// peerMaxHeaderList is the largest header list the client said it would
+	// take, with SETTINGS_MAX_HEADER_LIST_SIZE, or math.MaxInt64 for no
+	// limit, which is what it is until the client says otherwise.
+	peerMaxHeaderList int64
+	sendWindow        int64
 	// sendQueue holds the streams whose pending bytes the windows keep back,
 	// in the order they take turns at the connection's window, from
 	// sendHead on; see flushLocked.
@@ -281,23 +285,24 @@ func newH2ServerConn(h *ServerHandler, c *fib.Connection, remoteAddr string) *h2
 	dec := hpack.NewDecoder(hpack.DefaultTableSize)
 	dec.MaxStringLength = h.config.MaxHeaderBytes
 	sc := &h2ServerConn{
-		handler:      h,
-		conn:         c,
-		remoteAddr:   remoteAddr,
-		maxStreams:   maxStreams,
-		dec:          dec,
-		recvWindow:   h2ConnWindow,
-		streams:      make(map[uint32]*h2ServerStream),
-		enc:          hpack.NewEncoder(),
-		peerMaxFrame: h2DefaultMaxFrameSize,
-		peerWindow:   h2DefaultWindow,
-		sendWindow:   h2DefaultWindow,
-		pushEnabled:  true,
-		nextPushID:   2,
-		peerMaxPush:  math.MaxUint32,
-		flushPool:    handlerPool(c),
-		reuseStreams: h.config.ReuseRequests && h.config.ReuseURLs && h.config.ReuseContexts,
-		reuseHeaders: h.config.ReuseHeaders,
+		handler:           h,
+		conn:              c,
+		remoteAddr:        remoteAddr,
+		maxStreams:        maxStreams,
+		dec:               dec,
+		recvWindow:        h2ConnWindow,
+		streams:           make(map[uint32]*h2ServerStream),
+		enc:               hpack.NewEncoder(),
+		peerMaxFrame:      h2DefaultMaxFrameSize,
+		peerWindow:        h2DefaultWindow,
+		sendWindow:        h2DefaultWindow,
+		peerMaxHeaderList: math.MaxInt64,
+		pushEnabled:       true,
+		nextPushID:        2,
+		peerMaxPush:       math.MaxUint32,
+		flushPool:         handlerPool(c),
+		reuseStreams:      h.config.ReuseRequests && h.config.ReuseURLs && h.config.ReuseContexts,
+		reuseHeaders:      h.config.ReuseHeaders,
 		maxContFrames: h2MaxContinuations(h.config.MaxContinuationFrames,
 			DefaultMaxContinuationFrames),
 		resets: h2NewBudget(h.config.StreamResetBurst, h.config.StreamResetRate,
@@ -684,6 +689,8 @@ func (sc *h2ServerConn) applySettingsLocked(payload []byte) error {
 				return h2ConnErr(H2ProtocolError, "MAX_FRAME_SIZE %d", value)
 			}
 			sc.peerMaxFrame = int(value)
+		case h2SettingMaxHeaderListSize:
+			sc.peerMaxHeaderList = int64(value)
 		}
 		return nil
 	})
@@ -1667,6 +1674,19 @@ func (st *h2ServerStream) respond(req *stdhttp.Request, response Response) error
 	if st.responded {
 		return errors.New("http: response already written")
 	}
+	var trailer stdhttp.Header
+	if bodyAllowed && req.Method != stdhttp.MethodHead {
+		trailer = h2Trailer(response.Trailer)
+	}
+	if sc.limitsHeaderListLocked() {
+		size := h2FieldSize(":status", "200") + h2HeaderSize(response.Header)
+		if bodyAllowed {
+			size += h2FieldSize("content-length", sc.lengthLocked(responseLength(req, response)))
+		}
+		if size > sc.peerMaxHeaderList || h2HeaderSize(trailer) > sc.peerMaxHeaderList {
+			return sc.refuseHeaderLocked(st)
+		}
+	}
 	st.responded = true
 
 	block := sc.enc.Begin(sc.headerBlock[:0])
@@ -1675,9 +1695,7 @@ func (st *h2ServerStream) respond(req *stdhttp.Request, response Response) error
 		block = sc.enc.AppendField(block, "content-length", sc.lengthLocked(responseLength(req, response)), false)
 	}
 	block = sc.appendHeaderLocked(block, response.Header)
-	if bodyAllowed && req.Method != stdhttp.MethodHead {
-		st.trailer = h2Trailer(response.Trailer)
-	}
+	st.trailer = trailer
 	// Framed in one buffer from the pool: the header block, and as much of
 	// the body as the windows let go now, each behind its frame headers.
 	sendable := max(min(int64(len(body)), sc.sendWindow, st.sendWindow), 0)
@@ -1792,6 +1810,45 @@ func (sc *h2ServerConn) appendHeaderLocked(block []byte, header stdhttp.Header) 
 	return block
 }
 
+// h2HeaderSize is the size of the header list appendHeaderLocked encodes
+// from header, as SETTINGS_MAX_HEADER_LIST_SIZE measures it.
+func h2HeaderSize(header stdhttp.Header) int64 {
+	var size int64
+	for key, values := range header {
+		name := h2LowerKey(key)
+		if h2ConnectionHeaders[name] || name == "content-length" {
+			continue
+		}
+		for _, value := range values {
+			size += h2FieldSize(name, value)
+		}
+	}
+	return size
+}
+
+// limitsHeaderListLocked reports whether the client has bounded the header
+// lists it takes, which only then are measured before they are sent.
+func (sc *h2ServerConn) limitsHeaderListLocked() bool {
+	return sc.peerMaxHeaderList < math.MaxInt64
+}
+
+// refuseHeaderLocked resets st, whose response has a header, or a trailer,
+// larger than the client said it would take with
+// SETTINGS_MAX_HEADER_LIST_SIZE, and reports errH2HeaderListTooLarge. The
+// client would refuse it, and sending it anyway would cost the bytes and
+// room in the HPACK table for nothing: the stream is reset with
+// INTERNAL_ERROR instead, as a response that cannot be finished is, so that
+// the client hears of it at once.
+func (sc *h2ServerConn) refuseHeaderLocked(st *h2ServerStream) error {
+	if feed := st.feed; feed != nil && !st.remoteDone {
+		feed.Fail(ErrBodyAbandoned)
+	}
+	sc.sendLocked(h2AppendRSTStream(nil, st.id, H2InternalError))
+	sc.forgetLocked(st)
+	sc.closeFinishedLocked()
+	return errH2HeaderListTooLarge
+}
+
 // writeInterim sends an informational 1xx response ahead of the final one.
 func (st *h2ServerStream) writeInterim(status int, header stdhttp.Header) error {
 	if err := h2CheckHeader(header); err != nil {
@@ -1805,6 +1862,11 @@ func (st *h2ServerStream) writeInterim(status int, header stdhttp.Header) error 
 	}
 	if st.responded {
 		return errors.New("http: interim response after the final one")
+	}
+	if sc.limitsHeaderListLocked() && h2FieldSize(":status", "100")+h2HeaderSize(header) > sc.peerMaxHeaderList {
+		// An interim response is a hint the client can do without, and the
+		// final one may still fit.
+		return errH2HeaderListTooLarge
 	}
 	block := sc.enc.Begin(nil)
 	block = sc.enc.AppendField(block, ":status", strconv.Itoa(status), false)

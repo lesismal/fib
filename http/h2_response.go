@@ -73,6 +73,15 @@ func (st *h2ServerStream) beginResponse(req *stdhttp.Request, status int, header
 	if st.responded {
 		return ErrResponseWritten
 	}
+	if sc.limitsHeaderListLocked() {
+		size := h2FieldSize(":status", "200") + h2HeaderSize(header)
+		if n := declaredLength(header); n >= 0 && statusHasBody(status) {
+			size += h2FieldSize("content-length", sc.lengthLocked(n))
+		}
+		if size > sc.peerMaxHeaderList {
+			return sc.refuseHeaderLocked(st)
+		}
+	}
 	st.responded = true
 	st.out = &h2Output{}
 	st.out.room.L = &sc.mu
@@ -220,8 +229,14 @@ func (st *h2ServerStream) endResponse(trailer stdhttp.Header, complete bool) err
 		sc.closeFinishedLocked()
 		return nil
 	}
-	st.out.ending = true
 	st.trailer = h2Trailer(trailer)
+	if sc.limitsHeaderListLocked() && h2HeaderSize(st.trailer) > sc.peerMaxHeaderList {
+		// The header and the body have gone; a response without its trailer
+		// would read as whole, which it is not.
+		st.trailer = nil
+		return sc.refuseHeaderLocked(st)
+	}
+	st.out.ending = true
 	sc.sendPooledLocked(sc.frameOutputLocked(st))
 	if o := st.out; len(st.pending) == 0 && o.buf != nil {
 		bufferpool.Put(o.buf)
