@@ -500,7 +500,21 @@ func (sc *h2ServerConn) fail(err *H2ConnError) {
 	sc.failBodiesLocked(err)
 	clear(sc.streams)
 	sc.mu.Unlock()
-	sc.conn.CloseAfterSend()
+	sc.closeAfterGoAway()
+}
+
+// closeAfterGoAway closes the connection once what it has sent, GOAWAY last,
+// is out. The client may still be sending when it does — a request it opened
+// before it read the GOAWAY, the rest of a body nobody will read, a window
+// update — and a socket closed with bytes unread is reset rather than
+// finished, which can throw away the GOAWAY, and the responses ahead of it,
+// at the client before it has read them. So the connection lingers as an
+// HTTP/1 one closing on an unread body does: it shuts its write side, which
+// the client reads as the end of the connection, then reads and drops what
+// arrives until the client closes its own side, or for lingerTimeout at most.
+// See fib.Connection.CloseAfterSendLinger.
+func (sc *h2ServerConn) closeAfterGoAway() {
+	sc.conn.CloseAfterSendLinger(lingerTimeout)
 }
 
 // retire is the server shutting down: GOAWAY tells the client that no
@@ -1619,12 +1633,12 @@ func (sc *h2ServerConn) closeFinishedLocked() {
 			sc.mu.Lock()
 			sc.closed = true
 			sc.mu.Unlock()
-			sc.conn.CloseAfterSend()
+			sc.closeAfterGoAway()
 		})
 		return
 	}
 	sc.closed = true
-	sc.conn.CloseAfterSend()
+	sc.closeAfterGoAway()
 }
 
 // respond sends a response on the stream. Its body goes out as flow control
