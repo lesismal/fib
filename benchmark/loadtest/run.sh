@@ -103,7 +103,6 @@ if [ "$PIN" = 1 ] && command -v taskset >/dev/null; then
   fi
 fi
 
-pin_server() { if [ -n "$CPU_SERVER" ]; then taskset -c "$CPU_SERVER" "$@"; else "$@"; fi; }
 pin_load() { if [ -n "$CPU_LOAD" ]; then taskset -c "$CPU_LOAD" "$@"; else "$@"; fi; }
 # stall_cmd is backgrounded as a function: it execs the real command, so the
 # PID the caller records is the client's and wait reaches it.
