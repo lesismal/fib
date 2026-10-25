@@ -1,0 +1,3 @@
+# Go build and temp caches that local sessions point GOCACHE/GOTMPDIR at
+/.claude/gocache*/
+/.claude/gotmp*/
