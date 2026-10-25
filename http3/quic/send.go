@@ -94,8 +94,12 @@ func (c *Conn) sealPlan(out []byte, p *packetPlan) []byte {
 }
 
 // sendBufferSize is the memory a round of sending builds its datagrams in:
-// room for a burst of full packets, and one of the buffer pool's classes.
-const sendBufferSize = 32 << 10
+// room for a burst of full packets, and one of the buffer pool's classes. A
+// round is one batched send, which with UDP GSO is one buffer the kernel
+// cuts into datagrams, and costs about the same however many it holds: 64
+// KiB, less the scratch of the payloads, holds 42 datagrams of 1452 bytes,
+// as many as one GSO send takes (see udpbatch), where 32 KiB held 19.
+const sendBufferSize = 64 << 10
 
 // maxRoundDatagrams bounds the datagrams a round of sending sends.
 const maxRoundDatagrams = 64
