@@ -440,6 +440,8 @@ type Conn struct {
 	bytesSent          uint64
 	// maxDatagram is the largest datagram this side sends: maxDatagram
 	// until the handshake is over, then what the config and the peer allow.
+	// The congestion controller counts its window in this size (see
+	// setMaxDatagramLocked).
 	maxDatagram int
 	// mtu is path MTU discovery's state (see pmtud.go).
 	mtu        mtuState
@@ -725,7 +727,7 @@ func newConn(pc PacketConn, remote net.Addr, config Config, handler Handler, isC
 		scid:         randomCID(),
 		peerCIDs:     make(map[uint64]peerCID),
 		rtt:          newRTTStats(),
-		cc:           newCongestion(config.CongestionControl),
+		cc:           newCongestion(config.CongestionControl, maxDatagram),
 		streams:      make(map[uint64]*Stream),
 		created:      now,
 		lastActivity: now,
@@ -1991,7 +1993,7 @@ func (c *Conn) onHandshakeComplete() error {
 		}
 	}
 	c.handshakeComplete = true
-	c.maxDatagram = int(min(uint64(c.config.MaxDatagramSize), c.peerParams.maxUDPPayloadSize))
+	c.setMaxDatagramLocked(int(min(uint64(c.config.MaxDatagramSize), c.peerParams.maxUDPPayloadSize)))
 	if !c.isClient {
 		c.handshakeDonePending = true
 		c.confirmHandshake()

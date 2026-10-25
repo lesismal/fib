@@ -10,12 +10,26 @@ const (
 	packetThreshold  = 3
 	timerGranularity = time.Millisecond
 	initialRTT       = 333 * time.Millisecond
-	// minCongestionWindow and initialCongestionWindow are in bytes.
-	minCongestionWindow     = 2 * maxDatagram
-	initialCongestionWindow = 10 * maxDatagram
 	// maxProbes is how many probe packets a PTO sends.
 	maxProbes = 2
 )
+
+// initialWindow is the initial congestion window, in bytes, of a connection
+// whose largest datagram is maxDatagramSize bytes: ten datagrams, or 14720
+// bytes where that is more, but never less than two datagrams (RFC 9002
+// section 7.2). The datagram size is the path's, so a connection that starts
+// on a path known to carry more than 1200 bytes starts with a window in
+// those bytes rather than in 1200-byte datagrams.
+func initialWindow(maxDatagramSize int) uint64 {
+	mds := uint64(datagramSize(maxDatagramSize))
+	return min(10*mds, max(2*mds, 14720))
+}
+
+// minWindow is the least congestion window, in bytes: two datagrams of the
+// path's size (RFC 9002 section 7.2).
+func minWindow(maxDatagramSize int) uint64 {
+	return 2 * uint64(datagramSize(maxDatagramSize))
+}
 
 // What a sent packet carried that loss or acknowledgement matters to.
 const (

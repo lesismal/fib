@@ -51,7 +51,7 @@ func (c *Conn) migrateLocked(now time.Time, first int) {
 		// flight on the old path stay counted until they are acknowledged
 		// or lost.
 		c.rtt = newRTTStats()
-		c.cc.resetPath(now)
+		c.cc.resetPath(now, maxDatagram)
 	}
 	c.pc, c.remote = pc, remote
 	c.pathValidated = false
@@ -59,7 +59,7 @@ func (c *Conn) migrateLocked(now time.Time, first int) {
 	// The new path is not known to carry the datagram size the old one
 	// did, so it gets the size every path carries, until it is validated
 	// and discovery has looked at it.
-	c.maxDatagram = maxDatagram
+	c.setMaxDatagramLocked(maxDatagram)
 	c.stopMTUDiscoveryLocked(now)
 	_, _ = rand.Read(c.challenge[:])
 	c.challengePending = true
@@ -91,7 +91,7 @@ func (c *Conn) pathValidLocked() {
 // and discover what more the path carries. Callers hold c.mu.
 func (c *Conn) settlePathLocked() {
 	if c.peerParams != nil {
-		c.maxDatagram = int(min(uint64(c.config.MaxDatagramSize), c.peerParams.maxUDPPayloadSize))
+		c.setMaxDatagramLocked(int(min(uint64(c.config.MaxDatagramSize), c.peerParams.maxUDPPayloadSize)))
 	}
 	c.startMTUDiscoveryLocked(c.now())
 }

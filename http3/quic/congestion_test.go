@@ -15,13 +15,128 @@ func ackSegment(cc *congestion, now time.Time, rtt time.Duration) {
 	cc.onAcked(&sentPacket{size: maxDatagram, time: now.Add(-time.Microsecond)}, now, rtt, true)
 }
 
+// The window is bytes, counted in the path's datagram size: RFC 9002
+// section 7.2's initial window is ten datagrams, 14720 bytes at most and two
+// datagrams at least, and the minimum window is two. A path known to carry
+// 1452-byte datagrams starts with 14520 bytes rather than the 12000 a
+// 1200-byte unit would give it, and a window chosen in bytes keeps those
+// bytes when the path carries larger datagrams.
+func TestWindowInBytes(t *testing.T) {
+	for _, tc := range []struct {
+		size             int
+		initial, minimum uint64
+	}{
+		{0, 12000, 2400}, // no size yet is the 1200 bytes every path carries
+		{maxDatagram, 12000, 2400},
+		{1452, 14520, 2904},
+		{1500, 14720, 3000}, // ten datagrams would be more than RFC 9002's cap
+	} {
+		cc := newCongestion(CUBIC, tc.size)
+		wantSize := uint64(max(tc.size, maxDatagram))
+		if cc.cwnd != tc.initial || cc.maxDatagramSize != wantSize {
+			t.Errorf("%d-byte datagrams: window %d of %d-byte units, want %d of %d",
+				tc.size, cc.cwnd, cc.maxDatagramSize, tc.initial, wantSize)
+		}
+		if got := minWindow(tc.size); got != tc.minimum {
+			t.Errorf("%d-byte datagrams: minimum window %d, want %d", tc.size, got, tc.minimum)
+		}
+	}
+	// A window the controller chose keeps its bytes as the path grows; only
+	// one under the new minimum is raised to it.
+	cc := newCongestion(NewReno, maxDatagram)
+	cc.cwnd = 2400
+	cc.setMaxDatagramSize(1452)
+	if cc.cwnd != 2904 || cc.maxDatagramSize != 1452 {
+		t.Fatalf("a 2400-byte window became %d in %d-byte units, want the 2904 minimum",
+			cc.cwnd, cc.maxDatagramSize)
+	}
+	cc.cwnd = 20000
+	cc.setMaxDatagramSize(1452)
+	if cc.cwnd != 20000 {
+		t.Fatalf("a 20000-byte window became %d when the datagram size grew", cc.cwnd)
+	}
+	cc.setMaxDatagramSize(0)
+	if cc.maxDatagramSize != maxDatagram {
+		t.Fatalf("a zero datagram size counted the window in %d bytes", cc.maxDatagramSize)
+	}
+	// Ten datagrams of the path's size fit exactly in the initial window,
+	// and an eleventh does not: what is in flight is bytes.
+	cc = newCongestion(CUBIC, 1452)
+	cc.bytesInFlight = 9 * 1452
+	if !cc.canSend() {
+		t.Fatal("the tenth 1452-byte datagram did not fit in 14520 bytes")
+	}
+	cc.bytesInFlight += 1452
+	if cc.canSend() {
+		t.Fatal("an eleventh 1452-byte datagram fit in 14520 bytes")
+	}
+}
+
+// NewReno's congestion-avoidance increase is one datagram of the path's size
+// a round trip (RFC 9002 section 7.3.1): a window's worth acknowledged in
+// 1452-byte datagrams grows the window by 1452 bytes, not the 1200 of the
+// size every path carries.
+func TestNewRenoGrowsByThePathsDatagram(t *testing.T) {
+	for _, size := range []int{maxDatagram, 1452} {
+		now := time.Now()
+		cc := newCongestion(NewReno, size)
+		cc.cwnd = uint64(20 * size)
+		cc.ssthresh = cc.cwnd / 2
+		cc.bytesInFlight = cc.cwnd
+		before := cc.cwnd
+		cc.onAcked(&sentPacket{size: int(cc.cwnd), time: now}, now, time.Millisecond, true)
+		if got := cc.cwnd - before; got != uint64(size) {
+			t.Fatalf("%d-byte datagrams: a window acknowledged grew the window by %d, want %d",
+				size, got, size)
+		}
+	}
+}
+
+// CUBIC's β and its curve are in the same byte window: a loss leaves 0.7 of
+// the bytes whatever the datagram size, K is still the cube root of the
+// datagrams the window is below the plateau, and W_est grows by α datagrams
+// of the path's size a round trip (RFC 9438 sections 4.2 and 4.3).
+func TestCubicWindowInBytes(t *testing.T) {
+	for _, size := range []int{maxDatagram, 1452} {
+		now := time.Now()
+		cc := newCongestion(CUBIC, size)
+		cc.cwnd = uint64(100 * size)
+		cc.onCongestion(now.Add(-time.Millisecond), now)
+		if want := uint64(70 * size); cc.cwnd != want || cc.ssthresh != want {
+			t.Fatalf("%d-byte datagrams: window %d and threshold %d after a loss at %d, want %d",
+				size, cc.cwnd, cc.ssthresh, 100*size, want)
+		}
+		// 30 datagrams below the plateau: K is where it was in datagrams.
+		at := now.Add(time.Millisecond)
+		cc.bytesInFlight = cc.cwnd
+		cc.onAcked(&sentPacket{size: int(cc.cwnd), time: at}, at, time.Millisecond, true)
+		if want := math.Cbrt(30 / cubicC); math.Abs(cc.k-want) > 1e-9 {
+			t.Errorf("%d-byte datagrams: K %v, want %v", size, cc.k, want)
+		}
+		// The Reno-friendly estimate below the window the loss came at
+		// grows by α datagrams of the path's size a round trip.
+		cc = newCongestion(CUBIC, size)
+		cc.cwnd = uint64(100 * size)
+		cc.onCongestion(now.Add(-time.Millisecond), now)
+		cc.cwndPrior = float64(200 * size)
+		cc.cwnd = uint64(100 * size)
+		cc.bytesInFlight = cc.cwnd
+		from := float64(cc.cwnd)
+		cc.onAcked(&sentPacket{size: int(cc.cwnd), time: at}, at, time.Millisecond, true)
+		if got, want := cc.wEst-from, cubicAlpha*float64(size); math.Abs(got-want) > 1e-6 {
+			t.Errorf("%d-byte datagrams: W_est grew %.3f bytes a round trip, want α*%d = %.3f",
+				size, got, size, want)
+		}
+	}
+}
+
 // A loss leaves CUBIC 0.7 of its window, with that as the threshold and the
-// window the loss came at as the plateau; a loss below the plateau lowers
-// it further, to halfway between the window and 0.7 of it (fast
+// window the loss came at as the plateau; a loss below the plateau lowers it
+// further, to halfway between the window and 0.7 of it (fast
 // convergence); NewReno halves. Each shrinks once a recovery period.
 func TestCubicReduction(t *testing.T) {
 	now := time.Now()
-	cc := newCongestion(CUBIC)
+	cc := newCongestion(CUBIC, maxDatagram)
 	cc.cwnd, cc.ssthresh = segs(100), segs(50)
 	cc.onCongestion(now.Add(-time.Millisecond), now)
 	if cc.cwnd != segs(70) || cc.ssthresh != segs(70) || cc.wMax != float64(segs(100)) || cc.cwndPrior != float64(segs(100)) {
@@ -39,11 +154,11 @@ func TestCubicReduction(t *testing.T) {
 	}
 	cc.cwnd = segs(2)
 	cc.onCongestion(later.Add(time.Millisecond), later.Add(2*time.Millisecond))
-	if cc.cwnd != minCongestionWindow {
+	if cc.cwnd != minWindow(maxDatagram) {
 		t.Fatalf("window %d below the minimum", cc.cwnd)
 	}
 
-	nr := newCongestion(NewReno)
+	nr := newCongestion(NewReno, maxDatagram)
 	nr.cwnd = segs(100)
 	nr.onCongestion(now.Add(-time.Millisecond), now)
 	if nr.cwnd != segs(50) || nr.ssthresh != segs(50) {
@@ -59,7 +174,7 @@ func TestCubicReduction(t *testing.T) {
 func TestCubicGrowth(t *testing.T) {
 	const rtt = 100 * time.Millisecond
 	start := time.Now()
-	cc := newCongestion(CUBIC)
+	cc := newCongestion(CUBIC, maxDatagram)
 	cc.cwnd = segs(100)
 	cc.onCongestion(start.Add(-time.Millisecond), start)
 	ackSegment(&cc, start.Add(time.Millisecond), rtt)
@@ -81,7 +196,7 @@ func TestCubicGrowth(t *testing.T) {
 	// follows the curve, a few segments behind it at most, since each
 	// acknowledgement closes 1/cwnd of the gap to where it is a round trip
 	// on; and it reaches the plateau at K, never past it.
-	cc = newCongestion(CUBIC)
+	cc = newCongestion(CUBIC, maxDatagram)
 	cc.cwnd = segs(100)
 	cc.onCongestion(start.Add(-time.Millisecond), start)
 	ackSegment(&cc, start.Add(time.Millisecond), rtt)
@@ -116,7 +231,7 @@ func TestCubicGrowth(t *testing.T) {
 func TestCubicRenoFriendly(t *testing.T) {
 	const rtt = time.Millisecond
 	start := time.Now()
-	cc := newCongestion(CUBIC)
+	cc := newCongestion(CUBIC, maxDatagram)
 	cc.cwnd = segs(100)
 	cc.onCongestion(start.Add(-time.Millisecond), start)
 	// After a timeout-like start (the plateau below the window) the curve
@@ -151,7 +266,7 @@ func TestCubicRenoFriendly(t *testing.T) {
 func TestCongestionAppLimited(t *testing.T) {
 	now := time.Now()
 	for _, algo := range []CongestionControl{CUBIC, NewReno} {
-		cc := newCongestion(algo)
+		cc := newCongestion(algo, maxDatagram)
 		cc.cwnd, cc.ssthresh = segs(100), segs(50)
 		if cc.limited(segs(50), false) || !cc.limited(segs(97), false) || !cc.limited(segs(10), true) {
 			t.Fatalf("%v: limited wrong in congestion avoidance", algo)
@@ -228,8 +343,48 @@ func TestPersistentCongestion(t *testing.T) {
 	s.nextPN = 5
 	s.largestAcked = 4
 	c.detectLost(spaceApp, lost[3].time.Add(time.Second))
-	if c.cc.cwnd != minCongestionWindow || c.cc.bytesInFlight != inFlight {
+	if c.cc.cwnd != minWindow(maxDatagram) || c.cc.bytesInFlight != inFlight {
 		t.Fatalf("window %d, %d bytes in flight after persistent congestion", c.cc.cwnd, c.cc.bytesInFlight)
+	}
+}
+
+// Persistent congestion is a matter of packet numbers and time, whatever
+// sizes the lost packets were, and the window it collapses to is the minimum
+// for the datagram size the path now carries: 2904 bytes at 1452, and 2400
+// once a black hole has put the connection back on 1200 (RFC 9002 sections
+// 7.2 and 7.6).
+func TestPersistentCongestionMixedDatagramSizes(t *testing.T) {
+	c := frameConn(t)
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	now := time.Now()
+	c.setMaxDatagramLocked(1452)
+	c.rtt = rttStats{smoothed: 10 * time.Millisecond, rttvar: 2 * time.Millisecond, hasSample: true, firstAt: now}
+	span := (c.rtt.smoothed + 4*c.rtt.rttvar + c.peerMaxAckDelay()) * persistentCongestionThreshold
+	sizes := []int{1200, 1452, 1200, 1452}
+	var lost []*sentPacket
+	for i, size := range sizes {
+		at := now.Add(time.Millisecond + time.Duration(i)*(span/3+time.Millisecond))
+		lost = append(lost, &sentPacket{pn: uint64(i), time: at, ackEliciting: true, inFlight: true, size: size})
+	}
+	if !c.persistentCongestion(lost) {
+		t.Fatal("losses of mixed datagram sizes over the span were not persistent congestion")
+	}
+	s := &c.spaces[spaceApp]
+	c.cc.cwnd = 100 * 1452
+	for _, p := range lost {
+		c.onPacketSent(spaceApp, p)
+	}
+	s.nextPN, s.largestAcked = uint64(len(lost)), int64(len(lost))-1
+	c.detectLost(spaceApp, lost[len(lost)-1].time.Add(time.Second))
+	if want := minWindow(1452); c.cc.cwnd != want {
+		t.Fatalf("window %d after persistent congestion in 1452-byte datagrams, want %d", c.cc.cwnd, want)
+	}
+	// A black hole takes the path back to 1200: the minimum follows it.
+	c.setMaxDatagramLocked(maxDatagram)
+	c.cc.onPersistentCongestion()
+	if want := minWindow(maxDatagram); c.cc.cwnd != want {
+		t.Fatalf("window %d after persistent congestion in 1200-byte datagrams, want %d", c.cc.cwnd, want)
 	}
 }
 
@@ -237,7 +392,7 @@ func TestPersistentCongestion(t *testing.T) {
 func TestCongestionControlConfig(t *testing.T) {
 	for _, algo := range []CongestionControl{CUBIC, NewReno} {
 		c := newConn(fuzzPacketConn{}, testAddr, Config{CongestionControl: algo}, fuzzHandler{}, true)
-		if c.cc.algo != algo || c.cc.cwnd != initialCongestionWindow {
+		if c.cc.algo != algo || c.cc.cwnd != initialWindow(maxDatagram) {
 			t.Fatalf("asked for %v, got %v with a window of %d", algo, c.cc.algo, c.cc.cwnd)
 		}
 	}
@@ -246,7 +401,7 @@ func TestCongestionControlConfig(t *testing.T) {
 // hsStart is a connection in the initial slow start, with HyStart++'s state
 // set as a test needs it.
 func hsStart() congestion {
-	cc := newCongestion(CUBIC)
+	cc := newCongestion(CUBIC, maxDatagram)
 	cc.cwnd, cc.ssthresh = segs(10), ^uint64(0)
 	cc.hy = hystart{started: true, roundEnd: 1000}
 	return cc

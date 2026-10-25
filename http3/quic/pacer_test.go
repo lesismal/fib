@@ -64,6 +64,29 @@ func TestPacingRate(t *testing.T) {
 	}
 }
 
+// Pacing is in bytes: the rate is 1.25 windows, in bytes, over the smoothed
+// round trip, whichever datagram size the path carries, so a path MTU that
+// path discovery raised from 1200 to 1452 paces the same window at the same
+// byte rate rather than 21% more.
+func TestPacingRateInBytes(t *testing.T) {
+	c := frameConn(t)
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.rtt.hasSample, c.rtt.smoothed = true, time.Second
+	c.cc.cwnd = 24_000
+	const want = 1.25 * 24_000
+	if got := c.pacingRate(); got != want {
+		t.Fatalf("rate %v bytes a second, want %v", got, want)
+	}
+	for _, size := range []int{maxDatagram, 1452} {
+		c.setMaxDatagramLocked(size)
+		c.cc.cwnd = 24_000
+		if got := c.pacingRate(); got != want {
+			t.Fatalf("rate %v bytes a second in %d-byte datagrams, want %v", got, size, want)
+		}
+	}
+}
+
 // recordPC keeps what it is sent, refusing it with EAGAIN while refuse is
 // above zero, and takes batches when counted is set.
 type recordPC struct {

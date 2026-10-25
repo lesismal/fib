@@ -253,8 +253,16 @@ These are still constants:
   peer raises the limit.
 - **Congestion control**: CUBIC (RFC 9438) by default, NewReno with
   `quic.Config.CongestionControl`, both with HyStart++ leaving the initial slow
-  start on a rise in the round trip; no BBR or ECN. Sending is paced at
-  1.25 congestion windows a smoothed RTT. A round of datagrams the send buffer
+  start on a rise in the round trip; no BBR or ECN. The congestion window is
+  counted in bytes, in units of the path's current maximum datagram size —
+  1200 until path MTU discovery finds more — so the initial window (ten
+  datagrams, but no more than 14720 bytes and no fewer than two), the minimum
+  window (two datagrams) and the congestion-avoidance increase (a datagram a
+  round trip for NewReno, and CUBIC's curve in datagram-sized segments) are
+  that size's bytes. A window already in bytes does not widen by itself when
+  the datagram size grows; only the minimum follows the path. Sending is paced
+  at 1.25 congestion windows a smoothed RTT, the same byte rate for a given
+  window. A round of datagrams the send buffer
   has no room for (`EAGAIN`) is kept, and the engine says when the socket has
   room again (`fib.Connection.NotifyWritable`), so it goes then, before anything
   new; where nothing can say that — Windows' completion ports, the portable
@@ -274,8 +282,8 @@ These are still constants:
   sending more than 1200 bytes goes back to 1200 when three larger packets
   are lost with none sent after them acknowledged, or after three probe
   timeouts in a row, and searches again a minute later; this holds for a size
-  set with `MaxDatagramSize` too. The congestion window is still counted in
-  1200-byte datagrams.
+  set with `MaxDatagramSize` too. The datagram size the congestion window is
+  counted in follows the path, back to 1200 with it.
 - **The peer's `SETTINGS_MAX_FIELD_SECTION_SIZE`** is honored once its SETTINGS
   have arrived, each field counted as RFC 9114 §4.2.2 counts it: a response
   header, interim response or trailer of the server's that is larger fails
@@ -451,9 +459,10 @@ Done:
   fixed-h3 went from 1658k to 1773k requests a second (+7%), static-h3 was
   unchanged (1175k, 1165k).
 - **PMTU discovery (DPLPMTUD, RFC 8899)**: done, with black hole detection
-  (see [Protocol details](#protocol-details)). Still open: searching above
+  (see [Protocol details](#protocol-details)), and the congestion window
+  counted in the discovered datagram size. Still open: searching above
   1452 bytes (jumbo frames, or 1472 over IPv4), which needs larger send
-  buffers, and counting the congestion window in the discovered size.
+  buffers.
 - **HyStart++** (RFC 9406): done, and on for the initial slow start. Each
   round it keeps the minimum round trip of the round and of the one before,
   and when the current round's has risen over the last one's by an eighth of

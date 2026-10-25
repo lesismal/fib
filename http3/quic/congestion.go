@@ -45,8 +45,9 @@ const (
 	// (RFC 9002 section 7.6.1).
 	persistentCongestionThreshold = 3
 	// maxBurstLimited is how much of the window may be left unused, in
-	// datagrams, before the sender counts as not using it: a round's last
-	// datagram, or what pacing holds back, leave a little.
+	// datagrams of the path's size, before the sender counts as not using
+	// it: a round's last datagram, or what pacing holds back, leave a
+	// little.
 	maxBurstLimited = 3
 	// HyStart++'s constants (RFC 9406 section 4.3): the samples a round
 	// needs before its delay is judged, what fraction of a round trip's
@@ -83,14 +84,22 @@ type hystart struct {
 	grown     float64
 }
 
-// congestion is the connection's congestion controller: the window, with
-// slow start and the recovery period (RFC 9002 section 7) common to both
-// algorithms, and how the window grows in congestion avoidance and shrinks
-// after a loss particular to each.
+// congestion is the connection's congestion controller: the window, in
+// bytes, with slow start and the recovery period (RFC 9002 section 7) common
+// to both algorithms, and how the window grows in congestion avoidance and
+// shrinks after a loss particular to each.
 type congestion struct {
-	algo                          CongestionControl
-	cwnd, ssthresh, bytesInFlight uint64
-	recoveryStart                 time.Time
+	algo CongestionControl
+	// maxDatagramSize is the largest datagram the connection sends, in
+	// bytes: RFC 9002's max_datagram_size, the segment the window is counted
+	// in. The window itself is bytes, so a path that carries larger
+	// datagrams does not silently widen it; the size is what the initial
+	// window, the minimum and the congestion-avoidance increase are made
+	// of. It follows the path (see setMaxDatagramSize) and is never zero.
+	maxDatagramSize uint64
+	cwnd, ssthresh  uint64
+	bytesInFlight   uint64
+	recoveryStart   time.Time
 
 	// hy is HyStart++'s state for the initial slow start, where the window
 	// doubles a round trip, and it is only used then (RFC 9406).
@@ -108,18 +117,43 @@ type congestion struct {
 	k                            float64
 }
 
-func newCongestion(algo CongestionControl) congestion {
-	return congestion{algo: algo, cwnd: initialCongestionWindow, ssthresh: ^uint64(0)}
+// datagramSize is a largest datagram size a window may be counted in: a path
+// whose size is not known yet, or a config that gave none, is the 1200 bytes
+// every path carries. Never zero, so that a window's arithmetic, CUBIC's
+// cube root above all, has a segment to divide by.
+func datagramSize(maxDatagramSize int) int {
+	return max(maxDatagramSize, maxDatagram)
+}
+
+func newCongestion(algo CongestionControl, maxDatagramSize int) congestion {
+	size := datagramSize(maxDatagramSize)
+	return congestion{algo: algo, maxDatagramSize: uint64(size), cwnd: initialWindow(size), ssthresh: ^uint64(0)}
 }
 
 // resetPath starts the window afresh for a path that has nothing in common
-// with the last one, keeping what is in flight on that one counted.
-func (cc *congestion) resetPath(now time.Time) {
-	*cc = congestion{algo: cc.algo, cwnd: initialCongestionWindow, ssthresh: ^uint64(0),
-		bytesInFlight: cc.bytesInFlight, recoveryStart: now}
+// with the last one, keeping what is in flight on that one counted. The new
+// path is counted in the datagram size it is known to carry, so a path
+// change starts from the initial window for that size.
+func (cc *congestion) resetPath(now time.Time, maxDatagramSize int) {
+	size := datagramSize(maxDatagramSize)
+	*cc = congestion{algo: cc.algo, maxDatagramSize: uint64(size), cwnd: initialWindow(size),
+		ssthresh: ^uint64(0), bytesInFlight: cc.bytesInFlight, recoveryStart: now}
 }
 
-func (cc *congestion) canSend() bool { return cc.bytesInFlight+maxDatagram <= cc.cwnd }
+// setMaxDatagramSize follows the connection's largest datagram as path MTU
+// discovery or a new path changes it. The window is bytes and stays what the
+// controller asked for, so raising the datagram size does not grow it by the
+// same fraction, while the minimum window follows the size and a window
+// below it is raised to it. A size of zero counts as the 1200 bytes every
+// path carries rather than a segment of nothing.
+func (cc *congestion) setMaxDatagramSize(maxDatagramSize int) {
+	cc.maxDatagramSize = uint64(datagramSize(maxDatagramSize))
+	if mw := minWindow(int(cc.maxDatagramSize)); cc.cwnd < mw {
+		cc.cwnd = mw
+	}
+}
+
+func (cc *congestion) canSend() bool { return cc.bytesInFlight+cc.maxDatagramSize <= cc.cwnd }
 
 // limited reports whether a sender that had prior bytes in flight when an
 // acknowledgement came was using the window, which only then grows: a window
@@ -129,7 +163,7 @@ func (cc *congestion) canSend() bool { return cc.bytesInFlight+maxDatagram <= cc
 // a round trip; and a sender that pacing held back was not the one holding
 // back.
 func (cc *congestion) limited(prior uint64, paced bool) bool {
-	if paced || prior+maxBurstLimited*maxDatagram >= cc.cwnd {
+	if paced || prior+maxBurstLimited*cc.maxDatagramSize >= cc.cwnd {
 		return true
 	}
 	return cc.cwnd < cc.ssthresh && prior > cc.cwnd/2
@@ -245,17 +279,21 @@ func (cc *congestion) onAcked(p *sentPacket, now time.Time, rtt time.Duration, l
 		return
 	}
 	if cc.algo == NewReno {
-		cc.cwnd += maxDatagram * uint64(p.size) / cc.cwnd
+		// A datagram of the path's size a round trip (RFC 9002 section
+		// 7.3.1), in bytes, whichever size the path carries.
+		cc.cwnd += cc.maxDatagramSize * uint64(p.size) / cc.cwnd
 		return
 	}
 	cc.cubicAcked(float64(p.size), now, rtt)
 }
 
 // cubicTarget is W_cubic(t) of RFC 9438's figure 1, in bytes, t seconds
-// into the congestion avoidance stage.
+// into the congestion avoidance stage. The curve is the RFC's in segments of
+// the datagram size the path carries, so a byte window multiplies C by that
+// size: W_cubic = C * max_datagram_size * (t-K)^3 + W_max.
 func (cc *congestion) cubicTarget(t float64) float64 {
 	d := t - cc.k
-	return cubicC*maxDatagram*d*d*d + cc.wMax
+	return cubicC*float64(cc.maxDatagramSize)*d*d*d + cc.wMax
 }
 
 // cubicAcked grows the window in congestion avoidance for acked bytes
@@ -269,17 +307,20 @@ func (cc *congestion) cubicAcked(acked float64, now time.Time, rtt time.Duration
 			// timeout: the curve starts at its inflection, here.
 			cc.wMax, cc.k = cwnd, 0
 		} else {
-			cc.k = math.Cbrt((cc.wMax - cwnd) / (cubicC * maxDatagram))
+			// K, from figure 2: the curve's distance from the plateau in
+			// units of the path's datagram size.
+			cc.k = math.Cbrt((cc.wMax - cwnd) / (cubicC * float64(cc.maxDatagramSize)))
 		}
 	}
 	t := now.Sub(cc.epoch).Seconds()
-	// The Reno-friendly estimate grows by α segments a round trip, and by
-	// one, NewReno's rate, once it is past the window the loss came at.
+	// The Reno-friendly estimate grows by α segments, a segment being the
+	// path's datagram, a round trip; and by one, NewReno's rate, once it is
+	// past the window the loss came at.
 	alpha := cubicAlpha
 	if cc.wEst >= cc.cwndPrior {
 		alpha = 1
 	}
-	cc.wEst += alpha * maxDatagram * acked / cwnd
+	cc.wEst += alpha * float64(cc.maxDatagramSize) * acked / cwnd
 	var grow float64
 	if cc.cubicTarget(t) < cc.wEst {
 		grow = cc.wEst - cwnd
@@ -307,7 +348,7 @@ func (cc *congestion) onCongestion(sent, now time.Time) {
 	}
 	cc.recoveryStart = now
 	if cc.algo == NewReno {
-		cc.ssthresh = max(cc.cwnd/2, minCongestionWindow)
+		cc.ssthresh = max(cc.cwnd/2, minWindow(int(cc.maxDatagramSize)))
 		cc.cwnd = cc.ssthresh
 		return
 	}
@@ -321,7 +362,7 @@ func (cc *congestion) onCongestion(sent, now time.Time) {
 	} else {
 		cc.wMax = cwnd
 	}
-	cc.ssthresh = max(uint64(cwnd*cubicBeta), minCongestionWindow)
+	cc.ssthresh = max(uint64(cwnd*cubicBeta), minWindow(int(cc.maxDatagramSize)))
 	cc.cwnd = cc.ssthresh
 	cc.epoch, cc.grown = time.Time{}, 0
 }
@@ -332,7 +373,7 @@ func (cc *congestion) onCongestion(sent, now time.Time) {
 // threshold the losses set, and CUBIC's curve starts afresh from there
 // (RFC 9438 section 4.8).
 func (cc *congestion) onPersistentCongestion() {
-	cc.cwnd = minCongestionWindow
+	cc.cwnd = minWindow(int(cc.maxDatagramSize))
 	cc.recoveryStart = time.Time{}
 	cc.wMax, cc.epoch, cc.grown = 0, time.Time{}, 0
 }

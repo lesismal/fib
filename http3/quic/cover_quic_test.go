@@ -362,7 +362,7 @@ func TestCqPathEdges(t *testing.T) {
 		c.rxPC, c.rxRemote = next, &net.UDPAddr{IP: net.IPv4(10, 0, 0, 2), Port: 1}
 		c.migrateLocked(time.Now(), 0)
 		defer c.mu.Unlock()
-		if c.cc.cwnd != initialCongestionWindow || c.rtt.smoothed == time.Second {
+		if c.cc.cwnd != initialWindow(c.maxDatagram) || c.rtt.smoothed == time.Second {
 			t.Fatalf("window %d, rtt %v kept from the old host", c.cc.cwnd, c.rtt.smoothed)
 		}
 		if c.pc != next || c.pathValidated || c.prevPC == nil {

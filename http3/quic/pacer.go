@@ -26,7 +26,8 @@ import (
 const (
 	// pacingGain is N of RFC 9002 section 7.7, in quarters.
 	pacingGain = 5
-	// maxBurstPackets is the least burst pacing allows: the initial window.
+	// maxBurstPackets is the least burst pacing allows: the initial window,
+	// in datagrams of the path's size.
 	maxBurstPackets = 10
 )
 

@@ -186,7 +186,7 @@ func (c *Conn) mtuAckedLocked(p *sentPacket, now time.Time) {
 	}
 	m.inFlight, m.fails = false, 0
 	m.lo = max(m.lo, p.size)
-	c.maxDatagram = max(c.maxDatagram, p.size)
+	c.setMaxDatagramLocked(max(c.maxDatagram, p.size))
 	c.nextMTUProbeLocked(now)
 }
 
@@ -228,7 +228,7 @@ func (c *Conn) mtuCheckBlackHoleLocked(now time.Time) {
 // maxDatagram, which every path carries, and discovery search again from
 // there a while later. Callers hold c.mu.
 func (c *Conn) mtuBlackHoleLocked(now time.Time) {
-	c.maxDatagram = maxDatagram
+	c.setMaxDatagramLocked(maxDatagram)
 	m := &c.mtu
 	m.largeAcked, m.largeLost = now, 0
 	if !m.on {
@@ -256,6 +256,15 @@ func (c *Conn) nextMTUProbeLocked(now time.Time) {
 	}
 	m.probe, m.at = (m.lo+m.hi)/2, time.Time{}
 	c.wantFlush = true
+}
+
+// setMaxDatagramLocked changes the largest datagram the connection sends,
+// as the handshake, a new path or path MTU discovery settles on a size. The
+// congestion controller counts its window in that size, and keeps its own
+// copy: it follows from here, minimum window included. Callers hold c.mu.
+func (c *Conn) setMaxDatagramLocked(size int) {
+	c.maxDatagram = size
+	c.cc.setMaxDatagramSize(size)
 }
 
 // DatagramSize returns the size of the largest datagram the connection

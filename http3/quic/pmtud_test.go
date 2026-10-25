@@ -203,7 +203,7 @@ func TestMTUBlackHoleOfConfiguredSize(t *testing.T) {
 func TestMTUBlackHoleByLoss(t *testing.T) {
 	c := newConn(nil, nil, Config{}, nil, false)
 	now := time.Now()
-	c.maxDatagram = 1400
+	c.setMaxDatagramLocked(1400)
 	c.mtu.largeAcked = now
 	large := func(pn uint64, sent time.Time) *sentPacket {
 		return &sentPacket{pn: pn, size: 1400, time: sent, ackEliciting: true, inFlight: true}
