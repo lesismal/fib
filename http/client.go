@@ -432,22 +432,23 @@ func (c *Client) do(req *stdhttp.Request, callback func(*ClientResponse, error),
 	if reqbody.Streams(req) {
 		upload = reqbody.NewSource(req)
 	} else if req.Body != nil && req.Body != stdhttp.NoBody {
-		body, err = io.ReadAll(req.Body)
+		body, err = readWhole(req.Body, req.ContentLength)
 		_ = req.Body.Close()
 		if err != nil {
 			callback(nil, err)
 			return nil
 		}
-		req.Body = io.NopCloser(bytes.NewReader(body))
+		req.Body = &bufferedBody{data: body}
 	}
 	var data []byte
+	pooled := false
 	declared, chunked := int64(-1), false
 	if upload != nil {
 		declared = reqbody.Declared(req)
 		chunked = declared < 0 || len(req.Trailer) > 0
 		data, err = marshalStreamedHead(req, declared, chunked)
 	} else {
-		data, err = marshalRequest(req, body)
+		data, pooled, err = marshalRequest(req, body)
 	}
 	if err != nil {
 		if upload != nil {
@@ -469,6 +470,10 @@ func (c *Client) do(req *stdhttp.Request, callback func(*ClientResponse, error),
 			r.headLen = len(data) - len(body)
 		}
 	}
+	if pooled {
+		// Held for the response; see releaseData.
+		r.dataRefs.Store(1)
+	}
 	// Either hook can fire before it has been stored, so both are stored under
 	// the lock finish reads them under.
 	r.mu.Lock()
@@ -484,15 +489,46 @@ func (c *Client) do(req *stdhttp.Request, callback func(*ClientResponse, error),
 	return r
 }
 
+// readWhole reads a body that is not streamed, of length declared when that
+// is positive: into one buffer of that size rather than one grown as it is
+// read, as io.ReadAll would, and then whatever follows past it, so that a
+// body longer or shorter than declared is read as io.ReadAll reads it, for
+// the framing to refuse or send as it would have.
+func readWhole(rc io.Reader, declared int64) ([]byte, error) {
+	if declared <= 0 {
+		return io.ReadAll(rc)
+	}
+	buf := make([]byte, declared)
+	n, err := io.ReadFull(rc, buf)
+	switch {
+	case err == io.EOF || err == io.ErrUnexpectedEOF:
+		return buf[:n], nil
+	case err != nil:
+		return nil, err
+	}
+	var one [1]byte
+	if _, err := io.ReadFull(rc, one[:]); err == io.EOF {
+		return buf, nil
+	} else if err != nil {
+		return nil, err
+	}
+	rest, err := io.ReadAll(rc)
+	if err != nil {
+		return nil, err
+	}
+	return append(append(buf, one[0]), rest...), nil
+}
+
 // marshalRequest frames req, whose body has already been read into body, for
 // an HTTP/1 connection. net/http writes every request as HTTP/1.1; one whose
 // ProtoMajor and ProtoMinor ask for HTTP/1.0 is written as that instead, with
 // its body framed by Content-Length, since HTTP/1.0 has no chunks, and so
-// without trailers.
-func marshalRequest(req *stdhttp.Request, body []byte) ([]byte, error) {
+// without trailers. pooled says the framing is a buffer from package
+// bufferpool, which the request gives back once its response has arrived.
+func marshalRequest(req *stdhttp.Request, body []byte) ([]byte, bool, error) {
 	http10 := req.ProtoMajor == 1 && req.ProtoMinor == 0
 	if data, ok := fastRequest(req, body, http10); ok {
-		return data, nil
+		return data, true, nil
 	}
 	out := req
 	if http10 {
@@ -507,17 +543,17 @@ func marshalRequest(req *stdhttp.Request, body []byte) ([]byte, error) {
 	}
 	var buf bytes.Buffer
 	if err := out.Write(&buf); err != nil {
-		return nil, err
+		return nil, false, err
 	}
 	data := buf.Bytes()
 	if http10 {
 		lineEnd := bytes.Index(data, []byte("\r\n"))
 		if lineEnd < 0 || !bytes.HasSuffix(data[:lineEnd], []byte(" HTTP/1.1")) {
-			return nil, fmt.Errorf("http: cannot write request line %q as HTTP/1.0", data[:max(lineEnd, 0)])
+			return nil, false, fmt.Errorf("http: cannot write request line %q as HTTP/1.0", data[:max(lineEnd, 0)])
 		}
 		data[lineEnd-1] = '0'
 	}
-	return data, nil
+	return data, false, nil
 }
 
 // marshalStreamedHead frames the header of req, whose body streams, for an
@@ -1172,6 +1208,13 @@ type clientRequest struct {
 	// is what HTTP/2 sends after the header block.
 	data []byte
 	body []byte
+	// dataRefs counts the holds on data when it is a buffer of package
+	// bufferpool, and is zero when it is not: one until the response has
+	// arrived, which answered marks, and one for each send under way. The last
+	// to let go gives data back (releaseData). A request that ends without a
+	// response leaves data to the collector.
+	dataRefs atomic.Int32
+	answered atomic.Bool
 	// upload is the body of a request whose body streams, sent after data,
 	// which then holds only the header, declared its length or -1, and
 	// chunked whether HTTP/1 frames it in chunks.
@@ -1342,6 +1385,29 @@ func (r *clientRequest) headerArrived() {
 		r.timer.Stop()
 	}
 	r.mu.Unlock()
+}
+
+// holdData takes a hold on data for a send, and reports whether it did:
+// not when data is not the pool's, or has been given back already.
+func (r *clientRequest) holdData() bool {
+	for {
+		n := r.dataRefs.Load()
+		if n <= 0 {
+			return false
+		}
+		if r.dataRefs.CompareAndSwap(n, n+1) {
+			return true
+		}
+	}
+}
+
+// releaseData lets go of a hold on data, and gives it back to the pool when
+// it was the last.
+func (r *clientRequest) releaseData() {
+	if r.dataRefs.Add(-1) == 0 {
+		bufferpool.Put(r.data)
+		r.data = nil
+	}
 }
 
 // expire fails the request whose Timeout or ResponseHeaderTimeout has run
@@ -1560,8 +1626,15 @@ func (cc *clientConn) send(r *clientRequest) {
 		cc.uploading = r
 		cc.mu.Unlock()
 	}
-	// A failed send closes the connection, and OnClose then settles r.
-	if cc.conn.Send(head) != nil {
+	// A failed send closes the connection, and OnClose then settles r. The
+	// response may arrive while Send is still copying what the socket did
+	// not take, so data is held across it.
+	held := r.holdData()
+	sent := cc.conn.Send(head) == nil
+	if held {
+		r.releaseData()
+	}
+	if !sent {
 		return
 	}
 	switch {
@@ -1603,7 +1676,22 @@ func (cc *clientConn) sendHeld(r *clientRequest) {
 		cc.startUpload(r)
 		return
 	}
-	if cc.conn.Send(r.data[r.headLen:]) == nil {
+	// The response may arrive while the body is still on its way, and takes
+	// the framing back when it does: hold it across the send, as send does.
+	held := false
+	if r.dataRefs.Load() > 0 {
+		if !r.holdData() {
+			// The framing went back while the gate opened: the response has
+			// answered the request, so there is nothing left to send.
+			return
+		}
+		held = true
+	}
+	sent := cc.conn.Send(r.data[r.headLen:]) == nil
+	if held {
+		r.releaseData()
+	}
+	if sent {
 		r.requestSent()
 	}
 }
@@ -1775,6 +1863,14 @@ func (cc *clientConn) OnData(conn *fib.Connection, data []byte) {
 	if resp != nil || cc.parser.head != nil {
 		r.headerArrived()
 		held = gate.Shut()
+		// Answered, unless the request goes again: a 425 turns down what the
+		// server took as early data, and the framing has to go with the
+		// retry, so it goes back only when there is not one.
+		if resp == nil || resp.StatusCode != stdhttp.StatusTooEarly || !r.early || !r.retryable() {
+			if r.answered.CompareAndSwap(false, true) {
+				r.releaseData()
+			}
+		}
 	} else if cc.parser.continued {
 		gate.Open()
 	}

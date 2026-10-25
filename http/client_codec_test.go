@@ -6,6 +6,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	stdhttp "net/http"
@@ -14,6 +15,9 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+	"testing/iotest"
+
+	"github.com/lesismal/fib/bufferpool"
 )
 
 // stdResponseHead is what ReadResponse makes of head, as parseHead used it
@@ -300,7 +304,7 @@ func TestFastRequest(t *testing.T) {
 		}
 		// marshalRequest itself, whichever way it goes.
 		req, body = c.request()
-		if got, err := marshalRequest(req, body); (err != nil) != (wantErr != nil) || err == nil && !bytes.Equal(got, want) {
+		if got, _, err := marshalRequest(req, body); (err != nil) != (wantErr != nil) || err == nil && !bytes.Equal(got, want) {
 			t.Errorf("%s: marshalRequest %q, %v; want %q, %v", c.name, got, err, want, wantErr)
 		}
 
@@ -372,13 +376,22 @@ func FuzzFastRequest(f *testing.F) {
 }
 
 // TestClientCodecAllocs bounds what writing a proxied request and reading a
-// plain response head allocate: the buffer for the one, and for the other
-// the Response, its Header (a map and its table), the head's string and the
-// values' backing.
+// plain response head allocate: nothing for the one, whose buffer is the
+// pool's and goes back to it, and for the other the Response, its Header (a
+// map and its table), the head's string and the values' backing.
 func TestClientCodecAllocs(t *testing.T) {
+	if raceEnabled {
+		t.Skip("sync.Pool drops buffers under the race detector")
+	}
 	req, _ := requestCases[0].request()
-	if n := testing.AllocsPerRun(100, func() { _, _ = marshalRequest(req, nil) }); n > 1 {
-		t.Errorf("marshalRequest: %v allocations, want 1", n)
+	if n := testing.AllocsPerRun(100, func() {
+		data, pooled, _ := marshalRequest(req, nil)
+		if !pooled {
+			t.Fatal("marshalRequest: the fast path's buffer is not the pool's")
+		}
+		bufferpool.Put(data)
+	}); n > 0 {
+		t.Errorf("marshalRequest: %v allocations, want 0", n)
 	}
 	head := []byte(responseHeads[1])
 	get := &stdhttp.Request{Method: stdhttp.MethodGet}
@@ -392,7 +405,7 @@ func BenchmarkMarshalRequest(b *testing.B) {
 	b.Run("fib", func(b *testing.B) {
 		b.ReportAllocs()
 		for b.Loop() {
-			_, _ = marshalRequest(req, nil)
+			_, _, _ = marshalRequest(req, nil)
 		}
 	})
 	b.Run("net-http", func(b *testing.B) {
@@ -445,4 +458,29 @@ func FuzzDecodeChunks(f *testing.F) {
 			t.Fatalf("%q: %q, net/http %q with trailer %v", chunks, got, want, resp.Trailer)
 		}
 	})
+}
+
+// TestReadWhole checks that a body read into a buffer of its declared length
+// comes out as io.ReadAll reads it, whether it is as long as declared,
+// shorter or longer, and that a read error is reported.
+func TestReadWhole(t *testing.T) {
+	for _, tc := range []struct {
+		body     string
+		declared int64
+	}{
+		{"hello", 5}, {"hello", 3}, {"hello", 9}, {"hello", 0}, {"hello", -1}, {"", 4},
+		{strings.Repeat("x", 4096), 4096}, {strings.Repeat("x", 4097), 4096},
+	} {
+		got, err := readWhole(iotest.OneByteReader(strings.NewReader(tc.body)), tc.declared)
+		if err != nil || string(got) != tc.body {
+			t.Errorf("readWhole(%d bytes, %d) = %d bytes, %v; want the body", len(tc.body), tc.declared, len(got), err)
+		}
+	}
+	fail := errors.New("broken")
+	for _, declared := range []int64{3, 5, 8} {
+		r := io.MultiReader(strings.NewReader("hello"), iotest.ErrReader(fail))
+		if _, err := readWhole(r, declared); !errors.Is(err, fail) {
+			t.Errorf("readWhole(broken after 5 bytes, %d): %v, want %v", declared, err, fail)
+		}
+	}
 }

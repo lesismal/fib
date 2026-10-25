@@ -9,6 +9,8 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+
+	"github.com/lesismal/fib/bufferpool"
 )
 
 // The client writes request heads and reads response heads itself, as the
@@ -170,7 +172,8 @@ func validToken(s string) bool {
 }
 
 // fastRequest frames req, whose body has been read into body, as
-// marshalRequest does, or reports false for a request it leaves to net/http.
+// marshalRequest does, in a buffer from package bufferpool, or reports false
+// for a request it leaves to net/http.
 func fastRequest(req *stdhttp.Request, body []byte, http10 bool) ([]byte, bool) {
 	hasBody := req.Body != nil && req.Body != stdhttp.NoBody
 	if len(req.TransferEncoding) != 0 || len(req.Trailer) != 0 {
@@ -199,8 +202,12 @@ func fastRequest(req *stdhttp.Request, body []byte, http10 bool) ([]byte, bool) 
 			size += len(key) + len(v) + 4
 		}
 	}
-	dst, ok := appendRequestStart(make([]byte, 0, size), req, http10)
+	// The framing is the pool's, and goes back to it once the response has
+	// arrived (clientRequest.releaseData).
+	buf := bufferpool.Get(size)
+	dst, ok := appendRequestStart(buf[:0], req, http10)
 	if !ok {
+		bufferpool.Put(buf)
 		return nil, false
 	}
 	if length >= 0 {
