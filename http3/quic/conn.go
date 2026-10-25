@@ -1124,10 +1124,14 @@ func (c *Conn) openStream(bidi bool) (*Stream, error) {
 	c.mu.Lock()
 	s, err := c.openStreamLocked(bidi)
 	if err == ErrStreamLimit && c.blockedPending() {
-		// The peer hears that this side wants more.
+		// The peer hears that this side wants more. The frame goes out here,
+		// but the handler's queued calls do not run here: a caller may hold a
+		// lock of its own that a call would want, as http3's client holds its
+		// connection's while it opens a stream, and the call would then wait
+		// on itself.
 		c.wantFlush = true
 		c.mu.Unlock()
-		c.dispatch()
+		c.flush()
 		return nil, err
 	}
 	c.mu.Unlock()
