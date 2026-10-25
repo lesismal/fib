@@ -118,7 +118,7 @@ func (c *Conn) sendRoundLocked() {
 	lens := &c.roundLens
 	n := 0
 	now := c.now()
-	c.maybeUpdateKeys()
+	c.maybeUpdateKeys(now)
 	c.paced = false
 	c.sendAt = time.Time{}
 	for !c.closed {

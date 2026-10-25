@@ -165,6 +165,35 @@ type Config struct {
 	// reset at once (see flood.go). HTTP/3 has H3_EXCESSIVE_LOAD for it.
 	// Zero closes it with the transport error PROTOCOL_VIOLATION instead.
 	ExcessiveLoadCode uint64
+	// StreamResetBurst and StreamResetRate bound the streams a server's
+	// peer may abandon while they are open, or have this side reset for an
+	// error it made on them: a bucket of StreamResetBurst of them, refilled
+	// at StreamResetRate a second, past which the connection closes with
+	// ExcessiveLoadCode (see flood.go). ControlFrameBurst and
+	// ControlFrameRate bound, in the same way, the frames a peer may send
+	// that ask for work and carry nothing. Zero means
+	// DefaultStreamResetBurst, DefaultStreamResetRate,
+	// DefaultControlFrameBurst and DefaultControlFrameRate; either of a
+	// pair below zero, no limit.
+	StreamResetBurst  int
+	StreamResetRate   int
+	ControlFrameBurst int
+	ControlFrameRate  int
+	// MaxAckDelay is the longest this side holds back the acknowledgement
+	// of a packet that asks for one, which it tells the peer in
+	// max_ack_delay (RFC 9000 section 18.2) for the peer's probe timeout to
+	// allow for. Shorter has the peer hear of what arrived sooner, at the
+	// cost of more acknowledgements. Default 25 milliseconds; at most
+	// 16383, and at least one.
+	MaxAckDelay time.Duration
+	// KeyUpdateInterval, when set, updates the 1-RTT keys a connection
+	// sends with once they have been in use this long (RFC 9001 section
+	// 6), as well as once they have protected as many packets as the AEAD
+	// allows, which they are updated at regardless: a key used for less
+	// protects less of what is sent should it ever leak. An update waits
+	// for the peer to have acknowledged a packet of the current keys, so
+	// a connection that sends nothing does not update.
+	KeyUpdateInterval time.Duration
 	// CongestionControl is the congestion controller: CUBIC, the default,
 	// or NewReno.
 	CongestionControl CongestionControl
@@ -237,6 +266,10 @@ func (config Config) withDefaults() Config {
 		config.MaxProbeDatagramSize = maxDatagramLimit
 	}
 	config.MaxProbeDatagramSize = min(max(config.MaxProbeDatagramSize, maxDatagram), maxDatagramLimit)
+	if config.MaxAckDelay <= 0 {
+		config.MaxAckDelay = DefaultMaxAckDelay
+	}
+	config.MaxAckDelay = min(max(config.MaxAckDelay, time.Millisecond), maxAckDelayLimit).Truncate(time.Millisecond)
 	return config
 }
 
@@ -338,6 +371,10 @@ type Conn struct {
 	txPhaseFirstPN uint64
 	txPhaseAcked   bool
 	txPhasePackets uint64
+	// txPhaseSince is when the current sending phase began, or when the
+	// handshake was confirmed for the first, which Config.KeyUpdateInterval
+	// counts from.
+	txPhaseSince time.Time
 	// decryptFailures counts packets that failed authentication, which the
 	// AEAD's integrity limit bounds.
 	decryptFailures uint64
@@ -522,18 +559,27 @@ func (c *Conn) updateTxKeys(s *pnSpace) {
 	c.txPhaseFirstPN = s.nextPN
 	c.txPhaseAcked = false
 	c.txPhasePackets = 0
+	c.txPhaseSince = c.now()
 }
 
 // maybeUpdateKeys starts a key update once this side has sent as many
-// packets as one key may protect (RFC 9001 section 6.6). An update needs a
-// confirmed handshake, and an acknowledgement of the phase in use, so that
-// two updates cannot overtake each other (RFC 9001 section 6.5).
-func (c *Conn) maybeUpdateKeys() {
+// packets as one key may protect (RFC 9001 section 6.6), or has used the key
+// for Config.KeyUpdateInterval. An update needs a confirmed handshake, and
+// an acknowledgement of the phase in use, so that two updates cannot
+// overtake each other (RFC 9001 section 6.5).
+func (c *Conn) maybeUpdateKeys(now time.Time) {
 	s := &c.spaces[spaceApp]
-	if !c.handshakeConfirmed || s.tx == nil || c.txGen != c.rxGen || !c.txPhaseAcked {
+	if !c.handshakeConfirmed || s.tx == nil {
 		return
 	}
-	if c.txPhasePackets >= confidentialityLimit(s.tx.suite) {
+	if c.txPhaseSince.IsZero() {
+		c.txPhaseSince = now
+	}
+	if c.txGen != c.rxGen || !c.txPhaseAcked {
+		return
+	}
+	if c.txPhasePackets >= confidentialityLimit(s.tx.suite) ||
+		c.config.KeyUpdateInterval > 0 && now.Sub(c.txPhaseSince) >= c.config.KeyUpdateInterval {
 		c.updateTxKeys(s)
 	}
 }
@@ -565,6 +611,8 @@ func newConn(pc PacketConn, remote net.Addr, config Config, handler Handler, isC
 		maxBidi:      config.MaxIncomingStreams,
 		maxUni:       config.MaxIncomingUniStreams,
 		maxDatagram:  maxDatagram,
+		glitches:     newFloodBudget(config.ControlFrameBurst, config.ControlFrameRate, DefaultControlFrameBurst, DefaultControlFrameRate),
+		resets:       newFloodBudget(config.StreamResetBurst, config.StreamResetRate, DefaultStreamResetBurst, DefaultStreamResetRate),
 		// The path a connection starts on is validated by its handshake,
 		// with the amplification limit that addressValidated keeps.
 		pathValidated: true,
@@ -583,6 +631,7 @@ func newConn(pc PacketConn, remote net.Addr, config Config, handler Handler, isC
 	c.local.maxStreamDataUni = config.StreamReceiveWindow
 	c.local.maxStreamsBidi = config.MaxIncomingStreams
 	c.local.maxStreamsUni = config.MaxIncomingUniStreams
+	c.local.maxAckDelay = config.MaxAckDelay
 	c.local.initialSCID, c.local.hasInitialSCID = c.scid, true
 	return c
 }

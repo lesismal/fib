@@ -50,11 +50,20 @@ type transportParams struct {
 	activeCIDLimit      uint64
 }
 
+// DefaultMaxAckDelay is Config.MaxAckDelay's default, which is also what a
+// peer that says nothing of it holds acknowledgements back for (RFC 9000
+// section 18.2).
+const DefaultMaxAckDelay = 25 * time.Millisecond
+
+// maxAckDelayLimit is the largest max_ack_delay there is: 2^14 milliseconds
+// and more are invalid.
+const maxAckDelayLimit = (1<<14 - 1) * time.Millisecond
+
 func defaultParams() transportParams {
 	return transportParams{
 		maxUDPPayloadSize: 65527,
 		ackDelayExponent:  3,
-		maxAckDelay:       25 * time.Millisecond,
+		maxAckDelay:       DefaultMaxAckDelay,
 		activeCIDLimit:    2,
 	}
 }
@@ -88,8 +97,14 @@ func (p *transportParams) encode() []byte {
 	b = appendParamVarint(b, paramMaxStreamDataUni, p.maxStreamDataUni)
 	b = appendParamVarint(b, paramInitialMaxStreamsBidi, p.maxStreamsBidi)
 	b = appendParamVarint(b, paramInitialMaxStreamsUni, p.maxStreamsUni)
+	if p.maxAckDelay > 0 && p.maxAckDelay != DefaultMaxAckDelay {
+		b = appendParamVarint(b, paramMaxAckDelay, uint64(p.maxAckDelay/time.Millisecond))
+	}
 	if p.disableMigration {
 		b = appendParamBytes(b, paramDisableMigration, nil)
+	}
+	if p.activeCIDLimit > 2 {
+		b = appendParamVarint(b, paramActiveCIDLimit, p.activeCIDLimit)
 	}
 	if p.hasInitialSCID {
 		b = appendParamBytes(b, paramInitialSCID, p.initialSCID)

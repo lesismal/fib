@@ -50,7 +50,7 @@ func sendRawFrames(p *testPair, frames [][]byte) {
 func floodPair(t *testing.T) *testPair {
 	return newTestPair(t, 0, func(_, server *Config) {
 		server.ExcessiveLoadCode = floodCode
-		server.MaxIncomingStreams = 4 * floodResetBurst
+		server.MaxIncomingStreams = 4 * DefaultStreamResetBurst
 	})
 }
 
@@ -116,15 +116,15 @@ func TestFloodGlitchesCounted(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			c := frameConn(t)
-			c.config.MaxIncomingStreams = 4 * floodGlitchBurst
-			c.maxBidi = 4 * floodGlitchBurst
+			c.config.MaxIncomingStreams = 4 * DefaultControlFrameBurst
+			c.maxBidi = 4 * DefaultControlFrameBurst
 			c.mu.Lock()
 			defer c.mu.Unlock()
 			if tc.setup != nil {
 				tc.setup(c)
 			}
 			var err error
-			for i := 0; i < floodGlitchBurst+10 && err == nil; i++ {
+			for i := 0; i < DefaultControlFrameBurst+10 && err == nil; i++ {
 				_, err = c.handleFrames(spaceApp, tc.payload(i), time.Now())
 			}
 			var te *TransportError
@@ -147,7 +147,7 @@ func TestFloodPingWithNewAck(t *testing.T) {
 	defer c.mu.Unlock()
 	s := &c.spaces[spaceApp]
 	now := time.Now()
-	for i := 0; i < floodGlitchBurst+10; i++ {
+	for i := 0; i < DefaultControlFrameBurst+10; i++ {
 		s.sent.push(&sentPacket{pn: s.nextPN, time: now})
 		ack := frame(frameAck, s.nextPN, 0, 0, 0)
 		s.nextPN++
@@ -157,7 +157,7 @@ func TestFloodPingWithNewAck(t *testing.T) {
 	}
 	// The same acknowledgement again acknowledges nothing new.
 	var err error
-	for i := 0; i < floodGlitchBurst+10 && err == nil; i++ {
+	for i := 0; i < DefaultControlFrameBurst+10 && err == nil; i++ {
 		_, err = c.handleFrames(spaceApp, append(frame(frameAck, s.nextPN-1, 0, 0, 0), framePing), now)
 	}
 	if err == nil {
@@ -169,7 +169,7 @@ func TestFloodPingWithNewAck(t *testing.T) {
 // the burst, has its connection closed with the code the server was given.
 func TestFloodPingsClose(t *testing.T) {
 	p := floodPair(t)
-	for i := 0; i < floodGlitchBurst+100; i++ {
+	for i := 0; i < DefaultControlFrameBurst+100; i++ {
 		sendRaw(p, frame(framePing))
 	}
 	waitPeerClose(t, p.clientH, floodCode)
@@ -192,8 +192,8 @@ func resetFrames(first, n int) [][]byte {
 // stream is counted once for its STOP_SENDING and RESET_STREAM together.
 func TestFloodRapidReset(t *testing.T) {
 	p := floodPair(t)
-	openedRaw(p, floodResetBurst+100)
-	sendRawFrames(p, resetFrames(0, floodResetBurst+100))
+	openedRaw(p, DefaultStreamResetBurst+100)
+	sendRawFrames(p, resetFrames(0, DefaultStreamResetBurst+100))
 	waitPeerClose(t, p.clientH, floodCode)
 }
 
@@ -201,7 +201,7 @@ func TestFloodRapidReset(t *testing.T) {
 // the connection serving.
 func TestFloodResetsUnderTheBurst(t *testing.T) {
 	p := floodPair(t)
-	n := floodResetBurst - 10
+	n := DefaultStreamResetBurst - 10
 	p.serverH.onData = func(s *Stream, data []byte, fin bool) {
 		if s.ID() >= uint64(4*n) {
 			_ = s.Write(data, fin)
@@ -222,9 +222,9 @@ func TestFloodResetsUnderTheBurst(t *testing.T) {
 func TestFloodResetsForPeerErrors(t *testing.T) {
 	p := floodPair(t)
 	p.serverH.onData = func(s *Stream, _ []byte, _ bool) { s.ResetForPeerError(1) }
-	openedRaw(p, floodResetBurst+100)
+	openedRaw(p, DefaultStreamResetBurst+100)
 	var frames [][]byte
-	for i := 0; i < floodResetBurst+100; i++ {
+	for i := 0; i < DefaultStreamResetBurst+100; i++ {
 		frames = append(frames, frame(frameStream|0x02, 4*i, 1, "x"))
 	}
 	sendRawFrames(p, frames)
@@ -238,7 +238,7 @@ func TestFloodResetsForPeerErrors(t *testing.T) {
 // STOP_SENDING does not count against the server's budget either.
 func TestFloodClientTakesResets(t *testing.T) {
 	p := floodPair(t)
-	n := floodResetBurst + 10
+	n := DefaultStreamResetBurst + 10
 	p.serverH.onData = func(s *Stream, data []byte, fin bool) {
 		if s.ID() >= uint64(4*n) {
 			_ = s.Write(data, fin)

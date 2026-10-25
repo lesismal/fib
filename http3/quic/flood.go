@@ -5,7 +5,7 @@ import "time"
 // What a peer may make a connection do for it without asking for anything,
 // before the connection closes with Config.ExcessiveLoadCode. Each is a
 // bucket of burst tokens, given back at rate a second, as HTTP/2's are in
-// package http.
+// package http, and Config sets both of each, these being the defaults.
 //
 // Resets count the streams the peer abandons while they are still open,
 // with RESET_STREAM or STOP_SENDING, and those this side resets for an
@@ -42,27 +42,49 @@ import "time"
 // repeats a limit, as one sent again after a loss does, or that reports one
 // this side never gave, is.
 const (
-	floodResetBurst  = 1000
-	floodResetRate   = 100
-	floodGlitchBurst = 1000
-	floodGlitchRate  = 100
+	DefaultStreamResetBurst  = 1000
+	DefaultStreamResetRate   = 100
+	DefaultControlFrameBurst = 1000
+	DefaultControlFrameRate  = 100
 )
 
 // floodBudget is one of a connection's flood buckets. It is guarded by the
 // connection's mu.
 type floodBudget struct {
 	tokens float64
-	last   time.Time
+	// burst and rate are the bucket's size and how many tokens it gets back
+	// a second; a burst below zero is a bucket that never runs out.
+	burst, rate float64
+	last        time.Time
+}
+
+// newFloodBudget is a bucket of burst tokens given back at rate a second,
+// with the fallback's values for those left at zero, and none at all when
+// either is below zero.
+func newFloodBudget(burst, rate, fallbackBurst, fallbackRate int) floodBudget {
+	if burst < 0 || rate < 0 {
+		return floodBudget{burst: -1}
+	}
+	if burst == 0 {
+		burst = fallbackBurst
+	}
+	if rate == 0 {
+		rate = fallbackRate
+	}
+	return floodBudget{burst: float64(burst), rate: float64(rate)}
 }
 
 // take spends a token, refilling the bucket for the time since the last
 // one, and reports false once there is none left.
-func (b *floodBudget) take(burst, rate float64) bool {
+func (b *floodBudget) take() bool {
+	if b.burst < 0 {
+		return true
+	}
 	now := time.Now()
 	if b.last.IsZero() {
-		b.tokens = burst
+		b.tokens = b.burst
 	} else {
-		b.tokens = min(burst, b.tokens+now.Sub(b.last).Seconds()*rate)
+		b.tokens = min(b.burst, b.tokens+now.Sub(b.last).Seconds()*b.rate)
 	}
 	b.last = now
 	if b.tokens < 1 {
@@ -86,7 +108,7 @@ func (c *Conn) floodErr(reason string) error {
 // reports the error to close the connection with once there have been too
 // many. Callers hold c.mu.
 func (c *Conn) glitch() error {
-	if c.glitches.take(floodGlitchBurst, floodGlitchRate) {
+	if c.glitches.take() {
 		return nil
 	}
 	return c.floodErr("too many frames that ask for nothing")
@@ -100,7 +122,7 @@ func (c *Conn) resetCounted(s *Stream) error {
 		return nil
 	}
 	s.floodCounted = true
-	if c.resets.take(floodResetBurst, floodResetRate) {
+	if c.resets.take() {
 		return nil
 	}
 	return c.floodErr("too many streams reset")
