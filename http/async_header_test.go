@@ -4,6 +4,7 @@ package http
 
 import (
 	"bytes"
+	"context"
 	"io"
 	stdhttp "net/http"
 	"strings"
@@ -230,5 +231,55 @@ func TestOnHeaderAsyncWholeHeldByOnResponse(t *testing.T) {
 		if resp.Header.Get("X-Async") != "set" || string(body) != "whole!" {
 			t.Fatalf("%s: %v %q", client.proto, resp.Header, body)
 		}
+	}
+}
+
+// TestOnHeaderAsyncWriteEndsOnCancel checks that a Write waiting for the
+// resume of a hook that never resumes, past what is held, returns the
+// request's error once the client goes, as it closes an HTTP/1 connection
+// and resets an HTTP/2 stream, so that the handler finishes.
+func TestOnHeaderAsyncWriteEndsOnCancel(t *testing.T) {
+	type result struct {
+		n   int
+		err error
+	}
+	started := make(chan struct{}, 1)
+	done := make(chan result, 1)
+	addr := serve(t, NewHandler(HandlerFunc(func(c *Context) {
+		c.OnHeaderAsync(func(int, stdhttp.Header, func(error)) {})
+		started <- struct{}{}
+		chunk := bytes.Repeat([]byte("w"), 1000)
+		n := 0
+		var err error
+		for n < 200*1000 && err == nil {
+			var m int
+			m, err = c.Write(chunk)
+			n += m
+		}
+		done <- result{n, err}
+	})))
+	for _, client := range hookClients(t) {
+		ctx, cancel := context.WithCancel(context.Background())
+		req, err := stdhttp.NewRequestWithContext(ctx, stdhttp.MethodGet, "http://"+addr+"/", nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		go func() {
+			<-started
+			cancel()
+		}()
+		if resp, err := client.Do(req); err == nil {
+			resp.Body.Close()
+			t.Fatalf("%s: answered %d", client.proto, resp.StatusCode)
+		}
+		select {
+		case r := <-done:
+			if r.err == nil || r.n > maxHeldBody {
+				t.Fatalf("%s: wrote %d, %v", client.proto, r.n, r.err)
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatalf("%s: Write still waits after the client went", client.proto)
+		}
+		cancel()
 	}
 }

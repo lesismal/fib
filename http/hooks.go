@@ -175,7 +175,8 @@ func (c *Context) OnBodyFilter(fn func(status int, header stdhttp.Header) BodyFi
 // Respond or as the handler finishes, is held as it is, its body copied. A
 // response that streams through the ResponseWriter methods holds what is
 // written, up to 64 kilobytes: past that Write waits for resume, as it
-// waits for a slow client, WriteNoWait reports above, and OnWritable runs
+// waits for a slow client, or returns the request's error once the request
+// is cancelled meanwhile, WriteNoWait reports above, and OnWritable runs
 // once the held body has gone after resume. Flush does nothing while the
 // header is held. A request whose client goes meanwhile ends as any other
 // does, and its resume sends nothing. fn is not run for the response of

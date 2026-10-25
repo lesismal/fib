@@ -236,8 +236,13 @@ func (c *Context) Write(p []byte) (int, error) {
 		c.WriteHeader(stdhttp.StatusOK)
 	}
 	if a := w.asyncHeader(); a != nil {
-		if held, _ := a.hold(p, true); held {
+		held, _, err := a.hold(c, p, true)
+		if held {
 			return len(p), nil
+		}
+		if err != nil {
+			// The client went while the Write waited for the resume.
+			return 0, err
 		}
 		if w.err != nil {
 			// The hook's resume failed the response.
@@ -342,7 +347,7 @@ func (c *Context) WriteNoWait(p []byte) (above bool, err error) {
 		c.WriteHeader(stdhttp.StatusOK)
 	}
 	if a := w.asyncHeader(); a != nil {
-		if held, above := a.hold(p, false); held {
+		if held, above, _ := a.hold(c, p, false); held {
 			return above, nil
 		}
 		if w.err != nil {

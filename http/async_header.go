@@ -17,8 +17,12 @@ import (
 type asyncHeader struct {
 	mu sync.Mutex
 	// room is where a Write that would hold more than maxHeldBody waits for
-	// the header to go.
-	room sync.Cond
+	// the header to go. watching says the first such wait registered gone
+	// with OnCancel, and gone is why the request was cancelled since, which
+	// ends the wait: a client that goes is not waited on for a resume.
+	room     sync.Cond
+	watching bool
+	gone     error
 	// started says a hook has been called, and active that the header is
 	// held, waiting for the resume of the hook at index at. passed says the
 	// hooks were passed over instead, the response not being retained.
@@ -70,17 +74,40 @@ func (w *responseWriter) asyncHeader() *asyncHeader {
 // did and whether more than maxHeldBody is now held. A Write, which may
 // wait, waits for the header to go rather than hold more than that; once it
 // has gone, hold reports false and the caller writes p as it would have.
-func (a *asyncHeader) hold(p []byte, wait bool) (held, above bool) {
+// A wait ends too when the request is cancelled, for which hold reports the
+// request's error.
+func (a *asyncHeader) hold(c *Context, p []byte, wait bool) (held, above bool, err error) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	for a.active {
-		if !wait || len(a.raw)+len(p) <= maxHeldBody {
+		switch {
+		case !wait || len(a.raw)+len(p) <= maxHeldBody:
 			a.raw = append(a.raw, p...)
-			return true, len(a.raw) > maxHeldBody
+			return true, len(a.raw) > maxHeldBody, nil
+		case a.gone != nil:
+			return false, false, a.gone
+		case !a.watching:
+			// Only a response that comes to wait pays for hearing of the
+			// cancellation, and only once. OnCancel runs the callback at
+			// once for a request cancelled already, which takes a.mu.
+			a.watching = true
+			a.mu.Unlock()
+			c.OnCancel(a.cancelled)
+			a.mu.Lock()
+		default:
+			a.room.Wait()
 		}
-		a.room.Wait()
 	}
-	return false, false
+	return false, false, nil
+}
+
+// cancelled is the OnCancel callback of a response whose Write waits while
+// the header is held: it ends the wait with err.
+func (a *asyncHeader) cancelled(err error) {
+	a.mu.Lock()
+	a.gone = err
+	a.room.Broadcast()
+	a.mu.Unlock()
 }
 
 // held reports whether the header is held.
