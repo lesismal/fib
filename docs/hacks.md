@@ -355,10 +355,14 @@ working together:
 4. **Object reuse, zero allocation.** Request, Header, URL and Context are recycled by default;
    the Router allocates nothing per request. At tens of millions of requests per second, GC and
    heap locks are the bottleneck (see [§6](#6-object-reuse-using-context-like-fasthttp)).
-5. **Bounded backlog.** When the peer does not read its responses, the write queue grows to
-   `WriteBufferHighWatermark` and then fib stops reading that peer's requests
-   (`MaxPendingBytes`, off by default, optionally bounds the server-wide total). That is why memory stays at a few tens of MB in
-   pipeline tests rather than growing to hundreds.
+5. **Bounded backlog.** When the peer does not read its responses, fib stops reading that
+   peer's requests once they have `WriteBufferHighWatermark` of replies queued
+   (`MaxPendingBytes`, off by default, optionally bounds the server-wide total). The watermark
+   pauses reads; it does not cap the queue itself, since a handler may keep sending from a
+   goroutine of its own. `Config.MaxWriteQueueBytes`, or `Connection.SetWriteQueueLimit` for one
+   connection, is the hard cap: a send that takes the queue past it closes the connection with
+   `fib.ErrSendQueueFull`. That is why memory stays at a few tens of MB in pipeline tests rather
+   than growing to hundreds.
 
 **Getting the same benefit in your own protocol**
 
@@ -560,6 +564,7 @@ backlog of its own is paused too**.
 | `SendShared(b)` | like `SendOwned`, never copies, but only ever reads `b` and never pools it, so one `b` can go to many connections; slow peers queue that one array | broadcast (`websocket.PreparedMessage` uses it) |
 | `SendFile(f, off, n)` | queues a file range in order with surrounding `Send`s; `sendfile(2)` straight to the socket, the file is read as the peer receives | large files, memory does not grow with file size |
 | `Cork()` / `Flush()` | manual control of write coalescing | answering several requests **outside the round**; or when a handler must hand data to the socket midway |
+| `Config.MaxWriteQueueBytes` / `Connection.SetWriteQueueLimit(n)` | caps what one connection may have queued for its socket; a send past it returns `ErrSendQueueFull` and closes the connection | broadcast to peers that may stop reading |
 
 **Corking by hand outside OnData**
 

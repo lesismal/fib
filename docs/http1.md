@@ -13,6 +13,7 @@ usage, see the [HTTP section of the Go guide](guide.zh-CN.md#http-子-package)
 | Area | Server | Client |
 | --- | --- | --- |
 | Versions | HTTP/1.0 and HTTP/1.1 requests; answers in the request's version | Sends HTTP/1.1, or HTTP/1.0 when the request's `ProtoMinor` is 0 |
+| TLS 0-RTT | `Config.EarlyData`: a request that arrived as early data carries `Early-Data: 1`, only GET/HEAD/OPTIONS/TRACE are served, and any other method is answered 425 and the connection closed; see [TLS 0-RTT](#tls-0-rtt) | `ClientConfig.EarlyData` with `SessionCache` sends a safe, bodyless request as early data, and sends it again after a 425; HTTP/1.1 only |
 | Connections | Keep-alive (HTTP/1.1 by default, HTTP/1.0 with `Connection: keep-alive`), `Connection: close` from either side, pipelining (responses in request order) | Keep-alive pool per host:port; an HTTP/1.0 connection is reused only if the request asked for keep-alive and the server agreed |
 | Request bodies | `Content-Length`, chunked with extensions and trailers (`Request.Trailer`); a body sent in gzip, x-gzip or deflate on top of chunked; buffered whole by default, or streamed to the handler as they arrive with `StreamRequestBody` | `Content-Length`; chunked with `c.Request.Trailer` when `ContentLength` is -1 |
 | Response bodies | `Content-Length`, chunked with trailers, close-delimited for HTTP/1.0 streams | `Content-Length`, chunked with trailers (`Response.Trailer`), close-delimited, and a body sent in gzip, x-gzip or deflate |
@@ -24,6 +25,27 @@ usage, see the [HTTP section of the Go guide](guide.zh-CN.md#http-子-package)
 | Validation | 400 for a missing or repeated `Host` in HTTP/1.1, for `Transfer-Encoding` in HTTP/1.0 and for malformed messages; 501 for a transfer coding it does not decode (`compress`, `br`, or more than one besides chunked); 417 for unknown expectations; 413/431 for limits | Malformed responses, transfer codings the client does not decode and short bodies fail the request |
 | Framing conflicts | `Content-Length` together with chunked: read as chunked, connection closed after the response | — |
 | Headers | `Date` added unless the handler set one; the framing headers the server writes replace the handler's | — |
+
+### TLS 0-RTT
+
+A client that resumes a TLS 1.3 session can send the first requests with its
+first flight (RFC 8446 section 2.3), a round trip ahead of the handshake.
+Setting `Config.EarlyData` turns that on for the HTTP/1 server, and for the
+`tls.Handler` it is wrapped in, through `tls.EarlyDataOptIn`. The TLS layer
+accepts a ticket's early data once, bounds it to `tls.Handler.MaxEarlyData`
+(16KiB by default), and skips what it does not accept, as it does for HTTP/3.
+
+A request that arrives this way carries `Early-Data: 1` (RFC 8470) and is
+served only if its method is GET, HEAD, OPTIONS or TRACE: those change
+nothing, while a replayed other method could. Any other method is answered
+425 Too Early and the connection is closed, so the client sends it again once
+its handshake is over; `Config.EarlyDataUnsafe` serves every method and leaves
+the check to the handler. The client side is `ClientConfig.EarlyData`: with a
+`SessionCache` it sends a safe, bodyless request as early data, and sends a
+request answered 425 again after the handshake. It does so only over a
+connection that cannot become HTTP/2 (`DisableHTTP2`, or a
+`TLSConfig.NextProtos` without "h2"), since HTTP/2's framing is known only
+once ALPN is.
 
 ### Response framing chosen by the writer
 

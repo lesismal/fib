@@ -23,6 +23,22 @@ The implementation lives in [`http`](../http) (`h2_*.go`) and the
 The suite that checks all of this runs in CI; see
 [Conformance testing](#conformance-testing) below.
 
+### TLS 0-RTT
+
+A client that resumes a TLS 1.3 session can send its first request frames with
+its first flight, before the handshake is over (RFC 8446 section 2.3). Setting
+`Config.EarlyData` turns that on for the HTTP/2 server (and for the
+`tls.Handler` it is wrapped in, through `tls.EarlyDataOptIn`): a stream whose
+HEADERS arrived that way carries `Early-Data: 1` (RFC 8470), and only a GET,
+HEAD, OPTIONS or TRACE method is served from it. Any other method is answered
+425 Too Early on that stream alone, its connection and the other streams
+carrying on, as HTTP/3 does; `Config.EarlyDataUnsafe` serves every method and
+leaves the check to the handler. The TLS layer accepts a ticket's early data
+once and bounds it to `tls.Handler.MaxEarlyData`, so a replay is turned away
+before it reaches the server. The client does not send HTTP/2 early data: the
+framing depends on the protocol ALPN picks, which it learns only when the
+handshake is over.
+
 ## Current limitations
 
 Behaviour to be aware of when using it.

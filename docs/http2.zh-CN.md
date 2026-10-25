@@ -20,6 +20,16 @@
 
 以上内容都有测试覆盖并在 CI 中运行，见下面的[一致性测试](#一致性测试)。
 
+### TLS 0-RTT
+
+恢复 TLS 1.3 会话的客户端可以把头几个请求帧随第一个飞行一起发出，握手结束前就到（RFC 8446 第 2.3 节）。
+`Config.EarlyData` 打开 HTTP/2 服务端的这个能力（也通过 `tls.EarlyDataOptIn` 打开包装它的 `tls.Handler`）：
+HEADERS 这样到达的 stream 带 `Early-Data: 1`（RFC 8470），只有 GET、HEAD、OPTIONS、TRACE 方法才从它服务。
+其他方法只在该 stream 上回 425 Too Early，连接和其他 stream 照常，和 HTTP/3 一致；`Config.EarlyDataUnsafe`
+让所有方法都交给 handler，由它自己检查这个头。TLS 层一张票据只接受一次 early data，总量以
+`tls.Handler.MaxEarlyData` 为限，重放到不了这一层。客户端不发送 HTTP/2 early data：帧格式取决于是 ALPN 选出的
+协议，而它要到握手结束才知道。
+
 ## 当前限制
 
 使用时需要了解的行为约束。

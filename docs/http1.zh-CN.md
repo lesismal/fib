@@ -12,6 +12,7 @@ HTTP/2、HTTP/3 各有单独的文档：[`http2.zh-CN.md`](http2.zh-CN.md)、
 | 方面 | 服务端 | 客户端 |
 | --- | --- | --- |
 | 版本 | 接受 HTTP/1.0 和 HTTP/1.1 请求，按请求的版本回复 | 发送 HTTP/1.1；请求的 `ProtoMinor` 为 0 时发送 HTTP/1.0 |
+| TLS 0-RTT | `Config.EarlyData`：作为 early data 到达的请求带 `Early-Data: 1`，只服务 GET/HEAD/OPTIONS/TRACE，其他方法回 425 并关闭连接，见 [TLS 0-RTT](#tls-0-rtt) | `ClientConfig.EarlyData` + `SessionCache`：只把安全方法且没有 body 的请求作为 early data 发出，收到 425 后重发；只走 HTTP/1.1 |
 | 连接 | keep-alive（HTTP/1.1 默认开启，HTTP/1.0 需 `Connection: keep-alive`）、任一方的 `Connection: close`、pipelining（按请求顺序回复） | 每个 host:port 一个 keep-alive 连接池；HTTP/1.0 连接只有在请求要求 keep-alive 且服务端同意时才复用 |
 | 请求 body | `Content-Length`、chunked（含 chunk 扩展和 trailer，`Request.Trailer`）、chunked 之上再用 gzip、x-gzip 或 deflate 编码的 body；默认整体缓存，开启 `StreamRequestBody` 后边收边交给 handler | `Content-Length`；`ContentLength` 为 -1 时用 chunked，可带 `c.Request.Trailer` |
 | 响应 body | `Content-Length`、chunked（含 trailer）、HTTP/1.0 流式响应以关闭连接结束 | `Content-Length`、chunked（含 trailer，`Response.Trailer`）、以关闭连接结束，以及 gzip、x-gzip、deflate 编码的 body |
@@ -23,6 +24,20 @@ HTTP/2、HTTP/3 各有单独的文档：[`http2.zh-CN.md`](http2.zh-CN.md)、
 | 校验 | HTTP/1.1 缺少或重复 `Host`、HTTP/1.0 带 `Transfer-Encoding`、报文格式错误时返回 400；不支持的 transfer coding（`compress`、`br`，或 chunked 之外的多个 coding）返回 501；无法满足的 `Expect` 返回 417；超限返回 413/431 | 格式错误的响应、客户端不支持的 transfer coding、body 不完整都会让请求失败 |
 | 帧格式冲突 | 同时有 `Content-Length` 和 chunked：按 chunked 读取，回复后关闭连接 | — |
 | 头部 | handler 未设置时自动添加 `Date`；服务端写的帧格式相关头会替换 handler 设置的同名头 | — |
+
+### TLS 0-RTT
+
+恢复 TLS 1.3 会话的客户端可以把头几个请求随第一个飞行一起发出（RFC 8446 第 2.3 节），比握手早一个往返。
+`Config.EarlyData` 打开 HTTP/1 服务端的这个能力，也通过 `tls.EarlyDataOptIn` 打开包装它的 `tls.Handler`。
+TLS 层一张票据只接受一次 early data，总量以 `tls.Handler.MaxEarlyData`（默认 16KiB）为限，不接受的部分按
+RFC 8446 4.2.10 跳过，和 HTTP/3 一样。
+
+这样到达的请求带 `Early-Data: 1`（RFC 8470），只有方法是 GET、HEAD、OPTIONS、TRACE 时才服务：这些方法
+不改变任何东西，而重放其他方法可能改变。其他方法回 425 Too Early 并关闭连接，客户端在握手结束后重发；
+`Config.EarlyDataUnsafe` 让所有方法都交给 handler，由它自己检查这个头。客户端一侧是
+`ClientConfig.EarlyData`：配合 `SessionCache`，只把安全方法且没有 body 的请求作为 early data 发出，收到
+425 的请求在握手结束后重发。只对不会协商成 HTTP/2 的连接生效（`DisableHTTP2`，或
+`TLSConfig.NextProtos` 不含 `h2`），因为 HTTP/2 的帧格式要等 ALPN。
 
 ### 响应帧格式的选择
 

@@ -17,7 +17,7 @@
 | --- | --- |
 | QUIC | version 1；Initial、Handshake、1-RTT 三个包号空间；AES-128-GCM、AES-256-GCM、ChaCha20-Poly1305 包保护与头部保护；双向 key update（本端按 AEAD 使用上限或可选的时间间隔主动发起，也响应对端发起）与解密失败次数上限；服务端负载高时发送 Retry，客户端处理 Retry；Version Negotiation；stateless reset；RFC 9002 丢包检测、PTO 与持续拥塞判定；CUBIC（RFC 9438，默认）或 NewReno 拥塞控制，带 pacing 和应用受限判断；服务端 3 倍放大限制；连接级与 stream 级双向流控及 BLOCKED 帧；MAX_STREAMS；用 NEW_CONNECTION_ID 签发、可退役的 Connection ID；draining 期；空闲超时与可选 keep-alive |
 | 服务端 | 与 HTTP/1、HTTP/2 共用同一个 `Handler` 和 `Context`；1xx 中间响应、自动 100 Continue、请求与响应 trailer、`Response.Close` 通过 GOAWAY 优雅关闭、413/431/417、非法请求（含 `:authority` 与 `Host` 不一致）以 H3_MESSAGE_ERROR 重置、协议错误按 RFC 9114 / RFC 9204 错误码关闭连接、`Request.TLS`、`AltSvc` 辅助函数、Extended CONNECT（RFC 9220）经 `Context.Upgrade` 切换为隧道，`websocket.ServerHandler.Upgrade` 即借此提供 WebSocket over HTTP/3 |
-| 客户端 | 异步 `Do`/`Go`；每个 host:port 一条连接、多路复用；遵守 MAX_STREAMS 并排队；取消只重置单个 stream；GOAWAY 与 H3_REQUEST_REJECTED 的请求自动在新连接上重发；`Expect: 100-continue` 等待 100；请求与响应 trailer；对端违反协议时按错误码关闭连接 |
+| 客户端 | 异步 `Do`/`Go`；每个 host:port 一条连接、多路复用；遵守 MAX_STREAMS 并排队；取消只重置单个 stream；GOAWAY 与 H3_REQUEST_REJECTED 的请求自动在新连接上重发；`Expect: 100-continue` 等待 100；请求与响应 trailer；对端违反协议时按错误码关闭连接；`AltSvcClient` 把它和 `http.Client` 组合起来按 `Alt-Svc`（RFC 7838）切换，并在失败时回退 TCP |
 | 一致性 | 与 quic-go 客户端、服务端双向互通，以及用手写帧构造的协议错误用例，都在 CI 中运行 |
 | 互通验证 | quic-go 客户端与服务端（双向，含 5% 丢包）；容器里的 quiche 客户端与服务端（双向，`http3/quicheinterop`）；客户端访问 Cloudflare、Google、nginx、Facebook（mvfst）、Varnish、quiche 的线上服务 |
 
@@ -202,8 +202,11 @@
 
 ### 客户端
 
-- 只支持 `https://`。不会根据 `Alt-Svc` 从 HTTP/1.1 或 HTTP/2 自动升级到 HTTP/3，也不会
-  在 UDP 被屏蔽时回退到 TCP；需要时在应用层组合使用 `http.Client` 和 `http3.Client`。
+- 只支持 `https://`。`Client` 自身不会根据 `Alt-Svc` 从 HTTP/1.1 或 HTTP/2 自动升级到 HTTP/3，
+  也不会在 UDP 被屏蔽时回退到 TCP；做这件事的是 `http3.AltSvcClient`：它让一个 origin 的
+  第一个请求走 `http.Client`，之后按响应里的 `Alt-Svc: h3="host:port"`（RFC 7838）走 HTTP/3，
+  请求的 `:authority` 和证书校验用的名字仍是 origin 的；QUIC 连不上时，可以安全重发的请求
+  回退到 TCP，并把这个 origin 在 TCP 上留一段时间。
 - 已收到部分响应后连接断开的请求直接失败，不论方法都不重发，与 `net/http` 一致：服务端
   已经开始回应，说明已经处理了请求，流式响应的回调也可能已经把部分 body 交出去了。只有被
   GOAWAY 或 H3_REQUEST_REJECTED 明确标为未处理的请求、以及还在排队没有发出的请求才会重发；
@@ -325,8 +328,8 @@
 
 - 已完成：keep-alive、接收窗口、单向 stream 上限、ACK 延迟、洪泛额度、按时间更新密钥和签发的
   Connection ID 数可在 `Config.Transport` 和 `ClientConfig.Transport` 中设置；发送时遵守对端的
-  `SETTINGS_MAX_FIELD_SECTION_SIZE`；客户端可以发送请求 trailer（body 整体发送或流式发送都可以）。
-- 客户端：根据 `Alt-Svc` 自动选择 HTTP/3，并在 UDP 不通时回退到 TCP。
+  `SETTINGS_MAX_FIELD_SECTION_SIZE`；客户端可以发送请求 trailer（body 整体发送或流式发送都可以）；
+  `AltSvcClient` 按 `Alt-Svc` 选择 HTTP/3，并在 UDP 不通时回退到 TCP。
 
 ### 5. 测试覆盖（低）
 

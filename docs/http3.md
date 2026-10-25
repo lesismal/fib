@@ -19,7 +19,7 @@ from scratch. The TLS 1.3 handshake is the standard library's
 | --- | --- |
 | QUIC | Version 1; Initial, Handshake and 1-RTT packet number spaces; AES-128-GCM, AES-256-GCM and ChaCha20-Poly1305 packet and header protection; key updates in both directions (started here when a key reaches its AEAD limit, or optionally after a time, and answered when the peer starts one) and a limit on decryption failures; Retry, sent by the server under load and handled by the client; Version Negotiation; stateless reset; RFC 9002 loss detection, PTO and persistent congestion; CUBIC (RFC 9438, the default) or NewReno congestion control, with pacing and app-limited detection; the server's 3x amplification limit; connection- and stream-level flow control in both directions, with BLOCKED frames; MAX_STREAMS; Connection IDs issued with NEW_CONNECTION_ID and retired; a draining period; idle timeout and optional keep-alive |
 | Server | Shares one `Handler` and `Context` with HTTP/1 and HTTP/2; 1xx interim responses, automatic 100 Continue, request and response trailers, graceful `Response.Close` via GOAWAY, 413/431/417, malformed requests (including an `:authority` and `Host` that disagree) reset with H3_MESSAGE_ERROR, protocol errors closing the connection with RFC 9114 and RFC 9204 codes, `Request.TLS`, an `AltSvc` helper, extended CONNECT (RFC 9220) switched to a tunnel with `Context.Upgrade`, which is how `websocket.ServerHandler.Upgrade` serves WebSocket over HTTP/3 |
-| Client | Asynchronous `Do`/`Go`; one multiplexed connection per host:port; honors MAX_STREAMS and queues the rest; cancellation resets only its own stream; requests the server marks as unprocessed (GOAWAY, H3_REQUEST_REJECTED) are retried on a new connection; `Expect: 100-continue` waits for the 100; request and response trailers; a peer that breaks the protocol ends the connection with its error code |
+| Client | Asynchronous `Do`/`Go`; one multiplexed connection per host:port; honors MAX_STREAMS and queues the rest; cancellation resets only its own stream; requests the server marks as unprocessed (GOAWAY, H3_REQUEST_REJECTED) are retried on a new connection; `Expect: 100-continue` waits for the 100; request and response trailers; a peer that breaks the protocol ends the connection with its error code; `AltSvcClient` composes it with an `http.Client` to follow `Alt-Svc` (RFC 7838) and fall back to TCP |
 | Resumption and 0-RTT | Session tickets, resumption, and 0-RTT early data, for the server (`Config.EarlyData`) and the client (`ClientConfig.EarlyData`); see [0-RTT](#0-rtt) |
 | Conformance | Both directions against quic-go, and protocol errors written frame by frame, all run in CI |
 | Interop | quic-go client and server, both directions, including 5% packet loss; quiche client and server, both directions, in a container (`http3/quicheinterop`); the client against the live services of Cloudflare, Google, nginx, Facebook (mvfst), Varnish and quiche |
@@ -278,9 +278,14 @@ These are still constants:
 
 ### Client
 
-- Only `https://`. The client does not switch from HTTP/1.1 or HTTP/2 to HTTP/3
-  on `Alt-Svc`, nor fall back to TCP when UDP is blocked; combine `http.Client`
-  and `http3.Client` in the application if needed.
+- Only `https://`. A `Client` by itself does not switch from HTTP/1.1 or
+  HTTP/2 to HTTP/3 on `Alt-Svc`, nor fall back to TCP when UDP is blocked:
+  `http3.AltSvcClient` is the integration layer for that. It sends an
+  origin's first request through an `http.Client`, follows a response's
+  `Alt-Svc: h3="host:port"` (RFC 7838) for the requests after it, keeps the
+  origin's `:authority` and the name its certificate is verified for, and
+  falls back to TCP for a request that is safe to repeat when the QUIC
+  attempt fails, leaving that origin on TCP for a while.
 - A request whose connection fails after part of its response has arrived
   fails and is not retried, whatever its method, as with `net/http`: the
   server has begun to answer, so it has acted on the request, and a streaming
@@ -455,9 +460,8 @@ Done:
   Connection IDs issued are set in `Config.Transport` and
   `ClientConfig.Transport`; the peer's `SETTINGS_MAX_FIELD_SECTION_SIZE` is
   honored when sending; the client sends request trailers, behind a body sent
-  whole or streamed.
-- Client: pick HTTP/3 automatically from `Alt-Svc`, and fall back to TCP when
-  UDP is blocked.
+  whole or streamed; `AltSvcClient` picks HTTP/3 from `Alt-Svc` and falls back
+  to TCP when UDP is blocked.
 
 ### 5. Test coverage (low)
 

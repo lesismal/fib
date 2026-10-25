@@ -527,8 +527,14 @@ err = fibtls.Dial(engine, "tcp", "example.com:443", 3*time.Second, tlsConfig, ha
     （没开、票据不允许、重放）按 RFC 8446 4.2.10 跳过随后到达的 early data 记录（总量限 64 KiB），握手照常完成，不再交给
     `crypto/tls`（它会直接断开）。客户端设 `Handler.SessionCache`（`DialOptions.SessionCache`）恢复会话，再设 `EarlyData`，握手完成前的
     `Send` 在票据允许时作为 early data 随 ClientHello 发出，保留一份副本，服务端拒绝时握手完成后重发。已用 OpenSSL 3.5 的
-    `s_client -early_data`（对服务端）和 `s_server -early_data`（对客户端）互通验证，包括重放被拒绝。HTTP/1、HTTP/2 的服务端还没有
-    接 `OnEarlyData`，要用得在 `tls` 这一层。
+    `s_client -early_data`（对服务端）和 `s_server -early_data`（对客户端）互通验证，包括重放被拒绝。
+    **HTTP/1 与 HTTP/2 已经接上**：`http.Config.EarlyData` 打开服务端的 0-RTT，并通过 `tls.EarlyDataOptIn` 让包装它的
+    `tls.Handler` 一起接受，不用在两层各设一次。作为 early data 到达的请求带 `Early-Data: 1`（RFC 8470），默认只服务
+    GET/HEAD/OPTIONS/TRACE，其他方法回 425 Too Early：HTTP/1 回复后关闭连接，HTTP/2 只回复该 stream，连接和其他请求继续
+    （`Config.EarlyDataUnsafe` 让全部方法都交给 handler，由它自己检查这个头）。`http.ClientConfig.EarlyData` 配合
+    `SessionCache` 是客户端一侧：只把 GET/HEAD/OPTIONS/TRACE 且没有 body 的请求作为 early data 发出，服务端回 425 时在
+    握手结束后重发一次。客户端只对不会协商成 HTTP/2 的连接这么做（`DisableHTTP2`，或 `TLSConfig.NextProtos` 不含 `h2`）：
+    HTTP/2 的帧格式要等 ALPN，握手完成前不知道。HTTP/3 的 0-RTT 见 [`docs/http3.zh-CN.md`](http3.zh-CN.md) 的 0-RTT 一节。
     会话恢复是自己的：TLS 1.3 发 NewSessionTicket（PSK 恢复），TLS 1.2 发 RFC 5077 的票据（恢复时是缩短的握手），票据用
     `Handler` 的密钥（每天轮换，保留 7 天；设了 `Config.SessionTicketKey` 就用它，多个进程可以共享）封装，无状态；
     `SessionTicketsDisabled` 关闭。`crypto/tls` 签发的票据它不认，客户端会做一次完整握手。
@@ -1276,6 +1282,7 @@ server, err := fib.New(fib.DefaultConfig(),
   按 RFC 9114 的错误码关闭连接。
 - 浏览器通过 HTTP/1.1 或 HTTP/2 响应里的 `Alt-Svc` 头发现 HTTP/3，`http3.AltSvc(port)`
   生成这个头的值；通常在同一端口号上同时跑 TCP 的 HTTPS 和 UDP 的 HTTP/3（见示例）。
+  Go 客户端用 `http3.NewAltSvcClient` 复用同一套逻辑：见下面“自动切换 HTTP/3”。
 
 QUIC 层的实现要点：
 
@@ -1339,6 +1346,30 @@ resp, err := client.Go(req).Wait()
   限制握手、QUIC 空闲超时和连接复用的空闲时间；`MaxResponseHeaderBytes`、
   `MaxResponseBodyBytes` 限制单个响应大小。支持 trailer，1xx 中间响应自动跳过。
 - 回调可能在任意 goroutine 上执行；先 `client.Close()` 再关闭 Engine。
+
+#### 自动切换 HTTP/3（Alt-Svc）
+
+`http3.AltSvcClient` 把 `http.Client` 和 `http3.Client` 组合起来，按 RFC 7838 使用 `Alt-Svc`：
+
+```go
+tcp := http.NewClient(engine, http.ClientConfig{TLSConfig: tlsConfig})
+h3 := http3.NewClient(engine, http3.DefaultClientConfig())
+client := http3.NewAltSvcClient(tcp, h3)
+defer client.Close()
+
+resp, err := client.Go(req).Wait() // 第一次走 TCP，响应里的 Alt-Svc 让后续请求走 HTTP/3
+```
+
+- 第一次请求走 TCP。响应带 `Alt-Svc: h3="host:port"`（`http3.AltSvc` 生成的就是这个形式，主机为空表示
+  原 host）时，同一 origin 之后的请求走 HTTP/3；请求的 `:authority` 仍是 origin，证书按 origin 的
+  host 校验，所以 alternative 可以指向另一台主机/端口。`ma` 到期、`ma=0` 或 `clear` 会让它回到 TCP。
+- UDP/QUIC 连不上时，可以安全重发的请求（GET/HEAD/OPTIONS/TRACE，body 可重读或没有 body）自动改走
+  TCP，并把该 origin 留在 TCP 上一段时间（30 秒），避免每个请求都等一次 QUIC 握手超时。已经发出、
+  可能被服务端执行的请求不重发。
+- 其他方法与 `http.Client` 相同：`Do`、`Start`（返回 `AltSvcCall`，`Cancel` 会作用到当时承载它的那个
+  客户端）、`Go`（总是等完整响应）、`StartUpgrade`（只在 TCP 上，HTTP/3 的 client 没有协议切换 API）
+  和 `Close`（同时关闭传入的两个 client）。超时和 body 限制分别由 `http.ClientConfig` 和
+  `http3.ClientConfig` 决定。
 
 ## WebSocket 子 package
 
@@ -1472,8 +1503,10 @@ for _, c := range conns {
 （每个连接要单独加密）时，才值得把连接按 `GOMAXPROCS` 分成几片并行发送；不需要每个连接
 一个 goroutine。
 
-要注意的是发送队列本身没有上限：`WriteBufferHighWatermark` 只暂停该连接的读，不限制往它发。
-对端长期不读时，广播会持续堆积在它的队列里，应用应该自己断开这类连接（比如用应用层心跳判断）。
+发送队列默认没有上限：`WriteBufferHighWatermark` 只暂停该连接的读，不限制往它发。要把对端长期不读的广播限制住，设
+`fib.Config.MaxWriteQueueBytes`（对引擎的每条连接生效）或对单条连接调用 `Connection.SetWriteQueueLimit`：等待 socket 的字节
+（含 cork 在一轮里的输出，以及 TLS 层加密后的字节）超过上限时，这次 `Send` 返回 `fib.ErrSendQueueFull` 并关闭连接，队列
+不会无限增长。对端只是慢、但还在读的场景，也可以继续用应用层心跳提前断开。
 
 ### 在 HTTP server 中升级为 WebSocket
 
