@@ -423,6 +423,19 @@ func (sc *h2ServerConn) sendPooledLocked(out []byte) {
 	bufferpool.Put(out)
 }
 
+// sendPooledPartsLocked sends first, a buffer from the pool, and second
+// beside it, as sendPooledLocked does, and gives first back: the connection
+// copies what it queues, so the two parts reach the socket as one write
+// without being joined here first. It is for a connection with no layer.
+func (sc *h2ServerConn) sendPooledPartsLocked(first, second []byte) {
+	if len(first)+len(second) > 0 && !sc.closed {
+		sc.conn.Cork()
+		_ = sc.conn.SendParts(first, second)
+		sc.scheduleFlush()
+	}
+	bufferpool.Put(first)
+}
+
 // scheduleFlush sends flusher to the pool unless it is on its way already,
 // and runs it here if the pool takes no more work. A flusher that has not
 // begun yet writes what was queued before this call; one that has begun
@@ -1765,6 +1778,26 @@ func (st *h2ServerStream) respond(req *stdhttp.Request, response Response) error
 	// Framed in one buffer from the pool: the header block, and as much of
 	// the body as the windows let go now, each behind its frame headers.
 	sendable := max(min(int64(len(body)), sc.sendWindow, st.sendWindow), 0)
+	if sendable == int64(len(body)) && sendable > 0 && sendable <= int64(sc.peerMaxFrame) &&
+		st.trailer == nil && st.out == nil && sc.conn.Layer() == nil && !(response.Close && !sc.goAway) {
+		// The whole body goes in one frame and the connection has no layer:
+		// the body is handed to it beside the frames rather than joined
+		// after them, which copies it into the queue once instead of twice.
+		// A layer such as TLS seals what it is given in one copy anyway, and
+		// is left the single buffer it had.
+		size := len(block) + h2FrameHeaderLen*(1+len(block)/sc.peerMaxFrame) + h2FrameHeaderLen
+		out := bufferpool.Get(size)[:0]
+		out = h2AppendHeaderBlock(out, st.id, block, false, sc.peerMaxFrame)
+		out = h2AppendFrameHeader(out, h2FrameData, h2FlagEndStream, st.id, len(body))
+		sc.keepHeaderBlockLocked(block)
+		sc.sendWindow -= sendable
+		st.sendWindow -= sendable
+		st.localDone = true
+		sc.sendPooledPartsLocked(out, body)
+		sc.finishStreamLocked(st)
+		sc.closeFinishedLocked()
+		return nil
+	}
 	size := len(block) + h2FrameHeaderLen*(1+len(block)/sc.peerMaxFrame)
 	if sendable > 0 {
 		size += int(sendable) + h2FrameHeaderLen*(1+int(sendable)/sc.peerMaxFrame)
