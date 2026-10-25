@@ -380,6 +380,18 @@ what `net/http`'s chunked reader refuses. Writing a proxied request takes one
 allocation and reading a plain response head five, against eight and thirteen
 through `net/http`.
 
+### The client and `Expect: 100-continue`
+
+A client request with a body and `Expect: 100-continue` sends its head alone
+and its body once the server answers 100 Continue, or once
+`ClientConfig.ExpectContinueTimeout` has passed (1 second in
+`DefaultClientConfig`, as in `net/http`'s default transport; zero sends the
+body with the head), since a server that does not know the expectation never
+answers it. A final response that comes first is the answer: the body is never
+sent, and the connection, whose head announced a body that did not follow, is
+closed rather than kept. Bodies read whole and bodies that stream are both
+held. The HTTP/2 and HTTP/3 clients do the same with their streams.
+
 ### Reading the body and the query without copying
 
 `Context.Body()` returns the request body that arrived whole before the

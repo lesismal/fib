@@ -16,7 +16,7 @@ The implementation lives in [`http`](../http) (`h2_*.go`) and the
 | Side | Features |
 | --- | --- |
 | Server | TLS + ALPN (h2), cleartext with prior knowledge (h2c), HTTP/1.1 `Upgrade: h2c`; multiplexing, flow control in both directions, HPACK (Huffman and dynamic table), CONTINUATION, trailers, server push, 1xx interim responses, automatic 100 Continue, graceful GOAWAY on `Response.Close`, `Request.TLS`, extended CONNECT (RFC 8441) switched to a tunnel with `Context.Upgrade`, which is how `websocket.ServerHandler.Upgrade` serves WebSocket over HTTP/2 |
-| Client | h2 over https through ALPN, cleartext prior knowledge with `UnencryptedHTTP2`; multiplexing on one connection, honouring the server's `MAX_CONCURRENT_STREAMS`, cancellation that resets only its own stream, automatic retry after GOAWAY / REFUSED_STREAM |
+| Client | h2 over https through ALPN, cleartext prior knowledge with `UnencryptedHTTP2`; multiplexing on one connection, honouring the server's `MAX_CONCURRENT_STREAMS`, cancellation that resets only its own stream, automatic retry after GOAWAY / REFUSED_STREAM; new streams on the least-loaded connection; `Expect: 100-continue` waits for the 100; optional PING health check |
 | Conformance | h2spec: 145 of 145 cases, over h2c and TLS |
 | Interop | Go `net/http` client and server (TLS and h2c); curl (nghttp2) over h2, h2c and Upgrade |
 
@@ -152,9 +152,8 @@ These are constants today and cannot be configured:
 - **Idle and keep-alive**: the server retires a connection that has carried
   no stream for `Config.IdleTimeout` (`ReadTimeout` when it is not set; 2
   minutes in `DefaultConfig`) with GOAWAY `NO_ERROR`, but sends no PING
-  keep-alives. The client only has
-  `IdleConnTimeout` (closing when idle) and does no PING health checks, so a
-  connection that dies silently is not noticed promptly.
+  keep-alives. The client's PING health check is described under
+  [Client](#client).
 - **SETTINGS acknowledgement timeout**: nothing checks that the peer
   acknowledges this side's SETTINGS in reasonable time (SETTINGS_TIMEOUT).
 
@@ -164,18 +163,42 @@ These are constants today and cannot be configured:
   one connection to it is dialed at a time (as in `net/http`), so the first
   burst of requests to an HTTP/1.1-only https server waits one extra TLS
   handshake.
-- Among several HTTP/2 connections, the first one with room is chosen rather
-  than the least loaded one.
-- A request whose connection breaks after part of its response has arrived
-  fails and is not retried. Only requests that received nothing and use an
-  idempotent method, and requests GOAWAY or REFUSED_STREAM marks as
-  unprocessed, are retried.
-- A request with `Expect: 100-continue` does not wait for the 100; the body is
-  sent along with the header (which the protocol allows).
+- Among several HTTP/2 connections to a host, a new stream goes to the one
+  with the most streams to spare, by each connection's own
+  `MAX_CONCURRENT_STREAMS`, so the load spreads over them rather than piling
+  onto the first; a tie goes to the earlier one. A second connection is only
+  dialed once every one is full, and once there are several they all stay in
+  use while requests keep them busy, closing once the host goes quiet for
+  `IdleConnTimeout`.
+- **Health check**: with `ClientConfig.ReadIdleTimeout` set, a connection that
+  has heard nothing from the server for that long sends it a PING, and one
+  that then hears nothing at all, acknowledgement or other frame, for
+  `PingTimeout` (15 seconds by default) is taken for dead and closed. Its
+  requests fail with `ErrPingTimeout`, or go again on another connection by
+  the rule below. Names and defaults are x/net/http2's; `ReadIdleTimeout`'s
+  zero, the default, leaves the check off.
+- **Retries**: a request whose connection breaks after any of its response
+  has arrived fails with the connection's error and is not sent again,
+  whatever its method. This is deliberate, and what `net/http` and
+  x/net/http2 do: the server has begun to answer, so it has acted on the
+  request, and repeating a POST would act twice; even for an idempotent
+  method, the callback of a streaming response may already have passed part
+  of the body on, which a second response cannot be stitched to, and the
+  second response may differ. A request that received nothing goes again,
+  once, on another connection when its method is idempotent (GET, HEAD,
+  OPTIONS, TRACE) and its body can be read again (`GetBody`, for one that
+  streams); one that GOAWAY or REFUSED_STREAM marks unprocessed goes again
+  whatever its method, since the server says it did nothing with it. A caller
+  that knows a request is safe to repeat after a partial answer can send it
+  again itself.
+- **`Expect: 100-continue`**: a request with a body and this header sends its
+  HEADERS alone and its DATA once the server answers 100, or once
+  `ClientConfig.ExpectContinueTimeout` (1 second in `DefaultClientConfig`;
+  zero sends the body at once) has passed. A final response that comes first
+  is the answer: the body is never sent, and the stream is reset once the
+  response is complete. HTTP/1 and HTTP/3 requests do the same.
 - Cleartext HTTP/2 is prior knowledge only; the client does not upgrade from
   HTTP/1.1 with `Upgrade: h2c`.
-- A request with `Expect: 100-continue` does not wait for the 100 (see above),
-  so a server that would refuse the body still receives it.
 
 ## Intentionally not implemented
 
@@ -282,6 +305,7 @@ concurrency.
 - Honour the peer's `SETTINGS_MAX_HEADER_LIST_SIZE` when sending.
 - Server: PING keep-alive; half-close and drain
   input after GOAWAY to avoid RST.
-- Client: optional PING health checks, least-loaded connection selection, and
-  a SETTINGS acknowledgement timeout.
+- Client: a SETTINGS acknowledgement timeout. (PING health checks,
+  least-loaded connection selection and waiting for 100-continue are done; see
+  [Client](#client).)
 - Support sending request trailers.

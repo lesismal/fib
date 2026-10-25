@@ -285,6 +285,15 @@ HTTP/1 客户端像 server 读请求、写响应那样，自己写请求头、�
 分块 body 也由客户端解码，`net/http` 的分块读取器拒绝的，它同样拒绝。写一个代理请求只分配一次，
 读一个普通响应头五次，经 `net/http` 分别是八次和十三次。
 
+### 客户端与 `Expect: 100-continue`
+
+客户端带 body 和 `Expect: 100-continue` 的请求先单独发送请求头，等服务端回 100 Continue，
+或者 `ClientConfig.ExpectContinueTimeout` 到期后（`DefaultClientConfig` 中为 1 秒，与
+`net/http` 默认 transport 相同；为零时 body 随请求头一起发送）再发送 body，因为不认识这个
+期望的服务端永远不会回 100。如果先收到最终响应，它就是答复：body 不会发送，连接的请求头
+声明了 body 却没有跟上，所以关闭而不复用。整体读入的 body 和流式 body 都会等待。HTTP/2 和
+HTTP/3 客户端对各自的 stream 做同样的处理。
+
 ### 不拷贝地读取 body 与 query
 
 `Context.Body()` 返回 handler 运行前已整体读完的请求 body（不走流式的 body 都是如此），

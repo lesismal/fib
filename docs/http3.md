@@ -19,7 +19,7 @@ from scratch. The TLS 1.3 handshake is the standard library's
 | --- | --- |
 | QUIC | Version 1; Initial, Handshake and 1-RTT packet number spaces; AES-128-GCM, AES-256-GCM and ChaCha20-Poly1305 packet and header protection; key updates in both directions (started here when a key reaches its AEAD limit, and answered when the peer starts one) and a limit on decryption failures; Retry, sent by the server under load and handled by the client; Version Negotiation; stateless reset; RFC 9002 loss detection, PTO and persistent congestion; CUBIC (RFC 9438, the default) or NewReno congestion control, with pacing and app-limited detection; the server's 3x amplification limit; connection- and stream-level flow control in both directions; MAX_STREAMS; idle timeout and optional keep-alive |
 | Server | Shares one `Handler` and `Context` with HTTP/1 and HTTP/2; 1xx interim responses, automatic 100 Continue, request and response trailers, graceful `Response.Close` via GOAWAY, 413/431/417, malformed requests (including an `:authority` and `Host` that disagree) reset with H3_MESSAGE_ERROR, protocol errors closing the connection with RFC 9114 and RFC 9204 codes, `Request.TLS`, an `AltSvc` helper, extended CONNECT (RFC 9220) switched to a tunnel with `Context.Upgrade`, which is how `websocket.ServerHandler.Upgrade` serves WebSocket over HTTP/3 |
-| Client | Asynchronous `Do`/`Go`; one multiplexed connection per host:port; honors MAX_STREAMS and queues the rest; cancellation resets only its own stream; requests the server marks as unprocessed (GOAWAY, H3_REQUEST_REJECTED) are retried on a new connection; request and response trailers; a peer that breaks the protocol ends the connection with its error code |
+| Client | Asynchronous `Do`/`Go`; one multiplexed connection per host:port; honors MAX_STREAMS and queues the rest; cancellation resets only its own stream; requests the server marks as unprocessed (GOAWAY, H3_REQUEST_REJECTED) are retried on a new connection; `Expect: 100-continue` waits for the 100; request and response trailers; a peer that breaks the protocol ends the connection with its error code |
 | Resumption and 0-RTT | Session tickets, resumption, and 0-RTT early data, for the server (`Config.EarlyData`) and the client (`ClientConfig.EarlyData`); see [0-RTT](#0-rtt) |
 | Conformance | Both directions against quic-go, and protocol errors written frame by frame, all run in CI |
 | Interop | quic-go client and server, both directions, including 5% packet loss; quiche client and server, both directions, in a container (`http3/quicheinterop`); the client against the live services of Cloudflare, Google, nginx, Facebook (mvfst), Varnish and quiche |
@@ -233,10 +233,20 @@ exposed through `http3.Config` or `http3.ClientConfig`:
   on `Alt-Svc`, nor fall back to TCP when UDP is blocked; combine `http.Client`
   and `http3.Client` in the application if needed.
 - A request whose connection fails after part of its response has arrived
-  fails and is not retried. Retries happen only for requests the server marks as
-  unprocessed (GOAWAY or H3_REQUEST_REJECTED) and for requests still queued.
-- Requests with `Expect: 100-continue` do not wait for the 100; the body is sent
-  together with the header.
+  fails and is not retried, whatever its method, as with `net/http`: the
+  server has begun to answer, so it has acted on the request, and a streaming
+  response's callback may already have passed part of the body on. Retries
+  happen only for requests the server marks as unprocessed (GOAWAY or
+  H3_REQUEST_REJECTED) and for requests still queued; a caller that knows a
+  request is safe to repeat after a partial answer can send it again itself.
+  The HTTP/2 client's reasoning is the same; see
+  [HTTP/2](http2.md#client).
+- A request with a body and `Expect: 100-continue` sends its HEADERS alone and
+  its body once the server answers 100, or once
+  `ClientConfig.ExpectContinueTimeout` (1 second in `DefaultClientConfig`;
+  zero sends the body at once) has passed. A final response that comes first
+  is the answer: the body is never sent, and the stream's sending side is
+  reset once the response is complete.
 - Sessions are resumed from `ClientConfig.SessionCache` by this module's
   handshake, or from `TLSConfig.ClientSessionCache` when the handshake is
   crypto/tls's (`BlockingTLSHandshake`, or a TLSConfig only crypto/tls serves).

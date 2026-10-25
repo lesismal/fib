@@ -14,7 +14,7 @@
 | 方向 | 内容 |
 | --- | --- |
 | 服务端 | TLS + ALPN（h2）、明文 prior knowledge（h2c）、HTTP/1.1 `Upgrade: h2c`；多路复用、双向流控、HPACK（含 Huffman、动态表）、CONTINUATION、trailer、server push、1xx 中间响应、自动 100 Continue、`Response.Close` 优雅 GOAWAY、`Request.TLS`、Extended CONNECT（RFC 8441）经 `Context.Upgrade` 切换为隧道，`websocket.ServerHandler.Upgrade` 即借此提供 WebSocket over HTTP/2 |
-| 客户端 | https 经 ALPN 协商 h2、`UnencryptedHTTP2` 明文 prior knowledge；单连接多路复用、遵守服务端 `MAX_CONCURRENT_STREAMS`、取消只重置单个 stream、GOAWAY / REFUSED_STREAM 自动重发 |
+| 客户端 | https 经 ALPN 协商 h2、`UnencryptedHTTP2` 明文 prior knowledge；单连接多路复用、遵守服务端 `MAX_CONCURRENT_STREAMS`、取消只重置单个 stream、GOAWAY / REFUSED_STREAM 自动重发；新 stream 交给负载最低的连接；`Expect: 100-continue` 等待 100；可选的 PING 健康检查 |
 | 一致性 | h2spec：145 项全部通过，h2c 与 TLS 两种方式 |
 | 互通验证 | Go `net/http` 客户端与服务端（TLS 与 h2c）、curl（nghttp2）的 h2 / h2c / Upgrade |
 
@@ -113,8 +113,8 @@
   但单独调用 `Engine.Stop`/`Close` 时仍不发送 GOAWAY，连接被直接关闭，客户端看到的是
   连接中断而不是优雅关闭。
 - **空闲与保活**：服务端在连接 `Config.IdleTimeout`（未设时用 `ReadTimeout`；`DefaultConfig`
-  中为 2 分钟）内没有任何流时发出 GOAWAY `NO_ERROR` 并关闭，但不发送 PING 保活；客户端只有
-  `IdleConnTimeout`（空闲时关闭），不做 PING 健康检查，无法及时发现静默断开的连接。
+  中为 2 分钟）内没有任何流时发出 GOAWAY `NO_ERROR` 并关闭，但不发送 PING 保活。客户端的
+  PING 健康检查见[客户端](#客户端)。
 - **SETTINGS 确认超时**：不检测对端是否在合理时间内确认了本端的 SETTINGS
   （SETTINGS_TIMEOUT）。
 
@@ -122,13 +122,26 @@
 
 - https 的 host 在第一次连接确定协议之前只会同时拨号一条连接（与 `net/http` 相同），
   对只支持 HTTP/1.1 的 https 服务，首批并发请求要多等一次 TLS 握手。
-- 多条 HTTP/2 连接之间按顺序选择第一条还有余量的连接，而不是选择负载最低的。
-- 已收到部分响应后连接断开的请求直接失败，不会重发；只有没有收到任何响应数据且方法
-  幂等的请求，以及被 GOAWAY / REFUSED_STREAM 明确标为未处理的请求会重发。
-- 带 `Expect: 100-continue` 的请求不会等待 100，body 和请求头一起发送（协议允许）。
+- 同一 host 有多条 HTTP/2 连接时，新 stream 交给剩余 stream 额度最多的那条（按各连接
+  自己的 `MAX_CONCURRENT_STREAMS` 计算），负载分摊到各条连接上，而不是先压满第一条；额度
+  相同时选靠前的。只有所有连接都满了才会拨第二条；有了多条之后，只要请求不断它们都会被使用，
+  host 安静 `IdleConnTimeout` 后关闭。
+- **健康检查**：设置 `ClientConfig.ReadIdleTimeout` 后，连接在这么久内没有收到服务端的任何
+  数据就发一个 PING；之后 `PingTimeout`（默认 15 秒）内什么都没收到（ACK 或其他帧都算）
+  就认为连接已死并关闭。上面的请求以 `ErrPingTimeout` 失败，或按下面的规则在另一条连接上
+  重发。参数名和默认值与 x/net/http2 相同；`ReadIdleTimeout` 为零（默认）时不检查。
+- **重发**：已收到部分响应后连接断开的请求以连接的错误失败，不论方法都不重发。这是有意的，
+  与 `net/http`、x/net/http2 一致：服务端已经开始回应，说明已经处理了请求，重发 POST 会
+  执行两次；即使方法幂等，流式响应的回调可能已经把部分 body 交出去了，第二个响应无法接上，
+  而且第二次的响应也可能不同。没有收到任何响应数据的请求，方法幂等（GET、HEAD、OPTIONS、
+  TRACE）且 body 能重新读取（流式 body 要有 `GetBody`）时，在另一条连接上重发一次；被 GOAWAY
+  或 REFUSED_STREAM 标为未处理的请求不论方法都会重发，因为服务端声明了没有处理它。调用方
+  确认请求在部分响应后重发也安全时，可以自己再发一次。
+- **`Expect: 100-continue`**：带 body 和这个头的请求先单独发送 HEADERS，等服务端回 100、
+  或 `ClientConfig.ExpectContinueTimeout`（`DefaultClientConfig` 中为 1 秒；为零时立即发送
+  body）到期后再发送 DATA。如果先收到最终响应，它就是答复：body 不会发送，响应完整后
+  重置 stream。HTTP/1 和 HTTP/3 的请求也是如此。
 - 明文 HTTP/2 只支持 prior knowledge，不支持从 HTTP/1.1 `Upgrade: h2c` 升级。
-- 带 `Expect: 100-continue` 的请求不等 100 就发送 body（见上），所以服务端即使想拒绝
-  body 也仍然会收到。
 
 ## 有意没有实现的功能
 
@@ -214,5 +227,5 @@ CI 的 `Fuzz the parsers` job 每个目标跑 20 秒。还缺的是压测（例�
 - 发送侧对多个待发送 stream 做轮询或按权重调度，保证公平。
 - 发送时遵守对端的 `SETTINGS_MAX_HEADER_LIST_SIZE`。
 - 服务端：PING 保活；GOAWAY 后半关闭并排空输入，避免 RST。
-- 客户端：可选的 PING 健康检查、按负载选择连接、SETTINGS 确认超时检测。
-- 客户端可选地等待 100-continue 再发送 body。
+- 客户端：SETTINGS 确认超时检测。（PING 健康检查、按负载选择连接、等待 100-continue
+  已完成，见[客户端](#客户端)。）

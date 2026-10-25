@@ -270,6 +270,15 @@ func NewClient(engine *fib.Engine, config ClientConfig) *Client {
 // ContentLength, fails the request. A body that has been sent, wholly or in
 // part, can only be sent again, as a request that a closed connection or the
 // server turned away is, through req.GetBody; without it such a request fails.
+// A request whose connection fails before any of its response has arrived,
+// an HTTP/2 connection or an HTTP/1 one kept from an earlier request, is sent
+// again, once, on another connection when its method is idempotent and its
+// body can be read again, and so is one the server says it left unprocessed,
+// with GOAWAY or REFUSED_STREAM, whatever its method. One whose connection
+// fails after part of its response has arrived fails with the connection's
+// error, as with net/http: the server has acted on it, and a streaming
+// response's callback may have passed part of the body on already.
+//
 // A request with a body and "Expect: 100-continue" sends its header first and
 // its body once the server answers 100 (Continue), or once
 // ClientConfig.ExpectContinueTimeout has passed; a final response before

@@ -1028,11 +1028,15 @@ client.Do(req, func(resp *fibhttp.ClientResponse, err error) {
   http 与 https 即使地址相同也各自使用独立的连接池。
 - HTTP/2：https 默认在 ALPN 中提供 `h2`、`http/1.1`（`TLSConfig.NextProtos` 已设置时
   以它为准），服务端选择 h2 时自动走 HTTP/2，一个连接并发承载多个请求（数量受服务端
-  `MAX_CONCURRENT_STREAMS` 限制），对同一 host 只保持必要数量的连接。
+  `MAX_CONCURRENT_STREAMS` 限制），对同一 host 只保持必要数量的连接；有多条 HTTP/2 连接时，
+  新 stream 交给剩余额度最多的那条。
   `ClientConfig.DisableHTTP2` 强制 HTTP/1.1；`ClientConfig.UnencryptedHTTP2` 让 http://
   以 prior knowledge 方式直接使用明文 HTTP/2（h2c）。HTTP/2 上超时或取消只会用
   RST_STREAM 结束对应 stream，不影响同连接上的其他请求；收到 GOAWAY 或
-  REFUSED_STREAM 时，服务端未处理的请求会自动在新连接上重发。设置了 `Request.Trailer`
+  REFUSED_STREAM 时，服务端未处理的请求会自动在新连接上重发。设置
+  `ClientConfig.ReadIdleTimeout` 后，HTTP/2 连接在这么久没收到数据时发 PING，
+  `PingTimeout`（默认 15 秒）内仍无任何回应就认为连接已静默断开、关闭它，请求以
+  `ErrPingTimeout` 失败（满足重发条件的则在新连接上重发）；默认不开启。设置了 `Request.Trailer`
   的请求，trailer 会在 body 之后用单独的 HEADERS 帧发送（HTTP/1 上则是 chunked 的
   trailer）。
 - 每个 host:port 维护连接池：keep-alive 复用，`MaxConnsPerHost` 限制同时打开或正在
@@ -1049,7 +1053,13 @@ client.Do(req, func(resp *fibhttp.ClientResponse, err error) {
   `errors.Is(err, os.ErrDeadlineExceeded)`；取消请求的 context 同样会结束请求。被
   放弃的请求所在的 HTTP/1.1 连接会被关闭。
 - 复用的空闲连接如果已被服务端关闭、且没有收到任何响应字节，GET/HEAD/OPTIONS/TRACE
-  会在新连接上自动重试一次；其他方法直接返回错误。
+  会在新连接上自动重试一次；其他方法直接返回错误。已收到部分响应后连接断开的请求不论
+  方法都不重发（与 `net/http` 相同）：服务端已经处理了请求，流式响应的回调也可能已经交出
+  部分 body。
+- 带 body 和 `Expect: 100-continue` 的请求先只发请求头，收到 100 或
+  `ClientConfig.ExpectContinueTimeout`（`DefaultClientConfig` 中为 1 秒，为零时不等待）
+  到期后再发 body；先收到最终响应时 body 不再发送（HTTP/1 连接随之关闭，HTTP/2 stream
+  在响应完整后重置）。
 - 回调可能在任意 goroutine 上执行：成功的响应在读取它的 worker 上回调，超时和取消在
   定时器 goroutine 上，连接失败在 `fib-client` 协程池上，`Do` 立即拒绝的请求在调用方
   goroutine 上。回调不要长时间阻塞。
@@ -1264,7 +1274,9 @@ resp, err := client.Go(req).Wait()
 - 每个 host:port 一个 QUIC 连接，所有请求各占一个 stream 并发发送，数量受服务端
   MAX_STREAMS 限制，超出的请求排队，等服务端放开 stream 后自动发送。
 - 收到 GOAWAY 时，服务端未处理的请求和排队中的请求自动在新连接上发送；被服务端以
-  H3_REQUEST_REJECTED 重置的请求同样重发一次。
+  H3_REQUEST_REJECTED 重置的请求同样重发一次。已收到部分响应的请求不重发。
+- `Expect: 100-continue` 与 HTTP/1、HTTP/2 客户端相同：`ExpectContinueTimeout`（默认
+  1 秒）内等服务端的 100，先收到最终响应则不发送 body，并重置 stream 的发送方向。
 - 支持发送请求 trailer（`c.Request.Trailer`，名字会在 `Trailer` 头里声明）和接收响应 trailer。
 - `Timeout`、请求的 context 取消只重置对应 stream（H3_REQUEST_CANCELLED），不影响
   同连接上的其他请求；`HandshakeTimeout`、`MaxIdleTimeout`、`IdleConnTimeout` 分别
