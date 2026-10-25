@@ -402,3 +402,26 @@ func TestPusherFailsWithQueue(t *testing.T) {
 		t.Fatalf("drained %v, buffered %d", drained, p.Buffered())
 	}
 }
+
+// discardSink always has room and keeps nothing.
+type discardSink struct{}
+
+func (discardSink) Room() bool        { return true }
+func (discardSink) Send([]byte) error { return nil }
+func (discardSink) End() error        { return nil }
+func (discardSink) Fail(error)        {}
+
+// BenchmarkPusherWrite is a producer whose transport keeps up, writing
+// 64 KiB at a time.
+func BenchmarkPusherWrite(b *testing.B) {
+	p := NewPusher(0)
+	if err := p.Attach(discardSink{}, -1); err != nil {
+		b.Fatal(err)
+	}
+	buf := make([]byte, 64<<10)
+	b.SetBytes(int64(len(buf)))
+	b.ReportAllocs()
+	for b.Loop() {
+		_, _ = p.Write(buf)
+	}
+}
