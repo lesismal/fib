@@ -63,6 +63,13 @@ func (c *Conn) migrateLocked(now time.Time, first int) {
 	c.stopMTUDiscoveryLocked(now)
 	_, _ = rand.Read(c.challenge[:])
 	c.challengePending = true
+	// The challenge is a probe of the new path and goes as a probe timeout's
+	// would, past the congestion window: the window is still the old path's,
+	// and the packets in flight on it leave no room in it, while what the
+	// peer must hear first on the address it moved to is the challenge (RFC
+	// 9000 section 9.3). An acknowledgement that came due with it would
+	// otherwise be the first packet there, without the challenge.
+	c.spaces[spaceApp].probes = max(c.spaces[spaceApp].probes, 1)
 	// Three times the larger of the current PTO and the one for a new path
 	// (RFC 9000 section 8.2.4).
 	initial := newRTTStats()

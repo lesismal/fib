@@ -24,6 +24,9 @@ type serverPath struct {
 	df     atomic.Bool
 	mu     sync.Mutex
 	closed bool
+	// first is the first datagram the path carried, kept for a test that
+	// asks what the server's first packet to an address held.
+	first []byte
 }
 
 func (p *serverPath) SetDontFragment() error {
@@ -42,11 +45,21 @@ func (p *serverPath) Send(d []byte) error {
 	if p.black.Load() || p.mtu.Load() > 0 && len(d) > int(p.mtu.Load()) {
 		return nil
 	}
+	if p.first == nil {
+		p.first = bytes.Clone(d)
+	}
 	select {
 	case p.toClient <- bytes.Clone(d):
 	default:
 	}
 	return nil
+}
+
+// firstDatagram is the first datagram the path carried, or nil.
+func (p *serverPath) firstDatagram() []byte {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.first
 }
 
 func (p *serverPath) Close() error {
@@ -335,4 +348,75 @@ func TestServerGivesUpUnansweredPath(t *testing.T) {
 	p.n.current.Store(p.a)
 	waitFinished(t, p.clientH, s.ID())
 	p.echo(t, "after")
+}
+
+// openFirstPacket opens the first packet of d with c's 1-RTT receive keys,
+// as c did when the datagram arrived, and returns its payload. Callers hold
+// c.mu, the lock the keys are used under.
+func openFirstPacket(c *Conn, d []byte) ([]byte, error) {
+	pkt := bytes.Clone(d)
+	h, err := parseHeader(pkt, len(c.scid))
+	if err != nil {
+		return nil, err
+	}
+	rx := c.spaces[spaceApp].rx
+	if h.typ != packet1RTT || rx == nil {
+		return nil, errors.New("the datagram does not open with a 1-RTT packet")
+	}
+	largest := int64(c.spaces[spaceApp].recv.largest())
+	pn, n, ok := unprotect(pkt, h.pnOffset, rx.hp, largest)
+	if !ok {
+		return nil, errors.New("the packet number could not be read")
+	}
+	return rx.open(pkt, h.pnOffset+n, pn)
+}
+
+// A server that follows a client to an address that is another host's
+// validates it with the first packet it sends there: the PATH_CHALLENGE is
+// in it even though the congestion window, still the old path's and full of
+// its packets, has no room, since otherwise the acknowledgement that goes
+// first would leave without it (RFC 9000 section 9.3). The Interop Runner's
+// address rebinding testcase asks for exactly that.
+func TestServerChallengesNewAddressFirst(t *testing.T) {
+	p := newRebindPairWith(t, func(p *rebindPair) {
+		// A new port keeps the congestion window (RFC 9000 section 9.4); an
+		// address on another host starts the path afresh, as the NAT
+		// rebinding the testcase makes does.
+		p.b.addr = &net.UDPAddr{IP: net.IPv4(192, 0, 2, 2), Port: 2000}
+	})
+	p.echo(t, "before")
+	// The window the new path starts with is full of the old path's packets
+	// in flight, and then some, so no acknowledgement that arrives during
+	// the test frees it.
+	p.server.mu.Lock()
+	p.server.cc.bytesInFlight = 4 * p.server.cc.cwnd
+	p.server.mu.Unlock()
+	p.n.current.Store(p.b)
+	s, err := p.client.OpenStream()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Write([]byte("across"), true); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, "the server's first datagram on the new path", func() bool {
+		return p.b.firstDatagram() != nil
+	})
+	p.server.mu.Lock()
+	on := p.server.pc == PacketConn(p.b)
+	challenge := append([]byte{framePathChallenge}, p.server.challenge[:]...)
+	p.server.mu.Unlock()
+	if !on {
+		t.Fatalf("the server sends on %v, not on the address the client moved to", p.a.addr)
+	}
+	p.client.mu.Lock()
+	payload, err := openFirstPacket(p.client, p.b.firstDatagram())
+	p.client.mu.Unlock()
+	if err != nil {
+		t.Fatalf("the server's first datagram on the new path: %v", err)
+	}
+	if !bytes.Contains(payload, challenge) {
+		t.Fatalf("the server's first packet on the new address carried % x, without its PATH_CHALLENGE % x",
+			payload, challenge)
+	}
 }
