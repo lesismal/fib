@@ -463,7 +463,8 @@ func (c *Conn) framesWaiting(space int) bool {
 	if cs.next < cs.end() || cs.hasLost() {
 		return true
 	}
-	return space == spaceApp && (len(c.sendQueue) > 0 || c.handshakeDonePending || c.challengePending || c.maxDataPending ||
+	return space == spaceApp && (len(c.sendQueue) > 0 || c.handshakeDonePending || c.newTokenPending ||
+		c.challengePending || c.maxDataPending ||
 		c.maxStreamsBidiPending || c.maxStreamsUniPending || len(c.pathResponses) > 0 ||
 		len(c.retireCIDs) > 0 || c.cidsPending || c.blockedPending() || c.pingPending || c.ackFreqPending)
 }
@@ -487,6 +488,20 @@ func (c *Conn) appendControlFrames(b []byte, max int, sp *sentPacket) []byte {
 		b = append(b, frameHandshakeDone)
 		c.handshakeDonePending = false
 		sp.add(sentFrame{kind: sfHandshakeDone})
+	}
+	if c.newTokenPending {
+		// One token for a later connection, with its address in it (RFC
+		// 9000 section 8.1.3). It is not sent again if lost: the client
+		// then connects as one without a token, by its handshake and the
+		// amplification limit, or by a Retry.
+		token := c.config.TokenKey.NewToken(c.remote)
+		if n := 1 + VarintLen(uint64(len(token))) + len(token); fits(n) {
+			b = append(b, frameNewToken)
+			b = AppendVarint(b, uint64(len(token)))
+			b = append(b, token...)
+			c.newTokenPending = false
+			sp.ackEliciting = true
+		}
 	}
 	if c.maxDataPending && fits(1+VarintLen(c.recvMaxData)) {
 		b = append(b, frameMaxData)

@@ -15,7 +15,7 @@
 
 | 方向 | 内容 |
 | --- | --- |
-| QUIC | version 1；Initial、Handshake、1-RTT 三个包号空间；AES-128-GCM、AES-256-GCM、ChaCha20-Poly1305 包保护与头部保护；双向 key update（本端按 AEAD 使用上限或可选的时间间隔主动发起，也响应对端发起）与解密失败次数上限；服务端负载高时发送 Retry，客户端处理 Retry；Version Negotiation；stateless reset；RFC 9002 丢包检测、PTO 与持续拥塞判定；CUBIC（RFC 9438，默认）或 NewReno 拥塞控制，带 pacing 和应用受限判断；HyStart++（RFC 9406），初始慢启动在 RTT 上升时提前退出；ACK_FREQUENCY（draft-ietf-quic-ack-frequency），大流量传输时协商使用；服务端 3 倍放大限制；连接级与 stream 级双向流控及 BLOCKED 帧；MAX_STREAMS；用 NEW_CONNECTION_ID 签发、可退役的 Connection ID；draining 期；空闲超时与可选 keep-alive |
+| QUIC | version 1；Initial、Handshake、1-RTT 三个包号空间；AES-128-GCM、AES-256-GCM、ChaCha20-Poly1305 包保护与头部保护；双向 key update（本端按 AEAD 使用上限或可选的时间间隔主动发起，也响应对端发起）与解密失败次数上限；服务端负载高时发送 Retry、客户端处理 Retry，以及 NEW_TOKEN：同一地址上后一个连接可以借此省掉 Retry；Version Negotiation；stateless reset；RFC 9002 丢包检测、PTO 与持续拥塞判定；CUBIC（RFC 9438，默认）或 NewReno 拥塞控制，带 pacing 和应用受限判断；HyStart++（RFC 9406），初始慢启动在 RTT 上升时提前退出；ACK_FREQUENCY（draft-ietf-quic-ack-frequency），大流量传输时协商使用；服务端 3 倍放大限制；连接级与 stream 级双向流控及 BLOCKED 帧；MAX_STREAMS；用 NEW_CONNECTION_ID 签发、可退役的 Connection ID；draining 期；空闲超时与可选 keep-alive |
 | 服务端 | 与 HTTP/1、HTTP/2 共用同一个 `Handler` 和 `Context`；1xx 中间响应、自动 100 Continue、请求与响应 trailer、`Response.Close` 通过 GOAWAY 优雅关闭、413/431/417、非法请求（含 `:authority` 与 `Host` 不一致）以 H3_MESSAGE_ERROR 重置、协议错误按 RFC 9114 / RFC 9204 错误码关闭连接、`Request.TLS`、`AltSvc` 辅助函数、Extended CONNECT（RFC 9220）经 `Context.Upgrade` 切换为隧道，`websocket.ServerHandler.Upgrade` 即借此提供 WebSocket over HTTP/3 |
 | 客户端 | 异步 `Do`/`Go`；每个 host:port 一条连接、多路复用；遵守 MAX_STREAMS 并排队；取消只重置单个 stream；GOAWAY 与 H3_REQUEST_REJECTED 的请求自动在新连接上重发；`Expect: 100-continue` 等待 100；请求与响应 trailer；对端违反协议时按错误码关闭连接；`AltSvcClient` 把它和 `http.Client` 组合起来按 `Alt-Svc`（RFC 7838）切换，并在失败时回退 TCP |
 | 一致性 | 与 quic-go 客户端、服务端双向互通，以及用手写帧构造的协议错误用例，都在 CI 中运行 |
@@ -249,7 +249,6 @@
 | 主动连接迁移 | 服务端已为每个连接签发并路由多个 Connection ID，但 PATH_CHALLENGE 在当前发送的路径上回复，而不是挑战到达的路径，客户端迁移前探测新路径无法完成验证；新路径上也仍向客户端的第一个 Connection ID 发送。NAT 重绑定（无论客户端是否换了 CID）会被跟随（见上）。 |
 | QPACK 动态表 | 两端都声明容量为 0：不会出现 blocked stream 造成的队头阻塞，编码器流和解码器流都没有内容，也没有额外的状态和内存。代价是重复出现的 header 每次都要完整发送。 |
 | Server push | 主流浏览器都不启用 HTTP/3 push。客户端不发 MAX_PUSH_ID，`Context.Push` 返回 `http.ErrNotSupported`。预加载推荐用 103 Early Hints（`WriteInterim`）。 |
-| NEW_TOKEN | 服务端在负载高时发送 Retry（见[待优化项](#1-正确性与安全加固)），但不发 NEW_TOKEN，所以客户端的下一个连接要重新验证地址：靠握手本身和 3 倍放大限制，或再一次 Retry。客户端会忽略 NEW_TOKEN。 |
 | QUIC v2（RFC 9369）等其他版本 | 部署上 version 1 已足够。客户端收到 Version Negotiation 时直接失败。 |
 | DATAGRAM（RFC 9221）、WebTransport | 依赖流式 stream 或不可靠数据报的 API，当前 handler 模型不支持。对端发来的 DATAGRAM 帧会被当作未知帧，连接以 FRAME_ENCODING_ERROR 关闭。 |
 | RFC 9218 可扩展优先级 | 在“body 整体缓存”的模型下，调度收益有限。 |
@@ -279,8 +278,15 @@
 - **握手资源消耗**：进行中的握手超过 `Config.RetryHandshakes`（默认 1024；小于 0 表示
   总是）时，新客户端先收到 Retry，它带回的令牌证明了源地址之后，服务端才做 TLS 运算、
   保存状态；超过 `Config.MaxHandshakes`（默认 4096）时新客户端的 Initial 被丢弃。
-  不合格的令牌（来自别的地址，或已超过 10 秒）以 INVALID_TOKEN 回应。令牌的 key 由每个
-  handler 随机生成，所以同一地址后面的另一台服务端不认这台发出的 Retry。
+  不合格的 Retry 令牌（来自别的地址，或已超过 10 秒）以 INVALID_TOKEN 回应。令牌的 key
+  由每个 handler 随机生成，所以同一地址后面的另一台服务端不认这台发出的 Retry。
+  握手完成之后，服务端再给客户端一个 NEW_TOKEN 令牌（RFC 9000 8.1.3 节），绑定客户端
+  的地址、有效期 10 分钟：同一地址上的后一个连接把它放在第一个 Initial 里，服务端就
+  直接把地址视为已验证，既省掉 Retry 的一个往返，也不必先为它做 TLS 运算。来自别的
+  地址、已经过期、或由服务端已不持有的 key 签出的 NEW_TOKEN 等同于没有令牌：连接按
+  新客户端的方式开始，服务端可以再发 Retry，而不是关闭连接。客户端用一个每个
+  `Client` 一份的缓存保存少数几个地址的令牌，每个 5 分钟；
+  `Transport.DisableNewTokens` 可以在任一端关掉这套机制。
 - **closing / draining 状态**：3×PTO 的 closing 期，其间对到达的包重发
   CONNECTION_CLOSE；收到对端 CONNECTION_CLOSE 后同样长的 draining 期，期间不发送；
   可配置固定的 stateless reset key（`Config.StatelessResetKey`）；`Engine.Close` 时给连接
@@ -382,7 +388,7 @@
 - 0-RTT 与 quiche、quic-go 之外更多服务端的互通，以及共享票据密钥的多台服务端之间的重放（票据登记表是每个进程一份）。
 - 压测才能暴露的并发问题。帧解析、请求构造、QPACK 解码、QUIC 包头、传输参数和帧处理
   都有 fuzz 目标，CI 的 `Fuzz the parsers` job 每个目标跑 20 秒。
-- QPACK 动态表、服务端推送、`NEW_TOKEN`、DATAGRAM 和 ECN 都未实现，无法测试；
+- QPACK 动态表、服务端推送、DATAGRAM 和 ECN 都未实现，无法测试；
   [QUIC Interop Runner](#quic-interop-runner) 端点会把 ECN 用例如实报成“不支持”，
   而不是让它悄悄通过。
 

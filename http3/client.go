@@ -178,9 +178,13 @@ type Client struct {
 	config    ClientConfig
 	tlsConfig *tls.Config
 	sessions  fibtls.QUICSessionCache
-	mu        sync.Mutex
-	conns     map[string]*clientConn
-	closed    bool
+	// tokens keeps what servers send in NEW_TOKEN frames, for a later
+	// connection to the same address (see quic.TokenCache); nil when
+	// Transport.DisableNewTokens is set.
+	tokens *quic.TokenCache
+	mu     sync.Mutex
+	conns  map[string]*clientConn
+	closed bool
 
 	resumed, earlySent, earlyAccepted, earlyRejected, tooEarly atomic.Uint64
 }
@@ -235,7 +239,15 @@ func NewClient(engine *fib.Engine, config ClientConfig) *Client {
 	if sessions == nil && config.EarlyData {
 		sessions = fibtls.NewQUICSessionCache(64)
 	}
-	return &Client{engine: engine, config: config, tlsConfig: tlsConfig, sessions: sessions, conns: make(map[string]*clientConn)}
+	// Every connection of the client keeps the tokens its servers send in
+	// one cache, so that a later connection to a server from the same
+	// address can skip the Retry it would be asked for under load.
+	var tokens *quic.TokenCache
+	if !config.Transport.DisableNewTokens {
+		tokens = quic.NewTokenCache()
+	}
+	return &Client{engine: engine, config: config, tlsConfig: tlsConfig, sessions: sessions, tokens: tokens,
+		conns: make(map[string]*clientConn)}
 }
 
 // Do sends req and calls callback exactly once with its response or the
@@ -820,6 +832,10 @@ func (cc *clientConn) dial() {
 			NewTLS:           c.newTLS(),
 			MaxIdleTimeout:   c.config.MaxIdleTimeout,
 			HandshakeTimeout: c.config.HandshakeTimeout,
+			// A token the server gave an earlier connection from this
+			// address, which saves the Retry it would otherwise be asked
+			// for under load (RFC 9000 section 8.1.3).
+			TokenCache: c.tokens,
 			// The client sends 1200 bytes until discovery finds more.
 			DisablePathMTUDiscovery: c.config.DisablePathMTUDiscovery,
 			MaxProbeDatagramSize:    c.config.MaxProbeDatagramSize,

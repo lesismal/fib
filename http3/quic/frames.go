@@ -217,6 +217,11 @@ func (c *Conn) handleFrames(space int, payload []byte, now time.Time) (bool, err
 				err = transportErr(errProtocolViolation, "NEW_TOKEN from a client")
 			} else if !r.bad && len(token) == 0 {
 				err = transportErr(errFrameEncoding, "empty NEW_TOKEN")
+			} else if !r.bad && !c.config.DisableNewTokens {
+				// The token goes back with the first Initial of a later
+				// connection from this address, which saves the Retry it
+				// would otherwise be asked for (RFC 9000 section 8.1.3).
+				c.config.TokenCache.remember(c.remote, token, now)
 			}
 		case typ >= frameStream && typ <= frameStream|7:
 			id := r.varint()

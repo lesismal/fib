@@ -117,8 +117,15 @@ client of `rebind-*` and `connectionmigration` is `transfer`. The client
 side of `chacha20`, and both sides of `ecn`, `v2` and `versionnegotiation`,
 exit 127, which the runner records as unsupported rather than failed.
 
+The server endpoint also sends a `NEW_TOKEN` frame after every handshake
+(RFC 9000 section 8.1.3), which no testcase looks for: the runner's clients
+make each connection from a new UDP socket, hence a new source port, while a
+token is bound to the address it was made for, so it is no token at all to
+the server, which falls back to the usual path. `retry` still sees exactly
+one Retry, and a client that comes back from the same address skips one.
+
 Outside what the runner checks: fib does not implement the QPACK dynamic
-table, server push, `NEW_TOKEN`, DATAGRAM or ECN, and its HTTP/3 stack serves
+table, server push, DATAGRAM or ECN, and its HTTP/3 stack serves
 requests with the static table only. The `http3` testcase therefore checks
 one transaction over parallel streams, not those features. `QLOGDIR` is
 accepted but fib writes no qlog.

@@ -126,11 +126,18 @@ func (s *rawServer) handle(addr *net.UDPAddr, data []byte) {
 		}
 		return
 	}
-	if s.forceRetry && s.tokenKey.Check(data, addr) == quic.TokenMissing {
-		if retry := s.tokenKey.Retry(data, addr); retry != nil {
-			_, _ = s.sock.WriteToUDP(retry, addr)
+	// The retry testcase wants a Retry for a client without a good token: one
+	// that has none, or whose NEW_TOKEN token is not good, which is no token
+	// at all (RFC 9000 section 8.1.3). An Initial whose Retry token is not
+	// good goes to Accept, which answers it with INVALID_TOKEN.
+	if s.forceRetry {
+		status, kind := s.tokenKey.CheckToken(data, addr)
+		if status != quic.TokenValid && kind != quic.TokenKindRetry {
+			if retry := s.tokenKey.Retry(data, addr); retry != nil {
+				_, _ = s.sock.WriteToUDP(retry, addr)
+			}
+			return
 		}
-		return
 	}
 	conn := &rawServerConn{s: s, www: s.www, streams: make(map[uint64]*rawRequest)}
 	qc := quic.Accept(path, addr, s.config, conn, data)

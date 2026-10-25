@@ -93,7 +93,7 @@ func TestRetryTokenChecks(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got, _ := k.check(h.token, addr, []byte("otherCID")); got != TokenMissing {
+	if got, _, _ := k.check(h.token, addr, []byte("otherCID")); got != TokenMissing {
 		t.Fatalf("to another connection ID: %v", got)
 	}
 }

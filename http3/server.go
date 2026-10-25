@@ -118,8 +118,13 @@ type Config struct {
 	// a round trip, but spares the server the TLS work, and the state, of an
 	// Initial whose source address is forged, which a flood of them would
 	// otherwise have it spend on each until MaxHandshakes turned everyone
-	// away. Below zero, RetryHandshakes asks every client. Zero means
-	// DefaultMaxHandshakes and DefaultRetryHandshakes.
+	// away. A client whose handshake completes is given a NEW_TOKEN token,
+	// good for 10 minutes and bound to its address (RFC 9000 section
+	// 8.1.3): its next connection from that address carries the token in
+	// its first Initial, and is taken in without the Retry. Below zero,
+	// RetryHandshakes asks every client. Zero means DefaultMaxHandshakes and
+	// DefaultRetryHandshakes. Transport.DisableNewTokens turns the tokens
+	// off.
 	MaxHandshakes   int
 	RetryHandshakes int
 	// StatelessResetKey, if set, is the key the server's stateless reset
@@ -449,8 +454,9 @@ func (h *ServerHandler) pathFor(peer *udpPeer, cid, data []byte) *peerPath {
 
 // admit reports whether a client's Initial in data, from c's address, may
 // start a connection, given the handshakes under way: past MaxHandshakes it
-// may not, and past RetryHandshakes, one without a token from the server's
-// Retry is answered with a Retry instead (see Config.MaxHandshakes).
+// may not, and past RetryHandshakes, one without a good token is answered
+// with a Retry instead (see Config.MaxHandshakes), or told why the token it
+// has is not good (see quic.Config.TokenKey).
 func (h *ServerHandler) admit(c *fib.Connection, data []byte) bool {
 	n := h.handshakes.Load()
 	if n >= int64(h.config.MaxHandshakes) {
@@ -461,9 +467,17 @@ func (h *ServerHandler) admit(c *fib.Connection, data []byte) bool {
 		return true
 	}
 	addr := c.RemoteAddr()
-	if h.tokenKey.Check(data, addr) != quic.TokenMissing {
-		// A good token is let in, and one that is not good is told so by
-		// Accept.
+	status, kind := h.tokenKey.CheckToken(data, addr)
+	switch {
+	case status == quic.TokenValid:
+		// A token of a Retry, or of a NEW_TOKEN frame of an earlier
+		// connection from this address: the client's address is its own,
+		// and no Retry is needed (RFC 9000 section 8.1.3).
+		return true
+	case status == quic.TokenInvalid && kind == quic.TokenKindRetry:
+		// Accept answers an Initial whose Retry token is not good with
+		// INVALID_TOKEN: the client takes no second Retry (RFC 9000
+		// section 8.1.2).
 		return true
 	}
 	if packet := h.tokenKey.Retry(data, addr); packet != nil {

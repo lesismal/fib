@@ -165,11 +165,30 @@ type Config struct {
 	ConnReceiveWindow   uint64
 	// ResetKey, on a server, lets its peers recognize stateless resets.
 	ResetKey *ResetKey
-	// TokenKey, on a server, checks the token of a client Initial that
-	// answers the server's Retry (see TokenKey.Retry): Accept takes a good
-	// one as proof of the client's address, and answers one it made that
-	// is not good with INVALID_TOKEN. Without it, a token is ignored.
+	// TokenKey, on a server, makes and checks the tokens of its Retry
+	// packets (see TokenKey.Retry) and NEW_TOKEN frames (see
+	// TokenKey.NewToken). Accept takes a good one as proof of the client's
+	// address; a Retry token it made that is not good is answered with
+	// INVALID_TOKEN, and a NEW_TOKEN one that is not leaves the client as
+	// one without a token. Without a key, a token is ignored, and a server
+	// sends no NEW_TOKEN.
 	TokenKey *TokenKey
+	// Token, on a client, is a token that an earlier connection to the same
+	// server address was given in a NEW_TOKEN frame, which the first Initial
+	// carries so that the server may take the client's address as proven,
+	// without a Retry (RFC 9000 section 8.1.3). Config.TokenCache keeps
+	// such tokens for the client; this is for one the application kept.
+	// Disabled by DisableNewTokens.
+	Token []byte
+	// TokenCache, on a client, keeps the tokens that servers send in
+	// NEW_TOKEN frames, for a later connection from the same address, and
+	// looks one up for the first Initial (see TokenCache). Config.Token
+	// takes its place. Nil keeps none.
+	TokenCache *TokenCache
+	// DisableNewTokens turns NEW_TOKEN off: a server sends none, and a
+	// client neither keeps the ones it is sent nor sends one, Config.Token
+	// included.
+	DisableNewTokens bool
 	// ExcessiveLoadCode is the application error code a connection closes
 	// with once its peer has made it do more work without asking for
 	// anything than it allows: PING after PING, say, or streams opened and
@@ -515,8 +534,12 @@ type Conn struct {
 	sendQueue                     []*Stream
 
 	handshakeDonePending bool
-	pingPending          bool
-	pathResponses        [][8]byte
+	// newTokenPending says a NEW_TOKEN frame is to go out, once, with the
+	// first 1-RTT packet after the handshake (RFC 9000 section 8.1.3): a
+	// server arms it only for a client whose address is validated.
+	newTokenPending bool
+	pingPending     bool
+	pathResponses   [][8]byte
 
 	// A server's path migration (see migrateLocked). pathValidated says the
 	// path the connection sends on is known to reach the peer. While it is
@@ -766,6 +789,19 @@ func Dial(pc PacketConn, remote net.Addr, config Config, handler Handler) (*Conn
 	c := newConn(pc, remote, config, handler, true)
 	c.odcid = randomCID()
 	c.dcid = c.odcid
+	if !config.DisableNewTokens {
+		// A token of an earlier connection from this address, which the
+		// server may take the address as proven from, rather than ask for a
+		// Retry (RFC 9000 section 8.1.3). One the server does not take is
+		// no worse than none: it answers with a Retry, or treats the client
+		// as any new one.
+		if cache := config.TokenCache; cache != nil {
+			c.token = bytes.Clone(cache.token(remote, c.created))
+		}
+		if len(config.Token) > 0 {
+			c.token = bytes.Clone(config.Token)
+		}
+	}
 	c.spaces[spaceInitial].tx, c.spaces[spaceInitial].rx = initialKeys(c.odcid, true)
 	c.tls = c.newTLS()
 	c.tls.SetTransportParameters(c.local.encode())
@@ -789,25 +825,36 @@ func Dial(pc PacketConn, remote net.Addr, config Config, handler Handler) (*Conn
 // datagram, which IsInitial has approved. It returns nil if the datagram
 // does not start a connection after all.
 //
-// A datagram whose token Config.TokenKey made for the client, in a Retry
-// that it answers, starts a connection whose client address is known to be
-// its own; one whose token the key made but is not good is answered with
-// INVALID_TOKEN, and starts none.
+// A datagram whose token Config.TokenKey made for the client starts a
+// connection whose client address is known to be its own: the token of a
+// Retry that the client answers (RFC 9000 section 8.1.2), or one of an
+// earlier NEW_TOKEN frame from the same address (section 8.1.3). A Retry
+// token the key made but is not good is answered with INVALID_TOKEN, and
+// starts none; a NEW_TOKEN token that is not good starts a connection whose
+// address is validated as any new client's, by its handshake and the 3x
+// amplification limit, or by a Retry.
 func Accept(pc PacketConn, remote net.Addr, config Config, handler Handler, datagram []byte) *Conn {
 	h, err := parseHeader(datagram, cidLen)
 	if err != nil || h.typ != packetInitial || len(h.dcid) < 8 || config.TLSConfig == nil {
 		return nil
 	}
 	odcid := h.dcid
-	retried := false
+	retried, validated := false, false
 	if k := config.TokenKey; k != nil && len(h.token) > 0 {
-		status, first := k.check(h.token, remote, h.dcid)
-		switch status {
-		case TokenInvalid:
+		status, kind, first := k.check(h.token, remote, h.dcid)
+		switch {
+		case status == TokenInvalid && kind == TokenKindRetry:
+			// A client that has had its Retry takes no other (RFC 9000
+			// section 8.1.2).
 			sendInvalidToken(pc, h)
 			return nil
-		case TokenValid:
+		case status == TokenValid && kind == TokenKindRetry:
 			odcid, retried = first, true
+		case status == TokenValid && kind == TokenKindNew:
+			// The token was made for a connection from this address that
+			// finished its handshake, which proves the address its own
+			// without a Retry (RFC 9000 section 8.1.3).
+			validated = true
 		}
 	}
 	c := newConn(pc, remote, config, handler, false)
@@ -823,6 +870,10 @@ func Accept(pc PacketConn, remote net.Addr, config Config, handler Handler, data
 		// Retry it had came from this server.
 		c.addressValidated = true
 		c.local.retrySCID, c.local.hasRetrySCID = c.odcid, true
+	} else if validated {
+		// Likewise for a NEW_TOKEN token, which was proof enough before the
+		// handshake began; there is no Retry for the client to check.
+		c.addressValidated = true
 	}
 	c.local.disableMigration = true
 	if config.ResetKey != nil {
@@ -1944,6 +1995,10 @@ func (c *Conn) onHandshakeComplete() error {
 	if !c.isClient {
 		c.handshakeDonePending = true
 		c.confirmHandshake()
+		// The client's address is its own now, by the handshake or the
+		// token that came before it: it may be given one to carry into a
+		// later connection (RFC 9000 section 8.1.3).
+		c.queueNewTokenLocked()
 		if tc := c.config.TLSConfig; !tc.SessionTicketsDisabled {
 			opts := tls.QUICSessionTicketOptions{}
 			if c.config.EarlyData {
@@ -2009,6 +2064,15 @@ func (c *Conn) confirmHandshake() {
 	c.issueCIDsLocked()
 }
 
+// queueNewTokenLocked has a server send the client one token for a later
+// connection, if it can: not before the client's address is validated, since
+// the token is proof of it (RFC 9000 section 8.1.3). The frame goes with the
+// first 1-RTT packet, once, and is not sent again if that is lost: a client
+// without a token connects as it always did. Callers hold c.mu.
+func (c *Conn) queueNewTokenLocked() {
+	c.newTokenPending = c.config.TokenKey != nil && !c.config.DisableNewTokens && c.addressValidated
+}
+
 func (c *Conn) handleVersionNegotiation(d []byte) {
 	if c.heardPeer {
 		return
@@ -2040,6 +2104,11 @@ func (c *Conn) handleRetry(pkt []byte, h header) {
 	}
 	c.retrySCID = bytes.Clone(h.scid)
 	c.dcid = c.retrySCID
+	if c.token != nil {
+		// A token this connection sent, of an earlier NEW_TOKEN frame, was
+		// not taken: the server asks for a Retry anyway.
+		c.config.TokenCache.forget(c.remote)
+	}
 	c.token = bytes.Clone(h.token[:len(h.token)-16])
 	s := &c.spaces[spaceInitial]
 	s.tx, s.rx = initialKeys(c.dcid, true)
@@ -2154,6 +2223,14 @@ func (c *Conn) terminateLocked(err error) {
 	}
 	c.closed = true
 	c.closeErr = err
+	if c.isClient && !c.handshakeComplete {
+		// A server that closes a client's first flight with INVALID_TOKEN
+		// did not take the token it carried; a later connection should not
+		// offer it again.
+		if te, ok := err.(*TransportError); ok && te.Remote && te.Code == errInvalidToken {
+			c.config.TokenCache.forget(c.remote)
+		}
+	}
 	if c.timer != nil {
 		c.timer.Stop()
 	}

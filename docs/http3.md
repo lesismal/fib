@@ -17,7 +17,7 @@ from scratch. The TLS 1.3 handshake is the standard library's
 
 | Area | Content |
 | --- | --- |
-| QUIC | Version 1; Initial, Handshake and 1-RTT packet number spaces; AES-128-GCM, AES-256-GCM and ChaCha20-Poly1305 packet and header protection; key updates in both directions (started here when a key reaches its AEAD limit, or optionally after a time, and answered when the peer starts one) and a limit on decryption failures; Retry, sent by the server under load and handled by the client; Version Negotiation; stateless reset; RFC 9002 loss detection, PTO and persistent congestion; CUBIC (RFC 9438, the default) or NewReno congestion control, with pacing and app-limited detection; HyStart++ (RFC 9406), which leaves the initial slow start on a rise in the round-trip time; ACK_FREQUENCY (draft-ietf-quic-ack-frequency), which a bulk transfer asks for; the server's 3x amplification limit; connection- and stream-level flow control in both directions, with BLOCKED frames; MAX_STREAMS; Connection IDs issued with NEW_CONNECTION_ID and retired; a draining period; idle timeout and optional keep-alive |
+| QUIC | Version 1; Initial, Handshake and 1-RTT packet number spaces; AES-128-GCM, AES-256-GCM and ChaCha20-Poly1305 packet and header protection; key updates in both directions (started here when a key reaches its AEAD limit, or optionally after a time, and answered when the peer starts one) and a limit on decryption failures; Retry, sent by the server under load and handled by the client, and NEW_TOKEN, so that a later connection from the same address skips the Retry; Version Negotiation; stateless reset; RFC 9002 loss detection, PTO and persistent congestion; CUBIC (RFC 9438, the default) or NewReno congestion control, with pacing and app-limited detection; HyStart++ (RFC 9406), which leaves the initial slow start on a rise in the round-trip time; ACK_FREQUENCY (draft-ietf-quic-ack-frequency), which a bulk transfer asks for; the server's 3x amplification limit; connection- and stream-level flow control in both directions, with BLOCKED frames; MAX_STREAMS; Connection IDs issued with NEW_CONNECTION_ID and retired; a draining period; idle timeout and optional keep-alive |
 | Server | Shares one `Handler` and `Context` with HTTP/1 and HTTP/2; 1xx interim responses, automatic 100 Continue, request and response trailers, graceful `Response.Close` via GOAWAY, 413/431/417, malformed requests (including an `:authority` and `Host` that disagree) reset with H3_MESSAGE_ERROR, protocol errors closing the connection with RFC 9114 and RFC 9204 codes, `Request.TLS`, an `AltSvc` helper, extended CONNECT (RFC 9220) switched to a tunnel with `Context.Upgrade`, which is how `websocket.ServerHandler.Upgrade` serves WebSocket over HTTP/3 |
 | Client | Asynchronous `Do`/`Go`; one multiplexed connection per host:port; honors MAX_STREAMS and queues the rest; cancellation resets only its own stream; requests the server marks as unprocessed (GOAWAY, H3_REQUEST_REJECTED) are retried on a new connection; `Expect: 100-continue` waits for the 100; request and response trailers; a peer that breaks the protocol ends the connection with its error code; `AltSvcClient` composes it with an `http.Client` to follow `Alt-Svc` (RFC 7838) and fall back to TCP |
 | Resumption and 0-RTT | Session tickets, resumption, and 0-RTT early data, for the server (`Config.EarlyData`) and the client (`ClientConfig.EarlyData`); see [0-RTT](#0-rtt) |
@@ -353,7 +353,6 @@ uses, resumes and sends early data through the same QUIC code.
 | Active connection migration | The server issues and routes several Connection IDs per connection, but answers PATH_CHALLENGE on the path it sends on, not the one the challenge came from, so a client probing a new path before it moves would not validate it; it also keeps sending to the client's first Connection ID on the new path. A NAT rebinding is followed, with the client's Connection ID changed or not (see above). |
 | QPACK dynamic table | Both sides advertise a capacity of 0: no head-of-line blocking from blocked streams, silent encoder and decoder streams, and no extra state or memory. The cost is that repeated headers are sent in full every time. |
 | Server push | No major browser enables HTTP/3 push. The client sends no MAX_PUSH_ID, and `Context.Push` returns `http.ErrNotSupported`. Use 103 Early Hints (`WriteInterim`) for preloading. |
-| NEW_TOKEN | The server sends Retry under load (see [Planned improvements](#1-correctness-and-hardening)), but no NEW_TOKEN, so a client's next connection is validated afresh: by its handshake and the 3x amplification limit, or by another Retry. The client ignores NEW_TOKEN. |
 | QUIC v2 (RFC 9369) and other versions | Version 1 is enough in practice. The client fails on Version Negotiation. |
 | DATAGRAM (RFC 9221), WebTransport | They need APIs for streaming or unreliable datagrams, which the current handler model lacks. A DATAGRAM frame from the peer is an unknown frame and closes the connection with FRAME_ENCODING_ERROR. |
 | RFC 9218 extensible priorities | With whole bodies, scheduling gains little. |
@@ -391,9 +390,21 @@ Done:
   (1024 by default; below zero, always), a new client is first sent a Retry,
   whose token proves its address before the server does any TLS work or keeps
   any state for it; past `Config.MaxHandshakes` (4096) its Initial is dropped.
-  A token that is not good, from another address or more than 10 seconds old,
-  is answered with INVALID_TOKEN. The tokens' key is random to each handler,
-  so a Retry from one server is not good at another behind the same address.
+  A Retry token that is not good, from another address or more than 10 seconds
+  old, is answered with INVALID_TOKEN. The tokens' key is random to each
+  handler, so a Retry from one server is not good at another behind the same
+  address.
+  A server that completes a handshake gives the client a token in a NEW_TOKEN
+  frame in return (RFC 9000 section 8.1.3), bound to the client's address and
+  good for 10 minutes: a later connection from that address carries it in
+  its first Initial, and the server takes the address as proven, without the
+  Retry's round trip (or its TLS work before the token is checked). A token
+  of a NEW_TOKEN frame from another address, expired, or made with a key the
+  server no longer has is no token at all: the connection starts as any new
+  client's would, and the server may send a Retry instead of closing it. A
+  client keeps tokens for a few addresses at most, for five minutes each, in
+  one cache per `Client`; `Transport.DisableNewTokens` turns the exchange off
+  on either side.
 - **Closing and draining states**: the 3×PTO closing period, with
   CONNECTION_CLOSE sent again to what arrives in it, and as long a draining
   period after the peer's CONNECTION_CLOSE, sending nothing; a fixed stateless reset
@@ -552,7 +563,7 @@ What is still not covered end to end:
   requests, QPACK decoding, QUIC packet headers, transport parameters and
   frame handling all have fuzz targets, which the `Fuzz the parsers` CI job
   runs for 20 seconds each.
-- QPACK's dynamic table, server push, `NEW_TOKEN`, DATAGRAM and ECN are not
+- QPACK's dynamic table, server push, DATAGRAM and ECN are not
   implemented, so no test can cover them. The [QUIC Interop
   Runner](#quic-interop-runner) endpoint reports the ECN testcase as
   unsupported rather than passing it silently.

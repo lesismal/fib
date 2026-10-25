@@ -56,6 +56,14 @@ type TransportConfig struct {
 	// ActiveConnectionIDs is how many connection IDs a connection gives its
 	// peer to send to at once, as many as the peer allows. Default 4.
 	ActiveConnectionIDs int
+	// DisableNewTokens turns NEW_TOKEN off (RFC 9000 section 8.1.3). By
+	// default a server gives each client that completes a handshake a
+	// token, and a client keeps the ones it is given and sends one with the
+	// first Initial of a later connection from the same address: the server
+	// then takes the address as proven, without a Retry, which is a round
+	// trip saved under load. A token is bound to the address, and good for
+	// 10 minutes; see quic.Config.TokenCache for what the client keeps.
+	DisableNewTokens bool
 }
 
 // apply sets what the TransportConfig sets in a QUIC config.
@@ -69,4 +77,5 @@ func (t TransportConfig) apply(c *quic.Config) {
 	c.ControlFrameBurst, c.ControlFrameRate = t.ControlFrameBurst, t.ControlFrameRate
 	c.KeyUpdateInterval = t.KeyUpdateInterval
 	c.ActiveConnectionIDs = t.ActiveConnectionIDs
+	c.DisableNewTokens = t.DisableNewTokens
 }
