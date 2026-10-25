@@ -562,8 +562,10 @@ not such a CONNECT.
   handler once its body has arrived, bounded by `MaxBodyBytes`. Setting
   `Config.StreamRequestBody` lifts this; see
   [Streaming request bodies](#streaming-request-bodies).
-- **Client response bodies are buffered whole**, bounded by
-  `MaxResponseBodyBytes`; the client has no streaming download.
+- **Client response bodies are buffered whole by default**, bounded by
+  `MaxResponseBodyBytes`. Setting `ClientConfig.StreamResponseBody` hands a
+  large body to the callback as it arrives instead, bounded by
+  `MaxStreamedBodyBytes`; see the [guide](guide.zh-CN.md#http-子-package).
 - **The client does not pipeline**: one request per HTTP/1 connection at a
   time.
 - **A response is ended when the last hold on it goes**, which for a handler

@@ -390,7 +390,9 @@ TLS 1.3 或 1.2 的 AES-GCM，TLS 1.2 或 1.1 的 AES-CBC）：
 - **请求 body 默认整体缓存**：body 收完后才调用 handler，受 `MaxBodyBytes` 限制。设置
   `Config.StreamRequestBody` 后不再受此限制，见
   [流式请求 body](#流式请求-body)。
-- **客户端响应 body 整体缓存**：受 `MaxResponseBodyBytes` 限制，客户端没有流式下载。
+- **客户端响应 body 默认整体缓存**：受 `MaxResponseBodyBytes` 限制。设置
+  `ClientConfig.StreamResponseBody` 后大 body 边到边交给回调，受
+  `MaxStreamedBodyBytes` 限制，见[使用指南](guide.zh-CN.md#http-子-package)。
 - **客户端不做 pipelining**：一个 HTTP/1 连接同时只有一个请求。
 - **响应在最后一个引用释放时结束**：什么都不 Retain 的 handler 就是它自己返回的时候，
   与 `net/http` 一致。要稍后回复、或者要在其他 goroutine 里接着写的 handler 先
