@@ -380,8 +380,12 @@
 - 0-RTT 与 quiche、quic-go 之外更多服务端的互通，以及共享票据密钥的多台服务端之间的重放（票据登记表是每个进程一份）。
 - 压测才能暴露的并发问题。帧解析、请求构造、QPACK 解码、QUIC 包头、传输参数和帧处理
   都有 fuzz 目标，CI 的 `Fuzz the parsers` job 每个目标跑 20 秒。
-- 可以考虑接入 [QUIC Interop Runner](https://github.com/quic-interop/quic-interop-runner)，
-  与更多实现（quiche、ngtcp2、mvfst 等）持续做互通测试。
+- QPACK 动态表、服务端推送、`NEW_TOKEN`、DATAGRAM 和 ECN 都未实现，无法测试；
+  [QUIC Interop Runner](#quic-interop-runner) 端点会把 ECN 用例如实报成“不支持”，
+  而不是让它悄悄通过。
+
+与其他实现的互通现在有了容器化端点和 CI job，见下面的
+[QUIC Interop Runner](#quic-interop-runner)。
 
 ## 一致性测试
 
@@ -394,8 +398,36 @@ job 在 Linux、macOS、Windows 上运行。
 测试把它编译成一个程序并以子进程方式驱动，两边用 JSON 逐行通信。构建不了（例如没有
 网络）时这些用例会跳过，CI 里设了 `FIB_REQUIRE_H3_INTEROP=1`，跳过即失败。
 
+### QUIC Interop Runner
+
+`http3/interoprunner` 是 [QUIC Interop
+Runner](https://github.com/quic-interop/quic-interop-runner) 的端点，和
+`http3/interop` 一样是独立 module。同一个镜像两种角色：`ROLE=server` 时在 UDP 443
+上按 `TESTCASE` 用 `/certs` 里的证书提供 `/www`；`ROLE=client` 时把 `REQUESTS`
+下载到 `DOWNLOADS`，并把 TLS 密钥写进 `SSLKEYLOGFILE`，让 runner 能解密抓包。
+runner 除 `http3` 外都走 HTTP/0.9（QUIC stream 上一行请求加原始文件），所以这些用例
+直接跑 fib 的 QUIC 传输；`http3` 则跑 fib 完整的 HTTP/3 服务端和客户端。
+
+```sh
+docker build -f http3/interoprunner/Dockerfile -t fib-interop .
+http3/interoprunner/local-test.sh       # 镜像自己对自己，不需要 runner
+http3/interoprunner/run-runner.sh       # 真正的 runner，fib 对 quic-go
+```
+
+`local-test.sh` 只需要 Docker 和 openssl，用同一个镜像做两端跑七个用例。
+`run-runner.sh` 需要带 compose 的 Docker、tshark 和 runner 的 Python 依赖，
+会克隆 runner、登记镜像，然后与 quic-go 双向跑；`TESTCASES`、`PEER`、`DIRECTION`
+可以选择子集。逐个 testcase 的支持表、以 127 退出的原因和实测结果都在
+`http3/interoprunner/README.md`。
+
+CI 里有两个 job：`HTTP/3 interop endpoint image`（阻塞：构建镜像并让端点自己对自己
+跑支持的用例）和 `HTTP/3 QUIC Interop Runner`（只在 `workflow_dispatch` 触发、
+非阻塞：真正的 runner 对 quic-go；它要拉模拟器和对端镜像，还要 tshark，较慢也更容易
+受环境影响）。
+
 | 对端 | 验证内容 |
 | --- | --- |
+| QUIC Interop Runner 的 fib 端点（`http3/interoprunner`，对 quic-go 端点） | 双向、两种角色：HTTP/3，以及 HTTP/0.9-over-QUIC 的握手、传输、Retry、会话恢复、0-RTT、密钥更新、多路复用、丢包、IPv6、NAT 重绑定和长 RTT。fib 没有 ECN、QUIC v2、TLS 1.3 套件限制和 `preferred_address`，这些用例以 127 退出，runner 会如实记为“不支持”；没有通过的两个（服务端在地址重绑定下、客户端在长 RTT 下）在那个 README 里单独列出并说明原因。 |
 | quic-go 的 HTTP/3 客户端（对 fib 服务端） | GET/POST/PUT/HEAD、请求与响应头、多个 Cookie 与 Set-Cookie、4 MiB 上传与下载（按哈希校验）、单连接 50 个并发请求、204、响应 trailer、请求 trailer、103 Early Hints、100-continue、417、413、431、各种状态码 |
 | quic-go 的 HTTP/3 服务端（对 fib 客户端） | 同样的矩阵反过来验证，另加：超时后连接仍可用、服务端优雅关闭（GOAWAY）时在途请求正常完成、服务端用 Retry 验证源地址、证书不受信任时拒绝连接 |
 | 测试内置的手写 HTTP/3 客户端（零依赖，对 fib 服务端） | 正常实现不会发的东西：HEADERS 之前的 DATA、不以 SETTINGS 开头的控制流、第二条控制流、缺少伪头部的请求、引用 QPACK 动态表、CANCEL_PUSH、调低的 MAX_PUSH_ID、抬高的 GOAWAY、QPACK 插入指令、`:authority` 与 `Host` 不一致、两者都缺失 |

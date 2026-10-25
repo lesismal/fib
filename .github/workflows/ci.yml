@@ -65,10 +65,17 @@ jobs:
         run: |
           go vet ./...
           "$(go env GOPATH)/bin/staticcheck" ./...
+      # The Interop Runner endpoint is another module of its own, for the
+      # same reason: nothing it needs reaches fib's go.mod.
+      - name: Lint the Interop Runner endpoint
+        working-directory: http3/interoprunner
+        run: |
+          go vet ./...
+          "$(go env GOPATH)/bin/staticcheck" ./...
       - name: go mod tidy
         shell: bash
         run: |
-          for module in . http3/interop taskpool/benchmark; do
+          for module in . http3/interop http3/interoprunner taskpool/benchmark; do
             echo "::group::$module"
             (cd "$module" && go mod tidy -diff)
             echo "::endgroup::"
@@ -497,6 +504,70 @@ jobs:
         with:
           name: http3-conformance-log-${{ matrix.os }}
           path: ${{ runner.temp }}/h3conformance.log
+          if-no-files-found: ignore
+
+  # The QUIC Interop Runner endpoint, run against itself: the same image is
+  # the server and the client on a docker network, for the testcases it
+  # supports. This checks the container contract the runner relies on
+  # (ROLE, TESTCASE, /www, /downloads, /certs, /logs) without the runner's
+  # Python, simulator, tshark or peer images, so it is deterministic and
+  # blocking. It takes a few minutes because the image has to build.
+  http3-interop-image:
+    name: HTTP/3 interop endpoint image
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v5
+      - name: Build the image and run the endpoint against itself
+        run: ./http3/interoprunner/local-test.sh fib-interop:ci
+
+  # The real QUIC Interop Runner, with fib and quic-go as each other's peer.
+  # Opt-in (workflow_dispatch only) and non-blocking: it pulls the runner's
+  # network simulator and peer images, needs tshark and the runner's Python
+  # dependencies, and is slower and more brittle than the rest of the suite.
+  # The endpoint's supported testcases and the ones that exit 127 are listed
+  # in http3/interoprunner/README.md; fib's missing ECN, QUIC v2, cipher
+  # suite restriction and preferred_address are reported, not hidden.
+  http3-interop-runner:
+    name: HTTP/3 QUIC Interop Runner (opt-in, non-blocking)
+    if: github.event_name == 'workflow_dispatch'
+    continue-on-error: true
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v6
+        with:
+          go-version: stable
+      - name: Install the runner and its dependencies
+        env:
+          RUNNER_DIR: ${{ runner.temp }}/quic-interop-runner
+        run: |
+          sudo modprobe ip6table_filter || true
+          sudo apt-get update
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y tshark
+          git clone --depth 1 https://github.com/quic-interop/quic-interop-runner "$RUNNER_DIR"
+          python3 -m pip install --break-system-packages -r "$RUNNER_DIR/requirements.txt"
+          tshark --version | head -1
+          docker compose version
+      - name: Build the endpoint image
+        run: docker build -f http3/interoprunner/Dockerfile -t fib-interop:ci .
+      - name: Run fib and quic-go against each other
+        env:
+          RUNNER_DIR: ${{ runner.temp }}/quic-interop-runner
+          IMAGE: fib-interop:ci
+          # The core matrix: the HTTP/3 testcase plus the QUIC-level ones
+          # over HTTP/0.9. chacha20 and keyupdate are server-only here and
+          # multiplexing, handshakeloss and the rebinding tests are slower;
+          # see README.md for the full list and how to run it.
+          TESTCASES: http3,handshake,transfer,retry,resumption,zerortt
+        run: ./http3/interoprunner/run-runner.sh
+      - name: Upload the runner logs
+        if: always()
+        uses: actions/upload-artifact@v5
+        with:
+          name: http3-interop-runner-logs
+          path: ${{ runner.temp }}/quic-interop-runner/logs_*
           if-no-files-found: ignore
 
   # The parsers all take bytes from the network, so each gets a short fuzz

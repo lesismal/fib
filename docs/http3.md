@@ -550,9 +550,13 @@ What is still not covered end to end:
   requests, QPACK decoding, QUIC packet headers, transport parameters and
   frame handling all have fuzz targets, which the `Fuzz the parsers` CI job
   runs for 20 seconds each.
-- Consider joining the
-  [QUIC Interop Runner](https://github.com/quic-interop/quic-interop-runner) for
-  continuous interop testing against quiche, ngtcp2, mvfst and the rest.
+- QPACK's dynamic table, server push, `NEW_TOKEN`, DATAGRAM and ECN are not
+  implemented, so no test can cover them. The [QUIC Interop
+  Runner](#quic-interop-runner) endpoint reports the ECN testcase as
+  unsupported rather than passing it silently.
+
+Interop with other implementations now has a containerised endpoint and a
+CI job; see [QUIC Interop Runner](#quic-interop-runner) just below.
 
 ## Conformance tests
 
@@ -568,8 +572,41 @@ build it as a program and drive it as a subprocess, a line of JSON at a time.
 When it cannot be built, for want of network access for instance, those cases
 skip; CI sets `FIB_REQUIRE_H3_INTEROP=1`, which turns a skip into a failure.
 
+### QUIC Interop Runner
+
+`http3/interoprunner` is an endpoint for the
+[QUIC Interop Runner](https://github.com/quic-interop/quic-interop-runner),
+a module of its own like `http3/interop`. One image is both roles: with
+`ROLE=server` it serves `/www` on UDP port 443 with the certificate in
+`/certs` for `TESTCASE`; with `ROLE=client` it downloads `REQUESTS` into
+`DOWNLOADS`, writing its TLS secrets to `SSLKEYLOGFILE` so the runner can
+decrypt the capture. The runner drives all but the `http3` testcase over
+HTTP/0.9 — a request line and the file on a QUIC stream — so those run on
+fib's QUIC transport directly, and `http3` runs on fib's HTTP/3 server and
+client.
+
+```sh
+docker build -f http3/interoprunner/Dockerfile -t fib-interop .
+http3/interoprunner/local-test.sh       # the image against itself, no runner
+http3/interoprunner/run-runner.sh       # the real runner, fib vs quic-go
+```
+
+`local-test.sh` needs only Docker and openssl and runs seven cases with the
+image on both sides. `run-runner.sh` needs Docker with compose, tshark and
+the runner's Python dependencies, clones the runner, registers the image and
+runs both directions against quic-go; `TESTCASES`, `PEER` and `DIRECTION`
+pick a subset. The testcase-by-testcase support table, the reasons for the
+cases that exit 127, and the verified results are in
+`http3/interoprunner/README.md`.
+
+The CI jobs are `HTTP/3 interop endpoint image` (blocking: builds the image
+and runs the supported cases against itself) and `HTTP/3 QUIC Interop
+Runner` (`workflow_dispatch` only and non-blocking: the real runner against
+quic-go, because it pulls the simulator and peer images and needs tshark).
+
 | Peer | What it checks |
 | --- | --- |
+| The QUIC Interop Runner's fib endpoint (`http3/interoprunner`), against quic-go's endpoint | Both roles, both directions: HTTP/3 and the HTTP/0.9-over-QUIC cases — handshake, transfer, Retry, resumption, 0-RTT, key update, multiplexing, loss, IPv6, NAT rebinding and long RTT. fib's missing ECN, QUIC v2, cipher-suite restriction and `preferred_address` make those cases exit 127, which the runner reports as unsupported; the two cases that do not pass (the server under address rebinding and the client under long RTT) are listed in that README with the reason. |
 | quic-go's HTTP/3 client, against the fib server | GET/POST/PUT/HEAD, request and response headers, several cookies and Set-Cookies, 4 MiB uploads and downloads checked by hash, 50 concurrent requests on one connection, 204, response trailers, request trailers, 103 Early Hints, 100-continue, 417, 413, 431, status codes |
 | quic-go's HTTP/3 server, against the fib client | The same ground from the other side, and: the connection still serves after a timeout, a request in flight finishes when the server retires the connection with GOAWAY, a server that validates the address with Retry, and a certificate the client does not trust |
 | The suite's own hand-written HTTP/3 client (no dependency), against the fib server | What a sound implementation never sends: DATA before HEADERS, a control stream that does not start with SETTINGS, a second control stream, a request missing a pseudo-header, a reference to the QPACK dynamic table, CANCEL_PUSH, a lowered MAX_PUSH_ID, a raised GOAWAY, a QPACK insertion, an `:authority` and `Host` that disagree, and neither of them |
