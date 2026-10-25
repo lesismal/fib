@@ -12,6 +12,8 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
+	"time"
 
 	"github.com/lesismal/fib/bufferpool"
 	"github.com/lesismal/fib/hpack"
@@ -19,6 +21,15 @@ import (
 	"github.com/lesismal/fib/internal/reqbody"
 	"github.com/lesismal/fib/sidepool"
 )
+
+// ErrPingTimeout is what the requests on an HTTP/2 connection get when the
+// connection is taken for dead, the server having answered neither the PING
+// that ClientConfig.ReadIdleTimeout sent nor anything else within
+// ClientConfig.PingTimeout.
+var ErrPingTimeout = errors.New("http2: connection lost: no answer to PING within PingTimeout")
+
+// DefaultPingTimeout is ClientConfig.PingTimeout's zero.
+const DefaultPingTimeout = 15 * time.Second
 
 // errStreamGone is what sending a streamed request body gets once its stream
 // or connection has ended, which whoever ended it reports.
@@ -73,7 +84,20 @@ type h2ClientConn struct {
 	// failed is the error this side ended the connection with, which the
 	// requests still on it then report.
 	failed error
+
+	// The health check, with ClientConfig.ReadIdleTimeout set, which
+	// checking says: lastRead is when the server was last heard from, in
+	// Unix nanoseconds, health the timer that looks, and pingSent when the
+	// PING it sent went, zero while none is out. health and pingSent are
+	// guarded by mu.
+	checking bool
+	lastRead atomic.Int64
+	health   *time.Timer
+	pingSent int64
 }
+
+// healthPing is the payload of the health check's PING.
+var healthPing = [8]byte{'f', 'i', 'b', 'h', 'l', 't', 'h', 0}
 
 type h2ClientStream struct {
 	id uint32
@@ -128,6 +152,13 @@ func (cc *clientConn) startH2() {
 		glitches:     h2NewBudget(0, 0, DefaultControlFrameBurst, DefaultControlFrameRate),
 	}
 	hc.room.L = &hc.mu
+	if config.ReadIdleTimeout > 0 {
+		hc.checking = true
+		hc.lastRead.Store(time.Now().UnixNano())
+		hc.mu.Lock()
+		hc.health = time.AfterFunc(config.ReadIdleTimeout, hc.checkHealth)
+		hc.mu.Unlock()
+	}
 	cc.maxStreams = h2InitialMaxStreams
 	cc.h2 = hc
 	out := append([]byte(nil), h2Preface...)
@@ -138,6 +169,57 @@ func (cc *clientConn) startH2() {
 	)
 	out = h2AppendWindowUpdate(out, 0, h2ConnWindow-h2DefaultWindow)
 	_ = cc.conn.SendOwned(out)
+}
+
+// checkHealth runs when the health check's timer fires. A server not heard
+// from for ReadIdleTimeout is sent a PING; one that then stays silent for
+// PingTimeout, its acknowledgement and every other frame included, is taken
+// for dead: the connection is closed, and its requests fail with
+// ErrPingTimeout, or go again on another when the server answered nothing
+// of them and they are safe to repeat (see shutdown). Anything heard since
+// the PING settles it, since a server that is sending is alive, if busy.
+// Otherwise the timer is set for when there is next something to look at.
+func (hc *h2ClientConn) checkHealth() {
+	config := &hc.client.config
+	readIdle, pingTimeout := int64(config.ReadIdleTimeout), int64(config.PingTimeout)
+	now := time.Now().UnixNano()
+	last := hc.lastRead.Load()
+	hc.mu.Lock()
+	if hc.closed {
+		hc.mu.Unlock()
+		return
+	}
+	if hc.pingSent != 0 {
+		switch {
+		case last >= hc.pingSent:
+			hc.pingSent = 0
+		case now-hc.pingSent >= pingTimeout:
+			if hc.failed == nil {
+				hc.failed = ErrPingTimeout
+			}
+			hc.goAway = true
+			hc.mu.Unlock()
+			hc.client.retire(hc.cc)
+			// Not CloseAfterSend: the socket of a dead connection may
+			// never drain what is queued for it.
+			hc.cc.conn.Close()
+			return
+		default:
+			hc.health.Reset(time.Duration(hc.pingSent + pingTimeout - now))
+			hc.mu.Unlock()
+			return
+		}
+	}
+	if idle := now - last; idle < readIdle {
+		hc.health.Reset(time.Duration(readIdle - idle))
+		hc.mu.Unlock()
+		return
+	}
+	hc.pingSent = now
+	out := h2AppendFrameHeader(nil, h2FramePing, 0, 0, len(healthPing))
+	hc.sendLocked(append(out, healthPing[:]...))
+	hc.health.Reset(time.Duration(pingTimeout))
+	hc.mu.Unlock()
 }
 
 func (hc *h2ClientConn) sendLocked(out []byte) {
@@ -458,6 +540,9 @@ func (hc *h2ClientConn) cancel(r *clientRequest) {
 func (hc *h2ClientConn) shutdown(err error) {
 	hc.mu.Lock()
 	hc.closed = true
+	if hc.health != nil {
+		hc.health.Stop()
+	}
 	if hc.failed != nil {
 		err = hc.failed
 	}
@@ -513,6 +598,9 @@ func (hc *h2ClientConn) closeIfDoneLocked() {
 }
 
 func (hc *h2ClientConn) feed(data []byte) {
+	if hc.checking {
+		hc.lastRead.Store(time.Now().UnixNano())
+	}
 	hc.in = bufferpool.Append(hc.in, data)
 	offset := 0
 	for {

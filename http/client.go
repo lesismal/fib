@@ -70,6 +70,20 @@ type ClientConfig struct {
 	// HTTP/2 stream reset once the response is complete. Zero sends the body
 	// with the header, without waiting, as before.
 	ExpectContinueTimeout time.Duration
+	// ReadIdleTimeout is how long an HTTP/2 connection may hear nothing from
+	// the server before the client sends it a PING, and PingTimeout how long
+	// it then waits for the server, the PING's acknowledgement or any other
+	// frame, before taking the connection for dead: it is closed, and its
+	// requests fail with ErrPingTimeout, or are sent again on another
+	// connection when the server had answered nothing of them and they are
+	// safe to repeat. This finds a connection that died without a word, as
+	// one through a NAT that forgot it does, which TCP would otherwise only
+	// give up on after many minutes. As with x/net/http2, ReadIdleTimeout's
+	// zero leaves the check off, and PingTimeout's means 15 seconds. HTTP/1
+	// connections are not checked: one carries a request at a time, which
+	// its Timeout or ResponseHeaderTimeout bounds.
+	ReadIdleTimeout time.Duration
+	PingTimeout     time.Duration
 	// DialTimeout bounds one connect. Zero leaves it to the operating system.
 	DialTimeout time.Duration
 	// Dial opens the client's connections, in place of the engine's
@@ -222,6 +236,9 @@ func NewClient(engine *fib.Engine, config ClientConfig) *Client {
 	}
 	if config.StreamResponseBodyBuffer <= 0 {
 		config.StreamResponseBodyBuffer = DefaultStreamResponseBodyBuffer
+	}
+	if config.PingTimeout <= 0 {
+		config.PingTimeout = DefaultPingTimeout
 	}
 	tlsConfig := config.TLSConfig
 	if !config.DisableHTTP2 && (tlsConfig == nil || len(tlsConfig.NextProtos) == 0) {
