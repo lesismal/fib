@@ -276,6 +276,45 @@ func (c *Connection) sysSendDatagrams(datagrams [][]byte) (int, error) {
 	return sent, nil
 }
 
+// udpGatherOff is set once the kernel has refused a message of several
+// buffers, after which the parts of a datagram are joined here rather than
+// sent as they are: the other BSDs take no such message, and a kernel may
+// refuse one.
+var udpGatherOff atomic.Bool
+
+// sysSendDatagramParts sends first and second as one datagram, with one
+// system call where the platform takes a message of several buffers, so that
+// nothing is joined: sendmsg on Linux with the two iovecs, and sendmsg_x on
+// macOS. Callers hold c.mu.
+func (c *Connection) sysSendDatagramParts(first, second []byte) error {
+	fd, to := c.FD(), syscall.Sockaddr(nil)
+	if l := c.udp.listener; l != nil {
+		fd, to = l.fd, c.udp.sa
+	}
+	if !udpGatherOff.Load() {
+		parts := [2][]byte{first, second}
+		for {
+			err := udpbatch.SendParts(fd, to, parts[:])
+			if err == syscall.EINTR {
+				continue
+			}
+			if err == nil {
+				return nil
+			}
+			if err != syscall.ENOSYS && err != syscall.EOPNOTSUPP {
+				return err
+			}
+			udpGatherOff.Store(true)
+			break
+		}
+	}
+	// sendDatagram hands the bytes to the socket before it returns, so the
+	// joined copy goes straight back to the pool.
+	data := bufferpool.Join(nil, first, second)
+	defer bufferpool.Put(data)
+	return c.sysSendDatagram(data)
+}
+
 func (e *Engine) open(config Config, bindings []Binding) error {
 	e.nextGeneration.Store(firstGeneration)
 	if p := e.parent; p != nil && p.pollersListen {

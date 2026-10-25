@@ -174,6 +174,38 @@ func sendBatchSys(fd int, to syscall.Sockaddr, datagrams [][]byte) (int, error) 
 	return sent, nil
 }
 
+// sendPartsSys sends parts as one datagram with sendmsg, which takes the
+// message's buffers as they are: no buffer is joined.
+func sendPartsSys(fd int, to syscall.Sockaddr, parts [][]byte) error {
+	s := sendScratches.Get().(*sendScratch)
+	namelen := rawSockaddr(to, &s.name)
+	for i, p := range parts {
+		s.iovs[i].Base = &p[0]
+		s.iovs[i].SetLen(len(p))
+	}
+	h := &s.hdrs[0].hdr
+	h.Name, h.Namelen = nil, 0
+	if namelen > 0 {
+		h.Name, h.Namelen = (*byte)(unsafe.Pointer(&s.name)), namelen
+	}
+	h.Iov = &s.iovs[0]
+	setLen(&h.Iovlen, len(parts))
+	h.Control, h.Controllen = nil, 0
+	_, _, errno := syscall.Syscall6(syscall.SYS_SENDMSG, uintptr(fd),
+		uintptr(unsafe.Pointer(&s.hdrs[0])), 0, 0, 0, 0)
+	// The parts are the caller's again: nothing kept may point at them.
+	clear(s.iovs[:len(parts)])
+	sendScratches.Put(s)
+	if errno != 0 {
+		return errno
+	}
+	return nil
+}
+
+// maxParts is the most parts one datagram is described to the kernel by: a
+// message of as many buffers as sendScratch has room for.
+const maxParts = Size
+
 // rawSockaddr writes sa in the form the kernel takes it into rsa and returns
 // its length, or 0 for a nil sa.
 func rawSockaddr(sa syscall.Sockaddr, rsa *syscall.RawSockaddrAny) uint32 {

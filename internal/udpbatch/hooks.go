@@ -19,3 +19,9 @@ func SingleSends() bool { return singleSends.Load() }
 func SendSys(fd int, to syscall.Sockaddr, datagrams [][]byte) (int, error) {
 	return sendBatchSys(fd, to, datagrams)
 }
+
+// SendPartsSys is the parts send itself, without SendParts' shortcuts. For
+// tests.
+func SendPartsSys(fd int, to syscall.Sockaddr, parts [][]byte) error {
+	return sendPartsSys(fd, to, parts)
+}
