@@ -35,6 +35,7 @@ func (c *Conn) migrateLocked(now time.Time, first int) {
 		c.giveUpLocked(c.pc)
 		c.pc, c.remote = c.prevPC, c.prevRemote
 		c.endValidationLocked()
+		c.settlePathLocked()
 		return
 	}
 	if c.pathValidated {
@@ -56,8 +57,10 @@ func (c *Conn) migrateLocked(now time.Time, first int) {
 	c.pathValidated = false
 	c.pathRecv, c.pathSent = 0, 0
 	// The new path is not known to carry the datagram size the old one
-	// did, so it gets the size every path carries.
+	// did, so it gets the size every path carries, until it is validated
+	// and discovery has looked at it.
 	c.maxDatagram = maxDatagram
+	c.stopMTUDiscoveryLocked(now)
 	_, _ = rand.Read(c.challenge[:])
 	c.challengePending = true
 	// Three times the larger of the current PTO and the one for a new path
@@ -73,9 +76,17 @@ func (c *Conn) pathValidLocked() {
 		c.giveUpLocked(c.prevPC)
 	}
 	c.endValidationLocked()
+	c.settlePathLocked()
+}
+
+// settlePathLocked has a connection that settled on a validated path, a new
+// one or the one it went back to, send what the config and the peer allow,
+// and discover what more the path carries. Callers hold c.mu.
+func (c *Conn) settlePathLocked() {
 	if c.peerParams != nil {
 		c.maxDatagram = int(min(uint64(c.config.MaxDatagramSize), c.peerParams.maxUDPPayloadSize))
 	}
+	c.startMTUDiscoveryLocked(c.now())
 }
 
 // pathFailedLocked ends a validation the client did not answer in time: the
@@ -90,6 +101,7 @@ func (c *Conn) pathFailedLocked() {
 	c.pc, c.remote = c.prevPC, c.prevRemote
 	c.events = append(c.events, event{kind: evPath})
 	c.endValidationLocked()
+	c.settlePathLocked()
 }
 
 // endValidationLocked leaves the connection on a validated path. Callers

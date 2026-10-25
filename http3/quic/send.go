@@ -126,6 +126,19 @@ func (c *Conn) sendRoundLocked() {
 			c.wantFlush = true
 			break
 		}
+		if size := c.mtuProbeDue(now); size > 0 && cap(buf)-len(buf) >= size {
+			// A probe ends its round, the last datagram of the batch, so
+			// that a socket refusing it for its size, as one that knows the
+			// interface's MTU does, refuses nothing after it. What else
+			// there is goes in the next round.
+			start := len(buf)
+			buf = c.appendMTUProbe(buf, scratch, size, now)
+			c.bytesSent += uint64(len(buf) - start)
+			lens[n] = uint16(len(buf) - start)
+			n++
+			c.wantFlush = true
+			break
+		}
 		start := len(buf)
 		buf = c.appendDatagram(buf, scratch, now)
 		if len(buf) == start {

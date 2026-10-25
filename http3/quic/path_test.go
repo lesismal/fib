@@ -2,6 +2,7 @@ package quic
 
 import (
 	"bytes"
+	"errors"
 	"net"
 	"sync"
 	"sync/atomic"
@@ -17,8 +18,19 @@ type serverPath struct {
 	addr     *net.UDPAddr
 	toClient chan []byte
 	black    atomic.Bool
-	mu       sync.Mutex
-	closed   bool
+	// mtu, when set, drops the datagrams larger than it, and df says
+	// SetDontFragment succeeds, which path MTU discovery waits for.
+	mtu    atomic.Int32
+	df     atomic.Bool
+	mu     sync.Mutex
+	closed bool
+}
+
+func (p *serverPath) SetDontFragment() error {
+	if !p.df.Load() {
+		return errors.ErrUnsupported
+	}
+	return nil
 }
 
 func (p *serverPath) Send(d []byte) error {
@@ -27,7 +39,7 @@ func (p *serverPath) Send(d []byte) error {
 	if p.closed {
 		return net.ErrClosed
 	}
-	if p.black.Load() {
+	if p.black.Load() || p.mtu.Load() > 0 && len(d) > int(p.mtu.Load()) {
 		return nil
 	}
 	select {
@@ -102,6 +114,13 @@ type rebindPair struct {
 // client starts on path a; b is the address a NAT may move it to.
 func newRebindPair(t *testing.T) *rebindPair {
 	t.Helper()
+	return newRebindPairWith(t, nil)
+}
+
+// newRebindPairWith is newRebindPair with setup run on the pair before the
+// client dials.
+func newRebindPairWith(t *testing.T, setup func(*rebindPair)) *rebindPair {
+	t.Helper()
 	serverTLS, clientTLS, err := tlstest.Configs()
 	if err != nil {
 		t.Fatal(err)
@@ -114,6 +133,9 @@ func newRebindPair(t *testing.T) *rebindPair {
 		b: &serverPath{addr: &net.UDPAddr{IP: net.IPv4(192, 0, 2, 1), Port: 2000}, toClient: n.toClient}}
 	p.serverH.onData = func(s *Stream, data []byte, fin bool) { _ = s.Write(data, fin) }
 	n.current.Store(p.a)
+	if setup != nil {
+		setup(p)
+	}
 	done := make(chan struct{})
 	var wg sync.WaitGroup
 	var serverMu sync.Mutex

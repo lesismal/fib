@@ -27,9 +27,23 @@ type pipeEnd struct {
 	peer  *pipeEnd
 	loss  float64
 	// drop, when set, decides the fate of each datagram instead of loss.
-	drop   func([]byte) bool
+	drop func([]byte) bool
+	// mtu, when set, drops the datagrams larger than it, as a path does
+	// those with the Don't Fragment bit; df says SetDontFragment succeeds,
+	// which path MTU discovery waits for.
+	mtu    int
+	df     bool
 	mu     sync.Mutex
 	closed bool
+}
+
+func (p *pipeEnd) SetDontFragment() error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if !p.df {
+		return errors.ErrUnsupported
+	}
+	return nil
 }
 
 func (p *pipeEnd) Send(d []byte) error {
@@ -37,6 +51,9 @@ func (p *pipeEnd) Send(d []byte) error {
 	defer p.mu.Unlock()
 	if p.closed {
 		return net.ErrClosed
+	}
+	if p.mtu > 0 && len(d) > p.mtu {
+		return nil
 	}
 	if p.drop != nil && p.drop(d) || p.drop == nil && p.loss > 0 && mrand.Float64() < p.loss {
 		return nil

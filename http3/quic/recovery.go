@@ -49,8 +49,10 @@ type sentPacket struct {
 	ackEliciting bool
 	inFlight     bool
 	// early says the packet was sent as 0-RTT data.
-	early  bool
-	frames []sentFrame
+	early bool
+	// mtuProbe says the packet is a probe of path MTU discovery.
+	mtuProbe bool
+	frames   []sentFrame
 }
 
 // maxFreeSent bounds the sent packets a connection keeps for reuse, and
@@ -220,6 +222,14 @@ func (c *Conn) onAckReceived(space int, ranges []pnRange, ackDelay time.Duration
 	// Whether the window was in use is a matter of what was in flight
 	// before this acknowledgement, and before what it shows lost.
 	limited := c.cc.limited(c.cc.bytesInFlight, c.paced)
+	if space == spaceApp {
+		// What the acknowledgement says of the path's MTU comes first: a
+		// large packet acknowledged makes those lost before it no black
+		// hole.
+		for _, p := range acked {
+			c.mtuAckedLocked(p, now)
+		}
+	}
 	c.detectLost(space, now)
 	for _, p := range acked {
 		if p.ackEliciting {
@@ -309,11 +319,21 @@ func (c *Conn) detectLost(space int, now time.Time) {
 		}
 		if p.inFlight {
 			c.cc.bytesInFlight -= uint64(p.size)
-			latest = p.time
+			if !p.mtuProbe {
+				// A probe lost for its size says nothing of congestion
+				// (RFC 9000 section 14.4).
+				latest = p.time
+			}
+		}
+		if space == spaceApp {
+			c.mtuLostLocked(p, now)
 		}
 		for i := range p.frames {
 			c.frameLost(space, &p.frames[i])
 		}
+	}
+	if space == spaceApp {
+		c.mtuCheckBlackHoleLocked(now)
 	}
 	if !latest.IsZero() {
 		c.cc.onCongestion(latest, now)
@@ -340,7 +360,7 @@ func (c *Conn) persistentCongestion(lost []*sentPacket) bool {
 		if i > 0 && p.pn != lost[i-1].pn+1 {
 			first = nil
 		}
-		if !p.ackEliciting {
+		if !p.ackEliciting || p.mtuProbe {
 			continue
 		}
 		if p.time.Before(c.rtt.firstAt) {
@@ -494,6 +514,12 @@ func (c *Conn) onLossDetectionTimeout(now time.Time) {
 		}
 	} else {
 		_, space := c.ptoTimeSpace(now)
+		if space == spaceApp && c.handshakeConfirmed && c.ptoCount+1 >= mtuBlackHolePTOs && c.maxDatagram > maxDatagram {
+			// Nothing sent in that long has been acknowledged: the path may
+			// have stopped carrying large datagrams, and the probes go
+			// with the size every path carries.
+			c.mtuBlackHoleLocked(now)
+		}
 		c.probe(space)
 	}
 	c.ptoCount++

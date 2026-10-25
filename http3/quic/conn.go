@@ -169,10 +169,24 @@ type Config struct {
 	// or NewReno.
 	CongestionControl CongestionControl
 	// MaxDatagramSize is the largest datagram sent once the handshake is
-	// over, if the peer's max_udp_payload_size allows it. Default 1200, the
-	// size every path carries; more saves packets, and the syscalls that
-	// send them, on a path known to carry them. At most 1452.
+	// over, if the peer's max_udp_payload_size allows it, until path MTU
+	// discovery finds the path carries more. Default 1200, the size every
+	// path carries; more saves packets, and the syscalls that send them, on
+	// a path known to carry them. At most 1452. A connection whose larger
+	// datagrams stop getting through goes back to 1200 (see pmtud.go).
 	MaxDatagramSize int
+	// DisablePathMTUDiscovery turns path MTU discovery (RFC 8899) off. With
+	// it on, the default, a connection whose path stops datagrams that are
+	// too large rather than fragment them (see DontFragmenter) probes for
+	// the largest datagram it carries once the handshake is confirmed, up to
+	// MaxProbeDatagramSize and the peer's max_udp_payload_size, and sends
+	// datagrams of that size.
+	DisablePathMTUDiscovery bool
+	// MaxProbeDatagramSize is the largest datagram path MTU discovery looks
+	// for. Default and at most 1452, what an Ethernet MTU of 1500 bytes
+	// leaves for UDP over IPv6; one no larger than MaxDatagramSize turns
+	// discovery off.
+	MaxProbeDatagramSize int
 	// EarlyData lets a client send 0-RTT data on a session it resumes, if
 	// its TLS keeps sessions that allow it (see CanSendEarly), and lets a
 	// server accept 0-RTT data from clients resuming a session: its tickets
@@ -219,6 +233,10 @@ func (config Config) withDefaults() Config {
 		config.ConnReceiveWindow = 16 << 20
 	}
 	config.MaxDatagramSize = min(max(config.MaxDatagramSize, maxDatagram), maxDatagramLimit)
+	if config.MaxProbeDatagramSize <= 0 {
+		config.MaxProbeDatagramSize = maxDatagramLimit
+	}
+	config.MaxProbeDatagramSize = min(max(config.MaxProbeDatagramSize, maxDatagram), maxDatagramLimit)
 	return config
 }
 
@@ -297,8 +315,10 @@ type Conn struct {
 	// maxDatagram is the largest datagram this side sends: maxDatagram
 	// until the handshake is over, then what the config and the peer allow.
 	maxDatagram int
-	local       transportParams
-	peerParams  *transportParams
+	// mtu is path MTU discovery's state (see pmtud.go).
+	mtu        mtuState
+	local      transportParams
+	peerParams *transportParams
 
 	// 1-RTT key updates (RFC 9001 section 6). txGen and rxGen count the
 	// updates each direction has made; the Key Phase bit is the low bit of
@@ -1753,6 +1773,7 @@ func (c *Conn) confirmHandshake() {
 	}
 	c.handshakeConfirmed = true
 	c.discardSpace(spaceHandshake)
+	c.startMTUDiscoveryLocked(c.now())
 }
 
 func (c *Conn) handleVersionNegotiation(d []byte) {
@@ -1937,6 +1958,7 @@ func (c *Conn) armTimerLocked(now time.Time) {
 	earliest(c.sendAt)
 	earliest(c.pathDeadline)
 	earliest(c.closeDeadline)
+	earliest(c.mtuProbeTimer())
 	if s := &c.spaces[spaceApp]; s.ackPending && !s.ackNow {
 		earliest(s.ackDeadline)
 	}
@@ -2013,6 +2035,10 @@ func (c *Conn) onTimer() {
 			due = true
 		}
 		if s := &c.spaces[spaceApp]; s.ackPending && !s.ackDeadline.IsZero() && !now.Before(s.ackDeadline) {
+			due = true
+		}
+		if t := c.mtuProbeTimer(); !t.IsZero() && !now.Before(t) {
+			// Path MTU discovery searches again.
 			due = true
 		}
 		if !c.sendAt.IsZero() && !now.Before(c.sendAt) {
