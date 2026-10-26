@@ -11,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/lesismal/fib/log"
 	"github.com/lesismal/fib/taskpool"
 )
 
@@ -166,13 +167,13 @@ func TestCodecValueKinds(t *testing.T) {
 }
 
 // TestSetLoggerNilRestoresDefault pins down that SetLogger(nil) puts the
-// package back on slog.Default.
+// package back on fib/log's logger, which is slog.Default until configured.
 func TestSetLoggerNilRestoresDefault(t *testing.T) {
 	discard := slog.New(slog.NewTextHandler(io.Discard, nil))
 	SetLogger(nil)
 	defer SetLogger(discard)
-	if logger() != slog.Default() {
-		t.Fatal("SetLogger(nil) did not restore slog.Default")
+	if logger() != log.Logger() {
+		t.Fatal("SetLogger(nil) did not restore fib/log's logger")
 	}
 	SetLogger(discard)
 	if logger() != discard {

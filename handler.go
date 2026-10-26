@@ -4,7 +4,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"log/slog"
 	"net"
 	"os"
 	"strings"
@@ -12,6 +11,7 @@ import (
 	"time"
 
 	"github.com/lesismal/fib/bufferpool"
+	"github.com/lesismal/fib/log"
 )
 
 // Handler callbacks run on a logical worker, except OnOpen, which runs on the
@@ -496,7 +496,7 @@ func (e *Engine) logRun() {
 	accept, applies := e.acceptPlacements()
 	if e.acceptPlacement != AcceptFDModulo && !applies {
 		// Said whatever LogStatus says: the setting asked for does nothing.
-		slog.Warn("fib: Config.AcceptPlacement applies to no listener: it needs IOPollers without EngineLoop and a TCP address on Linux, where each poller listens on a socket of its own with SO_REUSEPORT",
+		log.Warn("fib: Config.AcceptPlacement applies to no listener: it needs IOPollers without EngineLoop and a TCP address on Linux, where each poller listens on a socket of its own with SO_REUSEPORT",
 			"engine", e.name, "acceptPlacement", e.acceptPlacement.String())
 	}
 	if e.logStatus {
@@ -514,7 +514,7 @@ func (e *Engine) logRun() {
 		if named, ok := e.taskPool.(interface{ Name() string }); ok {
 			pool = named.Name()
 		}
-		slog.Info("fib: engine started", "engine", e.name, "listen", listening, "taskPool", pool,
+		log.Info("fib: engine started", "engine", e.name, "listen", listening, "taskPool", pool,
 			"pollers", len(e.pollers), "accept", accept)
 	}
 	if e.logSettings && !logSettingsSilenced() {
@@ -522,17 +522,28 @@ func (e *Engine) logRun() {
 	}
 }
 
-// LogSettings logs every effective setting, one line per parameter, with its
-// value, whether fib's default or the caller's produced it, and what it does.
-// The engine calls it at startup when Config.LogSettings is set, which
-// DefaultConfig does; call it directly to print the list on demand, whether
-// or not the config asks for it.
+// LogSettings logs every effective setting, with its value, whether fib's
+// default or the caller's produced it, and what it does: in fib/log's
+// FormatLine as one record with the settings as a table below it, and
+// otherwise as a record for the list and one per parameter. The engine calls
+// it at startup when Config.LogSettings is set, which DefaultConfig does;
+// call it directly to print the list on demand, whether or not the config
+// asks for it.
 func (e *Engine) LogSettings() {
 	settings := e.Settings()
 	parameters := settings.Parameters()
-	slog.Info("fib: engine config", "engine", e.name, "parameters", len(parameters))
+	if log.IsLine(log.Logger().Handler()) {
+		rows := make([][]string, len(parameters))
+		for i, p := range parameters {
+			rows[i] = []string{p.Name, p.Value, p.Source, p.About}
+		}
+		log.Info("fib: engine config", "engine", e.name, "parameters", len(parameters),
+			"settings", log.Table([]string{"parameter", "value", "source", "about"}, rows))
+		return
+	}
+	log.Info("fib: engine config", "engine", e.name, "parameters", len(parameters))
 	for _, p := range parameters {
-		slog.Info("fib: config", "parameter", p.Name,
+		log.Info("fib: config", "parameter", p.Name,
 			"value", p.Value, "source", p.Source, "about", p.About)
 	}
 }

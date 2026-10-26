@@ -7,7 +7,6 @@ import (
 	stdtls "crypto/tls"
 	"errors"
 	"fmt"
-	"log/slog"
 	"math"
 	"net"
 	"reflect"
@@ -24,6 +23,7 @@ import (
 	"github.com/lesismal/fib/grpc/peer"
 	"github.com/lesismal/fib/grpc/status"
 	"github.com/lesismal/fib/hpack"
+	"github.com/lesismal/fib/log"
 	fibtls "github.com/lesismal/fib/tls"
 )
 
@@ -568,7 +568,7 @@ func (ss *serverStream) RunTask() {
 func (s *Server) invoke(ss ServerStream, method string, svc *service, unary *MethodDesc, sd *StreamDesc) (err error) {
 	defer func() {
 		if recovered := recover(); recovered != nil {
-			slog.Error("grpc: handler panicked", "method", method, "panic", recovered, "stack", string(debug.Stack()))
+			log.Error("grpc: handler panicked", "method", method, "panic", recovered, "stack", log.Lines(debug.Stack()))
 			err = status.Errorf(codes.Internal, "grpc: handler panicked: %v", recovered)
 		}
 	}()

@@ -4,18 +4,18 @@ package recover_test
 
 import (
 	"bytes"
-	"log"
 	stdhttp "net/http"
 	"strings"
 	"sync"
 	"testing"
 
 	fibhttp "github.com/lesismal/fib/http"
+	"github.com/lesismal/fib/log"
 	"github.com/lesismal/fib/middleware/mwtest"
 	"github.com/lesismal/fib/middleware/recover"
 )
 
-// lockedBuffer is the standard logger's output for a test, written from the
+// lockedBuffer is fib's log for a test, written from the
 // server's goroutines.
 type lockedBuffer struct {
 	mu  sync.Mutex
@@ -34,13 +34,11 @@ func (b *lockedBuffer) String() string {
 	return b.buf.String()
 }
 
-// captureLog sends the standard logger's output to a buffer until the test
-// ends.
+// captureLog sends fib's log to a buffer, in FormatLine, until the test ends.
 func captureLog(t *testing.T) *lockedBuffer {
 	out := &lockedBuffer{}
-	prev := log.Writer()
-	log.SetOutput(out)
-	t.Cleanup(func() { log.SetOutput(prev) })
+	log.Setup(log.Config{Output: out})
+	t.Cleanup(func() { log.SetLogger(nil) })
 	return out
 }
 
@@ -81,9 +79,8 @@ func TestRecoverAbortHandler(t *testing.T) {
 	}
 }
 
-// TestRecoverDefaultLog checks the default Log, which writes the panic to the
-// standard logger with its stack, or without it when DisableStackTrace is
-// set.
+// TestRecoverDefaultLog checks the default Log, which writes the panic to
+// fib's log with its stack, or without it when DisableStackTrace is set.
 func TestRecoverDefaultLog(t *testing.T) {
 	for _, disable := range []bool{false, true} {
 		out := captureLog(t)
@@ -97,7 +94,7 @@ func TestRecoverDefaultLog(t *testing.T) {
 		// The line is logged before the 500 is written, so it is there by
 		// the time the client has the response.
 		got := out.String()
-		if !strings.Contains(got, "http: panic serving GET /where: kaboom") {
+		if !strings.Contains(got, "ERROR http: panic serving method=GET url=/where panic=kaboom") {
 			t.Errorf("DisableStackTrace %v: logged %q", disable, got)
 		}
 		if hasStack := strings.Contains(got, "goroutine "); hasStack == disable {

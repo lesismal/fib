@@ -7,6 +7,8 @@ import (
 	"log/slog"
 	"strings"
 	"testing"
+
+	"github.com/lesismal/fib/log"
 )
 
 // Settings reports what the engine runs with, after the defaults have filled
@@ -222,5 +224,37 @@ func TestLogSettingsEnvSilences(t *testing.T) {
 				t.Fatalf("LogSettings with %s=%q printed %q", logSettingsEnv, value, out)
 			}
 		})
+	}
+}
+
+// In fib/log's FormatLine the settings are one record with a table below it,
+// a row a parameter, its columns aligned.
+func TestLogSettingsLineTable(t *testing.T) {
+	var buf bytes.Buffer
+	log.Setup(log.Config{Output: &buf})
+	defer log.SetLogger(nil)
+	config := DefaultConfig()
+	config.ReadBufferSize = 64 << 10
+	engine, err := New(config, Binding{Addr: "127.0.0.1:0", Handler: HandlerFuncs{}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer engine.Close()
+	engine.LogSettings()
+	lines := strings.Split(strings.TrimSuffix(buf.String(), "\n"), "\n")
+	parameters := engine.Settings().Parameters()
+	if len(lines) != len(parameters)+3 {
+		t.Fatalf("got %d lines, want a record, a key, a header and %d rows:\n%s", len(lines), len(parameters), buf.String())
+	}
+	if !strings.Contains(lines[0], "INFO  fib: engine config engine=fib parameters=") || lines[1] != "\tsettings:" {
+		t.Fatalf("record %q, %q", lines[0], lines[1])
+	}
+	value, source, about := strings.Index(lines[2], "value"), strings.Index(lines[2], "source"), strings.Index(lines[2], "about")
+	for i, p := range parameters {
+		row := lines[i+3]
+		if !strings.HasPrefix(row, "\t\t"+p.Name+" ") || !strings.HasPrefix(row[value:], p.Value+"  ") ||
+			!strings.HasPrefix(row[source:], p.Source+" ") || row[about:] != p.About {
+			t.Errorf("row %q for %+v", row, p)
+		}
 	}
 }

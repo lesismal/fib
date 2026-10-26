@@ -9,11 +9,12 @@
 package recover
 
 import (
-	"log"
+	"fmt"
 	stdhttp "net/http"
 	"runtime/debug"
 
 	fibhttp "github.com/lesismal/fib/http"
+	"github.com/lesismal/fib/log"
 	"github.com/lesismal/fib/middleware"
 )
 
@@ -25,7 +26,8 @@ type Config struct {
 	// been begun already, which leaves nothing to answer with.
 	Handler func(c *fibhttp.Context, recovered any)
 	// Log reports the panic, with the stack it was raised on unless
-	// DisableStackTrace is set. By default it goes to the standard logger;
+	// DisableStackTrace is set. By default it goes to package fib/log, at
+	// error, as "http: panic serving" with the request's method and URL;
 	// a function that does nothing silences it.
 	Log               func(r *stdhttp.Request, recovered any, stack []byte)
 	DisableStackTrace bool
@@ -86,8 +88,9 @@ func internalError(c *fibhttp.Context, _ any) {
 
 func logPanic(r *stdhttp.Request, recovered any, stack []byte) {
 	if len(stack) == 0 {
-		log.Printf("http: panic serving %s %s: %v", r.Method, r.URL, recovered)
+		log.Error("http: panic serving", "method", r.Method, "url", r.URL.String(), "panic", fmt.Sprint(recovered))
 		return
 	}
-	log.Printf("http: panic serving %s %s: %v\n%s", r.Method, r.URL, recovered, stack)
+	log.Error("http: panic serving", "method", r.Method, "url", r.URL.String(), "panic", fmt.Sprint(recovered),
+		"stack", log.Lines(stack))
 }

@@ -5,7 +5,6 @@ package fib
 import (
 	"errors"
 	"fmt"
-	"log/slog"
 	"net"
 	"net/netip"
 	"os"
@@ -14,6 +13,7 @@ import (
 
 	"github.com/lesismal/fib/internal/listener"
 	"github.com/lesismal/fib/internal/netaddr"
+	"github.com/lesismal/fib/log"
 )
 
 // placement is a socket AddBinding opened and the loop that is to wait on
@@ -288,10 +288,10 @@ func (e *Engine) balanceInitialGroups() {
 // capabilities simply do not allow it, and at error for anything else.
 func (e *Engine) logBalanceFallback(err error) {
 	if errors.Is(err, errReusePortBalanceUnsupported) {
-		slog.Warn("fib: BalanceReusePort could not attach a reuseport selector; keeping the kernel's hash",
+		log.Warn("fib: BalanceReusePort could not attach a reuseport selector; keeping the kernel's hash",
 			"engine", e.name, "error", err)
 	} else {
-		slog.Error("fib: BalanceReusePort failed to attach a reuseport selector; keeping the kernel's hash",
+		log.Error("fib: BalanceReusePort failed to attach a reuseport selector; keeping the kernel's hash",
 			"engine", e.name, "error", err)
 	}
 }

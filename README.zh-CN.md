@@ -418,8 +418,10 @@ engine, err := fib.New(cfg, fib.Binding{Addr: ":8080", Handler: handler})
 ```
 
 启动时默认逐项打印生效配置，每项带 `default`/`custom` 来源和说明；`Engine.LogSettings()` 可随时
-打印同样的列表。全部 `Config`、`Binding` 字段、默认值、机器 sizing 公式和启动日志说明见
-[配置](docs/configuration.zh-CN.md)。
+打印同样的列表。fib 的所有日志都经过 `fib/log` 包，可输出行日志、logfmt 文本或 JSON：
+`fiblog.Setup(fiblog.Config{Format: fiblog.FormatJSON})`，或设置环境变量 `FIB_LOG_FORMAT=json`；
+未配置时写到 `slog.Default()`。全部 `Config`、`Binding` 字段、默认值、机器 sizing 公式、启动日志和
+日志配置见 [配置](docs/configuration.zh-CN.md)。
 
 ## 架构
 

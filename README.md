@@ -442,8 +442,11 @@ engine, err := fib.New(cfg, fib.Binding{Addr: ":8080", Handler: handler})
 
 The effective settings are logged at startup by default, one line per parameter, with its
 `default`/`custom` source and a description; `Engine.LogSettings()` prints the same list on demand.
-The full reference — every `Config` and `Binding` field, its default, the machine sizing formula
-and the startup log — is in [Configuration](docs/configuration.md).
+All of fib logs through package `fib/log`, as lines, logfmt text or JSON:
+`fiblog.Setup(fiblog.Config{Format: fiblog.FormatJSON})`, or `FIB_LOG_FORMAT=json` in the
+environment; until then it writes to `slog.Default()`. The full reference — every `Config` and
+`Binding` field, its default, the machine sizing formula, the startup log and logging — is in
+[Configuration](docs/configuration.md).
 
 ## Architecture
 

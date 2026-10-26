@@ -8,6 +8,8 @@ import (
 	"log/slog"
 	"sync/atomic"
 	"unsafe"
+
+	"github.com/lesismal/fib/log"
 )
 
 // Codec encodes and decodes the payloads of messages.
@@ -80,12 +82,13 @@ var loggerValue atomic.Pointer[slog.Logger]
 
 // SetLogger sets where the package logs what goes wrong away from any caller:
 // a message no handler takes, a response nobody waits for, a handler that
-// panics. Nil restores slog.Default.
+// panics. Nil goes back to the logger of package fib/log, which the rest of
+// fib logs to.
 func SetLogger(l *slog.Logger) { loggerValue.Store(l) }
 
 func logger() *slog.Logger {
 	if l := loggerValue.Load(); l != nil {
 		return l
 	}
-	return slog.Default()
+	return log.Logger()
 }

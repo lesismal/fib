@@ -3,10 +3,11 @@ package taskpool
 
 import (
 	"fmt"
-	"log/slog"
 	"runtime/debug"
 	"sync"
 	"sync/atomic"
+
+	"github.com/lesismal/fib/log"
 )
 
 type Mode uint8
@@ -72,7 +73,7 @@ type backend interface {
 	submitBatch([]Task) int
 	stop()
 	workerCount() int
-	// attrs describes what the backend runs once built, as slog key-value
+	// attrs describes what the backend runs once built, as key-value
 	// pairs.
 	attrs() []any
 }
@@ -108,8 +109,8 @@ func (e *executor) call(task Task) {
 				handler(recovered, debug.Stack())
 				return
 			}
-			slog.Error("taskpool: task panicked", "pool", e.name, "id", e.id,
-				"panic", fmt.Sprint(recovered), "stack", string(debug.Stack()))
+			log.Error("taskpool: task panicked", "pool", e.name, "id", e.id,
+				"panic", fmt.Sprint(recovered), "stack", log.Lines(debug.Stack()))
 		}
 	}()
 	task.RunTask()
@@ -179,7 +180,7 @@ func start(name string, mode Mode, build func(*executor) backend) *TaskPool {
 	pool := &TaskPool{executor: executor, backend: build(executor), mode: mode}
 	if logStatus.Load() {
 		label := []any{"pool", name, "id", executor.id, "mode", mode.String()}
-		slog.Info("taskpool: started", append(label, pool.backend.attrs()...)...)
+		log.Info("taskpool: started", append(label, pool.backend.attrs()...)...)
 	}
 	return pool
 }

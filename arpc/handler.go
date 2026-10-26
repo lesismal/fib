@@ -12,6 +12,7 @@ import (
 
 	fib "github.com/lesismal/fib"
 	"github.com/lesismal/fib/bufferpool"
+	"github.com/lesismal/fib/log"
 	"github.com/lesismal/fib/taskpool"
 )
 
@@ -585,5 +586,5 @@ func (h *Handler) onMessage(c *Client, msg *Message) {
 
 // recoverHandler logs a panic of a handler, which leaves its connection open.
 func recoverHandler(what string, recovered any) {
-	logger().Error("arpc: "+what+" panicked", "panic", recovered, "stack", string(debug.Stack()))
+	logger().Error("arpc: "+what+" panicked", "panic", recovered, "stack", log.Lines(debug.Stack()))
 }

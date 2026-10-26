@@ -164,6 +164,18 @@ INFO fib: config parameter=writeWatermark value="262144 (256 KiB)" source=defaul
 INFO fib: config parameter=maxPendingBytes value="33255979008 (30.97 GiB)" source=custom about="bytes all connections together may have waiting; zero means no budget"
 ```
 
+In fib/log's `line` format (see [Logging](#logging)) the list is one record instead, with the
+settings as an aligned table below it:
+
+```text
+2026-10-27 10:00:00.000 INFO  fib: engine config engine=gateway parameters=29
+	settings:
+		parameter           value             source   about
+		readBuffer          65536 (64 KiB)    custom   bytes one read of a connection's socket takes
+		writeWatermark      262144 (256 KiB)  default  bytes a connection may have waiting before its reads pause; ...
+		...
+```
+
 `source=default` means the value came from fib's default or its machine sizing; `source=custom`
 means the caller set a different value. `Engine.LogSettings()` prints the same list at any time,
 whether or not `LogSettings` is set. `Engine.Settings()` returns the values programmatically, and
@@ -174,6 +186,44 @@ silences the startup list without changing the config. It is how fib's CI keeps 
 lines the tests would print from burying a failure; `Engine.LogSettings()` still prints the list.
 
 `LogStatus` is separate: it prints the one-line `fib: engine started` banner, off by default.
+
+## Logging
+
+Every package of fib logs through package `github.com/lesismal/fib/log`: the engine, the task
+pools, arpc, grpc, and the `logger` and `recover` middleware. Until it is set up it writes to
+`slog.Default()`, so an application that calls `slog.SetDefault` gets fib's lines too. To choose
+fib's own format instead:
+
+```go
+import fiblog "github.com/lesismal/fib/log"
+
+fiblog.Setup(fiblog.Config{
+	Format: fiblog.FormatJSON, // FormatLine (the default), FormatText or FormatJSON
+	Level:  slog.LevelWarn,    // or a *slog.LevelVar to change it while running
+	Output: os.Stderr,         // the default
+})
+```
+
+```text
+line  2026-10-27 10:00:00.000 INFO  fib: engine started engine=fib listen=tcp://[::]:8080
+text  time=2026-10-27T10:00:00.000+08:00 level=INFO msg="fib: engine started" engine=fib
+json  {"time":"2026-10-27T10:00:00.000+08:00","level":"INFO","msg":"fib: engine started","engine":"fib"}
+```
+
+`line` is for people; `text` and `json` are structured, one record a line, for programs that
+collect logs. In `line`, a panic's stack goes on the lines below its record, each indented, and
+any other line break or control character is escaped, so that a request cannot forge a line.
+`fiblog.SetLogger` takes any `*slog.Logger` instead, and `nil` goes back to `slog.Default()`.
+`arpc.SetLogger` still gives arpc a logger of its own.
+
+Without a call in the program, the environment may choose: `FIB_LOG_FORMAT` (`line`, `text` or
+`json`) and `FIB_LOG_LEVEL` (`debug`, `info`, `warn`, `error`) set fib's logger up when the
+program starts. A call to `Setup` or `SetLogger` replaces what they chose.
+
+The `logger` middleware logs each response as a record, message `http: access`, with the fields
+`Config.Fields` names (`status`, `latency`, `ip`, `method` and `path` by default), in whatever
+format the logger has. Setting its `Format` or `Output` writes a `${tag}` line of a layout of its
+own straight to `Output` instead, as it did before.
 
 ## Changing things at runtime
 

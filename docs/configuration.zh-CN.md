@@ -155,6 +155,17 @@ INFO fib: config parameter=writeWatermark value="262144 (256 KiB)" source=defaul
 INFO fib: config parameter=maxPendingBytes value="33255979008 (30.97 GiB)" source=custom about="bytes all connections together may have waiting; zero means no budget"
 ```
 
+使用 fib/log 的 `line` 格式时（见[日志](#日志)），整个列表是一条记录，参数以对齐的表格写在它下面：
+
+```text
+2026-10-27 10:00:00.000 INFO  fib: engine config engine=gateway parameters=29
+	settings:
+		parameter           value             source   about
+		readBuffer          65536 (64 KiB)    custom   bytes one read of a connection's socket takes
+		writeWatermark      262144 (256 KiB)  default  bytes a connection may have waiting before its reads pause; ...
+		...
+```
+
 `source=default` 表示值来自 fib 默认或机器 sizing；`source=custom` 表示调用方改成了不同的值。
 `Engine.LogSettings()` 可以随时打印同样的列表，不受 `LogSettings` 开关影响；
 `Engine.Settings()` 以结构体返回，`Settings.Parameters()` 返回日志使用的同一组行。
@@ -164,6 +175,41 @@ INFO fib: config parameter=maxPendingBytes value="33255979008 (30.97 GiB)" sourc
 `Engine.LogSettings()` 仍可随时打印。
 
 `LogStatus` 是另一个开关，只控制 `fib: engine started` 那一行，默认关闭。
+
+## 日志
+
+fib 的所有包都通过 `github.com/lesismal/fib/log` 打日志：Engine、协程池、arpc、grpc，以及
+`logger` 和 `recover` 中间件。没有配置时它写到 `slog.Default()`，所以调用过 `slog.SetDefault` 的
+应用会一并收到 fib 的日志。要使用 fib 自己的格式：
+
+```go
+import fiblog "github.com/lesismal/fib/log"
+
+fiblog.Setup(fiblog.Config{
+	Format: fiblog.FormatJSON, // FormatLine（默认）、FormatText 或 FormatJSON
+	Level:  slog.LevelWarn,    // 也可以传 *slog.LevelVar，运行时调整
+	Output: os.Stderr,         // 默认值
+})
+```
+
+```text
+line  2026-10-27 10:00:00.000 INFO  fib: engine started engine=fib listen=tcp://[::]:8080
+text  time=2026-10-27T10:00:00.000+08:00 level=INFO msg="fib: engine started" engine=fib
+json  {"time":"2026-10-27T10:00:00.000+08:00","level":"INFO","msg":"fib: engine started","engine":"fib"}
+```
+
+`line` 给人看；`text` 和 `json` 是结构化日志，一条记录一行，便于程序采集。`line` 格式下，panic 的
+调用栈写在记录下面的若干行，逐行缩进；其他换行和控制字符一律转义，请求无法伪造出一行日志。
+`fiblog.SetLogger` 可以直接传任意 `*slog.Logger`，传 `nil` 恢复 `slog.Default()`。
+`arpc.SetLogger` 仍可给 arpc 单独指定 logger。
+
+程序里没有调用时，也可以用环境变量选择：`FIB_LOG_FORMAT`（`line`、`text`、`json`）和
+`FIB_LOG_LEVEL`（`debug`、`info`、`warn`、`error`）在程序启动时配置 fib 的 logger。之后调用
+`Setup` 或 `SetLogger` 会覆盖它们。
+
+`logger` 中间件把每个响应作为一条记录打出，消息为 `http: access`，字段由 `Config.Fields` 指定（默认
+`status`、`latency`、`ip`、`method`、`path`），格式跟随 logger。设置了它的 `Format` 或 `Output` 时，
+改为按 `${tag}` 模板把一行直接写到 `Output`，与以前相同。
 
 ## 运行时修改
 

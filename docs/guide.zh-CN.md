@@ -104,7 +104,7 @@
   按自己的配置创建协程池，之后的同名 Engine 直接使用它，其余配置不生效。需要隔离时
   可以给 Engine 起不同的名字，或把 `SharedTaskPool` 设为 `false`（仍用同名的
   `<Name>-streams`）。
-- 参数日志默认开启（`log/slog`，可用 `slog.SetDefault` 调整输出）：Engine 启动后逐项打印
+- 参数日志默认开启（经 `fib/log` 输出，格式见[配置](configuration.zh-CN.md#日志)）：Engine 启动后逐项打印
   实际生效的 `readBuffer`、`writeWatermark`、`maxPendingBytes`、`maxWriteQueueBytes` 等
   全部基础配置，每项带 `default`/`custom` 来源标记和一句说明。`config.LogSettings = false`
   关闭它，或调用 `Engine.LogSettings()` 手动打印。`config.LogStatus = true` 另外打印一行
@@ -1266,7 +1266,7 @@ cd http/routerbench && go test -bench . -benchmem
 handler := middleware.Chain(app,
     recover.New(),      // panic 转成 500，连接和同连接上的其他请求不受影响
     requestid.New(),    // X-Request-ID：沿用客户端的，否则生成 UUID
-    logger.New(),       // 每个响应写一行，格式用 ${status}、${latency} 等标签
+    logger.New(),       // 每个响应经 fib/log 打一条记录，字段用 status、latency 等标签
     responsetime.New(), // X-Response-Time
     limiter.New(limiter.Config{Max: 100, Expiration: time.Minute}), // 按 IP 限流，超出返回 429
     cors.New(cors.Config{AllowOrigins: []string{"https://app.example.com"}}),
