@@ -135,8 +135,10 @@ type ClientConfig struct {
 	// where it cannot be, there is no discovery.
 	DisablePathMTUDiscovery bool
 	// MaxProbeDatagramSize is the largest UDP payload path MTU discovery
-	// looks for. Zero means 1452, and so does more: what an Ethernet MTU of
-	// 1500 bytes leaves for UDP over IPv6.
+	// looks for. Zero means 1472 over IPv4 and 1452 over IPv6, and so does
+	// more: what an Ethernet MTU of 1500 bytes leaves for UDP once the IP
+	// header is taken off, 20 bytes over IPv4 and 40 over IPv6. A path not
+	// known to be IPv4 gets the IPv6 size, which every IP path carries.
 	MaxProbeDatagramSize int
 	// SessionCache holds the sessions connections resume from, and the
 	// tickets of those that end up in it. With EarlyData and none given, the

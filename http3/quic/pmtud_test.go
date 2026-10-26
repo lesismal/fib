@@ -2,11 +2,107 @@ package quic
 
 import (
 	"bytes"
+	"net"
 	"slices"
 	"sync"
 	"testing"
 	"time"
 )
+
+// pathAddr is a path's peer address that is not a *net.UDPAddr, as a custom
+// PacketConn or an in-memory test path has: only its network string can say
+// whether it is IPv4.
+type pathAddr string
+
+func (a pathAddr) Network() string { return string(a) }
+func (a pathAddr) String() string  { return string(a) }
+
+// maxDatagramFor gives an IPv4 path what an Ethernet MTU of 1500 bytes leaves
+// for UDP over IPv4, 1472 bytes, and an IPv6 or unidentifiable path what it
+// leaves over IPv6, 1452, which every IP path carries.
+func TestMaxDatagramFor(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		remote net.Addr
+		want   int
+	}{
+		{"IPv4", &net.UDPAddr{IP: net.IPv4(192, 0, 2, 1), Port: 443}, maxDatagramLimit},
+		{"IPv4 as 16-byte IP", &net.UDPAddr{IP: net.ParseIP("192.0.2.1"), Port: 443}, maxDatagramLimit},
+		{"IPv6", &net.UDPAddr{IP: net.ParseIP("2001:db8::1"), Port: 443}, maxDatagramIPv6},
+		{"IPv6 zone", &net.UDPAddr{IP: net.ParseIP("fe80::1"), Port: 443, Zone: "en0"}, maxDatagramIPv6},
+		{"UDPAddr without an IP", &net.UDPAddr{Port: 443}, maxDatagramIPv6},
+		{"nil UDPAddr", (*net.UDPAddr)(nil), maxDatagramIPv6},
+		{"udp4 network", pathAddr("udp4"), maxDatagramLimit},
+		{"udp network", pathAddr("udp"), maxDatagramIPv6},
+		{"nil", nil, maxDatagramIPv6},
+	} {
+		if got := maxDatagramFor(tc.remote); got != tc.want {
+			t.Errorf("%s: maxDatagramFor(%v) = %d, want %d", tc.name, tc.remote, got, tc.want)
+		}
+	}
+}
+
+// A connection clamps what its config allows to what its path carries: 1472
+// bytes on IPv4, 1452 on IPv6 and on a path not identifiable as IPv4, both
+// for what it sends and for what discovery looks for.
+func TestPathDatagramLimitClampsConfig(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		remote net.Addr
+		want   int
+	}{
+		{"IPv4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 1}, maxDatagramLimit},
+		{"IPv6", &net.UDPAddr{IP: net.IPv6loopback, Port: 1}, maxDatagramIPv6},
+		{"unidentified", nil, maxDatagramIPv6},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			pc, _ := newPipe()
+			pc.df = true
+			c := newConn(pc, tc.remote, Config{
+				MaxDatagramSize:      maxDatagramLimit,
+				MaxProbeDatagramSize: maxDatagramLimit,
+			}, nil, true)
+			if c.config.MaxDatagramSize != tc.want || c.config.MaxProbeDatagramSize != tc.want {
+				t.Fatalf("config allows %d and probes %d, want %d and %d",
+					c.config.MaxDatagramSize, c.config.MaxProbeDatagramSize, tc.want, tc.want)
+			}
+			// Every path (re)validation sets the size through here.
+			c.setMaxDatagramLocked(maxDatagramLimit)
+			if c.maxDatagram != tc.want {
+				t.Fatalf("datagram size %d, want %d", c.maxDatagram, tc.want)
+			}
+			// Discovery clamps the size it looks for too, even when the
+			// config it reads was not clamped, as after a move to a path of
+			// the other family.
+			c.setMaxDatagramLocked(maxDatagram)
+			c.config.MaxProbeDatagramSize = maxDatagramLimit
+			c.handshakeConfirmed = true
+			params := defaultParams()
+			c.peerParams = &params
+			c.startMTUDiscoveryLocked(time.Now())
+			if !c.mtu.on || c.mtu.limit != tc.want || c.mtu.probe != tc.want {
+				t.Fatalf("discovery on %v, limit %d, probe %d, want %d and %d",
+					c.mtu.on, c.mtu.limit, c.mtu.probe, tc.want, tc.want)
+			}
+		})
+	}
+}
+
+// An IPv6 path gets the IPv6 limit: discovery looks for 1452 bytes, not the
+// 1472 an IPv4 path of the same Ethernet MTU carries.
+func TestMTUDiscoveryOnIPv6Path(t *testing.T) {
+	p := newTestPairOpts(t, 0, nil, pairOpts{
+		remote: &net.UDPAddr{IP: net.IPv6loopback, Port: 1},
+		pipes: func(client, server *pipeEnd) {
+			for _, end := range []*pipeEnd{client, server} {
+				end.df = true
+			}
+		},
+	})
+	waitDatagramSize(t, p.client, maxDatagramIPv6, maxDatagramIPv6)
+	waitDatagramSize(t, p.server, maxDatagramIPv6, maxDatagramIPv6)
+	echoLarge(t, p, 256<<10)
+}
 
 // newMTUPair connects a client and a server over a pipe that stops
 // fragmenting, each direction carrying datagrams of at most mtu bytes, or
@@ -285,34 +381,42 @@ func TestMTUBlackHoleByLoss(t *testing.T) {
 }
 
 // The search finds what a path carries, to within mtuSearchStep, with few
-// probes, losing each size it rejects mtuProbeAttempts times.
+// probes, losing each size it rejects mtuProbeAttempts times, up to what the
+// path's address family carries.
 func TestMTUSearch(t *testing.T) {
-	for _, pathMTU := range []int{1200, 1250, 1280, 1350, 1400, 1440, 1451, 1452, 1500} {
-		c := newConn(nil, nil, Config{}, nil, false)
-		now := time.Now()
-		c.mtu = mtuState{on: true, limit: maxDatagramLimit, lo: maxDatagram, hi: maxDatagramLimit + 1, probe: maxDatagramLimit}
-		probes := 0
-		for pn := uint64(0); c.mtu.probe > 0 && c.mtu.at.IsZero(); pn++ {
-			if probes++; probes > 40 {
-				t.Fatalf("path of %d: search does not end", pathMTU)
+	remotes := []net.Addr{
+		&net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 1},
+		nil,
+	}
+	for _, remote := range remotes {
+		limit := maxDatagramFor(remote)
+		for _, pathMTU := range []int{1200, 1250, 1280, 1350, 1400, 1440, 1451, 1452, 1500} {
+			c := newConn(nil, remote, Config{}, nil, false)
+			now := time.Now()
+			c.mtu = mtuState{on: true, limit: limit, lo: maxDatagram, hi: limit + 1, probe: limit}
+			probes := 0
+			for pn := uint64(0); c.mtu.probe > 0 && c.mtu.at.IsZero(); pn++ {
+				if probes++; probes > 40 {
+					t.Fatalf("path of %d: search does not end", pathMTU)
+				}
+				c.mtu.inFlight, c.mtu.probePN = true, pn
+				p := &sentPacket{pn: pn, size: c.mtu.probe, mtuProbe: true, ackEliciting: true, inFlight: true}
+				if p.size <= pathMTU {
+					c.mtuAckedLocked(p, now)
+				} else {
+					c.mtuLostLocked(p, now)
+				}
 			}
-			c.mtu.inFlight, c.mtu.probePN = true, pn
-			p := &sentPacket{pn: pn, size: c.mtu.probe, mtuProbe: true, ackEliciting: true, inFlight: true}
-			if p.size <= pathMTU {
-				c.mtuAckedLocked(p, now)
-			} else {
-				c.mtuLostLocked(p, now)
+			want := min(pathMTU, limit)
+			if c.maxDatagram > want || c.maxDatagram <= want-mtuSearchStep || c.mtu.lo != c.maxDatagram {
+				t.Errorf("path of %d over %v: settled on %d", pathMTU, remote, c.maxDatagram)
 			}
-		}
-		want := min(pathMTU, maxDatagramLimit)
-		if c.maxDatagram > want || c.maxDatagram <= want-mtuSearchStep || c.mtu.lo != c.maxDatagram {
-			t.Errorf("path of %d: settled on %d", pathMTU, c.maxDatagram)
-		}
-		if probes > 25 {
-			t.Errorf("path of %d: %d probes", pathMTU, probes)
-		}
-		if want == maxDatagramLimit && c.mtu.probe != 0 {
-			t.Errorf("path of %d: searching again for %d", pathMTU, c.mtu.probe)
+			if probes > 25 {
+				t.Errorf("path of %d: %d probes", pathMTU, probes)
+			}
+			if want == limit && c.mtu.probe != 0 {
+				t.Errorf("path of %d over %v: searching again for %d", pathMTU, remote, c.mtu.probe)
+			}
 		}
 	}
 }

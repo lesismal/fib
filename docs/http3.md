@@ -222,7 +222,7 @@ These are still constants:
 
 | Parameter | Value |
 | --- | --- |
-| Datagram size | 1200 bytes until path MTU discovery finds more (see [Protocol details](#protocol-details)), at most 1452; a server can start higher with `Config.MaxDatagramSize` on a network known to carry that |
+| Datagram size | 1200 bytes until path MTU discovery finds more (see [Protocol details](#protocol-details)), at most 1472 over IPv4 and 1452 over IPv6; a server can start higher with `Config.MaxDatagramSize` on a network known to carry that |
 | Bidirectional stream limit the client advertises | 1 (servers may not open request streams) |
 | QPACK dynamic table capacity | 0 |
 | Received packet number ranges remembered | 32; older packets are treated as duplicates |
@@ -281,9 +281,13 @@ These are still constants:
   full device queue — a millisecond timer tries again.
 - **Path MTU discovery** (DPLPMTUD, RFC 8899; RFC 9000 §14.3), on by default
   at both ends: once the handshake is confirmed a connection sends a probe, a
-  PING padded to 1452 bytes (`MaxProbeDatagramSize`, and no more than the
-  peer's `max_udp_payload_size`), and sends datagrams that large once it is
-  acknowledged. A probe lost three times has the sizes below searched by
+  PING padded to 1472 bytes over IPv4 or 1452 over IPv6 (`MaxProbeDatagramSize`,
+  no more than the peer's `max_udp_payload_size`, and what an Ethernet MTU of
+  1500 bytes leaves for UDP), and sends datagrams that large once it is
+  acknowledged. `MaxDatagramSize` and `MaxProbeDatagramSize`, in `Config` and
+  `ClientConfig`, are clamped to the path's limit, 1472 on IPv4 and 1452 on
+  anything not identifiable as IPv4, so an IPv6 connection never probes or
+  sends the IPv4 size. A probe lost three times has the sizes below searched by
   halves, to within 20 bytes, and from the top again ten minutes later. Lost
   probes do not count as congestion. It runs only where the engine's UDP
   socket can be set not to fragment (`fib.Connection.SetDontFragment`: Linux
@@ -473,8 +477,9 @@ Done:
   unchanged (1175k, 1165k).
 - **PMTU discovery (DPLPMTUD, RFC 8899)**: done, with black hole detection
   (see [Protocol details](#protocol-details)), and the congestion window
-  counted in the discovered datagram size. Still open: searching above
-  1452 bytes (jumbo frames, or 1472 over IPv4), which needs larger send
+  counted in the discovered datagram size. It searches up to 1472 bytes over
+  IPv4 and 1452 over IPv6, what an Ethernet MTU of 1500 bytes leaves for UDP.
+  Still open: searching above that (jumbo frames), which needs larger send
   buffers.
 - **HyStart++** (RFC 9406): done, and on for the initial slow start. Each
   round it keeps the minimum round trip of the round and of the one before,

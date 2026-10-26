@@ -202,6 +202,10 @@ type pairOpts struct {
 	wrapClient func(*testHandler) Handler
 	// pipes, if set, is told the ends of the path before anything is sent.
 	pipes func(client, server *pipeEnd)
+	// remote, if set, is the peer address the client dials and the server
+	// accepts from, in place of a loopback IPv4 one: a test of a path whose
+	// address family changes what it carries sets an IPv6 address.
+	remote net.Addr
 	// retry, if set, has the server answer an Initial without a token of
 	// the key's with a Retry, and check the tokens of the others with it.
 	retry *TokenKey
@@ -251,7 +255,10 @@ func newTestPairOpts(t testing.TB, loss float64, configure func(client, server *
 	if opts.pipes != nil {
 		opts.pipes(p.clientEnd, p.serverEnd)
 	}
-	addr := &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 1}
+	var addr net.Addr = &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 1}
+	if opts.remote != nil {
+		addr = opts.remote
+	}
 	p.wg.Add(2)
 	go func() {
 		defer p.wg.Done()

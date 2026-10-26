@@ -239,8 +239,10 @@ type Config struct {
 	// over, if the peer's max_udp_payload_size allows it, until path MTU
 	// discovery finds the path carries more. Default 1200, the size every
 	// path carries; more saves packets, and the syscalls that send them, on
-	// a path known to carry them. At most 1452. A connection whose larger
-	// datagrams stop getting through goes back to 1200 (see pmtud.go).
+	// a path known to carry them. At most 1472 bytes on an IPv4 path and
+	// 1452 on an IPv6 one, what an Ethernet MTU of 1500 bytes leaves for UDP
+	// (see MaxProbeDatagramSize). A connection whose larger datagrams stop
+	// getting through goes back to 1200 (see pmtud.go).
 	MaxDatagramSize int
 	// DisablePathMTUDiscovery turns path MTU discovery (RFC 8899) off. With
 	// it on, the default, a connection whose path stops datagrams that are
@@ -250,9 +252,11 @@ type Config struct {
 	// datagrams of that size.
 	DisablePathMTUDiscovery bool
 	// MaxProbeDatagramSize is the largest datagram path MTU discovery looks
-	// for. Default and at most 1452, what an Ethernet MTU of 1500 bytes
-	// leaves for UDP over IPv6; one no larger than MaxDatagramSize turns
-	// discovery off.
+	// for. Default and at most 1472 bytes on an IPv4 path and 1452 on an
+	// IPv6 one, what an Ethernet MTU of 1500 bytes leaves for UDP: the IP
+	// header is 20 bytes over IPv4 and 40 over IPv6. A path not identifiable
+	// as IPv4 gets the IPv6 size, which every IP path carries. One no larger
+	// than MaxDatagramSize turns discovery off.
 	MaxProbeDatagramSize int
 	// EarlyData lets a client send 0-RTT data on a session it resumes, if
 	// its TLS keeps sessions that allow it (see CanSendEarly), and lets a
@@ -439,9 +443,9 @@ type Conn struct {
 	bytesRecv          uint64
 	bytesSent          uint64
 	// maxDatagram is the largest datagram this side sends: maxDatagram
-	// until the handshake is over, then what the config and the peer allow.
-	// The congestion controller counts its window in this size (see
-	// setMaxDatagramLocked).
+	// until the handshake is over, then what the config, the peer and the
+	// path allow (see setMaxDatagramLocked). The congestion controller
+	// counts its window in this size.
 	maxDatagram int
 	// mtu is path MTU discovery's state (see pmtud.go).
 	mtu        mtuState
@@ -717,6 +721,14 @@ func randomCID() []byte {
 
 func newConn(pc PacketConn, remote net.Addr, config Config, handler Handler, isClient bool) *Conn {
 	config = config.withDefaults()
+	// The config is for IP paths in general, but an IPv6 path carries less
+	// than an IPv4 one (see maxDatagramFor): clamp what it allows to this
+	// path. Discovery clamps again when it starts and the sending size is
+	// clamped whenever it is set, in case the connection later moves to a
+	// path of the other family.
+	limit := maxDatagramFor(remote)
+	config.MaxDatagramSize = min(config.MaxDatagramSize, limit)
+	config.MaxProbeDatagramSize = min(config.MaxProbeDatagramSize, limit)
 	now := time.Now()
 	c := &Conn{
 		pc:           pc,

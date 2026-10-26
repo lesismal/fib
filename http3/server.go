@@ -186,8 +186,9 @@ type Config struct {
 	// connection's handshake is over, if the client allows it, until path
 	// MTU discovery finds the path carries more. Zero means 1200 bytes,
 	// which every path carries; a network known to carry more saves packets
-	// with more, up to 1452. A connection whose larger datagrams stop
-	// getting through goes back to 1200.
+	// with more, up to 1472 over IPv4 and 1452 over IPv6, what an Ethernet
+	// MTU of 1500 bytes leaves for UDP. A connection whose larger datagrams
+	// stop getting through goes back to 1200.
 	MaxDatagramSize int
 	// DisablePathMTUDiscovery turns path MTU discovery (RFC 8899) off. With
 	// it on, the default, each connection probes for the largest datagram
@@ -198,8 +199,10 @@ type Config struct {
 	// discovery needs; where it cannot be, there is no discovery.
 	DisablePathMTUDiscovery bool
 	// MaxProbeDatagramSize is the largest UDP payload path MTU discovery
-	// looks for. Zero means 1452, and so does more: what an Ethernet MTU of
-	// 1500 bytes leaves for UDP over IPv6.
+	// looks for. Zero means 1472 over IPv4 and 1452 over IPv6, and so does
+	// more: what an Ethernet MTU of 1500 bytes leaves for UDP once the IP
+	// header is taken off, 20 bytes over IPv4 and 40 over IPv6. A path not
+	// known to be IPv4 gets the IPv6 size, which every IP path carries.
 	MaxProbeDatagramSize int
 	// Transport is how the QUIC connections under the server behave, beyond
 	// what the fields above set; see TransportConfig.

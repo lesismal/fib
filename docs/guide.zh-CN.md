@@ -1341,10 +1341,11 @@ QUIC 层的实现要点：
   拥塞窗口 pacing；大流量传输时用 ACK_FREQUENCY 扩展（draft-ietf-quic-ack-frequency）
   请对端减少确认，丢包后自动改回频繁确认。服务端在验证客户端地址前遵守 3 倍放大限制。
   数据报从 1200 字节
-  （所有 IPv6 路径都能承载的大小）开始，握手确认后做路径 MTU 探测（RFC 8899），以太网上
-  通常升到 1452 字节；更大的包持续丢失时退回 1200 字节（黑洞检测）。探测要求 UDP socket
+  （所有 IP 路径都能承载的大小）开始，握手确认后做路径 MTU 探测（RFC 8899），以太网上
+  IPv4 路径通常升到 1472 字节、IPv6 路径升到 1452 字节（1500 减去 IP 头与 8 字节 UDP 头）；
+  更大的包持续丢失时退回 1200 字节（黑洞检测）。探测要求 UDP socket
   不分片，由 `fib.Connection.SetDontFragment` 设置；`DisablePathMTUDiscovery` 关闭探测，
-  `MaxProbeDatagramSize` 设上限。
+  `MaxProbeDatagramSize` 设上限，并按路径的地址族收紧（IPv4 1472、IPv6 1452）。
 - 流控：遵守对端的连接级和 stream 级限制，被挡住时每个新上限发一次 DATA_BLOCKED、
   STREAM_DATA_BLOCKED 或 STREAMS_BLOCKED；接收方向默认每个 stream 窗口 1MB、连接窗口
   16MB（`TransportConfig` 可调），按消费量自动补充；并发 stream 数用 MAX_STREAMS 动态放开。

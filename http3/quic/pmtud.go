@@ -1,6 +1,9 @@
 package quic
 
-import "time"
+import (
+	"net"
+	"time"
+)
 
 // Path MTU discovery is DPLPMTUD (RFC 8899), as RFC 9000 section 14.3 has
 // QUIC do it: once the handshake is confirmed, the connection sends probes,
@@ -62,6 +65,33 @@ const (
 	mtuBlackHolePTOs = 3
 )
 
+// maxDatagramFor returns the largest UDP payload an Ethernet MTU of 1500
+// bytes leaves for a path to remote: 1472 bytes over IPv4, whose header is 20
+// bytes, and 1452 over IPv6, whose header is 40. A path is IPv4 when remote is
+// a *net.UDPAddr with an IPv4 address, or when it says its network is "udp4";
+// anything else, a custom PacketConn's address, an in-memory test path or a
+// nil remote among them, gets the IPv6 size, which every IP path carries. Only
+// the peer's address says which family the path is, so the local one, which a
+// test or a custom PacketConn may not even have, is not looked at.
+func maxDatagramFor(remote net.Addr) int {
+	if ua, ok := remote.(*net.UDPAddr); ok {
+		if ua != nil && ua.IP.To4() != nil {
+			return maxDatagramLimit
+		}
+		return maxDatagramIPv6
+	}
+	if remote != nil && remote.Network() == "udp4" {
+		return maxDatagramLimit
+	}
+	return maxDatagramIPv6
+}
+
+// pathDatagramLimitLocked is the largest datagram the path the connection
+// sends on carries: maxDatagramFor of its remote address. Callers hold c.mu.
+func (c *Conn) pathDatagramLimitLocked() int {
+	return maxDatagramFor(c.remote)
+}
+
 // mtuState is a connection's path MTU discovery, and its black hole
 // detection.
 type mtuState struct {
@@ -98,6 +128,11 @@ func (c *Conn) startMTUDiscoveryLocked(now time.Time) {
 		return
 	}
 	limit := int(min(uint64(c.config.MaxProbeDatagramSize), c.peerParams.maxUDPPayloadSize))
+	// The config is clamped to the path when the connection starts and
+	// whenever the path is revalidated, but discovery is where the size it
+	// looks for is chosen, so clamp here too: a path that moved to another
+	// address family must not be probed above what it carries.
+	limit = min(limit, c.pathDatagramLimitLocked())
 	if limit <= c.maxDatagram {
 		return
 	}
@@ -263,16 +298,21 @@ func (c *Conn) nextMTUProbeLocked(now time.Time) {
 
 // setMaxDatagramLocked changes the largest datagram the connection sends,
 // as the handshake, a new path or path MTU discovery settles on a size. The
-// congestion controller counts its window in that size, and keeps its own
-// copy: it follows from here, minimum window included. Callers hold c.mu.
+// size is clamped to what the path carries (see maxDatagramFor), so a
+// connection that moves to an address family with a smaller limit does not
+// keep sending above it. The congestion controller counts its window in that
+// size, and keeps its own copy: it follows from here, minimum window
+// included. Callers hold c.mu.
 func (c *Conn) setMaxDatagramLocked(size int) {
+	size = min(size, c.pathDatagramLimitLocked())
 	c.maxDatagram = size
 	c.cc.setMaxDatagramSize(size)
 }
 
 // DatagramSize returns the size of the largest datagram the connection
-// sends now: maxDatagram until the handshake is over, then what the config
-// and the peer allow and path MTU discovery found the path to carry.
+// sends now: maxDatagram until the handshake is over, then what the config,
+// the peer and the path allow and path MTU discovery found the path to
+// carry.
 func (c *Conn) DatagramSize() int {
 	c.mu.Lock()
 	defer c.mu.Unlock()

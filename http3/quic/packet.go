@@ -31,11 +31,17 @@ const (
 	minInitialDatagram = 1200
 	// maxDatagram is the largest datagram sent until the handshake is over,
 	// and after it unless Config.MaxDatagramSize allows more. It is the size
-	// every IPv6 path carries, which spares path MTU discovery.
+	// every path carries, which spares path MTU discovery.
 	maxDatagram = 1200
-	// maxDatagramLimit is the most Config.MaxDatagramSize may allow: what an
-	// Ethernet MTU of 1500 bytes leaves for UDP over IPv6.
-	maxDatagramLimit = 1452
+	// maxDatagramLimit is the largest datagram Config.MaxDatagramSize and
+	// Config.MaxProbeDatagramSize may allow, and the most an IPv4 path
+	// carries over an Ethernet MTU of 1500 bytes: 1500 less the 20-byte IP
+	// header and the 8-byte UDP header.
+	maxDatagramLimit = 1472
+	// maxDatagramIPv6 is what an Ethernet MTU of 1500 bytes leaves for UDP
+	// over IPv6, whose header is 20 bytes larger than IPv4's. It is also the
+	// limit for a path not known to be IPv4, which every one of them carries.
+	maxDatagramIPv6 = 1452
 	// aeadOverhead is the tag every supported AEAD appends.
 	aeadOverhead = 16
 	// statelessResetTokenLen is the length of a stateless reset token.

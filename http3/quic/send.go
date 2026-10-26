@@ -108,8 +108,9 @@ func (c *Conn) sealPlan(out []byte, p *packetPlan) []byte {
 // room for a burst of full packets, and one of the buffer pool's classes. A
 // round is one batched send, which with UDP GSO is one buffer the kernel
 // cuts into datagrams, and costs about the same however many it holds: 64
-// KiB holds 45 datagrams of 1452 bytes, as many as one GSO send takes (see
-// udpbatch), where 32 KiB held 19.
+// KiB holds 44 datagrams of 1472 bytes, the largest an IPv4 path carries, or
+// 45 of 1452, the largest an IPv6 one does. That is what a round of full
+// datagrams sends, where 32 KiB held 19.
 const sendBufferSize = 64 << 10
 
 // maxRoundDatagrams bounds the datagrams a round of sending sends.

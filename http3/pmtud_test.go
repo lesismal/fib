@@ -36,7 +36,9 @@ func TestPathMTUDiscovery(t *testing.T) {
 		limit   int
 		want    int
 	}{
-		{"default", false, 0, 1452},
+		// Loopback here is IPv4, which carries 1472 bytes over an Ethernet
+		// MTU of 1500; an IPv6 path would discover 1452.
+		{"default", false, 0, 1472},
 		{"limit", false, 1300, 1300},
 		{"disabled", true, 0, 1200},
 	} {
