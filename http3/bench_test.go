@@ -18,9 +18,9 @@ import (
 
 // BenchmarkHTTP3Transfer measures a response body of a declared length over
 // one connection, one request after another: the bulk download a single
-// connection gives.
+// connection gives, and a small one that a whole response is kept for too.
 func BenchmarkHTTP3Transfer(b *testing.B) {
-	for _, size := range []int{64 << 10, 1 << 20} {
+	for _, size := range []int{4 << 10, 64 << 10, 1 << 20} {
 		b.Run(fmt.Sprintf("%dKiB", size>>10), func(b *testing.B) {
 			payload := make([]byte, size)
 			for i := range payload {

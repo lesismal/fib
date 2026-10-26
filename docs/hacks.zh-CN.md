@@ -439,7 +439,7 @@ HTTP/3 同样复用请求 stream，`http3.Config.DisableReuse` 关闭。
 - `Context.Body()`：非流式 body（handler 运行前已整体读完）直接返回 server 自己的 buffer。
   `io.ReadAll(c.Request.Body)` 要用逐步增长的 buffer 再拷贝一遍。这些字节**在响应结束之前归 handler 所有，
   不可修改，也不可保留**。`Respond`/`Write` 会拷贝属于请求自己的 body（`c.Body()` 就是），所以 echo 可以直接
-  `c.Respond(200, "application/octet-stream", c.Body())`；其他来源、超过 4KiB 的 body 会留到响应发出（HTTP/2）或对端确认（HTTP/3），写入之后不能再改，见 `fibhttp.Response.Body`。流式 body 时返回 nil。
+  `c.Respond(200, "application/octet-stream", c.Body())`；其他来源的 body 无论大小都会留到响应发出（HTTP/1、HTTP/2）或对端确认（HTTP/3），写入之后不能再改，见 `fibhttp.Response.Body`。流式 body 时返回 nil。
 - `Context.Query(name)`：和 `c.Request.URL.Query().Get(name)` 解码方式相同，但不构建 map；
   不需要解码的值就是原始 query 的子串，零分配。
 - `Router` 的路由状态挂在 `Context` 上，随 Context 复用：路由一个请求零分配；`c.Param(name)` /

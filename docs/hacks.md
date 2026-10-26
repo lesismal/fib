@@ -507,9 +507,10 @@ HTTP/3 reuses request streams as well; `http3.Config.DisableReuse` turns it off.
   server's own buffer. `io.ReadAll(c.Request.Body)` grows a buffer and copies again. These bytes **belong
   to the handler until the response ends; they must not be modified or kept**. `Respond` and
   `Write` copy a body that is the request's own, as `c.Body()` is, so an echo can be
-  `c.Respond(200, "application/octet-stream", c.Body())`. Any other body above 4KiB is kept
-  until the response has been sent (HTTP/2) or acknowledged (HTTP/3), so it must not be changed
-  once written; see `fibhttp.Response.Body`. It returns nil for a streamed body.
+  `c.Respond(200, "application/octet-stream", c.Body())`. Any other body is kept until the
+  response has been sent (HTTP/1, HTTP/2) or acknowledged (HTTP/3), whatever its size, so it
+  must not be changed once written; see `fibhttp.Response.Body`. It returns nil for a streamed
+  body.
 - `Context.Query(name)`: decoded exactly like `c.Request.URL.Query().Get(name)` but without building a
   map; a value that needs no decoding is a substring of the raw query, with zero allocation.
 - The `Router` keeps its routing state on the `Context`, reused with it: routing a request

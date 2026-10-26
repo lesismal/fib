@@ -164,10 +164,10 @@ body 都是压测服务端缓存的那一份，所以不管多少 stream 持有�
 - **HTTP/3 现在**和 HTTP/2 一样，把 body 留在 handler 给它的地方，按对端窗口、再按
   对端确认逐步装帧：stream 以若干 run 持有响应（`quic.Stream.WriteFinalParts`），
   卡住的 stream 因此只占流控窗口允许的那些帧，每个约五分之一 MiB，而不是一个比
-  body 还大的池缓冲。body 只剩装进 packet 的那一次拷贝，这是 AEAD 需要的。4KiB
-  及以下的 body 仍然拷进构造帧的那块缓冲，因为这么小的 body 分成多个部分比拷贝
-  更贵。这对 handler 的要求见 [HTTP/3](http3.zh-CN.md) 和 `fibhttp.Response.Body`：
-  更大的 body 在对端确认之前不能修改。
+  body 还大的池缓冲。body 只剩装进 packet 的那一次拷贝，这是 AEAD 需要的，与 body
+  大小无关：小响应的帧仍然共用一块池缓冲，所以小的整体响应并不比大的贵。这对
+  handler 的要求见 [HTTP/3](http3.zh-CN.md) 和 `fibhttp.Response.Body`：
+  body 在对端确认之前不能修改。
 
 这是部署上的限制，不是错误结果：对端没有被 reset，快速负载照常跑。规划时值得注意：
 

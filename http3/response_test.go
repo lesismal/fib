@@ -5,6 +5,7 @@ package http3
 import (
 	"bytes"
 	stdhttp "net/http"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -279,5 +280,165 @@ func TestStreamFailureCancelsTheContext(t *testing.T) {
 	case err := <-cancelled:
 		t.Fatalf("an answered request was cancelled too: %v", err)
 	case <-time.After(100 * time.Millisecond):
+	}
+}
+
+// A whole response is kept the same way whatever its body's size, the one of
+// 4KiB or less that used to be copied into the buffer its frames were built
+// in as much as a larger one: a reader that stalls it with its window and then
+// reads gets every byte, and the trailer, back.
+func TestResponseWholeBodyStalled(t *testing.T) {
+	// The window is small enough that the frames alone cannot carry a body of
+	// the sizes below through it, so each response waits in its stream until
+	// the reader takes what it has.
+	const window = 256
+	for _, size := range []int{1 << 10, 4 << 10, 4<<10 + 1, 64 << 10} {
+		t.Run(strconv.Itoa(size), func(t *testing.T) {
+			body := make([]byte, size)
+			for i := range body {
+				body[i] = byte('a' + i%26)
+			}
+			trailer := "t" + strconv.Itoa(size)
+			base := startServer(t, Config{}, func(c *fibhttp.Context) {
+				_ = c.WriteResponse(fibhttp.Response{StatusCode: stdhttp.StatusOK, Body: body,
+					Trailer: stdhttp.Header{"X-Sum": {trailer}}})
+			})
+			w := dialH3WireWith(t, nil, base, quic.Config{StreamReceiveWindow: window})
+			s, err := w.qc.OpenStream()
+			if err != nil {
+				t.Fatal(err)
+			}
+			// The reader takes nothing of what arrives until the test says so.
+			s.HoldCredit()
+			head, _ := h3Request{path: "/"}.frames()
+			if err := s.Write(head, true); err != nil {
+				t.Fatal(err)
+			}
+			id := s.ID()
+			st := w.await(id, "the header", func(st *h3WireStream) bool { return st.status == stdhttp.StatusOK })
+			time.Sleep(50 * time.Millisecond)
+			w.mu.Lock()
+			got, gotTrailer := len(st.body), st.trailer.Get("X-Sum")
+			w.mu.Unlock()
+			if got >= size || gotTrailer != "" {
+				t.Fatalf("a window of %d took %d of %d bytes and trailer %q", window, got, size, gotTrailer)
+			}
+			// Read it, giving the stream room as the reader takes it.
+			credited := 0
+			for {
+				w.mu.Lock()
+				n, done, changed := len(st.body), st.done, st.changed
+				w.mu.Unlock()
+				if n > credited {
+					s.Credit(n - credited)
+					credited = n
+				}
+				if done {
+					break
+				}
+				select {
+				case <-changed:
+				case <-time.After(20 * time.Second):
+					t.Fatalf("stalled at %d of %d bytes", n, size)
+				}
+			}
+			w.mu.Lock()
+			read, readTrailer, reset, readErr := bytes.Clone(st.body), st.trailer.Get("X-Sum"), st.reset, st.err
+			w.mu.Unlock()
+			if readErr != nil || reset {
+				t.Fatalf("the response ended with %v, reset %v", readErr, reset)
+			}
+			if !bytes.Equal(read, body) || readTrailer != trailer {
+				t.Fatalf("read %d bytes and trailer %q, want %d and %q", len(read), readTrailer, size, trailer)
+			}
+		})
+	}
+}
+
+// A body no larger than the size that used to be copied with its frames is
+// not copied now either: the stream reads the handler's slice as the reader's
+// window lets it, so what the handler writes into that slice after Respond
+// returns, before the reader has taken it, is what the reader gets.
+//
+// The handler runs on the connection's reader here (StreamPool.Disable), so
+// writing the body after Respond returns and the stream's later read of it are
+// that goroutine's alone, and the test is not a data race.
+func TestResponseSmallBodyIsNotCopied(t *testing.T) {
+	const size = 4 << 10
+	const window = 512
+	body := bytes.Repeat([]byte("a"), size)
+	// The handler changes the tail of its body, which is past the window the
+	// reader has, once Respond has returned.
+	changed := bytes.Repeat([]byte("b"), window)
+	responded, mutate, mutated := make(chan struct{}), make(chan struct{}), make(chan struct{})
+	config := Config{}
+	config.StreamPool = fibhttp.StreamPoolConfig{Disable: true}
+	base := startServer(t, config, func(c *fibhttp.Context) {
+		_ = c.Respond(stdhttp.StatusOK, "application/octet-stream", body)
+		close(responded)
+		<-mutate
+		copy(body[size-window:], changed)
+		close(mutated)
+	})
+	w := dialH3WireWith(t, nil, base, quic.Config{StreamReceiveWindow: window})
+	s, err := w.qc.OpenStream()
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.HoldCredit()
+	head, _ := h3Request{path: "/"}.frames()
+	if err := s.Write(head, true); err != nil {
+		t.Fatal(err)
+	}
+	id := s.ID()
+	st := w.await(id, "the header", func(st *h3WireStream) bool { return st.status == stdhttp.StatusOK })
+	select {
+	case <-responded:
+	case <-time.After(20 * time.Second):
+		t.Fatal("the handler did not return from Respond")
+	}
+	// Nothing of the tail has gone out: the window carries the frames and the
+	// front of the body at most.
+	w.mu.Lock()
+	taken := len(st.body)
+	w.mu.Unlock()
+	if taken > size-window {
+		t.Fatalf("%d bytes read before the handler changed any, want at most %d", taken, size-window)
+	}
+	close(mutate)
+	<-mutated
+	credited := 0
+	for {
+		w.mu.Lock()
+		n, done, next := len(st.body), st.done, st.changed
+		w.mu.Unlock()
+		if n > credited {
+			s.Credit(n - credited)
+			credited = n
+		}
+		if done {
+			break
+		}
+		select {
+		case <-next:
+		case <-time.After(20 * time.Second):
+			t.Fatalf("stalled at %d of %d bytes", n, size)
+		}
+	}
+	want := bytes.Repeat([]byte("a"), size)
+	copy(want[size-window:], changed)
+	w.mu.Lock()
+	read, readErr := bytes.Clone(st.body), st.err
+	w.mu.Unlock()
+	if readErr != nil {
+		t.Fatalf("the response ended with %v", readErr)
+	}
+	if !bytes.Equal(read, want) {
+		tail := read
+		if len(tail) > size-window {
+			tail = tail[size-window:]
+		}
+		t.Fatalf("read %d bytes, %d of the tail changed, want %d bytes and %d changed",
+			len(read), bytes.Count(tail, []byte("b")), size, window)
 	}
 }

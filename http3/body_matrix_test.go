@@ -256,6 +256,8 @@ type h3WireStream struct {
 	status  int
 	interim []int
 	body    []byte
+	// trailer is what a HEADERS frame after the first carried.
+	trailer stdhttp.Header
 	done    bool
 	reset   bool
 	err     error
@@ -293,8 +295,18 @@ func (h h3WireHandler) OnStreamData(s *quic.Stream, data []byte, fin bool) {
 			if typ != frameHeaders {
 				return nil
 			}
+			// A HEADERS frame after the response's own is a trailer, which
+			// may carry fields other than :status; the first one is the
+			// response's header, whose other fields this does not keep.
+			trailer := st.status != 0
 			return qpack.Decode(payload, 1<<20, func(f qpack.HeaderField) error {
 				if f.Name != ":status" {
+					if trailer {
+						if st.trailer == nil {
+							st.trailer = make(stdhttp.Header)
+						}
+						st.trailer.Add(f.Name, f.Value)
+					}
 					return nil
 				}
 				status, err := strconv.Atoi(f.Value)

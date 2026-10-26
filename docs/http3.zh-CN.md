@@ -124,8 +124,9 @@
   把 handler 的 body 原样留着，按对端窗口、再按对端确认逐步装帧，因此一个卡住的 stream
   占的是它窗口内的那些帧，而不是 body 本身：16 个卡住的 8MiB 响应占 19MiB 活堆，
   而过去把 body 拷进一块 2 的幂缓冲时要占 275MiB（见[压测](loadtest.zh-CN.md)）。
-  4KiB 及以下的 body 仍然拷进构造帧的那块缓冲；更大的 body 在 `Respond` 或
-  `WriteResponse` 返回之后不能修改，对 handler 的要求见 `fibhttp.Response.Body`。
+  无论大小，body 都留在 handler 给它的地方直到对端确认响应，帧则用 stream 自己的池缓冲，
+  所以 `Respond` 或 `WriteResponse` 返回之后不能修改它——除非这次调用拷贝了 body；
+  `fibhttp.Response.Body` 对每种协议都是这一条规则。
   用 `Write` 和 `Flush` 流式发送只需 64KiB。
 - 请求完整后按 `Config.StreamPool` 的描述交给 engine 的 handler 协程池（与 HTTP/2 server
   相同：同名 engine 的 `<Name>-streams`，不与 engine 的协程池共用），因此同一连接上客户端并发发起的多个请求是并发处理的，阻塞的 handler 只拖累它
@@ -345,17 +346,17 @@
   内核合并的一串数据报作为一次读取返回，Engine 按控制消息给出的大小再拆回单个数据报，
   一串数据报因此只花一次接收而不是每个一次系统调用。内核不支持 `UDP_GRO` 时以及其他系统上
   仍然一次读一个数据报。
-- **减少复制与分配**：整体给出的响应（超过 4KiB）留在 handler 放它的地方，直接从那里
+- **减少复制与分配**：整体给出的响应无论大小都留在 handler 放它的地方，直接从那里
   装帧，因此 body 只复制一次——装进 packet 的那次，AEAD 需要它；流式给出的响应还会复制
-  进 DATA 帧的缓冲，那正是 stream 自己发送缓冲的用途。要发的内容在组包时复制进 packet，
-  而每个 packet 直接建在它要发出去的位置（payload 跟在 header 占的位置之后），所以封包
-  不再复制任何东西。接收时 Engine 复制一次（复制进缓冲池里的缓冲区），HTTP/3 帧解析器
-  只复制跨片段的帧和请求 body。4KiB 及以下的响应仍然连同帧一起拷进一块缓冲，因为这么
-  小的 body 分成多段比拷贝更贵。包保护已经不再分配：ChaCha20-Poly1305 的认证器原来每个包一次堆分配，现在是值类型。QUIC stream 有意
+  进 DATA 帧的缓冲，那正是 stream 自己发送缓冲的用途。HEADERS 帧和 DATA 帧头仍然在
+  同一块池缓冲里，trailer 另用一块，所以小响应的帧分配与 body 和帧共用一块缓冲时一样。
+  要发的内容在组包时复制进 packet，而每个 packet 直接建在它要发出去的位置（payload 跟在
+  header 占的位置之后），所以封包不再复制任何东西。接收时 Engine 复制一次（复制进缓冲池里的缓冲区），HTTP/3 帧解析器
+  只复制跨片段的帧和请求 body。包保护已经不再分配：ChaCha20-Poly1305 的认证器原来每个包一次堆分配，现在是值类型。QUIC stream 有意
   不做池化：`*Stream` 会交给应用，生命周期由应用决定，重用会把「stream 结束后继续使用」
-  变成破坏另一条 stream。开、关一条 stream 8 次分配，内存管道上一个请求 12-13 次（整体
-  响应分成多段时多一次，见上）；请求
-  stream 和 header 会被复用（见上文）。
+  变成破坏另一条 stream。开、关一条 stream 8 次分配，内存管道上一个请求 12 次；请求
+  stream 和 header 会被复用（见上文）。整体响应带 trailer 时比不带多一次分配：第三个
+  run 超出一条 stream 内联的两个（见上）。
 - **ACK 频率**：ACK_FREQUENCY 扩展（draft-ietf-quic-ack-frequency）已完成。两端都在传输
   参数里声明 `min_ack_delay`；对端声明了的一端在已发送 32 KiB 之后请求对端每 10 个
   ack-eliciting 包确认一次（容忍 2 个包的乱序），且最迟不超过平滑 RTT 的四分之一，这样
@@ -384,7 +385,7 @@
 - **基准测试**：已完成，都是普通的 `go test -bench` 目标。`http3/quic` 里有内存管道上
   64 KiB、1 MiB、4 MiB 的单连接传输，单个与按 CPU 数并发的请求，1% 与 5% 丢包下的传输，
   开、关一条 stream，以及 ChaCha20-Poly1305 的 seal、open 和头部保护；`http3` 里有
-  64 KiB 与 1 MiB 的响应 body、上传、小请求和并发请求，走 loopback 的 UDP socket，
+  4 KiB、64 KiB 与 1 MiB 的响应 body、上传、小请求和并发请求，走 loopback 的 UDP socket，
   包含 Engine 和 HTTP/3 组包。上面的数字就是它们在基准机上的中位数：本轮改动前后各取
   六个样本，两轮交替测量。
 

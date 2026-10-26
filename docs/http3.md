@@ -171,11 +171,13 @@ request that arrives whole in one packet, as most do, costs none.
   its acknowledgements, let it go, as HTTP/2 does, so a stalled stream costs
   its window of frames rather than the body: 16 stalled responses of 8MiB cost
   19MiB of live heap against the 275MiB they cost when the body was copied
-  into one power-of-two buffer (see [Load testing](loadtest.md)). A body of
-  4KiB or less is still copied into the buffer its frames are built in, and a
-  larger one must not be changed once `Respond` or `WriteResponse` returns;
-  `fibhttp.Response.Body` says what that asks of the handler. Streaming the
-  body through `Write` and `Flush` keeps what waits to 64KiB instead.
+  into one power-of-two buffer (see [Load testing](loadtest.md)). Whatever its
+  size, the body stays where the handler gave it until the peer has
+  acknowledged the response, and the frames are the stream's own, so it must
+  not be changed once `Respond` or `WriteResponse` returns, unless that call
+  copies it; `fibhttp.Response.Body` states that rule for every protocol.
+  Streaming the body through `Write` and `Flush` keeps what waits to 64KiB
+  instead.
 - A request that is complete goes to the engine's handler pool, as
   `Config.StreamPool` describes — the engine name's `<Name>-streams` pool,
   never an engine's; the HTTP/2 server uses the same — so the requests one client
@@ -500,23 +502,26 @@ Done:
   one receive rather than one a datagram; a kernel without `UDP_GRO`, and the
   other systems, read a datagram at a time.
 - **Fewer copies and allocations**: a response given whole is kept where the
-  handler put it (above 4KiB) and framed from there, so the body is copied
-  once, into the packets, which the AEAD needs; a streamed one is copied into
-  its DATA frame's buffer as well, which is what the stream's send buffer is
-  for. What is sent is copied into packets as they are built, and each packet
-  is built where it is sent, its payload behind the room its header takes, so
-  sealing a datagram copies nothing. Receiving copies in the engine, into a
+  handler put it, whatever its size, and framed from there, so the body is
+  copied once, into the packets, which the AEAD needs; a streamed one is
+  copied into its DATA frame's buffer as well, which is what the stream's send
+  buffer is for. The HEADERS frame and the DATA frame's header are one pool
+  buffer, and a trailer another, so a small response's frames cost what they
+  did when they shared a buffer with its body. What is sent is copied into
+  packets as they are built, and each packet is built where it is sent, its
+  payload behind the room its header takes, so sealing a datagram copies
+  nothing. Receiving copies in the engine, into a
   pooled buffer, and in the HTTP/3 frame parser only a frame split across
-  pieces and the request body. A response of 4KiB or less is copied into one
-  buffer with its frames, since parts cost more than the copy for one that
-  small. Packet protection allocates nothing now: the
+  pieces and the request body. Packet protection allocates nothing now: the
   ChaCha20-Poly1305 authenticator was one heap allocation per packet and is a
   value. QUIC streams are deliberately not pooled: a `*Stream` is handed to
   the application and its lifetime is the application's, so reusing one would
   turn a use after the stream is done into corruption of another stream. A
   stream opened and closed costs 8 allocations, a request over the in-memory
-  path 12 or 13 (one more where the response is given as several parts, see
-  above), and the HTTP/3 request stream and header are recycled (see above).
+  path 12, and the HTTP/3 request stream and header are recycled (see above).
+  A whole response with a trailer costs one allocation more than one without,
+  its third run taking the send buffer's list past the two it carries inline
+  (see above).
 - **ACK frequency**: the ACK_FREQUENCY extension
   (draft-ietf-quic-ack-frequency) is done. Both ends advertise `min_ack_delay`
   in their transport parameters; a connection whose peer advertises it asks,
@@ -563,7 +568,7 @@ Done:
   bulk transfers of 64 KiB, 1 MiB and 4 MiB over the in-memory path, requests
   one at a time and from as many goroutines as processors, transfers at 1% and
   5% loss, a stream opened and closed, and ChaCha20-Poly1305's seal, open and
-  header protection; `http3` has a 64 KiB and a 1 MiB response body, an
+  header protection; `http3` has a 4 KiB, 64 KiB and 1 MiB response body, an
   upload, small requests and concurrent requests over a UDP socket on the
   loopback interface, which include the engine and the framing. The numbers
   above are their medians on the benchmark host, before and after the changes

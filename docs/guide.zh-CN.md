@@ -653,11 +653,11 @@ func(c *fibhttp.Context) {
 - trailer：在 `Trailer` 头里声明名字，写完 body 后设置对应的值；也可以在任何时候设置带
   `http.TrailerPrefix` 前缀的键。`Response.Trailer` 同样可以随 `WriteResponse` 发送。
   HTTP/1.0 客户端收不到 trailer。
-- `Response.Body` 的归属：HTTP/1 用 `SendParts` 把头和 body 一起交给 socket，socket
-  没一次吃下的部分会被拷贝，所以 `WriteResponse` 返回后 body 又归 handler 所有。HTTP/2
-  与 HTTP/3 把 body 原样留着，按对端窗口和确认逐步装帧（HTTP/3 上是到对端确认为止），
-  因此在那里 `WriteResponse` 返回之后 handler 不能修改它；HTTP/3 上 4KiB 及以下的
-  body 会被拷贝，不受这一条限制。见 `fibhttp.Response.Body`。
+- `Response.Body` 的归属：`WriteResponse`/`Respond` 返回之后 handler 不能修改 body，
+  与它的大小无关——响应在结束之前一直留着它：HTTP/1 和 HTTP/2 是发出为止，HTTP/3 是
+  对端确认为止。HTTP/1 会把 socket 没一次吃下的部分拷贝，HTTP/2 按对端窗口逐步装帧，
+  HTTP/3 把 body 原样留着、只把帧放进池缓冲。handler 要提前复用 body 就先自己拷贝，
+  或改用会拷贝 body 的写方法；见 `fibhttp.Response.Body`。
 - `ReadFrom`（`io.Copy`、`http.ServeContent` 都会用到）遇到普通文件，或包着文件的
   `*io.LimitedReader` 时，通过 `Connection.SendFile` 发送；TLS 连接退化为读取后加密发送。
 - handler 返回时响应自动结束（写出剩余数据、结束 chunk、发送 trailer），与 `net/http`

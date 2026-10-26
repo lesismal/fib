@@ -391,8 +391,9 @@ func TestDialFailure(t *testing.T) {
 
 // Trailers go out as a trailing HEADERS frame, whether the handler gives them
 // with the whole response or writes the response through the ResponseWriter
-// methods. A whole body above the size that is copied with its frames is kept
-// where the handler put it, and its trailer behind it, so both paths are here.
+// methods. A whole response keeps the body where the handler put it whatever
+// its size, its trailer in a run behind it, so a small one and a large one are
+// both here.
 func TestResponseTrailers(t *testing.T) {
 	large := bytes.Repeat([]byte("large"), 2048)
 	url := startServer(t, Config{}, func(c *fibhttp.Context) {

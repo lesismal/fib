@@ -205,11 +205,10 @@ The difference is in how each send path holds a whole response:
   what a stalled stream costs is the frames the flow-control window admits,
   about a fifth of a MiB each, rather than a pool buffer larger than the body.
   The only copy of the body left is the one into the packets, which the AEAD
-  needs. A body of 4KiB or less is still copied into the buffer its frames are
-  built in, since a message of several parts costs more than the copy for one
-  that small. See [HTTP/3](http3.md) and `fibhttp.Response.Body` for what that
-  asks of the handler: a larger body must not be changed until the peer has
-  acknowledged it.
+  needs, whatever the body's size: a small response's frames are still one
+  pool buffer, so a small whole response costs no more than a large one does.
+  See [HTTP/3](http3.md) and `fibhttp.Response.Body` for what that asks of the
+  handler: the body must not be changed until the peer has acknowledged it.
 
 This is a deployment limit rather than a wrong answer: the peers are
 well-behaved enough not to be reset, and the fast load carries on. It is

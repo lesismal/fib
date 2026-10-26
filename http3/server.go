@@ -1937,50 +1937,38 @@ func (rs *requestStream) WriteResponse(req *stdhttp.Request, response fibhttp.Re
 	// request, which goes back to the pool once the response is written: this
 	// response goes on reading it as the client's windows, and then its
 	// acknowledgements, let it go, so it takes a copy of that one, as it did
-	// of every body.
+	// of every body. Every other body is kept where the handler gave it,
+	// whatever its size: the whole response costs its body's memory once, as
+	// it does on HTTP/2, rather than a copy and a pool class larger than it,
+	// and a handler has one rule to keep rather than one per size. See
+	// fibhttp.Response.Body for what that asks of the handler.
 	owned := false
 	if len(body) > 0 && rs.block.BodyWithin(body) {
 		copied := bufferpool.Get(len(body))[:len(body)]
 		copy(copied, body)
 		body, owned = copied, true
 	}
-	var err error
-	if len(body) <= maxCopiedBody {
-		// A small body goes into one buffer with the frames, as every body
-		// did: the stream keeps it as the buffer it sends from, and a message
-		// of several parts would cost it more than the copy does.
-		out := bufferpool.Get(len(block) + len(body) + 256)[:0]
-		out = appendHeadersFrame(out, block)
-		if len(body) > 0 {
-			out = appendFrameHeader(out, frameData, len(body))
-			out = append(out, body...)
-		}
-		if bodyAllowed(req, status) {
-			out = appendTrailer(out, response.Trailer)
-		}
-		err = rs.s.WriteFinal(out, expected)
-	} else {
-		// A large one is kept as the handler gave it, rather than copied into
-		// a buffer of the stream's own: the whole response costs its body's
-		// memory once, as it does on HTTP/2, and not a pool class larger than
-		// it. See fibhttp.Response.Body for what that asks of the handler.
-		head := bufferpool.Get(len(block) + 16)[:0]
-		head = appendHeadersFrame(head, block)
+	// The frames are the stream's own: the HEADERS frame and the DATA frame's
+	// header in one buffer from the pool, and a trailer, behind the body, in
+	// another.
+	head := bufferpool.Get(len(block) + 16)[:0]
+	head = appendHeadersFrame(head, block)
+	if len(body) > 0 {
 		head = appendFrameHeader(head, frameData, len(body))
-		var tail []byte
-		if bodyAllowed(req, status) && len(response.Trailer) > 0 {
-			if tail = appendTrailer(bufferpool.Get(256)[:0], response.Trailer); len(tail) == 0 {
-				bufferpool.Put(tail)
-				tail = nil
-			}
-		}
-		parts := [3]quic.Part{
-			{Data: head, Owned: true},
-			{Data: body, Owned: owned},
-			{Data: tail, Owned: true},
-		}
-		err = rs.s.WriteFinalParts(parts[:], expected)
 	}
+	var tail []byte
+	if bodyAllowed(req, status) && len(response.Trailer) > 0 {
+		if tail = appendTrailer(bufferpool.Get(256)[:0], response.Trailer); len(tail) == 0 {
+			bufferpool.Put(tail)
+			tail = nil
+		}
+	}
+	parts := [3]quic.Part{
+		{Data: head, Owned: true},
+		{Data: body, Owned: owned},
+		{Data: tail, Owned: true},
+	}
+	err := rs.s.WriteFinalParts(parts[:], expected)
 	// The response is all this stream sends, and a request whose response
 	// is written wants nothing more of what arrives for it, so QUIC is told
 	// to forget the request as it takes the response rather than once the
@@ -2008,12 +1996,6 @@ func (rs *requestStream) WriteResponse(req *stdhttp.Request, response fibhttp.Re
 	}
 	return nil
 }
-
-// maxCopiedBody is the largest response body that is copied into the buffer
-// its frames are built in: a whole body up to this size stays one buffer, as
-// it always did, and a larger one is kept where the handler put it, which is
-// what spares it a copy and a pool class larger than it.
-const maxCopiedBody = 4 << 10
 
 // appendTrailer appends a HEADERS frame carrying what of trailer HTTP/3 can
 // send, if that is anything.

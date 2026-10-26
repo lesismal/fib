@@ -33,17 +33,18 @@ func (f HandlerFunc) ServeHTTP(c *Context) { f(c) }
 type Response struct {
 	StatusCode int
 	Header     stdhttp.Header
-	// Body is the response body. HTTP/1 copies what the socket does not take
-	// at once, but HTTP/2 and HTTP/3 keep the slice itself and frame it as
-	// the peer's windows let them, so it must not be changed until the
-	// response is finished, which can be after WriteResponse returns.
+	// Body is the response body. The response keeps the slice itself rather
+	// than copying it, until the response is finished: sent on HTTP/1 and
+	// HTTP/2, acknowledged by the peer on HTTP/3, which can be after
+	// WriteResponse or Respond returns. Whatever its size, it must not be
+	// changed until then, unless the call that writes it copies it: a body
+	// the handler must reuse sooner is copied first.
 	Body []byte
 	// Trailer is sent after the body. HTTP/1.1 carries it by sending the
 	// body chunked, and announces its names in a Trailer header; HTTP/2 and
 	// HTTP/3 send it as a trailing header block. An HTTP/1.0 client, and a
-	// response that has no body, gets none of it. Like Body, it is read
-	// until it is sent, which on HTTP/2 can be after WriteResponse returns,
-	// so it must not be changed until the response is finished.
+	// response that has no body, gets none of it. Like Body, it is kept until
+	// the response is finished, so it must not be changed until then.
 	Trailer stdhttp.Header
 	Close   bool
 }
