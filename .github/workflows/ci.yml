@@ -113,7 +113,9 @@ jobs:
           if [ "$status" -ne 0 ]; then
             # Surface the failures as an annotation so they are readable
             # without opening the full log.
-            summary=$(grep -a -E -B2 -A20 -- '--- FAIL|^panic:|^FAIL|fatal error:' "$RUNNER_TEMP/test.log" | head -c 60000)
+            # DATA RACE too: a package that fails on one has no --- FAIL line,
+            # and the warning is what says why.
+            summary=$(grep -a -E -B2 -A20 -- '--- FAIL|^panic:|^FAIL|fatal error:|WARNING: DATA RACE|^exit status|signal:' "$RUNNER_TEMP/test.log" | head -c 60000)
             summary=${summary//'%'/'%25'}
             summary=${summary//$'\r'/'%0D'}
             summary=${summary//$'\n'/'%0A'}
