@@ -161,8 +161,8 @@ func TestResponseCopyFailsOnResetStream(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	head, body := h3Request{path: "/cancel", framing: h3Length, body: make([]byte, 100)}.frames()
-	if err := s.Write(append(head, body[:20]...), false); err != nil {
+	reqHead, reqBody := h3Request{path: "/cancel", framing: h3Length, body: make([]byte, 100)}.frames()
+	if err := s.Write(append(reqHead, reqBody[:20]...), false); err != nil {
 		t.Fatal(err)
 	}
 	select {
