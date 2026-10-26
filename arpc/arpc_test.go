@@ -625,6 +625,7 @@ func TestReconnect(t *testing.T) {
 
 func TestReconnectGivesUp(t *testing.T) {
 	s := NewServer()
+	s.Handler.Handle("/echo", func(ctx *Context) { ctx.Write(ctx.Body()) })
 	engine, err := fib.New(fib.DefaultConfig(), fib.Binding{Addr: "127.0.0.1:0", Handler: s})
 	if err != nil {
 		t.Fatal(err)
@@ -646,6 +647,18 @@ func TestReconnectGivesUp(t *testing.T) {
 	stopped := make(chan struct{})
 	handler.HandleDisconnected(func(*Client) { close(stopped) })
 	c := dial(t, addr.String(), handler)
+
+	// Have the server take the connection before it closes. Stop shuts the
+	// pollers' listeners down one at a time, and a connection still in a
+	// listener's backlog is reset as that listener goes. The client would then
+	// start reconnecting while the other listeners are still stopping, and an
+	// attempt that lands on one of those can connect before it is reaped in
+	// turn. That success ends the sequence, so the client's three attempts
+	// start over and the test counts more than three.
+	var rsp string
+	if err := c.Call("/echo", "ping", &rsp, time.Second); err != nil || rsp != "ping" {
+		t.Fatalf("Call before closing = %q, %v", rsp, err)
+	}
 
 	engine.Stop()
 	<-runDone
