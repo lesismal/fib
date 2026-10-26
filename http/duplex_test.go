@@ -357,63 +357,123 @@ func TestServeDuplexHTTP1(t *testing.T) {
 	}
 }
 
-// TestServeDuplexCloseEndsResponse checks that Close finishes the response
-// while the handler is still running, and that a handler that writes nothing
-// still answers with an empty 200 rather than leaving the client waiting for
-// the handler to return.
+// TestServeDuplexCloseEndsResponse checks Close's own contract: it flushes
+// what the handler wrote and ends the response there and then, so a client has
+// the whole answer while the handler is still working. It covers HTTP/2 and
+// HTTP/1.1, where the end of the response has to be flushed by the same call.
 func TestServeDuplexCloseEndsResponse(t *testing.T) {
-	release := make(chan struct{})
-	released := false
+	for _, tc := range []struct {
+		name   string
+		client *stdhttp.Client
+	}{
+		{"h2c", h2cClient()},
+		{"http1", &stdhttp.Client{Timeout: 10 * time.Second}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			defer tc.client.CloseIdleConnections()
+			release := make(chan struct{}, 1)
+			// A fatal above must not leave the handler waiting forever.
+			defer func() {
+				select {
+				case release <- struct{}{}:
+				default:
+				}
+			}()
+			results := make(chan error, 2)
+			handler := NewHandler(HandlerFunc(func(c *Context) {
+				if err := c.ServeDuplex(func(d *Duplex) {
+					// Written but not flushed: Close sends it.
+					if _, err := d.Write([]byte("bye")); err != nil {
+						results <- err
+						results <- nil
+						return
+					}
+					err := d.Close()
+					results <- err
+					if err == nil {
+						if err := d.Err(); !errors.Is(err, ErrDuplexClosed) {
+							results <- errors.New("Err after Close: " + errString(err))
+						} else {
+							results <- nil
+						}
+					}
+					// The client must already have the whole response.
+					<-release
+				}); err != nil {
+					results <- err
+					results <- nil
+				}
+			}))
+			addr := serve(t, handler)
+			resp, err := tc.client.Get("http://" + addr + "/duplex")
+			if err != nil {
+				t.Fatalf("the response did not end at Close: %v", err)
+			}
+			body, err := io.ReadAll(resp.Body)
+			resp.Body.Close()
+			if err != nil {
+				t.Fatalf("the response body: %v", err)
+			}
+			if string(body) != "bye" {
+				t.Fatalf("response body %q, want %q", body, "bye")
+			}
+			release <- struct{}{}
+			for i := 0; i < 2; i++ {
+				select {
+				case err := <-results:
+					if err != nil {
+						t.Fatalf("the handler: %v", err)
+					}
+				case <-time.After(10 * time.Second):
+					t.Fatal("the handler did not return")
+				}
+			}
+		})
+	}
+}
+
+// TestServeDuplexCloseWithoutWrite checks that closing a duplex that never
+// wrote still ends the response with an empty one, rather than leaving the
+// client waiting for the handler's return.
+func TestServeDuplexCloseWithoutWrite(t *testing.T) {
+	release := make(chan struct{}, 1)
+	closed := make(chan error, 1)
 	defer func() {
-		if !released {
-			close(release)
+		select {
+		case release <- struct{}{}:
+		default:
 		}
 	}()
-	done := make(chan struct{})
-	closeErr := make(chan error, 1)
-	config := DefaultConfig()
-	config.StreamRequestBody = true
-	handler := NewHandlerWithConfig(config, HandlerFunc(func(c *Context) {
+	handler := NewHandler(HandlerFunc(func(c *Context) {
 		if err := c.ServeDuplex(func(d *Duplex) {
-			err := d.Close()
-			close(done)
+			closed <- d.Close()
 			<-release
-			closeErr <- err
 		}); err != nil {
-			closeErr <- err
+			closed <- err
 		}
 	}))
 	addr := serve(t, handler)
-	client := h2cClient()
+	client := &stdhttp.Client{Timeout: 10 * time.Second}
 	defer client.CloseIdleConnections()
 	resp, err := client.Get("http://" + addr + "/duplex")
 	if err != nil {
-		t.Fatalf("the request: %v", err)
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != stdhttp.StatusOK {
-		t.Fatalf("status %d, want 200", resp.StatusCode)
+		t.Fatalf("the response did not end at Close: %v", err)
 	}
 	body, err := io.ReadAll(resp.Body)
+	resp.Body.Close()
 	if err != nil {
 		t.Fatalf("the response body: %v", err)
 	}
-	if len(body) != 0 {
-		t.Fatalf("response body %q, want empty", body)
+	if resp.StatusCode != stdhttp.StatusOK || len(body) != 0 {
+		t.Fatalf("response %d with body %q, want 200 with none", resp.StatusCode, body)
 	}
+	release <- struct{}{}
 	select {
-	case <-done:
-	case <-time.After(10 * time.Second):
-		t.Fatal("the duplex handler did not reach its wait after Close")
-	}
-	released = true
-	close(release)
-	select {
-	case err := <-closeErr:
+	case err := <-closed:
 		if err != nil {
 			t.Fatalf("Close: %v", err)
 		}
 	case <-time.After(10 * time.Second):
-		t.Fatal("the duplex handler did not finish")
+		t.Fatal("Close did not return")
 	}
 }

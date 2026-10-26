@@ -950,6 +950,9 @@ handler := fibhttp.NewHandlerWithConfig(config, fibhttp.HandlerFunc(
 - HTTP/2 和 HTTP/3 的请求 stream 本身是全双工的，所以这是它们上的完整实现，也是
   WebTransport 之外写双向协议的直接办法。HTTP/1.1 上响应可以先于请求 body 发出，但
   客户端如果看到响应就停止上传，`Read` 会一直等；这类 handler 应当先拿到需要的 body。
+  响应结束时 body 还没收完的话，HTTP/1.1 连接会在响应之后关闭（剩余超过 256KB 或长度
+  未知时），不会把剩余 body 当成下一个请求的开头；HTTP/2 和 HTTP/3 只重置这条 stream，
+  连接继续服务其他 stream。
 - 请求 body 走 `OnBody`，所以 `ServeDuplex` 的 handler 不要再读 `Request.Body` 或调用
   `OnBody`。它必须在响应开始之前调用，且对一个请求只调用一次；`Config.StreamRequestBody`
   决定 body 是边到边读还是已经整体到达（整体到达时 `Read` 不等待）。
