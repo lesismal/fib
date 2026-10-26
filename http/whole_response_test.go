@@ -8,6 +8,7 @@ import (
 	"io"
 	"net"
 	stdhttp "net/http"
+	"runtime"
 	"strconv"
 	"sync/atomic"
 	"testing"
@@ -22,6 +23,11 @@ import (
 // counted as queued bytes, and the peer that reads on gets exactly the bytes
 // given, so nothing has copied it or written into it while it waited.
 func TestRespondToStalledReaderKeepsTheBody(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		// An overlapped send hands the whole body to the kernel at once, so
+		// none of it waits in the queue this looks at.
+		t.Skip("Windows hands a queued send to the kernel whole")
+	}
 	const size = 8 << 20
 	body := make([]byte, size)
 	for i := range body {

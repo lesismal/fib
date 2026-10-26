@@ -434,7 +434,9 @@ func TestResponseCopyReleasesOnCancel(t *testing.T) {
 		err      error
 	}
 	results := make(chan result, 1)
+	started := make(chan struct{})
 	addr := serve(t, NewHandler(HandlerFunc(func(c *Context) {
+		close(started)
 		var copyAddr unsafe.Pointer
 		c.OnResponse(func(response *Response) { copyAddr = unsafe.Pointer(unsafe.SliceData(response.Body)) })
 		cancelled := make(chan struct{})
@@ -464,9 +466,15 @@ func TestResponseCopyReleasesOnCancel(t *testing.T) {
 	if _, err := io.WriteString(conn, "GET /cancel HTTP/1.1\r\nHost: t\r\n\r\n"); err != nil {
 		t.Fatal(err)
 	}
-	// Let the request reach the handler, and its callbacks be registered,
-	// before the connection goes.
-	time.Sleep(100 * time.Millisecond)
+	// The connection goes once the handler has the request and has
+	// registered its callbacks: a sleep long enough on one machine is a
+	// guess on another, and a handler that never started never hears of the
+	// close, which is what the macOS and Windows jobs saw.
+	select {
+	case <-started:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the handler never ran")
+	}
 	conn.Close()
 	var got result
 	select {
