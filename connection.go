@@ -406,6 +406,19 @@ func (c *Connection) Close() error {
 // CloseAfterSend closes the connection after all data already accepted by Send
 // has been handed to the kernel.
 func (c *Connection) CloseAfterSend() {
+	c.mu.Lock()
+	corked := c.corked
+	c.mu.Unlock()
+	if corked {
+		// The layer holds what Send took while the cork was on, and this
+		// close comes after everything Send took: the cork comes off here,
+		// so that what it held reaches the socket before the close does,
+		// rather than being queued behind a close that drops the queue.
+		if err := c.uncork(); err != nil {
+			c.closeWithError(err)
+			return
+		}
+	}
 	if l := c.layer; l != nil {
 		l.CloseAfterSend()
 		return
