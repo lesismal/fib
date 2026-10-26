@@ -11,12 +11,10 @@ import (
 // spelling, so hw.memsize on a 16 GiB machine is eight bytes rather than
 // "17179869184".
 func sysctlUint(raw string) uint64 {
-	b := []byte(raw)
-	switch {
-	case len(b) >= 8:
-		return binary.NativeEndian.Uint64(b[:8])
-	case len(b) >= 4:
-		return uint64(binary.NativeEndian.Uint32(b[:4]))
-	}
-	return 0
+	// A sysctl value is trimmed of trailing zero bytes by the sysctl
+	// wrapper, so a 36 GiB hw.memsize comes back as seven bytes rather than
+	// eight. Pad to the width and decode.
+	var b [8]byte
+	copy(b[:], raw)
+	return binary.NativeEndian.Uint64(b[:])
 }

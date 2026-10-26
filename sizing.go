@@ -89,6 +89,7 @@ func (m Machine) Sizing(readBuffer int, pendingBytes int64, maxConns int) Sizing
 		return s
 	}
 
+	hasBudget := s.MaxPendingBytes > 0
 	budget := s.MaxPendingBytes
 	if budget <= 0 {
 		budget = m.Memory * sizingMemoryShareNum / sizingMemoryShareDen
@@ -130,7 +131,7 @@ func (m Machine) Sizing(readBuffer int, pendingBytes int64, maxConns int) Sizing
 	w = floorInt64(w, sizingWatermarkStep)
 	s.WriteWatermark = int(w)
 
-	if budget > 0 {
+	if hasBudget {
 		q := budget / 8
 		q = clampInt64(q, sizingQueueMin, sizingQueueMax)
 		// One connection may not hold more than half of a small budget.

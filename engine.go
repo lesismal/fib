@@ -288,10 +288,10 @@ func newEngine(config Config, bindings []Binding) (*Engine, error) {
 		config.PollBatchSize = defaultPollBatchSize
 	}
 	if config.ReadBufferSize <= 0 {
-		config.ReadBufferSize = 16 * 1024
+		config.ReadBufferSize = defaultReadBufferSize
 	}
 	if config.WriteBufferHighWatermark == 0 {
-		config.WriteBufferHighWatermark = 4 * 1024
+		config.WriteBufferHighWatermark = DefaultWriteWatermark(config.ReadBufferSize, config.MaxPendingBytes, config.MaxConns)
 	}
 	if config.Backlog <= 0 {
 		config.Backlog = sys.DefaultBacklog()
@@ -365,7 +365,7 @@ func newEngine(config Config, bindings []Binding) (*Engine, error) {
 func (e *Engine) openPollers(config Config) error {
 	n := pollerCount(config)
 	for i := 0; i < n; i++ {
-		p := &Engine{parent: e, name: e.name, logStatus: e.logStatus, maxEvents: e.maxEvents,
+		p := &Engine{parent: e, name: e.name, logStatus: e.logStatus, maxEvents: e.maxEvents, bindConfig: config,
 			pollBatchSize: e.pollBatchSize, useWritev: e.useWritev,
 			socketSyscalls: e.socketSyscalls, coalesceWrites: e.coalesceWrites,
 			writeHighWatermark: e.writeHighWatermark,
@@ -1194,8 +1194,10 @@ type Config struct {
 	// LogStatus has the engine log a line when it starts serving, with its
 	// name, the addresses it listens on, its task pool, its pollers and, as
 	// "accept", which loop accepts each TCP and Unix listener's connections
-	// and which poller then serves them (see AcceptPlacement). It is
-	// off by default. The task pools' own lines are switched separately, with
+	// and which poller then serves them (see AcceptPlacement). A second line
+	// prints every effective setting, the sized watermark and budget among
+	// them, as key=value pairs; see Engine.Settings. It is off by default.
+	// The task pools' own lines are switched separately, with
 	// taskpool.SetLogStatus.
 	LogStatus bool
 	// Network is the network of every Binding that leaves its own empty;
@@ -1220,7 +1222,10 @@ type Config struct {
 	ReadBufferSize int
 	// WriteBufferHighWatermark pauses socket reads while at least this many
 	// bytes are waiting to be written. This bounds userspace buffering while
-	// TCP backpressure catches up. Set below zero to disable write backpressure.
+	// TCP backpressure catches up. Zero means the default, sized from
+	// ReadBufferSize and the machine: four read buffers, bounded by 64 KiB,
+	// 256 KiB and the budget and connection count; see DefaultWriteWatermark.
+	// Set below zero to disable write backpressure.
 	//
 	// Crossing it is not free: a round that crosses it flushes before it
 	// reads on, and on Windows pausing and resuming go through the event
@@ -1455,11 +1460,33 @@ type Config struct {
 	customPoolSizing bool
 }
 
+// DefaultConfig returns fib's defaults, sized for the machine this process
+// runs on. The pool follows the CPUs, the backlog the kernel, and the write
+// watermark the read buffer and the machine's memory and descriptor limits;
+// see DefaultConfigFor and Machine.Sizing.
 func DefaultConfig() Config {
+	return DefaultConfigFor(0)
+}
+
+// DefaultConfigFor returns fib's defaults with readBuffer for
+// Config.ReadBufferSize, and the rest sized for it: zero means fib's own read
+// buffer. The write watermark follows the read buffer at four times it,
+// bounded by 64 KiB and 256 KiB and by the reference budget and connection
+// count; see Machine.Sizing.
+//
+// The server-wide budget stays off, as it is by default: only the
+// per-connection watermark applies. A deployment that wants the aggregate
+// bound sets Config.MaxPendingBytes, and Config.MaxWriteQueueBytes for one
+// peer's share of it.
+func DefaultConfigFor(readBuffer int) Config {
+	if readBuffer <= 0 {
+		readBuffer = defaultReadBufferSize
+	}
 	sizing := DefaultPoolSizing(taskpool.ModeAdaptive)
+	backpressure := DefaultSizing(readBuffer, 0, 0)
 	return Config{Name: DefaultName, Network: "tcp", Backlog: sys.DefaultBacklog(), WorkerCount: sizing.WorkerCount,
-		MaxEvents: sizing.MaxEvents, ReadBufferSize: 16 * 1024,
-		WriteBufferHighWatermark: defaultWriteHighWatermark, MaxPendingBytes: defaultMaxPendingBytes,
+		MaxEvents: sizing.MaxEvents, ReadBufferSize: readBuffer,
+		WriteBufferHighWatermark: backpressure.WriteWatermark, MaxPendingBytes: defaultMaxPendingBytes,
 		UseWritev: true, CoalesceWrites: true, SocketSyscalls: true, TaskPoolMode: taskpool.ModeAdaptive, SharedTaskPool: true,
 		IOPollers: true, ReusePort: true}
 }

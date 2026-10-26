@@ -31,7 +31,7 @@ func TestBindFillsInZeroSizes(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer e.Close()
-	if e.maxEvents != 256 || e.readBufferSize != 16<<10 || e.writeHighWatermark != 4<<10 {
+	if e.maxEvents != 256 || e.readBufferSize != defaultReadBufferSize || e.writeHighWatermark != defaultWriteHighWatermark {
 		t.Fatalf("maxEvents %d, readBufferSize %d, writeHighWatermark %d", e.maxEvents, e.readBufferSize, e.writeHighWatermark)
 	}
 	if e.pollBatchSize != defaultPollBatchSize {

@@ -54,9 +54,10 @@ uSockets, workflow, axum, h2, quiche and rustls.
   and DragonFly, and IOCP on Windows. Other systems fall back to the standard `net` package.
 - **Per-connection scheduling**: each connection's events run in order, one at a time, on any idle
   worker. No connection is tied to a thread, so load spreads by real work rather than by fd count.
-- **Backpressure**: a per-connection write watermark (64 KiB) pauses reads when it fills, and an
-  optional server-wide budget for pending bytes (`MaxPendingBytes`, off by default) bounds the sum.
-  `HoldReads` gives read-side flow control.
+- **Backpressure**: a per-connection write watermark pauses reads when it fills, sized from the
+  read buffer and the machine (four read buffers, 64 KiB to 256 KiB; 64 KiB for the default
+  16 KiB read buffer), and an optional server-wide budget for pending bytes (`MaxPendingBytes`,
+  off by default) bounds the sum. `HoldReads` gives read-side flow control.
 - **Pools**: an adaptive worker pool that grows and shrinks with load, and a size-classed buffer
   pool aligned to the Go allocator's size classes.
 - **Many protocols, one engine**: each `Binding` passed to `fib.New` gives a group of addresses, TCP, Unix or

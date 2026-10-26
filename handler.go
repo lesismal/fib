@@ -496,4 +496,5 @@ func (e *Engine) logRun() {
 	}
 	slog.Info("fib: engine started", "engine", e.name, "listen", listening, "taskPool", pool,
 		"pollers", len(e.pollers), "accept", accept)
+	slog.Info("fib: engine config", "engine", e.name, "config", e.Settings().String())
 }

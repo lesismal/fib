@@ -113,8 +113,11 @@
   `WorkerCount`、`SharedTaskPool` 和池容量配置都不再生效；Engine 关闭时不会
   停止该池，由调用方在所有使用它的 Engine 关闭后自行停止。`GoTasks` 返回接受的
   前缀长度，未被接受的任务对应的连接会被关闭，所以池只应在停止时拒绝任务。
-- 默认 `WriteBufferHighWatermark` 为 64 KiB，`MaxPendingBytes` 为 0（不设全局预算，只有
-  每连接水位线生效）；连接数很多、水位线乘连接数超出内存承受范围时再设置它。
+- `WriteBufferHighWatermark` 默认按读缓冲和机器自动计算：四倍读缓冲，下限 64 KiB、上限
+  256 KiB；默认 16 KiB 读缓冲时为 64 KiB，fit 的 64 KiB 读缓冲在内存足够的机器上是 256 KiB。
+  `MaxPendingBytes` 默认 0（不设全局预算，只有每连接水位线生效）；连接数很多、水位线乘
+  连接数超出内存承受范围时再设置它。`LogStatus` 开启后启动日志会打印实际生效的
+  `readBuffer`、`writeWatermark`、`maxPendingBytes`、`maxWriteQueueBytes` 等全部基础配置。
 - `Send` 先直接发送，余量复制进发送队列。默认启用自适应 writev：单缓冲走
   write，`SendParts` 的两段数据和包含多个缓冲的发送队列走 writev；仅在背压
   时复制未发送部分。`SendOwned` 把缓冲交给连接，背压时直接排队、不复制；`SendShared`
