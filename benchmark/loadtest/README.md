@@ -43,6 +43,7 @@ Useful options:
 | `--warmup N` | warm-up seconds (default 3) |
 | `--rounds N` | interleaved rounds of the six A/B cases (default 3) |
 | `--cases LIST` | only these case names, comma separated |
+| `--bin DIR` | run the `server`, `h3load` and `stall` already built in DIR |
 | `--growth-runs N` | repeated short runs against one server (default 10) |
 | `--out DIR` | output directory |
 | `--no-pin` | do not split the CPUs between server and load generator |
@@ -52,6 +53,44 @@ when `taskset` is available, so a Go client and a Go server do not steal each
 other's cores. The campaign starts a fresh server per case, records
 `/stats?gc=1` before, after and two seconds after each case, and writes one
 row per case to `results.tsv`.
+
+## A clean A/B between two revisions
+
+The campaign's rounds compare configurations of one build. To compare two
+revisions on a shared host, build each side once from its own tree into a
+directory of its own, then interleave the two builds with `ab.sh`:
+
+```sh
+(cd /tmp/fib-before && go build -o bin/server ./benchmark/loadtest/server &&
+  go build -o bin/h3load ./benchmark/loadtest/h3load &&
+  go build -o bin/stall  ./benchmark/loadtest/stall)
+# the same in /tmp/fib-after
+./benchmark/loadtest/ab.sh --a /tmp/fib-before/bin --b /tmp/fib-after/bin \
+  --out /tmp/fib-ab --rounds 5
+```
+
+`ab.sh` runs one case at a time, A then B, then B then A, and so on, with a
+fresh server for every run and the same CPU split; nothing is rebuilt between
+rounds. Before each run it samples `/proc/stat` for one second and waits
+while more than `--max-busy` percent (20) of the host is busy with something
+else, for up to `--wait-max` seconds (1200) in total. A run whose host was
+still busy when it finished is not counted and is repeated.
+
+The one-minute load average cannot be the gate during a campaign: the run
+pins all CPUs for 33 seconds, so the average stays between 3 and 20 between
+runs even on an otherwise idle host, and waiting for it to fall below 1.5
+would add up to a minute and a half to every run and measure the decay of the
+campaign's own load. `ab.sh` gates on the one-second busy sample instead and
+records the average: `ab.tsv` adds side, round, `load1_before`, the busy
+percent before and after, and the live heap after and once idle to the columns
+of `results.tsv`, and `loadavg.tsv` has a row for every attempt, counted or
+not. `--cases` and `--duration` work as they do for `run.sh`; `growth-*`
+cases run once per side by default and their `growth.tsv` is copied to
+`growth/`.
+
+The campaign that used it, and the verdict it produced, are in
+[docs/loadtest.md](../../docs/loadtest.md); its `ab-fast.tsv`, `ab-slow.tsv`
+and `loadavg-*.tsv` are under `results/`.
 
 ## Output
 
@@ -77,6 +116,13 @@ not report that number (`h2load` has no percentiles).
 ```sh
 python3 benchmark/loadtest/report.py <out>
 ```
+
+`ab.sh` writes `runs/<case>/<side>-<round>-a<attempt>/`, one `run.sh` output
+directory per run, and its merged `ab.tsv` and `loadavg.tsv` beside them.
+`ab.tsv` is `results.tsv` with `side`, `round`, `load1_before`, `busy_before`,
+`load1_after` and `busy_after` prepended, and the live heap after the run and
+once idle appended; `loadavg.tsv` records every attempt including the ones it
+did not count.
 
 ## A stalled reader on its own
 

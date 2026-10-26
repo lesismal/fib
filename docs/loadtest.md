@@ -47,7 +47,8 @@ blocking jobs stay deterministic. Run `--mode smoke` on a test host instead.
 | `benchmark/loadtest/h3load` | a sustained HTTP/3 driver on fib's own client: one QUIC connection per client, a fixed number of requests in flight in total, a per-request timeout, and throughput, p50/p90/p99, per-second completions and error samples when the measurement ends |
 | `benchmark/loadtest/stall` | a client that requests `/big?n=8388608`, reads the response header and then either reads it slowly (`-delay`) or stops reading it altogether (`-stall`), one connection per stream. It is run beside the fast load to exercise backpressure, flow control and cleanup |
 | `benchmark/loadtest/stallmem.sh` | the stalled-reader case on its own: starts a fresh server, holds N responses of `--body` bytes open without reading them, and records the live heap and RSS from `/stats?gc=1` while they are still open. `--bin DIR` takes a `server` and `stall` already built, so a run before a change and a run after it can be interleaved against the same clients |
-| `benchmark/loadtest/run.sh` | the campaign: builds the three, pins the server to the first half of the CPUs and the load generator to the second half, starts a fresh server per case, and summarises each case |
+| `benchmark/loadtest/run.sh` | the campaign: builds the three and pins the server to the first half of the CPUs and the load generator to the second half, or takes `--bin DIR` for a build made already, starts a fresh server per case, and summarises each case |
+| `benchmark/loadtest/ab.sh` | the interleaved A/B: runs the campaign's cases against two builds, A then B and then B then A, waits for the host to be idle before each run, and records the side, round, host load and live heap with every counted run |
 
 HTTP/1 and HTTP/2 are driven by `h2load` 1.59.0: `--h1` for HTTP/1,
 prior knowledge for h2c, ALPN for HTTP/2 over TLS. HTTP/3 is driven by
@@ -58,18 +59,28 @@ QUIC.
 
 The host is the shared 16-thread Ryzen 7 7800X3D used for the package
 benchmarks, with Go 1.27.3, Linux socket buffers of 16MiB, and the server on
-CPUs 0-7 and the load generator on 8-15. The stalled-reader measurements
-before and after the HTTP/3 change were interleaved round by round on that
-host with `stallmem.sh`, so that a change in its load moved both sides
-together; the two full campaigns compared for the fast cases were run an hour
-apart, and the host's load average was 10-17 then, higher than for the
-campaign above, which is why their request rates are lower throughout. Each case starts a fresh server
+CPUs 0-7 and the load generator on 8-15. Each case starts a fresh server
 process; the measurement runs for 30 seconds after a 3-second warm-up, and
 the six A/B configurations are repeated three times, interleaved, with the
 median reported. Other workstreams share the host; the load average was
 checked at the start of the campaign, and one three-second `http3.test` from
 another workstream overlapped the first HTTP/3 case, so that case's first
-round is the low one in the per-run rows.
+round is the low one in the per-run rows. The stalled-reader measurements
+before and after the HTTP/3 change were interleaved round by round on that
+host with `stallmem.sh`, so that a change in its load moved both sides
+together.
+
+Comparing two revisions is a different run. Each side is built once from its
+own tree into its own directory, and the two builds are interleaved case by
+case with `ab.sh`; the run behind the fast cases below used A = `a88c75d2`
+and B = main at `f03d3dff`, five counted rounds per side, a fresh server for
+every run and the same CPU split. `ab.sh` waits for the host to be idle
+before each run, but not by the load average: the run itself pins all 16
+CPUs for 33 seconds, so the average stays between 3 and 20 between runs and
+would take a minute and a half to fall below 1.5. It samples `/proc/stat` for
+one second instead, and records the load average and the busy percentage of
+every run beside its throughput; the rows are in
+`benchmark/loadtest/results/2026-10-26-a88c75d2-main/`.
 
 HTTP/1 and HTTP/2 requests and their responses are tiny (`/plain`, 3 bytes),
 so the numbers are request-rate numbers, not throughput ones. `h2load`
@@ -281,36 +292,110 @@ That limit was then fixed for HTTP/3, and only for HTTP/3: the QUIC stream now
 keeps the handler's body as it is, and its send path builds every packet where
 it is sent, so neither the response nor a datagram is copied together. HTTP/1
 and HTTP/2 were as they were at that point (HTTP/1's copy was removed later;
-see its table above). The campaign was then run again, with the same
-cases, three interleaved rounds and the same reading of the host: its load
-average was 10-17 both times, and it was quieter for the second run, so every
-protocol's fast cases are up, HTTP/1's and HTTP/2's included, although their
-code did not change. The fast cases are therefore not a comparison of the two
-revisions; the stalled-reader numbers above, interleaved against the same
-clients, are. What the campaign does say is that nothing failed in either run
-and that the slow-reader cases are as they were:
+see its table above). The fast cases were compared again, this time as an
+interleaved A/B of the two revisions, below.
 
-| Case | req/s before | req/s now | p99 before | p99 now | RSS after, before | RSS after, now |
+### Fast cases: a clean A/B between the two revisions
+
+The earlier version of this section compared the fast cases between the two
+full campaigns, run an hour apart. That comparison cannot separate the code
+from the host: HTTP/1's and HTTP/2's code did not change between the
+campaigns, yet their request rates moved by 39% and 66% at 16 and 256
+connections and by 10% and 14% at 4 x 128, while HTTP/3's moved by 76% at
+4 x 128 and 7% at 32 x 16. The two revisions were therefore built once each
+from their own trees and run against the same clients, one case at a time,
+five counted rounds per side:
+
+- A is `a88c75d2`, the base the earlier comparison used.
+- B is main at `f03d3dff`, the revision of this branch.
+- A round is A then B on odd rounds and B then A on even ones; every run has
+  a fresh server, 30 seconds of measurement after a 3-second warm-up, and the
+  same CPU split (server 0-7, clients 8-15). Nothing is rebuilt between
+  rounds.
+- Before each counted run `ab.sh` sampled `/proc/stat` for one second and
+  waited while more than 20% of the host was busy with something else. 72 of
+  the 120 fast runs started with the host idle and the rest with up to 20%
+  busy, which is the gate's threshold. Sixteen runs that were still busy when
+  they finished were discarded and repeated; `loadavg-fast.tsv` has every
+  attempt, counted or not. The one-minute load average recorded with each row
+  is 2.9-20.4: it includes the campaign's own 33-second run on all 16 CPUs and
+  has not decayed between runs, which is why the gate is the busy sample and
+  not the average.
+- 120 counted fast runs over 12 cases: no request failed, errored or timed
+  out, and no server logged a warning.
+
+Medians of the five runs per side, with each side's minimum-maximum range:
+
+| Case | A req/s | A min-max | B req/s | B min-max | A -> B | Verdict |
 | --- | --- | --- | --- | --- | --- | --- |
-| h1-16c | 300,350 | 418,320 | - | - | 23MiB | 22MiB |
-| h1-256c | 499,671 | 828,433 | - | - | 27MiB | 23MiB |
-| h2c-4x128 | 1,102,394 | 1,207,983 | - | - | 39MiB | 37MiB |
-| h2-4x128 | 992,534 | 1,131,507 | - | - | 48MiB | 45MiB |
-| h3-4x128 | 539,183 | 947,026 | 3.16ms | 1.37ms | 41MiB | 40MiB |
-| h3-32x16 | 659,866 | 705,770 | 3.36ms | 2.50ms | 43MiB | 44MiB |
-| h3-1x256 | 333,445 | 337,569 | 1.72ms | 1.29ms | 38MiB | 34MiB |
-| slow-h1 | 418,834 | 417,694 | - | - | 43MiB | 43MiB |
-| slow-h2c | 1,217,853 | 1,209,984 | - | - | 73MiB | 53MiB |
-| slow-h3 | 1,005,391 | 980,328 | 1.28ms | 1.32ms | 94MiB | 63MiB |
+| h1-16c | 414,794 | 390,685-415,463 | 408,712 | 399,914-414,979 | -1.5% | noise |
+| h1-256c | 712,925 | 660,863-750,313 | 704,682 | 649,985-735,142 | -1.2% | noise |
+| h1-pipeline-4x16 | 1,644,221 | 1,606,829-1,685,558 | 1,639,282 | 1,557,372-1,652,933 | -0.3% | noise |
+| h2c-4x128 | 1,195,445 | 1,136,841-1,208,638 | 1,197,895 | 1,146,898-1,217,977 | +0.2% | noise |
+| h2-4x128 | 1,126,303 | 1,124,792-1,131,276 | 1,128,179 | 1,124,704-1,131,844 | +0.2% | noise |
+| h3-4x128 | 949,003 | 930,502-976,227 | 940,551 | 884,371-944,290 | -0.9% | noise |
+| h2c-64x8 | 2,855,628 | 2,848,286-2,964,777 | 2,876,195 | 2,849,593-2,974,949 | +0.7% | noise |
+| h2-64x8 | 2,548,596 | 2,491,822-2,647,748 | 2,533,972 | 2,482,374-2,642,316 | -0.6% | noise |
+| h3-32x16 | 696,093 | 688,773-701,082 | 686,090 | 666,388-697,011 | -1.4% | noise |
+| h2c-512x1 | 745,574 | 729,465-763,091 | 748,591 | 745,657-760,357 | +0.4% | noise |
+| h2-512x1 | 568,584 | 547,394-569,659 | 567,669 | 565,630-571,005 | -0.2% | noise |
+| h3-1x256 | 387,968 | 369,148-398,239 | 382,323 | 370,287-385,478 | -1.5% | noise |
 
-The two slow cases that did not change are flat in request rate, and their
-RSS moved by as much between runs as HTTP/3's did: a stalled reader's cost is
-noisy in a single 30-second case, which is why the memory measurement above
-is the interleaved one. The HTTP/3 slow case held the same 67MB of responses
-open in both runs, its fast load kept 98% of its rate, its p99 was unchanged,
-and the stalled clients that ended with an error fell from 8 to 1: their
-connections are closed by the QUIC idle timeout once they let nothing flow,
-which lands near the end of the case.
+A difference is called real only when the two sides' ranges do not overlap
+and the median delta is larger than the wider of the two spreads; that is a
+conservative test for five runs on a shared host. By it, all twelve fast
+cases are noise: every pair of ranges overlaps, and the median deltas are
+between -1.5% and +0.7%, smaller than the wider spread in every case. No
+fast-case regression, and no improvement, is large enough to be seen above the
+host's spread in the 17 commits between the two revisions: neither the HTTP/3
+whole-response change nor the HTTP/1 body-ownership change is visible in
+request rate at these shapes.
+
+Mean latency followed the request rate: the largest change in the median mean
+was 0.02ms (`h1-256c`), and HTTP/3's p99 medians were 1.36ms against 1.40ms
+at 4 x 128, 2.70ms against 2.64ms at 32 x 16, and 1.33ms against 1.34ms on
+one connection. RSS after a run and two seconds after it are within 4MiB
+between the two sides in eleven of the twelve cases; HTTP/3's idle RSS is
+1-7MiB higher on B (30.0 against 36.5MiB at 4 x 128, ranges 28.3-35.3 and
+32.1-38.5). Those ranges overlap, so the whole-response change could explain
+the difference, but this run does not separate it from the host. The live heap
+after each run and once idle is in
+`benchmark/loadtest/results/2026-10-26-a88c75d2-main/`.
+
+The three slow cases were measured the same way in a second batch, once the
+host had quieted, and they stay where the earlier campaign found them:
+
+| Case | A req/s | A min-max | B req/s | B min-max | A -> B | Verdict |
+| --- | --- | --- | --- | --- | --- | --- |
+| slow-h1 | 415,868 | 413,606-416,599 | 416,437 | 415,634-416,956 | +0.1% | noise |
+| slow-h2c | 1,206,099 | 1,104,663-1,214,633 | 1,214,393 | 1,103,869-1,219,205 | +0.7% | noise |
+| slow-h3 | 987,300 | 915,355-999,254 | 946,572 | 777,850-953,614 | -4.1% | noise |
+
+`slow-h3` has the widest spread and one low B run; its ranges overlap, so by
+the same rule it is noise. What is not noise is what the held responses cost:
+the live heap at the after snapshot was 156.2MiB on A against 12.1MiB on B for
+`slow-h1` (RSS 320.8 against 39.6MiB), 20.5 against 15.5MiB for `slow-h2c`
+(RSS 61.0 against 56.3MiB, ranges overlapping), and 37.1 against 21.1MiB for
+`slow-h3` (RSS 96.0 against 62.0MiB). That is the whole-response change, and
+it matches the interleaved `stallmem.sh` tables above: the fast load is
+unchanged, the memory a stalled reader costs is not.
+
+The two growth cases ran once per side: ten 5-second runs against one server
+kept descriptors at 22 on both sides, RSS ended at 36MiB (A h2c) and 37MiB
+(B h2c) from 31 and 32MiB, and at 46MiB for both over HTTP/3 from 42 and
+43MiB. The same smoke test as before, not an A/B.
+
+The before/now table does not survive this. Its "before" column is below the
+clean A side's minimum in all seven of its fast cases (h1-16c 300k against
+391-415k, h3-4x128 539k against 931-976k), so that campaign measured the
+host's load, not the revision. Its "now" column is not a clean second
+measurement either: h1-256c reads 828k against a clean B range of 650-735k,
+and h3-1x256 338k against 370-385k; the other fast cases are within 1.5% of a
+clean range. The campaign's own medians in the table above stand as a
+description of that build; they are not a comparison between revisions. What
+the 17 commits do change is what a stalled reader costs, which both the
+`stallmem.sh` measurement above and the slow cases' live heap in this run
+show.
 
 ## Limits of the campaign
 
@@ -328,9 +413,11 @@ which lands near the end of the case.
 - Ten 5-second runs are a smoke test for leaks, not a soak. A multi-hour run
   with connection churn, TLS session resumption and varied body sizes is
   still open.
-- The campaign ran on the commit before the branch was rebased onto main,
-  with one three-second test from another workstream in the first HTTP/3
-  round. A two-round rerun of the six A/B cases after the rebase matched the
-  first four within 0-5%; h2c-64x8 read 2.50-2.57M against 2.71-2.92M and
-  h3-32x16 625-656k against 661-701k, within the spread those two show on a
-  shared host.
+- Five rounds per side are enough to see that a fast-case difference is inside
+  the host's spread; they cannot resolve a few percent, and a case whose
+  ranges overlap is called noise rather than proven equal. The fast batch
+  started every counted run with 0-20% of the host busy and the slow batch
+  with 0-15%; sixteen fast attempts were discarded and repeated because the
+  host was still busy when they finished, and the slow batch had none. The
+  load average and busy percentage of every attempt, counted or not, are in
+  `benchmark/loadtest/results/`.
