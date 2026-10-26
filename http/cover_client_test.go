@@ -338,7 +338,13 @@ func TestCvCliIdleTimerSetAgain(t *testing.T) {
 		time.Sleep(timeout * 3 / 4)
 	}
 	at := cvCliWait(t, closed, "the idle connection to close")
-	if early := last.Add(timeout).Sub(at); early > 0 {
+	// The connection goes idle when the response is complete, which is a
+	// little before last is taken here: a runner whose scheduler runs this
+	// test's goroutine late widens that gap. The allowance below is a fraction
+	// of the timeout, far smaller than the gap a timer that never restarted
+	// per request would show.
+	const slack = 25 * time.Millisecond
+	if early := last.Add(timeout - slack).Sub(at); early > 0 {
 		t.Fatalf("closed %v before IdleConnTimeout after it last went idle", early)
 	}
 }

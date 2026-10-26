@@ -154,7 +154,11 @@ func TestReadBodyTimeoutWithReadsHeld(t *testing.T) {
 					c.Release()
 				})
 				go func() {
-					deadline := time.Now().Add(5 * time.Second)
+					// A megabyte has to reach the server and fill its buffer for
+					// the reads to be held, which a slow runner can take longer
+					// over than the few milliseconds this takes here: the window
+					// matches the one the test waits for the cancel with.
+					deadline := time.Now().Add(30 * time.Second)
 					for !c.Conn.ReadsHeld() && time.Now().Before(deadline) {
 						time.Sleep(time.Millisecond)
 					}
