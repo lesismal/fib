@@ -67,15 +67,24 @@ handler returns (see `Connection.Flush`).
 
 ### A response given whole
 
-`WriteResponse` and `Respond` send the head and the body with
-`Connection.SendParts`, which asks the socket to take both in one write. What
-the socket does not take at once is copied into a buffer from the pool and
-kept until it does, which is the memory a stalled reader of a large whole
-response costs ([Load testing](loadtest.md) has the measurements), and what
-`Config.MaxWriteQueueBytes` bounds. The body is therefore the handler's again
-once `WriteResponse` returns. HTTP/2 and HTTP/3 keep it until it has been sent
-or acknowledged and frame it from there, so there a handler must not change it
-until the response is finished; see `fibhttp.Response.Body`.
+`WriteResponse` and `Respond` hand the head and the body of the response to
+the connection in one call, which asks the socket to take both in one write.
+The head is built in a buffer from the pool; a body of 4KiB or less is copied
+into the round's send buffer with it, so that an ordinary small reply is one
+buffered write and allocates nothing of its own. A larger body is kept as the
+handler gave it: what the socket does not take at once waits in the queue as
+that slice, until the socket takes it, so a stalled reader of a large whole
+response costs the body's memory once rather than a copy of it in a pool class
+larger than the body ([Load testing](loadtest.md) has the measurements), and
+`Config.MaxWriteQueueBytes` bounds how much may wait. The body is therefore
+still the response's once `WriteResponse` returns, and not the handler's to
+change: the rule is the same on every protocol, with HTTP/2 and HTTP/3 keeping
+it until their windows and the peer's acknowledgements let it go, so a handler
+must not change it until the response is finished; see `fibhttp.Response.Body`. Two cases are copied: a
+body that is part of the request's own buffer, as `Context.Body` is, since the
+server takes that buffer back once the handler returns, and a body going
+through a layer that transforms it, such as TLS, which seals it into records
+of its own.
 
 ### Transfer codings
 

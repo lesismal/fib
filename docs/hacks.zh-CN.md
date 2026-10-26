@@ -439,7 +439,7 @@ HTTP/3 同样复用请求 stream，`http3.Config.DisableReuse` 关闭。
 - `Context.Body()`：非流式 body（handler 运行前已整体读完）直接返回 server 自己的 buffer。
   `io.ReadAll(c.Request.Body)` 要用逐步增长的 buffer 再拷贝一遍。这些字节**在响应结束之前归 handler 所有，
   不可修改，也不可保留**。`Respond`/`Write` 会拷贝属于请求自己的 body（`c.Body()` 就是），所以 echo 可以直接
-  `c.Respond(200, "application/octet-stream", c.Body())`；其他来源的 body 无论大小都会留到响应发出（HTTP/1、HTTP/2）或对端确认（HTTP/3），写入之后不能再改，见 `fibhttp.Response.Body`。流式 body 时返回 nil。
+  `c.Respond(200, "application/octet-stream", c.Body())`；其他来源的 body 无论大小都会留到响应发出（HTTP/1、HTTP/2）或对端确认（HTTP/3）：HTTP/1 让它在连接发送队列里按 handler 给的原样等待，HTTP/2 按窗口放行的部分装帧，写入之后不能再改，见 `fibhttp.Response.Body`。流式 body 时返回 nil。
 - `Context.Query(name)`：和 `c.Request.URL.Query().Get(name)` 解码方式相同，但不构建 map；
   不需要解码的值就是原始 query 的子串，零分配。
 - `Router` 的路由状态挂在 `Context` 上，随 Context 复用：路由一个请求零分配；`c.Param(name)` /
@@ -484,6 +484,7 @@ Data: func(c *fib.Connection, data []byte) {
 | --- | --- | --- |
 | `Send(b)` | 先尝试直接写，余量复制进发送队列；永不阻塞 | 默认 |
 | `SendParts(a, b)` | 两段数据不拼接，走 `writev`；背压时只复制未发出的后缀 | 帧头 + payload，避免拼接拷贝 |
+| `SendPartsShared(a, b)` | 同 `SendParts`，但 `b` 按原样排在队列里，不复制、不写入、不放回池 | 整体响应的 body（`http` 包用它），或多连接共享的一段数据 |
 | `SendShared(b)` | 与 `SendOwned` 一样不复制，但只读不写、不放回池，同一个 `b` 可以同时发给多个连接；慢连接的队列里排的都是这一份 | 广播（`websocket.PreparedMessage` 用它） |
 | `SendFile(f, off, n)` | 排进发送队列，与前后 `Send` 保序；`sendfile(2)` 直发，随对端接收进度读文件 | 大文件，内存不随文件大小增长 |
 | `Cork()` / `Flush()` | 手动控制合并写 | 在**本轮之外**回复多个请求；或在 handler 里需要中途把数据交给 socket |

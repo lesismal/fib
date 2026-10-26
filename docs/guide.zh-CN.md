@@ -655,9 +655,12 @@ func(c *fibhttp.Context) {
   HTTP/1.0 客户端收不到 trailer。
 - `Response.Body` 的归属：`WriteResponse`/`Respond` 返回之后 handler 不能修改 body，
   与它的大小无关——响应在结束之前一直留着它：HTTP/1 和 HTTP/2 是发出为止，HTTP/3 是
-  对端确认为止。HTTP/1 会把 socket 没一次吃下的部分拷贝，HTTP/2 按对端窗口逐步装帧，
-  HTTP/3 把 body 原样留着、只把帧放进池缓冲。handler 要提前复用 body 就先自己拷贝，
-  或改用会拷贝 body 的写方法；见 `fibhttp.Response.Body`。
+  对端确认为止。HTTP/1 把 socket 没一次吃下的部分按原样排在发送队列里（4KiB 及以下
+  的 body 会拷进本轮发送缓冲，但这不是对 handler 的承诺），HTTP/2 按对端窗口逐步
+  装帧，HTTP/3 把 body 原样留着、只把帧放进池缓冲。handler 要提前复用 body 就先自己
+  拷贝，或改用会拷贝 body 的写方法。用 `Context.Body` 回显请求 body 时 HTTP/1 会拷贝
+  它，因为请求的缓冲在 handler 返回后就要还给池；经过 TLS 的 body 也会被封进记录，
+  同样会拷贝。见 `fibhttp.Response.Body`。
 - `ReadFrom`（`io.Copy`、`http.ServeContent` 都会用到）遇到普通文件，或包着文件的
   `*io.LimitedReader` 时，通过 `Connection.SendFile` 发送；TLS 连接退化为读取后加密发送。
 - handler 返回时响应自动结束（写出剩余数据、结束 chunk、发送 trailer），与 `net/http`

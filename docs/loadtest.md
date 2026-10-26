@@ -161,23 +161,42 @@ a fresh server with the campaign's `/big` body cached, the responses cost:
 
 | Protocol | Stalled streams | Live heap | RSS |
 | --- | --- | --- | --- |
-| h1 | 16 | 147MiB | 258MiB |
+| h1 | 16 | 268MiB | 206MiB |
 | h2c | 16 | 45MiB | 158MiB |
 | h3 | 1 | 32MiB | 31MiB |
 | h3 | 4 | 81MiB | 79MiB |
 | h3 | 16 | 275MiB | 260MiB |
 
-The HTTP/3 figures are the ones before the send path was changed; the two
-after it, measured with `stallmem.sh` (three interleaved rounds of each
-server, medians, server and stalled clients on separate halves of the host),
-are much lower. The body is the test server's cached one in both rows, so it
-is a single 8MiB copy however many streams hold it:
+The HTTP/1 row was re-measured with `stallmem.sh` for the change described
+below; the other rows are the original campaign's. The HTTP/3 figures are the
+ones before its send path was changed; the two after it, measured with
+`stallmem.sh` (three interleaved rounds of each server, medians, server and
+stalled clients on separate halves of the host), are much lower. The body is
+the test server's cached one in every row, so it is a single 8MiB copy however
+many streams hold it:
 
 | Stalled streams | Before: live heap | Before: RSS | Now: live heap | Now: RSS |
 | --- | --- | --- | --- | --- |
 | 1 | 32MiB | 29MiB | 16MiB | 21MiB |
 | 4 | 83MiB | 78MiB | 19MiB | 46MiB |
 | 16 | 275MiB | 209MiB | 19MiB | 113MiB |
+
+The HTTP/1 path was changed the same way later, and measured with the same
+script, three interleaved rounds of the server before and after, medians, the
+same cached 8MiB body:
+
+| Stalled connections | Before: live heap | Before: RSS | Now: live heap | Now: RSS |
+| --- | --- | --- | --- | --- |
+| 1 | 27MiB | 28MiB | 11MiB | 20MiB |
+| 4 | 75MiB | 76MiB | 11MiB | 44MiB |
+| 16 | 268MiB | 206MiB | 12MiB | 85MiB |
+
+Before, each connection held a copy of the body in a 16MiB pool class, so 16
+of them cost 16 x 16MiB on top of the cached body. Now the queue holds the
+handler's slice, so the 16 hold the one 8MiB the test server cached, and the
+live heap stays at 12MiB however many stall. RSS still climbs with the
+connection count because each has the socket buffers the kernel keeps, which
+is what 85MiB at 16 connections is.
 
 The difference is in how each send path holds a whole response:
 
@@ -187,12 +206,15 @@ The difference is in how each send path holds a whole response:
   buffers, not the body, which is why 16 stalled streams leave only 45MiB of
   live heap. Its 158MiB RSS is allocator high-water from the frame buffers,
   and falls to 39MiB once the streams end.
-- **HTTP/1** calls `Conn.SendParts(head, body)`. If the socket takes only
-  part of the body, `queueLocked` copies the rest into a buffer from the
-  pool and keeps it until the socket takes it. A stalled connection therefore
-  holds a copy of the body, rounded to a power-of-two class. The copy is
-  released when the peer goes, but the process's RSS stays high until the
-  runtime reuses it.
+- **HTTP/1** handed the head and the body to `Conn.SendParts`, which copied
+  what the socket did not take into a buffer from the pool: a stalled
+  connection held a copy of the body rounded up to a power-of-two class, and
+  16 of them held 16 copies. The response path now keeps a body above 4KiB as
+  the handler gave it (`Conn.SendPartsShared`), queued beside the head and
+  counted by its length, so what 16 stalled connections hold is the one cached
+  8MiB body. A body of 4KiB or less is still copied into the round's send
+  buffer, which is what keeps a small reply one buffered write. See
+  [HTTP/1](http1.md) and `fibhttp.Response.Body`.
 - **HTTP/3** built the response's HEADERS and its whole body into one frame
   buffer and gave it to the QUIC stream with `WriteFinal`, which kept it
   until the peer acknowledged it. `bufferpool` classes are powers of two, so
@@ -225,8 +247,11 @@ worth planning for:
 - A whole response no longer bounds an HTTP/3 server by its body: what a
   stalled stream holds is what the peer's windows let through, so
   `MaxConcurrentStreams` times the stream window, plus the bodies the handlers
-  themselves keep, is the bound. HTTP/1 still copies what its socket does not
-  take, so the advice above is for it.
+  themselves keep, is the bound. HTTP/1 now holds the handler's body too, one
+  copy however many stalled connections were given it, so what a stalled
+  HTTP/1 reader costs is the body itself; `MaxWriteQueueBytes` still bounds
+  how much may wait, and streaming is what keeps it from being the whole
+  body at once.
 - The 30-second QUIC idle timeout closes a connection whose stalled stream
   keeps no packets flowing. That is what the campaign's stalled HTTP/3
   clients reported, as `quic: idle timeout`, not as a reset or a GOAWAY; a
@@ -255,7 +280,8 @@ one-line defect.
 That limit was then fixed for HTTP/3, and only for HTTP/3: the QUIC stream now
 keeps the handler's body as it is, and its send path builds every packet where
 it is sent, so neither the response nor a datagram is copied together. HTTP/1
-and HTTP/2 are as they were. The campaign was then run again, with the same
+and HTTP/2 were as they were at that point (HTTP/1's copy was removed later;
+see its table above). The campaign was then run again, with the same
 cases, three interleaved rounds and the same reading of the host: its load
 average was 10-17 both times, and it was quieter for the second run, so every
 protocol's fast cases are up, HTTP/1's and HTTP/2's included, although their

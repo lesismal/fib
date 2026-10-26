@@ -54,12 +54,17 @@ handler 用 `Write`/`WriteHeader` 而不是 `WriteResponse` 写响应时，服�
 
 ### 整体给出的响应
 
-`WriteResponse` 和 `Respond` 用 `Connection.SendParts` 把响应头和 body 一起交给
-socket，让它在一次写里吃下两部分。socket 一次没吃下的部分会拷进缓冲池里的一块缓冲，
-直到吃完；这就是不读的大响应读者所付的内存代价（测量见[压测](loadtest.zh-CN.md)），
-也是 `Config.MaxWriteQueueBytes` 限制的东西。因此 `WriteResponse` 返回后 body 又归
-handler 所有。HTTP/2 与 HTTP/3 会把 body 留到发出或对端确认为止并从那里装帧，所以在
-那两种协议上 handler 在响应结束前不能修改它；见 `fibhttp.Response.Body`。
+`WriteResponse` 和 `Respond` 把响应头和 body 一起交给连接，让 socket 在一次写里吃下
+两部分。响应头建在缓冲池的一块缓冲里；4KiB 及以下的 body 会和它一起拷进这一轮的发送
+缓冲，所以普通的小响应仍然是一次带缓冲的写、自己不再分配内存。更大的 body 则按 handler
+给的 slice 保留：socket 一次没吃下的部分就按原样排在队列里，直到 socket 吃下为止，因此
+不读的大响应读者只让 body 占一份内存，而不是再占一份比 body 还大的池缓冲（测量见
+[压测](loadtest.zh-CN.md)），`Config.MaxWriteQueueBytes` 限制的也是这个等待量。所以
+`WriteResponse` 返回后 body 不再归 handler 所有：所有协议都是同一条规则，HTTP/2 与
+HTTP/3 会把 body 留到对端窗口和确认放行为止，handler 在响应结束前都不能修改它；见
+`fibhttp.Response.Body`。有两种情况仍会拷贝：body 是请求自己的缓冲的一部分（`Context.Body`
+就是一种），因为 handler 返回后服务端就要把这块缓冲收回；以及经过会改写字节的 layer
+（例如 TLS 会把 body 封进自己的记录）时。
 
 ### Transfer coding
 

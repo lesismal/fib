@@ -131,14 +131,15 @@ HTTP/3 这一行是 30 秒空闲超时关掉卡住的连接之后的数据。str
 
 | 协议 | 卡住的 stream | 活堆 | RSS |
 | --- | --- | --- | --- |
-| h1 | 16 | 147MiB | 258MiB |
+| h1 | 16 | 268MiB | 206MiB |
 | h2c | 16 | 45MiB | 158MiB |
 | h3 | 1 | 32MiB | 31MiB |
 | h3 | 4 | 81MiB | 79MiB |
 | h3 | 16 | 275MiB | 260MiB |
 
-HTTP/3 这几行是发送路径改动之前的数据；改动之后用 `stallmem.sh` 测（改动前后各三轮、
-交替进行、取中位数，服务端和卡住的客户端钉在机器的不同半边），低得多。两行里
+HTTP/1 这一行是按下面那次改动用 `stallmem.sh` 重测的，其余几行是当初压测的数据。
+HTTP/3 这几行是它发送路径改动之前的数据；改动之后用 `stallmem.sh` 测（改动前后各三轮、
+交替进行、取中位数，服务端和卡住的客户端钉在机器的不同半边），低得多。每一行里
 body 都是压测服务端缓存的那一份，所以不管多少 stream 持有，它只有一份 8MiB：
 
 | 卡住的 stream | 改动前：活堆 | 改动前：RSS | 现在：活堆 | 现在：RSS |
@@ -147,16 +148,33 @@ body 都是压测服务端缓存的那一份，所以不管多少 stream 持有�
 | 4 | 83MiB | 78MiB | 19MiB | 46MiB |
 | 16 | 275MiB | 209MiB | 19MiB | 113MiB |
 
+HTTP/1 的发送路径后来也按同样思路改了，用同一个脚本、改动前后各三轮交替、取中位数，
+body 还是缓存的那一份 8MiB：
+
+| 卡住的连接 | 改动前：活堆 | 改动前：RSS | 现在：活堆 | 现在：RSS |
+| --- | --- | --- | --- | --- |
+| 1 | 27MiB | 28MiB | 11MiB | 20MiB |
+| 4 | 75MiB | 76MiB | 11MiB | 44MiB |
+| 16 | 268MiB | 206MiB | 12MiB | 85MiB |
+
+改动前每条连接都持有一份 body 拷贝，按 16MiB 的池分档，16 条就是 16 x 16MiB 加上
+缓存的那一份；现在队列里排的是 handler 的 slice，16 条连接共用服务端缓存的那一份
+8MiB，所以活堆停在 12MiB，不管卡住多少条。RSS 仍随连接数上涨，因为每条连接都有
+内核保留的 socket 缓冲，16 条时的 85MiB 就是它。
+
 差别在三条发送路径如何持有整体响应：
 
 - **HTTP/2** 只把当前 stream 窗口和连接窗口允许的部分装帧，其余保留为对 handler
   的 `Response.Body` 的引用。卡住的 stream 只占大约一个 stream 窗口（1MiB）的帧
   缓冲，而不是整个 body，所以 16 个卡住的 stream 只有 45MiB 活堆。158MiB 的 RSS 是
   帧缓冲带来的分配器高水位，stream 结束后会回落到 39MiB。
-- **HTTP/1** 走 `Conn.SendParts(head, body)`。socket 只吃下部分 body 时，
-  `queueLocked` 把剩下的拷进池里的一块缓冲，直到 socket 吃下为止。卡住的连接因此
-  持有一份 body 拷贝，并按 2 的幂大小分档。对端消失后拷贝会释放，但进程 RSS 要等
-  运行时复用才会降。
+- **HTTP/1** 过去把响应头和 body 交给 `Conn.SendParts`，socket 只吃下部分 body 时，
+  `queueLocked` 把剩下的拷进池里的一块缓冲：卡住的连接因此持有一份 body 拷贝，
+  并按 2 的幂大小分档，16 条连接就是 16 份。现在超过 4KiB 的 body 按 handler 给的
+  原样保留（`Conn.SendPartsShared`），排在响应头旁边，按长度计数，所以 16 条卡住
+  的连接持有的是缓存的那一份 8MiB。4KiB 及以下的 body 仍然拷进本轮发送缓冲，
+  这样小响应还是一次带缓冲的写。见 [HTTP/1](http1.zh-CN.md) 和
+  `fibhttp.Response.Body`。
 - **HTTP/3** 过去把响应的 HEADERS 和整个 body 构造成一块帧缓冲，用 `WriteFinal`
   交给 QUIC stream，后者一直保留到对端确认。`bufferpool` 按 2 的幂分档，8MiB 的
   body 要占 16MiB 缓冲：16 个卡住的 stream 就是 16 x 16MiB，再加一份缓存 body
@@ -179,8 +197,9 @@ body 都是压测服务端缓存的那一份，所以不管多少 stream 持有�
   `Config.MaxPendingBytes` 限制整个服务端的待发输出。两者默认都不限。
 - 整体响应不再让 HTTP/3 服务端的内存由 body 大小决定：卡住的 stream 只持有对端
   窗口允许的部分，因此上界大致是 `MaxConcurrentStreams` 乘以 stream 窗口，再加
-  handler 自己保留的那些 body。HTTP/1 仍然拷贝 socket 没吃下的部分，上面那条建议
-  对它仍然适用。
+  handler 自己保留的那些 body。HTTP/1 现在也保留 handler 的 body，多少条连接卡住
+  都只有一份，所以卡住的 HTTP/1 读者占的就是 body 本身；`MaxWriteQueueBytes` 仍然
+  限制等待的字节数，而流式写是不让它一次占住整个 body 的办法。
 - QUIC 的 30 秒空闲超时会关掉没有包流动的连接。本次压测里卡住的 HTTP/3 客户端报的
   就是 `quic: idle timeout`，不是 reset 或 GOAWAY；持续消费的慢客户端会发送窗口
   更新，连接不会因空闲被关。
@@ -201,7 +220,8 @@ RSS 漂移更像分配器高水位而不是确定的增长；在下结论之前�
 
 这个限制后来只对 HTTP/3 做了修复：QUIC stream 现在把 handler 的 body 原样留着，
 发送路径也把每个 packet 直接建在它要发出去的位置，因此响应和 datagram 都不再被
-拼成一整块拷贝。HTTP/1 与 HTTP/2 保持原样。改动之后又跑了一遍整轮压测，用例、三轮
+拼成一整块拷贝。HTTP/1 与 HTTP/2 在那个时候保持原样（HTTP/1 的拷贝后来也去掉了，
+见上面 HTTP/1 的表）。改动之后又跑了一遍整轮压测，用例、三轮
 交替和读数方式都相同：两次的 load average 都是 10-17，第二次机器更闲，所以三个协议
 的快速用例都偏高，包括代码没动的 HTTP/1 和 HTTP/2。因此快速用例不是两个版本的对比；
 能对比的是上面那些交替跑出来的卡住读者数据。这次压测能说明的是两次都没有失败，慢客户端

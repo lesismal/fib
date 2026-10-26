@@ -3,9 +3,9 @@
 //
 // A Handler sits in front of an ordinary fib.Handler and hands it plaintext.
 // The wrapped handler sees an ordinary connection: its Send, SendOwned,
-// SendParts and CloseAfterSend encrypt, and its OnData receives decrypted
-// bytes, so protocol handlers such as the http and websocket packages run over
-// TLS unchanged.
+// SendParts, SendPartsShared and CloseAfterSend encrypt, and its OnData
+// receives decrypted bytes, so protocol handlers such as the http and
+// websocket packages run over TLS unchanged.
 package tls
 
 import (

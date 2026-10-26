@@ -153,8 +153,8 @@ func (h HandlerFuncs) OnClose(c *Connection, err error) {
 // frames or encrypts what a connection sends, such as a DTLS implementation
 // over UDP, installs its own the same way.
 //
-// While a layer is installed, Send, SendOwned and SendParts hand their bytes
-// to its Send, and CloseAfterSend calls its CloseAfterSend. The layer reaches
+// While a layer is installed, Send, SendOwned, SendParts and SendPartsShared
+// hand their bytes to its Send, and CloseAfterSend calls its CloseAfterSend. The layer reaches
 // the socket itself through SendRaw and CloseAfterSendRaw. Incoming bytes are
 // not the layer's concern: the handler that installed it sees them in OnData
 // and decides what the handler it wraps receives.

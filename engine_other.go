@@ -985,6 +985,13 @@ func (c *Connection) SendParts(first, second []byte) error {
 	return c.Send(data)
 }
 
+// SendPartsShared is equivalent to SendParts on the synchronous portable
+// backend, which never keeps either part past the call, and so has no copy to
+// spare.
+func (c *Connection) SendPartsShared(first, second []byte) error {
+	return c.SendParts(first, second)
+}
+
 // sendClosed reports whether the connection has stopped accepting sends.
 func (c *Connection) sendClosed() bool {
 	c.mu.Lock()

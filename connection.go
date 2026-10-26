@@ -718,6 +718,30 @@ func (c *Connection) queueCorkedLocked(first, second []byte) {
 	c.corkedBytes += int64(len(first) + len(second))
 }
 
+// queueCorkedSharedLocked is queueCorkedLocked for a parts send whose second
+// part stays the caller's: the head is copied into the cork's buffer as any
+// reply is, and the shared part is queued as the caller gave it, so that a
+// corked response above the copy threshold costs its body's memory rather than
+// a copy of it. Callers hold c.mu.
+func (c *Connection) queueCorkedSharedLocked(first, second []byte) {
+	c.queueSharedPartsLocked(first, second)
+	c.corkedBytes += int64(len(first) + len(second))
+}
+
+// queueSharedPartsLocked queues what a parts send the caller shares did not
+// hand the socket: first, the head of the message, is copied into the queue's
+// pooled buffer, and second is queued as the caller gave it, since the
+// connection does not own it and nothing here writes into it. Callers hold
+// c.mu.
+func (c *Connection) queueSharedPartsLocked(first, second []byte) {
+	if len(first) > 0 {
+		c.queueLocked(first, nil)
+	}
+	if len(second) > 0 {
+		c.queueOwnedLocked(second)
+	}
+}
+
 // foldCorkedLocked counts in pendingBytes what queueCorkedLocked queued
 // without counting. Whatever reads or moves the backlog calls it first.
 // Callers hold c.mu.
@@ -1071,6 +1095,26 @@ func (c *Connection) send(data []byte, mode sendMode) error {
 // SendParts writes a two-part message without first joining the parts. If the
 // socket is backpressured, only the unsent suffix is copied before returning.
 func (c *Connection) SendParts(first, second []byte) error {
+	return c.sendParts(first, second, false)
+}
+
+// SendPartsShared writes a two-part message like SendParts, but keeps second,
+// the part the caller shares, as the caller gave it: what the socket does not
+// take waits in the queue as that slice rather than as a copy of it, as
+// SendShared keeps its array. The connection never writes into second and
+// never hands it to a pool, and only reads it until it is sent, so the same
+// array can go to many connections at once, and the caller must not change it
+// until then. first, the head of the message, is copied when the socket does
+// not take it, so a head built for one response may go back to its pool once
+// this returns. Where a layer such as TLS transforms the parts, both are
+// copied, as SendParts copies them.
+func (c *Connection) SendPartsShared(first, second []byte) error {
+	return c.sendParts(first, second, true)
+}
+
+// sendParts is SendParts and SendPartsShared: shared says second is kept as
+// the caller gave it rather than copied.
+func (c *Connection) sendParts(first, second []byte, shared bool) error {
 	if l := c.layer; l != nil {
 		// Layer.Send is an interface call, so whatever it is handed escapes to
 		// the heap. Only second would be harmless, being the caller's buffer
@@ -1091,7 +1135,11 @@ func (c *Connection) SendParts(first, second []byte) error {
 		return syscall.EPIPE
 	}
 	if c.corked {
-		c.queueCorkedLocked(first, second)
+		if shared {
+			c.queueCorkedSharedLocked(first, second)
+		} else {
+			c.queueCorkedLocked(first, second)
+		}
 		over := c.sendQueueOverLocked()
 		c.mu.Unlock()
 		if over {
@@ -1122,7 +1170,13 @@ func (c *Connection) SendParts(first, second []byte) error {
 			return nil
 		}
 	}
-	if sent < len(first) {
+	if shared {
+		if sent < len(first) {
+			c.queueSharedPartsLocked(first[sent:], second)
+		} else {
+			c.queueSharedPartsLocked(nil, second[sent-len(first):])
+		}
+	} else if sent < len(first) {
 		c.queueLocked(first[sent:], second)
 	} else {
 		c.queueLocked(second[sent-len(first):], nil)

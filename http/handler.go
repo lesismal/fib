@@ -33,12 +33,12 @@ func (f HandlerFunc) ServeHTTP(c *Context) { f(c) }
 type Response struct {
 	StatusCode int
 	Header     stdhttp.Header
-	// Body is the response body. The response keeps the slice itself rather
-	// than copying it, until the response is finished: sent on HTTP/1 and
-	// HTTP/2, acknowledged by the peer on HTTP/3, which can be after
-	// WriteResponse or Respond returns. Whatever its size, it must not be
-	// changed until then, unless the call that writes it copies it: a body
-	// the handler must reuse sooner is copied first.
+	// Body is the response body. The response may keep the slice itself until
+	// it is finished: sent on HTTP/1 and HTTP/2, acknowledged by the peer on
+	// HTTP/3, which can be after WriteResponse or Respond returns. Whatever
+	// its size, it must not be changed until then, unless the call that
+	// writes it copies it: a body the handler must reuse sooner is copied
+	// first, as a per-response opt-in copy does.
 	Body []byte
 	// Trailer is sent after the body. HTTP/1.1 carries it by sending the
 	// body chunked, and announces its names in a Trailer header; HTTP/2 and
@@ -251,7 +251,14 @@ func (r *StreamRequest) bind(conn *fib.Connection, body []byte) *Context {
 // past that, as one framing a whole response does until the peer has
 // acknowledged it, must copy them instead.
 func (r *StreamRequest) BodyWithin(p []byte) bool {
-	b := r.body.data
+	return within(p, r.body.data)
+}
+
+// within reports whether p is a part of b: bytes a server buffer holds, which
+// goes back once the response is finished. A whole response built from them,
+// as an echo is from Context.Body, must copy them rather than keep them, since
+// it reads its body until it has been sent.
+func within(p, b []byte) bool {
 	if len(p) == 0 || len(p) > len(b) {
 		return false
 	}
@@ -1636,16 +1643,24 @@ func (h *ServerHandler) idleForShutdown(parser *Parser) bool {
 // sendResponse writes a whole HTTP/1 response to the connection.
 //
 // The head is built in a pooled buffer and goes to the connection with the
-// body through SendParts, which copies only what the socket does not take at
-// once. A response written from inside a read round, which is where nearly
-// every one is written, is corked, so both parts are copied into the round's
-// send buffer behind the responses before it and reach the socket with them
-// in one write: answering a request allocates nothing for its response, and
-// the round's replies share one buffer that goes back to the pool once they
-// are sent, rather than each holding an array of its own until then.
+// body through SendParts, or through SendPartsShared for a body above
+// maxCopiedResponseBody, which the connection then keeps as the handler gave
+// it rather than copying the part the socket does not take at once. A response
+// written from inside a read round, which is where nearly every one is
+// written, is corked, so the head is copied into the round's send buffer
+// behind the responses before it, and a small body with it, and both reach the
+// socket with them in one write: answering a request with a small response
+// allocates nothing for its response, and the round's replies share one buffer
+// that goes back to the pool once they are sent, rather than each holding an
+// array of its own until then. A large body waits beside that buffer, so that
+// a stalled reader of a whole response costs its body's memory once, as it
+// does on HTTP/2 and HTTP/3, rather than a copy of it in a pool class larger
+// than the body.
 //
-// A chunked response, which carries trailers, is rare enough to be built
-// whole instead.
+// A body that is part of the request's own, as Context.Body's is, is copied
+// instead: the server takes that buffer back once the handler returns, which a
+// response still sending it would outlive. A chunked response, which carries
+// trailers, is rare enough to be built whole instead.
 func (c *Context) sendResponse(response Response, contentType string, closeConnection bool) error {
 	framing, body, trailer := responseFraming(c.Request, response, closeConnection)
 	framing.contentType = contentType
@@ -1659,12 +1674,25 @@ func (c *Context) sendResponse(response Response, contentType string, closeConne
 	pooled := bufferpool.Get(headCapacity(response.Header) + len(contentType))
 	head, err := appendResponseHead(pooled[:0], c.Request, framing)
 	if err == nil {
-		err = c.Conn.SendParts(head, body)
+		if len(body) > maxCopiedResponseBody && !(c.whole != nil && within(body, c.whole.data)) {
+			err = c.Conn.SendPartsShared(head, body)
+		} else {
+			err = c.Conn.SendParts(head, body)
+		}
 		pooled = head
 	}
 	bufferpool.Put(pooled)
 	return err
 }
+
+// maxCopiedResponseBody is the largest whole-response body an HTTP/1 send
+// copies into the queue rather than keeping as the handler gave it. A corked
+// round's replies share one buffer and reach the socket in one write, which is
+// what an ordinary small reply wants, and a message of several parts would
+// cost the socket more than the copy does; above it the body's own memory is
+// cheaper than a copy of it. HTTP/3 used the same bound while it still copied
+// a small whole response into its frames, before it kept every size.
+const maxCopiedResponseBody = 4 << 10
 
 // marshalResponse builds a whole response into one array, which it hands to
 // the caller to give to the connection.
