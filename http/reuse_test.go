@@ -307,9 +307,18 @@ func TestH2RecycledStreamsKeepRequestsApart(t *testing.T) {
 			if i%3 == 0 {
 				method, body = stdhttp.MethodPost, strings.Repeat(n, 1+i%7)
 			}
-			req, _ := stdhttp.NewRequest(method, fmt.Sprintf("https://%s/r%s?n=%s", addr, n, n), strings.NewReader(body))
-			req.Header.Set("X-N", n)
-			resp, err := client.Do(req)
+			// A connection the peer reset under this many at once says
+			// nothing about the streams sharing one; the request, which the
+			// server answers the same way twice, goes again on another.
+			var resp *stdhttp.Response
+			var err error
+			for attempt := 0; attempt < 2; attempt++ {
+				req, _ := stdhttp.NewRequest(method, fmt.Sprintf("https://%s/r%s?n=%s", addr, n, n), strings.NewReader(body))
+				req.Header.Set("X-N", n)
+				if resp, err = client.Do(req); err == nil {
+					break
+				}
+			}
 			if err != nil {
 				errs <- err
 				return
