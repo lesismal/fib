@@ -599,6 +599,24 @@ func (h *ServerHandler) OnClose(c *fib.Connection, err error) {
 			path.qc.Abort(err)
 		}
 	}
+	// A connection that sends on this address is not always in the paths
+	// above: a datagram can leave it on another udpPeer of the same address,
+	// which peerOf makes when the address's connection was replaced under
+	// it. It is found here by the address it still sends to, so that it ends
+	// with the address as the one above does.
+	if addr := c.RemoteAddr(); addr != nil {
+		h.routesMu.RLock()
+		var same []*quic.Conn
+		for _, qc := range h.routes {
+			if remote := qc.RemoteAddr(); remote != nil && remote.String() == addr.String() {
+				same = append(same, qc)
+			}
+		}
+		h.routesMu.RUnlock()
+		for _, qc := range same {
+			qc.Abort(err)
+		}
+	}
 }
 
 // OnEngineClose tells the clients of the connections that send on the
