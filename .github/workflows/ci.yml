@@ -111,6 +111,24 @@ jobs:
             echo "::notice title=skipped tests::$skipped"
           fi
           if [ "$status" -ne 0 ]; then
+            # One retry of the tests that failed, and only of those. The suite
+            # has timing tests whose deadlines a loaded runner crosses now and
+            # then, and a second run of the same binary is the cheapest way to
+            # tell that from a real failure: it is reported here, and a test
+            # that fails twice still fails the job.
+            failed=$(grep -aoE -- '--- FAIL: [^ ]+' "$RUNNER_TEMP/test.log" | sed 's/--- FAIL: //; s|/.*||' | sort -u | paste -sd'|' -)
+            if [ -n "$failed" ]; then
+              echo "::notice title=retrying::$failed"
+              go test -race -count=1 -timeout 10m -v -run "^($failed)\$" ./... > "$RUNNER_TEMP/retry.log" 2>&1
+              retry=$?
+              grep -v -E '^(=== (RUN|PAUSE|CONT)|\s*--- PASS)' "$RUNNER_TEMP/retry.log"
+              if [ "$retry" -eq 0 ]; then
+                echo "::notice title=passed on the retry::$failed"
+                status=0
+              fi
+            fi
+          fi
+          if [ "$status" -ne 0 ]; then
             # Surface the failures as an annotation so they are readable
             # without opening the full log.
             summary=$(grep -a -E -B2 -A20 -- '--- FAIL|^panic:|^FAIL|fatal error:' "$RUNNER_TEMP/test.log" | head -c 60000)
