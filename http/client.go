@@ -1510,6 +1510,13 @@ func (r *clientRequest) retryable() bool {
 // may be replayed (RFC 8446 section 2.3): a method that changes nothing, no
 // body, and not a protocol switch.
 func (r *clientRequest) canSendEarly() bool {
+	if r.retried {
+		// The server turned down what it took as early data once, which may be
+		// a replay (RFC 8470 section 5.2): the request goes again only once
+		// the handshake is over, or the retry's own early data is turned down
+		// as well and this time there is no second retry to make.
+		return false
+	}
 	if r.tunnel != nil {
 		return false
 	}
