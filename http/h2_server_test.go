@@ -358,9 +358,7 @@ func (tc *h2TestConn) readRaw() h2Frame {
 			if goAway == "" {
 				goAway = "no GOAWAY"
 			}
-			var dump bytes.Buffer
-			_ = pprof.Lookup("goroutine").WriteTo(&dump, 1)
-			tc.t.Logf("goroutine dump:\n%s", dump.String())
+			tc.t.Fatalf("read: %v, %v after the dial (%s); %s", err, time.Since(tc.opened), goAway, fibStacks())
 			tc.t.Fatalf("read: %v, %v after the dial (%s)", err, time.Since(tc.opened), goAway)
 		}
 		tc.in = append(tc.in, buf[:m]...)
@@ -665,4 +663,35 @@ func TestH2ServerCancelsTheContextOfAResetStream(t *testing.T) {
 		t.Fatalf("an answered stream was cancelled too: %v", err)
 	case <-time.After(100 * time.Millisecond):
 	}
+}
+
+// fibStacks names the goroutines whose stack mentions this module, one line
+// each, so that a failure annotation carries where the server is without the
+// thousands of lines the whole dump would take.
+func fibStacks() string {
+	var dump bytes.Buffer
+	_ = pprof.Lookup("goroutine").WriteTo(&dump, 1)
+	var out []string
+	lines := strings.Split(dump.String(), "\n")
+	for i, line := range lines {
+		if strings.HasPrefix(line, "goroutine ") {
+			keep := false
+			for j := i; j < len(lines) && j < i+12; j++ {
+				if strings.Contains(lines[j], "lesismal/fib/") {
+					keep = true
+					break
+				}
+			}
+			if keep {
+				out = append(out, line)
+				for j := i + 1; j < len(lines) && j < i+8 && !strings.HasPrefix(lines[j], "goroutine "); j++ {
+					out = append(out, lines[j])
+				}
+			}
+		}
+	}
+	if len(out) > 40 {
+		out = out[:40]
+	}
+	return strings.Join(out, " | ")
 }

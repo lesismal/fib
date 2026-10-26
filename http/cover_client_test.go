@@ -269,7 +269,10 @@ func TestCvCliIdleTimerReused(t *testing.T) {
 		}
 	})
 	config := DefaultClientConfig()
-	config.IdleConnTimeout = 300 * time.Millisecond
+	// Long enough that the timer does not fire while the loop runs: what it
+	// checks is that the connection keeps the timer it was given, not what
+	// happens when one fires mid-loop, which a slow runner's clock decides.
+	config.IdleConnTimeout = 2 * time.Second
 	client := newTestClient(t, config)
 	var timer *time.Timer
 	for i := 0; i < 8; i++ {
@@ -338,7 +341,9 @@ func TestCvCliIdleTimerSetAgain(t *testing.T) {
 		time.Sleep(timeout * 3 / 4)
 	}
 	at := cvCliWait(t, closed, "the idle connection to close")
-	if early := last.Add(timeout).Sub(at); early > 0 {
+	// 10ms: last is taken after the body was read, so the client's own mark
+	// came a little before it, and a runner's timer granularity is coarse.
+	if early := last.Add(timeout).Sub(at); early > 10*time.Millisecond {
 		t.Fatalf("closed %v before IdleConnTimeout after it last went idle", early)
 	}
 }
