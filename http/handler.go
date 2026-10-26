@@ -44,7 +44,9 @@ type Response struct {
 	// to fill again or to change, writes the response with one of them, and
 	// the copy is what the response sends. Nothing else copies a body, except
 	// a protocol's copy of the request's own buffer, which the server
-	// recycles.
+	// recycles: a body that is Context.Body, or a part of it, is copied by
+	// every protocol's send path, HTTP/1's, HTTP/2's and HTTP/3's alike, so
+	// that echoing the request body is safe however long the response takes.
 	Body []byte
 	// Trailer is sent after the body. HTTP/1.1 carries it by sending the
 	// body chunked, and announces its names in a Trailer header; HTTP/2 and
@@ -52,7 +54,10 @@ type Response struct {
 	// response that has no body, gets none of it. Like Body, it is kept until
 	// the response is finished, so it must not be changed until then;
 	// WriteResponseCopy copies it, map and values, at the call, as it does
-	// the body.
+	// the body. Unlike Body, it has no request-buffer exception to allow for:
+	// a header's values are strings, so a trailer filled from the request's
+	// header, or from Request.Trailer, holds no byte of the buffer the server
+	// recycles.
 	Trailer stdhttp.Header
 	Close   bool
 }

@@ -46,7 +46,11 @@ HEADERS 这样到达的 stream 带 `Early-Data: 1`（RFC 8470），只有 GET、
   `MaxStreamedBodyBytes` 而不是 `MaxBodyBytes`；`Expect: 100-continue` 要等 handler
   第一次要 body 时才回复 100。
 - 交给 `WriteResponse` 或 `Respond` 的响应通过 `Response.Body []byte` 一次性给出；客户端
-  同样把响应 body 完整缓存后再回调。
+  同样把响应 body 完整缓存后再回调。stream 会一直留着这个 slice 直到响应结束——对端窗口
+  放行为止——所以 handler 在此之前不能修改它；要提前复用就改用 `RespondCopy` /
+  `WriteResponseCopy`，它们在调用时拷贝。body 若是请求自己的缓冲（`Context.Body()` 就是），
+  则由服务端拷贝：这块缓冲在 handler 返回后就要还给池，HTTP/1 的 send 也是这么拷贝的；
+  其他 body（包括 `RespondCopy` 做的那份拷贝）都按原样保留，不会再拷贝一次。
 - handler 也可以通过 `Context` 的 `http.ResponseWriter` 方法（`Header`/`WriteHeader`/
   `Write`/`Flush`）写响应（含 trailer），或把 `Context` 交给 `http.ServeFile`、
   `http.ServeContent`。不超过 4KB（或设置了不超过 64KB 的 `Content-Length`）且没有

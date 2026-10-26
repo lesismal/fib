@@ -1752,7 +1752,9 @@ func (sc *h2ServerConn) closeFinishedLocked() {
 }
 
 // respond sends a response on the stream. Its body goes out as flow control
-// allows; what does not fit yet waits for the client's WINDOW_UPDATE.
+// allows; what does not fit yet waits for the client's WINDOW_UPDATE. A body
+// that is the request's own is copied where it would wait past the handler's
+// return, as HTTP/1's send copies one; see the slow path below.
 func (st *h2ServerStream) respond(req *stdhttp.Request, response Response) error {
 	status := response.StatusCode
 	if status < 200 || status > 999 {
@@ -1834,6 +1836,15 @@ func (st *h2ServerStream) respond(req *stdhttp.Request, response Response) error
 	} else {
 		st.pending = body
 		out = sc.flushStreamLocked(out, st)
+		if len(st.pending) > 0 && st.block.BodyWithin(body) {
+			// What the windows kept back waits here past the handler's return,
+			// when the server takes the request's buffer back: the body is the
+			// request's own, as Context.Body is, so what is left of it is
+			// copied, as HTTP/1's send and HTTP/3's response copy it. What
+			// just went was framed from it before it could be reused. Every
+			// other body is kept, whatever its size; see Response.Body.
+			st.pending = append([]byte(nil), st.pending...)
+		}
 	}
 	if response.Close && !sc.goAway {
 		// HTTP/2 cannot close one request's connection under the others, so
@@ -2322,6 +2333,13 @@ func (sc *h2ServerConn) endStreamLocked(out []byte, st *h2ServerStream) []byte {
 // h2Trailer is what of trailer a response may send after its body, or nil if
 // that is none: trailer itself when all of it may go, which it nearly always
 // may, and otherwise a copy without the fields that may not.
+//
+// It is kept until the body's end goes out, which can be after the handler
+// returns, so it follows the rule Body does for a handler's own body. Unlike
+// the body, none of it can be the request's buffer: a header's values are
+// strings, and those of the request's header and trailer are the decoder's
+// own, while the trailer map itself, even one taken from Request.Trailer, is
+// not recycled with the rest of the request.
 func h2Trailer(trailer stdhttp.Header) stdhttp.Header {
 	if len(trailer) == 0 {
 		return nil

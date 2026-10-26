@@ -61,7 +61,13 @@ Behaviour to be aware of when using it.
   `Expect: 100-continue` is answered only once the handler asks for the body.
 - A response given to `WriteResponse` or `Respond` is given all at once as
   `Response.Body []byte`. The client buffers the whole response body before
-  its callback.
+  its callback. The stream keeps the slice until it is finished, until the
+  client's windows let it go, so the handler must not change it; `RespondCopy`
+  and `WriteResponseCopy` are the calls that copy it. A body that is the
+  request's own buffer, as `Context.Body()` is, is copied by the server
+  instead, since that buffer goes back to the pool once the handler returns,
+  exactly as HTTP/1's send copies one; every other body, including the copy
+  `RespondCopy` makes, is kept as given rather than copied again.
 - A handler may instead write its response through `Context`'s
   `http.ResponseWriter` methods (`Header`/`WriteHeader`/`Write`/`Flush`),
   trailers included, and hand `Context` to `http.ServeFile` or
