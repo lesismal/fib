@@ -477,3 +477,191 @@ func TestServeDuplexCloseWithoutWrite(t *testing.T) {
 		t.Fatal("Close did not return")
 	}
 }
+
+// TestDuplexAfterClose checks what a handler sees after it ends the duplex:
+// every direction reports ErrDuplexClosed, and closing again is a no-op.
+func TestDuplexAfterClose(t *testing.T) {
+	results := make(chan error, 1)
+	handler := NewHandler(HandlerFunc(func(c *Context) {
+		if err := c.ServeDuplex(func(d *Duplex) {
+			if d.Context() != c {
+				results <- errors.New("Duplex.Context is not the request")
+				return
+			}
+			if err := d.Err(); err != nil {
+				results <- errors.New("Err while open: " + errString(err))
+				return
+			}
+			if err := d.Close(); err != nil {
+				results <- err
+				return
+			}
+			if _, err := d.Read(make([]byte, 1)); !errors.Is(err, ErrDuplexClosed) {
+				results <- errors.New("Read after Close: " + errString(err))
+				return
+			}
+			if _, err := d.Write([]byte("x")); !errors.Is(err, ErrDuplexClosed) {
+				results <- errors.New("Write after Close: " + errString(err))
+				return
+			}
+			if err := d.Flush(); !errors.Is(err, ErrDuplexClosed) {
+				results <- errors.New("Flush after Close: " + errString(err))
+				return
+			}
+			if err := d.Close(); err != nil {
+				results <- errors.New("second Close: " + errString(err))
+				return
+			}
+			if !errors.Is(d.Err(), ErrDuplexClosed) {
+				results <- errors.New("Err after Close: " + errString(d.Err()))
+				return
+			}
+			results <- nil
+		}); err != nil {
+			results <- err
+		}
+	}))
+	addr := serve(t, handler)
+	client := h2cClient()
+	defer client.CloseIdleConnections()
+	resp, err := client.Get("http://" + addr + "/duplex")
+	if err != nil {
+		t.Fatalf("the request: %v", err)
+	}
+	resp.Body.Close()
+	if err := <-results; err != nil {
+		t.Fatal(err)
+	}
+}
+
+// TestDuplexWithError checks the closed operations of a duplex that already
+// has an error, without a request or a connection under it.
+func TestServeDuplexWithoutRequest(t *testing.T) {
+	var c Context
+	if err := c.ServeDuplex(func(*Duplex) {}); !errors.Is(err, ErrResponseWritten) {
+		t.Fatalf("ServeDuplex on a Context without a request = %v, want ErrResponseWritten", err)
+	}
+}
+
+func TestDuplexWithError(t *testing.T) {
+	boom := errors.New("boom")
+	d := &Duplex{closed: true, err: boom}
+	if _, err := d.Read(make([]byte, 1)); !errors.Is(err, boom) {
+		t.Errorf("Read = %v, want the duplex's error", err)
+	}
+	if _, err := d.Write([]byte("x")); !errors.Is(err, boom) {
+		t.Errorf("Write = %v, want the duplex's error", err)
+	}
+	if err := d.Flush(); !errors.Is(err, boom) {
+		t.Errorf("Flush = %v, want the duplex's error", err)
+	}
+	if err := d.Err(); !errors.Is(err, boom) {
+		t.Errorf("Err = %v, want the duplex's error", err)
+	}
+	d.setErr(nil)
+	if err := d.Err(); !errors.Is(err, boom) {
+		t.Errorf("setErr(nil) replaced the error: %v", err)
+	}
+}
+
+// TestServeDuplexPanic checks that a panicking handler is recovered, the
+// response abandoned, and the server still serves the next request.
+func TestServeDuplexPanic(t *testing.T) {
+	config := DefaultConfig()
+	config.StreamRequestBody = true
+	handler := NewHandlerWithConfig(config, HandlerFunc(func(c *Context) {
+		if c.Request.URL.Path == "/again" {
+			c.WriteHeader(stdhttp.StatusOK)
+			return
+		}
+		if err := c.ServeDuplex(func(*Duplex) {
+			panic("duplex panic")
+		}); err != nil {
+			t.Errorf("ServeDuplex: %v", err)
+		}
+	}))
+	addr := serve(t, handler)
+	client := h2cClient()
+	defer client.CloseIdleConnections()
+	resp, err := client.Get("http://" + addr + "/duplex")
+	if err == nil {
+		resp.Body.Close()
+	}
+	// The stream is abandoned; a second request on a new connection must
+	// still be served.
+	client.CloseIdleConnections()
+	client = h2cClient()
+	defer client.CloseIdleConnections()
+	resp, err = client.Get("http://" + addr + "/again")
+	if err != nil {
+		t.Fatalf("the request after the panic: %v", err)
+	}
+	resp.Body.Close()
+}
+
+// TestDuplexBody covers the body pipe directly: what it hands on, what a
+// closed one reports, its compaction, and a writer waiting on a full buffer.
+func TestDuplexBody(t *testing.T) {
+	p := newDuplexBody()
+	p.write([]byte("abcd"), false, nil)
+	buf := make([]byte, 3)
+	if n, err := p.Read(buf); n != 3 || err != nil || string(buf) != "abc" {
+		t.Fatalf("Read = %d, %v, %q", n, err, buf)
+	}
+	// Writing after a partial read compacts the buffer.
+	p.write([]byte("ef"), false, nil)
+	if n, err := p.Read(buf); n != 3 || err != nil || string(buf) != "def" {
+		t.Fatalf("Read after compaction = %d, %v, %q", n, err, buf)
+	}
+	// fin ends the body with io.EOF.
+	p.write([]byte("g"), true, nil)
+	if n, err := p.Read(buf); n != 1 || err != nil || string(buf[:n]) != "g" {
+		t.Fatalf("last Read = %d, %v, %q", n, err, buf[:n])
+	}
+	if _, err := p.Read(buf); !errors.Is(err, io.EOF) {
+		t.Fatalf("Read at the end = %v, want io.EOF", err)
+	}
+
+	// A body that fails reports its error.
+	p = newDuplexBody()
+	p.write(nil, false, errors.New("body failed"))
+	if _, err := p.Read(buf); err == nil || err.Error() != "body failed" {
+		t.Fatalf("Read of a failed body = %v", err)
+	}
+
+	// A pipe closed without an error reports ErrDuplexClosed.
+	p = newDuplexBody()
+	p.close(nil)
+	if _, err := p.Read(buf); !errors.Is(err, ErrDuplexClosed) {
+		t.Fatalf("Read of a closed pipe = %v, want ErrDuplexClosed", err)
+	}
+
+	// A writer past the limit waits for the reader, and close wakes it.
+	p = newDuplexBody()
+	written := make(chan struct{})
+	go func() {
+		p.write(make([]byte, duplexBodyLimit+1), false, nil)
+		close(written)
+	}()
+	if n, err := p.Read(buf); n == 0 || err != nil {
+		t.Fatalf("Read of the first bytes = %d, %v", n, err)
+	}
+	p.close(ErrDuplexClosed)
+	<-written
+	// What arrived after close is dropped; what was buffered is drained
+	// before the close's reason is reported.
+	p.write([]byte("late"), false, nil)
+	for {
+		if _, err := p.Read(buf); err != nil {
+			if !errors.Is(err, ErrDuplexClosed) {
+				t.Fatalf("Read after close = %v, want ErrDuplexClosed", err)
+			}
+			break
+		}
+	}
+	// close keeps its first reason.
+	p.close(errors.New("later"))
+	if _, err := p.Read(buf); !errors.Is(err, ErrDuplexClosed) {
+		t.Fatalf("Read after a second close = %v, want the first reason", err)
+	}
+}

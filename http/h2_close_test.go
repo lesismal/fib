@@ -83,7 +83,11 @@ func TestCloseLetsGoOfAnIdleHTTP2Connection(t *testing.T) {
 		runtime.GOMAXPROCS(procs)
 		runtime.AddCleanup(engine, func(b *atomic.Bool) { b.Store(true) }, &collected)
 	}()
-	deadline := time.Now().Add(5 * time.Second)
+	// Twenty seconds rather than five: the coverage job runs the whole
+	// module with atomic counters and shares the runner, and a collector
+	// pass that needs a few cycles can miss a five-second window without the
+	// connection being reachable.
+	deadline := time.Now().Add(20 * time.Second)
 	for !collected.Load() && time.Now().Before(deadline) {
 		runtime.GC()
 		time.Sleep(20 * time.Millisecond)
