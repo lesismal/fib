@@ -170,8 +170,9 @@ func TestResponseCopyFailsOnResetStream(t *testing.T) {
 	case <-time.After(20 * time.Second):
 		t.Fatal("the handler did not run")
 	}
-	// Let the handler register its callbacks before the reset lands.
-	time.Sleep(100 * time.Millisecond)
+	// The handler registered its callbacks before it closed started, so the
+	// reset can land now: a sleep here was a guess at when the server had
+	// caught up, and on a loaded runner the guess was sometimes wrong.
 	s.Reset(uint64(ErrCodeRequestCancelled))
 	select {
 	case err = <-results:

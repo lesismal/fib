@@ -394,7 +394,12 @@ func TestHTTP1WriteTimeoutRefusesLateWrites(t *testing.T) {
 // that comes back after the last response's timeout has passed is served.
 func TestHTTP1WriteTimeoutLeavesIdleConnectionsAlone(t *testing.T) {
 	config := DefaultConfig()
-	config.WriteTimeout = 100 * time.Millisecond
+	// A second, not a hundred milliseconds: what the test checks is that the
+	// client that comes back after the timeout has passed is served, and on a
+	// loaded runner a 100ms bound can cut a 256 KiB body in half while the
+	// client's next read is still waiting to be scheduled, which the Windows
+	// job saw as a body ending early.
+	config.WriteTimeout = time.Second
 	_, addr, _ := serveEngineStoppable(t, config, func(c *Context) {
 		for i := range 8 {
 			if _, err := c.Write(streamPattern(i)); err != nil {
@@ -406,7 +411,9 @@ func TestHTTP1WriteTimeoutLeavesIdleConnectionsAlone(t *testing.T) {
 	reader := bufio.NewReader(conn)
 	for i := range 3 {
 		if i > 0 {
-			time.Sleep(250 * time.Millisecond)
+			// Longer than WriteTimeout: the request comes after the bound on
+			// the response before it has passed.
+			time.Sleep(1200 * time.Millisecond)
 			if _, err := io.WriteString(conn, "GET / HTTP/1.1\r\nHost: x\r\n\r\n"); err != nil {
 				t.Fatal(err)
 			}

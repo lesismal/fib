@@ -40,6 +40,11 @@ func serve(t *testing.T, handler fib.Handler) string {
 	// connection meant for the one before it, whose subtest has ended: that
 	// client then waits for an answer nobody will send.
 	config.ReusePort = false
+	// A backlog that fits the tests that dial hundreds of connections at
+	// once: with DefaultConfig's 128 a burst overflows the accept queue, and
+	// macOS resets the connections that do not fit, which the client sees as
+	// "connection reset by peer" instead of the server's answer.
+	config.Backlog = 4096
 	server, err := fib.New(config, fib.Binding{Addr: "127.0.0.1:0", Handler: handler})
 	if err != nil {
 		t.Fatal(err)
