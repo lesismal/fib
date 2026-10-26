@@ -10,6 +10,14 @@ on:
 permissions:
   contents: read
 
+# Each engine prints its effective settings at startup, one line per
+# parameter; across the test binaries that is thousands of lines that bury a
+# failure and the data race or panic behind it. The tests run with the list
+# off, and Engine.LogSettings still prints it on demand. This applies to the
+# example servers the conformance jobs start too, so their logs stay short.
+env:
+  FIB_LOG_SETTINGS: '0'
+
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true

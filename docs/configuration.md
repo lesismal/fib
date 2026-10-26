@@ -169,6 +169,10 @@ means the caller set a different value. `Engine.LogSettings()` prints the same l
 whether or not `LogSettings` is set. `Engine.Settings()` returns the values programmatically, and
 `Settings.Parameters()` returns the same rows the log uses.
 
+Setting the environment variable `FIB_LOG_SETTINGS=0` (also `false`, `off` or `no`, in any case)
+silences the startup list without changing the config. It is how fib's CI keeps the thousands of
+lines the tests would print from burying a failure; `Engine.LogSettings()` still prints the list.
+
 `LogStatus` is separate: it prints the one-line `fib: engine started` banner, off by default.
 
 ## Changing things at runtime

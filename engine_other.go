@@ -586,7 +586,8 @@ type Config struct {
 	// LogSettings has the engine log every effective setting when it starts,
 	// one line per parameter; see Engine.LogSettings and
 	// Settings.Parameters. DefaultConfig sets it, so set it false to silence
-	// the list.
+	// the list. Setting the environment variable FIB_LOG_SETTINGS=0 silences
+	// the startup list too, without changing this field.
 	LogSettings bool
 	// Network is the network of every Binding that leaves its own empty;
 	// see Binding.Network. Empty means "tcp".

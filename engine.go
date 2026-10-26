@@ -1205,7 +1205,9 @@ type Config struct {
 	// the caller's, and what it does; see Engine.LogSettings and
 	// Settings.Parameters. DefaultConfig sets it, so a fib engine reports its
 	// sizing by default; set it to false to silence the list, or call
-	// Engine.LogSettings to print it on demand.
+	// Engine.LogSettings to print it on demand. Setting the environment
+	// variable FIB_LOG_SETTINGS=0 silences the startup list too, without
+	// changing this field.
 	LogSettings bool
 	// Network is the network of every Binding that leaves its own empty;
 	// see Binding.Network. Empty means "tcp".

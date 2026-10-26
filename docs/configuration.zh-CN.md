@@ -159,6 +159,10 @@ INFO fib: config parameter=maxPendingBytes value="33255979008 (30.97 GiB)" sourc
 `Engine.LogSettings()` 可以随时打印同样的列表，不受 `LogSettings` 开关影响；
 `Engine.Settings()` 以结构体返回，`Settings.Parameters()` 返回日志使用的同一组行。
 
+环境变量 `FIB_LOG_SETTINGS=0`（也可以是 `false`、`off`、`no`，不区分大小写）会在不改配置的
+情况下关闭启动时的列表。fib 的 CI 就是这样避免测试打印的几千行配置淹没失败的；
+`Engine.LogSettings()` 仍可随时打印。
+
 `LogStatus` 是另一个开关，只控制 `fib: engine started` 那一行，默认关闭。
 
 ## 运行时修改

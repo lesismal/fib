@@ -468,10 +468,30 @@ func (e *Engine) Name() string { return e.name }
 // accepted or dialed it, even when one of its pollers serves it.
 func (c *Connection) Engine() *Engine { return c.engine.root() }
 
+// logSettingsEnv is the environment variable that silences the startup
+// settings list without changing Config.LogSettings: set it to 0, false, off
+// or no. fib's CI sets it so that the list, one line per parameter per engine,
+// does not bury a failing test's output.
+const logSettingsEnv = "FIB_LOG_SETTINGS"
+
+// logSettingsSilenced reports whether the environment asks for the startup
+// settings list to be left out. It only silences: Config.LogSettings still
+// decides whether an engine prints the list at all, and Engine.LogSettings
+// prints it on demand whatever this says.
+func logSettingsSilenced() bool {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv(logSettingsEnv))) {
+	case "0", "false", "off", "no":
+		return true
+	default:
+		return false
+	}
+}
+
 // logRun logs that the engine has started serving, under its name, with the
 // addresses it listens on and the task pool its connections run on, when
 // Config.LogStatus asks for it, and the effective settings when
-// Config.LogSettings asks for those.
+// Config.LogSettings asks for those and the environment has not silenced the
+// list.
 func (e *Engine) logRun() {
 	accept, applies := e.acceptPlacements()
 	if e.acceptPlacement != AcceptFDModulo && !applies {
@@ -497,7 +517,7 @@ func (e *Engine) logRun() {
 		slog.Info("fib: engine started", "engine", e.name, "listen", listening, "taskPool", pool,
 			"pollers", len(e.pollers), "accept", accept)
 	}
-	if e.logSettings {
+	if e.logSettings && !logSettingsSilenced() {
 		e.LogSettings()
 	}
 }

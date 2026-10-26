@@ -76,6 +76,9 @@ func TestEngineSettings(t *testing.T) {
 // The startup log prints the settings line, with the sized values, when
 // LogStatus asks for it.
 func TestLogRunPrintsSettings(t *testing.T) {
+	// The CI environment silences the list by default; this test is about
+	// the list, so it asks for it.
+	t.Setenv(logSettingsEnv, "1")
 	var buf bytes.Buffer
 	old := slog.Default()
 	slog.SetDefault(slog.New(slog.NewTextHandler(&buf, nil)))
@@ -167,6 +170,7 @@ func TestSettingsParameterSources(t *testing.T) {
 // The settings list is on by default and can be turned off; the method still
 // prints it on demand.
 func TestLogSettingsDefaultAndDisable(t *testing.T) {
+	t.Setenv(logSettingsEnv, "1")
 	if !DefaultConfig().LogSettings {
 		t.Fatal("DefaultConfig does not log its settings")
 	}
@@ -190,5 +194,33 @@ func TestLogSettingsDefaultAndDisable(t *testing.T) {
 	engine.LogSettings()
 	if out := buf.String(); !strings.Contains(out, "fib: engine config") || !strings.Contains(out, "parameter=readBuffer") {
 		t.Fatalf("LogSettings did not print the list: %q", out)
+	}
+}
+
+// FIB_LOG_SETTINGS silences the automatic settings list, as fib's CI sets it,
+// while Engine.LogSettings still prints the list on demand.
+func TestLogSettingsEnvSilences(t *testing.T) {
+	for _, value := range []string{"0", "false", "off", "no", "FALSE", " off "} {
+		t.Run(value, func(t *testing.T) {
+			t.Setenv(logSettingsEnv, value)
+			var buf bytes.Buffer
+			old := slog.Default()
+			slog.SetDefault(slog.New(slog.NewTextHandler(&buf, nil)))
+			defer slog.SetDefault(old)
+
+			engine, err := New(DefaultConfig(), Binding{Addr: "127.0.0.1:0", Handler: HandlerFuncs{}})
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer engine.Close()
+			engine.logRun()
+			if buf.Len() != 0 {
+				t.Fatalf("logRun with %s=%q wrote %q", logSettingsEnv, value, buf.String())
+			}
+			engine.LogSettings()
+			if out := buf.String(); !strings.Contains(out, "fib: engine config") || !strings.Contains(out, "parameter=readBuffer") {
+				t.Fatalf("LogSettings with %s=%q printed %q", logSettingsEnv, value, out)
+			}
+		})
 	}
 }
