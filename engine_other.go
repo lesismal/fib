@@ -95,7 +95,7 @@ func newEngine(config Config, bindings []Binding) (*Engine, error) {
 		config.MaxEvents = 256
 	}
 	if config.ReadBufferSize <= 0 {
-		config.ReadBufferSize = 16 * 1024
+		config.ReadBufferSize = defaultReadBufferSize
 	}
 	// Dialed connections are served by the handler each dial names; one
 	// that names none gets this, which does nothing.
@@ -567,6 +567,10 @@ func (e *Engine) Close() error {
 
 var _ io.Closer = (*Engine)(nil)
 
+// defaultReadBufferSize is Config.ReadBufferSize when it is left at zero,
+// as on the native backends.
+const defaultReadBufferSize = 16 << 10
+
 type Config struct {
 	// Name labels the engine in what it logs, and names the task pools its
 	// connections run on: "<Name>-workers" for the engine's own and
@@ -579,6 +583,11 @@ type Config struct {
 	// off by default. The task pools' own lines are switched separately, with
 	// taskpool.SetLogStatus.
 	LogStatus bool
+	// LogSettings has the engine log every effective setting when it starts,
+	// one line per parameter; see Engine.LogSettings and
+	// Settings.Parameters. DefaultConfig sets it, so set it false to silence
+	// the list.
+	LogSettings bool
 	// Network is the network of every Binding that leaves its own empty;
 	// see Binding.Network. Empty means "tcp".
 	Network                         string
@@ -588,6 +597,11 @@ type Config struct {
 	PollBatchSize            int
 	ReadBufferSize           int
 	WriteBufferHighWatermark int
+	// MaxPendingBytes caps the bytes this server may hold waiting for its
+	// sockets. This backend writes each send before it returns, so it does
+	// not queue output, and accepts the field only so that one config serves
+	// both.
+	MaxPendingBytes int64
 	// MaxWriteQueueBytes caps a connection's send queue, as it does on the
 	// other backends; see the native Config's field. This backend writes each
 	// send before it returns, so it never holds a queue for the limit to
@@ -653,7 +667,7 @@ type Config struct {
 
 func DefaultConfig() Config {
 	sizing := DefaultPoolSizing(taskpool.ModeAdaptive)
-	return Config{Name: DefaultName, Network: "tcp", Backlog: 128, WorkerCount: sizing.WorkerCount, MaxEvents: sizing.MaxEvents, ReadBufferSize: 16 * 1024, WriteBufferHighWatermark: 4 * 1024, UseWritev: true, CoalesceWrites: true, SocketSyscalls: true, TaskPoolMode: taskpool.ModeAdaptive, SharedTaskPool: true, IOPollers: true, ReusePort: true, LogSettings: true}
+	return Config{Name: DefaultName, Network: "tcp", Backlog: 128, WorkerCount: sizing.WorkerCount, MaxEvents: sizing.MaxEvents, ReadBufferSize: defaultReadBufferSize, WriteBufferHighWatermark: 4 * 1024, UseWritev: true, CoalesceWrites: true, SocketSyscalls: true, TaskPoolMode: taskpool.ModeAdaptive, SharedTaskPool: true, IOPollers: true, ReusePort: true, LogSettings: true}
 }
 
 type portableEvent struct {
