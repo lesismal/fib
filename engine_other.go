@@ -1078,7 +1078,9 @@ func (c *Connection) process() {
 			c.engine.finishConnection(c, event.closeErr)
 			return
 		}
+		c.inOnData.Store(true)
 		c.handler.OnData(c, event.data)
+		c.inOnData.Store(false)
 	}
 }
 

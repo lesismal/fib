@@ -57,7 +57,8 @@ type DatagramsHandler interface {
 //
 // OnHangup runs on the event loop, at most once per connection, when the
 // loop sees the peer end its side of the connection, or the socket fail,
-// while a round of the connection is running or waiting to run. It must
+// while a round of the connection is running. A round only queued for a
+// worker is not running: it reads the end itself, at once. It must
 // not block, nor take a lock that a handler in OnData may hold; work that
 // would do either goes to a goroutine or a pool. A hangup that arrives
 // while no round is running needs no early word: the round it starts
