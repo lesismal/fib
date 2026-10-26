@@ -53,7 +53,13 @@ func TestMaxBodyHold(t *testing.T) {
 			if resp.StatusCode != stdhttp.StatusGatewayTimeout || got != ErrBodyHeldTooLong.Error() {
 				t.Fatalf("status %d, body %q", resp.StatusCode, got)
 			}
-			if waited := time.Since(start); waited < 100*time.Millisecond {
+			// The hold may have begun before start, which is taken after
+			// the upload: a hundred milliseconds from here is the right
+			// answer only if nothing was spent before it. Half of
+			// MaxBodyHold still tells an immediate failure apart from the
+			// hold running its course, and a coarse Windows clock cannot
+			// move it.
+			if waited := time.Since(start); waited < 50*time.Millisecond {
 				t.Fatalf("failed after %v, before MaxBodyHold", waited)
 			}
 		})
