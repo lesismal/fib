@@ -220,3 +220,82 @@ func testEpollRelay(t *testing.T, pipes int) {
 			lostInRelay, lostInInstance, pipes*rounds)
 	}
 }
+
+// stopRelayWriters tells a relay test's writers to stop and waits for them to
+// return. They have to be gone before the descriptors they write to are
+// closed: a write to one that was closed under it, and since given to a
+// socket, would put its byte on that socket's stream.
+func stopRelayWriters(stop chan struct{}, writers *sync.WaitGroup) {
+	close(stop)
+	writers.Wait()
+}
+
+// TestRelayWritersStoppedBeforeTheirPipeCloses pins the teardown rule of
+// TestEpollRelayLosesNoWakeup: its loop acks a writer for a byte it then
+// stops taking, so a writer is still to write when the test ends, and it must
+// be waited for before the pipes close. The kernel hands out the lowest free
+// descriptors, so the pipe's numbers come back for the sockets of the test
+// that follows, as they did for the echo test whose peer read an 0x01 ahead
+// of its echo.
+func TestRelayWritersStoppedBeforeTheirPipeCloses(t *testing.T) {
+	var p [2]int
+	if err := syscall.Pipe2(p[:], syscall.O_NONBLOCK|syscall.O_CLOEXEC); err != nil {
+		t.Fatal(err)
+	}
+	var writers sync.WaitGroup
+	var wrote atomic.Bool
+	writers.Add(1)
+	go func() {
+		defer writers.Done()
+		// A writer whose loop has taken its last ack has nothing left to
+		// look at stop for: it writes after its spin. A sleep stands in for
+		// its being descheduled there while the test ends.
+		time.Sleep(2 * time.Millisecond)
+		wrote.Store(true)
+		for {
+			if _, err := syscall.Write(p[1], []byte{1}); err != syscall.EINTR {
+				break
+			}
+		}
+	}()
+	stopRelayWriters(make(chan struct{}), &writers)
+	for _, fd := range p {
+		if err := syscall.Close(fd); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// The pair takes the descriptors the pipe had, as the next test's
+	// sockets do.
+	pair, err := syscall.Socketpair(syscall.AF_UNIX, syscall.SOCK_STREAM|syscall.SOCK_CLOEXEC, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer syscall.Close(pair[1])
+	defer syscall.Close(pair[0])
+	if pair[0] != p[0] || pair[1] != p[1] {
+		t.Fatalf("the socket pair took descriptors %v, not the pipe's %v", pair, p)
+	}
+	// A writer that was not waited for writes its byte in the pair's second
+	// end once it wakes; one that was waited for wrote it to the pipe, which
+	// the close above took with it.
+	if err := syscall.SetNonblock(pair[0], true); err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(200 * time.Millisecond)
+	var b [1]byte
+	for {
+		switch n, err := syscall.Read(pair[0], b[:]); {
+		case n > 0:
+			t.Fatalf("a stray 0x%02x reached the descriptor the pipe's number was reused for", b[0])
+		case err != nil && err != syscall.EAGAIN && err != syscall.EINTR:
+			t.Fatal(err)
+		}
+		if time.Now().After(deadline) {
+			break
+		}
+		time.Sleep(time.Millisecond)
+	}
+	if !wrote.Load() {
+		t.Fatal("the writer never wrote")
+	}
+}
