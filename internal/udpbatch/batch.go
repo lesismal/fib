@@ -118,30 +118,6 @@ func (b *Batch) Recv(fd, n int, one bool) (int, bool, error) {
 // themselves, rather than failing one.
 func batchRefused(err error) bool { return err == syscall.ENOSYS || err == syscall.EOPNOTSUPP }
 
-// MaxParts is the most parts one datagram may be sent as with SendParts: a
-// message of as many buffers as a batched send has room for.
-const MaxParts = Size
-
-// SendParts sends parts as one datagram, with one system call where the
-// platform takes a message of several buffers, sendmsg on Linux and sendmsg_x
-// on macOS, rather than joining them first. Where it does not, the other BSDs,
-// SendParts reports ENOSYS and the caller joins them. The parts must be no
-// more than MaxParts.
-func SendParts(fd int, to syscall.Sockaddr, parts [][]byte) error {
-	switch {
-	case len(parts) == 0:
-		return nil
-	case len(parts) > MaxParts:
-		return syscall.EINVAL
-	case len(parts) == 1 && to == nil:
-		_, err := syscall.Write(fd, parts[0])
-		return err
-	case len(parts) == 1:
-		return syscall.Sendto(fd, parts[0], 0, to)
-	}
-	return sendPartsSys(fd, to, parts)
-}
-
 // sendScratch is the memory a batched send describes its datagrams to the
 // kernel in. The kernel is handed its address as a number, which escape
 // analysis cannot follow, so a stack copy of it would be moved to the heap

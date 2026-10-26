@@ -1767,22 +1767,11 @@ func (c *Connection) sendDatagramParts(first, second []byte) error {
 	if len(first) == 0 {
 		return c.sendDatagram(second)
 	}
-	if len(first)+len(second) == 0 {
-		return nil
-	}
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	if c.closing || c.closed || c.closeAfterSend {
-		return syscall.EPIPE
-	}
-	// The parts go to the socket as they are where the platform takes a
-	// message of several buffers, and are joined here where it does not.
-	// Either way the bytes have reached the socket by the time this returns.
-	err := c.sysSendDatagramParts(first, second)
-	if err == nil {
-		c.udp.lastActive.Store(time.Now().UnixNano())
-	}
-	return err
+	// sendDatagram hands the bytes to the socket before it returns, so the
+	// joined copy goes straight back to the pool.
+	data := bufferpool.Join(nil, first, second)
+	defer bufferpool.Put(data)
+	return c.sendDatagram(data)
 }
 
 // detachPeer drops a closed peer from its listener's table. The socket is the

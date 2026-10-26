@@ -207,24 +207,6 @@ func (c *Connection) sysSendDatagrams(datagrams [][]byte) (int, error) {
 	return len(datagrams), nil
 }
 
-// sysSendDatagramParts sends first and second as one datagram, with one
-// WSASendto of the two buffers: Winsock gathers what a message lists, so
-// nothing is joined first. Callers hold c.mu.
-func (c *Connection) sysSendDatagramParts(first, second []byte) error {
-	bufs := [2]syscall.WSABuf{sys.WSABuf(first), sys.WSABuf(second)}
-	var n uint32
-	var err error
-	if l := c.udp.listener; l != nil {
-		err = syscall.WSASendto(l.fd, &bufs[0], 2, &n, 0, c.udp.sa, nil, nil)
-	} else {
-		err = syscall.WSASend(c.socket(), &bufs[0], 2, &n, 0, nil, nil)
-	}
-	if sys.IsWouldBlock(err) {
-		return syscall.EAGAIN
-	}
-	return err
-}
-
 // sysSendDatagram sends one datagram without waiting. A socket with no room
 // reports EAGAIN, as it does on the other systems, rather than Winsock's
 // WSAEWOULDBLOCK, so that a sender that keeps what a full socket refused,

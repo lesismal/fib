@@ -16,11 +16,3 @@ type batchHeader struct{}
 func (b *Batch) recvBatch(int, int) (int, error) { return 0, syscall.ENOSYS }
 
 func sendBatchSys(int, syscall.Sockaddr, [][]byte) (int, error) { return 0, syscall.ENOSYS }
-
-// sendPartsSys reports that a message of several buffers is not taken here:
-// SendParts joins the parts instead.
-func sendPartsSys(int, syscall.Sockaddr, [][]byte) error { return syscall.ENOSYS }
-
-// maxParts is what a message of several buffers would hold, which these
-// kernels do not take; the parts of a datagram are joined instead.
-const maxParts = Size

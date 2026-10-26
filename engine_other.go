@@ -964,16 +964,6 @@ func (c *Connection) WriteQueueLimit() int64 {
 	return c.engine.bindConfig.MaxWriteQueueBytes
 }
 
-// sysSendDatagramParts sends first and second as one datagram. This backend
-// has no message of several buffers, so they are joined first; the copy is
-// done with as soon as Send returns, the socket having taken the bytes by
-// then. Callers hold c.mu.
-func (c *Connection) sysSendDatagramParts(first, second []byte) error {
-	data := bufferpool.Join(nil, first, second)
-	defer bufferpool.Put(data)
-	return c.sysSendDatagram(data)
-}
-
 func (c *Connection) SendParts(first, second []byte) error {
 	if l := c.layer; l != nil {
 		return l.Send(first, second)

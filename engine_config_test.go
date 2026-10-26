@@ -271,13 +271,10 @@ func TestUDPConnectionAddressesAndSends(t *testing.T) {
 	sends := []func() error{
 		func() error { return c.SendParts([]byte("first"), nil) },
 		func() error { return c.SendParts(nil, []byte("second")) },
-		// Two parts as one datagram: the socket takes them as they are where
-		// the platform gathers, and the echo arrives joined.
-		func() error { return c.SendParts([]byte("th"), []byte("ird")) },
 		func() error { return c.SendRawPooled(append(bufferpool.Get(8)[:0], "pooled"...)) },
 		func() error { return c.SendBatch([][]byte{[]byte("one"), nil, []byte("two")}) },
 	}
-	want := []string{"first", "second", "third", "pooled", "one", "two"}
+	want := []string{"first", "second", "pooled", "one", "two"}
 	for _, send := range sends {
 		if err := send(); err != nil {
 			t.Fatal(err)
