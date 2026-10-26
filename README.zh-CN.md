@@ -53,8 +53,9 @@ HTTP/3 和 WebSocket。少量事件循环负责等待 I/O 就绪，具体工作�
   Windows 用 IOCP。其他系统回退到标准库 `net`。
 - **按连接调度**：同一连接的事件按顺序、一次一个地在任意空闲 worker 上执行。连接不绑定线程，
   负载按实际工作量分摊，而不是按 fd 数量。
-- **背压**：每连接有写水位线（64 KiB），满了就暂停读取；全服务待发字节预算（`MaxPendingBytes`）
-  可选、默认关闭，用来限制总量；`HoldReads` 提供读端流控。
+- **背压**：每连接写水位线按读缓冲和机器计算（四倍读缓冲，64–256 KiB；默认 16 KiB 读缓冲
+  时为 64 KiB），满了就暂停读取；全服务待发字节预算（`MaxPendingBytes`）可选、默认关闭，
+  用来限制总量；`HoldReads` 提供读端流控。
 - **池**：随负载伸缩的自适应 worker 池；按 Go 分配器 size class 对齐的分级 buffer 池。
 - **一个引擎，多种协议**：传给 `fib.New` 的每个 `Binding` 为一组地址（TCP、Unix 或 UDP）各配一个 handler，
   一个引擎即可同时提供 HTTP、HTTPS、HTTP/3、WebSocket、gRPC 和裸 TCP，共享事件循环、池和 buffer。
