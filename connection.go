@@ -74,6 +74,10 @@ type Connection struct {
 	// corkedBytes is output queued under a cork that pendingBytes does not
 	// count yet; see queueCorkedLocked. Guarded by mu.
 	corkedBytes int64
+	// corkedPending mirrors corkedBytes for readers that have no lock to
+	// take, such as waitOutput's fast path: a sender must not be told the
+	// queue is short while another goroutine's cork holds the backlog.
+	corkedPending atomic.Int64
 	// attachType and attachData are the two words of the attachment, an any
 	// kept unboxed, so that reading it is not a trip to an object of its own.
 	// SetAttachment writes them under mu between two steps of the sequence
@@ -715,7 +719,9 @@ func (c *Connection) queueLocked(first, second []byte) {
 // c.mu.
 func (c *Connection) queueCorkedLocked(first, second []byte) {
 	c.queueLocked(first, second)
-	c.corkedBytes += int64(len(first) + len(second))
+	n := int64(len(first) + len(second))
+	c.corkedBytes += n
+	c.corkedPending.Add(n)
 }
 
 // queueCorkedSharedLocked is queueCorkedLocked for a parts send whose second
@@ -725,7 +731,9 @@ func (c *Connection) queueCorkedLocked(first, second []byte) {
 // a copy of it. Callers hold c.mu.
 func (c *Connection) queueCorkedSharedLocked(first, second []byte) {
 	c.queueSharedPartsLocked(first, second)
-	c.corkedBytes += int64(len(first) + len(second))
+	n := int64(len(first) + len(second))
+	c.corkedBytes += n
+	c.corkedPending.Add(n)
 }
 
 // queueSharedPartsLocked queues what a parts send the caller shares did not
@@ -748,6 +756,7 @@ func (c *Connection) queueSharedPartsLocked(first, second []byte) {
 func (c *Connection) foldCorkedLocked() {
 	if n := c.corkedBytes; n != 0 {
 		c.corkedBytes = 0
+		c.corkedPending.Add(-n)
 		c.pendingBytes.Add(n)
 	}
 }
@@ -1645,7 +1654,12 @@ func (c *Connection) unsent() int64 {
 // by a cork is let go, as Flush lets it go, since the wait would otherwise
 // be for output nothing is going to write.
 func (c *Connection) waitOutput(limit int64) error {
-	if c.pendingBytes.Load() <= limit && !c.flags.has(flagFileQueued) || c.udp != nil {
+	if c.udp != nil {
+		return nil
+	}
+	// pendingBytes alone would say the queue is short while another goroutine's
+	// cork holds a backlog that has not been folded in yet; see corkedPending.
+	if c.pendingBytes.Load()+c.corkedPending.Load() <= limit && !c.flags.has(flagFileQueued) {
 		return nil
 	}
 	release := limit / 2
