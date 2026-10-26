@@ -23,6 +23,7 @@ HTTP/3 和 WebSocket。少量事件循环负责等待 I/O 就绪，具体工作�
 
 - [特性](#特性)
 - [快速开始](#快速开始)
+- [配置](#配置)
 - [架构](#架构)
 - [性能与内存从哪里来](#性能与内存从哪里来)
 - [基准测试](#基准测试)
@@ -403,6 +404,23 @@ go run ./gateway/client
 
 [fibhub](https://github.com/lesismal/fibhub) 是一个基于 fib 的 TCP 引擎、arpc 与 WebSocket 构建的完整应用：经由中心节点，把 TCP 连接隧道转发到 NAT 与防火墙后面的设备。
 
+## 配置
+
+`fib.DefaultConfig()` 返回一个按机器 sizing 的 Engine：worker 池跟随 CPU，监听 backlog 跟随内核，
+写水位线按读缓冲、内存和 fd 上限计算。把它和若干个 `fib.Binding` 传给 `fib.New`，只设置自己需要的字段：
+
+```go
+cfg := fib.DefaultConfig()
+cfg.MaxPendingBytes = 1 << 30 // 可选的全服务待发总量预算
+cfg.LogSettings = false       // 关闭启动时的参数列表
+
+engine, err := fib.New(cfg, fib.Binding{Addr: ":8080", Handler: handler})
+```
+
+启动时默认逐项打印生效配置，每项带 `default`/`custom` 来源和说明；`Engine.LogSettings()` 可随时
+打印同样的列表。全部 `Config`、`Binding` 字段、默认值、机器 sizing 公式和启动日志说明见
+[配置](docs/configuration.zh-CN.md)。
+
 ## 架构
 
 fib 把“等待 I/O”和“干活”分开：
@@ -693,6 +711,8 @@ CI 每次 push 都在 Linux、macOS、Windows 上运行 [`taskpool/benchmark`](t
 
 ## 文档
 
+- [配置](docs/configuration.zh-CN.md)：全部 `Config`、`Binding` 字段、默认值、机器 sizing 公式和启动
+  配置日志
 - [架构](docs/architecture.zh-CN.html)：事件循环、poller 与池、handler 分层、读调度、写背压、负载
   均衡、连接关闭
 - [协议流程](docs/flows.zh-CN.html)：TLS、HTTP/1、HTTP/2、HTTP/3、WebSocket 各由哪个循环、哪个池执行

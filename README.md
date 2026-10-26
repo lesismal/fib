@@ -24,6 +24,7 @@ uSockets, workflow, axum, h2, quiche and rustls.
 
 - [Features](#features)
 - [Quick start](#quick-start)
+- [Configuration](#configuration)
 - [Architecture](#architecture)
 - [Where the speed and the memory come from](#where-the-speed-and-the-memory-come-from)
 - [Benchmarks](#benchmarks)
@@ -425,6 +426,25 @@ Each server directory but `multiprotocol` has a matching `client` next to it; `m
 
 [fibhub](https://github.com/lesismal/fibhub), a hub that tunnels TCP connections to devices behind NATs and firewalls, is a complete application built on fib's TCP engine, arpc and WebSocket.
 
+## Configuration
+
+`fib.DefaultConfig()` returns an engine sized for the machine: the pool follows the CPUs, the
+backlog the kernel, and the write watermark the read buffer and the machine's memory and descriptor
+limits. Pass it to `fib.New` with one or more `fib.Binding`s, and set only what you need:
+
+```go
+cfg := fib.DefaultConfig()
+cfg.MaxPendingBytes = 1 << 30 // optional server-wide output budget
+cfg.LogSettings = false       // silence the startup settings list
+
+engine, err := fib.New(cfg, fib.Binding{Addr: ":8080", Handler: handler})
+```
+
+The effective settings are logged at startup by default, one line per parameter, with its
+`default`/`custom` source and a description; `Engine.LogSettings()` prints the same list on demand.
+The full reference — every `Config` and `Binding` field, its default, the machine sizing formula
+and the startup log — is in [Configuration](docs/configuration.md).
+
 ## Architecture
 
 fib separates waiting for I/O from doing the work:
@@ -743,6 +763,8 @@ Run it yourself with `cd taskpool/benchmark && ./bench.sh` (or `bench.ps1` on Wi
 
 ## Documentation
 
+- [Configuration](docs/configuration.md): every `Config` and `Binding` field, its default, the
+  machine sizing formula and the startup settings log
 - [Architecture](docs/architecture.html): event loops, pollers and pools, handler layers, read
   scheduling, write backpressure, load balancing and connection teardown
 - [Protocol flows](docs/flows.html): which loop and which pool runs what for TLS, HTTP/1, HTTP/2,
