@@ -1507,6 +1507,26 @@ func TestSetWriteBackpressure(t *testing.T) {
 	}
 }
 
+// waitConnState waits until check reports true, run with c's lock held. A
+// test uses it to ask the connection where it has got to rather than sleeping
+// a guessed time for it; the deadline bounds how long a failure takes to show,
+// and is generous because a loaded host may stretch even an event that is a
+// formality on an idle one.
+func waitConnState(t *testing.T, c *Connection, what string, check func() bool) {
+	t.Helper()
+	for deadline := time.Now().Add(20 * time.Second); ; time.Sleep(time.Millisecond) {
+		c.mu.Lock()
+		ok := check()
+		c.mu.Unlock()
+		if ok {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("%s", what)
+		}
+	}
+}
+
 // A read deferred because the backlog reached the watermark is still owed
 // while the queue never empties: a sender that keeps topping it up, as a
 // streamed upload waiting on waitOutput does, may never let it empty, and the
@@ -1531,6 +1551,9 @@ func TestDeferredReadDeliveredWhileQueueStaysNonEmpty(t *testing.T) {
 	got := make(chan struct{})
 	stop := make(chan struct{})
 	pumpDone := make(chan struct{})
+	// deferred is closed once the round has left the ping's read for
+	// whatever drains the queue.
+	deferred := make(chan struct{})
 	payload := make([]byte, chunk)
 	pump := func(c *Connection) {
 		defer close(pumpDone)
@@ -1541,9 +1564,17 @@ func TestDeferredReadDeliveredWhileQueueStaysNonEmpty(t *testing.T) {
 			}
 		}
 		close(full)
-		// While the round runs its sends are corked, which waitOutput does
-		// not count; top up only once it has gone.
-		<-release
+		// While the round runs, the queue its handler's replies go into is
+		// corked: the bytes count as unsent but not as pending, which is what
+		// waitOutput's quick check reads, so a sender that waited now would
+		// queue megabytes past the watermark instead of the keep it means to
+		// hold. Top up only once the round has deferred the read and let the
+		// cork go.
+		select {
+		case <-deferred:
+		case <-stop:
+			return
+		}
 		for {
 			select {
 			case <-stop:
@@ -1585,11 +1616,16 @@ func TestDeferredReadDeliveredWhileQueueStaysNonEmpty(t *testing.T) {
 	// The ping's edge reaches the round still running, before anything is
 	// queued, so it is noted for the round rather than held back as a paused
 	// read. The round then finds the backlog past the watermark, and defers
-	// the read to whatever drains it.
+	// the read to whatever drains it. Ask the connection for that edge
+	// instead of sleeping a guessed time for it: the pump must not start
+	// filling the queue until the edge is there, or the ping arrives at a
+	// read the watermark has paused and a different path delivers it.
 	if _, err := conn.Write([]byte("ping")); err != nil {
 		t.Fatal(err)
 	}
-	time.Sleep(50 * time.Millisecond)
+	waitConnState(t, c, "the event loop never noted the ping's read", func() bool {
+		return uint32(c.pendingEvents)&evIn != 0
+	})
 	go pump(c)
 	var releaseOnce sync.Once
 	letGo := func() { releaseOnce.Do(func() { close(release) }) }
@@ -1606,22 +1642,43 @@ func TestDeferredReadDeliveredWhileQueueStaysNonEmpty(t *testing.T) {
 		t.Fatal("the server's queue never reached the watermark")
 	}
 	letGo()
+	// The round has to leave the read to the queue before the pump tops it up,
+	// which also proves the read is deferred at all: without that this would
+	// test the ordinary read a round does with nothing queued.
+	waitConnState(t, c, "the round never left the ping's read to the queue", func() bool {
+		return c.readDeferred
+	})
+	close(deferred)
 
 	// Read until the server has the ping. The socket buffers are small enough
 	// that no flush takes all the pump keeps queued.
+	//
+	// The deadline bounds how long a failure takes to show, rather than
+	// deciding when the test may go on: the loop ends as soon as the server
+	// delivers the ping. Delivering it takes the queue falling under the
+	// watermark, about a megabyte drained through a 16 KiB socket send buffer
+	// in 16 KiB reads, which a loaded host stretches from milliseconds to
+	// seconds. Twenty seconds is far past that, so only a connection that has
+	// stopped delivering reaches it.
 	buf := make([]byte, 16<<10)
-	deadline := time.Now().Add(5 * time.Second)
+	deadline := time.Now().Add(20 * time.Second)
 	for {
 		select {
 		case <-got:
 			return
 		default:
 		}
-		if time.Now().After(deadline) {
-			t.Fatal("the peer's data went unread while the server kept output queued")
+		if err := conn.SetReadDeadline(deadline); err != nil {
+			t.Fatal(err)
 		}
-		_ = conn.SetReadDeadline(time.Now().Add(time.Second))
 		if _, err := conn.Read(buf); err != nil {
+			if errors.Is(err, os.ErrDeadlineExceeded) {
+				c.mu.Lock()
+				queued, left := c.queuedLocked(), c.readDeferred
+				c.mu.Unlock()
+				t.Fatalf("the peer's data went unread while the server kept output queued "+
+					"(%d bytes queued, read deferred %v)", queued, left)
+			}
 			t.Fatal(err)
 		}
 	}
