@@ -87,20 +87,74 @@ func TestLogRunPrintsSettings(t *testing.T) {
 
 	out := buf.String()
 	if !strings.Contains(out, "fib: engine config") {
-		t.Fatalf("logRun did not print the settings line: %q", out)
+		t.Fatalf("logRun did not print the settings header: %q", out)
 	}
 	for _, want := range []string{
 		"engine=" + DefaultName,
-		"readBuffer=16384",
-		"writeWatermark=65536",
-		"maxPendingBytes=0",
-		"maxWriteQueueBytes=0",
-		"maxConns=0",
-		"coalesceWrites=true",
-		"socketSyscalls=true",
+		"parameter=name",
+		"parameter=readBuffer",
+		"parameter=writeWatermark",
+		"parameter=maxPendingBytes",
+		"value=\"16384 (16 KiB)\"",
+		"value=\"65536 (64 KiB)\"",
+		"source=default",
+		"about=",
 	} {
 		if !strings.Contains(out, want) {
 			t.Errorf("logRun output %q is missing %q", out, want)
 		}
+	}
+}
+
+// A setting the caller changed is reported as custom, one fib sized from the
+// read buffer and the machine as default.
+func TestSettingsParameterSources(t *testing.T) {
+	source := func(settings Settings, name string) string {
+		t.Helper()
+		for _, p := range settings.Parameters() {
+			if p.Name == name {
+				return p.Source
+			}
+		}
+		t.Fatalf("no parameter %q", name)
+		return ""
+	}
+
+	engine, err := New(DefaultConfig(), Binding{Addr: "127.0.0.1:0", Handler: HandlerFuncs{}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{"name", "readBuffer", "writeWatermark", "maxPendingBytes", "useWritev", "ioPollers"} {
+		if got := source(engine.Settings(), name); got != "default" {
+			t.Errorf("DefaultConfig %s source = %q, want default", name, got)
+		}
+	}
+	engine.Close()
+
+	config := DefaultConfig()
+	config.Name = "custom"
+	config.ReadBufferSize = 64 << 10
+	config.WriteBufferHighWatermark = 0 // sized from the new read buffer
+	config.MaxPendingBytes = 1 << 30
+	config.MaxConns = 100_000
+	config.MaxWriteQueueBytes = 32 << 20
+	config.UseWritev = false
+	config.IOPollers = false
+	config.LogStatus = true
+	engine, err = New(config, Binding{Addr: "127.0.0.1:0", Handler: HandlerFuncs{}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer engine.Close()
+	settings := engine.Settings()
+	for _, name := range []string{"name", "readBuffer", "maxPendingBytes", "maxConns", "maxWriteQueueBytes", "useWritev", "ioPollers", "logStatus"} {
+		if got := source(settings, name); got != "custom" {
+			t.Errorf("%s source = %q, want custom", name, got)
+		}
+	}
+	// The watermark was left to fib, so it is default even though its
+	// effective value follows the custom read buffer and budget.
+	if got := source(settings, "writeWatermark"); got != "default" {
+		t.Errorf("writeWatermark source = %q, want default", got)
 	}
 }

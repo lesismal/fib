@@ -102,6 +102,10 @@ type bindingState struct {
 	// bindConfig is the Config the engine was created with, less its
 	// Bindings, which the sockets AddBinding opens take their options from.
 	bindConfig Config
+	// configCustom records which settings the caller set rather than leaving
+	// them for fib's defaults. Settings reports it, and the startup log says
+	// which parameters are custom.
+	configCustom map[string]bool
 	// bindingCount is how many binding indices the engine has handed out,
 	// the ones New was given first. Guarded by bindMu.
 	bindingCount int

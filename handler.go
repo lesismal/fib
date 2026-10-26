@@ -497,5 +497,11 @@ func (e *Engine) logRun() {
 	}
 	slog.Info("fib: engine started", "engine", e.name, "listen", listening, "taskPool", pool,
 		"pollers", len(e.pollers), "accept", accept)
-	slog.Info("fib: engine config", "engine", e.name, "config", e.Settings().String())
+	settings := e.Settings()
+	parameters := settings.Parameters()
+	slog.Info("fib: engine config", "engine", e.name, "parameters", len(parameters))
+	for _, p := range parameters {
+		slog.Info("fib: config", "parameter", p.Name,
+			"value", p.Value, "source", p.Source, "about", p.About)
+	}
 }

@@ -275,6 +275,7 @@ func (e *Engine) releaseSendBuffer(data []byte) {
 // newEngine creates the engine New describes, listening on bindings, which
 // bindingsOf has resolved.
 func newEngine(config Config, bindings []Binding) (*Engine, error) {
+	custom := customConfig(config)
 	if err := config.validateTaskPool(); err != nil {
 		return nil, err
 	}
@@ -303,7 +304,7 @@ func newEngine(config Config, bindings []Binding) (*Engine, error) {
 		config.ReusePort = true
 	}
 
-	e := &Engine{name: engineName(config), logStatus: config.LogStatus, maxEvents: config.MaxEvents,
+	e := &Engine{name: engineName(config), logStatus: config.LogStatus, maxEvents: config.MaxEvents, configCustom: custom,
 		pollBatchSize:      config.PollBatchSize,
 		noLoop:             !engineLoop(config),
 		acceptPlacement:    config.AcceptPlacement,
@@ -365,7 +366,7 @@ func newEngine(config Config, bindings []Binding) (*Engine, error) {
 func (e *Engine) openPollers(config Config) error {
 	n := pollerCount(config)
 	for i := 0; i < n; i++ {
-		p := &Engine{parent: e, name: e.name, logStatus: e.logStatus, maxEvents: e.maxEvents, bindConfig: config,
+		p := &Engine{parent: e, name: e.name, logStatus: e.logStatus, maxEvents: e.maxEvents, bindConfig: config, configCustom: e.configCustom,
 			pollBatchSize: e.pollBatchSize, useWritev: e.useWritev,
 			socketSyscalls: e.socketSyscalls, coalesceWrites: e.coalesceWrites,
 			writeHighWatermark: e.writeHighWatermark,
@@ -1194,11 +1195,12 @@ type Config struct {
 	// LogStatus has the engine log a line when it starts serving, with its
 	// name, the addresses it listens on, its task pool, its pollers and, as
 	// "accept", which loop accepts each TCP and Unix listener's connections
-	// and which poller then serves them (see AcceptPlacement). A second line
-	// prints every effective setting, the sized watermark and budget among
-	// them, as key=value pairs; see Engine.Settings. It is off by default.
-	// The task pools' own lines are switched separately, with
-	// taskpool.SetLogStatus.
+	// and which poller then serves them (see AcceptPlacement). It then prints
+	// every effective setting, one line per parameter and the sized watermark
+	// and budget among them, each with its value, whether it is fib's default
+	// or the caller's, and what it does; see Engine.Settings and
+	// Settings.Parameters. It is off by default. The task pools' own lines are
+	// switched separately, with taskpool.SetLogStatus.
 	LogStatus bool
 	// Network is the network of every Binding that leaves its own empty;
 	// see Binding.Network. Empty means "tcp".

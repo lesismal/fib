@@ -83,6 +83,7 @@ func (e *Engine) root() *Engine { return e }
 // newEngine creates the engine New describes, listening on bindings, which
 // bindingsOf has resolved.
 func newEngine(config Config, bindings []Binding) (*Engine, error) {
+	custom := customConfig(config)
 	if err := config.validateTaskPool(); err != nil {
 		return nil, err
 	}
@@ -103,7 +104,7 @@ func newEngine(config Config, bindings []Binding) (*Engine, error) {
 		return nil, err
 	}
 	pool, releasePool := acquireTaskPool(config)
-	e := &Engine{accepted: acceptedConns{max: int64(config.MaxConns)}, name: engineName(config), logStatus: config.LogStatus, acceptPlacement: config.AcceptPlacement, listeners: listeners, handler: handler, taskPool: pool, releaseTaskPool: releasePool,
+	e := &Engine{accepted: acceptedConns{max: int64(config.MaxConns)}, name: engineName(config), logStatus: config.LogStatus, acceptPlacement: config.AcceptPlacement, listeners: listeners, handler: handler, taskPool: pool, releaseTaskPool: releasePool, configCustom: custom,
 		connections: make(map[*Connection]struct{}), stopped: make(chan struct{}), serveErr: make(chan error, 1),
 		udpListeners: udpListeners, udpIdleTimeout: udpIdleTimeout(config.UDPIdleTimeout)}
 	e.readBufferSize = config.ReadBufferSize
