@@ -3,6 +3,7 @@ package quic
 import (
 	"bytes"
 	"slices"
+	"sync"
 	"testing"
 	"time"
 )
@@ -188,12 +189,62 @@ func TestMTUBlackHole(t *testing.T) {
 // A large datagram set with Config.MaxDatagramSize on a path that does not
 // carry it is a black hole too, discovery or not.
 func TestMTUBlackHoleOfConfiguredSize(t *testing.T) {
+	const path = 1300
+	var (
+		mu   sync.Mutex
+		sent []int
+	)
 	p := newTestPairOpts(t, 0, func(client, server *Config) {
 		server.MaxDatagramSize = 1400
-	}, pairOpts{pipes: func(client, server *pipeEnd) { server.mtu = 1300 }})
-	echoLarge(t, p, 256<<10)
+	}, pairOpts{pipes: func(client, server *pipeEnd) {
+		// The server's path drops what it does not carry, as a link with a
+		// smaller MTU does, and keeps what the server tried to send over it.
+		server.drop = func(d []byte) bool {
+			mu.Lock()
+			sent = append(sent, len(d))
+			mu.Unlock()
+			return len(d) > path
+		}
+	}})
+	// The server holds the whole stream and echoes it in one send when the
+	// client ends it. Echoing a chunk at a time leaves it with only what a
+	// chunk holds, and the client's chunks are under what the path carries:
+	// whether it ever tried a datagram too large for the path would then
+	// depend on how the peer's writes happened to be paced, which is what a
+	// loaded host changes.
+	p.serverH.onData = func(s *Stream, data []byte, fin bool) {
+		if fin {
+			_ = s.Write(p.serverH.received(s.ID()), true)
+		}
+	}
+	waitDatagramSize(t, p.server, 1400, 1400)
+	payload := bytes.Repeat([]byte("pmtud"), 256<<10/5)
+	s, err := p.client.OpenStream()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Write(payload, true); err != nil {
+		t.Fatal(err)
+	}
+	// The fallback is what the test is about, so wait for the connection to
+	// make it and not for the echo to finish: the echo cannot finish before
+	// the fallback, and waiting on the connection's own state says which of
+	// the two did not happen when the test fails.
+	waitDatagramSize(t, p.server, maxDatagram, maxDatagram)
+	waitFinished(t, p.clientH, s.ID())
+	if got := p.clientH.received(s.ID()); !bytes.Equal(got, payload) {
+		t.Fatalf("echo of %d bytes came back as %d", len(payload), len(got))
+	}
 	if size := p.server.DatagramSize(); size != maxDatagram {
-		t.Fatalf("server's datagram size %d, want %d", size, maxDatagram)
+		t.Fatalf("server's datagram size %d after a black hole, want %d", size, maxDatagram)
+	}
+	// The size it fell back from was one the path did not carry, not one
+	// that happened to fit.
+	mu.Lock()
+	largest := slices.Max(append(sent, 0))
+	mu.Unlock()
+	if largest <= path {
+		t.Fatalf("server's largest datagram is %d bytes, no larger than the path carries", largest)
 	}
 }
 
