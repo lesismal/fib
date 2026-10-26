@@ -191,8 +191,7 @@ func sendPartsSys(fd int, to syscall.Sockaddr, parts [][]byte) error {
 	h.Iov = &s.iovs[0]
 	setLen(&h.Iovlen, len(parts))
 	h.Control, h.Controllen = nil, 0
-	_, _, errno := syscall.Syscall6(syscall.SYS_SENDMSG, uintptr(fd),
-		uintptr(unsafe.Pointer(&s.hdrs[0])), 0, 0, 0, 0)
+	_, _, errno := rawSendmsg(fd, unsafe.Pointer(&s.hdrs[0]))
 	// The parts are the caller's again: nothing kept may point at them.
 	clear(s.iovs[:len(parts)])
 	sendScratches.Put(s)
