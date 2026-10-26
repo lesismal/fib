@@ -106,10 +106,16 @@ type Connection struct {
 	// next round is to act on. Guarded by mu.
 	pendingEvents uint16
 	scheduled     bool
-	closing       bool
-	closed        bool
-	readPaused    bool
-	budgetPaused  bool
+	// inOnData says a round of this connection is inside the handler's
+	// OnData now: that is when a hangup is worth telling the handler
+	// about early, as OnHangup's contract says. A round that is only
+	// reading, or only queued, hears the end of input through the read
+	// it makes itself.
+	inOnData     atomic.Bool
+	closing      bool
+	closed       bool
+	readPaused   bool
+	budgetPaused bool
 	// readStalled records that a read round stopped with bytes possibly
 	// still in the socket, because the write backlog filled up first. Those
 	// bytes raise no further edge on their own, so the event loop owes the
@@ -1898,7 +1904,9 @@ func (c *Connection) readLoop() error {
 		c.traceStep("read n=%d err=%v", n, err)
 		if n > 0 {
 			if !c.flags.has(flagLingering) {
+				c.inOnData.Store(true)
 				c.handler.OnData(c, buf[:n])
+				c.inOnData.Store(false)
 			} else if c.lingerOver() {
 				// The round would otherwise drop input for as long as a
 				// peer that goes on sending keeps the socket full, and the

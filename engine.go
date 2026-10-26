@@ -889,7 +889,7 @@ func (e *Engine) noteEvent(c *Connection, events uint32) *Connection {
 	// done, which may be a long while for one that waits in OnData; see
 	// HangupHandler. The end of input a CloseRead raises, or a lingering
 	// close is waiting for, is not the peer going.
-	hangup := !submit && !c.hangupNoted && events&(evErr|evHup|evRdHup) != 0 &&
+	hangup := c.inOnData.Load() && !c.hangupNoted && events&(evErr|evHup|evRdHup) != 0 &&
 		!c.flags.has(flagReadShut) && !c.flags.has(flagLingering)
 	var handler Handler
 	if hangup {
