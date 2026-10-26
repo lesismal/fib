@@ -180,10 +180,10 @@ func TestMTUBlackHole(t *testing.T) {
 	if probe != maxDatagramLimit || at.Before(start.Add(mtuBlackHoleWait)) {
 		t.Fatalf("next probe of %d bytes in %v, want %d in about %v", probe, time.Until(at), maxDatagramLimit, mtuBlackHoleWait)
 	}
-	// The client's path still carries its datagrams.
-	if size := p.client.DatagramSize(); size != maxDatagramLimit {
-		t.Fatalf("client's datagram size %d, want %d", size, maxDatagramLimit)
-	}
+	// The client's path still carries its datagrams, and the client's own
+	// search may not have finished when the server's black hole did: the
+	// check waits for it, as the server's does.
+	waitDatagramSize(t, p.client, maxDatagramLimit, maxDatagramLimit)
 }
 
 // A large datagram set with Config.MaxDatagramSize on a path that does not
