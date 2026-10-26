@@ -103,15 +103,62 @@ func requestURLs() ([]*url.URL, error) {
 	return urls, nil
 }
 
-func runServer(testcase string) error {
+// baseTestcase canonicalizes TESTCASE to the name the endpoint's raw
+// HTTP/0.9 paths implement. The runner does not pass the loss and corruption
+// cases to an endpoint by their own names: its TestCase.testname maps
+// handshakeloss and handshakecorruption to multiconnect, and transferloss and
+// transfercorruption to transfer, while the simulator drops or corrupts the
+// packets. Accepting all four names as aliases keeps the endpoint right when
+// it is started with one directly, and makes the mapping explicit here.
+func baseTestcase(testcase string) string {
 	switch testcase {
+	case "handshakeloss", "handshakecorruption":
+		// The check counts one handshake per file, so the client has to use
+		// one connection per file, which is what multiconnect does.
+		return "multiconnect"
+	case "transferloss", "transfercorruption":
+		return "transfer"
+	}
+	return testcase
+}
+
+// testcaseAction is what an endpoint role does with TESTCASE: run one of the
+// raw HTTP/0.9 paths, run the HTTP/3 path, or report it as unsupported, which
+// main turns into the runner's exit status 127.
+type testcaseAction int
+
+const (
+	actionUnsupported testcaseAction = iota
+	actionRaw
+	actionH3
+)
+
+// dispatchServer reports the server's action for TESTCASE, with the canonical
+// name the raw path runs. TESTCASE may be one of the loss or corruption
+// aliases; see baseTestcase.
+func dispatchServer(testcase string) (testcaseAction, string) {
+	base := baseTestcase(testcase)
+	switch base {
 	case "http3":
-		return serveH3()
+		return actionH3, base
 	case "handshake", "transfer", "retry", "resumption", "zerortt", "chacha20", "multiconnect":
 		// These are the testcases the runner names to a server. The rest of
 		// its matrix reaches the server under one of these names, for
 		// instance transfer for a blackhole or a rebinding test.
-		return serveRaw(testcase)
+		return actionRaw, base
+	}
+	return actionUnsupported, base
+}
+
+func runServer(testcase string) error {
+	action, base := dispatchServer(testcase)
+	switch action {
+	case actionH3:
+		return serveH3()
+	case actionRaw:
+		return serveRaw(base)
+	}
+	switch testcase {
 	case "connectionmigration":
 		return unsupported(testcase, "fib does not send preferred_address, so it cannot offer the client an address to migrate to")
 	case "ecn":
@@ -129,7 +176,7 @@ func runServer(testcase string) error {
 // for, supported or not, so that an unknown one exits 127 before REQUESTS
 // is looked at.
 func clientTestcaseKnown(testcase string) bool {
-	switch testcase {
+	switch baseTestcase(testcase) {
 	case "http3", "handshake", "transfer", "retry", "resumption", "zerortt",
 		"multiconnect", "keyupdate", "chacha20", "ecn", "v2", "versionnegotiation":
 		return true
@@ -137,12 +184,29 @@ func clientTestcaseKnown(testcase string) bool {
 	return false
 }
 
-func runClient(testcase string, urls []*url.URL) error {
-	switch testcase {
+// dispatchClient reports the client's action for TESTCASE, with the canonical
+// name the raw path runs. TESTCASE may be one of the loss or corruption
+// aliases; see baseTestcase.
+func dispatchClient(testcase string) (testcaseAction, string) {
+	base := baseTestcase(testcase)
+	switch base {
 	case "http3":
-		return fetchH3(urls)
+		return actionH3, base
 	case "handshake", "transfer", "retry", "resumption", "zerortt", "multiconnect", "keyupdate", "chacha20":
-		return fetchRaw(testcase, urls)
+		return actionRaw, base
+	}
+	return actionUnsupported, base
+}
+
+func runClient(testcase string, urls []*url.URL) error {
+	action, base := dispatchClient(testcase)
+	switch action {
+	case actionH3:
+		return fetchH3(urls)
+	case actionRaw:
+		return fetchRaw(base, urls)
+	}
+	switch testcase {
 	case "ecn":
 		return unsupported(testcase, "fib does not mark or validate ECN")
 	case "v2":

@@ -77,13 +77,18 @@ docker network, as `local-test.sh` does.
 
 ## Testcases
 
-"Supported" means the endpoint implements the testcase; the marks are the
-result against quic-go's published endpoint image
+A "✓" is a run that passed against quic-go's published endpoint image
 (`martenseemann/quic-go-interop:latest`, commit `d961427`) on Linux with
-Docker 29.1.3 and tshark 4.6.6, on 2026-10-26. The runner names a testcase
-to a role through `TestCase.testname`: most of its matrix reaches the server
-as `transfer`, `handshake` or `multiconnect`, which is why those names cover
-more than their own testcase.
+Docker 29.1.3 and tshark 4.6.6, on 2026-10-26; "supported" means the
+endpoint implements the testcase, but it was not re-run in this change. The
+runner names a testcase to a role through `TestCase.testname`: most of its
+matrix reaches the endpoint as `transfer`, `handshake` or `multiconnect`,
+which is why those names cover more than their own testcase. In particular
+the loss and corruption cases all map to a raw path: `handshakeloss` and
+`handshakecorruption` to `multiconnect` (one connection per file), and
+`transferloss` and `transfercorruption` to `transfer`; the runner's
+simulator supplies the loss or corruption. The endpoint also accepts the
+four names directly, as aliases of those paths.
 
 | Testcase | Server | Client | Notes |
 | --- | --- | --- | --- |
@@ -102,8 +107,8 @@ more than their own testcase.
 | `amplificationlimit` | ✓ | ✓ | |
 | `handshakeloss` | ✓ | ✓ | 50 connections at 30% loss |
 | `transferloss` | ✓ | ✓ | 2 MiB at 2% loss |
-| `handshakecorruption` | not run | not run | same endpoint path as `handshakeloss` |
-| `transfercorruption` | not run | not run | same endpoint path as `transferloss` |
+| `handshakecorruption` | supported | supported | 50 connections at 30% corruption; same endpoint path as `handshakeloss` (the runner passes `multiconnect`, and the endpoint accepts the name too); not re-run in this change |
+| `transfercorruption` | supported | supported | 2 MiB at 2% corruption; same endpoint path as `transferloss` (the runner passes `transfer`, and the endpoint accepts the name too); not re-run in this change |
 | `ipv6` | ✓ | ✓ | the client resolves `server6`; the server listens on both families |
 | `v2` | unsupported | unsupported | fib speaks QUIC version 1 only |
 | `rebind-port` | ✓ | ✓ | the server follows the NAT rebinding and answers with its own PATH_CHALLENGE |
@@ -111,11 +116,14 @@ more than their own testcase.
 | `connectionmigration` | unsupported | not run | the server has no `preferred_address` to offer; quic-go's server exits 127 for it too, so the pair is unsupported. The client's role is `transfer`, and fib cannot perform the active migration the check wants |
 | `versionnegotiation` | unsupported | unsupported | disabled by the runner; fib's client cannot start with a reserved version |
 
-The marks above are what the endpoint's two roles do, not what the testcase
-checks in every direction: `keyupdate` is server-side `transfer`, and the
-client of `rebind-*` and `connectionmigration` is `transfer`. Both sides of
-`ecn`, `v2` and `versionnegotiation` exit 127, which the runner records as
-unsupported rather than failed.
+The entries above are what the endpoint's two roles do, not what the
+testcase checks in every direction: `keyupdate` is server-side `transfer`,
+and the client of `rebind-*` and `connectionmigration` is `transfer`. Both
+sides of `ecn`, `v2` and `versionnegotiation` exit 127, which the runner
+records as unsupported rather than failed. The loss and corruption rows are
+the same endpoint behavior under different simulator scenarios: the
+handshake pair uses the `multiconnect` client, one connection per file, and
+the transfer pair uses `transfer`.
 
 The server endpoint also sends a `NEW_TOKEN` frame after every handshake
 (RFC 9000 section 8.1.3), which no testcase looks for: the runner's clients
@@ -146,6 +154,18 @@ Ubuntu 24.04's package, cannot follow the migrated connection and makes
   `amplificationlimit`, `blackhole`, `handshakeloss`.
 - Both roles exit 127 for `ecn`, `v2` and the server side of
   `connectionmigration`; the runner reports those as unsupported.
+
+`handshakecorruption` and `transfercorruption` are supported by the endpoint
+but were not re-run in this change: the runner needs Docker, `tshark` and its
+Python dependencies. The runner does not hand any of the four loss or
+corruption names to an endpoint: `TestCaseHandshakeLoss.testname` returns
+`multiconnect` and `TestCaseTransferLoss.testname` returns `transfer`, for
+the loss cases and, inherited, for the corruption cases, while the simulator
+drops or corrupts the packets. The `handshakeloss` and `transferloss` runs
+above therefore cover the same paths. The endpoint's dispatch now also
+accepts both corruption names, and `handshakeloss`/`transferloss`
+themselves, as aliases, so starting it with one directly runs the same
+server and client.
 
 `chacha20` was rerun on 2026-10-26, once the client could offer
 ChaCha20-Poly1305 alone:
