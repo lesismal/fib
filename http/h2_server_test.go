@@ -244,7 +244,10 @@ func dialH2(t *testing.T, addr string, settings ...[2]uint32) *h2TestConn {
 }
 
 func newH2TestConn(t *testing.T, c net.Conn) *h2TestConn {
-	_ = c.SetDeadline(time.Now().Add(10 * time.Second))
+	// 30s, not 10: a runner that is slow to schedule the round that answers
+	// leaves the client waiting, and what the tests check is the answer, not
+	// how long it took. The job's own timeout still bounds a real hang.
+	_ = c.SetDeadline(time.Now().Add(30 * time.Second))
 	return &h2TestConn{t: t, c: c, enc: hpack.NewEncoder(), dec: hpack.NewDecoder(hpack.DefaultTableSize),
 		streams: map[uint32]*h2TestStream{}, opened: time.Now()}
 }
