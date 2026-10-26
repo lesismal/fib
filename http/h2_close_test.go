@@ -21,6 +21,12 @@ import (
 // a closed engine stayed in memory until the timer fired, two minutes by
 // default. A process that starts and closes servers, as tests do, piled up a
 // megabyte or more for each until it ran short of memory.
+//
+// The timers the connection stops on its way out are not collected at once,
+// though: a stopped timer waits in its processor's timer heap, as a zombie
+// whose argument the collector still scans, until that processor next looks
+// at the heap, so the wait below reclaims them before it starts rather than
+// assuming it; see the comment there.
 func TestCloseLetsGoOfAnIdleHTTP2Connection(t *testing.T) {
 	var collected atomic.Bool
 	func() {
@@ -61,6 +67,20 @@ func TestCloseLetsGoOfAnIdleHTTP2Connection(t *testing.T) {
 			t.Fatal(err)
 		}
 		transport.CloseIdleConnections()
+		// A stopped timer stays in its processor's timer heap until that
+		// processor next looks at the heap, as a zombie whose argument the
+		// collector still scans. The connection's SETTINGS timer, armed for
+		// SettingsTimeout (ten seconds by default) when the connection
+		// started and stopped when the client acknowledged it, then keeps
+		// the connection, and through it the engine, reachable for up to
+		// that long after Close, however promptly OnClose stopped it.
+		// Shrinking the processor count destroys the other processors, and
+		// the runtime hands the timers they own to the one left, dropping
+		// the stopped ones as it does, so the wait below measures the
+		// engine's own graph rather than when the runtime next visits a
+		// timer heap.
+		procs := runtime.GOMAXPROCS(1)
+		runtime.GOMAXPROCS(procs)
 		runtime.AddCleanup(engine, func(b *atomic.Bool) { b.Store(true) }, &collected)
 	}()
 	deadline := time.Now().Add(5 * time.Second)
