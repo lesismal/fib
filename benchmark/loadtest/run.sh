@@ -27,11 +27,12 @@ ROUNDS=3
 OUT=""
 CASES=""
 PIN=1
+BIN_OVERRIDE=""
 GROWTH_RUNS=10
 GROWTH_DUR=5
 
 usage() {
-  sed -n '2,22p' "$0" | sed 's/^# \{0,1\}//'
+  sed -n '2,17p' "$0" | sed 's/^# \{0,1\}//'
   cat <<'EOF'
 
 Options:
@@ -41,6 +42,8 @@ Options:
   --rounds N          interleaved rounds of the six A/B cases (default 3)
   --out DIR           output directory (default /tmp/fib-loadtest/<time>)
   --cases LIST        comma-separated case names to run, others skipped
+  --bin DIR           run an already built server, h3load and stall from DIR
+                      instead of building them into <out>/bin
   --growth-runs N     repeated short runs per protocol (default 10)
   --no-pin            do not pin the server and the load generator
 EOF
@@ -54,6 +57,7 @@ while [ $# -gt 0 ]; do
     --rounds) ROUNDS=$2; shift 2;;
     --out) OUT=$2; shift 2;;
     --cases) CASES=$2; shift 2;;
+    --bin) BIN_OVERRIDE=$2; shift 2;;
     --growth-runs) GROWTH_RUNS=$2; shift 2;;
     --no-pin) PIN=0; shift;;
     -h|--help) usage; exit 0;;
@@ -79,7 +83,7 @@ if ! command -v python3 >/dev/null; then
 fi
 
 OUT=${OUT:-/tmp/fib-loadtest/$(date +%Y%m%d-%H%M%S)}
-BIN=$OUT/bin
+BIN=${BIN_OVERRIDE:-$OUT/bin}
 RUNDIR=$OUT/cases
 mkdir -p "$BIN" "$RUNDIR"
 
@@ -130,11 +134,13 @@ trap cleanup EXIT INT TERM
 echo "[$(date -u +%H:%M:%S)] load-test campaign: mode=$MODE duration=${DUR}s warmup=${WARMUP}s rounds=$ROUNDS"
 echo "out=$OUT server-cpus=${CPU_SERVER:-all} load-cpus=${CPU_LOAD:-all}"
 
-{
-  go build -o "$BIN/server" ./benchmark/loadtest/server
-  go build -o "$BIN/h3load" ./benchmark/loadtest/h3load
-  go build -o "$BIN/stall" ./benchmark/loadtest/stall
-} || { echo "run.sh: build failed" >&2; exit 1; }
+if [ -z "$BIN_OVERRIDE" ]; then
+  {
+    go build -o "$BIN/server" ./benchmark/loadtest/server
+    go build -o "$BIN/h3load" ./benchmark/loadtest/h3load
+    go build -o "$BIN/stall" ./benchmark/loadtest/stall
+  } || { echo "run.sh: build failed" >&2; exit 1; }
+fi
 
 printf '%s\n' \
   'case	proto	conc	reqs	rps	ok	failed	errored	timeout	p50_ms	p99_ms	mean_ms	max_ms	rss_before_mib	rss_after_mib	rss_settle_mib	gor_before	gor_after	gor_peak	gor_settle	fds_after	fds_peak	fds_settle	openconns	pending	paused	stall_bytes	stall_errors	stall_empty	warnings	load_exit' \
