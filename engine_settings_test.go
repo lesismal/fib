@@ -61,6 +61,8 @@ func TestEngineSettings(t *testing.T) {
 		"useWritev=true",
 		"socketSyscalls=true",
 		"udpIdleTimeout=1m0s",
+		"logStatus=false",
+		"logSettings=true",
 	} {
 		if !strings.Contains(line, want) {
 			t.Errorf("Settings.String() = %q, missing %q", line, want)
