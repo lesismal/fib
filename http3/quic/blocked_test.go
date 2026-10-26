@@ -3,6 +3,7 @@ package quic
 import (
 	"errors"
 	"testing"
+	"time"
 )
 
 // A sender held back by flow control says so with a BLOCKED frame for each
@@ -41,7 +42,11 @@ func TestBlockedFramesSent(t *testing.T) {
 			}
 		}
 		server := p.serverConn(t)
-		waitFor(t, "DATA_BLOCKED", func() bool {
+		// A send round has to reach the third stream's limit before the
+		// frame goes; on the Windows runners under -race that can take
+		// longer than the usual five seconds when the package shares the
+		// machine with the rest of ./http3/....
+		waitForWithin(t, 30*time.Second, "DATA_BLOCKED", func() bool {
 			server.mu.Lock()
 			defer server.mu.Unlock()
 			return server.dataBlockedAt == 6000
