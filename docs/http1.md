@@ -637,6 +637,8 @@ not such a CONNECT.
 
 ## Planned improvements
 
+The complete list, including the HTTP/2, HTTP/3, engine and test-infrastructure items, is in the [roadmap](roadmap.md), with the reason, the rough cost and when each is worth reconsidering.
+
 - A `compress` (LZW) transfer coding decoder. `compress/lzw` reads the
   12-bit-code variants of GIF, TIFF and PDF, while `compress(1)` grows codes
   to 16 bits, so it cannot decode one of those streams past its first few

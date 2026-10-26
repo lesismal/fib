@@ -386,6 +386,8 @@ uses, resumes and sends early data through the same QUIC code.
 
 ## Intentionally not implemented
 
+The complete list, including the HTTP/1, HTTP/2, engine and test-infrastructure items, is in the [roadmap](roadmap.md), with the reason, the rough cost and when each is worth reconsidering.
+
 | Feature | Reason |
 | --- | --- |
 | Active connection migration | The server issues and routes several Connection IDs per connection, but answers PATH_CHALLENGE on the path it sends on, not the one the challenge came from, so a client probing a new path before it moves would not validate it; it also keeps sending to the client's first Connection ID on the new path. A NAT rebinding is followed, with the client's Connection ID changed or not (see above). |

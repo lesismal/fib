@@ -443,6 +443,8 @@ TLS 1.3 或 1.2 的 AES-GCM、ChaCha20-Poly1305，TLS 1.2 或 1.1 的 AES-CBC）
 
 ## 待优化
 
+完整清单（含 HTTP/2、HTTP/3、引擎与测试设施里的项）见[路线图](roadmap.zh-CN.md)，那里给出每项的原因、成本量级和重新评估的条件。
+
 - `compress`（LZW）transfer coding 的解码器。`compress/lzw` 读的是 GIF、TIFF、PDF 那种
   12 位 code 的变体，而 `compress(1)` 的 code 会增长到 16 位，所以它解不了这类流开头几 KB
   之后的部分；在有自研解码器之前，这个 coding 会被拒绝。

@@ -286,6 +286,8 @@ the table what either side's HPACK encoder may keep between header blocks.
 
 ## Intentionally not implemented
 
+The complete list, including the HTTP/1, HTTP/3, engine and test-infrastructure items, is in the [roadmap](roadmap.md), with the reason, the rough cost and when each is worth reconsidering.
+
 | Feature | Reason |
 | --- | --- |
 | Receiving server push in the client | Chrome and Firefox have removed push, and Go's `net/http` client never supported it. The client sends `ENABLE_PUSH=0`; the server's push support remains for clients that still want it. For preloading, 103 Early Hints (`Context.WriteInterim`) is the recommended replacement. |

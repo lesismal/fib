@@ -201,6 +201,8 @@ header block 之间能保留多少。
 
 ## 有意没有实现的功能
 
+完整清单（含 HTTP/1、HTTP/3、引擎与测试设施里的项）见[路线图](roadmap.zh-CN.md)，那里给出每项的原因、成本量级和重新评估的条件。
+
 | 功能 | 原因 |
 | --- | --- |
 | 客户端接收 server push | Chrome、Firefox 已移除 push，Go 的 `net/http` 客户端也从未支持。客户端在 SETTINGS 中声明 `ENABLE_PUSH=0`，服务端 push 能力保留给仍然需要它的客户端。预加载推荐用 103 Early Hints（`Context.WriteInterim`）。 |
