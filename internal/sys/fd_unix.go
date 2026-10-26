@@ -13,9 +13,13 @@ func FDLimit() int {
 	if err := syscall.Getrlimit(syscall.RLIMIT_NOFILE, &limit); err != nil {
 		return 0
 	}
+	// Cur is uint64 on Linux and the BSDs Go gives it as one, and int64 on
+	// FreeBSD, where a negative value is the unlimited one: converting to
+	// uint64 puts both past maxInt, and both clamp to it.
 	maxInt := uint64(^uint(0) >> 1)
-	if limit.Cur > maxInt {
+	cur := uint64(limit.Cur)
+	if cur > maxInt {
 		return int(maxInt)
 	}
-	return int(limit.Cur)
+	return int(cur)
 }

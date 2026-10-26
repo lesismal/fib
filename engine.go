@@ -31,11 +31,6 @@ const (
 	// round's fixed costs are already spread thin, so a larger buffer mostly
 	// delays handing the first events of a round to the workers.
 	defaultPollBatchSize = 1024
-	// defaultReadBufferSize is Config.ReadBufferSize when it is left at zero,
-	// and the size DefaultConfig uses. It is the bytes one read of a
-	// connection's socket takes, and, for a proxy, the bytes one write passes
-	// on.
-	defaultReadBufferSize = 16 << 10
 	// defaultWriteHighWatermark is the per-connection outbound budget. Two
 	// costs sit either side of it. Lower, and ordinary traffic crosses it on
 	// every reply: a round that crosses it flushes before it reads on, and a

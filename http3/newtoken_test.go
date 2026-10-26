@@ -48,46 +48,42 @@ func (p *sharedUDPPath) Send(d []byte) error {
 
 func (p *sharedUDPPath) Close() error { return nil }
 
-// deliver hands d to qc and then queues it for the test: a datagram the test
-// has seen has been handled. Callers hold p.mu across both, so that what the
-// test reads is in the order the path took the datagrams: without that, use
-// could still be draining the backlog that arrived before Dial when the
-// answer to the handshake a Retry starts arrives, and the answer would be
-// queued first, as the connection's first answer.
-func (p *sharedUDPPath) deliver(qc *quic.Conn, d []byte) {
+// use makes qc the connection the path delivers to, and hands it what
+// arrived before.
+func (p *sharedUDPPath) use(qc *quic.Conn) {
+	p.mu.Lock()
+	p.qc = qc
+	backlog := p.backlog
+	p.backlog = nil
+	p.mu.Unlock()
+	for _, d := range backlog {
+		qc.HandleDatagram(d)
+		select {
+		case p.answers <- d:
+		default:
+		}
+	}
+}
+
+// receive queues a datagram for the test, then delivers it: a datagram the
+// test has seen has been handled.
+func (p *sharedUDPPath) receive(d []byte) {
+	p.mu.Lock()
+	qc := p.qc
+	if qc == nil {
+		// A connection is between Dial and use.
+		if len(p.backlog) < 8 {
+			p.backlog = append(p.backlog, d)
+		}
+		p.mu.Unlock()
+		return
+	}
+	p.mu.Unlock()
 	qc.HandleDatagram(d)
 	select {
 	case p.answers <- d:
 	default:
 	}
-}
-
-// use makes qc the connection the path delivers to, and hands it what
-// arrived before.
-func (p *sharedUDPPath) use(qc *quic.Conn) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	p.qc = qc
-	backlog := p.backlog
-	p.backlog = nil
-	for _, d := range backlog {
-		p.deliver(qc, d)
-	}
-}
-
-// receive takes a datagram from the socket and delivers it: a datagram the
-// test has seen has been handled.
-func (p *sharedUDPPath) receive(d []byte) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	if p.qc == nil {
-		// A connection is between Dial and use.
-		if len(p.backlog) < 8 {
-			p.backlog = append(p.backlog, d)
-		}
-		return
-	}
-	p.deliver(p.qc, d)
 }
 
 // waitQuiet waits until the path has been quiet for a while, which is when
