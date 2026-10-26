@@ -35,6 +35,11 @@ func serve(t *testing.T, handler fib.Handler) string {
 		setReuse(&server.config, false)
 	}
 	config := fib.DefaultConfig()
+	// No SO_REUSEPORT: on macOS two sockets bound to one port share the
+	// connections that arrive on it, so a test's server can take a
+	// connection meant for the one before it, whose subtest has ended: that
+	// client then waits for an answer nobody will send.
+	config.ReusePort = false
 	server, err := fib.New(config, fib.Binding{Addr: "127.0.0.1:0", Handler: handler})
 	if err != nil {
 		t.Fatal(err)
