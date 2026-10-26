@@ -23,6 +23,60 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  # A clean checkout must build. The test job's Build step below runs
+  # `go build ./...` in the root module only, so it cannot see a file that a
+  # nested module needs, and it builds a working tree that may hold files no
+  # commit has: engine.go once read defaultReadBufferSize, which existed only
+  # as an uncommitted local edit, so the tree built here while a clean
+  # checkout did not. The repo is six modules (the root and five nested), and
+  # git ls-files lists the tracked go.mod files, so a module present only in
+  # a local tree cannot stand in for one a clone lacks. Build only: lint and
+  # the tests are other jobs, and this one needs no Docker, cgo or peer.
+  build-clean:
+    name: Build (every module)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v6
+        with:
+          go-version: stable
+          # Every module's go.mod, and the go.sum of the modules that have
+          # dependencies: the root and http3/interoprunner have no go.sum.
+          cache-dependency-path: |
+            go.mod
+            **/go.mod
+            **/go.sum
+      - name: Build every module
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Tracked go.mod files only: a module that exists only in a local
+          # working tree is not in a clean checkout and must not be built.
+          modules=$(git ls-files '**/go.mod' 'go.mod')
+          if [ -z "$modules" ]; then
+            echo "::error title=No tracked go.mod::git ls-files found no tracked go.mod"
+            exit 1
+          fi
+          count=$(printf '%s\n' "$modules" | wc -l | tr -d ' ')
+          echo "Building $count module(s):"
+          printf '%s\n' "$modules"
+          failed=()
+          for mod in $modules; do
+            dir=$(dirname "$mod")
+            echo "::group::go build ./... in $dir"
+            if ! (cd "$dir" && go build ./...); then
+              failed+=("$dir")
+              echo "::error title=Build failed in $dir::go build ./... failed in the $dir module from a clean checkout"
+            fi
+            echo "::endgroup::"
+          done
+          if [ ${#failed[@]} -ne 0 ]; then
+            echo "::error title=Build failed::these modules did not build: ${failed[*]}"
+            exit 1
+          fi
+          echo "All $count modules built."
+
   lint:
     name: Lint (gofmt / vet / staticcheck)
     runs-on: ubuntu-latest
