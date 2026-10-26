@@ -1266,7 +1266,15 @@ func (t *layer) completeNative(handler fib.Handler, hs nativeHandshake, rest []b
 	}
 	state := hs.connectionState()
 	t.state = &state
-	t.rx, t.tx = hs.recordKeys()
+	rx, tx := hs.recordKeys()
+	t.rx = rx
+	// The keys the reads use are this round's, under readMu, which the caller
+	// holds. The ones writes use are read by a flush on another goroutine,
+	// under wmu, so they are set under it here as the other handshake's are:
+	// what was held while the handshake ran is sealed with them.
+	t.wmu.Lock()
+	t.tx = tx
+	t.wmu.Unlock()
 
 	if k, ok := hs.(interface{ sink() *ticketSink }); ok {
 		t.sink = k.sink()
