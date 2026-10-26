@@ -356,3 +356,64 @@ func TestServeDuplexHTTP1(t *testing.T) {
 		t.Fatalf("the handler: %v", err)
 	}
 }
+
+// TestServeDuplexCloseEndsResponse checks that Close finishes the response
+// while the handler is still running, and that a handler that writes nothing
+// still answers with an empty 200 rather than leaving the client waiting for
+// the handler to return.
+func TestServeDuplexCloseEndsResponse(t *testing.T) {
+	release := make(chan struct{})
+	released := false
+	defer func() {
+		if !released {
+			close(release)
+		}
+	}()
+	done := make(chan struct{})
+	closeErr := make(chan error, 1)
+	config := DefaultConfig()
+	config.StreamRequestBody = true
+	handler := NewHandlerWithConfig(config, HandlerFunc(func(c *Context) {
+		if err := c.ServeDuplex(func(d *Duplex) {
+			err := d.Close()
+			close(done)
+			<-release
+			closeErr <- err
+		}); err != nil {
+			closeErr <- err
+		}
+	}))
+	addr := serve(t, handler)
+	client := h2cClient()
+	defer client.CloseIdleConnections()
+	resp, err := client.Get("http://" + addr + "/duplex")
+	if err != nil {
+		t.Fatalf("the request: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != stdhttp.StatusOK {
+		t.Fatalf("status %d, want 200", resp.StatusCode)
+	}
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("the response body: %v", err)
+	}
+	if len(body) != 0 {
+		t.Fatalf("response body %q, want empty", body)
+	}
+	select {
+	case <-done:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the duplex handler did not reach its wait after Close")
+	}
+	released = true
+	close(release)
+	select {
+	case err := <-closeErr:
+		if err != nil {
+			t.Fatalf("Close: %v", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("the duplex handler did not finish")
+	}
+}

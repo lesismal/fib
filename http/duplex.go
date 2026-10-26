@@ -113,10 +113,11 @@ func (d *Duplex) Flush() error {
 	return nil
 }
 
-// Close ends the duplex: the response is finished, the rest of the request
-// body is dropped, and later Reads and Writes report ErrDuplexClosed. It is
-// safe to call more than once. A handler that returns without calling Close
-// has it called for it.
+// Close ends the duplex: what was written is flushed, an empty 200 is begun
+// when nothing was, the response is finished, the rest of the request body is
+// dropped, and later Reads and Writes report ErrDuplexClosed. It is safe to
+// call more than once; a handler that returns without calling it has its end
+// done for it.
 func (d *Duplex) Close() error {
 	d.mu.Lock()
 	if d.closed {
@@ -131,21 +132,37 @@ func (d *Duplex) Close() error {
 	if stream := d.c.RequestBody(); stream != nil {
 		_ = stream.Close()
 	}
-	return d.c.Finish()
+	// FlushError begins a 200 when nothing was written, so Close ends the
+	// response even for a handler that answers with nothing; Finish would
+	// leave a status-0 response to the handler's return otherwise.
+	if err := d.c.FlushError(); err != nil && !errors.Is(err, ErrResponseWritten) {
+		d.setErr(err)
+		_ = d.c.Finish()
+		return err
+	}
+	err := d.c.Finish()
+	if err != nil {
+		d.setErr(err)
+		return err
+	}
+	if d.c.Conn != nil {
+		if ferr := d.c.Conn.Flush(); ferr != nil {
+			d.setErr(ferr)
+		}
+	}
+	return nil
 }
 
 // Err returns why the duplex ended: the request's error when the client went
 // away or the stream failed, otherwise the error a Read or Write saw, or
-// ErrDuplexClosed after Close.
+// ErrDuplexClosed once it ended. It reads only the duplex's own state, so it
+// is safe after the handler has returned and the request has been released.
 func (d *Duplex) Err() error {
 	d.mu.Lock()
 	err := d.err
 	closed := d.closed
 	d.mu.Unlock()
 	if err != nil {
-		return err
-	}
-	if err := d.c.Err(); err != nil {
 		return err
 	}
 	if closed {
@@ -208,12 +225,6 @@ func (c *Context) ServeDuplex(h DuplexHandler) error {
 		p := newDuplexBody()
 		d.r, d.pipe = p, p
 		c.OnBody(p.write)
-		c.OnCancel(func(err error) {
-			if err == nil {
-				err = ErrDuplexClosed
-			}
-			p.close(err)
-		})
 	} else if body := c.Body(); body != nil {
 		// The body arrived whole and stays the handler's while the response
 		// is held open, so the duplex reads it without copying or waiting.
@@ -223,6 +234,17 @@ func (c *Context) ServeDuplex(h DuplexHandler) error {
 	} else {
 		d.r = bytes.NewReader(nil)
 	}
+	// The error is kept with the duplex, so that Err and a waiting Read
+	// report it even after the request has been released and recycled.
+	c.OnCancel(func(err error) {
+		if err == nil {
+			err = ErrDuplexClosed
+		}
+		d.setErr(err)
+		if d.pipe != nil {
+			d.pipe.close(err)
+		}
+	})
 	go func() {
 		defer func() {
 			if recovered := recover(); recovered != nil {
@@ -244,6 +266,11 @@ func (c *Context) ServeDuplex(h DuplexHandler) error {
 // waiting on a full buffer, and closing the stream drops a body the client is
 // still sending instead of holding the request until it stops.
 func (d *Duplex) finish() {
+	// Keep the request's error before Release: Err must not read a Context
+	// that may already be serving another request.
+	if err := d.c.Err(); err != nil {
+		d.setErr(err)
+	}
 	d.mu.Lock()
 	closed := d.closed
 	d.closed = true
