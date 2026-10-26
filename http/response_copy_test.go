@@ -426,6 +426,12 @@ func withOneProcessor() func() {
 // handler sees the write fail, and the copy is not left to the collector with
 // the Context.
 func TestResponseCopyReleasesOnCancel(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		// Windows arms a connection's read between its rounds, so a handler
+		// waiting in OnData hears of the peer going only when its round ends:
+		// there is no cancel to hear while it waits, as handler.go says.
+		t.Skip("Windows hears a hangup between rounds")
+	}
 	// A body the HTTP/1 send copies, so that the copy comes from the pool and
 	// this checks that it goes back, whatever its size.
 	body := bytes.Repeat([]byte("x"), 64<<10)
