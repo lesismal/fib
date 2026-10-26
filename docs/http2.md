@@ -422,6 +422,13 @@ still open.
   client's windows; a body read whole still has its window replenished on
   receipt. The client streams a response body to its callback under
   `ClientConfig.StreamResponseBody`, and buffers it whole otherwise.
+- Bidirectional streaming is done: `Context.ServeDuplex` runs a
+  `DuplexHandler` on a goroutine of its own, with `Duplex.Read` waiting for
+  the request body while `Duplex.Write` and `Duplex.Flush` write the
+  response, so a handler can drive both directions at once. It works the
+  same on HTTP/3, and over HTTP/1.1 as described in the guide; the request
+  body streams under `Config.StreamRequestBody`, and at most 1 MiB of it is
+  held for a handler that falls behind.
 
 ### 4. Performance (medium)
 

@@ -310,6 +310,10 @@ HTTP/3 比 HTTP/2 明显。更长时间的 soak 和带丢包的网络路径仍�
 - 流式请求 body 已经实现，接收窗口随 handler 的消费补充；流式响应也已实现，由客户端的
   窗口限速。整体缓存的 body 仍然是“收到即补充窗口”。客户端在 `ClientConfig.StreamResponseBody` 下把响应 body
   流式交给回调，否则整体缓存。
+- 双向流式已经实现：`Context.ServeDuplex` 在自己的 goroutine 上运行 `DuplexHandler`，
+  `Duplex.Read` 等请求 body，`Duplex.Write` 和 `Duplex.Flush` 写响应，handler 可以同时
+  操作两个方向。HTTP/3 上用法相同，HTTP/1.1 的边界见使用指南；请求 body 在
+  `Config.StreamRequestBody` 下边到边读，handler 落后时最多缓存 1MB。
 
 ### 4. 性能（中）
 

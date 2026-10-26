@@ -910,10 +910,49 @@ handler := fibhttp.NewHandlerWithConfig(config, fibhttp.HandlerFunc(
   连接关闭。
 - 连接中途断开时 `Read` 返回 `io.ErrUnexpectedEOF` 而不是 `io.EOF`，截断的上传不会被
   当成完整的；超过 `MaxStreamedBodyBytes` 时返回 `ErrBodyTooLarge`。
-- 目前只有 HTTP/1.x 支持，HTTP/2 和 HTTP/3 的 body 仍然收齐后交付。
 
 handler 收下 128MB 的上传并计数：整体缓存时堆内存峰值约 470MB，流式时约 4MB
 （`StreamRequestBodyBuffer` 为默认的 256KB）。
+
+### 全双工请求（ServeDuplex）
+
+有些协议不是"先收完请求、再写响应"，而是一边读一边写：gRPC 的双向流、WebTransport，
+以及任何要按消息来回的私有协议。`Context.ServeDuplex` 把请求交给一个 `DuplexHandler`，
+它在自己的 goroutine 上运行，`Duplex.Read` 等请求 body，`Duplex.Write`/`Flush` 写响应，
+两个方向可以任意交错：
+
+```go
+handler := fibhttp.NewHandlerWithConfig(config, fibhttp.HandlerFunc(
+    func(c *fibhttp.Context) {
+        if err := c.ServeDuplex(func(d *fibhttp.Duplex) {
+            buf := make([]byte, 4)
+            if _, err := io.ReadFull(d, buf); err != nil { // 等客户端先发 4 字节
+                return
+            }
+            d.Write([]byte("one:"))
+            d.Flush() // 先把这一段落发给客户端，不等它的 body 结束
+            rest, _ := io.ReadAll(d)
+            d.Write([]byte("two:" + string(rest)))
+        }); err != nil {
+            // 响应已经开始、请求已结束，或者 handler 为 nil
+        }
+    },
+))
+```
+
+- `ServeDuplex` 只启动 goroutine 就返回；调用它的 handler 可以立即返回，请求由
+  `Retain` 保持打开，`DuplexHandler` 返回（或 `Duplex.Close`）时响应结束。
+- `Read` 会阻塞调用它的 goroutine，而不是 Engine 的 worker；最多缓存 1MB 没被读走的
+  body，超过之后 body 回调等待，客户端的流控随之把发送速度压下来。
+- `Write` 不等待客户端，和 `ResponseWriter` 一样把内核暂时收不下的部分排队；`Flush`
+  把已写的部分推出去。`Close` 结束双向流并丢弃剩余 body，之后 `Read`/`Write` 返回
+  `ErrDuplexClosed`。
+- HTTP/2 和 HTTP/3 的请求 stream 本身是全双工的，所以这是它们上的完整实现，也是
+  WebTransport 之外写双向协议的直接办法。HTTP/1.1 上响应可以先于请求 body 发出，但
+  客户端如果看到响应就停止上传，`Read` 会一直等；这类 handler 应当先拿到需要的 body。
+- 请求 body 走 `OnBody`，所以 `ServeDuplex` 的 handler 不要再读 `Request.Body` 或调用
+  `OnBody`。它必须在响应开始之前调用，且对一个请求只调用一次；`Config.StreamRequestBody`
+  决定 body 是边到边读还是已经整体到达（整体到达时 `Read` 不等待）。
 
 ### HTTP/2
 

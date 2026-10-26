@@ -591,9 +591,13 @@ Done:
 - Done: streamed request bodies, with the receive window given back as the
   handler consumes the body, and streamed responses, written as the handler
   produces them.
-- Bidirectional streaming is what WebTransport needs; extended CONNECT has it
-  through `Context.Upgrade`, but the handler model has no APIs for the two
-  directions at once.
+- Bidirectional streaming is done: `Context.ServeDuplex` runs a
+  `DuplexHandler` on a goroutine of its own, with `Duplex.Read` waiting for
+  the request body and `Duplex.Write`/`Duplex.Flush` writing the response,
+  so one handler drives both directions over the request's stream. The same
+  API serves HTTP/2 and, as the guide describes, HTTP/1.1. WebTransport
+  still needs its own framing and its own streams inside a session, but the
+  one-stream both-ways handler API it needs is here.
 
 ### 4. Configurability (low)
 

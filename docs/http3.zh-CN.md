@@ -402,8 +402,11 @@
 
 - 已完成：流式请求 body（接收窗口随 handler 的消费补充）和流式响应写出（handler 写多少
   就发多少）。
-- 双向流式是 WebTransport 的前提；Extended CONNECT 已通过 `Context.Upgrade` 实现，但
-  handler 模型还没有同时操作两个方向的 API。
+- 双向流式已完成：`Context.ServeDuplex` 在自己的 goroutine 上运行 `DuplexHandler`，
+  `Duplex.Read` 等请求 body，`Duplex.Write`/`Duplex.Flush` 写响应，一个 handler 就能在
+  请求的 stream 上同时操作两个方向。同一套 API 也用于 HTTP/2，HTTP/1.1 的边界见使用指南。
+  WebTransport 仍需要自己的帧格式和会话内的多条 stream，但它所需的“单 stream 双向
+  handler”API 已经有了。
 
 ### 4. 可配置性（低）
 
