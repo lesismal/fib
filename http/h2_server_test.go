@@ -10,6 +10,8 @@ import (
 	"io"
 	"net"
 	stdhttp "net/http"
+	"os"
+	"runtime/pprof"
 	"strconv"
 	"strings"
 	"sync"
@@ -356,6 +358,11 @@ func (tc *h2TestConn) readRaw() h2Frame {
 			goAway := tc.goAway
 			if goAway == "" {
 				goAway = "no GOAWAY"
+			}
+			if f, werr := os.CreateTemp("", "fib-h2-*.stack"); werr == nil {
+				_ = pprof.Lookup("goroutine").WriteTo(f, 1)
+				_ = f.Close()
+				tc.t.Logf("goroutine dump: %s", f.Name())
 			}
 			tc.t.Fatalf("read: %v, %v after the dial (%s)", err, time.Since(tc.opened), goAway)
 		}
