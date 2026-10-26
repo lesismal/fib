@@ -12,7 +12,6 @@
 | --- | --- | --- | --- | --- |
 | BBR 拥塞控制 | 有意不做 | 它换的是**对路径的模型**而不只是窗口：按每轮投递量估带宽、算 pacing 速率，还有自己的 startup／drain／probe-bw 阶段；要可靠就得把已发送包的记录扩展成每轮的投递率采样，并与 RFC 9002 的丢包恢复、持续拥塞判定协调起来。改动很大，而且除了内存管道这里没有可靠的验证手段；半成品比没有更糟 | L | 有自己的网络与真实流量，能量到 CUBIC 在丢包／长肥管道上确实是瓶颈 |
 | ECN | 有意不做 | 需要在 Engine 的 UDP 层读写 IP 头的 ECN 位，收益主要体现在拥塞控制上；没有配套的拥塞控制时收益有限 | M | 数据中心内部署、或换上有 ECN 的拥塞控制时 |
-| PMTU 探到 1452 以上（巨型帧、IPv4 上的 1472） | 计划中未做 | 需要更大的发送缓冲区；收益是 1–2% 的包数减少。比它更值得做的"拥塞窗口按字节算"已完成 | S–M | 已知路径支持更大数据报、或包数开销成为瓶颈 |
 | ChaCha20-Poly1305 汇编（AVX2／NEON） | 有意不做 | 分架构、常量时间容易写错的一大块代码；而只有**没有** AES 硬件的机器才会优先协商这个套件。纯 Go 版本已经比原实现快 54–81% | L | 目标机器普遍没有 AES 硬件 |
 | QUIC `*Stream` 池化 | 有意不做 | `*Stream` 会交给应用、生命周期由应用决定；重用会把"stream 结束后继续使用"变成破坏另一条 stream。现在开／关一条 stream 8 次分配，请求 stream 与 header 已复用 | M | 不重估：这是 API 所有权边界 |
 | 主动连接迁移、`preferred_address` | 有意不做 | 服务端已为每个连接签发并路由多个 Connection ID，但 `PATH_CHALLENGE` 在当前发送路径上回复而不是挑战到达的路径，客户端迁移前对新路径的验证无法完成。NAT 重绑定（含换 CID）会被跟随，实际场景已覆盖 | L | 移动端长连接、Wi-Fi／蜂窝切换频繁的产品 |
@@ -20,7 +19,6 @@
 | Server push | 有意不做 | 主流浏览器都不启用 HTTP/3 push；客户端不发 `MAX_PUSH_ID`，`Context.Push` 返回 `http.ErrNotSupported`。预加载用 103 Early Hints（`WriteInterim`） | L | 不重估：浏览器侧已凉 |
 | DATAGRAM（RFC 9221）、WebTransport | 有意不做 | 依赖流式 stream 或不可靠数据报的 API，当前 handler 模型不支持；对端发来的 DATAGRAM 帧被当未知帧，连接以 `FRAME_ENCODING_ERROR` 关闭 | L | 要做实时媒体／游戏类服务时，且需要同时扩展 handler 模型 |
 | QUIC v2（RFC 9369）等其它版本 | 有意不做 | 部署上 version 1 已足够；客户端收到 Version Negotiation 直接失败 | S–M | 出现要求 v2 的部署环境 |
-| 双向流式的 handler API | 计划中未做 | Extended CONNECT 已通过 `Context.Upgrade` 实现（WebTransport 的前提之一），但 handler 模型还没有同时操作两个方向的 API | M | 同 WebTransport 一项 |
 | 接收方向再省一次拷贝 | 计划中未做 | 接收时 Engine 复制一次（复制进缓冲池），帧解析器只复制跨片段的帧与 body；要再省需要零拷贝投递，代价是生命周期管理 | M | 接收吞吐成为瓶颈时 |
 | Interop Runner 的 `ecn`、`v2`、`connectionmigration` | 有意不做 | 直接来自上面三项；端点以 127 退出，runner 记为"不支持"而不是通过 | — | 同上 |
 
@@ -60,9 +58,7 @@
 
 | 项 | 状态 | 原因 | 成本 | 何时重估 |
 | --- | --- | --- | --- | --- |
-| CI 里"干净 checkout 的 `go build ./...` 必过" | 计划中未做 | 多次外部提交把别人的文件带回旧状态，导致 main 不可编译，只能人工发现回补 | S | 建议尽快做 |
 | `http3-interop-image` job 依赖 Docker Hub | 已知风险 | 需要拉 `golang:1.27.3` 基础镜像，极端情况下 rate limit 会让 PR 失败 | S | 出现失败时改成非阻塞或换镜像源 |
-| Interop Runner 的 `handshakecorruption`／`transfercorruption` | 计划中未做 | 与 `handshakeloss`／`transferloss` 走同一端点路径，尚未单独跑过 | S | 想补齐矩阵时 |
 | 与更多 QUIC 实现的互通 | 部分完成 | 现在有容器化端点（`http3/interoprunner/`）和 CI job，但只与 quic-go 互为对端；quiche、ngtcp2、mvfst 未接 | M | 需要更广的兼容性证据时 |
 | 0-RTT 与更多实现互通、多机共享票据密钥的防重放 | 计划中未做 | 票据登记表是每个进程一份；放在负载均衡后面的服务端要自己防重放 | M | 真的上线 0-RTT 时 |
 | 压测（并发问题） | 已完成 | `benchmark/loadtest/` 的完整战役 + `stallmem.sh` 内存用例；结论见 `docs/loadtest*.md` | — | 见该文档的"如何做一次干净的 A/B" |

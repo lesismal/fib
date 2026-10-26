@@ -1,2 +1,6 @@
 # Local Claude Code session data (covers gocache*/gotmp* used by GOCACHE/GOTMPDIR)
 /.claude/
+
+# The HTTP/3 conformance peer's binary, built in place by `go build ./...`
+# in its module (the clean-build CI job does this).
+/http3/interop/interop
