@@ -30,7 +30,8 @@ type AsyncHandlerFunc func(ctx *Context, err error)
 // ReconnectInfo describes one attempt of a Client to reconnect, which
 // Handler.HandleReconnect hears about.
 type ReconnectInfo struct {
-	// Times counts the attempts since the connection was lost, from 1.
+	// Times counts the attempts since the connection was lost, from 1. A
+	// successful attempt ends the sequence, and the next loss starts a new one.
 	Times int
 	// MaxTimes is Handler.MaxReconnectTimes, where zero or less is no limit.
 	MaxTimes int
