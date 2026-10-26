@@ -6,6 +6,7 @@ import (
 	"bytes"
 	"errors"
 	"net"
+	"runtime"
 	"testing"
 	"time"
 	"unsafe"
@@ -166,6 +167,11 @@ func TestSendPartsSharedPastTheQueueLimitClosesTheConnection(t *testing.T) {
 // a send path that wrote into it while it waited, or a close that read it
 // after the test reused it, would show.
 func TestCloseDropsTheCallersQueuedBody(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		// An overlapped send hands the whole body to the kernel at once, so
+		// nothing of it is left in the queue for the close to drop.
+		t.Skip("Windows hands a queued send to the kernel whole")
+	}
 	closed := make(chan struct{}, 1)
 	c, _ := acceptOne(t, "tcp", HandlerFuncs{
 		Close: func(*Connection, error) { closed <- struct{}{} },
