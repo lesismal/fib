@@ -6,9 +6,10 @@ import (
 	"bytes"
 	"errors"
 	"io"
-	"log/slog"
 	"runtime/debug"
 	"sync"
+
+	"github.com/lesismal/fib/log"
 )
 
 // ErrDuplexClosed is what a Duplex reports once it has been closed, or once
@@ -225,8 +226,8 @@ func (c *Context) ServeDuplex(h DuplexHandler) error {
 	go func() {
 		defer func() {
 			if recovered := recover(); recovered != nil {
-				slog.Error("http: duplex handler panicked",
-					"panic", recovered, "stack", string(debug.Stack()))
+				log.Error("http: duplex handler panicked",
+					"panic", recovered, "stack", log.Lines(debug.Stack()))
 				d.setErr(ErrDuplexClosed)
 				d.c.abandon()
 			}
