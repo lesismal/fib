@@ -113,9 +113,14 @@ jobs:
           if [ "$status" -ne 0 ]; then
             # Surface the failures as an annotation so they are readable
             # without opening the full log.
+            # The names first: an annotation is capped at a few kilobytes,
+            # and a package's log can be megabytes, so the context below can
+            # be cut before the reader sees which test it was.
+            failed=$(grep -a -oE -- '--- FAIL: [^ ]+' "$RUNNER_TEMP/test.log" | sed 's/--- FAIL: //' | sort -u | paste -sd' ' -)
+            summary="failing: ${failed:-none (a race, a panic, or a killed test binary)}"$'\n'
             # DATA RACE too: a package that fails on one has no --- FAIL line,
             # and the warning is what says why.
-            summary=$(grep -a -E -B2 -A20 -- '--- FAIL|^panic:|^FAIL|fatal error:|WARNING: DATA RACE|^exit status|signal:' "$RUNNER_TEMP/test.log" | head -c 60000)
+            summary="$summary"$(grep -a -E -A12 -- '--- FAIL|^panic:|^FAIL|fatal error:|WARNING: DATA RACE|^exit status|signal:' "$RUNNER_TEMP/test.log" | head -c 3000)
             summary=${summary//'%'/'%25'}
             summary=${summary//$'\r'/'%0D'}
             summary=${summary//$'\n'/'%0A'}
