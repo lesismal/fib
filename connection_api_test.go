@@ -17,15 +17,6 @@ import (
 )
 
 // readAllFrom reads conn until it has want bytes or fails.
-func readAllFrom(t *testing.T, conn net.Conn, want int) []byte {
-	t.Helper()
-	_ = conn.SetReadDeadline(time.Now().Add(10 * time.Second))
-	got := make([]byte, want)
-	if _, err := io.ReadFull(conn, got); err != nil {
-		t.Fatalf("read %d bytes: %v", want, err)
-	}
-	return got
-}
 
 // Write is Send for code written against net.Conn: it reports everything
 // written, and the error once the connection has closed. An empty Send writes
