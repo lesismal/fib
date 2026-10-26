@@ -42,6 +42,7 @@ type Settings struct {
 	AcceptPlacement          string
 	UDPIdleTimeout           time.Duration
 	LogStatus                bool
+	LogSettings              bool
 
 	// custom records which fields the caller set rather than leaving for
 	// fib's defaults. Parameters reports it.
@@ -88,6 +89,7 @@ func (e *Engine) Settings() Settings {
 		AcceptPlacement:          c.AcceptPlacement.String(),
 		UDPIdleTimeout:           udpIdleTimeout(c.UDPIdleTimeout),
 		LogStatus:                c.LogStatus,
+		LogSettings:              c.LogSettings,
 		custom:                   e.configCustom,
 	}
 }
@@ -105,8 +107,8 @@ func (s Settings) String() string {
 		s.TaskPool, s.TaskPoolMode, s.MinWorkerCount, s.SharedTaskPool)
 	fmt.Fprintf(&b, "ioPollers=%t ioPollerCount=%d pollers=%d engineLoop=%t reusePort=%t balanceReusePort=%t ",
 		s.IOPollers, s.IOPollerCount, s.Pollers, s.EngineLoop, s.ReusePort, s.BalanceReusePort)
-	fmt.Fprintf(&b, "accept=%s coalesceWrites=%t useWritev=%t socketSyscalls=%t udpIdleTimeout=%s logStatus=%t",
-		s.AcceptPlacement, s.CoalesceWrites, s.UseWritev, s.SocketSyscalls, s.UDPIdleTimeout, s.LogStatus)
+	fmt.Fprintf(&b, "accept=%s coalesceWrites=%t useWritev=%t socketSyscalls=%t udpIdleTimeout=%s logStatus=%t logSettings=%t",
+		s.AcceptPlacement, s.CoalesceWrites, s.UseWritev, s.SocketSyscalls, s.UDPIdleTimeout, s.LogStatus, s.LogSettings)
 	return b.String()
 }
 
@@ -164,7 +166,8 @@ func (s Settings) Parameters() []Parameter {
 		{"balanceReusePort", boolValue(s.BalanceReusePort), source("balanceReusePort"), "hand reuseport connections out round-robin with eBPF"},
 		{"accept", s.AcceptPlacement, source("accept"), "which poller serves a connection accepted on a poller's own socket"},
 		{"udpIdleTimeout", s.UDPIdleTimeout.String(), source("udpIdleTimeout"), "close a UDP peer silent this long; zero means the default"},
-		{"logStatus", boolValue(s.LogStatus), source("logStatus"), "log this list when the engine starts"},
+		{"logStatus", boolValue(s.LogStatus), source("logStatus"), "log the engine started line when it starts"},
+		{"logSettings", boolValue(s.LogSettings), source("logSettings"), "log this setting list when the engine starts"},
 	}
 }
 
@@ -207,6 +210,7 @@ func customConfig(c Config) map[string]bool {
 	set("accept", c.AcceptPlacement != 0 && c.AcceptPlacement != base.AcceptPlacement)
 	set("udpIdleTimeout", c.UDPIdleTimeout != 0)
 	set("logStatus", c.LogStatus != base.LogStatus)
+	set("logSettings", c.LogSettings != base.LogSettings)
 	return custom
 }
 

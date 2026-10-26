@@ -470,7 +470,8 @@ func (c *Connection) Engine() *Engine { return c.engine.root() }
 
 // logRun logs that the engine has started serving, under its name, with the
 // addresses it listens on and the task pool its connections run on, when
-// Config.LogStatus asks for it.
+// Config.LogStatus asks for it, and the effective settings when
+// Config.LogSettings asks for those.
 func (e *Engine) logRun() {
 	accept, applies := e.acceptPlacements()
 	if e.acceptPlacement != AcceptFDModulo && !applies {
@@ -478,25 +479,35 @@ func (e *Engine) logRun() {
 		slog.Warn("fib: Config.AcceptPlacement applies to no listener: it needs IOPollers without EngineLoop and a TCP address on Linux, where each poller listens on a socket of its own with SO_REUSEPORT",
 			"engine", e.name, "acceptPlacement", e.acceptPlacement.String())
 	}
-	if !e.logStatus {
-		return
-	}
-	listening := "none"
-	if addrs, err := e.ListenAddrs(); err != nil {
-		listening = err.Error()
-	} else if len(addrs) > 0 {
-		parts := make([]string, len(addrs))
-		for i, addr := range addrs {
-			parts[i] = addr.Network() + "://" + addr.String()
+	if e.logStatus {
+		listening := "none"
+		if addrs, err := e.ListenAddrs(); err != nil {
+			listening = err.Error()
+		} else if len(addrs) > 0 {
+			parts := make([]string, len(addrs))
+			for i, addr := range addrs {
+				parts[i] = addr.Network() + "://" + addr.String()
+			}
+			listening = strings.Join(parts, ",")
 		}
-		listening = strings.Join(parts, ",")
+		pool := fmt.Sprintf("%T", e.taskPool)
+		if named, ok := e.taskPool.(interface{ Name() string }); ok {
+			pool = named.Name()
+		}
+		slog.Info("fib: engine started", "engine", e.name, "listen", listening, "taskPool", pool,
+			"pollers", len(e.pollers), "accept", accept)
 	}
-	pool := fmt.Sprintf("%T", e.taskPool)
-	if named, ok := e.taskPool.(interface{ Name() string }); ok {
-		pool = named.Name()
+	if e.logSettings {
+		e.LogSettings()
 	}
-	slog.Info("fib: engine started", "engine", e.name, "listen", listening, "taskPool", pool,
-		"pollers", len(e.pollers), "accept", accept)
+}
+
+// LogSettings logs every effective setting, one line per parameter, with its
+// value, whether fib's default or the caller's produced it, and what it does.
+// The engine calls it at startup when Config.LogSettings is set, which
+// DefaultConfig does; call it directly to print the list on demand, whether
+// or not the config asks for it.
+func (e *Engine) LogSettings() {
 	settings := e.Settings()
 	parameters := settings.Parameters()
 	slog.Info("fib: engine config", "engine", e.name, "parameters", len(parameters))

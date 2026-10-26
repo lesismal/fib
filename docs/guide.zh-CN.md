@@ -104,10 +104,13 @@
   按自己的配置创建协程池，之后的同名 Engine 直接使用它，其余配置不生效。需要隔离时
   可以给 Engine 起不同的名字，或把 `SharedTaskPool` 设为 `false`（仍用同名的
   `<Name>-streams`）。
-- 状态日志默认关闭（`log/slog`，可用 `slog.SetDefault` 调整输出）。`config.LogStatus = true`
-  时 Engine 启动后打印名字、监听地址、协程池和 poller 数；`taskpool.SetLogStatus(true)`
-  之后创建的协程池在启动后打印协程池名字，以及实际运行的分片数、worker 数和队列容量等。任务 panic 且没有设置 `SetPanicHandler` 时，无论开关
-  如何，都以 ERROR 级别打印协程池名字、panic 值与调用栈。
+- 参数日志默认开启（`log/slog`，可用 `slog.SetDefault` 调整输出）：Engine 启动后逐项打印
+  实际生效的 `readBuffer`、`writeWatermark`、`maxPendingBytes`、`maxWriteQueueBytes` 等
+  全部基础配置，每项带 `default`/`custom` 来源标记和一句说明。`config.LogSettings = false`
+  关闭它，或调用 `Engine.LogSettings()` 手动打印。`config.LogStatus = true` 另外打印一行
+  名字、监听地址、协程池和 poller 数；`taskpool.SetLogStatus(true)` 之后创建的协程池在启动后
+  打印协程池名字，以及实际运行的分片数、worker 数和队列容量等。任务 panic 且没有设置
+  `SetPanicHandler` 时，无论开关如何，都以 ERROR 级别打印协程池名字、panic 值与调用栈。
 - `config.SetTaskPool(pool)` 让 Engine 使用外部提供的任务池（实现 `fib.TaskPool`
   接口，`*taskpool.TaskPool` 本身即满足）。设置后 `TaskPoolMode`、
   `WorkerCount`、`SharedTaskPool` 和池容量配置都不再生效；Engine 关闭时不会
@@ -116,9 +119,7 @@
 - `WriteBufferHighWatermark` 默认按读缓冲和机器自动计算：四倍读缓冲，下限 64 KiB、上限
   256 KiB；默认 16 KiB 读缓冲时为 64 KiB，fit 的 64 KiB 读缓冲在内存足够的机器上是 256 KiB。
   `MaxPendingBytes` 默认 0（不设全局预算，只有每连接水位线生效）；连接数很多、水位线乘
-  连接数超出内存承受范围时再设置它。`LogStatus` 开启后启动日志会逐项打印实际生效的
-  `readBuffer`、`writeWatermark`、`maxPendingBytes`、`maxWriteQueueBytes` 等全部基础配置，
-  每项带 `default`/`custom` 来源标记和一句说明。
+  连接数超出内存承受范围时再设置它。
 - `Send` 先直接发送，余量复制进发送队列。默认启用自适应 writev：单缓冲走
   write，`SendParts` 的两段数据和包含多个缓冲的发送队列走 writev；仅在背压
   时复制未发送部分。`SendOwned` 把缓冲交给连接，背压时直接排队、不复制；`SendShared`

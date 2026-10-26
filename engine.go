@@ -134,6 +134,7 @@ type Engine struct {
 	acceptPlacement    AcceptPlacement
 	name               string
 	logStatus          bool
+	logSettings        bool
 	maxEvents          int
 	pollBatchSize      int // see Config.PollBatchSize
 	useWritev          bool
@@ -304,7 +305,7 @@ func newEngine(config Config, bindings []Binding) (*Engine, error) {
 		config.ReusePort = true
 	}
 
-	e := &Engine{name: engineName(config), logStatus: config.LogStatus, maxEvents: config.MaxEvents, configCustom: custom,
+	e := &Engine{name: engineName(config), logStatus: config.LogStatus, logSettings: config.LogSettings, maxEvents: config.MaxEvents, configCustom: custom,
 		pollBatchSize:      config.PollBatchSize,
 		noLoop:             !engineLoop(config),
 		acceptPlacement:    config.AcceptPlacement,
@@ -366,7 +367,7 @@ func newEngine(config Config, bindings []Binding) (*Engine, error) {
 func (e *Engine) openPollers(config Config) error {
 	n := pollerCount(config)
 	for i := 0; i < n; i++ {
-		p := &Engine{parent: e, name: e.name, logStatus: e.logStatus, maxEvents: e.maxEvents, bindConfig: config, configCustom: e.configCustom,
+		p := &Engine{parent: e, name: e.name, logStatus: e.logStatus, logSettings: e.logSettings, maxEvents: e.maxEvents, bindConfig: config, configCustom: e.configCustom,
 			pollBatchSize: e.pollBatchSize, useWritev: e.useWritev,
 			socketSyscalls: e.socketSyscalls, coalesceWrites: e.coalesceWrites,
 			writeHighWatermark: e.writeHighWatermark,
@@ -1195,13 +1196,17 @@ type Config struct {
 	// LogStatus has the engine log a line when it starts serving, with its
 	// name, the addresses it listens on, its task pool, its pollers and, as
 	// "accept", which loop accepts each TCP and Unix listener's connections
-	// and which poller then serves them (see AcceptPlacement). It then prints
-	// every effective setting, one line per parameter and the sized watermark
-	// and budget among them, each with its value, whether it is fib's default
-	// or the caller's, and what it does; see Engine.Settings and
-	// Settings.Parameters. It is off by default. The task pools' own lines are
-	// switched separately, with taskpool.SetLogStatus.
+	// and which poller then serves them (see AcceptPlacement). It is off by
+	// default. The task pools' own lines are switched separately, with
+	// taskpool.SetLogStatus.
 	LogStatus bool
+	// LogSettings has the engine log every effective setting when it starts,
+	// one line per parameter, with its value, whether it is fib's default or
+	// the caller's, and what it does; see Engine.LogSettings and
+	// Settings.Parameters. DefaultConfig sets it, so a fib engine reports its
+	// sizing by default; set it to false to silence the list, or call
+	// Engine.LogSettings to print it on demand.
+	LogSettings bool
 	// Network is the network of every Binding that leaves its own empty;
 	// see Binding.Network. Empty means "tcp".
 	Network     string
@@ -1490,7 +1495,7 @@ func DefaultConfigFor(readBuffer int) Config {
 		MaxEvents: sizing.MaxEvents, ReadBufferSize: readBuffer,
 		WriteBufferHighWatermark: backpressure.WriteWatermark, MaxPendingBytes: defaultMaxPendingBytes,
 		UseWritev: true, CoalesceWrites: true, SocketSyscalls: true, TaskPoolMode: taskpool.ModeAdaptive, SharedTaskPool: true,
-		IOPollers: true, ReusePort: true}
+		IOPollers: true, ReusePort: true, LogSettings: true}
 }
 
 // UDP rides on the same connections, handlers and workers as TCP. What is

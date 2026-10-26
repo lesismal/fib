@@ -42,6 +42,9 @@ func TestEngineSettings(t *testing.T) {
 	if got.UDPIdleTimeout != DefaultUDPIdleTimeout {
 		t.Errorf("UDPIdleTimeout = %v, want %v", got.UDPIdleTimeout, DefaultUDPIdleTimeout)
 	}
+	if !got.LogSettings {
+		t.Error("LogSettings = false, want fib's default on")
+	}
 
 	line := got.String()
 	for _, want := range []string{
@@ -156,5 +159,34 @@ func TestSettingsParameterSources(t *testing.T) {
 	// effective value follows the custom read buffer and budget.
 	if got := source(settings, "writeWatermark"); got != "default" {
 		t.Errorf("writeWatermark source = %q, want default", got)
+	}
+}
+
+// The settings list is on by default and can be turned off; the method still
+// prints it on demand.
+func TestLogSettingsDefaultAndDisable(t *testing.T) {
+	if !DefaultConfig().LogSettings {
+		t.Fatal("DefaultConfig does not log its settings")
+	}
+	var buf bytes.Buffer
+	old := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&buf, nil)))
+	defer slog.SetDefault(old)
+
+	config := DefaultConfig()
+	config.LogStatus = false
+	config.LogSettings = false
+	engine, err := New(config, Binding{Addr: "127.0.0.1:0", Handler: HandlerFuncs{}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer engine.Close()
+	engine.logRun()
+	if buf.Len() != 0 {
+		t.Fatalf("logRun with LogSettings false wrote %q", buf.String())
+	}
+	engine.LogSettings()
+	if out := buf.String(); !strings.Contains(out, "fib: engine config") || !strings.Contains(out, "parameter=readBuffer") {
+		t.Fatalf("LogSettings did not print the list: %q", out)
 	}
 }

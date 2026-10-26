@@ -35,6 +35,7 @@ type Engine struct {
 	accepted        acceptedConns
 	name            string
 	logStatus       bool
+	logSettings     bool
 	listeners       []boundListener
 	handler         Handler
 	taskPool        TaskPool
@@ -104,7 +105,7 @@ func newEngine(config Config, bindings []Binding) (*Engine, error) {
 		return nil, err
 	}
 	pool, releasePool := acquireTaskPool(config)
-	e := &Engine{accepted: acceptedConns{max: int64(config.MaxConns)}, name: engineName(config), logStatus: config.LogStatus, acceptPlacement: config.AcceptPlacement, listeners: listeners, handler: handler, taskPool: pool, releaseTaskPool: releasePool, configCustom: custom,
+	e := &Engine{accepted: acceptedConns{max: int64(config.MaxConns)}, name: engineName(config), logStatus: config.LogStatus, logSettings: config.LogSettings, acceptPlacement: config.AcceptPlacement, listeners: listeners, handler: handler, taskPool: pool, releaseTaskPool: releasePool, configCustom: custom,
 		connections: make(map[*Connection]struct{}), stopped: make(chan struct{}), serveErr: make(chan error, 1),
 		udpListeners: udpListeners, udpIdleTimeout: udpIdleTimeout(config.UDPIdleTimeout)}
 	e.readBufferSize = config.ReadBufferSize
@@ -652,7 +653,7 @@ type Config struct {
 
 func DefaultConfig() Config {
 	sizing := DefaultPoolSizing(taskpool.ModeAdaptive)
-	return Config{Name: DefaultName, Network: "tcp", Backlog: 128, WorkerCount: sizing.WorkerCount, MaxEvents: sizing.MaxEvents, ReadBufferSize: 16 * 1024, WriteBufferHighWatermark: 4 * 1024, UseWritev: true, CoalesceWrites: true, SocketSyscalls: true, TaskPoolMode: taskpool.ModeAdaptive, SharedTaskPool: true, IOPollers: true, ReusePort: true}
+	return Config{Name: DefaultName, Network: "tcp", Backlog: 128, WorkerCount: sizing.WorkerCount, MaxEvents: sizing.MaxEvents, ReadBufferSize: 16 * 1024, WriteBufferHighWatermark: 4 * 1024, UseWritev: true, CoalesceWrites: true, SocketSyscalls: true, TaskPoolMode: taskpool.ModeAdaptive, SharedTaskPool: true, IOPollers: true, ReusePort: true, LogSettings: true}
 }
 
 type portableEvent struct {

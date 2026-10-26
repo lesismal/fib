@@ -125,6 +125,9 @@ func TestLogStatusLogsTheEngine(t *testing.T) {
 	config := DefaultConfig()
 	config.Name = "logged"
 	config.LogStatus = true
+	// This test counts the started lines; the settings list has a line of its
+	// own and is not what it is about.
+	config.LogSettings = false
 	server, addr := startEchoServer(t, config, echoHandler())
 	client, err := New(config)
 	if err != nil {
