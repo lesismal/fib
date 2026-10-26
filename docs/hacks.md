@@ -512,6 +512,15 @@ HTTP/3 reuses request streams as well; `http3.Config.DisableReuse` turns it off.
   HTTP/1 it waits in the connection's send queue as the handler gave it, and on HTTP/2 it is
   framed as the windows admit, so it must not be changed once written; see
   `fibhttp.Response.Body`. It returns nil for a streamed body.
+- A handler that wants its buffer back as soon as the call returns — a scratch buffer it fills
+  again for the next request — answers with `RespondCopy` or `WriteResponseCopy` instead: they
+  copy the body at the call, and the latter the trailer too, map and values, so the handler may
+  reuse both at once. The copy comes from the pool where a send path can take it over: HTTP/1's
+  send, which copies it into the round's buffer or the queue and is done with it when it
+  returns, and HTTP/3's `quic.Part{Owned: true}` run, which gives it back once the peer has
+  acknowledged it. An HTTP/2 stream keeps a body until the windows let it go, so its copy is a
+  plain one. It is the only path that copies for the handler's sake: `Respond` and
+  `WriteResponse` hand the caller's slices over.
 - `Context.Query(name)`: decoded exactly like `c.Request.URL.Query().Get(name)` but without building a
   map; a value that needs no decoding is a substring of the raw query, with zero allocation.
 - The `Router` keeps its routing state on the `Context`, reused with it: routing a request
@@ -570,6 +579,10 @@ backlog of its own is paused too**.
 | `SendFile(f, off, n)` | queues a file range in order with surrounding `Send`s; `sendfile(2)` straight to the socket, the file is read as the peer receives | large files, memory does not grow with file size |
 | `Cork()` / `Flush()` | manual control of write coalescing | answering several requests **outside the round**; or when a handler must hand data to the socket midway |
 | `Config.MaxWriteQueueBytes` / `Connection.SetWriteQueueLimit(n)` | caps what one connection may have queued for its socket; a send past it returns `ErrSendQueueFull` and closes the connection | broadcast to peers that may stop reading |
+
+**A whole response's body** is handed to `SendParts` without a copy. A handler that wants its
+buffer back at the call — a scratch buffer it fills again — answers with
+`Context.RespondCopy` or `Context.WriteResponseCopy` instead; see [§7](#7-zero-copy-reads-contextbody--contextquery).
 
 **Corking by hand outside OnData**
 

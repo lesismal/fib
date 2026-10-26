@@ -66,6 +66,15 @@ HTTP/3 会把 body 留到对端窗口和确认放行为止，handler 在响应�
 就是一种），因为 handler 返回后服务端就要把这块缓冲收回；以及经过会改写字节的 layer
 （例如 TLS 会把 body 封进自己的记录）时。
 
+handler 如果希望调用一返回就拿回自己的 buffer（重新填充或修改），改用 `RespondCopy` /
+`WriteResponseCopy`：它们在调用时拷贝 body（`WriteResponseCopy` 还拷贝 trailer 的 map 和
+其中的值），线上发的是那份拷贝，handler 可以立刻复用原来的 buffer。这是按响应选择加入的
+唯一开关；除了请求自己的缓冲和 layer 的记录之外，没有别的路径会为了 handler 去拷贝 body。
+拷贝取自池：send 会像拷贝响应头一样把它拷进本轮缓冲或队列，随即把池缓冲还回去，所以池是
+热的时这份按响应选择加入的拷贝零分配；它的代价是 body 被多拷贝一次，而不是原样交出去——
+这就是拿回 handler 自己 buffer 的代价。见 `fibhttp.Response.Body`，trailer 的规则见
+`fibhttp.Response.Trailer`。
+
 ### Transfer coding
 
 chunked 不是唯一会被解码的 transfer coding（RFC 9112 第 7 节）。chunked 之上再加 gzip、

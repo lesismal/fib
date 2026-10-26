@@ -3,6 +3,7 @@
 package http
 
 import (
+	"bytes"
 	stdtls "crypto/tls"
 	"errors"
 	"fmt"
@@ -36,15 +37,22 @@ type Response struct {
 	// Body is the response body. The response may keep the slice itself until
 	// it is finished: sent on HTTP/1 and HTTP/2, acknowledged by the peer on
 	// HTTP/3, which can be after WriteResponse or Respond returns. Whatever
-	// its size, it must not be changed until then, unless the call that
-	// writes it copies it: a body the handler must reuse sooner is copied
-	// first, as a per-response opt-in copy does.
+	// its size, it must not be changed until then.
+	//
+	// RespondCopy and WriteResponseCopy are the calls that copy it, at the
+	// call: a handler that wants its buffer back as soon as the call returns,
+	// to fill again or to change, writes the response with one of them, and
+	// the copy is what the response sends. Nothing else copies a body, except
+	// a protocol's copy of the request's own buffer, which the server
+	// recycles.
 	Body []byte
 	// Trailer is sent after the body. HTTP/1.1 carries it by sending the
 	// body chunked, and announces its names in a Trailer header; HTTP/2 and
 	// HTTP/3 send it as a trailing header block. An HTTP/1.0 client, and a
 	// response that has no body, gets none of it. Like Body, it is kept until
-	// the response is finished, so it must not be changed until then.
+	// the response is finished, so it must not be changed until then;
+	// WriteResponseCopy copies it, map and values, at the call, as it does
+	// the body.
 	Trailer stdhttp.Header
 	Close   bool
 }
@@ -183,6 +191,26 @@ type ResponseNotifier interface {
 	// error when the stream ends first, and reports true; it reports false,
 	// and never runs fn, when the stream holds no more than half already.
 	NotifyWritable(fn func(error)) bool
+}
+
+// OwnedResponseWriter is implemented by a Stream that can take over the body
+// of a response written with Context.RespondCopy or Context.WriteResponseCopy:
+// a buffer from package bufferpool, which the stream returns to the pool once
+// it is done with it, rather than the caller's buffer, which the handler may
+// reuse as soon as the call returns.
+//
+// A Stream that does not implement it is written to with a copy of the body
+// that the collector frees instead, so every Stream serves the *Copy methods;
+// this is what makes them cost no allocation where the stream can take a
+// pooled buffer, as HTTP/3 does with a quic.Part{Owned: true}.
+type OwnedResponseWriter interface {
+	// WriteResponseOwned sends the final response to req, as WriteResponse
+	// does, for a body that is response.Body, a buffer from package
+	// bufferpool. The stream takes the buffer over, and returns it to the
+	// pool once it is done with it: sent, acknowledged, reset, failed, or
+	// never handed to the connection at all. It must not read the buffer
+	// after that.
+	WriteResponseOwned(req *stdhttp.Request, response Response, body []byte) error
 }
 
 // NewStreamContext returns the Context through which a handler answers req,
@@ -489,16 +517,42 @@ func (c *Context) closeAfterResponse() {
 func (c *Context) draining() bool { return c.Conn != nil && c.Conn.ShuttingDown() }
 
 func (c *Context) Respond(status int, contentType string, body []byte) error {
+	return c.respond(status, contentType, body, nil)
+}
+
+// RespondCopy sends a whole response, as Respond does, with a body the
+// handler may reuse or change as soon as it returns: the body is copied at
+// the call, and the copy is what the response sends. It is for a body that is a
+// scratch buffer — one the handler fills again for the next request, or one
+// from a buffer pool — where Respond, which keeps the slice until the
+// response is finished, would not do; see Response.Body.
+//
+// A body the handler will not touch again costs nothing to hand over: Respond
+// sends it without a copy, and so does RespondCopy for an empty one. A
+// trailer is not a parameter of either call; WriteResponseCopy copies one.
+func (c *Context) RespondCopy(status int, contentType string, body []byte) error {
+	if c.begun() {
+		return ErrResponseWritten
+	}
+	body, copied := c.copyResponseBody(body)
+	return c.respond(status, contentType, body, copied)
+}
+
+// respond sends a whole response. copied, when it is not nil, is body's copy
+// from the pool, which this call gives back once the send path has done with
+// it.
+func (c *Context) respond(status int, contentType string, body, copied []byte) error {
 	if contentType == "" {
-		return c.WriteResponse(Response{StatusCode: status, Body: body})
+		return c.writeWhole(Response{StatusCode: status, Body: body}, copied)
 	}
 	if c.isHTTP1() && c.hooked() == nil {
 		// HTTP/1 writes the one field straight into the response's head,
 		// without a header map to build and walk.
 		if c.w != nil && c.w.status != 0 {
+			releaseBody(copied)
 			return ErrResponseWritten
 		}
-		return c.writeHTTP1(Response{StatusCode: status, Body: body}, contentType)
+		return c.writeHTTP1(Response{StatusCode: status, Body: body}, contentType, copied)
 	}
 	// Every path a response takes — HTTP/1's marshalResponse, HTTP/2's
 	// encoder, an external stream's — has read the header by the time it
@@ -510,13 +564,14 @@ func (c *Context) Respond(status int, contentType string, body []byte) error {
 	header["Content-Type"] = append(header["Content-Type"][:0], contentType)
 	var err error
 	if c.w != nil && c.w.status != 0 {
+		releaseBody(copied)
 		err = ErrResponseWritten
 	} else {
 		// The header is this call's own, so the hooks may change it without
 		// the copy WriteResponse makes of a caller's. Whatever fields they
 		// added go before it serves another reply, including when they took
 		// Content-Type out, as a 304 does, and left one field of their own.
-		err = c.writeResponse(Response{StatusCode: status, Header: header, Body: body})
+		err = c.writeResponse(Response{StatusCode: status, Header: header, Body: body}, copied)
 		if _, kept := header["Content-Type"]; len(header) > 1 || !kept {
 			for key := range header {
 				if key != "Content-Type" {
@@ -538,8 +593,14 @@ var contentTypeHeaders = sync.Pool{New: func() any {
 
 // WriteResponse sends the whole response at once. It fails once the
 // response has been begun through the ResponseWriter methods.
-func (c *Context) WriteResponse(response Response) error {
+func (c *Context) WriteResponse(response Response) error { return c.writeWhole(response, nil) }
+
+// writeWhole is WriteResponse for a response whose body may be a copy this
+// call made. copied, when it is not nil, is that copy, from the pool, which
+// this call gives back once the send path has done with it.
+func (c *Context) writeWhole(response Response, copied []byte) error {
 	if c.w != nil && c.w.status != 0 {
+		releaseBody(copied)
 		return ErrResponseWritten
 	}
 	if hooks := c.hooked(); hooks != nil && hooks.changes && response.Header != nil && !c.wrote {
@@ -548,11 +609,80 @@ func (c *Context) WriteResponse(response Response) error {
 		// may not, so a response only they hook is sent with it as it is.
 		response.Header = response.Header.Clone()
 	}
-	return c.writeResponse(response)
+	return c.writeResponse(response, copied)
 }
 
-func (c *Context) writeResponse(response Response) error {
+// WriteResponseCopy sends the whole response at once, as WriteResponse does,
+// with its Body and Trailer copied at the call: the handler may reuse or
+// change its own body and trailer as soon as it returns, since the copy is
+// what the response sends. Header is not copied, as for WriteResponse.
+//
+// It is WriteResponse for a body or a trailer the handler owns as a scratch
+// buffer — one it fills again for the next response. A response whose body
+// the handler will not touch again goes through WriteResponse, which hands
+// the slice over without a copy; see Response.Body and Response.Trailer for
+// the rule they follow until the response is finished.
+func (c *Context) WriteResponseCopy(response Response) error {
+	if c.begun() {
+		return ErrResponseWritten
+	}
+	body, copied := c.copyResponseBody(response.Body)
+	response.Body = body
+	response.Trailer = response.Trailer.Clone()
+	return c.writeWhole(response, copied)
+}
+
+// copyResponseBody copies body for a *Copy call, reporting the copy and, when
+// a send path can give it back once it has done with it, the buffer from the
+// pool the copy is. A body the sender cannot take over is copied plainly
+// instead, for the collector to free. An empty body is not copied at all, so
+// it costs what it costs Respond.
+func (c *Context) copyResponseBody(body []byte) (copied, pooled []byte) {
+	if len(body) == 0 {
+		return body, nil
+	}
+	if !c.senderTakesCopiedBody() {
+		return bytes.Clone(body), nil
+	}
+	pooled = bufferpool.Get(len(body))
+	copy(pooled, body)
+	return pooled, pooled
+}
+
+// senderTakesCopiedBody reports whether the sender of the response this
+// Context is writing can take over a buffer from the pool, and give it back
+// once it is done with it.
+//
+// HTTP/1's connection can: sendResponse sends a body from a *Copy call with
+// SendParts, which copies what the socket does not take into the round's
+// buffer or the queue, and is done with the body when it returns, so the pool
+// gets the copy back and the wire gets the queue's own copy. An external
+// Stream that implements OwnedResponseWriter can too, as HTTP/3's does.
+// HTTP/2's streams keep a body by reference until the windows let it go and
+// have no room for a pool lease, so a copy for them is a plain one.
+func (c *Context) senderTakesCopiedBody() bool {
+	if c.external != nil {
+		_, ok := c.external.(OwnedResponseWriter)
+		return ok
+	}
+	return c.stream == nil
+}
+
+// releaseBody gives a *Copy call's buffer back to the pool, if it is one.
+func releaseBody(copied []byte) {
+	if copied != nil {
+		bufferpool.Put(copied)
+	}
+}
+
+// sameBody reports whether a and b are the same bytes of the same array.
+func sameBody(a, b []byte) bool {
+	return len(a) == len(b) && len(a) > 0 && unsafe.SliceData(a) == unsafe.SliceData(b)
+}
+
+func (c *Context) writeResponse(response Response, copied []byte) error {
 	if c.wrote {
+		releaseBody(copied)
 		return ErrResponseWritten
 	}
 	if response.StatusCode == 0 {
@@ -568,12 +698,16 @@ func (c *Context) writeResponse(response Response) error {
 		if !hooks.ran {
 			hooks.ran = true
 			if at := hooks.beforeFrom(&hooks.response, len(hooks.list)-1); at >= 0 && c.holdWhole(hooks, at) {
-				// An OnHeaderAsync hook holds it; its resume sends it.
+				// An OnHeaderAsync hook holds it, as a copy of its own, and
+				// its resume sends it.
+				releaseBody(copied)
 				return nil
 			}
 		}
 		if c.Request.Method != stdhttp.MethodHead && hooks.splitAsync() {
-			// An asynchronous filter sends it from its done.
+			// An asynchronous filter sends it from its done, from a copy of
+			// its own.
+			releaseBody(copied)
 			response = hooks.response
 			hooks.response = Response{}
 			return c.holdBodyWhole(hooks, response)
@@ -583,23 +717,45 @@ func (c *Context) writeResponse(response Response) error {
 		hooks.response = Response{}
 		if err != nil {
 			hooks.ran = false
+			releaseBody(copied)
 			return err
+		}
+		if copied != nil && !sameBody(response.Body, copied) {
+			// A hook put a body of its own in its place.
+			releaseBody(copied)
+			copied = nil
 		}
 	}
 	var err error
 	switch {
 	case c.external != nil:
-		if err = c.external.WriteResponse(c.Request, response); err == nil {
+		if owner, ok := c.external.(OwnedResponseWriter); ok && copied != nil {
+			// The stream takes the pooled copy over, and gives it back when
+			// it is done with it, so this call no longer holds it.
+			err = owner.WriteResponseOwned(c.Request, response, copied)
+			copied = nil
+		} else {
+			releaseBody(copied)
+			copied = nil
+			err = c.external.WriteResponse(c.Request, response)
+		}
+		if err == nil {
 			c.wrote, c.status = true, uint16(response.StatusCode)
 		}
 	case c.stream != nil:
 		// HTTP/2 multiplexes the connection, so Close retires it gracefully
-		// with GOAWAY rather than cutting the other streams short.
+		// with GOAWAY rather than cutting the other streams short. Its
+		// bodies are copies of their own, which the collector frees once the
+		// response has been sent; see senderTakesCopiedBody.
+		releaseBody(copied)
+		copied = nil
 		if err = c.stream.respond(c.Request, response); err == nil {
 			c.wrote, c.status = true, uint16(response.StatusCode)
 		}
 	default:
-		err = c.writeHTTP1(response, "")
+		// writeHTTP1 gives the copy back once its send has done with it.
+		err = c.writeHTTP1(response, "", copied)
+		copied = nil
 	}
 	if err != nil && hooks != nil && !c.wrote {
 		// Nothing was sent, so the response the handler answers with
@@ -632,7 +788,7 @@ func (c *Context) sendHeld(response *Response, hooks *responseHooks) error {
 	case c.stream != nil:
 		err = c.stream.respond(c.Request, *response)
 	default:
-		err = c.sendHTTP1(*response, "")
+		err = c.sendHTTP1(*response, "", nil)
 	}
 	if err == nil {
 		hooks.finished(response.StatusCode, response.Header, wholeSize(c.Request, response))
@@ -642,23 +798,26 @@ func (c *Context) sendHeld(response *Response, hooks *responseHooks) error {
 
 // writeHTTP1 is writeResponse for HTTP/1. contentType, when it is not empty,
 // is sent as a Content-Type field besides those of response.Header, which
-// then has none of its own.
-func (c *Context) writeHTTP1(response Response, contentType string) error {
+// then has none of its own. copied is a *Copy call's body, which this call
+// gives back once its send has done with it.
+func (c *Context) writeHTTP1(response Response, contentType string, copied []byte) error {
 	if c.wrote {
+		releaseBody(copied)
 		return ErrResponseWritten
 	}
-	return c.sendHTTP1(response, contentType)
+	return c.sendHTTP1(response, contentType, copied)
 }
 
 // sendHTTP1 is writeHTTP1 for a response that may read as written already,
-// having been held by an OnHeaderAsync hook.
-func (c *Context) sendHTTP1(response Response, contentType string) error {
+// having been held by an OnHeaderAsync hook; such a response's body is a copy
+// of its own, so copied is nil then.
+func (c *Context) sendHTTP1(response Response, contentType string, copied []byte) error {
 	if response.StatusCode == 0 {
 		response.StatusCode = stdhttp.StatusOK
 	}
 	closeConnection := response.Close || c.Request.Close || headerHasToken(response.Header, "Connection", "close") ||
 		c.draining() || c.bodyFailed() || c.bodyCutShort()
-	if err := c.sendResponse(response, contentType, closeConnection); err != nil {
+	if err := c.sendResponse(response, contentType, closeConnection, copied); err != nil {
 		return err
 	}
 	if !c.wrote {
@@ -1660,8 +1819,14 @@ func (h *ServerHandler) idleForShutdown(parser *Parser) bool {
 // A body that is part of the request's own, as Context.Body's is, is copied
 // instead: the server takes that buffer back once the handler returns, which a
 // response still sending it would outlive. A chunked response, which carries
-// trailers, is rare enough to be built whole instead.
-func (c *Context) sendResponse(response Response, contentType string, closeConnection bool) error {
+// trailers, is rare enough to be built whole instead. A body copied for a
+// *Copy call goes through SendParts whatever its size, so that the copy, a
+// buffer from the pool, is the send's to be done with when it returns.
+func (c *Context) sendResponse(response Response, contentType string, closeConnection bool, copied []byte) error {
+	// A body copied for a *Copy call, from the pool, is this call's to give
+	// back: the send below copies it, as it copies the head, so nothing reads
+	// it once this returns.
+	defer releaseBody(copied)
 	framing, body, trailer := responseFraming(c.Request, response, closeConnection)
 	framing.contentType = contentType
 	if framing.chunked {
@@ -1674,7 +1839,12 @@ func (c *Context) sendResponse(response Response, contentType string, closeConne
 	pooled := bufferpool.Get(headCapacity(response.Header) + len(contentType))
 	head, err := appendResponseHead(pooled[:0], c.Request, framing)
 	if err == nil {
-		if len(body) > maxCopiedResponseBody && !(c.whole != nil && within(body, c.whole.data)) {
+		// A body from a *Copy call is a buffer of this call's, from the pool,
+		// which SendParts copies into the round's buffer or the queue as it
+		// copies the head; SendPartsShared would keep it, and the pool could
+		// not have it back when this returns.
+		if len(body) > maxCopiedResponseBody && copied == nil &&
+			!(c.whole != nil && within(body, c.whole.data)) {
 			err = c.Conn.SendPartsShared(head, body)
 		} else {
 			err = c.Conn.SendParts(head, body)

@@ -1039,7 +1039,7 @@ func (c *Context) finish(w *responseWriter) error {
 			// The stream's own framing reports the length.
 			delete(response.Header, "Content-Length")
 		}
-		return c.writeResponse(response)
+		return c.writeResponse(response, nil)
 	}
 	if !c.isHTTP1() {
 		return c.endStream()

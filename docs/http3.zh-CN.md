@@ -125,8 +125,11 @@
   占的是它窗口内的那些帧，而不是 body 本身：16 个卡住的 8MiB 响应占 19MiB 活堆，
   而过去把 body 拷进一块 2 的幂缓冲时要占 275MiB（见[压测](loadtest.zh-CN.md)）。
   无论大小，body 都留在 handler 给它的地方直到对端确认响应，帧则用 stream 自己的池缓冲，
-  所以 `Respond` 或 `WriteResponse` 返回之后不能修改它——除非这次调用拷贝了 body；
-  `fibhttp.Response.Body` 对每种协议都是这一条规则。
+  所以 `Respond` 或 `WriteResponse` 返回之后不能修改它；`fibhttp.Response.Body` 对每种协议
+  都是这一条规则。handler 如果要在调用返回时立刻拿回自己的 buffer，改用 `RespondCopy` 或
+  `WriteResponseCopy`：拷贝在调用时从池里取，QUIC 把它当作 owned run 留着、在对端确认后
+  放回池里，因此池是热的时这份按响应选择加入的拷贝不分配内存。`WriteResponseCopy` 也会
+  拷贝 trailer，默认路径则和 body 一样保留它。
   用 `Write` 和 `Flush` 流式发送只需 64KiB。
 - 请求完整后按 `Config.StreamPool` 的描述交给 engine 的 handler 协程池（与 HTTP/2 server
   相同：同名 engine 的 `<Name>-streams`，不与 engine 的协程池共用），因此同一连接上客户端并发发起的多个请求是并发处理的，阻塞的 handler 只拖累它

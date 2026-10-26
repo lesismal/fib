@@ -1877,8 +1877,31 @@ func (rs *requestStream) peerReset() {
 // frame, then the end of the stream. QUIC flow and congestion control pace
 // the body.
 func (rs *requestStream) WriteResponse(req *stdhttp.Request, response fibhttp.Response) error {
+	return rs.writeResponse(req, response, nil)
+}
+
+// WriteResponseOwned is WriteResponse for a body that is a buffer from
+// package bufferpool, which this stream takes over: it goes on reading it as
+// the client's windows, and then its acknowledgements, let it go, and the
+// buffer goes back to the pool once the peer has acknowledged it, or at once
+// if the response cannot be sent; see fibhttp.OwnedResponseWriter.
+func (rs *requestStream) WriteResponseOwned(req *stdhttp.Request, response fibhttp.Response, body []byte) error {
+	return rs.writeResponse(req, response, body)
+}
+
+func (rs *requestStream) writeResponse(req *stdhttp.Request, response fibhttp.Response, released []byte) error {
 	// After the response is written, so that what was held leaves with it.
 	defer rs.writeDone()
+	// A body the caller gave up is the stream's whether or not it goes out:
+	// what the connection does not take over, and acknowledge, comes back to
+	// the pool here.
+	if released != nil {
+		defer func() {
+			if released != nil {
+				bufferpool.Put(released)
+			}
+		}()
+	}
 	status := response.StatusCode
 	if status < 200 || status > 999 {
 		return fmt.Errorf("http3: invalid status code %d", status)
@@ -1943,7 +1966,13 @@ func (rs *requestStream) WriteResponse(req *stdhttp.Request, response fibhttp.Re
 	// and a handler has one rule to keep rather than one per size. See
 	// fibhttp.Response.Body for what that asks of the handler.
 	owned := false
-	if len(body) > 0 && rs.block.BodyWithin(body) {
+	if released != nil {
+		// A body from a *Copy call: the stream takes it over, and the
+		// connection gives it back once it has been acknowledged.
+		if body != nil {
+			body, owned = released, true
+		}
+	} else if len(body) > 0 && rs.block.BodyWithin(body) {
 		copied := bufferpool.Get(len(body))[:len(body)]
 		copy(copied, body)
 		body, owned = copied, true
@@ -1969,6 +1998,11 @@ func (rs *requestStream) WriteResponse(req *stdhttp.Request, response fibhttp.Re
 		{Data: tail, Owned: true},
 	}
 	err := rs.s.WriteFinalParts(parts[:], expected)
+	if released != nil {
+		// The connection owns the body now, whether it writes it or drops it
+		// on a stream that ended: it goes back to the pool from there.
+		released = nil
+	}
 	// The response is all this stream sends, and a request whose response
 	// is written wants nothing more of what arrives for it, so QUIC is told
 	// to forget the request as it takes the response rather than once the
@@ -2353,9 +2387,10 @@ func (rs *requestStream) Push(*stdhttp.Request, string, *stdhttp.PushOptions) er
 }
 
 var (
-	_ fibhttp.Stream           = (*requestStream)(nil)
-	_ fibhttp.ResponseStreamer = (*requestStream)(nil)
-	_ fibhttp.ResponseNotifier = (*requestStream)(nil)
+	_ fibhttp.Stream              = (*requestStream)(nil)
+	_ fibhttp.ResponseStreamer    = (*requestStream)(nil)
+	_ fibhttp.ResponseNotifier    = (*requestStream)(nil)
+	_ fibhttp.OwnedResponseWriter = (*requestStream)(nil)
 )
 
 // newTLS is how a connection's TLS handshake is made: by this module's state

@@ -440,6 +440,13 @@ HTTP/3 同样复用请求 stream，`http3.Config.DisableReuse` 关闭。
   `io.ReadAll(c.Request.Body)` 要用逐步增长的 buffer 再拷贝一遍。这些字节**在响应结束之前归 handler 所有，
   不可修改，也不可保留**。`Respond`/`Write` 会拷贝属于请求自己的 body（`c.Body()` 就是），所以 echo 可以直接
   `c.Respond(200, "application/octet-stream", c.Body())`；其他来源的 body 无论大小都会留到响应发出（HTTP/1、HTTP/2）或对端确认（HTTP/3）：HTTP/1 让它在连接发送队列里按 handler 给的原样等待，HTTP/2 按窗口放行的部分装帧，写入之后不能再改，见 `fibhttp.Response.Body`。流式 body 时返回 nil。
+- handler 如果要在调用返回时立刻拿回自己的 buffer（下一个请求还要重新填的 scratch buffer），
+  改用 `RespondCopy` / `WriteResponseCopy`：它们在调用时拷贝 body，后者还拷贝 trailer 的 map
+  和其中的值，所以 body 和 trailer 都可以立刻复用。拷贝在 send 路径能接管时取自池：HTTP/1 的
+  send 会像拷贝响应头一样把它拷进本轮缓冲或队列，返回时就把池缓冲还回去；HTTP/3 的
+  `quic.Part{Owned: true}` run 会在对端确认后放回池里。HTTP/2 的 stream 会把 body 留到窗口
+  放行为止，所以给它的拷贝是普通分配。这是唯一一条为了 handler 而拷贝的路径，
+  `Respond` 和 `WriteResponse` 都把调用者的切片原样交出去。
 - `Context.Query(name)`：和 `c.Request.URL.Query().Get(name)` 解码方式相同，但不构建 map；
   不需要解码的值就是原始 query 的子串，零分配。
 - `Router` 的路由状态挂在 `Context` 上，随 Context 复用：路由一个请求零分配；`c.Param(name)` /
@@ -489,6 +496,10 @@ Data: func(c *fib.Connection, data []byte) {
 | `SendFile(f, off, n)` | 排进发送队列，与前后 `Send` 保序；`sendfile(2)` 直发，随对端接收进度读文件 | 大文件，内存不随文件大小增长 |
 | `Cork()` / `Flush()` | 手动控制合并写 | 在**本轮之外**回复多个请求；或在 handler 里需要中途把数据交给 socket |
 | `Config.MaxWriteQueueBytes` / `Connection.SetWriteQueueLimit(n)` | 限制单条连接发送队列的字节数；超过时 `Send` 返回 `ErrSendQueueFull` 并关闭连接 | 广播给可能不再读的连接 |
+
+**整体响应的 body** 不拷贝，直接交给 `SendParts`。handler 若要在调用返回时拿回自己的 buffer
+（下一个请求还要重新填的 scratch buffer），改用 `Context.RespondCopy` 或
+`Context.WriteResponseCopy`；见 [§7](#7-零拷贝读contextbody--contextquery)。
 
 **在 OnData 之外手动 cork**
 

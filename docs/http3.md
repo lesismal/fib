@@ -174,8 +174,13 @@ request that arrives whole in one packet, as most do, costs none.
   into one power-of-two buffer (see [Load testing](loadtest.md)). Whatever its
   size, the body stays where the handler gave it until the peer has
   acknowledged the response, and the frames are the stream's own, so it must
-  not be changed once `Respond` or `WriteResponse` returns, unless that call
-  copies it; `fibhttp.Response.Body` states that rule for every protocol.
+  not be changed once `Respond` or `WriteResponse` returns;
+  `fibhttp.Response.Body` states that rule for every protocol. A handler that
+  wants its buffer back at the call answers with `RespondCopy` or
+  `WriteResponseCopy`: the copy is taken from the pool, and QUIC keeps it as an
+  owned run, returning it once the peer has acknowledged it, so with a warm
+  pool the opt-in copy allocates nothing. `WriteResponseCopy` copies the
+  trailer too, which is otherwise kept like the body.
   Streaming the body through `Write` and `Flush` keeps what waits to 64KiB
   instead.
 - A request that is complete goes to the engine's handler pool, as

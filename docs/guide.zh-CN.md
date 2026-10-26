@@ -661,6 +661,12 @@ func(c *fibhttp.Context) {
   拷贝，或改用会拷贝 body 的写方法。用 `Context.Body` 回显请求 body 时 HTTP/1 会拷贝
   它，因为请求的缓冲在 handler 返回后就要还给池；经过 TLS 的 body 也会被封进记录，
   同样会拷贝。见 `fibhttp.Response.Body`。
+- handler 要提前复用 body（或 trailer）就用 `RespondCopy`/`WriteResponseCopy`：它们在调用时
+  拷贝 body，后者还拷贝 trailer 的 map 和其中的值，调用一返回 handler 就能改、能重新填；
+  默认路径不拷贝。拷贝在 send 路径能接管时取自池——HTTP/1 的 send 会把它拷进本轮缓冲或
+  队列后归还池缓冲，HTTP/3 则作为 owned run 留到对端确认——池是热的时零分配；HTTP/2 的
+  stream 会把 body 留到窗口放行为止，所以它的拷贝是普通分配。见 `fibhttp.Response.Body` 与
+  `fibhttp.Response.Trailer`。
 - `ReadFrom`（`io.Copy`、`http.ServeContent` 都会用到）遇到普通文件，或包着文件的
   `*io.LimitedReader` 时，通过 `Connection.SendFile` 发送；TLS 连接退化为读取后加密发送。
 - handler 返回时响应自动结束（写出剩余数据、结束 chunk、发送 trailer），与 `net/http`

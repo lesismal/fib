@@ -86,6 +86,19 @@ server takes that buffer back once the handler returns, and a body going
 through a layer that transforms it, such as TLS, which seals it into records
 of its own.
 
+A handler that wants its own buffer back as soon as the call returns, to fill
+again or to change, answers with `RespondCopy` or `WriteResponseCopy` instead:
+they copy the body — and `WriteResponseCopy` the trailer, map and values — at
+the call, so what goes on the wire is the copy, and the handler may reuse its
+buffer at once. It is the one per-response opt-in; nothing else copies a body
+for the handler's sake, except the request's own buffer and a layer's records.
+The copy comes from the pool: the send copies it into the round's buffer or
+the queue, as it copies the head, and gives it back once that returns, so a
+warm pool makes the opt-in allocate nothing. What it costs is copying the body
+rather than handing it over, which is the price of getting the handler's own
+buffer back. See `fibhttp.Response.Body`, and `fibhttp.Response.Trailer` for
+what the same rule asks of a trailer.
+
 ### Transfer codings
 
 Chunked is not the only transfer coding decoded (RFC 9112 section 7). A body

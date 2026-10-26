@@ -645,8 +645,11 @@ func (c *Context) BodyComplete() bool {
 // The bytes stay the handler's for as long as the body does: until the
 // response is finished, at the handler's return or at the last Release of a
 // request it retained. They must not be changed, nor kept past that; keep a
-// copy instead. Respond and Write copy what they are given, so the body can
-// be answered with as it is.
+// copy instead. They can be answered with as they are: a body that is the
+// request's own is the one buffer the server recycles, so a protocol that
+// goes on reading the body after the response — HTTP/3, until the peer
+// acknowledges it — copies it. A scratch buffer the handler fills again goes
+// through RespondCopy or WriteResponseCopy instead; see Response.Body.
 //
 // It returns nil for a request without a body, and for one whose body streams,
 // which RequestBody and OnBody read instead.
