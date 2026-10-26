@@ -5,6 +5,7 @@ package fib
 import (
 	"runtime"
 	"strconv"
+	"sync"
 	"sync/atomic"
 	"syscall"
 	"testing"
@@ -85,11 +86,19 @@ func testEpollRelay(t *testing.T, pipes int) {
 	written := make([]atomic.Int64, pipes)
 	acks := make([]chan struct{}, pipes)
 	stop := make(chan struct{})
+	// The writers hold raw descriptor numbers: they must be gone before the
+	// defer closes those, or a write can land in a descriptor a later test has
+	// been given, and its connection gets a byte nobody sent it. Waiting for
+	// them is deferred after the closers, so it runs before them.
+	var wg sync.WaitGroup
+	defer wg.Wait()
 	defer close(stop)
 	for i := 0; i < pipes; i++ {
 		acks[i] = make(chan struct{}, 1)
 		acks[i] <- struct{}{}
+		wg.Add(1)
 		go func(i int) {
+			defer wg.Done()
 			rnd := uint64(i + 1)
 			for {
 				select {
@@ -126,7 +135,9 @@ func testEpollRelay(t *testing.T, pipes int) {
 	}
 
 	const lostAfter = 500 * time.Millisecond
+	wg.Add(1)
 	go func() {
+		defer wg.Done()
 		for {
 			select {
 			case <-stop:
