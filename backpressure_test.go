@@ -10,6 +10,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"runtime"
 	"slices"
 	"strconv"
 	"sync"
@@ -1535,6 +1536,13 @@ func waitConnState(t *testing.T, c *Connection, what string, check func() bool) 
 // write edge's round, or on Windows the next completed send's, reads once the
 // backlog is under the watermark.
 func TestDeferredReadDeliveredWhileQueueStaysNonEmpty(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		// Windows hears of data through a zero-byte read posted between
+		// rounds, and the round waiting in the handler has used its own: a
+		// ping that arrives meanwhile raises no edge to note, and is found
+		// by the read the next round posts.
+		t.Skip("Windows posts its read probe between rounds")
+	}
 	const (
 		watermark = 1 << 20
 		chunk     = 32 << 10

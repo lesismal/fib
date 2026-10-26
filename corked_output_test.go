@@ -4,6 +4,7 @@ package fib
 
 import (
 	"io"
+	"runtime"
 	"testing"
 	"time"
 )
@@ -16,6 +17,13 @@ import (
 // queueing, which is what a response written beside a streaming one used to
 // do.
 func TestWaitOutputSeesCorkedBytes(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		// An overlapped send hands the whole queued slice to the kernel at
+		// once, so the queue drains as far as fib is concerned even with a
+		// small SO_SNDBUF, which Windows keeps as a hint: there is no
+		// backlog left for the wait to stand behind.
+		t.Skip("Windows hands a queued send to the kernel whole")
+	}
 	c, client := connectOne(t, HandlerFuncs{})
 	defer client.Close()
 	// Keep the socket from swallowing the whole payload, so the wait really
