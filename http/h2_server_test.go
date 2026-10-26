@@ -666,32 +666,54 @@ func TestH2ServerCancelsTheContextOfAResetStream(t *testing.T) {
 }
 
 // fibStacks names the goroutines whose stack mentions this module, one line
-// each, so that a failure annotation carries where the server is without the
-// thousands of lines the whole dump would take.
+// each with the functions it is in, from the innermost out: a failure
+// annotation is small, and this is what says where the server waits.
 func fibStacks() string {
 	var dump bytes.Buffer
 	_ = pprof.Lookup("goroutine").WriteTo(&dump, 1)
 	var out []string
 	lines := strings.Split(dump.String(), "\n")
-	for i, line := range lines {
-		if strings.HasPrefix(line, "goroutine ") {
-			keep := false
-			for j := i; j < len(lines) && j < i+12; j++ {
-				if strings.Contains(lines[j], "lesismal/fib/") {
-					keep = true
-					break
-				}
+	for i := 0; i < len(lines); i++ {
+		line := strings.TrimSpace(lines[i])
+		if !strings.Contains(line, " @ 0x") {
+			continue
+		}
+		head := strings.SplitN(line, " @ ", 2)[0]
+		var names []string
+		fib := false
+		for j := i + 1; j < len(lines) && j < i+40; j++ {
+			l := strings.TrimSpace(lines[j])
+			if strings.Contains(l, " @ 0x") {
+				break
 			}
-			if keep {
-				out = append(out, line)
-				for j := i + 1; j < len(lines) && j < i+8 && !strings.HasPrefix(lines[j], "goroutine "); j++ {
-					out = append(out, lines[j])
-				}
+			if !strings.HasPrefix(l, "#") {
+				continue
+			}
+			fields := strings.Fields(l)
+			if len(fields) < 3 {
+				continue
+			}
+			fn := fields[2]
+			if idx := strings.LastIndex(fn, "/"); idx >= 0 {
+				fn = fn[idx+1:]
+			}
+			if strings.Contains(fields[2], "lesismal/fib/") {
+				fib = true
+			}
+			if len(names) < 6 {
+				names = append(names, fn)
 			}
 		}
+		if fib {
+			out = append(out, head+" in "+strings.Join(names, "<-"))
+		}
 	}
-	if len(out) > 40 {
-		out = out[:40]
+	if len(out) > 8 {
+		out = out[:8]
 	}
-	return strings.Join(out, " | ")
+	text := strings.Join(out, " | ")
+	if len(text) > 1800 {
+		text = text[:1800]
+	}
+	return text
 }
