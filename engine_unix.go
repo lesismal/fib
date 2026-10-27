@@ -71,9 +71,14 @@ type enginePlatform struct {
 	// goroutine calls it, and listenAddrs, the addresses they were bound to
 	// when they stopped: on Darwin and the BSDs a stopped listener's
 	// descriptor holds an unbound socket, so its address is kept from before.
-	listenMu      sync.Mutex
-	listenStopped bool
-	listenAddrs   []syscall.Sockaddr
+	// It also guards the list of listeners where a goroutine other than the
+	// loop changes it, and listenReleased, which says Close has taken the
+	// listeners to close: closeBinding on an engine with no loop of its own
+	// leaves them to Close from then on.
+	listenMu       sync.Mutex
+	listenStopped  bool
+	listenReleased bool
+	listenAddrs    []syscall.Sockaddr
 	// connections is a paged table indexed by file descriptor: a descriptor is
 	// a small dense integer the kernel already allocates, so the lookup on
 	// every event is two bounds checks rather than a hash.
@@ -979,7 +984,13 @@ func (e *Engine) release() error {
 	}
 	e.closeUDPPeers()
 	e.budgetPaused = nil
-	for _, l := range e.listeners {
+	// An engine with no loop of its own has its listeners taken off by
+	// closeBinding on the goroutine that calls it, under listenMu.
+	e.listenMu.Lock()
+	listeners := e.listeners
+	e.listenReleased = true
+	e.listenMu.Unlock()
+	for _, l := range listeners {
 		if l.shared && e.parent != nil {
 			// The engine's own, closed below once every poller is done
 			// with it.

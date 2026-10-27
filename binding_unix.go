@@ -375,10 +375,11 @@ func (e *Engine) closeBinding(i int, keepUDP bool) (bool, error) {
 	if e.noLoop {
 		e.listenMu.Lock()
 		var held []streamListener
-		if err == nil {
+		if err == nil && !e.listenReleased {
 			held = e.dropListenersLocked(i)
 		} else {
-			// A poller may still wait on them, so they stay for Close.
+			// A poller may still wait on them, or Close has taken them, so
+			// they stay for Close.
 			for _, l := range e.listeners {
 				found = found || l.binding == i
 			}
