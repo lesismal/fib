@@ -81,6 +81,8 @@ func (c *earlyRawClient) exchange(t *testing.T, addr string, req []byte, want fu
 	t.Helper()
 	var mu sync.Mutex
 	var data []byte
+	var closed bool
+	var closeErr error
 	wake := make(chan struct{}, 1)
 	nudge := func() {
 		select {
@@ -97,7 +99,12 @@ func (c *earlyRawClient) exchange(t *testing.T, addr string, req []byte, want fu
 			mu.Unlock()
 			nudge()
 		},
-		Close: func(_ *fib.Connection, _ error) { nudge() },
+		Close: func(_ *fib.Connection, err error) {
+			mu.Lock()
+			closed, closeErr = true, err
+			mu.Unlock()
+			nudge()
+		},
 	}
 	err := fibtls.DialWithOptions(c.engine, "tcp", addr, 5*time.Second, c.tlsConfig,
 		fibtls.DialOptions{SessionCache: c.cache, EarlyData: true}, handler,
@@ -130,6 +137,7 @@ func (c *earlyRawClient) exchange(t *testing.T, addr string, req []byte, want fu
 	for {
 		mu.Lock()
 		got := append([]byte(nil), data...)
+		ended, why := closed, closeErr
 		mu.Unlock()
 		if want != nil && want(got) {
 			break
@@ -137,7 +145,10 @@ func (c *earlyRawClient) exchange(t *testing.T, addr string, req []byte, want fu
 		select {
 		case <-wake:
 		case <-deadline.C:
-			t.Fatalf("timed out; got %q", got)
+			if ended {
+				t.Fatalf("timed out; got %q, and the connection closed: %v", got, why)
+			}
+			t.Fatalf("timed out; got %q, the connection still open", got)
 		}
 	}
 	// What want saw may be the start of the rest, so give the round a moment

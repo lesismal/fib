@@ -787,9 +787,11 @@ func (s *covConnEarlyServer) OnHandshake(_ *fib.Connection, state stdtls.Connect
 	s.mu.Unlock()
 }
 
-// A server that takes early data sends what OnOpen sent, and close_notify
-// after it if OnOpen asked, as soon as its flight is out, and tells the
-// handler of the handshake then. A client that would send early data whose
+// A server that takes early data sends what OnOpen sent as soon as its
+// flight is out, and tells the handler of the handshake then; the
+// close_notify OnOpen asked for follows once the handshake is over, and
+// nothing is sent after the CloseAfterSend, the answer to the early data
+// included. A client that would send early data whose
 // hello cannot be sent fails before its handshake starts.
 func TestCovConnEarlyServerFlushesOpen(t *testing.T) {
 	serverConfig, clientConfig := tlsConfigs(t)

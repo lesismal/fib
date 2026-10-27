@@ -7,6 +7,8 @@ import (
 	stdtls "crypto/tls"
 	"crypto/x509"
 	"encoding/pem"
+	"errors"
+	"io"
 	"net"
 	"os"
 	"os/exec"
@@ -384,4 +386,68 @@ func testClientEarlyDataToOpenSSL(t *testing.T, openssl string, suiteArgs []stri
 	if !strings.Contains(log, "Early data received") || !strings.Contains(log, "zero-rtt-line") {
 		t.Fatalf("s_server did not take the early data:\n%s", log)
 	}
+}
+
+// earlyCloser answers early data and ends the connection after the answer,
+// as an HTTP/1 server does for a request that says Connection: close.
+type earlyCloser struct {
+	fib.HandlerFuncs
+}
+
+func (earlyCloser) OnEarlyData(c *fib.Connection, b []byte) {
+	_ = c.Send(append([]byte("early:"), b...))
+	c.CloseAfterSend()
+}
+
+// TestEarlyAnswerClosesAfterHandshake has a server answer early data and
+// close at once, ahead of the end of its handshake: the connection closes
+// only once the client's last flight is read, so that it ends cleanly rather
+// than reset over bytes the server never read, a reset that on Windows took
+// the answer with it. The handshake is over by then, and the ticket that
+// follows it reaches the client.
+func TestEarlyAnswerClosesAfterHandshake(t *testing.T) {
+	serverConfig, clientConfig := tlsConfigs(t)
+	clientConfig.MinVersion = stdtls.VersionTLS13
+	server := NewServer(serverConfig, earlyCloser{fib.HandlerFuncs{Data: func(c *fib.Connection, b []byte) {
+		_ = c.Send(append([]byte("data:"), b...))
+	}}})
+	server.EarlyData = true
+	_, addr := startEchoServer(t, fib.DefaultConfig(), server)
+	client, _ := startEchoServer(t, fib.DefaultConfig(), nil)
+	cache := NewQUICSessionCache(4)
+	dial := func(write string) *covConnRecorder {
+		t.Helper()
+		r := newCovConnRecorder()
+		err := DialWithOptions(client, "tcp", addr, 5*time.Second, clientConfig, DialOptions{SessionCache: cache, EarlyData: true}, r,
+			func(c *fib.Connection, err error) {
+				if err == nil {
+					_ = c.Send([]byte(write))
+				}
+			})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return r
+	}
+	ticket := func(not *QUICSession) *QUICSession {
+		t.Helper()
+		for deadline := time.Now().Add(5 * time.Second); time.Now().Before(deadline); time.Sleep(5 * time.Millisecond) {
+			if s := cache.Get("localhost"); s != nil && s != not {
+				return s
+			}
+		}
+		t.Fatal("no new ticket")
+		return nil
+	}
+
+	dial("first").waitData(t, "data:first")
+	used := ticket(nil)
+	second := dial("zero-rtt")
+	if err := second.waitClose(t); err != nil && !errors.Is(err, io.EOF) {
+		t.Fatalf("closed with %v", err)
+	}
+	if _, got, _, _ := second.snapshot(); string(got) != "early:zero-rtt" {
+		t.Fatalf("received %q, want %q", got, "early:zero-rtt")
+	}
+	ticket(used)
 }

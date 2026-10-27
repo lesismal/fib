@@ -592,8 +592,15 @@ type layer struct {
 
 	// wmu orders sends. Until ready, they wait in pending in the order they
 	// were made, and closeAfterSend remembers a CloseAfterSend among them.
+	// earlyAhead says a server sends ahead of the end of its handshake, as
+	// earlyOpened does, until the handshake is over: a CloseAfterSend then
+	// waits for it, so that the client's last flight is read before the
+	// connection closes. Closing over bytes still to come resets the
+	// connection, and on Windows the reset takes with it what the client has
+	// yet to read of the answer.
 	wmu            sync.Mutex
 	ready          bool
+	earlyAhead     bool
 	failed         bool
 	pending        [][]byte
 	closeAfterSend bool
@@ -932,7 +939,7 @@ func (t *layer) CloseAfterSend() {
 		return
 	}
 	t.closeAfterSend = true
-	if t.ready {
+	if t.ready && !t.earlyAhead {
 		t.closeNotifyLocked()
 	} else if t.failed {
 		t.c.Close()
@@ -1196,7 +1203,7 @@ func (t *layer) serveEarly(handler fib.Handler, hs nativeHandshake, es earlyServ
 		t.state = &state
 		t.wmu.Lock()
 		t.tx = keys
-		pending, closeAfterSend := t.pending, t.closeAfterSend
+		pending := t.pending
 		t.pending = nil
 		var err error
 		for i, held := range pending {
@@ -1209,10 +1216,9 @@ func (t *layer) serveEarly(handler fib.Handler, hs nativeHandshake, es earlyServ
 		if err != nil {
 			t.failed = true
 		} else {
-			t.ready = true
-			if closeAfterSend {
-				t.closeNotifyLocked()
-			}
+			// A CloseAfterSend waits for the end of the handshake, which
+			// sends the close_notify; see earlyAhead.
+			t.ready, t.earlyAhead = true, true
 		}
 		t.wmu.Unlock()
 		if err != nil {
@@ -1306,6 +1312,7 @@ func (t *layer) completeNative(handler fib.Handler, hs nativeHandshake, rest []b
 		bufferpool.Put(held)
 		pending[i] = nil
 	}
+	t.earlyAhead = false
 	if err != nil {
 		t.failed = true
 	} else {
