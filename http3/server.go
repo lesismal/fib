@@ -83,6 +83,10 @@ type Config struct {
 	// only as the handler consumes what it has. Off, the default, a handler
 	// runs only once its request has arrived whole.
 	StreamRequestBody bool
+	// StreamRequestBody does not cost a request its recycling: one whose
+	// body turns out to stream is left out of the pool (see DisableReuse),
+	// and the rest, most of a streaming server's requests, are recycled by
+	// default.
 	// StreamRequestBodyThreshold keeps the smaller bodies read whole when
 	// StreamRequestBody is set: only a body whose content-length is larger
 	// than this, or one without a content-length of which more than this has
@@ -1100,8 +1104,13 @@ func (sc *serverConn) newRequestStream(s *quic.Stream) *requestStream {
 		sc.lastRequest = time.Now()
 	}
 	sc.mu.Unlock()
+	// Every request starts out recyclable, whatever Config.StreamRequestBody
+	// says: that setting says what the server may do with a body, not what a
+	// request turned out to be, and most requests have none. One whose body
+	// does stream keeps itself out of the pool once it does, as a tunnel
+	// does; see startStream.
 	var rs *requestStream
-	if !sc.h.config.DisableReuse && !sc.h.config.StreamRequestBody {
+	if !sc.h.config.DisableReuse {
 		rs = requestStreamPool.Get().(*requestStream)
 		rs.pooled = true
 	} else {
@@ -1317,8 +1326,10 @@ type requestStream struct {
 	// refs counts what still may, the connection's table until untrack and
 	// the Context from the handler's dispatch until it ends, and the last
 	// of them to go puts the stream on the connection's dead list through
-	// nextDead; see serverConn.recycleDead. A request header taken from the
-	// pool is headerFromPool. Both fields sit higher up, where they pack.
+	// nextDead; see serverConn.recycleDead. A request whose body streams to
+	// its handler, or that becomes a tunnel, sets it back to false, and is
+	// left to the collector. A request header taken from the pool is
+	// headerFromPool. Both fields sit higher up, where they pack.
 	nextDead       *requestStream
 	headerFromPool *pooledHeader
 }
@@ -1709,6 +1720,12 @@ func (rs *requestStream) onFrame(typ uint64, payload []byte) error {
 // arrived already, a buffer from the pool, whose room was given back as it
 // came.
 func (rs *requestStream) startStream(buffered []byte) {
+	// The body streams to its handler, whose reads of it may outlast the
+	// request's response, so the request is not recycled; as a tunnel, it
+	// keeps itself out of the pool. Config.StreamRequestBody alone does not
+	// settle that: most of a streaming server's requests have no body, and
+	// those do go back to the pool.
+	rs.pooled = false
 	sc, b := rs.sc, rs.streamed
 	var sendContinue func()
 	if len(buffered) == 0 && strings.EqualFold(rs.req.Header.Get("Expect"), "100-continue") {

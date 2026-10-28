@@ -198,9 +198,11 @@ request that arrives whole in one packet, as most do, costs none.
   it holds, is recycled once the request has ended, unless
   `Config.DisableReuse` is set: a handler must not keep any of them past its
   response and its last `Release`, the rule `http.Config.ReuseRequests`
-  describes. Requests whose body streams and extended CONNECTs are not
-  recycled. On a server held to 8 CPUs this served 1.56M requests a second
-  where leaving them to the collector served 1.19M.
+  describes. A request whose body streams, and an extended CONNECT, are not
+  recycled; `Config.StreamRequestBody` does not settle it for the others, so a
+  bodyless GET is recycled as on HTTP/1 and HTTP/2, which is most of a
+  streaming server's requests. On a server held to 8 CPUs this served 1.56M
+  requests a second where leaving them to the collector served 1.19M.
 
 ### Fixed parameters
 

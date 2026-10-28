@@ -141,7 +141,9 @@
 - 请求结束后，请求的 stream 连同它持有的 `*http.Request`、`Header`、`URL`、`*Context` 会被
   复用（设置 `Config.DisableReuse` 则不复用）：handler 不能在响应完成、最后一次 `Release` 之后
   继续持有它们，规则同 `http.Config.ReuseRequests`。body 流式交付的请求和 extended CONNECT
-  不复用。服务端限制在 8 个 CPU 时，复用后每秒 156 万请求，不复用 119 万。
+  不复用；`Config.StreamRequestBody` 只让 body 真正流式交付的请求留在池外，其余请求——流式
+  服务端的大多数，即无 body 的 GET——与 HTTP/1、HTTP/2 一样复用。服务端限制在 8 个 CPU 时，
+  复用后每秒 156 万请求，不复用 119 万。
 
 ### 固定参数
 
