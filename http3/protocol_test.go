@@ -224,8 +224,9 @@ type rawServer struct {
 	closed  chan error
 	// setup writes the control stream's frames after SETTINGS.
 	setup func(control *quic.Stream)
-	// respond writes a response on a request stream.
-	respond func(s *quic.Stream)
+	// respond writes a response on a request stream. Like setup, it is set
+	// before the server starts, which reads it on its own goroutine.
+	respond func(r *rawServer, s *quic.Stream)
 }
 
 func (r *rawServer) OnHandshake(qc *quic.Conn) {
@@ -247,7 +248,7 @@ func (r *rawServer) OnStreamData(s *quic.Stream, _ []byte, fin bool) {
 		return
 	}
 	if r.respond != nil {
-		r.respond(s)
+		r.respond(r, s)
 		return
 	}
 	block := append([]byte(nil), qpack.Prefix...)
@@ -291,13 +292,13 @@ func (h *rawServerHandler) OnClose(c *fib.Connection, err error) {
 }
 
 // startRawServer serves HTTP/3 by hand and returns the server and its URL.
-func startRawServer(t *testing.T, setup func(control *quic.Stream)) (*rawServer, string) {
+func startRawServer(t *testing.T, setup func(control *quic.Stream), respond func(r *rawServer, s *quic.Stream)) (*rawServer, string) {
 	t.Helper()
 	serverTLS, _, err := tlstest.Configs()
 	if err != nil {
 		t.Fatal(err)
 	}
-	server := &rawServer{closed: make(chan error, 4), setup: setup}
+	server := &rawServer{closed: make(chan error, 4), setup: setup, respond: respond}
 	config := fib.DefaultConfig()
 	engine, err := fib.New(config, fib.Binding{Network: "udp", Addr: "127.0.0.1:0", Handler: &rawServerHandler{t: t, server: server,
 		config: quic.Config{TLSConfig: ConfigureTLS(serverTLS)}}})
@@ -342,7 +343,7 @@ func controlFrame(typ uint64, payload []byte) []byte {
 func TestClientRejectsMaxPushID(t *testing.T) {
 	server, url := startRawServer(t, func(control *quic.Stream) {
 		_ = control.Write(controlFrame(frameMaxPushID, quic.AppendVarint(nil, 10)), false)
-	})
+	}, nil)
 	expectClientCloses(t, server, url, ErrCodeFrameUnexpected)
 }
 
@@ -351,7 +352,7 @@ func TestClientRejectsMaxPushID(t *testing.T) {
 func TestClientRejectsCancelPush(t *testing.T) {
 	server, url := startRawServer(t, func(control *quic.Stream) {
 		_ = control.Write(controlFrame(frameCancelPush, quic.AppendVarint(nil, 0)), false)
-	})
+	}, nil)
 	expectClientCloses(t, server, url, ErrCodeIDError)
 }
 
@@ -360,26 +361,24 @@ func TestClientRejectsCancelPush(t *testing.T) {
 func TestClientRejectsGoAwayOnAnotherStreamType(t *testing.T) {
 	server, url := startRawServer(t, func(control *quic.Stream) {
 		_ = control.Write(controlFrame(frameGoAway, quic.AppendVarint(nil, 3)), false)
-	})
+	}, nil)
 	expectClientCloses(t, server, url, ErrCodeIDError)
 }
 
 // GOAWAY may only lower the identifier it names (RFC 9114 section 5.2).
 func TestClientRejectsRaisedGoAway(t *testing.T) {
-	var server *rawServer
 	server, url := startRawServer(t, func(control *quic.Stream) {
 		// Stream 0, the request this test sends, is below this one and so
 		// is served; the connection therefore stays open.
 		_ = control.Write(controlFrame(frameGoAway, quic.AppendVarint(nil, 4)), false)
-	})
-	// The second GOAWAY goes out once the request is there, and raises what
-	// the first one named. The request itself is left unanswered.
-	server.respond = func(*quic.Stream) {
-		server.mu.Lock()
-		control := server.control
-		server.mu.Unlock()
+	}, func(r *rawServer, _ *quic.Stream) {
+		// The second GOAWAY goes out once the request is there, and raises
+		// what the first one named. The request itself is left unanswered.
+		r.mu.Lock()
+		control := r.control
+		r.mu.Unlock()
 		_ = control.Write(controlFrame(frameGoAway, quic.AppendVarint(nil, 8)), false)
-	}
+	})
 	expectClientCloses(t, server, url, ErrCodeIDError)
 }
 
@@ -394,18 +393,17 @@ func TestClientRejectsQPACKInsertion(t *testing.T) {
 		}
 		// An Insert With Literal Name instruction, which needs a table.
 		_ = encoder.Write([]byte{streamQPACKEncoder, 0x40 | 0x03, 'a', 'b', 'c', 0x00}, false)
-	})
+	}, nil)
 	expectClientCloses(t, server, url, ErrCodeQPACKEncoderStreamError)
 }
 
 // A response whose field section refers to the dynamic table cannot be
 // decoded (RFC 9204 section 2.2).
 func TestClientRejectsDynamicTableReference(t *testing.T) {
-	server, url := startRawServer(t, nil)
-	server.respond = func(s *quic.Stream) {
+	server, url := startRawServer(t, nil, func(_ *rawServer, s *quic.Stream) {
 		// A Required Insert Count of one refers to a table that is empty.
 		_ = s.Write(appendHeadersFrame(nil, []byte{0x02, 0x00, 0x80}), true)
-	}
+	})
 	expectClientCloses(t, server, url, ErrCodeQPACKDecompressionFailed)
 }
 
