@@ -679,28 +679,58 @@ func (t *layer) sealSendWith(keys *recordKeys, typ byte, first, second []byte) e
 	if t.ktls == ktlsOn {
 		return t.kernelSendLocked(typ, first, second)
 	}
-	n := len(first) + len(second)
-	records := max(1, (n+maxPlaintext-1)/maxPlaintext)
-	if keys.seq > ^uint64(0)-uint64(records) {
-		return errSequenceExhausted
-	}
-	buf := bufferpool.Get(n + records*keys.overhead())[:0]
+	overhead := keys.overhead()
 	for {
-		a := first[:min(len(first), maxPlaintext)]
-		b := second[:min(len(second), maxPlaintext-len(a))]
-		var err error
-		if buf, err = keys.seal(buf, typ, a, b); err != nil {
-			bufferpool.Put(buf)
+		n := len(first) + len(second)
+		size := sealedSize(n, overhead)
+		// One more record than n alone needs: where the buffer is cut
+		// short, its last record is too.
+		if keys.seq > ^uint64(0)-uint64(size/(maxPlaintext+overhead)+2) {
+			return errSequenceExhausted
+		}
+		size = sealBufferSize(size)
+		buf := bufferpool.Get(size)[:0]
+		for {
+			take := min(maxPlaintext, size-len(buf)-overhead)
+			a := first[:min(len(first), take)]
+			b := second[:min(len(second), take-len(a))]
+			var err error
+			if buf, err = keys.seal(buf, typ, a, b); err != nil {
+				bufferpool.Put(buf)
+				return err
+			}
+			first, second = first[len(a):], second[len(b):]
+			if len(first)+len(second) == 0 || size-len(buf) <= overhead {
+				break
+			}
+		}
+		// The connection takes the sealed records over, rather than copying
+		// them into its queue while it is corked.
+		if err := t.c.SendRawPooled(buf); err != nil || len(first)+len(second) == 0 {
 			return err
 		}
-		first, second = first[len(a):], second[len(b):]
-		if len(first)+len(second) == 0 {
-			break
-		}
 	}
-	// The connection takes the sealed records over, rather than copying
-	// them into its queue while it is corked.
-	return t.c.SendRawPooled(buf)
+}
+
+// sealedSize is how many bytes n bytes of plaintext take sealed, in records
+// of maxPlaintext with overhead each.
+func sealedSize(n, overhead int) int {
+	return n + max(1, (n+maxPlaintext-1)/maxPlaintext)*overhead
+}
+
+// sealBufferSize is how much of size bytes of records to seal into one buffer
+// from the pool. The buffer waits in the connection's queue, whole, until the
+// socket has taken all of it, so one just past a size class, half of whose
+// next class it would leave empty, holds the class below instead, its last
+// record cut short to fit, and the rest goes in a buffer of its own: a
+// proxied 64 KiB read, framed for HTTP/2 and sealed, was 65.7 KB in a 128 KiB
+// buffer.
+func sealBufferSize(size int) int {
+	class := bufferpool.Align(size)
+	if half := class / 2; size-half < class/4 && half >= 4*maxPlaintext {
+		return half
+	}
+	return size
 }
 
 var _ fib.CorkHolder = (*layer)(nil)
