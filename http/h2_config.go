@@ -27,7 +27,10 @@ type HTTP2Config struct {
 	// setting, and 2^31-1.
 	StreamWindow int
 	// ConnWindow is the window of the whole connection, shared by its
-	// streams, given back once half of it has been taken. Zero means
+	// streams, given back once half of it has been taken; what a body that
+	// streams takes is given back only as the body is consumed, as its
+	// stream's window is, so it bounds what all the connection's streamed
+	// bodies may have waiting for their handlers together. Zero means
 	// DefaultH2ConnWindow (16MB); the value is kept between 65535 and
 	// 2^31-1.
 	ConnWindow int

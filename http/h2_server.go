@@ -115,7 +115,10 @@ type h2ServerConn struct {
 	// one feed, and only the reader touches it.
 	early bool
 	// recvWindow is what the client may still send before the next
-	// WINDOW_UPDATE, and recvUnacked what it sent since the last one.
+	// WINDOW_UPDATE, and recvUnacked what may be given back with it: what it
+	// sent since the last one, but for the bodies streaming to handlers that
+	// have yet to consume them. Both are guarded by mu, since a handler gives
+	// its body's share back as it consumes it.
 	recvWindow  int64
 	recvUnacked int64
 	// local is what the server lets the client send; see HTTP2Config.
@@ -234,12 +237,12 @@ func (f *h2Flusher) RunTask() {
 
 // h2ServerStream is one request and its response.
 type h2ServerStream struct {
-	sc  *h2ServerConn
-	id  uint32
-	req *stdhttp.Request
+	sc *h2ServerConn
+	id uint32
 	// pushed marks a stream this side promised, which carries a response
 	// only; the request it answers came in PUSH_PROMISE.
 	pushed bool
+	req    *stdhttp.Request
 	// The reader alone touches body, declared and feed, and, until the body
 	// streams, the receive window.
 	body        []byte
@@ -251,8 +254,12 @@ type h2ServerStream struct {
 	// guarded by the connection's mu, since it is given back as the handler
 	// consumes the body, from the handler's goroutine. creditSkip is how much
 	// of what the handler consumes was given back when it arrived.
+	// connHeld, also guarded by mu, is how much of the connection's window
+	// the body holds: what has arrived of it that the handler has yet to
+	// consume, given back as the handler consumes it, or once the stream ends.
 	feed       *BodyFeed
 	creditSkip int64
+	connHeld   int64
 	// The rest is guarded by the connection's mu.
 	remoteDone bool
 	responded  bool
@@ -878,24 +885,29 @@ func (sc *h2ServerConn) handleData(f *h2Frame) error {
 		}
 	}
 	length := int64(f.length)
+	var out []byte
+	if b := sc.local.bdp; b != nil {
+		out = b.data(length)
+	}
+	sc.mu.Lock()
 	if length > sc.recvWindow {
+		sc.mu.Unlock()
 		return h2ConnErr(H2FlowControlError, "DATA exceeds connection window")
 	}
 	sc.recvWindow -= length
-	sc.recvUnacked += length
-	var out []byte
-	if sc.recvUnacked >= sc.local.connWindow/2 {
-		out = h2AppendWindowUpdate(out, 0, uint32(sc.recvUnacked))
-		sc.recvWindow += sc.recvUnacked
-		sc.recvUnacked = 0
-	}
-	if b := sc.local.bdp; b != nil {
-		out = append(out, b.data(length)...)
-	}
-	sc.mu.Lock()
 	idle := sc.idleLocked(f.streamID)
 	st := sc.streams[f.streamID]
 	remoteDone := st != nil && st.remoteDone
+	// The data of a body streaming to its handler holds the connection's
+	// window until the handler consumes it, as it does its stream's, so that
+	// a handler slower than its client slows the client rather than leaving
+	// the body to pile up here; the rest of the frame is given back now.
+	held := int64(0)
+	if st != nil && !remoteDone && st.feed != nil && length <= st.recvWindow {
+		held = int64(len(f.payload))
+		st.connHeld += held
+	}
+	out = sc.creditConnLocked(out, length-held)
 	sc.sendLocked(out)
 	sc.mu.Unlock()
 	if idle {
@@ -1442,19 +1454,40 @@ func (sc *h2ServerConn) endStreamed(st *h2ServerStream, trailer stdhttp.Header) 
 }
 
 // creditBody gives the client back the window n bytes of a streamed body
-// took, once the handler has consumed them, half a window at a time.
+// took, once the handler has consumed them: the stream's half a window at a
+// time, and the connection's as creditConnLocked has it.
 func (sc *h2ServerConn) creditBody(st *h2ServerStream, n int) {
 	sc.mu.Lock()
 	defer sc.mu.Unlock()
 	skip := min(int64(n), st.creditSkip)
 	st.creditSkip -= skip
-	st.recvUnacked += int64(n) - skip
-	if st.remoteDone || sc.closed || sc.streams[st.id] != st || st.recvUnacked < sc.local.streamWindow/2 {
-		return
+	rest := int64(n) - skip
+	conn := min(rest, st.connHeld)
+	st.connHeld -= conn
+	out := sc.creditConnLocked(nil, conn)
+	st.recvUnacked += rest
+	if !st.remoteDone && !sc.closed && sc.streams[st.id] == st && st.recvUnacked >= sc.local.streamWindow/2 {
+		out = h2AppendWindowUpdate(out, st.id, uint32(st.recvUnacked))
+		st.recvWindow += st.recvUnacked
+		st.recvUnacked = 0
 	}
-	sc.sendLocked(h2AppendWindowUpdate(nil, st.id, uint32(st.recvUnacked)))
-	st.recvWindow += st.recvUnacked
-	st.recvUnacked = 0
+	sc.sendLocked(out)
+}
+
+// creditConnLocked counts n more bytes the client may be given back of the
+// connection's window, and appends to out the WINDOW_UPDATE that gives them
+// back once they come to half the window, or to as much as the client has
+// left of it. The second is for the window that bodies yet to be consumed
+// hold: what remains to be given back must not wait on them.
+func (sc *h2ServerConn) creditConnLocked(out []byte, n int64) []byte {
+	sc.recvUnacked += n
+	if sc.recvUnacked == 0 || sc.recvUnacked < sc.local.connWindow/2 && sc.recvUnacked < sc.recvWindow {
+		return out
+	}
+	out = h2AppendWindowUpdate(out, 0, uint32(sc.recvUnacked))
+	sc.recvWindow += sc.recvUnacked
+	sc.recvUnacked = 0
+	return out
 }
 
 // failBodyLocked tells the handler of a body still streaming that the rest of
@@ -2050,6 +2083,12 @@ func (sc *h2ServerConn) forgetLocked(st *h2ServerStream) {
 	if sc.streams[st.id] != st {
 		return
 	}
+	// What its body still holds of the connection's window is the
+	// connection's again, whether or not the handler goes on to consume it.
+	if st.connHeld > 0 {
+		sc.sendLocked(sc.creditConnLocked(nil, st.connHeld))
+		st.connHeld = 0
+	}
 	delete(sc.streams, st.id)
 	if len(sc.streams) == 0 {
 		sc.armIdleLocked()
@@ -2121,7 +2160,7 @@ func (st *h2ServerStream) recycle() {
 	st.values = [h2RequestValues]string{}
 	st.sc, st.id, st.req, st.pushed = nil, 0, nil, false
 	st.body, st.declared, st.recvWindow, st.recvUnacked = nil, 0, 0, 0
-	st.feed, st.creditSkip = nil, 0
+	st.feed, st.creditSkip, st.connHeld = nil, 0, 0
 	st.remoteDone, st.responded, st.trailer, st.localDone, st.reset, st.queued = false, false, nil, false, false, false
 	st.weight, st.turn = 0, 0
 	st.timedOut, st.writeTimer = false, nil
