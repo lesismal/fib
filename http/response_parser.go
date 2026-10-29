@@ -131,8 +131,11 @@ func (p *responseParser) buffered() bool { return len(p.buffer) > 0 }
 // returns its header, with streamedDone set, once the body has ended and the
 // sink has been told so.
 func (p *responseParser) feed(data []byte, req *stdhttp.Request) (*stdhttp.Response, error) {
-	p.buffer = bufferpool.Append(p.buffer, data)
 	p.streamedDone = false
+	if len(p.buffer) == 0 && p.started && p.framing == framingLength {
+		return p.feedLength(data), nil
+	}
+	p.buffer = bufferpool.Append(p.buffer, data)
 	for {
 		if p.head == nil {
 			done, err := p.parseHead(req)
@@ -261,6 +264,27 @@ func (p *responseParser) feedStream() (*stdhttp.Response, error) {
 		}
 		return nil, nil
 	}
+}
+
+// feedLength is feed for a Content-Length body that streams with nothing
+// held back from the last read: what was read goes to the sink from where it
+// was read, rather than through the parser's buffer, which would copy every
+// byte of the body and grow on every connection to the size of its reads.
+// Only what follows the body, the next response's start, is kept.
+func (p *responseParser) feedLength(data []byte) *stdhttp.Response {
+	n := min(int64(len(data)), p.remaining)
+	if n > 0 {
+		// Within the limit: parseHead refused a Content-Length past it.
+		_ = p.pass(data[:n])
+		p.remaining -= n
+	}
+	if p.remaining > 0 {
+		return nil
+	}
+	if int64(len(data)) > n {
+		p.buffer = bufferpool.Append(p.buffer, data[n:])
+	}
+	return p.endStream(nil)
 }
 
 // passBody gives the sink a piece of the body, decoding it first when it
