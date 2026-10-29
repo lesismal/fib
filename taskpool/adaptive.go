@@ -27,7 +27,8 @@ type AdaptiveConfig struct {
 	// greater than zero and not below MinWorkers.
 	MaxWorkers int
 	// QueueSize bounds the tasks waiting for a worker. A submission that finds
-	// the queue full waits for room.
+	// the queue full waits for room. The queue starts small and grows with
+	// its deepest backlog, up to this.
 	QueueSize int
 	// ShrinkInterval is how often the pool retires workers that stayed idle
 	// for the whole of the previous interval. Zero means one second.
@@ -393,7 +394,7 @@ type adaptivePool struct {
 	index int32
 	// workerWG is the backend's, since a worker may move between shards.
 	workerWG *sync.WaitGroup
-	ring     *taskRing
+	ring     taskRing
 	_        cacheLinePad
 	// The counters a wake-up reads and writes share a line, so that a hop
 	// of the fan-out moves one line between cores rather than one per
@@ -438,8 +439,8 @@ type adaptivePool struct {
 }
 
 func newAdaptivePool(b *adaptiveBackend, executor *executor, queueSize int, index int32) *adaptivePool {
-	p := &adaptivePool{backend: b, budget: &b.budget, executor: executor, workerWG: &b.workerWG,
-		ring: newTaskRing(queueSize), index: index}
+	p := &adaptivePool{backend: b, budget: &b.budget, executor: executor, workerWG: &b.workerWG, index: index}
+	p.ring.init(queueSize, ringStartCells)
 	p.notFull = sync.NewCond(&p.mu)
 	return p
 }

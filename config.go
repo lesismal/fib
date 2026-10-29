@@ -74,7 +74,9 @@ const (
 	// The queue holds connections the loop has made runnable but no worker has
 	// picked up yet, so it is sized from the pool rather than independently,
 	// within bounds that keep a small pool's queue usable and a large pool's
-	// queue from being allocated far wider than a round can fill.
+	// queue from growing far wider than a round can fill. Under ModeAdaptive
+	// the queue's memory follows its backlog, so a bound costs nothing until
+	// the queue reaches it.
 	eventsPerWorker = 10
 	minMaxEvents    = 10000
 	maxMaxEvents    = 100000

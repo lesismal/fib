@@ -17,10 +17,13 @@ func (indexTask) RunTask() {}
 // A producer or consumer that finds the ring full or empty yields: spinning
 // in place, it would hold a lone P until preemption took it off, 10ms a time,
 // and with GOMAXPROCS 1 the test would take minutes.
+//
+// The larger limits start from a segment of two cells, so that the queue grows
+// while producers claim in it and consumers drain the segments it left.
 func TestTaskRingDeliversEachTaskOnce(t *testing.T) {
-	for _, limit := range []int{1, 2, 3, 5, 8} {
+	for _, limit := range []int{1, 2, 3, 5, 8, 100, 1000} {
 		const tasks, producers, consumers = 200000, 3, 4
-		r := newTaskRing(limit)
+		r := newTaskRingFrom(limit, 2)
 		var seen [tasks]atomic.Int32
 		var taken atomic.Int64
 		var wg sync.WaitGroup
@@ -84,8 +87,9 @@ func TestTaskRingHoldsItsLimit(t *testing.T) {
 // reaches them; and a zeroed cell is free for its first lap.
 func TestTaskRingStartsUntouched(t *testing.T) {
 	r := newTaskRing(1000)
-	for i := range r.cells {
-		if seq := r.cells[i].seq.Load(); seq != 0 {
+	cells := r.tail.Load().cells
+	for i := range cells {
+		if seq := cells[i].seq.Load(); seq != 0 {
 			t.Fatalf("cell %d starts at seq %d", i, seq)
 		}
 	}
@@ -109,6 +113,92 @@ func TestTaskRingStartsUntouched(t *testing.T) {
 		if _, ok := r.pop(); ok {
 			t.Fatalf("lap %d: pop from an empty ring", lap)
 		}
+	}
+}
+
+// A queue starts small and grows only as far as its backlog takes it, so that
+// a pool with a limit of 100,000 tasks costs a few kilobytes while it is
+// never more than a few tasks deep.
+func TestTaskRingGrowsWithItsBacklog(t *testing.T) {
+	r := newTaskRing(100000)
+	if got := len(r.tail.Load().cells); got != ringStartCells {
+		t.Fatalf("a new queue has %d cells, want %d", got, ringStartCells)
+	}
+	// Many laps of a shallow queue leave it as it was.
+	for i := 0; i < 10*ringStartCells; i++ {
+		if !r.push(indexTask(i)) {
+			t.Fatalf("push %d refused", i)
+		}
+		if task, ok := r.pop(); !ok || task.(indexTask) != indexTask(i) {
+			t.Fatalf("pop %d = %v, %v", i, task, ok)
+		}
+	}
+	if r.head.Load() != r.tail.Load() || len(r.tail.Load().cells) != ringStartCells {
+		t.Fatal("a queue never more than one task deep grew")
+	}
+	// A backlog grows it, and its tasks come out in order across the
+	// segments.
+	const backlog = 5000
+	for i := 0; i < backlog; i++ {
+		if !r.push(indexTask(i)) {
+			t.Fatalf("push %d refused below the limit", i)
+		}
+	}
+	if got := r.len(); got != backlog {
+		t.Fatalf("len = %d, want %d", got, backlog)
+	}
+	// The segments of 256 to 2,048 cells hold 3,840 of them.
+	if got := len(r.tail.Load().cells); got != 4096 {
+		t.Fatalf("a backlog of %d grew the queue to %d cells, want 4096", backlog, got)
+	}
+	for i := 0; i < backlog; i++ {
+		if task, ok := r.pop(); !ok || task.(indexTask) != indexTask(i) {
+			t.Fatalf("pop %d = %v, %v", i, task, ok)
+		}
+	}
+	if _, ok := r.pop(); ok {
+		t.Fatal("pop from an empty queue")
+	}
+	if r.head.Load() != r.tail.Load() {
+		t.Fatal("the drained segments are still linked")
+	}
+}
+
+// The tasks in the segments a queue grew out of count against its limit
+// until they are taken.
+func TestTaskRingHoldsItsLimitWhileGrowing(t *testing.T) {
+	r := newTaskRingFrom(10, 2)
+	for i := 0; i < 10; i++ {
+		if !r.push(indexTask(i)) {
+			t.Fatalf("push %d refused below the limit", i)
+		}
+	}
+	if r.push(indexTask(10)) {
+		t.Fatal("push accepted past the limit")
+	}
+	if got := r.len(); got != 10 {
+		t.Fatalf("len = %d, want 10", got)
+	}
+	if r.head.Load() == r.tail.Load() {
+		t.Fatal("the queue did not grow")
+	}
+	if task, ok := r.pop(); !ok || task.(indexTask) != 0 {
+		t.Fatalf("pop = %v, %v, want the oldest task", task, ok)
+	}
+	if !r.push(indexTask(10)) {
+		t.Fatal("push refused after a pop made room")
+	}
+	if r.push(indexTask(11)) {
+		t.Fatal("push accepted past the limit")
+	}
+	for i := 1; i <= 10; i++ {
+		if task, ok := r.pop(); !ok || task.(indexTask) != indexTask(i) {
+			t.Fatalf("pop %d = %v, %v", i, task, ok)
+		}
+	}
+	// Segments of 2, 4 and 8 cells hold the 10 tasks.
+	if got := len(r.tail.Load().cells); got != 8 {
+		t.Fatalf("the queue grew to %d cells, want 8", got)
 	}
 }
 
