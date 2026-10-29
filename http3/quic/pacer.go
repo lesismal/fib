@@ -42,6 +42,12 @@ func (c *Conn) paceAllows(now time.Time) bool {
 	if !c.rtt.hasSample {
 		return true
 	}
+	if !c.paceLast.IsZero() && !now.After(c.paceLast) {
+		// The round's datagrams after its first find the budget as the
+		// first left it: no time has passed to fill it.
+		c.paceLast = now
+		return c.paceBudget >= c.maxDatagram
+	}
 	rate := c.pacingRate()
 	burst := max(float64(maxBurstPackets*c.maxDatagram), rate*2*minPacingDelay.Seconds())
 	if c.paceLast.IsZero() {

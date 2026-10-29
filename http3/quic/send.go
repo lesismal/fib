@@ -492,10 +492,16 @@ func (c *Conn) framesWaiting(space int) bool {
 	if cs.next < cs.end() || cs.hasLost() {
 		return true
 	}
-	return space == spaceApp && (len(c.sendQueue) > 0 || c.handshakeDonePending || c.newTokenPending ||
-		c.challengePending || c.maxDataPending ||
+	return space == spaceApp && (len(c.sendQueue) > 0 || c.controlPending())
+}
+
+// controlPending reports whether a control frame of the application space
+// waits to be sent, which appendControlFrames finds out for sure: false
+// means it has none, as nearly every packet of a transfer finds.
+func (c *Conn) controlPending() bool {
+	return c.handshakeDonePending || c.newTokenPending || c.challengePending || c.maxDataPending ||
 		c.maxStreamsBidiPending || c.maxStreamsUniPending || len(c.pathResponses) > 0 ||
-		len(c.retireCIDs) > 0 || c.cidsPending || c.blockedPending() || c.pingPending || c.ackFreqPending)
+		len(c.retireCIDs) > 0 || c.cidsPending || c.blockedPending() || c.pingPending || c.ackFreqPending
 }
 
 // appendFrames adds a space's ack-eliciting frames, up to max bytes of
@@ -512,6 +518,9 @@ func (c *Conn) appendFrames(b []byte, space, max int, sp *sentPacket) []byte {
 }
 
 func (c *Conn) appendControlFrames(b []byte, max int, sp *sentPacket) []byte {
+	if !c.controlPending() {
+		return b
+	}
 	fits := func(n int) bool { return len(b)+n <= max }
 	if c.handshakeDonePending && fits(1) {
 		b = append(b, frameHandshakeDone)
