@@ -122,6 +122,14 @@ type BodyStream struct {
 	buf   []byte
 	read  int
 	spare []byte
+	// more holds, for a body that arrives on a multiplexed connection, what
+	// arrived after buf filled up: chunks of streamChunk bytes, oldest
+	// first, which buf moves on to as it empties. A body that waits there
+	// for its handler, up to its stream's window, takes as many bytes as
+	// are waiting, a chunk at a time, rather than one buffer grown, a copy
+	// at a time, to the next class up, and each chunk goes back to the pool
+	// as soon as it has been handed on.
+	more [][]byte
 	// remaining counts down a Content-Length body; chunked leaves it at -1
 	// and decoder frames the body instead.
 	remaining int64
@@ -331,6 +339,16 @@ func (s *BodyStream) drain(worker bool) {
 		}
 		full, pending := s.buf, s.buf[s.read:]
 		s.buf, s.read = nil, 0
+		if len(s.more) > 0 {
+			// The next chunk is the buffer from here; this one goes to
+			// the sink.
+			s.buf = s.more[0]
+			s.more[0] = nil
+			s.more = s.more[1:]
+			if len(s.more) == 0 {
+				s.more = nil
+			}
+		}
 		s.releaseLocked()
 		var fin bool
 		var err error
@@ -338,7 +356,7 @@ func (s *BodyStream) drain(worker bool) {
 		case len(pending) > 0:
 			// The body's end goes with its last bytes, but an error is
 			// reported on a call of its own once the bytes before it are in.
-			fin = s.ended && s.err == nil
+			fin = s.ended && s.err == nil && len(s.buf) == 0
 		case s.abandoned && !s.ended && s.err == nil:
 			fin, err = true, ErrBodyAbandoned
 		default:
@@ -386,12 +404,58 @@ func (s *BodyStream) recycleLocked(buf []byte, last bool) {
 }
 
 // appendLocked buffers data after what is waiting already, in the spare
-// buffer when the stream has none, growing it through the pool.
+// buffer when the stream has none, growing it through the pool; or, for a
+// body on a multiplexed connection, in chunks (see more).
 func (s *BodyStream) appendLocked(data []byte) {
 	if s.buf == nil && s.spare != nil {
 		s.buf, s.spare = s.spare, nil
 	}
-	s.buf = bufferpool.Append(s.buf, data)
+	if !s.offload {
+		s.buf = bufferpool.Append(s.buf, data)
+		return
+	}
+	if s.buf == nil {
+		s.buf = bufferpool.Get(streamChunk)[:0]
+	}
+	for len(data) > 0 {
+		tail := &s.buf
+		if len(s.more) > 0 {
+			tail = &s.more[len(s.more)-1]
+		}
+		room := cap(*tail) - len(*tail)
+		if room == 0 {
+			s.more = append(s.more, bufferpool.Get(streamChunk)[:0])
+			continue
+		}
+		n := min(room, len(data))
+		*tail = append(*tail, data[:n]...)
+		data = data[n:]
+	}
+}
+
+// streamChunk is the size of the chunks a body on a multiplexed connection is
+// buffered in.
+const streamChunk = 64 << 10
+
+// nextLocked moves buf on to the next chunk once it has all been handed out,
+// and reports whether it did; the emptied buffer is kept as the spare, or
+// goes back to the pool.
+func (s *BodyStream) nextLocked() bool {
+	if len(s.more) == 0 || s.read < len(s.buf) {
+		return false
+	}
+	if s.spare == nil {
+		s.spare = s.buf[:0]
+	} else {
+		bufferpool.Put(s.buf)
+	}
+	s.buf, s.read = s.more[0], 0
+	s.more[0] = nil
+	s.more = s.more[1:]
+	if len(s.more) == 0 {
+		s.more = nil
+	}
+	return true
 }
 
 func newBodyStream(conn *fib.Connection, request *stdhttp.Request, config Config, decoder *chunkedDecoder, wantContinue bool) *BodyStream {
@@ -692,6 +756,7 @@ func (s *BodyStream) grantContinue() {
 // pausing and resuming the socket for each of them, the same hysteresis the
 // engine's write watermarks use.
 func (s *BodyStream) compactLocked() {
+	s.nextLocked()
 	if s.read == len(s.buf) {
 		// The buffer is kept whatever it grew to: a body never buffers more
 		// than the watermark plus one read, so taking a new one every time it
@@ -712,6 +777,12 @@ func (s *BodyStream) compactLocked() {
 // that was.
 func (s *BodyStream) dropLocked() int {
 	n := len(s.buf) - s.read
+	for i, chunk := range s.more {
+		n += len(chunk)
+		bufferpool.Put(chunk)
+		s.more[i] = nil
+	}
+	s.more = nil
 	bufferpool.Put(s.buf)
 	bufferpool.Put(s.spare)
 	s.buf, s.read, s.spare = nil, 0, nil

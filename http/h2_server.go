@@ -912,9 +912,9 @@ func (sc *h2ServerConn) handleData(f *h2Frame) error {
 		config.StreamRequestBody && st.declared < 0 && st.req != nil && got > config.StreamRequestBodyThreshold {
 		// A body streams once the threshold of it has arrived: more than
 		// that for one of no declared length, as a chunked HTTP/1 body does.
-		buffered := bufferpool.Append(st.body, f.payload)
+		buffered := st.body
 		st.body = nil
-		sc.streamRequest(st, buffered)
+		sc.streamRequest(st, buffered, f.payload)
 		if f.has(h2FlagEndStream) {
 			return sc.endStreamed(st, nil)
 		}
@@ -1110,7 +1110,7 @@ func (sc *h2ServerConn) handleHeaderBlock(id uint32, block []byte, endStream boo
 	if atHeader || config.StreamRequestBody && st.declared > config.StreamRequestBodyThreshold &&
 		config.StreamRequestBodyThreshold == 0 {
 		// The body streams to the handler, which runs now.
-		sc.streamRequest(st, nil)
+		sc.streamRequest(st, nil, nil)
 		return nil
 	}
 	// The body is collected, whole or up to the streaming threshold, before
@@ -1320,21 +1320,22 @@ func (sc *h2ServerConn) finishRequest(st *h2ServerStream) error {
 }
 
 // streamRequest runs the handler for a request whose body is still arriving,
-// which streams to it through a BodyFeed. buffered is what of the body has
-// arrived already, a buffer from the pool.
+// which streams to it through a BodyFeed. buffered, a buffer from the pool,
+// and then arrived, the DATA frame's payload that made the body stream, are
+// what of the body has arrived already.
 //
 // From here the stream's receive window is given back as the handler
 // consumes the body rather than as it arrives, which is what paces the
 // client: a connection carrying other streams cannot stop reading for this
 // one. What had arrived before is given back now, and not again when the
 // handler consumes it.
-func (sc *h2ServerConn) streamRequest(st *h2ServerStream, buffered []byte) {
+func (sc *h2ServerConn) streamRequest(st *h2ServerStream, buffered, arrived []byte) {
 	config := &sc.handler.config
 	// A body that streams keeps the stream from callbacks of its own, which
 	// the stream's references do not count; such a stream is not recycled.
 	st.pooled = false
 	var sendContinue func()
-	if len(buffered) == 0 && strings.EqualFold(st.req.Header.Get("Expect"), "100-continue") {
+	if len(buffered) == 0 && len(arrived) == 0 && strings.EqualFold(st.req.Header.Get("Expect"), "100-continue") {
 		sendContinue = func() { _ = st.writeInterim(stdhttp.StatusContinue, nil) }
 	}
 	c := st.block.bind(sc.conn, nil)
@@ -1345,7 +1346,7 @@ func (sc *h2ServerConn) streamRequest(st *h2ServerStream, buffered []byte) {
 		st.recvWindow += st.recvUnacked
 		st.recvUnacked = 0
 	}
-	st.creditSkip = int64(len(buffered))
+	st.creditSkip = int64(len(buffered) + len(arrived))
 	st.feed = st.block.streamBody(c, BodyFeedConfig{
 		Declared: st.declared,
 		Limit:    config.MaxStreamedBodyBytes,
@@ -1364,6 +1365,7 @@ func (sc *h2ServerConn) streamRequest(st *h2ServerStream, buffered []byte) {
 	}
 	sc.mu.Unlock()
 	_ = st.feed.Write(buffered)
+	_ = st.feed.Write(arrived)
 	bufferpool.Put(buffered)
 	sc.armWriteTimeout(st)
 	sc.handler.streams.Serve(&sc.gate, sc.conn, sc.handler.handler, &st.block)
