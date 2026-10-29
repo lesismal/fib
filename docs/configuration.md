@@ -64,7 +64,8 @@ marked *dynamic* and explained in [How the machine sizes the defaults](#how-the-
 
 | Field | Default | Description |
 | --- | --- | --- |
-| `ReadBufferSize` | `16 KiB` | Bytes one read of a connection's socket takes; for a proxy, also the most passed on in one write. One buffer per event-loop round, borrowed from the pool, not one per connection. |
+| `ReadBufferSize` | `16 KiB` | The most bytes one read of a connection's socket takes; for a proxy, also the most passed on in one write. One buffer per event-loop round, borrowed from the pool, not one per connection. |
+| `ReadBufferStartSize` | `16 KiB` (`ReadBufferSize` when smaller) | The buffer a connection's round starts with. A read that fills it moves the round to `ReadBufferSize`, and the connection's next rounds start there, until four rounds in a row read less than this: a connection of small requests holds the small buffer and one carrying a large transfer reads at the full size. Only differs from `ReadBufferSize` when that is raised; negative, or at least `ReadBufferSize`, reads every round at the full size. |
 | `WriteBufferHighWatermark` | *dynamic* (64 KiB for the default read buffer) | Bytes a connection may have waiting for its socket before its reads pause. The low watermark is a quarter of it. It bounds userspace buffering while TCP backpressure catches up; it does not cap the queue. Zero sizes it from `ReadBufferSize`, the machine and the budget; negative disables it. |
 | `MaxPendingBytes` | `0` (off) | Bytes all connections together may have waiting for their sockets. When the sum reaches it, every connection pauses reads until it falls to a quarter. Zero leaves only the per-connection watermark; set it when the watermark times the connection count is more memory than the deployment can spare. |
 | `MaxWriteQueueBytes` | `0` (off) | Per connection, the bytes queued for the socket that it has not taken: what `Send`, `SendParts` and TLS leave behind, not an unread `SendFile` file. A send past it closes the connection with `ErrSendQueueFull`. It is the bound a broadcast wants, since the watermark only pauses reads and `MaxPendingBytes` bounds the total rather than one peer. Zero means no cap; a connection may set its own with `SetWriteQueueLimit`. |
@@ -158,8 +159,8 @@ gateway that proxies bodies usually wants.
 With `LogSettings` on, the engine prints a header and one line per setting when it starts:
 
 ```text
-INFO fib: engine config engine=gateway parameters=29
-INFO fib: config parameter=readBuffer value="65536 (64 KiB)" source=custom about="bytes one read of a connection's socket takes"
+INFO fib: engine config engine=gateway parameters=30
+INFO fib: config parameter=readBuffer value="65536 (64 KiB)" source=custom about="the most bytes one read of a connection's socket takes"
 INFO fib: config parameter=writeWatermark value="262144 (256 KiB)" source=default about="bytes a connection may have waiting before its reads pause; zero is sized from readBuffer and the machine"
 INFO fib: config parameter=maxPendingBytes value="33255979008 (30.97 GiB)" source=custom about="bytes all connections together may have waiting; zero means no budget"
 ```
@@ -168,10 +169,10 @@ In fib/log's `line` format (see [Logging](#logging)) the list is one record inst
 settings as an aligned table below it:
 
 ```text
-2026-10-27 10:00:00.000 INFO  fib: engine config engine=gateway parameters=29
+2026-10-27 10:00:00.000 INFO  fib: engine config engine=gateway parameters=30
 	settings:
 		parameter           value             source   about
-		readBuffer          65536 (64 KiB)    custom   bytes one read of a connection's socket takes
+		readBuffer          65536 (64 KiB)    custom   the most bytes one read of a connection's socket takes
 		writeWatermark      262144 (256 KiB)  default  bytes a connection may have waiting before its reads pause; ...
 		...
 ```

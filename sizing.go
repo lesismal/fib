@@ -147,6 +147,20 @@ func DefaultSizing(readBuffer int, pendingBytes int64, maxConns int) Sizing {
 	return DetectMachine().Sizing(readBuffer, pendingBytes, maxConns)
 }
 
+// readBufferStart is the size a read round starts at for Config's
+// ReadBufferStartSize and ReadBufferSize, the latter already defaulted: zero
+// means fib's default read buffer, below zero or at least ReadBufferSize
+// means ReadBufferSize, which leaves every round at the full size.
+func readBufferStart(start, full int) int {
+	if start == 0 {
+		start = defaultReadBufferSize
+	}
+	if start < 0 || start > full {
+		return full
+	}
+	return start
+}
+
 // DefaultWriteWatermark reports the per-connection write watermark for
 // readBuffer and the deployment's budget and connection cap. It is what
 // Config.WriteBufferHighWatermark is when that is left at zero.

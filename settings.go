@@ -22,6 +22,7 @@ type Settings struct {
 	MaxEvents                int
 	PollBatchSize            int
 	ReadBufferSize           int
+	ReadBufferStartSize      int
 	WriteBufferHighWatermark int
 	MaxPendingBytes          int64
 	MaxWriteQueueBytes       int64
@@ -69,6 +70,7 @@ func (e *Engine) Settings() Settings {
 		MaxEvents:                c.MaxEvents,
 		PollBatchSize:            c.PollBatchSize,
 		ReadBufferSize:           c.ReadBufferSize,
+		ReadBufferStartSize:      c.ReadBufferStartSize,
 		WriteBufferHighWatermark: c.WriteBufferHighWatermark,
 		MaxPendingBytes:          c.MaxPendingBytes,
 		MaxWriteQueueBytes:       c.MaxWriteQueueBytes,
@@ -101,8 +103,8 @@ func (s Settings) String() string {
 	var b strings.Builder
 	fmt.Fprintf(&b, "name=%s network=%s backlog=%d workers=%d maxEvents=%d pollBatch=%d ",
 		s.Name, s.Network, s.Backlog, s.WorkerCount, s.MaxEvents, s.PollBatchSize)
-	fmt.Fprintf(&b, "readBuffer=%d writeWatermark=%d writeLowWatermark=%d maxPendingBytes=%d maxWriteQueueBytes=%d maxConns=%d ",
-		s.ReadBufferSize, s.WriteBufferHighWatermark, s.WriteBufferHighWatermark/4, s.MaxPendingBytes, s.MaxWriteQueueBytes, s.MaxConns)
+	fmt.Fprintf(&b, "readBuffer=%d readBufferStart=%d writeWatermark=%d writeLowWatermark=%d maxPendingBytes=%d maxWriteQueueBytes=%d maxConns=%d ",
+		s.ReadBufferSize, s.ReadBufferStartSize, s.WriteBufferHighWatermark, s.WriteBufferHighWatermark/4, s.MaxPendingBytes, s.MaxWriteQueueBytes, s.MaxConns)
 	fmt.Fprintf(&b, "taskPool=%s taskPoolMode=%s minWorkers=%d sharedTaskPool=%t ",
 		s.TaskPool, s.TaskPoolMode, s.MinWorkerCount, s.SharedTaskPool)
 	fmt.Fprintf(&b, "ioPollers=%t ioPollerCount=%d pollers=%d engineLoop=%t reusePort=%t balanceReusePort=%t ",
@@ -145,7 +147,8 @@ func (s Settings) Parameters() []Parameter {
 		{"workers", intValue(int64(s.WorkerCount)), source("workers"), "task pool worker ceiling; follows GOMAXPROCS and the cores"},
 		{"maxEvents", intValue(int64(s.MaxEvents)), source("maxEvents"), "tasks the pool may hold waiting for a worker"},
 		{"pollBatch", intValue(int64(s.PollBatchSize)), source("pollBatch"), "most events one wait of an event loop collects"},
-		{"readBuffer", byteSize(int64(s.ReadBufferSize)), source("readBuffer"), "bytes one read of a connection's socket takes"},
+		{"readBuffer", byteSize(int64(s.ReadBufferSize)), source("readBuffer"), "the most bytes one read of a connection's socket takes"},
+		{"readBufferStart", byteSize(int64(s.ReadBufferStartSize)), source("readBufferStart"), "bytes a connection's read round starts with; a round that fills it moves the connection to readBuffer"},
 		{"writeWatermark", offBytes(int64(s.WriteBufferHighWatermark)), source("writeWatermark"), "bytes a connection may have waiting before its reads pause; zero is sized from readBuffer and the machine"},
 		{"writeLowWatermark", low, "default", "backlog at which paused reads resume; a quarter of writeWatermark"},
 		{"maxPendingBytes", offBytes(s.MaxPendingBytes), source("maxPendingBytes"), "bytes all connections together may have waiting; zero means no budget"},
@@ -191,6 +194,7 @@ func customConfig(c Config) map[string]bool {
 	set("maxEvents", c.MaxEvents != 0 && c.MaxEvents != base.MaxEvents)
 	set("pollBatch", c.PollBatchSize != 0 && c.PollBatchSize != base.PollBatchSize)
 	set("readBuffer", c.ReadBufferSize != 0 && c.ReadBufferSize != base.ReadBufferSize)
+	set("readBufferStart", c.ReadBufferStartSize != 0 && c.ReadBufferStartSize != readBufferStart(0, c.ReadBufferSize))
 	set("writeWatermark", c.WriteBufferHighWatermark != 0 && c.WriteBufferHighWatermark != autoWatermark)
 	set("maxPendingBytes", c.MaxPendingBytes != 0)
 	set("maxWriteQueueBytes", c.MaxWriteQueueBytes != 0)

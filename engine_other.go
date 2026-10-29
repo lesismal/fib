@@ -64,6 +64,9 @@ type Engine struct {
 	sweeping       bool
 	readers        sync.WaitGroup
 	readBufferSize int
+	// readBufferStart is the buffer a connection reads into until a read
+	// fills it; see Config.ReadBufferStartSize.
+	readBufferStart int
 	// udpListeners are the engine's UDP sockets, when Config.Network names
 	// UDP, and udpIdleTimeout closes their silent peers.
 	udpListeners   []*udpListener
@@ -97,6 +100,7 @@ func newEngine(config Config, bindings []Binding) (*Engine, error) {
 	if config.ReadBufferSize <= 0 {
 		config.ReadBufferSize = defaultReadBufferSize
 	}
+	config.ReadBufferStartSize = readBufferStart(config.ReadBufferStartSize, config.ReadBufferSize)
 	// Dialed connections are served by the handler each dial names; one
 	// that names none gets this, which does nothing.
 	var handler Handler = HandlerFuncs{}
@@ -109,6 +113,7 @@ func newEngine(config Config, bindings []Binding) (*Engine, error) {
 		connections: make(map[*Connection]struct{}), stopped: make(chan struct{}), serveErr: make(chan error, 1),
 		udpListeners: udpListeners, udpIdleTimeout: udpIdleTimeout(config.UDPIdleTimeout)}
 	e.readBufferSize = config.ReadBufferSize
+	e.readBufferStart = config.ReadBufferStartSize
 	e.bindConfig = config
 	e.bindingCount = len(bindings)
 	e.startUDPSweeper()
@@ -427,8 +432,14 @@ func (e *Engine) readConnection(c *Connection) {
 		// A datagram larger than the buffer would be truncated.
 		size = maxDatagramSize
 	}
+	if !c.udp {
+		// A connection reads into the small buffer until a read fills it,
+		// and then into the full one until a read takes no more than the
+		// small one holds; see the native readLoop.
+		size = e.readBufferStart
+	}
 	buf := bufferpool.Get(size)
-	defer bufferpool.Put(buf)
+	defer func() { bufferpool.Put(buf) }()
 	for {
 		if !c.udp && !c.awaitReadable() {
 			return
@@ -436,6 +447,16 @@ func (e *Engine) readConnection(c *Connection) {
 		n, err := c.conn.Read(buf)
 		if n > 0 && !c.enqueueData(buf[:n]) {
 			return
+		}
+		if !c.udp && e.readBufferStart < e.readBufferSize {
+			// enqueueData copied what the read delivered.
+			if n == len(buf) && len(buf) < e.readBufferSize {
+				bufferpool.Put(buf)
+				buf = bufferpool.Get(e.readBufferSize)
+			} else if n > 0 && n < e.readBufferStart && len(buf) > e.readBufferStart {
+				bufferpool.Put(buf)
+				buf = bufferpool.Get(e.readBufferStart)
+			}
 		}
 		if (err != nil || n == 0) && !c.udp && c.readEnded() {
 			// CloseRead ended input, and with it the reads; the connection
@@ -595,8 +616,13 @@ type Config struct {
 	Backlog, WorkerCount, MaxEvents int
 	// PollBatchSize caps how many events one wait of an epoll, kqueue or
 	// IOCP event loop collects. This backend has no loops, and ignores it.
-	PollBatchSize            int
-	ReadBufferSize           int
+	PollBatchSize  int
+	ReadBufferSize int
+	// ReadBufferStartSize is the buffer a connection reads into until a read
+	// fills it, and again once a read takes less than it; zero means 16 KiB,
+	// below zero or at least ReadBufferSize means ReadBufferSize. See the
+	// native backends' Config.
+	ReadBufferStartSize      int
 	WriteBufferHighWatermark int
 	// MaxPendingBytes caps the bytes this server may hold waiting for its
 	// sockets. This backend writes each send before it returns, so it does

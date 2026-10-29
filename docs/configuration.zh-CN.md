@@ -60,7 +60,8 @@ if err := engine.Run(); err != nil {
 
 | 字段 | 默认值 | 说明 |
 | --- | --- | --- |
-| `ReadBufferSize` | `16 KiB` | 一次 read 读多少字节；对代理来说也基本是一次 write 写多少字节。一轮从池里借一块，不是每连接一块。 |
+| `ReadBufferSize` | `16 KiB` | 一次 read 最多读多少字节；对代理来说也基本是一次 write 最多写多少字节。一轮从池里借一块，不是每连接一块。 |
+| `ReadBufferStartSize` | `16 KiB`（`ReadBufferSize` 更小时取它） | 连接一轮开始时用的缓冲。某次 read 读满它，这一轮换成 `ReadBufferSize`，此后该连接的轮次也从大缓冲开始，直到连续四轮读到的都少于它：小请求的连接只占小缓冲，大传输的连接一直按大缓冲读。只有调大 `ReadBufferSize` 时才与它不同；负值或不小于 `ReadBufferSize` 时每轮都用大缓冲。 |
 | `WriteBufferHighWatermark` | *动态*（默认读缓冲下 64 KiB） | 单连接待写字节达到它就暂停读；低水位是它的四分之一。它限制用户态缓冲，不限制发送队列。0 表示按 `ReadBufferSize`、机器、预算和连接数计算；负值关闭。 |
 | `MaxPendingBytes` | `0`（关） | 所有连接加在一起允许等待的字节数；达到后所有连接暂停读，降到四分之一恢复。0 表示只有每连接水位线；当“水位线 × 连接数”超出内存承受范围时设置它。 |
 | `MaxWriteQueueBytes` | `0`（关） | 单连接已经排队、socket 还没取走的字节上限（`Send`、`SendParts`、TLS 留下的；不含 `SendFile` 未读的文件）。超过时这次 send 返回 `ErrSendQueueFull` 并关闭连接。广播最需要它：水位线只暂停读，`MaxPendingBytes` 限制总量而不是单个对端。0 表示不限制；单连接可用 `SetWriteQueueLimit` 自己设。 |
@@ -149,8 +150,8 @@ W    = 向下取整到 16 KiB
 `LogSettings` 开启时，Engine 启动会打印一个 header 和每个参数一行：
 
 ```text
-INFO fib: engine config engine=gateway parameters=29
-INFO fib: config parameter=readBuffer value="65536 (64 KiB)" source=custom about="bytes one read of a connection's socket takes"
+INFO fib: engine config engine=gateway parameters=30
+INFO fib: config parameter=readBuffer value="65536 (64 KiB)" source=custom about="the most bytes one read of a connection's socket takes"
 INFO fib: config parameter=writeWatermark value="262144 (256 KiB)" source=default about="bytes a connection may have waiting before its reads pause; zero is sized from readBuffer and the machine"
 INFO fib: config parameter=maxPendingBytes value="33255979008 (30.97 GiB)" source=custom about="bytes all connections together may have waiting; zero means no budget"
 ```
@@ -158,10 +159,10 @@ INFO fib: config parameter=maxPendingBytes value="33255979008 (30.97 GiB)" sourc
 使用 fib/log 的 `line` 格式时（见[日志](#日志)），整个列表是一条记录，参数以对齐的表格写在它下面：
 
 ```text
-2026-10-27 10:00:00.000 INFO  fib: engine config engine=gateway parameters=29
+2026-10-27 10:00:00.000 INFO  fib: engine config engine=gateway parameters=30
 	settings:
 		parameter           value             source   about
-		readBuffer          65536 (64 KiB)    custom   bytes one read of a connection's socket takes
+		readBuffer          65536 (64 KiB)    custom   the most bytes one read of a connection's socket takes
 		writeWatermark      262144 (256 KiB)  default  bytes a connection may have waiting before its reads pause; ...
 		...
 ```

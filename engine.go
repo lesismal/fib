@@ -198,6 +198,9 @@ type Engine struct {
 	releaseTaskPool func()
 	taskWG          sync.WaitGroup
 	readBufferSize  int
+	// readBufferStart is the size a connection's read round starts at
+	// until a round of its fills it; see Config.ReadBufferStartSize.
+	readBufferStart int
 	closeOnce       sync.Once
 	// udpListeners are the engine's UDP sockets, those of the bindings whose
 	// network is UDP. udpIdleTimeout closes their silent peers, and udpSweep is the
@@ -292,6 +295,7 @@ func newEngine(config Config, bindings []Binding) (*Engine, error) {
 	if config.ReadBufferSize <= 0 {
 		config.ReadBufferSize = defaultReadBufferSize
 	}
+	config.ReadBufferStartSize = readBufferStart(config.ReadBufferStartSize, config.ReadBufferSize)
 	if config.WriteBufferHighWatermark == 0 {
 		config.WriteBufferHighWatermark = DefaultWriteWatermark(config.ReadBufferSize, config.MaxPendingBytes, config.MaxConns)
 	}
@@ -342,6 +346,7 @@ func newEngine(config Config, bindings []Binding) (*Engine, error) {
 		accepted:       &acceptedConns{max: int64(config.MaxConns)},
 		handler:        handler}
 	e.readBufferSize = config.ReadBufferSize
+	e.readBufferStart = config.ReadBufferStartSize
 	e.bindConfig = config
 	e.bindingCount = len(bindings)
 	e.taskPool, e.releaseTaskPool = acquireTaskPool(config)
@@ -375,7 +380,7 @@ func (e *Engine) openPollers(config Config) error {
 			budgetResumeBytes: e.budgetResumeBytes, writeQueueLimit: e.writeQueueLimit, sendBufferSize: e.sendBufferSize,
 			udpIdleTimeout: e.udpIdleTimeout, pendingTotal: e.pendingTotal, accepted: e.accepted, handler: e.handler,
 			taskPool: e.taskPool, releaseTaskPool: func() {},
-			readBufferSize: e.readBufferSize}
+			readBufferSize: e.readBufferSize, readBufferStart: e.readBufferStart}
 		if err := p.open(config, nil); err != nil {
 			return err
 		}
@@ -1229,6 +1234,17 @@ type Config struct {
 	// events ready than the batch holds sees any difference.
 	PollBatchSize  int
 	ReadBufferSize int
+	// ReadBufferStartSize is the buffer a connection's read round starts
+	// with. A read that fills it moves the round to ReadBufferSize, and the
+	// connection's next rounds start there too, until a round reads less
+	// than ReadBufferStartSize in all. So a connection serving small
+	// requests holds the small buffer while a round serves it, and one
+	// carrying a large transfer reads at ReadBufferSize from the start of
+	// each round. Zero means fib's default read buffer, 16 KiB, which
+	// changes nothing while ReadBufferSize is no larger; below zero, or at
+	// least ReadBufferSize, means ReadBufferSize: every round reads at the
+	// full size.
+	ReadBufferStartSize int
 	// WriteBufferHighWatermark pauses socket reads while at least this many
 	// bytes are waiting to be written. This bounds userspace buffering while
 	// TCP backpressure catches up. Zero means the default, sized from

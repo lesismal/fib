@@ -53,6 +53,7 @@ func TestEngineSettings(t *testing.T) {
 		"name=fib",
 		"network=tcp",
 		"readBuffer=16384",
+		"readBufferStart=16384",
 		"writeWatermark=65536",
 		"maxPendingBytes=0",
 		"maxWriteQueueBytes=0",

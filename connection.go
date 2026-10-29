@@ -134,6 +134,13 @@ type Connection struct {
 	// bytes possibly left in the socket, for a hold or for the write
 	// budget. Only the round that owns the connection touches it.
 	roundStalled bool
+	// readGrown records that a round of this connection filled the starting
+	// read buffer, so its next rounds start at the full one, and readSmall
+	// counts the rounds since that have read less than the starting buffer
+	// holds; see Config.ReadBufferStartSize and readShrinkRounds. Only the
+	// round that owns the connection touches them.
+	readGrown bool
+	readSmall uint8
 	// closePending records that the loop has closed the connection and left
 	// OnClose, and the release of the descriptor, to its last round; see
 	// Engine.closeConnection. Guarded by mu.
@@ -1892,9 +1899,42 @@ func (c *Connection) readShouldStop() bool {
 	return pause
 }
 
+// readShrinkRounds is how many rounds in a row must read less than the
+// starting buffer before a connection whose rounds grew starts small again.
+// One is not enough: a transfer's last round, or one that found the socket
+// between two of the peer's writes, is often small, and starting the next
+// round small again would cost the transfer the read the growth saves.
+const readShrinkRounds = 4
+
 func (c *Connection) readLoop() error {
-	buf := bufferpool.Get(c.engine.readBufferSize)
-	defer bufferpool.Put(buf)
+	// A round's buffer is what a connection costs while a round serves it,
+	// and at high concurrency that, not the connection, is what the process
+	// pays per request. So a round starts at the small buffer, which a small
+	// request never fills, and moves to the full one when a read fills it.
+	// The connection remembers that, and its next rounds start at the full
+	// buffer, so a large transfer does not pay a small read every round,
+	// until readShrinkRounds rounds in a row read less than would have fit
+	// the small one.
+	start, full := c.engine.readBufferStart, c.engine.readBufferSize
+	size := start
+	if c.readGrown {
+		size = full
+	}
+	buf := bufferpool.Get(size)
+	// total counts what the round has read in all, which decides whether the
+	// connection's next round starts small again.
+	total := 0
+	defer func() {
+		bufferpool.Put(buf)
+		if !c.readGrown {
+			return
+		}
+		if total >= start {
+			c.readSmall = 0
+		} else if c.readSmall++; c.readSmall >= readShrinkRounds {
+			c.readGrown, c.readSmall = false, 0
+		}
+	}()
 	// read counts what the round has read since it last settled; see
 	// roundFlushBytes.
 	read := 0
@@ -1916,6 +1956,7 @@ func (c *Connection) readLoop() error {
 		n, err := c.sysRead(buf)
 		c.traceStep("read n=%d err=%v", n, err)
 		if n > 0 {
+			total += n
 			if !c.flags.has(flagLingering) {
 				c.inOnData.Store(true)
 				c.handler.OnData(c, buf[:n])
@@ -1937,6 +1978,15 @@ func (c *Connection) readLoop() error {
 				// not take, and asks the loop to pause reads if that crosses a
 				// watermark. A handler that holds reads asked the loop itself.
 				return nil
+			}
+			if len(buf) < full {
+				// The read filled the small buffer, so there is more waiting:
+				// read the rest of the round, and start the next rounds, at
+				// the full size. OnData has returned, and what it kept of the
+				// small buffer it copied.
+				bufferpool.Put(buf)
+				buf = bufferpool.Get(full)
+				c.readGrown = true
 			}
 			if read += n; read >= roundFlushBytes {
 				read = 0
