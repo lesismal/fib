@@ -1236,9 +1236,9 @@ type Config struct {
 	ReadBufferSize int
 	// ReadBufferStartSize is the buffer a connection's read round starts
 	// with. A read that fills it moves the round to ReadBufferSize, and the
-	// connection's next rounds start there too, until a round reads less
-	// than ReadBufferStartSize in all. So a connection serving small
-	// requests holds the small buffer while a round serves it, and one
+	// connection's next rounds start there too, until four rounds in a
+	// row each read less than ReadBufferStartSize. So a connection serving
+	// small requests holds the small buffer while a round serves it, and one
 	// carrying a large transfer reads at ReadBufferSize from the start of
 	// each round. Zero means fib's default read buffer, 16 KiB, which
 	// changes nothing while ReadBufferSize is no larger; below zero, or at
