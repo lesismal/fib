@@ -1,6 +1,7 @@
 package quic
 
 import (
+	"sync"
 	"time"
 )
 
@@ -73,16 +74,31 @@ type sentPacket struct {
 	// mtuProbe says the packet is a probe of path MTU discovery.
 	mtuProbe bool
 	frames   []sentFrame
+	// inline is where frames starts out: a packet of a stream's data
+	// carries a frame or two, the end of one stream's and the start of the
+	// next one's, which then need no array of their own.
+	inline [2]sentFrame
 }
 
 // maxFreeSent bounds the sent packets a connection keeps for reuse, and
 // maxFreeFrames the frames one of them keeps room for: records a connection
 // has in flight at once come back and go out again, and what is kept past
-// that is memory for every connection.
+// that is memory for every connection. Records past maxFreeSent go to
+// sentPool, which the connections share.
 const (
 	maxFreeSent   = 16
 	maxFreeFrames = 16
 )
+
+// sentPool holds the sent packet records the connections let go of past
+// their own maxFreeSent: a connection sending a large response has hundreds
+// of packets in flight, each needing a record until it is acknowledged, and
+// allocating each would leave the garbage collector as many to collect.
+var sentPool = sync.Pool{New: func() any {
+	p := new(sentPacket)
+	p.frames = p.inline[:0]
+	return p
+}}
 
 // newSentPacket returns a record for the packet numbered pn, reusing one
 // that was acknowledged or declared lost when there is one: every packet
@@ -91,7 +107,9 @@ const (
 func (c *Conn) newSentPacket(pn uint64) *sentPacket {
 	n := len(c.freeSent)
 	if n == 0 {
-		return &sentPacket{pn: pn}
+		p := sentPool.Get().(*sentPacket)
+		p.pn = pn
+		return p
 	}
 	p := c.freeSent[n-1]
 	c.freeSent[n-1] = nil
@@ -103,16 +121,16 @@ func (c *Conn) newSentPacket(pn uint64) *sentPacket {
 // releaseSent takes back a record nothing refers to any more. Callers hold
 // c.mu.
 func (c *Conn) releaseSent(p *sentPacket) {
-	if len(c.freeSent) >= maxFreeSent {
-		return
-	}
 	frames := p.frames[:0]
 	if cap(frames) > maxFreeFrames {
-		frames = nil
-	} else {
-		clear(p.frames)
+		frames = p.inline[:0]
 	}
+	clear(p.frames)
 	*p = sentPacket{frames: frames}
+	if len(c.freeSent) >= maxFreeSent {
+		sentPool.Put(p)
+		return
+	}
 	c.freeSent = append(c.freeSent, p)
 }
 

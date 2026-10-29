@@ -275,14 +275,15 @@ func TestRecycledDatagramsAndCallsDone(t *testing.T) {
 }
 
 // Records of sent packets with many frames are not kept for reuse with all
-// their room; a RESET_STREAM, MAX_DATA or HANDSHAKE_DONE that is lost is
-// sent again, and the lost data of a stream since reset is not.
+// their room, only with their inline room for a frame or two; a
+// RESET_STREAM, MAX_DATA or HANDSHAKE_DONE that is lost is sent again, and
+// the lost data of a stream since reset is not.
 func TestLostResetAndMaxData(t *testing.T) {
 	c := frameConn(t)
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.releaseSent(&sentPacket{frames: make([]sentFrame, 0, 4*maxFreeFrames)})
-	if p := c.freeSent[len(c.freeSent)-1]; cap(p.frames) != 0 {
+	if p := c.freeSent[len(c.freeSent)-1]; cap(p.frames) > len(p.inline) {
 		t.Fatalf("kept room for %d frames", cap(p.frames))
 	}
 	s := c.newStream(1)

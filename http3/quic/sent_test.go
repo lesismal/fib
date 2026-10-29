@@ -139,3 +139,60 @@ func TestTimerArmsOnlySooner(t *testing.T) {
 		time.Sleep(time.Millisecond)
 	}
 }
+
+// A sent packet record holds the frame or two of a packet of stream data in
+// room of its own, so that a record reused from the connection's free list
+// allocates nothing for them.
+func TestSentPacketInlineFrames(t *testing.T) {
+	c := frameConn(t)
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.releaseSent(c.newSentPacket(0))
+	allocs := testing.AllocsPerRun(100, func() {
+		p := c.newSentPacket(1)
+		p.add(sentFrame{kind: sfStream, n: 1})
+		p.add(sentFrame{kind: sfStream, n: 2})
+		c.releaseSent(p)
+	})
+	if allocs != 0 {
+		t.Fatalf("a record of two frames allocated %v times", allocs)
+	}
+}
+
+// Records released past what a connection keeps go to the pool the
+// connections share, emptied first: they refer to no stream of the
+// connection that let them go, and keep no more room than their own.
+func TestSentPacketsPastFreeListAreEmptied(t *testing.T) {
+	c := frameConn(t)
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	s := c.newStream(1)
+	records := make([]*sentPacket, maxFreeSent+2)
+	for i := range records {
+		p := c.newSentPacket(uint64(i))
+		for j := 0; j <= i%4; j++ {
+			p.add(sentFrame{kind: sfStream, stream: s, n: 1})
+		}
+		p.ackEliciting, p.size = true, 1200
+		records[i] = p
+	}
+	for _, p := range records {
+		c.releaseSent(p)
+	}
+	if len(c.freeSent) != maxFreeSent {
+		t.Fatalf("connection keeps %d records, want %d", len(c.freeSent), maxFreeSent)
+	}
+	for i, p := range records {
+		if p.pn != 0 || p.ackEliciting || p.size != 0 || len(p.frames) != 0 || cap(p.frames) > maxFreeFrames {
+			t.Fatalf("record %d released as %+v", i, p)
+		}
+		for _, f := range p.frames[:cap(p.frames)] {
+			if f.stream != nil {
+				t.Fatalf("record %d still refers to a stream", i)
+			}
+		}
+		if p.inline != [2]sentFrame{} {
+			t.Fatalf("record %d keeps its inline frames", i)
+		}
+	}
+}
