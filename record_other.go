@@ -7,3 +7,9 @@ const kernelRecords = false
 
 // sysSendRecord is never reached here, since SendRawRecord queues no record.
 func (c *Connection) sysSendRecord(uint8, []byte) (int, error) { return 0, errNoKernelRecords }
+
+// sysWriteMore is never reached here, since SetKernelTLS sets nothing.
+func (c *Connection) sysWriteMore(buffers [][]byte) (int, error) { return c.sysWritev(buffers) }
+
+// corkKernelTLS does nothing here, where no kernel seals.
+func (c *Connection) corkKernelTLS(bool) bool { return false }

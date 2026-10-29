@@ -236,6 +236,9 @@ const (
 	// flagPeerSet marks a peer address SetRemoteAddrPort gave, in peer, which
 	// RemoteAddr then reports too.
 	flagPeerSet
+	// flagKernelTLS marks a socket whose sends the kernel's TLS seals; see
+	// SetKernelTLS.
+	flagKernelTLS
 )
 
 // attachSeq is the unit of the sequence count kept in the upper half of
@@ -2128,14 +2131,13 @@ func (c *Connection) flushLocked() error {
 			data := head.data[head.offset:]
 			attempted = len(data)
 			n, err = c.sysSendRecord(head.record, data)
-		} else if c.engine.useWritev && pending > 1 {
-			count := pending
-			if count > maxWritevItems {
-				count = maxWritevItems
-			}
+		} else {
 			var batch [maxWritevItems][]byte
-			buffers := batch[:count]
-			for i := 0; i < count; i++ {
+			buffers := batch[:1]
+			if c.engine.useWritev {
+				buffers = batch[:min(pending, maxWritevItems)]
+			}
+			for i := range buffers {
 				item := &c.sends[c.sendHead+i]
 				if item.file != nil || item.record != 0 {
 					// A file, or a record of the kernel's, is sent on its
@@ -2146,11 +2148,16 @@ func (c *Connection) flushLocked() error {
 				buffers[i] = item.data[item.offset:]
 				attempted += len(buffers[i])
 			}
-			n, err = c.sysWritev(buffers)
-		} else {
-			item := c.sends[c.sendHead]
-			attempted = len(item.data) - item.offset
-			n, err = c.sysWrite(item.data[item.offset:])
+			var more bool
+			buffers, attempted, more = c.kernelCutLocked(buffers, attempted)
+			switch {
+			case more:
+				n, err = c.sysWriteMore(buffers)
+			case len(buffers) == 1:
+				n, err = c.sysWrite(buffers[0])
+			default:
+				n, err = c.sysWritev(buffers)
+			}
 		}
 		if n > 0 {
 			if fromFile {
@@ -2910,6 +2917,61 @@ func (c *Connection) SendRawRecord(typ uint8, data []byte) error {
 
 // errNoKernelRecords is what SendRawRecord reports where it cannot send.
 var errNoKernelRecords = errors.New("fib: no kernel TLS records here")
+
+// SetKernelTLS tells the connection that the kernel's TLS now seals what it
+// sends, as a layer that handed the sealing over through ControlIdle does,
+// so that it writes as suits the kernel's records. Linux's TLS hands each
+// record it closes to TCP to send at once, unless the send it came in says
+// more follows; written as they were, replies of tens of KiB went out in
+// three times the TCP sends, of a third the size, that they took sealed
+// above the kernel. So a write of more than a record goes in two, its whole
+// records first, marked as having more to follow, and then the rest; a write
+// with a file queued behind it goes marked so; and a file goes by sendfile
+// with the socket corked, since sendfile takes no such mark.
+func (c *Connection) SetKernelTLS() {
+	if kernelRecords && c.udp == nil {
+		c.flags.set(flagKernelTLS, true)
+	}
+}
+
+// kernelCutLocked is how a write of buffers, n bytes in all, goes where the
+// kernel's TLS seals it (SetKernelTLS): whole, telling the kernel more
+// follows, when a file is queued behind it, so that it shares a record with
+// the file's first bytes rather than going in a record and a push of its
+// own; cut to its whole records, which go telling the kernel more follows,
+// when it is more than a record; and as it is otherwise, or anywhere else.
+// Callers hold c.mu.
+func (c *Connection) kernelCutLocked(buffers [][]byte, n int) ([][]byte, int, bool) {
+	if !c.flags.has(flagKernelTLS) {
+		return buffers, n, false
+	}
+	if next := c.sendHead + len(buffers); next < len(c.sends) && c.sends[next].file != nil {
+		return buffers, n, true
+	}
+	if n <= kernelRecordSize {
+		return buffers, n, false
+	}
+	buffers, n = cutToRecords(buffers, n)
+	return buffers, n, true
+}
+
+// kernelRecordSize is the most plaintext the kernel's TLS puts in a record.
+const kernelRecordSize = 16 << 10
+
+// cutToRecords cuts buffers, of n bytes in all, more than a record, to the
+// whole records before the last byte, and reports how many bytes that is.
+func cutToRecords(buffers [][]byte, n int) ([][]byte, int) {
+	cut := (n - 1) / kernelRecordSize * kernelRecordSize
+	left := cut
+	for i, b := range buffers {
+		if len(b) >= left {
+			buffers[i] = b[:left]
+			return buffers[:i+1], cut
+		}
+		left -= len(b)
+	}
+	return buffers, cut
+}
 
 // Read takes what the socket has without waiting for the peer, and reports
 // ErrWouldBlock when it has nothing. It is for a handler that wants to read

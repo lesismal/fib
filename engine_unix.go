@@ -1384,7 +1384,11 @@ func (c *Connection) sysSendFileLocked(item *sendItem) (n, attempted int, fromFi
 	if s.copyBuf == nil {
 		for {
 			offset := s.offset
+			corked := c.corkKernelTLS(true)
 			n, err = sendfile(c.FD(), s.fd, &offset, attempted)
+			if corked {
+				c.corkKernelTLS(false)
+			}
 			n = max(n, 0)
 			if err == syscall.EINTR && n == 0 {
 				continue

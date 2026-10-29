@@ -5,3 +5,5 @@ package sys
 import "syscall"
 
 const SysSendmmsg = syscall.SYS_SENDMMSG
+
+const SysSendmsg = syscall.SYS_SENDMSG

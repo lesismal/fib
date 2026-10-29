@@ -9,6 +9,7 @@ import (
 	"net"
 	"net/netip"
 	"os"
+	"slices"
 	"syscall"
 	"testing"
 	"time"
@@ -504,5 +505,39 @@ func TestClosedConnectionAnswers(t *testing.T) {
 	u.udp = &udpState{}
 	if ap := u.RemoteAddrPort(); ap.IsValid() {
 		t.Errorf("RemoteAddrPort of a UDP connection with no peer = %v", ap)
+	}
+}
+
+// cutToRecords keeps the whole records before a write's last byte, across
+// the buffers they span, so that the rest, one record or less, goes in a
+// write of its own.
+func TestCutToRecords(t *testing.T) {
+	const r = kernelRecordSize
+	for _, tc := range []struct {
+		sizes []int
+		cut   int
+		kept  []int
+	}{
+		{[]int{r + 1}, r, []int{r}},
+		{[]int{2 * r}, r, []int{r}},
+		{[]int{2*r + 5}, 2 * r, []int{2 * r}},
+		{[]int{100, r, 7}, r, []int{100, r - 100}},
+		{[]int{r, r, 1}, 2 * r, []int{r, r}},
+		{[]int{10, 3 * r}, 3 * r, []int{10, 3*r - 10}},
+	} {
+		var buffers [][]byte
+		n := 0
+		for _, s := range tc.sizes {
+			buffers = append(buffers, make([]byte, s))
+			n += s
+		}
+		kept, cut := cutToRecords(buffers, n)
+		var sizes []int
+		for _, b := range kept {
+			sizes = append(sizes, len(b))
+		}
+		if cut != tc.cut || !slices.Equal(sizes, tc.kept) {
+			t.Errorf("%v: cut %d into %v, want %d into %v", tc.sizes, cut, sizes, tc.cut, tc.kept)
+		}
 	}
 }
