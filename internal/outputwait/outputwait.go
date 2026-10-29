@@ -15,6 +15,12 @@ var Wait func(c any, limit int64) error
 // is.
 var Pending func(c any) int64
 
+// Queued is Pending with what a cork holds counted too, as Wait counts it,
+// without taking the connection's lock: a writer that paces what it queues
+// by it sees what it queued a moment ago even before the cork comes off. It
+// is set and nil where Wait is.
+var Queued func(c any) int64
+
 // Unsent is Pending read under the connection's lock, for a caller that
 // wants the exact figure rather than one to pace by: it never counts bytes a
 // write in progress has already handed the socket, which the peer may have

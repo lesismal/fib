@@ -22,6 +22,8 @@ import (
 	fib "github.com/lesismal/fib"
 	"github.com/lesismal/fib/bufferpool"
 	"github.com/lesismal/fib/hpack"
+	"github.com/lesismal/fib/internal/outputwait"
+	"github.com/lesismal/fib/sidepool"
 	"github.com/lesismal/fib/taskpool"
 )
 
@@ -203,6 +205,15 @@ type h2ServerConn struct {
 	flushPending atomic.Bool
 	flusher      h2Flusher
 	flushPool    *taskpool.TaskPool
+
+	// outputFull says framing stopped short of what the windows allow
+	// because the connection had h2MaxQueuedOutput waiting for its socket,
+	// and drainArmed that drained will run once the socket has taken most
+	// of it; drainFn is drained as a func, made once. See outputRoomLocked.
+	// Guarded by mu.
+	outputFull bool
+	drainArmed bool
+	drainFn    func(error)
 
 	// reuseStreams and reuseHeaders say what the Reuse options have the
 	// connection recycle, and dead is the list of its streams nothing can
@@ -420,6 +431,7 @@ func (sc *h2ServerConn) sendLocked(out []byte) {
 		_ = sc.conn.SendOwned(out)
 		sc.scheduleFlush()
 	}
+	sc.armDrainLocked()
 }
 
 // sendPooledLocked sends out, a buffer from the pool, as sendLocked does,
@@ -432,6 +444,7 @@ func (sc *h2ServerConn) sendPooledLocked(out []byte) {
 		sc.scheduleFlush()
 	}
 	bufferpool.Put(out)
+	sc.armDrainLocked()
 }
 
 // sendPooledPartsLocked sends first, a buffer from the pool, and second
@@ -445,6 +458,7 @@ func (sc *h2ServerConn) sendPooledPartsLocked(first, second []byte) {
 		sc.scheduleFlush()
 	}
 	bufferpool.Put(first)
+	sc.armDrainLocked()
 }
 
 // scheduleFlush sends flusher to the pool unless it is on its way already,
@@ -1805,7 +1819,7 @@ func (st *h2ServerStream) respond(req *stdhttp.Request, response Response) error
 	st.trailer = trailer
 	// Framed in one buffer from the pool: the header block, and as much of
 	// the body as the windows let go now, each behind its frame headers.
-	sendable := max(min(int64(len(body)), sc.sendWindow, st.sendWindow), 0)
+	sendable := sc.sendableLocked(st, int64(len(body)), nil)
 	if sendable == int64(len(body)) && sendable > 0 && sendable <= int64(sc.peerMaxFrame) &&
 		st.trailer == nil && st.out == nil && sc.conn.Layer() == nil && !(response.Close && !sc.goAway) {
 		// The whole body goes in one frame and the connection has no layer:
@@ -2140,6 +2154,111 @@ func (sc *h2ServerConn) finishStreamLocked(st *h2ServerStream) {
 	sc.closeFinishedLocked()
 }
 
+// h2MaxQueuedOutput is how much a connection lets wait for its socket before
+// it frames more of the bodies of responses sent whole, which the windows
+// alone would let it frame at once. A client that grants large windows, as
+// h2load's 1 GiB ones do, would otherwise have every such body framed, and
+// copied into the connection's queue, as soon as it was sent: a hundred
+// 1 MiB downloads at a time held more than a MiB each. Past it, what is left
+// of a body waits in its stream as the array the handler gave, which costs
+// nothing, and is framed as the socket takes what is queued; see
+// streamRoomLocked for the bodies that stream. A quarter of it left queued
+// is what drained resumes at, so that it frames in large turns while the
+// socket's own buffer still has plenty to send.
+const h2MaxQueuedOutput = 1 << 20
+
+// h2QueuedSlack is what of h2MaxQueuedOutput framing leaves for the last
+// frame begun before the queue is full, which goes whole rather than cut to
+// a sliver, and for the frame headers and a layer's record overhead: what
+// one turn frames, sealed or not, then fits a buffer of h2MaxQueuedOutput's
+// size class from the pool, rather than taking one of twice the size.
+const h2QueuedSlack = h2DefaultMaxFrameSize + 4<<10
+
+// outputRoomLocked is how many more bytes may begin to be framed now,
+// besides out, before the connection's queue holds h2MaxQueuedOutput. When
+// there is none it says so in outputFull, for the send that follows to
+// arrange for drained to frame the rest; see armDrainLocked.
+func (sc *h2ServerConn) outputRoomLocked(out []byte) int64 {
+	if outputwait.Queued == nil {
+		return math.MaxInt64
+	}
+	room := h2MaxQueuedOutput - h2QueuedSlack - outputwait.Queued(sc.conn) - int64(len(out))
+	if room <= 0 {
+		sc.outputFull = true
+		return 0
+	}
+	return room
+}
+
+// sendableLocked is how many of n bytes pending on st the windows and the
+// connection's queue let be framed now, besides out.
+func (sc *h2ServerConn) sendableLocked(st *h2ServerStream, n int64, out []byte) int64 {
+	return max(min(n, sc.sendWindow, st.sendWindow, sc.streamRoomLocked(st, out)), 0)
+}
+
+// streamRoomLocked is how much of st's body the connection's queue lets be
+// framed now, besides out. A body sent whole waits for room, in the array
+// its handler gave, which costs nothing. One that streams, or a tunnel's, is
+// framed as far as the windows let it, from the writer's own bytes, which
+// the stream would otherwise have to copy to keep: waiting on the socket
+// held each stream's writer back as soon as it had written a little, and,
+// with the streams of a connection sharing one queue, all of them at once,
+// which cost a proxy a third of its throughput. Its writer is held back by
+// what the stream keeps, h2MaxPendingOutput, as it always was.
+func (sc *h2ServerConn) streamRoomLocked(st *h2ServerStream, out []byte) int64 {
+	if st.out != nil || st.tunnel != nil {
+		return math.MaxInt64
+	}
+	return frameRoom(sc.outputRoomLocked(out))
+}
+
+// frameRoom is how much the frames begun with room left may carry: the last
+// may take a whole frame past it.
+func frameRoom(room int64) int64 {
+	if room <= 0 || room == math.MaxInt64 {
+		return room
+	}
+	return room + h2DefaultMaxFrameSize
+}
+
+// armDrainLocked arranges for drained to run once the socket has taken most
+// of the connection's queue, if framing stopped short for it since the last
+// time. A queue that has drained that far already, which only what a layer
+// holds back from it could make it, has drained run at once instead.
+func (sc *h2ServerConn) armDrainLocked() {
+	if !sc.outputFull || sc.drainArmed || sc.closed {
+		return
+	}
+	sc.outputFull = false
+	if sc.drainFn == nil {
+		sc.drainFn = sc.drained
+	}
+	sc.drainArmed = true
+	if !outputwait.Notify(sc.conn, h2MaxQueuedOutput/2, sc.drainFn) {
+		sidepool.Post(func() { sc.drainFn(nil) })
+	}
+}
+
+// drained frames what the windows let go of the bodies waiting for room in
+// the connection's queue, now that the socket has taken most of it, unless
+// the connection has ended.
+func (sc *h2ServerConn) drained(err error) {
+	sc.mu.Lock()
+	defer sc.mu.Unlock()
+	sc.drainArmed = false
+	if err != nil || sc.closed || sc.sendHead == len(sc.sendQueue) {
+		return
+	}
+	room := min(sc.outputRoomLocked(nil), max(sc.sendWindow, 0))
+	if room <= 0 {
+		sc.armDrainLocked()
+		return
+	}
+	out := bufferpool.Get(int(room) + h2QueuedSlack)
+	sc.sendPooledLocked(sc.flushLocked(out[:0]))
+	sc.closeFinishedLocked()
+}
+
 // flushLocked sends what response bodies the windows now allow, the streams
 // waiting for them taking turns at the connection's window in the order they
 // began to wait: a window update that lets less go than they all have pending
@@ -2159,6 +2278,11 @@ func (sc *h2ServerConn) flushLocked(out []byte) []byte {
 	// stream waiting has had one, only their own windows can let more go.
 	stalled := 0
 	for sc.sendWindow > 0 && stalled < len(sc.sendQueue)-sc.sendHead {
+		if sc.outputRoomLocked(out) <= 0 {
+			// The socket has all the connection may queue: the stream at
+			// the head keeps its place, and its turn, until drained.
+			break
+		}
 		st := sc.sendQueue[sc.sendHead]
 		if len(st.pending) == 0 {
 			// It ended while it waited its turn.
@@ -2277,8 +2401,12 @@ func (sc *h2ServerConn) flushStreamLocked(out []byte, st *h2ServerStream) []byte
 // flushLocked and flushStreamLocked decide.
 func (sc *h2ServerConn) flushStreamUpToLocked(out []byte, st *h2ServerStream, quota int64) []byte {
 	for len(st.pending) > 0 {
+		room := sc.streamRoomLocked(st, out)
+		if room <= 0 {
+			break
+		}
 		n := int64(len(st.pending))
-		n = min(n, sc.sendWindow, st.sendWindow, int64(sc.peerMaxFrame), quota)
+		n = min(n, sc.sendWindow, st.sendWindow, int64(sc.peerMaxFrame), quota, room)
 		if n <= 0 {
 			break
 		}

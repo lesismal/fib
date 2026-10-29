@@ -1647,6 +1647,10 @@ func (c *Connection) noteWritableLocked() {
 func init() {
 	outputwait.Wait = func(c any, limit int64) error { return c.(*Connection).waitOutput(limit) }
 	outputwait.Pending = func(c any) int64 { return c.(*Connection).pendingBytes.Load() }
+	outputwait.Queued = func(c any) int64 {
+		conn := c.(*Connection)
+		return conn.pendingBytes.Load() + conn.corkedPending.Load()
+	}
 	outputwait.Unsent = func(c any) int64 { return c.(*Connection).unsent() }
 	outputwait.Notify = func(c any, limit int64, fn func(error)) bool {
 		return c.(*Connection).notifyOutput(limit, fn)
