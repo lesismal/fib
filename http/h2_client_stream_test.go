@@ -154,7 +154,7 @@ func TestClientHTTP2StreamWindowPacesSlowReader(t *testing.T) {
 	cr := <-ready
 	time.Sleep(300 * time.Millisecond)
 	cr.s.mu.Lock()
-	buffered := len(cr.s.buf)
+	buffered := cr.s.buffered
 	cr.s.mu.Unlock()
 	if buffered == 0 || buffered > h2StreamWindow {
 		t.Fatalf("buffered %d bytes, want 1 to %d: the sender was not held to the window", buffered, h2StreamWindow)

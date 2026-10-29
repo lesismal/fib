@@ -8,6 +8,7 @@ import (
 	stdhttp "net/http"
 	"sync"
 
+	"github.com/lesismal/fib/bufferpool"
 	"github.com/lesismal/fib/sidepool"
 )
 
@@ -330,9 +331,16 @@ type ResponseStream struct {
 	detached  bool
 
 	mu sync.Mutex
-	// buf holds body that has arrived and not been taken.
-	buf []byte
-	fn  BodyFunc
+	// chunks hold body that has arrived and not been taken, oldest first, in
+	// buffers of streamChunk bytes from the pool; off is how much of the
+	// first one Read has taken, and buffered how many bytes they hold in all.
+	// Each chunk is handed over whole and goes back to the pool as soon as
+	// it has been, so the body waiting costs what is waiting, rather than a
+	// buffer grown to it a copy at a time and left to the collector.
+	chunks   [][]byte
+	off      int
+	buffered int
+	fn       BodyFunc
 	// fired says the callback has been started, inCallback that it is running,
 	// delivering that a goroutine is inside fn, touched that something took or
 	// read the body, and discarding that the callback returned without any
@@ -349,12 +357,51 @@ type ResponseStream struct {
 	paused   bool
 	consumed int64
 	trailer  stdhttp.Header
-	// preCredited counts what of buf has been credited already, when
+	// preCredited counts what of chunks has been credited already, when
 	// hooks.Credit paces the sender.
 	preCredited int64
 }
 
-// takeLocked accounts n bytes leaving buf, read, delivered or thrown away, and
+// pushLocked adds b to the body waiting, filling the last chunk first.
+func (s *ResponseStream) pushLocked(b []byte) {
+	s.buffered += len(b)
+	for len(b) > 0 {
+		last := len(s.chunks) - 1
+		if last < 0 || len(s.chunks[last]) == cap(s.chunks[last]) {
+			s.chunks = append(s.chunks, bufferpool.Get(streamChunk)[:0])
+			last++
+		}
+		tail := s.chunks[last]
+		n := min(cap(tail)-len(tail), len(b))
+		s.chunks[last] = append(tail, b[:n]...)
+		b = b[n:]
+	}
+}
+
+// popLocked takes the oldest chunk off the body waiting, and returns what of
+// it is unread, data, and the chunk, which goes back to the pool once data
+// has been handed on.
+func (s *ResponseStream) popLocked() (data, chunk []byte) {
+	chunk = s.chunks[0]
+	data = chunk[s.off:]
+	n := copy(s.chunks, s.chunks[1:])
+	s.chunks[n] = nil
+	s.chunks = s.chunks[:n]
+	s.off = 0
+	s.buffered -= len(data)
+	return data, chunk
+}
+
+// dropLocked throws the body waiting away.
+func (s *ResponseStream) dropLocked() {
+	for i, chunk := range s.chunks {
+		bufferpool.Put(chunk)
+		s.chunks[i] = nil
+	}
+	s.chunks, s.off, s.buffered = s.chunks[:0], 0, 0
+}
+
+// takeLocked accounts n bytes leaving chunks, read, delivered or thrown away, and
 // returns how many of them the sender is still owed window for.
 func (s *ResponseStream) takeLocked(n int) int64 {
 	if s.hooks.Credit == nil {
@@ -411,8 +458,8 @@ func (s *ResponseStream) afterCallback() {
 	s.inCallback = false
 	if s.fn == nil && !s.touched {
 		s.discarding = true
-		c := s.takeLocked(len(s.buf))
-		s.buf = nil
+		c := s.takeLocked(s.buffered)
+		s.dropLocked()
 		s.unholdLocked()
 		s.mu.Unlock()
 		s.give(c)
@@ -446,7 +493,7 @@ func (s *ResponseStream) Data(b []byte) {
 		}
 		return
 	}
-	if s.fn != nil && s.fired && !s.inCallback && !s.delivering && len(s.buf) == 0 && !s.detached && !s.paused {
+	if s.fn != nil && s.fired && !s.inCallback && !s.delivering && s.buffered == 0 && !s.detached && !s.paused {
 		// Nobody is behind: hand it over from where it was read.
 		fn := s.fn
 		s.delivering = true
@@ -456,20 +503,20 @@ func (s *ResponseStream) Data(b []byte) {
 		s.give(int64(len(b)))
 		s.mu.Lock()
 		s.delivering = false
-		more := len(s.buf) > 0 || s.err != nil
+		more := s.buffered > 0 || s.err != nil
 		s.mu.Unlock()
 		if more {
 			s.drain()
 		}
 		return
 	}
-	s.buf = append(s.buf, b...)
+	s.pushLocked(b)
 	var early int64
 	if !s.fired && s.hooks.Credit != nil {
 		early = int64(len(b))
 		s.preCredited += early
 	}
-	fire := !s.fired && int64(len(s.buf)) >= s.threshold
+	fire := !s.fired && int64(s.buffered) >= s.threshold
 	if !fire {
 		s.holdLocked()
 	}
@@ -490,8 +537,18 @@ func (s *ResponseStream) End() {
 	s.trailer = s.cr.Response.Trailer
 	s.unholdLocked()
 	if !s.fired {
-		body := s.buf
-		s.buf = nil
+		var body []byte
+		if s.buffered > 0 {
+			// The body keeps no more than its size, and the chunks go back.
+			body = make([]byte, 0, s.buffered)
+			for i, chunk := range s.chunks {
+				if i == 0 {
+					chunk = chunk[s.off:]
+				}
+				body = append(body, chunk...)
+			}
+		}
+		s.dropLocked()
 		s.mu.Unlock()
 		resp := s.cr.Response
 		if len(body) == 0 {
@@ -518,7 +575,7 @@ func (s *ResponseStream) Fail(err error) {
 	if s.err == nil && !s.finSent {
 		s.err = err
 	}
-	s.buf = nil
+	s.dropLocked()
 	s.unholdLocked()
 	s.mu.Unlock()
 	s.deliver()
@@ -604,13 +661,13 @@ func (s *ResponseStream) drainLocked() {
 	for {
 		fn := s.fn
 		switch {
-		case len(s.buf) > 0 && s.err == nil && !s.paused:
-			data := s.buf
-			s.buf = nil
+		case s.buffered > 0 && s.err == nil && !s.paused:
+			data, chunk := s.popLocked()
 			s.consumed += int64(len(data))
 			c := s.takeLocked(len(data))
 			s.mu.Unlock()
 			fn(data, false, nil)
+			bufferpool.Put(chunk)
 			s.give(c)
 			s.mu.Lock()
 			continue
@@ -642,10 +699,10 @@ func (s *ResponseStream) holdLocked() {
 		return
 	}
 	switch {
-	case !s.held && s.fired && !s.ended && s.err == nil && len(s.buf) > s.highWater:
+	case !s.held && s.fired && !s.ended && s.err == nil && s.buffered > s.highWater:
 		s.held = true
 		s.hooks.Hold(true)
-	case s.held && len(s.buf) <= s.highWater/2:
+	case s.held && s.buffered <= s.highWater/2:
 		s.held = false
 		s.hooks.Hold(false)
 	}
@@ -694,9 +751,19 @@ func (b *streamBody) Read(p []byte) (int, error) {
 		return 0, ErrResponseAbandoned
 	}
 	s.touched = true
-	if len(s.buf) > 0 {
-		n := copy(p, s.buf)
-		s.buf = s.buf[n:]
+	if s.buffered > 0 {
+		n := 0
+		for n < len(p) && s.buffered > 0 {
+			k := copy(p[n:], s.chunks[0][s.off:])
+			n += k
+			s.off += k
+			s.buffered -= k
+			if s.off == len(s.chunks[0]) {
+				// Read all of it: the chunk goes back.
+				_, chunk := s.popLocked()
+				bufferpool.Put(chunk)
+			}
+		}
 		s.consumed += int64(n)
 		c := s.takeLocked(n)
 		s.holdLocked()

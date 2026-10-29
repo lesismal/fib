@@ -444,7 +444,7 @@ func TestClientStreamHoldsReadsForSlowReader(t *testing.T) {
 	cr := <-ready
 	time.Sleep(300 * time.Millisecond)
 	cr.s.mu.Lock()
-	buffered, held := len(cr.s.buf), cr.s.held
+	buffered, held := cr.s.buffered, cr.s.held
 	cr.s.mu.Unlock()
 	if !held || buffered > 1<<20 {
 		t.Fatalf("buffered %d bytes, held %v: reads were not held back", buffered, held)
