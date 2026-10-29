@@ -30,6 +30,14 @@ import (
 // HandshakeTimeout at zero.
 const DefaultHandshakeTimeout = 10 * time.Second
 
+// DefaultKernelTLSMinFile is KernelTLSMinFile when it is zero. On a Ryzen 7
+// 7800X3D under Linux 7.0, an HTTPS/1.1 server sending files of one size by
+// SendFile served 1 MiB ones 30% faster with the kernel sealing them, 256 KiB
+// ones 22% faster and 64 KiB ones no faster; a website of files up to 300
+// KiB, most of its replies from memory, was 6% slower with its connections
+// handed over on their first file.
+const DefaultKernelTLSMinFile = 512 << 10
+
 // readBufferSize holds the largest record crypto/tls will hand back from one
 // Read, so a drain never splits a record's plaintext across two calls.
 const readBufferSize = 16 << 10
@@ -141,12 +149,20 @@ type Handler struct {
 	// means 16 KiB.
 	MaxEarlyData uint32
 	// NoKernelTLS keeps the sealing of every record in this package. By
-	// default, on Linux, a connection that sends a file with SendFile, over
-	// an AES-GCM suite of TLS 1.3 or 1.2, hands the sealing of what it sends
-	// from then on to the kernel's TLS, when the kernel has it, so that the
-	// file goes from the page cache to the socket by sendfile; see
-	// Connection.SendFile in package fib.
+	// default, on Linux, a connection that sends a file of KernelTLSMinFile
+	// bytes or more with SendFile, a range or the whole of it, over an AES-GCM suite of TLS 1.3 or 1.2,
+	// hands the sealing of what it sends from then on to the kernel's TLS,
+	// when the kernel has it, so that the file goes from the page cache to
+	// the socket by sendfile; see Connection.SendFile in package fib.
 	NoKernelTLS bool
+	// KernelTLSMinFile is the smallest file whose SendFile hands the
+	// sealing to the kernel's TLS, where NoKernelTLS allows it: the range
+	// sent, or the file it is of, as an *os.File tells. Zero means
+	// DefaultKernelTLSMinFile. Once handed over, the kernel seals everything
+	// the connection sends, its replies from memory too, which costs more
+	// than sealing them here: a large file pays that back, and a smaller one
+	// is sealed here as it is read.
+	KernelTLSMinFile int64
 	// SessionCache, on a client, is where tickets go and sessions come from,
 	// for client handshakes that run without a worker: a connection then
 	// resumes the session of one before it. With EarlyData also set, what is

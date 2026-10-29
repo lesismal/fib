@@ -2,6 +2,7 @@ package tls
 
 import (
 	"errors"
+	"io/fs"
 	"sync/atomic"
 	"syscall"
 
@@ -13,12 +14,21 @@ import (
 // handshake is done and this package protects the records (fast.go).
 //
 // Where the kernel has TLS, which is Linux's with the suite one of AES-GCM's,
-// the first file the connection sends hands the sealing of everything it
-// sends from then on to the kernel, and the file goes by sendfile, from the
-// page cache to the socket, sealed on its way. The switch is made at a moment
-// when nothing sealed here is still queued, which the connection tells
-// (fib.Connection.ControlIdle); a file sent at another moment is sealed here,
-// and the next one tries again.
+// the first file of Handler.KernelTLSMinFile bytes or more the connection
+// sends hands the sealing of everything it sends from then on to the kernel,
+// and the file goes by sendfile, from the page cache to the socket, sealed
+// on its way. The switch is made at a moment when nothing sealed here is
+// still queued, which the connection tells (fib.Connection.ControlIdle); a
+// file sent at another moment is sealed here, and the next one tries again.
+// The connection is told (fib.Connection.SetKernelTLS), so that it writes as
+// suits the kernel's records.
+//
+// A smaller file is sealed here until then. The switch is for good, and the
+// kernel seals a reply from memory at more cost than this package does:
+// Linux's TLS takes a few records' worth of plaintext through more work for
+// each record, so that a connection serving mostly replies from memory and
+// files of tens of KiB went slower for it, while a file of hundreds of KiB
+// that is not read and sealed here pays it back.
 //
 // Otherwise the file is sealed here, a chunk at a time as the socket takes
 // it, by the connection's flush (fib.FileSealer): the records it will take
@@ -89,7 +99,7 @@ func (t *layer) SendFile(f fib.File, offset, count int64) error {
 	if t.closeAfterSend || t.isClosed() || !t.canSendFileLocked() {
 		return syscall.EPIPE
 	}
-	if t.kernelSealsLocked() {
+	if t.kernelSealsLocked(f, count) {
 		if len(t.held) > 0 {
 			if err := t.releaseHeldLocked(); err != nil {
 				return err
@@ -118,8 +128,9 @@ func (t *layer) SendFile(f fib.File, offset, count int64) error {
 
 // kernelSealsLocked reports whether the kernel seals what the connection
 // sends, handing the sealing to it first if it has not been yet, the kernel
-// can, and nothing sealed here is still queued. The caller holds wmu.
-func (t *layer) kernelSealsLocked() bool {
+// can, the count bytes of f about to go are a large file's (largeFile), and
+// nothing sealed here is still queued. The caller holds wmu.
+func (t *layer) kernelSealsLocked(f fib.File, count int64) bool {
 	switch t.ktls {
 	case ktlsOn:
 		return true
@@ -128,6 +139,9 @@ func (t *layer) kernelSealsLocked() bool {
 	}
 	if t.owner != nil && t.owner.NoKernelTLS || !kernelTLSFits(t.tx) {
 		t.ktls = ktlsOff
+		return false
+	}
+	if !largeFile(f, count, t.kernelTLSMinFile()) {
 		return false
 	}
 	ran, err := t.c.ControlIdle(func(fd uintptr) error { return startKernelTLS(fd, t.tx) })
@@ -141,7 +155,33 @@ func (t *layer) kernelSealsLocked() bool {
 		return false
 	}
 	t.ktls = ktlsOn
+	t.c.SetKernelTLS()
 	return true
+}
+
+// largeFile reports whether count bytes of f come to min or more, or f does,
+// as a file has that an HTTP response sends in pieces (fib/http's
+// SendFileStall queues 256 KiB at a time). A file that cannot tell its size
+// is as large as the range.
+func largeFile(f fib.File, count, min int64) bool {
+	if count >= min {
+		return true
+	}
+	s, ok := f.(interface{ Stat() (fs.FileInfo, error) })
+	if !ok {
+		return false
+	}
+	info, err := s.Stat()
+	return err == nil && info.Size() >= min
+}
+
+// kernelTLSMinFile is the smallest file that hands the sealing to the
+// kernel.
+func (t *layer) kernelTLSMinFile() int64 {
+	if t.owner != nil && t.owner.KernelTLSMinFile > 0 {
+		return t.owner.KernelTLSMinFile
+	}
+	return DefaultKernelTLSMinFile
 }
 
 // kernelSendLocked sends first followed by second as a record of typ for the

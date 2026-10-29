@@ -37,14 +37,23 @@ func writeFile(t testing.TB, size int) (*os.File, []byte) {
 }
 
 // fileServer serves TLS, settling on version and suite, with the kernel's TLS
-// or without, and hands the test each connection's layer once its handshake
-// is done; onData, if set, runs on each read.
+// for a file of any size or without it, and hands the test each connection's
+// layer once its handshake is done; onData, if set, runs on each read.
 func fileServer(t testing.TB, kernel bool, version, suite uint16, onData func(*fib.Connection, []byte)) (layerOf, *stdtls.Config, string) {
+	t.Helper()
+	return fileServerWith(t, version, suite, onData, func(h *Handler) {
+		h.NoKernelTLS = !kernel
+		h.KernelTLSMinFile = 1
+	})
+}
+
+// fileServerWith is fileServer with the handler set up by setup.
+func fileServerWith(t testing.TB, version, suite uint16, onData func(*fib.Connection, []byte), setup func(*Handler)) (layerOf, *stdtls.Config, string) {
 	t.Helper()
 	serverConfig, clientConfig := suiteConfigs(t, version, suite)
 	layers := make(layerOf, 4)
 	h := NewServer(serverConfig, &settledHandler{HandlerFuncs: fib.HandlerFuncs{Data: onData}, layers: layers})
-	h.NoKernelTLS = !kernel
+	setup(h)
 	_, addr := startEchoServer(t, fib.DefaultConfig(), h)
 	return layers, clientConfig, addr
 }
@@ -199,6 +208,112 @@ func TestSendFileOverTLS(t *testing.T) {
 				}
 			})
 		}
+	}
+}
+
+// By default a file smaller than DefaultKernelTLSMinFile is sealed here and
+// leaves the kernel's TLS untried, and the first file of that size hands the
+// sealing over, even sent a piece at a time, as fib/http sends a response;
+// KernelTLSMinFile moves the mark.
+func TestKernelTLSMinFile(t *testing.T) {
+	small, smallData := writeFile(t, 64<<10)
+	large, largeData := writeFile(t, DefaultKernelTLSMinFile)
+	for _, min := range []int64{0, 128 << 10} {
+		layers, config, addr := fileServerWith(t, stdtls.VersionTLS13, 0, nil, func(h *Handler) { h.KernelTLSMinFile = min })
+		conn := dialFileServer(t, addr, config)
+		l := <-layers
+		for _, file := range []struct {
+			f      *os.File
+			data   []byte
+			kernel bool
+		}{
+			{small, smallData, false},
+			{large, largeData[:64<<10], true},
+			{small, smallData, true},
+		} {
+			if err := l.c.SendFile(file.f, 0, int64(len(file.data))); err != nil {
+				t.Fatal(err)
+			}
+			got := make([]byte, len(file.data))
+			if _, err := io.ReadFull(conn, got); err != nil || !bytes.Equal(got, file.data) {
+				t.Fatalf("min %d, a file of %d bytes: %v", min, len(file.data), err)
+			}
+			wantKernel(t, l, file.kernel)
+			l.wmu.Lock()
+			state, fits := l.ktls, kernelTLSFits(l.tx)
+			l.wmu.Unlock()
+			if !file.kernel && fits && state != ktlsUntried {
+				t.Fatalf("min %d: a file of %d bytes left the kernel's TLS in state %d", min, len(file.data), state)
+			}
+		}
+	}
+}
+
+// Once a file has handed the sealing to the kernel, what the connection sends
+// after it, in writes of more than a record that go in two, the whole records
+// marked as having more to follow, reaches the client whole and in order:
+// single writes from outside the handler, and corked replies written
+// together, each around a record's size.
+func TestKernelTLSLargeSends(t *testing.T) {
+	f, data := writeFile(t, 64<<10)
+	sizes := []int{1, maxPlaintext - 1, maxPlaintext, maxPlaintext + 1, 3 * maxPlaintext, 3*maxPlaintext + 1, 200_000}
+	payload := make([]byte, 200_000)
+	rand.New(rand.NewSource(3)).Read(payload)
+	var want []byte
+	for _, n := range sizes {
+		want = append(want, payload[:n]...)
+	}
+	for _, kernel := range []bool{true, false} {
+		t.Run(map[bool]string{true: "kernel", false: "userland"}[kernel], func(t *testing.T) {
+			layers, config, addr := fileServer(t, kernel, stdtls.VersionTLS13, 0, func(c *fib.Connection, _ []byte) {
+				for _, n := range sizes {
+					if err := c.Send(payload[:n]); err != nil {
+						t.Error(err)
+					}
+				}
+			})
+			conn := dialFileServer(t, addr, config)
+			l := <-layers
+			if err := l.c.SendFile(f, 0, int64(len(data))); err != nil {
+				t.Fatal(err)
+			}
+			got := make([]byte, len(data))
+			if _, err := io.ReadFull(conn, got); err != nil || !bytes.Equal(got, data) {
+				t.Fatalf("the file: %v", err)
+			}
+			wantKernel(t, l, kernel)
+			for _, n := range sizes {
+				if err := l.c.Send(payload[:n]); err != nil {
+					t.Fatal(err)
+				}
+			}
+			got = make([]byte, len(want))
+			if _, err := io.ReadFull(conn, got); err != nil || !bytes.Equal(got, want) {
+				t.Fatalf("the writes from outside: %v", err)
+			}
+			if _, err := conn.Write([]byte("x")); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := io.ReadFull(conn, got); err != nil || !bytes.Equal(got, want) {
+				t.Fatalf("the corked replies: %v", err)
+			}
+			// Writes queued ahead of a file, of more than a record and of
+			// less, go whole, sharing a record with the file's first bytes.
+			head := payload[:3*maxPlaintext+1]
+			for _, b := range [][]byte{head, []byte("x")} {
+				if err := l.c.Send(b); err != nil {
+					t.Fatal(err)
+				}
+				if err := l.c.SendFile(f, 7, int64(len(data)-7)); err != nil {
+					t.Fatal(err)
+				}
+				wantBoth := append(append([]byte(nil), b...), data[7:]...)
+				got = make([]byte, len(wantBoth))
+				if _, err := io.ReadFull(conn, got); err != nil || !bytes.Equal(got, wantBoth) {
+					t.Fatalf("%d bytes ahead of a file: %v", len(b), err)
+				}
+			}
+		})
 	}
 }
 
