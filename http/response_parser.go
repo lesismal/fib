@@ -521,13 +521,21 @@ func (p *responseParser) completeChunked(end int, req *stdhttp.Request) (*stdhtt
 }
 
 // complete hands out the response in progress with its body and removes it
-// from the buffer. The body is copied: the buffer is reused for the next
-// response on the connection.
+// from the buffer. The body is copied: the parser's buffer is reused for the
+// next response on the connection. A small body's copy is a buffer from the
+// pool, which a caller that passes the body on can give back (TakeBody,
+// Context.WriteResponseOwned); a larger one is of its own size, since a
+// pool's class can be nearly twice that, and a caller may keep the body.
 func (p *responseParser) complete(end int, body []byte) *stdhttp.Response {
 	resp := p.head
-	if len(body) == 0 {
+	switch {
+	case len(body) == 0:
 		resp.Body = stdhttp.NoBody
-	} else {
+	case len(body) <= maxCopiedResponseBody:
+		data := bufferpool.Get(len(body))
+		copy(data, body)
+		resp.Body = &bufferedBody{data: data, pooled: true}
+	default:
 		resp.Body = &bufferedBody{data: append([]byte(nil), body...)}
 	}
 	p.head = nil

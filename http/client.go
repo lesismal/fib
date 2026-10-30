@@ -428,9 +428,15 @@ func (c *Client) do(req *stdhttp.Request, callback func(*ClientResponse, error),
 	// HTTP/1.1 or HTTP/2 framing is only known once a connection has been
 	// chosen. Others are read as they are sent.
 	var body []byte
+	var borrowed bool
 	var upload *reqbody.Source
 	if reqbody.Streams(req) {
 		upload = reqbody.NewSource(req)
+	} else if b, ok := req.Body.(*bufferedBody); ok {
+		// A body that is bytes already (NewBufferedBody) is taken as it is,
+		// not read into a copy: HTTP/1 copies it into data below, and HTTP/2,
+		// which would send it by reference later, copies it then (borrowed).
+		body, borrowed = b.data[b.off:], true
 	} else if req.Body != nil && req.Body != stdhttp.NoBody {
 		body, err = readWhole(req.Body, req.ContentLength)
 		_ = req.Body.Close()
@@ -459,8 +465,8 @@ func (c *Client) do(req *stdhttp.Request, callback func(*ClientResponse, error),
 		callback(nil, err)
 		return nil
 	}
-	r := &clientRequest{req: req, data: data, body: body, upload: upload, declared: declared, chunked: chunked,
-		callback: callback, whole: whole, tunnel: tunnel, headerWait: c.config.ResponseHeaderTimeout}
+	r := &clientRequest{req: req, data: data, body: body, borrowed: borrowed, upload: upload, declared: declared,
+		chunked: chunked, callback: callback, whole: whole, tunnel: tunnel, headerWait: c.config.ResponseHeaderTimeout}
 	r.headLen = len(data)
 	if c.config.ExpectContinueTimeout > 0 && reqbody.ExpectsContinue(req, len(body) > 0 || upload != nil) {
 		r.expect = true
@@ -1215,6 +1221,12 @@ type clientRequest struct {
 	// is what HTTP/2 sends after the header block.
 	data []byte
 	body []byte
+	// borrowed says body is the caller's bytes rather than a copy of them:
+	// the request's Body was a NewBufferedBody. HTTP/1 has copied it into
+	// data, and HTTP/2 copies it before sending it, since the caller may take
+	// it back once the response has arrived, which can be before the body has
+	// all gone.
+	borrowed bool
 	// dataRefs counts the holds on data when it is a buffer of package
 	// bufferpool, and is zero when it is not: one until the response has
 	// arrived, which answered marks, and one for each send under way. The last

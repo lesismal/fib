@@ -371,6 +371,9 @@ func (hc *h2ClientConn) startBodyLocked(out []byte, st *h2ClientStream) []byte {
 	case r.upload != nil:
 	case len(r.body) > 0:
 		st.pending = r.body
+		if r.borrowed {
+			st.pending = slices.Clone(r.body)
+		}
 		out = hc.flushStreamLocked(out, st)
 	case len(st.trailer) > 0:
 		out = hc.appendTrailerLocked(out, st)

@@ -637,6 +637,27 @@ func (c *Context) WriteResponseCopy(response Response) error {
 	return c.writeWhole(response, copied)
 }
 
+// WriteResponseOwned sends the whole response at once, as WriteResponse does,
+// for a Body that is a buffer from package bufferpool, which the response
+// takes over: it gives it back to the pool once the send path is done with
+// it, or leaves it to the collector where giving it back would cost more than
+// it saves: HTTP/2's streams keep a body by reference with no way to give it
+// back, and HTTP/1 sends a body larger than a small reply's by reference
+// rather than copying it into its queue. The caller must not touch the buffer
+// after the call, whatever it returns. It is how a proxy sends on a
+// response's body from ClientResponse.TakeBody without a copy.
+func (c *Context) WriteResponseOwned(response Response) error {
+	owned := response.Body
+	if len(owned) == 0 || !c.senderTakesCopiedBody() || c.external == nil && len(owned) > maxCopiedResponseBody {
+		owned = nil
+	}
+	if c.begun() {
+		releaseBody(owned)
+		return ErrResponseWritten
+	}
+	return c.writeWhole(response, owned)
+}
+
 // copyResponseBody copies body for a *Copy call, reporting the copy and, when
 // a send path can give it back once it has done with it, the buffer from the
 // pool the copy is. A body the sender cannot take over is copied plainly

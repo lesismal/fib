@@ -66,6 +66,10 @@ func (c *ClientResponse) Tunnel() *Tunnel { return c.tunnel }
 // NewBufferedBody returns the Body for a response that arrived whole, which
 // DeliverResponse can hand to OnBody without copying it. The body does not
 // copy data either.
+//
+// It is also the Body for a request whose body is bytes already: Client
+// takes data as it is rather than reading it into a copy, so data must stay
+// as it is until the request's callback has run.
 func NewBufferedBody(data []byte) io.ReadCloser {
 	if len(data) == 0 {
 		return stdhttp.NoBody
@@ -209,6 +213,35 @@ func (c *ClientResponse) BodyBytes() ([]byte, bool) {
 	return nil, false
 }
 
+// TakeBody hands over the body of a response that arrived whole: what of it
+// Body has yet to read, and true; it reports false for a body that streams.
+// From then on the bytes are the caller's, and Body, BodyBytes and OnBody
+// find the body empty.
+//
+// pooled says the bytes are a buffer from package bufferpool, which the
+// caller may give back, with bufferpool.Put or by sending it with
+// Context.WriteResponseOwned, once it has done with them; it need not, since
+// the collector frees a buffer that is not given back. It is how a proxy
+// passes a response on without a copy and without the allocation each
+// response's body otherwise costs: TakeBody, then WriteResponseOwned.
+func (c *ClientResponse) TakeBody() (body []byte, pooled, ok bool) {
+	if c.s != nil {
+		return nil, false, false
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	w := c.whole
+	if w == nil {
+		if b := c.Response.Body; b == nil || b == stdhttp.NoBody {
+			return nil, false, true
+		}
+		return nil, false, false
+	}
+	body, pooled = w.data[w.off:], w.pooled && w.off == 0
+	w.data, w.off, w.pooled = nil, 0, false
+	return body, pooled, true
+}
+
 // BodyComplete reports whether all of the body has arrived, which is always so
 // unless the response streams. It is the way to tell, inside the callback,
 // whether Body holds the whole of it.
@@ -248,10 +281,15 @@ func (c *ClientResponse) Close() {
 	}
 }
 
-// bufferedBody is the Body of a response that arrived whole.
+// bufferedBody is the Body of a response that arrived whole, or of a request
+// whose body is bytes already.
 type bufferedBody struct {
 	data []byte
 	off  int
+	// pooled says data is a buffer from package bufferpool, which TakeBody
+	// can hand over for the caller to give back. Left to the collector
+	// otherwise, as Body and BodyBytes leave it.
+	pooled bool
 }
 
 func (b *bufferedBody) Read(p []byte) (int, error) {
