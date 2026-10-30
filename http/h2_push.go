@@ -115,12 +115,6 @@ func (st *h2ServerStream) push(parent *stdhttp.Request, target string, opts *std
 	// promise is sent, so that a client resetting the stream straight away
 	// leaves it to the handler rather than recycling it under the handler.
 	promised.refs.Add(1)
-	sc.streams[id] = promised
-	sc.pushedStreams++
-	sc.busyLocked()
-	sc.sendLocked(h2AppendPushPromise(nil, st.id, id, block, sc.peerMaxFrame))
-	sc.mu.Unlock()
-
 	// The promised request is the stream's own, as a client's request is, so
 	// that a recycled stream hands its Request, URL and Context to the next
 	// push rather than allocating others.
@@ -150,8 +144,17 @@ func (st *h2ServerStream) push(parent *stdhttp.Request, target string, opts *std
 		req.Header[key] = append(req.Header[key], values...)
 	}
 	promised.req = req
+	// Its Context is bound before the stream is the connection's, under the
+	// lock, since a client that resets the stream straight away has the
+	// reader look at it from then.
 	c := promised.block.bind(sc.conn, nil)
 	c.stream = promised
+	sc.streams[id] = promised
+	sc.pushedStreams++
+	sc.busyLocked()
+	sc.sendLocked(h2AppendPushPromise(nil, st.id, id, block, sc.peerMaxFrame))
+	sc.mu.Unlock()
+
 	sc.armWriteTimeout(promised)
 
 	// Its handler runs here, on the goroutine of the one pushing it, which
