@@ -194,8 +194,10 @@ func TestServerEarlyDataHTTP1(t *testing.T) {
 	case <-time.After(100 * time.Millisecond):
 	}
 	// The POST's connection may have carried a ticket; the next warm-up has
-	// to be a full handshake, so that its ticket makes the GET early.
-	client.cache.Put("localhost", nil)
+	// to be a full handshake, so that its ticket makes the GET early. The
+	// cache is a new one rather than the old one emptied, since the POST's
+	// ticket can reach the cache its dial was given after the exchange ends.
+	client.cache = fibtls.NewQUICSessionCache(4)
 	warm()
 	if got := client.exchange(t, addr, get("/early"), bodyEndsWith("ok")); !bytes.Contains(got, []byte(" 200 ")) {
 		t.Fatalf("early GET response %q", got)
@@ -295,8 +297,10 @@ func TestServerEarlyDataHTTP2(t *testing.T) {
 	case <-time.After(100 * time.Millisecond):
 	}
 	// The POST's connection may have carried a ticket; the next warm-up has
-	// to be a full handshake, so that its ticket makes the GET early.
-	client.cache.Put("localhost", nil)
+	// to be a full handshake, so that its ticket makes the GET early. The
+	// cache is a new one rather than the old one emptied, since the POST's
+	// ticket can reach the cache its dial was given after the exchange ends.
+	client.cache = fibtls.NewQUICSessionCache(4)
 	warm()
 	got := exchange(stdhttp.MethodGet, "/early")
 	if status, _ := h2Reply(t, got); status != "200" {
