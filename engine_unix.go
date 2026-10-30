@@ -1377,7 +1377,10 @@ func (c *Connection) sysSendFileLocked(item *sendItem) (n, attempted int, fromFi
 			return 0, 0, false, err
 		}
 		data := item.data[item.offset:]
-		n, err = c.sysWrite(data)
+		// While more of the file follows at once, TCP holds what a chunk
+		// leaves of a segment unfilled for the next one, rather than pushing
+		// each chunk on its own as the end of what there is to send.
+		n, err = writeSealed(c, data, s.remaining > 0)
 		return max(n, 0), len(data), false, err
 	}
 	attempted = int(min(s.remaining, maxSendFileCall))
@@ -1448,6 +1451,15 @@ func (c *Connection) sysSendFileLocked(item *sendItem) (n, attempted int, fromFi
 // sendfile is syscall.Sendfile, which a test replaces to have it come up
 // short.
 var sendfile = syscall.Sendfile
+
+// writeSealed writes a sealed chunk of a file, telling the kernel more
+// follows it when more says so; a test replaces it to see which do.
+var writeSealed = func(c *Connection, data []byte, more bool) (int, error) {
+	if more {
+		return c.sysWriteMore([][]byte{data})
+	}
+	return c.sysWrite(data)
+}
 
 // rawSocket is what the kernel names a socket by: a file descriptor here.
 type rawSocket = int

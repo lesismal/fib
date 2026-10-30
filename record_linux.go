@@ -37,8 +37,9 @@ func (c *Connection) sysSendRecord(typ uint8, data []byte) (int, error) {
 }
 
 // sysWriteMore writes buffers, which must hold some bytes, telling the kernel
-// more follows them: its TLS then hands the records they fill to TCP without
-// pushing each. Callers hold c.mu.
+// more follows them: TCP then holds a segment they leave unfilled for what
+// follows rather than pushing it, and the kernel's TLS hands the records they
+// fill to TCP without pushing each. Callers hold c.mu.
 func (c *Connection) sysWriteMore(buffers [][]byte) (int, error) {
 	var iov [maxWritevItems]syscall.Iovec
 	count := 0
