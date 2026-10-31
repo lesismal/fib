@@ -252,7 +252,6 @@ func TestConsentLost(t *testing.T) {
 		t.Fatal("not connected")
 	}
 	n.cut = true
-	start := n.now
 	if !n.run(15*time.Second, func() bool { return a.a.State() == StateDisconnected }) {
 		t.Fatalf("not disconnected: %v", a.a.State())
 	}
@@ -261,7 +260,7 @@ func TestConsentLost(t *testing.T) {
 		t.Fatal("did not come back")
 	}
 	n.cut = true
-	start = n.now
+	start := n.now
 	if !n.run(time.Minute, func() bool { return a.a.State() == StateFailed && b.a.State() == StateFailed }) {
 		t.Fatalf("consent not lost: %v %v", a.a.State(), b.a.State())
 	}
