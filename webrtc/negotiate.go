@@ -93,15 +93,13 @@ func (pc *PeerConnection) newMid() string {
 }
 
 // setup is the a=setup this side writes: actpass in an offer until the
-// DTLS roles are settled, and its role after that, as RFC 8842 has it.
-func (pc *PeerConnection) setup(typ SDPType) sdp.Setup {
+// DTLS roles are settled, and its role after that, as RFC 8842 has it. An
+// answer always has its role, which the remote offer settled.
+func (pc *PeerConnection) setup() sdp.Setup {
 	if pc.dtlsRole != "" {
 		return pc.dtlsRole
 	}
-	if typ == SDPTypeOffer {
-		return sdp.SetupActpass
-	}
-	return sdp.SetupActive
+	return sdp.SetupActpass
 }
 
 // buildDescription writes the offer or answer for the sections in
@@ -114,7 +112,7 @@ func (pc *PeerConnection) buildDescription(typ SDPType, ufrag, pwd string) *sdp.
 	}
 	sd.AddAttribute("msid-semantic", " WMS *")
 	var bundle []string
-	setup := pc.setup(typ)
+	setup := pc.setup()
 	for _, mid := range pc.midOrder {
 		var md *sdp.MediaDescription
 		if mid == pc.dataMid {
@@ -224,15 +222,9 @@ func (pc *PeerConnection) mediaSection(typ SDPType, t *Transceiver) *sdp.MediaDe
 		if typ == SDPTypeAnswer {
 			return nil
 		}
+		// An offer's codecs are the configured ones of the kind, so with
+		// none there are none to name.
 		md := sdp.NewMedia(string(t.kind), 0, sdp.ProtoRTP)
-		if len(codecs) == 0 {
-			for _, c := range pc.codecs {
-				if c.Kind() == t.kind {
-					codecs = append(codecs, c.toSDP(c.PayloadType))
-					break
-				}
-			}
-		}
 		for _, c := range codecs[:min(1, len(codecs))] {
 			md.AddCodec(c)
 		}

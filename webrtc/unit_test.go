@@ -1,10 +1,13 @@
 package webrtc
 
 import (
+	"fmt"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/lesismal/fib/tls"
+	"github.com/lesismal/fib/webrtc/ice"
 	"github.com/lesismal/fib/webrtc/sdp"
 	"github.com/lesismal/fib/webrtc/stun"
 )
@@ -22,7 +25,16 @@ func TestRequestUfrag(t *testing.T) {
 	var r stun.Message
 	r.Build(stun.MessageType{Method: stun.MethodBinding, Class: stun.ClassSuccessResponse}, stun.NewTransactionID())
 	r.AddString(stun.AttrUsername, "a:b")
-	for _, b := range [][]byte{r.Raw, m.Raw[:10], {0, 1, 0, 4, 0x21, 0x12, 0xa4, 0x42}, append(m.Raw[:20:20], 0, 6, 0, 99)} {
+	// A request with no USERNAME, or one with no colon, names no ufrag;
+	// neither does one whose attribute runs past the message.
+	var noUser, noColon stun.Message
+	noUser.Build(stun.BindingRequest, stun.NewTransactionID())
+	noUser.AddString(stun.AttrSoftware, "x")
+	noColon.Build(stun.BindingRequest, stun.NewTransactionID())
+	noColon.AddString(stun.AttrUsername, "nocolon")
+	overrun := append([]byte(nil), noUser.Raw...)
+	overrun[22], overrun[23] = 0, 200
+	for _, b := range [][]byte{r.Raw, m.Raw[:10], {0, 1, 0, 4, 0x21, 0x12, 0xa4, 0x42}, append(m.Raw[:20:20], 0, 6, 0, 99), noUser.Raw, noColon.Raw, overrun} {
 		if got := requestUfrag(b); got != "" {
 			t.Fatalf("%x: got %q", b, got)
 		}
@@ -129,5 +141,82 @@ func TestSignalingErrors(t *testing.T) {
 	}
 	if _, err := NewPeerConnection(Configuration{BundlePolicy: 1}); err == nil {
 		t.Fatal("bundle policy accepted")
+	}
+}
+
+func TestOrderSection(t *testing.T) {
+	md := sdp.NewMedia("audio", 9, sdp.ProtoRTP)
+	md.SetMid("0")
+	md.SetDirection(sdp.SendRecv)
+	md.SetSetup(sdp.SetupActive)
+	md.SetICECredentials("ufrag", "pwd")
+	(&PeerConnection{}).orderSection(md)
+	var names []string
+	for _, l := range md.Lines {
+		if l.Type == 'a' {
+			name, _, _ := l.Attribute()
+			names = append(names, name)
+		}
+	}
+	if got := strings.Join(names, " "); got != "ice-ufrag ice-pwd setup mid sendrecv" {
+		t.Fatalf("attributes in the order %s", got)
+	}
+}
+
+func TestExtensionIDs(t *testing.T) {
+	pc := &PeerConnection{extIDs: map[string]uint8{}}
+	for i := range 14 {
+		if id, ok := pc.extensionID(fmt.Sprint("urn:x:", i)); !ok || id != uint8(i+1) {
+			t.Fatalf("extension %d got id %d", i, id)
+		}
+	}
+	if id, ok := pc.extensionID("urn:x:3"); !ok || id != 4 {
+		t.Fatalf("a URI's id changed to %d", id)
+	}
+	if _, ok := pc.extensionID("urn:x:14"); ok {
+		t.Fatal("a fifteenth one-byte extension id")
+	}
+}
+
+func TestVerifyPeerWithoutCertificate(t *testing.T) {
+	if err := (&PeerConnection{}).verifyPeer(nil, nil); err != ErrFingerprint {
+		t.Fatalf("no certificate: %v", err)
+	}
+}
+
+// TestAgentStates maps each ice.State to the ICE and PeerConnection states
+// of a PeerConnection that has no DTLS connection yet.
+func TestAgentStates(t *testing.T) {
+	pc := &PeerConnection{iceState: ICEConnectionStateChecking}
+	for _, tc := range []struct {
+		agent ice.State
+		ice   ICEConnectionState
+		conn  PeerConnectionState
+	}{
+		{ice.StateNew, ICEConnectionStateNew, PeerConnectionStateNew},
+		{ice.StateNew, ICEConnectionStateNew, PeerConnectionStateNew},
+		{ice.StateChecking, ICEConnectionStateChecking, PeerConnectionStateConnecting},
+		{ice.StateConnected, ICEConnectionStateConnected, PeerConnectionStateConnecting},
+		{ice.StateDisconnected, ICEConnectionStateDisconnected, PeerConnectionStateDisconnected},
+		{ice.StateFailed, ICEConnectionStateFailed, PeerConnectionStateFailed},
+	} {
+		pc.onAgentState(tc.agent)
+		if pc.iceState != tc.ice || pc.connState != tc.conn {
+			t.Fatalf("agent %v: %v and %v, want %v and %v", tc.agent, pc.iceState, pc.connState, tc.ice, tc.conn)
+		}
+	}
+}
+
+// TestLiteDeadline checks the defaults a lite PeerConnection times a
+// silent peer by: disconnected after 8s, failed 30s after that.
+func TestLiteDeadline(t *testing.T) {
+	at := time.Unix(1_700_000_000, 0)
+	pc := &PeerConnection{lastRecv: at, iceState: ICEConnectionStateConnected}
+	if d := pc.liteDeadline().Sub(at); d != 8*time.Second {
+		t.Fatalf("connected: %v", d)
+	}
+	pc.iceState = ICEConnectionStateDisconnected
+	if d := pc.liteDeadline().Sub(at); d != 30*time.Second {
+		t.Fatalf("disconnected: %v", d)
 	}
 }

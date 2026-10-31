@@ -360,9 +360,6 @@ func (t *TrackLocal) SetHeaderExtensions(ids map[string]uint8) {
 }
 
 func (t *TrackLocal) codecMatches(c Codec) bool {
-	if t == nil {
-		return false
-	}
 	if t.codec.ClockRate == 0 {
 		return strings.EqualFold(t.codec.MimeType, c.MimeType)
 	}
@@ -769,9 +766,6 @@ func (pc *PeerConnection) scheduleReports(now time.Time) {
 // receiver report for the streams received, at most 31 of them.
 func (pc *PeerConnection) sendReports(now time.Time) {
 	pc.scheduleReports(now)
-	if pc.srtpOut == nil {
-		return
-	}
 	buf := pc.rtcpBuf[:0]
 	for _, t := range pc.transceivers {
 		s := t.sender
@@ -786,9 +780,6 @@ func (pc *PeerConnection) sendReports(now time.Time) {
 	for _, tr := range pc.tracks {
 		if len(rr.Reports) == 31 {
 			break
-		}
-		if tr.received == 0 {
-			continue
 		}
 		expected := tr.max - tr.base + 1
 		lost := expected - tr.received

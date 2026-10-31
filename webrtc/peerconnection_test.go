@@ -18,10 +18,16 @@ import (
 
 const waitTimeout = 20 * time.Second
 
-func startEngine(t testing.TB) *fib.Engine {
+func startEngine(t testing.TB) *fib.Engine { return startEngineWith(t, nil) }
+
+// startEngineWith runs an engine whose configuration tune changes first.
+func startEngineWith(t testing.TB, tune func(*fib.Config)) *fib.Engine {
 	t.Helper()
 	config := fib.DefaultConfig()
 	config.LogSettings = false
+	if tune != nil {
+		tune(&config)
+	}
 	e, err := fib.New(config)
 	if err != nil {
 		t.Fatal(err)

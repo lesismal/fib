@@ -48,11 +48,7 @@ func waitGathered(ctx context.Context, pc *PeerConnection) (SessionDescription, 
 	case <-pc.GatheringComplete():
 	case <-ctx.Done():
 	}
-	d := pc.LocalDescription()
-	if d == nil {
-		return SessionDescription{}, ErrClosed
-	}
-	return *d, nil
+	return *pc.LocalDescription(), nil
 }
 
 // fingerprintOf is the fingerprint of a DER certificate under the SDP hash
