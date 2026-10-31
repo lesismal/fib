@@ -17,7 +17,33 @@ import (
 
 // TestEngineCloseTellsClients checks that a server whose engine closes tells
 // its clients so, with H3_NO_ERROR, rather than leaving them to time out.
+//
+// The close is one datagram, which a loaded loopback may drop (macOS refuses
+// a send with ENOBUFS), and with the server's socket gone nothing can send it
+// again: the client, which is quiet, is then told only by its idle timeout.
+// So when a client is not told, the test closes another server, a few times
+// over: a server that never tells its clients fails every try.
 func TestEngineCloseTellsClients(t *testing.T) {
+	const tries = 3
+	for i := range tries {
+		told, err := engineCloseTellsClient(t)
+		if !told {
+			t.Logf("try %d: the client was not told", i+1)
+			continue
+		}
+		var appErr *quic.ApplicationError
+		if !errors.As(err, &appErr) || !appErr.Remote || appErr.Code != uint64(ErrCodeNoError) {
+			t.Fatalf("closed with %v, want the server's H3_NO_ERROR", err)
+		}
+		return
+	}
+	t.Fatalf("the client was not told, in %d tries", tries)
+}
+
+// engineCloseTellsClient closes the engine of a server with a client, and
+// reports whether the client was closed within a few seconds, and with what.
+func engineCloseTellsClient(t *testing.T) (bool, error) {
+	t.Helper()
 	serverTLS, _, err := tlstest.Configs()
 	if err != nil {
 		t.Fatal(err)
@@ -48,12 +74,9 @@ func TestEngineCloseTellsClients(t *testing.T) {
 	}
 	select {
 	case err := <-w.closed:
-		var appErr *quic.ApplicationError
-		if !errors.As(err, &appErr) || !appErr.Remote || appErr.Code != uint64(ErrCodeNoError) {
-			t.Fatalf("closed with %v, want the server's H3_NO_ERROR", err)
-		}
-	case <-time.After(10 * time.Second):
-		t.Fatal("the client was not told")
+		return true, err
+	case <-time.After(5 * time.Second):
+		return false, nil
 	}
 }
 
