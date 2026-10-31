@@ -88,9 +88,18 @@ func TestClientHTTP2HealthCheckRetriesOnNewConnection(t *testing.T) {
 	}
 }
 
+// liveConfig is healthConfig with 500ms for the server to answer, which a
+// peer that answers every PING within 50ms of reading it meets even where
+// the runner stalls the test's goroutines for a while, as Windows CI's has.
+func liveConfig(c *ClientConfig) {
+	healthConfig(c)
+	c.PingTimeout = 500 * time.Millisecond
+}
+
 // A server that answers the PINGs keeps its connection however long the
 // response takes, and so does one that keeps sending without answering
-// them, for 1s, well past ReadIdleTimeout and PingTimeout.
+// them, for 2s, well past ReadIdleTimeout and PingTimeout: a client that
+// took no answer for one would have given the connection up by 600ms.
 func TestClientHTTP2HealthCheckKeepsLiveConnection(t *testing.T) {
 	for _, mode := range []string{"ack", "trickle"} {
 		t.Run(mode, func(t *testing.T) {
@@ -103,7 +112,7 @@ func TestClientHTTP2HealthCheckKeepsLiveConnection(t *testing.T) {
 				}
 				p.headers(id, false, ":status", "200")
 				n := 0
-				deadline := time.Now().Add(time.Second)
+				deadline := time.Now().Add(2 * time.Second)
 				for time.Now().Before(deadline) {
 					if mode == "trickle" {
 						p.frame(h2FrameData, 0, id, 'x')
@@ -122,7 +131,7 @@ func TestClientHTTP2HealthCheckKeepsLiveConnection(t *testing.T) {
 				pings <- n
 				p.drain()
 			})
-			client := cvH2cClient(t, healthConfig)
+			client := cvH2cClient(t, liveConfig)
 			resp, err := client.Go(mustRequest(t, "POST", url, nil)).Wait()
 			if err != nil {
 				t.Fatal(err)

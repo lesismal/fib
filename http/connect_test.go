@@ -525,17 +525,20 @@ func TestConnectProxyDoesNotWait(t *testing.T) {
 }
 
 // A tunnel that carries something more often than its idle timeout stays
-// open, and one silent for longer is closed, with its target.
+// open, and one silent for longer is closed, with its target. The timeout is
+// a second, five times the gap between the writes, so that a runner that
+// stalls the test for a few hundred milliseconds, as Windows CI's has, does
+// not leave the tunnel idle for the whole of it.
 func TestConnectProxyIdleTimeout(t *testing.T) {
-	const idle = 300 * time.Millisecond
+	const idle = time.Second
 	target := echoServer(t)
 	proxy := serve(t, NewHandler(NewConnectProxy(ConnectProxyConfig{IdleTimeout: idle})))
 	conn, line := connectThrough(t, proxy, target, "")
 	if line != "HTTP/1.1 200 OK" {
 		t.Fatalf("status %q", line)
 	}
-	for range 6 {
-		time.Sleep(idle / 3)
+	for range 5 {
+		time.Sleep(idle / 5)
 		_, _ = conn.Write([]byte("x"))
 		readFull(t, conn, "x")
 	}
