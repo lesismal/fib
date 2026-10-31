@@ -150,9 +150,10 @@ func newSimServer(n *simNet, addr netip.AddrPort, cfg ServerConfig) *simServer {
 		cfg.Auth = StaticAuth(testRealm, map[string]string{testUser: testPass, "bob": "hunter2"})
 	}
 	cfg.Send = func(t FiveTuple, b []byte) { n.send(t.Server, t.Client, b) }
-	cfg.AllocateRelay = func(t FiveTuple, user string, ipv6 bool) (Relay, error) {
+	cfg.AllocateRelay = func(t FiveTuple, user string, ipv6 bool, done func(Relay, error)) {
 		if ipv6 {
-			return nil, ErrNoRelay
+			done(nil, ErrNoRelay)
+			return
 		}
 		r := &memRelay{h: h, addr: netip.AddrPortFrom(addr.Addr(), h.port)}
 		h.port++
@@ -160,7 +161,7 @@ func newSimServer(n *simNet, addr netip.AddrPort, cfg ServerConfig) *simServer {
 		n.at[r.addr] = func(from netip.AddrPort, b []byte) {
 			_ = h.s.HandleRelayPacket(r.addr, from, b, n.now)
 		}
-		return r, nil
+		done(r, nil)
 	}
 	s, err := NewServer(cfg)
 	if err != nil {

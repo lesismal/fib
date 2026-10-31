@@ -14,9 +14,17 @@
 // the lifetimes, the quotas and the bandwidth hook, and whose own fields
 // say where relayed addresses are opened.
 //
-// The turn.Server core is not safe for concurrent use, and fib runs the
-// handlers of different connections on different workers, so a mutex
-// serializes every call into it; datagrams are sent after it is released.
+// A Server never makes a fib worker wait. The turn.Server core is safe for
+// concurrent use and relays the datagrams of different allocations in
+// parallel, so a worker's OnData runs the core and sends what it emits
+// without a lock any other allocation takes; sends are fib's, which queue
+// rather than wait. What does wait, Engine.AddBinding to open a relayed
+// address and Engine.OpenUDPPeer to reach a peer that has not spoken first,
+// runs on a few goroutines of the Server's own, fed by a bounded queue
+// (Config.SetupWorkers and SetupQueue): an Allocate is answered once its
+// relayed address is bound, and the datagrams for a peer being opened wait
+// for it in a short queue of their own. A queue that is full refuses the
+// allocation with 508 or drops the datagram rather than wait for room.
 package turnserver
 
 import (
@@ -27,11 +35,22 @@ import (
 	"net/netip"
 	"strconv"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/lesismal/fib"
 	"github.com/lesismal/fib/webrtc/turn"
 )
+
+// Defaults of the Config fields that bound the setup queue.
+const (
+	DefaultSetupWorkers = 4
+	DefaultSetupQueue   = 1024
+)
+
+// maxPeerBacklog is how many datagrams wait for a peer's connection to
+// open; more are dropped, as a congested link would.
+const maxPeerBacklog = 16
 
 // Config configures a Server.
 type Config struct {
@@ -51,6 +70,12 @@ type Config struct {
 	// opens a range expects. Zero leaves the choice of each port to the
 	// kernel.
 	PortMin, PortMax uint16
+
+	// SetupWorkers is the number of goroutines that bind relayed
+	// addresses and open peers' connections, the calls that wait for the
+	// engine's loops, DefaultSetupWorkers if zero; SetupQueue bounds the
+	// work waiting for them, DefaultSetupQueue if zero.
+	SetupWorkers, SetupQueue int
 }
 
 // Server is a TURN server running on a fib engine. It is the fib.Handler of
@@ -59,32 +84,27 @@ type Server struct {
 	cfg  Config
 	core *turn.Server
 
-	// mu serializes the core, and guards out, which collects the
-	// datagrams the core emits until mu is released.
-	mu  sync.Mutex
-	out []datagram
+	// run is the engine and listening binding Start gave, nil before.
+	run atomic.Pointer[running]
 
-	engine  *fib.Engine
-	binding int
+	// clients are the connections to clients by their 5-tuple, which
+	// OnOpen records on the event loop and OnClose forgets.
+	clients sync.Map // turn.FiveTuple -> *fib.Connection
 
-	// connMu guards the connection tables, which handlers running on the
-	// event loop (OnOpen, OnClose) touch too: it is never held while
-	// waiting for the loop.
-	connMu  sync.Mutex
-	clients map[netip.AddrPort]*fib.Connection
-	locals  map[*fib.Connection]netip.AddrPort
+	setup chan func()
+	// unsent counts the datagrams dropped for want of a connection to send
+	// them on: its open failed, or the setup queue was full.
+	unsent atomic.Uint64
 
-	done chan struct{}
-	once sync.Once
-	wg   sync.WaitGroup
+	done      chan struct{}
+	startOnce sync.Once
+	once      sync.Once
+	wg        sync.WaitGroup
 }
 
-// datagram is one the core emitted: to a client from the listening
-// binding if relay is nil, and to a peer from relay's binding otherwise.
-type datagram struct {
-	relay *relay
-	to    netip.AddrPort
-	b     []byte
+type running struct {
+	engine  *fib.Engine
+	binding int
 }
 
 var errBadConfig = errors.New("turnserver: Config.Send and Config.AllocateRelay are set by the Server")
@@ -101,11 +121,16 @@ func New(config Config) (*Server, error) {
 	if config.PortMin > config.PortMax {
 		return nil, errors.New("turnserver: Config.PortMin exceeds PortMax")
 	}
+	if config.SetupWorkers <= 0 {
+		config.SetupWorkers = DefaultSetupWorkers
+	}
+	if config.SetupQueue <= 0 {
+		config.SetupQueue = DefaultSetupQueue
+	}
 	s := &Server{
-		cfg:     config,
-		clients: make(map[netip.AddrPort]*fib.Connection),
-		locals:  make(map[*fib.Connection]netip.AddrPort),
-		done:    make(chan struct{}),
+		cfg:   config,
+		setup: make(chan func(), config.SetupQueue),
+		done:  make(chan struct{}),
 	}
 	sc := config.ServerConfig
 	sc.Send = s.sendToClient
@@ -134,14 +159,18 @@ func Listen(engine *fib.Engine, addr string, config Config) (*Server, error) {
 }
 
 // Start has s serve on engine, whose UDP binding at index binding has s as
-// its handler, and starts the timer that frees expired allocations. Datagrams
-// that arrive before Start are dropped.
+// its handler, and starts the timer that frees expired allocations and the
+// goroutines that open relayed addresses. Datagrams that arrive before Start
+// are dropped. Only the first call counts.
 func (s *Server) Start(engine *fib.Engine, binding int) {
-	s.mu.Lock()
-	s.engine, s.binding = engine, binding
-	s.mu.Unlock()
-	s.wg.Add(1)
-	go s.timer()
+	s.startOnce.Do(func() {
+		s.wg.Add(1 + s.cfg.SetupWorkers)
+		go s.timer()
+		for range s.cfg.SetupWorkers {
+			go s.worker()
+		}
+		s.run.Store(&running{engine: engine, binding: binding})
+	})
 }
 
 func (s *Server) timer() {
@@ -157,12 +186,36 @@ func (s *Server) timer() {
 		case <-s.done:
 			return
 		case now := <-t.C:
-			s.mu.Lock()
 			s.core.HandleTimeout(now)
-			out := s.takeOut()
-			s.mu.Unlock()
-			s.flush(out)
 		}
+	}
+}
+
+func (s *Server) worker() {
+	defer s.wg.Done()
+	for {
+		select {
+		case <-s.done:
+			return
+		case fn := <-s.setup:
+			fn()
+		}
+	}
+}
+
+// enqueue hands fn to the setup goroutines, and reports false, without
+// waiting, if their queue is full or the server has closed.
+func (s *Server) enqueue(fn func()) bool {
+	select {
+	case <-s.done:
+		return false
+	default:
+	}
+	select {
+	case s.setup <- fn:
+		return true
+	default:
+		return false
 	}
 }
 
@@ -172,59 +225,43 @@ func (s *Server) Close() {
 	s.once.Do(func() {
 		close(s.done)
 		s.wg.Wait()
-		s.mu.Lock()
 		s.core.Close()
-		s.mu.Unlock()
 	})
 }
 
 // Allocations is the number of allocations the server holds.
-func (s *Server) Allocations() int {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.core.Allocations()
-}
+func (s *Server) Allocations() int { return s.core.Allocations() }
 
-func (s *Server) takeOut() []datagram {
-	out := s.out
-	s.out = nil
-	return out
-}
+// Core is the turn.Server s runs, for what Config does not cover.
+func (s *Server) Core() *turn.Server { return s.core }
+
+// Unsent is the number of datagrams dropped for want of a connection to
+// send them on: one that could not be opened, or a setup queue too full to
+// open it.
+func (s *Server) Unsent() uint64 { return s.unsent.Load() }
 
 func (s *Server) sendToClient(t turn.FiveTuple, b []byte) {
-	s.out = append(s.out, datagram{to: t.Client, b: append([]byte(nil), b...)})
-}
-
-// flush sends the datagrams the core emitted, opening the connection of a
-// client or peer that has none on its binding.
-func (s *Server) flush(out []datagram) {
-	for _, d := range out {
-		var c *fib.Connection
-		if d.relay == nil {
-			c = s.conn(s.clients, s.binding, d.to)
-		} else {
-			c = s.conn(d.relay.peers, d.relay.binding, d.to)
+	if c, ok := s.clients.Load(t); ok {
+		_ = c.(*fib.Connection).Send(b)
+		return
+	}
+	// A client whose connection fib closed for idleness: open it again,
+	// off the worker.
+	r := s.run.Load()
+	if r == nil {
+		return
+	}
+	d := append([]byte(nil), b...)
+	if !s.enqueue(func() {
+		c, err := r.engine.OpenUDPPeer(r.binding, t.Client)
+		if err != nil {
+			s.unsent.Add(1)
+			return
 		}
-		if c != nil {
-			_ = c.SendOwned(d.b)
-		}
+		_ = c.SendOwned(d)
+	}) {
+		s.unsent.Add(1)
 	}
-}
-
-func (s *Server) conn(table map[netip.AddrPort]*fib.Connection, binding int, to netip.AddrPort) *fib.Connection {
-	s.connMu.Lock()
-	c := table[to]
-	s.connMu.Unlock()
-	if c != nil {
-		return c
-	}
-	// OpenUDPPeer waits for the loop, whose OnOpen takes connMu: it is
-	// called with connMu released, and its OnOpen records the connection.
-	c, err := s.engine.OpenUDPPeer(binding, to)
-	if err != nil {
-		return nil
-	}
-	return c
 }
 
 // remote is c's peer address, unmapped as the core keys it.
@@ -241,36 +278,29 @@ func addrPort(a net.Addr) netip.AddrPort {
 	return netip.AddrPort{}
 }
 
-// OnOpen records a client's connection, under its address: with
+// tupleOf is the 5-tuple of a client's connection, kept as its attachment.
+func tupleOf(c *fib.Connection) turn.FiveTuple {
+	if t, ok := c.Attachment().(turn.FiveTuple); ok {
+		return t
+	}
+	return turn.FiveTuple{Client: remote(c), Server: addrPort(c.LocalAddr())}
+}
+
+// OnOpen records a client's connection, under its 5-tuple: with
 // Config.ReusePort the same client may have one on each poller's socket,
 // and the latest serves for sending.
 func (s *Server) OnOpen(c *fib.Connection) {
-	local := addrPort(c.LocalAddr())
-	s.connMu.Lock()
-	s.clients[remote(c)] = c
-	s.locals[c] = local
-	s.connMu.Unlock()
+	t := tupleOf(c)
+	c.SetAttachment(t)
+	s.clients.Store(t, c)
 }
 
 // OnData passes a client's datagram to the core.
 func (s *Server) OnData(c *fib.Connection, b []byte) {
-	s.connMu.Lock()
-	local, ok := s.locals[c]
-	if !ok {
-		local = addrPort(c.LocalAddr())
-		s.locals[c] = local
-		s.clients[remote(c)] = c
-	}
-	s.connMu.Unlock()
-	s.mu.Lock()
-	if s.engine == nil {
-		s.mu.Unlock()
+	if s.run.Load() == nil {
 		return
 	}
-	_ = s.core.HandlePacket(turn.FiveTuple{Client: remote(c), Server: local}, b, time.Now())
-	out := s.takeOut()
-	s.mu.Unlock()
-	s.flush(out)
+	_ = s.core.HandlePacket(tupleOf(c), b, time.Now())
 }
 
 // OnPriorityData is not used by UDP.
@@ -278,12 +308,7 @@ func (s *Server) OnPriorityData(*fib.Connection, []byte) {}
 
 // OnClose forgets a client's connection.
 func (s *Server) OnClose(c *fib.Connection, _ error) {
-	s.connMu.Lock()
-	if s.clients[remote(c)] == c {
-		delete(s.clients, remote(c))
-	}
-	delete(s.locals, c)
-	s.connMu.Unlock()
+	s.clients.CompareAndDelete(tupleOf(c), c)
 }
 
 // relay is one relayed address: a UDP binding whose handler it is.
@@ -291,20 +316,43 @@ type relay struct {
 	s       *Server
 	binding int
 	addr    netip.AddrPort
-	peers   map[netip.AddrPort]*fib.Connection // guarded by s.connMu
-	closed  bool                               // guarded by s.mu
+	closed  atomic.Bool
+
+	// mu guards peers, the connections to peers by address, and backlog,
+	// the datagrams for peers whose connections are being opened. It is
+	// the allocation's alone, and never held while waiting.
+	mu      sync.Mutex
+	peers   map[netip.AddrPort]*fib.Connection
+	backlog map[netip.AddrPort][][]byte
 }
 
-// allocateRelay opens a relayed address, binding a port in the configured
-// range or one the kernel picks. It runs inside the core, under s.mu, on
-// the worker of the client's datagram.
-func (s *Server) allocateRelay(_ turn.FiveTuple, _ string, ipv6 bool) (turn.Relay, error) {
-	if s.engine == nil || ipv6 != s.cfg.RelayIP.Is6() {
-		return nil, turn.ErrNoRelay
+// allocateRelay opens a relayed address for the core, on a setup
+// goroutine, and hands it to done there.
+func (s *Server) allocateRelay(_ turn.FiveTuple, _ string, ipv6 bool, done func(turn.Relay, error)) {
+	r := s.run.Load()
+	if r == nil || ipv6 != s.cfg.RelayIP.Is6() {
+		done(nil, turn.ErrNoRelay)
+		return
 	}
-	r := &relay{s: s, peers: make(map[netip.AddrPort]*fib.Connection)}
+	if !s.enqueue(func() {
+		rl, err := s.bindRelay(r.engine)
+		if err != nil {
+			done(nil, err)
+			return
+		}
+		done(rl, nil)
+	}) {
+		done(nil, turn.ErrNoRelay)
+	}
+}
+
+// bindRelay opens a relayed address, binding a port in the configured
+// range or one the kernel picks. It waits for the engine's loops, so it
+// runs on a setup goroutine.
+func (s *Server) bindRelay(engine *fib.Engine) (*relay, error) {
+	r := &relay{s: s, peers: make(map[netip.AddrPort]*fib.Connection), backlog: make(map[netip.AddrPort][][]byte)}
 	try := func(port uint16) error {
-		i, err := s.engine.AddBinding(fib.Binding{
+		i, err := engine.AddBinding(fib.Binding{
 			Network: "udp",
 			Addr:    net.JoinHostPort(s.cfg.RelayIP.String(), strconv.Itoa(int(port))),
 			Handler: r,
@@ -312,9 +360,9 @@ func (s *Server) allocateRelay(_ turn.FiveTuple, _ string, ipv6 bool) (turn.Rela
 		if err != nil {
 			return err
 		}
-		addrs, err := s.engine.BindingAddrs(i)
+		addrs, err := engine.BindingAddrs(i)
 		if err != nil || len(addrs) == 0 {
-			_ = s.engine.RemoveBinding(i)
+			_ = engine.RemoveBinding(i)
 			return fmt.Errorf("turnserver: relay binding has no address: %w", err)
 		}
 		r.binding = i
@@ -344,47 +392,85 @@ func (s *Server) allocateRelay(_ turn.FiveTuple, _ string, ipv6 bool) (turn.Rela
 
 func (r *relay) Addr() netip.AddrPort { return r.addr }
 
+// SendTo sends b to peer on the peer's connection, or, when the peer has
+// none yet, queues it and has a setup goroutine open one.
 func (r *relay) SendTo(peer netip.AddrPort, b []byte) {
-	r.s.out = append(r.s.out, datagram{relay: r, to: peer, b: append([]byte(nil), b...)})
-}
-
-// Close removes the relay's binding. The core calls it under s.mu, perhaps
-// on the worker running OnData for this very binding, so the removal, which
-// closes its sockets and connections, runs on a goroutine of its own.
-func (r *relay) Close() {
-	if r.closed {
+	r.mu.Lock()
+	c := r.peers[peer]
+	if c == nil {
+		q, opening := r.backlog[peer]
+		if len(q) < maxPeerBacklog {
+			r.backlog[peer] = append(q, append([]byte(nil), b...))
+		} else {
+			r.s.unsent.Add(1)
+		}
+		r.mu.Unlock()
+		if !opening && !r.s.enqueue(func() { r.open(peer) }) {
+			r.mu.Lock()
+			r.s.unsent.Add(uint64(len(r.backlog[peer])))
+			delete(r.backlog, peer)
+			r.mu.Unlock()
+		}
 		return
 	}
-	r.closed = true
-	e, i := r.s.engine, r.binding
+	r.mu.Unlock()
+	_ = c.Send(b)
+}
+
+// open opens the connection to peer on the relay's binding, on a setup
+// goroutine, and sends what waited for it.
+func (r *relay) open(peer netip.AddrPort) {
+	var c *fib.Connection
+	err := net.ErrClosed
+	if !r.closed.Load() {
+		c, err = r.s.run.Load().engine.OpenUDPPeer(r.binding, peer)
+	}
+	r.mu.Lock()
+	q := r.backlog[peer]
+	delete(r.backlog, peer)
+	if err == nil && r.peers[peer] == nil {
+		r.peers[peer] = c
+	}
+	r.mu.Unlock()
+	if err != nil {
+		r.s.unsent.Add(uint64(len(q)))
+		return
+	}
+	for _, d := range q {
+		_ = c.SendOwned(d)
+	}
+}
+
+// Close removes the relay's binding. The core may call it on the worker
+// running OnData for this very binding, so the removal, which closes its
+// sockets and connections, runs on a goroutine of its own.
+func (r *relay) Close() {
+	if !r.closed.CompareAndSwap(false, true) {
+		return
+	}
+	e, i := r.s.run.Load().engine, r.binding
 	go func() { _ = e.RemoveBinding(i) }()
 }
 
 func (r *relay) OnOpen(c *fib.Connection) {
-	r.s.connMu.Lock()
+	r.mu.Lock()
 	r.peers[remote(c)] = c
-	r.s.connMu.Unlock()
+	r.mu.Unlock()
 }
 
 func (r *relay) OnData(c *fib.Connection, b []byte) {
-	s := r.s
-	s.mu.Lock()
-	if r.closed {
-		s.mu.Unlock()
+	if r.closed.Load() {
 		return
 	}
-	_ = s.core.HandleRelayPacket(r.addr, remote(c), b, time.Now())
-	out := s.takeOut()
-	s.mu.Unlock()
-	s.flush(out)
+	_ = r.s.core.HandleRelayPacket(r.addr, remote(c), b, time.Now())
 }
 
 func (r *relay) OnPriorityData(*fib.Connection, []byte) {}
 
 func (r *relay) OnClose(c *fib.Connection, _ error) {
-	r.s.connMu.Lock()
+	r.mu.Lock()
 	if r.peers[remote(c)] == c {
 		delete(r.peers, remote(c))
 	}
-	r.s.connMu.Unlock()
+	r.mu.Unlock()
 }

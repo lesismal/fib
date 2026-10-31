@@ -51,9 +51,9 @@ func FuzzServer(f *testing.F) {
 			Auth:        StaticAuth(testRealm, map[string]string{testUser: testPass}),
 			NonceSecret: []byte("fixed"),
 			Send:        func(FiveTuple, []byte) {},
-			AllocateRelay: func(FiveTuple, string, bool) (Relay, error) {
+			AllocateRelay: func(_ FiveTuple, _ string, _ bool, done func(Relay, error)) {
 				relay = &coreRelay{addr: netip.AddrPortFrom(relayIP, 50000)}
-				return relay, nil
+				done(relay, nil)
 			},
 		})
 		if err != nil {
@@ -72,7 +72,7 @@ func FuzzServer(f *testing.F) {
 		for _, add := range []func(*stun.Message){allocateReq, channelReq(MinChannel, peerAddr)} {
 			var m stun.Message
 			method := stun.MethodAllocate
-			if len(s.allocs) > 0 {
+			if s.Allocations() > 0 {
 				method = stun.MethodChannelBind
 			}
 			m.Build(stun.MessageType{Method: method, Class: stun.ClassRequest}, stun.NewTransactionID())
@@ -83,7 +83,7 @@ func FuzzServer(f *testing.F) {
 			m.AddIntegrity(key)
 			_ = s.HandlePacket(tuple, m.Raw, now)
 		}
-		if len(s.allocs) != 1 {
+		if s.Allocations() != 1 {
 			t.Fatal("setup failed")
 		}
 		in := bytes.Clone(b)

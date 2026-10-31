@@ -45,11 +45,11 @@ func newCore(t *testing.T, cfg ServerConfig) *core {
 		cfg.Auth = StaticAuth(testRealm, map[string]string{testUser: testPass, "bob": "hunter2"})
 	}
 	cfg.Send = func(ft FiveTuple, b []byte) { c.sent = append(c.sent, coreSent{ft, bytes.Clone(b)}) }
-	cfg.AllocateRelay = func(FiveTuple, string, bool) (Relay, error) {
+	cfg.AllocateRelay = func(_ FiveTuple, _ string, _ bool, done func(Relay, error)) {
 		r := &coreRelay{c: c, addr: netip.AddrPortFrom(relayIP, c.port)}
 		c.port++
 		c.relays[r.addr] = r
-		return r, nil
+		done(r, nil)
 	}
 	s, err := NewServer(cfg)
 	if err != nil {
@@ -399,7 +399,7 @@ func TestServerSSRF(t *testing.T) {
 	if r := u.do(stun.MethodCreatePermission, permissionReq(peerAddr, netip.MustParseAddrPort("127.0.0.1:1"))); code(r) != stun.CodeForbidden {
 		t.Errorf("mixed peers: %d", code(r))
 	}
-	a := c.s.allocs[u.tuple()]
+	a := c.s.lookup(u.tuple())
 	if len(a.perms) != 0 {
 		t.Fatalf("permissions installed: %v", a.perms)
 	}
@@ -476,7 +476,7 @@ func TestServerBandwidthHook(t *testing.T) {
 func TestServerConfig(t *testing.T) {
 	auth := StaticAuth(testRealm, nil)
 	send := func(FiveTuple, []byte) {}
-	alloc := func(FiveTuple, string, bool) (Relay, error) { return nil, ErrNoRelay }
+	alloc := func(_ FiveTuple, _ string, _ bool, done func(Relay, error)) { done(nil, ErrNoRelay) }
 	for name, cfg := range map[string]ServerConfig{
 		"no realm":         {Auth: auth, Send: send, AllocateRelay: alloc},
 		"no auth":          {Realm: testRealm, Send: send, AllocateRelay: alloc},
@@ -603,23 +603,23 @@ func TestServerCredentialChecks(t *testing.T) {
 func TestServerRelayFailures(t *testing.T) {
 	c := newCore(t, ServerConfig{})
 	u := c.user(clientAddr, testUser, testPass)
-	c.s.cfg.AllocateRelay = func(FiveTuple, string, bool) (Relay, error) { return nil, errors.New("ports exhausted") }
+	c.s.cfg.AllocateRelay = func(_ FiveTuple, _ string, _ bool, done func(Relay, error)) { done(nil, errors.New("ports exhausted")) }
 	if r := u.do(stun.MethodAllocate, allocateReq); code(r) != stun.CodeInsufficientCapacity {
 		t.Fatalf("host refused a relay: %d", code(r))
 	}
 	// A host that hands out an address in use gets it back, closed.
 	same := &coreRelay{c: c, addr: netip.AddrPortFrom(relayIP, 50000)}
-	c.s.cfg.AllocateRelay = func(FiveTuple, string, bool) (Relay, error) {
-		r := *same
-		return &r, nil
+	c.s.cfg.AllocateRelay = func(_ FiveTuple, _ string, _ bool, done func(Relay, error)) {
+		r := &coreRelay{c: c, addr: same.addr}
+		done(r, nil)
 	}
 	if r := u.do(stun.MethodAllocate, allocateReq); code(r) != 0 {
 		t.Fatal(code(r))
 	}
 	var dup *coreRelay
-	c.s.cfg.AllocateRelay = func(FiveTuple, string, bool) (Relay, error) {
+	c.s.cfg.AllocateRelay = func(_ FiveTuple, _ string, _ bool, done func(Relay, error)) {
 		dup = &coreRelay{c: c, addr: same.addr}
-		return dup, nil
+		done(dup, nil)
 	}
 	v := c.user(netip.MustParseAddrPort("198.51.100.10:40003"), testUser, testPass)
 	if r := v.do(stun.MethodAllocate, allocateReq); code(r) != stun.CodeInsufficientCapacity || !dup.closed {
@@ -657,7 +657,7 @@ func TestServerRelayPackets(t *testing.T) {
 	}
 	// Between sweeps, an expired allocation is freed by the first packet
 	// that finds it, from either side.
-	if c.s.HandleTimeout(c.now); len(c.s.allocs) != 1 {
+	if c.s.HandleTimeout(c.now); c.s.Allocations() != 1 {
 		t.Fatal("a sweep before its time freed the allocation")
 	}
 	c.now = c.now.Add(DefaultLifetime)

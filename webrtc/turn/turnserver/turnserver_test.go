@@ -41,7 +41,7 @@ func startServer(t *testing.T, config fib.Config, cfg Config) (*Server, netip.Ad
 	if err != nil {
 		t.Fatal(err)
 	}
-	addrs, err := e.BindingAddrs(s.binding)
+	addrs, err := e.BindingAddrs(s.run.Load().binding)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -356,14 +356,19 @@ func TestBeforeStart(t *testing.T) {
 }
 
 func TestAllocateRelay(t *testing.T) {
-	s, _, _ := startServer(t, fib.DefaultConfig(), Config{})
-	if _, err := s.allocateRelay(turn.FiveTuple{}, user, true); err != turn.ErrNoRelay {
+	s, _, e := startServer(t, fib.DefaultConfig(), Config{})
+	refused := func(ipv6 bool) error {
+		ch := make(chan error, 1)
+		s.allocateRelay(turn.FiveTuple{}, user, ipv6, func(r turn.Relay, err error) { ch <- err })
+		return wait(t, ch, "done")
+	}
+	if err := refused(true); err != turn.ErrNoRelay {
 		t.Fatalf("IPv6 on an IPv4 relay address: %v", err)
 	}
 
 	// A relayed address behind a 1:1 NAT is told as the public one.
 	s.cfg.PublicIP = netip.MustParseAddr("::ffff:198.51.100.1")
-	r, err := s.allocateRelay(turn.FiveTuple{}, user, false)
+	r, err := s.bindRelay(e)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -371,13 +376,11 @@ func TestAllocateRelay(t *testing.T) {
 		t.Fatalf("relayed %v", r.Addr())
 	}
 	bound := netip.AddrPortFrom(loopback, r.Addr().Port())
-	s.mu.Lock()
 	r.Close()
 	r.Close()
-	s.mu.Unlock()
 	// A datagram a closed relay still gets is dropped, not given to the
 	// core.
-	r.(*relay).OnData(nil, []byte("late"))
+	r.OnData(nil, []byte("late"))
 	if !freed(bound) {
 		t.Fatalf("relay %v still bound after Close", bound)
 	}
@@ -391,16 +394,92 @@ func TestAllocateRelay(t *testing.T) {
 	defer taken.Close()
 	port := uint16(taken.LocalAddr().(*net.UDPAddr).Port)
 	s.cfg.PortMin, s.cfg.PortMax = port, port
-	if _, err := s.allocateRelay(turn.FiveTuple{}, user, false); err != turn.ErrNoRelay {
+	if err := refused(false); err != turn.ErrNoRelay {
 		t.Fatalf("a range with no free port: %v", err)
 	}
 	// An address the host does not have.
 	s.cfg.PortMin, s.cfg.PortMax = 0, 0
 	s.cfg.RelayIP = netip.MustParseAddr("192.0.2.1")
-	if _, err := s.allocateRelay(turn.FiveTuple{}, user, false); err == nil {
+	if _, err := s.bindRelay(e); err == nil {
 		t.Fatal("bound a relay to an address the host does not have")
 	}
 	if a := addrPort(&net.TCPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 1}); a.IsValid() {
 		t.Fatalf("a TCP address as a UDP one: %v", a)
+	}
+}
+
+// The setup queue is never waited for: with it full, an allocation is
+// refused and a datagram for a peer or client with no connection dropped,
+// and so once the server has closed.
+func TestSetupQueueFull(t *testing.T) {
+	e := runEngine(t)
+	cfg := Config{RelayIP: loopback, SetupQueue: 1}
+	cfg.Realm, cfg.Auth = realm, turn.StaticAuth(realm, nil)
+	s, err := New(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Running but with no setup goroutines yet, so the queue stays full.
+	s.run.Store(&running{engine: e})
+	if !s.enqueue(func() {}) || s.enqueue(func() {}) {
+		t.Fatal("a queue of one")
+	}
+	ch := make(chan error, 1)
+	s.allocateRelay(turn.FiveTuple{}, user, false, func(_ turn.Relay, err error) { ch <- err })
+	if err := <-ch; err != turn.ErrNoRelay {
+		t.Fatalf("allocation with the queue full: %v", err)
+	}
+	r := &relay{s: s, peers: map[netip.AddrPort]*fib.Connection{}, backlog: map[netip.AddrPort][][]byte{}}
+	peer := netip.MustParseAddrPort("127.0.0.1:9")
+	r.SendTo(peer, []byte("x"))
+	s.sendToClient(turn.FiveTuple{Client: peer}, []byte("y"))
+	if s.Unsent() != 2 || len(r.backlog) != 0 {
+		t.Fatalf("%d unsent, %d peers waiting", s.Unsent(), len(r.backlog))
+	}
+	// A peer's backlog is bounded while its connection opens.
+	<-s.setup
+	for range maxPeerBacklog + 3 {
+		r.SendTo(peer, []byte("z"))
+	}
+	if len(r.backlog[peer]) != maxPeerBacklog || s.Unsent() != 5 {
+		t.Fatalf("backlog %d, %d unsent", len(r.backlog[peer]), s.Unsent())
+	}
+	// The queued open, run on a closed relay, drops the backlog.
+	r.closed.Store(true)
+	(<-s.setup)()
+	if s.Unsent() != 5+maxPeerBacklog {
+		t.Fatalf("%d unsent", s.Unsent())
+	}
+	s.Close()
+	if s.enqueue(func() {}) {
+		t.Fatal("queued after Close")
+	}
+}
+
+// A client whose connection fib forgot is reached by opening it again, on
+// a setup goroutine.
+func TestSendToForgottenClient(t *testing.T) {
+	s, _, _ := startServer(t, fib.DefaultConfig(), Config{})
+	conn, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	client := conn.LocalAddr().(*net.UDPAddr).AddrPort()
+	s.sendToClient(turn.FiveTuple{Client: client}, []byte("hello"))
+	_ = conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+	buf := make([]byte, 64)
+	n, _, err := conn.ReadFromUDPAddrPort(buf)
+	if err != nil || string(buf[:n]) != "hello" {
+		t.Fatalf("read %q: %v", buf[:n], err)
+	}
+	// One the engine cannot reach is counted unsent.
+	s.sendToClient(turn.FiveTuple{Client: netip.MustParseAddrPort("[::1]:9")}, []byte("x"))
+	deadline := time.Now().Add(5 * time.Second)
+	for s.Unsent() == 0 && time.Now().Before(deadline) {
+		time.Sleep(5 * time.Millisecond)
+	}
+	if s.Unsent() != 1 {
+		t.Fatal("an unreachable client was not counted")
 	}
 }

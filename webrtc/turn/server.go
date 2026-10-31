@@ -10,6 +10,8 @@ import (
 	"io"
 	"net/netip"
 	"strconv"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/lesismal/fib/webrtc/stun"
@@ -40,7 +42,9 @@ type Relay interface {
 	// to; it is the key the host passes HandleRelayPacket either way.
 	Addr() netip.AddrPort
 	// SendTo sends b to peer from the relayed address. b is valid only
-	// during the call.
+	// during the call. It may be called from several goroutines at once,
+	// and must not wait: a peer the host cannot send to at once is one it
+	// drops the datagram for, or queues it.
 	SendTo(peer netip.AddrPort, b []byte)
 	// Close releases the relayed address, once its allocation ends.
 	Close()
@@ -58,13 +62,20 @@ type ServerConfig struct {
 	Software string
 
 	// Send sends b to t.Client from the server address t.Server. b is
-	// valid only during the call.
+	// valid only during the call. It may be called from several goroutines
+	// at once, and must not wait.
 	Send func(t FiveTuple, b []byte)
 	// AllocateRelay opens a relayed transport address for a new
 	// allocation of user's, of IPv6 if ipv6 is set and IPv4 otherwise, as
-	// REQUESTED-ADDRESS-FAMILY asks. An error refuses the allocation with
-	// 508 (Insufficient Capacity), as when a port range is exhausted.
-	AllocateRelay func(t FiveTuple, user string, ipv6 bool) (Relay, error)
+	// REQUESTED-ADDRESS-FAMILY asks, and calls done with it once it is
+	// open, exactly once: at once, from AllocateRelay itself, or later
+	// from any goroutine. The Allocate request is answered when done
+	// runs; its retransmissions meanwhile are dropped, and the allocation
+	// counts against the quotas from the request on. An error refuses the
+	// allocation with 508 (Insufficient Capacity), as when a port range is
+	// exhausted. AllocateRelay must not wait: a host whose sockets take a
+	// while to open opens them elsewhere, on a goroutine of its own.
+	AllocateRelay func(t FiveTuple, user string, ipv6 bool, done func(Relay, error))
 
 	// DefaultLifetime is the lifetime of an allocation whose client asks
 	// for none or for less, 600s by default; MaxLifetime caps what a client
@@ -87,7 +98,8 @@ type ServerConfig struct {
 	// OnRelay, if set, is told of every datagram before it is relayed: n
 	// bytes of user's, to a peer if toPeer and from one otherwise. It
 	// returning false drops the datagram, which is where a host enforces
-	// bandwidth limits and counts traffic.
+	// bandwidth limits and counts traffic. It may be called from several
+	// goroutines at once.
 	OnRelay func(user string, toPeer bool, n int) bool
 
 	// PeerAllowed decides which peer addresses clients may install
@@ -140,21 +152,57 @@ type chanBinding struct {
 	expires time.Time
 }
 
+// allocation is one client's. Its fields up to mu are set when it is made
+// and never change; mu guards the rest.
 type allocation struct {
 	tuple     FiveTuple
 	user      string
 	key       []byte
 	relay     Relay
 	relayAddr netip.AddrPort
-	expires   time.Time
 	// txID and lifetime are those of the Allocate request that made the
 	// allocation, to answer its retransmissions alike.
 	txID     [stun.TransactionIDSize]byte
 	lifetime time.Duration
 
+	mu sync.Mutex
+	// freed is set once the allocation has left the server's tables, so
+	// that a request or datagram that found it just before does nothing.
+	freed      bool
+	expires    time.Time
 	perms      map[netip.Addr]time.Time
 	chans      map[uint16]*chanBinding
 	chanByPeer map[netip.AddrPort]*chanBinding
+}
+
+// pendingAlloc is an Allocate request waiting for its relayed address.
+type pendingAlloc struct {
+	tuple    FiveTuple
+	user     string
+	key      []byte
+	txID     [stun.TransactionIDSize]byte
+	lifetime time.Duration
+	// now is the request's time, which the lifetime runs from.
+	now time.Time
+	// done is set by the first call of the host's done.
+	done atomic.Bool
+	// canceled, guarded by Server.mu, is set when the client's connection
+	// closes or the server does before the relay is ready.
+	canceled bool
+}
+
+// shardCount is the number of shards the allocations are spread over, so
+// that datagrams of different allocations look theirs up without contending
+// for one lock.
+const shardCount = 64
+
+// shard holds the allocations whose client address, or relayed address,
+// hashes to it. The padding keeps two shards' locks off one cache line.
+type shard struct {
+	mu      sync.RWMutex
+	allocs  map[FiveTuple]*allocation
+	byRelay map[netip.AddrPort]*allocation
+	_       [64]byte
 }
 
 // Server is the core of a TURN server (RFC 8656) relaying UDP for clients
@@ -164,21 +212,45 @@ type allocation struct {
 // receives through HandleRelayPacket, sends what it emits through
 // ServerConfig.Send and Relay.SendTo, opens relayed addresses when
 // ServerConfig.AllocateRelay asks, and passes the time through NextTimeout
-// and HandleTimeout. Its methods must be called from one goroutine at a
-// time. Package turnserver runs it on a fib engine.
+// and HandleTimeout. Package turnserver runs it on a fib engine.
+//
+// Its methods may be called from any number of goroutines at once.
+// Datagrams of different allocations are relayed in parallel: each
+// allocation has a lock of its own, and the tables that find one are
+// spread over shards. The quotas and the allocations in the making are
+// behind one lock, which only Allocate, Refresh to zero, the sweep and
+// Close take. No lock is held while a callback runs.
 type Server struct {
 	cfg      ServerConfig
 	nonceKey []byte
+	// indID is the random prefix of Data indications' transaction IDs and
+	// indSeq the counter in their last eight bytes.
+	indID  [stun.TransactionIDSize]byte
+	indSeq atomic.Uint64
 
-	allocs  map[FiveTuple]*allocation
-	byRelay map[netip.AddrPort]*allocation
-	perUser map[string]int
+	shards [shardCount]shard
 
+	// mu guards the fields below it, and orders every change to the
+	// shards' tables: lookups take only a shard's lock.
+	mu        sync.Mutex
+	count     int
+	perUser   map[string]int
+	pending   map[FiveTuple]*pendingAlloc
 	nextSweep time.Time
-	indID     [stun.TransactionIDSize]byte
-	in, out   stun.Message
-	buf       []byte
+	closed    bool
 }
+
+// scratch holds what handling one packet decodes and builds, so that
+// packets handled at once on several goroutines each have their own.
+type scratch struct {
+	in, out stun.Message
+	buf     []byte
+}
+
+var scratchPool = sync.Pool{New: func() any { return new(scratch) }}
+
+func getScratch() *scratch  { return scratchPool.Get().(*scratch) }
+func putScratch(x *scratch) { scratchPool.Put(x) }
 
 // NewServer returns a server configured by config.
 func NewServer(config ServerConfig) (*Server, error) {
@@ -195,9 +267,12 @@ func NewServer(config ServerConfig) (*Server, error) {
 	config.setDefaults()
 	s := &Server{
 		cfg:     config,
-		allocs:  make(map[FiveTuple]*allocation),
-		byRelay: make(map[netip.AddrPort]*allocation),
 		perUser: make(map[string]int),
+		pending: make(map[FiveTuple]*pendingAlloc),
+	}
+	for i := range s.shards {
+		s.shards[i].allocs = make(map[FiveTuple]*allocation)
+		s.shards[i].byRelay = make(map[netip.AddrPort]*allocation)
 	}
 	s.nonceKey = config.NonceSecret
 	if len(s.nonceKey) == 0 {
@@ -212,13 +287,51 @@ func NewServer(config ServerConfig) (*Server, error) {
 	return s, nil
 }
 
+// hashAddr mixes an address and port into a shard index.
+func hashAddr(a netip.AddrPort) uint64 {
+	b := a.Addr().As16()
+	h := binary.LittleEndian.Uint64(b[:8]) ^ binary.LittleEndian.Uint64(b[8:])*0x9E3779B97F4A7C15
+	h ^= uint64(a.Port()) * 0xBF58476D1CE4E5B9
+	h ^= h >> 29
+	return h
+}
+
+func (s *Server) tupleShard(t FiveTuple) *shard {
+	return &s.shards[hashAddr(t.Client)%shardCount]
+}
+
+func (s *Server) relayShard(a netip.AddrPort) *shard {
+	return &s.shards[hashAddr(a)%shardCount]
+}
+
+// lookup returns t's allocation, expired or not.
+func (s *Server) lookup(t FiveTuple) *allocation {
+	sh := s.tupleShard(t)
+	sh.mu.RLock()
+	a := sh.allocs[t]
+	sh.mu.RUnlock()
+	return a
+}
+
+func (s *Server) lookupRelay(addr netip.AddrPort) *allocation {
+	sh := s.relayShard(addr)
+	sh.mu.RLock()
+	a := sh.byRelay[addr]
+	sh.mu.RUnlock()
+	return a
+}
+
 // Allocations is the number of allocations the server holds, including
 // expired ones the next sweep will free.
-func (s *Server) Allocations() int { return len(s.allocs) }
+func (s *Server) Allocations() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.count
+}
 
 // RelayFor returns the relayed address of the allocation t made, if any.
 func (s *Server) RelayFor(t FiveTuple) (netip.AddrPort, bool) {
-	a := s.allocs[normTuple(t)]
+	a := s.lookup(normTuple(t))
 	if a == nil {
 		return netip.AddrPort{}, false
 	}
@@ -292,7 +405,9 @@ func (s *Server) HandlePacket(t FiveTuple, b []byte, now time.Time) error {
 	if !stun.IsMessage(b) {
 		return ErrNotTURN
 	}
-	m := &s.in
+	x := getScratch()
+	defer putScratch(x)
+	m := &x.in
 	if err := m.Decode(b); err != nil {
 		return err
 	}
@@ -303,7 +418,7 @@ func (s *Server) HandlePacket(t FiveTuple, b []byte, now time.Time) error {
 	}
 	switch m.Type.Class {
 	case stun.ClassRequest:
-		s.handleRequest(t, m, now)
+		s.handleRequest(&exchange{s: s, t: t, m: m, x: x, now: now})
 		return nil
 	case stun.ClassIndication:
 		if m.Type.Method == stun.MethodSend {
@@ -313,32 +428,104 @@ func (s *Server) HandlePacket(t FiveTuple, b []byte, now time.Time) error {
 	return ErrDropped
 }
 
+// lockLive locks a and reports whether it is still the server's and has not
+// expired, freeing it if it has; a is left locked only when it reports
+// true.
+func (s *Server) lockLive(a *allocation, now time.Time) bool {
+	a.mu.Lock()
+	if a.freed {
+		a.mu.Unlock()
+		return false
+	}
+	if !now.Before(a.expires) {
+		a.mu.Unlock()
+		s.free(a)
+		return false
+	}
+	return true
+}
+
 // live returns t's allocation if it has one that has not expired, freeing
 // one that has.
 func (s *Server) live(t FiveTuple, now time.Time) *allocation {
-	a := s.allocs[t]
-	if a != nil && !now.Before(a.expires) {
-		s.remove(a)
+	a := s.lookup(t)
+	if a == nil || !s.lockLive(a, now) {
 		return nil
 	}
+	a.mu.Unlock()
 	return a
 }
 
-// remove frees a, which every caller found in allocs or byRelay, which
-// hold the same allocations.
-func (s *Server) remove(a *allocation) {
-	delete(s.allocs, a.tuple)
-	delete(s.byRelay, a.relayAddr)
+// free takes a out of the server's tables and releases it, unless another
+// goroutine got there first.
+func (s *Server) free(a *allocation) {
+	s.mu.Lock()
+	ok := s.unlinkLocked(a)
+	s.mu.Unlock()
+	if ok {
+		s.release(a)
+	}
+}
+
+// unlinkLocked takes a out of the tables, reporting whether it was there.
+// Callers hold s.mu.
+func (s *Server) unlinkLocked(a *allocation) bool {
+	sh := s.tupleShard(a.tuple)
+	sh.mu.Lock()
+	ok := sh.allocs[a.tuple] == a
+	if ok {
+		delete(sh.allocs, a.tuple)
+	}
+	sh.mu.Unlock()
+	if !ok {
+		return false
+	}
+	rs := s.relayShard(a.relayAddr)
+	rs.mu.Lock()
+	if rs.byRelay[a.relayAddr] == a {
+		delete(rs.byRelay, a.relayAddr)
+	}
+	rs.mu.Unlock()
+	s.count--
 	if s.perUser[a.user]--; s.perUser[a.user] <= 0 {
 		delete(s.perUser, a.user)
 	}
+	return true
+}
+
+// release marks a freed and closes its relayed address. Callers hold no
+// lock.
+func (s *Server) release(a *allocation) {
+	a.mu.Lock()
+	a.freed = true
+	a.mu.Unlock()
 	a.relay.Close()
 }
 
-// Close frees every allocation, closing its relayed address.
+// Close frees every allocation, closing its relayed address. An allocation
+// whose relayed address is still being opened is refused once it is, and
+// the address closed. Nothing is relayed or allocated after.
 func (s *Server) Close() {
-	for _, a := range s.allocs {
-		s.remove(a)
+	s.mu.Lock()
+	s.closed = true
+	var gone []*allocation
+	for i := range s.shards {
+		sh := &s.shards[i]
+		sh.mu.RLock()
+		for _, a := range sh.allocs {
+			gone = append(gone, a)
+		}
+		sh.mu.RUnlock()
+	}
+	for _, a := range gone {
+		s.unlinkLocked(a)
+	}
+	for _, p := range s.pending {
+		p.canceled = true
+	}
+	s.mu.Unlock()
+	for _, a := range gone {
+		s.release(a)
 	}
 }
 
@@ -357,23 +544,50 @@ func knownAttr(t stun.AttrType) bool {
 	return !t.Required()
 }
 
-func (s *Server) handleRequest(t FiveTuple, m *stun.Message, now time.Time) {
+// exchange is one request being answered: what it came with, and the
+// credentials it was found to have.
+type exchange struct {
+	s    *Server
+	t    FiveTuple
+	m    *stun.Message
+	x    *scratch
+	now  time.Time
+	user string
+	key  []byte
+}
+
+// fail answers the request with an error.
+func (e *exchange) fail(code int, reason string) {
+	e.s.errorHeader(e.x, e.m, code, reason)
+	e.s.finish(e.x, e.t, e.key)
+}
+
+// success starts a success response, which send sends.
+func (e *exchange) success() *stun.Message {
+	o := &e.x.out
+	o.Build(stun.MessageType{Method: e.m.Type.Method, Class: stun.ClassSuccessResponse}, e.m.TransactionID)
+	return o
+}
+
+func (e *exchange) send() { e.s.finish(e.x, e.t, e.key) }
+
+func (s *Server) handleRequest(e *exchange) {
+	m := e.m
 	switch m.Type.Method {
 	case stun.MethodBinding:
 		// A TURN server is a STUN server too, which ICE agents ask for
 		// their server-reflexive address without credentials.
-		o := &s.out
+		o := &e.x.out
 		o.Build(stun.BindingSuccess, m.TransactionID)
-		o.AddXORAddress(stun.AttrXORMappedAddress, t.Client)
-		s.finish(t, nil)
+		o.AddXORAddress(stun.AttrXORMappedAddress, e.t.Client)
+		e.send()
 		return
 	case stun.MethodAllocate, stun.MethodRefresh, stun.MethodCreatePermission, stun.MethodChannelBind:
 	default:
-		s.respondError(t, m, stun.CodeBadRequest, "Bad Request", nil)
+		e.fail(stun.CodeBadRequest, "Bad Request")
 		return
 	}
-	user, key, ok := s.authenticate(t, m, now)
-	if !ok {
+	if !s.authenticate(e) {
 		return
 	}
 	var unknown []stun.AttrType
@@ -383,60 +597,63 @@ func (s *Server) handleRequest(t FiveTuple, m *stun.Message, now time.Time) {
 		}
 	}
 	if len(unknown) > 0 {
-		o := s.errorHeader(m, stun.CodeUnknownAttribute, "Unknown Attribute")
+		o := s.errorHeader(e.x, m, stun.CodeUnknownAttribute, "Unknown Attribute")
 		o.AddUnknownAttributes(unknown)
-		s.finish(t, key)
+		e.send()
 		return
 	}
-	a := s.live(t, now)
-	if a != nil && a.user != user {
+	a := s.live(e.t, e.now)
+	if a != nil && a.user != e.user {
 		// Requests on an allocation must use its credentials (RFC 8656
 		// section 5).
-		s.respondError(t, m, stun.CodeWrongCredentials, "Wrong Credentials", key)
+		e.fail(stun.CodeWrongCredentials, "Wrong Credentials")
 		return
 	}
 	switch m.Type.Method {
 	case stun.MethodAllocate:
-		s.allocate(t, m, a, user, key, now)
+		s.allocate(e, a)
 	case stun.MethodRefresh:
-		s.refresh(t, m, a, key, now)
+		s.refresh(e, a)
 	case stun.MethodCreatePermission:
-		s.createPermission(t, m, a, key, now)
+		s.createPermission(e, a)
 	case stun.MethodChannelBind:
-		s.channelBind(t, m, a, key, now)
+		s.channelBind(e, a)
 	}
 }
 
 // authenticate checks a request's long-term credentials (RFC 8489 section
 // 9.2.4), answering it itself when they fail: 401 with the realm and a
 // nonce for a request without credentials or with wrong ones, 400 for
-// incomplete ones, and 438 with a fresh nonce for a stale one.
-func (s *Server) authenticate(t FiveTuple, m *stun.Message, now time.Time) (user string, key []byte, ok bool) {
+// incomplete ones, and 438 with a fresh nonce for a stale one. It sets the
+// exchange's user and key when they pass.
+func (s *Server) authenticate(e *exchange) bool {
+	m := e.m
 	if !m.Contains(stun.AttrMessageIntegrity) {
-		s.challenge(t, m, stun.CodeUnauthorized, "Unauthorized", now)
-		return "", nil, false
+		s.challenge(e, stun.CodeUnauthorized, "Unauthorized")
+		return false
 	}
 	u, okUser := m.Get(stun.AttrUsername)
 	realm, okRealm := m.Get(stun.AttrRealm)
 	nonce, okNonce := m.Get(stun.AttrNonce)
 	if !okUser || !okRealm || !okNonce {
-		s.respondError(t, m, stun.CodeBadRequest, "Bad Request", nil)
-		return "", nil, false
+		e.fail(stun.CodeBadRequest, "Bad Request")
+		return false
 	}
-	if !s.validNonce(nonce, t.Client, now) {
-		s.challenge(t, m, stun.CodeStaleNonce, "Stale Nonce", now)
-		return "", nil, false
+	if !s.validNonce(nonce, e.t.Client, e.now) {
+		s.challenge(e, stun.CodeStaleNonce, "Stale Nonce")
+		return false
 	}
 	if string(realm) != s.cfg.Realm {
-		s.challenge(t, m, stun.CodeUnauthorized, "Unauthorized", now)
-		return "", nil, false
+		s.challenge(e, stun.CodeUnauthorized, "Unauthorized")
+		return false
 	}
-	key, ok = s.cfg.Auth(string(u), string(realm))
+	key, ok := s.cfg.Auth(string(u), string(realm))
 	if !ok || m.CheckIntegrity(key) != nil {
-		s.challenge(t, m, stun.CodeUnauthorized, "Unauthorized", now)
-		return "", nil, false
+		s.challenge(e, stun.CodeUnauthorized, "Unauthorized")
+		return false
 	}
-	return string(u), key, true
+	e.user, e.key = string(u), key
+	return true
 }
 
 // nonceSize is the length of a nonce: 16 hex digits of its expiry in Unix
@@ -465,35 +682,24 @@ func (s *Server) validNonce(nonce []byte, client netip.AddrPort, now time.Time) 
 	return hmac.Equal(nonce, s.makeNonce(client, int64(expiry)))
 }
 
-func (s *Server) challenge(t FiveTuple, m *stun.Message, code int, reason string, now time.Time) {
-	o := s.errorHeader(m, code, reason)
+func (s *Server) challenge(e *exchange, code int, reason string) {
+	o := s.errorHeader(e.x, e.m, code, reason)
 	o.AddString(stun.AttrRealm, s.cfg.Realm)
-	o.Add(stun.AttrNonce, s.makeNonce(t.Client, now.Add(s.cfg.NonceLifetime).Unix()))
-	s.finish(t, nil)
+	o.Add(stun.AttrNonce, s.makeNonce(e.t.Client, e.now.Add(s.cfg.NonceLifetime).Unix()))
+	s.finish(e.x, e.t, nil)
 }
 
-func (s *Server) errorHeader(m *stun.Message, code int, reason string) *stun.Message {
-	o := &s.out
+func (s *Server) errorHeader(x *scratch, m *stun.Message, code int, reason string) *stun.Message {
+	o := &x.out
 	o.Build(stun.MessageType{Method: m.Type.Method, Class: stun.ClassErrorResponse}, m.TransactionID)
 	o.AddErrorCode(code, reason)
 	return o
 }
 
-func (s *Server) respondError(t FiveTuple, m *stun.Message, code int, reason string, key []byte) {
-	s.errorHeader(m, code, reason)
-	s.finish(t, key)
-}
-
-func (s *Server) successHeader(m *stun.Message) *stun.Message {
-	o := &s.out
-	o.Build(stun.MessageType{Method: m.Type.Method, Class: stun.ClassSuccessResponse}, m.TransactionID)
-	return o
-}
-
 // finish adds SOFTWARE, MESSAGE-INTEGRITY with key if any, and FINGERPRINT
-// to the response being built, and sends it.
-func (s *Server) finish(t FiveTuple, key []byte) {
-	o := &s.out
+// to the response being built in x, and sends it to t.
+func (s *Server) finish(x *scratch, t FiveTuple, key []byte) {
+	o := &x.out
 	if s.cfg.Software != "" {
 		o.AddString(stun.AttrSoftware, s.cfg.Software)
 	}
@@ -517,104 +723,200 @@ func (s *Server) lifetime(m *stun.Message) time.Duration {
 	return max(min(l, s.cfg.MaxLifetime), s.cfg.DefaultLifetime)
 }
 
-func (s *Server) allocate(t FiveTuple, m *stun.Message, a *allocation, user string, key []byte, now time.Time) {
+func (s *Server) allocate(e *exchange, a *allocation) {
+	m := e.m
 	if a != nil {
 		if a.txID == m.TransactionID {
-			s.allocated(t, m, a, key)
+			s.allocated(e.x, e.t, a, e.key)
 			return
 		}
-		s.respondError(t, m, stun.CodeAllocationMismatch, "Allocation Mismatch", key)
+		e.fail(stun.CodeAllocationMismatch, "Allocation Mismatch")
 		return
 	}
 	proto, err := m.RequestedTransport()
 	if err != nil {
-		s.respondError(t, m, stun.CodeBadRequest, "Bad Request", key)
+		e.fail(stun.CodeBadRequest, "Bad Request")
 		return
 	}
 	if proto != stun.ProtoUDP {
-		s.respondError(t, m, stun.CodeUnsupportedTransportProtocol, "Unsupported Transport Protocol", key)
+		e.fail(stun.CodeUnsupportedTransportProtocol, "Unsupported Transport Protocol")
 		return
 	}
 	ipv6 := false
 	if v, ok := m.Get(stun.AttrRequestedAddressFamily); ok {
 		if len(v) != 4 || v[0] != 1 && v[0] != 2 {
-			s.respondError(t, m, stun.CodeAddressFamilyNotSupported, "Address Family not Supported", key)
+			e.fail(stun.CodeAddressFamilyNotSupported, "Address Family not Supported")
 			return
 		}
 		ipv6 = v[0] == 2
-	}
-	if q := s.cfg.MaxAllocationsPerUser; q > 0 && s.perUser[user] >= q {
-		if s.sweep(now); s.perUser[user] >= q {
-			s.respondError(t, m, stun.CodeAllocationQuotaReached, "Allocation Quota Reached", key)
-			return
-		}
-	}
-	if q := s.cfg.MaxAllocations; q > 0 && len(s.allocs) >= q {
-		if s.sweep(now); len(s.allocs) >= q {
-			s.respondError(t, m, stun.CodeInsufficientCapacity, "Insufficient Capacity", key)
-			return
-		}
-	}
-	relay, err := s.cfg.AllocateRelay(t, user, ipv6)
-	if err != nil || relay == nil {
-		s.respondError(t, m, stun.CodeInsufficientCapacity, "Insufficient Capacity", key)
-		return
 	}
 	lifetime := s.lifetime(m)
 	if lifetime == 0 {
 		lifetime = s.cfg.DefaultLifetime
 	}
+	p := &pendingAlloc{tuple: e.t, user: e.user, key: e.key, txID: m.TransactionID, lifetime: lifetime, now: e.now}
+	code, reason, gone := s.reserve(p)
+	s.releaseAll(gone)
+	switch code {
+	case 0:
+	case -1:
+		// A retransmission of the request in the making, or a server
+		// that has closed: nothing to say.
+		return
+	default:
+		e.fail(code, reason)
+		return
+	}
+	s.cfg.AllocateRelay(e.t, e.user, ipv6, func(r Relay, err error) { s.relayReady(p, r, err) })
+}
+
+// reserve records p as an allocation in the making, counted against the
+// quotas, or says what to answer instead: an error code, or -1 for
+// nothing at all. It returns the allocations the quotas' sweep freed, for
+// the caller to release.
+func (s *Server) reserve(p *pendingAlloc) (code int, reason string, gone []*allocation) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closed {
+		return -1, "", nil
+	}
+	if s.lookup(p.tuple) != nil {
+		// Another goroutine made one since the caller looked.
+		return stun.CodeAllocationMismatch, "Allocation Mismatch", nil
+	}
+	if o := s.pending[p.tuple]; o != nil {
+		if o.txID == p.txID {
+			return -1, "", nil
+		}
+		return stun.CodeAllocationMismatch, "Allocation Mismatch", nil
+	}
+	if q := s.cfg.MaxAllocationsPerUser; q > 0 && s.perUser[p.user] >= q {
+		if gone = s.sweepLocked(p.now); s.perUser[p.user] >= q {
+			return stun.CodeAllocationQuotaReached, "Allocation Quota Reached", gone
+		}
+	}
+	if q := s.cfg.MaxAllocations; q > 0 && s.count+len(s.pending) >= q {
+		gone = append(gone, s.sweepLocked(p.now)...)
+		if s.count+len(s.pending) >= q {
+			return stun.CodeInsufficientCapacity, "Insufficient Capacity", gone
+		}
+	}
+	s.pending[p.tuple] = p
+	s.perUser[p.user]++
+	return 0, "", gone
+}
+
+// relayReady is the done of an AllocateRelay: it makes the allocation and
+// answers the request, or refuses it.
+func (s *Server) relayReady(p *pendingAlloc, r Relay, err error) {
+	if !p.done.CompareAndSwap(false, true) {
+		// done called twice: the first call settled the request.
+		if r != nil {
+			r.Close()
+		}
+		return
+	}
+	a, refused := s.admit(p, r, err)
+	if a == nil {
+		if r != nil {
+			r.Close()
+		}
+		if refused {
+			x := getScratch()
+			o := &x.out
+			o.Build(stun.MessageType{Method: stun.MethodAllocate, Class: stun.ClassErrorResponse}, p.txID)
+			o.AddErrorCode(stun.CodeInsufficientCapacity, "Insufficient Capacity")
+			s.finish(x, p.tuple, p.key)
+			putScratch(x)
+		}
+		return
+	}
+	x := getScratch()
+	s.allocated(x, p.tuple, a, p.key)
+	putScratch(x)
+}
+
+// admit makes p's allocation with relay r, unless err, a duplicate
+// relayed address, the client's going or the server's closing stand in
+// the way; refused says the request is to be answered with 508.
+func (s *Server) admit(p *pendingAlloc, r Relay, err error) (a *allocation, refused bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.pending[p.tuple] == p {
+		delete(s.pending, p.tuple)
+	}
+	gone := p.canceled || s.closed
+	var relayAddr netip.AddrPort
+	if !gone && err == nil && r != nil {
+		relayAddr = unmap(r.Addr())
+		if s.lookupRelay(relayAddr) != nil {
+			// The host handed out an address still in use; the newer
+			// allocation cannot share it.
+			r = nil
+		}
+	}
+	if gone || err != nil || r == nil {
+		if s.perUser[p.user]--; s.perUser[p.user] <= 0 {
+			delete(s.perUser, p.user)
+		}
+		return nil, !gone
+	}
 	a = &allocation{
-		tuple:      t,
-		user:       user,
-		key:        key,
-		relay:      relay,
-		relayAddr:  unmap(relay.Addr()),
-		expires:    now.Add(lifetime),
-		txID:       m.TransactionID,
-		lifetime:   lifetime,
+		tuple:      p.tuple,
+		user:       p.user,
+		key:        p.key,
+		relay:      r,
+		relayAddr:  relayAddr,
+		expires:    p.now.Add(p.lifetime),
+		txID:       p.txID,
+		lifetime:   p.lifetime,
 		perms:      make(map[netip.Addr]time.Time),
 		chans:      make(map[uint16]*chanBinding),
 		chanByPeer: make(map[netip.AddrPort]*chanBinding),
 	}
-	if old := s.byRelay[a.relayAddr]; old != nil {
-		// The host handed out an address still in use; the newer
-		// allocation cannot share it.
-		relay.Close()
-		s.respondError(t, m, stun.CodeInsufficientCapacity, "Insufficient Capacity", key)
-		return
+	sh := s.tupleShard(a.tuple)
+	sh.mu.Lock()
+	sh.allocs[a.tuple] = a
+	sh.mu.Unlock()
+	rs := s.relayShard(relayAddr)
+	rs.mu.Lock()
+	rs.byRelay[relayAddr] = a
+	rs.mu.Unlock()
+	s.count++
+	if s.nextSweep.IsZero() || s.nextSweep.After(p.now.Add(s.cfg.SweepInterval)) {
+		s.nextSweep = p.now.Add(s.cfg.SweepInterval)
 	}
-	s.allocs[t] = a
-	s.byRelay[a.relayAddr] = a
-	s.perUser[user]++
-	if s.nextSweep.IsZero() || s.nextSweep.After(now.Add(s.cfg.SweepInterval)) {
-		s.nextSweep = now.Add(s.cfg.SweepInterval)
-	}
-	s.allocated(t, m, a, key)
+	return a, false
 }
 
-func (s *Server) allocated(t FiveTuple, m *stun.Message, a *allocation, key []byte) {
-	o := s.successHeader(m)
+func (s *Server) allocated(x *scratch, t FiveTuple, a *allocation, key []byte) {
+	o := &x.out
+	o.Build(stun.MessageType{Method: stun.MethodAllocate, Class: stun.ClassSuccessResponse}, a.txID)
 	o.AddXORAddress(stun.AttrXORRelayedAddress, a.relayAddr)
 	o.AddLifetime(a.lifetime)
 	o.AddXORAddress(stun.AttrXORMappedAddress, t.Client)
-	s.finish(t, key)
+	s.finish(x, t, key)
 }
 
-func (s *Server) refresh(t FiveTuple, m *stun.Message, a *allocation, key []byte, now time.Time) {
+func (s *Server) refresh(e *exchange, a *allocation) {
 	if a == nil {
-		s.respondError(t, m, stun.CodeAllocationMismatch, "Allocation Mismatch", key)
+		e.fail(stun.CodeAllocationMismatch, "Allocation Mismatch")
 		return
 	}
-	lifetime := s.lifetime(m)
+	lifetime := s.lifetime(e.m)
 	if lifetime == 0 {
-		s.remove(a)
+		s.free(a)
 	} else {
-		a.expires = now.Add(lifetime)
+		if !s.lockLive(a, e.now) {
+			e.fail(stun.CodeAllocationMismatch, "Allocation Mismatch")
+			return
+		}
+		a.expires = e.now.Add(lifetime)
+		a.mu.Unlock()
 	}
-	o := s.successHeader(m)
+	o := e.success()
 	o.AddLifetime(lifetime)
-	s.finish(t, key)
+	e.send()
 }
 
 // peers appends the XOR-PEER-ADDRESS attributes of m to dst; a
@@ -637,71 +939,91 @@ func peers(dst []netip.AddrPort, m *stun.Message) ([]netip.AddrPort, error) {
 	return dst, nil
 }
 
-// checkPeer answers m with the error peer calls for, if any: 443 for a
-// peer of another family than the relayed address, 403 for one the server
-// does not relay to.
-func (s *Server) checkPeer(t FiveTuple, m *stun.Message, a *allocation, peer netip.AddrPort, key []byte) bool {
+// checkPeer answers the request with the error peer calls for, if any: 443
+// for a peer of another family than the relayed address, 403 for one the
+// server does not relay to.
+func (s *Server) checkPeer(e *exchange, a *allocation, peer netip.AddrPort) bool {
 	if peer.Addr().Is4() != a.relayAddr.Addr().Is4() {
-		s.respondError(t, m, stun.CodePeerAddressFamilyMismatch, "Peer Address Family Mismatch", key)
+		e.fail(stun.CodePeerAddressFamilyMismatch, "Peer Address Family Mismatch")
 		return false
 	}
 	if !s.peerAllowed(peer.Addr()) {
-		s.respondError(t, m, stun.CodeForbidden, "Forbidden", key)
+		e.fail(stun.CodeForbidden, "Forbidden")
 		return false
 	}
 	return true
 }
 
-func (s *Server) createPermission(t FiveTuple, m *stun.Message, a *allocation, key []byte, now time.Time) {
+func (s *Server) createPermission(e *exchange, a *allocation) {
 	if a == nil {
-		s.respondError(t, m, stun.CodeAllocationMismatch, "Allocation Mismatch", key)
+		e.fail(stun.CodeAllocationMismatch, "Allocation Mismatch")
 		return
 	}
 	var buf [4]netip.AddrPort
-	ps, err := peers(buf[:0], m)
+	ps, err := peers(buf[:0], e.m)
 	if err != nil || len(ps) == 0 {
-		s.respondError(t, m, stun.CodeBadRequest, "Bad Request", key)
+		e.fail(stun.CodeBadRequest, "Bad Request")
 		return
 	}
 	// Either every permission is installed or, if one peer is refused,
 	// none is (RFC 8656 section 9.2).
 	for _, p := range ps {
-		if !s.checkPeer(t, m, a, p, key) {
+		if !s.checkPeer(e, a, p) {
 			return
 		}
 	}
-	for _, p := range ps {
-		a.perms[p.Addr()] = now.Add(PermissionLifetime)
-	}
-	s.successHeader(m)
-	s.finish(t, key)
-}
-
-func (s *Server) channelBind(t FiveTuple, m *stun.Message, a *allocation, key []byte, now time.Time) {
-	if a == nil {
-		s.respondError(t, m, stun.CodeAllocationMismatch, "Allocation Mismatch", key)
+	if !s.lockLive(a, e.now) {
+		e.fail(stun.CodeAllocationMismatch, "Allocation Mismatch")
 		return
 	}
-	n, err1 := m.ChannelNumber()
-	peer, err2 := m.XORAddress(stun.AttrXORPeerAddress)
+	for _, p := range ps {
+		a.perms[p.Addr()] = e.now.Add(PermissionLifetime)
+	}
+	a.mu.Unlock()
+	e.success()
+	e.send()
+}
+
+func (s *Server) channelBind(e *exchange, a *allocation) {
+	if a == nil {
+		e.fail(stun.CodeAllocationMismatch, "Allocation Mismatch")
+		return
+	}
+	n, err1 := e.m.ChannelNumber()
+	peer, err2 := e.m.XORAddress(stun.AttrXORPeerAddress)
 	if err1 != nil || err2 != nil || n < MinChannel || n > MaxChannel {
-		s.respondError(t, m, stun.CodeBadRequest, "Bad Request", key)
+		e.fail(stun.CodeBadRequest, "Bad Request")
 		return
 	}
 	peer = unmap(peer)
-	if !s.checkPeer(t, m, a, peer, key) {
+	if !s.checkPeer(e, a, peer) {
 		return
 	}
+	if !s.lockLive(a, e.now) {
+		e.fail(stun.CodeAllocationMismatch, "Allocation Mismatch")
+		return
+	}
+	code := s.bindLocked(a, n, peer, e.now)
+	a.mu.Unlock()
+	if code != 0 {
+		e.fail(code, "Bad Request")
+		return
+	}
+	e.success()
+	e.send()
+}
+
+// bindLocked binds channel n to peer on a, or refreshes the binding, and
+// returns 0, or the error code to refuse it with. Callers hold a.mu.
+func (s *Server) bindLocked(a *allocation, n uint16, peer netip.AddrPort, now time.Time) int {
 	// A number stays bound to its peer, and a peer to its number, until
 	// the quarantine after the binding expires (RFC 8656 section 11.2).
 	b := a.chans[n]
-	if b != nil && b.peer != peer && !s.dropDeadChannel(a, b, now) {
-		s.respondError(t, m, stun.CodeBadRequest, "Bad Request", key)
-		return
+	if b != nil && b.peer != peer && !dropDeadChannel(a, b, now) {
+		return stun.CodeBadRequest
 	}
-	if o := a.chanByPeer[peer]; o != nil && o.number != n && !s.dropDeadChannel(a, o, now) {
-		s.respondError(t, m, stun.CodeBadRequest, "Bad Request", key)
-		return
+	if o := a.chanByPeer[peer]; o != nil && o.number != n && !dropDeadChannel(a, o, now) {
+		return stun.CodeBadRequest
 	}
 	if b == nil || b.peer != peer {
 		b = &chanBinding{number: n, peer: peer}
@@ -710,13 +1032,12 @@ func (s *Server) channelBind(t FiveTuple, m *stun.Message, a *allocation, key []
 	}
 	b.expires = now.Add(ChannelLifetime)
 	a.perms[peer.Addr()] = now.Add(PermissionLifetime)
-	s.successHeader(m)
-	s.finish(t, key)
+	return 0
 }
 
 // dropDeadChannel forgets b if its quarantine is over, and reports whether
-// it did.
-func (s *Server) dropDeadChannel(a *allocation, b *chanBinding, now time.Time) bool {
+// it did. Callers hold a.mu.
+func dropDeadChannel(a *allocation, b *chanBinding, now time.Time) bool {
 	if now.Before(b.expires.Add(channelQuarantine)) {
 		return false
 	}
@@ -729,13 +1050,14 @@ func (s *Server) dropDeadChannel(a *allocation, b *chanBinding, now time.Time) b
 	return true
 }
 
+// permitted reports whether a has a permission for ip. Callers hold a.mu.
 func (a *allocation) permitted(ip netip.Addr, now time.Time) bool {
 	exp, ok := a.perms[ip]
 	return ok && now.Before(exp)
 }
 
 func (s *Server) handleSend(t FiveTuple, m *stun.Message, now time.Time) error {
-	a := s.live(t, now)
+	a := s.lookup(t)
 	if a == nil {
 		return ErrDropped
 	}
@@ -745,7 +1067,12 @@ func (s *Server) handleSend(t FiveTuple, m *stun.Message, now time.Time) error {
 		return ErrDropped
 	}
 	peer = unmap(peer)
-	if !a.permitted(peer.Addr(), now) {
+	if !s.lockLive(a, now) {
+		return ErrDropped
+	}
+	ok = a.permitted(peer.Addr(), now)
+	a.mu.Unlock()
+	if !ok {
 		return ErrDropped
 	}
 	return s.toPeer(a, peer, data)
@@ -756,15 +1083,21 @@ func (s *Server) handleChannelData(t FiveTuple, b []byte, now time.Time) error {
 	if err != nil {
 		return err
 	}
-	a := s.live(t, now)
-	if a == nil {
+	a := s.lookup(t)
+	if a == nil || !s.lockLive(a, now) {
 		return ErrDropped
 	}
+	var peer netip.AddrPort
 	c := a.chans[n]
-	if c == nil || !now.Before(c.expires) || !a.permitted(c.peer.Addr(), now) {
+	ok := c != nil && now.Before(c.expires) && a.permitted(c.peer.Addr(), now)
+	if ok {
+		peer = c.peer
+	}
+	a.mu.Unlock()
+	if !ok {
 		return ErrDropped
 	}
-	return s.toPeer(a, c.peer, data)
+	return s.toPeer(a, peer, data)
 }
 
 func (s *Server) toPeer(a *allocation, peer netip.AddrPort, data []byte) error {
@@ -780,27 +1113,31 @@ func (s *Server) toPeer(a *allocation, peer netip.AddrPort, data []byte) error {
 // ChannelData if a channel is bound to the peer and in a Data indication
 // otherwise, if the peer has a permission. b is not retained.
 func (s *Server) HandleRelayPacket(relay, from netip.AddrPort, b []byte, now time.Time) error {
-	a := s.byRelay[unmap(relay)]
-	if a == nil {
-		return ErrDropped
-	}
-	if !now.Before(a.expires) {
-		s.remove(a)
+	a := s.lookupRelay(unmap(relay))
+	if a == nil || !s.lockLive(a, now) {
 		return ErrDropped
 	}
 	from = unmap(from)
-	if !a.permitted(from.Addr(), now) {
+	ok := a.permitted(from.Addr(), now)
+	var ch uint16
+	if c := a.chanByPeer[from]; c != nil && now.Before(c.expires) {
+		ch = c.number
+	}
+	a.mu.Unlock()
+	if !ok {
 		return ErrDropped
 	}
 	if s.cfg.OnRelay != nil && !s.cfg.OnRelay(a.user, false, len(b)) {
 		return ErrDropped
 	}
-	if c := a.chanByPeer[from]; c != nil && now.Before(c.expires) {
-		s.buf = AppendChannelData(s.buf[:0], c.number, b)
-		s.cfg.Send(a.tuple, s.buf)
+	x := getScratch()
+	defer putScratch(x)
+	if ch != 0 {
+		x.buf = AppendChannelData(x.buf[:0], ch, b)
+		s.cfg.Send(a.tuple, x.buf)
 		return nil
 	}
-	o := &s.out
+	o := &x.out
 	o.Build(stun.MessageType{Method: stun.MethodData, Class: stun.ClassIndication}, s.nextIndicationID())
 	o.AddXORAddress(stun.AttrXORPeerAddress, from)
 	o.Add(stun.AttrData, b)
@@ -813,15 +1150,18 @@ func (s *Server) HandleRelayPacket(relay, from netip.AddrPort, b []byte, now tim
 // prefix and a counter, unique without a read of random bytes per
 // datagram. Indications are not answered, so nothing hinges on guessing it.
 func (s *Server) nextIndicationID() [stun.TransactionIDSize]byte {
-	n := binary.BigEndian.Uint64(s.indID[4:]) + 1
-	binary.BigEndian.PutUint64(s.indID[4:], n)
-	return s.indID
+	id := s.indID
+	n := binary.BigEndian.Uint64(id[4:]) + s.indSeq.Add(1)
+	binary.BigEndian.PutUint64(id[4:], n)
+	return id
 }
 
 // NextTimeout returns when HandleTimeout must next be called: the next
 // sweep, while the server holds allocations.
 func (s *Server) NextTimeout() (time.Time, bool) {
-	if len(s.allocs) == 0 {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.count == 0 {
 		return time.Time{}, false
 	}
 	return s.nextSweep, true
@@ -830,26 +1170,51 @@ func (s *Server) NextTimeout() (time.Time, bool) {
 // HandleTimeout frees the allocations whose lifetime is over, closing their
 // relayed addresses, and forgets expired permissions and channels.
 func (s *Server) HandleTimeout(now time.Time) {
+	s.mu.Lock()
 	if now.Before(s.nextSweep) {
+		s.mu.Unlock()
 		return
 	}
-	s.sweep(now)
+	gone := s.sweepLocked(now)
+	s.mu.Unlock()
+	s.releaseAll(gone)
 }
 
-func (s *Server) sweep(now time.Time) {
-	s.nextSweep = now.Add(s.cfg.SweepInterval)
-	for _, a := range s.allocs {
-		if !now.Before(a.expires) {
-			s.remove(a)
-			continue
-		}
-		for ip, exp := range a.perms {
-			if !now.Before(exp) {
-				delete(a.perms, ip)
-			}
-		}
-		for _, b := range a.chans {
-			s.dropDeadChannel(a, b, now)
-		}
+func (s *Server) releaseAll(gone []*allocation) {
+	for _, a := range gone {
+		s.release(a)
 	}
+}
+
+// sweepLocked takes the expired allocations out of the tables and returns
+// them, for the caller to release once it has let go of s.mu, and forgets
+// the live ones' expired permissions and channels. Callers hold s.mu.
+func (s *Server) sweepLocked(now time.Time) []*allocation {
+	s.nextSweep = now.Add(s.cfg.SweepInterval)
+	var gone []*allocation
+	for i := range s.shards {
+		sh := &s.shards[i]
+		sh.mu.RLock()
+		for _, a := range sh.allocs {
+			a.mu.Lock()
+			if !now.Before(a.expires) {
+				gone = append(gone, a)
+			} else {
+				for ip, exp := range a.perms {
+					if !now.Before(exp) {
+						delete(a.perms, ip)
+					}
+				}
+				for _, b := range a.chans {
+					dropDeadChannel(a, b, now)
+				}
+			}
+			a.mu.Unlock()
+		}
+		sh.mu.RUnlock()
+	}
+	for _, a := range gone {
+		s.unlinkLocked(a)
+	}
+	return gone
 }

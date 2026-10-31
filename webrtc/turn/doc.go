@@ -36,6 +36,11 @@
 //
 // Output goes through callbacks set at construction (ClientConfig.Send,
 // ServerConfig.Send, Relay.SendTo), whose buffers are valid only during the
-// call. Neither the client nor the server locks: the caller serializes
-// calls to each.
+// call. The client does not lock: its caller serializes calls to it. The
+// server may be called from any number of goroutines at once, and relays
+// for different allocations in parallel, each allocation behind a lock of
+// its own; it opens relayed addresses asynchronously, answering an Allocate
+// when ServerConfig.AllocateRelay's done runs, so that a host whose sockets
+// take a while to open need not hold up the goroutine the request came in
+// on. It holds no lock while it calls back into the host.
 package turn
