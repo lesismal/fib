@@ -341,9 +341,12 @@ func TestCvCliIdleTimerSetAgain(t *testing.T) {
 		time.Sleep(timeout * 3 / 4)
 	}
 	at := cvCliWait(t, closed, "the idle connection to close")
-	// 10ms: last is taken after the body was read, so the client's own mark
-	// came a little before it, and a runner's timer granularity is coarse.
-	if early := last.Add(timeout).Sub(at); early > 10*time.Millisecond {
+	// last is taken after the body was read, so the client's own mark came a
+	// little before it, and a runner's timer granularity is coarse: Windows
+	// closed it 13.5ms early. A timer kept from an earlier idle spell would
+	// close it 150ms early, the 3/4 of timeout slept between the requests,
+	// so timeout/4 tells the two apart.
+	if early := last.Add(timeout).Sub(at); early > timeout/4 {
 		t.Fatalf("closed %v before IdleConnTimeout after it last went idle", early)
 	}
 }
