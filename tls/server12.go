@@ -95,12 +95,7 @@ func (h *serverHS) plan12(ch *clientHelloMsg) (*plan12, *hsError) {
 	}
 	p := &plan12{cert: cert, alg: alg}
 	preferred := serverSuites12
-	prefersAES := peerPrefersAESGCM(ch.suites)
-	if h.dtls {
-		// A DTLS 1.2 client offers no TLS 1.3 suite to go by.
-		prefersAES = peerPrefersAESGCM12(ch.suites)
-	}
-	if !aesGCMHardware || !prefersAES {
+	if !aesGCMHardware || !peerPrefersAESGCM(ch.suites) {
 		preferred = serverSuites12NoAES
 	}
 	for _, s := range preferred {

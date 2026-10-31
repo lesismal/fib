@@ -50,10 +50,11 @@ func suites13(peerPrefersChaCha20 bool) []uint16 {
 	return tls13SuitesNoAES
 }
 
-// peerPrefersAESGCM reports whether suites, a ClientHello's, offers an AES-GCM
-// suite before a ChaCha20-Poly1305 one, which is how crypto/tls's
-// isAESGCMPreferred picks a server's order: a client's first suite is its
-// preference.
+// peerPrefersAESGCM reports whether the first suite of suites, a
+// ClientHello's, that is a TLS 1.3 or TLS 1.2 suite this package knows is an
+// AES-GCM one, which is how crypto/tls's isAESGCMPreferred picks a server's
+// order: a client's first suite is its preference. A client that offers TLS
+// 1.2 alone, or DTLS 1.2, has only the TLS 1.2 suites to go by.
 func peerPrefersAESGCM(suites []uint16) bool {
 	for _, id := range suites {
 		switch id {
@@ -62,19 +63,8 @@ func peerPrefersAESGCM(suites []uint16) bool {
 		case stdtls.TLS_CHACHA20_POLY1305_SHA256:
 			return false
 		}
-	}
-	return false
-}
-
-// peerPrefersAESGCM12 is peerPrefersAESGCM by the TLS 1.2 AEAD suites, for a
-// client that offers no TLS 1.3 suite.
-func peerPrefersAESGCM12(suites []uint16) bool {
-	for _, id := range suites {
-		if isChaCha20Suite(id) {
-			return false
-		}
-		if s, ok := lookupSuite(stdtls.VersionTLS12, id); ok && s.mode == modeGCM12 {
-			return true
+		if s, ok := lookupSuite(stdtls.VersionTLS12, id); ok {
+			return s.mode == modeGCM12
 		}
 	}
 	return false
