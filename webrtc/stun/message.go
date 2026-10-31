@@ -146,9 +146,9 @@ func IsMessage(b []byte) bool {
 // every new transaction: one an attacker cannot guess lets a client tell a
 // forged response from its own.
 func NewTransactionID() (id [TransactionIDSize]byte) {
-	if _, err := rand.Read(id[:]); err != nil {
-		panic("stun: crypto/rand failed: " + err.Error())
-	}
+	// crypto/rand.Read never fails: it crashes the program rather than
+	// return an error.
+	_, _ = rand.Read(id[:])
 	return id
 }
 
@@ -226,10 +226,10 @@ func (m *Message) Decode(b []byte) error {
 	m.Type = ParseMessageType(binary.BigEndian.Uint16(b[0:2]))
 	copy(m.TransactionID[:], b[8:HeaderSize])
 	integrity := false
+	// The length is a multiple of four and so is every attribute with its
+	// padding, so an attribute's header is never cut short, and a value that
+	// fits fits with its padding: only the value can overrun.
 	for off := HeaderSize; off < len(m.Raw); {
-		if len(m.Raw)-off < attrHeaderSize {
-			return ErrTruncated
-		}
 		t := AttrType(binary.BigEndian.Uint16(m.Raw[off:]))
 		l := int(binary.BigEndian.Uint16(m.Raw[off+2:]))
 		v := off + attrHeaderSize
@@ -237,9 +237,6 @@ func (m *Message) Decode(b []byte) error {
 			return ErrTruncated
 		}
 		off = v + pad4(l)
-		if off > len(m.Raw) {
-			return ErrTruncated
-		}
 		switch {
 		case t == AttrFingerprint:
 			m.attrs = append(m.attrs, attr{t, v, l})

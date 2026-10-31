@@ -590,3 +590,105 @@ func TestDecodeReuseNoAlloc(t *testing.T) {
 		t.Fatalf("%v allocations a decode", n)
 	}
 }
+
+func TestTypeStrings(t *testing.T) {
+	for _, tc := range []struct {
+		t    MessageType
+		want string
+	}{
+		{BindingRequest, "Binding request"},
+		{BindingIndication, "Binding indication"},
+		{BindingSuccess, "Binding success response"},
+		{BindingError, "Binding error response"},
+		{MessageType{MethodAllocate, ClassRequest}, "Allocate request"},
+		{MessageType{MethodRefresh, ClassRequest}, "Refresh request"},
+		{MessageType{MethodSend, ClassIndication}, "Send indication"},
+		{MessageType{MethodData, ClassIndication}, "Data indication"},
+		{MessageType{MethodCreatePermission, ClassRequest}, "CreatePermission request"},
+		{MessageType{MethodChannelBind, ClassRequest}, "ChannelBind request"},
+		{MessageType{MethodConnect, ClassRequest}, "Connect request"},
+		{MessageType{MethodConnectionBind, ClassRequest}, "ConnectionBind request"},
+		{MessageType{MethodConnectionAttempt, ClassIndication}, "ConnectionAttempt indication"},
+		{MessageType{0x123, 7}, "Method(0x123) Class(7)"},
+	} {
+		if got := tc.t.String(); got != tc.want {
+			t.Errorf("%#04x: %q, want %q", tc.t.Value(), got, tc.want)
+		}
+	}
+}
+
+// Adding to a zero Message builds its header first, with the type and
+// transaction ID it holds.
+func TestAddToZeroMessage(t *testing.T) {
+	m := Message{Type: BindingIndication, TransactionID: [TransactionIDSize]byte{1, 2, 3}}
+	m.AddUint64(AttrICEControlled, 42)
+	d := mustDecode(t, m.Raw)
+	if d.Type != BindingIndication || d.TransactionID != m.TransactionID {
+		t.Fatalf("decoded %v %x", d.Type, d.TransactionID)
+	}
+	if v, err := d.Uint64(AttrICEControlled); err != nil || v != 42 {
+		t.Fatalf("ICE-CONTROLLED %d %v", v, err)
+	}
+	if _, err := d.Uint64(AttrICEControlling); !errors.Is(err, ErrAttrNotFound) {
+		t.Fatal(err)
+	}
+}
+
+func TestBadAddressAndFingerprint(t *testing.T) {
+	m := new(Message)
+	m.Build(BindingSuccess, NewTransactionID())
+	m.Add(AttrXORMappedAddress, []byte{0, 2, 0, 0, 1, 2, 3, 4}) // IPv6, 4 bytes
+	m.Add(AttrMappedAddress, []byte{0, 1, 0})
+	m.Add(AttrICEControlling, []byte{1, 2, 3, 4})
+	m.Add(AttrFingerprint, []byte{1, 2})
+	d := mustDecode(t, m.Raw)
+	if _, err := d.Uint64(AttrICEControlling); !errors.Is(err, ErrAttrSize) {
+		t.Fatal(err)
+	}
+	if _, err := d.XORAddress(AttrXORMappedAddress); !errors.Is(err, ErrAttrSize) {
+		t.Fatal(err)
+	}
+	if _, err := d.Address(AttrMappedAddress); !errors.Is(err, ErrAttrSize) {
+		t.Fatal(err)
+	}
+	if err := d.CheckFingerprint(); !errors.Is(err, ErrAttrSize) {
+		t.Fatal(err)
+	}
+
+	// A FINGERPRINT that is not last, as one built and then added to.
+	m.Build(BindingSuccess, NewTransactionID())
+	m.AddFingerprint()
+	m.AddString(AttrSoftware, "after")
+	if err := m.CheckFingerprint(); !errors.Is(err, ErrFingerprintLast) {
+		t.Fatal(err)
+	}
+	// One of the right size and place, but the wrong CRC.
+	m.Build(BindingSuccess, NewTransactionID())
+	m.Add(AttrFingerprint, []byte{1, 2, 3, 4})
+	if err := mustDecode(t, m.Raw).CheckFingerprint(); !errors.Is(err, ErrFingerprint) {
+		t.Fatal(err)
+	}
+}
+
+// The SHA-256 long-term key of RFC 8489 section 9.2.2 keys
+// MESSAGE-INTEGRITY-SHA256, and only the right password's verifies.
+func TestLongTermKeySHA256(t *testing.T) {
+	key := LongTermKeySHA256(sampleUsername, sampleRealm, samplePassword2)
+	if len(key) != 32 {
+		t.Fatalf("key of %d bytes", len(key))
+	}
+	m := new(Message)
+	m.Build(BindingRequest, NewTransactionID())
+	m.AddString(AttrRealm, sampleRealm)
+	m.AddIntegritySHA256(key)
+	d := mustDecode(t, m.Raw)
+	if err := d.CheckIntegritySHA256(key); err != nil {
+		t.Fatal(err)
+	}
+	if err := d.CheckIntegritySHA256(LongTermKeySHA256(sampleUsername, sampleRealm, "wrong")); !errors.Is(err, ErrIntegrity) {
+		t.Fatal(err)
+	}
+	if bytes.Equal(key[:16], LongTermKey(sampleUsername, sampleRealm, samplePassword2)) {
+		t.Fatal("the SHA-256 key is the MD5 one")
+	}
+}
