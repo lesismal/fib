@@ -11,9 +11,12 @@ import (
 // Winsock and NT values the syscall package does not export.
 const (
 	WSAEWOULDBLOCK = syscall.Errno(10035)
-	WSAEINVAL      = syscall.Errno(10022)
-	WSAEMSGSIZE    = syscall.Errno(10040)
-	WSAECONNRESET  = syscall.Errno(10054)
+	// SoExclusiveAddrUse is SO_EXCLUSIVEADDRUSE, which winsock2.h defines
+	// as ~SO_REUSEADDR.
+	SoExclusiveAddrUse = ^syscall.SO_REUSEADDR
+	WSAEINVAL          = syscall.Errno(10022)
+	WSAEMSGSIZE        = syscall.Errno(10040)
+	WSAECONNRESET      = syscall.Errno(10054)
 	// sioUDPConnReset is SIO_UDP_CONNRESET, which stops an ICMP port
 	// unreachable from failing a UDP socket's next receive.
 	SioUDPConnReset = 0x9800000C

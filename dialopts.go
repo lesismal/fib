@@ -31,7 +31,10 @@ type DialOptions struct {
 	//
 	// The socket is bound as net.Dialer binds it, without SO_REUSEADDR, so a
 	// port in use by any other socket, a TCP port still in TIME_WAIT among
-	// them, fails the bind with EADDRINUSE.
+	// them, fails the bind with EADDRINUSE. That holds for a socket on
+	// another address of the family too, the wildcard against a specific
+	// one: on Windows, which would let those share the port, the socket is
+	// bound with SO_EXCLUSIVEADDRUSE to refuse it the same way.
 	LocalAddr netip.AddrPort
 	// PortMin and PortMax, when PortMax is not zero, are the inclusive range
 	// the local port is taken from, LocalAddr's port being zero. Ports are

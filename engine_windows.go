@@ -1203,6 +1203,24 @@ func (e *Engine) dialLoop(*dialRequest) *Engine { return e }
 // never happens here.
 func closeDialSocket(fd int) { _ = syscall.Closesocket(syscall.Handle(fd)) }
 
+// exclusiveBind binds a dial's socket to the local end DialWith named, with
+// SO_EXCLUSIVEADDRUSE. Without it Winsock lets a bind share a port another
+// socket holds on a different address of the same family, the wildcard next
+// to a specific address or the reverse, and the more specific socket then
+// takes the datagrams and connections meant for this one; the Unix kernels
+// refuse that bind with EADDRINUSE. With it the bind fails with
+// WSAEADDRINUSE whenever any socket holds the port, so a range moves on to
+// the next port as it does elsewhere, and no socket can later bind the port
+// on a more specific address under this one.
+func exclusiveBind(s syscall.Handle) func(syscall.Sockaddr) error {
+	return func(sa syscall.Sockaddr) error {
+		if err := syscall.SetsockoptInt(s, syscall.SOL_SOCKET, sys.SoExclusiveAddrUse, 1); err != nil {
+			return err
+		}
+		return syscall.Bind(s, sa)
+	}
+}
+
 // connectSocket opens a socket and starts an overlapped ConnectEx on it, whose
 // completion reports the connect's outcome. ConnectEx always completes through
 // the port, even when it finishes at once, so connected is always false here.
@@ -1222,7 +1240,7 @@ func (e *Engine) connectSocket(d *dialRequest) (c *Connection, connected bool, e
 	// the choice of interface and port to the kernel, as connect() would. A
 	// dial that names its local end is bound there instead.
 	if d.hasLocal {
-		err = d.bindLocal(func(sa syscall.Sockaddr) error { return syscall.Bind(s, sa) })
+		err = d.bindLocal(exclusiveBind(s))
 	} else {
 		var local syscall.Sockaddr = &syscall.SockaddrInet4{}
 		if d.family == syscall.AF_INET6 {
@@ -1269,7 +1287,7 @@ func (e *Engine) connectDatagram(d *dialRequest) (c *Connection, connected bool,
 	if err != nil {
 		return nil, false, err
 	}
-	err = d.bindLocal(func(sa syscall.Sockaddr) error { return syscall.Bind(s, sa) })
+	err = d.bindLocal(exclusiveBind(s))
 	if err == nil {
 		err = syscall.Connect(s, d.sa)
 	}
