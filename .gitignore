@@ -4,3 +4,6 @@
 # The HTTP/3 conformance peer's binary, built in place by `go build ./...`
 # in its module (the clean-build CI job does this).
 /http3/interop/interop
+
+# Test binaries that `go test -c` leaves in a package directory.
+*.test
