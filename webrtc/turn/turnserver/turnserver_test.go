@@ -3,6 +3,7 @@
 package turnserver
 
 import (
+	"context"
 	"net"
 	"net/netip"
 	"sync"
@@ -481,5 +482,66 @@ func TestSendToForgottenClient(t *testing.T) {
 	}
 	if s.Unsent() != 1 {
 		t.Fatal("an unreachable client was not counted")
+	}
+}
+
+// Shutdown refuses new allocations while the held ones go on, and closes
+// once they end, or when its context does.
+func TestShutdown(t *testing.T) {
+	s, addr, _ := startServer(t, fib.DefaultConfig(), Config{})
+	u := newUDPClient(t, addr, false)
+	u.do(func(c *turn.Client) { _ = c.Allocate(time.Now()) })
+	wait(t, u.allocated, "the allocation")
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+	if err := s.Shutdown(ctx); err != context.DeadlineExceeded || s.Allocations() != 0 {
+		t.Fatalf("Shutdown with an allocation held: %v, %d left", err, s.Allocations())
+	}
+
+	s2, addr2, _ := startServer(t, fib.DefaultConfig(), Config{})
+	v := newUDPClient(t, addr2, false)
+	v.do(func(c *turn.Client) { _ = c.Allocate(time.Now()) })
+	wait(t, v.allocated, "the allocation")
+	done := make(chan error, 1)
+	go func() { done <- s2.Shutdown(context.Background()) }()
+	deadline := time.Now().Add(5 * time.Second)
+	for !s2.Core().Draining() && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	// A new client is refused, the held one deallocates and Shutdown
+	// returns.
+	w := newUDPClient(t, addr2, false)
+	w.do(func(c *turn.Client) { _ = c.Allocate(time.Now()) })
+	if err := wait(t, w.failed, "the refusal"); err == nil {
+		t.Fatal("allocated while draining")
+	}
+	v.do(func(c *turn.Client) { c.Close(time.Now()) })
+	if err := wait(t, done, "Shutdown"); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// Limits and credentials change in place, without a restart.
+func TestUpdateInPlace(t *testing.T) {
+	s, addr, _ := startServer(t, fib.DefaultConfig(), Config{})
+	u := newUDPClient(t, addr, false)
+	u.do(func(c *turn.Client) { _ = c.Allocate(time.Now()) })
+	wait(t, u.allocated, "the allocation")
+	s.Core().SetLimits(turn.Limits{MaxAllocations: 1})
+	v := newUDPClient(t, addr, false)
+	v.do(func(c *turn.Client) { _ = c.Allocate(time.Now()) })
+	if err := wait(t, v.failed, "the refusal"); err == nil {
+		t.Fatal("allocated past a lowered quota")
+	}
+	if s.Allocations() != 1 || s.Core().Limits().MaxAllocations != 1 || s.Core().Limits().DefaultLifetime != turn.DefaultLifetime {
+		t.Fatal("the held allocation, or the limits")
+	}
+	s.Core().SetAuth(nil)
+	s.Core().SetAuth(turn.StaticAuth(realm, map[string]string{user: "changed"}))
+	s.Core().SetLimits(turn.Limits{})
+	w := newUDPClient(t, addr, false)
+	w.do(func(c *turn.Client) { _ = c.Allocate(time.Now()) })
+	if err := wait(t, w.failed, "the refusal"); err == nil {
+		t.Fatal("allocated with old credentials")
 	}
 }

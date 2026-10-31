@@ -563,7 +563,7 @@ func TestClientStaleNonceNewRealm(t *testing.T) {
 	c.allocate(t)
 	// The server's realm changes; its users are the same.
 	srv.s.cfg.Realm = "other.test"
-	srv.s.cfg.Auth = StaticAuth("other.test", map[string]string{testUser: testPass})
+	srv.s.SetAuth(StaticAuth("other.test", map[string]string{testUser: testPass}))
 	for i := range srv.s.nonceKey {
 		srv.s.nonceKey[i] ^= 1
 	}

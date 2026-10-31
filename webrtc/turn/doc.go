@@ -24,7 +24,10 @@
 // allocation's permissions and channels, asks a host's PeerAllowed about a
 // peer's port as well as its address, tells ServerConfig.OnEvent of
 // allocations made, refreshed and freed and of requests refused, and
-// counts what it holds and relays in Stats. StaticAuth,
+// counts what it holds and relays in Stats. Its lifetimes and quotas
+// (Limits) and its AuthFunc change in place, through SetLimits and SetAuth,
+// and Drain has it refuse new allocations while the held ones run out, so
+// that a reload neither restarts it nor drops what it holds. StaticAuth,
 // EphemeralAuth and EphemeralCredentials cover fixed users and the
 // time-limited credentials of the TURN REST API that WebRTC services hand
 // out.

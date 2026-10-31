@@ -25,9 +25,14 @@
 // relayed address is bound, and the datagrams for a peer being opened wait
 // for it in a short queue of their own. A queue that is full refuses the
 // allocation with 508 or drops the datagram rather than wait for room.
+//
+// A reload changes the core's limits and credentials in place, through
+// Core().SetLimits and SetAuth; a server being replaced is stopped with
+// Shutdown, which lets its allocations end before it closes.
 package turnserver
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"math/rand/v2"
@@ -228,6 +233,36 @@ func (s *Server) Close() {
 		s.core.Close()
 	})
 }
+
+// Shutdown stops the server gracefully: it drains the core, which refuses
+// new allocations with 508 while those held go on relaying and refreshing,
+// waits until none is left, or ctx is done, and then closes the server as
+// Close does. It returns ctx.Err() if ctx ended the wait, and nil
+// otherwise. Lifetimes, quotas and credentials are changed in place
+// through Core's SetLimits and SetAuth, with no need to shut down.
+func (s *Server) Shutdown(ctx context.Context) error {
+	s.core.Drain()
+	t := time.NewTicker(shutdownPoll)
+	defer t.Stop()
+	var err error
+	for {
+		if st := s.core.Stats(); st.Allocations+st.Pending == 0 {
+			break
+		}
+		select {
+		case <-ctx.Done():
+			err = ctx.Err()
+		case <-t.C:
+			continue
+		}
+		break
+	}
+	s.Close()
+	return err
+}
+
+// shutdownPoll is how often Shutdown looks for allocations left.
+const shutdownPoll = 20 * time.Millisecond
 
 // Allocations is the number of allocations the server holds.
 func (s *Server) Allocations() int { return s.core.Allocations() }

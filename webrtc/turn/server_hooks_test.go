@@ -184,3 +184,28 @@ func TestServerEvents(t *testing.T) {
 		t.Fatal("zero values' names")
 	}
 }
+
+// A draining server refuses new allocations and keeps refreshing the held
+// ones; SetLimits applies to the next request.
+func TestServerDrainAndLimits(t *testing.T) {
+	c := newCore(t, ServerConfig{})
+	u := c.user(clientAddr, testUser, testPass)
+	_ = u.do(stun.MethodAllocate, allocateReq)
+	c.s.SetLimits(Limits{DefaultLifetime: time.Minute, MaxLifetime: 2 * time.Minute})
+	if r := u.do(stun.MethodRefresh, func(m *stun.Message) { m.AddLifetime(time.Hour) }); code(r) != 0 {
+		t.Fatal(code(r))
+	} else if l, _ := r.Lifetime(); l != 2*time.Minute {
+		t.Fatalf("lifetime %v under the new maximum", l)
+	}
+	if c.s.Draining() {
+		t.Fatal("draining before Drain")
+	}
+	c.s.Drain()
+	v := c.user(netip.MustParseAddrPort("198.51.100.10:40500"), testUser, testPass)
+	if r := v.do(stun.MethodAllocate, allocateReq); code(r) != stun.CodeInsufficientCapacity {
+		t.Fatalf("Allocate while draining: %d", code(r))
+	}
+	if r := u.do(stun.MethodRefresh, nil); code(r) != 0 || !c.s.Draining() {
+		t.Fatalf("Refresh while draining: %d", code(r))
+	}
+}

@@ -364,7 +364,7 @@ func TestServerQuotas(t *testing.T) {
 	if r := a2.do(stun.MethodAllocate, allocateReq); code(r) != 0 {
 		t.Fatalf("after a deallocation: %d", code(r))
 	}
-	c.s.cfg.MaxAllocationsPerUser = 0
+	c.s.SetLimits(Limits{MaxAllocations: 2})
 	if r := c3.do(stun.MethodAllocate, allocateReq); code(r) != stun.CodeInsufficientCapacity {
 		t.Fatalf("beyond the total: %d", code(r))
 	}

@@ -78,32 +78,13 @@ type ServerConfig struct {
 	// while to open opens them elsewhere, on a goroutine of its own.
 	AllocateRelay func(t FiveTuple, user string, ipv6 bool, done func(Relay, error))
 
-	// DefaultLifetime is the lifetime of an allocation whose client asks
-	// for none or for less, 600s by default; MaxLifetime caps what a client
-	// may ask for, 3600s by default.
-	DefaultLifetime, MaxLifetime time.Duration
-	// NonceLifetime is how long a nonce is good for before a request with
-	// it is answered 438 (Stale Nonce) and a fresh one. Default 10 minutes.
-	// Nonces are not stored: each is its expiry and an HMAC of it and the
-	// client's address under NonceSecret.
-	NonceLifetime time.Duration
+	// Limits are the lifetimes and quotas, which SetLimits changes while
+	// the server runs.
+	Limits
 	// NonceSecret keys the nonces' HMAC. Random if empty; servers behind
 	// one load balancer that may each see a client's requests share one.
 	NonceSecret []byte
 
-	// MaxAllocations caps the allocations the server holds in all, which
-	// it refuses beyond with 508 (Insufficient Capacity); and
-	// MaxAllocationsPerUser those of one username, refused with 486
-	// (Allocation Quota Reached). Zero means no limit.
-	MaxAllocations, MaxAllocationsPerUser int
-	// MaxPermissions caps the permissions one allocation holds, and
-	// MaxChannels its channel bindings, so that a client with credentials
-	// cannot have the server keep memory without bound: a CreatePermission
-	// or ChannelBind that would go past either is refused with 508
-	// (Insufficient Capacity), as RFC 8656 section 9 allows, once the
-	// allocation's expired ones are forgotten. A permission a channel
-	// installs counts. Zero means no limit beyond the 4096 channel numbers.
-	MaxPermissions, MaxChannels int
 	// OnRelay, if set, is told of every datagram before it is relayed: n
 	// bytes of user's, to a peer if toPeer and from one otherwise. It
 	// returning false drops the datagram, which is where a host enforces
@@ -146,19 +127,55 @@ type ServerConfig struct {
 	Rand io.Reader
 }
 
-func (c *ServerConfig) setDefaults() {
+// Limits are a server's lifetimes and quotas: ServerConfig's, and what
+// Server.SetLimits changes them to while it runs.
+type Limits struct {
+	// DefaultLifetime is the lifetime of an allocation whose client asks
+	// for none or for less, 600s by default; MaxLifetime caps what a client
+	// may ask for, 3600s by default.
+	DefaultLifetime, MaxLifetime time.Duration
+	// NonceLifetime is how long a nonce is good for before a request with
+	// it is answered 438 (Stale Nonce) and a fresh one. Default 10 minutes.
+	// Nonces are not stored: each is its expiry and an HMAC of it and the
+	// client's address under NonceSecret.
+	NonceLifetime time.Duration
+
+	// MaxAllocations caps the allocations the server holds in all, which
+	// it refuses beyond with 508 (Insufficient Capacity); and
+	// MaxAllocationsPerUser those of one username, refused with 486
+	// (Allocation Quota Reached). Zero means no limit.
+	MaxAllocations, MaxAllocationsPerUser int
+	// MaxPermissions caps the permissions one allocation holds, and
+	// MaxChannels its channel bindings, so that a client with credentials
+	// cannot have the server keep memory without bound: a CreatePermission
+	// or ChannelBind that would go past either is refused with 508
+	// (Insufficient Capacity), as RFC 8656 section 9 allows, once the
+	// allocation's expired ones are forgotten. A permission a channel
+	// installs counts. Zero means no limit beyond the 4096 channel numbers.
+	MaxPermissions, MaxChannels int
+}
+
+// withDefaults is l with its zero lifetimes set to their defaults.
+func (l Limits) withDefaults() Limits {
 	def := func(d *time.Duration, v time.Duration) {
 		if *d <= 0 {
 			*d = v
 		}
 	}
-	def(&c.DefaultLifetime, DefaultLifetime)
-	def(&c.MaxLifetime, time.Hour)
-	if c.MaxLifetime < c.DefaultLifetime {
-		c.MaxLifetime = c.DefaultLifetime
+	def(&l.DefaultLifetime, DefaultLifetime)
+	def(&l.MaxLifetime, time.Hour)
+	if l.MaxLifetime < l.DefaultLifetime {
+		l.MaxLifetime = l.DefaultLifetime
 	}
-	def(&c.NonceLifetime, 10*time.Minute)
-	def(&c.SweepInterval, time.Second)
+	def(&l.NonceLifetime, 10*time.Minute)
+	return l
+}
+
+func (c *ServerConfig) setDefaults() {
+	c.Limits = c.Limits.withDefaults()
+	if c.SweepInterval <= 0 {
+		c.SweepInterval = time.Second
+	}
 	if c.Rand == nil {
 		c.Rand = rand.Reader
 	}
@@ -253,6 +270,12 @@ type Server struct {
 	indID  [stun.TransactionIDSize]byte
 	indSeq atomic.Uint64
 
+	// limits and auth are what SetLimits and SetAuth last set; draining
+	// is set by Drain.
+	limits   atomic.Pointer[Limits]
+	auth     atomic.Pointer[AuthFunc]
+	draining atomic.Bool
+
 	shards [shardCount]shard
 
 	// What freed allocations relayed, and the datagrams, requests and
@@ -304,6 +327,8 @@ func NewServer(config ServerConfig) (*Server, error) {
 		s.shards[i].allocs = make(map[FiveTuple]*allocation)
 		s.shards[i].byRelay = make(map[netip.AddrPort]*allocation)
 	}
+	s.limits.Store(&config.Limits)
+	s.auth.Store(&config.Auth)
 	s.nonceKey = config.NonceSecret
 	if len(s.nonceKey) == 0 {
 		s.nonceKey = make([]byte, 32)
@@ -544,6 +569,37 @@ func (s *Server) release(a *allocation, why FreeReason) {
 		ToPeer: toPeer, ToClient: toClient})
 }
 
+// SetLimits changes the lifetimes and quotas while the server runs, its
+// zero lifetimes set to their defaults. They apply from the next request
+// on: an allocation, permission or channel held past a lowered quota is
+// kept until it ends, and a lifetime already granted runs its course.
+func (s *Server) SetLimits(l Limits) {
+	l = l.withDefaults()
+	s.limits.Store(&l)
+}
+
+// Limits returns the lifetimes and quotas in force.
+func (s *Server) Limits() Limits { return *s.limits.Load() }
+
+// SetAuth changes how credentials are checked, from the next request on,
+// those on allocations already made included; nil is ignored. A user the
+// new AuthFunc refuses can no longer refresh, and its allocations end
+// with their lifetimes.
+func (s *Server) SetAuth(auth AuthFunc) {
+	if auth != nil {
+		s.auth.Store(&auth)
+	}
+}
+
+// Drain has the server refuse new allocations with 508 (Insufficient
+// Capacity) while those it holds go on relaying, and refreshing, until
+// they end or Close: the server being replaced lets its clients finish, or
+// move to another as their refreshes fail. It cannot be undone.
+func (s *Server) Drain() { s.draining.Store(true) }
+
+// Draining reports whether Drain was called.
+func (s *Server) Draining() bool { return s.draining.Load() }
+
 // Close frees every allocation, closing its relayed address. An allocation
 // whose relayed address is still being opened is refused once it is, and
 // the address closed. Nothing is relayed or allocated after.
@@ -701,7 +757,7 @@ func (s *Server) authenticate(e *exchange) bool {
 		s.authFailedEvent(e, string(u), stun.CodeUnauthorized)
 		return false
 	}
-	key, ok := s.cfg.Auth(string(u), string(realm))
+	key, ok := (*s.auth.Load())(string(u), string(realm))
 	if !ok || m.CheckIntegrity(key) != nil {
 		s.challenge(e, stun.CodeUnauthorized, "Unauthorized")
 		s.authFailedEvent(e, string(u), stun.CodeUnauthorized)
@@ -745,7 +801,7 @@ func (s *Server) validNonce(nonce []byte, client netip.AddrPort, now time.Time) 
 func (s *Server) challenge(e *exchange, code int, reason string) {
 	o := s.errorHeader(e.x, e.m, code, reason)
 	o.AddString(stun.AttrRealm, s.cfg.Realm)
-	o.Add(stun.AttrNonce, s.makeNonce(e.t.Client, e.now.Add(s.cfg.NonceLifetime).Unix()))
+	o.Add(stun.AttrNonce, s.makeNonce(e.t.Client, e.now.Add(s.limits.Load().NonceLifetime).Unix()))
 	s.finish(e.x, e.t, nil)
 }
 
@@ -773,14 +829,15 @@ func (s *Server) finish(x *scratch, t FiveTuple, key []byte) {
 // lifetime is the lifetime a request asks for, bounded by the server's
 // default and maximum (RFC 8656 section 7.2), or zero if it asks for zero.
 func (s *Server) lifetime(m *stun.Message) time.Duration {
+	lim := s.limits.Load()
 	l, err := m.Lifetime()
 	if err != nil {
-		return s.cfg.DefaultLifetime
+		return lim.DefaultLifetime
 	}
 	if l == 0 {
 		return 0
 	}
-	return max(min(l, s.cfg.MaxLifetime), s.cfg.DefaultLifetime)
+	return max(min(l, lim.MaxLifetime), lim.DefaultLifetime)
 }
 
 func (s *Server) allocate(e *exchange, a *allocation) {
@@ -812,7 +869,7 @@ func (s *Server) allocate(e *exchange, a *allocation) {
 	}
 	lifetime := s.lifetime(m)
 	if lifetime == 0 {
-		lifetime = s.cfg.DefaultLifetime
+		lifetime = s.limits.Load().DefaultLifetime
 	}
 	p := &pendingAlloc{tuple: e.t, user: e.user, key: e.key, txID: m.TransactionID, lifetime: lifetime, now: e.now}
 	code, reason, gone := s.reserve(p)
@@ -850,12 +907,16 @@ func (s *Server) reserve(p *pendingAlloc) (code int, reason string, gone []*allo
 		}
 		return stun.CodeAllocationMismatch, "Allocation Mismatch", nil
 	}
-	if q := s.cfg.MaxAllocationsPerUser; q > 0 && s.perUser[p.user] >= q {
+	if s.draining.Load() {
+		return stun.CodeInsufficientCapacity, "Insufficient Capacity", nil
+	}
+	lim := s.limits.Load()
+	if q := lim.MaxAllocationsPerUser; q > 0 && s.perUser[p.user] >= q {
 		if gone = s.sweepLocked(p.now); s.perUser[p.user] >= q {
 			return stun.CodeAllocationQuotaReached, "Allocation Quota Reached", gone
 		}
 	}
-	if q := s.cfg.MaxAllocations; q > 0 && s.count+len(s.pending) >= q {
+	if q := lim.MaxAllocations; q > 0 && s.count+len(s.pending) >= q {
 		gone = append(gone, s.sweepLocked(p.now)...)
 		if s.count+len(s.pending) >= q {
 			return stun.CodeInsufficientCapacity, "Insufficient Capacity", gone
@@ -1039,7 +1100,7 @@ func (s *Server) createPermission(e *exchange, a *allocation) {
 		e.fail(stun.CodeAllocationMismatch, "Allocation Mismatch")
 		return
 	}
-	if q := s.cfg.MaxPermissions; q > 0 {
+	if q := s.limits.Load().MaxPermissions; q > 0 {
 		fresh := 0
 		for i, p := range ps {
 			if _, ok := a.perms[p.Addr()]; !ok && !slices.ContainsFunc(ps[:i], func(o netip.AddrPort) bool { return o.Addr() == p.Addr() }) {
@@ -1116,7 +1177,8 @@ func (s *Server) bindLocked(a *allocation, n uint16, peer netip.AddrPort, now ti
 		return stun.CodeBadRequest, "Bad Request"
 	}
 	b = a.chans[n]
-	if q := s.cfg.MaxChannels; b == nil && q > 0 && len(a.chans) >= q {
+	lim := s.limits.Load()
+	if q := lim.MaxChannels; b == nil && q > 0 && len(a.chans) >= q {
 		for _, o := range a.chans {
 			dropDeadChannel(a, o, now)
 		}
@@ -1125,7 +1187,7 @@ func (s *Server) bindLocked(a *allocation, n uint16, peer netip.AddrPort, now ti
 		}
 	}
 	if _, ok := a.perms[peer.Addr()]; !ok {
-		if q := s.cfg.MaxPermissions; q > 0 && len(a.perms) >= q {
+		if q := lim.MaxPermissions; q > 0 && len(a.perms) >= q {
 			if forgetPermissions(a, now); len(a.perms) >= q {
 				return stun.CodeInsufficientCapacity, "Insufficient Capacity"
 			}
