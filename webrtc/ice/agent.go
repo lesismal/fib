@@ -214,16 +214,20 @@ const (
 )
 
 type pending struct {
-	kind   txKind
-	pair   *pair
-	nomin  bool
-	ctrl   bool
-	key    string // the password the response is checked with
-	local  LocalID
-	to     netip.AddrPort
-	base   netip.AddrPort // a gather request's host address
-	tx     stun.Transaction
-	expire bool
+	kind  txKind
+	pair  *pair
+	nomin bool
+	ctrl  bool
+	key   string // the password the response is checked with
+	local LocalID
+	to    netip.AddrPort
+	base  netip.AddrPort // a gather request's host address
+	prio  uint32         // the PRIORITY a check carried
+	tx    stun.Transaction
+	// cancelled is set on a check superseded by a triggered check of its
+	// pair (RFC 8445 section 7.3.1.4): it is no longer retransmitted, and
+	// its timeout fails nothing, but a response to it still counts.
+	cancelled bool
 }
 
 // Agent is a full ICE agent (RFC 8445) for one data stream with one

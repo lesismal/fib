@@ -22,9 +22,10 @@
 // all the agent handles: candidates for other components are refused. It
 // leaves out ICE over TCP (RFC 6544), aggressive nomination, which RFC 8445
 // deprecates, and resolving the mDNS names browsers give host candidates,
-// which its caller does. It does not add the peer-reflexive local candidate
-// a check may reveal: pairs are keyed by their local base, so such a valid
-// pair is the very pair that was checked. Relay candidates come from the
-// caller, who runs the TURN allocation and relays what the agent sends
-// through it.
+// which its caller does. Pairs are keyed by their local base, so the valid
+// pair a check produces, with the local candidate its response's mapped
+// address names (a peer-reflexive one the agent then learns), is the pair
+// that was checked, its local candidate replaced. Relay candidates come from
+// the caller, who runs the TURN allocation and relays what the agent sends
+// through it (see package webrtc/turn).
 package ice

@@ -156,19 +156,33 @@ func (a *Agent) handleRequest(local LocalID, from netip.AddrPort, m *stun.Messag
 		p.nominateOnSuccess = true
 	}
 	// A triggered check (RFC 8445 section 7.3.1.4). A pair already being
-	// checked keeps its transaction rather than starting another: the
-	// response to it serves the same purpose.
-	switch p.state {
-	case pairFrozen, pairWaiting, pairFailed:
-		if a.selected != nil && !a.consentPaused && p != a.selected && !p.nominateOnSuccess {
-			// Checks ended with the selection; the peer's late checks
-			// are answered and no more.
-			return nil
-		}
-		p.state = pairWaiting
-		a.enqueueTriggered(p)
+	// checked has its transaction cancelled and is checked again at once:
+	// the peer's check says the path works now, while the request in
+	// flight may be waiting out a long RTO after losses.
+	if p.state == pairSucceeded {
+		return nil
 	}
+	if a.selected != nil && !a.consentPaused && p != a.selected && !p.nominateOnSuccess {
+		// Checks ended with the selection; the peer's late checks are
+		// answered and no more.
+		return nil
+	}
+	if p.state == pairInProgress {
+		a.cancelChecks(p)
+	}
+	p.state = pairWaiting
+	a.enqueueTriggered(p)
 	return nil
+}
+
+// cancelChecks cancels p's checks in flight: they are not sent again and
+// their timeout fails nothing, but a response that still arrives counts.
+func (a *Agent) cancelChecks(p *pair) {
+	for _, pend := range a.txs {
+		if pend.kind == txCheck && pend.pair == p {
+			pend.cancelled = true
+		}
+	}
 }
 
 func (a *Agent) remoteAt(addr netip.AddrPort) *Candidate {
@@ -277,6 +291,7 @@ func (a *Agent) handleResponse(local LocalID, from netip.AddrPort, m *stun.Messa
 		a.failPair(p)
 		return nil
 	}
+	a.learnMapped(p, m, pend.prio)
 	p.state = pairSucceeded
 	if a.firstValid.IsZero() {
 		a.firstValid = now
@@ -295,6 +310,62 @@ func (a *Agent) handleResponse(local LocalID, from netip.AddrPort, m *stun.Messa
 		a.selectPair(p, now)
 	}
 	return nil
+}
+
+// learnMapped makes the local candidate of the valid pair a successful
+// check of p produced the one at the address the peer saw the check come
+// from, XOR-MAPPED-ADDRESS (RFC 8445 section 7.2.5.3.1): a local candidate
+// at that address on p's transport, a server-reflexive one say, or else a
+// new peer-reflexive candidate with p's local candidate as its base and the
+// priority the check carried, such as a NAT's mapping no STUN server
+// revealed.
+//
+// The valid pair would have the same key as p, its transport and remote
+// address, and the agent sends from that transport either way, so rather
+// than adding a second pair that only duplicates p, p itself becomes the
+// valid pair: its local candidate is replaced, which is what SelectedPair
+// and OnSelectedPair then report. Peer-reflexive local candidates are not
+// signaled, nor paired with other remote candidates (RFC 8445 section
+// 7.2.5.3.1); LocalCandidates lists them.
+func (a *Agent) learnMapped(p *pair, m *stun.Message, prio uint32) {
+	mapped, err := m.XORAddress(stun.AttrXORMappedAddress)
+	if err != nil {
+		return
+	}
+	mapped = netip.AddrPortFrom(mapped.Addr().Unmap(), mapped.Port())
+	if p.local.AddrPort() == mapped {
+		return
+	}
+	var l *Candidate
+	for _, c := range a.locals {
+		if c.LocalID == p.key.local && c.AddrPort() == mapped {
+			l = c
+			break
+		}
+	}
+	if l == nil {
+		base := p.local
+		if base.Type == PeerReflexive || base.Type == ServerReflexive {
+			if b := a.localFor(p.key.local, p.key.remote); b != nil {
+				base = b
+			}
+		}
+		l = &Candidate{
+			Foundation:     foundation(PeerReflexive, base.Address, netip.AddrPort{}),
+			Component:      base.Component,
+			Transport:      "udp",
+			Priority:       prio,
+			Address:        mapped.Addr(),
+			Port:           mapped.Port(),
+			Type:           PeerReflexive,
+			RelatedAddress: base.AddrPort(),
+			LocalID:        p.key.local,
+		}
+		a.locals = append(a.locals, l)
+	}
+	p.local = l
+	p.priority = a.pairPriority(l, p.remote)
+	a.sortPairs()
 }
 
 func (a *Agent) failPair(p *pair) {
@@ -370,7 +441,8 @@ func (a *Agent) sendRequest(p *pair, kind txKind, now time.Time) {
 	// PRIORITY is what a peer-reflexive candidate learned from this check
 	// would have: its type's preference with the local candidate's local
 	// preference (RFC 8445 section 7.1.1).
-	o.AddUint32(stun.AttrPriority, Priority(PeerReflexive, uint16(p.local.Priority>>8), p.local.Component))
+	prio := Priority(PeerReflexive, uint16(p.local.Priority>>8), p.local.Component)
+	o.AddUint32(stun.AttrPriority, prio)
 	if a.controlling {
 		o.AddUint64(stun.AttrICEControlling, a.tieBreaker)
 	} else {
@@ -385,7 +457,7 @@ func (a *Agent) sendRequest(p *pair, kind txKind, now time.Time) {
 	}
 	o.AddIntegrity([]byte(a.rpwd))
 	o.AddFingerprint()
-	pend := &pending{kind: kind, pair: p, nomin: nomin, ctrl: a.controlling, key: a.rpwd, local: p.key.local, to: p.key.remote}
+	pend := &pending{kind: kind, pair: p, nomin: nomin, ctrl: a.controlling, key: a.rpwd, local: p.key.local, to: p.key.remote, prio: prio}
 	cfg := stun.TransactionConfig{RTO: a.cfg.CheckRTO, MaxRTO: a.cfg.CheckMaxRTO, MaxSends: a.cfg.CheckMaxSends, LastWait: 2}
 	if kind == txConsent {
 		// A consent check gives up before the next one is due.
@@ -446,7 +518,7 @@ func (a *Agent) HandleTimeout(now time.Time) {
 	}
 	for id, p := range a.txs {
 		b, err := p.tx.HandleTimeout(now)
-		if b != nil {
+		if b != nil && !p.cancelled {
 			a.cfg.Send(p.local, p.to, b)
 		}
 		if err == nil {
@@ -457,7 +529,7 @@ func (a *Agent) HandleTimeout(now time.Time) {
 		case txGather:
 			a.checkGatheringDone()
 		case txCheck:
-			if a.pairIndex[p.pair.key] == p.pair && p.pair.state == pairInProgress {
+			if !p.cancelled && a.pairIndex[p.pair.key] == p.pair && p.pair.state == pairInProgress {
 				a.failPair(p.pair)
 			}
 		}
