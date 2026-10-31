@@ -1,0 +1,3 @@
+# Session descriptions end their lines in CRLF, and the tests compare
+# them byte for byte, so git must not convert them.
+*.sdp -text
