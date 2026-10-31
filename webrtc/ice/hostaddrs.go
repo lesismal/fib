@@ -25,20 +25,28 @@ func HostAddrs() ([]netip.Addr, error) {
 			continue
 		}
 		for _, addr := range addrs {
-			ipn, ok := addr.(*net.IPNet)
-			if !ok {
-				continue
+			if ip, ok := hostAddr(addr); ok {
+				out = append(out, ip)
 			}
-			ip, ok := netip.AddrFromSlice(ipn.IP)
-			if !ok {
-				continue
-			}
-			ip = ip.Unmap()
-			if ip.IsLoopback() || ip.IsLinkLocalUnicast() || ip.IsMulticast() || ip.IsUnspecified() {
-				continue
-			}
-			out = append(out, ip)
 		}
 	}
 	return out, nil
+}
+
+// hostAddr is an interface's address as a host candidate's, if it may be
+// one.
+func hostAddr(addr net.Addr) (netip.Addr, bool) {
+	ipn, ok := addr.(*net.IPNet)
+	if !ok {
+		return netip.Addr{}, false
+	}
+	ip, ok := netip.AddrFromSlice(ipn.IP)
+	if !ok {
+		return netip.Addr{}, false
+	}
+	ip = ip.Unmap()
+	if ip.IsLoopback() || ip.IsLinkLocalUnicast() || ip.IsMulticast() || ip.IsUnspecified() {
+		return netip.Addr{}, false
+	}
+	return ip, true
 }

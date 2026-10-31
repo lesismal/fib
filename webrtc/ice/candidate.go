@@ -258,10 +258,8 @@ func ParseCandidate(s string) (Candidate, error) {
 
 // isICEChars reports whether s is made of ice-chars, ALPHA, DIGIT, "+" and
 // "/", as foundations, ufrags and passwords are (RFC 8839 section 5.1).
+// Its callers check the length, which may not be zero, themselves.
 func isICEChars(s string) bool {
-	if s == "" {
-		return false
-	}
 	for i := 0; i < len(s); i++ {
 		b := s[i]
 		if !('a' <= b && b <= 'z' || 'A' <= b && b <= 'Z' || '0' <= b && b <= '9' || b == '+' || b == '/') {
