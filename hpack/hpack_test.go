@@ -218,6 +218,54 @@ func TestDecodeInternsRepeatedLiterals(t *testing.T) {
 	}
 }
 
+// TestDecodeRemembersALongLiteral checks that a literal past what recent
+// holds, a bearer token a peer never indexes, is decoded and made a string
+// once while it repeats, that one of the same length that differs is decoded
+// anew, and that MaxStringLength still holds for one remembered.
+func TestDecodeRemembersALongLiteral(t *testing.T) {
+	token := HeaderField{"authorization", "Bearer " + strings.Repeat("eyJhbGciOiJIUzI1NiJ9.", 14)}
+	other := HeaderField{"authorization", token.Value[:len(token.Value)-1] + "!"}
+	for _, huffman := range []bool{false, true} {
+		d := NewDecoder(DefaultTableSize)
+		block := literalBlock(huffman, token)
+		first := decodeAll(t, d, block)
+		if !reflect.DeepEqual(first, []HeaderField{token}) {
+			t.Fatalf("huffman=%v: got %v", huffman, first)
+		}
+		allocs := testing.AllocsPerRun(100, func() {
+			_ = d.Decode(block, func(HeaderField) error { return nil })
+		})
+		if allocs != 0 {
+			t.Fatalf("huffman=%v: a long literal seen before took %v allocations", huffman, allocs)
+		}
+		if got := decodeAll(t, d, literalBlock(huffman, other)); !reflect.DeepEqual(got, []HeaderField{other}) {
+			t.Fatalf("huffman=%v: a different literal of the same length decoded as %v", huffman, got)
+		}
+		if got := decodeAll(t, d, literalBlock(!huffman, other)); !reflect.DeepEqual(got, []HeaderField{other}) {
+			t.Fatalf("huffman=%v: the literal coded the other way decoded as %v", huffman, got)
+		}
+		if !reflect.DeepEqual(first, []HeaderField{token}) {
+			t.Fatalf("huffman=%v: a string decoded earlier changed to %v", huffman, first)
+		}
+		d.MaxStringLength = len(token.Value) - 1
+		if err := d.Decode(literalBlock(!huffman, other), func(HeaderField) error { return nil }); err != ErrStringTooLong {
+			t.Fatalf("huffman=%v: past MaxStringLength: %v, want ErrStringTooLong", huffman, err)
+		}
+	}
+}
+
+// BenchmarkDecodeRepeatedToken decodes the block of a client that sends a
+// bearer token unindexed on every request, as curl and h2load do.
+func BenchmarkDecodeRepeatedToken(b *testing.B) {
+	d := NewDecoder(DefaultTableSize)
+	block := literalBlock(true, HeaderField{":path", "/api/items"},
+		HeaderField{"authorization", "Bearer " + strings.Repeat("eyJhbGciOiJIUzI1NiJ9.", 14)})
+	b.ReportAllocs()
+	for b.Loop() {
+		_ = d.Decode(block, func(HeaderField) error { return nil })
+	}
+}
+
 // BenchmarkDecodeRepeatedHuffman decodes the block a load generator sends on
 // every request: the same Huffman-coded literals, none of them indexed.
 func BenchmarkDecodeRepeatedHuffman(b *testing.B) {

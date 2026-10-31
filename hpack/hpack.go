@@ -129,6 +129,15 @@ type Decoder struct {
 	// decoding it took 8% of a server's time.
 	coded     [recentStrings]codedString
 	nextCoded int
+	// long is the last literal decoded past maxRecentString, up to
+	// maxLongString, as it came and as it decoded, with longHuffman saying
+	// whether it came Huffman coded: one such field a peer repeats unindexed
+	// on every block is decoded once. nghttp2, and so curl and h2load, never
+	// index an Authorization, so a bearer token comes so on every request;
+	// decoding it and making it a string again was half of what a proxy
+	// allocated for each request over HTTP/2.
+	long        codedString
+	longHuffman bool
 }
 
 // codedString is a Huffman-coded literal and the string it decodes to.
@@ -140,6 +149,7 @@ type codedString struct{ coded, plain string }
 const (
 	recentStrings   = 8
 	maxRecentString = 64
+	maxLongString   = 1024
 )
 
 // NewDecoder returns a decoder for a peer allowed a dynamic table of up to
@@ -275,6 +285,8 @@ func (d *Decoder) readString(block []byte) (string, []byte, error) {
 					return c.plain, rest, nil
 				}
 			}
+		} else if d.isLong(raw, true) {
+			return d.long.plain, rest, nil
 		}
 		coded := raw
 		d.huffman, err = huffmanDecodeAppend(d.huffman[:0], raw, d.MaxStringLength)
@@ -290,12 +302,30 @@ func (d *Decoder) readString(block []byte) (string, []byte, error) {
 		if short && plain != "" {
 			d.coded[d.nextCoded] = codedString{string(coded), plain}
 			d.nextCoded = (d.nextCoded + 1) % recentStrings
+		} else if len(coded) <= maxLongString {
+			d.long, d.longHuffman = codedString{string(coded), plain}, true
 		}
 		return plain, rest, nil
 	} else if d.MaxStringLength > 0 && len(raw) > d.MaxStringLength {
 		return "", nil, ErrStringTooLong
 	}
-	return d.intern(raw), rest, nil
+	if len(raw) <= maxRecentString || len(raw) > maxLongString {
+		return d.intern(raw), rest, nil
+	}
+	if d.isLong(raw, false) {
+		return d.long.plain, rest, nil
+	}
+	// The string is the bytes as they came, so it is its own key.
+	plain := string(raw)
+	d.long, d.longHuffman = codedString{plain, plain}, false
+	return plain, rest, nil
+}
+
+// isLong reports whether raw, past maxRecentString, is the long literal
+// remembered, as it came, and coded the same way.
+func (d *Decoder) isLong(raw []byte, huffman bool) bool {
+	return d.longHuffman == huffman && len(d.long.coded) == len(raw) && d.long.coded == string(raw) &&
+		(d.MaxStringLength <= 0 || len(d.long.plain) <= d.MaxStringLength)
 }
 
 // intern returns raw as a string: for a short one, the string it returned
