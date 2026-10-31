@@ -876,14 +876,16 @@ func (p *Parser) frameLength() (frameInfo, bool, error) {
 	if req.ContentLength < 0 {
 		return frameInfo{end: headerEnd, headerEnd: headerEnd, request: req, block: block}, true, nil
 	}
-	if p.config.StreamRequestBody && (req.ContentLength > p.config.StreamRequestBodyThreshold ||
-		req.ContentLength > 0 && p.streamAtHeader(req)) {
+	// StreamRequestBodyAtHeader is asked of a body of any size, since one it
+	// picks streams at once whatever the threshold says: a handler that
+	// refuses a large upload from its header, with LimitBody, does so before
+	// 100 Continue asks the client for it.
+	if atHeader := p.config.StreamRequestBody && req.ContentLength > 0 && p.streamAtHeader(req); atHeader ||
+		p.config.StreamRequestBody && req.ContentLength > p.config.StreamRequestBodyThreshold {
 		if limit := p.config.MaxStreamedBodyBytes; limit > 0 && req.ContentLength > limit {
 			return frameInfo{}, false, ErrBodyTooLarge
 		}
-		// A body no larger than the threshold is here because
-		// StreamRequestBodyAtHeader picked it, and streams at once.
-		if req.ContentLength <= p.config.StreamRequestBodyThreshold || int64(len(p.buffer)-headerEnd) >= p.config.StreamRequestBodyThreshold {
+		if atHeader || int64(len(p.buffer)-headerEnd) >= p.config.StreamRequestBodyThreshold {
 			return frameInfo{end: headerEnd, headerEnd: headerEnd, stream: true, request: req, block: block}, true, nil
 		}
 		// The handler waits until the threshold of the body has arrived.

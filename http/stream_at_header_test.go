@@ -173,3 +173,42 @@ func TestH2ClientSendsTETrailers(t *testing.T) {
 		}
 	}
 }
+
+// TestStreamRequestBodyAtHeaderLargeH1 checks that an HTTP/1 request picked by
+// StreamRequestBodyAtHeader streams from its header even when its
+// Content-Length is past StreamRequestBodyThreshold, as the option promises:
+// such a request waited for the threshold, after sending 100 Continue, so that
+// a handler could not refuse the upload with LimitBody before the client had
+// begun sending it.
+func TestStreamRequestBodyAtHeaderLargeH1(t *testing.T) {
+	config := DefaultConfig()
+	config.StreamRequestBody = true
+	config.StreamRequestBodyThreshold = 1 << 20
+	config.StreamRequestBodyAtHeader = func(r *stdhttp.Request) bool { return r.URL.Path == "/upload" }
+	ran := make(chan struct{}, 1)
+	addr := serve(t, NewHandlerWithConfig(config, HandlerFunc(func(c *Context) {
+		ran <- struct{}{}
+		_ = c.LimitBody(1 << 10)
+	})))
+	conn, err := net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	_ = conn.SetDeadline(time.Now().Add(10 * time.Second))
+	if _, err := io.WriteString(conn, "POST /upload HTTP/1.1\r\nHost: t\r\nContent-Length: 8388608\r\nExpect: 100-continue\r\n\r\n"); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-ran:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the handler did not run at the header")
+	}
+	resp, err := stdhttp.ReadResponse(bufio.NewReader(conn), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.StatusCode != stdhttp.StatusRequestEntityTooLarge {
+		t.Fatalf("answered %d before the body, want 413 and no 100 Continue", resp.StatusCode)
+	}
+}
