@@ -1732,7 +1732,7 @@ func (sc *h2ServerConn) reject(st *h2ServerStream, status int) {
 		StatusCode: status,
 		Header:     stdhttp.Header{"Content-Type": {"text/plain; charset=utf-8"}},
 		Body:       []byte(stdhttp.StatusText(status) + "\n"),
-	})
+	}, nil)
 }
 
 // resetStream ends a stream with RST_STREAM.
@@ -1804,7 +1804,19 @@ func (sc *h2ServerConn) closeFinishedLocked() {
 // allows; what does not fit yet waits for the client's WINDOW_UPDATE. A body
 // that is the request's own is copied where it would wait past the handler's
 // return, as HTTP/1's send copies one; see the slow path below.
-func (st *h2ServerStream) respond(req *stdhttp.Request, response Response) error {
+//
+// owned, when it is not nil, is response.Body as a buffer from package
+// bufferpool, which the call takes over. Framing copies the body, so the
+// buffer goes back to the pool before the call returns, unless the windows
+// keep some of it back: the stream then holds that tail past the call, with
+// no room left in it to remember the buffer, and the collector frees it.
+func (st *h2ServerStream) respond(req *stdhttp.Request, response Response, owned []byte) error {
+	keep := false
+	defer func() {
+		if !keep {
+			bufferpool.Put(owned)
+		}
+	}()
 	status := response.StatusCode
 	if status < 200 || status > 999 {
 		// Interim responses go through writeInterim.
@@ -1868,6 +1880,7 @@ func (st *h2ServerStream) respond(req *stdhttp.Request, response Response) error
 		sc.sendWindow -= sendable
 		st.sendWindow -= sendable
 		st.localDone = true
+		// SendParts copies the body into the queue or the socket.
 		sc.sendPooledPartsLocked(out, body)
 		sc.finishStreamLocked(st)
 		sc.closeFinishedLocked()
@@ -1894,6 +1907,9 @@ func (st *h2ServerStream) respond(req *stdhttp.Request, response Response) error
 			// other body is kept, whatever its size; see Response.Body.
 			st.pending = append([]byte(nil), st.pending...)
 		}
+		// What went was framed into out, a copy of it; what the windows
+		// kept back is the body's own tail still, unless it was copied.
+		keep = len(st.pending) > 0 && &st.pending[len(st.pending)-1] == &body[len(body)-1]
 	}
 	if response.Close && !sc.goAway {
 		// HTTP/2 cannot close one request's connection under the others, so

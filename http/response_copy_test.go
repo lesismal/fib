@@ -515,9 +515,9 @@ func BenchmarkH2ServerRespondCopy(b *testing.B) {
 }
 
 // TestResponseCopyOwnership pins where a *Copy call's copy comes from: the
-// pool for a body the send path is done with when it returns — HTTP/1, which
-// copies it on as it copies the head, and an external Stream that takes it
-// over — and a plain allocation for one the stream keeps, as HTTP/2's does.
+// pool for a sender that gives it back — HTTP/1, which copies it on as it
+// copies the head, HTTP/2, whose framing copies it, and an external Stream
+// that takes it over — and a plain allocation for a Stream that cannot.
 func TestResponseCopyOwnership(t *testing.T) {
 	small := bytes.Repeat([]byte("x"), 100)
 	large := bytes.Repeat([]byte("x"), 1<<20)
@@ -529,7 +529,7 @@ func TestResponseCopyOwnership(t *testing.T) {
 	}{
 		{"h1 small", &Context{}, small, true},
 		{"h1 large", &Context{}, large, true},
-		{"h2", &Context{stream: &h2ServerStream{}}, large, false},
+		{"h2", &Context{stream: &h2ServerStream{}}, large, true},
 		{"owned stream", copyTestContext(&ownedCopyStream{}), large, true},
 		{"plain stream", copyTestContext(&cloneCopyStream{}), large, false},
 	} {

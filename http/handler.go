@@ -641,14 +641,14 @@ func (c *Context) WriteResponseCopy(response Response) error {
 // for a Body that is a buffer from package bufferpool, which the response
 // takes over: it gives it back to the pool once the send path is done with
 // it, or leaves it to the collector where giving it back would cost more than
-// it saves: HTTP/2's streams keep a body by reference with no way to give it
-// back, and HTTP/1 sends a body larger than a small reply's by reference
-// rather than copying it into its queue. The caller must not touch the buffer
+// it saves: HTTP/1 sends a body larger than a small reply's by reference
+// rather than copying it into its queue, and HTTP/2 keeps by reference what
+// its windows hold back. The caller must not touch the buffer
 // after the call, whatever it returns. It is how a proxy sends on a
 // response's body from ClientResponse.TakeBody without a copy.
 func (c *Context) WriteResponseOwned(response Response) error {
 	owned := response.Body
-	if len(owned) == 0 || !c.senderTakesCopiedBody() || c.external == nil && len(owned) > maxCopiedResponseBody {
+	if len(owned) == 0 || !c.senderTakesCopiedBody() || c.external == nil && c.stream == nil && len(owned) > maxCopiedResponseBody {
 		owned = nil
 	}
 	if c.begun() {
@@ -682,16 +682,17 @@ func (c *Context) copyResponseBody(body []byte) (copied, pooled []byte) {
 // HTTP/1's connection can: sendResponse sends a body from a *Copy call with
 // SendParts, which copies what the socket does not take into the round's
 // buffer or the queue, and is done with the body when it returns, so the pool
-// gets the copy back and the wire gets the queue's own copy. An external
-// Stream that implements OwnedResponseWriter can too, as HTTP/3's does.
-// HTTP/2's streams keep a body by reference until the windows let it go and
-// have no room for a pool lease, so a copy for them is a plain one.
+// gets the copy back and the wire gets the queue's own copy. HTTP/2's
+// streams can, as framing copies the body: the copy goes back once framed,
+// and only a tail the windows keep back is left to the collector; see
+// h2ServerStream.respond. An external Stream that implements
+// OwnedResponseWriter can too, as HTTP/3's does.
 func (c *Context) senderTakesCopiedBody() bool {
 	if c.external != nil {
 		_, ok := c.external.(OwnedResponseWriter)
 		return ok
 	}
-	return c.stream == nil
+	return true
 }
 
 // releaseBody gives a *Copy call's buffer back to the pool, if it is one.
@@ -770,12 +771,11 @@ func (c *Context) writeResponse(response Response, copied []byte) error {
 		}
 	case c.stream != nil:
 		// HTTP/2 multiplexes the connection, so Close retires it gracefully
-		// with GOAWAY rather than cutting the other streams short. Its
-		// bodies are copies of their own, which the collector frees once the
-		// response has been sent; see senderTakesCopiedBody.
-		releaseBody(copied)
+		// with GOAWAY rather than cutting the other streams short. The
+		// stream takes the copy over; see senderTakesCopiedBody.
+		err = c.stream.respond(c.Request, response, copied)
 		copied = nil
-		if err = c.stream.respond(c.Request, response); err == nil {
+		if err == nil {
 			c.wrote, c.status = true, uint16(response.StatusCode)
 		}
 	default:
@@ -812,7 +812,7 @@ func (c *Context) sendHeld(response *Response, hooks *responseHooks) error {
 	case c.external != nil:
 		err = c.external.WriteResponse(c.Request, *response)
 	case c.stream != nil:
-		err = c.stream.respond(c.Request, *response)
+		err = c.stream.respond(c.Request, *response, nil)
 	default:
 		err = c.sendHTTP1(*response, "", nil)
 	}

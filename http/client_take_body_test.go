@@ -5,8 +5,10 @@ import (
 	"io"
 	stdhttp "net/http"
 	"net/http/httptest"
+	"sync"
 	"testing"
 	"time"
+	"unsafe"
 
 	"github.com/lesismal/fib/bufferpool"
 	fibtls "github.com/lesismal/fib/tls"
@@ -166,6 +168,68 @@ func TestWriteResponseOwned(t *testing.T) {
 			if body != string(pattern(n)) {
 				t.Errorf("%s%s over %s: %d bytes", base, path, resp.Proto, len(body))
 			}
+		}
+	}
+}
+
+// TestWriteResponseOwnedGivesTheBodyBack checks that a small body sent with
+// WriteResponseOwned goes back to the pool once sent, over HTTP/1 and over
+// HTTP/2, whose framing copies it: a later Get finds one of the buffers the
+// handler sent. The test keeps every buffer it sent alive, so that a Get
+// that finds one cannot have been given a new allocation at its address.
+func TestWriteResponseOwnedGivesTheBodyBack(t *testing.T) {
+	const size, requests = 1000, 50
+	var mu sync.Mutex
+	sent := map[*byte]bool{}
+	handler := HandlerFunc(func(c *Context) {
+		body := bufferpool.Get(size)
+		copy(body, pattern(size))
+		mu.Lock()
+		sent[unsafe.SliceData(body)] = true
+		mu.Unlock()
+		if err := c.WriteResponseOwned(Response{StatusCode: stdhttp.StatusOK, Body: body}); err != nil {
+			t.Error(err)
+		}
+	})
+	addr := serveHTTP1(t, handler)
+	serverConfig, clientConfig, err := tlstest.Configs()
+	if err != nil {
+		t.Fatal(err)
+	}
+	tlsAddr := serve(t, fibtls.NewServer(ConfigureTLS(serverConfig), NewHandler(handler)))
+	for base, client := range map[string]*stdhttp.Client{
+		"http://" + addr: {Timeout: 10 * time.Second},
+		"https://" + tlsAddr: {Timeout: 10 * time.Second, Transport: &stdhttp.Transport{
+			TLSClientConfig: clientConfig.Clone(), ForceAttemptHTTP2: true}},
+	} {
+		mu.Lock()
+		clear(sent)
+		mu.Unlock()
+		proto := ""
+		for range requests {
+			resp, body := do(t, client, mustRequest(t, "GET", base+"/", nil))
+			proto = resp.Proto
+			if body != string(pattern(size)) {
+				t.Fatalf("%s: %d bytes", proto, len(body))
+			}
+		}
+		mu.Lock()
+		found := false
+		var taken [][]byte
+		for range 4 * requests {
+			b := bufferpool.Get(size)
+			taken = append(taken, b)
+			if sent[unsafe.SliceData(b)] {
+				found = true
+				break
+			}
+		}
+		mu.Unlock()
+		for _, b := range taken {
+			bufferpool.Put(b)
+		}
+		if !found {
+			t.Errorf("%s: none of the %d bodies sent went back to the pool", proto, requests)
 		}
 	}
 }
