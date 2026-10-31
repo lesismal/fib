@@ -539,14 +539,18 @@ func (c *Client) failed(r *request, err error) {
 		}
 		c.fail(err)
 	case reqPermission:
-		// A refusal is kept, for SendTo to report; a request that went
-		// unanswered is forgotten, so that the next SendTo tries again.
+		// A refusal is kept, for SendTo to report. A request that went
+		// unanswered is sent again: the permission is kept until Close,
+		// and a refresh lost to the network must not let it lapse while
+		// no data goes to the peer to create it anew.
+		if errors.Is(err, stun.ErrTimeout) {
+			r.stale = 0
+			c.send(r)
+			return
+		}
 		if p := c.perms[r.peer.Addr()]; p != nil {
 			p.pending = false
 			p.err = err
-			if errors.Is(err, stun.ErrTimeout) {
-				delete(c.perms, r.peer.Addr())
-			}
 		}
 	case reqChannel:
 		// Data to the peer goes on in Send indications. A refused channel
@@ -562,9 +566,6 @@ func (c *Client) failed(r *request, err error) {
 }
 
 func (c *Client) fail(err error) {
-	if c.state == clientFailed || c.state == clientClosed {
-		return
-	}
 	c.state = clientFailed
 	clear(c.txs)
 	if c.cfg.OnFailed != nil {

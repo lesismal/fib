@@ -2,6 +2,7 @@ package turn
 
 import (
 	"bytes"
+	"errors"
 	"net/netip"
 	"testing"
 	"time"
@@ -469,5 +470,203 @@ func TestServerBandwidthHook(t *testing.T) {
 	}
 	if toPeer != 5 || fromPeer != 3 {
 		t.Fatalf("counted %d and %d", toPeer, fromPeer)
+	}
+}
+
+func TestServerConfig(t *testing.T) {
+	auth := StaticAuth(testRealm, nil)
+	send := func(FiveTuple, []byte) {}
+	alloc := func(FiveTuple, string, bool) (Relay, error) { return nil, ErrNoRelay }
+	for name, cfg := range map[string]ServerConfig{
+		"no realm":         {Auth: auth, Send: send, AllocateRelay: alloc},
+		"no auth":          {Realm: testRealm, Send: send, AllocateRelay: alloc},
+		"no send":          {Realm: testRealm, Auth: auth, AllocateRelay: alloc},
+		"no AllocateRelay": {Realm: testRealm, Auth: auth, Send: send},
+		"failing rand":     {Realm: testRealm, Auth: auth, Send: send, AllocateRelay: alloc, Rand: failingReader{}},
+		"failing rand with a secret": {Realm: testRealm, Auth: auth, Send: send, AllocateRelay: alloc,
+			Rand: failingReader{}, NonceSecret: []byte("shared")},
+	} {
+		if _, err := NewServer(cfg); err == nil {
+			t.Errorf("%s: accepted", name)
+		}
+	}
+
+	// A default lifetime over the maximum raises the maximum.
+	c := newCore(t, ServerConfig{DefaultLifetime: 2 * time.Hour})
+	u := c.user(clientAddr, testUser, testPass)
+	r := u.do(stun.MethodAllocate, func(m *stun.Message) { allocateReq(m); m.AddLifetime(5 * time.Hour) })
+	if l, _ := r.Lifetime(); code(r) != 0 || l != 2*time.Hour {
+		t.Fatalf("%d, lifetime %v", code(r), l)
+	}
+	// An Allocate asking for no lifetime gets the default.
+	u2 := c.user(netip.MustParseAddrPort("198.51.100.10:40002"), testUser, testPass)
+	r = u2.do(stun.MethodAllocate, func(m *stun.Message) { allocateReq(m); m.AddLifetime(0) })
+	if l, _ := r.Lifetime(); code(r) != 0 || l != 2*time.Hour {
+		t.Fatalf("%d, lifetime %v", code(r), l)
+	}
+	if _, ok := c.s.RelayFor(FiveTuple{peerAddr, serverAddr}); ok {
+		t.Fatal("a relay for a 5-tuple without an allocation")
+	}
+}
+
+func TestServerMalformed(t *testing.T) {
+	c := newCore(t, ServerConfig{})
+	u := c.user(clientAddr, testUser, testPass)
+	// Before any allocation, data from the client goes nowhere.
+	var send stun.Message
+	send.Build(stun.MessageType{Method: stun.MethodSend, Class: stun.ClassIndication}, stun.NewTransactionID())
+	send.AddXORAddress(stun.AttrXORPeerAddress, peerAddr)
+	send.Add(stun.AttrData, []byte("x"))
+	if err := c.s.HandlePacket(u.tuple(), send.Raw, c.now); err != ErrDropped {
+		t.Fatalf("Send without an allocation: %v", err)
+	}
+	if err := c.s.HandlePacket(u.tuple(), AppendChannelData(nil, MinChannel, []byte("x")), c.now); err != ErrDropped {
+		t.Fatalf("ChannelData without an allocation: %v", err)
+	}
+	_ = u.do(stun.MethodAllocate, allocateReq)
+	_ = u.do(stun.MethodCreatePermission, permissionReq(peerAddr))
+
+	badLength := bytes.Clone(send.Raw)
+	badLength[3] = 3
+	var fp, binding, noData stun.Message
+	fp.Build(stun.MessageType{Method: stun.MethodSend, Class: stun.ClassIndication}, stun.NewTransactionID())
+	fp.Add(stun.AttrFingerprint, []byte{1, 2, 3, 4})
+	binding.Build(stun.BindingIndication, stun.NewTransactionID())
+	noData.Build(stun.MessageType{Method: stun.MethodSend, Class: stun.ClassIndication}, stun.NewTransactionID())
+	noData.AddXORAddress(stun.AttrXORPeerAddress, peerAddr)
+	for name, tc := range map[string]struct {
+		b   []byte
+		err error
+	}{
+		"DTLS":               {[]byte{0x16, 0xfe, 0xfd, 0, 0}, ErrNotTURN},
+		"bad STUN length":    {badLength, stun.ErrBadLength},
+		"broken FINGERPRINT": {fp.Raw, stun.ErrFingerprint},
+		"Binding indication": {binding.Raw, ErrDropped},
+		"Send without DATA":  {noData.Raw, ErrDropped},
+		"ChannelData cut":    {[]byte{0x40, 0, 0, 9, 1}, ErrTruncated},
+	} {
+		if err := c.s.HandlePacket(u.tuple(), tc.b, c.now); !errors.Is(err, tc.err) {
+			t.Errorf("%s: %v, want %v", name, err, tc.err)
+		}
+	}
+	if len(c.relays[netip.AddrPortFrom(relayIP, 50000)].sent) != 0 {
+		t.Fatal("relayed a malformed request's data")
+	}
+
+	// Malformed peer addresses, and none at all.
+	if r := u.do(stun.MethodCreatePermission, func(m *stun.Message) { m.Add(stun.AttrXORPeerAddress, []byte{0, 1, 0}) }); code(r) != stun.CodeBadRequest {
+		t.Errorf("short XOR-PEER-ADDRESS: %d", code(r))
+	}
+	if r := u.do(stun.MethodCreatePermission, nil); code(r) != stun.CodeBadRequest {
+		t.Errorf("no XOR-PEER-ADDRESS: %d", code(r))
+	}
+}
+
+func TestServerCredentialChecks(t *testing.T) {
+	c := newCore(t, ServerConfig{})
+	u := c.user(clientAddr, testUser, testPass)
+	_ = u.do(stun.MethodAllocate, allocateReq)
+	req := func(realm, nonce string) int {
+		var m stun.Message
+		m.Build(stun.MessageType{Method: stun.MethodRefresh, Class: stun.ClassRequest}, stun.NewTransactionID())
+		m.AddString(stun.AttrUsername, testUser)
+		m.AddString(stun.AttrRealm, realm)
+		m.AddString(stun.AttrNonce, nonce)
+		m.AddIntegrity(stun.LongTermKey(testUser, realm, testPass))
+		return code(c.send(u.tuple(), m.Raw))
+	}
+	if got := req("elsewhere", u.nonce); got != stun.CodeUnauthorized {
+		t.Errorf("another realm: %d", got)
+	}
+	if got := req(testRealm, "short"); got != stun.CodeStaleNonce {
+		t.Errorf("a short nonce: %d", got)
+	}
+	if got := req(testRealm, u.nonce); got != 0 {
+		t.Errorf("the right ones: %d", got)
+	}
+	// StaticAuth knows only its realm's keys.
+	if _, ok := StaticAuth(testRealm, map[string]string{testUser: testPass})(testUser, "elsewhere"); ok {
+		t.Error("StaticAuth gave a key for another realm")
+	}
+	// EphemeralAuth runs on the wall clock unless given another.
+	secret := []byte("s")
+	auth := EphemeralAuth(secret, nil)
+	user, pass := EphemeralCredentials(secret, "", time.Now().Add(time.Minute))
+	if k, ok := auth(user, testRealm); !ok || !bytes.Equal(k, stun.LongTermKey(user, testRealm, pass)) {
+		t.Error("EphemeralAuth refused current credentials")
+	}
+	if user, _ := EphemeralCredentials(secret, "", time.Now().Add(-time.Minute)); func() bool { _, ok := auth(user, testRealm); return ok }() {
+		t.Error("EphemeralAuth took expired credentials")
+	}
+}
+
+func TestServerRelayFailures(t *testing.T) {
+	c := newCore(t, ServerConfig{})
+	u := c.user(clientAddr, testUser, testPass)
+	c.s.cfg.AllocateRelay = func(FiveTuple, string, bool) (Relay, error) { return nil, errors.New("ports exhausted") }
+	if r := u.do(stun.MethodAllocate, allocateReq); code(r) != stun.CodeInsufficientCapacity {
+		t.Fatalf("host refused a relay: %d", code(r))
+	}
+	// A host that hands out an address in use gets it back, closed.
+	same := &coreRelay{c: c, addr: netip.AddrPortFrom(relayIP, 50000)}
+	c.s.cfg.AllocateRelay = func(FiveTuple, string, bool) (Relay, error) {
+		r := *same
+		return &r, nil
+	}
+	if r := u.do(stun.MethodAllocate, allocateReq); code(r) != 0 {
+		t.Fatal(code(r))
+	}
+	var dup *coreRelay
+	c.s.cfg.AllocateRelay = func(FiveTuple, string, bool) (Relay, error) {
+		dup = &coreRelay{c: c, addr: same.addr}
+		return dup, nil
+	}
+	v := c.user(netip.MustParseAddrPort("198.51.100.10:40003"), testUser, testPass)
+	if r := v.do(stun.MethodAllocate, allocateReq); code(r) != stun.CodeInsufficientCapacity || !dup.closed {
+		t.Fatalf("a duplicate relayed address: %d, closed %v", code(r), dup != nil && dup.closed)
+	}
+	if c.s.Allocations() != 1 {
+		t.Fatalf("%d allocations", c.s.Allocations())
+	}
+}
+
+func TestServerRelayPackets(t *testing.T) {
+	refuse := false
+	c := newCore(t, ServerConfig{
+		DeniedPeers: []netip.Prefix{netip.MustParsePrefix("192.0.2.128/25")},
+		OnRelay:     func(_ string, out bool, _ int) bool { return out || !refuse },
+	})
+	u := c.user(clientAddr, testUser, testPass)
+	_ = u.do(stun.MethodAllocate, allocateReq)
+	relayed, _ := c.s.RelayFor(u.tuple())
+	if r := u.do(stun.MethodCreatePermission, permissionReq(netip.MustParseAddrPort("192.0.2.200:1"))); code(r) != stun.CodeForbidden {
+		t.Fatalf("a denied peer: %d", code(r))
+	}
+	_ = u.do(stun.MethodCreatePermission, permissionReq(peerAddr))
+	if err := c.s.HandleRelayPacket(netip.AddrPortFrom(relayIP, 1), peerAddr, []byte("x"), c.now); err != ErrDropped {
+		t.Fatalf("to an unknown relay: %v", err)
+	}
+	n := len(c.sent)
+	refuse = true
+	if err := c.s.HandleRelayPacket(relayed, peerAddr, []byte("x"), c.now); err != ErrDropped {
+		t.Fatalf("refused by OnRelay: %v", err)
+	}
+	refuse = false
+	if err := c.s.HandleRelayPacket(relayed, peerAddr, []byte("x"), c.now); err != nil || len(c.sent) != n+1 {
+		t.Fatalf("relayed: %v, %d sent", err, len(c.sent)-n)
+	}
+	// Between sweeps, an expired allocation is freed by the first packet
+	// that finds it, from either side.
+	if c.s.HandleTimeout(c.now); len(c.s.allocs) != 1 {
+		t.Fatal("a sweep before its time freed the allocation")
+	}
+	c.now = c.now.Add(DefaultLifetime)
+	if err := c.s.HandleRelayPacket(relayed, peerAddr, []byte("x"), c.now); err != ErrDropped || c.s.Allocations() != 0 || !c.relays[relayed].closed {
+		t.Fatalf("to an expired allocation: %v, %d allocations", err, c.s.Allocations())
+	}
+	_ = u.do(stun.MethodAllocate, allocateReq)
+	c.now = c.now.Add(DefaultLifetime)
+	if r := u.do(stun.MethodCreatePermission, permissionReq(peerAddr)); code(r) != stun.CodeAllocationMismatch || c.s.Allocations() != 0 {
+		t.Fatalf("a request on an expired allocation: %d, %d allocations", code(r), c.s.Allocations())
 	}
 }

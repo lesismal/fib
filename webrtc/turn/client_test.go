@@ -1,6 +1,7 @@
 package turn
 
 import (
+	"bytes"
 	"errors"
 	"net/netip"
 	"testing"
@@ -323,5 +324,343 @@ func TestClientIgnoresOthers(t *testing.T) {
 	m.AddLifetime(time.Minute)
 	if _, _, ok := c.HandlePacket(serverAddr, m.Raw, time.Now()); !ok || c.state == clientAllocated {
 		t.Fatal("a response without integrity was taken")
+	}
+}
+
+func TestClientConfigAndState(t *testing.T) {
+	send := func(netip.AddrPort, []byte) {}
+	if _, err := NewClient(ClientConfig{Server: serverAddr}); err == nil {
+		t.Fatal("no Send accepted")
+	}
+	if _, err := NewClient(ClientConfig{Send: send}); err == nil {
+		t.Fatal("no Server accepted")
+	}
+	c, err := NewClient(ClientConfig{Server: serverAddr, Send: send})
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Unix(0, 0)
+	if err := c.CreatePermission(peerAddr.Addr(), now); !errors.Is(err, ErrNotAllocated) {
+		t.Fatalf("CreatePermission before Allocate: %v", err)
+	}
+	if err := c.BindChannel(peerAddr, now); !errors.Is(err, ErrNotAllocated) {
+		t.Fatalf("BindChannel before Allocate: %v", err)
+	}
+	if err := c.Allocate(now); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.Allocate(now); !errors.Is(err, ErrAllocating) {
+		t.Fatalf("second Allocate: %v", err)
+	}
+	// Closed while allocating, the client is done at once.
+	c.Close(now)
+	if !c.Closed() {
+		t.Fatal("not closed")
+	}
+	if _, ok := c.NextTimeout(); ok {
+		t.Fatal("a closed client has timers")
+	}
+	if err := c.Allocate(now); !errors.Is(err, ErrClosed) {
+		t.Fatalf("Allocate after Close: %v", err)
+	}
+	c.Close(now)
+	if !c.Closed() {
+		t.Fatal("a second Close reopened it")
+	}
+
+	// A Rand that fails panics rather than send a guessable transaction ID.
+	c, _ = NewClient(ClientConfig{Server: serverAddr, Send: send, Rand: failingReader{}})
+	defer func() {
+		if r, _ := recover().(string); r == "" {
+			t.Fatal("no panic")
+		}
+	}()
+	_ = c.Allocate(now)
+}
+
+type failingReader struct{}
+
+func (failingReader) Read([]byte) (int, error) { return 0, errors.New("entropy exhausted") }
+
+// Requests already in flight are not sent twice.
+func TestClientPendingRequests(t *testing.T) {
+	n := newSimNet(t, 12)
+	newSimServer(n, serverAddr, ServerConfig{})
+	c := newSimClient(n, clientAddr, ClientConfig{Software: "fib-test"})
+	requests := map[stun.Method]int{}
+	software := 0
+	n.drop = func(from, to netip.AddrPort, b []byte) bool {
+		var m stun.Message
+		if from == clientAddr && m.Decode(b) == nil && m.Type.Class == stun.ClassRequest {
+			requests[m.Type.Method]++
+			if s, _ := m.Get(stun.AttrSoftware); string(s) == "fib-test" {
+				software++
+			}
+		}
+		return false
+	}
+	c.allocate(t)
+	for range 2 {
+		if err := c.c.CreatePermission(peerAddr.Addr(), n.now); err != nil {
+			t.Fatal(err)
+		}
+		if err := c.c.BindChannel(peerAddr, n.now); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if requests[stun.MethodCreatePermission] != 1 || requests[stun.MethodChannelBind] != 1 {
+		t.Fatalf("requests %v", requests)
+	}
+	n.run(time.Second, nil)
+	if ch := c.c.chans[peerAddr]; ch == nil || !ch.bound {
+		t.Fatal("channel not bound")
+	}
+	if total := requests[stun.MethodAllocate] + 2; software != total {
+		t.Fatalf("SOFTWARE in %d of %d requests", software, total)
+	}
+}
+
+// Channel numbers are handed out in turn, wrapping past MaxChannel, until
+// every one is bound.
+func TestClientChannelNumbers(t *testing.T) {
+	n := newSimNet(t, 13)
+	newSimServer(n, serverAddr, ServerConfig{})
+	c := newSimClient(n, clientAddr, ClientConfig{})
+	c.allocate(t)
+	n.drop = func(from, to netip.AddrPort, b []byte) bool { return true }
+	peer := func(i int) netip.AddrPort {
+		return netip.AddrPortFrom(netip.AddrFrom4([4]byte{192, 0, 2, byte(i >> 8)}), uint16(1000+i&0xff))
+	}
+	c.c.nextChan = MaxChannel
+	for i := range MaxChannel - MinChannel + 1 {
+		if err := c.c.BindChannel(peer(i), n.now); err != nil {
+			t.Fatalf("channel %d: %v", i, err)
+		}
+	}
+	if c.c.chans[peer(0)].number != MaxChannel || c.c.chans[peer(1)].number != MinChannel {
+		t.Fatalf("numbers %#x %#x", c.c.chans[peer(0)].number, c.c.chans[peer(1)].number)
+	}
+	if err := c.c.BindChannel(netip.MustParseAddrPort("198.51.100.99:1"), n.now); !errors.Is(err, ErrNoChannels) {
+		t.Fatalf("past the last channel: %v", err)
+	}
+}
+
+// fakeServer answers the client's requests at serverAddr with what reply
+// builds, without credentials: the client then sends none either.
+func fakeServer(n *simNet, reply func(m *stun.Message, r *stun.Message) bool) {
+	n.at[serverAddr] = func(from netip.AddrPort, b []byte) {
+		var m, r stun.Message
+		if m.Decode(b) != nil || m.Type.Class != stun.ClassRequest {
+			return
+		}
+		r.Build(stun.MessageType{Method: m.Type.Method, Class: stun.ClassSuccessResponse}, m.TransactionID)
+		if reply(&m, &r) {
+			n.send(serverAddr, from, r.Raw)
+		}
+	}
+}
+
+func allocated(m, r *stun.Message) {
+	r.AddXORAddress(stun.AttrXORRelayedAddress, netip.AddrPortFrom(relayIP, 50000))
+	r.AddXORAddress(stun.AttrXORMappedAddress, clientAddr)
+	r.AddLifetime(10 * time.Minute)
+}
+
+func TestClientBadResponses(t *testing.T) {
+	t.Run("allocation without addresses", func(t *testing.T) {
+		n := newSimNet(t, 14)
+		fakeServer(n, func(m, r *stun.Message) bool { r.AddLifetime(time.Minute); return true })
+		c := newSimClient(n, clientAddr, ClientConfig{})
+		_ = c.c.Allocate(n.now)
+		n.run(time.Second, nil)
+		if !errors.Is(c.failed, ErrBadResponse) || c.allocated {
+			t.Fatalf("failed %v", c.failed)
+		}
+	})
+	t.Run("error without a code", func(t *testing.T) {
+		n := newSimNet(t, 15)
+		fakeServer(n, func(m, r *stun.Message) bool {
+			r.Build(stun.MessageType{Method: m.Type.Method, Class: stun.ClassErrorResponse}, m.TransactionID)
+			return true
+		})
+		c := newSimClient(n, clientAddr, ClientConfig{})
+		_ = c.c.Allocate(n.now)
+		n.run(time.Second, nil)
+		if !errors.Is(c.failed, ErrBadResponse) {
+			t.Fatalf("failed %v", c.failed)
+		}
+	})
+	t.Run("refresh without a lifetime", func(t *testing.T) {
+		// A Refresh response without LIFETIME is taken to grant the
+		// default 600s.
+		n := newSimNet(t, 16)
+		fakeServer(n, func(m, r *stun.Message) bool {
+			if m.Type.Method == stun.MethodAllocate {
+				allocated(m, r)
+			}
+			return true
+		})
+		c := newSimClient(n, clientAddr, ClientConfig{})
+		_ = c.c.Allocate(n.now)
+		n.run(time.Second, nil)
+		start := n.now
+		var refreshes []time.Duration
+		n.drop = func(from, to netip.AddrPort, b []byte) bool {
+			var m stun.Message
+			if from == clientAddr && m.Decode(b) == nil && m.Type.Method == stun.MethodRefresh {
+				refreshes = append(refreshes, n.now.Sub(start))
+			}
+			return false
+		}
+		n.run(20*time.Minute, nil)
+		// The next is due 9 minutes after the response, which takes
+		// a round trip.
+		if d := DefaultLifetime - time.Minute; len(refreshes) != 2 || refreshes[1]-refreshes[0] < d || refreshes[1]-refreshes[0] > d+time.Second {
+			t.Fatalf("refreshes at %v", refreshes)
+		}
+	})
+	t.Run("packets that are not the server's to give", func(t *testing.T) {
+		n := newSimNet(t, 17)
+		newSimServer(n, serverAddr, ServerConfig{})
+		c := newSimClient(n, clientAddr, ClientConfig{})
+		c.allocate(t)
+		var data stun.Message
+		data.Build(stun.MessageType{Method: stun.MethodData, Class: stun.ClassIndication}, stun.NewTransactionID())
+		data.AddXORAddress(stun.AttrXORPeerAddress, peerAddr) // no DATA
+		var send stun.Message
+		send.Build(stun.MessageType{Method: stun.MethodSend, Class: stun.ClassIndication}, stun.NewTransactionID())
+		send.AddXORAddress(stun.AttrXORPeerAddress, peerAddr)
+		send.Add(stun.AttrData, []byte("x"))
+		bad := bytes.Clone(send.Raw)
+		bad[3] = 3 // a length not a multiple of four
+		var fp stun.Message
+		fp.Build(stun.MessageType{Method: stun.MethodData, Class: stun.ClassIndication}, stun.NewTransactionID())
+		fp.Add(stun.AttrFingerprint, []byte{1, 2, 3, 4})
+		for name, b := range map[string][]byte{
+			"ChannelData cut short": {0x40, 0x00, 0x00, 0x08, 1},
+			"ChannelData unbound":   AppendChannelData(nil, MinChannel+7, []byte("x")),
+			"malformed STUN":        bad,
+			"broken FINGERPRINT":    fp.Raw,
+			"Data without DATA":     data.Raw,
+			"a Send indication":     send.Raw,
+		} {
+			peer, d, ok := c.c.HandlePacket(serverAddr, b, n.now)
+			if !ok || d != nil || peer.IsValid() {
+				t.Errorf("%s: %v %q %v", name, peer, d, ok)
+			}
+		}
+		if c.failed != nil {
+			t.Fatal(c.failed)
+		}
+	})
+}
+
+// A server that changes realm in a 438 has the client derive its key anew.
+func TestClientStaleNonceNewRealm(t *testing.T) {
+	n := newSimNet(t, 18)
+	srv := newSimServer(n, serverAddr, ServerConfig{})
+	c := newSimClient(n, clientAddr, ClientConfig{})
+	c.allocate(t)
+	// The server's realm changes; its users are the same.
+	srv.s.cfg.Realm = "other.test"
+	srv.s.cfg.Auth = StaticAuth("other.test", map[string]string{testUser: testPass})
+	for i := range srv.s.nonceKey {
+		srv.s.nonceKey[i] ^= 1
+	}
+	if err := c.c.CreatePermission(peerAddr.Addr(), n.now); err != nil {
+		t.Fatal(err)
+	}
+	n.run(time.Second, nil)
+	if c.c.realm != "other.test" || c.c.perms[peerAddr.Addr()].pending || c.c.perms[peerAddr.Addr()].err != nil {
+		t.Fatalf("realm %q, permission %+v", c.c.realm, c.c.perms[peerAddr.Addr()])
+	}
+}
+
+// A lifetime under two minutes is refreshed halfway through, and one the
+// client asks for is what it is granted.
+func TestClientLifetimes(t *testing.T) {
+	n := newSimNet(t, 19)
+	newSimServer(n, serverAddr, ServerConfig{DefaultLifetime: time.Minute, MaxLifetime: time.Hour})
+	c := newSimClient(n, clientAddr, ClientConfig{Lifetime: 90 * time.Second})
+	c.allocate(t)
+	if d := c.c.refreshAt.Sub(n.now); d < 44*time.Second || d > 45*time.Second {
+		t.Fatalf("refresh in %v of a 90s lifetime", d)
+	}
+	n.run(10*time.Minute, nil)
+	if c.failed != nil {
+		t.Fatal(c.failed)
+	}
+}
+
+func TestDeallocateLostResponse(t *testing.T) {
+	// The response to the deallocation is lost: its retransmission finds
+	// the allocation gone, 437, which completes the Close too.
+	n := newSimNet(t, 20)
+	srv := newSimServer(n, serverAddr, ServerConfig{})
+	c := newSimClient(n, clientAddr, ClientConfig{})
+	c.allocate(t)
+	lost := false
+	n.drop = func(from, to netip.AddrPort, b []byte) bool {
+		var m stun.Message
+		if !lost && from == serverAddr && m.Decode(b) == nil && m.Type.Method == stun.MethodRefresh {
+			lost = true
+			return true
+		}
+		return false
+	}
+	c.c.Close(n.now)
+	n.run(time.Minute, func() bool { return c.c.Closed() })
+	if !lost || !c.c.Closed() || srv.s.Allocations() != 0 || c.failed != nil {
+		t.Fatalf("lost %v closed %v allocations %d failed %v", lost, c.c.Closed(), srv.s.Allocations(), c.failed)
+	}
+
+	// With the server gone altogether, Close gives up and is done.
+	n = newSimNet(t, 21)
+	newSimServer(n, serverAddr, ServerConfig{})
+	c = newSimClient(n, clientAddr, ClientConfig{})
+	c.allocate(t)
+	n.drop = func(from, to netip.AddrPort, b []byte) bool { return true }
+	c.c.Close(n.now)
+	if !n.run(time.Minute, func() bool { return c.c.Closed() }) || c.failed != nil {
+		t.Fatalf("closed %v, failed %v", c.c.Closed(), c.failed)
+	}
+}
+
+// A permission the client keeps only by refreshing it, with no data going
+// to the peer, survives a refresh whose every retransmission is lost.
+func TestPermissionRefreshRetried(t *testing.T) {
+	n := newSimNet(t, 22)
+	newSimServer(n, serverAddr, ServerConfig{})
+	c := newSimClient(n, clientAddr, ClientConfig{})
+	c.allocate(t)
+	relayed, _, _ := c.c.Relayed()
+	if err := c.c.CreatePermission(peerAddr.Addr(), n.now); err != nil {
+		t.Fatal(err)
+	}
+	n.run(time.Second, nil)
+	start := n.now
+	n.drop = func(from, to netip.AddrPort, b []byte) bool {
+		var m stun.Message
+		// The first refresh's transaction, from 4 minutes on, goes
+		// unanswered for its whole 39.5s.
+		return from == clientAddr && n.now.Sub(start) < 4*time.Minute+45*time.Second &&
+			m.Decode(b) == nil && m.Type.Method == stun.MethodCreatePermission
+	}
+	n.run(PermissionLifetime+time.Minute, nil)
+	n.send(peerAddr, relayed, []byte("still"))
+	n.run(time.Second, nil)
+	if len(c.got) != 1 || c.got[0] != (received{peerAddr, "still"}) {
+		t.Fatalf("the permission lapsed: client got %v", c.got)
+	}
+}
+
+func TestICERelayIgnoresOthers(t *testing.T) {
+	c, _ := NewClient(ClientConfig{Server: serverAddr, Send: func(netip.AddrPort, []byte) {}})
+	r := NewICERelay(nil, 2, c)
+	if _, ok := r.Candidate(); ok {
+		t.Fatal("a candidate before the allocation")
+	}
+	if _, _, handled := r.HandlePacket(peerAddr, []byte{0x16, 0xfe, 0xfd}, time.Now()); handled {
+		t.Fatal("handled a peer's packet")
 	}
 }

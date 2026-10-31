@@ -324,10 +324,9 @@ func (s *Server) live(t FiveTuple, now time.Time) *allocation {
 	return a
 }
 
+// remove frees a, which every caller found in allocs or byRelay, which
+// hold the same allocations.
 func (s *Server) remove(a *allocation) {
-	if s.allocs[a.tuple] != a {
-		return
-	}
 	delete(s.allocs, a.tuple)
 	delete(s.byRelay, a.relayAddr)
 	if s.perUser[a.user]--; s.perUser[a.user] <= 0 {
