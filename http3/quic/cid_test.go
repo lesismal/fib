@@ -70,16 +70,29 @@ func TestConnectionIDsIssuedAndRetired(t *testing.T) {
 	p.client.mu.Unlock()
 	first := server.LocalCID()
 	sendRaw(p, frame(frameRetireConnectionID, 0))
+	// One look at what the server owns for all of it: separate looks can
+	// see two before the retirement and the first gone before the
+	// replacement, which leaves no replacement to look for.
+	var replacement []byte
 	waitFor(t, "the first retired and replaced", func() bool {
 		cids := server.LocalCIDs()
-		return !server.Owns(first) && len(cids) == 2 && server.Owns(issued)
-	})
-	var replacement []byte
-	for _, cid := range server.LocalCIDs() {
-		if !bytes.Equal(cid, issued) {
-			replacement = cid
+		if len(cids) != 2 {
+			return false
 		}
-	}
+		kept := false
+		replacement = nil
+		for _, cid := range cids {
+			switch {
+			case bytes.Equal(cid, first):
+				return false
+			case bytes.Equal(cid, issued):
+				kept = true
+			default:
+				replacement = cid
+			}
+		}
+		return kept && replacement != nil
+	})
 	waitFor(t, "the replacement at the client", func() bool {
 		p.client.mu.Lock()
 		defer p.client.mu.Unlock()
