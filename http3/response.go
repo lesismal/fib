@@ -124,14 +124,24 @@ func (rs *requestStream) WriteBodyNoWait(p []byte) (bool, error) {
 }
 
 // NotifyWritable runs fn once no more than half of maxUnsentOutput is
-// unsent, or with the stream's error once it closes.
+// unsent, or with the stream's error once it closes. The callback holds a
+// reference to rs until it has run: it runs on another goroutine, after the
+// stream has closed, perhaps, and the Context has ended, and rs would be
+// recycled under it otherwise. A callback that another replaces never runs,
+// and leaves rs to the collector rather than to the pool.
 func (rs *requestStream) NotifyWritable(fn func(error)) bool {
-	return rs.s.NotifySendable(maxUnsentOutput/2, func(err error) {
+	rs.refs.Add(1)
+	if rs.s.NotifySendable(maxUnsentOutput/2, func(err error) {
 		if err != nil {
 			err = rs.closedErr()
 		}
 		fn(err)
-	})
+		rs.unref()
+	}) {
+		return true
+	}
+	rs.unref()
+	return false
 }
 
 // EndResponse ends a response that streams with the stream's FIN, behind the

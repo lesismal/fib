@@ -8,6 +8,7 @@ import (
 	"os"
 	"testing"
 	"time"
+	"unsafe"
 
 	fibhttp "github.com/lesismal/fib/http"
 	"github.com/lesismal/fib/http3/quic"
@@ -111,5 +112,71 @@ func TestOnWritableWriteTimeout(t *testing.T) {
 	}
 	if p.above == 0 {
 		t.Error("WriteNoWait never reported above the limit")
+	}
+}
+
+// TestOnWritableHoldsTheStream checks that the stream of a response whose
+// OnWritable function is still to run is not recycled meanwhile: the
+// function runs after the stream has closed and its Context has ended, when
+// nothing else holds the stream, and it read a stream that another request
+// may have taken.
+func TestOnWritableHoldsTheStream(t *testing.T) {
+	streams := make(chan *requestStream, 1)
+	gate, refs := make(chan struct{}), make(chan int32, 1)
+	base := startServer(t, Config{}, func(c *fibhttp.Context) {
+		off := unsafe.Offsetof(requestStream{}.block) + unsafe.Offsetof(fibhttp.StreamRequest{}.Request)
+		rs := (*requestStream)(unsafe.Add(unsafe.Pointer(c.Request), -int(off)))
+		if rs.req != c.Request {
+			t.Error("the request's stream is not where the test looks for it")
+			return
+		}
+		piece := make([]byte, 16<<10)
+		for {
+			above, err := c.WriteNoWait(piece)
+			if err != nil {
+				t.Error(err)
+				return
+			}
+			if above {
+				break
+			}
+		}
+		if !c.OnWritable(func(error) {
+			<-gate
+			refs <- rs.refs.Load()
+		}) {
+			t.Error("OnWritable reported room")
+			return
+		}
+		streams <- rs
+	})
+	w := dialH3WireWith(t, nil, base, quic.Config{StreamReceiveWindow: 16 << 10})
+	s, err := w.qc.OpenStream()
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.HoldCredit()
+	head, _ := h3Request{path: "/stall"}.frames()
+	if err := s.Write(head, true); err != nil {
+		t.Fatal(err)
+	}
+	rs := <-streams
+	s.StopSending(uint64(ErrCodeRequestCancelled))
+	// The connection lets go of the stream once it is reset, and the Context
+	// once the handler has returned: then only the function may hold it.
+	sc := rs.sc
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		sc.mu.Lock()
+		open := len(sc.streams)
+		sc.mu.Unlock()
+		if open == 0 && rs.refs.Load() <= 1 || time.Now().After(deadline) {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	close(gate)
+	if n := <-refs; n != 1 {
+		t.Fatalf("the stream had %d references while OnWritable's function ran, want its own", n)
 	}
 }
