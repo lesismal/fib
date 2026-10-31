@@ -97,26 +97,47 @@ func (h *clientHS) serverHello12(msg []byte, random, sessionID []byte, cipherSui
 }
 
 func (h *clientHS) certificate12(msg []byte, out *[]byte) *hsError {
-	r := newReader(msg[4:])
-	list := newReader(r.vec24())
-	if !r.empty() || !list.ok {
-		return fail(alertDecodeError, "malformed Certificate")
-	}
-	var ders [][]byte
-	for len(list.b) > 0 {
-		der := list.vec24()
-		if !list.ok || len(der) == 0 {
-			return fail(alertDecodeError, "malformed Certificate")
-		}
-		ders = append(ders, der)
+	ders, herr := parseCertificates12(msg)
+	if herr != nil {
+		return herr
 	}
 	h.transcript = append(h.transcript, msg...)
 	h.state = hs12ExpectServerKeyExchange
 	return h.acceptCertificates(ders, out)
 }
 
+// parseCertificates12 reads the chain of a TLS 1.2 Certificate message,
+// which may be empty.
+func parseCertificates12(msg []byte) ([][]byte, *hsError) {
+	r := newReader(msg[4:])
+	list := newReader(r.vec24())
+	if !r.empty() || !list.ok {
+		return nil, fail(alertDecodeError, "malformed Certificate")
+	}
+	var ders [][]byte
+	for len(list.b) > 0 {
+		der := list.vec24()
+		if !list.ok || len(der) == 0 {
+			return nil, fail(alertDecodeError, "malformed Certificate")
+		}
+		ders = append(ders, der)
+	}
+	return ders, nil
+}
+
 // serverKeyExchange checks the ECDHE parameters the server signed.
 func (h *clientHS) serverKeyExchange(msg []byte) *hsError {
+	if herr := h.checkServerKeyExchange(msg); herr != nil {
+		return herr
+	}
+	h.transcript = append(h.transcript, msg...)
+	h.state = hs12ExpectCertificateRequestOrDone
+	return nil
+}
+
+// checkServerKeyExchange reads the server's ECDHE parameters and checks its
+// signature over them and the randoms.
+func (h *clientHS) checkServerKeyExchange(msg []byte) *hsError {
 	body := msg[4:]
 	r := newReader(body)
 	curveType := r.u8()
@@ -143,8 +164,6 @@ func (h *clientHS) serverKeyExchange(msg []byte) *hsError {
 		return fail(alertDecryptError, "invalid signature by the server certificate: %v", err)
 	}
 	h.skxCurve, h.skxPub = curveID, bytes.Clone(pub)
-	h.transcript = append(h.transcript, msg...)
-	h.state = hs12ExpectCertificateRequestOrDone
 	return nil
 }
 
@@ -255,12 +274,11 @@ func (h *clientHS) finish12(out *[]byte) *hsError {
 	// The extended master secret covers the transcript through the key
 	// exchange, and not the CertificateVerify that follows it.
 	f := h.suite.hash
+	var sessionHash []byte
 	if h.ems {
-		h.master = prf12(f, premaster, "extended master secret", h.transcriptHash(), 48)
-	} else {
-		seed := append(append([]byte(nil), h.random[:]...), h.serverRandom[:]...)
-		h.master = prf12(f, premaster, "master secret", seed, 48)
+		sessionHash = h.transcriptHash()
 	}
+	h.master = masterSecret12(f, premaster, h.ems, sessionHash, h.random[:], h.serverRandom[:])
 	if h.certReq {
 		cv, herr := h.certificateVerify12()
 		if herr != nil {

@@ -8,6 +8,7 @@ import (
 	"crypto/hmac"
 	"crypto/rsa"
 	stdtls "crypto/tls"
+	"hash"
 	"io"
 	"slices"
 	"time"
@@ -94,7 +95,12 @@ func (h *serverHS) plan12(ch *clientHelloMsg) (*plan12, *hsError) {
 	}
 	p := &plan12{cert: cert, alg: alg}
 	preferred := serverSuites12
-	if !aesGCMHardware || !peerPrefersAESGCM(ch.suites) {
+	prefersAES := peerPrefersAESGCM(ch.suites)
+	if h.dtls {
+		// A DTLS 1.2 client offers no TLS 1.3 suite to go by.
+		prefersAES = peerPrefersAESGCM12(ch.suites)
+	}
+	if !aesGCMHardware || !prefersAES {
 		preferred = serverSuites12NoAES
 	}
 	for _, s := range preferred {
@@ -258,6 +264,14 @@ func (h *serverHS) flightResume12(state ticketState12, out *[]byte) *hsError {
 // flightFull12 answers a ClientHello with the server's side of a full
 // handshake, ending in the ServerHelloDone.
 func (h *serverHS) flightFull12(p *plan12, out *[]byte) *hsError {
+	return h.serverFlight12(p, nil, func(msg []byte) { h.sendPlain(out, msg) })
+}
+
+// serverFlight12 makes the messages of the server's side of a full handshake,
+// from the ServerHello to the ServerHelloDone, and hands each to send, which
+// puts it in the transcript and on the wire: in records over TCP, and in
+// DTLS's own (see dtls.go). more adds extensions to the ServerHello.
+func (h *serverHS) serverFlight12(p *plan12, more func(*builder), send func(msg []byte)) *hsError {
 	ch := h.ch
 	h.cert, h.alg, h.suiteID, h.group = p.cert, p.alg, p.suite, p.group
 	h.suite, _ = lookupSuite(stdtls.VersionTLS12, p.suite)
@@ -286,8 +300,11 @@ func (h *serverHS) flightFull12(p *plan12, out *[]byte) *hsError {
 				})
 			})
 		}
+		if more != nil {
+			more(b)
+		}
 	})
-	h.sendPlain(out, hello)
+	send(hello)
 
 	var cm builder
 	cm.u8(hsCertificate)
@@ -301,7 +318,7 @@ func (h *serverHS) flightFull12(p *plan12, out *[]byte) *hsError {
 	certMsg := finishMessage(&cm)
 	listLen := len(certMsg) - listAt - 3
 	certMsg[listAt], certMsg[listAt+1], certMsg[listAt+2] = byte(listLen>>16), byte(listLen>>8), byte(listLen)
-	h.sendPlain(out, certMsg)
+	send(certMsg)
 
 	if ch.statusRequest && len(h.cert.OCSPStaple) > 0 {
 		var sm builder
@@ -310,7 +327,7 @@ func (h *serverHS) flightFull12(p *plan12, out *[]byte) *hsError {
 		sm.u8(1) // ocsp
 		sm.u24(len(h.cert.OCSPStaple))
 		sm.raw(h.cert.OCSPStaple)
-		h.sendPlain(out, finishMessage(&sm))
+		send(finishMessage(&sm))
 	}
 
 	// ServerKeyExchange: the ECDHE parameters, signed with the randoms.
@@ -329,41 +346,29 @@ func (h *serverHS) flightFull12(p *plan12, out *[]byte) *hsError {
 	kx.raw(params)
 	kx.u16(h.alg)
 	kx.vec16(func(b *builder) { b.raw(signature) })
-	h.sendPlain(out, finishMessage(&kx))
+	send(finishMessage(&kx))
 
 	h.state = srv12AwaitKeyExchange
 	if h.requestsCert() {
-		h.sendPlain(out, h.requestCertificate(true))
+		send(h.requestCertificate(true))
 		h.state = srv12AwaitClientCert
 	}
-	h.sendPlain(out, []byte{hsServerHelloDone, 0, 0, 0})
+	send([]byte{hsServerHelloDone, 0, 0, 0})
 	return nil
 }
 
 // clientKeyExchange takes the client's share, and with it the master secret.
 func (h *serverHS) clientKeyExchange(msg []byte) *hsError {
-	r := newReader(msg[4:])
-	public := r.vec8()
-	if !r.empty() {
-		return fail(alertDecodeError, "malformed ClientKeyExchange")
-	}
-	curve := curveOf(h.group)
-	peer, err := curve.NewPublicKey(public)
-	if err != nil {
-		return fail(alertIllegalParameter, "invalid client key share: %v", err)
-	}
-	premaster, err := h.ecdhe.ECDH(peer)
-	if err != nil {
-		return fail(alertIllegalParameter, "key exchange failed: %v", err)
+	premaster, herr := h.clientShare12(msg)
+	if herr != nil {
+		return herr
 	}
 	h.transcript = append(h.transcript, msg...)
-	f := h.suite.hash
+	var sessionHash []byte
 	if h.ems {
-		h.master = prf12(f, premaster, "extended master secret", h.transcriptHash(), 48)
-	} else {
-		seed := append(append([]byte(nil), h.ch.random...), h.random[:]...)
-		h.master = prf12(f, premaster, "master secret", seed, 48)
+		sessionHash = h.transcriptHash()
 	}
+	h.master = masterSecret12(h.suite.hash, premaster, h.ems, sessionHash, h.ch.random, h.random[:])
 	if herr := h.keys12(); herr != nil {
 		return herr
 	}
@@ -372,6 +377,38 @@ func (h *serverHS) clientKeyExchange(msg []byte) *hsError {
 		h.state = srv12AwaitClientCertVerify
 	}
 	return nil
+}
+
+// clientShare12 reads the client's ECDHE share from its ClientKeyExchange and
+// returns the premaster secret it makes with ours.
+func (h *serverHS) clientShare12(msg []byte) ([]byte, *hsError) {
+	r := newReader(msg[4:])
+	public := r.vec8()
+	if !r.empty() {
+		return nil, fail(alertDecodeError, "malformed ClientKeyExchange")
+	}
+	curve := curveOf(h.group)
+	peer, err := curve.NewPublicKey(public)
+	if err != nil {
+		return nil, fail(alertIllegalParameter, "invalid client key share: %v", err)
+	}
+	premaster, err := h.ecdhe.ECDH(peer)
+	if err != nil {
+		return nil, fail(alertIllegalParameter, "key exchange failed: %v", err)
+	}
+	return premaster, nil
+}
+
+// masterSecret12 derives the TLS 1.2 master secret from the premaster: the
+// extended one over the session hash, the transcript through the
+// ClientKeyExchange, if both sides asked for it (RFC 7627 section 4), and
+// the original one over the randoms otherwise.
+func masterSecret12(f func() hash.Hash, premaster []byte, ems bool, sessionHash, clientRandom, serverRandom []byte) []byte {
+	if ems {
+		return prf12(f, premaster, "extended master secret", sessionHash, 48)
+	}
+	seed := append(append(make([]byte, 0, 64), clientRandom...), serverRandom...)
+	return prf12(f, premaster, "master secret", seed, 48)
 }
 
 // keys12 derives the record keys from the master secret: ours are in use once

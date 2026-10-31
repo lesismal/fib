@@ -66,6 +66,20 @@ func peerPrefersAESGCM(suites []uint16) bool {
 	return false
 }
 
+// peerPrefersAESGCM12 is peerPrefersAESGCM by the TLS 1.2 AEAD suites, for a
+// client that offers no TLS 1.3 suite.
+func peerPrefersAESGCM12(suites []uint16) bool {
+	for _, id := range suites {
+		if isChaCha20Suite(id) {
+			return false
+		}
+		if s, ok := lookupSuite(stdtls.VersionTLS12, id); ok && s.mode == modeGCM12 {
+			return true
+		}
+	}
+	return false
+}
+
 // isChaCha20Suite reports whether id is one of the ChaCha20-Poly1305 suites the
 // record layer protects.
 func isChaCha20Suite(id uint16) bool {

@@ -133,6 +133,8 @@ type serverHS struct {
 	transcript []byte
 	hsBuf      []byte
 	ccsSeen    int
+	// dtls says the handshake is a DTLS one, whose framing dtls.go does.
+	dtls bool
 
 	// version is what the handshake serves, once the ClientHello has said,
 	// and allow13 and allow12 what the Config lets it serve. plan is what

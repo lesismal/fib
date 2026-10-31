@@ -546,18 +546,9 @@ func (h *serverHS) clientCertificateVerify13(msg []byte) *hsError {
 // clientCertificate12 handles the client's Certificate in TLS 1.2, which it
 // sends, empty or not, when it is asked for one.
 func (h *serverHS) clientCertificate12(msg []byte) *hsError {
-	r := newReader(msg[4:])
-	list := newReader(r.vec24())
-	if !r.empty() || !list.ok {
-		return fail(alertDecodeError, "malformed Certificate")
-	}
-	var ders [][]byte
-	for len(list.b) > 0 {
-		der := list.vec24()
-		if !list.ok || len(der) == 0 {
-			return fail(alertDecodeError, "malformed Certificate")
-		}
-		ders = append(ders, der)
+	ders, herr := parseCertificates12(msg)
+	if herr != nil {
+		return herr
 	}
 	if herr := h.acceptClientCertificates(ders); herr != nil {
 		return herr
@@ -570,6 +561,17 @@ func (h *serverHS) clientCertificate12(msg []byte) *hsError {
 // clientCertificateVerify12 checks the client's CertificateVerify in TLS 1.2,
 // which signs every handshake message before it.
 func (h *serverHS) clientCertificateVerify12(msg []byte) *hsError {
+	if herr := h.checkCertificateVerify12(msg, h.transcript); herr != nil {
+		return herr
+	}
+	h.transcript = append(h.transcript, msg...)
+	h.state = srv12AwaitCCS
+	return nil
+}
+
+// checkCertificateVerify12 checks the client's CertificateVerify in TLS 1.2,
+// a signature over signed, the handshake messages before it.
+func (h *serverHS) checkCertificateVerify12(msg, signed []byte) *hsError {
 	r := newReader(msg[4:])
 	alg := r.u16()
 	signature := r.vec16()
@@ -579,11 +581,9 @@ func (h *serverHS) clientCertificateVerify12(msg []byte) *hsError {
 	if !slices.Contains(clientSignatureAlgs12, alg) {
 		return fail(alertIllegalParameter, "client certificate used with invalid signature algorithm")
 	}
-	if err := verifySignature12(alg, h.peerCerts[0].PublicKey, h.transcript, signature); err != nil {
+	if err := verifySignature12(alg, h.peerCerts[0].PublicKey, signed, signature); err != nil {
 		return fail(alertDecryptError, "invalid signature by the client certificate: %v", err)
 	}
-	h.transcript = append(h.transcript, msg...)
-	h.state = srv12AwaitCCS
 	return nil
 }
 

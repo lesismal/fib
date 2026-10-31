@@ -6,6 +6,10 @@
 // SendParts, SendPartsShared and CloseAfterSend encrypt, and its OnData
 // receives decrypted bytes, so protocol handlers such as the http and
 // websocket packages run over TLS unchanged.
+//
+// DTLSConn runs DTLS 1.2 (RFC 6347) with DTLS-SRTP (RFC 5764) for WebRTC,
+// sans-IO, over datagrams its caller moves; see NewDTLSServer and
+// NewDTLSClient.
 package tls
 
 import (
