@@ -120,16 +120,11 @@ func NewContext(profile Profile, masterKey, masterSalt []byte, opts *Options) (*
 			c.rtcpReplayWindow = opts.RTCPReplayWindow
 		}
 	}
-	master, err := aes.NewCipher(masterKey)
-	if err != nil {
-		return nil, err
-	}
-	if err := c.rtp.init(profile, master, masterSalt, labelRTPEncryption); err != nil {
-		return nil, err
-	}
-	if err := c.rtcp.init(profile, master, masterSalt, labelRTCPEncryption); err != nil {
-		return nil, err
-	}
+	// AES takes the key, whose length the profile checked, and GCM the
+	// standard library's AES block, without error.
+	master, _ := aes.NewCipher(masterKey)
+	c.rtp.init(profile, master, masterSalt, labelRTPEncryption)
+	c.rtcp.init(profile, master, masterSalt, labelRTCPEncryption)
 	return c, nil
 }
 
@@ -155,12 +150,9 @@ func NewContexts(keyingMaterial []byte, profile Profile, isDTLSClient bool, opts
 	if !isDTLSClient {
 		localKey, localSalt, remoteKey, remoteSalt = serverKey, serverSalt, clientKey, clientSalt
 	}
-	if local, err = NewContext(profile, localKey, localSalt, opts); err != nil {
-		return nil, nil, err
-	}
-	if remote, err = NewContext(profile, remoteKey, remoteSalt, opts); err != nil {
-		return nil, nil, err
-	}
+	// The profile and the lengths are checked, so NewContext succeeds.
+	local, _ = NewContext(profile, localKey, localSalt, opts)
+	remote, _ = NewContext(profile, remoteKey, remoteSalt, opts)
 	return local, remote, nil
 }
 
@@ -180,21 +172,17 @@ func deriveKey(master cipher.Block, masterSalt []byte, label byte, n int) []byte
 	return out[:n]
 }
 
-func (k *sessionKeys) init(profile Profile, master cipher.Block, masterSalt []byte, encLabel byte) error {
+func (k *sessionKeys) init(profile Profile, master cipher.Block, masterSalt []byte, encLabel byte) {
 	key := deriveKey(master, masterSalt, encLabel, profile.KeyLen())
 	salt := deriveKey(master, masterSalt, encLabel+2, profile.SaltLen())
 	copy(k.salt[:], salt)
-	block, err := aes.NewCipher(key)
-	if err != nil {
-		return err
-	}
+	block, _ := aes.NewCipher(key)
 	if profile.aead() {
-		k.gcm, err = cipher.NewGCM(block)
-		return err
+		k.gcm, _ = cipher.NewGCM(block)
+		return
 	}
 	k.block = block
 	k.mac = hmac.New(sha1.New, deriveKey(master, masterSalt, encLabel+1, authKeyLen))
-	return nil
 }
 
 // sliceForAppend extends dst by n bytes and returns the whole and the part

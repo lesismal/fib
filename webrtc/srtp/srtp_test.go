@@ -471,3 +471,152 @@ func BenchmarkUnprotectRTP(b *testing.B) {
 		})
 	}
 }
+
+// TestContextErrors checks the inputs a Context refuses, and its
+// accessors.
+func TestContextErrors(t *testing.T) {
+	if _, err := NewContext(9, make([]byte, 16), make([]byte, 14), nil); !errors.Is(err, ErrProfile) {
+		t.Fatal(err)
+	}
+	if _, err := NewContext(ProfileAEADAES256GCM, make([]byte, 16), make([]byte, 12), nil); !errors.Is(err, ErrKeyLength) {
+		t.Fatal(err)
+	}
+	if s := Profile(9).String(); s != "Profile(9)" {
+		t.Fatal(s)
+	}
+	tx, rx := newPair(t, ProfileAES128CMHMACSHA1_32, nil)
+	if tx.Profile() != ProfileAES128CMHMACSHA1_32 {
+		t.Fatal(tx.Profile())
+	}
+	if _, err := tx.ProtectRTP(nil, []byte{0x80, 96, 0}); !errors.Is(err, ErrMalformed) {
+		t.Fatal(err)
+	}
+	for _, pkt := range [][]byte{{0x80, 201, 0, 1}, {0x40, 201, 0, 1, 0, 0, 0, 1}} {
+		want := ErrShortPacket
+		if len(pkt) == 8 {
+			want = ErrMalformed
+		}
+		if _, err := tx.ProtectRTCP(nil, pkt); !errors.Is(err, want) {
+			t.Fatalf("protect %x: %v", pkt, err)
+		}
+		if _, err := rx.UnprotectRTCP(nil, pkt); !errors.Is(err, want) {
+			t.Fatalf("unprotect %x: %v", pkt, err)
+		}
+	}
+	// A header and sender SSRC but no room for the index and tag.
+	enc, err := tx.ProtectRTCP(nil, rtcpPacket(1, 1))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := rx.UnprotectRTCP(nil, enc[:8+4+9]); !errors.Is(err, ErrShortPacket) {
+		t.Fatal(err)
+	}
+	if _, err := rx.UnprotectRTCP(nil, enc); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// TestSRTCPIndexExhausted checks that a sender whose SRTCP index reached
+// its 31-bit limit stops, as it must be rekeyed, and that other SSRCs and
+// forgotten ones go on.
+func TestSRTCPIndexExhausted(t *testing.T) {
+	tx, _ := newPair(t, ProfileAEADAES128GCM, nil)
+	tx.rtcpOut[1] = maxSRTCPIndex - 1
+	if _, err := tx.ProtectRTCP(nil, rtcpPacket(1, 1)); err != nil {
+		t.Fatal(err)
+	}
+	if b, err := tx.ProtectRTCP([]byte{7}, rtcpPacket(1, 1)); !errors.Is(err, ErrIndexExhaust) || len(b) != 1 {
+		t.Fatal(b, err)
+	}
+	if _, err := tx.ProtectRTCP(nil, rtcpPacket(2, 1)); err != nil {
+		t.Fatal(err)
+	}
+	tx.RemoveSSRC(1)
+	if _, err := tx.ProtectRTCP(nil, rtcpPacket(1, 1)); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// TestRemoveSSRC forgets a receiver's state: its rollover counter and the
+// replay windows, so that a packet seen before is taken again.
+func TestRemoveSSRC(t *testing.T) {
+	tx, rx := newPair(t, ProfileAES128CMHMACSHA1_80, nil)
+	if _, ok := rx.ROC(4); ok {
+		t.Fatal("ROC of an unknown SSRC")
+	}
+	enc := mustProtect(t, tx, rtpPacket(4, 10, 8))
+	encRTCP, _ := tx.ProtectRTCP(nil, rtcpPacket(4, 1))
+	for range 2 {
+		if _, err := rx.UnprotectRTP(nil, enc); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := rx.UnprotectRTCP(nil, encRTCP); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := rx.UnprotectRTP(nil, enc); !errors.Is(err, ErrReplayed) {
+			t.Fatal(err)
+		}
+		if _, err := rx.UnprotectRTCP(nil, encRTCP); !errors.Is(err, ErrReplayed) {
+			t.Fatal(err)
+		}
+		if _, ok := rx.ROC(4); !ok {
+			t.Fatal("no ROC")
+		}
+		rx.RemoveSSRC(4)
+		if _, ok := rx.ROC(4); ok {
+			t.Fatal("ROC kept")
+		}
+	}
+}
+
+// TestLateBeforeRollover receives a packet from before the sequence
+// number wrapped after packets from after it: it is taken under the
+// previous rollover counter, which stays where it was.
+func TestLateBeforeRollover(t *testing.T) {
+	tx, rx := newPair(t, ProfileAES128CMHMACSHA1_80, nil)
+	pkts := map[uint16][]byte{}
+	for _, seq := range []uint16{65534, 65535, 0, 1} {
+		pkts[seq] = mustProtect(t, tx, rtpPacket(6, seq, 4))
+	}
+	for _, seq := range []uint16{65534, 0, 1, 65535} {
+		out, err := rx.UnprotectRTP(nil, pkts[seq])
+		if err != nil {
+			t.Fatalf("seq %d: %v", seq, err)
+		}
+		if !bytes.Equal(out, rtpPacket(6, seq, 4)) {
+			t.Fatalf("seq %d: payload", seq)
+		}
+	}
+	if roc, _ := rx.ROC(6); roc != 1 {
+		t.Fatalf("ROC %d", roc)
+	}
+}
+
+// TestRTCPReplayWindow checks the SRTCP window's edge, for the default
+// size and Options.RTCPReplayWindow.
+func TestRTCPReplayWindow(t *testing.T) {
+	for _, size := range []int{0, 100} {
+		want := size
+		if want == 0 {
+			want = DefaultReplayWindow
+		}
+		tx, rx := newPair(t, ProfileAES128CMHMACSHA1_80, &Options{RTCPReplayWindow: size})
+		var pkts [][]byte
+		for range 200 {
+			enc, err := tx.ProtectRTCP(nil, rtcpPacket(1, 1))
+			if err != nil {
+				t.Fatal(err)
+			}
+			pkts = append(pkts, enc)
+		}
+		if _, err := rx.UnprotectRTCP(nil, pkts[199]); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := rx.UnprotectRTCP(nil, pkts[199-want]); !errors.Is(err, ErrReplayed) {
+			t.Errorf("window %d: a packet %d behind: %v", want, want, err)
+		}
+		if _, err := rx.UnprotectRTCP(nil, pkts[199-want+1]); err != nil {
+			t.Errorf("window %d: a packet %d behind: %v", want, want-1, err)
+		}
+	}
+}
