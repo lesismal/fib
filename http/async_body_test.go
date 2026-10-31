@@ -12,6 +12,8 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/lesismal/fib/bufferpool"
 )
 
 // upperLater is an AsyncBodyFilter that upper-cases each part of the body
@@ -328,6 +330,31 @@ func TestOnBodyFilterAsyncNil(t *testing.T) {
 		resp.Body.Close()
 		if string(body) != "plain" {
 			t.Fatalf("%s: %q", client.proto, body)
+		}
+	}
+}
+
+// TestWriteResponseOwnedThroughHooks checks a body sent with
+// WriteResponseOwned that hooks change: an asynchronous filter's output, and
+// a body an OnResponse hook put in its place, are what is sent.
+func TestWriteResponseOwnedThroughHooks(t *testing.T) {
+	addr := serveHTTP1(t, HandlerFunc(func(c *Context) {
+		switch c.Request.URL.Path {
+		case "/async":
+			c.OnBodyFilterAsync(func(int, stdhttp.Header) AsyncBodyFilter { return &upperLater{} })
+		case "/replaced":
+			c.OnResponse(func(r *Response) { r.Body = []byte("replaced") })
+		}
+		body := bufferpool.Get(5)
+		copy(body, "owned")
+		if err := c.WriteResponseOwned(Response{StatusCode: stdhttp.StatusOK, Body: body}); err != nil {
+			t.Error(err)
+		}
+	}))
+	client := &stdhttp.Client{Timeout: 10 * time.Second}
+	for path, want := range map[string]string{"/async": "OWNED", "/replaced": "replaced"} {
+		if _, body := do(t, client, mustRequest(t, "GET", "http://"+addr+path, nil)); body != want {
+			t.Errorf("%s: %q, want %q", path, body, want)
 		}
 	}
 }

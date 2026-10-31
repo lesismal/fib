@@ -2,6 +2,7 @@ package http
 
 import (
 	"bytes"
+	"errors"
 	"io"
 	stdhttp "net/http"
 	"net/http/httptest"
@@ -251,5 +252,47 @@ func TestWriteResponseOwnedGivesTheBodyBack(t *testing.T) {
 		if n == 0 && !found() {
 			t.Errorf("%s: none of the %d bodies sent went back to the pool", proto, requests)
 		}
+	}
+}
+
+// TestBodyOfNoWholeResponse checks BodyBytes and TakeBody for a response that
+// did not arrive whole: one without a body hands over none, and true; one
+// whose body is a reader of its own hands over nothing, and false.
+func TestBodyOfNoWholeResponse(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		body io.ReadCloser
+		ok   bool
+	}{
+		{"nil", nil, true},
+		{"NoBody", stdhttp.NoBody, true},
+		{"reader", io.NopCloser(bytes.NewReader([]byte("body"))), false},
+	} {
+		r := &ClientResponse{Response: &stdhttp.Response{Body: tc.body}}
+		if b, ok := r.BodyBytes(); b != nil || ok != tc.ok {
+			t.Errorf("%s: BodyBytes %q, %v, want nil, %v", tc.name, b, ok, tc.ok)
+		}
+		if b, pooled, ok := r.TakeBody(); b != nil || pooled || ok != tc.ok {
+			t.Errorf("%s: TakeBody %q, %v, %v, want nil, false, %v", tc.name, b, pooled, ok, tc.ok)
+		}
+	}
+}
+
+// TestWriteResponseOwnedAfterResponse checks that WriteResponseOwned on a
+// response already begun reports ErrResponseWritten, and sends nothing more.
+func TestWriteResponseOwnedAfterResponse(t *testing.T) {
+	got := make(chan error, 1)
+	addr := serveHTTP1(t, HandlerFunc(func(c *Context) {
+		_ = c.Respond(stdhttp.StatusOK, "text/plain", []byte("first"))
+		body := bufferpool.Get(16)
+		copy(body, "second, not sent")
+		got <- c.WriteResponseOwned(Response{StatusCode: stdhttp.StatusOK, Body: body})
+	}))
+	_, body := do(t, &stdhttp.Client{Timeout: 10 * time.Second}, mustRequest(t, "GET", "http://"+addr+"/", nil))
+	if body != "first" {
+		t.Errorf("body %q, want the first response's", body)
+	}
+	if err := <-got; !errors.Is(err, ErrResponseWritten) {
+		t.Errorf("WriteResponseOwned: %v, want ErrResponseWritten", err)
 	}
 }
