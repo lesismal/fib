@@ -284,9 +284,6 @@ func (c *DTLSConn) serverHello(msg []byte) *hsError {
 		default:
 			return fail(alertUnsupportedExtension, "server sent an unsolicited extension %d", typ)
 		}
-		if !d.ok {
-			return fail(alertDecodeError, "malformed ServerHello extension")
-		}
 	}
 	copy(h.serverRandom[:], random)
 	h.suiteID, h.suite = suiteID, s
