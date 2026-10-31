@@ -1,9 +1,9 @@
 # fib roadmap: what is planned but not done, and what is deliberately not done
 
-Each protocol document (`http1*.md`, `http2*.md`, `http3*.md`) has its own "Intentionally not implemented" and "Planned improvements" sections. This page gathers them, plus the trade-offs recorded in `guide.zh-CN.md`, so that the whole picture is in one place: for every item, **why** it is not done, roughly **what it would cost**, and **when it would be worth reconsidering**.
+Each protocol document (`http1*.md`, `http2*.md`, `http3*.md`, `webrtc*.md`) has its own "Intentionally not implemented" and "Planned improvements" sections. This page gathers them, plus the trade-offs recorded in `guide.zh-CN.md`, so that the whole picture is in one place: for every item, **why** it is not done, roughly **what it would cost**, and **when it would be worth reconsidering**.
 
 - The cost column is an order of magnitude: S (a day or two), M (a few days), L (a week or more, or it needs test infrastructure that does not exist yet).
-- "Deliberately not done" is a conclusion, not an oversight. When the requirement changes, re-evaluate it as described in section 6.
+- "Deliberately not done" is a conclusion, not an oversight. When the requirement changes, re-evaluate it as described in section 7.
 - The authoritative detail stays in the protocol documents; this page indexes it and records the reason, citing the source at the end of each row.
 
 ## 1. QUIC and HTTP/3
@@ -54,7 +54,20 @@ Each protocol document (`http1*.md`, `http2*.md`, `http3*.md`) has its own "Inte
 | `MaxWriteQueueBytes` lets one message overshoot | Known limit | The cap is checked after queueing, so a single oversized send can pass it by one message before the connection closes; that keeps "one send either succeeds or closes the connection" simple | S | A strict cap is required |
 | The WebSocket broadcast send queue | Mitigated | Unlimited by default (only `MaxWriteQueueBytes`/`SetWriteQueueLimit` bound it); a peer that never reads must be dropped by application-level heartbeats | — | See the broadcast section of `guide.zh-CN.md` |
 
-## 5. Testing and infrastructure
+## 5. WebRTC
+
+| Item | Status | Why | Cost | Reconsider when |
+| --- | --- | --- | --- | --- |
+| Transport-wide congestion control feedback and bandwidth estimation | Deliberately not done | The PeerConnection forwards RTP and has no encoder to steer; an SFU leaves rate control to the browsers at each end, and REMB can be sent through `WriteRTCP` | L | A Go sender with its own encoder, or an SFU that adapts per viewer |
+| RTX, FEC and answering NACKs | Deliberately not done | Repair needs a history of sent packets per stream, memory a server with many peers would hold for every one; RTX is not offered | M | Lossy paths where key-frame recovery by PLI is too slow |
+| Sending simulcast | Deliberately not done | Receiving it by RID works, which is what an SFU needs; sending layers means an encoder per layer | M | A Go publisher of simulcast |
+| ICE over TCP, TURN over TCP/TLS | Deliberately not done | Browsers reach a server with a public UDP port without it; UDP-blocking networks need TURN over TCP/TLS, which turnserver does not serve | M–L | Deployments behind UDP-blocking firewalls |
+| DTLS 1.3 | Deliberately not done | Every browser speaks DTLS 1.2, which is what WebRTC requires today | L | Browsers require DTLS 1.3 |
+| mDNS resolution of host candidates | Deliberately not done | A browser's checks reveal its address as a peer-reflexive candidate anyway, and a lite server needs nothing more | S | Two full agents behind mDNS on one LAN must connect without STUN |
+| Provisional answers and rollback | Deliberately not done | Glare handling belongs to the signaling; neither WHIP nor WHEP uses them | S | An application negotiates from both sides at once |
+| Interop tests in CI | Planned | pion, OpenSSL and Chromium interop ran out of tree; CI runs fib against fib and the RFC vectors | M | Before declaring the API stable |
+
+## 6. Testing and infrastructure
 
 | Item | Status | Why | Cost | Reconsider when |
 | --- | --- | --- | --- | --- |
@@ -65,19 +78,20 @@ Each protocol document (`http1*.md`, `http2*.md`, `http3*.md`) has its own "Inte
 | The `arpc` reconnect test's ephemeral-port race | Known limit | `TestReconnectGivesUp` relies on the server's port staying closed during the retry window; another process rebinding it could confuse the test, which 6600+ runs have not shown | S | On a false failure: use a fixed port or inject connection refusal |
 | HTTP/3 whole responses with a trailer cost one extra list allocation | Known cost | The send buffer inlines two pieces; a third slot would cost ~56 bytes on every stream, judged not worth it | S | Trailers become the norm |
 
-## 6. How to re-evaluate an item
+## 7. How to re-evaluate an item
 
 1. Measure first: is there evidence that it is a bottleneck now (pprof, the load campaign, real traffic)? The method in `docs/loadtest*.md` applies.
 2. Weigh the cost column: S and M items can be scheduled directly; L items (BBR, WebTransport, active migration, assembly) should wait until there is a way to validate them.
 3. After doing one, delete its row here and record the reasoning in the commit message and the protocol document; this page keeps no history.
 
-## 7. Where each item is recorded
+## 8. Where each item is recorded
 
 | Content | Chinese | English |
 | --- | --- | --- |
 | HTTP/1 limits and planned work | `docs/http1.zh-CN.md`, "当前限制", "待优化" | `docs/http1.md`, "Current limitations", "Planned improvements" |
 | HTTP/2 limits, intentional omissions, planned work | `docs/http2.zh-CN.md`, "当前限制", "有意没有实现的功能", "待优化项" | `docs/http2.md`, "Current limitations", "Intentionally not implemented", "Planned improvements" |
 | HTTP/3 limits, intentional omissions, planned work | `docs/http3.zh-CN.md`, "当前限制", "有意没有实现的功能", "待优化项" | `docs/http3.md`, "Current limitations", "Intentionally not implemented", "Planned improvements" |
+| WebRTC limits and intentional omissions | `docs/webrtc.zh-CN.md`, "配置与限制", "有意没有实现的功能" | `docs/webrtc.md`, "Configuration and limits", "Intentionally not implemented" |
 | Engine, TLS and WebSocket trade-offs | `docs/guide.zh-CN.md`, the relevant sections | The same (the guide is Chinese only) |
 | Load-test method and conclusions | `docs/loadtest.zh-CN.md` | `docs/loadtest.md` |
 | Per-case interop results | `http3/interoprunner/README.md` | The same |

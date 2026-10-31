@@ -1,9 +1,9 @@
 # fib 路线图：计划中但未做，以及有意不做
 
-各协议的文档（`http1*.md`、`http2*.md`、`http3*.md`）各有一节"有意没有实现的功能"和"待优化"。这份文档把它们、以及散在 `guide.zh-CN.md` 里的取舍，汇总成一页，每项给出**原因**、**成本量级**和**什么情况下该重新评估**。
+各协议的文档（`http1*.md`、`http2*.md`、`http3*.md`、`webrtc*.md`）各有一节"有意没有实现的功能"和"待优化"。这份文档把它们、以及散在 `guide.zh-CN.md` 里的取舍，汇总成一页，每项给出**原因**、**成本量级**和**什么情况下该重新评估**。
 
 - 表里的"成本"是量级估计：S（一两天内）／M（几天）／L（一两周以上，需要新的测试手段）
-- 标"有意不做"的，是权衡后的结论，不是遗漏；需求变了就按第 6 节重新评估
+- 标"有意不做"的，是权衡后的结论，不是遗漏；需求变了就按第 7 节重新评估
 - 各项的权威细节仍在原协议文档里，本页只做索引与理由，行尾给出出处
 
 ## 1. QUIC 与 HTTP/3
@@ -54,7 +54,20 @@
 | `MaxWriteQueueBytes` 允许单条消息越界 | 已知边界 | 上限在入队后检查，一条超大消息可以超出上限一条消息才关闭连接；这是为了让"一次发送要么成功要么关闭"语义简单 | S | 需要严格上限时改成入队前预判 |
 | WebSocket 广播的发送队列 | 已缓解 | 默认无上限（只有 `MaxWriteQueueBytes`／`SetWriteQueueLimit` 可开）；对端长期不读要靠应用层心跳断开 | — | 见 `guide.zh-CN.md` 的广播一节 |
 
-## 5. 测试与基础设施
+## 5. WebRTC
+
+| 项 | 状态 | 原因 | 成本 | 何时重估 |
+| --- | --- | --- | --- | --- |
+| transport-wide 拥塞控制反馈与带宽估计 | 有意不做 | PeerConnection 只转发 RTP，没有可调节的编码器；SFU 把码率控制交给两端的浏览器，REMB 可以经 `WriteRTCP` 发送 | L | 有自带编码器的 Go 发送端，或需要按观看者自适应的 SFU |
+| RTX、FEC 与应答 NACK | 有意不做 | 修复需要每条流保存已发送的包，有大量对端的服务端要为每一个都付这份内存；不提供 RTX | M | 丢包路径上靠 PLI 恢复关键帧太慢时 |
+| 发送 simulcast | 有意不做 | 按 RID 接收已支持，这正是 SFU 需要的；发送多层意味着每层一个编码器 | M | 有发送 simulcast 的 Go 发布端 |
+| 基于 TCP 的 ICE，基于 TCP/TLS 的 TURN | 有意不做 | 服务端有公网 UDP 端口时浏览器用不到；封锁 UDP 的网络需要 TCP/TLS 上的 TURN，turnserver 不提供 | M–L | 部署在封锁 UDP 的防火墙之后 |
+| DTLS 1.3 | 有意不做 | 所有浏览器都支持 DTLS 1.2，这也是 WebRTC 目前的要求 | L | 浏览器要求 DTLS 1.3 |
+| 解析 host candidate 的 mDNS 名字 | 有意不做 | 浏览器的检查本来就会以 peer-reflexive candidate 暴露它的地址，lite 服务端不需要更多 | S | 同一局域网内两个都用 mDNS 的 full agent 要在没有 STUN 时连通 |
+| provisional answer 与 rollback | 有意不做 | glare 处理属于信令；WHIP、WHEP 都用不到 | S | 应用需要双方同时发起协商 |
+| CI 中的互通测试 | 计划中 | 与 pion、OpenSSL、Chromium 的互通在仓库外完成；CI 跑的是 fib 对 fib 与 RFC 向量 | M | 宣布 API 稳定之前 |
+
+## 6. 测试与基础设施
 
 | 项 | 状态 | 原因 | 成本 | 何时重估 |
 | --- | --- | --- | --- | --- |
@@ -65,19 +78,20 @@
 | `arpc` 重连用例的临时端口竞态 | 已知边界 | `TestReconnectGivesUp` 依赖服务端端口在重连窗口内保持关闭；理论上别的进程抢占该临时端口会让它误判，6600+ 次运行未出现 | S | 出现误报时改成用固定端口或连接拒绝注入 |
 | HTTP/3 带 trailer 的整段响应多一次列表分配 | 已知成本 | send buffer 内联只放两个 piece；给每条 stream 加槽位要多 ~56 字节，判断不值得 | S | trailer 变成常态时 |
 
-## 6. 如何重新评估一项
+## 7. 如何重新评估一项
 
 1. 先量：有没有证据说明它现在是瓶颈（pprof、压测、真实流量）——`docs/loadtest*.md` 里的方法可以复用
 2. 再看成本量级：S／M 的项可以直接排；L 的项（BBR、WebTransport、主动迁移、汇编）应当有明确的验证手段再动手
 3. 改完删掉这里的对应行，并把理由写进提交信息与原协议文档；本页不保留历史
 
-## 7. 各项在协议文档里的出处
+## 8. 各项在协议文档里的出处
 
 | 内容 | 中文 | 英文 |
 | --- | --- | --- |
 | HTTP/1 限制与待优化 | `docs/http1.zh-CN.md` "当前限制"、"待优化" | `docs/http1.md` "Current limitations"、"Planned improvements" |
 | HTTP/2 限制／有意不做／待优化 | `docs/http2.zh-CN.md` "当前限制"、"有意没有实现的功能"、"待优化项" | `docs/http2.md` "Current limitations"、"Intentionally not implemented"、"Planned improvements" |
 | HTTP/3 限制／有意不做／待优化 | `docs/http3.zh-CN.md` "当前限制"、"有意没有实现的功能"、"待优化项" | `docs/http3.md` "Current limitations"、"Intentionally not implemented"、"Planned improvements" |
+| WebRTC 限制与有意不做 | `docs/webrtc.zh-CN.md` "配置与限制"、"有意没有实现的功能" | `docs/webrtc.md` "Configuration and limits"、"Intentionally not implemented" |
 | 引擎、TLS、WebSocket 的取舍 | `docs/guide.zh-CN.md` 对应小节 | 同左（guide 只有中文） |
 | 压测方法与结论 | `docs/loadtest.zh-CN.md` | `docs/loadtest.md` |
 | Interop 逐 case 结果 | `http3/interoprunner/README.md` | 同左 |

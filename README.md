@@ -5,7 +5,7 @@
 [English](README.md) | [简体中文](README.zh-CN.md)
 
 fib is an event-driven networking library for Go. It covers TCP, UDP and Unix sockets, TLS,
-HTTP/1.x, HTTP/2, HTTP/3 over QUIC, and WebSocket. A few event loops wait for I/O readiness,
+HTTP/1.x, HTTP/2, HTTP/3 over QUIC, WebSocket and WebRTC. A few event loops wait for I/O readiness,
 and a shared worker pool does the work, so a connection costs no goroutine while it is idle.
 HTTP handlers take the standard `*http.Request` and answer through an `http.ResponseWriter`,
 which means a `net/http` handler, `http.ServeMux` or `http.FileServer` runs on fib unchanged.
@@ -48,6 +48,7 @@ uSockets, workflow, axum, h2, quiche and rustls.
 | HTTP CONNECT proxy | ✓ HTTP/1.x, HTTP/2, HTTP/3 | — | `Context.Connect` tunnels, paced both ways; `ConnectProxy` is a ready proxy for curl `-x`, browsers and `HTTPS_PROXY` |
 | SOCKS5 / SOCKS4 / 4a | ✓ | ✓ (async dial) | CONNECT, BIND and UDP ASSOCIATE, username/password; the HTTP, WebSocket and TLS clients dial through it |
 | gRPC | ✓ h2 and h2c | ✓ | unary and streaming both ways, metadata, deadlines, interceptors, gzip; works with protoc-gen-go-grpc code and talks to grpc-go |
+| WebRTC | ✓ | ✓ | PeerConnections sharing one UDP port: ICE (lite and full, trickle), DTLS 1.2-SRTP, data channels, RTP forwarding for SFUs, and a TURN client and server, all written from scratch; talks to browsers and pion ([details](docs/webrtc.md)) |
 
 ### Engine
 
@@ -416,6 +417,7 @@ go run ./websocket/nontls/server
 go run ./http3/tls/server
 go run ./arpc/server
 go run ./grpc/server
+go run ./webrtc               # a page whose data channel and camera come back from the server; webrtc/sfu forwards one publisher to many viewers
 go run ./socks/server        # SOCKS5/4/4a and an HTTP CONNECT proxy on one port; socks/client fetches through it
 go run ./gateway/upstream     # a reverse proxy / gateway for HTTP/1.1, HTTP/2, HTTP/3 and WebSocket:
 go run ./gateway/server       # upstream, gateway and client, all callback-based (see its server's doc comment)
@@ -504,6 +506,7 @@ two, and connections are spread over them by fd. A poller parks in Go's own netp
 | HTTP/2 | — | framing, HPACK decoding | `<Name>-streams` runs handlers, HPACK encoding and writes |
 | HTTP/3 | reads UDP in batches, sorts datagrams by peer | QUIC packets, TLS 1.3, QPACK | `<Name>-streams` (handlers) |
 | WebSocket | — | handshake, frames, `OnMessage`, deflate | over HTTP/2 or HTTP/3: `Upgrade` and `OnOpen` on streams |
+| WebRTC | reads UDP, sorts datagrams by peer | the Mux routes by sender; ICE, DTLS, SRTP and SCTP under a mutex per PeerConnection, then its callbacks | — (one timer per PeerConnection) |
 | arpc | — | framing, responses, handlers registered sync | `<Name>-streams` (async handlers, the default) |
 | gRPC | — | HTTP/2 framing, HPACK, flow control | `<Name>-streams` (every call) |
 
@@ -759,6 +762,7 @@ Run it yourself with `cd taskpool/benchmark && ./bench.sh` (or `bench.ps1` on Wi
 | [`websocket`](websocket) | RFC 6455 server and client, permessage-deflate, upgrades over HTTP/1.1, HTTP/2 and HTTP/3 |
 | [`arpc`](arpc) | [lesismal/arpc](https://github.com/lesismal/arpc) server and client, wire compatible |
 | [`grpc`](grpc) | gRPC server and client over an HTTP/2 transport of its own, compatible with grpc-go and its generated code |
+| [`webrtc`](webrtc) | WebRTC PeerConnection and a UDP Mux shared by many; `stun`, `ice`, `turn` (and `turnserver`), `sdp`, `sctp`, `srtp` and `rtp` underneath, DTLS 1.2 in `tls` |
 | [`middleware`](middleware) | Middleware chain and the common middleware |
 | [`socks`](socks) | SOCKS5, SOCKS4 and SOCKS4a proxy server and non-blocking dialer; `http.ConnectProxy` is the HTTP proxy |
 | [`mux`](mux) | Several protocols on one port, told apart by the first bytes a client sends |
@@ -776,6 +780,8 @@ Run it yourself with `cd taskpool/benchmark && ./bench.sh` (or `bench.ps1` on Wi
   HoldReads, Cork, object reuse and the pitfalls of each
 - [HTTP/1.x](docs/http1.md), [HTTP/2](docs/http2.md), [HTTP/3](docs/http3.md): what is supported,
   the limitations, and the conformance tests
+- [WebRTC](docs/webrtc.md): the layers, the shared Mux and the callback model, a server and a client,
+  data channels, media forwarding, TURN, the limits, and the interop with pion, OpenSSL and Chromium
 - [Roadmap](docs/roadmap.md): what is planned but not done, and what is deliberately not done, with the reason, the rough cost and when to reconsider each
 - [Load testing](docs/loadtest.md): the `benchmark/loadtest` campaign, its results and the
   memory cost of whole responses to slow readers
