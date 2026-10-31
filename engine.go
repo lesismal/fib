@@ -1651,6 +1651,12 @@ func (e *Engine) udpPeer(l *udpListener, from *syscall.RawSockaddrAny) *Connecti
 	if !ok {
 		return nil
 	}
+	return e.udpPeerAt(l, key, zone)
+}
+
+// udpPeerAt is udpPeer for the peer at key, whose IPv6 scope is zone.
+// Callers run on the event loop.
+func (e *Engine) udpPeerAt(l *udpListener, key netip.AddrPort, zone uint32) *Connection {
 	if c := l.peers[key]; c != nil {
 		return c
 	}

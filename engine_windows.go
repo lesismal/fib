@@ -191,6 +191,9 @@ func (c *Connection) initUDPPeer() { c.handle.Store(uintptr(syscall.InvalidHandl
 
 func (l *udpListener) sockname() (syscall.Sockaddr, error) { return syscall.Getsockname(l.fd) }
 
+// udpClosed says the socket is closed, as one on the retired list is.
+func (l *udpListener) udpClosed() bool { return l.closed }
+
 func (c *Connection) peerSockaddr() (syscall.Sockaddr, error) { return syscall.Getpeername(c.socket()) }
 
 func (c *Connection) sockname() (syscall.Sockaddr, error) { return syscall.Getsockname(c.socket()) }

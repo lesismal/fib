@@ -241,6 +241,10 @@ func (c *Connection) initUDPPeer() { c.fd.Store(-1) }
 
 func (l *udpListener) sockname() (syscall.Sockaddr, error) { return syscall.Getsockname(l.fd) }
 
+// udpClosed says the socket is closed. A closed one leaves its loop's list at
+// once, so one on the list is open.
+func (l *udpListener) udpClosed() bool { return false }
+
 func (c *Connection) peerSockaddr() (syscall.Sockaddr, error) { return syscall.Getpeername(c.FD()) }
 
 func (c *Connection) sockname() (syscall.Sockaddr, error) { return syscall.Getsockname(c.FD()) }
