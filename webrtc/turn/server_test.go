@@ -415,7 +415,7 @@ func TestServerSSRF(t *testing.T) {
 	if r := u.do(stun.MethodCreatePermission, permissionReq(netip.MustParseAddrPort("10.1.2.3:80"))); code(r) != 0 {
 		t.Errorf("allowed private peer: %d", code(r))
 	}
-	c.s.cfg.PeerAllowed = func(ip netip.Addr) bool { return ip.IsLoopback() }
+	c.s.cfg.PeerAllowed = func(p netip.AddrPort) bool { return p.Addr().IsLoopback() }
 	if r := u.do(stun.MethodCreatePermission, permissionReq(netip.MustParseAddrPort("127.0.0.1:80"))); code(r) != 0 {
 		t.Errorf("PeerAllowed: %d", code(r))
 	}

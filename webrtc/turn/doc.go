@@ -20,7 +20,11 @@
 // AuthFunc, issues nonces that expire without being stored, enforces
 // permissions, channel bindings, lifetimes and quotas, and refuses to relay
 // to loopback, private and other internal addresses unless told to, so that
-// it cannot be used to reach into the network it runs in. StaticAuth,
+// it cannot be used to reach into the network it runs in. It caps each
+// allocation's permissions and channels, asks a host's PeerAllowed about a
+// peer's port as well as its address, tells ServerConfig.OnEvent of
+// allocations made, refreshed and freed and of requests refused, and
+// counts what it holds and relays in Stats. StaticAuth,
 // EphemeralAuth and EphemeralCredentials cover fixed users and the
 // time-limited credentials of the TURN REST API that WebRTC services hand
 // out.

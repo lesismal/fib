@@ -283,8 +283,8 @@ func TestServerStaleAllocation(t *testing.T) {
 	_ = u.do(stun.MethodAllocate, allocateReq)
 	_ = u.do(stun.MethodCreatePermission, permissionReq(peerAddr))
 	a := c.s.lookup(u.tuple())
-	c.s.free(a)
-	c.s.free(a)
+	c.s.free(a, FreedDeleted)
+	c.s.free(a, FreedDeleted)
 	for _, tc := range []struct {
 		method stun.Method
 		add    func(*stun.Message)
