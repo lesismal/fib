@@ -30,8 +30,9 @@ func IsChannelData(b []byte) bool {
 }
 
 // AppendChannelData appends a ChannelData message carrying data on channel
-// to dst. Over UDP, which is all this package speaks, the message is not
-// padded to a multiple of four bytes (RFC 8656 section 12.5).
+// to dst, unpadded, as it goes over UDP; over TCP or TLS it is padded to a
+// multiple of four bytes (RFC 8656 section 12.5), which the client and
+// server do themselves when their transport is a stream.
 func AppendChannelData(dst []byte, channel uint16, data []byte) []byte {
 	dst = binary.BigEndian.AppendUint16(dst, channel)
 	dst = binary.BigEndian.AppendUint16(dst, uint16(len(data)))

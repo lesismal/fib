@@ -25,12 +25,31 @@ var (
 	errNoAllocate = errors.New("turn: ServerConfig.AllocateRelay is nil")
 )
 
-// FiveTuple names an allocation by the client's address and the server's
-// address the client sends to, over UDP: RFC 8656's 5-tuple, the transport
-// protocol left out since this package speaks only UDP. A server listening
-// on several addresses keeps the allocations made through each apart.
+// Transport is how a client reaches the server: UDP, or a stream, TCP or
+// TLS over TCP (RFC 8656 section 3.1). Peers are reached over UDP either
+// way.
+type Transport uint8
+
+const (
+	TransportUDP Transport = iota
+	TransportTCP
+)
+
+func (t Transport) String() string {
+	if t == TransportTCP {
+		return "tcp"
+	}
+	return "udp"
+}
+
+// FiveTuple names an allocation by the client's address, the server's
+// address the client reaches, and the transport between them: RFC 8656's
+// 5-tuple. A server listening on several addresses keeps the allocations
+// made through each apart, and over TCP each connection is a 5-tuple of
+// its own.
 type FiveTuple struct {
 	Client, Server netip.AddrPort
+	Transport      Transport
 }
 
 // Relay is one relayed transport address the host opened for an
@@ -393,7 +412,9 @@ func (s *Server) RelayFor(t FiveTuple) (netip.AddrPort, bool) {
 	return a.relayAddr, true
 }
 
-func normTuple(t FiveTuple) FiveTuple { return FiveTuple{unmap(t.Client), unmap(t.Server)} }
+func normTuple(t FiveTuple) FiveTuple {
+	return FiveTuple{unmap(t.Client), unmap(t.Server), t.Transport}
+}
 
 // DeniedByDefault reports whether ip is in a range a TURN server should not
 // relay to unless told to: unspecified, loopback, private (RFC 1918 and
@@ -599,6 +620,22 @@ func (s *Server) Drain() { s.draining.Store(true) }
 
 // Draining reports whether Drain was called.
 func (s *Server) Draining() bool { return s.draining.Load() }
+
+// ClientClosed frees the allocation of t, a client whose stream connection
+// closed: over TCP and TLS an allocation lasts as long as its connection
+// (RFC 8656 section 3.1). An allocation still being made for it is
+// refused once its relayed address is ready, and the address closed.
+func (s *Server) ClientClosed(t FiveTuple) {
+	t = normTuple(t)
+	s.mu.Lock()
+	if p := s.pending[t]; p != nil {
+		p.canceled = true
+	}
+	s.mu.Unlock()
+	if a := s.lookup(t); a != nil {
+		s.free(a, FreedClosed)
+	}
+}
 
 // Close frees every allocation, closing its relayed address. An allocation
 // whose relayed address is still being opened is refused once it is, and
@@ -1315,6 +1352,9 @@ func (s *Server) handleRelayPacket(relay, from netip.AddrPort, b []byte, now tim
 	defer putScratch(x)
 	if ch != 0 {
 		x.buf = AppendChannelData(x.buf[:0], ch, b)
+		if a.tuple.Transport != TransportUDP {
+			x.buf = padChannelData(x.buf)
+		}
 		s.cfg.Send(a.tuple, x.buf)
 		return nil
 	}

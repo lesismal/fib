@@ -65,7 +65,7 @@ func FuzzServer(f *testing.F) {
 	seedRequests(f, s, now)
 	f.Fuzz(func(t *testing.T, b []byte, fromPeer bool) {
 		s, _ := mk()
-		tuple := FiveTuple{clientAddr, serverAddr}
+		tuple := FiveTuple{Client: clientAddr, Server: serverAddr}
 		// Allocate, permit and bind, so the fuzzed datagram meets state.
 		nonce := string(s.makeNonce(clientAddr, now.Add(time.Hour).Unix()))
 		key := stun.LongTermKey(testUser, testRealm, testPass)

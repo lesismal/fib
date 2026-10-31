@@ -404,8 +404,8 @@ func TestAllocateRelay(t *testing.T) {
 	if _, err := s.bindRelay(e); err == nil {
 		t.Fatal("bound a relay to an address the host does not have")
 	}
-	if a := addrPort(&net.TCPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 1}); a.IsValid() {
-		t.Fatalf("a TCP address as a UDP one: %v", a)
+	if a := addrPort(&net.UnixAddr{Name: "x", Net: "unix"}); a.IsValid() {
+		t.Fatalf("a Unix address as an IP one: %v", a)
 	}
 }
 

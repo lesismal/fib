@@ -73,6 +73,12 @@ type ClientConfig struct {
 	// Transaction sets how requests are retransmitted; the zero value is
 	// RFC 8489's.
 	Transaction stun.TransactionConfig
+	// Stream says the client reaches the server over TCP or TLS: its
+	// ChannelData messages are padded to a multiple of four bytes, and
+	// its requests are sent once (Transaction.Reliable). The host frames
+	// what the stream brings with FrameLen and passes each message to
+	// HandlePacket.
+	Stream bool
 
 	// Send sends b to the server at to. b is valid only during the call.
 	// It is required.
@@ -201,6 +207,9 @@ func NewClient(config ClientConfig) (*Client, error) {
 	if config.Rand == nil {
 		config.Rand = rand.Reader
 	}
+	if config.Stream {
+		config.Transaction.Reliable = true
+	}
 	return &Client{
 		cfg:       config,
 		server:    unmap(config.Server),
@@ -327,6 +336,9 @@ func (c *Client) SendTo(peer netip.AddrPort, data []byte) error {
 	peer = unmap(peer)
 	if ch := c.chans[peer]; ch != nil && ch.bound {
 		c.buf = AppendChannelData(c.buf[:0], ch.number, data)
+		if c.cfg.Stream {
+			c.buf = padChannelData(c.buf)
+		}
 		c.cfg.Send(c.server, c.buf)
 		return nil
 	}

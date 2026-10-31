@@ -169,7 +169,7 @@ func newSimServer(n *simNet, addr netip.AddrPort, cfg ServerConfig) *simServer {
 	}
 	h.s = s
 	n.at[addr] = func(from netip.AddrPort, b []byte) {
-		_ = s.HandlePacket(FiveTuple{from, addr}, b, n.now)
+		_ = s.HandlePacket(FiveTuple{Client: from, Server: addr}, b, n.now)
 	}
 	n.timers = append(n.timers, s)
 	return h

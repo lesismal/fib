@@ -34,7 +34,7 @@ type coreRelay struct {
 
 func (r *coreRelay) Addr() netip.AddrPort { return r.addr }
 func (r *coreRelay) SendTo(peer netip.AddrPort, b []byte) {
-	r.sent = append(r.sent, coreSent{FiveTuple{peer, r.addr}, bytes.Clone(b)})
+	r.sent = append(r.sent, coreSent{FiveTuple{Client: peer, Server: r.addr}, bytes.Clone(b)})
 }
 func (r *coreRelay) Close() { r.closed = true }
 
@@ -72,7 +72,7 @@ func (c *core) user(addr netip.AddrPort, name, pass string) *user {
 	return &user{c: c, addr: addr, name: name, pass: pass, key: stun.LongTermKey(name, testRealm, pass)}
 }
 
-func (u *user) tuple() FiveTuple { return FiveTuple{u.addr, serverAddr} }
+func (u *user) tuple() FiveTuple { return FiveTuple{Client: u.addr, Server: serverAddr} }
 
 // do sends a request of method with the attributes add adds, with
 // credentials, learning the nonce from a 401 or 438 first, and returns the
@@ -504,7 +504,7 @@ func TestServerConfig(t *testing.T) {
 	if l, _ := r.Lifetime(); code(r) != 0 || l != 2*time.Hour {
 		t.Fatalf("%d, lifetime %v", code(r), l)
 	}
-	if _, ok := c.s.RelayFor(FiveTuple{peerAddr, serverAddr}); ok {
+	if _, ok := c.s.RelayFor(FiveTuple{Client: peerAddr, Server: serverAddr}); ok {
 		t.Fatal("a relay for a 5-tuple without an allocation")
 	}
 }

@@ -4,7 +4,9 @@
 // addresses and relays for its clients. Package turnserver runs the server
 // on a fib engine.
 //
-// Both speak TURN over UDP and relay UDP, which is what WebRTC uses: the
+// Both speak TURN over UDP, TCP or TLS to the server (FiveTuple.Transport,
+// ClientConfig.Stream; FrameLen frames a stream's STUN and padded
+// ChannelData messages) and relay UDP, which is what WebRTC uses: the
 // client, Client, makes an allocation with the long-term credentials of RFC
 // 8489 section 9.2 (the 401 challenge for the realm and nonce, a retry with
 // a fresh nonce on 438, and a move to another server on 300), refreshes it
@@ -32,8 +34,7 @@
 // time-limited credentials of the TURN REST API that WebRTC services hand
 // out.
 //
-// Left out: TURN over TCP and TLS, and relaying TCP (RFC 6062); DTLS to the
-// server; dual allocations (ADDITIONAL-ADDRESS-FAMILY), EVEN-PORT and
+// Left out: relaying TCP to peers (RFC 6062); DTLS to the server; dual allocations (ADDITIONAL-ADDRESS-FAMILY), EVEN-PORT and
 // RESERVATION-TOKEN; DONT-FRAGMENT, which the server refuses with 420 as RFC
 // 8656 section 7.2 has a server that cannot set the DF bit do; the SHA-256
 // password algorithm, USERHASH and the nonce cookie of RFC 8489 section

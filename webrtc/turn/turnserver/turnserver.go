@@ -6,7 +6,10 @@
 // that the Server adds with Engine.AddBinding and removes when the
 // allocation ends. Datagrams go to clients and peers through the
 // connections of those bindings, opened with Engine.OpenUDPPeer when the
-// peer has not spoken first.
+// peer has not spoken first. Clients may also reach the server over TCP or
+// TLS (ListenTCP, ListenTLS, StreamHandler), which RFC 8656 has a client
+// behind a firewall that lets only those through do; their allocations
+// still relay UDP, and end when their connection closes.
 //
 // A Server is meant to be embedded in a larger service, a WebRTC gateway
 // say, that shares the engine with other protocols: everything it does is
@@ -33,6 +36,7 @@ package turnserver
 
 import (
 	"context"
+	stdtls "crypto/tls"
 	"errors"
 	"fmt"
 	"math/rand/v2"
@@ -44,6 +48,7 @@ import (
 	"time"
 
 	"github.com/lesismal/fib"
+	fibtls "github.com/lesismal/fib/tls"
 	"github.com/lesismal/fib/webrtc/turn"
 )
 
@@ -51,6 +56,10 @@ import (
 const (
 	DefaultSetupWorkers = 4
 	DefaultSetupQueue   = 1024
+	// DefaultMaxStreamMessage and DefaultStreamIdleTimeout are those of
+	// Config's stream bounds.
+	DefaultMaxStreamMessage  = 8 << 10
+	DefaultStreamIdleTimeout = 30 * time.Second
 )
 
 // maxPeerBacklog is how many datagrams wait for a peer's connection to
@@ -81,6 +90,18 @@ type Config struct {
 	// engine's loops, DefaultSetupWorkers if zero; SetupQueue bounds the
 	// work waiting for them, DefaultSetupQueue if zero.
 	SetupWorkers, SetupQueue int
+
+	// MaxStreamMessage is the largest message a TCP or TLS client may
+	// send, and so what its connection holds of one not yet whole,
+	// DefaultMaxStreamMessage if zero; a connection whose next message
+	// claims more is closed. TURN's messages are small, a ChannelData
+	// message at most the 4-byte header and a datagram.
+	MaxStreamMessage int
+	// StreamIdleTimeout is how long a TCP or TLS client's connection may
+	// stay open without an allocation, before its first Allocate or after
+	// its allocation ended, DefaultStreamIdleTimeout if zero. It is checked
+	// every SweepInterval.
+	StreamIdleTimeout time.Duration
 }
 
 // Server is a TURN server running on a fib engine. It is the fib.Handler of
@@ -95,6 +116,9 @@ type Server struct {
 	// clients are the connections to clients by their 5-tuple, which
 	// OnOpen records on the event loop and OnClose forgets.
 	clients sync.Map // turn.FiveTuple -> *fib.Connection
+	// streams are the TCP and TLS clients' connections, for the idle
+	// sweep and Close.
+	streams sync.Map // *fib.Connection -> *streamConn
 
 	setup chan func()
 	// unsent counts the datagrams dropped for want of a connection to send
@@ -131,6 +155,12 @@ func New(config Config) (*Server, error) {
 	}
 	if config.SetupQueue <= 0 {
 		config.SetupQueue = DefaultSetupQueue
+	}
+	if config.MaxStreamMessage <= 0 {
+		config.MaxStreamMessage = DefaultMaxStreamMessage
+	}
+	if config.StreamIdleTimeout <= 0 {
+		config.StreamIdleTimeout = DefaultStreamIdleTimeout
 	}
 	s := &Server{
 		cfg:   config,
@@ -192,6 +222,7 @@ func (s *Server) timer() {
 			return
 		case now := <-t.C:
 			s.core.HandleTimeout(now)
+			s.sweepStreams(now)
 		}
 	}
 }
@@ -225,12 +256,17 @@ func (s *Server) enqueue(fn func()) bool {
 }
 
 // Close stops the server: it frees every allocation, removing its relayed
-// binding. The listening binding is the caller's to remove.
+// binding, and closes its TCP and TLS clients' connections. The listening
+// bindings are the caller's to remove.
 func (s *Server) Close() {
 	s.once.Do(func() {
 		close(s.done)
 		s.wg.Wait()
 		s.core.Close()
+		s.streams.Range(func(c, _ any) bool {
+			_ = c.(*fib.Connection).Close()
+			return true
+		})
 	})
 }
 
@@ -280,6 +316,11 @@ func (s *Server) sendToClient(t turn.FiveTuple, b []byte) {
 		_ = c.(*fib.Connection).Send(b)
 		return
 	}
+	if t.Transport != turn.TransportUDP {
+		// A stream client's connection has closed: nothing reaches it.
+		s.unsent.Add(1)
+		return
+	}
 	// A client whose connection fib closed for idleness: open it again,
 	// off the worker.
 	r := s.run.Load()
@@ -306,11 +347,16 @@ func remote(c *fib.Connection) netip.AddrPort {
 }
 
 func addrPort(a net.Addr) netip.AddrPort {
-	if u, ok := a.(*net.UDPAddr); ok {
-		ap := u.AddrPort()
-		return netip.AddrPortFrom(ap.Addr().Unmap(), ap.Port())
+	var ap netip.AddrPort
+	switch a := a.(type) {
+	case *net.UDPAddr:
+		ap = a.AddrPort()
+	case *net.TCPAddr:
+		ap = a.AddrPort()
+	default:
+		return ap
 	}
-	return netip.AddrPort{}
+	return netip.AddrPortFrom(ap.Addr().Unmap(), ap.Port())
 }
 
 // tupleOf is the 5-tuple of a client's connection, kept as its attachment.
@@ -508,4 +554,113 @@ func (r *relay) OnClose(c *fib.Connection, _ error) {
 		delete(r.peers, remote(c))
 	}
 	r.mu.Unlock()
+}
+
+// streamConn is what a TCP or TLS client's connection keeps: its 5-tuple,
+// the bytes of a message not yet whole, and since when it has had no
+// allocation, in Unix nanoseconds.
+type streamConn struct {
+	tuple     turn.FiveTuple
+	buf       []byte
+	idleSince atomic.Int64
+}
+
+// streamHandler serves TURN over TCP, or over TLS behind fib's tls
+// handler: a connection is one client, whose allocation ends when it
+// closes.
+type streamHandler struct{ s *Server }
+
+// StreamHandler returns the fib.Handler that serves TURN over a TCP
+// binding of the engine s runs on, or over TLS, wrapped in fib's tls
+// handler: fibtls.NewServer(config, s.StreamHandler()). ListenTCP and
+// ListenTLS add such bindings.
+func (s *Server) StreamHandler() fib.Handler { return streamHandler{s} }
+
+// ListenTCP has s serve TURN over TCP at addr, a "host:port" for a new TCP
+// binding of the engine Start gave it, and returns the binding's index,
+// which is the caller's to remove.
+func (s *Server) ListenTCP(addr string) (int, error) {
+	return s.listenStream(addr, s.StreamHandler())
+}
+
+// ListenTLS has s serve TURN over TLS with config at addr, as ListenTCP
+// does over TCP; browsers reach such a server as turns:host:443.
+func (s *Server) ListenTLS(addr string, config *stdtls.Config) (int, error) {
+	return s.listenStream(addr, fibtls.NewServer(config, s.StreamHandler()))
+}
+
+func (s *Server) listenStream(addr string, h fib.Handler) (int, error) {
+	r := s.run.Load()
+	if r == nil {
+		return -1, errNotStarted
+	}
+	return r.engine.AddBinding(fib.Binding{Network: "tcp", Addr: addr, Handler: h})
+}
+
+var errNotStarted = errors.New("turnserver: Server not started")
+
+func (h streamHandler) OnOpen(c *fib.Connection) {
+	sc := &streamConn{tuple: turn.FiveTuple{Client: remote(c), Server: addrPort(c.LocalAddr()), Transport: turn.TransportTCP}}
+	sc.idleSince.Store(time.Now().UnixNano())
+	c.SetAttachment(sc)
+	h.s.streams.Store(c, sc)
+	h.s.clients.Store(sc.tuple, c)
+}
+
+// OnData frames what the client sent into STUN and ChannelData messages
+// and passes each whole one to the core, keeping the rest for the next
+// call. A stream that frames as neither is closed, as is one whose message
+// is longer than Config.MaxStreamMessage.
+func (h streamHandler) OnData(c *fib.Connection, b []byte) {
+	sc, ok := c.Attachment().(*streamConn)
+	if !ok || h.s.run.Load() == nil {
+		return
+	}
+	data := b
+	if len(sc.buf) > 0 {
+		sc.buf = append(sc.buf, b...)
+		data = sc.buf
+	}
+	now := time.Now()
+	for {
+		n, err := turn.FrameLen(data)
+		if err != nil || n > h.s.cfg.MaxStreamMessage {
+			_ = c.Close()
+			return
+		}
+		if n == 0 || n > len(data) {
+			break
+		}
+		_ = h.s.core.HandlePacket(sc.tuple, data[:n], now)
+		data = data[n:]
+	}
+	// copy, which append uses, moves overlapping bytes correctly when
+	// data is the tail of sc.buf.
+	sc.buf = append(sc.buf[:0], data...)
+}
+
+func (h streamHandler) OnPriorityData(*fib.Connection, []byte) {}
+
+func (h streamHandler) OnClose(c *fib.Connection, _ error) {
+	sc, ok := c.Attachment().(*streamConn)
+	if !ok {
+		return
+	}
+	h.s.streams.Delete(c)
+	h.s.clients.CompareAndDelete(sc.tuple, c)
+	h.s.core.ClientClosed(sc.tuple)
+}
+
+// sweepStreams closes the TCP and TLS clients' connections that have gone
+// without an allocation for Config.StreamIdleTimeout.
+func (s *Server) sweepStreams(now time.Time) {
+	s.streams.Range(func(c, v any) bool {
+		sc := v.(*streamConn)
+		if _, ok := s.core.RelayFor(sc.tuple); ok {
+			sc.idleSince.Store(now.UnixNano())
+		} else if now.UnixNano()-sc.idleSince.Load() >= int64(s.cfg.StreamIdleTimeout) {
+			_ = c.(*fib.Connection).Close()
+		}
+		return true
+	})
 }
