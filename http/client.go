@@ -1175,7 +1175,7 @@ func (c *Client) streamDone(cc *clientConn) {
 // more idle connections than MaxIdleConnsPerHost.
 func (c *Client) idleH2Locked(cc *clientConn) bool {
 	h := cc.host
-	if cc.streams > 0 || !cc.idleUntil.IsZero() {
+	if cc.streams > 0 || !cc.idleUntil.IsZero() || cc.forgotten {
 		return false
 	}
 	idle := 0
@@ -1200,10 +1200,16 @@ func (c *Client) retire(cc *clientConn) {
 }
 
 // forget drops a closed connection from its host and lets waiting requests
-// have its place.
+// have its place, once: the client forgets a connection it closes itself as
+// it closes it (see discard), and OnClose, which comes later, finds it gone.
 func (c *Client) forget(cc *clientConn) {
 	h := cc.host
 	c.mu.Lock()
+	if cc.forgotten {
+		c.mu.Unlock()
+		return
+	}
+	cc.forgotten = true
 	removeConn(&h.idle, cc)
 	removeConn(&h.h2, cc)
 	cc.stopIdleLocked()
@@ -1309,6 +1315,13 @@ func (r *clientRequest) finish(resp *stdhttp.Response, err error) bool {
 	if !r.markDone() {
 		return false
 	}
+	r.deliver(resp, err)
+	return true
+}
+
+// deliver hands the outcome of a request markDone has settled to its
+// callback, or to the stream its callback has.
+func (r *clientRequest) deliver(resp *stdhttp.Response, err error) {
 	r.mu.Lock()
 	stream, fired := r.stream, r.fired
 	r.mu.Unlock()
@@ -1316,14 +1329,13 @@ func (r *clientRequest) finish(resp *stdhttp.Response, err error) bool {
 		if err != nil {
 			stream.Fail(err)
 		}
-		return true
+		return
 	}
 	if err != nil {
 		r.callback(nil, err)
-		return true
+		return
 	}
 	DeliverResponse(resp, r.abort, r.callback)
-	return true
 }
 
 // markDone settles the request, once, and stops what would abandon it.
@@ -1475,24 +1487,26 @@ func (r *clientRequest) begin(s *ResponseStream) bool {
 }
 
 // abort fails the request from outside the exchange. A connection left in the
-// middle of it cannot carry another request, so it is closed.
+// middle of it cannot carry another request, so it is closed, before the
+// callback hears of the failure: by then the connection no longer counts
+// against MaxConnsPerHost, and a request the callback sends may dial another.
 func (r *clientRequest) abort(err error) {
-	if !r.finish(nil, err) {
+	if !r.markDone() {
 		return
 	}
 	r.mu.Lock()
 	cc := r.conn
 	r.conn = nil
 	r.mu.Unlock()
-	if cc == nil {
-		return
-	}
-	if cc.h2 != nil {
+	switch {
+	case cc == nil:
+	case cc.h2 != nil:
 		// Only this request's stream is abandoned, not the connection.
 		cc.h2.cancel(r)
-		return
+	default:
+		cc.discard()
 	}
-	cc.discard()
+	r.deliver(nil, err)
 }
 
 // attach records the connection carrying the request. It reports false if the
@@ -1600,6 +1614,9 @@ type clientConn struct {
 	h2         *h2ClientConn
 	streams    int
 	maxStreams int
+	// forgotten records that the connection no longer counts against its
+	// host's MaxConnsPerHost (see forget). Guarded by Client.mu.
+	forgotten bool
 }
 
 func (cc *clientConn) isClosed() bool {
@@ -1797,7 +1814,14 @@ func (cc *clientConn) sendBody(r *clientRequest) {
 	r.abort(err)
 }
 
-// discard closes the connection without handing it back.
+// discard closes the connection without handing it back, and stops it
+// counting against MaxConnsPerHost there and then: it carries nothing more
+// once closed, and waiting for OnClose, which comes once the event loop has
+// dealt with the close, would leave a request sent in the meantime, such as
+// one from the callback of the request the close failed, queued behind a
+// connection already dead instead of dialing another. A connection whose dial
+// has not been settled is not the client's yet: OnClose settles the dial as
+// failed, and that gives its place back.
 func (cc *clientConn) discard() {
 	cc.mu.Lock()
 	cc.closed = true
@@ -1805,9 +1829,13 @@ func (cc *clientConn) discard() {
 	cc.uploading = nil
 	gate := cc.gate
 	cc.gate = nil
+	settled := cc.settled
 	cc.mu.Unlock()
 	gate.Shut()
 	cc.conn.Close()
+	if settled {
+		cc.client.forget(cc)
+	}
 }
 
 func (cc *clientConn) OnOpen(conn *fib.Connection) {

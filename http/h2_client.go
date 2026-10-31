@@ -219,8 +219,9 @@ func (hc *h2ClientConn) checkHealth() {
 			hc.mu.Unlock()
 			hc.client.retire(hc.cc)
 			// Not CloseAfterSend: the socket of a dead connection may
-			// never drain what is queued for it.
-			hc.cc.conn.Close()
+			// never drain what is queued for it. discard also stops it
+			// counting against MaxConnsPerHost at once.
+			hc.cc.discard()
 			return
 		default:
 			hc.health.Reset(time.Duration(hc.pingSent + pingTimeout - now))
@@ -276,7 +277,7 @@ func (hc *h2ClientConn) settingsExpired() {
 	}
 	hc.mu.Unlock()
 	hc.client.retire(hc.cc)
-	hc.cc.conn.Close()
+	hc.cc.discard()
 }
 
 // acknowledgeSettings records the server's acknowledgement of the client's

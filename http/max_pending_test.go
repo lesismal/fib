@@ -305,3 +305,65 @@ func hostPoolOf(t *testing.T, c *Client, u string) *hostPool {
 	t.Fatal("no host for " + u)
 	return nil
 }
+
+// A connection the client closes stops counting against MaxConnsPerHost by
+// the time the request that closed it hears why: with MaxConnsPerHost 1 and
+// MaxPendingPerHost 1, a burst of three sent from the callback of a request
+// whose ResponseHeaderTimeout ran out is turned away as on a fresh host, one
+// request and not two. The timed-out connection used to count until the
+// client handled its close, after the callback, so that the burst queued
+// behind a connection already dead with nothing to cover it.
+func TestMaxPendingPerHostAfterHeaderTimeout(t *testing.T) {
+	release := make(chan struct{})
+	u := rawServer(t, func(conn net.Conn, i int) {
+		r := bufio.NewReader(conn)
+		for {
+			if _, err := stdhttp.ReadRequest(r); err != nil {
+				return
+			}
+			<-release
+			if i == 0 {
+				// The first connection never answers; the client closes it.
+				_, _ = io.Copy(io.Discard, r)
+				return
+			}
+			if _, err := io.WriteString(conn, cvCliOK); err != nil {
+				return
+			}
+		}
+	})
+	config := DefaultClientConfig()
+	config.MaxConnsPerHost = 1
+	config.MaxPendingPerHost = 1
+	config.ResponseHeaderTimeout = 50 * time.Millisecond
+	client := newTestClient(t, config)
+	results := make(chan error, 3)
+	refused := make(chan int, 1)
+	client.Do(mustRequest(t, "GET", u, nil), func(_ *ClientResponse, err error) {
+		if !errors.Is(err, ErrResponseHeaderTimeout) {
+			t.Errorf("the first request got %v, want %v", err, ErrResponseHeaderTimeout)
+		}
+		// Refusals come back inside Do, so they are all in once it returns.
+		n := 0
+		for i := 0; i < 3; i++ {
+			client.Do(mustRequest(t, "GET", u, nil), func(_ *ClientResponse, err error) {
+				if errors.Is(err, ErrTooManyPending) {
+					n++
+					return
+				}
+				results <- err
+			})
+		}
+		refused <- n
+	})
+	n := <-refused
+	if n != 1 {
+		t.Errorf("the burst after the header timeout had %d requests turned away, want 1", n)
+	}
+	close(release)
+	for i := n; i < 3; i++ {
+		if err := cvCliWait(t, results, "the requests let in"); err != nil {
+			t.Fatalf("a request let in got %v", err)
+		}
+	}
+}
