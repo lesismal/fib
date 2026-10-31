@@ -390,6 +390,10 @@ err := server.Dial("tcp", "127.0.0.1:9001", 3*time.Second, func(c *fib.Connectio
   `DialWithHandler` 指定 handler。
 - 不传 binding 的 `fib.New(config)` 创建不监听任何地址的 Engine，只用于 Dial 出去
   的连接；它的 `LocalAddr` 返回错误。
+- `DialWith(fib.DialOptions{...}, done)` 指定拨出的本地端：`LocalAddr` 是 bind 的 IP 和端口（端口
+  为 0 由内核选择），`PortMin`/`PortMax` 给出端口范围，从随机起点依次尝试，`EADDRINUSE` 换下一个，
+  整个范围都被占用时 done 收到匹配 `fib.ErrNoLocalPort` 的错误。本地地址须与远端同一协议族，
+  域名只解析为该族的地址。与 `net.Dialer` 一样不设置 `SO_REUSEADDR`，TCP 与 UDP 都适用。
 
 ### Unix Socket
 

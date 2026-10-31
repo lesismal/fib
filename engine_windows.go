@@ -1219,12 +1219,17 @@ func (e *Engine) connectSocket(d *dialRequest) (c *Connection, connected bool, e
 		return nil, false, err
 	}
 	// ConnectEx requires a bound socket, and binding the wildcard address leaves
-	// the choice of interface and port to the kernel, as connect() would.
-	var local syscall.Sockaddr = &syscall.SockaddrInet4{}
-	if d.family == syscall.AF_INET6 {
-		local = &syscall.SockaddrInet6{}
+	// the choice of interface and port to the kernel, as connect() would. A
+	// dial that names its local end is bound there instead.
+	if d.hasLocal {
+		err = d.bindLocal(func(sa syscall.Sockaddr) error { return syscall.Bind(s, sa) })
+	} else {
+		var local syscall.Sockaddr = &syscall.SockaddrInet4{}
+		if d.family == syscall.AF_INET6 {
+			local = &syscall.SockaddrInet6{}
+		}
+		err = syscall.Bind(s, local)
 	}
-	err = syscall.Bind(s, local)
 	if err == nil {
 		err = sys.SetNonblock(s)
 	}
@@ -1264,7 +1269,10 @@ func (e *Engine) connectDatagram(d *dialRequest) (c *Connection, connected bool,
 	if err != nil {
 		return nil, false, err
 	}
-	err = syscall.Connect(s, d.sa)
+	err = d.bindLocal(func(sa syscall.Sockaddr) error { return syscall.Bind(s, sa) })
+	if err == nil {
+		err = syscall.Connect(s, d.sa)
+	}
 	if err == nil {
 		_, err = syscall.CreateIoCompletionPort(s, e.port, 0, 0)
 	}

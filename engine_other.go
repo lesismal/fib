@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math/rand/v2"
 	"net"
 	"net/netip"
 	"os"
@@ -401,9 +402,18 @@ func (e *Engine) Dial(network, addr string, timeout time.Duration, done func(*Co
 // DialWithHandler is Dial with a handler of the connection's own. A nil
 // handler means the engine's.
 func (e *Engine) DialWithHandler(network, addr string, timeout time.Duration, handler Handler, done func(*Connection, error)) error {
+	return e.DialWith(DialOptions{Network: network, Addr: addr, Timeout: timeout, Handler: handler}, done)
+}
+
+// DialWith is DialWithHandler with the options of opts; see DialOptions. On
+// this backend net.Dialer binds the local end, and a range is searched by
+// dialing from each port in turn until one is not in use.
+func (e *Engine) DialWith(opts DialOptions, done func(*Connection, error)) error {
+	handler := opts.Handler
 	if handler == nil {
 		handler = e.handler
 	}
+	network := opts.Network
 	switch network {
 	case "":
 		network = "tcp"
@@ -414,8 +424,11 @@ func (e *Engine) DialWithHandler(network, addr string, timeout time.Duration, ha
 	if e.stopping.Load() {
 		return &net.OpError{Op: "dial", Net: network, Err: net.ErrClosed}
 	}
+	if err := opts.check(network); err != nil {
+		return &net.OpError{Op: "dial", Net: network, Err: err}
+	}
 	go func() {
-		conn, err := net.DialTimeout(network, addr, timeout)
+		conn, err := dialFrom(network, &opts)
 		if err == nil && !e.adoptWith(conn, handler, done, netaddr.IsUDP(network), true, 0) {
 			err = &net.OpError{Op: "dial", Net: network, Addr: conn.RemoteAddr(), Err: net.ErrClosed}
 		}
@@ -424,6 +437,51 @@ func (e *Engine) DialWithHandler(network, addr string, timeout time.Duration, ha
 		}
 	}()
 	return nil
+}
+
+// dialFrom dials as opts says, from the local end it names, searching its
+// port range from a random start for a port not in use.
+func dialFrom(network string, opts *DialOptions) (net.Conn, error) {
+	dialer := net.Dialer{Timeout: opts.Timeout}
+	if opts.Timeout > 0 {
+		// The whole search shares the one timeout.
+		dialer.Deadline = time.Now().Add(opts.Timeout)
+	}
+	if !opts.hasLocal() {
+		return dialer.Dial(network, opts.Addr)
+	}
+	var ip net.IP
+	var zone string
+	if local := opts.localIP(); local.IsValid() {
+		ip, zone = local.AsSlice(), local.Zone()
+	}
+	from := func(port int) (net.Conn, error) {
+		if netaddr.IsUDP(network) {
+			dialer.LocalAddr = &net.UDPAddr{IP: ip, Port: port, Zone: zone}
+		} else {
+			dialer.LocalAddr = &net.TCPAddr{IP: ip, Port: port, Zone: zone}
+		}
+		return dialer.Dial(network, opts.Addr)
+	}
+	lo, hi := int(opts.PortMin), int(opts.PortMax)
+	if hi == 0 {
+		return from(int(opts.LocalAddr.Port()))
+	}
+	n := hi - lo + 1
+	start := rand.IntN(n)
+	var err error
+	for i := range n {
+		var conn net.Conn
+		if conn, err = from(lo + (start+i)%n); err == nil || !errors.Is(err, syscall.EADDRINUSE) {
+			return conn, err
+		}
+	}
+	var opErr *net.OpError
+	if errors.As(err, &opErr) {
+		err = opErr.Err
+	}
+	return nil, &net.OpError{Op: "dial", Net: network, Source: dialer.LocalAddr,
+		Err: fmt.Errorf("%w %d-%d: %w", ErrNoLocalPort, lo, hi, err)}
 }
 func (e *Engine) readConnection(c *Connection) {
 	defer e.readers.Done()

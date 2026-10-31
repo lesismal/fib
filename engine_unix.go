@@ -1156,16 +1156,28 @@ func (e *Engine) dialLoop(d *dialRequest) *Engine {
 }
 
 // openSocket returns the socket opened for d ahead of time, if there is one,
-// and otherwise opens one of the kind d's network needs. The caller owns it.
+// and otherwise opens one of the kind d's network needs, bound to the local
+// end DialWith asked for. The caller owns it.
 func (d *dialRequest) openSocket() (int, error) {
 	if d.hasSocket {
 		d.hasSocket = false
 		return d.socket, nil
 	}
+	var fd int
+	var err error
 	if netaddr.IsUDP(d.network) {
-		return sys.NewDatagramSocket(d.family)
+		fd, err = sys.NewDatagramSocket(d.family)
+	} else {
+		fd, err = sys.NewSocket(d.family)
 	}
-	return sys.NewSocket(d.family)
+	if err != nil {
+		return -1, err
+	}
+	if err = d.bindLocal(func(sa syscall.Sockaddr) error { return syscall.Bind(fd, sa) }); err != nil {
+		syscall.Close(fd)
+		return -1, err
+	}
+	return fd, nil
 }
 
 // closeDialSocket closes a socket opened for a dial that never connected it.

@@ -3,7 +3,10 @@
 package fib
 
 import (
+	"fmt"
+	"math/rand/v2"
 	"net"
+	"net/netip"
 	"os"
 	"strings"
 	"syscall"
@@ -23,6 +26,10 @@ type dialRequest struct {
 	done    func(*Connection, error)
 	// handler serves the connection once it is established.
 	handler Handler
+	// local is what DialWith asked the socket to be bound to, when hasLocal
+	// says it asked at all; see bindLocal.
+	local    DialOptions
+	hasLocal bool
 	// family and sa are the resolved address to connect to, and raddr the same
 	// address as the net package reports it. err is set instead when resolving
 	// failed, and the loop only has to report it.
@@ -72,29 +79,55 @@ func (e *Engine) Dial(network, addr string, timeout time.Duration, done func(*Co
 // clients it talks to, each with its own protocol. A nil handler means the
 // engine's.
 func (e *Engine) DialWithHandler(network, addr string, timeout time.Duration, handler Handler, done func(*Connection, error)) error {
+	return e.DialWith(DialOptions{Network: network, Addr: addr, Timeout: timeout, Handler: handler}, done)
+}
+
+// DialWith is DialWithHandler with the options of opts, the local address
+// and port range the socket is bound to among them; see DialOptions. The
+// bind, and the search of the range, happen before the connect, off the
+// caller's goroutine where Dial resolves names off it too, and a failed one
+// reaches done like a failed connect. An option that cannot work, as a
+// range that is empty or a local address of the other family than a literal
+// Addr, fails DialWith itself.
+func (e *Engine) DialWith(opts DialOptions, done func(*Connection, error)) error {
+	handler := opts.Handler
 	if handler == nil {
 		handler = e.handler
 	}
-	d := &dialRequest{network: network, addr: addr, timeout: timeout, done: done, handler: handler}
+	network := opts.Network
 	if network == "" {
-		d.network = "tcp"
+		network = "tcp"
 	}
+	d := &dialRequest{network: network, addr: opts.Addr, timeout: opts.Timeout, done: done, handler: handler,
+		local: opts, hasLocal: opts.hasLocal()}
 	if e.stopping.Load() {
 		return d.opError(net.ErrClosed)
 	}
-	if !isLiteralAddr(addr) {
-		if !netaddr.IsDialNetwork(network) {
-			return d.opError(net.UnknownNetworkError(network))
-		}
+	if !netaddr.IsDialNetwork(network) {
+		return d.opError(net.UnknownNetworkError(network))
+	}
+	if err := opts.check(network); err != nil {
+		return d.opError(err)
+	}
+	if !isLiteralAddr(opts.Addr) {
+		resolveOn := opts.resolveNetwork(network)
 		sidepool.Go(func() {
-			d.family, d.sa, d.raddr, d.err = netaddr.ResolveDial(network, addr)
+			d.family, d.sa, d.raddr, d.err = netaddr.ResolveDial(resolveOn, opts.Addr)
+			if d.err == nil && d.raddr != nil {
+				d.err = opts.familyMismatch(d.raddr.IP)
+			}
 			e.requestDial(d)
 		})
 		return nil
 	}
 	var err error
-	if d.family, d.sa, d.raddr, err = netaddr.ResolveDial(network, addr); err != nil {
+	if d.family, d.sa, d.raddr, err = netaddr.ResolveDial(network, opts.Addr); err != nil {
 		return d.opError(err)
+	}
+	if d.raddr != nil {
+		if err = opts.familyMismatch(d.raddr.IP); err != nil {
+			return d.opError(err)
+		}
 	}
 	e.requestDial(d)
 	return nil
@@ -141,6 +174,9 @@ func (d *dialRequest) opError(err error) error {
 		err = os.NewSyscallError("connect", sys.PortableErrno(errno))
 	}
 	opErr := &net.OpError{Op: "dial", Net: d.network, Err: err}
+	if d.hasLocal {
+		opErr.Source = d.sourceAddr()
+	}
 	if netaddr.IsUnix(d.network) {
 		opErr.Addr = &net.UnixAddr{Name: d.addr, Net: "unix"}
 	} else if d.raddr != nil {
@@ -150,6 +186,76 @@ func (d *dialRequest) opError(err error) error {
 		}
 	}
 	return opErr
+}
+
+// sourceAddr is the local end d asked for, as net reports it.
+func (d *dialRequest) sourceAddr() net.Addr {
+	ip := d.local.localIP()
+	var ipb net.IP
+	if ip.IsValid() {
+		ipb = ip.AsSlice()
+	}
+	port := int(d.local.LocalAddr.Port())
+	if netaddr.IsUDP(d.network) {
+		return &net.UDPAddr{IP: ipb, Port: port, Zone: ip.Zone()}
+	}
+	return &net.TCPAddr{IP: ipb, Port: port, Zone: ip.Zone()}
+}
+
+// bindLocal binds the socket opened for d, through bind, to the local end
+// DialWith asked for, if it asked for one: the port it names, or the first
+// free one of its range from a random start. It runs before the connect, on
+// whichever goroutine opens the socket.
+func (d *dialRequest) bindLocal(bind func(syscall.Sockaddr) error) error {
+	if !d.hasLocal {
+		return nil
+	}
+	ip := d.local.localIP()
+	if !ip.IsValid() {
+		ip = netip.IPv4Unspecified()
+		if d.family == syscall.AF_INET6 {
+			ip = netip.IPv6Unspecified()
+		}
+	}
+	sockaddr := func(port int) (syscall.Sockaddr, error) {
+		if d.family == syscall.AF_INET {
+			return &syscall.SockaddrInet4{Addr: ip.As4(), Port: port}, nil
+		}
+		sa := &syscall.SockaddrInet6{Addr: ip.As16(), Port: port}
+		if zone := ip.Zone(); zone != "" {
+			ifi, err := net.InterfaceByName(zone)
+			if err != nil {
+				return nil, err
+			}
+			sa.ZoneId = uint32(ifi.Index)
+		}
+		return sa, nil
+	}
+	try := func(port int) error {
+		sa, err := sockaddr(port)
+		if err != nil {
+			return err
+		}
+		if err = bind(sa); err != nil {
+			if errno, ok := err.(syscall.Errno); ok {
+				err = os.NewSyscallError("bind", sys.PortableErrno(errno))
+			}
+		}
+		return err
+	}
+	lo, hi := int(d.local.PortMin), int(d.local.PortMax)
+	if hi == 0 {
+		return try(int(d.local.LocalAddr.Port()))
+	}
+	n := hi - lo + 1
+	start := rand.IntN(n)
+	var err error
+	for i := range n {
+		if err = try(lo + (start+i)%n); err == nil || !sys.IsAddrInUse(err) {
+			return err
+		}
+	}
+	return fmt.Errorf("%w %d-%d: %w", ErrNoLocalPort, lo, hi, err)
 }
 
 // startDial runs on the event loop: it opens the socket, starts the connect

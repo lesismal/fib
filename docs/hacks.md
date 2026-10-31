@@ -715,6 +715,9 @@ client := fibhttp.NewClient(engine, fibhttp.DefaultClientConfig()) // reuses the
 - `Engine.DialWithHandler(...)`: the connection uses **its own handler**, as each binding's
   connections do theirs, so one Engine can host servers and clients of different protocols at once.
 - `fib.New(config)` with no bindings creates an Engine that **does not listen**, only for dialing.
+- `Engine.DialWith(fib.DialOptions{...}, done)` dials **from a chosen local address**: `LocalAddr`
+  (IP and port, port 0 = the kernel's pick) and an optional `PortMin`-`PortMax` range searched from
+  a random start, for a firewall that admits one source address and port range.
 - `client.Go(req).Wait()` is the Future form, for places that may block (such as `main` or tests).
   **Never `Wait()` inside a handler**, which holds a worker; in a handler use a callback with
   `Retain`/`Release`.

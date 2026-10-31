@@ -3,6 +3,7 @@
 package sys
 
 import (
+	"errors"
 	"syscall"
 	"unsafe"
 )
@@ -175,6 +176,8 @@ const (
 	errorConnectionRefused  = syscall.Errno(1225)
 	errorNetworkUnreachable = syscall.Errno(1231)
 	errorHostUnreachable    = syscall.Errno(1232)
+	wsaeAccess              = syscall.Errno(10013)
+	wsaeAddrInUse           = syscall.Errno(10048)
 	wsaeNetUnreach          = syscall.Errno(10051)
 	wsaeConnRefused         = syscall.Errno(10061)
 	wsaeHostUnreach         = syscall.Errno(10065)
@@ -195,10 +198,19 @@ func PortableErrno(errno syscall.Errno) error {
 		portable = syscall.ENETUNREACH
 	case errorHostUnreachable, wsaeHostUnreach:
 		portable = syscall.EHOSTUNREACH
+	case wsaeAddrInUse:
+		portable = syscall.EADDRINUSE
 	default:
 		return errno
 	}
 	return &connectErrno{errno: errno, portable: portable}
+}
+
+// IsAddrInUse reports whether err says a bind found its address taken. A
+// port another socket holds exclusively, or one Windows reserves, fails
+// with WSAEACCES rather than WSAEADDRINUSE, and is just as unavailable.
+func IsAddrInUse(err error) bool {
+	return errors.Is(err, wsaeAddrInUse) || errors.Is(err, wsaeAccess)
 }
 
 // connectErrno is a Windows code that also matches its portable error.
