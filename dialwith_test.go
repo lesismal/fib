@@ -3,6 +3,7 @@
 package fib
 
 import (
+	"context"
 	"errors"
 	"math/rand/v2"
 	"net"
@@ -71,18 +72,23 @@ func (h *heldPorts) close() {
 }
 
 // holdPorts finds n consecutive free ports on 127.0.0.1 and holds them all.
+// They are taken below every system's ephemeral range, which starts at 32768
+// at the lowest, so that no other test's connection lingers on them, and the
+// holders are bound as a dial binds, without SO_REUSEADDR, so that a port
+// one of these tests left in TIME_WAIT is passed over.
 func holdPorts(t *testing.T, network string, n int) *heldPorts {
 	t.Helper()
+	probe := net.ListenConfig{Control: probeControl}
 	for attempt := 0; attempt < 200; attempt++ {
-		h := &heldPorts{first: 20000 + rand.IntN(30000)}
+		h := &heldPorts{first: 20000 + rand.IntN(12000)}
 		for i := 0; i < n; i++ {
 			addr := net.JoinHostPort("127.0.0.1", strconv.Itoa(h.first+i))
 			var held any
 			var err error
 			if network == "udp" {
-				held, err = net.ListenPacket("udp4", addr)
+				held, err = probe.ListenPacket(context.Background(), "udp4", addr)
 			} else {
-				held, err = net.Listen("tcp4", addr)
+				held, err = probe.Listen(context.Background(), "tcp4", addr)
 			}
 			if err != nil {
 				break
