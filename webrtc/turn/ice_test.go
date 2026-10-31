@@ -77,9 +77,21 @@ func newICEPeer(t *testing.T, n *simNet, host netip.AddrPort, controlling bool) 
 }
 
 func TestICEOverRelay(t *testing.T) {
-	for _, loss := range []float64{0, 0.2} {
+	// A consent check and its response cross the lossy links four times,
+	// from one client to the server, from the server to the other client,
+	// and back, so that at 15% one send in two gets through, and consent,
+	// lost only when every check goes unanswered for 30s, held in 150,000
+	// runs. At 20% on all six links, the hop between the relays counted
+	// too, a send got through one time in four, and consent lapsed in one
+	// run in fifteen.
+	for _, loss := range []float64{0, 0.15} {
 		n := newSimNet(t, 11)
-		n.loss = loss
+		// Both relayed addresses are the server's, so what one sends the
+		// other never leaves the server's host: only the links between the
+		// clients and the server lose datagrams.
+		n.drop = func(from, to netip.AddrPort, b []byte) bool {
+			return from.Addr() != to.Addr() && n.rng.Float64() < loss
+		}
 		newSimServer(n, serverAddr, ServerConfig{})
 		a := newICEPeer(t, n, netip.MustParseAddrPort("198.51.100.10:1000"), true)
 		b := newICEPeer(t, n, netip.MustParseAddrPort("198.51.100.20:2000"), false)
