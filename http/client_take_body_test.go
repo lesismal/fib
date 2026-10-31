@@ -174,17 +174,24 @@ func TestWriteResponseOwned(t *testing.T) {
 
 // TestWriteResponseOwnedGivesTheBodyBack checks that a small body sent with
 // WriteResponseOwned goes back to the pool once sent, over HTTP/1 and over
-// HTTP/2, whose framing copies it: a later Get finds one of the buffers the
-// handler sent. The test keeps every buffer it sent alive, so that a Get
-// that finds one cannot have been given a new allocation at its address.
+// HTTP/2, whose framing copies it: a buffer the handler sent turns up again
+// from the pool, at a handler's Get or at the test's own once the requests
+// are done. The test keeps every buffer it sent alive, so that one turning up
+// cannot be a new allocation at its address. A buffer given back may be
+// held by something else on the server when the requests end, so the test's
+// own Get looks for a while rather than once.
 func TestWriteResponseOwnedGivesTheBodyBack(t *testing.T) {
 	const size, requests = 1000, 50
 	var mu sync.Mutex
 	sent := map[*byte]bool{}
+	reused := 0
 	handler := HandlerFunc(func(c *Context) {
 		body := bufferpool.Get(size)
 		copy(body, pattern(size))
 		mu.Lock()
+		if sent[unsafe.SliceData(body)] {
+			reused++
+		}
 		sent[unsafe.SliceData(body)] = true
 		mu.Unlock()
 		if err := c.WriteResponseOwned(Response{StatusCode: stdhttp.StatusOK, Body: body}); err != nil {
@@ -197,6 +204,30 @@ func TestWriteResponseOwnedGivesTheBodyBack(t *testing.T) {
 		t.Fatal(err)
 	}
 	tlsAddr := serve(t, fibtls.NewServer(ConfigureTLS(serverConfig), NewHandler(handler)))
+	// found reports whether a Get finds a buffer the handler sent, looking
+	// for up to two seconds.
+	found := func() bool {
+		for deadline := time.Now().Add(2 * time.Second); time.Now().Before(deadline); time.Sleep(10 * time.Millisecond) {
+			var taken [][]byte
+			hit := false
+			mu.Lock()
+			for range 4 * requests {
+				b := bufferpool.Get(size)
+				taken = append(taken, b)
+				if hit = sent[unsafe.SliceData(b)]; hit {
+					break
+				}
+			}
+			mu.Unlock()
+			for _, b := range taken {
+				bufferpool.Put(b)
+			}
+			if hit {
+				return true
+			}
+		}
+		return false
+	}
 	for base, client := range map[string]*stdhttp.Client{
 		"http://" + addr: {Timeout: 10 * time.Second},
 		"https://" + tlsAddr: {Timeout: 10 * time.Second, Transport: &stdhttp.Transport{
@@ -204,6 +235,7 @@ func TestWriteResponseOwnedGivesTheBodyBack(t *testing.T) {
 	} {
 		mu.Lock()
 		clear(sent)
+		reused = 0
 		mu.Unlock()
 		proto := ""
 		for range requests {
@@ -214,21 +246,9 @@ func TestWriteResponseOwnedGivesTheBodyBack(t *testing.T) {
 			}
 		}
 		mu.Lock()
-		found := false
-		var taken [][]byte
-		for range 4 * requests {
-			b := bufferpool.Get(size)
-			taken = append(taken, b)
-			if sent[unsafe.SliceData(b)] {
-				found = true
-				break
-			}
-		}
+		n := reused
 		mu.Unlock()
-		for _, b := range taken {
-			bufferpool.Put(b)
-		}
-		if !found {
+		if n == 0 && !found() {
 			t.Errorf("%s: none of the %d bodies sent went back to the pool", proto, requests)
 		}
 	}
