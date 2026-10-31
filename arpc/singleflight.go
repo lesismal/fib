@@ -31,9 +31,12 @@ type sfCall struct {
 	result any
 	err    error
 
-	// finished and subs are guarded by the group's mutex.
-	finished bool
-	subs     []*sfAsyncSub
+	// finished, subs and followers are guarded by the group's mutex.
+	// followers counts the callers that joined the call, which a test
+	// waits on before the leader may finish.
+	finished  bool
+	subs      []*sfAsyncSub
+	followers int
 }
 
 // sfAsyncSub is a follower of an asynchronous call. Its handler runs once,
@@ -72,6 +75,7 @@ func (g *singleflightGroup) acquire(k sfKey) (*sfCall, bool) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	if call, ok := g.calls[k]; ok {
+		call.followers++
 		return call, false
 	}
 	if g.calls == nil {

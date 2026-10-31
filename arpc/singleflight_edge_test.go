@@ -93,7 +93,18 @@ func TestSingleflightBlockingOutcomes(t *testing.T) {
 	c, keyed := sfClient(t, addr)
 
 	type outcome struct{ err error }
+	// joined is how many callers joined the call in flight for req, or -1
+	// when there is none.
+	joined := func(req string) int {
+		c.sfGroup.mu.Lock()
+		defer c.sfGroup.mu.Unlock()
+		if call := c.sfGroup.calls[sfKey{method: "/get", key: req}]; call != nil {
+			return call.followers
+		}
+		return -1
+	}
 	call := func(req string, rsp any, timeout time.Duration) <-chan outcome {
+		before := joined(req)
 		ch := make(chan outcome, 1)
 		go func() {
 			ctx, cancel := context.WithTimeout(context.Background(), timeout)
@@ -101,6 +112,12 @@ func TestSingleflightBlockingOutcomes(t *testing.T) {
 			ch <- outcome{c.CallContext(ctx, "/get", req, rsp)}
 		}()
 		recvArpc(t, keyed, "the call to look for one in flight")
+		// The key is taken before the call joins the one in flight; a gate
+		// opened in between lets the leader finish first, and the follower
+		// then goes to the server itself.
+		if before >= 0 {
+			waitArpc(t, "the follower to join", func() bool { return joined(req) > before })
+		}
 		return ch
 	}
 	lead := func(req string, rsp any, timeout time.Duration) <-chan outcome {
