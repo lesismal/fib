@@ -264,17 +264,26 @@ func TestMaxPendingPerHostAsTheDialEnds(t *testing.T) {
 			client.Do(mustRequest(t, "GET", u, nil), func(_ *ClientResponse, err error) { more <- err })
 		}
 	}()
+	// Nothing the burst asks for can be answered while the server holds the
+	// response, so the first thing to arrive is a refusal. The server lets
+	// go only once it has: a slow runner whose burst came in after the first
+	// request had finished would find room, and none of it be turned away.
+	// The burst may wait for the connection's lock, which the dial takes
+	// under the client's, so the test lets go of it first, once the burst
+	// has had time to come in where the dial's gap was.
 	time.Sleep(50 * time.Millisecond)
-	cc.mu.Unlock()
-	close(release)
 	refused := 0
-	for i := 0; i < 2; i++ {
-		if err := cvCliWait(t, more, "a request of the burst"); errors.Is(err, ErrTooManyPending) {
+	countBurst := func(err error) {
+		if errors.Is(err, ErrTooManyPending) {
 			refused++
 		} else if err != nil {
 			t.Fatalf("a request of the burst got %v", err)
 		}
 	}
+	cc.mu.Unlock()
+	countBurst(cvCliWait(t, more, "the burst's refusal"))
+	close(release)
+	countBurst(cvCliWait(t, more, "a request of the burst"))
 	if err := cvCliWait(t, results, "the request the dial was for"); err != nil {
 		t.Fatalf("the request the dial was for got %v", err)
 	}
