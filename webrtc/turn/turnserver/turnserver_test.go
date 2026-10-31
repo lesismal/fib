@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/lesismal/fib"
+	"github.com/lesismal/fib/webrtc/stun"
 	"github.com/lesismal/fib/webrtc/turn"
 )
 
@@ -63,6 +64,9 @@ type udpClient struct {
 	allocated chan struct{}
 	failed    chan error
 	done      chan struct{}
+	// quiet, guarded by mu, stops the client's timers: it sends no more
+	// refreshes.
+	quiet bool
 }
 
 func newUDPClient(t *testing.T, server netip.AddrPort, bind bool) *udpClient {
@@ -105,7 +109,7 @@ func newUDPClient(t *testing.T, server netip.AddrPort, bind bool) *udpClient {
 				return
 			case now := <-tick.C:
 				u.mu.Lock()
-				if d, ok := c.NextTimeout(); ok && !d.After(now) {
+				if d, ok := c.NextTimeout(); ok && !d.After(now) && !u.quiet {
 					c.HandleTimeout(now)
 				}
 				u.mu.Unlock()
@@ -230,6 +234,16 @@ func TestSSRFOnEngine(t *testing.T) {
 
 func TestConfigRejected(t *testing.T) {
 	base := turn.ServerConfig{Realm: realm, Auth: turn.StaticAuth(realm, nil)}
+	if _, err := New(Config{ServerConfig: turn.ServerConfig{Auth: base.Auth}, RelayIP: loopback}); err == nil {
+		t.Fatal("no realm")
+	}
+	e := runEngine(t)
+	if _, err := Listen(e, "127.0.0.1:0", Config{ServerConfig: base}); err == nil {
+		t.Fatal("Listen with no RelayIP")
+	}
+	if _, err := Listen(e, "not an address", Config{ServerConfig: base, RelayIP: loopback}); err == nil {
+		t.Fatal("Listen on no address")
+	}
 	if _, err := New(Config{ServerConfig: base}); err == nil {
 		t.Fatal("no RelayIP")
 	}
@@ -243,5 +257,150 @@ func TestConfigRejected(t *testing.T) {
 	}
 	if _, err := New(Config{ServerConfig: base, RelayIP: loopback, PortMin: 2, PortMax: 1}); err == nil {
 		t.Fatal("inverted port range")
+	}
+}
+
+// An allocation whose client goes silent is freed by the server's timer,
+// its relayed binding removed.
+func TestExpiryOnEngine(t *testing.T) {
+	cfg := Config{}
+	cfg.DefaultLifetime, cfg.MaxLifetime = time.Second, time.Second
+	cfg.SweepInterval = 50 * time.Millisecond
+	s, addr, _ := startServer(t, fib.DefaultConfig(), cfg)
+	u := newUDPClient(t, addr, false)
+	u.do(func(c *turn.Client) { _ = c.Allocate(time.Now()) })
+	wait(t, u.allocated, "the allocation")
+	var relayed netip.AddrPort
+	u.do(func(c *turn.Client) { relayed, _, _ = c.Relayed(); u.quiet = true })
+	deadline := time.Now().Add(10 * time.Second)
+	for s.Allocations() != 0 && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if s.Allocations() != 0 || !freed(relayed) {
+		t.Fatalf("%d allocations, relayed %v freed %v", s.Allocations(), relayed, freed(relayed))
+	}
+}
+
+// runEngine runs an engine with no bindings until the test ends.
+func runEngine(t *testing.T) *fib.Engine {
+	t.Helper()
+	config := fib.DefaultConfig()
+	config.LogSettings = false
+	e, err := fib.New(config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan error, 1)
+	go func() { done <- e.Run() }()
+	t.Cleanup(func() {
+		e.Stop()
+		<-done
+		_ = e.Close()
+	})
+	return e
+}
+
+// freed waits until a UDP socket can bind addr, as it can once the relayed
+// binding that held it is removed.
+func freed(addr netip.AddrPort) bool {
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if c, err := net.ListenUDP("udp", net.UDPAddrFromAddrPort(addr)); err == nil {
+			c.Close()
+			return true
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	return false
+}
+
+// Datagrams that reach the listening binding before Start are dropped.
+func TestBeforeStart(t *testing.T) {
+	e := runEngine(t)
+	cfg := Config{RelayIP: loopback}
+	cfg.Realm, cfg.Auth = realm, turn.StaticAuth(realm, nil)
+	s, err := New(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	i, err := e.AddBinding(fib.Binding{Network: "udp", Addr: "127.0.0.1:0", Handler: s})
+	if err != nil {
+		t.Fatal(err)
+	}
+	addrs, _ := e.BindingAddrs(i)
+	conn, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	var m stun.Message
+	m.Build(stun.BindingRequest, stun.NewTransactionID())
+	ask := func() bool {
+		_, _ = conn.WriteToUDPAddrPort(m.Raw, addrPort(addrs[0]))
+		_ = conn.SetReadDeadline(time.Now().Add(300 * time.Millisecond))
+		buf := make([]byte, 512)
+		_, _, err := conn.ReadFromUDPAddrPort(buf)
+		return err == nil
+	}
+	if ask() {
+		t.Fatal("answered before Start")
+	}
+	s.Start(e, i)
+	for range 10 {
+		if ask() {
+			return
+		}
+	}
+	t.Fatal("not answered after Start")
+}
+
+func TestAllocateRelay(t *testing.T) {
+	s, _, _ := startServer(t, fib.DefaultConfig(), Config{})
+	if _, err := s.allocateRelay(turn.FiveTuple{}, user, true); err != turn.ErrNoRelay {
+		t.Fatalf("IPv6 on an IPv4 relay address: %v", err)
+	}
+
+	// A relayed address behind a 1:1 NAT is told as the public one.
+	s.cfg.PublicIP = netip.MustParseAddr("::ffff:198.51.100.1")
+	r, err := s.allocateRelay(turn.FiveTuple{}, user, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if r.Addr().Addr() != netip.MustParseAddr("198.51.100.1") || r.Addr().Port() == 0 {
+		t.Fatalf("relayed %v", r.Addr())
+	}
+	bound := netip.AddrPortFrom(loopback, r.Addr().Port())
+	s.mu.Lock()
+	r.Close()
+	r.Close()
+	s.mu.Unlock()
+	// A datagram a closed relay still gets is dropped, not given to the
+	// core.
+	r.(*relay).OnData(nil, []byte("late"))
+	if !freed(bound) {
+		t.Fatalf("relay %v still bound after Close", bound)
+	}
+	s.cfg.PublicIP = netip.Addr{}
+
+	// Every port of the range taken.
+	taken, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer taken.Close()
+	port := uint16(taken.LocalAddr().(*net.UDPAddr).Port)
+	s.cfg.PortMin, s.cfg.PortMax = port, port
+	if _, err := s.allocateRelay(turn.FiveTuple{}, user, false); err != turn.ErrNoRelay {
+		t.Fatalf("a range with no free port: %v", err)
+	}
+	// An address the host does not have.
+	s.cfg.PortMin, s.cfg.PortMax = 0, 0
+	s.cfg.RelayIP = netip.MustParseAddr("192.0.2.1")
+	if _, err := s.allocateRelay(turn.FiveTuple{}, user, false); err == nil {
+		t.Fatal("bound a relay to an address the host does not have")
+	}
+	if a := addrPort(&net.TCPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 1}); a.IsValid() {
+		t.Fatalf("a TCP address as a UDP one: %v", a)
 	}
 }

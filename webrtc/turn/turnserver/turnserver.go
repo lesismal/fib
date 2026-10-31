@@ -218,9 +218,6 @@ func (s *Server) conn(table map[netip.AddrPort]*fib.Connection, binding int, to 
 	if c != nil {
 		return c
 	}
-	if s.engine == nil {
-		return nil
-	}
 	// OpenUDPPeer waits for the loop, whose OnOpen takes connMu: it is
 	// called with connMu released, and its OnOpen records the connection.
 	c, err := s.engine.OpenUDPPeer(binding, to)
