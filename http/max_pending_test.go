@@ -14,6 +14,8 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	fib "github.com/lesismal/fib"
 )
 
 // holdingServer answers each request with cvCliOK once release is closed,
@@ -201,4 +203,96 @@ func TestMaxPendingPerHostEndedWhileWaiting(t *testing.T) {
 	if waiting, ended := hostQueue(client, u); waiting != 0 || ended != 0 {
 		t.Fatalf("%d requests waiting and %d counted as ended once all are over, want none", waiting, ended)
 	}
+}
+
+// With MaxConnsPerHost 1 and MaxPendingPerHost 1, a burst that arrives as the
+// host's first connection is dialed takes the request the connection was
+// dialed for and one more, and turns one away. A dial that had just succeeded
+// stopped counting as dialing before the connection took its request, under
+// a second hold of the client's lock, so that a request arriving between the
+// two found the one the dial was for waiting with nothing to cover it, and
+// was turned away with the next.
+//
+// The test holds the connection's own lock across that moment, once the dial
+// has settled under it: dialed then stops where it asks whether the
+// connection is in flight, and the burst arrives there.
+func TestMaxPendingPerHostAsTheDialEnds(t *testing.T) {
+	release := make(chan struct{})
+	u, _ := holdingServer(t, release)
+	dialed, settle := make(chan *clientConn, 1), make(chan struct{})
+	config := DefaultClientConfig()
+	config.MaxConnsPerHost = 1
+	config.MaxPendingPerHost = 1
+	config.Dial = func(engine *fib.Engine, network, addr string, timeout time.Duration, handler fib.Handler, done func(*fib.Connection, error)) error {
+		return engine.DialWithHandler(network, addr, timeout, handler, func(c *fib.Connection, err error) {
+			dialed <- handler.(*clientConn)
+			<-settle
+			done(c, err)
+		})
+	}
+	client := newTestClient(t, config)
+	results := sendAll(t, client, u, 1)
+	cc := <-dialed
+	h := hostPoolOf(t, client, u)
+	// The client's lock keeps dialed from going past settling the dial, which
+	// it does under the connection's, until the test holds that one.
+	client.mu.Lock()
+	close(settle)
+	for {
+		cc.mu.Lock()
+		if cc.settled {
+			break
+		}
+		cc.mu.Unlock()
+		time.Sleep(time.Millisecond)
+	}
+	client.mu.Unlock()
+	// dialed now stops at the connection's lock, either having let the
+	// client's go there or holding it, which TryLock tells.
+	for deadline := time.Now().Add(200 * time.Millisecond); time.Now().Before(deadline); time.Sleep(time.Millisecond) {
+		if client.mu.TryLock() {
+			dialing := h.dialing
+			client.mu.Unlock()
+			if dialing == 0 {
+				break
+			}
+		}
+	}
+	more := make(chan error, 2)
+	go func() {
+		for i := 0; i < 2; i++ {
+			client.Do(mustRequest(t, "GET", u, nil), func(_ *ClientResponse, err error) { more <- err })
+		}
+	}()
+	time.Sleep(50 * time.Millisecond)
+	cc.mu.Unlock()
+	close(release)
+	refused := 0
+	for i := 0; i < 2; i++ {
+		if err := cvCliWait(t, more, "a request of the burst"); errors.Is(err, ErrTooManyPending) {
+			refused++
+		} else if err != nil {
+			t.Fatalf("a request of the burst got %v", err)
+		}
+	}
+	if err := cvCliWait(t, results, "the request the dial was for"); err != nil {
+		t.Fatalf("the request the dial was for got %v", err)
+	}
+	if refused != 1 {
+		t.Fatalf("%d of the burst turned away, want 1", refused)
+	}
+}
+
+// hostPoolOf finds the pool the client keeps for u's host.
+func hostPoolOf(t *testing.T, c *Client, u string) *hostPool {
+	t.Helper()
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	for target, h := range c.hosts {
+		if strings.HasSuffix(u, target.addr) || strings.Contains(u, target.addr+"/") {
+			return h
+		}
+	}
+	t.Fatal("no host for " + u)
+	return nil
 }

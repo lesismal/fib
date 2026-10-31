@@ -1021,13 +1021,17 @@ func (c *Client) dialed(cc *clientConn, err error) {
 		return
 	}
 	if err == nil {
-		c.mu.Unlock()
+		// The connection takes its request in the same hold of the lock that
+		// stops it counting as dialing: a request arriving between the two
+		// would find the one it was dialed for waiting with nothing to cover
+		// it, and be turned away past MaxPendingPerHost.
 		if cc.inFlight() {
 			// Its first request went as early data and is still being
 			// answered; the response's release hands the connection on.
+			c.mu.Unlock()
 			return
 		}
-		c.release(cc)
+		c.releaseLocked(cc)
 		return
 	}
 	h.open--
@@ -1050,8 +1054,13 @@ func (c *Client) dialed(cc *clientConn, err error) {
 // release hands a connection with nothing in flight to the next waiting
 // request, or keeps it idle, or closes it if there is room for neither.
 func (c *Client) release(cc *clientConn) {
-	h := cc.host
 	c.mu.Lock()
+	c.releaseLocked(cc)
+}
+
+// releaseLocked is release with the client's lock held, which it lets go.
+func (c *Client) releaseLocked(cc *clientConn) {
+	h := cc.host
 	if cc.isClosed() {
 		c.mu.Unlock()
 		return
