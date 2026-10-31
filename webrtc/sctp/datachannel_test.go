@@ -2,6 +2,7 @@ package sctp
 
 import (
 	"bytes"
+	"encoding/binary"
 	"errors"
 	"testing"
 	"time"
@@ -219,5 +220,141 @@ func TestChannelsLossy(t *testing.T) {
 	}
 	if n := len(e.msgs[0]) + len(e.msgs[1]); n != 50 {
 		t.Fatalf("%d messages", n)
+	}
+}
+
+// TestChannelOpenErrors checks what OpenChannel refuses, and that a
+// channel whose DCEP OPEN cannot be sent leaves its stream id free.
+func TestChannelOpenErrors(t *testing.T) {
+	l := newLink(t, 1, func(i int, c *Config) { c.Streams = 4 })
+	l.connect(false)
+	a := l.ends[0]
+	if _, err := a.OpenChannel(ChannelOptions{Negotiated: true, ID: 9}); !errors.Is(err, ErrInvalidStream) {
+		t.Fatalf("negotiated id past the streams: %v", err)
+	}
+	if _, err := a.OpenChannel(ChannelOptions{Label: string(make([]byte, 0x10000))}); !errors.Is(err, ErrMessageTooLarge) {
+		t.Fatalf("label too long: %v", err)
+	}
+	a.SetRemoteMaxMessageSize(20)
+	if _, err := a.OpenChannel(ChannelOptions{Label: "longer than the peer takes"}); !errors.Is(err, ErrMessageTooLarge) {
+		t.Fatalf("OPEN larger than the peer takes: %v", err)
+	}
+	a.SetRemoteMaxMessageSize(0)
+	ch, err := a.OpenChannel(ChannelOptions{Label: "ok"})
+	if err != nil || ch.ID() != 0 {
+		t.Fatalf("id %d, %v", ch.ID(), err)
+	}
+	ch.SetBufferedAmountLowThreshold(123)
+	if ch.BufferedAmountLowThreshold() != 123 {
+		t.Fatal(ch.BufferedAmountLowThreshold())
+	}
+}
+
+// TestChannelsBeforeEstablishment checks the channels made before the
+// association is up: one closed meanwhile is never announced, and one on
+// a stream the peer turns out not to have closes.
+func TestChannelsBeforeEstablishment(t *testing.T) {
+	var e chanEnds
+	l := newLink(t, 1, func(i int, c *Config) {
+		e.configure(i, c)
+		c.Streams = 4
+	})
+	a := l.ends[0]
+	gone, _ := a.OpenChannel(ChannelOptions{Label: "gone"})
+	e.watch(0, gone)
+	if err := gone.Close(); err != nil || gone.State() != ChannelClosed || e.closes[0] != 1 {
+		t.Fatalf("%v, state %v, %d closes", err, gone.State(), e.closes[0])
+	}
+	if err := gone.Close(); err != nil || e.closes[0] != 1 {
+		t.Fatalf("second Close: %v, %d closes", err, e.closes[0])
+	}
+	far, err := a.OpenChannel(ChannelOptions{Label: "far", Negotiated: true, ID: 9})
+	if err != nil {
+		t.Fatal(err)
+	}
+	e.watch(0, far)
+	l.connect(true)
+	l.run(time.Second, nil)
+	if far.State() != ChannelClosed || e.closes[0] != 2 || len(e.opened[1]) != 0 {
+		t.Fatalf("far %v, %d closes, peer opened %d", far.State(), e.closes[0], len(e.opened[1]))
+	}
+}
+
+// TestDCEPIgnored checks that DCEP messages that make no sense, and data on
+// a stream with no channel, are dropped.
+func TestDCEPIgnored(t *testing.T) {
+	var e chanEnds
+	l := newLink(t, 1, e.configure)
+	l.connect(false)
+	a := l.ends[0]
+	ch, _ := a.OpenChannel(ChannelOptions{Label: "x"})
+	l.run(time.Second, func() bool { return len(e.opened[1]) == 1 })
+	silent := e.opened[1][0]
+	silent.OnMessage = nil
+	for _, m := range []struct {
+		sid  uint16
+		ppid uint32
+		data []byte
+	}{
+		{6, PPIDDCEP, []byte{dcepOpen, 0, 0}},                                  // short
+		{6, PPIDDCEP, []byte{dcepOpen, 0, 0, 0, 0, 0, 0, 0, 0, 9, 0, 0}},       // label past the end
+		{ch.ID(), PPIDDCEP, []byte{dcepOpen, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}}, // stream taken
+		{6, PPIDDCEP, []byte{0x7f}},                                            // unknown
+		{8, PPIDString, []byte("nobody")},                                      // no channel
+		{ch.ID(), PPIDString, []byte("no OnMessage")},                          // channel not listening
+	} {
+		if err := a.Send(m.sid, m.ppid, m.data, SendOptions{}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	l.run(time.Second, nil)
+	if len(e.opened[1]) != 1 || len(e.msgs[1]) != 0 || !l.established() {
+		t.Fatalf("opened %d, messages %d", len(e.opened[1]), len(e.msgs[1]))
+	}
+}
+
+// TestChannelAckedByData checks that data from the peer on a channel whose
+// DCEP ACK was lost counts as the ACK.
+func TestChannelAckedByData(t *testing.T) {
+	var e chanEnds
+	l := newLink(t, 1, e.configure)
+	l.connect(false)
+	dropped := false
+	l.drop = func(from int, p []byte) bool {
+		// The ACK goes in a DATA chunk of PPID 50, maybe behind a SACK.
+		for c := p[headerSize:]; !dropped && from == 1 && len(c) > 0; {
+			typ, _, v, rest, err := nextChunk(c)
+			if err != nil {
+				break
+			}
+			if typ == chunkData && binary.BigEndian.Uint32(v[8:]) == PPIDDCEP {
+				dropped = true
+				return true
+			}
+			c = rest
+		}
+		return false
+	}
+	// Unordered, the peer's reply does not wait behind the ACK sent again.
+	ch, _ := l.ends[0].OpenChannel(ChannelOptions{Label: "x", Type: ChannelPartialReliableTimedUnordered, ReliabilityParameter: 1000})
+	e.watch(0, ch)
+	l.run(time.Second, func() bool { return len(e.opened[1]) == 1 })
+	l.run(100*time.Millisecond, nil)
+	if len(e.opened[1]) != 1 || ch.acked || !dropped {
+		t.Fatalf("opened %d, acked %v", len(e.opened[1]), ch.acked)
+	}
+	peer := e.opened[1][0]
+	if peer.Type() != ChannelPartialReliableTimedUnordered || peer.ReliabilityParameter() != 1000 {
+		t.Fatalf("type %v, parameter %d", peer.Type(), peer.ReliabilityParameter())
+	}
+	_ = ch.SendText("timed")
+	_ = peer.SendText("reply")
+	l.run(100*time.Millisecond, func() bool { return len(e.msgs[0]) == 1 })
+	if !ch.acked || len(e.msgs[0]) != 1 {
+		t.Fatalf("before the ACK came again: acked %v, %d messages", ch.acked, len(e.msgs[0]))
+	}
+	l.run(time.Second, func() bool { return len(e.msgs[1]) == 1 })
+	if len(e.msgs[0]) != 1 || string(e.msgs[1][0].data) != "timed" {
+		t.Fatalf("acked %v, messages %v %v", ch.acked, e.msgs[0], e.msgs[1])
 	}
 }
