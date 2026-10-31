@@ -18,3 +18,6 @@ func (b *requestBlock) recycleServerState() {}
 // runOnStreams runs fn here. Only a server's Context gives a body the
 // callback it would hand on, and there is no server here.
 func runOnStreams(_ *fib.Connection, fn func()) { fn() }
+
+// cancelLive has no request to cancel here; see the server's.
+func (p *Parser) cancelLive(*BodyStream, error) bool { return false }

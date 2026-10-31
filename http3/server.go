@@ -1836,8 +1836,10 @@ func (rs *requestStream) abortWith(code ErrorCode, err error) {
 	stopped := rs.stopWriteTimerLocked()
 	readStopped := rs.stopReadTimerLocked()
 	rs.mu.Unlock()
-	rs.failBody(err)
+	// Cancelled before its body fails, so that OnBody's last call cannot
+	// end the request first; see http.StreamRequest.Cancel.
 	rs.cancel(err)
+	rs.failBody(err)
 	if stopped {
 		rs.unref()
 	}
@@ -1895,8 +1897,10 @@ func (rs *requestStream) peerReset() {
 	stopped := rs.stopWriteTimerLocked()
 	readStopped := rs.stopReadTimerLocked()
 	rs.mu.Unlock()
-	rs.failBody(errRequestReset)
+	// Cancelled before its body fails, so that OnBody's last call cannot
+	// end the request first; see http.StreamRequest.Cancel.
 	rs.cancel(errRequestReset)
+	rs.failBody(errRequestReset)
 	if stopped {
 		rs.unref()
 	}

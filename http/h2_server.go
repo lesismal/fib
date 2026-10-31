@@ -1498,6 +1498,14 @@ func (sc *h2ServerConn) creditConnLocked(out []byte, n int64) []byte {
 // connection that closed does: its Context is cancelled, see
 // Context.OnCancel.
 func (sc *h2ServerConn) failBodyLocked(st *h2ServerStream, err error) {
+	// A response still streaming is still being written, as one not begun
+	// is. The stream is still the connection's, which is what Cancel needs,
+	// and the cancellation runs elsewhere, since an OnCancel callback may
+	// answer, which takes the lock held here. It comes before the body
+	// fails, so that OnBody's last call cannot end the request first.
+	if st.block.context.stream == st && (!st.responded || st.out != nil) {
+		st.block.Cancel(err)
+	}
 	if feed := st.feed; feed != nil && !st.remoteDone {
 		feed.Fail(err)
 	}
@@ -1507,13 +1515,6 @@ func (sc *h2ServerConn) failBodyLocked(st *h2ServerStream, err error) {
 		// A handler waiting for room to write finds the stream gone.
 		o.room.Broadcast()
 		st.runWritableLocked(err)
-	}
-	// A response still streaming is still being written, as one not begun
-	// is. The stream is still the connection's, which is what Cancel needs,
-	// and the cancellation runs elsewhere, since an OnCancel callback may
-	// answer, which takes the lock held here.
-	if st.block.context.stream == st && (!st.responded || st.out != nil) {
-		st.block.Cancel(err)
 	}
 }
 

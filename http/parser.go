@@ -671,7 +671,11 @@ func (p *Parser) bodyEnded(done bool, err error) (bool, error) {
 	p.live.Store(nil)
 	p.requestEnded()
 	if err != nil {
-		stream.fail(err, true)
+		if errors.Is(err, ErrBodyTooLarge) || !p.cancelLive(stream, err) {
+			// A body ended for its size is answered with 413 rather than
+			// cancelled; see LimitBody.
+			stream.fail(err, true)
+		}
 		return false, err
 	}
 	return true, nil

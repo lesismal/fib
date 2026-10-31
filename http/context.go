@@ -54,6 +54,33 @@ func (p *Parser) resetServerState() {
 	p.earlyPending = 0
 }
 
+// cancelLive cancels the request being served, whose streamed body has
+// failed with err, and then fails the body. The request is marked cancelled
+// first because OnBody's last call may be the last hold on it, and a request
+// let go with that call would end unanswered rather than cancelled, leaving
+// OnCancel's callbacks unheard; they run on the engine's handler pool, as a
+// close's do. It reports false, leaving the body for the caller to fail, when
+// no request is live.
+func (p *Parser) cancelLive(stream *BodyStream, err error) bool {
+	context := p.liveContext.Load()
+	if context == nil {
+		return false
+	}
+	// As in OnClose: the generation is read while the Context is still this
+	// connection's, which the second load confirms.
+	gen := context.generation()
+	if p.liveContext.Load() != context {
+		return false
+	}
+	rest := context.markCancelled(err, gen)
+	if rest == nil {
+		return false
+	}
+	stream.fail(err, true)
+	cancelElsewhere(p.conn, rest)
+	return true
+}
+
 // bodyDeadline is a deadline a handler set with SetReadDeadline for the rest
 // of its request's body to arrive by, which stands in for the one
 // Config.ReadTimeout puts on it. The handler may set it from any goroutine,
@@ -468,9 +495,13 @@ func (c *Context) Err() error {
 // so it can stop and give back what it holds, and for one that waits in place,
 // on a database or another server, so it can stop waiting: a peer that hangs
 // up on it is heard while it waits, rather than once it returns, where the
-// engine's backend can tell (see fib.HangupHandler). A handler that takes the
-// body through OnBody hears the same thing there and needs no second
-// callback.
+// engine's backend can tell (see fib.HangupHandler). A body that fails part
+// way cancels the request too, whether or not its handler takes the body
+// through OnBody: the callback OnBody registered hears the body's failure, so
+// a handler that takes the body there needs no OnCancel of its own, and every
+// OnCancel callback runs as well, so that a middleware which registered one
+// hears of it whatever the handler did with the body. A body refused for its
+// size is the exception, being answered with 413; see LimitBody.
 //
 // Every callback registered is kept, and they run in the reverse of the order
 // they were registered, as the OnFinish hooks do, so that a middleware which
@@ -1151,6 +1182,20 @@ func (c *Context) claimResume() bool {
 // gen is the generation the request was served in, which a Context recycled
 // since has moved past; see recycle.
 func (c *Context) cancelWith(err error, gen uint64) {
+	if rest := c.markCancelled(err, gen); rest != nil {
+		rest()
+	}
+}
+
+// markCancelled is cancelWith's first half: it moves the request to
+// cancelled, so that the last hold going from here on, OnBody's last call
+// among them, no longer ends it unanswered, and returns the rest, which
+// tells the handler, or nil when the request was not open in generation gen.
+// It takes only the Context's own lock, so a protocol may call it under its
+// own and run the rest elsewhere; the body is failed after it, so that
+// OnBody's callback never hears of the failure while the request could still
+// end without its OnCancel callbacks.
+func (c *Context) markCancelled(err error, gen uint64) func() {
 	if err == nil {
 		err = net.ErrClosed
 	}
@@ -1160,7 +1205,7 @@ func (c *Context) cancelWith(err error, gen uint64) {
 		w := c.word.Load()
 		if ctxState(w) != ctxOpen || w>>ctxGenShift != gen {
 			c.mu.Unlock()
-			return
+			return nil
 		}
 		next := withState(w&^(ctxShare|ctxResume), ctxCancelled) | ctxCancelling
 		if c.word.CompareAndSwap(w, next) {
@@ -1184,27 +1229,30 @@ func (c *Context) cancelWith(err error, gen uint64) {
 	}
 	c.mu.Unlock()
 	c.forget()
-	if stop != nil {
-		stop(err)
-	}
-	if stream := c.RequestBody(); stream == nil {
-		c.deliverBody(nil, true, err, false)
-	} else if !stream.failSink(err) {
-		// OnBody has not handed the body its callback, though it may have
-		// registered it here already. The body's own failure is what the
-		// callback is told, as failureLocked tells one registered later.
-		bodyErr := err
-		if failed := stream.failure(); failed != nil {
-			bodyErr = failed
+	return func() {
+		if stop != nil {
+			stop(err)
 		}
-		c.deliverBody(nil, true, bodyErr, false)
+		if stream := c.RequestBody(); stream == nil {
+			c.deliverBody(nil, true, err, false)
+		} else if !stream.failSink(err) {
+			// OnBody has not handed the body its callback, though it may
+			// have registered it here already. The body's own failure is
+			// what the callback is told, as failureLocked tells one
+			// registered later.
+			bodyErr := err
+			if failed := stream.failure(); failed != nil {
+				bodyErr = failed
+			}
+			c.deliverBody(nil, true, bodyErr, false)
+		}
+		runCancel(onCancel, more, err)
+		done := ctxCancelling
+		if owed {
+			done |= ctxConn
+		}
+		c.drop(done)
 	}
-	runCancel(onCancel, more, err)
-	done := ctxCancelling
-	if owed {
-		done |= ctxConn
-	}
-	c.drop(done)
 }
 
 // forget drops the connection's pointer to this request, so that a close

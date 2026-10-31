@@ -325,14 +325,24 @@ func (r *StreamRequest) Recycle() {
 // a handler that answered and goes on working is not told, since its
 // response is not lost. The cancellation runs on the handler pool, since an
 // OnCancel callback may answer, which may take what the caller holds; a
-// Context recycled for another request by then is left alone.
+// Context recycled for another request by then is left alone. Only the
+// request's state changes where Cancel is called, under the Context's own
+// lock, so the protocol may call it under its locks. It calls Cancel before
+// it fails the request's body: OnBody's last call may be the last hold on the
+// request, which would otherwise end it unanswered, before the cancellation,
+// and OnCancel's callbacks would never run.
 func (r *StreamRequest) Cancel(err error) {
 	c := &r.context
 	if c.Request == nil {
 		return
 	}
 	if w := c.word.Load(); ctxState(w) == ctxOpen {
-		cancelElsewhere(c.Conn, func() { c.cancelWith(err, w>>ctxGenShift) })
+		// The request is marked cancelled here, before the protocol fails its
+		// body, so that OnBody's last call cannot end it first; see
+		// markCancelled.
+		if rest := c.markCancelled(err, w>>ctxGenShift); rest != nil {
+			cancelElsewhere(c.Conn, rest)
+		}
 	}
 }
 
@@ -1693,11 +1703,16 @@ func (h *ServerHandler) OnClose(c *fib.Connection, err error) {
 		}
 		if stream != nil || context != nil {
 			runOnStreams(c, func() {
-				if stream != nil {
-					stream.fail(err, false)
-				}
+				// The request is cancelled before its body fails: OnBody's
+				// last call may be the last hold on the request, and a
+				// request let go with it would end unanswered rather than
+				// cancelled, leaving OnCancel's callbacks unheard.
+				// cancelWith hands that call the body's failure itself.
 				if context != nil {
 					context.cancelWith(err, gen)
+				}
+				if stream != nil {
+					stream.fail(err, false)
 				}
 			})
 		}
