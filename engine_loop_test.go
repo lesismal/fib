@@ -6,6 +6,7 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"io"
 	"log/slog"
 	"net"
 	"strings"
@@ -250,8 +251,22 @@ func TestPollersKeepOwnAccepts(t *testing.T) {
 	}
 	moved := 0
 	for i := 0; i < conns; i++ {
-		if got := exchange(t, addr, "ping"); got != "ping" {
-			t.Fatalf("answered %q", got)
+		// Each connection is held open, so that each has a descriptor of
+		// its own: closed, the next takes the same one, and should one
+		// poller accept them all, as it may while the others are still to
+		// listen, every one sits where that descriptor picks a third of the
+		// time, which Linux CI met.
+		conn, err := net.DialTimeout("tcp", addr.String(), 5*time.Second)
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = conn.Close() })
+		_ = conn.SetDeadline(time.Now().Add(5 * time.Second))
+		if _, err := conn.Write([]byte("ping")); err != nil {
+			t.Fatal(err)
+		}
+		if got, err := io.ReadAll(io.LimitReader(conn, 4)); err != nil || string(got) != "ping" {
+			t.Fatalf("answered %q, %v", got, err)
 		}
 		c := <-accepted
 		if c.engine.parent != server {
