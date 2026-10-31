@@ -720,3 +720,99 @@ func BenchmarkMarshal(b *testing.B) {
 		buf = sd.AppendTo(buf[:0])
 	}
 }
+
+// TestMissingAndWildcard covers the readers of what a description may
+// lack, the attribute values they refuse, and the codec details read from
+// a=rtpmap and a=rtcp-fb lines that name a payload type the m= line does
+// not, or every payload type with "*".
+func TestMissingAndWildcard(t *testing.T) {
+	var empty SessionDescription
+	if _, ok := empty.Origin(); ok {
+		t.Error("origin of an empty description")
+	}
+	if empty.MediaByMid("0") != nil {
+		t.Error("media of an empty description")
+	}
+	var bare MediaDescription
+	if _, ok := bare.MediaName(); ok || bare.Codecs() != nil {
+		t.Error("codecs of a section with no m= line")
+	}
+
+	md := NewMedia("video", 9, ProtoRTP, "96", "97")
+	md.AddAttribute("rtpmap", "96 VP8/90000")
+	md.AddAttribute("rtpmap", "100 H264/90000")
+	md.AddAttribute("fmtp", "100 x=1")
+	md.AddAttribute("rtcp-fb", "* nack")
+	md.AddAttribute("rtcp-fb", "x")
+	md.AddAttribute("rtcp-fb", "96 goog-remb")
+	md.AddAttribute("rtcp-fb", "100 ccm fir")
+	codecs := md.Codecs()
+	want := []Codec{
+		{PayloadType: 96, Name: "VP8", ClockRate: 90000, Feedback: []string{"nack", "goog-remb"}},
+		{PayloadType: 97, Feedback: []string{"nack"}},
+	}
+	if !reflect.DeepEqual(codecs, want) {
+		t.Fatalf("codecs %+v", codecs)
+	}
+	if _, ok := md.Codec(100); ok {
+		t.Error("codec of a payload type the m= line does not list")
+	}
+
+	sd := New(1, 1)
+	sd.AddMedia(md)
+	if sd.MediaDirection(md) != SendRecv {
+		t.Error("default direction")
+	}
+	sd.SetDirection(SendOnly)
+	if sd.MediaDirection(md) != SendOnly {
+		t.Error("session direction not inherited")
+	}
+
+	md.SetICEOptions("trickle")
+	md.SetICEOptions()
+	if _, ok := md.Attribute("ice-options"); ok {
+		t.Error("ice-options kept")
+	}
+
+	for _, tc := range []struct {
+		in    string
+		parse func(string) error
+	}{
+		{"111 opus/48000/x", func(s string) error { _, err := ParseRTPMap(s); return err }},
+		{"1 :x", func(s string) error { _, err := ParseSSRC(s); return err }},
+		{" ", func(s string) error { _, err := ParseSSRCGroup(s); return err }},
+	} {
+		if err := tc.parse(tc.in); !errors.Is(err, ErrInvalidAttribute) {
+			t.Errorf("%q: %v", tc.in, err)
+		}
+	}
+	// A long value is cut short in the error.
+	long := "111 opus/" + strings.Repeat("9", 60)
+	_, err := ParseRTPMap(long)
+	if !errors.Is(err, ErrInvalidAttribute) || !strings.Contains(err.Error(), strings.Repeat("9", 40)+"...") || strings.Contains(err.Error(), strings.Repeat("9", 41)) {
+		t.Errorf("%v", err)
+	}
+}
+
+// TestAddLineOrder checks where SetLine adds a line a section lacks, and
+// that a line of a type RFC 8866 does not name goes before the attributes.
+func TestAddLineOrder(t *testing.T) {
+	sd := New(1, 1)
+	sd.AddAttribute("group", "BUNDLE 0")
+	sd.SetLine('i', "info")
+	sd.AddLine('y', "1")
+	const want = "v=0\r\no=- 1 1 IN IP4 127.0.0.1\r\ns=-\r\ni=info\r\nt=0 0\r\ny=1\r\na=group:BUNDLE 0\r\n"
+	if got := sd.String(); got != want {
+		t.Fatalf("session:\n%s", got)
+	}
+	md := NewMedia("audio", 9, ProtoRTP, "0")
+	md.AddAttribute("mid", "0")
+	md.AddLine('y', "1")
+	var got []string
+	for _, l := range md.Lines {
+		got = append(got, l.String())
+	}
+	if !reflect.DeepEqual(got, []string{"m=audio 9 UDP/TLS/RTP/SAVPF 0", "c=IN IP4 0.0.0.0", "y=1", "a=mid:0"}) {
+		t.Fatalf("media: %q", got)
+	}
+}
