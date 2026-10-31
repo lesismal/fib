@@ -65,13 +65,16 @@ func Decode(block []byte, maxSize int, emit func(HeaderField) error) error {
 
 // Decoder decodes the field sections of one connection. A connection's
 // requests repeat most of their fields — the authority, the paths, the
-// client's own fields — so it remembers the strings it decoded last, and a
-// field line it has seen before costs neither decoding nor an allocation. A
-// Decoder is used by one goroutine at a time. The zero value is ready, and
-// a nil *Decoder decodes as Decode does, remembering nothing.
+// client's own fields — in the same order, so it remembers each string of
+// the last section by its place in it, and a string the same as the one in
+// its place before costs neither decoding nor an allocation: a path that
+// changes misses its own place and no other. A Decoder is used by one
+// goroutine at a time. The zero value is ready, and a nil *Decoder decodes
+// as Decode does, remembering nothing.
 type Decoder struct {
 	recent [recentStrings]recentString
-	next   int
+	// place is the place in its section of the next string read.
+	place int
 }
 
 // recentString is a string as a field line encoded it, with a prefix of n
@@ -83,12 +86,16 @@ type recentString struct {
 }
 
 const (
-	// recentStrings is how many strings a Decoder remembers, which is more
-	// than an ordinary request has that the static table does not cover.
-	recentStrings = 8
+	// recentStrings is how many places of a section a Decoder remembers,
+	// more than the literals a browser's request has: its path, its
+	// authority and some ten fields the static table has no value for, as
+	// HTTP/3 clients that leave QPACK's dynamic table alone send every one
+	// on every request.
+	recentStrings = 16
 	// maxRecentString bounds the encoded length of a string worth
-	// remembering: long ones are rarely the same twice.
-	maxRecentString = 128
+	// remembering, a browser's cookie and user agent among them, which
+	// bounds what a connection keeps to a few kilobytes.
+	maxRecentString = 256
 )
 
 // AppendFields decodes a field section as Decode does, appending its fields
@@ -110,6 +117,9 @@ func (d *Decoder) decode(block []byte, maxSize int, emit func(HeaderField) error
 	}
 	if _, rest, err = readInt(rest, 7); err != nil {
 		return err
+	}
+	if d != nil {
+		d.place = 0
 	}
 	size := 0
 	for len(rest) > 0 {
@@ -209,22 +219,20 @@ func appendInt(dst []byte, first byte, n uint8, v uint64) []byte {
 }
 
 // readString reads a string whose length has an n-bit prefix, with the
-// Huffman flag in the bit just above it, and remembers it for the next field
-// line that encodes it the same way.
+// Huffman flag in the bit just above it, and remembers it for the string in
+// the same place of the next section, if that encodes it the same way.
 func (d *Decoder) readString(b []byte, n uint8, maxLen int) (string, []byte, error) {
-	if d == nil {
+	if d == nil || d.place >= recentStrings {
 		return readString(b, n, maxLen)
 	}
+	r := &d.recent[d.place]
+	d.place++
 	// A remembered string is taken only where readString would have taken
 	// it, raw length limit and all.
 	if length, after, err := readInt(b, n); err == nil && length <= uint64(len(after)) && (maxLen <= 0 || length <= uint64(maxLen)) {
 		if end := len(b) - len(after) + int(length); end <= maxRecentString {
-			encoded := b[:end]
-			for i := range d.recent {
-				r := &d.recent[i]
-				if r.n == n && r.encoded == string(encoded) && (maxLen <= 0 || len(r.decoded) <= maxLen) {
-					return r.decoded, b[end:], nil
-				}
+			if r.n == n && r.encoded == string(b[:end]) && (maxLen <= 0 || len(r.decoded) <= maxLen) {
+				return r.decoded, b[end:], nil
 			}
 		}
 	}
@@ -233,8 +241,7 @@ func (d *Decoder) readString(b []byte, n uint8, maxLen int) (string, []byte, err
 		return s, rest, err
 	}
 	if encoded := b[:len(b)-len(rest)]; len(encoded) <= maxRecentString {
-		d.recent[d.next] = recentString{encoded: string(encoded), decoded: s, n: n}
-		d.next = (d.next + 1) % recentStrings
+		*r = recentString{encoded: string(encoded), decoded: s, n: n}
 	}
 	return s, rest, nil
 }

@@ -129,6 +129,58 @@ func TestDecoderRemembersStrings(t *testing.T) {
 	}
 }
 
+// A Decoder remembers a browser's request, whose literals outnumber what it
+// would remember were they not kept by their place, and whose cookie is
+// long: a request that repeats it costs no allocation, and one with another
+// path decodes the path alone anew, and keeps it.
+func TestDecoderRemembersABrowsersRequest(t *testing.T) {
+	fields := func(path string) []HeaderField {
+		return []HeaderField{
+			{":method", "GET"}, {":scheme", "https"}, {":authority", "www.example.com"}, {":path", path},
+			{"user-agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/129.0.0.0 Safari/537.36"},
+			{"accept", "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8"},
+			{"accept-language", "en-US,en;q=0.9,zh-CN;q=0.8"},
+			{"accept-encoding", "gzip, deflate, br, zstd"},
+			{"referer", "https://www.example.com/products/catalog?page=2"},
+			{"cookie", "session=" + strings.Repeat("s", 48) + "; cart=" + strings.Repeat("c", 32) + "; _ga=GA1.2.1418925463.1729700000; consent=all"},
+			{"sec-fetch-site", "same-origin"}, {"sec-fetch-mode", "navigate"}, {"sec-fetch-dest", "document"},
+			{"x-forwarded-proto", "https"},
+		}
+	}
+	first, second := encode(fields("/site/a/one.html")), encode(fields("/site/b/two.html"))
+	var d Decoder
+	got, err := d.AppendFields(nil, first, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	allocs := testing.AllocsPerRun(100, func() {
+		got, _ = d.AppendFields(got[:0], first, 0)
+	})
+	if allocs != 0 {
+		t.Fatalf("a browser's request seen before took %v allocations", allocs)
+	}
+	want := fields("/site/b/two.html")
+	if got, err = d.AppendFields(got[:0], second, 0); err != nil {
+		t.Fatal(err)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("field %d is %q, want %q", i, got[i], want[i])
+		}
+	}
+	allocs = testing.AllocsPerRun(100, func() {
+		block := first
+		if len(got) > 0 && got[3].Value == "/site/a/one.html" {
+			block = second
+		}
+		got, _ = d.AppendFields(got[:0], block, 0)
+	})
+	// The path's string, and its encoding kept for the next request.
+	if allocs > 2 {
+		t.Fatalf("a request with another path took %v allocations, want the path's alone", allocs)
+	}
+}
+
 // A field in the static table is sent as its index, the first one it has,
 // and a field whose name alone is there refers to the first entry with that
 // name; one marked never to be indexed only ever refers to the name.
