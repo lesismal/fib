@@ -4,11 +4,13 @@ import "math/bits"
 
 // bufPool recycles the buffers that hold queued messages and received
 // chunks, by power-of-two size class, so steady traffic allocates nothing.
-// It belongs to one association and needs no lock. Each class keeps up to
-// 512 KiB of buffers, and at least 32, which covers a sender that keeps
-// about that much buffered.
+// It belongs to one association and needs no lock. By default each class
+// keeps up to 512 KiB of buffers, and at least 32, which covers a sender
+// that keeps about that much buffered; Config.PoolBytes sets a strict bound
+// per class instead, under which a class of larger buffers keeps none.
 type bufPool struct {
-	classes [poolClasses][][]byte
+	classes  [poolClasses][][]byte
+	keepSize int
 }
 
 const (
@@ -46,7 +48,14 @@ func (p *bufPool) put(b []byte) {
 		return
 	}
 	c := poolClass(n)
-	if c < poolClasses && len(p.classes[c]) < max(poolKeep, poolKeepSize>>(c+poolMinShift)) {
+	if c >= poolClasses || p.keepSize < 0 {
+		return
+	}
+	limit := max(poolKeep, poolKeepSize>>(c+poolMinShift))
+	if p.keepSize > 0 {
+		limit = p.keepSize >> (c + poolMinShift)
+	}
+	if len(p.classes[c]) < limit {
 		p.classes[c] = append(p.classes[c], b[:0])
 	}
 }

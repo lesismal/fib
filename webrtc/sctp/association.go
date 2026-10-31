@@ -123,6 +123,17 @@ type Config struct {
 	// with it (RFC 9260 section 6.2), 200ms when zero.
 	SACKDelay time.Duration
 
+	// PoolBytes bounds the spare buffers the association keeps for queued
+	// and received messages, per power-of-two size class from 64 bytes to
+	// 512 KiB. Zero keeps up to 512 KiB a class, or 32 buffers where that
+	// is more, which lets a busy association send and receive without
+	// allocating but may hold megabytes after a burst of large messages;
+	// a positive value keeps at most that many bytes a class, and a
+	// negative one keeps none. A
+	// server with many mostly idle associations sets it low, trading an
+	// allocation per message for the memory each would otherwise hold.
+	PoolBytes int
+
 	// CookieSecret keys the HMAC of the state cookie. A random one is made
 	// when nil.
 	CookieSecret []byte
@@ -287,6 +298,7 @@ func NewAssociation(cfg Config) *Association {
 		rto:        cfg.RTOInitial,
 		out:        make([]byte, headerSize, cfg.MTU),
 		secret:     cfg.CookieSecret,
+		pool:       bufPool{keepSize: cfg.PoolBytes},
 	}
 	var r [16]byte
 	_, _ = rand.Read(r[:])
