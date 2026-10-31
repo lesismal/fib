@@ -3,6 +3,7 @@ package rtp
 import (
 	"bytes"
 	"errors"
+	"math"
 	"reflect"
 	"slices"
 	"testing"
@@ -387,5 +388,230 @@ func TestRawRTCPAndIsRTCP(t *testing.T) {
 	}
 	if !IsRTCP(b) || IsRTCP(unhex(t, chromePacket)) {
 		t.Fatal("IsRTCP")
+	}
+}
+
+// TestRTCPErrors checks the error each malformed packet is refused with,
+// parsed both as its own type and as part of a compound packet.
+func TestRTCPErrors(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		p    RTCP
+		wire string
+		err  error
+	}{
+		{"short header", &SenderReport{}, "80c8", ErrShortPacket},
+		{"version", &SenderReport{}, "40c80000", ErrVersion},
+		{"SR as RR", &SenderReport{}, "80c90001 00000001", ErrRTCPType},
+		{"SR reports past end", &SenderReport{}, "81c80006 00000001 00000000 00000000 00000000 00000000 00000000", ErrRTCPFormat},
+		{"RR as SR", &ReceiverReport{}, "80c80001 00000001", ErrRTCPType},
+		{"RR no SSRC", &ReceiverReport{}, "80c90000", ErrRTCPFormat},
+		{"SDES as BYE", &SourceDescription{}, "80cb0000", ErrRTCPType},
+		{"SDES chunk past end", &SourceDescription{}, "81ca0000", ErrRTCPFormat},
+		// The END item at offset 4 asks for three bytes of padding the
+		// packet's own padding has taken away.
+		{"SDES END padding past end", &SourceDescription{}, "a1ca0002 00000001 00000002", ErrRTCPFormat},
+		{"BYE as SDES", &Goodbye{}, "80ca0000", ErrRTCPType},
+		{"BYE sources past end", &Goodbye{}, "82cb0001 00000001", ErrRTCPFormat},
+		{"APP as BYE", &ApplicationDefined{}, "80cb0000", ErrRTCPType},
+		{"APP no name", &ApplicationDefined{}, "80cc0001 00000001", ErrRTCPFormat},
+		{"padding bit, no body", &PLI{}, "a1ce0000", ErrPadding},
+		{"PLI no media SSRC", &PLI{}, "81ce0001 00000001", ErrRTCPFormat},
+		{"NACK as TCC", &NACK{}, "8fcd0002 00000001 00000002", ErrRTCPType},
+		{"NACK partial pair", &NACK{}, "a1cd0003 00000001 00000002 00640001", ErrRTCPFormat},
+		{"FIR as PLI", &FIR{}, "81ce0002 00000001 00000002", ErrRTCPType},
+		{"FIR partial entry", &FIR{}, "84ce0003 00000001 00000000 00000002", ErrRTCPFormat},
+		{"REMB as FIR", &REMB{}, "84ce0002 00000001 00000000", ErrRTCPType},
+		{"TCC as NACK", &TransportCC{}, "81cd0002 00000001 00000002", ErrRTCPType},
+		{"TCC no base", &TransportCC{}, "8fcd0003 00000001 00000002 00050001", ErrRTCPFormat},
+		{"TCC reserved symbol in a vector", &TransportCC{}, "8fcd0005 00000001 00000002 00050001 00000102 f0000000", ErrRTCPFormat},
+		// The packet's padding cuts the large delta's second byte.
+		{"TCC large delta past end", &TransportCC{}, "afcd0005 00000001 00000002 00050001 00000102 40010002", ErrRTCPFormat},
+		{"raw short", &RawRTCP{}, "80", ErrShortPacket},
+		{"raw length", &RawRTCP{}, "80cf0002 00000000", ErrRTCPLength},
+	} {
+		b := unhex(t, tc.wire)
+		if err := tc.p.Unmarshal(b); !errors.Is(err, tc.err) {
+			t.Errorf("%s: %v, want %v", tc.name, err, tc.err)
+		}
+	}
+	// A compound packet stops at its first bad packet, returning those
+	// before it.
+	b := unhex(t, "80c90001 00000007 80c80001 00000001")
+	pkts, err := UnmarshalRTCP(b)
+	if !errors.Is(err, ErrRTCPFormat) || len(pkts) != 1 || pkts[0].(*ReceiverReport).SSRC != 7 {
+		t.Fatalf("%v %v", pkts, err)
+	}
+	if _, err := UnmarshalRTCP(unhex(t, "40c90000")); !errors.Is(err, ErrVersion) {
+		t.Fatal(err)
+	}
+}
+
+// TestRTCPAppendErrors checks what each type refuses to marshal, and that
+// AppendRTCP stops at the first such packet with what it appended before.
+func TestRTCPAppendErrors(t *testing.T) {
+	long := make([]byte, 256)
+	sdesItems := make([]SDESItem, 1100)
+	for i := range sdesItems {
+		sdesItems[i] = SDESItem{Type: SDESNote, Text: long[:255]}
+	}
+	for _, tc := range []struct {
+		name string
+		p    RTCP
+		err  error
+	}{
+		{"SR reports", &SenderReport{Reports: make([]ReceptionReport, 32)}, ErrRTCPTooMany},
+		{"SR extensions", &SenderReport{ProfileExtensions: []byte{1, 2, 3}}, ErrRTCPLength},
+		{"RR extensions", &ReceiverReport{ProfileExtensions: []byte{1}}, ErrRTCPLength},
+		{"SDES chunks", &SourceDescription{Chunks: make([]SDESChunk, 32)}, ErrRTCPTooMany},
+		{"SDES too long", &SourceDescription{Chunks: []SDESChunk{{Items: sdesItems}}}, ErrRTCPLength},
+		{"SDES END item", &SourceDescription{Chunks: []SDESChunk{{Items: []SDESItem{{Type: SDESEnd}}}}}, ErrRTCPFormat},
+		{"BYE sources", &Goodbye{Sources: make([]uint32, 32)}, ErrRTCPTooMany},
+		{"BYE reason", &Goodbye{Reason: long}, ErrRTCPItem},
+		{"APP subtype", &ApplicationDefined{SubType: 32}, ErrRTCPFormat},
+		{"APP data", &ApplicationDefined{Data: []byte{1, 2}}, ErrRTCPLength},
+		{"NACK pairs", &NACK{Pairs: make([]NACKPair, 0xffff)}, ErrRTCPTooMany},
+		{"FIR entries", &FIR{Entries: make([]FIREntry, 0x8000)}, ErrRTCPTooMany},
+		{"REMB SSRCs", &REMB{SSRCs: make([]uint32, 256)}, ErrRTCPTooMany},
+		{"TCC status", &TransportCC{Status: make([]uint8, 0x10000)}, ErrRTCPTooMany},
+		{"TCC symbol", &TransportCC{Status: []uint8{3}}, ErrRTCPFormat},
+		{"TCC missing delta", &TransportCC{Status: []uint8{TCCSmallDelta}}, ErrRTCPFormat},
+		{"TCC small delta too large", &TransportCC{Status: []uint8{TCCSmallDelta}, Deltas: []int16{256}}, ErrRTCPFormat},
+		{"TCC extra delta", &TransportCC{Status: []uint8{TCCSmallDelta}, Deltas: []int16{1, 2}}, ErrRTCPFormat},
+		{"raw body", &RawRTCP{Body: []byte{1}}, ErrRTCPLength},
+	} {
+		if b, err := tc.p.Append([]byte{9}); !errors.Is(err, tc.err) || !bytes.Equal(b, []byte{9}) {
+			t.Errorf("%s: %v, want %v, appended %d bytes", tc.name, err, tc.err, len(b)-1)
+		}
+	}
+	pli := &PLI{SenderSSRC: 1, MediaSSRC: 2}
+	b, err := AppendRTCP(nil, pli, &RawRTCP{Body: []byte{1}}, pli)
+	if !errors.Is(err, ErrRTCPLength) || len(b) != pli.MarshalSize() {
+		t.Fatalf("%d bytes, %v", len(b), err)
+	}
+}
+
+// TestRTCPEdgeValues round-trips what the sample packets leave out: a
+// padded unknown packet, a one-byte BYE reason, which takes padding, and a
+// REMB bitrate too large for 64 bits.
+func TestRTCPEdgeValues(t *testing.T) {
+	b := unhex(t, "a0cf0001 00000001")
+	var raw RawRTCP
+	if err := raw.Unmarshal(b); err != nil || !raw.Header.Padding || raw.MarshalSize() != len(b) {
+		t.Fatalf("%+v %v", raw, err)
+	}
+	if out, _ := raw.Append(nil); !bytes.Equal(out, b) {
+		t.Fatalf("%x", out)
+	}
+
+	bye := &Goodbye{Sources: []uint32{1}, Reason: []byte("x")}
+	b, _ = bye.Append(nil)
+	if !bytes.Equal(b, unhex(t, "81cb0002 00000001 01780000")) {
+		t.Fatalf("%x", b)
+	}
+	var got Goodbye
+	if err := got.Unmarshal(b); err != nil || string(got.Reason) != "x" {
+		t.Fatal(got, err)
+	}
+
+	// Mantissa 3 shifted by 63 overflows; the bitrate saturates.
+	var remb REMB
+	if err := remb.Unmarshal(unhex(t, "8fce0004 00000001 00000000 52454d42 00fc0003")); err != nil || remb.Bitrate != math.MaxUint64 {
+		t.Fatal(remb.Bitrate, err)
+	}
+	pkts, err := UnmarshalRTCP(unhex(t, "8fce0004 00000001 00000000 52454d42 00fc0003"))
+	if err != nil || len(pkts) != 1 {
+		t.Fatal(err)
+	}
+	if _, ok := pkts[0].(*REMB); !ok {
+		t.Fatalf("%T", pkts[0])
+	}
+}
+
+// TestFeedbackIterators stops the iterators early and checks that
+// duplicate sequence numbers fold into one NACK bit.
+func TestFeedbackIterators(t *testing.T) {
+	pair := NACKPair{PacketID: 10, LostPackets: 0b101}
+	var got []uint16
+	for seq := range pair.All {
+		got = append(got, seq)
+		break
+	}
+	for seq := range pair.All {
+		got = append(got, seq)
+		if len(got) == 3 {
+			break
+		}
+	}
+	if !slices.Equal(got, []uint16{10, 10, 11}) {
+		t.Fatal(got)
+	}
+	if pairs := AppendNACKPairs(nil, []uint16{5, 5, 6, 6}); !slices.Equal(pairs, []NACKPair{{5, 1}}) {
+		t.Fatal(pairs)
+	}
+	fb := TransportCC{BaseSeq: 7, Status: []uint8{TCCSmallDelta, TCCNotReceived}, Deltas: []int16{4}}
+	n := 0
+	for seq, at := range fb.All {
+		if seq != 7 || at != 4*TCCDeltaUnit {
+			t.Fatal(seq, at)
+		}
+		n++
+		break
+	}
+	if n != 1 {
+		t.Fatal(n)
+	}
+}
+
+// TestTransportCCRecorderGaps covers feedback with no arrivals, a gap of
+// lost packets long enough for a run length chunk, and arrivals too far
+// apart in sequence for one packet's 16-bit status count.
+func TestTransportCCRecorderGaps(t *testing.T) {
+	var r TransportCCRecorder
+	if r.Pending() {
+		t.Fatal("pending before any arrival")
+	}
+	if b, err := r.AppendFeedback([]byte{1}); err != nil || len(b) != 1 {
+		t.Fatal(b, err)
+	}
+	r.Record(0, 0)
+	r.Record(100, time.Millisecond)
+	if !r.Pending() {
+		t.Fatal("not pending")
+	}
+	b, err := r.AppendFeedback(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var fb TransportCC
+	if err := fb.Unmarshal(b); err != nil {
+		t.Fatal(err)
+	}
+	if len(fb.Status) != 101 || fb.Status[0] != TCCSmallDelta || fb.Status[50] != TCCNotReceived || fb.Status[100] != TCCSmallDelta {
+		t.Fatalf("%d symbols", len(fb.Status))
+	}
+	if r.Pending() {
+		t.Fatal("pending after feedback")
+	}
+	// Each step is under half the sequence space, so the unwrapper keeps
+	// counting up: 101, 30101 and 60101 apart, then 90101, past what one
+	// packet's status count reaches from the first.
+	r.MaxPacketSize = 1 << 20
+	for _, seq := range []uint16{101, 30101, 60101, uint16(90101 & 0xffff)} {
+		r.Record(seq, 2*time.Millisecond)
+	}
+	b, err = r.AppendFeedback(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pkts, err := UnmarshalRTCP(b)
+	if err != nil || len(pkts) != 2 {
+		t.Fatal(len(pkts), err)
+	}
+	if first := pkts[0].(*TransportCC); first.BaseSeq != 101 || len(first.Status) != 60001 {
+		t.Fatalf("first covers %d from %d", len(first.Status), first.BaseSeq)
+	}
+	if second := pkts[1].(*TransportCC); second.BaseSeq != uint16(90101&0xffff) || len(second.Status) != 1 {
+		t.Fatalf("second covers %d from %d", len(second.Status), second.BaseSeq)
 	}
 }

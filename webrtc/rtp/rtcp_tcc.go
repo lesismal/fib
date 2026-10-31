@@ -182,11 +182,10 @@ func (p *TransportCC) Append(dst []byte) ([]byte, error) {
 	if received != len(p.Deltas) {
 		return dst, ErrRTCPFormat
 	}
+	// At most 0xffff symbols, two bytes of delta each and a chunk for each
+	// seven, take some 150KB, well within what the length field counts.
 	fci := p.fciSize()
 	pad := (4 - fci%4) % 4
-	if (8+fci+pad)/4 > 0xffff {
-		return dst, ErrRTCPTooMany
-	}
 	start := len(dst)
 	dst = appendFeedbackHeader(dst, TypeRTPFB, FormatTCC, p.SenderSSRC, p.MediaSSRC, fci+pad)
 	if pad > 0 {

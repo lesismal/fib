@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/hex"
 	"errors"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -289,5 +290,106 @@ func BenchmarkPacketUnmarshal(b *testing.B) {
 			b.Fatal(err)
 		}
 		_ = p.GetExtension(5)
+	}
+}
+
+// TestExtensionEdges walks malformed and foreign extension blocks, and the
+// argument checks of SetExtension and DelExtension.
+func TestExtensionEdges(t *testing.T) {
+	// In the one-byte form, id 15 ends the block whatever follows.
+	h := Header{Extension: true, ExtensionProfile: ExtensionProfileOneByte, ExtensionData: []byte{0x10, 0xaa, 0xf0, 0x20}}
+	var ids []uint8
+	for id := range h.Extensions() {
+		ids = append(ids, id)
+	}
+	if !slices.Equal(ids, []uint8{1}) || h.GetExtension(2) != nil {
+		t.Fatalf("ids %v", ids)
+	}
+	// Two-byte elements cut short, after padding or by their length.
+	for _, data := range [][]byte{{0, 0, 0, 5}, {1, 9, 0, 0}} {
+		h := Header{Extension: true, ExtensionProfile: ExtensionProfileTwoByte, ExtensionData: data}
+		if h.GetExtension(data[0]) != nil || h.GetExtension(5) != nil {
+			t.Fatalf("%x: element found", data)
+		}
+		if err := h.SetExtension(2, []byte{1}); !errors.Is(err, ErrExtension) {
+			t.Fatalf("%x: %v", data, err)
+		}
+	}
+	h = Header{Extension: true, ExtensionProfile: 0x1234, ExtensionData: []byte{0x10, 1, 0, 0}}
+	for range h.Extensions() {
+		t.Fatal("element of a foreign profile yielded")
+	}
+	var none Header
+	if none.GetExtension(1) != nil || h.GetExtension(0) != nil {
+		t.Fatal("element found")
+	}
+	if err := none.SetExtension(1, make([]byte, 256)); !errors.Is(err, ErrExtensionSize) {
+		t.Fatal(err)
+	}
+	if err := none.DelExtension(1); err != nil || none.Extension {
+		t.Fatal(err)
+	}
+	if err := h.DelExtension(0); err != nil || len(h.ExtensionData) != 4 {
+		t.Fatal(err)
+	}
+	// A full one-byte block that must turn two-byte, a byte more for each
+	// element, no longer fits the 16-bit length.
+	full := bytes.Repeat([]byte{0x10, 0xaa}, 0xffff*2)
+	h = Header{Extension: true, ExtensionProfile: ExtensionProfileOneByte, ExtensionData: full}
+	if err := h.SetExtension(15, []byte{1}); !errors.Is(err, ErrExtensionLength) {
+		t.Fatal(err)
+	}
+	if len(h.ExtensionData) != len(full) || h.ExtensionProfile != ExtensionProfileOneByte {
+		t.Fatal("block changed")
+	}
+}
+
+// TestPacketAppendError checks that a header Append refuses fails the
+// packet's, which leaves the header's own padding bit alone.
+func TestPacketAppendError(t *testing.T) {
+	p := Packet{Header: Header{PayloadType: 128, Padding: true}, Payload: []byte{1}, PaddingSize: 0}
+	if b, err := p.Append([]byte{7}); !errors.Is(err, ErrPayloadType) || len(b) != 1 {
+		t.Fatal(b, err)
+	}
+	if !p.Header.Padding {
+		t.Fatal("padding bit lost")
+	}
+	if _, err := ParseTransportCCSeq([]byte{1}); !errors.Is(err, ErrShortPacket) {
+		t.Fatal(err)
+	}
+	if seq, err := ParseTransportCCSeq(AppendTransportCCSeq(nil, 0xbeef)); err != nil || seq != 0xbeef {
+		t.Fatal(seq, err)
+	}
+	if _, _, err := ParseAudioLevel(nil); !errors.Is(err, ErrShortPacket) {
+		t.Fatal(err)
+	}
+}
+
+// TestHeaderLen finds the payload's offset as Unmarshal does, and refuses
+// the headers Unmarshal refuses.
+func TestHeaderLen(t *testing.T) {
+	good := unhex(t, chromePacket)
+	var h Header
+	want, err := h.Unmarshal(good)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n, err := HeaderLen(good); err != nil || n != want {
+		t.Fatalf("%d %v, want %d", n, err, want)
+	}
+	for _, tc := range []struct {
+		name string
+		b    []byte
+		err  error
+	}{
+		{"short", good[:11], ErrShortPacket},
+		{"version", append([]byte{0x40}, good[1:]...), ErrVersion},
+		{"extension header cut", good[:14], ErrShortPacket},
+		{"extension beyond end", good[:20], ErrShortPacket},
+		{"csrc beyond end", append([]byte{0x8f}, good[1:12]...), ErrShortPacket},
+	} {
+		if _, err := HeaderLen(tc.b); !errors.Is(err, tc.err) {
+			t.Errorf("%s: %v, want %v", tc.name, err, tc.err)
+		}
 	}
 }
