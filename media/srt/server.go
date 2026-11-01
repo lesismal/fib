@@ -54,6 +54,14 @@ type ServerConfig struct {
 	// waiting that long for it (hub.SubscribeOptions.Wait); without it, a
 	// player of a missing stream is rejected with RejectNotFound.
 	PlayWait time.Duration
+	// PlayGOPCache starts players with the hub's cached GOP rather than
+	// at the next keyframe. It is off by default because the GOP goes out
+	// at once: a 4 Mbit/s stream's megabyte overflows a receiver's UDP
+	// buffer (Linux's 208 KiB by default) faster than NAKs can bring it
+	// back within the latency, all of it stamped with the time it was
+	// sent, and the player loses its start. Turn it on for small streams
+	// or receivers with large buffers and latencies.
+	PlayGOPCache bool
 	// Muxer and Demuxer configure the MPEG-TS of players and publishers;
 	// their callbacks are the server's.
 	Muxer   mpegts.MuxerConfig
@@ -264,8 +272,9 @@ func (s *Server) accept(req *Request) (Config, error) {
 			sess.pub = pub
 		case ModeRequest:
 			sub, err := s.cfg.Hub.Subscribe(id.Resource, sess.sink(), hub.SubscribeOptions{
-				Info: hub.SubscribeInfo{Protocol: "srt", Remote: req.Remote, Query: id.Query},
-				Wait: s.cfg.PlayWait,
+				Info:       hub.SubscribeInfo{Protocol: "srt", Remote: req.Remote, Query: id.Query},
+				Wait:       s.cfg.PlayWait,
+				NoGOPCache: !s.cfg.PlayGOPCache,
 			})
 			switch {
 			case errors.Is(err, hub.ErrNotFound):

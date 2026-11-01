@@ -189,7 +189,7 @@ func TestPublishPlay(t *testing.T) {
 				t.Fatal(err)
 			}
 			waitFor(t, "the player", func() bool { return len(srv.Sessions()) == 2 })
-			// The player starts from the server's GOP cache; then more.
+			// The player starts at the next keyframe (no PlayGOPCache).
 			for range 3 {
 				for _, p := range pkts {
 					q := *p
