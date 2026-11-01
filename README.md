@@ -5,8 +5,9 @@
 [English](README.md) | [简体中文](README.zh-CN.md)
 
 fib is an event-driven networking library for Go. It covers TCP, UDP and Unix sockets, TLS,
-HTTP/1.x, HTTP/2, HTTP/3 over QUIC, WebSocket and WebRTC. A few event loops wait for I/O readiness,
-and a shared worker pool does the work, so a connection costs no goroutine while it is idle.
+HTTP/1.x, HTTP/2, HTTP/3 over QUIC, WebSocket and WebRTC, and live streaming media over RTMP, RTSP,
+SRT, HTTP-FLV, HLS and WHIP/WHEP. A few event loops wait for I/O readiness, and a shared worker pool
+does the work, so a connection costs no goroutine while it is idle.
 HTTP handlers take the standard `*http.Request` and answer through an `http.ResponseWriter`,
 which means a `net/http` handler, `http.ServeMux` or `http.FileServer` runs on fib unchanged.
 
@@ -49,6 +50,7 @@ uSockets, workflow, axum, h2, quiche and rustls.
 | SOCKS5 / SOCKS4 / 4a | ✓ | ✓ (async dial) | CONNECT, BIND and UDP ASSOCIATE, username/password; the HTTP, WebSocket and TLS clients dial through it |
 | gRPC | ✓ h2 and h2c | ✓ | unary and streaming both ways, metadata, deadlines, interceptors, gzip; works with protoc-gen-go-grpc code and talks to grpc-go |
 | WebRTC | ✓ | ✓ | PeerConnections sharing one UDP port: ICE (lite and full, trickle), DTLS 1.2-SRTP, data channels, RTP forwarding for SFUs, and a TURN client and server, all written from scratch; talks to browsers and pion ([details](docs/webrtc.md)) |
+| Streaming media | ✓ | ✓ | RTMP/RTMPS (Enhanced RTMP), RTSP over TCP and UDP, SRT, HTTP-FLV and WebSocket-FLV, HLS with fMP4 or TS segments and LL-HLS, WHIP and WHEP, joined by a hub that remuxes between them without transcoding; pull and push relays for each; checked against ffmpeg and Chromium ([details](docs/media.md)) |
 
 ### Engine
 
@@ -507,6 +509,7 @@ two, and connections are spread over them by fd. A poller parks in Go's own netp
 | HTTP/3 | reads UDP in batches, sorts datagrams by peer | QUIC packets, TLS 1.3, QPACK | `<Name>-streams` (handlers) |
 | WebSocket | — | handshake, frames, `OnMessage`, deflate | over HTTP/2 or HTTP/3: `Upgrade` and `OnOpen` on streams |
 | WebRTC | reads UDP, sorts datagrams by peer | the Mux routes by sender; ICE, DTLS, SRTP and SCTP under a mutex per PeerConnection, then its callbacks | — (one timer per PeerConnection) |
+| Streaming media | reads UDP for SRT, RTSP and WHIP/WHEP | ingest parsing, then the hub's fan-out: every subscriber muxes and queues its writes on the publisher's worker | — (one timer per SRT session) |
 | arpc | — | framing, responses, handlers registered sync | `<Name>-streams` (async handlers, the default) |
 | gRPC | — | HTTP/2 framing, HPACK, flow control | `<Name>-streams` (every call) |
 
@@ -763,6 +766,7 @@ Run it yourself with `cd taskpool/benchmark && ./bench.sh` (or `bench.ps1` on Wi
 | [`arpc`](arpc) | [lesismal/arpc](https://github.com/lesismal/arpc) server and client, wire compatible |
 | [`grpc`](grpc) | gRPC server and client over an HTTP/2 transport of its own, compatible with grpc-go and its generated code |
 | [`webrtc`](webrtc) | WebRTC PeerConnection and a UDP Mux shared by many; `stun`, `ice`, `turn` (and `turnserver`), `sdp`, `sctp`, `srtp` and `rtp` underneath, DTLS 1.2 in `tls` |
+| [`media`](media) | Live streaming: `rtmp`, `rtsp`, `srt`, `httpflv`, `hls` and `rtc` (WHIP/WHEP) on the `hub`; `av`, `flv`, `amf`, `mpegts`, `fmp4`, `rtpcodec` and `codec/{h264,h265,aac,opus}` underneath |
 | [`middleware`](middleware) | Middleware chain and the common middleware |
 | [`socks`](socks) | SOCKS5, SOCKS4 and SOCKS4a proxy server and non-blocking dialer; `http.ConnectProxy` is the HTTP proxy |
 | [`mux`](mux) | Several protocols on one port, told apart by the first bytes a client sends |
@@ -782,6 +786,8 @@ Run it yourself with `cd taskpool/benchmark && ./bench.sh` (or `bench.ps1` on Wi
   the limitations, and the conformance tests
 - [WebRTC](docs/webrtc.md): the layers, the shared Mux and the callback model, a server and a client,
   data channels, media forwarding, TURN, the limits, and the interop with pion, OpenSSL and Chromium
+- [Streaming media](docs/media.md): RTMP, RTSP, SRT, HTTP-FLV, HLS and WHIP/WHEP on one hub, the
+  codecs each carries, a server for every protocol, relays, the limits, and the interop with ffmpeg and Chromium
 - [Roadmap](docs/roadmap.md): what is planned but not done, and what is deliberately not done, with the reason, the rough cost and when to reconsider each
 - [Load testing](docs/loadtest.md): the `benchmark/loadtest` campaign, its results and the
   memory cost of whole responses to slow readers

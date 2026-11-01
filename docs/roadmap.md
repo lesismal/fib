@@ -1,9 +1,9 @@
 # fib roadmap: what is planned but not done, and what is deliberately not done
 
-Each protocol document (`http1*.md`, `http2*.md`, `http3*.md`, `webrtc*.md`) has its own "Intentionally not implemented" and "Planned improvements" sections. This page gathers them, plus the trade-offs recorded in `guide.zh-CN.md`, so that the whole picture is in one place: for every item, **why** it is not done, roughly **what it would cost**, and **when it would be worth reconsidering**.
+Each protocol document (`http1*.md`, `http2*.md`, `http3*.md`, `webrtc*.md`, `media*.md`) has its own "Intentionally not implemented" and "Planned improvements" sections. This page gathers them, plus the trade-offs recorded in `guide.zh-CN.md`, so that the whole picture is in one place: for every item, **why** it is not done, roughly **what it would cost**, and **when it would be worth reconsidering**.
 
 - The cost column is an order of magnitude: S (a day or two), M (a few days), L (a week or more, or it needs test infrastructure that does not exist yet).
-- "Deliberately not done" is a conclusion, not an oversight. When the requirement changes, re-evaluate it as described in section 7.
+- "Deliberately not done" is a conclusion, not an oversight. When the requirement changes, re-evaluate it as described in section 8.
 - The authoritative detail stays in the protocol documents; this page indexes it and records the reason, citing the source at the end of each row.
 
 ## 1. QUIC and HTTP/3
@@ -67,7 +67,21 @@ Each protocol document (`http1*.md`, `http2*.md`, `http3*.md`, `webrtc*.md`) has
 | Provisional answers and rollback | Deliberately not done | Glare handling belongs to the signaling; neither WHIP nor WHEP uses them | S | An application negotiates from both sides at once |
 | Interop tests in CI | Planned | pion, OpenSSL and Chromium interop ran out of tree; CI runs fib against fib and the RFC vectors | M | Before declaring the API stable |
 
-## 6. Testing and infrastructure
+## 6. Streaming media
+
+| Item | Status | Why | Cost | Reconsider when |
+| --- | --- | --- | --- | --- |
+| Transcoding (AAC to Opus for WHEP, renditions for HLS) | Deliberately not done | It needs audio and video decoders and encoders, which means cgo or a dependency, and CPU per stream that a remuxing server does not spend; the hub carries what publishers send and each egress leaves out what it cannot carry | L | Never in fib itself: an external transcoder subscribes and republishes into the hub |
+| HTTP-FLV pull client | Planned | It needs a fib/http client that streams response bodies into `flv.Demuxer`; `rtmp.Pull` covers relaying from origins that speak RTMP | M | Relaying from origins or CDNs that offer only HTTP-FLV |
+| RTSP over TLS, over HTTP tunnels, RTSP 2.0, multicast | Deliberately not done | Cameras and players speak plain RTSP 1.0 over TCP or UDP unicast | M | Deployments that require rtsps or tunnelling through HTTP proxies |
+| SRT rendezvous, file mode, AES-GCM, FEC, bonding | Deliberately not done | Live mode with AES-CTR is what ffmpeg, OBS and encoders use for ingest and distribution | L | An encoder or network that needs one of them |
+| WHIP/WHEP ICE restart, simulcast layers, A/V sync from sender reports | Known limit | ICE restart is answered 422, as RFC 9725 asks; only a section's first simulcast layer is received; WHIP times packets by arrival, in step to within the network's jitter | M | Mobile publishers that change networks, or SFU-style layer selection |
+| AV1 over RTP (RTSP, WHEP) | Known limit | rtpcodec has no AV1 payload format; AV1 travels over Enhanced RTMP, HTTP-FLV and HLS fMP4 | M | AV1 publishers whose viewers use WebRTC or RTSP |
+| Recording, DVR and VOD | Deliberately not done | Every stream is live; a recorder is a hub subscriber the application writes (fmp4 and mpegts mux to files as well as to segments) | M | Recording becomes a common request |
+| HLS delta playlists, rendition reports, PROGRAM-DATE-TIME, encryption | Deliberately not done | One variant per stream, no transcoding, and players play without them | M | Long playlists where delta updates save bandwidth, or DRM |
+| Interop tests in CI | Planned | ffmpeg and Chromium interop ran out of tree (the in-repo tests run without ffmpeg); CI runs fib against fib and captured fixtures | M | Before declaring the API stable |
+
+## 7. Testing and infrastructure
 
 | Item | Status | Why | Cost | Reconsider when |
 | --- | --- | --- | --- | --- |
@@ -78,13 +92,13 @@ Each protocol document (`http1*.md`, `http2*.md`, `http3*.md`, `webrtc*.md`) has
 | The `arpc` reconnect test's ephemeral-port race | Known limit | `TestReconnectGivesUp` relies on the server's port staying closed during the retry window; another process rebinding it could confuse the test, which 6600+ runs have not shown | S | On a false failure: use a fixed port or inject connection refusal |
 | HTTP/3 whole responses with a trailer cost one extra list allocation | Known cost | The send buffer inlines two pieces; a third slot would cost ~56 bytes on every stream, judged not worth it | S | Trailers become the norm |
 
-## 7. How to re-evaluate an item
+## 8. How to re-evaluate an item
 
 1. Measure first: is there evidence that it is a bottleneck now (pprof, the load campaign, real traffic)? The method in `docs/loadtest*.md` applies.
 2. Weigh the cost column: S and M items can be scheduled directly; L items (BBR, WebTransport, active migration, assembly) should wait until there is a way to validate them.
 3. After doing one, delete its row here and record the reasoning in the commit message and the protocol document; this page keeps no history.
 
-## 8. Where each item is recorded
+## 9. Where each item is recorded
 
 | Content | Chinese | English |
 | --- | --- | --- |
@@ -92,6 +106,7 @@ Each protocol document (`http1*.md`, `http2*.md`, `http3*.md`, `webrtc*.md`) has
 | HTTP/2 limits, intentional omissions, planned work | `docs/http2.zh-CN.md`, "当前限制", "有意没有实现的功能", "待优化项" | `docs/http2.md`, "Current limitations", "Intentionally not implemented", "Planned improvements" |
 | HTTP/3 limits, intentional omissions, planned work | `docs/http3.zh-CN.md`, "当前限制", "有意没有实现的功能", "待优化项" | `docs/http3.md`, "Current limitations", "Intentionally not implemented", "Planned improvements" |
 | WebRTC limits and intentional omissions | `docs/webrtc.zh-CN.md`, "配置与限制", "有意没有实现的功能" | `docs/webrtc.md`, "Configuration and limits", "Intentionally not implemented" |
+| Streaming media limits and intentional omissions | `docs/media.zh-CN.md`, "配置与限制", "有意没有实现的功能" | `docs/media.md`, "Configuration and limits", "Intentionally not implemented" |
 | Engine, TLS and WebSocket trade-offs | `docs/guide.zh-CN.md`, the relevant sections | The same (the guide is Chinese only) |
 | Load-test method and conclusions | `docs/loadtest.zh-CN.md` | `docs/loadtest.md` |
 | Per-case interop results | `http3/interoprunner/README.md` | The same |

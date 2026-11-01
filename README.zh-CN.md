@@ -5,7 +5,8 @@
 [English](README.md) | [简体中文](README.zh-CN.md)
 
 fib 是一个事件驱动的 Go 网络库，支持 TCP、UDP、Unix socket、TLS、HTTP/1.x、HTTP/2、基于 QUIC 的
-HTTP/3、WebSocket 和 WebRTC。少量事件循环负责等待 I/O 就绪，具体工作交给共享的 worker 协程池，所以连接
+HTTP/3、WebSocket 和 WebRTC，以及基于 RTMP、RTSP、SRT、HTTP-FLV、HLS 和 WHIP/WHEP 的直播流媒体。
+少量事件循环负责等待 I/O 就绪，具体工作交给共享的 worker 协程池，所以连接
 不占用 goroutine，空闲连接几乎没有开销。HTTP handler 接收标准库的 `*http.Request`，通过
 `http.ResponseWriter` 回写，因此 `net/http` 的 handler、`http.ServeMux`、`http.FileServer` 不用改动
 就能跑在 fib 上。
@@ -48,6 +49,7 @@ HTTP/3、WebSocket 和 WebRTC。少量事件循环负责等待 I/O 就绪，具�
 | SOCKS5 / SOCKS4 / 4a | ✓ | ✓（异步拨号） | CONNECT、BIND 与 UDP ASSOCIATE，用户名/密码认证；HTTP、WebSocket 与 TLS 客户端可经它拨号 |
 | gRPC | ✓ h2 和 h2c | ✓ | unary 与双向 streaming、metadata、deadline、拦截器、gzip；可直接用 protoc-gen-go-grpc 生成的代码，与 grpc-go 互通 |
 | WebRTC | ✓ | ✓ | 多个 PeerConnection 共用一个 UDP 端口：ICE（lite 与 full、trickle）、DTLS 1.2-SRTP、data channel、供 SFU 使用的 RTP 转发、TURN 客户端与服务端，全部自行实现；可与浏览器和 pion 互通（[详见](docs/webrtc.zh-CN.md)） |
+| 流媒体 | ✓ | ✓ | RTMP/RTMPS（Enhanced RTMP）、TCP 与 UDP 的 RTSP、SRT、HTTP-FLV 与 WebSocket-FLV、fMP4 或 TS 分片的 HLS 及 LL-HLS、WHIP 与 WHEP，由一个 hub 在它们之间转封装、不转码；每种协议都有拉流转发和转推；与 ffmpeg 和 Chromium 互通验证（[详见](docs/media.zh-CN.md)） |
 
 ### 引擎
 
@@ -475,6 +477,7 @@ poller 数量（`Config.IOPollers`、`IOPollerCount`）取决于 CPU 数：4 核
 | HTTP/3 | 批量读 UDP、按对端分拣数据报 | QUIC 包、TLS 1.3、QPACK | `<Name>-streams`（handler） |
 | WebSocket | — | 握手、帧、`OnMessage`、deflate | 经 HTTP/2 或 HTTP/3 时：`Upgrade` 和 `OnOpen` 在 streams 池 |
 | WebRTC | 读 UDP、按对端分拣数据报 | Mux 按发送方路由；ICE、DTLS、SRTP、SCTP 在每个 PeerConnection 的锁下执行，之后执行它的回调 | —（每个 PeerConnection 一个定时器） |
+| 流媒体 | 为 SRT、RTSP 和 WHIP/WHEP 读 UDP | 接入解析，然后是 hub 的分发：每个订阅者在发布者的 worker 上复用并排队写出 | —（每个 SRT 会话一个定时器） |
 | arpc | — | 拆包、响应、注册为同步的 handler | `<Name>-streams`（异步 handler，默认） |
 | gRPC | — | HTTP/2 分帧、HPACK、流控 | `<Name>-streams`（所有调用） |
 
@@ -710,6 +713,7 @@ CI 每次 push 都在 Linux、macOS、Windows 上运行 [`taskpool/benchmark`](t
 | [`arpc`](arpc) | [lesismal/arpc](https://github.com/lesismal/arpc) 服务端和客户端，协议兼容 |
 | [`grpc`](grpc) | gRPC 服务端和客户端，自带 HTTP/2 传输层，与 grpc-go 及其生成代码兼容 |
 | [`webrtc`](webrtc) | WebRTC PeerConnection，以及供多个 PeerConnection 共用的 UDP Mux；其下是 `stun`、`ice`、`turn`（及 `turnserver`）、`sdp`、`sctp`、`srtp`、`rtp`，DTLS 1.2 在 `tls` 中 |
+| [`media`](media) | 直播流媒体：`hub` 之上的 `rtmp`、`rtsp`、`srt`、`httpflv`、`hls` 和 `rtc`（WHIP/WHEP）；其下是 `av`、`flv`、`amf`、`mpegts`、`fmp4`、`rtpcodec` 和 `codec/{h264,h265,aac,opus}` |
 | [`middleware`](middleware) | 中间件链和常用中间件 |
 | [`socks`](socks) | SOCKS5、SOCKS4 与 SOCKS4a 代理服务端及非阻塞拨号器；HTTP 代理见 `http.ConnectProxy` |
 | [`mux`](mux) | 按客户端最先发送的字节识别协议，多种协议共用一个端口 |
@@ -728,6 +732,8 @@ CI 每次 push 都在 Linux、macOS、Windows 上运行 [`taskpool/benchmark`](t
   支持范围、限制和一致性测试
 - [WebRTC](docs/webrtc.zh-CN.md)：分层、共用的 Mux 与回调模型、服务端与客户端、data channel、媒体转发、
   TURN、各项限制，以及与 pion、OpenSSL、Chromium 的互通验证
+- [流媒体](docs/media.zh-CN.md)：一个 hub 上的 RTMP、RTSP、SRT、HTTP-FLV、HLS 与 WHIP/WHEP，各协议承载的编码，
+  跑全部协议的服务端、转发、各项限制，以及与 ffmpeg、Chromium 的互通验证
 - [路线图](docs/roadmap.zh-CN.md)：计划中但未做、以及有意不做的项，各带原因、成本量级和重新评估的条件
 - [压测](docs/loadtest.zh-CN.md)：`benchmark/loadtest` 压测、结果，以及整体响应发给慢客户端时的内存代价
 
