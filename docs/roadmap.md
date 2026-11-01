@@ -33,7 +33,7 @@ Each protocol document (`http1*.md`, `http2*.md`, `http3*.md`, `webrtc*.md`, `me
 | 1xx interim responses to HTTP/1.0 requests | Deliberately not done | HTTP/1.0 clients do not know 1xx; `WriteInterim` returns `http.ErrNotSupported` | — | Never |
 | Pushing a pushed request | Deliberately not done | PUSH_PROMISE may only be sent on a client-initiated stream | — | Never |
 | Recycling streams whose body streams to the handler | Planned | Their `feed` callbacks can outlive the response, so safe reuse needs an extra feed-lifetime reference; the risk outweighs the payoff, one stream allocation | M–H | Streamed request bodies become the common case and allocations show up in profiles |
-| Vectored send for multi-frame bodies | Planned | It needs the protocol layer to hand several buffers to `Layer` at once. pprof puts the h2 send path at the syscall (44.7% `Syscall6`) with memmove at 2.5%, so the ceiling is a few percent; the second copy of a one-frame body is already gone over h2c | M | Copies on the send path climb into the profile's top rows |
+| Vectored send of multi-frame bodies over TLS | Planned | Done for h2c (bodies over 4 KB go out beside their frame headers: 64 KB–4 MB responses 24–46% faster). Over TLS the layer seals each send into records of its own, so a header and payload sent apart would cost a record per frame; it needs an N-part seal in the `Layer` interface, and AES-GCM, not the copy, dominates that path | M | TLS send throughput becomes copy-bound |
 | Client-side 0-RTT | Planned | HTTP/2's framing depends on ALPN, which is only known after the handshake. The server side is done (`Config.EarlyData`, `Early-Data: 1`, 425 Too Early) | M | The TLS layer can know ALPN in advance (for example, offering only h2) |
 
 ## 3. HTTP/1.x

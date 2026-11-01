@@ -33,7 +33,7 @@
 | HTTP/1.0 请求的 1xx 中间响应 | 有意不做 | HTTP/1.0 客户端不认识 1xx，`WriteInterim` 返回 `http.ErrNotSupported` | — | 不重估 |
 | 在被推送的请求上再次 push | 有意不做 | 协议规定 PUSH_PROMISE 只能在客户端发起的 stream 上发送 | — | 不重估 |
 | body 流式交付的 stream 复用 | 计划中未做 | 它的 `feed` 回调可能在响应结束之后发生，安全复用需要额外一层 feed 生命周期引用，风险大于收益（一次 stream 分配） | M–H | 流式请求成为主流、分配成为瓶颈 |
-| 多帧 body 的分散写（vectored send） | 计划中未做 | 需要协议层把多个缓冲区直接交给 `Layer`。h2 侧 pprof 显示发送路径系统调用打满（`Syscall6` 44.7%）、memmove 只占 2.5%，上限只有几个百分点；单帧 body 的第二次拷贝已在 h2c 上去掉 | M | 发送侧拷贝出现在 pprof 前排时 |
+| TLS 上多帧 body 的分散写 | 计划中未做 | h2c 已完成（超过 4 KB 的 body 与帧头一起分散写出，64 KB–4 MB 的响应快 24–46%）。TLS 层把每次发送单独封成 record，帧头和载荷分开发送会让每帧多一个 record；需要 `Layer` 接口支持多段封装，而且这条路径的瓶颈是 AES-GCM 而不是拷贝 | M | TLS 发送吞吐受拷贝限制时 |
 | 客户端 0-RTT | 计划中未做 | HTTP/2 的帧格式要等 ALPN，握手完成前不知道用哪个协议。服务端方向的 0-RTT 已实现（`Config.EarlyData`、`Early-Data: 1`、425） | M | TLS 层能提前确定 ALPN（例如只提供 h2）时 |
 
 ## 3. HTTP/1.x
