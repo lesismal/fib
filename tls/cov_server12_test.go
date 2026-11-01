@@ -497,6 +497,7 @@ func TestCovS12SessionPeer(t *testing.T) {
 		{"a root no longer trusted", stdtls.RequireAndVerifyClientCert, [][]byte{leaf}, chain, untrusted, false, false},
 		{"a chain the ticket kept that does not parse", stdtls.RequireAndVerifyClientCert, [][]byte{leaf}, [][][]byte{{leaf, {3}}}, nil, true, true},
 		{"no longer verified", stdtls.RequestClientCert, [][]byte{leaf}, chain, nil, true, false},
+		{"verified with what the client sent beside its own", stdtls.RequireAndVerifyClientCert, [][]byte{leaf, ca.cert.Raw}, chain, nil, true, true},
 	} {
 		config := &stdtls.Config{ClientAuth: tc.auth, ClientCAs: ca.pool}
 		if tc.config != nil {
@@ -513,7 +514,7 @@ func TestCovS12SessionPeer(t *testing.T) {
 		if !ok {
 			continue
 		}
-		if len(certs) != 1 {
+		if len(certs) != len(tc.raw) {
 			t.Errorf("%s: %d certificates", tc.name, len(certs))
 		}
 		if !tc.chain && chains != nil {
