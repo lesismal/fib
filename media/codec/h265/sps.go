@@ -78,6 +78,12 @@ type SPS struct {
 	Width, Height  int
 	BitDepthLuma   uint8
 	BitDepthChroma uint8
+	// MaxNumReorderPics is sps_max_num_reorder_pics of the highest
+	// sub-layer: how many pictures may precede one in decode order and
+	// follow it in output order, which a depacketizer needs to recover
+	// decode times from presentation times. It is -1 when the SPS is cut
+	// short before it.
+	MaxNumReorderPics int
 }
 
 // Unmarshal parses the SPS NAL unit nalu, header included. It keeps
@@ -134,6 +140,21 @@ func (s *SPS) Unmarshal(nalu []byte) error {
 		return ErrSPS
 	}
 	s.Width, s.Height = int(w-cw), int(h-ch)
+	s.MaxNumReorderPics = -1
+	r.UE() // log2_max_pic_order_cnt_lsb_minus4
+	first := sub
+	if r.Flag() { // sps_sub_layer_ordering_info_present_flag
+		first = 0
+	}
+	reorder := uint32(0)
+	for i := first; i <= sub; i++ {
+		r.UE() // sps_max_dec_pic_buffering_minus1
+		reorder = r.UE()
+		r.UE() // sps_max_latency_increase_plus1
+	}
+	if r.Err() == nil && reorder <= 16 {
+		s.MaxNumReorderPics = int(reorder)
+	}
 	return nil
 }
 

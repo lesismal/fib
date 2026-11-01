@@ -1,0 +1,10 @@
+v=0
+o=- 0 0 IN IP4 127.0.0.1
+s=No Name
+c=IN IP4 127.0.0.1
+t=0 0
+a=tool:libavformat LIBAVFORMAT_VERSION
+m=audio 5004 RTP/AVP 97
+b=AS:64
+a=rtpmap:97 MP4A-LATM/44100/1
+a=fmtp:97 profile-level-id=41;cpresent=0;config=400024103fc0

@@ -172,6 +172,10 @@ type spsSpec struct {
 	conf       []uint32
 	depth      uint32
 	id         uint32
+	// reorder, when not nil, writes the sub-layer ordering info with
+	// these sps_max_num_reorder_pics, one per sub-layer when there is more
+	// than one value and for the highest only otherwise.
+	reorder []uint32
 }
 
 func (p spsSpec) build(typ NALUType) []byte {
@@ -219,8 +223,41 @@ func (p spsSpec) build(typ NALUType) []byte {
 	}
 	w.UE(p.depth)
 	w.UE(p.depth)
+	if p.reorder != nil {
+		w.UE(4)
+		w.Flag(len(p.reorder) > 1)
+		for _, n := range p.reorder {
+			w.UE(n + 1)
+			w.UE(n)
+			w.UE(0)
+		}
+	}
 	w.Bits(1, 1)
 	return h264.AddEmulationPrevention([]byte{byte(typ) << 1, 1}, w.Bytes())
+}
+
+func TestSPSReorder(t *testing.T) {
+	for _, tc := range []struct {
+		spec spsSpec
+		want int
+	}{
+		{spsSpec{chroma: 1, w: 64, h: 64}, -1},
+		{spsSpec{chroma: 1, w: 64, h: 64, reorder: []uint32{2}}, 2},
+		{spsSpec{sub: 2, subProfile: make([]bool, 2), chroma: 1, w: 64, h: 64, reorder: []uint32{0, 1, 3}}, 3},
+		{spsSpec{chroma: 1, w: 64, h: 64, reorder: []uint32{17}}, -1},
+	} {
+		var s SPS
+		if err := s.Unmarshal(tc.spec.build(NALSPS)); err != nil || s.MaxNumReorderPics != tc.want {
+			t.Errorf("%+v: %v reorder %d, want %d", tc.spec, err, s.MaxNumReorderPics, tc.want)
+		}
+	}
+	for _, f := range fixtures {
+		_, sps, _ := parameterSets(t, f.name)
+		var s SPS
+		if err := s.Unmarshal(sps[0]); err != nil || s.MaxNumReorderPics < 0 {
+			t.Errorf("%s: %v reorder %d", f.name, err, s.MaxNumReorderPics)
+		}
+	}
 }
 
 func TestSyntheticSPS(t *testing.T) {
