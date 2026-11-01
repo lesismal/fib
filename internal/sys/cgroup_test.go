@@ -38,7 +38,10 @@ func TestCgroupMemoryLimitSkipsMaxAndUnlimited(t *testing.T) {
 func TestCgroupMemoryLimitV1(t *testing.T) {
 	dir := t.TempDir()
 	proc, root, v1 := filepath.Join(dir, "cgroup"), filepath.Join(dir, "cgroup2"), filepath.Join(dir, "cgroup1")
-	writeTestFile(t, proc, "4:memory,cpu:/docker/x\n")
+	// A hierarchy without the memory controller, or a malformed line, is not
+	// read.
+	writeTestFile(t, proc, "3:cpu,cpuacct:/other\nbad\n4:memory,cpu:/docker/x\n")
+	writeTestFile(t, filepath.Join(v1, "other", "memory.limit_in_bytes"), "1024\n")
 	writeTestFile(t, filepath.Join(v1, "docker", "x", "memory.limit_in_bytes"), "1073741824\n")
 
 	if got, want := cgroupMemoryLimit(proc, root, v1), int64(1073741824); got != want {

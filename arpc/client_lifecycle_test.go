@@ -522,6 +522,10 @@ func TestPendingFailOnStop(t *testing.T) {
 			t.Fatalf("Recv on the %s stream of a stopped Client = %v", name, err)
 		}
 	}
+	// Stop closed the stream's sending half, and a send says why.
+	if err := local.Send("late"); err != ErrClientStopped {
+		t.Fatalf("Send on a stream of a stopped Client = %v, want ErrClientStopped", err)
+	}
 }
 
 // TestCallStoppedWhileWaiting pins down that a Call waiting for its response

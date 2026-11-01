@@ -5,6 +5,7 @@ package greeter
 import (
 	"context"
 	"errors"
+	"io"
 	"testing"
 	"time"
 
@@ -80,6 +81,27 @@ func TestSayHelloThroughAnInterceptor(t *testing.T) {
 	}
 	if method != "/greeter.Greeter/SayHello" {
 		t.Fatalf("interceptor saw %q", method)
+	}
+}
+
+// Without an interceptor, a unary call reaches the server directly, and
+// the streaming call streams its replies back.
+func TestSayHelloAndSayHellos(t *testing.T) {
+	client, _ := connect(t)
+	ctx := callContext(t)
+	reply, err := client.SayHello(ctx, &HelloRequest{Name: "direct"})
+	if err != nil || reply.Message != "hello, direct" {
+		t.Fatalf("SayHello: %v, %v", reply, err)
+	}
+	stream, err := client.SayHellos(ctx, &HelloRequest{Name: "streamed"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if reply, err := stream.Recv(); err != nil || reply.Message != "hello, streamed" {
+		t.Fatalf("SayHellos: %v, %v", reply, err)
+	}
+	if _, err := stream.Recv(); err != io.EOF {
+		t.Fatalf("after the reply: %v", err)
 	}
 }
 

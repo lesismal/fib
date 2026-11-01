@@ -12,6 +12,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	fib "github.com/lesismal/fib"
 	"github.com/lesismal/fib/arpc"
@@ -93,6 +94,37 @@ func TestClientCountsFailures(t *testing.T) {
 	}
 	if calls, fails := client(t, serve(grpc.NewServer()), "-proto", "grpc"); calls != "0" || fails == "0" {
 		t.Errorf("grpc: calls=%s fails=%s", calls, fails)
+	}
+}
+
+// The arpc server answers a request whose payload it cannot bind, one that
+// comes flagged as an error, with an error.
+func TestArpcServerAnswersAnUnboundRequestWithAnError(t *testing.T) {
+	addr := startServer(t, "-proto", "arpc")
+	engine, stop := example.ClientEngine()
+	t.Cleanup(stop)
+	handler := arpc.NewHandler()
+	// The request was pushed rather than called, so its response finds no
+	// call waiting for it.
+	answers := make(chan bool, 1)
+	handler.HandleSessionMiss(func(_ *arpc.Client, msg *arpc.Message) { answers <- msg.IsError() })
+	c, err := arpc.Dial(engine, "tcp", addr, 5*time.Second, handler)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(c.Stop)
+	msg := c.NewMessage(arpc.CmdRequest, "/echo", "x")
+	msg.SetError(true)
+	if err := c.PushMsg(msg, 5*time.Second); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case isError := <-answers:
+		if !isError {
+			t.Fatal("the answer is not an error")
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("no answer")
 	}
 }
 

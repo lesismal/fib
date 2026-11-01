@@ -162,6 +162,11 @@ func TestListenerErrorsOnBadInput(t *testing.T) {
 	if _, err := listenSocket(o, noFamily, &syscall.SockaddrInet4{}, true, false); err == nil {
 		t.Error("listenSocket on no family succeeded")
 	}
+	// An address no interface has is refused at the bind.
+	notLocal := &syscall.SockaddrInet4{Addr: [4]byte{192, 0, 2, 1}}
+	if _, err := listenSocket(o, syscall.AF_INET, notLocal, true, false); err == nil {
+		t.Error("listenSocket bound an address no interface has")
+	}
 	if _, err := bindUDPSocket(o, noFamily, &syscall.SockaddrInet4{}); err == nil {
 		t.Error("bindUDPSocket on no family succeeded")
 	}
