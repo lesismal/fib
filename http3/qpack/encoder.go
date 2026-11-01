@@ -15,8 +15,8 @@ import (
 // SETTINGS_QPACK_BLOCKED_STREAMS allows, and with none allowed, waits for
 // the acknowledgment, which leaves the field sent whole a third time. A
 // sensitive field, which its caller marks never-indexed, is sent as before,
-// never indexed, unless its value is long enough not to be guessed (see
-// minIndexedSecret), as a large cookie or bearer token is.
+// never indexed, unless it is a cookie long enough not to be guessed (see
+// indexable).
 //
 // An Encoder is safe for concurrent use; a section holds it from Begin to
 // End. A nil *Encoder encodes without a dynamic table, as AppendField does.
@@ -67,12 +67,9 @@ const (
 	// refer to the table; past it, sections refer to none until the peer
 	// acknowledges some, which bounds what a peer that never does costs.
 	maxPending = 1024
-	// minIndexedSecret is the shortest value of a sensitive field the
-	// table takes. A shorter one could be guessed by an attacker who can
-	// add fields of its own to a connection's requests and watch how long
-	// they come out (RFC 9204 section 7.1); this is the bound browsers put
-	// on the cookies they index.
-	minIndexedSecret = 20
+	// minIndexedCookie is the shortest cookie or set-cookie value the
+	// table takes when its caller marks it never-indexed; see indexable.
+	minIndexedCookie = 20
 )
 
 var seenSeed = maphash.MakeSeed()
@@ -185,7 +182,7 @@ func (s *Section) Append(dst []byte, name, value string, neverIndex bool) []byte
 			}
 		}
 	}
-	indexable := !neverIndex || len(value) >= minIndexedSecret
+	indexable := indexable(name, value, neverIndex)
 	f := HeaderField{name, value}
 	abs, inTable := e.fields[f]
 	if !inTable && indexable && e.repeated(name, value) && e.insert(f, static, s) {
@@ -216,6 +213,21 @@ func (s *Section) Append(dst []byte, name, value string, neverIndex bool) []byte
 		return appendString(dst, 0, 7, value)
 	}
 	return appendString(appendString(dst, 0x20|n>>1, 3, name), 0, 7, value)
+}
+
+// indexable reports whether the table may take a field its caller marked
+// neverIndex or not. A field in the table is sent as an index, which an
+// attacker who can add fields of its own to the connection's requests can
+// probe for, a guess at a time, by how long the sections come out (RFC 9204
+// section 7.1). So credentials, authorization and proxy-authorization, are
+// never indexed, and a cookie or set-cookie only when it is long enough not
+// to be guessed whole, the bound browsers put on the cookies they index;
+// any other field marked never-indexed is never indexed either.
+func indexable(name, value string, neverIndex bool) bool {
+	if !neverIndex {
+		return true
+	}
+	return (name == "cookie" || name == "set-cookie") && len(value) >= minIndexedCookie
 }
 
 // mayRefer reports whether the section may refer to the entry abs, which

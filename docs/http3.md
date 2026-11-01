@@ -248,10 +248,14 @@ static table and literals.
   the encoder refers to one (by a post-base index, as soon as it is inserted)
   only on as many streams at once as the peer's blocked streams allow; a peer
   that allows none gets references to acknowledged entries only, after its
-  Insert Count Increment or Section Acknowledgment. `authorization`,
-  `proxy-authorization`, `cookie` and `set-cookie` values shorter than 20
-  bytes are never indexed and keep the never-indexed bit; longer ones, which
-  cannot be guessed whole, are indexed. Eviction never drops an entry that an
+  Insert Count Increment or Section Acknowledgment. `authorization` and
+  `proxy-authorization` are never indexed, whatever their length: an
+  attacker who can add requests on the same connection could probe an
+  indexed credential a guess at a time by how long the sections come out.
+  `cookie` and `set-cookie` values shorter than 20 bytes are never indexed
+  either; longer ones, which cannot be guessed whole, are. Fields left out
+  keep the never-indexed bit, as Firefox and Go's HPACK transport do.
+  Eviction never drops an entry that an
   unacknowledged section refers to: a field that would need it is sent as a
   literal. Past 1024 unacknowledged sections, sections leave the table alone
   until the peer acknowledges some.
@@ -276,8 +280,10 @@ static table and literals.
 
   | Benchmark (Apple M4 Pro, benchstat over 10 runs) | Table off | 4 KiB table |
   | --- | --- | --- |
-  | `qpack.BenchmarkSections`: an RPC client's requests, a 600-byte cookie and a 200-byte bearer token among them, encoded and decoded | 3.45 µs, 709 bytes on the wire, 7 allocations | 0.55 µs, 31 bytes, 4 allocations |
-  | `http3.BenchmarkHTTP3LargeHeaders`: the same requests and their responses over loopback, counted through a UDP relay | 70.1 µs, 975 bytes on the wire, 106 allocations | 66.3 µs, 169 bytes, 83 allocations |
+  | `qpack.BenchmarkSections`: an RPC client's requests, a 600-byte cookie and a 200-byte bearer token among them, encoded and decoded | 3.50 µs, 709 bytes on the wire, 7 allocations | 0.80 µs, 187 bytes, 4 allocations |
+  | `http3.BenchmarkHTTP3LargeHeaders`: the same requests and their responses over loopback, counted through a UDP relay | 72.3 µs, 975 bytes on the wire, 106 allocations | 69.0 µs, 329 bytes, 87 allocations |
+
+  The bearer token, never indexed, is most of what the table leaves.
 
   With the table off, `BenchmarkHTTP3Requests` and
   `BenchmarkHTTP3ConcurrentRequests` are as before: the same time within
@@ -286,8 +292,8 @@ static table and literals.
   a 4096-byte table and 16 blocked streams by default, both ways, 20 requests
   each: aioquic's request header sections into the fib server go from 629
   bytes to 12-16, the fib server's response sections from 800 to 9; the fib
-  client's request sections from 648 to 23-27, aioquic's responses from 779
-  to 8. The quic-go conformance suites below also pass with the table on in
+  client's request sections from 648 to 181-185, the bearer token sent whole
+  each time, and aioquic's responses from 779 to 8. The quic-go conformance suites below also pass with the table on in
   fib; quic-go has no table, so it stays unused.
 
 ### Protocol details

@@ -73,18 +73,18 @@ type Config struct {
 	// at up to this many bytes: the peer's encoder may fill a table of that
 	// size, which costs the server as much memory per connection, and the
 	// server's encoder fills one of the lesser of it and what the peer allows.
-	// A field that repeats, such as a large cookie, a bearer token or a custom
-	// field of an RPC, is then sent as an index of a byte or two once it has
-	// been seen twice; a secret value shorter than 20 bytes is never indexed.
-	// The encoder refers to entries the peer has not acknowledged, which may
-	// have its stream wait for them, on no more streams than the peer's blocked
-	// streams allow. QPACKBlockedStreams is that number for the server's own
-	// streams: how many the peer's encoder may have wait for entries its
-	// encoder stream has yet to bring, each holding what arrives meanwhile up
-	// to the field section limit and 1 MiB more. Zero, the default, keeps the
-	// table off: both sides then send every field whole, and the QPACK streams
-	// carry nothing. The gain is bandwidth, and the CPU of coding large values
-	// again; 4096 suits most uses.
+	// A field that repeats, such as a large cookie or a custom field of an RPC,
+	// is then sent as an index of a byte or two once it has been seen twice;
+	// authorization and proxy-authorization are never indexed, nor a cookie or
+	// set-cookie shorter than 20 bytes. The encoder refers to entries the peer
+	// has not acknowledged, which may have its stream wait for them, on no more
+	// streams than the peer's blocked streams allow. QPACKBlockedStreams is
+	// that number for the server's own streams: how many the peer's encoder may
+	// have wait for entries its encoder stream has yet to bring, each holding
+	// what arrives meanwhile up to the field section limit and 1 MiB more.
+	// Zero, the default, keeps the table off: both sides then send every field
+	// whole, and the QPACK streams carry nothing. The gain is bandwidth, and
+	// the CPU of coding large values again; 4096 suits most uses.
 	QPACKTableCapacity  int
 	QPACKBlockedStreams int
 	// MaxBodyBytes bounds a request body that is read whole before its

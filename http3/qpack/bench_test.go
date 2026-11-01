@@ -50,7 +50,7 @@ func benchSections(b *testing.B, capacity uint64) {
 		var s Section
 		s, block = enc.Begin(block[:0], uint64(4*i))
 		for _, f := range mixes[i%len(mixes)] {
-			block = s.Append(block, f.Name, f.Value, f.Name == "cookie" || f.Name == "authorization")
+			block = s.Append(block, f.Name, f.Value, sensitive(f.Name))
 		}
 		block = s.End(block)
 		var err error

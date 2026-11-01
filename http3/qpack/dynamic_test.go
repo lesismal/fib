@@ -27,10 +27,24 @@ func newPair(capacity uint64, blocked int) *pair {
 	return p
 }
 
+// sensitive is what package http3 marks never-indexed.
+func sensitive(name string) bool {
+	return name == "authorization" || name == "proxy-authorization" || name == "cookie" || name == "set-cookie"
+}
+
+// neverIndexed reports whether a field line, a literal, has its
+// never-indexed bit set.
+func neverIndexed(line byte) bool {
+	if line&0xc0 == 0x40 {
+		return line&0x20 != 0
+	}
+	return line&0xe0 == 0x20 && line&0x10 != 0
+}
+
 func (p *pair) encode(fields []HeaderField, streamID uint64) []byte {
 	s, block := p.enc.Begin(nil, streamID)
 	for _, f := range fields {
-		block = s.Append(block, f.Name, f.Value, f.Name == "authorization" || f.Name == "cookie")
+		block = s.Append(block, f.Name, f.Value, sensitive(f.Name))
 	}
 	return s.End(block)
 }
@@ -189,8 +203,11 @@ func TestDynamicRoundTrip(t *testing.T) {
 	if sizes[0] < len(plain)-8 || sizes[1] < len(plain)-8 {
 		t.Fatalf("first sections take %v bytes, want about %d", sizes[:2], len(plain))
 	}
-	if sizes[2] > 40 || sizes[4] > 40 {
-		t.Fatalf("later sections take %v bytes, want them indexed", sizes)
+	// All but the bearer token, which is never indexed, and the request
+	// ID, which changes.
+	token := len(AppendField(nil, fields[4].Name, fields[4].Value, true))
+	if sizes[2] > token+40 || sizes[4] > token+40 {
+		t.Fatalf("later sections take %v bytes, want all but the %d-byte token indexed", sizes, token)
 	}
 	if p.enc.pending != 0 {
 		t.Fatalf("%d sections unacknowledged", p.enc.pending)
@@ -238,19 +255,29 @@ func TestDynamicBlockingEncoder(t *testing.T) {
 	p.carry(t)
 }
 
-// TestDynamicSecrets: a short secret is never indexed, however often it is
-// sent; a long one is.
+// TestDynamicSecrets: credentials and short cookies are never indexed,
+// however often and however long they are sent; a long cookie is.
 func TestDynamicSecrets(t *testing.T) {
 	p := newPair(4096, 0)
-	short := []HeaderField{{"authorization", "Basic YTpi"}}
-	long := []HeaderField{{"cookie", strings.Repeat("s", minIndexedSecret)}}
-	for i := 0; i < 4; i++ {
-		block := p.encode(short, 0)
-		if block[0] != 0 || block[2]&0xf0 != 0x70 {
-			t.Fatalf("short secret encoded as %x, want a never-indexed literal", block)
+	long := []HeaderField{{"cookie", strings.Repeat("s", minIndexedCookie)}}
+	for _, never := range []HeaderField{
+		{"authorization", "Basic YTpi"},
+		{"authorization", "Bearer " + strings.Repeat("t", 200)},
+		{"proxy-authorization", strings.Repeat("p", 100)},
+		{"cookie", strings.Repeat("s", minIndexedCookie-1)},
+		{"set-cookie", strings.Repeat("s", minIndexedCookie-1)},
+	} {
+		for i := 0; i < 4; i++ {
+			block := p.encode([]HeaderField{never}, 0)
+			if block[0] != 0 || !neverIndexed(block[2]) {
+				t.Fatalf("%s encoded as %x, want a never-indexed literal", never.Name, block)
+			}
+			sameFields(t, p.decode(t, block, 0), []HeaderField{never})
+			p.carry(t)
 		}
-		sameFields(t, p.decode(t, block, 0), short)
-		p.carry(t)
+	}
+	if inserted, _ := p.enc.Counts(); inserted != 0 {
+		t.Fatalf("%d secrets inserted", inserted)
 	}
 	var last []byte
 	for i := 0; i < 4; i++ {

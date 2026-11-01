@@ -1424,7 +1424,7 @@ QUIC 层的实现要点：
 - QPACK 默认两端都声明动态表容量为 0：编码只用静态表和字面量（字面量在更短时使用
   Huffman 编码），解码拒绝任何动态表引用，因此编码器流和解码器流无需内容。
   `Config.QPACKTableCapacity` / `ClientConfig.QPACKTableCapacity` 可打开动态表，重复的大
-  字段（cookie、bearer token、RPC 自定义头）之后只发索引，详见
+  字段（较长的 cookie、RPC 自定义头；`authorization` 从不进表）之后只发索引，详见
   [`docs/http3.zh-CN.md`](http3.zh-CN.md#qpack-动态表)。
 - 已与 quic-go 做双向互通测试（包括 5% 随机丢包下的 20MB 双向传输），客户端也验证过
   Cloudflare、Google、nginx、Facebook、Varnish、quiche 的线上 HTTP/3 服务。

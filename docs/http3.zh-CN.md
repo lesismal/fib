@@ -183,9 +183,11 @@
   （放得下的话），之后只发一两个字节的索引。对端还没确认的条目可能让对端的 stream
   等待编码器流，所以编码器只在对端 blocked streams 允许的 stream 数以内引用这类条目
   （插入后立即用 post-base 索引）；对端一个都不允许时，只引用已确认的条目，即收到对端的
-  Insert Count Increment 或 Section Acknowledgment 之后。`authorization`、
-  `proxy-authorization`、`cookie`、`set-cookie` 的值短于 20 字节时从不进表，并保留
-  never-indexed 位；更长的值无法被整体猜中，会进表。淘汰从不丢掉未确认 section 引用的
+  Insert Count Increment 或 Section Acknowledgment 之后。`authorization` 和
+  `proxy-authorization` 无论多长都从不进表：能在同一连接上发请求的攻击者，可以通过
+  section 的长度逐次猜测进了表的凭据。`cookie`、`set-cookie` 的值短于 20 字节时也从不
+  进表，更长的值无法被整体猜中，会进表。不进表的字段保留 never-indexed 位，与 Firefox
+  和 Go 的 HPACK transport 的做法一致。淘汰从不丢掉未确认 section 引用的
   条目：需要腾出这些条目的字段改用字面量发送。未确认的 section 超过 1024 个时，后续
   section 不再引用动态表，直到对端确认了一部分。
 - **解码器。** 执行编码器流的指令（Set Dynamic Table Capacity 不超过本端声明的值、
@@ -202,15 +204,17 @@
 
   | 基准（Apple M4 Pro，benchstat，10 次） | 关闭动态表 | 4 KiB 动态表 |
   | --- | --- | --- |
-  | `qpack.BenchmarkSections`：RPC 客户端的请求（含 600 字节的 cookie 和 200 字节的 bearer token），编码加解码 | 3.45 µs，线上 709 字节，7 次分配 | 0.55 µs，31 字节，4 次分配 |
-  | `http3.BenchmarkHTTP3LargeHeaders`：同样的请求及其响应走 loopback，经 UDP 中继计数 | 70.1 µs，线上 975 字节，106 次分配 | 66.3 µs，169 字节，83 次分配 |
+  | `qpack.BenchmarkSections`：RPC 客户端的请求（含 600 字节的 cookie 和 200 字节的 bearer token），编码加解码 | 3.50 µs，线上 709 字节，7 次分配 | 0.80 µs，187 字节，4 次分配 |
+  | `http3.BenchmarkHTTP3LargeHeaders`：同样的请求及其响应走 loopback，经 UDP 中继计数 | 72.3 µs，线上 975 字节，106 次分配 | 69.0 µs，329 字节，87 次分配 |
+
+  动态表剩下的字节大部分是从不进表的 bearer token。
 
   关闭动态表时，`BenchmarkHTTP3Requests` 和 `BenchmarkHTTP3ConcurrentRequests` 与之前
   相同：耗时在噪声范围内，分配次数不变。
 - **互通。** 已手工与 aioquic 1.7.1 双向验证，各 20 个请求；它的 pylsqpack 默认打开
   4096 字节的动态表和 16 个 blocked streams：aioquic 发给 fib 服务端的请求头 section 从
   629 字节降到 12-16 字节，fib 服务端的响应 section 从 800 降到 9；fib 客户端的请求
-  section 从 648 降到 23-27，aioquic 的响应从 779 降到 8。fib 打开动态表时，下面的
+  section 从 648 降到 181-185（bearer token 每次都完整发送），aioquic 的响应从 779 降到 8。fib 打开动态表时，下面的
   quic-go 一致性测试也全部通过；quic-go 没有动态表，所以表不会被用到。
 
 ### 协议细节
