@@ -5,6 +5,7 @@ package udpbatch
 import (
 	"syscall"
 	"testing"
+	"time"
 	"unsafe"
 )
 
@@ -35,12 +36,27 @@ func udpPair(t *testing.T) (rfd int, to *syscall.SockaddrInet4, sfd int) {
 	return rfd, sa.(*syscall.SockaddrInet4), sfd
 }
 
+// recvWait is b.Recv that waits for a datagram to arrive: macOS's loopback
+// hands a sent datagram to the receiving socket a moment later, not within
+// the send.
+func recvWait(t *testing.T, b *Batch, fd int, one bool) (int, error) {
+	t.Helper()
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		n, _, err := b.Recv(fd, Size, one)
+		if err != syscall.EAGAIN || time.Now().After(deadline) {
+			return n, err
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
 // recvAll reads n datagrams that were sent before it is called.
 func recvAll(t *testing.T, b *Batch, fd, n int) []string {
 	t.Helper()
 	var got []string
 	for len(got) < n {
-		k, _, err := b.Recv(fd, Size, len(got) > 0)
+		k, err := recvWait(t, b, fd, len(got) > 0)
 		if err != nil {
 			t.Fatalf("Recv after %d datagrams: %v", len(got), err)
 		}
@@ -120,7 +136,7 @@ func TestBatchRoundTrip(t *testing.T) {
 	if n, err := Send(sfd, to, [][]byte{[]byte("d"), []byte("e")}); n != 2 || err != nil {
 		t.Fatalf("Send = %d, %v", n, err)
 	}
-	if n, _, err := b.Recv(rfd, Size, true); n != 1 || err != nil || string(b.Datagram(0)) != "d" {
+	if n, err := recvWait(t, b, rfd, true); n != 1 || err != nil || string(b.Datagram(0)) != "d" {
 		t.Fatalf("Recv of one = %d, %q, %v", n, b.Datagram(0), err)
 	}
 }
