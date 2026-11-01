@@ -23,8 +23,14 @@ import (
 // own duration, a 30 fps frame), and the track's decode time carries on
 // without the jump, so the timeline of a Writer never goes back.
 //
-// Decode times start from the first packet the Writer is given, at 0; a
-// track whose first packet is earlier than that starts at 0 too.
+// Decode times start at 0 from the earliest first packet of the tracks,
+// so that they keep the stream's lining up of the tracks: a stream joined
+// at a keyframe often has audio a little earlier than the keyframe come
+// after it, and a track starting late at 0 would play that much late for
+// good. Until the first Flush, a track whose first packet is earlier than
+// the start so far moves it back, and the tracks already started forward
+// by as much; after it, or when the step is more than ten seconds, such a
+// track starts at 0, as no fragment can take back a decode time written.
 //
 // A Writer is not safe for concurrent use. It keeps the packets' data, which
 // the hub shares and nobody modifies, until the Flush that writes them.
@@ -109,8 +115,13 @@ func (w *Writer) WritePacket(pkt *av.Packet) {
 		w.started, w.epoch = true, pkt.DTS
 	}
 	if !t.started {
+		d := pkt.DTS - w.epoch
+		if d < 0 && w.seq == 0 && d >= -maxGap {
+			w.rebase(-d)
+			d = 0
+		}
 		t.started = true
-		if d := pkt.DTS - w.epoch; d > 0 {
+		if d > 0 {
 			t.dec = uint64(av.ToTicks(d, int(t.info.timescale)))
 		}
 	} else if t.held != nil {
@@ -118,6 +129,22 @@ func (w *Writer) WritePacket(pkt *av.Packet) {
 	}
 	t.held = pkt
 	w.buffered += len(pkt.Data)
+}
+
+// rebase moves the start of decode times by d earlier: the tracks started
+// so far, none of them flushed, start d later.
+func (w *Writer) rebase(d time.Duration) {
+	w.epoch -= d
+	for _, u := range w.tracks {
+		if u == nil || !u.started {
+			continue
+		}
+		n := uint64(av.ToTicks(d, int(u.info.timescale)))
+		u.dec += n
+		if len(u.pending) > 0 {
+			u.start += n
+		}
+	}
 }
 
 func (w *Writer) track(pkt *av.Packet) *wtrack {

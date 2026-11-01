@@ -342,8 +342,9 @@ func TestWriterDurations(t *testing.T) {
 		t.Fatal(err)
 	}
 	init, _ := ParseInit(w.Init())
-	// Track 1 starts before the epoch; track 0 jumps back, then forward by
-	// more than maxGap: both keep the previous duration.
+	// Track 1 starts before track 0, moving the start of decode times back
+	// to it; track 0 jumps back, then forward by more than maxGap: both keep
+	// the previous duration.
 	w.WritePacket(pkt(0, 100, 0, true, "v0"))
 	w.WritePacket(pkt(1, 50, 0, true, "a0"))
 	w.WritePacket(pkt(0, 140, 0, false, "v1"))
@@ -376,16 +377,16 @@ func TestWriterDurations(t *testing.T) {
 		}
 	}
 	ms := time.Millisecond
-	if len(v) != 5 || v[0] != 0 || v[1] != 40*ms || v[2] != 80*ms || v[3] != 120*ms || v[4] != 160*ms {
+	if len(v) != 5 || v[0] != 50*ms || v[1] != 90*ms || v[2] != 130*ms || v[3] != 170*ms || v[4] != 210*ms {
 		t.Fatal(v)
 	}
 	if len(a) != 1 || a[0] != 0 {
 		t.Fatal(a)
 	}
-	if len(o) != 3 || o[0] != 100*ms || o[1] != 200*ms || o[2] != 300*ms {
+	if len(o) != 3 || o[0] != 150*ms || o[1] != 250*ms || o[2] != 350*ms {
 		t.Fatal(o)
 	}
-	if len(h) != 1 || h[0] != 0 {
+	if len(h) != 1 || h[0] != 50*ms {
 		t.Fatal(h)
 	}
 	// The durations of last samples: a 30 fps frame for video with no
