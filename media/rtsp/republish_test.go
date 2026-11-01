@@ -59,11 +59,10 @@ func TestPlayerRepublish(t *testing.T) {
 	pub.WritePacket(pkt(20 * time.Millisecond))
 	next()
 	next()
-	// 160 ticks a 20 ms packet at 8 kHz.
-	for i, want := range []uint32{160, 320, 480} {
-		if stamps[i+1]-stamps[0] != want {
-			t.Fatalf("RTP timestamps %v", stamps)
-		}
+	// 160 ticks a 20 ms packet at 8 kHz; the new clock starts after the
+	// last packet by as long as the stream was quiet, 20 ms or more.
+	if d := stamps[2] - stamps[1]; stamps[1]-stamps[0] != 160 || d < 160 || d > 8000 || stamps[3]-stamps[2] != 160 {
+		t.Fatalf("RTP timestamps %v", stamps)
 	}
 	pub.Close()
 	// Another codec: the player ends.

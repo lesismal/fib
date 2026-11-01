@@ -466,22 +466,24 @@ type player struct {
 	wall0    time.Time
 	lastPTS  time.Duration
 	// After a republish (restart), the next publisher's clock may start
-	// anywhere: offset moves its times on from lastDTS, the largest sent,
-	// into shifted, as flv.Timeline does for RTMP.
+	// anywhere: offset moves its times on from lastDTS, the largest sent
+	// (at lastAt), into shifted, as flv.Timeline does for RTMP.
 	restart bool
 	offset  time.Duration
 	lastDTS time.Duration
+	lastAt  time.Time
 	shifted av.Packet
 	closed  bool
 	buf     []byte
 }
 
 // maxClockJump is how far past the last packet the first one after a
-// republish may be and still be taken as the same clock carrying on, and
-// restartGap how far after the last packet a new clock starts.
+// republish may be and still be taken as the same clock carrying on. A
+// new clock starts after the last packet by as long as the stream was
+// quiet, at least minRestartGap and at most maxClockJump.
 const (
-	maxClockJump = 10 * time.Second
-	restartGap   = 20 * time.Millisecond
+	maxClockJump  = 10 * time.Second
+	minRestartGap = 20 * time.Millisecond
 )
 
 func newPlayer(s *session) *player {
@@ -548,8 +550,8 @@ func (p *player) OnPacket(pkt *av.Packet) {
 	}
 	if p.restart {
 		p.restart = false
-		if d := pkt.DTS + p.offset; d < p.lastDTS || d > p.lastDTS+maxClockJump {
-			at := p.lastDTS + restartGap
+		if d := pkt.DTS + p.offset; d <= p.lastDTS || d > p.lastDTS+maxClockJump {
+			at := p.lastDTS + max(min(now.Sub(p.lastAt), maxClockJump), minRestartGap)
 			p.offset = at - pkt.DTS
 			// Sender reports place the new clock at the wall time it
 			// starts.
@@ -562,7 +564,7 @@ func (p *player) OnPacket(pkt *av.Packet) {
 		p.shifted.PTS += p.offset
 		pkt = &p.shifted
 	}
-	p.lastDTS = max(p.lastDTS, pkt.DTS)
+	p.lastDTS, p.lastAt = max(p.lastDTS, pkt.DTS), now
 	st := p.streams[pkt.Track]
 	p.lastPTS = pkt.PTS
 	defer func() {

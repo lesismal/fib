@@ -2,12 +2,15 @@ package flv
 
 import "time"
 
+// now is the clock of Timeline, a variable for tests.
+var now = time.Now
+
 // maxTimelineJump is how far past the last timestamp a packet after
 // Restart may land and still be taken as the same clock carrying on.
 const maxTimelineJump = 10 * time.Second
 
-// restartGap is how far after the last timestamp a new clock starts.
-const restartGap = 20
+// minRestartGap is the least a new clock starts after the last timestamp.
+const minRestartGap = 20 * time.Millisecond
 
 // Timeline turns the decode times of a hub stream's packets into the
 // millisecond timestamps of FLV tags and RTMP messages, which players
@@ -18,10 +21,12 @@ const restartGap = 20
 // packet after it and flv.js and MSE players stall on.
 //
 // After Restart, the next packet whose time is behind the last timestamp,
-// or more than ten seconds past it, starts a new clock just after it. A
-// packet of a track behind that track's last timestamp, as audio
-// interleaved a little behind the keyframe a stream started at, is given
-// the last one.
+// or more than ten seconds past it, starts a new clock after it by as long
+// as the stream was quiet (20 ms to ten seconds), so that timestamps keep
+// pace with the wall clock players wait by, and frames of the two clocks
+// never share a timestamp. A packet of a track behind that track's last
+// timestamp, as audio interleaved a little behind the keyframe a stream
+// started at, is given the last one.
 //
 // The zero Timeline starts at the first packet's own time; with
 // FromZero, the first packet is at 0, as FLV files start.
@@ -32,8 +37,9 @@ type Timeline struct {
 	// offset is added to a packet's time in milliseconds.
 	offset int64
 	// last is the largest timestamp given, and lastVideo and lastAudio
-	// those of each track.
+	// those of each track; lastAt is when the last packet was stamped.
 	last, lastVideo, lastAudio int64
+	lastAt                     time.Time
 }
 
 // Restart says the packets that come next may follow a new clock: the
@@ -57,10 +63,12 @@ func (t *Timeline) Stamp(video bool, dts time.Duration) uint32 {
 		}
 	case t.restart:
 		t.restart = false
-		if ts := ms + t.offset; ts < t.last || ts > t.last+maxTimelineJump.Milliseconds() {
-			t.offset = t.last + restartGap - ms
+		if ts := ms + t.offset; ts <= t.last || ts > t.last+maxTimelineJump.Milliseconds() {
+			gap := max(min(now().Sub(t.lastAt), maxTimelineJump), minRestartGap)
+			t.offset = t.last + gap.Milliseconds() - ms
 		}
 	}
+	t.lastAt = now()
 	ts := max(ms+t.offset, 0)
 	last := &t.lastAudio
 	if video {

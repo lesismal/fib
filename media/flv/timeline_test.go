@@ -46,6 +46,26 @@ func TestTimeline(t *testing.T) {
 	stamp(&abs, true, 0, 2020)
 }
 
+// A new clock starts after the last timestamp by as long as the stream
+// was quiet.
+func TestTimelineQuiet(t *testing.T) {
+	at := time.Unix(1000, 0)
+	now = func() time.Time { return at }
+	defer func() { now = time.Now }()
+	var tl Timeline
+	tl.Stamp(true, 8*time.Second)
+	at = at.Add(2500 * time.Millisecond)
+	tl.Restart()
+	if ts := tl.Stamp(true, 0); ts != 10500 {
+		t.Fatal(ts)
+	}
+	at = at.Add(time.Hour)
+	tl.Restart()
+	if ts := tl.Stamp(true, 0); ts != 20500 {
+		t.Fatal("capped at ten seconds:", ts)
+	}
+}
+
 // An FLV player of a stream that is republished sees timestamps go on.
 func TestMuxerRepublish(t *testing.T) {
 	tracks := []*av.Track{{Codec: av.CodecPCMA, SampleRate: 8000, Channels: 1}}
