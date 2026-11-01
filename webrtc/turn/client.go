@@ -157,9 +157,9 @@ type channel struct {
 	failed    bool
 }
 
-// Client is the client side of one TURN allocation over UDP (RFC 8656): it
-// allocates a relayed address on the server, keeps it, its permissions and
-// its channels refreshed, wraps what is sent to peers in Send indications or
+// Client is the client side of one TURN allocation (RFC 8656), over UDP or,
+// with ClientConfig.Stream, over TCP or TLS: it allocates a relayed address
+// on the server, keeps it, its permissions and its channels refreshed, wraps what is sent to peers in Send indications or
 // ChannelData messages, and unwraps what the server relays back. It does no
 // I/O: what it sends goes out through ClientConfig.Send, the caller passes
 // it every packet from the server's address through HandlePacket, and time

@@ -52,7 +52,9 @@
 // (m=request, the default) subscribes to the hub and receives the stream
 // muxed into MPEG-TS, 7 transport packets per SRT packet, from the next
 // keyframe (ServerConfig.PlayGOPCache), dropped (hub.NewDropper) while the
-// peer acknowledges too little.
+// peer acknowledges too little. With ServerConfig.PlayWait a player waits
+// for a stream not yet published, and for the next publisher after its
+// own leaves, its MPEG-TS times carrying on across the republish.
 //
 // Dial, Publish and Play are the caller side on Engine.OpenUDPPeer: a raw
 // session, a push of a hub stream to a listener (an SRT server, or ffmpeg

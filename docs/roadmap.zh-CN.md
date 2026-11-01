@@ -61,7 +61,7 @@
 | transport-wide 拥塞控制反馈与带宽估计 | 有意不做 | PeerConnection 只转发 RTP，没有可调节的编码器；SFU 把码率控制交给两端的浏览器，REMB 可以经 `WriteRTCP` 发送 | L | 有自带编码器的 Go 发送端，或需要按观看者自适应的 SFU |
 | RTX、FEC 与应答 NACK | 有意不做 | 修复需要每条流保存已发送的包，有大量对端的服务端要为每一个都付这份内存；不提供 RTX | M | 丢包路径上靠 PLI 恢复关键帧太慢时 |
 | 发送 simulcast | 有意不做 | 按 RID 接收已支持，这正是 SFU 需要的；发送多层意味着每层一个编码器 | M | 有发送 simulcast 的 Go 发布端 |
-| 基于 TCP 的 ICE，基于 TCP/TLS 的 TURN | 有意不做 | 服务端有公网 UDP 端口时浏览器用不到；封锁 UDP 的网络需要 TCP/TLS 上的 TURN，turnserver 不提供 | M–L | 部署在封锁 UDP 的防火墙之后 |
+| 基于 TCP 的 ICE（RFC 6544），PeerConnection 自己的 TURN 客户端走 TCP/TLS | 有意不做 | 服务端有公网 UDP 端口时浏览器用不到。turnserver 和 turn.Client 已支持 TCP 与 TLS，封锁 UDP 的网络里的浏览器可经 `turns:` 连到服务端；只有 PeerConnection 自己的 TURN 客户端仍只经 UDP 访问 TURN（不接受 `turns:` 和 `?transport=tcp` 的 URL） | M | 部署在封锁 UDP 的防火墙之后 |
 | DTLS 1.3 | 有意不做 | 所有浏览器都支持 DTLS 1.2，这也是 WebRTC 目前的要求 | L | 浏览器要求 DTLS 1.3 |
 | 解析 host candidate 的 mDNS 名字 | 有意不做 | 浏览器的检查本来就会以 peer-reflexive candidate 暴露它的地址，lite 服务端不需要更多 | S | 同一局域网内两个都用 mDNS 的 full agent 要在没有 STUN 时连通 |
 | provisional answer 与 rollback | 有意不做 | glare 处理属于信令；WHIP、WHEP 都用不到 | S | 应用需要双方同时发起协商 |
@@ -72,7 +72,8 @@
 | 项 | 状态 | 原因 | 成本 | 何时重估 |
 | --- | --- | --- | --- | --- |
 | 转码（为 WHEP 把 AAC 转成 Opus，为 HLS 生成多码率） | 有意不做 | 需要音视频解码器和编码器，意味着 cgo 或引入依赖，还要为每路流付出转封装服务器本不需要的 CPU；hub 承载发布者发来的内容，每个出口去掉自己承载不了的 track | L | fib 本身永远不做：由外部转码器订阅后再发布回 hub |
-| HTTP-FLV 拉流客户端 | 计划中 | 需要一个能把响应 body 流式送进 `flv.Demuxer` 的 fib/http 客户端；从 RTMP 源站转发已由 `rtmp.Pull` 覆盖 | M | 需要从只提供 HTTP-FLV 的源站或 CDN 转发 |
+| HTTP-FLV 拉流客户端 | 计划中 | 尚未编写：把 fib/http 客户端流式收到的响应 body（`StreamResponseBody`、`ClientResponse.OnBody`）送进 `flv.Demuxer` 即可；从 RTMP 源站转发已由 `rtmp.Pull` 覆盖 | M | 需要从只提供 HTTP-FLV 的源站或 CDN 转发 |
+| RTSP UDP 播放者的慢消费者策略 | 已知限制 | 它们的 RTP 来一个发一个，路径丢包时丢的是数据报而不会堆积；`MaxQueuedBytes` 只对 TCP 播放者丢包和断开 | S | UDP 播放者所在链路的 socket 缓冲会被填满 |
 | 基于 TLS、HTTP 隧道的 RTSP，RTSP 2.0，组播 | 有意不做 | 摄像头和播放器用的是基于 TCP 或 UDP 单播的普通 RTSP 1.0 | M | 部署要求 rtsps，或必须穿过 HTTP 代理 |
 | SRT 的 rendezvous、file 模式、AES-GCM、FEC、bonding | 有意不做 | ffmpeg、OBS 和编码器接入与分发用的是带 AES-CTR 的 live 模式 | L | 有编码器或网络需要其中之一 |
 | WHIP/WHEP 的 ICE restart、simulcast 多层、基于 sender report 的音视频同步 | 已知限制 | ICE restart 按 RFC 9725 的要求回 422；每个 section 只接收 simulcast 的第一层；WHIP 按到达时间打时间戳，各 track 偏差不超过网络抖动 | M | 会切换网络的移动端发布者，或 SFU 式的分层选择 |

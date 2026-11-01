@@ -48,7 +48,7 @@ HTTP/3、WebSocket 和 WebRTC，以及基于 RTMP、RTSP、SRT、HTTP-FLV、HLS 
 | HTTP CONNECT 代理 | ✓ HTTP/1.x、HTTP/2、HTTP/3 | — | `Context.Connect` 建立隧道，双向背压；`ConnectProxy` 是现成的代理，可供 curl `-x`、浏览器与 `HTTPS_PROXY` 使用 |
 | SOCKS5 / SOCKS4 / 4a | ✓ | ✓（异步拨号） | CONNECT、BIND 与 UDP ASSOCIATE，用户名/密码认证；HTTP、WebSocket 与 TLS 客户端可经它拨号 |
 | gRPC | ✓ h2 和 h2c | ✓ | unary 与双向 streaming、metadata、deadline、拦截器、gzip；可直接用 protoc-gen-go-grpc 生成的代码，与 grpc-go 互通 |
-| WebRTC | ✓ | ✓ | 多个 PeerConnection 共用一个 UDP 端口：ICE（lite 与 full、trickle）、DTLS 1.2-SRTP、data channel、供 SFU 使用的 RTP 转发、TURN 客户端与服务端，全部自行实现；可与浏览器和 pion 互通（[详见](docs/webrtc.zh-CN.md)） |
+| WebRTC | ✓ | ✓ | 多个 PeerConnection 共用一个 UDP 端口：ICE（lite 与 full、trickle）、DTLS 1.2-SRTP、data channel、供 SFU 使用的 RTP 转发、支持 UDP、TCP 与 TLS 的 TURN 客户端与服务端（配额、事件与统计、热加载、drain），全部自行实现；可与浏览器和 pion 互通（[详见](docs/webrtc.zh-CN.md)） |
 | 流媒体 | ✓ | ✓ | RTMP/RTMPS（Enhanced RTMP）、TCP 与 UDP 的 RTSP、SRT、HTTP-FLV 与 WebSocket-FLV、fMP4 或 TS 分片的 HLS 及 LL-HLS、WHIP 与 WHEP，由一个 hub 在它们之间转封装、不转码；每种协议都有拉流转发和转推；与 ffmpeg 和 Chromium 互通验证（[详见](docs/media.zh-CN.md)） |
 
 ### 引擎
@@ -64,8 +64,8 @@ HTTP/3、WebSocket 和 WebRTC，以及基于 RTMP、RTSP、SRT、HTTP-FLV、HLS 
 - **一个引擎，多种协议**：传给 `fib.New` 的每个 `Binding` 为一组地址（TCP、Unix 或 UDP）各配一个 handler，
   一个引擎即可同时提供 HTTP、HTTPS、HTTP/3、WebSocket、gRPC 和裸 TCP，共享事件循环、池和 buffer。
   `mux` 包更进一步：按客户端最先发送的字节识别协议，让多种协议共用同一个端口。
-- **异步客户端**：非阻塞 dial，以及 HTTP/1.x、HTTP/2、HTTP/3、WebSocket 客户端，结果通过回调或
-  future 返回。
+- **异步客户端**：非阻塞 dial（需要时可指定本地地址和端口范围），以及 HTTP/1.x、HTTP/2、HTTP/3、
+  WebSocket 客户端，结果通过回调或 future 返回。
 - **静态文件**：`http.FileCache` 从内存提供一个目录下的文件，支持预压缩的 `.br`/`.gz` 文件，并跟随
   磁盘变化：Linux 上用 inotify，其他平台每个请求 stat 一次。
 - **Router**：[chi](https://github.com/go-chi/chi) 风格的 API，支持参数、正则、通配、分组、
@@ -391,14 +391,20 @@ git clone https://github.com/lesismal/fib-examples && cd fib-examples
 go run ./multiprotocol/server # 一个引擎同时提供 HTTP、HTTPS、HTTP/3、WebSocket 和裸 TCP，另有一个按首字节分流的端口
 go run ./multiproto/server   # 同一端口上的 HTTPS、HTTP/1.1、h2c、WebSocket、gRPC、SOCKS、HTTP CONNECT、arpc 与 TCP 回显
 go run ./tcp/nontls/server
+go run ./tcp/dialfrom          # Engine.DialWith：从指定的本地地址和端口范围拨出
+go run ./udp/openpeer         # Engine.OpenUDPPeer：让 UDP binding 先发
+go run ./tls/dtls/server      # DTLS 1.2 回显，导出 DTLS-SRTP 密钥；它的 client 经 OpenUDPPeer 先发
 go run ./http/nontls/server
 go run ./http/router
+go run ./http/upload/server   # 大 body：SaveBody、可续传的 SaveBodyResumable、OnBody 回显；见同目录的 mkfile 和 client
+go run ./http2/upload/server  # 同样的上传接口跑在 HTTP/2（TLS）上
+go run ./http3/upload/server  # ……以及 HTTP/3（QUIC）上
 go run ./websocket/nontls/server
+go run ./http3/tls/server
 go run ./arpc/server
 go run ./grpc/server
 go run ./webrtc               # 网页的 data channel 消息和摄像头画面由服务端送回；webrtc/sfu 把一个发布者转发给多个观看者
 go run ./socks/server        # 同一端口上的 SOCKS5/4/4a 与 HTTP CONNECT 代理；socks/client 经它抓取 URL
-go run ./http3/tls/server
 go run ./gateway/upstream    # 反向代理 / 网关：HTTP/1.1、HTTP/2、HTTP/3、WebSocket，全部异步回调
 go run ./gateway/server      # 依次启动 upstream、gateway、client（见 server 的文件头注释）
 go run ./gateway/client

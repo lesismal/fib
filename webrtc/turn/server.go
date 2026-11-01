@@ -267,9 +267,9 @@ type shard struct {
 }
 
 // Server is the core of a TURN server (RFC 8656) relaying UDP for clients
-// that reach it over UDP, with the long-term credentials of RFC 8489. It
-// does no I/O: the host passes it every datagram the listening socket
-// receives through HandlePacket and every datagram a relayed address
+// that reach it over UDP, TCP or TLS, with the long-term credentials of RFC
+// 8489. It does no I/O: the host passes it every message a client sends
+// through HandlePacket and every datagram a relayed address
 // receives through HandleRelayPacket, sends what it emits through
 // ServerConfig.Send and Relay.SendTo, opens relayed addresses when
 // ServerConfig.AllocateRelay asks, and passes the time through NextTimeout

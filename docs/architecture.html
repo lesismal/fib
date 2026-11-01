@@ -406,14 +406,16 @@ flowchart LR
   <div class="tbl"><table>
     <thead><tr><th>Package</th><th>Contents</th></tr></thead>
     <tbody>
-      <tr><td><code>fib</code></td><td>Engine, Connection, Handler, Config; TCP, Unix sockets and UDP; Dial, the net.Conn adapter, deadlines, SendFile, HoldReads</td></tr>
+      <tr><td><code>fib</code></td><td>Engine, Connection, Handler, Config; TCP, Unix sockets and UDP; Dial and DialWith (a chosen local address and port range), OpenUDPPeer, the net.Conn adapter, deadlines, SendFile, HoldReads</td></tr>
       <tr><td><code>taskpool</code></td><td>Interchangeable bounded schedulers: Elastic, Adaptive, AdaptiveChan, Inline</td></tr>
       <tr><td><code>streampool</code> · <code>sidepool</code></td><td>The stream pools, one per engine name; the handshake and client pools, one per process</td></tr>
       <tr><td><code>bufferpool</code></td><td>The shared buffer pool in power-of-two classes</td></tr>
-      <tr><td><code>tls</code></td><td>TLS over a connection: crypto/tls handshakes, with AES-GCM and AES-CBC records protected by the package itself</td></tr>
+      <tr><td><code>tls</code></td><td>TLS over a connection: crypto/tls handshakes, with AES-GCM and AES-CBC records protected by the package itself; sans-IO DTLS 1.2 with DTLS-SRTP for WebRTC</td></tr>
       <tr><td><code>http</code> · <code>hpack</code></td><td>HTTP/1.x and HTTP/2 servers and asynchronous clients; Context, streamed bodies, Tunnel, StreamPool</td></tr>
       <tr><td><code>http3</code> · <code>http3/quic</code> · <code>http3/qpack</code></td><td>HTTP/3 server and client, with their own QUIC and QPACK</td></tr>
       <tr><td><code>websocket</code></td><td>Server, client, frame-at-a-time delivery, permessage-deflate, upgrades over HTTP/1, 2 and 3</td></tr>
+      <tr><td><code>webrtc/*</code></td><td>PeerConnection and a UDP Mux shared by many; ICE, STUN, TURN (client and server), SDP, SCTP data channels, SRTP and RTP</td></tr>
+      <tr><td><code>media/*</code></td><td>Live streaming on a hub: RTMP, RTSP, SRT, HTTP-FLV, HLS and WHIP/WHEP, remuxed without transcoding</td></tr>
       <tr><td><code>middleware/*</code></td><td>HTTP middleware</td></tr>
       <tr><td><code>c/</code></td><td>The earlier C implementation (one epoll loop and a pthread pool), not covered here</td></tr>
     </tbody>

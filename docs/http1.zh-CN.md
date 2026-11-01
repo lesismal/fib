@@ -75,6 +75,10 @@ handler 如果希望调用一返回就拿回自己的 buffer（重新填充或�
 这就是拿回 handler 自己 buffer 的代价。见 `fibhttp.Response.Body`，trailer 的规则见
 `fibhttp.Response.Trailer`。
 
+代理转发响应可以既不拷贝也不分配：`ClientResponse.TakeBody()` 交出完整到达的响应的 body
+（`body, pooled, ok`；HTTP/1 的小 body 取自 `bufferpool`），`Context.WriteResponseOwned` 发送
+`Body` 是这种 buffer 的 `Response`，send 路径用完后把它还给池。调用之后调用方不能再碰这块 buffer。
+
 ### Transfer coding
 
 chunked 不是唯一会被解码的 transfer coding（RFC 9112 第 7 节）。chunked 之上再加 gzip、
@@ -246,6 +250,10 @@ body 单独计时，从它的 HEADERS 算起：流式交给 handler 的 body 以
 `Config.StreamRequestBodyThreshold` 在开启流式时让较小的 body 仍然整体缓存：只有
 `Content-Length` 超过它的 body，以及已经发来超过这么多字节的 chunked body 才流式交付。
 为 0 时所有 body 都流式交付；不开 `StreamRequestBody` 时它不起作用。
+`Config.StreamRequestBodyAtHeader`（`func(*http.Request) bool`）挑出 header 一到就流式交付
+的请求，不论阈值是多少，HTTP/1 与 HTTP/2 都适用（`http3.Config` 有自己的同名选项）。任何大小的
+body 都会问它，所以 handler 能在 `100 Continue` 请客户端发送之前用 `LimitBody` 拒绝大上传。
+经代理的 gRPC 调用需要它：客户端可能要等第一条小消息的回复才发下一条，阈值永远等不到。
 
 ```go
 config := fibhttp.DefaultConfig()

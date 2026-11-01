@@ -87,10 +87,11 @@ type ServerConfig struct {
 	// with its publisher.
 	PlayWait time.Duration
 
-	// MaxQueuedBytes is how much a player may have queued and not yet sent
-	// before its packets are dropped, video until the next keyframe (see
-	// hub.NewDropper); twice as much closes it. Zero means
-	// DefaultMaxQueuedBytes.
+	// MaxQueuedBytes is how much a player over TCP may have queued and not
+	// yet sent before its packets are dropped, video until the next
+	// keyframe (see hub.NewDropper); twice as much closes it. Players over
+	// UDP send RTP as it comes and are never dropped or closed for falling
+	// behind. Zero means DefaultMaxQueuedBytes.
 	MaxQueuedBytes int64
 
 	// MTU bounds the RTP packets sent, header included; zero means

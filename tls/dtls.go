@@ -48,9 +48,9 @@ import (
 // 5705), from which SRTP takes its keys. What it leaves out: DTLS 1.0 and
 // 1.3, CBC suites, session resumption, renegotiation (a HelloRequest or a
 // second ClientHello is ignored), an SRTP MKI, and the certificate
-// callbacks' running off the caller's
-// goroutine: GetCertificate and GetClientCertificate, VerifyPeerCertificate
-// and VerifyConnection are called from HandleDatagram.
+// callbacks' running off the caller's goroutine: GetCertificate and
+// GetClientCertificate, VerifyPeerCertificate and VerifyConnection are
+// called from HandleDatagram.
 //
 // WebRTC peers authenticate each other by the fingerprints of their
 // certificates, which their SDP carries (RFC 8122), and not by a chain to a

@@ -44,5 +44,8 @@
 // feedback and bandwidth estimation, simulcast sending (receiving it, by
 // RID, is supported), the RTP packetization of codecs, DTLS 1.3, SDES
 // keying, and statistics beyond the RTCP reports. A TURN relay needs a
-// PeerConnection with a port of its own, not a shared Mux.
+// PeerConnection with a port of its own, not a shared Mux, and the
+// PeerConnection reaches TURN servers over UDP only: turns: and
+// ?transport=tcp URLs are skipped, though package turn's client and server
+// speak TCP and TLS.
 package webrtc

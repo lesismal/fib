@@ -407,14 +407,16 @@ flowchart LR
   <div class="tbl"><table>
     <thead><tr><th>包</th><th>内容</th></tr></thead>
     <tbody>
-      <tr><td><code>fib</code></td><td>Engine、Connection、Handler、Config；TCP / Unix socket / UDP；Dial、net.Conn 适配、deadline、SendFile、HoldReads</td></tr>
+      <tr><td><code>fib</code></td><td>Engine、Connection、Handler、Config；TCP / Unix socket / UDP；Dial 与 DialWith（指定本地地址与端口范围）、OpenUDPPeer、net.Conn 适配、deadline、SendFile、HoldReads</td></tr>
       <tr><td><code>taskpool</code></td><td>可互换的有界调度器：Elastic、Adaptive、AdaptiveChan、Inline</td></tr>
       <tr><td><code>streampool</code> · <code>sidepool</code></td><td>流池（按 Engine 名）；握手池与客户端池（进程级）</td></tr>
       <tr><td><code>bufferpool</code></td><td>2 的幂分级的共享缓冲池</td></tr>
-      <tr><td><code>tls</code></td><td>在连接上运行 TLS：crypto/tls 握手，AES-GCM / AES-CBC 记录由本包加解密</td></tr>
+      <tr><td><code>tls</code></td><td>在连接上运行 TLS：crypto/tls 握手，AES-GCM / AES-CBC 记录由本包加解密；供 WebRTC 用的 sans-IO DTLS 1.2 与 DTLS-SRTP</td></tr>
       <tr><td><code>http</code> · <code>hpack</code></td><td>HTTP/1.x 与 HTTP/2 服务端和异步客户端，Context、流式 body、Tunnel、StreamPool</td></tr>
       <tr><td><code>http3</code> · <code>http3/quic</code> · <code>http3/qpack</code></td><td>HTTP/3 服务端和客户端，自带 QUIC 与 QPACK 实现</td></tr>
       <tr><td><code>websocket</code></td><td>服务端、客户端、按帧接收、permessage-deflate、经 HTTP/1、2、3 升级</td></tr>
+      <tr><td><code>webrtc/*</code></td><td>PeerConnection 与多个 PeerConnection 共用的 UDP Mux；ICE、STUN、TURN（客户端与服务端）、SDP、SCTP data channel、SRTP 与 RTP</td></tr>
+      <tr><td><code>media/*</code></td><td>一个 hub 上的直播流媒体：RTMP、RTSP、SRT、HTTP-FLV、HLS 与 WHIP/WHEP，转封装、不转码</td></tr>
       <tr><td><code>middleware/*</code></td><td>HTTP 中间件</td></tr>
       <tr><td><code>c/</code></td><td>早期的 C 实现（单循环 epoll + pthread 线程池），本文不涉及</td></tr>
     </tbody>

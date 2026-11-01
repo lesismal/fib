@@ -6,4 +6,9 @@
 // connections for the workers. By default, Config.IOPollers spreads the
 // connections over several loops; without it, a single loop waits for all of
 // them.
+//
+// Engine.Dial and Engine.DialWith, which may bind a chosen local address and
+// port range, open outgoing connections on the same loops and workers, and
+// Engine.OpenUDPPeer lets a UDP binding speak first to an address that has
+// sent it nothing.
 package fib

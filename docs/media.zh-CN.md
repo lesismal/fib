@@ -101,10 +101,26 @@ RTMP 推上来的流能用 RTSP、SRT、HTTP-FLV、HLS 和 WHEP 播放，是因�
 一个 sink 的内存不超过限值加一个包，发布者也永远不用等待。有连接可断的出口还会检查第二个、
 更高的限值，超过它，或输出在空闲超时内一直不动，就断开这个消费者。
 
+| 出口 | 积压 | 超过多少丢包 | 何时断开 |
+| --- | --- | --- | --- |
+| RTMP | 连接排队的字节 | `WriteQueueLimit`（2 MiB） | 超过 `MaxWriteQueue`（16 MiB），或输出在 `IdleTimeout`（30 s）内一直不动 |
+| HTTP-FLV、WebSocket-FLV | 排队的字节；HTTP/2 与 HTTP/3 上为流控压住超过 64 KiB 的数据 | `WriteQueueLimit`（2 MiB） | HTTP/1 超过 `MaxWriteQueue`（16 MiB）；任何输出在 `IdleTimeout`（30 s）内一直不动的播放者 |
+| 走 TCP 的 RTSP 播放者 | 连接排队的字节 | `MaxQueuedBytes`（4 MiB） | 超过 `MaxQueuedBytes` 的两倍 |
+| 走 UDP 的 RTSP 播放者 | —（数据报来一个就发一个给 socket） | — | `SessionTimeout`（60 s）内没有请求或 RTCP |
+| SRT 播放者 | 未确认的载荷 | `MaxSendBacklog`（4 MiB） | 对端在 `PeerIdleTimeout`（5 s）内不发任何数据 |
+| WHEP 观众 | 其接收端报告的丢包率 | `MaxLoss`（25%） | ICE consent 丢失 |
+| HLS | —（每路流每种格式一个 Muxer，而不是每个播放者一个） | Muxer 的 `MaxBytes`（64 MiB）淘汰旧分片 | — |
+
+转推也以同样的方式丢包：`rtmp.Push` 超过 `ClientConfig.WriteQueueLimit`，
+`rtsp.PublishFromHub` 超过 `ClientConfig.MaxQueuedBytes`，`srt.Publish` 超过
+`ClientConfig.MaxSendBacklog`，`rtc.PushFromHub` 在服务端报告丢包超过 25% 期间。
+
 **上限。** 流数由 `MaxStreams` 限制，订阅数由 `MaxSubscribersPerStream` 限制（超过任一个返回
 `ErrLimit`），缓存由 `GOPCacheBytes` 限制，每个 sink 的队列由 sink 自己限制。既没有发布者也
-没有订阅的流会从流表中移除。`Hub.Streams` 返回每路流的快照：路径、track、发布者、订阅者数，
-以及流入的字节数与包数。
+没有订阅的流会从流表中移除。`Hub.Streams` 返回按路径排序的每路流快照：路径、track、已经在直播
+还是仅被预占、发布者的 `PublishInfo` 及开始时间、订阅者数，以及流入的字节数与包数。
+`Hub.Close` 以 `ErrClosed` 结束所有订阅，丢弃发布者之后写入的内容，并让之后的 `Publish`、
+`Reserve` 和 `Subscribe` 失败。
 
 ### 线程规则
 
@@ -131,10 +147,11 @@ worker。
 
 `hub.Config.OnPublish` 和 `OnSubscribe` 能看到每一次推流和播放，不论协议，参数是
 `PublishInfo`/`SubscribeInfo`：协议名（`rtmp`、`rtsp`、`srt`、`whip`、`whep`、`http-flv`、
-`ws-flv`、`hls`，RTMP 的转发是 `rtmp-pull`/`rtmp-push`）、远端地址，以及 URL 的 query，
-token 通常放在这里。返回错误即拒绝这次推流或播放。拉流转发同样会填写这些信息：
-`rtsp.PlayToHub` 填 RTSP 服务端的地址和其 URL 的 query，`srt.Play` 与 `srt.Publish` 填普通
-stream ID 中的 query（`live/s?token=...`）。URL 带 query 的 RTSP 播放者会像 ffmpeg 那样以该
+`ws-flv`、`hls`；RTMP 的转发是 `rtmp-pull` 和 `rtmp-push`，其它协议的转发用协议名本身）、
+远端地址，以及 URL 的 query，token 通常放在这里。返回错误即拒绝这次推流或播放。转发同样会
+填写这些信息：`rtmp.Pull` 与 `rtsp.PlayToHub` 填远端服务器的地址和其 URL 的 query，
+`rtc.PullToHub` 填其 URL 的 query，`srt.Play` 与 `srt.Publish` 填服务器地址和普通 stream ID
+中的 query（`live/s?token=...`）。URL 带 query 的 RTSP 播放者会像 ffmpeg 那样以该
 URL 为基准 SETUP 各 track（`rtsp://host/live/s?token=x/trackID=0`），服务端会把 `trackID`
 从 query 中取回。每个协议还有自己的钩子，处理只有它才知道的信息：
 
@@ -183,7 +200,10 @@ rtcServer, _ := rtc.NewServer(rtc.Config{Hub: h,
 ```
 
 `rtmp.ServerConfig` 有 `OnConnect`、`OnPublish` 和 `OnPlay`（其 `OnPublish` 先于 hub 的钩子
-执行），`httpflv.Config` 有 `OnPlay`，在 hub 的 `OnSubscribe` 之后执行。HLS 对每路流的每种
+执行），`httpflv.Config` 有 `OnPlay`，在 hub 的 `OnSubscribe` 之后执行。RTSP 在 DESCRIBE
+和 PLAY 时各询问一次 `OnSubscribe`。WHIP 与 WHEP 先询问 `rtc.Config.Authorize`，再询问 hub
+的钩子：`Authorize` 拒绝时，没有 token 回 401，有 token 回 403；钩子拒绝回 403，路径已被
+占用回 409，流不存在回 404。HLS 对每路流的每种
 格式只订阅一次，发生在第一个播放列表请求时，所以 `OnSubscribe` 只能看到那一个请求；要检查
 每个 HLS 请求，应在 handler 前面加一层 HTTP 中间件。
 
@@ -436,8 +456,10 @@ rtc.PullToHub(cc, "https://origin.example.com/whep/live/webrtc", h, "live/webrtc
   已被占用时立即以 `hub.ErrStreamBusy` 失败），把 track 的变化以 `SetTracks` 传下去，远端流结束时取消发布。
   发布被拒绝会关闭客户端。
 - 转推从流的第一组 track 开始，远端跟不上的包按 `hub.NewDropper` 的方式丢弃，流结束时转推
-  也结束。RTSP 在一个会话内无法重新 announce track，所以 track 变化会关闭 RTSP 转推；WHIP
-  转推在 PeerConnection 连上之前暂存最近一个 GOP。
+  也结束。track 变化时，RTMP 转推发送新的 sequence header，SRT 转推发送新的 PMT；WHIP 转推
+  沿用连接时的编码继续，新出现的编码不发，因为那需要新的 offer；RTSP 在一个会话内无法重新
+  announce track，所以 track 变化会关闭 RTSP 转推。WHIP 转推在 PeerConnection 连上之前暂存
+  最近一个 GOP。
 - 重连由应用负责：`done`/`OnClose` 告知转发已结束，重新启动只需一次调用。转推的 `Wait` 让它
   在源流重新推流期间保住位置。
 - 不用 hub 时，这些客户端就是普通的播放器和推流端：`rtmp.Play(engine, url, config, sink,
@@ -486,7 +508,8 @@ NAK 只有一个延迟（120 ms）的时间去找回几百个包，结果找不�
 ## 配置与限制
 
 除了 `Hub`（以及 `rtc.Config` 中带 Mux 或 engine 的 `WebRTC`），所有字段都是可选的；零值取
-下面的默认值。处处都有超时，对端能填满的每个缓冲区都有上限。
+下面的默认值。RTMP 服务端在 `OnPublish` 为每次推流返回 sink 时可以不用 hub，SRT 服务端在
+`OnSession` 接管所有会话时也可以。处处都有超时，对端能填满的每个缓冲区都有上限。
 
 **hub.Config**
 
@@ -496,11 +519,14 @@ NAK 只有一个延迟（120 ms）的时间去找回几百个包，结果找不�
 | `MaxStreams`、`MaxSubscribersPerStream` | 不限 | 超过时返回 `ErrLimit` |
 | `OnPublish`、`OnUnpublish`、`OnSubscribe` | 无 | 认证与观察，调用时不持有 hub 的锁 |
 
-**rtmp.ServerConfig**（以及字段大多相同的 `ClientConfig`）
+`hub.SubscribeOptions` 有 `Info`（`OnSubscribe` 看到的内容）、`Wait`（0 表示不等待：没有
+发布者时返回 `ErrNotFound`，发布者离开时订阅结束）和 `NoGOPCache`（从下一个关键帧开始）。
+
+**rtmp.ServerConfig**
 
 | 字段 | 默认值 | 含义 |
 | --- | --- | --- |
-| `HandshakeTimeout` | 10 s | 从连接到开始推流或播放（客户端另有 `DialTimeout`，10 s） |
+| `HandshakeTimeout` | 10 s | 从连接到开始推流或播放 |
 | `IdleTimeout` | 30 s | 不发任何数据的发布者，或输出不动的播放者 |
 | `PlayWait` | 0 | 播放等待缺席发布者、或自己的发布者离开后等待下一个发布者的时长；0 表示立即回 `StreamNotFound` |
 | `MaxMessageSize` | 8 MiB | 对端可发送的最大消息 |
@@ -508,6 +534,11 @@ NAK 只有一个延迟（120 ms）的时间去找回几百个包，结果找不�
 | `WriteQueueLimit`、`MaxWriteQueue` | 2 MiB、16 MiB | 超过前者丢包（视频丢到下一个关键帧），超过后者断开 |
 | `Encoder.LegacyHEVC` | false | 用 codec id 12 而不是 Enhanced RTMP 写 H.265 |
 | `OnConnect`、`OnPublish`、`OnPlay`、`OnClose` | 无 | 钩子；`OnPublish` 可以返回一个 sink，从而让服务端不用 hub 也能运行 |
+
+`rtmp.ClientConfig` 同样有 `HandshakeTimeout`、`IdleTimeout`、`MaxMessageSize`、
+`ChunkSize`、`WriteQueueLimit`、`MaxWriteQueue` 和 `Encoder`，另有 `DialTimeout`（10 s）、
+用于 `rtmps://` URL 的 `TLSConfig`、`FlashVer`、`SimpleHandshake`（不设置时发送 digest
+握手；检查 digest 的服务端会拒绝 simple 握手）以及 `OnClose`。
 
 **httpflv.Config**：`Path`（`/app/stream.flv` 播放 `app/stream`）、`OnPlay`、`CORS`、
 `Wait`（0 表示缺席的流回 404）、`WriteQueueLimit` 与 `MaxWriteQueue`（2 MiB 与 16 MiB；在
@@ -523,22 +554,24 @@ HTTP/2 和 HTTP/3 上，积压指流控压住超过 64 KiB 的数据，且只有
 | `SessionTimeout`、`IdleTimeout` | 60 s、60 s | 会话没有请求、RTCP 或（录制时）RTP 的时长；连接没有会话的时长 |
 | `MaxHeaderBytes`、`MaxBodyBytes` | 16 KiB、256 KiB | 请求的上限 |
 | `PlayWait` | 0 | 播放者在发布者离开后继续存在、等待编码相同的下一个发布者的时长；0 表示播放者随发布者一起结束 |
-| `MaxQueuedBytes` | 4 MiB | 播放者积压超过它就丢包；超过两倍就关闭 |
+| `MaxQueuedBytes` | 4 MiB | 走 TCP 的播放者积压超过它就丢包；超过两倍就关闭。走 UDP 的播放者，RTP 来一个就发一个给 socket |
 | `MTU`、`SenderReportInterval` | 1400、5 s | RTP 包大小，RTCP sender report 间隔 |
 | `ReorderSize`、`ReorderDelay` | 128 个包、100 ms | 每路经 UDP 录制的流的重排缓冲区 |
 | `OnRequest` | 无 | 查看每个已认证的请求，也可以代为应答 |
 
-`rtsp.ClientConfig` 有 `Transport`（TCP 或 UDP）、`DialTimeout`、`RequestTimeout` 与
-`ReadTimeout`（各 10 s）、`KeepAlive`（服务端给出的会话超时的一半，最多 30 s）、`MTU`、
-`MaxQueuedBytes`，以及重排缓冲区的大小和延迟。
+`rtsp.ClientConfig` 有 `Engine`（必填，且已在运行）、`Transport`（TCP 或 UDP）与
+`UDPHost`（UDP binding 的本地地址）、`Username` 与 `Password`（不设置时取 URL 中的用户
+信息）、`DialTimeout`、`RequestTimeout` 与 `ReadTimeout`（各 10 s）、`KeepAlive`（服务端
+给出的会话超时的一半，最多 30 s）、`MTU`、`MaxQueuedBytes`（4 MiB）、重排缓冲区的大小和
+延迟、`UserAgent`，以及回调 `OnTracks`、`OnPacket`、`OnReady` 和 `OnClose`。
 
-**srt.ServerConfig**（以及 `ClientConfig`）
+**srt.ServerConfig**
 
 | 字段 | 默认值 | 含义 |
 | --- | --- | --- |
 | `Latency` | 120 ms | 请求的 TSBPD 延迟；取两端中较大的 |
-| `Passphrase`、`PBKeyLen` | 无、16 | 加密：10 到 79 字节；密钥长度 16、24 或 32。设置了口令时，拒绝没有口令的 caller，反之亦然 |
-| `HandshakeTimeout`、`PeerIdleTimeout` | 3 s、5 s | 握手超时，以及对端不发任何数据的超时 |
+| `Passphrase`、`PBKeyLen` | 无、16 | 加密：10 到 79 字节；密钥长度 16、24 或 32（listener 采用 caller 的）。设置了口令时，拒绝没有口令的 caller，反之亦然 |
+| `PeerIdleTimeout` | 5 s | 对端不发任何数据的超时 |
 | `FlowWindow`、`SendBufferPackets` | 8192、8192 个包 | 接收缓冲区与对端在途包数；未确认加待发的包数 |
 | `MaxSendBacklog` | 4 MiB | 播放者未确认的载荷超过它就丢包 |
 | `PlayWait` | 0 | 播放者等待缺席流、或自己的发布者离开后等待下一个发布者的时长；0 表示以 `RejectNotFound` 拒绝缺席流的播放者 |
@@ -548,6 +581,13 @@ HTTP/2 和 HTTP/3 上，积压指流控压住超过 64 KiB 的数据，且只有
 | `Muxer`、`Demuxer` | MPEG-TS 默认值 | 每 100 ms 发送一次 PAT/PMT、每 40 ms 一个 PCR，PES 上限 4 MiB，得知 track 期间最多暂存 256 个包 |
 
 载荷最多 1456 字节；播放者每个 SRT 包收到 7 个 TS 包（1316 字节）。
+
+`srt.ClientConfig` 有 `StreamID`，同样的 `Latency`、`Passphrase`、`PBKeyLen`、
+`PeerIdleTimeout`、`FlowWindow`、`SendBufferPackets`、`MaxSendBacklog`、`Muxer` 和
+`Demuxer`，另有 `HandshakeTimeout`（3 s）、`Wait`（`Publish` 的
+`hub.SubscribeOptions.Wait`），以及回调 `OnConnect`、`OnClose`（listener 拒绝时为一个
+`RejectReason`）和 `OnData`（`Dial` 会话的载荷）。不带 hub 的 `Play` 把流交给 `Demuxer` 的
+`OnTracks` 与 `OnPacket`。
 
 **hls.HandlerConfig** 及其 `Muxer hls.Config`
 
@@ -574,15 +614,23 @@ HTTP/2 和 HTTP/3 上，积压指流控压住超过 64 KiB 的数据，且只有
 | `Authorize`、`AllowOrigin`、`LinkICEServers` | 无 | bearer token、CORS、以 Link 头下发的 ICE 服务器 |
 | `GatherTimeout`、`ConnectTimeout` | 5 s、15 s | 应答前的 candidate 收集，应答后的连接 |
 | `RepublishWait` | 10 s | 观众等待下一个发布者的时长 |
-| `NoGOPCache`、`MaxHeldBytes` | false、8 MiB | 观众从缓存的 GOP 开始，连接期间暂存它 |
+| `NoGOPCache`、`MaxHeldBytes` | false、8 MiB | 观众从下一个关键帧而不是缓存的 GOP 开始；观众连接期间暂存的数据上限 |
 | `MaxLoss` | 0.25 | 观众报告的丢包率超过它就丢包（视频丢到下一个关键帧） |
 | `MTU`、`ReorderSize`、`ReorderDelay` | 1200、128、100 ms | RTP 包大小，以及 WHIP track 的重排缓冲区 |
 | `PLIInterval`、`KeyFrameInterval` | 500 ms、0 | 两次关键帧请求的最小间隔；定期请求 |
 | `MaxOfferBytes` | 64 KiB | offer 或 PATCH body 的上限 |
 | `OnKeyFrameRequest` | 无 | 观众对一路不由本服务端 WHIP 会话发布的流请求关键帧 |
 
-`rtc.ClientConfig` 有 `Timeout`（15 s）、`Token`、`Header`、`MTU`、`MaxHeldBytes`、重排
-缓冲区、`PLIInterval` 和 `KeyFrameInterval`。
+`rtc.Config.WebRTC.Codecs` 被忽略：每个会话使用其流或 offer 的编码。`Certificates` 为空时，
+所有 PeerConnection 共用一张生成的证书。
+
+`rtc.ClientConfig` 有 `Engine`（已在运行；除非设置了 `HTTPClient`，由它发送请求，除非
+`WebRTC` 指定了 Mux 或 engine，由它打开 PeerConnection 的端口）、`HTTPClient`、`WebRTC`
+（播放的客户端提供其中的 `Codecs`，为 nil 时用 `rtc.DefaultReceiveCodecs()`；推流的客户端
+提供其 track 的编码）、`Timeout`（15 s）、`Token`、`Header`、`MTU`（1200）、
+`MaxHeldBytes`（8 MiB）、重排缓冲区、`PLIInterval`（500 ms）和 `KeyFrameInterval`，以及回调
+`OnTracks`、`OnPacket`、`OnReady`、`OnClose` 和 `OnKeyFrameRequest`（服务端向推流的客户端
+请求关键帧）。
 
 核心内部的固定上限：
 
@@ -611,8 +659,9 @@ HTTP/2 和 HTTP/3 上，积压指流控压住超过 64 KiB 的数据，且只有
 - **FLV 与 AMF**：VP8、VP9，以及原规范中除上面矩阵所列之外的编码（Sorenson H.263、VP6、
   Screen Video、Nellymoser、Speex、ADPCM：能解析，随后丢弃）；FLV 加密头；AMF3 编码、其
   externalizable 对象，以及 AMF0 的保留标记。
-- **HTTP-FLV**：拉流客户端（`rtmp.Pull` 从 RTMP 转发；拉 HTTP-FLV 需要一个能把响应 body 流式
-  送进 `flv.Demuxer` 的 fib/http 客户端，留待以后）；提供录制文件。
+- **HTTP-FLV**：拉流客户端（`rtmp.Pull` 从 RTMP 转发）。它还没有写：做法是把 fib/http
+  客户端的响应 body（`ClientConfig.StreamResponseBody`、`ClientResponse.OnBody`）送进
+  `flv.Demuxer`。提供录制文件。
 - **RTSP**：RTSP 2.0；基于 TLS（rtsps）和 HTTP 隧道的 RTSP；组播；用于跳转的 PLAY Range、
   Scale 与 Speed；比连接活得更久的会话；向录制端发送 RTCP receiver report。
 - **RTP 载荷**：H.264 的 interleaved 模式（能读，但不按解码顺序号重排）；H.265 的 DONL；MP3 和

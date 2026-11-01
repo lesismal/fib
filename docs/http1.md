@@ -99,6 +99,13 @@ rather than handing it over, which is the price of getting the handler's own
 buffer back. See `fibhttp.Response.Body`, and `fibhttp.Response.Trailer` for
 what the same rule asks of a trailer.
 
+A proxy passes a response on with neither a copy nor an allocation:
+`ClientResponse.TakeBody()` hands over the body of a response that arrived
+whole (`body, pooled, ok`; a small HTTP/1 body comes from `bufferpool`), and
+`Context.WriteResponseOwned` sends a `Response` whose `Body` is such a buffer
+and gives it back to the pool once the send path is done with it. The caller
+must not touch the buffer after the call.
+
 ### Transfer codings
 
 Chunked is not the only transfer coding decoded (RFC 9112 section 7). A body
@@ -324,6 +331,13 @@ and [`fib-examples/gateway`](https://github.com/lesismal/fib-examples/tree/main/
 while streaming is on: only a body whose `Content-Length` is larger than it,
 or a chunked body that has already sent more than it, streams. Zero streams
 every body; without `StreamRequestBody` it does nothing.
+`Config.StreamRequestBodyAtHeader`, a `func(*http.Request) bool`, picks
+requests whose bodies stream as soon as their header is in, whatever the
+threshold says, on HTTP/1 and HTTP/2 alike (`http3.Config` has its own). It is
+asked of a body of any size, so a handler can refuse a large upload with
+`LimitBody` before `100 Continue` asks the client for it. A gRPC call through a
+proxy needs it: its client may wait for the answer to a small first message,
+and the threshold would never arrive.
 
 ```go
 config := fibhttp.DefaultConfig()

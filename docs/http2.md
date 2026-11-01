@@ -67,7 +67,10 @@ Behaviour to be aware of when using it.
   request's own buffer, as `Context.Body()` is, is copied by the server
   instead, since that buffer goes back to the pool once the handler returns,
   exactly as HTTP/1's send copies one; every other body, including the copy
-  `RespondCopy` makes, is kept as given rather than copied again.
+  `RespondCopy` makes, is kept as given rather than copied again. A pooled
+  body (the `*Copy` calls' copy, or one given to `WriteResponseOwned`) goes
+  back to the pool once it is framed, unless the windows keep a tail of it
+  back, which is left to the collector.
 - A handler may instead write its response through `Context`'s
   `http.ResponseWriter` methods (`Header`/`WriteHeader`/`Write`/`Flush`),
   trailers included, and hand `Context` to `http.ServeFile` or

@@ -20,7 +20,12 @@
 // player past Config.MaxWriteQueue, or one whose output has not moved for
 // Config.IdleTimeout, is disconnected.
 //
-// Left out: an HTTP-FLV pull client (rtmp.Pull relays from RTMP; pulling
-// HTTP-FLV needs a client of fib/http that streams response bodies into
-// flv.Demuxer, which is left for later), and serving recorded files.
+// A player waits up to Config.Wait for a stream that has no publisher yet,
+// or for the next publisher after its own leaves; its FLV timestamps keep
+// increasing across the republish (flv.Timeline).
+//
+// Left out: an HTTP-FLV pull client (rtmp.Pull relays from RTMP), which
+// is not written yet: it would feed the body of a fib/http client
+// response (ClientConfig.StreamResponseBody, ClientResponse.OnBody) into
+// flv.Demuxer. Serving recorded files is left out too.
 package httpflv

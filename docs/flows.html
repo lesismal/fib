@@ -856,6 +856,8 @@ flowchart TD
       <tr><td>WS over HTTP/2 (±TLS)</td><td>as HTTP/2</td><td>framing, tunnel DATA delivery, OnMessage (usually)</td><td>TLS only: handshake</td><td>Upgrade, OnOpen, OnMessage for queued data</td><td>sends cut to the flow-control windows</td></tr>
       <tr><td>WS over HTTP/3</td><td>read UDP, sort by peer</td><td>QUIC packets, tunnel DATA delivery, OnMessage (usually)</td><td class="dash">—</td><td>Upgrade, OnOpen, OnMessage for queued data</td><td>QUIC timers</td></tr>
       <tr><td>HTTP/3</td><td>read UDP, sort by peer (root loop, or each poller)</td><td>QUIC packets, TLS 1.3 handshake, frames, QPACK decode</td><td class="dash">—</td><td>handler, QPACK encode, sendmmsg</td><td>QUIC timers send; UDP sweep</td></tr>
+      <tr><td>WebRTC</td><td>read UDP, sort by peer</td><td>the Mux routes by sender; ICE, DTLS, SRTP and SCTP under a mutex per PeerConnection, then its callbacks</td><td class="dash">—</td><td class="dash">—</td><td>one timer per PeerConnection</td></tr>
+      <tr><td>Streaming media</td><td>as its transports: TCP for RTMP, RTSP and HTTP; UDP for SRT, RTSP and WHIP/WHEP</td><td>ingest parsing, then the hub's fan-out: every subscriber muxes and queues its writes on the publisher's worker</td><td class="dash">—</td><td class="dash">—</td><td>one timer per SRT session</td></tr>
     </tbody>
   </table></div>
 </section>

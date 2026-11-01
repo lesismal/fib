@@ -830,6 +830,8 @@ flowchart TD
       <tr><td>WS over HTTP/2（±TLS）</td><td>同 HTTP/2</td><td>分帧、隧道 DATA 交付、OnMessage（通常）</td><td>仅 TLS：握手</td><td>Upgrade、OnOpen、排队数据的 OnMessage</td><td>发送按流控窗口切帧</td></tr>
       <tr><td>WS over HTTP/3</td><td>读 UDP、分拣</td><td>QUIC 解包、隧道 DATA 交付、OnMessage（通常）</td><td class="dash">—</td><td>Upgrade、OnOpen、排队数据的 OnMessage</td><td>QUIC 定时器</td></tr>
       <tr><td>HTTP/3</td><td>读 UDP、按对端分拣（根循环或各 poller）</td><td>QUIC 解包、TLS 1.3 握手、帧、QPACK 解码</td><td class="dash">—</td><td>handler、QPACK 编码、sendmmsg</td><td>QUIC 定时器发包；UDP sweep</td></tr>
+      <tr><td>WebRTC</td><td>读 UDP、按对端分拣</td><td>Mux 按发送方路由；ICE、DTLS、SRTP、SCTP 在每个 PeerConnection 的锁下执行，之后执行它的回调</td><td class="dash">—</td><td class="dash">—</td><td>每个 PeerConnection 一个定时器</td></tr>
+      <tr><td>流媒体</td><td>同各自的传输：RTMP、RTSP、HTTP 走 TCP；SRT、RTSP、WHIP/WHEP 走 UDP</td><td>接入解析，然后是 hub 的分发：每个订阅者在发布者的 worker 上复用并排队写出</td><td class="dash">—</td><td class="dash">—</td><td>每个 SRT 会话一个定时器</td></tr>
     </tbody>
   </table></div>
 </section>

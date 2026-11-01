@@ -20,7 +20,8 @@
 // a fragment at each Flush out. Since a sample's duration is the distance to
 // the next sample of its track, it holds the last packet of each track back
 // until the next one, or a Flush told what comes next, arrives; see Writer
-// for how jumps in the clock are taken.
+// for how jumps in the clock are taken. StartAt and End let a new Writer
+// carry on where another ended, as HLS does after a discontinuity.
 //
 // ParseInit and Init.ParseFragment read init segments and fragments back
 // into av.Tracks and av.Packets, for tests and for ingests that take fMP4;

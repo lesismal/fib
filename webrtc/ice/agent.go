@@ -230,9 +230,9 @@ type pending struct {
 	cancelled bool
 }
 
-// Agent is a full ICE agent (RFC 8445) for one data stream with one
-// component, as WebRTC uses with BUNDLE and rtcp-mux, with trickle (RFC
-// 8838) and consent freshness (RFC 7675). It does no I/O: packets come in
+// Agent is an ICE agent (RFC 8445), full or, with Config.Lite, lite, for one
+// data stream with one component, as WebRTC uses with BUNDLE and rtcp-mux,
+// with trickle (RFC 8838) and consent freshness (RFC 7675). It does no I/O: packets come in
 // through HandlePacket, go out through Config.Send, and time passes through
 // HandleTimeout. Its methods must be called from one goroutine at a time.
 type Agent struct {

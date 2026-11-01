@@ -49,7 +49,7 @@ uSockets, workflow, axum, h2, quiche and rustls.
 | HTTP CONNECT proxy | ✓ HTTP/1.x, HTTP/2, HTTP/3 | — | `Context.Connect` tunnels, paced both ways; `ConnectProxy` is a ready proxy for curl `-x`, browsers and `HTTPS_PROXY` |
 | SOCKS5 / SOCKS4 / 4a | ✓ | ✓ (async dial) | CONNECT, BIND and UDP ASSOCIATE, username/password; the HTTP, WebSocket and TLS clients dial through it |
 | gRPC | ✓ h2 and h2c | ✓ | unary and streaming both ways, metadata, deadlines, interceptors, gzip; works with protoc-gen-go-grpc code and talks to grpc-go |
-| WebRTC | ✓ | ✓ | PeerConnections sharing one UDP port: ICE (lite and full, trickle), DTLS 1.2-SRTP, data channels, RTP forwarding for SFUs, and a TURN client and server, all written from scratch; talks to browsers and pion ([details](docs/webrtc.md)) |
+| WebRTC | ✓ | ✓ | PeerConnections sharing one UDP port: ICE (lite and full, trickle), DTLS 1.2-SRTP, data channels, RTP forwarding for SFUs, and a TURN client and server over UDP, TCP and TLS (quotas, events and stats, hot reload, drain), all written from scratch; talks to browsers and pion ([details](docs/webrtc.md)) |
 | Streaming media | ✓ | ✓ | RTMP/RTMPS (Enhanced RTMP), RTSP over TCP and UDP, SRT, HTTP-FLV and WebSocket-FLV, HLS with fMP4 or TS segments and LL-HLS, WHIP and WHEP, joined by a hub that remuxes between them without transcoding; pull and push relays for each; checked against ffmpeg and Chromium ([details](docs/media.md)) |
 
 ### Engine
@@ -68,8 +68,9 @@ uSockets, workflow, axum, h2, quiche and rustls.
   UDP, a handler of its own, so one engine serves HTTP, HTTPS, HTTP/3, WebSocket, gRPC and raw TCP
   side by side on shared loops, pools and buffers. Package `mux` goes further and serves several
   protocols on one port, told apart by the first bytes each client sends.
-- **Async clients**: non-blocking dial, plus HTTP/1.x, HTTP/2, HTTP/3 and WebSocket clients that
-  report results through callbacks or futures.
+- **Async clients**: non-blocking dial, from a chosen local address and port range if need be,
+  plus HTTP/1.x, HTTP/2, HTTP/3 and WebSocket clients that report results through callbacks or
+  futures.
 - **Static files**: `http.FileCache` serves a directory from memory, with pre-compressed `.br`/`.gz`
   twins, and follows the disk: an inotify watch on Linux, a stat per request elsewhere.
 - **Router**: a [chi](https://github.com/go-chi/chi)-style API with parameters, regexps,
@@ -410,6 +411,9 @@ git clone https://github.com/lesismal/fib-examples && cd fib-examples
 go run ./multiprotocol/server # HTTP, HTTPS, HTTP/3, WebSocket and raw TCP from one engine, and a port that sniffs
 go run ./multiproto/server   # HTTPS, HTTP/1.1, h2c, WebSocket, gRPC, SOCKS, HTTP CONNECT, arpc and a TCP echo on one port
 go run ./tcp/nontls/server
+go run ./tcp/dialfrom          # Engine.DialWith: a dial from a chosen local address and port range
+go run ./udp/openpeer         # Engine.OpenUDPPeer: a UDP binding that speaks first
+go run ./tls/dtls/server      # a DTLS 1.2 echo with DTLS-SRTP keys; its client speaks first through OpenUDPPeer
 go run ./http/nontls/server
 go run ./http/router
 go run ./http/upload/server   # big bodies: SaveBody, resumable SaveBodyResumable, OnBody echo; see its mkfile and client

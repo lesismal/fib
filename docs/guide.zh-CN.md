@@ -280,7 +280,7 @@ UDP server 的 peer）或 `fib.ProtocolUnix`，`String()` 给出 net 包的网�
 之后也不变。
 
 `c.IsAccepted()` 表示连接由 Engine 的 listener 接受（accept 的 TCP、Unix 连接，以及向 UDP
-server 发来第一个数据报的 peer），`c.IsDialed()` 表示由 `Dial` / `DialWithHandler` 拨出，两者
+server 发来第一个数据报的 peer，以及 `OpenUDPPeer` 在 UDP binding 上打开的 peer），`c.IsDialed()` 表示由 `Dial` / `DialWithHandler` / `DialWith` 拨出，两者
 互斥，同样关闭之后也不变。同一个 handler 既服务 accept 的连接又服务拨出的连接时，可以用它区分
 服务端和客户端。
 
@@ -393,7 +393,11 @@ err := server.Dial("tcp", "127.0.0.1:9001", 3*time.Second, func(c *fib.Connectio
 - `DialWith(fib.DialOptions{...}, done)` 指定拨出的本地端：`LocalAddr` 是 bind 的 IP 和端口（端口
   为 0 由内核选择），`PortMin`/`PortMax` 给出端口范围，从随机起点依次尝试，`EADDRINUSE` 换下一个，
   整个范围都被占用时 done 收到匹配 `fib.ErrNoLocalPort` 的错误。本地地址须与远端同一协议族，
-  域名只解析为该族的地址。与 `net.Dialer` 一样不设置 `SO_REUSEADDR`，TCP 与 UDP 都适用。
+  域名只解析为该族的地址。与 `net.Dialer` 一样不设置 `SO_REUSEADDR`，所以被任何其他 socket
+  占用的端口（包括仍在 TIME_WAIT 的 TCP 端口、同族其他地址上的同一端口）都 bind 失败；Windows 本会
+  让通配地址与具体地址共用端口，因此那里用 `SO_EXCLUSIVEADDRUSE` 同样拒绝。TCP 与 UDP 都适用，
+  `"unix"` 不接受本地端；端口与范围同时设置、范围为空或从 0 开始时 `DialWith` 直接返回错误。
+  兼容后端由 `net.Dialer` bind，范围内逐个端口尝试拨号。示例见 fib-examples 的 `tcp/dialfrom`。
 
 ### Unix Socket
 
@@ -437,6 +441,15 @@ addr, _ := server.LocalUDPAddr()
   `IsUDP()` 返回 true。UDP 没有关闭报文，对端静默超过 `Config.UDPIdleTimeout`
   （默认 `DefaultUDPIdleTimeout`，60 秒；负数表示不超时）后连接被关闭，`OnClose`
   收到 `ErrUDPIdleTimeout`。拨号出去的 UDP 连接不做超时。
+- `Engine.OpenUDPPeer(binding, addr)` 让监听 socket 先开口：它返回 UDP binding（`binding` 是
+  它在 `fib.New` 参数里的下标）的 socket 上 `addr` 这个对端的连接，没有就打开一条，和对端第一个
+  数据报会打开的那条一样，用 binding 的 handler、调用它的 `OnOpen`，对端的回复因此回到这条连接。
+  ICE 从一个 socket 检查对端的各个地址、向 STUN/TURN 服务器询问这个 socket 的外部地址，用的就是它。
+  它要等 socket 所在的事件循环，所以不能在那个循环执行的回调里调用（UDP 对端的 `OnOpen`、
+  `OnHangup`、引擎在循环上运行的函数）；Engine 停止或 binding 正在 drain 时返回 `net.ErrClosed`，
+  IPv4 socket 上给 IPv6 地址返回错误。开启 `ReusePort` 时连接开在第一个 socket 上，回复可能落到
+  另一个 socket 并为同一地址再开一条连接，所以协议应按地址而不是按连接记录对端。示例见
+  fib-examples 的 `udp/openpeer`。
 - 数据报边界保持不变：每次 `OnData` 恰好是一个数据报，每次 `Send`/`SendParts`
   恰好发送一个数据报。
 - Handler 如果实现了 `fib.DatagramsHandler`，worker 运行时连接已经排队的数据报会按到达
@@ -605,7 +618,10 @@ err = fibtls.Dial(engine, "tcp", "example.com:443", 3*time.Second, tlsConfig, ha
 - 这个 package 只使用 fib 的公开 API：它通过 `Connection.SetLayer` 安装一个
   `fib.Layer` 来加密发送，用 `SendRaw`、`CloseAfterSendRaw` 直接写 socket，用
   `CloseWithError` 把握手失败的原因交给 `OnClose`。其他加密或分帧协议也可以用同样
-  的方式接入；本库不内置 DTLS，UDP 上需要加密时可以用这个接口接入自己选择的实现。
+  的方式接入。UDP 上的加密用 DTLS 1.2：`fibtls.NewDTLSServer`/`NewDTLSClient` 返回 sans-IO 的
+  `DTLSConn`，调用方用 `HandleDatagram` 交给它收到的数据报，它经 `DTLSOptions.Output` 发出
+  数据报，`NextTimeout`/`HandleTimeout` 负责重传；支持 DTLS-SRTP（`use_srtp`、
+  `ExportKeyingMaterial`），WebRTC 用的就是它（见 `docs/webrtc.zh-CN.md`）。
 - 连接 cork 期间（读轮次里，或 `Cork` 与 `Flush` 之间）发送的明文先由 layer 留着，
   cork 解除时合成一个 record 加密发出，而不是每次发送一个 record：HTTP/2 一轮的
   多个响应因此只有一次加密、一份 record 开销、一项写队列。留着的明文最多一个 record
@@ -673,9 +689,12 @@ func(c *fibhttp.Context) {
 - handler 要提前复用 body（或 trailer）就用 `RespondCopy`/`WriteResponseCopy`：它们在调用时
   拷贝 body，后者还拷贝 trailer 的 map 和其中的值，调用一返回 handler 就能改、能重新填；
   默认路径不拷贝。拷贝在 send 路径能接管时取自池——HTTP/1 的 send 会把它拷进本轮缓冲或
-  队列后归还池缓冲，HTTP/3 则作为 owned run 留到对端确认——池是热的时零分配；HTTP/2 的
-  stream 会把 body 留到窗口放行为止，所以它的拷贝是普通分配。见 `fibhttp.Response.Body` 与
+  队列后归还池缓冲，HTTP/2 分帧时拷贝 body、随即归还（窗口留下的尾巴除外，那部分交给 GC），
+  HTTP/3 则作为 owned run 留到对端确认——池是热的时零分配。见 `fibhttp.Response.Body` 与
   `fibhttp.Response.Trailer`。
+- 代理转发上游响应：`ClientResponse.TakeBody()` 交出完整到达的响应 body（`body, pooled, ok`，
+  HTTP/1 的小 body 取自 `bufferpool`），`Context.WriteResponseOwned` 发送它并在 send 路径用完后
+  归还池，全程不拷贝、不分配；调用之后不能再碰这块 buffer。
 - `ReadFrom`（`io.Copy`、`http.ServeContent` 都会用到）遇到普通文件，或包着文件的
   `*io.LimitedReader` 时，通过 `Connection.SendFile` 发送；TLS 连接退化为读取后加密发送。
 - handler 返回时响应自动结束（写出剩余数据、结束 chunk、发送 trailer），与 `net/http`
@@ -764,7 +783,8 @@ func(c *fibhttp.Context) {
 
 **异常情况**：连接断开、读超时、body 收不完，都会让请求被取消——不再写出任何东西，剩余
 引用全部作废，handler 只被告知一次：`OnBody` 的 `err`，以及 `Context.OnCancel(func(error))`
-（给只 `Retain`、不用 `OnBody` 的异步 handler）。两者都在 engine 的 stream 协程池上执行
+（给只 `Retain`、不用 `OnBody` 的异步 handler；用了 `OnBody` 时 body 中途失败也会执行它注册的
+回调，中间件因此能收尾）。两者都在 engine 的 stream 协程池上执行
 而不是事件循环上，拖不住服务端。`Context.Err()` 可以主动查。需要 `context.Context` 的代码
 （数据库查询、`httputil.ReverseProxy`）用 `c.Context()`：请求被取消时它随之取消
 （`context.Cause` 是原因），否则在请求结束（handler 返回且全部 `Release`）时取消。之后一切幂等：已经结束的请求上再调
@@ -839,7 +859,8 @@ handler := fibhttp.NewHandlerWithConfig(config, myHandler)
 默认情况下请求的 body 收齐之后 handler 才会被调用，上传一个 1GB 的文件就意味着先在
 内存里放下 1GB。开启 `Config.StreamRequestBody`（默认关闭）之后，body 不再等待收齐：
 header 解析完就调用 handler（`StreamRequestBodyThreshold` 可以让不超过它的 body 仍然
-整体缓存，0 表示所有 body 都流式交付），`Request.Body` 是一个 `*fibhttp.BodyStream`，
+整体缓存，0 表示所有 body 都流式交付；`StreamRequestBodyAtHeader` 返回 true 的请求不论阈值、
+header 一到就流式交付），`Request.Body` 是一个 `*fibhttp.BodyStream`，
 边收边读：
 
 ```go
@@ -1169,7 +1190,10 @@ client.Do(req, func(resp *fibhttp.ClientResponse, err error) {
   的请求，trailer 会在 body 之后用单独的 HEADERS 帧发送（HTTP/1 上则是 chunked 的
   trailer）。
 - 每个 host:port 维护连接池：keep-alive 复用，`MaxConnsPerHost` 限制同时打开或正在
-  建立的连接数，超出的请求排队；`MaxIdleConnsPerHost`、`IdleConnTimeout` 控制空闲
+  建立的连接数，超出的请求排队；`MaxPendingPerHost` 限制排队的请求数，再多的立即以
+  `ErrTooManyPending` 失败（正在为它拨号、或 `MaxConnsPerHost` 还允许再拨的请求不计入），
+  不设 `MaxConnsPerHost` 时不起作用；客户端自己关掉的连接（超时、取消）在失败的请求收到
+  回调之前就不再计入 `MaxConnsPerHost`；`MaxIdleConnsPerHost`、`IdleConnTimeout` 控制空闲
   连接的保留。HTTP/1.1 连接同时只跑一个请求，不做 pipelining。
 - 支持 `Content-Length`、chunked（含 trailer）、以关闭连接为结束的 body，HEAD、
   204、304 不读 body，1xx 中间响应自动跳过。请求的 `ContentLength` 为 -1 时 body 以
@@ -1297,7 +1321,8 @@ server, err := fib.New(config, fib.Binding{Addr: ":8080", Handler: fibhttp.NewHa
   写出时都先经过它（`Filter`），结束时 `Close` 交出剩下的部分，`Flush` 时实现了 `BodyFlusher` 的
   过滤器交出已缓冲的部分。流式响应仍然流式发送，`Flush` 照常生效；整体发送的响应一次过滤，
   钩子看到的 header 里有 body 的 `Content-Length`。有过滤器的响应不带 `Content-Length`、不走
-  sendfile。用它压缩响应不需要整体缓存。
+  sendfile。用它压缩响应不需要整体缓存。过滤器返回错误时 `Write` 返回该错误，响应被放弃，
+  不会把已写出的部分当作完整的 body 结束；同步过滤器在异步过滤器之前失败也是如此。
 - `OnHeaderAsync(fn)`：在 `OnHeader` 的位置调用，但响应头要等 fn 拿到的 `resume` 被调用（可以来自任何
   goroutine，也可以在 fn 里）才发出，供必须在别的池上决定响应头的中间件使用。期间响应被持有，handler
   可以先返回；整体发送的响应连同 body 的副本原样暂存，流式响应最多暂存 64 KB，超过时 `Write` 等待、
@@ -1726,13 +1751,14 @@ fib 内部用它的地方：连接的读 buffer 与发送队列缓冲、`SendFil
 示例在独立仓库 [fib-examples](https://github.com/lesismal/fib-examples) 中，下面的命令都在它的根目录运行
 （`git clone https://github.com/lesismal/fib-examples && cd fib-examples`）。
 
-每种协议一个目录，每个目录下分 TLS 与非 TLS 两个子目录（UDP 只有非 TLS：本库
-不内置 DTLS；HTTP/3 只有 TLS：QUIC 总是加密的），各有一个 echo server 和一个 echo client：
+每种协议一个目录，每个目录下分 TLS 与非 TLS 两个子目录（UDP 加密的版本是 DTLS，在
+`tls/dtls`；HTTP/3 只有 TLS：QUIC 总是加密的），各有一个 echo server 和一个 echo client：
 
 ```text
 fib-examples/
 ├── tcp/        nontls/{server,client}  127.0.0.1:9000    tls/{server,client}  127.0.0.1:9443
 ├── udp/        nontls/{server,client}  127.0.0.1:9001
+├── tls/dtls/   {server,client}         127.0.0.1:4444    (DTLS 1.2，客户端经 OpenUDPPeer 先发)
 ├── http/       nontls/{server,client}  127.0.0.1:8080    tls/{server,client}  127.0.0.1:8443 (HTTPS)
 ├── http3/                                                tls/{server,client}  127.0.0.1:8445 (UDP)
 ├── gateway/    upstream 127.0.0.1:9000 / 9443    server 127.0.0.1:8081 / 8446 (HTTP/3 在同端口 UDP)    client
@@ -1786,6 +1812,9 @@ go run ./tcp/tls/client -n 10
   `ContentLength` 就会边读边发（HTTP/1、HTTP/2、HTTP/3 都支持）；`Context.Upgrade` 只能在 handler 返回前调用，所以 WebSocket 先升级下游再异步拨号上游，
   上游不可达时用关闭码 1014 通知客户端，而不是 HTTP 502；HTTP/2 与 HTTP/3 下游的 `Write` 在窗口用尽时会等待客户端，
   这个等待发生在上游连接的 worker 上，上限是 64KB。
+- [`fib-examples/tcp/dialfrom`](https://github.com/lesismal/fib-examples/tree/main/tcp/dialfrom) 用 `DialWith` 从指定本地地址和端口范围拨出；
+  [`fib-examples/udp/openpeer`](https://github.com/lesismal/fib-examples/tree/main/udp/openpeer) 用 `OpenUDPPeer` 让 UDP binding 先发；
+  [`fib-examples/webrtc`](https://github.com/lesismal/fib-examples/tree/main/webrtc) 是 WebRTC 的浏览器示例（data channel、媒体回传、`webrtc/sfu` 转发等）。
 - [`fib-examples/http/router`](https://github.com/lesismal/fib-examples/tree/main/http/router) 演示 Router：带参数与正则的路由、带自己中间件的 `Route`、`Mount`
   的子 Router，以及 404/405，`go run ./http/router` 后用文件头注释里的 curl 命令访问。
 
@@ -1898,7 +1927,7 @@ Engine 的 worker 池（`<Name>-workers`），每条连接的每一轮都在 wor
   `EADDRINUSE`，之后也只有自己设置了 `SO_REUSEPORT` 的 socket 能加入；设置 `ReusePort` 则是明确
   允许同一用户的其他进程监听同一地址并分走连接（例如平滑重启）。Unix socket 和其他平台仍由
   Engine 自己的循环 accept；macOS 的 `SO_REUSEPORT` 不在多个 socket 之间分摊 TCP 连接。
-- `Dial` / `DialWithHandler` 发起的连接（TCP、UDP、Unix socket）也同样按 fd 取模分到 poller 上。
+- `Dial` / `DialWithHandler` / `DialWith` 发起的连接（TCP、UDP、Unix socket）也同样按 fd 取模分到 poller 上。
 - UDP server 默认只有一个 socket，各个 peer 共用它，所以留在 Engine 自己的循环上。Linux 上设置
   `ReusePort` 时，UDP 地址也改由 poller 读：每个 poller 在这个地址上用 `SO_REUSEPORT` bind 一个
   自己的 socket（第一个 poller 直接接管 Engine bind 的那个，Engine 自己不留 socket，因为已 bind

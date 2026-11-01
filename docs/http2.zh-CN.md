@@ -50,7 +50,9 @@ HEADERS 这样到达的 stream 带 `Early-Data: 1`（RFC 8470），只有 GET、
   放行为止——所以 handler 在此之前不能修改它；要提前复用就改用 `RespondCopy` /
   `WriteResponseCopy`，它们在调用时拷贝。body 若是请求自己的缓冲（`Context.Body()` 就是），
   则由服务端拷贝：这块缓冲在 handler 返回后就要还给池，HTTP/1 的 send 也是这么拷贝的；
-  其他 body（包括 `RespondCopy` 做的那份拷贝）都按原样保留，不会再拷贝一次。
+  其他 body（包括 `RespondCopy` 做的那份拷贝）都按原样保留，不会再拷贝一次。池里的 body
+  （`*Copy` 调用的拷贝，或交给 `WriteResponseOwned` 的）分帧后就还给池，窗口留下尾巴时
+  那部分交给 GC。
 - handler 也可以通过 `Context` 的 `http.ResponseWriter` 方法（`Header`/`WriteHeader`/
   `Write`/`Flush`）写响应（含 trailer），或把 `Context` 交给 `http.ServeFile`、
   `http.ServeContent`。不超过 4KB（或设置了不超过 64KB 的 `Content-Length`）且没有

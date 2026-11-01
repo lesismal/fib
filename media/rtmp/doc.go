@@ -29,7 +29,10 @@
 // headers first, and a player that falls behind has its packets dropped
 // (video until the next keyframe, hub.NewDropper) and, past a second limit
 // or when its output stops moving for IdleTimeout, is disconnected, so a
-// player never grows the server's memory. Callbacks (OnConnect, OnPublish,
+// player never grows the server's memory. With ServerConfig.PlayWait a
+// player waits for a stream not yet published, and for the next publisher
+// after its own leaves, its timestamps increasing across the republish
+// (flv.Timeline). Callbacks (OnConnect, OnPublish,
 // OnPlay) authorize, and let a server run without a hub.
 //
 // Publish and Play are the client: they dial through a fib.Engine, run the

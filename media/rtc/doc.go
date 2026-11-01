@@ -14,8 +14,9 @@
 // (application/trickle-ice-sdpfrag, RFC 8840). An ICE restart is not
 // supported and is answered 422, as RFC 9725 section 4.3.2 asks. OPTIONS
 // answers CORS preflights when Config.AllowOrigin is set, and the ICE
-// servers clients are to use can be sent as Link headers. Authorization takes a bearer token
-// through Config.Authorize, and the hub's OnPublish and OnSubscribe hooks
+// servers clients are to use can be sent as Link headers. Authorization
+// takes a bearer token through Config.Authorize (a refusal is 401 without
+// a token, 403 with one), and the hub's OnPublish and OnSubscribe hooks
 // see the request's query. A publish to a path that has a publisher is
 // answered 409 Conflict, a play of a path that has none 404, an offer with
 // nothing to send or receive 406, and one past Config.MaxSessions 503.

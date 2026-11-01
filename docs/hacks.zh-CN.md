@@ -263,7 +263,9 @@ c.OnBody(func(data []byte, fin bool, err error) {
   你只被告知**一次**。
 - 用了 `OnBody` 的 handler 在回调里收到 `err`；只 `Retain`、不用 `OnBody` 的异步 handler 用
   `Context.OnCancel(func(error))`；也可以主动查 `Context.Err()`。注册的每个回调都会保留，
-  按注册的逆序执行，所以中间件和它里面的 handler 可以各注册一个。
+  按注册的逆序执行，所以中间件和它里面的 handler 可以各注册一个。body 中途失败时 `OnCancel` 的
+  回调也会执行，而不只是 `OnBody` 的，所以只注册了 `OnCancel` 的中间件也能得知；body 超过大小限制
+  仍然回 413，不算取消。
 - 通知在 Engine 的 handler 池上执行，不在事件循环上，拖不住服务端。
 
 ```go
@@ -610,6 +612,11 @@ client := fibhttp.NewClient(engine, fibhttp.DefaultClientConfig()) // 复用 ser
 - `Engine.DialWithHandler(...)`：这条连接用**自己的 handler**，就像每个 binding 的连接用各自的
   handler——同一个 Engine 因此能同时承载使用不同协议的 server 和 client。
 - 不传 binding 的 `fib.New(config)` 创建**不监听**的 Engine，只用于 dial。
+- `Engine.DialWith(fib.DialOptions{...}, done)` **从指定的本地地址拨出**：`LocalAddr`（IP 和端口，
+  端口 0 由内核选择），以及可选的 `PortMin`-`PortMax` 范围，从随机起点开始找，适合只放行一个源地址和
+  端口范围的防火墙。socket 与 `net.Dialer` 一样不设 `SO_REUSEADDR`，被占用的端口（包括 TIME_WAIT 的）
+  会跳过；Windows 上用 `SO_EXCLUSIVEADDRUSE` 拒绝同样的端口。范围内没有空闲端口时，dial 失败的错误
+  匹配 `fib.ErrNoLocalPort`。
 - `client.Go(req).Wait()` 是 Future 形式，需要阻塞的地方（比如 `main`、测试）用。**不要在 handler 里
   `Wait()`**——那会占 worker。handler 里请用回调 + `Retain`/`Release`。
 - 回调可能在任意 goroutine 上执行（读响应的 worker、定时器 goroutine、`fib-client` 池、调用方
@@ -661,6 +668,11 @@ files.ServeFile(c, strings.TrimPrefix(c.Request.URL.Path, "/static/"))
   可靠 UDP 协议。
 - 数据报来自 `bufferpool`，用完且不再引用时 `bufferpool.Put` 还回去。**装它们的切片不能在
   `OnDatagrams` 返回后持有**。
+- **`Engine.OpenUDPPeer(binding, addr)`**：让 UDP binding **先开口**：返回 binding 的 socket 上 `addr`
+  这个对端的连接，没有就用 binding 的 handler 和 `OnOpen` 打开一条，和对端第一个数据报会打开的一样，
+  回复因此回到这条连接。ICE、STUN 用的就是它。它要等 socket 所在的事件循环，所以**不要在那个循环执行的
+  回调里调用**（UDP 对端的 `OnOpen`、`OnHangup`）。开启 `ReusePort` 时回复可能落到另一个 poller 的 socket，
+  为同一地址再开一条连接：按地址而不是按连接记录对端。
 - **`SendBatch`**：Linux 用 `sendmmsg`、macOS 用 `sendmsg_x`，一次系统调用发一批。
 - **`SetDontFragment`**：数据报要么完整送达要么丢弃（IPv4 设 DF，IPv6 本机不分片），路径 MTU
   探测需要它；对监听 socket 的对端设置时作用于共享的 socket。HTTP/3 自己会开启，其他 UDP

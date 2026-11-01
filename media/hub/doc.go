@@ -50,5 +50,6 @@
 // Everything is bounded: the cache by GOPCacheBytes, streams by
 // MaxStreams, subscriptions by MaxSubscribersPerStream, and each sink's
 // queue by the sink itself. A stream with neither publisher nor
-// subscription leaves the registry.
+// subscription leaves the registry. Hub.Streams returns a snapshot of
+// every stream, and Hub.Close ends them all.
 package hub

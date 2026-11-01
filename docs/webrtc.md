@@ -9,12 +9,15 @@ was checked against other implementations. Runnable programs are in
 [`webrtc`](https://github.com/lesismal/fib-examples/tree/main/webrtc), a page
 whose data channel and camera a server echoes back, and
 [`webrtc/sfu`](https://github.com/lesismal/fib-examples/tree/main/webrtc/sfu),
-one publisher forwarded to many viewers. Without a browser,
+one publisher forwarded to many viewers, both answering WHIP and WHEP offers
+through the
+[`webrtc/whip`](https://github.com/lesismal/fib-examples/tree/main/webrtc/whip)
+package they share. Without a browser,
 [`webrtc/datachannel`](https://github.com/lesismal/fib-examples/tree/main/webrtc/datachannel)
 and [`webrtc/media`](https://github.com/lesismal/fib-examples/tree/main/webrtc/media)
 connect two Go PeerConnections,
 [`webrtc/turnserver`](https://github.com/lesismal/fib-examples/tree/main/webrtc/turnserver)
-is a standalone TURN server,
+is a standalone TURN server over UDP, TCP and TLS,
 [`webrtc/stun`](https://github.com/lesismal/fib-examples/tree/main/webrtc/stun)
 a STUN client and server, and
 [`tls/dtls`](https://github.com/lesismal/fib-examples/tree/main/tls/dtls) and
@@ -34,11 +37,11 @@ standard library: there is no dependency on pion or any other module.
 
 | Area | Content |
 | --- | --- |
-| PeerConnection | The RTCPeerConnection model: `CreateOffer` (with ICE restart), `CreateAnswer`, `SetLocalDescription`, `SetRemoteDescription`, `AddICECandidate`/`OnICECandidate`, the connection, ICE, gathering and signaling states with their callbacks, renegotiation from either side, `GatheringComplete`, and `Offer`/`Answer` helpers that run a whole exchange as WHIP and WHEP do; max-bundle and rtcp-mux on one transport |
+| PeerConnection | The RTCPeerConnection model: `CreateOffer` (with ICE restart), `CreateAnswer`, `SetLocalDescription`, `SetRemoteDescription`, `AddICECandidate`/`OnICECandidate`, the connection, ICE, gathering and signaling states with their callbacks, renegotiation from either side, `GatheringComplete`, `SelectedCandidatePair`, and `Offer`/`Answer` helpers that run a whole exchange as WHIP and WHEP do; max-bundle and rtcp-mux on one transport |
 | Mux | One UDP port of a fib engine shared by any number of PeerConnections, as a server wants; a PeerConnection without one opens a port of its own, as a client does |
 | ICE | RFC 8445 full and lite agents, both roles, role conflicts, frozen/waiting pairs, paced and triggered checks, peer-reflexive candidates, regular nomination, restarts; trickle (RFC 8838); consent freshness (RFC 7675); server-reflexive candidates from STUN servers; relay candidates from TURN servers |
 | STUN | RFC 8489 messages decoded in place, the attributes of STUN, ICE and TURN, short- and long-term MESSAGE-INTEGRITY, MESSAGE-INTEGRITY-SHA256, FINGERPRINT, and a client transaction with RFC 8489's retransmissions |
-| TURN | A client (RFC 8656 over UDP: allocations, refreshes, permissions, channels, 300/401/438 handling) and a server core with long-term credentials, stateless nonces, quotas and a relay policy that refuses internal addresses; `turnserver` runs the server on a fib engine |
+| TURN | A client (RFC 8656 over UDP, TCP or TLS: allocations, refreshes, permissions, channels, 300/401/438 handling) and a server core safe for concurrent use, with long-term credentials, stateless nonces, quotas per server, user and allocation, a relay policy that refuses internal addresses, events and statistics, limits and credentials changed in place, and draining; `turnserver` runs the server on a fib engine over UDP, TCP and TLS. The PeerConnection reaches TURN servers over UDP |
 | DTLS | DTLS 1.2 (RFC 6347) with use_srtp (RFC 5764), sans-IO, sharing fib's TLS 1.2 handshake code: ECDHE with AES-GCM and ChaCha20-Poly1305, ECDSA, Ed25519 and RSA keys, X25519, P-256 and P-384, flights cut to the MTU and retransmitted, a 64-record replay window, a stateless cookie, and certificates checked by SDP fingerprint |
 | SRTP | SRTP and SRTCP (RFC 3711) keyed from DTLS-SRTP: AES_CM_128_HMAC_SHA1_80 and _32, AEAD_AES_128_GCM and AEAD_AES_256_GCM (RFC 7714), rollover counters and replay windows per SSRC; no allocation per packet once an SSRC is known |
 | RTP and RTCP | RTP parsed in place, RFC 8285 header extensions in both forms, helpers for MID, RID, abs-send-time, transport-wide sequence numbers and audio level; RTCP SR, RR, SDES, BYE, APP, NACK, PLI, FIR, REMB and transport-cc feedback, compound packets walked without allocating |
@@ -62,11 +65,15 @@ that loses, reorders and duplicates packets under a fake clock.
 | --- | --- | --- | --- | --- |
 | ICE agent | `webrtc/ice` `Agent` | `HandlePacket(local, from, b, now)` | `Config.Send(local, to, b)` | `NextTimeout` / `HandleTimeout` |
 | TURN client | `webrtc/turn` `Client`, `ICERelay` | `HandlePacket(from, b, now)` | `ClientConfig.Send` | `NextTimeout` / `HandleTimeout` |
-| TURN server | `webrtc/turn` `Server` | `HandlePacket`, `HandleRelayPacket` | `ServerConfig.Send`, `Relay.SendTo` | `HandleTimeout` |
+| TURN server | `webrtc/turn` `Server` | `HandlePacket(t, b, now)`, `HandleRelayPacket`, `ClientClosed` | `ServerConfig.Send`, `Relay.SendTo`; relayed addresses opened through `ServerConfig.AllocateRelay` | `NextTimeout` / `HandleTimeout` |
 | DTLS | `tls` `DTLSConn` | `HandleDatagram(b, now)` | `DTLSOptions.Output` | `NextTimeout` / `HandleTimeout` |
 | SRTP | `webrtc/srtp` `Context` | `UnprotectRTP` / `UnprotectRTCP` | returns the packet (`ProtectRTP` / `ProtectRTCP`) | none |
 | SCTP | `webrtc/sctp` `Association` | `HandlePacket(b, now)` | `Config.Output` | `NextTimeout` / `HandleTimeout` |
 | SDP, RTP, RTCP, STUN | `webrtc/sdp`, `webrtc/rtp`, `webrtc/stun` | parsed in place | built into the caller's buffer | none |
+
+Each of these is called by one goroutine at a time, except the TURN server
+core, which takes calls from any number at once and relays for different
+allocations in parallel.
 
 The ICE agent knows its transports only as opaque `LocalID`s: the Mux's socket
 is one, each TURN allocation another. A candidate pair is keyed by its
@@ -131,7 +138,7 @@ that blocks delays every later one of its PeerConnection, and the other
 connections of the worker it runs on. Hand slow work to a goroutine or a pool.
 
 Buffers follow fib's usual rule: the `pkt` of `TrackRemote.OnRTP` and
-`OnRTCP` is valid only during the call, while a `DataChannelMessage`'s `Data`
+`PeerConnection.OnRTCP` is valid only during the call, while a `DataChannelMessage`'s `Data`
 belongs to the callback, which may keep it. `TrackLocal.WriteRTP` may be called
 from any goroutine and does not keep the packet.
 
@@ -506,13 +513,21 @@ pc, err := webrtc.NewPeerConnection(webrtc.Configuration{
 - TURN needs a PeerConnection with a port of its own: a TURN server tells its
   clients apart by their address, which the PeerConnections of a Mux share.
   `NewPeerConnection` refuses a TURN server with a Mux, and the relay policy
-  without a TURN server, with `ErrConfiguration`.
+  without a TURN server, with `ErrConfiguration`. A lite PeerConnection
+  gathers host candidates only and ignores `ICEServers`.
 - URLs are `stun:host[:port]` and `turn:host[:port]`, port 3478 by default,
-  resolved when the PeerConnection is made. TURN runs over UDP only:
-  `turns:`, `stuns:` and `?transport=tcp` URLs are skipped.
+  resolved when the PeerConnection is made. The PeerConnection reaches TURN
+  servers over UDP only: `turns:`, `stuns:` and `?transport=tcp` URLs are
+  skipped.
 - The client handles the 401 challenge, 438 with a fresh nonce and 300 to an
   alternate server, refreshes the allocation, a permission per peer address
-  (every 4 minutes) and the channels it binds, and deallocates on `Close`.
+  (every 4 minutes) and the channels it binds, sends again a request that
+  goes unanswered, and deallocates on `Close`.
+
+`turn.Client` itself also speaks to a server over TCP or TLS:
+`ClientConfig.Stream` pads its ChannelData messages to four bytes and sends
+each request once, and the host frames what the stream brings with
+`turn.FrameLen` before passing each message to `HandlePacket`.
 
 Browsers are the usual TURN clients, though: a fib server on a shared Mux is
 reached through the browser's relay, and needs no TURN of its own.
@@ -542,6 +557,7 @@ cfg.Realm = "example.com"
 cfg.Auth = turn.EphemeralAuth(secret, time.Now)
 // or fixed users: cfg.Auth = turn.StaticAuth(cfg.Realm, map[string]string{"alice": "secret"})
 cfg.MaxAllocations, cfg.MaxAllocationsPerUser = 10000, 10
+cfg.MaxPermissions, cfg.MaxChannels = 64, 64
 // The WebRTC servers on the private network that clients may relay to;
 // everything else private stays refused.
 cfg.AllowedPeers = []netip.Prefix{netip.MustParsePrefix("10.0.1.0/24")}
@@ -557,6 +573,16 @@ go engine.Run()
 user, pass := turn.EphemeralCredentials(secret, "alice", time.Now().Add(time.Hour))
 // RTCIceServer: {urls: "turn:203.0.113.7:3478", username: user, credential: pass}
 ```
+
+**Never waiting on a worker.** The core is safe for concurrent use: each
+allocation has a lock of its own and the tables that find one are sharded, so
+datagrams of different allocations are relayed in parallel from fib's workers,
+and no lock is held while it calls back. What has to wait for an event loop,
+`AddBinding` for a relayed address and `OpenUDPPeer` for a peer that has not
+spoken first, runs on `SetupWorkers` goroutines (4) fed by a queue of
+`SetupQueue` (1024). An Allocate is answered once its address is bound; a full
+queue refuses it with 508, or drops the datagram, which `Server.Unsent`
+counts.
 
 **Authentication.** `ServerConfig.Auth` returns a user's long-term key,
 MD5(username:realm:password), so a server may store keys rather than
@@ -583,22 +609,123 @@ ones. `AllowedPeers` lets prefixes through before that check, `DeniedPeers`
 refuses more, and `PeerAllowed`, when set, decides alone. A deployment whose
 WebRTC servers sit on a private network lists exactly their prefixes in
 `AllowedPeers`; the fib-examples `webrtc` program allows only its own Mux's
-addresses.
+addresses and its relay address.
+
+`PeerAllowed` takes a `netip.AddrPort`. A CreatePermission asks with port 0,
+since a permission is for an address alone; a ChannelBind asks with its peer,
+and every datagram relayed either way asks again with its port. With
+`HoldsRelay` a server can let two of its own clients relay to each other
+through its relayed ports while every other port of its address stays closed:
+
+```go
+var server *turnserver.Server // set from Listen before any request comes
+publicIP := netip.MustParseAddr("203.0.113.7")
+cfg.PeerAllowed = func(p netip.AddrPort) bool {
+	if p.Addr() == publicIP {
+		return p.Port() == 0 || server.Core().HoldsRelay(p)
+	}
+	return !turn.DeniedByDefault(p.Addr())
+}
+```
 
 **Other limits.** Allocations last `DefaultLifetime` (600s) unless the client
 asks for more, up to `MaxLifetime` (3600s); permissions last 300s and channel
 bindings 600s, and a channel number or peer is quarantined for five minutes
 before it is bound anew. `MaxAllocations` (refused with 508) and
-`MaxAllocationsPerUser` (486) cap allocations; zero means no cap.
-`OnRelay` sees every relayed datagram's size and user before it goes, and
-returning false drops it: that is the hook for bandwidth limits and
-accounting. Binding requests are answered without credentials, for ICE's
-server-reflexive candidates.
+`MaxAllocationsPerUser` (486) cap allocations, and `MaxPermissions` and
+`MaxChannels` what one allocation holds (508 past either, a permission a
+channel installs counting); zero means no cap. These are `turn.Limits`,
+which `ServerConfig` embeds. `OnRelay` sees every relayed datagram's size and
+user before it goes, and returning false drops it: that is the hook for
+bandwidth limits and accounting. Binding requests are answered without
+credentials, for ICE's server-reflexive candidates.
 
-`Server.Close` frees every allocation and removes its binding; the listening
-binding is the caller's to remove. `turnserver.New` and `Server.Start` take
-an existing binding instead of `Listen` making one, which is how a caller
-learns the port of a binding on `:0` from `Engine.BindingAddrs`.
+### TURN over TCP and TLS
+
+Some networks let only TCP through, or only TLS on port 443, and their
+clients are why WebRTC services run TURN at all. `ListenTCP` and `ListenTLS`
+add a TCP binding for the same Server, after `Listen` or `Start`; a browser
+reaches the TLS one as `turns:host:443`, or a TCP one as
+`turn:host:3478?transport=tcp`. Each connection is one client, its messages
+framed by `turn.FrameLen`; its allocation still relays UDP to peers, and ends
+when the connection closes. `StreamHandler` is the handler for a binding the
+caller adds itself.
+
+```go
+if _, err := server.ListenTCP(":3478"); err != nil {
+	panic(err)
+}
+if _, err := server.ListenTLS(":443", &stdtls.Config{Certificates: []stdtls.Certificate{cert}}); err != nil {
+	panic(err)
+}
+```
+
+`MaxStreamMessage` (8 KiB) bounds a message, and so what a connection
+buffers, and closes a connection whose next message claims more;
+`StreamIdleTimeout` (30s) closes one that goes that long without an
+allocation, before its first or after its last.
+
+### Events and statistics
+
+`ServerConfig.OnEvent` hears of allocations made, refreshed and freed (with
+the reason, deleted, expired or closed, and the traffic relayed each way), of
+requests refused after their credentials passed (with the error code), and of
+credentials that failed. It runs on the goroutine that handled the packet and
+must not wait. `Core().Stats()` returns the allocations, pending allocations,
+permissions and channels held, the traffic relayed, and the datagrams dropped,
+requests refused and auth failures; it walks every allocation, so it is for a
+metrics scrape.
+
+```go
+cfg.OnEvent = func(e turn.Event) {
+	switch e.Kind {
+	case turn.EventFreed:
+		log.Printf("%s freed %v (%v): %d bytes out, %d back", e.User, e.Relay, e.Reason, e.ToPeer.Bytes, e.ToClient.Bytes)
+	case turn.EventAuthFailed:
+		log.Printf("auth failed for %q from %v", e.User, e.Tuple.Client)
+	}
+}
+```
+
+### Reloading and shutting down
+
+Limits and credentials change in place, from the next request on, without a
+restart and without losing what is held. An allocation, permission or channel
+held past a lowered quota is kept until it ends, and a user the new `AuthFunc`
+refuses can no longer refresh. `Shutdown` drains a server being replaced: new
+allocations are refused with 508, held ones go on relaying and refreshing, and
+it closes once none is left or its context ends.
+
+```go
+core := server.Core()
+l := core.Limits()
+l.MaxAllocationsPerUser = 5
+core.SetLimits(l)
+core.SetAuth(turn.EphemeralAuth(newSecret, time.Now))
+
+// Replacing the server: its clients finish, or move on as refreshes fail.
+ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
+defer cancel()
+_ = server.Shutdown(ctx)
+```
+
+`Server.Close` frees every allocation at once, removing its binding, and
+closes the TCP and TLS clients' connections; the listening bindings are the
+caller's to remove. `turnserver.New` and `Server.Start` take an existing UDP
+binding instead of `Listen` making one, which is how a caller learns the port
+of a binding on `:0` from `Engine.BindingAddrs`.
+
+`turnserver.Config` embeds `turn.ServerConfig`, which needs `Realm` and `Auth`
+(the Server sets `Send` and `AllocateRelay` itself), and adds:
+
+| Field | Default | Meaning |
+| --- | --- | --- |
+| `RelayIP` | required | The specific address relayed ports bind to; its family is every allocation's |
+| `PublicIP` | `RelayIP` | The address clients are told, behind a 1:1 NAT |
+| `PortMin`, `PortMax` | kernel's pick | The range relayed ports are taken from |
+| `SetupWorkers`, `SetupQueue` | 4, 1024 | Goroutines that bind relayed addresses and open peers, and the work queued for them |
+| `MaxStreamMessage` | 8 KiB | Largest message from a TCP or TLS client |
+| `StreamIdleTimeout` | 30s | How long a TCP or TLS client may go without an allocation |
 
 ## Configuration and limits
 
@@ -653,7 +780,8 @@ browsers speak it does not need it, or because it belongs to the application.
   peer-reflexive candidate anyway); RTX and FEC; transport-wide congestion
   control feedback and bandwidth estimation; sending simulcast (receiving it,
   by RID, works); the RTP packetization of codecs; DTLS 1.3; SDES keying;
-  statistics beyond the RTCP reports; TURN on a shared Mux.
+  statistics beyond the RTCP reports; TURN on a shared Mux, and TURN over
+  TCP or TLS (`turns:` and `?transport=tcp` URLs).
 - **ICE**: ICE over TCP (RFC 6544); aggressive nomination, which RFC 8445
   deprecates; components other than the one bundled data stream.
 - **DTLS**: DTLS 1.3, and suites other than ECDHE with an AEAD.
@@ -670,10 +798,10 @@ browsers speak it does not need it, or because it belongs to the application.
 - **STUN**: the OpaqueString and SASLprep profiles for passwords (non-ASCII
   credentials are the caller's to prepare), USERHASH, the STUN URI and DNS
   discovery.
-- **TURN**: TURN over TCP and TLS, relaying TCP (RFC 6062), DTLS to the
-  server, dual allocations, EVEN-PORT and RESERVATION-TOKEN, DONT-FRAGMENT
-  (answered 420), the SHA-256 password algorithm, USERHASH and the nonce
-  cookie of RFC 8489, the ICMP attribute, and mobility (RFC 8016).
+- **TURN**: relaying TCP to peers (RFC 6062), DTLS to the server, dual
+  allocations, EVEN-PORT and RESERVATION-TOKEN, DONT-FRAGMENT (answered 420),
+  the SHA-256 password algorithm, USERHASH and the nonce cookie of RFC 8489,
+  the ICMP attribute, and mobility (RFC 8016).
 
 ## How it was verified
 
@@ -696,7 +824,7 @@ are those the commit messages record.
 | pion/turn v4 | fib's client through pion's server, and pion's client through `turnserver`, allocating, refreshing, permitting, binding and relaying |
 | Chromium | The fib-examples pages against their servers: data channel echo, a canvas video track sent as VP8 and decoded back from the server, relay-only ICE through `turnserver` on the same engine, and the SFU forwarding video and audio to a viewer with its PLI passed to the publisher |
 | RFC test vectors | STUN (RFC 5769), SRTP key derivation and key stream (RFC 3711, RFC 6188), SRTP and SRTCP with AES-GCM (RFC 7714) |
-| fib against fib | Two PeerConnections on one engine and on two: data channels up to 200 KiB both ways, VP8 and Opus with SRTP, PLI and RTCP reports, renegotiation from either side, ICE restarts with data still flowing, close seen by the peer; 200 ICE-lite PeerConnections on one Mux; a relay-only pair through `turnserver` |
+| fib against fib | Two PeerConnections on one engine and on two: data channels up to 200 KiB both ways, VP8 and Opus with SRTP, PLI and RTCP reports, renegotiation from either side, ICE restarts with data still flowing, close seen by the peer; 200 ICE-lite PeerConnections on one Mux; a relay-only pair through `turnserver`; `turn.Client` over TCP and TLS through `turnserver`, with and without channels |
 
 fib's SCTP moved 64 KiB messages fib to fib at 240 MB/s over loopback where
 pion to pion managed 163 MB/s; in memory, two associations move them at about

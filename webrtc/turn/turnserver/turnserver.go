@@ -14,8 +14,8 @@
 // A Server is meant to be embedded in a larger service, a WebRTC gateway
 // say, that shares the engine with other protocols: everything it does is
 // set by Config, whose turn.ServerConfig carries the realm, the AuthFunc,
-// the lifetimes, the quotas and the bandwidth hook, and whose own fields
-// say where relayed addresses are opened.
+// the lifetimes, the quotas, the peer policy and the bandwidth and event
+// hooks, and whose own fields say where relayed addresses are opened.
 //
 // A Server never makes a fib worker wait. The turn.Server core is safe for
 // concurrent use and relays the datagrams of different allocations in

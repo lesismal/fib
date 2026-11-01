@@ -8,11 +8,13 @@
 [`webrtc`](https://github.com/lesismal/fib-examples/tree/main/webrtc) 是一个网页，服务端把它
 data channel 上的消息和摄像头画面原样送回；
 [`webrtc/sfu`](https://github.com/lesismal/fib-examples/tree/main/webrtc/sfu) 把一个发布者的
-音视频转发给多个观看者。不用浏览器的有：
+音视频转发给多个观看者，两者都经共用的
+[`webrtc/whip`](https://github.com/lesismal/fib-examples/tree/main/webrtc/whip) package 应答
+WHIP 与 WHEP 的 offer。不用浏览器的有：
 [`webrtc/datachannel`](https://github.com/lesismal/fib-examples/tree/main/webrtc/datachannel) 和
 [`webrtc/media`](https://github.com/lesismal/fib-examples/tree/main/webrtc/media) 连接两个 Go
 PeerConnection，[`webrtc/turnserver`](https://github.com/lesismal/fib-examples/tree/main/webrtc/turnserver)
-是独立的 TURN 服务器，[`webrtc/stun`](https://github.com/lesismal/fib-examples/tree/main/webrtc/stun)
+是独立的 TURN 服务器，支持 UDP、TCP 与 TLS，[`webrtc/stun`](https://github.com/lesismal/fib-examples/tree/main/webrtc/stun)
 是 STUN 客户端与服务端，[`tls/dtls`](https://github.com/lesismal/fib-examples/tree/main/tls/dtls) 和
 [`udp/openpeer`](https://github.com/lesismal/fib-examples/tree/main/udp/openpeer) 分别单独演示 DTLS
 与 `Engine.OpenUDPPeer`。
@@ -28,11 +30,11 @@ PeerConnection，[`webrtc/turnserver`](https://github.com/lesismal/fib-examples/
 
 | 方向 | 内容 |
 | --- | --- |
-| PeerConnection | 沿用 RTCPeerConnection 的模型：`CreateOffer`（支持 ICE restart）、`CreateAnswer`、`SetLocalDescription`、`SetRemoteDescription`、`AddICECandidate`/`OnICECandidate`，connection、ICE、gathering、signaling 四种状态及其回调，任一端发起的重新协商，`GatheringComplete`，以及像 WHIP、WHEP 那样一次完成整个交换的 `Offer`/`Answer` 辅助函数；max-bundle 与 rtcp-mux，所有内容走同一个传输 |
+| PeerConnection | 沿用 RTCPeerConnection 的模型：`CreateOffer`（支持 ICE restart）、`CreateAnswer`、`SetLocalDescription`、`SetRemoteDescription`、`AddICECandidate`/`OnICECandidate`，connection、ICE、gathering、signaling 四种状态及其回调，任一端发起的重新协商，`GatheringComplete`，`SelectedCandidatePair`，以及像 WHIP、WHEP 那样一次完成整个交换的 `Offer`/`Answer` 辅助函数；max-bundle 与 rtcp-mux，所有内容走同一个传输 |
 | Mux | fib engine 的一个 UDP 端口，任意多个 PeerConnection 共用，这是服务端需要的形态；没有 Mux 的 PeerConnection 自己开一个端口，就像客户端那样 |
 | ICE | RFC 8445 的 full 与 lite agent、两种角色、角色冲突、frozen/waiting 状态的 pair、按节奏发送的普通检查与 triggered check、peer-reflexive candidate、regular nomination、restart；trickle（RFC 8838）；consent freshness（RFC 7675）；向 STUN 服务器取 server-reflexive candidate；向 TURN 服务器取 relay candidate |
 | STUN | RFC 8489 消息原地解码，STUN、ICE、TURN 的属性，短期与长期凭据的 MESSAGE-INTEGRITY、MESSAGE-INTEGRITY-SHA256、FINGERPRINT，以及按 RFC 8489 重传的客户端事务 |
-| TURN | 客户端（基于 UDP 的 RFC 8656：allocation、刷新、permission、channel，处理 300/401/438），以及服务端核心：长期凭据、无状态 nonce、配额，以及拒绝内网地址的转发策略；`turnserver` 把服务端跑在 fib engine 上 |
+| TURN | 客户端（基于 UDP、TCP 或 TLS 的 RFC 8656：allocation、刷新、permission、channel，处理 300/401/438），以及可并发调用的服务端核心：长期凭据、无状态 nonce、按服务器、用户和 allocation 的配额、拒绝内网地址的转发策略、事件与统计、原地修改限制与凭据、drain；`turnserver` 把服务端跑在 fib engine 上，支持 UDP、TCP 与 TLS。PeerConnection 只经 UDP 访问 TURN 服务器 |
 | DTLS | DTLS 1.2（RFC 6347）与 use_srtp（RFC 5764），sans-IO，与 fib 的 TLS 1.2 共用握手代码：ECDHE 搭配 AES-GCM 和 ChaCha20-Poly1305，ECDSA、Ed25519、RSA 密钥，X25519、P-256、P-384，按 MTU 切分并重传的 flight，64 条记录的防重放窗口，无状态 cookie，按 SDP fingerprint 校验证书 |
 | SRTP | 由 DTLS-SRTP 派生密钥的 SRTP 与 SRTCP（RFC 3711）：AES_CM_128_HMAC_SHA1_80 与 _32、AEAD_AES_128_GCM 与 AEAD_AES_256_GCM（RFC 7714），每个 SSRC 各自的 rollover counter 与防重放窗口；某个 SSRC 一旦见过，处理每个包都不再分配内存 |
 | RTP 与 RTCP | RTP 原地解析，RFC 8285 两种格式的头部扩展，MID、RID、abs-send-time、transport-wide 序号与 audio level 的辅助函数；RTCP 的 SR、RR、SDES、BYE、APP、NACK、PLI、FIR、REMB 与 transport-cc 反馈，遍历复合包不分配内存 |
@@ -54,11 +56,14 @@ PeerConnection 才能用一把锁、一个定时器驱动所有层；测试也�
 | --- | --- | --- | --- | --- |
 | ICE agent | `webrtc/ice` `Agent` | `HandlePacket(local, from, b, now)` | `Config.Send(local, to, b)` | `NextTimeout` / `HandleTimeout` |
 | TURN 客户端 | `webrtc/turn` `Client`、`ICERelay` | `HandlePacket(from, b, now)` | `ClientConfig.Send` | `NextTimeout` / `HandleTimeout` |
-| TURN 服务端 | `webrtc/turn` `Server` | `HandlePacket`、`HandleRelayPacket` | `ServerConfig.Send`、`Relay.SendTo` | `HandleTimeout` |
+| TURN 服务端 | `webrtc/turn` `Server` | `HandlePacket(t, b, now)`、`HandleRelayPacket`、`ClientClosed` | `ServerConfig.Send`、`Relay.SendTo`；中继地址通过 `ServerConfig.AllocateRelay` 打开 | `NextTimeout` / `HandleTimeout` |
 | DTLS | `tls` `DTLSConn` | `HandleDatagram(b, now)` | `DTLSOptions.Output` | `NextTimeout` / `HandleTimeout` |
 | SRTP | `webrtc/srtp` `Context` | `UnprotectRTP` / `UnprotectRTCP` | 返回包本身（`ProtectRTP` / `ProtectRTCP`） | 无 |
 | SCTP | `webrtc/sctp` `Association` | `HandlePacket(b, now)` | `Config.Output` | `NextTimeout` / `HandleTimeout` |
 | SDP、RTP、RTCP、STUN | `webrtc/sdp`、`webrtc/rtp`、`webrtc/stun` | 原地解析 | 写入调用方给的 buffer | 无 |
+
+这些状态机同一时刻只能由一个 goroutine 调用，TURN 服务端核心除外：它可以被任意多个
+goroutine 同时调用，不同 allocation 的转发并行进行。
 
 ICE agent 只把它的传输看作不透明的 `LocalID`：Mux 的 socket 是一个，每个 TURN allocation
 又是一个。candidate pair 以 `LocalID` 加远端地址为键，从不以连接对象为键，原因见下一节。
@@ -110,7 +115,7 @@ RTCP report 中最早的那个截止时间，在另一个 goroutine 上触发。
 `OnTrack` 里调用 `RequestKeyFrame`）；但阻塞的回调会拖住同一个 PeerConnection 后面所有的
 回调，以及它所在 worker 上的其它连接。耗时的工作请交给 goroutine 或任务池。
 
-buffer 遵循 fib 一贯的约定：`TrackRemote.OnRTP` 和 `OnRTCP` 的 `pkt` 只在回调期间有效；
+buffer 遵循 fib 一贯的约定：`TrackRemote.OnRTP` 和 `PeerConnection.OnRTCP` 的 `pkt` 只在回调期间有效；
 `DataChannelMessage` 的 `Data` 归回调所有，可以留着用。`TrackLocal.WriteRTP` 可以在任何
 goroutine 上调用，不会保留传入的包。
 
@@ -451,11 +456,18 @@ pc, err := webrtc.NewPeerConnection(webrtc.Configuration{
 
 - TURN 要求 PeerConnection 有自己的端口：TURN 服务器靠地址区分客户端，而同一个 Mux 上的
   PeerConnection 共用一个地址。`NewPeerConnection` 遇到"有 Mux 又配了 TURN"，或"relay 策略
-  却没有 TURN 服务器"，都返回 `ErrConfiguration`。
+  却没有 TURN 服务器"，都返回 `ErrConfiguration`。lite PeerConnection 只收集 host
+  candidate，会忽略 `ICEServers`。
 - URL 形如 `stun:host[:port]` 和 `turn:host[:port]`，端口默认 3478，在创建 PeerConnection
-  时解析。TURN 只走 UDP：`turns:`、`stuns:` 和带 `?transport=tcp` 的 URL 会被跳过。
+  时解析。PeerConnection 只经 UDP 访问 TURN 服务器：`turns:`、`stuns:` 和带
+  `?transport=tcp` 的 URL 会被跳过。
 - 客户端处理 401 质询、带新 nonce 的 438、转向备用服务器的 300，刷新 allocation、每个对端
-  地址的 permission（每 4 分钟）以及它绑定的 channel，`Close` 时释放 allocation。
+  地址的 permission（每 4 分钟）以及它绑定的 channel，没得到应答的请求会重发，`Close` 时
+  释放 allocation。
+
+`turn.Client` 本身也能经 TCP 或 TLS 访问服务器：`ClientConfig.Stream` 让它把 ChannelData
+消息补齐到 4 字节、每个请求只发一次；宿主用 `turn.FrameLen` 从流中切出每条消息，再交给
+`HandlePacket`。
 
 不过 TURN 客户端通常是浏览器：共用 Mux 的 fib 服务端经由浏览器的 relay 被访问，自己并不需要
 TURN。
@@ -483,6 +495,7 @@ cfg.Realm = "example.com"
 cfg.Auth = turn.EphemeralAuth(secret, time.Now)
 // or fixed users: cfg.Auth = turn.StaticAuth(cfg.Realm, map[string]string{"alice": "secret"})
 cfg.MaxAllocations, cfg.MaxAllocationsPerUser = 10000, 10
+cfg.MaxPermissions, cfg.MaxChannels = 64, 64
 // The WebRTC servers on the private network that clients may relay to;
 // everything else private stays refused.
 cfg.AllowedPeers = []netip.Prefix{netip.MustParsePrefix("10.0.1.0/24")}
@@ -498,6 +511,13 @@ go engine.Run()
 user, pass := turn.EphemeralCredentials(secret, "alice", time.Now().Add(time.Hour))
 // RTCIceServer: {urls: "turn:203.0.113.7:3478", username: user, credential: pass}
 ```
+
+**从不让 worker 等待。** 核心可以并发调用：每个 allocation 有自己的锁，查找 allocation 的
+表分了片，所以不同 allocation 的数据报在 fib 的各个 worker 上并行中继，回调宿主时也不持有
+任何锁。必须等事件循环的操作，即为中继地址调用 `AddBinding`、为尚未先发包的对端调用
+`OpenUDPPeer`，交给 `SetupWorkers` 个 goroutine（默认 4）去做，它们从容量为 `SetupQueue`
+（默认 1024）的队列取任务。Allocate 在中继地址绑定好之后才应答；队列满时 allocation 以 508
+拒绝，或数据报被丢弃，丢弃数由 `Server.Unsent` 统计。
 
 **认证。** `ServerConfig.Auth` 返回用户的长期密钥 MD5(username:realm:password)，因此服务端
 可以只存密钥、不存密码。`StaticAuth` 适用于固定的一组用户。`EphemeralAuth` 接受 TURN REST
@@ -516,18 +536,110 @@ HMAC-SHA1(secret, username) 的 base64。Web 服务与 TURN 服务器之间只�
 6to4）、site-local 与 discard-only 地址。`AllowedPeers` 中的前缀在这项检查之前放行，
 `DeniedPeers` 额外拒绝更多，设置了 `PeerAllowed` 则完全由它决定。WebRTC 服务器位于私有网络
 的部署，应在 `AllowedPeers` 中恰好列出这些服务器的前缀；fib-examples 的 `webrtc` 程序只放行
-它自己 Mux 的地址。
+它自己 Mux 的地址和它的中继地址。
+
+`PeerAllowed` 接受 `netip.AddrPort`。permission 只针对地址，所以 CreatePermission 以端口 0
+询问；ChannelBind 以它的对端询问，双向中继的每个数据报还会带上端口再问一次。借助
+`HoldsRelay`，服务器可以让自己的两个客户端经各自的中继端口互相中继，而本机地址的其它端口
+依然对中继关闭：
+
+```go
+var server *turnserver.Server // set from Listen before any request comes
+publicIP := netip.MustParseAddr("203.0.113.7")
+cfg.PeerAllowed = func(p netip.AddrPort) bool {
+	if p.Addr() == publicIP {
+		return p.Port() == 0 || server.Core().HoldsRelay(p)
+	}
+	return !turn.DeniedByDefault(p.Addr())
+}
+```
 
 **其它限制。** allocation 的存活时间是 `DefaultLifetime`（600 秒），客户端可以要求更长，
 上限 `MaxLifetime`（3600 秒）；permission 存活 300 秒，channel 绑定 600 秒，一个 channel 号
 或对端在重新绑定前要隔离 5 分钟。`MaxAllocations`（超出以 508 拒绝）和
-`MaxAllocationsPerUser`（486）限制 allocation 数量，0 表示不限。`OnRelay` 在每个数据报中继
-之前看到它的大小和所属用户，返回 false 即丢弃：带宽限制和流量统计就挂在这里。Binding
-request 无需凭据即可应答，供 ICE 获取 server-reflexive candidate。
+`MaxAllocationsPerUser`（486）限制 allocation 数量，`MaxPermissions` 和 `MaxChannels`
+限制单个 allocation 持有的数量（超出任一项以 508 拒绝，channel 顺带装上的 permission 也算
+在内）；0 表示不限。这些字段属于 `turn.Limits`，内嵌在 `ServerConfig` 中。`OnRelay` 在每个
+数据报中继之前看到它的大小和所属用户，返回 false 即丢弃：带宽限制和流量统计就挂在这里。
+Binding request 无需凭据即可应答，供 ICE 获取 server-reflexive candidate。
 
-`Server.Close` 释放所有 allocation 并移除它们的 binding；监听用的 binding 由调用方自己移除。
-不用 `Listen` 新建 binding，也可以用 `turnserver.New` 加 `Server.Start` 接管一个已有的
-binding，这样调用方就能用 `Engine.BindingAddrs` 得知监听在 `:0` 上的实际端口。
+### 经 TCP 与 TLS 的 TURN
+
+有些网络只放行 TCP，或者只放行 443 端口上的 TLS，而 WebRTC 服务之所以要跑 TURN，正是为了
+这些客户端。`ListenTCP` 和 `ListenTLS` 为同一个 Server 加一个 TCP binding，须在 `Listen`
+或 `Start` 之后调用；浏览器以 `turns:host:443` 访问 TLS 的那个，以
+`turn:host:3478?transport=tcp` 访问 TCP 的那个。每个连接就是一个客户端，消息由
+`turn.FrameLen` 切分；它的 allocation 到对端仍走 UDP，连接关闭时随之结束。调用方自己加
+binding 时，用 `StreamHandler` 作为 handler。
+
+```go
+if _, err := server.ListenTCP(":3478"); err != nil {
+	panic(err)
+}
+if _, err := server.ListenTLS(":443", &stdtls.Config{Certificates: []stdtls.Certificate{cert}}); err != nil {
+	panic(err)
+}
+```
+
+`MaxStreamMessage`（8 KiB）限制单条消息的大小，也就限制了一个连接缓存的数据，下一条消息
+声称更大时关闭连接；`StreamIdleTimeout`（30 秒）关闭在这么长时间里没有 allocation 的连接，
+无论是第一个 allocation 之前还是最后一个结束之后。
+
+### 事件与统计
+
+`ServerConfig.OnEvent` 会收到这些事件：allocation 的创建、刷新与释放（附带原因：deleted、
+expired 或 closed，以及双向的中继流量），凭据通过之后仍被拒绝的请求（附带错误码），以及
+凭据校验失败。它在处理该数据包的 goroutine 上运行，不能阻塞。`Core().Stats()` 返回当前持有
+的 allocation、待完成的 allocation、permission 和 channel 数，已中继的流量，以及丢弃的数据报、
+被拒绝的请求和认证失败的次数；它会遍历所有 allocation，适合在采集指标时调用。
+
+```go
+cfg.OnEvent = func(e turn.Event) {
+	switch e.Kind {
+	case turn.EventFreed:
+		log.Printf("%s freed %v (%v): %d bytes out, %d back", e.User, e.Relay, e.Reason, e.ToPeer.Bytes, e.ToClient.Bytes)
+	case turn.EventAuthFailed:
+		log.Printf("auth failed for %q from %v", e.User, e.Tuple.Client)
+	}
+}
+```
+
+### 重载与关闭
+
+限制和凭据可以原地修改，从下一个请求开始生效，无需重启，也不会丢掉已持有的状态。降低配额
+后，超出的 allocation、permission 或 channel 保留到它自然结束；新的 `AuthFunc` 拒绝的用户
+不能再刷新。`Shutdown` 用于替换服务器时排空：新的 allocation 以 508 拒绝，已有的继续中继和
+刷新，等到一个都不剩或 context 结束时关闭。
+
+```go
+core := server.Core()
+l := core.Limits()
+l.MaxAllocationsPerUser = 5
+core.SetLimits(l)
+core.SetAuth(turn.EphemeralAuth(newSecret, time.Now))
+
+// Replacing the server: its clients finish, or move on as refreshes fail.
+ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
+defer cancel()
+_ = server.Shutdown(ctx)
+```
+
+`Server.Close` 立即释放所有 allocation 并移除它们的 binding，同时关闭 TCP 与 TLS 客户端的
+连接；监听用的 binding 由调用方自己移除。不用 `Listen` 新建 binding，也可以用
+`turnserver.New` 加 `Server.Start` 接管一个已有的 UDP binding，这样调用方就能用
+`Engine.BindingAddrs` 得知监听在 `:0` 上的实际端口。
+
+`turnserver.Config` 内嵌 `turn.ServerConfig`，其中 `Realm` 和 `Auth` 必填（`Send` 与
+`AllocateRelay` 由 Server 自己设置），另外还有：
+
+| 字段 | 默认值 | 含义 |
+| --- | --- | --- |
+| `RelayIP` | 必填 | 中继端口绑定的具体地址；它的地址族就是所有 allocation 的地址族 |
+| `PublicIP` | `RelayIP` | 告诉客户端的地址，用于一对一 NAT 之后 |
+| `PortMin`、`PortMax` | 由内核挑选 | 中继端口的取值范围 |
+| `SetupWorkers`、`SetupQueue` | 4、1024 | 绑定中继地址、打开对端连接的 goroutine 数，以及为它们排队的任务数 |
+| `MaxStreamMessage` | 8 KiB | TCP 或 TLS 客户端单条消息的上限 |
+| `StreamIdleTimeout` | 30 秒 | TCP 或 TLS 客户端没有 allocation 时连接可保持的时长 |
 
 ## 配置与限制
 
@@ -578,7 +690,8 @@ ICE-lite PeerConnection 共用一个 Mux，每个都和自己的客户端在 dat
   BundlePolicy；基于 TCP 的 ICE；解析浏览器 host candidate 的 mDNS 名字（对端的检查本来就
   会以 peer-reflexive candidate 的形式暴露它的地址）；RTX 与 FEC；transport-wide 拥塞控制
   反馈与带宽估计；发送 simulcast（按 RID 接收是支持的）；编解码器的 RTP 打包；DTLS 1.3；
-  SDES 密钥交换；RTCP report 以外的统计；在共用的 Mux 上使用 TURN。
+  SDES 密钥交换；RTCP report 以外的统计；在共用的 Mux 上使用 TURN，以及经 TCP 或 TLS 的
+  TURN（`turns:` 与 `?transport=tcp` 的 URL）。
 - **ICE**：基于 TCP 的 ICE（RFC 6544）；RFC 8445 已废弃的 aggressive nomination；bundle 后
   那一条数据流以外的 component。
 - **DTLS**：DTLS 1.3，以及 ECDHE 加 AEAD 以外的密码套件。
@@ -591,7 +704,7 @@ ICE-lite PeerConnection 共用一个 Mux，每个都和自己的客户端在 dat
 - **SDP**：k=、z=、r= 行只保留不处理；组播与端口数只解析不处理。
 - **STUN**：密码的 OpaqueString 与 SASLprep profile（非 ASCII 凭据由调用方自行预处理）、
   USERHASH、STUN URI 与 DNS 发现。
-- **TURN**：基于 TCP 与 TLS 的 TURN、中继 TCP（RFC 6062）、到服务器的 DTLS、双栈 allocation、
+- **TURN**：向对端中继 TCP（RFC 6062）、到服务器的 DTLS、双栈 allocation、
   EVEN-PORT 与 RESERVATION-TOKEN、DONT-FRAGMENT（以 420 应答）、SHA-256 密码算法、RFC 8489
   的 USERHASH 与 nonce cookie、ICMP 属性，以及移动性扩展（RFC 8016）。
 
@@ -614,7 +727,7 @@ ICE-lite PeerConnection 共用一个 Mux，每个都和自己的客户端在 dat
 | pion/turn v4 | fib 的客户端经 pion 的服务器，pion 的客户端经 `turnserver`：allocate、refresh、permission、channel 绑定与中继 |
 | Chromium | fib-examples 的网页对接各自的服务端：data channel 回显；canvas 生成的视频 track 以 VP8 发出，从服务端回来后被成功解码；经同一个 engine 上的 `turnserver` 只走 relay 的 ICE；SFU 把视频和音频转发给观看者，观看者的 PLI 被转交给发布者 |
 | RFC 测试向量 | STUN（RFC 5769）、SRTP 密钥派生与密钥流（RFC 3711、RFC 6188）、AES-GCM 的 SRTP 与 SRTCP（RFC 7714） |
-| fib 对 fib | 两个 PeerConnection 在同一个 engine 上或两个 engine 上：双向最大 200 KiB 的 data channel 消息，带 SRTP 的 VP8 与 Opus，PLI 与 RTCP report，任一端发起的重新协商，ICE restart 期间数据不断，对端能看到关闭；200 个 ICE-lite PeerConnection 共用一个 Mux；一对只走 relay、经 `turnserver` 中转的 PeerConnection |
+| fib 对 fib | 两个 PeerConnection 在同一个 engine 上或两个 engine 上：双向最大 200 KiB 的 data channel 消息，带 SRTP 的 VP8 与 Opus，PLI 与 RTCP report，任一端发起的重新协商，ICE restart 期间数据不断，对端能看到关闭；200 个 ICE-lite PeerConnection 共用一个 Mux；一对只走 relay、经 `turnserver` 中转的 PeerConnection；`turn.Client` 经 TCP 与 TLS 通过 `turnserver` 中继，带或不带 channel |
 
 fib 的 SCTP 在环回地址上 fib 对 fib 传 64 KiB 消息达到 240 MB/s，同样条件下 pion 对 pion 是
 163 MB/s；在内存中，两个 association 传这样的消息约 1.9 GB/s，每条消息不分配内存。在 M4 Pro

@@ -299,7 +299,9 @@ handles it:
 - A handler using `OnBody` gets `err` in the callback; an async handler that only `Retain`s uses
   `Context.OnCancel(func(error))`; you can also poll `Context.Err()`. Every callback registered
   is kept, and they run in the reverse of the order they were registered, so a middleware and
-  the handler inside it can each register one.
+  the handler inside it can each register one. A body that fails part way runs the `OnCancel`
+  callbacks too, not only `OnBody`'s, so a middleware that registered only `OnCancel` hears of
+  it; a body over its size limit is still answered with 413 rather than cancelled.
 - The notification runs on the Engine's handler pool, not on the event loop, so it cannot hold
   the server back.
 
@@ -717,7 +719,10 @@ client := fibhttp.NewClient(engine, fibhttp.DefaultClientConfig()) // reuses the
 - `fib.New(config)` with no bindings creates an Engine that **does not listen**, only for dialing.
 - `Engine.DialWith(fib.DialOptions{...}, done)` dials **from a chosen local address**: `LocalAddr`
   (IP and port, port 0 = the kernel's pick) and an optional `PortMin`-`PortMax` range searched from
-  a random start, for a firewall that admits one source address and port range.
+  a random start, for a firewall that admits one source address and port range. The socket is
+  bound without `SO_REUSEADDR`, as `net.Dialer` binds it, so a port in use (one in TIME_WAIT
+  too) is skipped; on Windows `SO_EXCLUSIVEADDRUSE` refuses the same ports. A range with no free
+  port fails the dial with an error matching `fib.ErrNoLocalPort`.
 - `client.Go(req).Wait()` is the Future form, for places that may block (such as `main` or tests).
   **Never `Wait()` inside a handler**, which holds a worker; in a handler use a callback with
   `Retain`/`Release`.
@@ -779,6 +784,12 @@ files.ServeFile(c, strings.TrimPrefix(c.Request.URL.Path, "/static/"))
   your own reliable-UDP protocol too.
 - Datagrams come from `bufferpool`; give them back with `bufferpool.Put` when done and no longer
   referenced. **The slice holding them must not be kept after `OnDatagrams` returns.**
+- **`Engine.OpenUDPPeer(binding, addr)`:** a UDP binding **speaks first**: it returns the
+  connection of the peer at `addr` on the binding's socket, opening it with the binding's handler
+  and `OnOpen` as the peer's first datagram would, so the reply comes back to it. ICE and STUN use
+  it. It waits for the socket's loop, so **don't call it from a callback that loop runs** (a UDP
+  peer's `OnOpen`, `OnHangup`). With `ReusePort` a reply may land on another poller's socket and
+  open a second connection for the same address: key peers by address, not by connection.
 - **`SendBatch`:** `sendmmsg` on Linux, `sendmsg_x` on macOS, one system call for a batch.
 - **`SetDontFragment`:** datagrams go whole or not at all (DF over IPv4, no host fragmentation over
   IPv6), which path MTU discovery needs; on a listener's peer it sets the shared socket. HTTP/3

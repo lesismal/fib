@@ -127,12 +127,30 @@ publisher never waits. Egresses with a connection to close check a second,
 higher limit and disconnect a consumer past it, or one whose output has not
 moved for an idle timeout.
 
+| Egress | Backlog | Drops past | Disconnects |
+| --- | --- | --- | --- |
+| RTMP | the connection's queued bytes | `WriteQueueLimit` (2 MiB) | past `MaxWriteQueue` (16 MiB), or output still for `IdleTimeout` (30 s) |
+| HTTP-FLV, WebSocket-FLV | queued bytes; on HTTP/2 and HTTP/3, flow control holding more than 64 KiB | `WriteQueueLimit` (2 MiB) | HTTP/1 past `MaxWriteQueue` (16 MiB); any player whose output is still for `IdleTimeout` (30 s) |
+| RTSP player over TCP | the connection's queued bytes | `MaxQueuedBytes` (4 MiB) | past twice `MaxQueuedBytes` |
+| RTSP player over UDP | — (datagrams go to the socket as they come) | — | `SessionTimeout` (60 s) without a request or RTCP |
+| SRT player | unacknowledged payload | `MaxSendBacklog` (4 MiB) | a peer silent for `PeerIdleTimeout` (5 s) |
+| WHEP viewer | the loss its receiver reports | `MaxLoss` (25%) | ICE consent lost |
+| HLS | — (one Muxer per stream and format, not per player) | the Muxer's `MaxBytes` (64 MiB) drops old segments | — |
+
+Push relays drop the same way: `rtmp.Push` past `ClientConfig.WriteQueueLimit`,
+`rtsp.PublishFromHub` past `ClientConfig.MaxQueuedBytes`, `srt.Publish` past
+`ClientConfig.MaxSendBacklog`, and `rtc.PushFromHub` while the server reports
+more than 25% lost.
+
 **Bounds.** Streams by `MaxStreams`, subscriptions by
 `MaxSubscribersPerStream` (`ErrLimit` past either), the cache by
 `GOPCacheBytes`, and each sink's queue by the sink itself. A stream with
 neither publisher nor subscription leaves the registry. `Hub.Streams` returns
-a snapshot of every stream: path, tracks, publisher, subscribers, bytes and
-packets in.
+a snapshot of every stream, sorted by path: path, tracks, whether it is live
+or only reserved, its publisher's `PublishInfo` and since when, subscribers,
+bytes and packets in. `Hub.Close` ends every subscription with `ErrClosed`,
+drops what publishers still write, and fails later `Publish`, `Reserve` and
+`Subscribe`.
 
 ### Threading rules
 
@@ -167,12 +185,14 @@ lock, so no fib worker is held by a waiting player.
 
 `hub.Config.OnPublish` and `OnSubscribe` see every publish and play, whatever
 the protocol, with `PublishInfo`/`SubscribeInfo`: the protocol (`rtmp`,
-`rtsp`, `srt`, `whip`, `whep`, `http-flv`, `ws-flv`, `hls`, and
-`rtmp-pull`/`rtmp-push` for RTMP's relays), the remote address, and the
-query of the URL, where tokens usually travel. Returning an error refuses the
-publish or play. The pull relays fill it in too: `rtsp.PlayToHub` with the
-RTSP server's address and its URL's query, `srt.Play` and `srt.Publish` with
-the query of a plain stream ID (`live/s?token=...`). An RTSP player whose URL
+`rtsp`, `srt`, `whip`, `whep`, `http-flv`, `ws-flv`, `hls`; RTMP's relays
+are `rtmp-pull` and `rtmp-push`, the others' their protocol's name), the
+remote address, and the query of the URL, where tokens usually travel.
+Returning an error refuses the publish or play. The relays fill it in too:
+`rtmp.Pull` and `rtsp.PlayToHub` with the remote server's address and its
+URL's query, `rtc.PullToHub` with its URL's query, `srt.Play` and
+`srt.Publish` with the server's address and the query of a plain stream ID
+(`live/s?token=...`). An RTSP player whose URL
 carries a query sets its tracks up against that URL, as ffmpeg does
 (`rtsp://host/live/s?token=x/trackID=0`), and the server takes the
 `trackID` back out of the query. Each protocol also has a hook of its own for
@@ -224,10 +244,13 @@ rtcServer, _ := rtc.NewServer(rtc.Config{Hub: h,
 
 `rtmp.ServerConfig` has `OnConnect`, `OnPublish` and `OnPlay` (its
 `OnPublish` runs before the hub's), and `httpflv.Config` has `OnPlay`, which
-runs after the hub's `OnSubscribe`. HLS subscribes once per stream and
-format, for the first playlist request, so `OnSubscribe` sees that request
-only; checking every HLS request belongs in an HTTP middleware in front of the
-handler.
+runs after the hub's `OnSubscribe`. RTSP asks `OnSubscribe` at DESCRIBE and
+again at PLAY. WHIP and WHEP ask `rtc.Config.Authorize` first, then the hub's
+hooks. `Authorize` refusing is answered 401 without a token and 403 with
+one, a hook refusing 403, a busy path 409, a missing stream 404. HLS
+subscribes once per stream and format, for the first playlist request, so
+`OnSubscribe` sees that request only; checking every HLS request belongs in
+an HTTP middleware in front of the handler.
 
 ## The canonical packet
 
@@ -493,9 +516,11 @@ rtc.PullToHub(cc, "https://origin.example.com/whep/live/webrtc", h, "live/webrtc
   client.
 - A push relay starts with the stream's first tracks, drops packets the
   remote is too slow for as `hub.NewDropper` does, and ends when the stream
-  does. RTSP cannot announce new tracks within a session, so a change of
-  tracks closes an RTSP push; WHIP pushes hold the latest GOP until the
-  PeerConnection connects.
+  does. On a change of tracks, RTMP pushes send new sequence headers and SRT
+  pushes a new PMT; a WHIP push carries on with the codecs it connected
+  with and leaves a new codec out, since that would need a new offer; RTSP
+  cannot announce new tracks within a session, so the change closes an RTSP
+  push. WHIP pushes hold the latest GOP until the PeerConnection connects.
 - Reconnecting is the application's: `done`/`OnClose` say a relay ended, and
   starting it again is one call. A push relay's `Wait` keeps it in place across
   a republish of its source.
@@ -561,7 +586,9 @@ timeline on:
 ## Configuration and limits
 
 Every field is optional but the `Hub` (and, for `rtc.Config`, a `WebRTC` with
-a Mux or an engine); zero values take the defaults below. Timeouts are
+a Mux or an engine); zero values take the defaults below. The RTMP server
+may run without a hub when its `OnPublish` returns a sink for every publish,
+and the SRT server when `OnSession` takes every session. Timeouts are
 everywhere, and every buffer a peer can fill is bounded.
 
 **hub.Config**
@@ -572,11 +599,15 @@ everywhere, and every buffer a peer can fill is bounded.
 | `MaxStreams`, `MaxSubscribersPerStream` | unlimited | `ErrLimit` past them |
 | `OnPublish`, `OnUnpublish`, `OnSubscribe` | none | Authentication and observation, called without the hub's locks |
 
-**rtmp.ServerConfig** (and `ClientConfig`, which shares most fields)
+`hub.SubscribeOptions` has `Info` (what `OnSubscribe` sees), `Wait` (0: no
+waiting, `ErrNotFound` without a publisher and the end with it) and
+`NoGOPCache` (start at the next keyframe).
+
+**rtmp.ServerConfig**
 
 | Field | Default | Meaning |
 | --- | --- | --- |
-| `HandshakeTimeout` | 10 s | From connect until publish or play (client: plus `DialTimeout`, 10 s) |
+| `HandshakeTimeout` | 10 s | From connect until publish or play |
 | `IdleTimeout` | 30 s | A publisher that sends nothing, or a player whose output does not move |
 | `PlayWait` | 0 | How long a play waits for a missing publisher, or for the next one after its own leaves; 0 answers `StreamNotFound` at once |
 | `MaxMessageSize` | 8 MiB | Largest message a peer may send |
@@ -584,6 +615,12 @@ everywhere, and every buffer a peer can fill is bounded.
 | `WriteQueueLimit`, `MaxWriteQueue` | 2 MiB, 16 MiB | Drop past the first (video to the next keyframe), disconnect past the second |
 | `Encoder.LegacyHEVC` | false | Write H.265 with codec id 12 instead of Enhanced RTMP |
 | `OnConnect`, `OnPublish`, `OnPlay`, `OnClose` | none | Hooks; `OnPublish` may return a sink, which lets a server run without a hub |
+
+`rtmp.ClientConfig` shares `HandshakeTimeout`, `IdleTimeout`,
+`MaxMessageSize`, `ChunkSize`, `WriteQueueLimit`, `MaxWriteQueue` and
+`Encoder`, and adds `DialTimeout` (10 s), `TLSConfig` for `rtmps://` URLs,
+`FlashVer`, `SimpleHandshake` (the digest handshake is sent unless set;
+servers that check digests refuse the simple one) and `OnClose`.
 
 **httpflv.Config**: `Path` (`/app/stream.flv` plays `app/stream`), `OnPlay`,
 `CORS`, `Wait` (0: 404 for a missing stream), `WriteQueueLimit` and
@@ -601,23 +638,26 @@ value accepts every origin).
 | `SessionTimeout`, `IdleTimeout` | 60 s, 60 s | A session without a request, RTCP or (recording) RTP; a connection without a session |
 | `MaxHeaderBytes`, `MaxBodyBytes` | 16 KiB, 256 KiB | Bounds of a request |
 | `PlayWait` | 0 | How long a player outlives its publisher, waiting for the next one with the same codecs; 0 ends players with their publisher |
-| `MaxQueuedBytes` | 4 MiB | A player's backlog past which packets drop; twice as much closes it |
+| `MaxQueuedBytes` | 4 MiB | A TCP player's backlog past which packets drop; twice as much closes it. A UDP player's RTP goes to the socket as it comes |
 | `MTU`, `SenderReportInterval` | 1400, 5 s | RTP packet size, RTCP sender reports |
 | `ReorderSize`, `ReorderDelay` | 128 packets, 100 ms | The reorder buffer of each stream recorded over UDP |
 | `OnRequest` | none | Sees, and may answer, every authenticated request |
 
-`rtsp.ClientConfig` has `Transport` (TCP or UDP), `DialTimeout`,
-`RequestTimeout` and `ReadTimeout` (10 s each), `KeepAlive` (half the session
-timeout the server gives, 30 s at most), `MTU`, `MaxQueuedBytes`, and the
-reorder buffer's size and delay.
+`rtsp.ClientConfig` has `Engine` (required and running), `Transport` (TCP
+or UDP) and `UDPHost` (the local host of UDP's bindings), `Username` and
+`Password` (else the URL's user info), `DialTimeout`, `RequestTimeout` and
+`ReadTimeout` (10 s each), `KeepAlive` (half the session timeout the server
+gives, 30 s at most), `MTU`, `MaxQueuedBytes` (4 MiB), the reorder buffer's
+size and delay, `UserAgent`, and the callbacks `OnTracks`, `OnPacket`,
+`OnReady` and `OnClose`.
 
-**srt.ServerConfig** (and `ClientConfig`)
+**srt.ServerConfig**
 
 | Field | Default | Meaning |
 | --- | --- | --- |
 | `Latency` | 120 ms | TSBPD latency asked for; the larger side wins |
-| `Passphrase`, `PBKeyLen` | none, 16 | Encryption: 10 to 79 bytes; key length 16, 24 or 32. With a passphrase, callers without one are rejected, and the reverse |
-| `HandshakeTimeout`, `PeerIdleTimeout` | 3 s, 5 s | Handshake, and a peer that sends nothing |
+| `Passphrase`, `PBKeyLen` | none, 16 | Encryption: 10 to 79 bytes; key length 16, 24 or 32 (a listener takes the caller's). With a passphrase, callers without one are rejected, and the reverse |
+| `PeerIdleTimeout` | 5 s | A peer that sends nothing |
 | `FlowWindow`, `SendBufferPackets` | 8192, 8192 packets | Receive buffer and peer's in-flight packets; unacknowledged plus waiting packets |
 | `MaxSendBacklog` | 4 MiB | Unacknowledged payload past which a player's packets drop |
 | `PlayWait` | 0 | How long a player waits for a missing stream, or for the next publisher after its own leaves; 0 rejects a player of a missing stream with `RejectNotFound` |
@@ -628,6 +668,14 @@ reorder buffer's size and delay.
 
 Payloads are at most 1456 bytes; players get 7 transport packets (1316 bytes)
 per SRT packet.
+
+`srt.ClientConfig` has `StreamID`, the same `Latency`, `Passphrase`,
+`PBKeyLen`, `PeerIdleTimeout`, `FlowWindow`, `SendBufferPackets`,
+`MaxSendBacklog`, `Muxer` and `Demuxer`, and adds `HandshakeTimeout` (3 s),
+`Wait` (`Publish`'s `hub.SubscribeOptions.Wait`), and the callbacks
+`OnConnect`, `OnClose` (a `RejectReason` when the listener refused) and
+`OnData` (the payloads of a `Dial` session). `Play` without a hub hands the
+stream to the `Demuxer`'s `OnTracks` and `OnPacket`.
 
 **hls.HandlerConfig** and its `Muxer hls.Config`
 
@@ -654,15 +702,26 @@ per SRT packet.
 | `Authorize`, `AllowOrigin`, `LinkICEServers` | none | Bearer tokens, CORS, ICE servers sent as Link headers |
 | `GatherTimeout`, `ConnectTimeout` | 5 s, 15 s | Gathering before the answer, connecting after it |
 | `RepublishWait` | 10 s | How long a viewer waits for the next publisher |
-| `NoGOPCache`, `MaxHeldBytes` | false, 8 MiB | Start viewers at the cached GOP, held while they connect |
+| `NoGOPCache`, `MaxHeldBytes` | false, 8 MiB | Start viewers at the next keyframe instead of the cached GOP; what a viewer holds while it connects |
 | `MaxLoss` | 0.25 | Reported loss past which a viewer's packets drop (video to the next keyframe) |
 | `MTU`, `ReorderSize`, `ReorderDelay` | 1200, 128, 100 ms | RTP size, and a WHIP track's reorder buffer |
 | `PLIInterval`, `KeyFrameInterval` | 500 ms, 0 | Least time between keyframe requests; periodic requests |
 | `MaxOfferBytes` | 64 KiB | An offer or a PATCH body |
 | `OnKeyFrameRequest` | none | A viewer's keyframe request for a stream no WHIP session of this server publishes |
 
-`rtc.ClientConfig` has `Timeout` (15 s), `Token`, `Header`, `MTU`,
-`MaxHeldBytes`, the reorder buffer, `PLIInterval` and `KeyFrameInterval`.
+`rtc.Config.WebRTC.Codecs` is ignored: each session takes the codecs of its
+stream or of the offer. One certificate is made for every PeerConnection
+when `Certificates` is empty.
+
+`rtc.ClientConfig` has `Engine` (a running one, which sends the requests
+unless `HTTPClient` is set and opens the PeerConnection's port unless
+`WebRTC` has a Mux or an engine), `HTTPClient`, `WebRTC` (a playing client
+offers its `Codecs`, `rtc.DefaultReceiveCodecs()` when nil; a pushing client
+offers its tracks'),
+`Timeout` (15 s), `Token`, `Header`, `MTU` (1200), `MaxHeldBytes` (8 MiB),
+the reorder buffer, `PLIInterval` (500 ms) and `KeyFrameInterval`, and the
+callbacks `OnTracks`, `OnPacket`, `OnReady`, `OnClose` and
+`OnKeyFrameRequest` (the server asking a pushing client for a keyframe).
 
 Fixed bounds inside the cores:
 
@@ -696,9 +755,10 @@ a codec fib does not have, or because it belongs to the application.
   matrix (Sorenson H.263, VP6, Screen Video, Nellymoser, Speex, ADPCM: parsed,
   then dropped); FLV encryption headers; encoding AMF3, its externalizable
   objects, and AMF0's reserved markers.
-- **HTTP-FLV**: a pull client (`rtmp.Pull` relays from RTMP; pulling HTTP-FLV
-  needs a fib/http client that streams response bodies into `flv.Demuxer`,
-  which is left for later); serving recorded files.
+- **HTTP-FLV**: a pull client (`rtmp.Pull` relays from RTMP). It is not
+  written yet: it would feed a fib/http client response body
+  (`ClientConfig.StreamResponseBody`, `ClientResponse.OnBody`) into
+  `flv.Demuxer`. Serving recorded files.
 - **RTSP**: RTSP 2.0; RTSP over TLS (rtsps) and over HTTP tunnels; multicast;
   a PLAY Range that seeks, Scale and Speed; sessions that outlive their
   connection; RTCP receiver reports to recorders.

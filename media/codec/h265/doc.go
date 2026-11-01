@@ -13,16 +13,18 @@
 //
 // SPS.Unmarshal reads a sequence parameter set (section 7.3.2.2) through
 // profile_tier_level with its sub-layers, the chroma format, the picture
-// size and conformance window, and the bit depths: what the
-// HEVCDecoderConfigurationRecord and a player's picture size need. VPS
+// size and conformance window, the bit depths, and
+// sps_max_num_reorder_pics: what the HEVCDecoderConfigurationRecord, a
+// player's picture size and an RTP depacketizer recovering decode times
+// need. VPS
 // reads the profile, tier and level and sub-layers of a video parameter
 // set. HEVCConfig parses and builds the HEVCDecoderConfigurationRecord of
 // ISO/IEC 14496-15 section 8.3.3.1, av.Track.Config for H.265, and
 // NewHEVCConfig builds it from parameter sets as ffmpeg's MP4 muxer does.
 //
-// Left out: the SPS beyond the bit depths (short-term reference picture
-// sets, scaling lists and the VUI, so no frame rate or sample aspect
-// ratio), the picture parameter set and slice headers, and the
+// Left out: the SPS beyond the bit depths and the reordering count
+// (short-term reference picture sets, scaling lists and the VUI, so no
+// frame rate or sample aspect ratio), the picture parameter set and slice headers, and the
 // multi-layer extensions (SHVC, MV-HEVC), whose layered NAL units pass
 // through as any other.
 package h265

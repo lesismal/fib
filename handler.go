@@ -318,11 +318,12 @@ func (c *Connection) IsUnix() bool { return c.Protocol() == ProtocolUnix }
 
 // IsAccepted reports whether one of the engine's listeners accepted the
 // connection: a TCP or Unix connection it accepted, or a peer that sent a
-// UDP listener its first datagram. It is the opposite of IsDialed.
+// UDP listener its first datagram or that OpenUDPPeer opened on one. It is
+// the opposite of IsDialed.
 func (c *Connection) IsAccepted() bool { return !c.dialed }
 
-// IsDialed reports whether Dial or DialWithHandler opened the connection. It
-// is the opposite of IsAccepted.
+// IsDialed reports whether Dial, DialWithHandler or DialWith opened the
+// connection. It is the opposite of IsAccepted.
 func (c *Connection) IsDialed() bool { return c.dialed }
 
 // ErrWouldBlock is what Read returns when the socket has nothing waiting. The
