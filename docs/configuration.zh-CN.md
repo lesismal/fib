@@ -64,7 +64,7 @@ if err := engine.Run(); err != nil {
 | `ReadBufferStartSize` | `16 KiB`（`ReadBufferSize` 更小时取它） | 连接一轮开始时用的缓冲。某次 read 读满它，这一轮换成 `ReadBufferSize`，此后该连接的轮次也从大缓冲开始，直到连续四轮读到的都少于它：小请求的连接只占小缓冲，大传输的连接一直按大缓冲读。只有调大 `ReadBufferSize` 时才与它不同；负值或不小于 `ReadBufferSize` 时每轮都用大缓冲。 |
 | `WriteBufferHighWatermark` | *动态*（默认读缓冲下 64 KiB） | 单连接待写字节达到它就暂停读；低水位是它的四分之一。它限制用户态缓冲，不限制发送队列。0 表示按 `ReadBufferSize`、机器、预算和连接数计算；负值关闭。 |
 | `MaxPendingBytes` | `0`（关） | 所有连接加在一起允许等待的字节数；达到后所有连接暂停读，降到四分之一恢复。0 表示只有每连接水位线；当“水位线 × 连接数”超出内存承受范围时设置它。 |
-| `MaxWriteQueueBytes` | `0`（关） | 单连接已经排队、socket 还没取走的字节上限（`Send`、`SendParts`、TLS 留下的；不含 `SendFile` 未读的文件）。超过时这次 send 返回 `ErrSendQueueFull` 并关闭连接。广播最需要它：水位线只暂停读，`MaxPendingBytes` 限制总量而不是单个对端。0 表示不限制；单连接可用 `SetWriteQueueLimit` 自己设。 |
+| `MaxWriteQueueBytes` | `0`（关） | 单连接已经排队、socket 还没取走的字节上限（`Send`、`SendParts`、TLS 留下的；不含 `SendFile` 未读的文件）。一次 send 若会让队列超过上限，就不入队，直接返回 `ErrSendQueueFull` 并关闭连接，所以队列永远不会超过上限。只有 socket 当场没取走的部分才算：内核整个取走的 send 再大也放行，只取走一部分的按剩下的部分判断。广播最需要它：水位线只暂停读，`MaxPendingBytes` 限制总量而不是单个对端。0 表示不限制；单连接可用 `SetWriteQueueLimit` 自己设。 |
 
 ### 写与批量
 

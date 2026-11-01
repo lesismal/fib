@@ -315,8 +315,8 @@ HTTP/1 pipeline（一次写 N 个请求、按顺序读 N 个响应）和 WebSock
 5. **有上限的积压。** 对端不读响应、积压达到 `WriteBufferHighWatermark` 时停止读它的请求
    （可选的 `MaxPendingBytes` 限制全服务总量，默认关闭）。水位线只暂停读，不封顶队列本身——
    handler 可以在自己的 goroutine 里一直发。硬上限是 `Config.MaxWriteQueueBytes`，或者对单条连接
-   调用 `Connection.SetWriteQueueLimit`：一次发送把队列推过上限就回 `fib.ErrSendQueueFull` 并关闭
-   连接。所以 pipeline 压测中内存稳定在几十 MB，而不是涨到几百 MB。
+   调用 `Connection.SetWriteQueueLimit`：一次发送若会把队列推过上限，就不入队，回 `fib.ErrSendQueueFull` 并关闭
+   连接，队列永远不超过上限。所以 pipeline 压测中内存稳定在几十 MB，而不是涨到几百 MB。
 
 **你自己写协议时怎么吃到同样的红利**
 
@@ -497,7 +497,7 @@ Data: func(c *fib.Connection, data []byte) {
 | `SendShared(b)` | 与 `SendOwned` 一样不复制，但只读不写、不放回池，同一个 `b` 可以同时发给多个连接；慢连接的队列里排的都是这一份 | 广播（`websocket.PreparedMessage` 用它） |
 | `SendFile(f, off, n)` | 排进发送队列，与前后 `Send` 保序；`sendfile(2)` 直发，随对端接收进度读文件 | 大文件，内存不随文件大小增长 |
 | `Cork()` / `Flush()` | 手动控制合并写 | 在**本轮之外**回复多个请求；或在 handler 里需要中途把数据交给 socket |
-| `Config.MaxWriteQueueBytes` / `Connection.SetWriteQueueLimit(n)` | 限制单条连接发送队列的字节数；超过时 `Send` 返回 `ErrSendQueueFull` 并关闭连接 | 广播给可能不再读的连接 |
+| `Config.MaxWriteQueueBytes` / `Connection.SetWriteQueueLimit(n)` | 限制单条连接发送队列的字节数；会超过时这次 `Send` 不入队，返回 `ErrSendQueueFull` 并关闭连接 | 广播给可能不再读的连接 |
 
 **整体响应的 body** 不拷贝，直接交给 `SendParts`。handler 若要在调用返回时拿回自己的 buffer
 （下一个请求还要重新填的 scratch buffer），改用 `Context.RespondCopy` 或

@@ -73,18 +73,22 @@ func TestWriteQueueLimit(t *testing.T) {
 	if got := c.WriteQueueLimit(); got != 1<<20 {
 		t.Fatalf("SetWriteQueueLimit(1MB): %d", got)
 	}
-	// A queue at the limit is not over it, and one byte past it is.
-	c.pendingBytes.Store(1 << 20)
-	if c.sendQueueOverLocked() {
-		t.Fatal("a queue at the limit is over it")
+	// A send that fills the queue to the limit is not over it, and one that
+	// would take it a byte past is, counting what a cork holds.
+	c.pendingBytes.Store(1<<20 - 8)
+	if c.sendQueueOverLocked(8) {
+		t.Fatal("a send that fills the queue to the limit is over it")
 	}
-	c.pendingBytes.Store(1<<20 + 1)
-	if !c.sendQueueOverLocked() {
-		t.Fatal("a queue past the limit is not over it")
+	if !c.sendQueueOverLocked(9) {
+		t.Fatal("a send past the limit is not over it")
+	}
+	c.corkedBytes = 8
+	if !c.sendQueueOverLocked(1) {
+		t.Fatal("a corked backlog does not count against the limit")
 	}
 	c.SetWriteQueueLimit(0)
 	c.pendingBytes.Store(1 << 30)
-	if c.sendQueueOverLocked() {
+	if c.sendQueueOverLocked(1 << 30) {
 		t.Fatal("a limit of zero still applies")
 	}
 	if got := c.WriteQueueLimit(); got != 0 {

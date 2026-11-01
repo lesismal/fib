@@ -1057,12 +1057,12 @@ func (c *Connection) send(data []byte, mode sendMode) error {
 		return syscall.EPIPE
 	}
 	if mode == sendCopy && c.corked {
-		c.queueCorkedLocked(data, nil)
-		over := c.sendQueueOverLocked()
-		c.mu.Unlock()
-		if over {
+		if c.sendQueueOverLocked(int64(len(data))) {
+			c.mu.Unlock()
 			return c.closeOverSendQueue()
 		}
+		c.queueCorkedLocked(data, nil)
+		c.mu.Unlock()
 		return nil
 	}
 	sent := 0
@@ -1095,6 +1095,16 @@ func (c *Connection) send(data []byte, mode sendMode) error {
 		}
 	}
 	queued := data[sent:]
+	// Only what the socket did not take counts against the limit: a send
+	// the kernel takes whole is never queued, however large, and one it
+	// takes in part is checked for the rest alone.
+	if c.sendQueueOverLocked(int64(len(queued))) {
+		c.mu.Unlock()
+		if mode == sendPooled {
+			bufferpool.Put(data)
+		}
+		return c.closeOverSendQueue()
+	}
 	switch mode {
 	case sendCopy:
 		c.queueLocked(queued, nil)
@@ -1114,12 +1124,8 @@ func (c *Connection) send(data []byte, mode sendMode) error {
 	if direct {
 		armErr = c.awaitWritableLocked()
 	}
-	over := c.sendQueueOverLocked()
 	refresh := !c.corked && c.settlePauseLocked(false)
 	c.mu.Unlock()
-	if over {
-		return c.closeOverSendQueue()
-	}
 	if armErr != nil {
 		c.closeWithError(armErr)
 		return armErr
@@ -1173,16 +1179,16 @@ func (c *Connection) sendParts(first, second []byte, shared bool) error {
 		return syscall.EPIPE
 	}
 	if c.corked {
+		if c.sendQueueOverLocked(int64(total)) {
+			c.mu.Unlock()
+			return c.closeOverSendQueue()
+		}
 		if shared {
 			c.queueCorkedSharedLocked(first, second)
 		} else {
 			c.queueCorkedLocked(first, second)
 		}
-		over := c.sendQueueOverLocked()
 		c.mu.Unlock()
-		if over {
-			return c.closeOverSendQueue()
-		}
 		return nil
 	}
 	sent := 0
@@ -1208,6 +1214,10 @@ func (c *Connection) sendParts(first, second []byte, shared bool) error {
 			return nil
 		}
 	}
+	if c.sendQueueOverLocked(int64(total - sent)) {
+		c.mu.Unlock()
+		return c.closeOverSendQueue()
+	}
 	if shared {
 		if sent < len(first) {
 			c.queueSharedPartsLocked(first[sent:], second)
@@ -1224,12 +1234,8 @@ func (c *Connection) sendParts(first, second []byte, shared bool) error {
 	if direct {
 		armErr = c.awaitWritableLocked()
 	}
-	over := c.sendQueueOverLocked()
 	refresh := !c.corked && c.settlePauseLocked(false)
 	c.mu.Unlock()
-	if over {
-		return c.closeOverSendQueue()
-	}
 	if armErr != nil {
 		c.closeWithError(armErr)
 		return armErr
@@ -1844,9 +1850,10 @@ func (c *Connection) SetWriteBackpressure(on bool) {
 
 // SetWriteQueueLimit caps the bytes this connection may have queued for its
 // socket, as Config.MaxWriteQueueBytes does for every connection: a send that
-// takes the queue past the limit closes the connection with
-// ErrSendQueueFull and reports it, rather than letting a peer that never
-// reads grow the queue without bound. Bytes a corked round has queued count,
+// would take the queue past the limit is not queued, but closes the
+// connection with ErrSendQueueFull and reports it, rather than letting a peer
+// that never reads grow the queue without bound. Only what the socket does
+// not take at once counts. Bytes a corked round has queued count,
 // and so do the sealed bytes a layer such as TLS leaves behind; a file
 // SendFile has queued but not read does not. A limit of zero or less removes
 // the cap, and a negative one restores the engine's, which is
@@ -1877,22 +1884,23 @@ func (c *Connection) writeQueueLimitLocked() int64 {
 	return c.engine.writeQueueLimit
 }
 
-// sendQueueOverLocked reports whether what is queued for the socket is past
-// the connection's limit. It counts the bytes waiting from memory, whether
-// queued outright or under a cork, and not a file SendFile has queued but not
-// read, which the peer's reading of the socket paces anyway. Callers hold
-// c.mu.
-func (c *Connection) sendQueueOverLocked() bool {
+// sendQueueOverLocked reports whether queueing n more bytes would take what
+// is queued for the socket past the connection's limit, so that a send is
+// refused before it is queued rather than after: the queue never holds more
+// than the limit. It counts the bytes waiting from memory, whether queued
+// outright or under a cork, and not a file SendFile has queued but not read,
+// which the peer's reading of the socket paces anyway. Callers hold c.mu.
+func (c *Connection) sendQueueOverLocked(n int64) bool {
 	limit := c.writeQueueLimitLocked()
 	if limit <= 0 {
 		return false
 	}
-	return c.pendingBytes.Load()+c.corkedBytes > limit
+	return c.pendingBytes.Load()+c.corkedBytes+n > limit
 }
 
-// closeOverSendQueue closes a connection whose send queue a send just took
-// past its limit, and reports the error that closes it. It is called after
-// c.mu is released.
+// closeOverSendQueue closes a connection a send would have taken past its
+// send queue's limit, and reports the error that closes it. The send is not
+// queued. It is called after c.mu is released.
 func (c *Connection) closeOverSendQueue() error {
 	c.closeWithError(ErrSendQueueFull)
 	return ErrSendQueueFull
@@ -2850,13 +2858,13 @@ func (c *Connection) stageSealedLocked(item *sendItem) error {
 		return err
 	}
 	s.sealed = sealed
+	if c.sendQueueOverLocked(int64(len(sealed))) {
+		return ErrSendQueueFull
+	}
 	item.data, item.offset = sealed, 0
 	s.advance(int64(want))
 	c.moveFileLocked(int64(want))
 	c.addPending(int64(len(sealed)))
-	if c.sendQueueOverLocked() {
-		return ErrSendQueueFull
-	}
 	return nil
 }
 
@@ -2896,15 +2904,15 @@ func (c *Connection) SendRawRecord(typ uint8, data []byte) error {
 		c.mu.Unlock()
 		return syscall.EPIPE
 	}
+	if c.sendQueueOverLocked(int64(len(data))) {
+		c.mu.Unlock()
+		return c.closeOverSendQueue()
+	}
 	direct := c.canWriteDirectlyLocked()
 	data = bufferpool.Append(nil, data)
 	c.pushLocked(sendItem{data: data, record: typ})
 	c.addPending(int64(len(data)))
-	over := c.sendQueueOverLocked()
 	c.mu.Unlock()
-	if over {
-		return c.closeOverSendQueue()
-	}
 	if !direct {
 		return nil
 	}

@@ -1041,8 +1041,8 @@ func (c *Connection) SendOwned(data []byte) error { return c.Send(data) }
 func (c *Connection) SendShared(data []byte) error { return c.Send(data) }
 
 // SetWriteQueueLimit caps a connection's send queue, as it does on the other
-// backends, where a send past the limit closes the connection with
-// ErrSendQueueFull. This backend writes each send before it returns and never
+// backends, where a send that would take the queue past the limit closes the
+// connection with ErrSendQueueFull. This backend writes each send before it returns and never
 // holds a queue, so the limit never applies; it is accepted, and reported by
 // WriteQueueLimit, so that one program serves both.
 func (c *Connection) SetWriteQueueLimit(limit int64) {
