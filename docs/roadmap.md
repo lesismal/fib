@@ -51,7 +51,6 @@ Each protocol document (`http1*.md`, `http2*.md`, `http3*.md`, `webrtc*.md`, `me
 | UDP writability events on Windows | Deliberately not done | Completion ports have no "writable" notion (readability is a zero-byte `WSARecv`, writability is inferred from a `WSASend` completion), so it would degrade to polling; the 1 ms retry timer already approximates it, and Windows rarely serves QUIC | M | Windows becomes a primary QUIC platform |
 | `ENOBUFS` (a full socket) notification on macOS | Deliberately not done | `sendmsg_x` has no "there is room again" signal, so the 1 ms timer stays; `EAGAIN` already goes through the writable event | S–M | A high-throughput QUIC server on macOS |
 | kqueue writable events verified only on darwin/arm64 | Known limit | The `EVFILT_WRITE` path has run on macOS; FreeBSD, NetBSD, OpenBSD and DragonFly have only cross-compilation behind them | S | A BSD production deployment |
-| `MaxWriteQueueBytes` lets one message overshoot | Known limit | The cap is checked after queueing, so a single oversized send can pass it by one message before the connection closes; that keeps "one send either succeeds or closes the connection" simple | S | A strict cap is required |
 | The WebSocket broadcast send queue | Mitigated | Unlimited by default (only `MaxWriteQueueBytes`/`SetWriteQueueLimit` bound it); a peer that never reads must be dropped by application-level heartbeats | — | See the broadcast section of `guide.zh-CN.md` |
 
 ## 5. WebRTC
@@ -72,7 +71,6 @@ Each protocol document (`http1*.md`, `http2*.md`, `http3*.md`, `webrtc*.md`, `me
 | Item | Status | Why | Cost | Reconsider when |
 | --- | --- | --- | --- | --- |
 | Transcoding (AAC to Opus for WHEP, renditions for HLS) | Deliberately not done | It needs audio and video decoders and encoders, which means cgo or a dependency, and CPU per stream that a remuxing server does not spend; the hub carries what publishers send and each egress leaves out what it cannot carry | L | Never in fib itself: an external transcoder subscribes and republishes into the hub |
-| HTTP-FLV pull client | Planned | Not written yet: it would feed a response body the fib/http client streams (`StreamResponseBody`, `ClientResponse.OnBody`) into `flv.Demuxer`; `rtmp.Pull` covers relaying from origins that speak RTMP | M | Relaying from origins or CDNs that offer only HTTP-FLV |
 | RTSP over TLS, over HTTP tunnels, RTSP 2.0, multicast | Deliberately not done | Cameras and players speak plain RTSP 1.0 over TCP or UDP unicast | M | Deployments that require rtsps or tunnelling through HTTP proxies |
 | SRT rendezvous, file mode, AES-GCM, FEC, bonding | Deliberately not done | Live mode with AES-CTR is what ffmpeg, OBS and encoders use for ingest and distribution | L | An encoder or network that needs one of them |
 | WHIP/WHEP ICE restart, simulcast layers, A/V sync from sender reports | Known limit | ICE restart is answered 422, as RFC 9725 asks; only a section's first simulcast layer is received; WHIP times packets by arrival, in step to within the network's jitter | M | Mobile publishers that change networks, or SFU-style layer selection |
@@ -85,7 +83,6 @@ Each protocol document (`http1*.md`, `http2*.md`, `http3*.md`, `webrtc*.md`, `me
 
 | Item | Status | Why | Cost | Reconsider when |
 | --- | --- | --- | --- | --- |
-| The `http3-interop-image` job depends on Docker Hub | Known risk | It pulls the `golang:1.27.3` base image; a rate limit can fail a PR | S | On the first failure: make it non-blocking, or mirror the image |
 | Interop with more QUIC implementations | Partial | There is a containerised endpoint (`http3/interoprunner/`) and a CI job, but only quic-go is a peer; quiche, ngtcp2 and mvfst are not wired in | M | When broader compatibility evidence is needed |
 | 0-RTT interop with more servers, and replay protection across servers | Planned | The ticket registry is per process; a server behind a load balancer must protect itself | M | When 0-RTT is actually deployed |
 | Load testing (concurrency problems) | Done | The full campaign in `benchmark/loadtest/` plus `stallmem.sh`; conclusions in `docs/loadtest*.md` | — | See "a clean A/B" in that document |

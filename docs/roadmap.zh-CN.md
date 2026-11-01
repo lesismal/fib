@@ -51,7 +51,6 @@
 | Windows 上 UDP 的可写事件 | 有意不做 | 完成端口没有"可写"语义（可读靠零字节 `WSARecv`、可写靠 `WSASend` 完成模拟），只能退化成轮询；现在的 1 毫秒重试定时器已经近似，而 Windows 上跑 QUIC 服务端本来就少 | M | Windows 成为 QUIC 的主要部署平台 |
 | macOS 上 `ENOBUFS`（socket 写满）的可写通知 | 有意不做 | 同上：`sendmsg_x` 不报"又有空间了"，仍用 1 毫秒重试；`EAGAIN` 已经走可写事件 | S–M | macOS 上跑高吞吐 QUIC 服务端 |
 | kqueue 可写事件只在 darwin/arm64 验证过 | 已知边界 | `EVFILT_WRITE` 路径在 macOS 上跑过，FreeBSD／NetBSD／OpenBSD／DragonFly 只有交叉编译验证 | S | 有 BSD 生产环境时补一次真机测试 |
-| `MaxWriteQueueBytes` 允许单条消息越界 | 已知边界 | 上限在入队后检查，一条超大消息可以超出上限一条消息才关闭连接；这是为了让"一次发送要么成功要么关闭"语义简单 | S | 需要严格上限时改成入队前预判 |
 | WebSocket 广播的发送队列 | 已缓解 | 默认无上限（只有 `MaxWriteQueueBytes`／`SetWriteQueueLimit` 可开）；对端长期不读要靠应用层心跳断开 | — | 见 `guide.zh-CN.md` 的广播一节 |
 
 ## 5. WebRTC
@@ -72,7 +71,6 @@
 | 项 | 状态 | 原因 | 成本 | 何时重估 |
 | --- | --- | --- | --- | --- |
 | 转码（为 WHEP 把 AAC 转成 Opus，为 HLS 生成多码率） | 有意不做 | 需要音视频解码器和编码器，意味着 cgo 或引入依赖，还要为每路流付出转封装服务器本不需要的 CPU；hub 承载发布者发来的内容，每个出口去掉自己承载不了的 track | L | fib 本身永远不做：由外部转码器订阅后再发布回 hub |
-| HTTP-FLV 拉流客户端 | 计划中 | 尚未编写：把 fib/http 客户端流式收到的响应 body（`StreamResponseBody`、`ClientResponse.OnBody`）送进 `flv.Demuxer` 即可；从 RTMP 源站转发已由 `rtmp.Pull` 覆盖 | M | 需要从只提供 HTTP-FLV 的源站或 CDN 转发 |
 | 基于 TLS、HTTP 隧道的 RTSP，RTSP 2.0，组播 | 有意不做 | 摄像头和播放器用的是基于 TCP 或 UDP 单播的普通 RTSP 1.0 | M | 部署要求 rtsps，或必须穿过 HTTP 代理 |
 | SRT 的 rendezvous、file 模式、AES-GCM、FEC、bonding | 有意不做 | ffmpeg、OBS 和编码器接入与分发用的是带 AES-CTR 的 live 模式 | L | 有编码器或网络需要其中之一 |
 | WHIP/WHEP 的 ICE restart、simulcast 多层、基于 sender report 的音视频同步 | 已知限制 | ICE restart 按 RFC 9725 的要求回 422；每个 section 只接收 simulcast 的第一层；WHIP 按到达时间打时间戳，各 track 偏差不超过网络抖动 | M | 会切换网络的移动端发布者，或 SFU 式的分层选择 |
@@ -85,7 +83,6 @@
 
 | 项 | 状态 | 原因 | 成本 | 何时重估 |
 | --- | --- | --- | --- | --- |
-| `http3-interop-image` job 依赖 Docker Hub | 已知风险 | 需要拉 `golang:1.27.3` 基础镜像，极端情况下 rate limit 会让 PR 失败 | S | 出现失败时改成非阻塞或换镜像源 |
 | 与更多 QUIC 实现的互通 | 部分完成 | 现在有容器化端点（`http3/interoprunner/`）和 CI job，但只与 quic-go 互为对端；quiche、ngtcp2、mvfst 未接 | M | 需要更广的兼容性证据时 |
 | 0-RTT 与更多实现互通、多机共享票据密钥的防重放 | 计划中未做 | 票据登记表是每个进程一份；放在负载均衡后面的服务端要自己防重放 | M | 真的上线 0-RTT 时 |
 | 压测（并发问题） | 已完成 | `benchmark/loadtest/` 的完整战役 + `stallmem.sh` 内存用例；结论见 `docs/loadtest*.md` | — | 见该文档的"如何做一次干净的 A/B" |
