@@ -10,6 +10,7 @@ import (
 	"io"
 	"net"
 	"net/netip"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -85,14 +86,23 @@ type Configuration struct {
 	Certificates []stdtls.Certificate
 
 	// ICEServers are the STUN servers asked for server-reflexive
-	// candidates and the TURN servers ("turn:host[:port]", over UDP) an
-	// allocation is made on for a relay candidate, with the server's
-	// Username and Credential. TURN needs a PeerConnection with a port of
-	// its own, without a Mux: a TURN server tells its clients apart by
-	// their address, which the PeerConnections of one Mux share. A lite
-	// PeerConnection asks no STUN server, and a TURN URL ("turn:" or
-	// "turns:") makes NewPeerConnection return ErrConfiguration.
+	// candidates and the TURN servers an allocation is made on for a relay
+	// candidate, with the server's Username and Credential: over UDP
+	// ("turn:host[:port]"), TCP ("turn:host[:port]?transport=tcp") or TLS
+	// ("turns:host[:port]", port 5349 by default). Only the leg to the
+	// server is TCP or TLS; the server relays to the peer over UDP. TURN
+	// needs a PeerConnection with a port of its own, without a Mux: a TURN
+	// server tells its clients apart by their address, which the
+	// PeerConnections of one Mux share. A "stuns:" URL, and a "turns:" one
+	// over UDP (DTLS), are skipped. A lite PeerConnection asks no STUN
+	// server, and a TURN URL ("turn:" or "turns:") makes NewPeerConnection
+	// return ErrConfiguration.
 	ICEServers []ICEServer
+	// TURNTLSConfig is the TLS configuration "turns:" servers are reached
+	// with; nil means crypto/tls's defaults, which verify the server
+	// against the system's roots. When it names no ServerName, the host of
+	// the URL is the name verified.
+	TURNTLSConfig *stdtls.Config
 	// ICETransportPolicy ICETransportPolicyRelay gathers relay candidates
 	// only, so that media goes through a TURN server and the peer never
 	// learns this side's addresses. It needs a TURN server and a full ICE
@@ -160,6 +170,8 @@ const (
 	// localID is the LocalID of the Mux socket in the ICE agent; a TURN
 	// allocation would take another.
 	localID ice.LocalID = 1
+	// turnDialTimeout bounds the connect to a TURN server over TCP or TLS.
+	turnDialTimeout = 10 * time.Second
 )
 
 // PeerConnection is a WebRTC peer, as RTCPeerConnection is: one ICE agent,
@@ -338,18 +350,18 @@ func NewPeerConnection(config Configuration) (*PeerConnection, error) {
 	pc.fingerprint = tls.CertificateFingerprint(pc.cert.Certificate[0])
 	for _, s := range config.ICEServers {
 		for _, u := range s.URLs {
-			addr, isTURN, err := iceServer(u)
+			is, err := iceServer(u)
 			if err != nil {
 				return nil, err
 			}
 			switch {
-			case isTURN && config.ICELite:
+			case is.isTURN && config.ICELite:
 				return nil, fmt.Errorf("%w: a lite PeerConnection gathers no relay candidate: %q", ErrConfiguration, u)
-			case !addr.IsValid():
-			case isTURN:
-				pc.turnServers = append(pc.turnServers, turnServer{addr, s.Username, s.Credential})
+			case !is.addr.IsValid():
+			case is.isTURN:
+				pc.turnServers = append(pc.turnServers, turnServer{is, s.Username, s.Credential})
 			default:
-				pc.stunServers = append(pc.stunServers, addr)
+				pc.stunServers = append(pc.stunServers, is.addr)
 			}
 		}
 	}
@@ -383,49 +395,105 @@ func NewPeerConnection(config Configuration) (*PeerConnection, error) {
 }
 
 type turnServer struct {
-	addr           netip.AddrPort
+	iceURL
 	user, password string
 }
 
-// iceServer parses a "stun:" or "turn:" URL and resolves its host. One
-// this side cannot use, TLS or TCP, reports an invalid address; isTURN
-// still tells a TURN server ("turn:" or "turns:") apart.
-func iceServer(u string) (addr netip.AddrPort, isTURN bool, err error) {
+// turnTransport is how a TURN server is reached.
+type turnTransport uint8
+
+const (
+	turnUDP turnTransport = iota
+	turnTCP
+	turnTLS
+)
+
+// iceURL is an ICE server URL taken apart.
+type iceURL struct {
+	// addr is the server's address, resolved; it is invalid for a server
+	// this side cannot use.
+	addr netip.AddrPort
+	// host is the URL's host, the name a TLS server is verified by.
+	host      string
+	isTURN    bool
+	transport turnTransport
+}
+
+// iceServer parses a "stun:", "turn:" or "turns:" URL and resolves its
+// host. One this side cannot use, "stuns:", "turns:" over UDP, which is
+// DTLS, or a transport other than UDP and TCP, reports an invalid address;
+// isTURN still tells a TURN server apart.
+func iceServer(u string) (is iceURL, err error) {
 	scheme, rest, ok := strings.Cut(u, ":")
 	if !ok {
-		return addr, false, fmt.Errorf("%w: ICE server URL %q", ErrConfiguration, u)
+		return is, fmt.Errorf("%w: ICE server URL %q", ErrConfiguration, u)
 	}
 	rest, query, _ := strings.Cut(rest, "?")
+	var transport string
+	for _, kv := range strings.Split(query, "&") {
+		if k, v, _ := strings.Cut(kv, "="); strings.EqualFold(k, "transport") {
+			transport = strings.ToLower(v)
+		}
+	}
+	port := "3478"
 	switch strings.ToLower(scheme) {
 	case "turn":
-		isTURN = true
-		if strings.Contains(strings.ToLower(query), "transport=tcp") {
-			return addr, true, nil
+		is.isTURN = true
+		switch transport {
+		case "", "udp":
+		case "tcp":
+			is.transport = turnTCP
+		default:
+			return is, nil
+		}
+	case "turns":
+		is.isTURN, is.transport, port = true, turnTLS, "5349"
+		if transport != "" && transport != "tcp" {
+			return is, nil
 		}
 	case "stun":
-	case "turns":
-		return addr, true, nil
 	case "stuns":
-		return addr, false, nil
+		return is, nil
 	default:
-		return addr, false, fmt.Errorf("%w: ICE server URL %q", ErrConfiguration, u)
+		return is, fmt.Errorf("%w: ICE server URL %q", ErrConfiguration, u)
 	}
-	if _, _, err := net.SplitHostPort(rest); err != nil {
-		rest = net.JoinHostPort(strings.Trim(rest, "[]"), "3478")
+	host, _, err := net.SplitHostPort(rest)
+	if err != nil {
+		host = strings.Trim(rest, "[]")
+		rest = net.JoinHostPort(host, port)
 	}
+	is.host = host
 	ua, err := net.ResolveUDPAddr("udp", rest)
 	if err != nil {
-		return addr, isTURN, fmt.Errorf("%w: ICE server %q: %w", ErrConfiguration, u, err)
+		return is, fmt.Errorf("%w: ICE server %q: %w", ErrConfiguration, u, err)
 	}
 	ap := ua.AddrPort()
-	return netip.AddrPortFrom(ap.Addr().Unmap(), ap.Port()), isTURN, nil
+	is.addr = netip.AddrPortFrom(ap.Addr().Unmap(), ap.Port())
+	return is, nil
 }
 
 // relay is a TURN allocation the ICE agent uses as a transport of its own.
 type relay struct {
-	r    *turn.ICERelay
-	id   ice.LocalID
-	done bool
+	r  *turn.ICERelay
+	id ice.LocalID
+	// done is set once the allocation is made or has failed, and failed
+	// once it has failed or was lost: its candidate is then withdrawn.
+	done, failed bool
+	// stream is set for a server reached over TCP or TLS, by conn once it
+	// is open; buf holds the start of a message not yet whole.
+	stream bool
+	conn   *fib.Connection
+	buf    []byte
+}
+
+// send sends b to a server reached over TCP or TLS. Everything the client
+// sends goes on the one connection, even to the alternate server a 300
+// response names, which the connection's server then refuses as it did
+// the first request.
+func (r *relay) send(_ netip.AddrPort, b []byte) {
+	if r.conn != nil {
+		_ = r.conn.Send(b)
+	}
 }
 
 func randomString(n int) string {
@@ -508,7 +576,9 @@ func (pc *PeerConnection) rearm() {
 		}
 	}
 	for _, r := range pc.relays {
-		take(r.r.NextTimeout())
+		if !r.failed {
+			take(r.r.NextTimeout())
+		}
 	}
 	if pc.agent != nil {
 		take(pc.agent.NextTimeout())
@@ -545,7 +615,7 @@ func (pc *PeerConnection) onTimer() {
 	now := time.Now()
 	pc.timerAt = time.Time{}
 	for _, r := range pc.relays {
-		if t, ok := r.r.NextTimeout(); ok && !t.After(now) {
+		if t, ok := r.r.NextTimeout(); ok && !r.failed && !t.After(now) {
 			r.r.HandleTimeout(now)
 			pc.relayProgress(r)
 		}
@@ -616,16 +686,7 @@ func (pc *PeerConnection) handleDatagram(from netip.AddrPort, b []byte) {
 	}
 	now := time.Now()
 	for _, r := range pc.relays {
-		if r.r.Client.Server() != from {
-			continue
-		}
-		peer, payload, handled := r.r.HandlePacket(from, b, now)
-		if handled {
-			pc.lastRecv = now
-			pc.relayProgress(r)
-			if len(payload) > 0 {
-				pc.demux(r.id, peer, payload, now)
-			}
+		if !r.stream && r.r.Client.Server() == from && pc.relayPacket(r, b, now) {
 			pc.unlock()
 			return
 		}
@@ -658,6 +719,40 @@ func (pc *PeerConnection) demux(local ice.LocalID, from netip.AddrPort, b []byte
 			}
 		}
 	}
+}
+
+// relayPacket passes the TURN client of r a packet its server sent, and
+// what a peer sent through the relay on to demux. It reports whether the
+// packet was the server's.
+func (pc *PeerConnection) relayPacket(r *relay, b []byte, now time.Time) bool {
+	peer, payload, handled := r.r.HandlePacket(r.r.Client.Server(), b, now)
+	if !handled {
+		return false
+	}
+	pc.lastRecv = now
+	pc.relayProgress(r)
+	if len(payload) > 0 {
+		pc.demux(r.id, peer, payload, now)
+	}
+	return true
+}
+
+// relayFailed notes an allocation that could not be made, or was lost with
+// its refresh or its server's connection: its relay candidate is withdrawn
+// from ICE, which goes on with the other pairs, and its part of gathering
+// ends.
+func (pc *PeerConnection) relayFailed(r *relay) {
+	if r.failed {
+		return
+	}
+	r.failed, r.done = true, true
+	if c := r.conn; c != nil {
+		r.conn = nil
+		pc.queue(func() { _ = c.Close() })
+	}
+	pc.agent.RemoveLocalCandidates(r.id, time.Now())
+	pc.localCands = slices.DeleteFunc(pc.localCands, func(c ice.Candidate) bool { return c.LocalID == r.id })
+	pc.checkGathering()
 }
 
 // relayProgress notes an allocation made or failed, which ends its part of
@@ -751,21 +846,29 @@ func (pc *PeerConnection) ensureAgent(controlling bool, now time.Time) error {
 	pc.setGathering(ICEGatheringStateGathering)
 	if !pc.cfg.ICELite {
 		for i, ts := range pc.turnServers {
-			r := &relay{id: localID + 1 + ice.LocalID(i)}
+			r := &relay{id: localID + 1 + ice.LocalID(i), stream: ts.transport != turnUDP}
+			send := pc.sendTo
+			if r.stream {
+				send = r.send
+			}
 			client, err := turn.NewClient(turn.ClientConfig{
 				Server:       ts.addr,
 				Username:     ts.user,
 				Password:     ts.password,
 				BindChannels: true,
-				Send:         pc.sendTo,
-				OnFailed:     func(error) { r.done = true; pc.checkGathering() },
+				Stream:       r.stream,
+				Send:         send,
+				OnFailed:     func(error) { pc.relayFailed(r) },
 			})
 			if err != nil {
 				return err
 			}
 			r.r = turn.NewICERelay(a, r.id, client)
 			pc.relays = append(pc.relays, r)
-			if err := client.Allocate(now); err != nil {
+			switch {
+			case r.stream:
+				pc.dialTURN(r, ts)
+			case client.Allocate(now) != nil:
 				r.done = true
 			}
 		}
@@ -1188,6 +1291,12 @@ func (pc *PeerConnection) closeLocked(notify bool) {
 	}
 	for _, r := range pc.relays {
 		r.r.Client.Close(time.Now())
+		if c := r.conn; c != nil {
+			// The deallocation goes out first; the server frees the
+			// allocation once the connection closes anyway.
+			r.conn = nil
+			pc.queue(c.CloseAfterSend)
+		}
 	}
 	if notify {
 		if pc.sctp != nil {

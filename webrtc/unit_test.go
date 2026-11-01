@@ -83,23 +83,29 @@ func TestCodecMatches(t *testing.T) {
 
 func TestICEServerURL(t *testing.T) {
 	for _, tc := range []struct {
-		url   string
-		addr  string
-		turn  bool
-		error bool
+		url       string
+		addr      string
+		host      string
+		turn      bool
+		transport turnTransport
+		error     bool
 	}{
-		{"stun:127.0.0.1", "127.0.0.1:3478", false, false},
-		{"stun:127.0.0.1:19302", "127.0.0.1:19302", false, false},
-		{"turn:[::1]:3479?transport=udp", "[::1]:3479", true, false},
-		{"turn:127.0.0.1?transport=tcp", "invalid AddrPort", true, false},
-		{"turns:127.0.0.1", "invalid AddrPort", true, false},
-		{"stuns:127.0.0.1", "invalid AddrPort", false, false},
-		{"http://x", "", false, true},
-		{"nonsense", "", false, true},
+		{"stun:127.0.0.1", "127.0.0.1:3478", "127.0.0.1", false, turnUDP, false},
+		{"stun:127.0.0.1:19302", "127.0.0.1:19302", "127.0.0.1", false, turnUDP, false},
+		{"turn:[::1]:3479?transport=udp", "[::1]:3479", "::1", true, turnUDP, false},
+		{"turn:127.0.0.1?transport=tcp", "127.0.0.1:3478", "127.0.0.1", true, turnTCP, false},
+		{"TURN:127.0.0.1:3479?foo=bar&Transport=TCP", "127.0.0.1:3479", "127.0.0.1", true, turnTCP, false},
+		{"turns:127.0.0.1", "127.0.0.1:5349", "127.0.0.1", true, turnTLS, false},
+		{"turns:[::1]:443?transport=tcp", "[::1]:443", "::1", true, turnTLS, false},
+		{"turns:127.0.0.1?transport=udp", "invalid AddrPort", "", true, turnTLS, false},
+		{"turn:127.0.0.1?transport=sctp", "invalid AddrPort", "", true, turnUDP, false},
+		{"stuns:127.0.0.1", "invalid AddrPort", "", false, turnUDP, false},
+		{"http://x", "", "", false, turnUDP, true},
+		{"nonsense", "", "", false, turnUDP, true},
 	} {
-		addr, turn, err := iceServer(tc.url)
-		if (err != nil) != tc.error || err == nil && (addr.String() != tc.addr || turn != tc.turn) {
-			t.Errorf("%s: %v %v %v", tc.url, addr, turn, err)
+		is, err := iceServer(tc.url)
+		if (err != nil) != tc.error || err == nil && (is.addr.String() != tc.addr || is.host != tc.host || is.isTURN != tc.turn || is.transport != tc.transport) {
+			t.Errorf("%s: %+v %v", tc.url, is, err)
 		}
 	}
 }

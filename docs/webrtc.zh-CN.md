@@ -34,7 +34,7 @@ PeerConnection，[`webrtc/turnserver`](https://github.com/lesismal/fib-examples/
 | Mux | fib engine 的一个 UDP 端口，任意多个 PeerConnection 共用，这是服务端需要的形态；没有 Mux 的 PeerConnection 自己开一个端口，就像客户端那样 |
 | ICE | RFC 8445 的 full 与 lite agent、两种角色、角色冲突、frozen/waiting 状态的 pair、按节奏发送的普通检查与 triggered check、peer-reflexive candidate、regular nomination、restart；trickle（RFC 8838）；consent freshness（RFC 7675）；向 STUN 服务器取 server-reflexive candidate；向 TURN 服务器取 relay candidate |
 | STUN | RFC 8489 消息原地解码，STUN、ICE、TURN 的属性，短期与长期凭据的 MESSAGE-INTEGRITY、MESSAGE-INTEGRITY-SHA256、FINGERPRINT，以及按 RFC 8489 重传的客户端事务 |
-| TURN | 客户端（基于 UDP、TCP 或 TLS 的 RFC 8656：allocation、刷新、permission、channel，处理 300/401/438），以及可并发调用的服务端核心：长期凭据、无状态 nonce、按服务器、用户和 allocation 的配额、拒绝内网地址的转发策略、事件与统计、原地修改限制与凭据、drain；`turnserver` 把服务端跑在 fib engine 上，支持 UDP、TCP 与 TLS。PeerConnection 只经 UDP 访问 TURN 服务器 |
+| TURN | 客户端（基于 UDP、TCP 或 TLS 的 RFC 8656：allocation、刷新、permission、channel，处理 300/401/438），以及可并发调用的服务端核心：长期凭据、无状态 nonce、按服务器、用户和 allocation 的配额、拒绝内网地址的转发策略、事件与统计、原地修改限制与凭据、drain；`turnserver` 把服务端跑在 fib engine 上，支持 UDP、TCP 与 TLS。PeerConnection 可经 UDP、TCP 与 TLS 访问 TURN 服务器 |
 | DTLS | DTLS 1.2（RFC 6347）与 use_srtp（RFC 5764），sans-IO，与 fib 的 TLS 1.2 共用握手代码：ECDHE 搭配 AES-GCM 和 ChaCha20-Poly1305，ECDSA、Ed25519、RSA 密钥，X25519、P-256、P-384，按 MTU 切分并重传的 flight，64 条记录的防重放窗口，无状态 cookie，按 SDP fingerprint 校验证书 |
 | SRTP | 由 DTLS-SRTP 派生密钥的 SRTP 与 SRTCP（RFC 3711）：AES_CM_128_HMAC_SHA1_80 与 _32、AEAD_AES_128_GCM 与 AEAD_AES_256_GCM（RFC 7714），每个 SSRC 各自的 rollover counter 与防重放窗口；某个 SSRC 一旦见过，处理每个包都不再分配内存 |
 | RTP 与 RTCP | RTP 原地解析，RFC 8285 两种格式的头部扩展，MID、RID、abs-send-time、transport-wide 序号与 audio level 的辅助函数；RTCP 的 SR、RR、SDES、BYE、APP、NACK、PLI、FIR、REMB 与 transport-cc 反馈，遍历复合包不分配内存 |
@@ -447,7 +447,11 @@ pc, err := webrtc.NewPeerConnection(webrtc.Configuration{
 	Engine: engine, // a port of its own: TURN cannot share a Mux
 	ICEServers: []webrtc.ICEServer{
 		{URLs: []string{"stun:stun.example.com"}},
-		{URLs: []string{"turn:turn.example.com:3478"}, Username: "1793480000:alice", Credential: "base64-hmac"},
+		{URLs: []string{
+			"turn:turn.example.com:3478",
+			"turn:turn.example.com:3478?transport=tcp",
+			"turns:turn.example.com:443",
+		}, Username: "1793480000:alice", Credential: "base64-hmac"},
 	},
 	// Relay candidates only: the peer never learns this side's addresses.
 	ICETransportPolicy: webrtc.ICETransportPolicyRelay,
@@ -461,16 +465,28 @@ pc, err := webrtc.NewPeerConnection(webrtc.Configuration{
   会被接受但不使用；而任何 TURN URL（`turn:` 或 `turns:`）以及 relay 策略都会让它返回
   `ErrConfiguration`，无论用 Mux 还是自己的端口：它永远收集不到这些配置所要的 relay
   candidate。
-- URL 形如 `stun:host[:port]` 和 `turn:host[:port]`，端口默认 3478，在创建 PeerConnection
-  时解析。PeerConnection 只经 UDP 访问 TURN 服务器：`turns:`、`stuns:` 和带
-  `?transport=tcp` 的 URL 在 full PeerConnection 上会被跳过。
-- 客户端处理 401 质询、带新 nonce 的 438、转向备用服务器的 300，刷新 allocation、每个对端
-  地址的 permission（每 4 分钟）以及它绑定的 channel，没得到应答的请求会重发，`Close` 时
-  释放 allocation。
+- URL 形如 `stun:host[:port]` 和 `turn:host[:port]`，端口默认 3478；经 TCP 的 TURN 写作
+  `turn:host[:port]?transport=tcp`，经 TLS 的写作 `turns:host[:port]`，端口默认 5349。
+  URL 在创建 PeerConnection 时解析。`stuns:` 与 `turns:...?transport=udp`（DTLS）的 URL
+  会被跳过。
+- 经 TCP 或 TLS 时，只有到服务器的这一段是流：allocation 向对端中继的仍是 UDP（RFC 8656），
+  对端看到的没有任何不同。连接在开始收集 candidate 时于 PeerConnection 的 engine 上非阻塞
+  地拨出，TLS 握手由 fib 的 `tls` 包完成。`Configuration.TURNTLSConfig` 是 TLS 配置，用于
+  私有根证书或客户端证书；为 nil 时使用系统根证书，未设置 `ServerName` 时以 URL 的主机名
+  校验服务器。
+- 无论经哪种传输，申请不到 allocation 都只是让该服务器的收集结束、不产生 candidate：连接
+  被拒或超时（10s）、TLS 握手失败、流无法按 TURN 切分，或者错误响应。之后才失去的
+  allocation（连接断开或刷新失败）会把它的 relay candidate 从 ICE agent 中撤回：相关的 pair
+  失败；若选中的 pair 在其上，就放弃它，controlling 一方随后提名另一个可用的 pair，若一个都
+  没有，ICE 在 `ICEFailedTimeout` 后失败。其他服务器的 candidate 照常工作。
+- 客户端处理 401 质询、带新 nonce 的 438、转向备用服务器的 300（仅 UDP；在流上所有消息都走
+  同一条连接），刷新 allocation、每个对端地址的 permission（每 4 分钟）以及它绑定的
+  channel，没得到应答的请求会重发，`Close` 时释放 allocation；经 TCP 或 TLS 时，释放请求
+  发出后连接随之关闭。
 
-`turn.Client` 本身也能经 TCP 或 TLS 访问服务器：`ClientConfig.Stream` 让它把 ChannelData
-消息补齐到 4 字节、每个请求只发一次；宿主用 `turn.FrameLen` 从流中切出每条消息，再交给
-`HandlePacket`。
+`turn.Client` 也可以单独使用：`ClientConfig.Stream` 让它把 ChannelData 消息补齐到 4 字节、
+每个请求只发一次；宿主用 `turn.FrameLen` 从流中切出每条消息，再交给 `HandlePacket`，
+PeerConnection 正是这样做的。
 
 不过 TURN 客户端通常是浏览器：共用 Mux 的 fib 服务端经由浏览器的 relay 被访问，自己并不需要
 TURN。
@@ -652,7 +668,8 @@ _ = server.Shutdown(ctx)
 | --- | --- | --- |
 | `Mux` / `Engine`、`ListenAddr` | — / `:0` | 共用一个 Mux，或在 engine 上开自己的端口 |
 | `Certificates` | 新生成的 ECDSA P-256 证书 | DTLS 证书；服务端的各个 PeerConnection 可共用一个 |
-| `ICEServers`、`ICETransportPolicy` | 无、all | STUN 与 TURN 服务器；只收集 relay candidate，需要有 TURN 服务器 |
+| `ICEServers`、`ICETransportPolicy` | 无、all | STUN 与 TURN 服务器（TURN 可经 UDP、TCP 或 TLS）；只收集 relay candidate，需要有 TURN 服务器 |
+| `TURNTLSConfig` | nil：系统根证书、URL 的主机名 | `turns:` 服务器的 TLS 配置 |
 | `ICELite` | false | 只应答检查，始终 controlled，只有 host candidate；不使用 STUN 服务器，拒绝 TURN 服务器与 relay 策略 |
 | `Codecs`、`HeaderExtensions` | `DefaultCodecs()`、`DefaultHeaderExtensions()` | 提供与接受的内容 |
 | `MaxMessageSize` | 256 KiB | 能接收的最大 data channel 消息 |
@@ -693,8 +710,8 @@ ICE-lite PeerConnection 共用一个 Mux，每个都和自己的客户端在 dat
   BundlePolicy；基于 TCP 的 ICE；解析浏览器 host candidate 的 mDNS 名字（对端的检查本来就
   会以 peer-reflexive candidate 的形式暴露它的地址）；RTX 与 FEC；transport-wide 拥塞控制
   反馈与带宽估计；发送 simulcast（按 RID 接收是支持的）；编解码器的 RTP 打包；DTLS 1.3；
-  SDES 密钥交换；RTCP report 以外的统计；在共用的 Mux 上使用 TURN，以及经 TCP 或 TLS 的
-  TURN（`turns:` 与 `?transport=tcp` 的 URL）。
+  SDES 密钥交换；RTCP report 以外的统计；在共用的 Mux 上使用 TURN，以及经 DTLS 的
+  TURN（`turns:...?transport=udp`）。
 - **ICE**：基于 TCP 的 ICE（RFC 6544）；RFC 8445 已废弃的 aggressive nomination；bundle 后
   那一条数据流以外的 component。
 - **DTLS**：DTLS 1.3，以及 ECDHE 加 AEAD 以外的密码套件。
