@@ -816,6 +816,30 @@ against other implementations were made over loopback with scratch modules
 outside the repository, since fib's `go.mod` takes no dependency; the versions
 are those the commit messages record.
 
+The checks against pion's PeerConnection, TURN and DTLS now live in
+[`webrtc/interop`](../webrtc/interop), a module of its own that may depend
+on pion. CI runs them on every push and pull request, in the `webrtc-interop`
+job (non-blocking for now):
+
+- fib offers and pion answers, without trickle; pion offers and fib answers,
+  with trickle. Each time a data channel echoes messages up to 60 KiB, and a
+  VP8 track from fib and an Opus track from pion arrive with the SSRC and
+  payload type each side signaled.
+- The same with both sides gathering relay candidates only, through fib's
+  `turnserver`: the selected pair is relay to relay, with two allocations.
+- fib's DTLS against pion/dtls, fib as client and as server, with ECDSA and
+  RSA certificates: use_srtp picks AES-128-GCM, both export the same keying
+  material, and data is echoed.
+
+They need only Go, and run on macOS as well as Linux:
+
+```sh
+cd webrtc/interop && go test -race ./...
+```
+
+The other rows below (pion/ice, srtp, rtp and rtcp, sctp and datachannel,
+sdp, turn as a library, OpenSSL and Chromium) were run by hand.
+
 | Peer | What it checks |
 | --- | --- |
 | pion/webrtc v4.2.26 | pion offers and fib answers, and the other way round, trickle and non-trickle: data channel messages up to 60 KiB echoed, fake VP8 and Opus RTP looped back both ways with the SSRC and payload type each answer signals, and both sides gathering relay candidates only through `turnserver` |
