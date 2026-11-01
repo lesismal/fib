@@ -7,6 +7,7 @@ import (
 	"errors"
 	"io"
 	stdhttp "net/http"
+	"runtime"
 	"testing"
 	"time"
 )
@@ -392,21 +393,27 @@ func TestCoverAsyncBodyOutputPaced(t *testing.T) {
 		t.Fatalf("body of %d bytes, want %d", len(body), len(big))
 	}
 	// Gone before it reads, the client's connection is closed under it.
-	conn = dialRaw(t, addr)
-	conn.send("GET / HTTP/1.1\r\nHost: test\r\n\r\n")
-	conn.head()
-	conn.Close()
-	// The response ends without its body's end, so the filter is aborted,
-	// whichever the server hears first: the close, which cancels the
-	// request, or a send failing on the closed socket, which fails the
-	// response and ends the request with it, OnCancel never running.
-	select {
-	case err := <-aborted:
-		if err == nil {
-			t.Fatal("the filter was aborted without a reason")
+	// Windows hands a queued send to the kernel whole, so there the body
+	// never waits on the client and the response ends whole, with nothing
+	// to abort, before the client has gone.
+	if runtime.GOOS != "windows" {
+		conn = dialRaw(t, addr)
+		conn.send("GET / HTTP/1.1\r\nHost: test\r\n\r\n")
+		conn.head()
+		conn.Close()
+		// The response ends without its body's end, so the filter is
+		// aborted, whichever the server hears first: the close, which
+		// cancels the request, or a send failing on the closed socket,
+		// which fails the response and ends the request with it, OnCancel
+		// never running.
+		select {
+		case err := <-aborted:
+			if err == nil {
+				t.Fatal("the filter was aborted without a reason")
+			}
+		case <-time.After(10 * time.Second):
+			t.Fatal("the response did not end with its client gone")
 		}
-	case <-time.After(10 * time.Second):
-		t.Fatal("the response did not end with its client gone")
 	}
 	// The server carries on serving others.
 	conn = dialRaw(t, addr)
