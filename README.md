@@ -432,8 +432,6 @@ go run ./gateway/client
 
 Each server directory but `multiprotocol` has a matching `client` next to it; `multiproto`'s server also lists a curl or client command for each of its protocols.
 
-[fibhub](https://github.com/lesismal/fibhub), a hub that tunnels TCP connections to devices behind NATs and firewalls, is a complete application built on fib's TCP engine, arpc and WebSocket.
-
 ## Configuration
 
 `fib.DefaultConfig()` returns an engine sized for the machine: the pool follows the CPUs, the

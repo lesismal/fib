@@ -412,8 +412,6 @@ go run ./gateway/client
 
 除 `multiprotocol` 外，每个 server 目录旁边都有对应的 `client`；`multiproto` 的 server 文件头注释还列出了各协议对应的 curl 或客户端命令。
 
-[fibhub](https://github.com/lesismal/fibhub) 是一个基于 fib 的 TCP 引擎、arpc 与 WebSocket 构建的完整应用：经由中心节点，把 TCP 连接隧道转发到 NAT 与防火墙后面的设备。
-
 ## 配置
 
 `fib.DefaultConfig()` 返回一个按机器 sizing 的 Engine：worker 池跟随 CPU，监听 backlog 跟随内核，
