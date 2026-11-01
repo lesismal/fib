@@ -10,17 +10,16 @@ import "github.com/lesismal/fib/media/av"
 //
 // FLV files start at timestamp 0, and players such as flv.js wait for
 // the gap otherwise: the Muxer subtracts the first packet's decode time
-// from every timestamp.
+// from every timestamp, and keeps them increasing across a republish (see
+// Timeline).
 type Muxer struct {
-	enc     Encoder
-	started bool
-	base    uint32
-	last    uint32
+	enc Encoder
+	tl  Timeline
 }
 
 // NewMuxer returns a Muxer.
 func NewMuxer(config EncoderConfig) *Muxer {
-	return &Muxer{enc: Encoder{config: config, video: -1, audio: -1}}
+	return &Muxer{enc: Encoder{config: config, video: -1, audio: -1}, tl: Timeline{FromZero: true}}
 }
 
 // Encoder returns the Encoder the Muxer writes tags with.
@@ -38,14 +37,12 @@ func (m *Muxer) AppendHeader(dst []byte, tracks []*av.Track) ([]byte, []int) {
 
 // AppendTracks appends the tags that announce tracks that changed
 // mid-stream, at the time of the last packet, and returns the indices of
-// the tracks FLV leaves out.
+// the tracks FLV leaves out. The tracks may come from a new publisher,
+// whose clock the packets after them follow (Timeline.Restart).
 func (m *Muxer) AppendTracks(dst []byte, tracks []*av.Track) ([]byte, []int) {
 	dropped := m.enc.SetTracks(tracks)
-	ts := uint32(0)
-	if m.started {
-		ts = m.last
-	}
-	return m.appendHeaders(dst, ts), dropped
+	m.tl.Restart()
+	return m.appendHeaders(dst, m.tl.Last()), dropped
 }
 
 func (m *Muxer) appendHeaders(dst []byte, ts uint32) []byte {
@@ -61,17 +58,7 @@ func (m *Muxer) AppendPacket(dst []byte, pkt *av.Packet) ([]byte, error) {
 	if pkt.Track != m.enc.video && pkt.Track != m.enc.audio || pkt.Track < 0 {
 		return dst, nil
 	}
-	ms := Millis(pkt.DTS)
-	if !m.started {
-		m.started, m.base = true, ms
-	}
-	ts := ms - m.base
-	if int32(ts) < 0 {
-		// A packet from before the first one, as audio interleaved a
-		// little behind the keyframe a stream started at.
-		ts = 0
-	}
-	m.last = ts
+	ts := m.tl.Stamp(pkt.Track == m.enc.video, pkt.DTS)
 	start := len(dst)
 	dst, _ = beginTag(dst, 0, ts)
 	dst, typ, err := m.enc.AppendPacket(dst, pkt)
