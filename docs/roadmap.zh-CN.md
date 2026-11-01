@@ -82,7 +82,7 @@
 
 | 项 | 状态 | 原因 | 成本 | 何时重估 |
 | --- | --- | --- | --- | --- |
-| 与更多 QUIC 实现的互通 | 部分完成 | 现在有容器化端点（`http3/interoprunner/`）和 CI job，但只与 quic-go 互为对端；quiche、ngtcp2、mvfst 未接 | M | 需要更广的兼容性证据时 |
+| 与更多 QUIC 实现的互通 | 大部分完成 | QUIC Interop Runner（`http3/interoprunner/`，CI 中手动触发）与 quic-go 双向全部通过；与 ngtcp2 只有 `connectionmigration` 失败（fib 客户端不迁移到 `preferred_address`）；与 quiche 剩下的失败在 quiche 一侧，或来自模拟运行其 amd64 镜像（见该目录的 README）；mvfst 尚未跑过 | S | 需要与 mvfst 兼容，或客户端支持 `preferred_address` 时 |
 | 0-RTT 与更多实现互通、多机共享票据密钥的防重放 | 计划中未做 | 票据登记表是每个进程一份；放在负载均衡后面的服务端要自己防重放 | M | 真的上线 0-RTT 时 |
 | 压测（并发问题） | 已完成 | `benchmark/loadtest/` 的完整战役 + `stallmem.sh` 内存用例；结论见 `docs/loadtest*.md` | — | 见该文档的"如何做一次干净的 A/B" |
 | `arpc` 重连用例的临时端口竞态 | 已知边界 | `TestReconnectGivesUp` 依赖服务端端口在重连窗口内保持关闭；理论上别的进程抢占该临时端口会让它误判，6600+ 次运行未出现 | S | 出现误报时改成用固定端口或连接拒绝注入 |
