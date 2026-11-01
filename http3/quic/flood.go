@@ -22,12 +22,13 @@ import "time"
 // for.
 //
 // Glitches count the frames that ask for work and carry nothing: a packet
-// that elicits an acknowledgement with nothing but PING, unless an
-// acknowledgement in it acknowledged something new, as the acknowledgements
-// a busy receiver bundles a PING with do; PATH_CHALLENGE, which is
-// answered; MAX_DATA, MAX_STREAM_DATA and MAX_STREAMS that raise no limit;
-// DATA_BLOCKED, STREAM_DATA_BLOCKED and STREAMS_BLOCKED that report no new
-// limit; a STREAM frame with no data that ends nothing; and
+// that elicits an acknowledgement with nothing but PING, or BLOCKED frames
+// that report no new limit, unless an acknowledgement in it acknowledged
+// something new, as the acknowledgements a busy receiver bundles a PING
+// with do; PATH_CHALLENGE, which is answered; MAX_DATA, MAX_STREAM_DATA and
+// MAX_STREAMS that raise no limit; DATA_BLOCKED, STREAM_DATA_BLOCKED and
+// STREAMS_BLOCKED for a limit this side never gave; a STREAM frame with no
+// data that ends nothing; and
 // NEW_CONNECTION_ID for a connection ID already retired, which is answered
 // with RETIRE_CONNECTION_ID. Frames that cost no more than their bytes to
 // read, and those a peer may send in flight for a stream that has ended,
@@ -39,8 +40,11 @@ import "time"
 // reaches a new limit as often as the windows are raised, which can be far
 // more than the glitch rate: a BLOCKED frame for a limit above the last one
 // it reported, up to the one this side gave, is not counted. One that
-// repeats a limit, as one sent again after a loss does, or that reports one
-// this side never gave, is.
+// repeats a limit, as one sent again after a loss does, is counted only as
+// a PING is, when its packet carries nothing else that asks for anything:
+// some senders, quiche among them, repeat it in every packet they send
+// while they are blocked, next to the data they still may send. One that
+// reports a limit this side never gave is always counted.
 const (
 	DefaultStreamResetBurst  = 1000
 	DefaultStreamResetRate   = 100
@@ -128,15 +132,21 @@ func (c *Conn) resetCounted(s *Stream) error {
 	return c.floodErr("too many streams reset")
 }
 
-// blockedAt counts a BLOCKED frame that reports the limit at, with *last
+// blockedAt takes a BLOCKED frame that reports the limit at, with *last
 // the highest one the peer reported before for the same thing and given
-// what this side has allowed: one for a new limit is a sender saying once
-// that it has reached it, and only the others count as glitches. Callers
-// hold c.mu.
-func (c *Conn) blockedAt(last *uint64, at, given uint64) error {
-	if at > *last && at <= given {
-		*last = at
-		return nil
+// what this side has allowed. One for a new limit is a sender saying once
+// that it has reached it, and asks for something. One that repeats a limit
+// or reports an older one, as a frame sent again after a loss does, asks
+// for nothing, and counts only as a PING does: when nothing else in its
+// packet asks for anything. One for a limit this side never gave counts as
+// a glitch. Callers hold c.mu.
+func (c *Conn) blockedAt(last *uint64, at, given uint64) (asking bool, err error) {
+	if at > given {
+		return false, c.glitch()
 	}
-	return c.glitch()
+	if at > *last {
+		*last = at
+		return true, nil
+	}
+	return false, nil
 }
