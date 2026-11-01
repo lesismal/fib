@@ -398,6 +398,9 @@ type relay struct {
 	binding int
 	addr    netip.AddrPort
 	closed  atomic.Bool
+	// ready is set once binding and addr are: a datagram a peer sends to
+	// a port just bound may come before then, and is dropped.
+	ready atomic.Bool
 
 	// mu guards peers, the connections to peers by address, and backlog,
 	// the datagrams for peers whose connections are being opened. It is
@@ -451,6 +454,7 @@ func (s *Server) bindRelay(engine *fib.Engine) (*relay, error) {
 		if s.cfg.PublicIP.IsValid() {
 			r.addr = netip.AddrPortFrom(s.cfg.PublicIP.Unmap(), r.addr.Port())
 		}
+		r.ready.Store(true)
 		return nil
 	}
 	if s.cfg.PortMax == 0 {
@@ -540,7 +544,7 @@ func (r *relay) OnOpen(c *fib.Connection) {
 }
 
 func (r *relay) OnData(c *fib.Connection, b []byte) {
-	if r.closed.Load() {
+	if !r.ready.Load() || r.closed.Load() {
 		return
 	}
 	_ = r.s.core.HandleRelayPacket(r.addr, remote(c), b, time.Now())

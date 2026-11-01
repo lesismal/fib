@@ -545,3 +545,10 @@ func TestUpdateInPlace(t *testing.T) {
 		t.Fatal("allocated with old credentials")
 	}
 }
+
+// TestRelayNotReady checks that a datagram reaching a relay's port before
+// the relay is set up is dropped: its server, here nil, is never asked.
+func TestRelayNotReady(t *testing.T) {
+	r := &relay{}
+	r.OnData(nil, []byte{1})
+}
