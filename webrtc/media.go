@@ -46,6 +46,14 @@ func (pc *PeerConnection) newTransceiver(kind MediaKind, dir Direction) *Transce
 		t.sender.ssrc = randomUint32()
 	}
 	pc.senders[t.sender.ssrc] = t.sender
+	if pc.cfg.Retransmit.Packets > 0 {
+		t.sender.rtxSSRC = randomUint32()
+		for pc.senders[t.sender.rtxSSRC] != nil {
+			t.sender.rtxSSRC = randomUint32()
+		}
+		pc.senders[t.sender.rtxSSRC] = t.sender
+		t.sender.rtxSeq = uint16(randomUint32())
+	}
 	pc.transceivers = append(pc.transceivers, t)
 	return t
 }
@@ -82,8 +90,8 @@ func (t *Transceiver) codecsOffered(all []Codec) []Codec {
 	return out
 }
 
-// resolve settles which way media flows once both sides have spoken, and
-// the payload type the sender writes.
+// resolve settles which way media flows once both sides have spoken, the
+// payload type the sender writes, and whether it answers NACKs.
 func (pc *PeerConnection) resolve(t *Transceiver) {
 	send := t.direction.sends() && t.sender.hasTrack() && t.remoteDir.receives()
 	recv := t.direction.receives() && t.remoteDir.sends()
@@ -93,15 +101,22 @@ func (pc *PeerConnection) resolve(t *Transceiver) {
 	}
 	t.midBytes = []byte(t.mid)
 	t.sender.setPayloadType(0)
+	t.sender.rtxPT = 0
+	nack := false
 	if t.current.sends() {
 		for _, c := range t.codecs {
 			if t.sender.track.codecMatches(c.Codec) {
 				t.sender.setPayloadType(c.sendPT)
 				t.sender.clockRate = c.ClockRate
+				if pc.cfg.Retransmit.Packets > 0 && hasNACK(c.Feedback) {
+					nack = true
+					t.sender.rtxPT = c.rtxSend
+				}
 				break
 			}
 		}
 	}
+	t.sender.setHistory(nack)
 }
 
 // Mid returns the transceiver's mid, once it has been negotiated.
@@ -158,6 +173,7 @@ func (t *Transceiver) Stop() {
 		t.direction = DirectionInactive
 		t.current = DirectionInactive
 		t.sender.setPayloadType(0)
+		t.sender.setHistory(false)
 		t.pc.negotiationNeeded()
 	}
 	t.pc.unlock()
@@ -247,6 +263,22 @@ type RTPSender struct {
 	lastTS          uint32
 	lastAt          time.Time
 
+	// Retransmission: the records of what was sent and the track whose
+	// history they refer to, the RTX stream's SSRC, payload type and next
+	// sequence number, the round trip time the peer's reports measure,
+	// and the token bucket that bounds the rate.
+	sent       []sentRecord
+	smask      uint16
+	histTrack  *TrackLocal
+	rtxSSRC    uint32
+	rtxPT      uint8
+	rtxSeq     uint16
+	rtt        time.Duration
+	tokens     float64
+	tokenAt    int64
+	rtxPackets uint64
+	rtxBytes   uint64
+
 	onKeyFrame atomic.Pointer[func()]
 }
 
@@ -300,6 +332,7 @@ func (s *RTPSender) setPayloadType(pt uint8) { s.pt = pt }
 // detach stops sending the track. It runs under the PeerConnection's
 // mutex.
 func (s *RTPSender) detach() {
+	s.setHistory(false)
 	if s.track != nil {
 		s.track.removeSender(s)
 		s.track = nil
@@ -317,6 +350,10 @@ type TrackLocal struct {
 	senders      atomic.Pointer[[]*RTPSender]
 	mu           sync.Mutex
 	srcExt       atomic.Pointer[[256]string]
+	// hist is the history of the packets written, which senders that
+	// answer NACKs resend from; histOn says there is one.
+	hist   *history
+	histOn atomic.Bool
 }
 
 // NewTrackLocal returns a track of codec, whose MimeType at least is set,
@@ -392,7 +429,8 @@ func (t *TrackLocal) removeSender(s *RTPSender) {
 // extensions to the ids it negotiated (see SetHeaderExtensions), then
 // protects it with SRTP; the sequence number, timestamp, marker and
 // payload go as written. A PeerConnection that is not connected yet, or
-// did not negotiate the track's codec, drops it. pkt is not retained.
+// did not negotiate the track's codec, drops it. pkt is not retained:
+// a track whose senders answer NACKs (see RetransmitConfig) keeps a copy.
 func (t *TrackLocal) WriteRTP(pkt []byte) error {
 	var p rtp.Packet
 	if err := p.Unmarshal(pkt); err != nil {
@@ -404,29 +442,56 @@ func (t *TrackLocal) WriteRTP(pkt []byte) error {
 // WritePacket is WriteRTP for a parsed packet.
 func (t *TrackLocal) WritePacket(p *rtp.Packet) error {
 	src := t.srcExt.Load()
+	id := t.remember(p, src)
 	for _, s := range *t.senders.Load() {
 		pc := s.pc
 		pc.mu.Lock()
-		pc.writeRTP(s, p, src)
+		pc.writeRTP(s, p, src, id)
 		pc.unlock()
 	}
 	return nil
 }
 
-// writeRTP sends p on the sender s.
-func (pc *PeerConnection) writeRTP(s *RTPSender, p *rtp.Packet, src *[256]string) {
+// writeRTP sends p on the sender s, recording it under id, the track's
+// history id for it, if the sender answers NACKs.
+func (pc *PeerConnection) writeRTP(s *RTPSender, p *rtp.Packet, src *[256]string, id uint64) {
 	if pc.closed || pc.srtpOut == nil || s.pt == 0 || s.track == nil {
 		return
 	}
-	t := s.t
 	now := time.Now()
+	abs := rtp.AbsSendTime(now)
+	buf, err := pc.appendRTP(pc.wbuf[:0], s, p, src, s.ssrc, s.pt, p.SequenceNumber, abs, false)
+	if err != nil {
+		return
+	}
+	pc.wbuf = buf[:0]
+	out, err := pc.srtpOut.ProtectRTP(pc.sbuf[:0], buf)
+	if err != nil {
+		return
+	}
+	pc.sbuf = out[:0]
+	pc.sendPeer(out)
+	if s.sent != nil {
+		s.sent[p.SequenceNumber&s.smask] = sentRecord{id: id, abs: abs}
+	}
+	s.packets++
+	s.octets += uint32(len(p.Payload))
+	s.lastTS, s.lastAt = p.Timestamp, now
+}
+
+// appendRTP appends p to dst as the sender s sends it: under ssrc, pt and
+// seq, with the MID, the abs-send-time abs and the extensions of src the
+// transceiver negotiated. An RTX packet carries p's sequence number ahead
+// of its payload, and none of its padding.
+func (pc *PeerConnection) appendRTP(dst []byte, s *RTPSender, p *rtp.Packet, src *[256]string, ssrc uint32, pt uint8, seq uint16, abs uint32, rtx bool) ([]byte, error) {
+	t := s.t
 	w := &pc.whdr
 	w.Padding = false
 	w.Marker = p.Marker
-	w.PayloadType = s.pt
-	w.SequenceNumber = p.SequenceNumber
+	w.PayloadType = pt
+	w.SequenceNumber = seq
 	w.Timestamp = p.Timestamp
-	w.SSRC = s.ssrc
+	w.SSRC = ssrc
 	w.CSRC = p.CSRC
 	w.Extension, w.ExtensionProfile, w.ExtensionData = false, 0, nil
 	if id := t.extIDs[rtp.ExtensionURIMid]; id != 0 && len(t.midBytes) > 0 {
@@ -434,7 +499,7 @@ func (pc *PeerConnection) writeRTP(s *RTPSender, p *rtp.Packet, src *[256]string
 	}
 	if id := t.extIDs[rtp.ExtensionURIAbsSendTime]; id != 0 {
 		var b [3]byte
-		_ = w.SetExtension(id, rtp.AppendAbsSendTime(b[:0], rtp.AbsSendTime(now)))
+		_ = w.SetExtension(id, rtp.AppendAbsSendTime(b[:0], abs))
 	}
 	if src != nil && p.Extension {
 		for id, payload := range p.Extensions() {
@@ -448,9 +513,13 @@ func (pc *PeerConnection) writeRTP(s *RTPSender, p *rtp.Packet, src *[256]string
 			}
 		}
 	}
-	buf, err := w.Append(pc.wbuf[:0])
+	buf, err := w.Append(dst)
 	if err != nil {
-		return
+		return dst, err
+	}
+	if rtx {
+		buf = binary.BigEndian.AppendUint16(buf, p.SequenceNumber)
+		return append(buf, p.Payload...), nil
 	}
 	buf = append(buf, p.Payload...)
 	if p.PaddingSize > 0 {
@@ -460,16 +529,7 @@ func (pc *PeerConnection) writeRTP(s *RTPSender, p *rtp.Packet, src *[256]string
 		buf = append(buf, p.PaddingSize)
 		buf[0] |= 0x20
 	}
-	pc.wbuf = buf[:0]
-	out, err := pc.srtpOut.ProtectRTP(pc.sbuf[:0], buf)
-	if err != nil {
-		return
-	}
-	pc.sbuf = out[:0]
-	pc.sendPeer(out)
-	s.packets++
-	s.octets += uint32(len(p.Payload))
-	s.lastTS, s.lastAt = p.Timestamp, now
+	return buf, nil
 }
 
 // TrackRemote is a stream of RTP packets the peer sends: an
@@ -632,7 +692,8 @@ func (pc *PeerConnection) handleRTP(b []byte, now time.Time) {
 	}
 	ssrc := binary.BigEndian.Uint32(b[8:])
 	tr := pc.tracks[ssrc]
-	if tr == nil && len(pc.tracks) >= pc.cfg.MaxRemoteSSRCs {
+	repaired := pc.rtxIn[ssrc]
+	if tr == nil && repaired == nil && len(pc.tracks)+len(pc.rtxIn) >= pc.cfg.MaxRemoteSSRCs {
 		return
 	}
 	pkt, err := pc.srtpIn.UnprotectRTP(b[:0], b)
@@ -640,16 +701,30 @@ func (pc *PeerConnection) handleRTP(b []byte, now time.Time) {
 		return
 	}
 	h := &pc.rhdr
-	if _, err := h.Unmarshal(pkt); err != nil {
+	n, err := h.Unmarshal(pkt)
+	if err != nil {
 		return
 	}
-	if tr == nil {
-		if tr = pc.newRemoteTrack(h); tr == nil {
+	if tr == nil && repaired == nil {
+		if tr, repaired = pc.newRemoteTrack(h); tr == nil && repaired == nil {
 			pc.srtpIn.RemoveSSRC(ssrc)
 			return
 		}
 	}
-	tr.update(h, now)
+	if repaired != nil {
+		// An RTX packet: the packet it repairs goes to its stream, whose
+		// reports do not count it.
+		apt, ok := repaired.t.aptOf(h.PayloadType)
+		if !ok {
+			return
+		}
+		if pkt = unwrapRTX(pkt, h, n, apt, repaired); pkt == nil {
+			return
+		}
+		tr = repaired
+	} else {
+		tr.update(h, now)
+	}
 	if tr.ready.Load() && tr.onRTP.Load() == nil {
 		return
 	}
@@ -661,7 +736,9 @@ func (pc *PeerConnection) handleRTP(b []byte, now time.Time) {
 // newRemoteTrack finds the transceiver of a new SSRC: by the MID header
 // extension, by the SSRCs the remote description lists, or as the first
 // receiving transceiver with no track that negotiated its payload type.
-func (pc *PeerConnection) newRemoteTrack(h *rtp.Header) *TrackRemote {
+// For an SSRC of an RTX payload type it returns instead, as repaired, the
+// stream the RTX stream repairs, once that has arrived.
+func (pc *PeerConnection) newRemoteTrack(h *rtp.Header) (tr, repaired *TrackRemote) {
 	var t *Transceiver
 	if pc.extMid != 0 {
 		if v := h.GetExtension(pc.extMid); v != nil {
@@ -682,13 +759,18 @@ func (pc *PeerConnection) newRemoteTrack(h *rtp.Header) *TrackRemote {
 		}
 	}
 	if t == nil || !t.current.receives() {
-		return nil
+		return nil, nil
 	}
 	c := t.codecByRecvPT(h.PayloadType)
 	if c == nil {
-		return nil
+		if _, ok := t.aptOf(h.PayloadType); ok {
+			if repaired = pc.rtxTrack(t, h); repaired != nil {
+				pc.rtxIn[h.SSRC] = repaired
+			}
+		}
+		return nil, repaired
 	}
-	tr := &TrackRemote{pc: pc, t: t, ssrc: h.SSRC, codec: *c}
+	tr = &TrackRemote{pc: pc, t: t, ssrc: h.SSRC, codec: *c}
 	if pc.extRid != 0 {
 		tr.rid = string(h.GetExtension(pc.extRid))
 	}
@@ -702,7 +784,7 @@ func (pc *PeerConnection) newRemoteTrack(h *rtp.Header) *TrackRemote {
 	} else {
 		tr.ready.Store(true)
 	}
-	return tr
+	return tr, nil
 }
 
 func (t *Transceiver) codecByRecvPT(pt uint8) *negotiatedCodec {
@@ -715,8 +797,9 @@ func (t *Transceiver) codecByRecvPT(pt uint8) *negotiatedCodec {
 }
 
 // handleRTCP takes an SRTCP packet: sender reports feed the receiver
-// reports, PLIs and FIRs go to their sender's OnKeyFrameRequest, and the
-// whole of it to OnRTCP.
+// reports, PLIs and FIRs go to their sender's OnKeyFrameRequest, NACKs
+// are answered by the senders that keep a history, and the whole of it
+// goes to OnRTCP.
 func (pc *PeerConnection) handleRTCP(b []byte, now time.Time) {
 	out, err := pc.srtpIn.UnprotectRTCP(b[:0], b)
 	if err != nil {
@@ -734,6 +817,13 @@ func (pc *PeerConnection) handleRTCP(b []byte, now time.Time) {
 				tr.lastSR = uint32(binary.BigEndian.Uint64(p[8:]) >> 16)
 				tr.lastSRAt = now
 			}
+			if len(p) > 28 {
+				pc.reportBlocks(p[28:], h.Count, now)
+			}
+		case h.Type == rtp.TypeRR && len(p) > 8:
+			pc.reportBlocks(p[8:], h.Count, now)
+		case h.Type == rtp.TypeRTPFB && h.Count == rtp.FormatNACK && len(p) >= 12:
+			pc.nacked(h, p, now)
 		case h.Type == rtp.TypePSFB && h.Count == rtp.FormatPLI && len(p) >= 12:
 			pc.keyFrameRequested(binary.BigEndian.Uint32(p[8:]))
 		case h.Type == rtp.TypePSFB && h.Count == rtp.FormatFIR:
@@ -749,7 +839,7 @@ func (pc *PeerConnection) handleRTCP(b []byte, now time.Time) {
 }
 
 func (pc *PeerConnection) keyFrameRequested(ssrc uint32) {
-	if s := pc.senders[ssrc]; s != nil {
+	if s := pc.senders[ssrc]; s != nil && s.ssrc == ssrc {
 		if fn := s.onKeyFrame.Load(); fn != nil && *fn != nil {
 			pc.queue(*fn)
 		}
