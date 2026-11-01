@@ -172,6 +172,11 @@ func TestRecordOpenRefusals(t *testing.T) {
 	rec, _ = sealCBC.seal(nil, recordTypeApplicationData, make([]byte, maxPlaintext+1), nil)
 	expect("CBC overflow", openCBC, rec, alertRecordOverflow)
 
+	sealChaCha, openChaCha := recordPair(t, stdtls.VersionTLS12, stdtls.TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256)
+	expect("TLS 1.2 ChaCha20 short body", openChaCha, appendRecord(nil, recordTypeApplicationData, 0x0303, make([]byte, gcmTagLen-1)), alertBadRecordMAC)
+	rec, _ = sealChaCha.seal(nil, recordTypeApplicationData, make([]byte, maxPlaintext+1), nil)
+	expect("TLS 1.2 ChaCha20 overflow", openChaCha, rec, alertRecordOverflow)
+
 	if n, good := extractPadding(nil); n != 0 || good != 0 {
 		t.Fatalf("empty payload: padding %d, good %d", n, good)
 	}

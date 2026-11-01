@@ -452,6 +452,38 @@ func TestCovConnCryptoTLSRecords(t *testing.T) {
 	}
 }
 
+// A record that does not authenticate, on a connection crypto/tls keeps, ends
+// the connection with the error crypto/tls read, not as though the peer had
+// finished.
+func TestCovConnCryptoTLSBadRecord(t *testing.T) {
+	serverConfig, clientConfig := tlsConfigs(t)
+	serverConfig.GetConfigForClient = func(*stdtls.ClientHelloInfo) (*stdtls.Config, error) { return nil, nil }
+	layers, closed := make(layerOf, 1), make(chan error, 1)
+	h := NewServer(serverConfig, &settledHandler{HandlerFuncs: fib.HandlerFuncs{
+		Close: func(_ *fib.Connection, err error) { closed <- err },
+	}, layers: layers})
+	_, addr := startEchoServer(t, fib.DefaultConfig(), h)
+	conn, rec := dialRecording(t, addr, clientConfig)
+	if l := <-layers; taken(l) {
+		t.Fatal("the connection left crypto/tls")
+	}
+	bogus := appendRecord(nil, recordTypeApplicationData, 0x0303, make([]byte, 40))
+	if _, err := rec.Conn.Write(bogus); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := conn.Read(make([]byte, 1)); err == nil {
+		t.Fatal("the connection carried on past a record that does not authenticate")
+	}
+	select {
+	case err := <-closed:
+		if err == nil || err == io.EOF || !strings.Contains(err.Error(), "bad record MAC") {
+			t.Fatalf("closed with %v", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("the connection did not close")
+	}
+}
+
 // The layer stands in for a net.Conn to crypto/tls: it has no local address
 // of its own, the connection's remote one while it has one, and deadlines that
 // do nothing.

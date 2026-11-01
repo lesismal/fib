@@ -630,3 +630,17 @@ func TestClientVerifiesThroughIntermediates(t *testing.T) {
 		t.Fatalf("done %v, %v, %d chains", done, herr, len(cli.chains))
 	}
 }
+
+// A check of the server's certificate that no worker takes fails the
+// handshake with an internal error, rather than leave it waiting.
+func TestClientCheckWithoutWorker(t *testing.T) {
+	config, pool := ecdsaServer(t)
+	cli := newHS(t, pool, nil)
+	cli.check.async = func(func()) bool { return false }
+	f := newFlight13(t, cli, config)
+	_, _, herr := f.send(cli, f.hello, f.records(f.msgs...))
+	wantAlert(t, "no worker", herr, alertInternalError)
+	if herr != nil && !errors.Is(herr.err, errNoHandshakeWorker) {
+		t.Fatalf("failed with %v", herr)
+	}
+}

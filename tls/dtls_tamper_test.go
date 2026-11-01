@@ -5,6 +5,7 @@ import (
 	"crypto"
 	stdtls "crypto/tls"
 	"errors"
+	"strings"
 	"testing"
 	"time"
 )
@@ -613,4 +614,43 @@ func TestDTLSConnAPI(t *testing.T) {
 			t.Fatalf("%v, %d sent", err, sent)
 		}
 	})
+}
+
+// TestDTLSServerHelloRenumbers checks that a client waiting for the server's
+// first message takes one numbered ahead of what it expects as the start of
+// the server's numbering, and drops what it kept of messages before it.
+func TestDTLSServerHelloRenumbers(t *testing.T) {
+	cc, _ := webrtcConfigs(t, "ecdsa", "ecdsa")
+	c, err := NewDTLSClient(cc, DTLSOptions{Output: func([]byte) {}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	c.Start(time.Now())
+	for _, rec := range [][]byte{
+		hsRecord(1, hsCertificate, 100, 2, 0, []byte{1}),
+		hsRecord(2, hsServerHello, 100, 3, 0, []byte{1}),
+	} {
+		if err := c.HandleDatagram(rec, time.Now()); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if c.rxMsgSeq != 3 || len(c.partial) != 1 || c.partial[0].seq != 3 {
+		t.Fatalf("expecting message %d, with %d kept", c.rxMsgSeq, len(c.partial))
+	}
+}
+
+// TestDTLSClientCertificateFails checks that a client whose
+// GetClientCertificate fails ends the handshake with that error.
+func TestDTLSClientCertificateFails(t *testing.T) {
+	cc, sc := webrtcConfigs(t, "ecdsa", "ecdsa")
+	cc.Certificates = nil
+	cc.GetClientCertificate = func(*stdtls.CertificateRequestInfo) (*stdtls.Certificate, error) {
+		return nil, errors.New("dtls: no certificate here")
+	}
+	n := newDTLSNet(t, 31)
+	n.pair(cc, sc, DTLSOptions{}, DTLSOptions{})
+	n.handshake(time.Minute)
+	if n.errs[0] == nil || !strings.Contains(n.errs[0].Error(), "no certificate here") || n.conns[0].HandshakeComplete() {
+		t.Fatalf("client: %v", n.errs[0])
+	}
 }

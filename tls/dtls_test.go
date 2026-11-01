@@ -718,6 +718,32 @@ func TestDTLSEarlyApplicationData(t *testing.T) {
 	if !n.conns[0].HandshakeComplete() || len(n.data[0]) != 1 || string(n.data[0][0]) != "early" {
 		t.Fatalf("client complete %v, data %q", n.conns[0].HandshakeComplete(), n.data[0])
 	}
+
+	// A client with no OnData lets the data that came ahead go.
+	n = newDTLSNet(t, 15)
+	held = nil
+	n.drop = func(to int, b []byte) bool {
+		if to == 0 && n.conns[1].txEpoch == 1 && len(held) == 0 {
+			held = append(held, bytes.Clone(b))
+			return true
+		}
+		return false
+	}
+	n.pair(cc, sc, DTLSOptions{}, DTLSOptions{})
+	n.conns[0].opts.OnData = nil
+	for !n.conns[1].HandshakeComplete() && n.step() {
+	}
+	if err := n.conns[1].Write([]byte("early")); err != nil {
+		t.Fatal(err)
+	}
+	n.drop = nil
+	n.drain()
+	if err := n.conns[0].HandleDatagram(held[0], n.now); err != nil {
+		t.Fatal(err)
+	}
+	if !n.conns[0].HandshakeComplete() || n.conns[0].early != nil {
+		t.Fatalf("client complete %v, %d kept", n.conns[0].HandshakeComplete(), len(n.conns[0].early))
+	}
 }
 
 func TestCertificateFingerprint(t *testing.T) {

@@ -479,6 +479,132 @@ func TestKernelTLSKeyUpdate(t *testing.T) {
 	}
 }
 
+// The first large file hands the sealing to the kernel only at a moment when
+// nothing sealed here is still queued: one sent behind sends the peer has not
+// read yet is sealed here, and the next file tries again.
+func TestKernelTLSWaitsForIdle(t *testing.T) {
+	const size = 256 << 10
+	f, data := writeFile(t, size)
+	layers, config, addr := fileServer(t, true, stdtls.VersionTLS13, 0, nil)
+	conn := dialFileServer(t, addr, config)
+	l := <-layers
+	// More than the socket buffers on both ends hold, unread.
+	const queued = 32 << 20
+	chunk := bytes.Repeat([]byte{'q'}, 1<<20)
+	for i := 0; i < queued/len(chunk); i++ {
+		if err := l.c.Send(chunk); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := l.c.SendFile(f, 0, size); err != nil {
+		t.Fatal(err)
+	}
+	l.wmu.Lock()
+	state := l.ktls
+	l.wmu.Unlock()
+	if state == ktlsOn {
+		t.Log("the queue had drained already: the kernel took the first file")
+	}
+	got := make([]byte, queued)
+	if _, err := io.ReadFull(conn, got); err != nil || !bytes.Equal(got, bytes.Repeat(chunk, queued/len(chunk))) {
+		t.Fatalf("the queued sends: %v", err)
+	}
+	got = make([]byte, size)
+	if _, err := io.ReadFull(conn, got); err != nil || !bytes.Equal(got, data) {
+		t.Fatalf("the first file: %v", err)
+	}
+	// With the stream read, a file that follows finds the queue empty, but
+	// for the moment the connection takes to see its last write done.
+	for i := 0; i < 20; i++ {
+		if err := l.c.SendFile(f, 0, size); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := io.ReadFull(conn, got); err != nil || !bytes.Equal(got, data) {
+			t.Fatalf("file %d: %v", i, err)
+		}
+		l.wmu.Lock()
+		state = l.ktls
+		l.wmu.Unlock()
+		if state != ktlsUntried {
+			break
+		}
+	}
+	wantKernel(t, l, true)
+}
+
+// Where the kernel seals, a KeyUpdate the peer asks for while sends are still
+// queued stays owed, and goes out ahead of a later send once nothing is
+// queued, the stream reaching the client whole on either side of it.
+func TestKernelTLSKeyUpdateOwed(t *testing.T) {
+	const size = 256 << 10
+	f, data := writeFile(t, size)
+	layers, config, addr := fileServer(t, true, stdtls.VersionTLS13, 0, nil)
+	conn := dialFileServer(t, addr, config)
+	l := <-layers
+	if err := l.c.SendFile(f, 0, size); err != nil {
+		t.Fatal(err)
+	}
+	got := make([]byte, size)
+	if _, err := io.ReadFull(conn, got); err != nil || !bytes.Equal(got, data) {
+		t.Fatalf("file: %v", err)
+	}
+	l.wmu.Lock()
+	on := l.ktls == ktlsOn
+	l.wmu.Unlock()
+	if !on {
+		t.Skip("the kernel does not seal here")
+	}
+	// More than the socket buffers on both ends hold, unread: the queue
+	// is not empty when the peer's request comes.
+	const queued = 32 << 20
+	chunk := bytes.Repeat([]byte{'q'}, 1<<20)
+	for i := 0; i < queued/len(chunk); i++ {
+		if err := l.c.Send(chunk); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if !l.updateWriteKeys() {
+		t.Fatal("a KeyUpdate asked for while sends are queued ended the connection")
+	}
+	l.wmu.Lock()
+	owed := l.rekeyOwed
+	l.wmu.Unlock()
+	if !owed {
+		t.Log("the queue had drained already: the KeyUpdate went at once")
+	}
+	got = make([]byte, queued)
+	if _, err := io.ReadFull(conn, got); err != nil || !bytes.Equal(got, bytes.Repeat(chunk, queued/len(chunk))) {
+		t.Fatalf("the queued sends: %v", err)
+	}
+	// A send at a moment when nothing is queued takes the KeyUpdate out
+	// first; one made while something still is leaves it owed.
+	for i := 0; owed; i++ {
+		if i == 100 {
+			t.Fatal("the KeyUpdate is still owed after 100 sends")
+		}
+		if err := l.c.Send([]byte{'x'}); err != nil {
+			if _, rerr := conn.Read(make([]byte, 1)); rerr == nil {
+				t.Fatalf("the connection carried on after the send failed: %v", err)
+			}
+			t.Skip("the kernel cannot take new keys")
+		}
+		if _, err := io.ReadFull(conn, got[:1]); err != nil || got[0] != 'x' {
+			t.Fatalf("send %d: %q, %v", i, got[:1], err)
+		}
+		l.wmu.Lock()
+		owed = l.rekeyOwed
+		l.wmu.Unlock()
+	}
+	msg := bytes.Repeat([]byte{'k'}, 40000)
+	if err := l.c.Send(msg); err != nil {
+		t.Fatal(err)
+	}
+	back := make([]byte, len(msg))
+	if _, err := io.ReadFull(conn, back); err != nil || !bytes.Equal(back, msg) {
+		t.Fatalf("after the key update: %v", err)
+	}
+}
+
 // A connection whose handshake runs through crypto/tls and settles on
 // ChaCha20-Poly1305 leaves it for the layer as the AES-GCM ones do, and a file
 // sent over it drains with the socket: the heap does not hold the file while
