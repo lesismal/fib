@@ -93,7 +93,9 @@ type Config struct {
 	// WHIPPrefix and WHEPPrefix are the URL paths the endpoints are
 	// under: POST WHIPPrefix+"live/cam" publishes the hub path "live/cam",
 	// POST WHEPPrefix+"live/cam" plays it. ResourcePrefix is where the
-	// sessions they make live, for PATCH and DELETE.
+	// sessions they make live, for PATCH and DELETE. Empty means
+	// DefaultWHIPPrefix ("/whip/"), DefaultWHEPPrefix ("/whep/") and
+	// DefaultResourcePrefix ("/rtc/session/").
 	WHIPPrefix, WHEPPrefix, ResourcePrefix string
 	// MaxSessions bounds the WHIP and WHEP sessions together; 0 is
 	// unlimited. A request past it is answered 503.
@@ -115,37 +117,43 @@ type Config struct {
 	LinkICEServers []webrtc.ICEServer
 	// GatherTimeout bounds how long an answer waits for its candidates,
 	// and ConnectTimeout how long a session may take to connect after it,
-	// before it is closed.
+	// before it is closed. Zero or less means DefaultGatherTimeout (5s)
+	// and DefaultConnectTimeout (15s).
 	GatherTimeout, ConnectTimeout time.Duration
 	// RepublishWait is how long a WHEP viewer waits for the stream's
-	// next publisher when its publisher leaves; a negative value ends it at
-	// once.
+	// next publisher when its publisher leaves; zero means
+	// DefaultRepublishWait (10s), and a negative value ends it at once.
 	RepublishWait time.Duration
 	// NoGOPCache starts viewers at the next keyframe rather than at the
 	// hub's cached GOP.
 	NoGOPCache bool
 	// MaxHeldBytes bounds what a viewer holds while it connects: the
-	// latest GOP, which it starts with.
+	// latest GOP, which it starts with. Zero or less means
+	// DefaultMaxHeldBytes (8 MiB).
 	MaxHeldBytes int
 	// MaxLoss is the fraction of packets a viewer may report lost before
 	// its packets are dropped, video until the next keyframe, as
-	// hub.NewDropper does; a negative value never drops.
+	// hub.NewDropper does; zero means DefaultMaxLoss (0.25), and a
+	// negative value never drops.
 	MaxLoss float64
-	// MTU bounds the RTP packets sent, header included.
+	// MTU bounds the RTP packets sent, header included; zero or less
+	// means DefaultMTU (1200).
 	MTU int
 	// ReorderSize and ReorderDelay size the reorder buffer of each track a
 	// WHIP publisher sends; zero means rtpcodec's defaults.
 	ReorderSize  int
 	ReorderDelay time.Duration
 	// PLIInterval is the least time between two keyframe requests to a
-	// publisher, and KeyFrameInterval, when positive, how often one is
-	// sent whether needed or not.
+	// publisher, zero or less meaning DefaultPLIInterval (500ms), and
+	// KeyFrameInterval, when positive, how often one is sent whether
+	// needed or not.
 	PLIInterval, KeyFrameInterval time.Duration
 	// OnKeyFrameRequest hears a viewer asking for a keyframe of a stream
 	// no WHIP session of this server publishes, for an application that
 	// can pass it on to its publisher. It must not block.
 	OnKeyFrameRequest func(path string)
-	// MaxOfferBytes bounds an offer or a PATCH body.
+	// MaxOfferBytes bounds an offer or a PATCH body; zero or less means
+	// DefaultMaxOfferBytes (64 KiB).
 	MaxOfferBytes int
 }
 

@@ -396,3 +396,25 @@ func TestReceiver(t *testing.T) {
 	r.startPeriodic()
 	r.onTimer()
 }
+
+// TestConfigDefaults holds the defaults the Config fields' comments state:
+// zero values become the Default constants, and the values that mean
+// something when negative keep them.
+func TestConfigDefaults(t *testing.T) {
+	var c Config
+	c.defaults()
+	if c.WHIPPrefix != "/whip/" || c.WHEPPrefix != "/whep/" || c.ResourcePrefix != "/rtc/session/" {
+		t.Fatalf("prefixes %q %q %q", c.WHIPPrefix, c.WHEPPrefix, c.ResourcePrefix)
+	}
+	if c.GatherTimeout != 5*time.Second || c.ConnectTimeout != 15*time.Second || c.RepublishWait != 10*time.Second {
+		t.Fatalf("timeouts %v %v %v", c.GatherTimeout, c.ConnectTimeout, c.RepublishWait)
+	}
+	if c.MaxHeldBytes != 8<<20 || c.MaxLoss != 0.25 || c.MTU != 1200 || c.PLIInterval != 500*time.Millisecond || c.MaxOfferBytes != 64<<10 {
+		t.Fatalf("limits %d %v %d %v %d", c.MaxHeldBytes, c.MaxLoss, c.MTU, c.PLIInterval, c.MaxOfferBytes)
+	}
+	c = Config{RepublishWait: -1, MaxLoss: -1}
+	c.defaults()
+	if c.RepublishWait != -1 || c.MaxLoss != -1 {
+		t.Fatalf("negatives became %v %v", c.RepublishWait, c.MaxLoss)
+	}
+}

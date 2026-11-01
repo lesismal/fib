@@ -71,7 +71,8 @@ type ClientConfig struct {
 	MTU          int
 	MaxHeldBytes int
 	// ReorderSize and ReorderDelay size the reorder buffers of a playing
-	// client, PLIInterval is the least time between its keyframe requests,
+	// client (zero means rtpcodec's defaults), PLIInterval is the least
+	// time between its keyframe requests (zero means DefaultPLIInterval),
 	// and KeyFrameInterval, when positive, how often it asks for one
 	// anyway.
 	ReorderSize                   int
