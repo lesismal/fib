@@ -28,7 +28,7 @@ jobs:
   # nested module needs, and it builds a working tree that may hold files no
   # commit has: engine.go once read defaultReadBufferSize, which existed only
   # as an uncommitted local edit, so the tree built here while a clean
-  # checkout did not. The repo is six modules (the root and five nested), and
+  # checkout did not. The repo is eight modules (the root and seven nested), and
   # git ls-files lists the tracked go.mod files, so a module present only in
   # a local tree cannot stand in for one a clone lacks. Build only: lint and
   # the tests are other jobs, and this one needs no Docker, cgo or peer.
@@ -42,7 +42,8 @@ jobs:
         with:
           go-version: stable
           # Every module's go.mod, and the go.sum of the modules that have
-          # dependencies: the root and http3/interoprunner have no go.sum.
+          # dependencies: the root, http3/interoprunner and media/interop have
+          # no go.sum.
           cache-dependency-path: |
             go.mod
             **/go.mod
@@ -134,10 +135,20 @@ jobs:
         run: |
           go vet ./...
           "$(go env GOPATH)/bin/staticcheck" ./...
+      # The media and WebRTC interop checks are modules of their own too,
+      # so that ffmpeg's harness and pion stay out of fib's go.mod.
+      - name: Lint the interop checks
+        shell: bash
+        run: |
+          for module in media/interop webrtc/interop; do
+            echo "::group::$module"
+            (cd "$module" && go vet ./... && "$(go env GOPATH)/bin/staticcheck" ./...)
+            echo "::endgroup::"
+          done
       - name: go mod tidy
         shell: bash
         run: |
-          for module in . http3/interop http3/interoprunner taskpool/benchmark; do
+          for module in . http3/interop http3/interoprunner taskpool/benchmark media/interop webrtc/interop; do
             echo "::group::$module"
             (cd "$module" && go mod tidy -diff)
             echo "::endgroup::"
@@ -649,6 +660,51 @@ jobs:
           name: http3-interop-runner-logs
           path: ${{ runner.temp }}/quic-interop-runner/logs_*
           if-no-files-found: ignore
+
+  # The media servers against ffmpeg: one engine serves every protocol, as
+  # in docs/media.md's one-server example, and ffmpeg publishes H.264+AAC,
+  # H.265+AAC and H.264+Opus over RTMP, RTSP (TCP and UDP) and SRT, and
+  # plays each back over RTMP, RTSP (TCP and UDP), SRT, HTTP-FLV, HLS (fMP4
+  # and TS) and LL-HLS, decoding 6 s with no error lines and DTS that never
+  # goes back; fib's WHEP client plays each too. run.sh runs it in the
+  # golang:1.27 container with Debian's ffmpeg 7.1, as it runs locally, in
+  # some three minutes. It runs on every push and pull request rather than
+  # on paths: the engine, http, tls and hub break it as easily as media/
+  # does. Non-blocking for now: it pulls the image and ffmpeg's packages,
+  # and the matrix is new to CI.
+  media-interop:
+    name: Media interop (ffmpeg)
+    continue-on-error: true
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v5
+      - name: Publish and play every protocol with ffmpeg
+        run: ./media/interop/run.sh
+
+  # The WebRTC stack against pion over loopback: PeerConnections with fib
+  # offering and pion answering and the other way round, a data channel
+  # echoed and a track each way, the same through fib's turnserver with
+  # relay candidates only, and fib's DTLS against pion/dtls in both roles.
+  # A module of its own (webrtc/interop) so that pion is never fib's
+  # dependency; plain go test, no Docker. Non-blocking for now, like the
+  # media checks above.
+  webrtc-interop:
+    name: WebRTC interop (pion)
+    continue-on-error: true
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v6
+        with:
+          go-version: stable
+          cache-dependency-path: |
+            go.mod
+            webrtc/interop/go.sum
+      - name: Test against pion
+        working-directory: webrtc/interop
+        run: go test -race -count=1 -v ./...
 
   # The parsers all take bytes from the network, so each gets a short fuzz
   # run: HTTP/1 requests, HTTP/2 frames and HPACK, HTTP/3 frames, requests
