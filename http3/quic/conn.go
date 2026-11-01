@@ -1688,6 +1688,10 @@ func (c *Conn) handlePacket(pkt []byte, h header, now time.Time) bool {
 		c.nonProbing && int64(pn) > largest {
 		c.migrateLocked(now, firstEvent)
 	}
+	if c.rxPC != c.pc && !c.isClient && !c.handshakeConfirmed &&
+		(h.typ == packetInitial || h.typ == packetHandshake) && int64(pn) > largest {
+		c.rebindHandshakeLocked(now, firstEvent)
+	}
 	if int64(pn) >= largest {
 		s.largestRecvTime = now
 	}

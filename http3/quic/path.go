@@ -76,6 +76,25 @@ func (c *Conn) migrateLocked(now time.Time, first int) {
 	c.pathDeadline = now.Add(3 * max(c.rtt.pto(), initial.pto()))
 }
 
+// rebindHandshakeLocked moves a server's connection whose handshake is not
+// done to the path the Initial or Handshake packet being handled arrived on,
+// numbered above every one before it in its space: the client's address
+// changed under it, as a NAT rebinding changes it, before there were keys to
+// validate the new one with. The connection sends there from then on, as
+// it did on the first: the amplification limit still holds what it sends to
+// three times what arrived until the client's address is validated (RFC
+// 9000 section 8.1), and a copy of an earlier packet, sent from elsewhere,
+// moves nothing, as its number is not new. Callers hold c.mu.
+func (c *Conn) rebindHandshakeLocked(now time.Time, first int) {
+	c.events = slices.Insert(c.events, first, event{kind: evPath})
+	c.giveUpLocked(c.pc)
+	if !sameHost(c.remote, c.rxRemote) {
+		c.rtt = newRTTStats()
+		c.cc.resetPath(now, maxDatagram)
+	}
+	c.pc, c.remote = c.rxPC, c.rxRemote
+}
+
 // pathValidLocked ends a validation the client answered: the connection
 // stays on the new path, and the one it left goes. Callers hold c.mu.
 func (c *Conn) pathValidLocked() {
