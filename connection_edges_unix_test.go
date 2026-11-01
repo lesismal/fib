@@ -202,6 +202,61 @@ func TestSendsToAFullSocket(t *testing.T) {
 	}
 }
 
+// The write queue limit is strict: a send that the socket takes whole passes
+// however large it is, sends may fill the queue right up to the limit, and
+// one that would take it past is refused before it is queued, closing the
+// connection, whether it would wait behind a full socket or under a cork.
+func TestSendQueueLimitIsStrict(t *testing.T) {
+	server := newOfflineServer(t)
+	c, _ := offlineSocketConnection(t, server)
+	c.SetWriteQueueLimit(4)
+	if err := c.Send(make([]byte, 1024)); err != nil {
+		t.Fatalf("a send the socket takes whole = %v", err)
+	}
+	fillSocket(t, c.FD())
+	if err := c.Send([]byte("ab")); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.SendParts([]byte("c"), []byte("d")); err != nil {
+		t.Fatalf("a send that fills the queue to the limit = %v", err)
+	}
+	if err := c.Send([]byte("e")); err != ErrSendQueueFull {
+		t.Fatalf("Send past the limit = %v, want ErrSendQueueFull", err)
+	}
+	if !closingOf(c) {
+		t.Fatal("a send past the limit left the connection open")
+	}
+	if got := c.pendingBytes.Load(); got > 4 {
+		t.Fatalf("the refused send was queued: %d bytes pending", got)
+	}
+
+	c, _ = offlineSocketConnection(t, server)
+	fillSocket(t, c.FD())
+	c.SetWriteQueueLimit(4)
+	if err := c.SendRawPooled(append(bufferpool.Get(8)[:0], "pooled"...)); err != ErrSendQueueFull {
+		t.Fatalf("SendRawPooled past the limit = %v, want ErrSendQueueFull", err)
+	}
+	if got := c.pendingBytes.Load(); got != 0 {
+		t.Fatalf("the refused pooled send was queued: %d bytes pending", got)
+	}
+
+	c, _ = offlineSocketConnection(t, server)
+	c.SetWriteQueueLimit(4)
+	c.Cork()
+	if err := c.Send([]byte("abcd")); err != nil {
+		t.Fatalf("a corked send that fills the queue to the limit = %v", err)
+	}
+	if err := c.Send([]byte("e")); err != ErrSendQueueFull {
+		t.Fatalf("corked Send past the limit = %v, want ErrSendQueueFull", err)
+	}
+	c.mu.Lock()
+	corked := c.corkedBytes + c.pendingBytes.Load()
+	c.mu.Unlock()
+	if corked > 4 {
+		t.Fatalf("the refused corked send was queued: %d bytes held", corked)
+	}
+}
+
 // CloseAfterSend on a corked connection first writes what the cork holds,
 // and closes the connection with the error when that write fails.
 func TestCloseAfterSendWhenTheUncorkFails(t *testing.T) {

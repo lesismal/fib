@@ -1624,8 +1624,8 @@ for _, c := range conns {
 
 发送队列默认没有上限：`WriteBufferHighWatermark` 只暂停该连接的读，不限制往它发。要把对端长期不读的广播限制住，设
 `fib.Config.MaxWriteQueueBytes`（对引擎的每条连接生效）或对单条连接调用 `Connection.SetWriteQueueLimit`：等待 socket 的字节
-（含 cork 在一轮里的输出，以及 TLS 层加密后的字节）超过上限时，这次 `Send` 返回 `fib.ErrSendQueueFull` 并关闭连接，队列
-不会无限增长。对端只是慢、但还在读的场景，也可以继续用应用层心跳提前断开。
+（含 cork 在一轮里的输出，以及 TLS 层加密后的字节）加上这次要排队的字节会超过上限时，这次 `Send` 不入队，返回
+`fib.ErrSendQueueFull` 并关闭连接，队列永远不超过上限。内核当场整个写走的发送不排队，也就不计入，再大也放行。对端只是慢、但还在读的场景，也可以继续用应用层心跳提前断开。
 
 ### 在 HTTP server 中升级为 WebSocket
 
