@@ -3,6 +3,7 @@
 package webrtc
 
 import (
+	"errors"
 	"fmt"
 	"net/netip"
 	"strings"
@@ -94,4 +95,56 @@ func TestTURNWithSharedMuxRefused(t *testing.T) {
 	if err == nil {
 		t.Fatal("TURN on a shared Mux accepted")
 	}
+}
+
+// TestLiteRefusesRelay has a lite PeerConnection, which gathers host
+// candidates only, refuse TURN servers and the relay policy, whether it
+// shares a Mux or has a port of its own.
+func TestLiteRefusesRelay(t *testing.T) {
+	e := startEngine(t)
+	turnURL := []ICEServer{{URLs: []string{"turn:127.0.0.1:3478"}, Username: "user", Credential: "pass"}}
+	for _, own := range []bool{false, true} {
+		for _, tc := range []struct {
+			name   string
+			config Configuration
+		}{
+			{"turn", Configuration{ICEServers: turnURL}},
+			{"turns", Configuration{ICEServers: []ICEServer{{URLs: []string{"stun:127.0.0.1:3478", "turns:127.0.0.1"}}}}},
+			{"turn over TCP", Configuration{ICEServers: []ICEServer{{URLs: []string{"turn:127.0.0.1?transport=tcp"}}}}},
+			{"relay policy", Configuration{ICETransportPolicy: ICETransportPolicyRelay}},
+			{"relay policy with TURN", Configuration{ICEServers: turnURL, ICETransportPolicy: ICETransportPolicyRelay}},
+		} {
+			config := tc.config
+			config.ICELite = true
+			if own {
+				config.Engine, config.ListenAddr = e, "127.0.0.1:0"
+			} else {
+				config.Mux = loopbackMux(t, e)
+			}
+			if _, err := NewPeerConnection(config); !errors.Is(err, ErrConfiguration) {
+				t.Errorf("%s, own port %v: %v", tc.name, own, err)
+			}
+		}
+	}
+}
+
+// TestLiteWithSTUN has a lite PeerConnection accept a STUN server, which
+// it never asks, and connect on its host candidate alone.
+func TestLiteWithSTUN(t *testing.T) {
+	e := startEngine(t)
+	stun := []ICEServer{{URLs: []string{"stun:127.0.0.1:9"}}}
+	shared := newPC(t, Configuration{Mux: loopbackMux(t, e), ICELite: true, ICEServers: stun})
+	if len(shared.stunServers) != 1 {
+		t.Fatalf("stun servers %v", shared.stunServers)
+	}
+	a := newPC(t, Configuration{Engine: e, ListenAddr: "127.0.0.1:0"})
+	b := newPC(t, Configuration{Engine: e, ListenAddr: "127.0.0.1:0", ICELite: true, ICEServers: stun})
+	trickle(a, b)
+	echoChannels(b)
+	d := openChannel(t, a, "lite")
+	ca := connectedCh(a)
+	negotiate(t, a, b, nil)
+	wait(t, ca, "connected")
+	waitOpen(t, d)
+	roundTrip(t, d, [][]byte{[]byte("host only")})
 }

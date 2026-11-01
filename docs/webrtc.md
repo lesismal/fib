@@ -513,12 +513,16 @@ pc, err := webrtc.NewPeerConnection(webrtc.Configuration{
 - TURN needs a PeerConnection with a port of its own: a TURN server tells its
   clients apart by their address, which the PeerConnections of a Mux share.
   `NewPeerConnection` refuses a TURN server with a Mux, and the relay policy
-  without a TURN server, with `ErrConfiguration`. A lite PeerConnection
-  gathers host candidates only and ignores `ICEServers`.
+  without a TURN server, with `ErrConfiguration`.
+- A lite PeerConnection gathers host candidates only. It asks no STUN
+  server, so `stun:` URLs are accepted and left unused, but it refuses any
+  TURN URL (`turn:` or `turns:`) and the relay policy with
+  `ErrConfiguration`, with a Mux or a port of its own: it could never gather
+  the relay candidate they ask for.
 - URLs are `stun:host[:port]` and `turn:host[:port]`, port 3478 by default,
   resolved when the PeerConnection is made. The PeerConnection reaches TURN
   servers over UDP only: `turns:`, `stuns:` and `?transport=tcp` URLs are
-  skipped.
+  skipped by a full PeerConnection.
 - The client handles the 401 challenge, 438 with a fresh nonce and 300 to an
   alternate server, refreshes the allocation, a permission per peer address
   (every 4 minutes) and the channels it binds, sends again a request that
@@ -735,8 +739,8 @@ of a binding on `:0` from `Engine.BindingAddrs`.
 | --- | --- | --- |
 | `Mux` / `Engine`, `ListenAddr` | — / `:0` | Share a Mux, or open a port of its own on the engine |
 | `Certificates` | a fresh ECDSA P-256 certificate | The DTLS certificate; share one among a server's PeerConnections |
-| `ICEServers`, `ICETransportPolicy` | none, all | STUN and TURN servers; relay-only gathering |
-| `ICELite` | false | Answer checks only, always controlled, host candidates only |
+| `ICEServers`, `ICETransportPolicy` | none, all | STUN and TURN servers; relay-only gathering, which needs a TURN server |
+| `ICELite` | false | Answer checks only, always controlled, host candidates only; STUN servers unused, TURN servers and the relay policy refused |
 | `Codecs`, `HeaderExtensions` | `DefaultCodecs()`, `DefaultHeaderExtensions()` | What is offered and accepted |
 | `MaxMessageSize` | 256 KiB | Largest data channel message received |
 | `SCTPReceiveWindow` | 1 MiB | SCTP receiver window |

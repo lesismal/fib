@@ -92,7 +92,8 @@ func TestICEServerURL(t *testing.T) {
 		{"stun:127.0.0.1:19302", "127.0.0.1:19302", false, false},
 		{"turn:[::1]:3479?transport=udp", "[::1]:3479", true, false},
 		{"turn:127.0.0.1?transport=tcp", "invalid AddrPort", true, false},
-		{"turns:127.0.0.1", "invalid AddrPort", false, false},
+		{"turns:127.0.0.1", "invalid AddrPort", true, false},
+		{"stuns:127.0.0.1", "invalid AddrPort", false, false},
 		{"http://x", "", false, true},
 		{"nonsense", "", false, true},
 	} {
