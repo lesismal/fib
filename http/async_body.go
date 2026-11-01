@@ -238,8 +238,10 @@ func (c *Context) writeAsync(b *asyncBody, p []byte, wait bool) (n int, above bo
 	q := p
 	if w.hooks.filters != nil {
 		if q, err = w.hooks.filter(p); err != nil {
+			// The body cannot go on: the response ends as one whose call
+			// failed does, rather than leave its client waiting for it.
 			err = w.fail(err)
-			b.mu.Unlock()
+			c.failAsync(b)
 			return 0, false, err
 		}
 	}

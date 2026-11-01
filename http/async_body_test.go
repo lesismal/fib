@@ -5,7 +5,9 @@ package http
 import (
 	"bytes"
 	"context"
+	"errors"
 	"io"
+	"net"
 	stdhttp "net/http"
 	"runtime"
 	"strings"
@@ -252,6 +254,38 @@ func TestOnBodyFilterAsyncFails(t *testing.T) {
 		}
 		if err == nil {
 			t.Fatalf("%s: the failed body read whole", client.proto)
+		}
+	}
+}
+
+// TestOnBodyFilterAsyncSyncFilterFails checks that a synchronous filter
+// running before the asynchronous one that fails on a Write fails the
+// response, as a failing call does, rather than leave the client waiting
+// for a response that never comes.
+func TestOnBodyFilterAsyncSyncFilterFails(t *testing.T) {
+	failed := make(chan error, 1)
+	addr := serve(t, NewHandler(HandlerFunc(func(c *Context) {
+		c.OnBodyFilterAsync(func(int, stdhttp.Header) AsyncBodyFilter { return &upperLater{} })
+		// Registered after it, so run before it.
+		c.OnBodyFilter(func(int, stdhttp.Header) BodyFilter { return failFilter{} })
+		_, err := io.WriteString(c, "body")
+		failed <- err
+	})))
+	for _, client := range hookClients(t) {
+		client.Timeout = 10 * time.Second
+		resp, err := client.Get("http://" + addr + "/")
+		if err == nil {
+			_, err = io.ReadAll(resp.Body)
+			resp.Body.Close()
+		}
+		if err == nil {
+			t.Fatalf("%s: the failed body read whole", client.proto)
+		}
+		if ne, ok := err.(net.Error); ok && ne.Timeout() {
+			t.Fatalf("%s: no response, and the connection left open: %v", client.proto, err)
+		}
+		if err := <-failed; !errors.Is(err, errFilter) {
+			t.Fatalf("%s: Write reported %v", client.proto, err)
 		}
 	}
 }
