@@ -904,6 +904,9 @@ func TestRetainOverHTTP2(t *testing.T) {
 // run, releases it once however often that func is called, and gives the hold
 // back when fn panics.
 func TestAsync(t *testing.T) {
+	// The test reads /written's verdict before it ends: the client closing
+	// first would leave the handler checking a context the close has failed.
+	writtenErr := make(chan error, 1)
 	addr := serveStreamingServer(t, DefaultConfig(), func(c *Context) {
 		switch c.Request.URL.Path {
 		case "/panic":
@@ -917,9 +920,7 @@ func TestAsync(t *testing.T) {
 			// release the handler's own one.
 			_ = c.Respond(stdhttp.StatusOK, "text/plain", []byte("written"))
 			c.Async(func() {})()
-			if c.Err() != nil {
-				t.Errorf("Err = %v after a no-op Async", c.Err())
-			}
+			writtenErr <- c.Err()
 		default:
 			run := c.Async(func() {
 				time.Sleep(30 * time.Millisecond)
@@ -935,5 +936,8 @@ func TestAsync(t *testing.T) {
 		if _, body := conn.response(stdhttp.MethodGet); body != want {
 			t.Fatalf("body = %q, want %q", body, want)
 		}
+	}
+	if err := <-writtenErr; err != nil {
+		t.Errorf("Err = %v after a no-op Async", err)
 	}
 }

@@ -16,15 +16,30 @@ import (
 type readBufferProbe struct {
 	mu   sync.Mutex
 	caps []int
+	lens []int
 }
 
 func (p *readBufferProbe) onData(c *Connection, b []byte) {
 	p.mu.Lock()
 	p.caps = append(p.caps, cap(b))
+	p.lens = append(p.lens, len(b))
 	p.mu.Unlock()
 	if n := bytes.Count(b, []byte{'\n'}); n > 0 {
 		_, _ = c.Write(bytes.Repeat([]byte{'k'}, n))
 	}
+}
+
+// roundsSince reports how many rounds came after the first n, or -1 if any
+// of them read less than least.
+func (p *readBufferProbe) roundsSince(n, least int) int {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	for _, l := range p.lens[n:] {
+		if l < least {
+			return -1
+		}
+	}
+	return len(p.lens) - n
 }
 
 func (p *readBufferProbe) snapshot() []int {
@@ -133,9 +148,19 @@ func TestReadBufferStartGrowthPersists(t *testing.T) {
 
 	// The tail of the body may have come in small rounds; one at least the
 	// starting size leaves the connection grown with no small round counted.
+	// The kernel may split mid too, so send it until it arrives in one round.
 	mid := bytes.Repeat([]byte{'b'}, 2*start)
 	mid[len(mid)-1] = '\n'
-	readExchange(t, conn, mid)
+	for try := 0; ; try++ {
+		before := len(probe.snapshot())
+		readExchange(t, conn, mid)
+		if probe.roundsSince(before, start) == 1 {
+			break
+		}
+		if try == 20 {
+			t.Fatalf("%d bytes never arrived in one round", len(mid))
+		}
+	}
 
 	before := len(probe.snapshot())
 	for i := 0; i <= readShrinkRounds; i++ {

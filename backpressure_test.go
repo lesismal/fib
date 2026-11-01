@@ -118,10 +118,12 @@ func TestEngineWideBudgetBoundsQueuedBytes(t *testing.T) {
 	if peak == 0 {
 		t.Fatal("no outbound backlog built up; the test never exercised the budget")
 	}
-	// The bound is checked before a round queues its replies, so one round's
-	// worth of output may land on top of it. Allow that overshoot, but nothing
-	// like the connections*watermark a per-connection bound alone would admit.
-	limit := int64(budget) * 4
+	// The bound is checked before a round queues its replies, so every
+	// connection may land one round's worth of output (8 replies to a full
+	// read buffer) on top of it when their rounds pass the check together.
+	// Allow that overshoot, but nothing like the connections*watermark a
+	// per-connection bound alone would admit.
+	limit := int64(budget) + connections*8*int64(config.ReadBufferSize)
 	if peak > limit {
 		t.Fatalf("peak pending = %d bytes, want at most %d (budget %d)", peak, limit, budget)
 	}
