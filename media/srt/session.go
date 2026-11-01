@@ -219,6 +219,10 @@ func (s *Session) abandon() {
 		s.sub.Close()
 		s.sub = nil
 	}
+	if s.pub != nil {
+		s.pub.Close()
+		s.pub = nil
+	}
 }
 
 // handle reads a datagram that arrived on fc.

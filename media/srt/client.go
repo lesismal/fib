@@ -135,7 +135,7 @@ func Publish(engine *fib.Engine, addr string, h *hub.Hub, path string, cfg Clien
 		// comes until the session is connected: a subscription made from
 		// OnConnect, under the session's mutex, could not take it.
 		sub, err := h.Subscribe(path, s.sink(), hub.SubscribeOptions{
-			Info: hub.SubscribeInfo{Protocol: "srt", Remote: s.remote},
+			Info: hub.SubscribeInfo{Protocol: "srt", Remote: s.remote, Query: s.id.Query},
 			Wait: cfg.Wait,
 		})
 		s.sub = sub
@@ -146,13 +146,25 @@ func Publish(engine *fib.Engine, addr string, h *hub.Hub, path string, cfg Clien
 // Play dials addr and demuxes the MPEG-TS it receives: into h at path when
 // h is set (a relay pulling from an SRT server or from ffmpeg listening),
 // or to cfg.Demuxer's OnTracks and OnPacket.
+//
+// With h, path is reserved (hub.Hub.Reserve) before anything is sent, so
+// a path that has a publisher fails Play with hub.ErrStreamBusy rather
+// than a session that connects and is then shut; the stream goes live
+// once the demuxer knows the tracks, and is unpublished when the session
+// ends.
 func Play(engine *fib.Engine, addr string, h *hub.Hub, path string, cfg ClientConfig) (*Session, error) {
 	if h == nil && (cfg.Demuxer.OnTracks == nil || cfg.Demuxer.OnPacket == nil) {
 		return nil, errNoPlayTarget
 	}
 	return dial(engine, addr, cfg, func(s *Session) error {
 		if h != nil {
-			s.startPublish(h, path, hub.PublishInfo{Protocol: "srt", Remote: s.remote}, cfg.Demuxer)
+			info := hub.PublishInfo{Protocol: "srt", Remote: s.remote, Query: s.id.Query}
+			pub, err := h.Reserve(path, info)
+			if err != nil {
+				return err
+			}
+			s.startPublish(h, path, info, cfg.Demuxer)
+			s.pub = pub
 		} else {
 			s.demux = mpegts.NewDemuxer(cfg.Demuxer)
 		}
