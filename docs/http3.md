@@ -226,8 +226,69 @@ These are still constants:
 | --- | --- |
 | Datagram size | 1200 bytes until path MTU discovery finds more (see [Protocol details](#protocol-details)), at most 1472 over IPv4 and 1452 over IPv6; a server can start higher with `Config.MaxDatagramSize` on a network known to carry that |
 | Bidirectional stream limit the client advertises | 1 (servers may not open request streams) |
-| QPACK dynamic table capacity | 0 |
 | Received packet number ranges remembered | 32; older packets are treated as duplicates |
+
+### QPACK dynamic table
+
+`Config.QPACKTableCapacity` and `ClientConfig.QPACKTableCapacity` turn
+QPACK's dynamic table (RFC 9204) on, both ways. It is off by default, as it
+is in quic-go and quiche: both sides then advertise a capacity of 0, the
+encoder and decoder streams carry nothing, and every field is sent with the
+static table and literals.
+
+- **What a side with the table on advertises.** `SETTINGS_QPACK_MAX_TABLE_CAPACITY`
+  of the capacity and `SETTINGS_QPACK_BLOCKED_STREAMS` of
+  `QPACKBlockedStreams`, and it opens its QPACK encoder and decoder streams.
+  A side with the table off opens neither and still treats an insertion from
+  the peer as QPACK_ENCODER_STREAM_ERROR.
+- **Encoder.** Its table takes the lesser of its own capacity and what the
+  peer allows. A field is inserted the second time it is seen, if it fits,
+  and is an index of a byte or two from then on. An entry the peer has not
+  acknowledged yet may have the peer's stream wait for the encoder stream, so
+  the encoder refers to one (by a post-base index, as soon as it is inserted)
+  only on as many streams at once as the peer's blocked streams allow; a peer
+  that allows none gets references to acknowledged entries only, after its
+  Insert Count Increment or Section Acknowledgment. `authorization`,
+  `proxy-authorization`, `cookie` and `set-cookie` values shorter than 20
+  bytes are never indexed and keep the never-indexed bit; longer ones, which
+  cannot be guessed whole, are indexed. Eviction never drops an entry that an
+  unacknowledged section refers to: a field that would need it is sent as a
+  literal. Past 1024 unacknowledged sections, sections leave the table alone
+  until the peer acknowledges some.
+- **Decoder.** It carries out the encoder stream (Set Dynamic Table Capacity
+  up to what it advertised, the two insertions and Duplicate), answers with
+  Insert Count Increment, acknowledges every section that referred to the
+  table, and sends Stream Cancellation for a stream that is reset, or
+  abandoned, before its sections were read. A section that needs entries
+  still to come holds its stream, and what arrives behind it, until they
+  come. More streams waiting than `QPACKBlockedStreams` is
+  QPACK_DECOMPRESSION_FAILED, and a waiting stream with more than 1 MiB past
+  the field section limit behind its section is given up on: the server
+  resets it with H3_EXCESSIVE_LOAD, the client fails the request.
+  Instructions that do not fit close the connection with
+  QPACK_ENCODER_STREAM_ERROR or QPACK_DECODER_STREAM_ERROR.
+- **Memory.** Per connection, at most: the decoder's table at the capacity it
+  advertised, the encoder's table at the lesser capacity, one unfinished
+  encoder instruction, 1024 records of unacknowledged sections, and the
+  waiting streams above.
+- **What it gains.** Mostly bandwidth, and the CPU of Huffman-coding the same
+  large values again on every request:
+
+  | Benchmark (Apple M4 Pro, benchstat over 10 runs) | Table off | 4 KiB table |
+  | --- | --- | --- |
+  | `qpack.BenchmarkSections`: an RPC client's requests, a 600-byte cookie and a 200-byte bearer token among them, encoded and decoded | 3.45 µs, 709 bytes on the wire, 7 allocations | 0.55 µs, 31 bytes, 4 allocations |
+  | `http3.BenchmarkHTTP3LargeHeaders`: the same requests and their responses over loopback, counted through a UDP relay | 70.1 µs, 975 bytes on the wire, 106 allocations | 66.3 µs, 169 bytes, 83 allocations |
+
+  With the table off, `BenchmarkHTTP3Requests` and
+  `BenchmarkHTTP3ConcurrentRequests` are as before: the same time within
+  noise and the same allocations.
+- **Interop.** Checked by hand against aioquic 1.7.1, whose pylsqpack enables
+  a 4096-byte table and 16 blocked streams by default, both ways, 20 requests
+  each: aioquic's request header sections into the fib server go from 629
+  bytes to 12-16, the fib server's response sections from 800 to 9; the fib
+  client's request sections from 648 to 23-27, aioquic's responses from 779
+  to 8. The quic-go conformance suites below also pass with the table on in
+  fib; quic-go has no table, so it stays unused.
 
 ### Protocol details
 
@@ -397,7 +458,6 @@ The complete list, including the HTTP/1, HTTP/2, engine and test-infrastructure 
 | Feature | Reason |
 | --- | --- |
 | Active connection migration | The server issues and routes several Connection IDs per connection, but answers PATH_CHALLENGE on the path it sends on, not the one the challenge came from, so a client probing a new path before it moves would not validate it; it also keeps sending to the client's first Connection ID on the new path. A NAT rebinding is followed, with the client's Connection ID changed or not (see above). |
-| QPACK dynamic table | Both sides advertise a capacity of 0: no head-of-line blocking from blocked streams, silent encoder and decoder streams, and no extra state or memory. The cost is that repeated headers are sent in full every time. |
 | Server push | No major browser enables HTTP/3 push. The client sends no MAX_PUSH_ID, and `Context.Push` returns `http.ErrNotSupported`. Use 103 Early Hints (`WriteInterim`) for preloading. |
 | QUIC v2 (RFC 9369) and other versions | Version 1 is enough in practice. The client fails on Version Negotiation. |
 | DATAGRAM (RFC 9221), WebTransport | They need APIs for streaming or unreliable datagrams, which the current handler model lacks. A DATAGRAM frame from the peer is an unknown frame and closes the connection with FRAME_ENCODING_ERROR. |
@@ -626,8 +686,9 @@ What is still not covered end to end:
   decoding, QUIC packet headers, transport parameters and frame handling all
   have fuzz targets, which the `Fuzz the parsers` CI job runs for 20 seconds
   each.
-- QPACK's dynamic table, server push, DATAGRAM and ECN are not
-  implemented, so no test can cover them. The [QUIC Interop
+- Server push, DATAGRAM and ECN are not implemented, so no test can
+  cover them. QPACK's dynamic table is tested against fib itself and by hand
+  against aioquic; no CI job runs a peer that uses one. The [QUIC Interop
   Runner](#quic-interop-runner) endpoint reports the ECN testcase as
   unsupported rather than passing it silently.
 
@@ -687,11 +748,12 @@ quic-go, because it pulls the simulator and peer images and needs tshark).
 | quic-go's HTTP/3 server, against the fib client | The same ground from the other side, and: the connection still serves after a timeout, a request in flight finishes when the server retires the connection with GOAWAY, a server that validates the address with Retry, and a certificate the client does not trust |
 | The suite's own hand-written HTTP/3 client (no dependency), against the fib server | What a sound implementation never sends: DATA before HEADERS, a control stream that does not start with SETTINGS, a second control stream, a request missing a pseudo-header, a reference to the QPACK dynamic table, CANCEL_PUSH, a lowered MAX_PUSH_ID, a raised GOAWAY, a QPACK insertion, an `:authority` and `Host` that disagree, and neither of them |
 | The suite's own hand-written HTTP/3 server (no dependency), against the fib client | How the client polices its peer: MAX_PUSH_ID from a server, CANCEL_PUSH, GOAWAY naming another kind of stream, a raised GOAWAY, a QPACK insertion, and a response that refers to the dynamic table |
+| QPACK's dynamic table on (`http3/qpack_dynamic_test.go`), fib against fib and against the hand-written peers | Repeated large fields in headers and trailers both ways until each encoder has entries acknowledged; a table on one side only; requests and responses whose sections wait on the encoder stream, with their bodies, and are acknowledged; the blocked streams limit; Stream Cancellation for a waiting stream that is reset or holds too much; malformed encoder and decoder stream instructions; SETTINGS that arrive before the table is on |
 | The body matrix's raw QUIC client (`http3/body_matrix_test.go`), against the fib server | Request bodies every way they can come: no body, a content-length, DATA with no length, a trailer and `Expect: 100-continue`, small and large, the stream written whole or in pieces with pauses, taken by the handler by reading, through OnBody, as `BodyComplete` decides or from another goroutine, with the server reading bodies whole, streaming them all and streaming past a threshold; also a stream reset mid-body, the body limits, the stream window pacing a slow handler, and OnBody holding the body back until the handler returns |
 | quiche, in a container (`http3/quicheinterop/run.sh`) | Both directions with both handshakes: 300 connections and 30 000 echoes, multiplexed streams, session resumption, 0-RTT in both directions (a GET goes in the first flight, a POST in early data is answered 425 and sent again, a server without early data is not sent any), certificate verification through `RootCAs` |
 | quic-go and fib, for early data (`http3/early_data_test.go`) | quic-go's client resuming and sending GET_0RTT to the fib server, the fib client sending early requests to quic-go's server, a server that does not accept it, a ticket used twice, and a 425 |
 | Two QUIC connections over an in-memory path | Handshake, transfers under 5% and 20% loss, stream limits, resets, application close, idle timeout, keep-alive, stateless reset, key updates (with the AEAD limits lowered), the decryption failure limit, Retry and its tokens, the flood limits and their settings, BLOCKED frames, draining, and Connection IDs issued, routed and retired |
-| Fuzzing (`go test -fuzz`) | The parsers that take untrusted bytes: the HTTP/3 frame parser, building requests from fields, QPACK decoding and its round trip, QUIC packet headers, transport parameters and 1-RTT frame handling |
+| Fuzzing (`go test -fuzz`) | The parsers that take untrusted bytes: the HTTP/3 frame parser, building requests from fields, QPACK decoding and its round trip, the QPACK encoder and decoder stream instructions and a round trip through the dynamic table, QUIC packet headers, transport parameters and 1-RTT frame handling |
 
 ## Load testing
 

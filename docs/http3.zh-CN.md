@@ -167,8 +167,51 @@
 | --- | --- |
 | 数据报大小 | 1200 字节，直到路径 MTU 探测找到更大的（见[协议细节](#协议细节)），IPv4 最多 1472、IPv6 最多 1452；已知网络能承载更大数据报时，服务端可以用 `Config.MaxDatagramSize` 从更大的值开始 |
 | 客户端声明的双向 stream 上限 | 1（服务端不能打开请求 stream） |
-| QPACK 动态表容量 | 0 |
 | 可记住的已接收包号区间 | 32 个，更早的包被当作重复包丢弃 |
+
+### QPACK 动态表
+
+`Config.QPACKTableCapacity` 和 `ClientConfig.QPACKTableCapacity` 打开 QPACK 动态表
+（RFC 9204），双向生效。默认关闭，quic-go 和 quiche 也是如此：两端都声明容量为 0，
+编码器流和解码器流不承载任何内容，每个字段都只用静态表和字面量发送。
+
+- **打开动态表的一端声明什么。** `SETTINGS_QPACK_MAX_TABLE_CAPACITY` 为所设容量，
+  `SETTINGS_QPACK_BLOCKED_STREAMS` 为 `QPACKBlockedStreams`，并打开自己的 QPACK
+  编码器流和解码器流。没打开的一端两条流都不开，对端发来插入指令仍按
+  QPACK_ENCODER_STREAM_ERROR 处理。
+- **编码器。** 表的容量取本端容量和对端允许值中较小的一个。字段第二次出现时插入表中
+  （放得下的话），之后只发一两个字节的索引。对端还没确认的条目可能让对端的 stream
+  等待编码器流，所以编码器只在对端 blocked streams 允许的 stream 数以内引用这类条目
+  （插入后立即用 post-base 索引）；对端一个都不允许时，只引用已确认的条目，即收到对端的
+  Insert Count Increment 或 Section Acknowledgment 之后。`authorization`、
+  `proxy-authorization`、`cookie`、`set-cookie` 的值短于 20 字节时从不进表，并保留
+  never-indexed 位；更长的值无法被整体猜中，会进表。淘汰从不丢掉未确认 section 引用的
+  条目：需要腾出这些条目的字段改用字面量发送。未确认的 section 超过 1024 个时，后续
+  section 不再引用动态表，直到对端确认了一部分。
+- **解码器。** 执行编码器流的指令（Set Dynamic Table Capacity 不超过本端声明的值、
+  两种插入以及 Duplicate），回复 Insert Count Increment，确认每个引用了动态表的
+  section，并对还没读完 section 就被 reset 或放弃读取的 stream 发送 Stream
+  Cancellation。需要尚未到达的条目的 section 会让它的 stream 连同后面到达的数据一起
+  等待，直到条目到达。等待的 stream 超过 `QPACKBlockedStreams` 视为
+  QPACK_DECOMPRESSION_FAILED；等待中的 stream 在 section 之后积压超过字段区段上限再加
+  1 MiB 时被放弃：服务端以 H3_EXCESSIVE_LOAD reset 该 stream，客户端让该请求失败。
+  不合规的指令以 QPACK_ENCODER_STREAM_ERROR 或 QPACK_DECODER_STREAM_ERROR 关闭连接。
+- **内存。** 每个连接最多：解码器的表（本端声明的容量）、编码器的表（较小的那个容量）、
+  一条未收完的编码器指令、1024 条未确认 section 的记录，以及上面说的等待中的 stream。
+- **收益。** 主要是带宽，另外省掉每个请求都对同样的大值重新做 Huffman 编码的 CPU：
+
+  | 基准（Apple M4 Pro，benchstat，10 次） | 关闭动态表 | 4 KiB 动态表 |
+  | --- | --- | --- |
+  | `qpack.BenchmarkSections`：RPC 客户端的请求（含 600 字节的 cookie 和 200 字节的 bearer token），编码加解码 | 3.45 µs，线上 709 字节，7 次分配 | 0.55 µs，31 字节，4 次分配 |
+  | `http3.BenchmarkHTTP3LargeHeaders`：同样的请求及其响应走 loopback，经 UDP 中继计数 | 70.1 µs，线上 975 字节，106 次分配 | 66.3 µs，169 字节，83 次分配 |
+
+  关闭动态表时，`BenchmarkHTTP3Requests` 和 `BenchmarkHTTP3ConcurrentRequests` 与之前
+  相同：耗时在噪声范围内，分配次数不变。
+- **互通。** 已手工与 aioquic 1.7.1 双向验证，各 20 个请求；它的 pylsqpack 默认打开
+  4096 字节的动态表和 16 个 blocked streams：aioquic 发给 fib 服务端的请求头 section 从
+  629 字节降到 12-16 字节，fib 服务端的响应 section 从 800 降到 9；fib 客户端的请求
+  section 从 648 降到 23-27，aioquic 的响应从 779 降到 8。fib 打开动态表时，下面的
+  quic-go 一致性测试也全部通过；quic-go 没有动态表，所以表不会被用到。
 
 ### 协议细节
 
@@ -277,7 +320,6 @@
 | 功能 | 原因 |
 | --- | --- |
 | 主动连接迁移 | 服务端已为每个连接签发并路由多个 Connection ID，但 PATH_CHALLENGE 在当前发送的路径上回复，而不是挑战到达的路径，客户端迁移前探测新路径无法完成验证；新路径上也仍向客户端的第一个 Connection ID 发送。NAT 重绑定（无论客户端是否换了 CID）会被跟随（见上）。 |
-| QPACK 动态表 | 两端都声明容量为 0：不会出现 blocked stream 造成的队头阻塞，编码器流和解码器流都没有内容，也没有额外的状态和内存。代价是重复出现的 header 每次都要完整发送。 |
 | Server push | 主流浏览器都不启用 HTTP/3 push。客户端不发 MAX_PUSH_ID，`Context.Push` 返回 `http.ErrNotSupported`。预加载推荐用 103 Early Hints（`WriteInterim`）。 |
 | QUIC v2（RFC 9369）等其他版本 | 部署上 version 1 已足够。客户端收到 Version Negotiation 时直接失败。 |
 | DATAGRAM（RFC 9221）、WebTransport | 依赖流式 stream 或不可靠数据报的 API，当前 handler 模型不支持。对端发来的 DATAGRAM 帧会被当作未知帧，连接以 FRAME_ENCODING_ERROR 关闭。 |
@@ -426,7 +468,8 @@
   压 30 秒，没有请求失败、reset 或 GOAWAY。它暴露了上面整体响应的内存代价（已修复）；带丢包的
   路径和长时间 soak 仍未覆盖。帧解析、请求构造、QPACK 解码、QUIC 包头、传输参数和帧
   处理都有 fuzz 目标，CI 的 `Fuzz the parsers` job 每个目标跑 20 秒。
-- QPACK 动态表、服务端推送、DATAGRAM 和 ECN 都未实现，无法测试；
+- 服务端推送、DATAGRAM 和 ECN 都未实现，无法测试。QPACK 动态表有 fib 对 fib 的测试，
+  并手工验证过 aioquic，但 CI 里没有使用动态表的对端；
   [QUIC Interop Runner](#quic-interop-runner) 端点会把 ECN 用例如实报成“不支持”，
   而不是让它悄悄通过。
 
@@ -479,8 +522,9 @@ CI 里有两个 job：`HTTP/3 interop endpoint image`（阻塞：构建镜像并
 | 测试内置的手写 HTTP/3 客户端（零依赖，对 fib 服务端） | 正常实现不会发的东西：HEADERS 之前的 DATA、不以 SETTINGS 开头的控制流、第二条控制流、缺少伪头部的请求、引用 QPACK 动态表、CANCEL_PUSH、调低的 MAX_PUSH_ID、抬高的 GOAWAY、QPACK 插入指令、`:authority` 与 `Host` 不一致、两者都缺失 |
 | body 矩阵的手写 QUIC 客户端（`http3/body_matrix_test.go`，对 fib 服务端） | 请求 body 的各种到达方式：无 body、带 content-length、不带长度的 DATA、带 trailer、`Expect: 100-continue`，小和大，stream 一次写完或分片间隔写，handler 直接读、用 OnBody、按 `BodyComplete` 二选一、或在别的 goroutine 里接收，服务端整体缓存、全部流式、超过阈值才流式；另有 body 发到一半 reset、body 上限、stream 窗口对慢 handler 的限速，以及 OnBody 在 handler 返回前不交付 body |
 | 测试内置的手写 HTTP/3 服务端（零依赖，对 fib 客户端） | 客户端的协议纠错：服务端发来的 MAX_PUSH_ID、CANCEL_PUSH、GOAWAY 指向非请求流、抬高的 GOAWAY、QPACK 插入指令、引用动态表的响应 |
+| 打开 QPACK 动态表（`http3/qpack_dynamic_test.go`），fib 对 fib 以及对手写的对端 | 头部和 trailer 里重复的大字段双向传输，直到两边编码器都有条目被确认；只有一端打开动态表；section 等待编码器流的请求和响应（连同 body）以及对它们的确认；blocked streams 上限；等待中的 stream 被 reset 或积压过多时发送 Stream Cancellation；不合规的编码器流和解码器流指令；动态表打开之前就到达的 SETTINGS |
 | 内存管道上的 QUIC 两端 | 握手、5% 与 20% 丢包下的传输、stream 数限制、reset、应用关闭、空闲超时、keep-alive、stateless reset、密钥更新（调低 AEAD 上限触发）、解密失败上限、Retry 及其令牌、洪泛限制及其配置、BLOCKED 帧、draining、Connection ID 的签发、路由与退役 |
-| fuzz（`go test -fuzz`） | 面向不可信输入的解析：HTTP/3 帧解析器、从字段构造请求、QPACK 解码与编解码往返、QUIC 包头、传输参数、1-RTT 帧处理 |
+| fuzz（`go test -fuzz`） | 面向不可信输入的解析：HTTP/3 帧解析器、从字段构造请求、QPACK 解码与编解码往返、QPACK 编码器流与解码器流指令以及经动态表的往返、QUIC 包头、传输参数、1-RTT 帧处理 |
 
 ## 压测
 

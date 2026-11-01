@@ -69,6 +69,24 @@ type Config struct {
 	// MaxHeaderBytes bounds a request's header section, decoded and counted
 	// as RFC 9114 section 4.2.2 does; the server also tells clients so.
 	MaxHeaderBytes int
+	// QPACKTableCapacity turns QPACK's dynamic table on (RFC 9204), both ways,
+	// at up to this many bytes: the peer's encoder may fill a table of that
+	// size, which costs the server as much memory per connection, and the
+	// server's encoder fills one of the lesser of it and what the peer allows.
+	// A field that repeats, such as a large cookie, a bearer token or a custom
+	// field of an RPC, is then sent as an index of a byte or two once it has
+	// been seen twice; a secret value shorter than 20 bytes is never indexed.
+	// The encoder refers to entries the peer has not acknowledged, which may
+	// have its stream wait for them, on no more streams than the peer's blocked
+	// streams allow. QPACKBlockedStreams is that number for the server's own
+	// streams: how many the peer's encoder may have wait for entries its
+	// encoder stream has yet to bring, each holding what arrives meanwhile up
+	// to the field section limit and 1 MiB more. Zero, the default, keeps the
+	// table off: both sides then send every field whole, and the QPACK streams
+	// carry nothing. The gain is bandwidth, and the CPU of coding large values
+	// again; 4096 suits most uses.
+	QPACKTableCapacity  int
+	QPACKBlockedStreams int
 	// MaxBodyBytes bounds a request body that is read whole before its
 	// handler runs, which is every body unless StreamRequestBody is set.
 	MaxBodyBytes int64
@@ -915,6 +933,10 @@ type serverConn struct {
 	// connection's handler on uses them.
 	decoder qpack.Decoder
 	fields  []qpack.HeaderField
+	// held are the request streams whose field sections wait on the
+	// client's QPACK encoder stream, by stream ID, which only that
+	// goroutine touches too; see Config.QPACKBlockedStreams.
+	held map[uint64]heldRequest
 
 	mu sync.Mutex
 	// streams are the requests not yet answered.
@@ -974,7 +996,9 @@ func (sc *serverConn) start(qc *quic.Conn) {
 		return
 	}
 	sc.qc = qc
-	control, err := openControl(qc, sc.h.config.MaxHeaderBytes, [2]uint64{settingEnableConnectProtocol, 1})
+	config := &sc.h.config
+	control, err := sc.peer.openStreams(qc, config.MaxHeaderBytes, config.QPACKTableCapacity, config.QPACKBlockedStreams,
+		&sc.decoder, sc.resumeHeld, [2]uint64{settingEnableConnectProtocol, 1})
 	if err != nil {
 		closeWith(qc, connErr(ErrCodeStreamCreationError, "cannot open the control stream"))
 		return
@@ -1131,6 +1155,7 @@ func (sc *serverConn) newRequestStream(s *quic.Stream) *requestStream {
 func (sc *serverConn) OnStreamReset(s *quic.Stream, _ uint64) {
 	switch st := s.Context.(type) {
 	case *requestStream:
+		sc.abandoned(st)
 		st.peerReset()
 	case *uniStream:
 		if st.typ == streamControl || st.typ == streamQPACKEncoder || st.typ == streamQPACKDecoder {
@@ -1141,7 +1166,51 @@ func (sc *serverConn) OnStreamReset(s *quic.Stream, _ uint64) {
 
 func (sc *serverConn) OnStopSending(s *quic.Stream, _ uint64) {
 	if st, ok := s.Context.(*requestStream); ok {
+		sc.abandoned(st)
 		st.peerReset()
+	}
+}
+
+// heldRequest is a request stream whose field section waits on the
+// client's encoder stream, and whether the stream's end has arrived behind
+// it.
+type heldRequest struct {
+	rs  *requestStream
+	fin bool
+}
+
+// abandoned is a request stream that will be read no further, as it is
+// reset: with a dynamic table, the client's encoder is told, unless the
+// request had all arrived, and the stream no longer waits on it.
+func (sc *serverConn) abandoned(rs *requestStream) {
+	q := sc.peer.qpack.Load()
+	if q == nil {
+		return
+	}
+	rs.mu.Lock()
+	arrived := rs.remoteDone
+	rs.mu.Unlock()
+	if !arrived {
+		delete(sc.held, rs.s.ID())
+		q.cancel(rs.s.ID())
+	}
+}
+
+// resumeHeld decodes again the field sections of the streams that waited on
+// the client's encoder stream, which has brought more; those that still
+// need more wait on. A stream given up on leaves the held streams as it
+// goes; see abandoned.
+func (sc *serverConn) resumeHeld() {
+	if len(sc.held) == 0 {
+		return
+	}
+	held := make([]heldRequest, 0, len(sc.held))
+	for id, h := range sc.held {
+		held = append(held, h)
+		delete(sc.held, id)
+	}
+	for _, h := range held {
+		h.rs.deliver(nil, h.fin, true)
 	}
 }
 
@@ -1465,11 +1534,33 @@ func (rs *requestStream) feed(data []byte, fin bool) {
 	if rs.done {
 		return
 	}
+	if _, ok := rs.sc.held[rs.s.ID()]; ok {
+		rs.hold(data, fin)
+		return
+	}
+	rs.deliver(data, fin, false)
+}
+
+// deliver reads what has arrived on the stream, or with replay set, what
+// arrived while a field section waited on the client's encoder stream,
+// which was given back as it arrived.
+func (rs *requestStream) deliver(data []byte, fin, replay bool) {
 	b := rs.streamed
 	if b != nil {
 		b.fedBody = 0
 	}
-	if err := rs.parser.feed(data, rs.onData, rs.onFrame); err != nil {
+	err := rs.parser.feed(data, rs.onData, rs.onFrame)
+	held := err == qpack.ErrBlocked
+	if held {
+		// The section, and whatever follows it, waits in the parser.
+		sc := rs.sc
+		if sc.held == nil {
+			sc.held = make(map[uint64]heldRequest)
+		}
+		sc.held[rs.s.ID()] = heldRequest{rs: rs, fin: fin}
+		err = nil
+	}
+	if err != nil {
 		rs.sc.fail(err)
 		return
 	}
@@ -1478,17 +1569,20 @@ func (rs *requestStream) feed(data []byte, fin bool) {
 	} else if b != nil {
 		// What of this delivery went to the handler's body is given back
 		// once the handler has consumed it; the rest now.
-		if b.fed {
+		switch {
+		case replay:
+			b.addSkip(b.fedBody)
+		case b.fed:
 			rs.s.Credit(len(data) - b.fedBody)
-		} else {
+		default:
 			b.fed = true
 			b.addSkip(b.fedBody)
 		}
 	}
-	if !fin && !rs.done {
+	if (!fin || held) && !rs.done {
 		rs.armPendingTimer()
 	}
-	if !fin || rs.done {
+	if !fin || held || rs.done {
 		return
 	}
 	rs.mu.Lock()
@@ -1582,6 +1676,29 @@ func (rs *requestStream) onData(chunk []byte) error {
 	return nil
 }
 
+// hold keeps what arrives behind a field section that waits on the client's
+// encoder stream, giving it back to the client as it arrives, up to
+// maxHeldBytes past the section limit.
+func (rs *requestStream) hold(data []byte, fin bool) {
+	rs.parser.buf = append(rs.parser.buf, data...)
+	id := rs.s.ID()
+	if fin {
+		rs.sc.held[id] = heldRequest{rs: rs, fin: true}
+	}
+	if rs.streamed != nil {
+		rs.s.Credit(len(data))
+	}
+	if len(rs.parser.buf) > int(rs.parser.maxFrame)+maxHeldBytes {
+		delete(rs.sc.held, id)
+		rs.sc.peer.qpack.Load().cancel(id)
+		rs.abort(ErrCodeExcessiveLoad)
+		return
+	}
+	if !fin {
+		rs.armPendingTimer()
+	}
+}
+
 // dropBody gives back a body that will not be served.
 func (rs *requestStream) dropBody() {
 	bufferpool.Put(rs.body)
@@ -1606,7 +1723,14 @@ func (rs *requestStream) onFrame(typ uint64, payload []byte) error {
 		return connErr(ErrCodeFrameUnexpected, "HEADERS after trailers")
 	}
 	sc := rs.sc
-	fields, err := decodeFields(&sc.decoder, sc.fields[:0], payload, sc.h.config.MaxHeaderBytes)
+	fields, err := sc.decoder.AppendSection(sc.fields[:0], payload, sc.h.config.MaxHeaderBytes, rs.s.ID())
+	if q := sc.peer.qpack.Load(); q != nil {
+		// A section that referred to the table is acknowledged.
+		q.flush()
+	}
+	if err == qpack.ErrBlocked {
+		return err
+	}
 	// What was decoded is copied out before the next section is, so the
 	// array can take that one.
 	defer func() {
@@ -1983,17 +2107,19 @@ func (rs *requestStream) writeResponse(req *stdhttp.Request, response fibhttp.Re
 
 	// The field sections go back to the pool once the frames are built from
 	// them; the frames' own buffer the stream takes over.
-	block := bufferpool.Append(nil, qpack.Prefix)
+	sec, block := beginFields(rs.encoder(), rs.s.ID())
 	defer func() { bufferpool.Put(block) }()
-	// The numbers are formatted on the stack: AppendField keeps nothing of
-	// what it is given, so the strings made of them need no allocation.
+	// The numbers are formatted on the stack: Append keeps nothing of what
+	// it is given unless it inserts it, which copies it, so the strings
+	// made of them need no allocation.
 	var digits [20]byte
-	block = qpack.AppendField(block, ":status", string(strconv.AppendInt(digits[:0], int64(status), 10)), false)
+	block = sec.Append(block, ":status", string(strconv.AppendInt(digits[:0], int64(status), 10)), false)
 	statusBody := status != stdhttp.StatusNoContent && status != stdhttp.StatusNotModified
 	if statusBody {
-		block = qpack.AppendField(block, "content-length", string(strconv.AppendInt(digits[:0], responseLength(req, response), 10)), false)
+		block = sec.Append(block, "content-length", string(strconv.AppendInt(digits[:0], responseLength(req, response), 10)), false)
 	}
-	block = appendHeader(block, response.Header, func(name string) bool { return name == "content-length" })
+	block = appendHeader(&sec, block, response.Header, func(name string) bool { return name == "content-length" })
+	block = sec.End(block)
 	body := response.Body
 	if !bodyAllowed(req, status) {
 		body = nil
@@ -2029,7 +2155,7 @@ func (rs *requestStream) writeResponse(req *stdhttp.Request, response fibhttp.Re
 	}
 	var tail []byte
 	if bodyAllowed(req, status) && len(response.Trailer) > 0 {
-		if tail = appendTrailer(bufferpool.Get(256)[:0], response.Trailer); len(tail) == 0 {
+		if tail = appendTrailer(rs.encoder(), rs.s.ID(), bufferpool.Get(256)[:0], response.Trailer); len(tail) == 0 {
 			bufferpool.Put(tail)
 			tail = nil
 		}
@@ -2074,22 +2200,22 @@ func (rs *requestStream) writeResponse(req *stdhttp.Request, response fibhttp.Re
 }
 
 // appendTrailer appends a HEADERS frame carrying what of trailer HTTP/3 can
-// send, if that is anything.
-func appendTrailer(out []byte, trailer stdhttp.Header) []byte {
+// send, if that is anything, encoded with enc for streamID.
+func appendTrailer(enc *qpack.Encoder, streamID uint64, out []byte, trailer stdhttp.Header) []byte {
 	if len(trailer) == 0 {
 		return out
 	}
-	block := bufferpool.Append(nil, qpack.Prefix)
+	sec, block := beginFields(enc, streamID)
 	for key, values := range trailer {
 		name := strings.ToLower(key)
 		if !validTrailer(name, values) {
 			continue
 		}
 		for _, value := range values {
-			block = qpack.AppendField(block, name, value, false)
+			block = sec.Append(block, name, value, false)
 		}
 	}
-	if len(block) > len(qpack.Prefix) {
+	if block = sec.End(block); len(block) > len(qpack.Prefix) {
 		out = appendHeadersFrame(out, block)
 	}
 	bufferpool.Put(block)
@@ -2413,9 +2539,10 @@ func (rs *requestStream) WriteInterim(status int, header stdhttp.Header) error {
 		return err
 	}
 	rs.mu.Unlock()
-	block := append([]byte(nil), qpack.Prefix...)
-	block = qpack.AppendField(block, ":status", strconv.Itoa(status), false)
-	block = appendHeader(block, header, nil)
+	sec, block := rs.encoder().Begin(nil, rs.s.ID())
+	block = sec.Append(block, ":status", strconv.Itoa(status), false)
+	block = appendHeader(&sec, block, header, nil)
+	block = sec.End(block)
 	if err := rs.s.Write(appendHeadersFrame(nil, block), false); err != nil {
 		return errStreamClosed
 	}

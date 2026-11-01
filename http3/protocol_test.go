@@ -227,6 +227,9 @@ type rawServer struct {
 	// respond writes a response on a request stream. Like setup, it is set
 	// before the server starts, which reads it on its own goroutine.
 	respond func(r *rawServer, s *quic.Stream)
+	// onUni, when set, is handed what arrives on the client's
+	// unidirectional streams.
+	onUni func(s *quic.Stream, data []byte)
 }
 
 func (r *rawServer) OnHandshake(qc *quic.Conn) {
@@ -243,7 +246,10 @@ func (r *rawServer) OnHandshake(qc *quic.Conn) {
 	}
 }
 
-func (r *rawServer) OnStreamData(s *quic.Stream, _ []byte, fin bool) {
+func (r *rawServer) OnStreamData(s *quic.Stream, data []byte, fin bool) {
+	if !s.Bidirectional() && r.onUni != nil {
+		r.onUni(s, data)
+	}
 	if !fin || !s.Bidirectional() {
 		return
 	}
@@ -294,11 +300,17 @@ func (h *rawServerHandler) OnClose(c *fib.Connection, err error) {
 // startRawServer serves HTTP/3 by hand and returns the server and its URL.
 func startRawServer(t *testing.T, setup func(control *quic.Stream), respond func(r *rawServer, s *quic.Stream)) (*rawServer, string) {
 	t.Helper()
+	return startRawServerFor(t, &rawServer{setup: setup, respond: respond})
+}
+
+// startRawServerFor is startRawServer for a server set up beforehand.
+func startRawServerFor(t *testing.T, server *rawServer) (*rawServer, string) {
+	t.Helper()
 	serverTLS, _, err := tlstest.Configs()
 	if err != nil {
 		t.Fatal(err)
 	}
-	server := &rawServer{closed: make(chan error, 4), setup: setup, respond: respond}
+	server.closed = make(chan error, 4)
 	config := fib.DefaultConfig()
 	engine, err := fib.New(config, fib.Binding{Network: "udp", Addr: "127.0.0.1:0", Handler: &rawServerHandler{t: t, server: server,
 		config: quic.Config{TLSConfig: ConfigureTLS(serverTLS)}}})

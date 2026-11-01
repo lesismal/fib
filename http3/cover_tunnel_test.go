@@ -270,7 +270,7 @@ func TestCcTunnelOpensWhileRetiring(t *testing.T) {
 		t.Fatalf("frame %d, want HEADERS", typ)
 	}
 	var decoder qpack.Decoder
-	if fields, err := decodeFields(&decoder, nil, payload, 1<<16); err != nil || len(fields) == 0 || fields[0].Value != "200" {
+	if fields, err := decoder.AppendFields(nil, payload, 1<<16); err != nil || len(fields) == 0 || fields[0].Value != "200" {
 		t.Fatalf("response %v %v", fields, err)
 	}
 	select {

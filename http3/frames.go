@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 
+	"github.com/lesismal/fib/http3/qpack"
 	"github.com/lesismal/fib/http3/quic"
 )
 
@@ -172,6 +173,20 @@ func parseSettings(payload []byte) (maxField uint64, limited bool, err error) {
 	return maxField, limited, nil
 }
 
+// settingValue is the value of setting id in a SETTINGS payload that
+// parseSettings has checked, or zero, its default, if it is not there.
+func settingValue(payload []byte, id uint64) uint64 {
+	for len(payload) > 0 {
+		key, n := quic.ReadVarint(payload)
+		value, m := quic.ReadVarint(payload[n:])
+		if key == id {
+			return value
+		}
+		payload = payload[n+m:]
+	}
+	return 0
+}
+
 // frameParser splits a stream into frames. DATA payloads are handed on as
 // they arrive; every other frame is collected whole first.
 type frameParser struct {
@@ -225,8 +240,13 @@ func (p *frameParser) feed(data []byte, onData func([]byte) error, onFrame func(
 			break
 		}
 		payload := buf[n1+n2 : n1+n2+int(length)]
+		frame := buf
 		buf = buf[n1+n2+int(length):]
-		err = onFrame(typ, payload)
+		if err = onFrame(typ, payload); err == qpack.ErrBlocked {
+			// A field section waiting on the encoder stream: it is kept,
+			// with what follows it, to be parsed again.
+			buf = frame
+		}
 	}
 	p.buf = append(p.buf[:0], buf...)
 	if cap(p.buf) > 64<<10 && len(p.buf) < 1<<10 {

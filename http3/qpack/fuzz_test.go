@@ -1,9 +1,100 @@
 package qpack
 
 import (
+	"errors"
 	"strings"
 	"testing"
 )
+
+// FuzzEncoderStream feeds a decoder with a small table arbitrary encoder
+// stream bytes, split in two anywhere, and then a field section: it either
+// takes them or fails with ErrEncoderStream, never panics, keeps its table
+// within the capacity, and buffers no more of an unfinished instruction
+// than one that fits could take.
+func FuzzEncoderStream(f *testing.F) {
+	f.Add([]byte{0x3f, 0xbd, 0x01, 0xc0, 0x01, 'a', 0x02, 0x80}, 3, []byte{0x02, 0x00, 0x80})
+	f.Add([]byte{0x3f, 0x45, 0x43, 'a', 'b', 'c', 0x01, 'x', 0x00, 0x81, 0x01, 'y'}, 5, []byte{0x03, 0x81, 0x10})
+	f.Add([]byte{0x2a, 0x5f, 0xff, 0xff, 0x7f}, 1, []byte{0x00, 0x00})
+	f.Fuzz(func(t *testing.T, data []byte, split int, block []byte) {
+		const capacity = 220
+		var d Decoder
+		d.EnableDynamic(capacity, 2)
+		split = min(max(split, 0), len(data))
+		err := d.FeedEncoder(data[:split])
+		if err == nil {
+			err = d.FeedEncoder(data[split:])
+		}
+		if err != nil && !errors.Is(err, ErrEncoderStream) {
+			t.Fatalf("got %v, want ErrEncoderStream", err)
+		}
+		if dyn := d.dyn; dyn.size > dyn.capacity || dyn.capacity > capacity || err == nil && len(dyn.in) > 8*capacity+32 {
+			t.Fatalf("table of %d bytes, capacity %d, %d bytes buffered", dyn.size, dyn.capacity, len(dyn.in))
+		}
+		_, err = d.AppendSection(nil, block, 1<<16, 0)
+		if err != nil && !errors.Is(err, ErrDecompression) && !errors.Is(err, ErrBlocked) && !errors.Is(err, ErrTooLarge) {
+			t.Fatalf("decoding: %v", err)
+		}
+	})
+}
+
+// FuzzDecoderStream feeds an encoder that has sent sections arbitrary
+// decoder stream bytes: it either takes them or fails with
+// ErrDecoderStream, and its count of unacknowledged sections stays true.
+func FuzzDecoderStream(f *testing.F) {
+	f.Add([]byte{0x84, 0x01, 0x44})
+	f.Add([]byte{0x01, 0x01, 0x80, 0x80})
+	f.Add([]byte{0xff, 0x80})
+	f.Fuzz(func(t *testing.T, data []byte) {
+		p := newPair(4096, 0)
+		fields := []HeaderField{{"x-a", "aaaaaaaa"}, {"x-b", "bbbbbbbb"}}
+		for i := 0; i < 3; i++ {
+			p.decode(t, p.encode(fields, 0), 0)
+			p.carry(t)
+		}
+		p.encode(fields, 0)
+		p.encode(fields, 4)
+		if err := p.enc.FeedDecoder(data); err != nil && !errors.Is(err, ErrDecoderStream) {
+			t.Fatalf("got %v, want ErrDecoderStream", err)
+		}
+		n := 0
+		for _, sections := range p.enc.unacked {
+			n += len(sections)
+		}
+		if n != p.enc.pending || p.enc.known > p.enc.t.inserted {
+			t.Fatalf("%d pending, %d counted; %d known of %d", p.enc.pending, n, p.enc.known, p.enc.t.inserted)
+		}
+	})
+}
+
+// FuzzDynamicRoundTrip has an Encoder and a Decoder with a small table
+// carry arbitrary fields over several sections, the acknowledgments now
+// and then a section behind: each decodes to what was encoded, whatever
+// the table evicts on the way.
+func FuzzDynamicRoundTrip(f *testing.F) {
+	f.Add("x-a", "1", "cookie", "a=0123456789abcdefghij", uint8(5))
+	f.Add(":authority", "example.com", "x-b", strings.Repeat("v", 90), uint8(9))
+	f.Fuzz(func(t *testing.T, name1, value1, name2, value2 string, rounds uint8) {
+		if strings.ToLower(name1) != name1 || strings.ToLower(name2) != name2 {
+			t.Skip()
+		}
+		// Without blocked streams, and with two.
+		for _, blocked := range []int{0, 2} {
+			p := newPair(256, blocked)
+			for i := 0; i < int(rounds%12); i++ {
+				want := []HeaderField{{name1, value1}, {name2, value2 + string(rune('0'+i%3))}}
+				id := uint64(4 * i)
+				got, waited := p.decodeLate(t, p.encode(want, id), id)
+				if waited && blocked == 0 {
+					t.Fatal("a section waited with no blocked streams allowed")
+				}
+				sameFields(t, got, want)
+				if i%4 != 3 {
+					p.carry(t)
+				}
+			}
+		}
+	})
+}
 
 // FuzzDecode feeds the decoder arbitrary field sections: whatever it is
 // given, it either returns fields or an error, and never panics or runs

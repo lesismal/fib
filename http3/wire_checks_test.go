@@ -128,7 +128,7 @@ func TestOutgoingFieldChecks(t *testing.T) {
 		t.Fatal("x-sum refused as a trailer")
 	}
 	// A trailer with nothing sendable adds no frame at all.
-	if out := appendTrailer(nil, stdhttp.Header{"Content-Length": {"1"}}); len(out) != 0 {
+	if out := appendTrailer(nil, 0, nil, stdhttp.Header{"Content-Length": {"1"}}); len(out) != 0 {
 		t.Fatalf("an empty trailer section was sent: % x", out)
 	}
 }

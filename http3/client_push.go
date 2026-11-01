@@ -4,7 +4,6 @@ package http3
 
 import (
 	"github.com/lesismal/fib/bufferpool"
-	"github.com/lesismal/fib/http3/qpack"
 	"github.com/lesismal/fib/internal/reqbody"
 )
 
@@ -44,10 +43,7 @@ func (s *pushSink) End() error {
 		return errFieldSectionTooLarge
 	}
 	if terr == nil && len(trailer) > 0 {
-		block := bufferpool.Append(nil, qpack.Prefix)
-		for _, f := range trailer {
-			block = qpack.AppendField(block, f.Name, f.Value, sensitive(f.Name))
-		}
+		block := appendFields(st.cc.peer.qpackEncoder(), trailer, st.s.ID())
 		out := appendHeadersFrame(bufferpool.Get(len(block) + 16)[:0], block)
 		bufferpool.Put(block)
 		err = st.s.WriteOwned(out, true)
