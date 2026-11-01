@@ -2,10 +2,10 @@ package hls
 
 import (
 	"strconv"
-	"strings"
 
 	"github.com/lesismal/fib/media/av"
 	"github.com/lesismal/fib/media/codec/aac"
+	"github.com/lesismal/fib/media/codec/av1"
 	"github.com/lesismal/fib/media/codec/h264"
 	"github.com/lesismal/fib/media/codec/h265"
 	"github.com/lesismal/fib/media/fmp4"
@@ -128,7 +128,10 @@ func CodecString(t *av.Track) string {
 			return c.CodecString()
 		}
 	case av.CodecAV1:
-		return av1CodecString(t.Config)
+		var c av1.Config
+		if c.Unmarshal(t.Config) == nil {
+			return c.CodecString()
+		}
 	case av.CodecAAC:
 		var c aac.Config
 		if c.Unmarshal(t.Config) != nil {
@@ -145,41 +148,6 @@ func CodecString(t *av.Track) string {
 		return "mp4a.40.34"
 	}
 	return ""
-}
-
-// av1CodecString builds "av01.P.LLT.DD" (the AV1 ISOBMFF binding, section
-// "Codecs Parameter String") from an AV1CodecConfigurationRecord.
-func av1CodecString(c []byte) string {
-	if len(c) < 3 {
-		return ""
-	}
-	profile, level := c[1]>>5, c[1]&0x1f
-	tier := "M"
-	if c[2]&0x80 != 0 {
-		tier = "H"
-	}
-	depth := 8
-	if c[2]&0x40 != 0 {
-		depth = 10
-		if profile == 2 && c[2]&0x20 != 0 {
-			depth = 12
-		}
-	}
-	var b strings.Builder
-	b.WriteString("av01.")
-	b.WriteString(strconv.Itoa(int(profile)))
-	b.WriteByte('.')
-	if level < 10 {
-		b.WriteByte('0')
-	}
-	b.WriteString(strconv.Itoa(int(level)))
-	b.WriteString(tier)
-	b.WriteByte('.')
-	if depth < 10 {
-		b.WriteByte('0')
-	}
-	b.WriteString(strconv.Itoa(depth))
-	return b.String()
 }
 
 // videoSize returns the picture size of a video track, from the track or
@@ -202,6 +170,12 @@ func videoSize(t *av.Track) (int, int) {
 			if n := c.NALUs(h265.NALSPS); len(n) > 0 && sps.Unmarshal(n[0]) == nil {
 				return sps.Width, sps.Height
 			}
+		}
+	case av.CodecAV1:
+		var c av1.Config
+		var s av1.SequenceHeader
+		if c.Unmarshal(t.Config) == nil && s.Unmarshal(c.SequenceHeader()) == nil {
+			return s.Width, s.Height
 		}
 	}
 	return 0, 0

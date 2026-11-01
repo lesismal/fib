@@ -6,6 +6,7 @@ import (
 
 	"github.com/lesismal/fib/media/av"
 	"github.com/lesismal/fib/media/codec/aac"
+	"github.com/lesismal/fib/media/codec/av1"
 	"github.com/lesismal/fib/media/codec/h264"
 	"github.com/lesismal/fib/media/codec/h265"
 	"github.com/lesismal/fib/media/codec/opus"
@@ -42,7 +43,8 @@ type trackInfo struct {
 	track     *av.Track
 	video     bool
 	timescale uint32
-	// width and height are the display size, from the track or its SPS.
+	// width and height are the display size, from the track or its SPS
+	// or sequence header.
 	width, height int
 	channels      int
 	sampleRate    int
@@ -67,10 +69,7 @@ func newTrackInfo(t *av.Track) (*trackInfo, error) {
 	case av.CodecH265:
 		err = ti.hevc()
 	case av.CodecAV1:
-		if len(t.Config) < 4 || t.Config[0]&0x80 == 0 {
-			return nil, ErrConfig
-		}
-		ti.entry = ti.visualEntry("av01", "av1C", t.Config)
+		err = ti.av01()
 	case av.CodecAAC:
 		err = ti.mp4a()
 	case av.CodecOpus:
@@ -133,6 +132,21 @@ func (ti *trackInfo) hevc() error {
 		}
 	}
 	ti.entry = ti.visualEntry("hvc1", "hvcC", config)
+	return nil
+}
+
+func (ti *trackInfo) av01() error {
+	var c av1.Config
+	if err := c.Unmarshal(ti.track.Config); err != nil {
+		return ErrConfig
+	}
+	if ti.width == 0 || ti.height == 0 {
+		var s av1.SequenceHeader
+		if s.Unmarshal(c.SequenceHeader()) == nil {
+			ti.width, ti.height = s.Width, s.Height
+		}
+	}
+	ti.entry = ti.visualEntry("av01", "av1C", ti.track.Config)
 	return nil
 }
 
