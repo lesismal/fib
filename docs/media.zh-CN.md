@@ -642,9 +642,17 @@ HTTP/2 和 HTTP/3 上，积压指流控压住超过 64 KiB 的数据，且只有
 | `PLIInterval`、`KeyFrameInterval` | 500 ms、0 | 两次关键帧请求的最小间隔；定期请求 |
 | `MaxOfferBytes` | 64 KiB | offer 或 PATCH body 的上限 |
 | `OnKeyFrameRequest` | 无 | 观众对一路不由本服务端 WHIP 会话发布的流请求关键帧 |
+| `RetransmitPackets` | 256 | 发给观众的每个 track 保留的最近 RTP 包数，用于应答其 NACK；负值不保留 |
 
 `rtc.Config.WebRTC.Codecs` 被忽略：每个会话使用其流或 offer 的编码。`Certificates` 为空时，
 所有 PeerConnection 共用一张生成的证书。
+
+WHEP 观众若在 offer 中要求 NACK（浏览器对视频都会这样做），它报告丢失的包会被重发：offer
+带 RTX 时（浏览器的 offer 都带）以 RTX（RFC 4588）重发，否则原样重发。每个观众的视频 track
+为此保留 `RetransmitPackets` 个包，约为 2 Mbit/s 码流的 1.2 秒，每个约 1.5 KiB，256 个即每个
+观众至多约 384 KiB；观众很多且网络干净的服务端可以设为负值关闭。`WebRTC.Retransmit.MaxAge`
+（1 s）和 `MaxBytesPerSecond`（每个 track 256 KiB/s）限制重发的量，同一个包每个往返时间至多
+重发一次。WHIP 会话不保留历史，也不发送 NACK。
 
 `rtc.ClientConfig` 有 `Engine`（已在运行；除非设置了 `HTTPClient`，由它发送请求，除非
 `WebRTC` 指定了 Mux 或 engine，由它打开 PeerConnection 的端口）、`HTTPClient`、`WebRTC`
@@ -699,7 +707,8 @@ HTTP/2 和 HTTP/3 上，积压指流控压住超过 64 KiB 的数据，且只有
   `EXT-X-PROGRAM-DATE-TIME`；多 variant；I 帧播放列表；加密。分片比目标时长更长时（关键帧
   间隔大于 `TargetDuration`），`EXT-X-TARGETDURATION` 会被调高，严格来说规范不允许这样做。
 - **WHIP/WHEP**：ICE restart（回 422）；simulcast（每个 media section 只接收第一层）；每种
-  媒体超过 offer 中 section 数量的流；RTX 与 FEC；流的编码变化时重新协商（旧编码的 track
+  媒体超过 offer 中 section 数量的流；FEC，以及 WHIP 会话与客户端发送 NACK（只有 WHEP 会话
+  应答 NACK）；流的编码变化时重新协商（旧编码的 track
   停止）；基于 RTCP sender report 的音视频同步（WHIP 按到达时间打时间戳，各 track 之间的
   偏差不超过网络抖动）。
 - **编码工具**：H.264 的 PPS、slice header、SVC/MVC 与 subset SPS；H.265 SPS 中位深和重排之后
