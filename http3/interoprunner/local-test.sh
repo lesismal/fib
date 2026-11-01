@@ -28,8 +28,29 @@ trap cleanup EXIT
 
 step() { printf '\n================ %s\n' "$*"; }
 
+# build retries with a backoff, then falls back to a mirror of the Go base
+# image: Docker Hub rate-limits anonymous pulls, which would otherwise fail
+# the build for reasons unrelated to the code.
+build() {
+    local go_image=$1
+    docker build -f "$here/Dockerfile" --build-arg "GO_IMAGE=$go_image" \
+        -t "$image" "$repo"
+}
+
 step "build $image"
-docker build -f "$here/Dockerfile" -t "$image" "$repo"
+built=0
+for attempt in 1 2 3; do
+    if build golang:1.27.3; then
+        built=1
+        break
+    fi
+    echo "build attempt $attempt failed"
+    [ "$attempt" = 3 ] || sleep $((attempt * 15))
+done
+if [ "$built" != 1 ]; then
+    echo "falling back to mirror.gcr.io for the Go base image"
+    build mirror.gcr.io/library/golang:1.27.3
+fi
 
 mkdir -p "$tmp/certs" "$tmp/www" "$tmp/downloads" "$logs_server" "$logs_client"
 openssl req -x509 -newkey rsa:2048 -nodes -sha256 -days 1 \
