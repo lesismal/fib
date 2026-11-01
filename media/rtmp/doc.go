@@ -21,6 +21,10 @@
 // and closeStream, and publishes to ServerConfig.Hub at path "app/stream"
 // (rtmp://host/app/stream), with the query that the app or the stream name
 // carried (?token=...) in hub.PublishInfo for the hub's hooks to check.
+// The publish command reserves the path (hub.Hub.Reserve), so a second
+// publisher hears NetStream.Publish.BadName at once, and the stream goes
+// live when the publisher's metadata and sequence headers have made its
+// tracks known; until then players that do not wait find no stream.
 // Players start from the hub's GOP cache, with onMetaData and the sequence
 // headers first, and a player that falls behind has its packets dropped
 // (video until the next keyframe, hub.NewDropper) and, past a second limit
