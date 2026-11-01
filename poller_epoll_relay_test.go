@@ -299,3 +299,39 @@ func TestRelayWritersStoppedBeforeTheirPipeCloses(t *testing.T) {
 		t.Fatal("the writer never wrote")
 	}
 }
+
+// A relay that cannot watch the loop's instance is not made, and without
+// one, wait blocks in epoll_wait itself; a look for events on no instance
+// reports why.
+func TestEpollWaiterFallbacks(t *testing.T) {
+	if w := newEpollWaiter(-1); w != nil {
+		w.close()
+		t.Fatal("a relay was made for no epoll instance")
+	}
+	epfd, err := syscall.EpollCreate1(syscall.EPOLL_CLOEXEC)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer syscall.Close(epfd)
+	var p [2]int
+	if err := syscall.Pipe2(p[:], syscall.O_CLOEXEC); err != nil {
+		t.Fatal(err)
+	}
+	defer syscall.Close(p[0])
+	defer syscall.Close(p[1])
+	ev := syscall.EpollEvent{Events: syscall.EPOLLIN, Fd: int32(p[0])}
+	if err := syscall.EpollCtl(epfd, syscall.EPOLL_CTL_ADD, p[0], &ev); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := syscall.Write(p[1], []byte{1}); err != nil {
+		t.Fatal(err)
+	}
+	var none *epollWaiter
+	events := make([]syscall.EpollEvent, 4)
+	if n, err := none.wait(epfd, events); n != 1 || err != nil || events[0].Fd != int32(p[0]) {
+		t.Fatalf("wait without a relay = %d, %v", n, err)
+	}
+	if _, err := pollEvents(-1, events); err == nil {
+		t.Fatal("pollEvents on no instance succeeded")
+	}
+}
