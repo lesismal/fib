@@ -64,7 +64,7 @@ Each protocol document (`http1*.md`, `http2*.md`, `http3*.md`, `webrtc*.md`, `me
 | DTLS 1.3 | Deliberately not done | Every browser speaks DTLS 1.2, which is what WebRTC requires today | L | Browsers require DTLS 1.3 |
 | mDNS resolution of host candidates | Deliberately not done | A browser's checks reveal its address as a peer-reflexive candidate anyway, and a lite server needs nothing more | S | Two full agents behind mDNS on one LAN must connect without STUN |
 | Provisional answers and rollback | Deliberately not done | Glare handling belongs to the signaling; neither WHIP nor WHEP uses them | S | An application negotiates from both sides at once |
-| Interop tests in CI | Planned | pion, OpenSSL and Chromium interop ran out of tree; CI runs fib against fib and the RFC vectors | M | Before declaring the API stable |
+| Interop tests in CI | Partly done | `webrtc/interop` (CI job `webrtc-interop`, non-blocking) runs fib against pion: PeerConnections both ways with a data channel and media, TURN relay through turnserver, and DTLS; OpenSSL, Chromium and pion's ice, srtp, sctp and sdp checks are still run by hand | M | Before declaring the API stable; make the job blocking once it has run stably |
 
 ## 6. Streaming media
 
@@ -77,7 +77,7 @@ Each protocol document (`http1*.md`, `http2*.md`, `http3*.md`, `webrtc*.md`, `me
 | AV1 over RTP (RTSP, WHEP) | Known limit | rtpcodec has no AV1 payload format; AV1 travels over Enhanced RTMP, HTTP-FLV and HLS fMP4 | M | AV1 publishers whose viewers use WebRTC or RTSP |
 | Recording, DVR and VOD | Deliberately not done | Every stream is live; a recorder is a hub subscriber the application writes (fmp4 and mpegts mux to files as well as to segments) | M | Recording becomes a common request |
 | HLS delta playlists, rendition reports, PROGRAM-DATE-TIME, encryption | Deliberately not done | One variant per stream, no transcoding, and players play without them | M | Long playlists where delta updates save bandwidth, or DRM |
-| Interop tests in CI | Planned | ffmpeg and Chromium interop ran out of tree (the in-repo tests run without ffmpeg); CI runs fib against fib and captured fixtures | M | Before declaring the API stable |
+| Interop tests in CI | Partly done | `media/interop` (CI job `media-interop`, non-blocking) runs the ffmpeg 7.1 matrix: H.264/H.265 with AAC/Opus, 4 ingests by 8 egresses, plus WHEP; ffmpeg 5.1, G.711, Chromium, A/V sync, republish, load and stalled players are still run by hand | M | Before declaring the API stable; make the job blocking once it has run stably |
 
 ## 7. Testing and infrastructure
 

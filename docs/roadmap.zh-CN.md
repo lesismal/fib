@@ -64,7 +64,7 @@
 | DTLS 1.3 | 有意不做 | 所有浏览器都支持 DTLS 1.2，这也是 WebRTC 目前的要求 | L | 浏览器要求 DTLS 1.3 |
 | 解析 host candidate 的 mDNS 名字 | 有意不做 | 浏览器的检查本来就会以 peer-reflexive candidate 暴露它的地址，lite 服务端不需要更多 | S | 同一局域网内两个都用 mDNS 的 full agent 要在没有 STUN 时连通 |
 | provisional answer 与 rollback | 有意不做 | glare 处理属于信令；WHIP、WHEP 都用不到 | S | 应用需要双方同时发起协商 |
-| CI 中的互通测试 | 计划中 | 与 pion、OpenSSL、Chromium 的互通在仓库外完成；CI 跑的是 fib 对 fib 与 RFC 向量 | M | 宣布 API 稳定之前 |
+| CI 中的互通测试 | 部分完成 | `webrtc/interop`（CI job `webrtc-interop`，不阻塞）跑 fib 对 pion：双向 PeerConnection 的数据通道与媒体、经 turnserver 的 TURN 中继、DTLS；OpenSSL、Chromium 以及 pion 的 ice、srtp、sctp、sdp 仍手工验证 | M | 宣布 API 稳定之前；job 稳定运行一段时间后改为阻塞 |
 
 ## 6. 流媒体
 
@@ -77,7 +77,7 @@
 | 基于 RTP 的 AV1（RTSP、WHEP） | 已知限制 | rtpcodec 没有 AV1 载荷格式；AV1 可经 Enhanced RTMP、HTTP-FLV 和 HLS fMP4 传输 | M | 有 AV1 发布者，而观众用 WebRTC 或 RTSP |
 | 录制、DVR 与点播 | 有意不做 | 所有流都是直播；录制器就是应用自己写的一个 hub 订阅者（fmp4 和 mpegts 既能输出分片也能输出文件） | M | 录制成为常见需求 |
 | HLS 增量播放列表、rendition report、PROGRAM-DATE-TIME、加密 | 有意不做 | 每路流一个 variant，不转码，播放器不需要它们也能播放 | M | 播放列表很长、增量更新能省带宽，或需要 DRM |
-| CI 中的互通测试 | 计划中 | 与 ffmpeg、Chromium 的互通在仓库外完成（仓库内的测试不依赖 ffmpeg）；CI 跑的是 fib 对 fib 与抓取的样本 | M | 宣布 API 稳定之前 |
+| CI 中的互通测试 | 部分完成 | `media/interop`（CI job `media-interop`，不阻塞）跑 ffmpeg 7.1 矩阵：H.264/H.265 配 AAC/Opus，4 种推流 × 8 种播放，外加 WHEP；ffmpeg 5.1、G.711、Chromium、音视频同步、重新推流、压测和卡住的播放者仍手工验证 | M | 宣布 API 稳定之前；job 稳定运行一段时间后改为阻塞 |
 
 ## 7. 测试与基础设施
 
