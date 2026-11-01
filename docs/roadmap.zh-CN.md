@@ -15,7 +15,6 @@
 | ChaCha20-Poly1305 汇编（AVX2／NEON） | 有意不做 | 分架构、常量时间容易写错的一大块代码；而只有**没有** AES 硬件的机器才会优先协商这个套件。纯 Go 版本已经比原实现快 54–81% | L | 目标机器普遍没有 AES 硬件 |
 | QUIC `*Stream` 池化 | 有意不做 | `*Stream` 会交给应用、生命周期由应用决定；重用会把"stream 结束后继续使用"变成破坏另一条 stream。现在开／关一条 stream 8 次分配，请求 stream 与 header 已复用 | M | 不重估：这是 API 所有权边界 |
 | 主动连接迁移、`preferred_address` | 有意不做 | 服务端已为每个连接签发并路由多个 Connection ID，但 `PATH_CHALLENGE` 在当前发送路径上回复而不是挑战到达的路径，客户端迁移前对新路径的验证无法完成。NAT 重绑定（含换 CID）会被跟随，实际场景已覆盖 | L | 移动端长连接、Wi-Fi／蜂窝切换频繁的产品 |
-| QPACK 动态表 | 有意不做 | 两端都声明容量 0：不会出现 blocked stream 造成的队头阻塞，编解码器流都没有内容，也没有额外状态与内存；代价是重复 header 每次完整发送 | M | header 很大且高度重复（如大 cookie、内部 RPC）成为带宽瓶颈 |
 | Server push | 有意不做 | 主流浏览器都不启用 HTTP/3 push；客户端不发 `MAX_PUSH_ID`，`Context.Push` 返回 `http.ErrNotSupported`。预加载用 103 Early Hints（`WriteInterim`） | L | 不重估：浏览器侧已凉 |
 | DATAGRAM（RFC 9221）、WebTransport | 有意不做 | 依赖流式 stream 或不可靠数据报的 API，当前 handler 模型不支持；对端发来的 DATAGRAM 帧被当未知帧，连接以 `FRAME_ENCODING_ERROR` 关闭 | L | 要做实时媒体／游戏类服务时，且需要同时扩展 handler 模型 |
 | QUIC v2（RFC 9369）等其它版本 | 有意不做 | 部署上 version 1 已足够；客户端收到 Version Negotiation 直接失败 | S–M | 出现要求 v2 的部署环境 |
