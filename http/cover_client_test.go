@@ -924,6 +924,77 @@ func TestCvCliResponseParserErrors(t *testing.T) {
 	}
 }
 
+// The response parser on bodies in a transfer coding besides chunked, and
+// on a Transfer-Encoding rewritten for net/http's reader: what they decode
+// to, and how they fail, buffered and streamed, framed or ended by the close.
+func TestCvCliResponseParserCodings(t *testing.T) {
+	get := &stdhttp.Request{Method: "GET"}
+	payload := []byte(strings.Repeat("a coded response body. ", 40))
+	coded := string(gzipBody(t, payload))
+	empty := string(gzipBody(t, nil))
+	truncated := coded[:len(coded)/2]
+	for _, tc := range []struct {
+		name   string
+		stream bool
+		input  string
+		closed bool
+		want   error
+		body   string
+	}{
+		{"chunked twice", false, "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked, chunked\r\n\r\n", false, ErrMalformedResponse, ""},
+		{"padded chunked", false, "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked, \r\n\r\n" + chunkedBody([]byte("plain")), false, nil, "plain"},
+		{"padded chunked bad trailer", false, "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked, \r\n\r\n5\r\nplain\r\n0\r\nno colon\r\n\r\n", false, ErrMalformedResponse, ""},
+		{"gzip chunked", false, "HTTP/1.1 200 OK\r\nTransfer-Encoding: gzip, chunked\r\n\r\n" + chunkedBody([]byte(coded)), false, nil, string(payload)},
+		{"gzip chunked malformed", false, "HTTP/1.1 200 OK\r\nTransfer-Encoding: gzip, chunked\r\n\r\n" + chunkedBody([]byte("not gzip at all")), false, ErrMalformedResponse, ""},
+		{"gzip until close", false, "HTTP/1.1 200 OK\r\nTransfer-Encoding: gzip\r\n\r\n" + coded, true, nil, string(payload)},
+		{"gzip until close empty", false, "HTTP/1.1 200 OK\r\nTransfer-Encoding: gzip\r\n\r\n" + empty, true, nil, ""},
+		{"gzip until close malformed", false, "HTTP/1.1 200 OK\r\nTransfer-Encoding: gzip\r\n\r\nnot gzip at all", true, ErrMalformedResponse, ""},
+		{"streamed gzip until close", true, "HTTP/1.1 200 OK\r\nTransfer-Encoding: gzip\r\n\r\n" + coded, true, nil, string(payload)},
+		{"streamed gzip until close truncated", true, "HTTP/1.1 200 OK\r\nTransfer-Encoding: gzip\r\n\r\n" + truncated, true, ErrMalformedResponse, ""},
+		{"streamed gzip chunked truncated", true, "HTTP/1.1 200 OK\r\nTransfer-Encoding: gzip, chunked\r\n\r\n" + chunkedBody([]byte(truncated)), false, ErrMalformedResponse, ""},
+		{"streamed gzip too large", true, "HTTP/1.1 200 OK\r\nTransfer-Encoding: gzip, chunked\r\n\r\n" + chunkedBody([]byte(coded)), false, ErrResponseBodyTooLarge, ""},
+	} {
+		p := &responseParser{maxHeader: 1 << 10, maxBody: 1 << 20}
+		sink := &cvCliSink{}
+		if tc.stream {
+			p.sink, p.streamOK, p.maxStreamed = sink, true, 1<<20
+			if tc.want == ErrResponseBodyTooLarge {
+				p.maxStreamed = 64
+			}
+		}
+		resp, err := p.feed([]byte(tc.input), get)
+		if tc.closed && err == nil {
+			resp, err = p.finish()
+		}
+		if !errors.Is(err, tc.want) || tc.want == nil && err != nil {
+			t.Errorf("%s: %v, want %v", tc.name, err, tc.want)
+			continue
+		}
+		if err != nil {
+			continue
+		}
+		got := string(sink.data)
+		if !tc.stream {
+			if resp == nil {
+				t.Errorf("%s: no response", tc.name)
+				continue
+			}
+			b, _ := io.ReadAll(resp.Body)
+			got = string(b)
+		}
+		if got != tc.body {
+			t.Errorf("%s: body %.30q, want %.30q", tc.name, got, tc.body)
+		}
+	}
+
+	// A large piece buffer is let go between responses.
+	p := &responseParser{piece: make([]byte, maxRetainedBuffer+1)}
+	p.reset()
+	if p.piece != nil {
+		t.Fatal("large piece kept")
+	}
+}
+
 // clientParseError speaks of responses, and passes other errors on.
 func TestCvCliClientParseError(t *testing.T) {
 	if err := clientParseError(ErrHeaderTooLarge); err != ErrResponseHeaderTooLarge {
@@ -935,5 +1006,128 @@ func TestCvCliClientParseError(t *testing.T) {
 	other := errors.New("cvcli: other")
 	if err := clientParseError(other); err != other {
 		t.Fatal(err)
+	}
+}
+
+// EarlyData without a SessionCache gets a cache of the client's own, and
+// StartUpgrade without a handler fails at once.
+func TestCvCliEarlyDataCacheAndUpgradeWithoutHandler(t *testing.T) {
+	config := DefaultClientConfig()
+	config.EarlyData = true
+	client := NewClient(nil, config)
+	defer client.Close()
+	if client.sessions == nil {
+		t.Fatal("EarlyData without a session cache")
+	}
+	var got error
+	if call := client.StartUpgrade(mustRequest(t, "GET", "http://example.com/", nil), nil,
+		func(_ *ClientResponse, err error) { got = err }); call.r != nil || got == nil {
+		t.Fatalf("StartUpgrade without a handler: %+v, %v", call, got)
+	}
+	// Nor does it need a callback to fail.
+	client.StartUpgrade(mustRequest(t, "GET", "http://example.com/", nil), nil, nil)
+}
+
+// Only a request that changes nothing, has no body and switches no protocol
+// may go as early data.
+func TestCvCliCanSendEarly(t *testing.T) {
+	get := mustRequest(t, "GET", "http://example.com/", nil)
+	for _, tc := range []struct {
+		name string
+		r    *clientRequest
+		want bool
+	}{
+		{"get", &clientRequest{req: get}, true},
+		{"retried", &clientRequest{req: get, retried: true}, false},
+		{"upgrade", &clientRequest{req: get, tunnel: &cvSrvTunnel{}}, false},
+		{"body", &clientRequest{req: mustRequest(t, "GET", "http://example.com/", strings.NewReader("x"))}, false},
+		{"post", &clientRequest{req: mustRequest(t, "POST", "http://example.com/", nil)}, false},
+	} {
+		if got := tc.r.canSendEarly(); got != tc.want {
+			t.Errorf("%s: %v, want %v", tc.name, got, tc.want)
+		}
+	}
+}
+
+// A streamed request's head that the fast path cannot write is written by
+// net/http, without the empty Content-Length it declares for a POST, the
+// length declared taking its place.
+func TestCvCliMarshalStreamedHeadSlowPath(t *testing.T) {
+	req := mustRequest(t, "POST", "http://example.com/up", nil)
+	req.Close = true
+	head, err := marshalStreamedHead(req, 5, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := string(head)
+	if strings.Contains(s, "Content-Length: 0\r\n") || !strings.Contains(s, "Content-Length: 5\r\n") ||
+		!strings.HasPrefix(s, "POST /up HTTP/1.1\r\n") || !strings.HasSuffix(s, "\r\n\r\n") {
+		t.Fatalf("head %q", s)
+	}
+}
+
+// Past MaxPendingPerHost, a queue mostly of requests that ended while they
+// waited is swept of them, which may leave room for the request after all;
+// a request that is not last in the queue is not taken out.
+func TestCvCliOverPendingSweeps(t *testing.T) {
+	c := &Client{config: ClientConfig{MaxPendingPerHost: 2, MaxConnsPerHost: 1}}
+	h := &hostPool{open: 1}
+	ended := func() *clientRequest {
+		r := &clientRequest{}
+		r.done.Store(true)
+		return r
+	}
+	live := func() *clientRequest {
+		r := &clientRequest{}
+		r.waitingIn.Store(h)
+		return r
+	}
+	r, kept := live(), live()
+	h.waiting = []*clientRequest{ended(), ended(), ended(), kept, r}
+	h.ended.Store(3)
+	if c.overPendingLocked(h, r) {
+		t.Fatal("refused with room once the queue was swept")
+	}
+	if len(h.waiting) != 2 || h.waiting[0] != kept || h.waiting[1] != r || h.ended.Load() != 0 {
+		t.Fatalf("swept queue %d long, %d ended", len(h.waiting), h.ended.Load())
+	}
+	h.waiting = []*clientRequest{live(), live(), live(), live()}
+	if c.overPendingLocked(h, r) || len(h.waiting) != 4 {
+		t.Fatalf("a request not in the queue was taken out of it: %d left", len(h.waiting))
+	}
+}
+
+// ResponseHeaderTimeout alone, with no Timeout, sets a timer of its own for
+// the header, which a header that arrives stops and one that does not fires.
+func TestCvCliResponseHeaderTimeoutAlone(t *testing.T) {
+	u := rawServer(t, func(conn net.Conn, _ int) {
+		r := bufio.NewReader(conn)
+		for {
+			req, err := stdhttp.ReadRequest(r)
+			if err != nil {
+				return
+			}
+			if req.URL.Path == "/hang" {
+				_, _ = io.Copy(io.Discard, r)
+				return
+			}
+			if _, err := io.WriteString(conn, cvCliOK); err != nil {
+				return
+			}
+		}
+	})
+	config := DefaultClientConfig()
+	config.Timeout = 0
+	config.ResponseHeaderTimeout = 100 * time.Millisecond
+	client := newTestClient(t, config)
+	resp, err := client.Go(mustRequest(t, "GET", u+"/", nil)).Wait()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := readBody(t, resp); got != "ok" {
+		t.Fatalf("body %q", got)
+	}
+	if _, err := client.Go(mustRequest(t, "GET", u+"/hang", nil)).Wait(); !errors.Is(err, ErrResponseHeaderTimeout) {
+		t.Fatalf("a header that never came: %v", err)
 	}
 }

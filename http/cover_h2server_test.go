@@ -421,3 +421,64 @@ func TestCoverH2ServerBodyEndsAfterHeaderRejection(t *testing.T) {
 		t.Fatalf("served %q", path)
 	}
 }
+
+// A handler with no PingTimeout of its own waits DefaultPingTimeout for a
+// PING's answer.
+func TestCoverH2ServerDefaultPingTimeout(t *testing.T) {
+	if d := (&ServerHandler{}).pingTimeout(); d != DefaultPingTimeout {
+		t.Fatalf("pingTimeout %v, want %v", d, DefaultPingTimeout)
+	}
+}
+
+// OnWritable on a response whose stream the client has reset runs its
+// function at once, with why the stream went.
+func TestCoverH2ServerOnWritableAfterReset(t *testing.T) {
+	cancelled := make(chan struct{})
+	writable := make(chan error, 1)
+	addr := serve(t, NewHandler(HandlerFunc(func(c *Context) {
+		c.Retain()
+		c.OnCancel(func(error) { close(cancelled) })
+		c.WriteHeader(stdhttp.StatusOK)
+		_, _ = c.WriteString("streaming")
+		c.Flush()
+		go func() {
+			defer c.Release()
+			<-cancelled
+			if !c.OnWritable(func(err error) { writable <- err }) {
+				writable <- errors.New("OnWritable not armed on a reset stream")
+			}
+		}()
+	})))
+	tc := dialH2(t, addr)
+	tc.headers(1, true, get("/")...)
+	tc.readUntil(h2FrameHeaders)
+	tc.write(append(h2AppendFrameHeader(nil, h2FrameRSTStream, 0, 1, 4), 0, 0, 0, byte(H2Cancel)))
+	if err := cvH2sWait(t, writable); err == nil {
+		t.Fatal("OnWritable ran without the reset's error")
+	}
+}
+
+// A DATA frame larger than what is left of the connection's window is a
+// FLOW_CONTROL_ERROR for the connection, and one larger than its stream's
+// window, within the connection's, for the stream. Frames that large need a
+// MaxFrameSize past the window: the window never drops below half of itself
+// otherwise.
+func TestCoverH2ServerDataPastWindows(t *testing.T) {
+	post := []string{":method", "POST", ":scheme", "http", ":authority", "test", ":path", "/up"}
+	config := DefaultConfig()
+	config.HTTP2 = HTTP2Config{ConnWindow: h2DefaultWindow, MaxFrameSize: 1 << 17}
+	tc := dialH2(t, serve(t, NewHandlerWithConfig(config, echoHandler())))
+	tc.headers(1, false, post...)
+	tc.data(1, false, make([]byte, h2DefaultWindow+1))
+	if code := h2covGoAway(t, tc); code != H2FlowControlError {
+		t.Fatalf("GOAWAY %v, want FLOW_CONTROL_ERROR", code)
+	}
+
+	config.HTTP2 = HTTP2Config{StreamWindow: h2DefaultWindow, MaxFrameSize: 1 << 17}
+	tc = dialH2(t, serve(t, NewHandlerWithConfig(config, echoHandler())))
+	tc.headers(1, false, post...)
+	tc.data(1, false, make([]byte, h2DefaultWindow+1))
+	if code := h2covReset(t, tc, 1); code != H2FlowControlError {
+		t.Fatalf("RST_STREAM %v, want FLOW_CONTROL_ERROR", code)
+	}
+}
