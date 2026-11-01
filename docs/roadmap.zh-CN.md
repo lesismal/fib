@@ -19,7 +19,7 @@
 | Server push | 有意不做 | 主流浏览器都不启用 HTTP/3 push；客户端不发 `MAX_PUSH_ID`，`Context.Push` 返回 `http.ErrNotSupported`。预加载用 103 Early Hints（`WriteInterim`） | L | 不重估：浏览器侧已凉 |
 | DATAGRAM（RFC 9221）、WebTransport | 有意不做 | 依赖流式 stream 或不可靠数据报的 API，当前 handler 模型不支持；对端发来的 DATAGRAM 帧被当未知帧，连接以 `FRAME_ENCODING_ERROR` 关闭 | L | 要做实时媒体／游戏类服务时，且需要同时扩展 handler 模型 |
 | QUIC v2（RFC 9369）等其它版本 | 有意不做 | 部署上 version 1 已足够；客户端收到 Version Negotiation 直接失败 | S–M | 出现要求 v2 的部署环境 |
-| 接收方向再省一次拷贝 | 计划中未做 | 接收时 Engine 复制一次（复制进缓冲池），帧解析器只复制跨片段的帧与 body；要再省需要零拷贝投递，代价是生命周期管理 | M | 接收吞吐成为瓶颈时 |
+| 接收方向再省一次拷贝 | 有意不做 | 数据报原地解密，按序到达的 stream 数据直接以 Engine 池化副本的切片交出。pprof（Linux，HTTP/3 256 KiB 上传）显示 Engine 的这次拷贝占 0.68% CPU，API 要求的 body 拼接占 0.76%，而 AES-GCM 占 3.9%；零拷贝读最多省下那 0.68%，却要为共用一个 64 KiB 槽的 GRO 读引入引用计数，排队的数据报也会占住整个槽 | M | Engine 的拷贝进入 profile 前列时，例如 jumbo 帧或大量 GRO 接收 |
 | Interop Runner 的 `ecn`、`v2`、`connectionmigration` | 有意不做 | 直接来自上面三项；端点以 127 退出，runner 记为"不支持"而不是通过 | — | 同上 |
 
 ## 2. HTTP/2
