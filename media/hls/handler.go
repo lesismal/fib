@@ -18,9 +18,10 @@ import (
 
 // Defaults of HandlerConfig's zero fields.
 const (
-	DefaultIdleTimeout   = 30 * time.Second
-	DefaultWaitTimeout   = 10 * time.Second
-	DefaultRepublishWait = 10 * time.Second
+	DefaultIdleTimeout    = 30 * time.Second
+	DefaultWaitTimeout    = 10 * time.Second
+	DefaultRepublishWait  = 10 * time.Second
+	DefaultMaxPlayWaiters = 1024
 )
 
 // Media types of the playlists (RFC 8216 section 4).
@@ -57,6 +58,16 @@ type HandlerConfig struct {
 	// after a discontinuity rather than ending it. Default 10 s; negative
 	// ends the playlist when the publisher leaves.
 	RepublishWait time.Duration
+	// PlayWait lets a playlist request wait this long for a stream that
+	// has no publisher yet (hub.SubscribeOptions.StartWait): its Muxer
+	// starts at once and the request is answered with the first segment,
+	// up to PlayWait plus WaitTimeout, or 404 when no publisher came in
+	// time. Zero answers such a request 404 at once.
+	PlayWait time.Duration
+	// MaxPlayWaiters bounds the requests waiting for a publisher at once,
+	// over every stream; one past it is answered 503. Zero means
+	// DefaultMaxPlayWaiters.
+	MaxPlayWaiters int
 	// AllowOrigin, when set, is the Access-Control-Allow-Origin of every
 	// response, as "*", so that players on other origins may fetch.
 	AllowOrigin string
@@ -74,7 +85,9 @@ type HandlerConfig struct {
 //	<Prefix>p/media.m3u8  the media playlist
 //	<Prefix>p/init-*, seg-*, part-*   what the playlists name
 //
-// A stream the hub does not have is 404. A playlist request waits, without
+// A stream the hub has no publisher for is 404, unless PlayWait lets the
+// playlist request wait for one (MaxPlayWaiters of them at once). A
+// playlist request waits, without
 // holding a worker (http.Context.Retain), for the stream's first segment,
 // and with Low-Latency HLS for the segment or part _HLS_msn and _HLS_part
 // name; a request for the part a preload hint named waits for it too.
@@ -86,6 +99,8 @@ type Handler struct {
 	mu      sync.Mutex
 	streams map[streamKey]*entry
 	closed  bool
+	// playWaiters counts the requests waiting for a publisher.
+	playWaiters atomic.Int64
 }
 
 // streamKey names the Muxer of a stream in one format, an index into
@@ -121,6 +136,9 @@ func NewHandler(config HandlerConfig) *Handler {
 		config.RepublishWait = DefaultRepublishWait
 	} else if config.RepublishWait < 0 {
 		config.RepublishWait = 0
+	}
+	if config.MaxPlayWaiters <= 0 {
+		config.MaxPlayWaiters = DefaultMaxPlayWaiters
 	}
 	h := &Handler{config: config, streams: map[streamKey]*entry{}}
 	first := config.Muxer
@@ -190,8 +208,9 @@ func (h *Handler) muxer(path string, format int, c *http.Context) (*entry, error
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	e := h.streams[key]
-	if e != nil && e.m.Ended() && h.publishing(path) {
-		// A playlist that ended while its publisher came back: start over.
+	if e != nil && e.m.Ended() && (h.publishing(path) || h.config.PlayWait > 0 && e.m.unstarted()) {
+		// A playlist that ended while its publisher came back, or a wait
+		// for a publisher that ran out: start over.
 		delete(h.streams, key)
 		e.stop()
 		e = nil
@@ -200,10 +219,14 @@ func (h *Handler) muxer(path string, format int, c *http.Context) (*entry, error
 		e.last.Store(time.Now().UnixNano())
 		return e, nil
 	}
-	if h.closed || !h.publishing(path) {
+	if h.closed || h.config.PlayWait <= 0 && !h.publishing(path) {
 		return nil, errNoStream
 	}
 	if h.config.MaxStreams > 0 && len(h.streams) >= h.config.MaxStreams {
+		return nil, hub.ErrLimit
+	}
+	if h.playWaiters.Load() >= int64(h.config.MaxPlayWaiters) && !h.publishing(path) {
+		// No Muxer for a request that could not wait for its publisher.
 		return nil, hub.ErrLimit
 	}
 	mc := h.config.Muxer
@@ -216,7 +239,7 @@ func (h *Handler) muxer(path string, format int, c *http.Context) (*entry, error
 	if c.Request.URL != nil {
 		info.Query = c.Request.URL.RawQuery
 	}
-	sub, err := h.config.Hub.Subscribe(path, m, hub.SubscribeOptions{Info: info, Wait: h.config.RepublishWait})
+	sub, err := h.config.Hub.Subscribe(path, m, hub.SubscribeOptions{Info: info, Wait: h.config.RepublishWait, StartWait: h.config.PlayWait})
 	if err != nil {
 		return nil, err
 	}
@@ -245,12 +268,8 @@ func (h *Handler) file(path, name string) (*entry, error) {
 
 // publishing reports whether the hub has a publisher on path.
 func (h *Handler) publishing(path string) bool {
-	for _, s := range h.config.Hub.Streams() {
-		if s.Path == path {
-			return s.Publishing
-		}
-	}
-	return false
+	s, ok := h.config.Hub.Stream(path)
+	return ok && s.Publishing
 }
 
 // idle stops e when no request has come for IdleTimeout, and checks again
@@ -401,7 +420,19 @@ func (h *Handler) servePlaylist(c *http.Context, m *Muxer, index bool, media str
 		}
 		h.respond(c, stdhttp.StatusOK, PlaylistContentType, cachePlaylist, body)
 	}
-	h.block(c, m, msn, part, answer)
+	timeout, done := h.config.WaitTimeout, func() {}
+	if st.unstarted {
+		// The stream has no publisher yet: the request waits for one too,
+		// within MaxPlayWaiters.
+		if h.playWaiters.Add(1) > int64(h.config.MaxPlayWaiters) {
+			h.playWaiters.Add(-1)
+			h.respond(c, stdhttp.StatusServiceUnavailable, "", "", nil)
+			return
+		}
+		timeout += h.config.PlayWait
+		done = func() { h.playWaiters.Add(-1) }
+	}
+	h.block(c, m, msn, part, timeout, done, answer)
 }
 
 // blockingParams reads _HLS_msn and _HLS_part, -1 when absent.
@@ -440,7 +471,7 @@ func (h *Handler) serveFile(c *http.Context, m *Muxer, name string) {
 		h.notFound(c)
 		return
 	}
-	h.block(c, m, msn, part, answer)
+	h.block(c, m, msn, part, h.config.WaitTimeout, func() {}, answer)
 }
 
 // hold is a request waiting on a Muxer.
@@ -452,10 +483,11 @@ type hold struct {
 }
 
 // block answers c once msn and part are ready on m (msn < 0: once a segment
-// is), or WaitTimeout has passed, without holding the goroutine it runs on:
+// is), or timeout has passed, without holding the goroutine it runs on:
 // the request is retained and answered from the goroutine that wakes it. A
-// request whose connection goes first is released unanswered.
-func (h *Handler) block(c *http.Context, m *Muxer, msn, part int64, answer func(timedOut bool)) {
+// request whose connection goes first is released unanswered. done runs
+// once the request is let go, however.
+func (h *Handler) block(c *http.Context, m *Muxer, msn, part int64, timeout time.Duration, done func(), answer func(timedOut bool)) {
 	st := &hold{}
 	finish := func(answering, timedOut bool) {
 		st.mu.Lock()
@@ -472,6 +504,7 @@ func (h *Handler) block(c *http.Context, m *Muxer, msn, part int64, answer func(
 			answer(timedOut)
 		}
 		c.Release()
+		done()
 	}
 	c.Retain()
 	st.mu.Lock()
@@ -485,10 +518,11 @@ func (h *Handler) block(c *http.Context, m *Muxer, msn, part int64, answer func(
 			answer(false)
 		}
 		c.Release()
+		done()
 		return
 	}
 	st.w = w
-	st.timer = time.AfterFunc(h.config.WaitTimeout, func() { finish(true, true) })
+	st.timer = time.AfterFunc(timeout, func() { finish(true, true) })
 	st.mu.Unlock()
 	c.OnCancel(func(error) { finish(false, false) })
 }

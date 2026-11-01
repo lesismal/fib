@@ -37,7 +37,8 @@
 // RESOLUTION, naming media.m3u8; otherwise index.m3u8 is the media playlist.
 //
 // Handler is the fib/http glue: it starts a Muxer for a stream on the first
-// playlist request (404 when the hub has no such stream), stops it after
+// playlist request (404 when the hub has no publisher for it, unless
+// HandlerConfig.PlayWait lets the request wait for one), stops it after
 // IdleTimeout without requests, answers requests that must wait (the first
 // segment, a blocking reload, a hinted part) from the goroutine that
 // completes what they wait for, with the request retained rather than a

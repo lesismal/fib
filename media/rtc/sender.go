@@ -76,12 +76,16 @@ type sender struct {
 	lost atomic.Uint32
 	// onClose ends the session: the stream is gone or cannot be sent.
 	onClose func(err error)
+	// tracked is closed by the first OnTracks; closeErr is what OnClose
+	// was given.
+	tracked  chan struct{}
+	closeErr error
 }
 
 // newSender returns a sender with no tracks yet, which holds what it is
 // given until setTracks and start.
 func newSender(heldLimit int) *sender {
-	return &sender{heldLimit: heldLimit}
+	return &sender{heldLimit: heldLimit, tracked: make(chan struct{})}
 }
 
 // setTracks gives the sender the tracks it sends.
@@ -141,6 +145,11 @@ func (s *sender) mapTracks(streams []*av.Track) {
 func (s *sender) OnTracks(tracks []*av.Track) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	select {
+	case <-s.tracked:
+	default:
+		close(s.tracked)
+	}
 	s.mapTracks(tracks)
 	s.rebase = true
 	s.held, s.heldBytes = nil, 0
@@ -165,11 +174,19 @@ func (s *sender) OnClose(err error) {
 	s.mu.Lock()
 	s.closed = true
 	s.held = nil
+	s.closeErr = err
 	fn := s.onClose
 	s.mu.Unlock()
 	if fn != nil {
 		fn(err)
 	}
+}
+
+// err returns what OnClose was given, nil before it.
+func (s *sender) err() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.closeErr
 }
 
 // hold keeps pkt until the PeerConnection is connected: from the latest

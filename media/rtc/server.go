@@ -36,6 +36,7 @@ const (
 	DefaultMTU            = 1200
 	DefaultPLIInterval    = 500 * time.Millisecond
 	DefaultMaxOfferBytes  = 64 << 10
+	DefaultMaxPlayWaiters = 1024
 )
 
 const (
@@ -124,6 +125,15 @@ type Config struct {
 	// next publisher when its publisher leaves; zero means
 	// DefaultRepublishWait (10s), and a negative value ends it at once.
 	RepublishWait time.Duration
+	// PlayWait lets a WHEP offer wait this long for a stream that has no
+	// publisher yet (hub.SubscribeOptions.StartWait): it is answered once
+	// one arrives, or 404 when none does in time. Zero answers such an
+	// offer 404 at once.
+	PlayWait time.Duration
+	// MaxPlayWaiters bounds the offers waiting for a publisher at once;
+	// one past it is answered 503. Zero or less means
+	// DefaultMaxPlayWaiters (1024).
+	MaxPlayWaiters int
 	// NoGOPCache starts viewers at the next keyframe rather than at the
 	// hub's cached GOP.
 	NoGOPCache bool
@@ -191,6 +201,9 @@ func (c *Config) defaults() {
 	if c.MaxOfferBytes <= 0 {
 		c.MaxOfferBytes = DefaultMaxOfferBytes
 	}
+	if c.MaxPlayWaiters <= 0 {
+		c.MaxPlayWaiters = DefaultMaxPlayWaiters
+	}
 }
 
 // Server is a WHIP endpoint and a WHEP endpoint on a hub. It is a fib/http
@@ -208,6 +221,8 @@ type Server struct {
 	publishers map[string]*session
 	closed     bool
 	logged     [256]atomic.Bool
+	// playWaiters counts the WHEP offers waiting for a publisher.
+	playWaiters atomic.Int64
 }
 
 var _ fibhttp.Handler = (*Server)(nil)
@@ -339,18 +354,19 @@ func (s *Server) serveEndpoint(c *fibhttp.Context, kind Kind, path string) {
 		replyText(c, http.StatusBadRequest, "malformed offer")
 		return
 	}
-	sess := &session{s: s, kind: kind, path: path, id: newID()}
+	sess := &session{s: s, kind: kind, path: path, id: newID(), done: make(chan struct{})}
 	sess.etag = `"` + sess.id + `"`
 	if err := s.add(sess); err != nil {
 		replyText(c, http.StatusServiceUnavailable, "%s", err.Error())
 		return
 	}
 	desc := webrtc.SessionDescription{Type: webrtc.SDPTypeOffer, SDP: string(body)}
+	wait := false
 	sess.setup.Lock()
 	if kind == KindWHIP {
 		err = sess.startIngest(c, offer, desc)
-	} else {
-		err = sess.startEgress(c, offer, desc)
+	} else if wait, err = sess.subscribe(c); err == nil && !wait {
+		err = sess.startEgress(offer, desc)
 	}
 	sess.setup.Unlock()
 	if err != nil {
@@ -358,7 +374,55 @@ func (s *Server) serveEndpoint(c *fibhttp.Context, kind Kind, path string) {
 		s.fail(c, err)
 		return
 	}
+	if wait {
+		s.awaitPublisher(c, sess, offer, desc)
+		return
+	}
 	s.answer(c, sess)
+}
+
+// awaitPublisher answers a WHEP offer once its stream has a publisher,
+// from a goroutine of its own, with the request retained. The
+// subscription's StartWait bounds the wait: it running out, the client
+// hanging up or the server closing ends the session, and the offer is
+// answered as it failed.
+func (s *Server) awaitPublisher(c *fibhttp.Context, sess *session, offer *sdp.SessionDescription, desc webrtc.SessionDescription) {
+	var answered atomic.Bool
+	c.Retain()
+	c.OnCancel(func(error) {
+		if !answered.Load() {
+			go sess.close()
+		}
+	})
+	go func() {
+		defer c.Release()
+		select {
+		case <-sess.snd.tracked:
+		case <-sess.done:
+		}
+		s.playWaiters.Add(-1)
+		var err error
+		sess.setup.Lock()
+		select {
+		case <-sess.done:
+			// The wait ran out (hub.ErrNotFound), the hub closed, or
+			// the server closed or the client went, which no answer
+			// reaches.
+			if err = sess.snd.err(); err == nil {
+				err = errServerClosed
+			}
+		default:
+			err = sess.startEgress(offer, desc)
+		}
+		sess.setup.Unlock()
+		if err != nil {
+			sess.close()
+			s.fail(c, err)
+			return
+		}
+		answered.Store(true)
+		s.gather(c, sess)
+	}()
 }
 
 // fail answers a POST that could not be served.
@@ -371,7 +435,7 @@ func (s *Server) fail(c *fibhttp.Context, err error) {
 		status = http.StatusConflict
 	case errors.Is(err, hub.ErrNotFound):
 		status = http.StatusNotFound
-	case errors.Is(err, hub.ErrLimit), errors.Is(err, hub.ErrClosed):
+	case errors.Is(err, hub.ErrLimit), errors.Is(err, hub.ErrClosed), errors.Is(err, errServerClosed):
 		status = http.StatusServiceUnavailable
 	case errors.Is(err, webrtc.ErrDescription), errors.Is(err, webrtc.ErrSignalingState):
 		status = http.StatusBadRequest
@@ -397,14 +461,20 @@ func (s *Server) answer(c *fibhttp.Context, sess *session) {
 	c.Retain()
 	go func() {
 		defer c.Release()
-		t := time.NewTimer(s.config.GatherTimeout)
-		defer t.Stop()
-		select {
-		case <-sess.pc.GatheringComplete():
-		case <-t.C:
-		}
-		s.respondAnswer(c, sess)
+		s.gather(c, sess)
 	}()
+}
+
+// gather waits for the answer's candidates, up to GatherTimeout, and sends
+// it.
+func (s *Server) gather(c *fibhttp.Context, sess *session) {
+	t := time.NewTimer(s.config.GatherTimeout)
+	defer t.Stop()
+	select {
+	case <-sess.pc.GatheringComplete():
+	case <-t.C:
+	}
+	s.respondAnswer(c, sess)
 }
 
 func (s *Server) respondAnswer(c *fibhttp.Context, sess *session) {
@@ -489,7 +559,7 @@ func (s *Server) add(sess *session) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.closed {
-		return errors.New("rtc: server closed")
+		return errServerClosed
 	}
 	if s.config.MaxSessions > 0 && len(s.sessions) >= s.config.MaxSessions {
 		return errors.New("rtc: too many sessions")
@@ -532,6 +602,9 @@ func (s *Server) dropped(codec av.CodecID) {
 // errInternal marks a failure of the server's own making: 500.
 var errInternal = errors.New("rtc: internal error")
 
+// errServerClosed is a request the closing of the server ended: 503.
+var errServerClosed = errors.New("rtc: server closed")
+
 // session is one WHIP or WHEP session: a PeerConnection and what it
 // publishes into or plays from the hub.
 type session struct {
@@ -550,8 +623,10 @@ type session struct {
 	pub *hub.Publisher
 
 	// setup is held while the session is being set up, which whatever
-	// ends or starts it from another goroutine waits for.
+	// ends or starts it from another goroutine waits for. done is closed
+	// when the session is.
 	setup     sync.Mutex
+	done      chan struct{}
 	connected atomic.Bool
 	timer     *time.Timer
 	closeOnce sync.Once
@@ -671,9 +746,9 @@ func (sess *session) startIngest(c *fibhttp.Context, offer *sdp.SessionDescripti
 	return nil
 }
 
-// startEgress sets up a WHEP session: a subscription to the stream, and a
-// PeerConnection that sends the tracks of it WebRTC can carry.
-func (sess *session) startEgress(c *fibhttp.Context, offer *sdp.SessionDescription, desc webrtc.SessionDescription) error {
+// subscribe starts a WHEP session with a subscription to the stream,
+// reporting whether the session is to wait for its publisher.
+func (sess *session) subscribe(c *fibhttp.Context) (bool, error) {
 	s := sess.s
 	snd := newSender(s.config.MaxHeldBytes)
 	snd.onClose = func(error) { go sess.close() }
@@ -689,17 +764,33 @@ func (sess *session) startEgress(c *fibhttp.Context, offer *sdp.SessionDescripti
 	sub, err := s.config.Hub.Subscribe(sess.path, sink, hub.SubscribeOptions{
 		Info:       hub.SubscribeInfo{Protocol: "whep", Remote: c.Conn.RemoteAddrPort(), Query: c.Request.URL.RawQuery},
 		Wait:       wait,
+		StartWait:  s.config.PlayWait,
 		NoGOPCache: s.config.NoGOPCache,
 	})
 	if err != nil {
-		return err
+		return false, err
 	}
 	sess.sub = sub
-	streams := snd.Streams()
-	if streams == nil {
-		// Waiting is for a republish, not for a stream that is not there.
-		return hub.ErrNotFound
+	if snd.Streams() != nil {
+		return false, nil
 	}
+	if s.config.PlayWait <= 0 {
+		// Waiting is for a republish, not for a stream that is not there.
+		return false, hub.ErrNotFound
+	}
+	if s.playWaiters.Add(1) > int64(s.config.MaxPlayWaiters) {
+		s.playWaiters.Add(-1)
+		return false, hub.ErrLimit
+	}
+	return true, nil
+}
+
+// startEgress goes on with a WHEP session whose stream has tracks: a
+// PeerConnection that sends those of them WebRTC can carry.
+func (sess *session) startEgress(offer *sdp.SessionDescription, desc webrtc.SessionDescription) error {
+	s := sess.s
+	snd := sess.snd
+	streams := snd.Streams()
 	outs, codecs := planEgress(streams, offer, s.config.MTU, s.dropped)
 	if len(outs) == 0 {
 		return ErrNoMedia
@@ -788,6 +879,9 @@ func (sess *session) close() {
 	sess.closeOnce.Do(func() {
 		sess.setup.Lock()
 		defer sess.setup.Unlock()
+		if sess.done != nil {
+			close(sess.done)
+		}
 		sess.s.remove(sess)
 		if sess.timer != nil {
 			sess.timer.Stop()
