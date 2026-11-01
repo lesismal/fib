@@ -60,7 +60,7 @@
 | transport-wide 拥塞控制反馈与带宽估计 | 有意不做 | PeerConnection 只转发 RTP，没有可调节的编码器；SFU 把码率控制交给两端的浏览器，REMB 可以经 `WriteRTCP` 发送 | L | 有自带编码器的 Go 发送端，或需要按观看者自适应的 SFU |
 | RTX、FEC 与应答 NACK | 有意不做 | 修复需要每条流保存已发送的包，有大量对端的服务端要为每一个都付这份内存；不提供 RTX | M | 丢包路径上靠 PLI 恢复关键帧太慢时 |
 | 发送 simulcast | 有意不做 | 按 RID 接收已支持，这正是 SFU 需要的；发送多层意味着每层一个编码器 | M | 有发送 simulcast 的 Go 发布端 |
-| 基于 TCP 的 ICE（RFC 6544），PeerConnection 自己的 TURN 客户端走 TCP/TLS | 有意不做 | 服务端有公网 UDP 端口时浏览器用不到。turnserver 和 turn.Client 已支持 TCP 与 TLS，封锁 UDP 的网络里的浏览器可经 `turns:` 连到服务端；只有 PeerConnection 自己的 TURN 客户端仍只经 UDP 访问 TURN（不接受 `turns:` 和 `?transport=tcp` 的 URL） | M | 部署在封锁 UDP 的防火墙之后 |
+| 基于 TCP 的 ICE（RFC 6544） | 有意不做 | 服务端有公网 UDP 端口时浏览器用不到；封锁 UDP 的网络里的浏览器可经 TCP 或 TLS 上的 TURN 连到服务端（turnserver 两者都支持，PeerConnection 自己的 TURN 客户端也支持 UDP、TCP 与 TLS） | M | 部署在封锁 UDP 的防火墙之后 |
 | DTLS 1.3 | 有意不做 | 所有浏览器都支持 DTLS 1.2，这也是 WebRTC 目前的要求 | L | 浏览器要求 DTLS 1.3 |
 | 解析 host candidate 的 mDNS 名字 | 有意不做 | 浏览器的检查本来就会以 peer-reflexive candidate 暴露它的地址，lite 服务端不需要更多 | S | 同一局域网内两个都用 mDNS 的 full agent 要在没有 STUN 时连通 |
 | provisional answer 与 rollback | 有意不做 | glare 处理属于信令；WHIP、WHEP 都用不到 | S | 应用需要双方同时发起协商 |
