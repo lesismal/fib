@@ -257,10 +257,11 @@ func TestStreamBounds(t *testing.T) {
 	if s.Allocations() != 1 || countStreams(s) != 1 {
 		t.Fatalf("%d allocations, %d streams after the idle timeout", s.Allocations(), countStreams(s))
 	}
-	// Closed with the server.
+	// Closed with the server: once the server has it, beside the stream
+	// that holds the allocation, or Close may run before it is accepted.
 	c = dialStream(t, addr, false)
 	deadline := time.Now().Add(5 * time.Second)
-	for countStreams(s) == 0 && time.Now().Before(deadline) {
+	for countStreams(s) < 2 && time.Now().Before(deadline) {
 		time.Sleep(5 * time.Millisecond)
 	}
 	s.Close()
