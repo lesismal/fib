@@ -295,6 +295,14 @@ func (s *RTPSender) OnKeyFrameRequest(fn func()) { s.onKeyFrame.Store(&fn) }
 
 func (s *RTPSender) hasTrack() bool { return s != nil && s.track != nil }
 
+// reportClock returns the report clock of the track sent, if it has one.
+func (s *RTPSender) reportClock() *reportClock {
+	if s.track == nil {
+		return nil
+	}
+	return s.track.clock.Load()
+}
+
 func (s *RTPSender) setPayloadType(pt uint8) { s.pt = pt }
 
 // detach stops sending the track. It runs under the PeerConnection's
@@ -317,6 +325,13 @@ type TrackLocal struct {
 	senders      atomic.Pointer[[]*RTPSender]
 	mu           sync.Mutex
 	srcExt       atomic.Pointer[[256]string]
+	clock        atomic.Pointer[reportClock]
+}
+
+// reportClock says RTP timestamp ts was sampled at wall time wall.
+type reportClock struct {
+	wall time.Time
+	ts   uint32
 }
 
 // NewTrackLocal returns a track of codec, whose MimeType at least is set,
@@ -357,6 +372,27 @@ func (t *TrackLocal) SetHeaderExtensions(ids map[string]uint8) {
 		m[id] = uri
 	}
 	t.srcExt.Store(&m)
+}
+
+// SetReportClock says RTP timestamp ts of the packets written to the track
+// is sampled at wall time wall, and the timestamps go on from there with
+// it: the sender reports of the track then map wall time to RTP time by
+// it. A sender of several tracks gives each the same wall time for the
+// same media time, so that the reports put the tracks on one clock, which
+// is what lets a receiver line them up. Without it, a report takes the
+// timestamp of the latest packet sent as sampled when it was sent, which
+// is off by however late that packet went, and by its composition offset
+// for video with B-frames.
+func (t *TrackLocal) SetReportClock(wall time.Time, ts uint32) {
+	t.clock.Store(&reportClock{wall: wall, ts: ts})
+}
+
+// rtpTime returns the RTP timestamp of wall time now, of a clock of rate
+// Hz, by the report clock.
+func (c *reportClock) rtpTime(now time.Time, rate uint32) uint32 {
+	d := now.Sub(c.wall)
+	ticks := int64(d/time.Second)*int64(rate) + int64(d%time.Second)*int64(rate)/int64(time.Second)
+	return c.ts + uint32(ticks)
 }
 
 func (t *TrackLocal) codecMatches(c Codec) bool {
@@ -773,6 +809,9 @@ func (pc *PeerConnection) sendReports(now time.Time) {
 			continue
 		}
 		rtpTime := s.lastTS + uint32(now.Sub(s.lastAt).Seconds()*float64(s.clockRate))
+		if c := s.reportClock(); c != nil {
+			rtpTime = c.rtpTime(now, s.clockRate)
+		}
 		sr := rtp.SenderReport{SSRC: s.ssrc, NTPTime: rtp.NTPTime(now), RTPTime: rtpTime, PacketCount: s.packets, OctetCount: s.octets}
 		buf, _ = sr.Append(buf)
 	}

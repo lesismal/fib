@@ -405,6 +405,11 @@ func (c *Client) connect(tracks []*av.Track) {
 				r.onTrack(tr)
 			}
 		})
+		pc.OnRTCP(func(pkt []byte) {
+			if r := c.rcv.Load(); r != nil {
+				r.onRTCP(pkt)
+			}
+		})
 		for _, kind := range []webrtc.MediaKind{webrtc.MediaKindVideo, webrtc.MediaKindAudio} {
 			if _, err := pc.AddTransceiver(kind, webrtc.DirectionRecvOnly); err != nil {
 				c.finish(err)

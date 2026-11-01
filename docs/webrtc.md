@@ -456,7 +456,11 @@ sender.OnKeyFrameRequest(func() {
 
 The PeerConnection sends sender reports for what it sends and receiver reports
 for what it receives every `RTCPReportInterval` (1s; negative turns them off)
-while media flows. A PLI or FIR from the peer for a stream this side sends
+while media flows. A sender report maps wall time to RTP time by the track's
+`SetReportClock(wall, ts)`, which says timestamp `ts` was sampled at `wall`; a
+sender of several tracks gives them all the same wall time for the same media
+time, so that a receiver can line them up. Without it, a report takes the
+latest packet's timestamp as sampled when the packet went. A PLI or FIR from the peer for a stream this side sends
 calls that `RTPSender`'s `OnKeyFrameRequest`; `TrackRemote.RequestKeyFrame`
 sends a PLI and `RequestFIR` a FIR. Every compound RTCP packet the peer sends
 also reaches `OnRTCP`, decrypted, and `WriteRTCP` sends any the `rtp` package

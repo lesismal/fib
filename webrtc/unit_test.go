@@ -11,6 +11,7 @@ import (
 
 	"github.com/lesismal/fib/tls"
 	"github.com/lesismal/fib/webrtc/ice"
+	"github.com/lesismal/fib/webrtc/rtp"
 	"github.com/lesismal/fib/webrtc/sdp"
 	"github.com/lesismal/fib/webrtc/srtp"
 	"github.com/lesismal/fib/webrtc/stun"
@@ -433,5 +434,40 @@ func TestReceiverReportLimit(t *testing.T) {
 	}
 	if reported != 31 {
 		t.Fatalf("%d streams reported", reported)
+	}
+}
+
+// TestReportClock maps a sender report's wall time to RTP time by the
+// track's report clock when it has one, and from the last packet sent
+// when it has none.
+func TestReportClock(t *testing.T) {
+	out, _ := srtpPair(t)
+	wall := time.Unix(1700000000, 0)
+	track := NewTrackLocal(Codec{MimeType: "audio/opus", ClockRate: 48000}, "a", "s")
+	s := &RTPSender{ssrc: 7, pt: 111, clockRate: 48000, packets: 1, lastTS: 5, lastAt: wall, track: track}
+	pc := &PeerConnection{srtpOut: out, transceivers: []*Transceiver{{sender: s}}}
+	report := func(now time.Time) uint32 {
+		t.Helper()
+		pc.sendReports(now)
+		_, p, _, err := rtp.NextRTCP(pc.rtcpBuf[:cap(pc.rtcpBuf)])
+		var sr rtp.SenderReport
+		if err != nil || sr.Unmarshal(p) != nil || sr.SSRC != 7 {
+			t.Fatalf("no sender report: %v", err)
+		}
+		return sr.RTPTime
+	}
+	if ts := report(wall.Add(time.Second)); ts != 5+48000 {
+		t.Fatalf("from the last packet: %d", ts)
+	}
+	track.SetReportClock(wall.Add(-2*time.Second), 1<<32-48000)
+	if ts := report(wall.Add(1500 * time.Millisecond)); ts != 48000*5/2 {
+		t.Fatalf("by the clock: %d", ts)
+	}
+	if ts := report(wall.Add(-3 * time.Second)); ts != 1<<32-48000*2 {
+		t.Fatalf("before the clock: %d", ts)
+	}
+	s.track = nil
+	if s.reportClock() != nil {
+		t.Fatal("a clock with no track")
 	}
 }

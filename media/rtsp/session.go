@@ -15,6 +15,7 @@ import (
 	"github.com/lesismal/fib/internal/outputwait"
 	"github.com/lesismal/fib/media/av"
 	"github.com/lesismal/fib/media/hub"
+	"github.com/lesismal/fib/media/internal/lipsync"
 	"github.com/lesismal/fib/media/rtpcodec"
 	"github.com/lesismal/fib/webrtc/rtp"
 )
@@ -57,7 +58,7 @@ type session struct {
 	pub         *hub.Publisher
 	pubTracks   []*av.Track
 	recordStart time.Time
-	sync        lipSync
+	sync        lipsync.Session
 }
 
 // stream is one stream of a session, as SETUP set it up.
@@ -89,7 +90,7 @@ type stream struct {
 	reorder   *rtpcodec.Reorder
 	pubIndex  int
 	originSet bool
-	sr        senderClock
+	sr        lipsync.Clock
 	pkt       rtp.Packet
 }
 
@@ -356,11 +357,11 @@ func (s *session) onInterleaved(now time.Time, m *Interleaved) {
 }
 
 // receiveRTCP takes an RTCP packet of a stream. A recorder's sender
-// reports line its streams up (lipSync); the rest, and a player's receiver
+// reports line its streams up (lipsync.Session); the rest, and a player's receiver
 // reports, only show the client is there.
 func (s *session) receiveRTCP(st *stream, now time.Time, b []byte) {
 	if st.dp != nil {
-		st.sr.update(b)
+		st.sr.Update(b)
 	} else if s.player != nil && !st.tcp {
 		s.player.receiverReport(st, b, now)
 	}
@@ -387,7 +388,7 @@ func (s *session) receiveRTP(st *stream, now time.Time, b []byte) {
 func (s *session) depacketize(st *stream, now time.Time, p *rtp.Packet) {
 	if !st.originSet {
 		st.originSet = true
-		at := s.sync.origin(st.sr, p.Timestamp, st.format.ClockRate, recordEpoch+now.Sub(s.recordStart))
+		at := s.sync.Origin(st.sr, p.Timestamp, st.format.ClockRate, recordEpoch+now.Sub(s.recordStart))
 		st.dp.SetOrigin(p.Timestamp, at)
 	}
 	_ = st.dp.Depacketize(p, func(pkt *av.Packet) {

@@ -242,7 +242,11 @@ func (s *sender) send(pkt *av.Packet) {
 		s.started = true
 		s.offset = sendEpoch - pkt.DTS
 		for _, o := range s.tracks {
+			// One clock for every track's sender reports, as RTSP's
+			// player has: the first packet's time is now, and the times
+			// go on with the wall clock from there.
 			o.pk.SetOrigin(0)
+			o.local.SetReportClock(now, o.pk.Timestamp(sendEpoch))
 		}
 	} else if s.rebase {
 		// The first packet after a change of tracks, as a republish
