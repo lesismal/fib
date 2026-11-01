@@ -359,21 +359,28 @@ func TestCoverAsyncBodyNilUnwritten(t *testing.T) {
 	}
 }
 
+// cvAsyncAborted is a cvAsyncFunc that reports its Abort.
+type cvAsyncAborted struct {
+	cvAsyncFunc
+	aborted chan error
+}
+
+func (a cvAsyncAborted) Abort(err error) { a.aborted <- err }
+
 // A filter whose output is more than the connection takes at once pauses
 // until the client has taken it, and fails the response when the client
 // goes first.
 func TestCoverAsyncBodyOutputPaced(t *testing.T) {
 	big := bytes.Repeat([]byte("z"), 16<<20)
-	cancelled := make(chan error, 3)
+	aborted := make(chan error, 3)
 	addr := serveHTTP1(t, func(c *Context) {
-		c.OnCancel(func(err error) { cancelled <- err })
 		c.OnBodyFilterAsync(func(int, stdhttp.Header) AsyncBodyFilter {
-			return cvAsyncFunc(func(p []byte, end bool) ([]byte, error) {
+			return cvAsyncAborted{cvAsyncFunc(func(p []byte, end bool) ([]byte, error) {
 				if end {
 					return p, nil
 				}
 				return big, nil
-			})
+			}), aborted}
 		})
 		_, _ = c.WriteString("a")
 		c.Flush()
@@ -389,8 +396,15 @@ func TestCoverAsyncBodyOutputPaced(t *testing.T) {
 	conn.send("GET / HTTP/1.1\r\nHost: test\r\n\r\n")
 	conn.head()
 	conn.Close()
+	// The response ends without its body's end, so the filter is aborted,
+	// whichever the server hears first: the close, which cancels the
+	// request, or a send failing on the closed socket, which fails the
+	// response and ends the request with it, OnCancel never running.
 	select {
-	case <-cancelled:
+	case err := <-aborted:
+		if err == nil {
+			t.Fatal("the filter was aborted without a reason")
+		}
 	case <-time.After(10 * time.Second):
 		t.Fatal("the response did not end with its client gone")
 	}
