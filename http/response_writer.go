@@ -128,6 +128,18 @@ func (w *responseWriter) fail(err error) error {
 	return err
 }
 
+// failed returns the error that failed the response, or nil. An
+// OnHeaderAsync hook's resume may fail the response from a goroutine of its
+// own, under the hook's lock, so a response with such a hook is read under
+// it too.
+func (w *responseWriter) failed() error {
+	if a := w.asyncHeader(); a != nil {
+		a.mu.Lock()
+		defer a.mu.Unlock()
+	}
+	return w.err
+}
+
 // reset clears the writer for its Context's next request. Of what it held
 // it keeps only its hooks' storage, emptied, for that request's hooks.
 func (w *responseWriter) reset() {
@@ -236,8 +248,8 @@ func (c *Context) Write(p []byte) (int, error) {
 		n, _, err := c.writeAsync(b, p, true)
 		return n, err
 	}
-	if w.err != nil {
-		return 0, w.err
+	if err := w.failed(); err != nil {
+		return 0, err
 	}
 	if w.status == 0 {
 		c.WriteHeader(stdhttp.StatusOK)
@@ -359,8 +371,8 @@ func (c *Context) WriteNoWait(p []byte) (above bool, err error) {
 		_, above, err := c.writeAsync(b, p, false)
 		return above, err
 	}
-	if w.err != nil {
-		return false, w.err
+	if err := w.failed(); err != nil {
+		return false, err
 	}
 	if w.status == 0 {
 		c.WriteHeader(stdhttp.StatusOK)
@@ -515,8 +527,8 @@ func (c *Context) FlushError() error {
 		return ErrResponseWritten
 	}
 	w := c.writer()
-	if w.err != nil {
-		return w.err
+	if err := w.failed(); err != nil {
+		return err
 	}
 	if ctxState(c.word.Load()) == ctxCancelled {
 		// The connection, or the stream, went under the response: a write
@@ -530,9 +542,8 @@ func (c *Context) FlushError() error {
 	if w.status == 0 {
 		c.WriteHeader(stdhttp.StatusOK)
 	}
-	if w.finished || c.holdsWhole() {
-		return nil
-	}
+	// A held header is settled first: its resume, on another goroutine,
+	// may finish the response, failed, until held reports it has run.
 	if a := w.asyncHeader(); a != nil {
 		if a.held() {
 			return nil
@@ -540,6 +551,9 @@ func (c *Context) FlushError() error {
 		if w.err != nil {
 			return w.err
 		}
+	}
+	if w.finished || c.holdsWhole() {
+		return nil
 	}
 	if b := w.asyncBody(); b != nil {
 		return c.flushAsync(b)

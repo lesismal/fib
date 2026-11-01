@@ -154,6 +154,59 @@ func TestOnHeaderAsyncFails(t *testing.T) {
 	}
 }
 
+// TestOnHeaderAsyncFailsWhileWriting has a hook's resume fail the response
+// on another goroutine while the handler goes on writing and flushing, which
+// must not race: every write after the failure reports it.
+func TestOnHeaderAsyncFailsWhileWriting(t *testing.T) {
+	failed := make(chan error, 1)
+	addr := serve(t, NewHandler(HandlerFunc(func(c *Context) {
+		start := make(chan struct{})
+		c.OnHeaderAsync(func(status int, h stdhttp.Header, resume func(error)) {
+			go func() {
+				<-start
+				resume(io.ErrUnexpectedEOF)
+			}()
+		})
+		c.WriteHeader(stdhttp.StatusOK)
+		c.Flush()
+		close(start)
+		var err error
+		for i := 0; i < 1000 && err == nil; i++ {
+			switch i % 3 {
+			case 0:
+				_, err = c.Write([]byte("x"))
+			case 1:
+				_, err = c.WriteNoWait([]byte("x"))
+			default:
+				err = c.FlushError()
+			}
+			runtime.Gosched()
+		}
+		for err == nil {
+			// Held, the writes went on; once the resume has run, they fail.
+			_, err = c.Write([]byte("x"))
+			runtime.Gosched()
+		}
+		failed <- err
+	})))
+	for _, client := range hookClients(t) {
+		resp, err := client.Get("http://" + addr + "/")
+		if err == nil {
+			body, _ := io.ReadAll(resp.Body)
+			resp.Body.Close()
+			t.Fatalf("%s answered %d %q", client.proto, resp.StatusCode, body)
+		}
+		select {
+		case err := <-failed:
+			if err != io.ErrUnexpectedEOF {
+				t.Errorf("%s: the handler's writes failed with %v, want %v", client.proto, err, io.ErrUnexpectedEOF)
+			}
+		case <-time.After(10 * time.Second):
+			t.Fatalf("%s: the handler never saw its response fail", client.proto)
+		}
+	}
+}
+
 // TestOnHeaderAsyncNoWait checks that WriteNoWait reports above once more
 // than is held is written while the header is held, and that the function
 // OnWritable is given then runs once the resume has sent it.
