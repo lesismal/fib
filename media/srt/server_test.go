@@ -352,6 +352,29 @@ func TestPublishReserved(t *testing.T) {
 	}
 }
 
+// TestPublishTaken covers a publisher OnSession takes: the path it
+// reserved is released.
+func TestPublishTaken(t *testing.T) {
+	serverHub := hub.New(hub.Config{})
+	taken := make(chan struct{})
+	_, addr, _ := startServer(t, ServerConfig{Hub: serverHub, OnSession: func(*Session) bool {
+		close(taken)
+		return true
+	}})
+	client := startEngine(t)
+	if _, err := Dial(client, addr, ClientConfig{StreamID: "#!::r=t,m=publish"}); err != nil {
+		t.Fatal(err)
+	}
+	<-taken
+	deadline := time.Now().Add(5 * time.Second)
+	for len(serverHub.Streams()) != 0 {
+		if time.Now().After(deadline) {
+			t.Fatalf("%+v", serverHub.Streams())
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
 func TestPublishReject(t *testing.T) {
 	for _, tc := range []struct {
 		err  error
