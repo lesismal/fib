@@ -1,0 +1,46 @@
+// Package hub joins the protocols of fib's media stack: a registry of
+// streams by path, each fed by one Publisher and fanned out to any number
+// of subscribers, so a stream an RTMP encoder publishes plays over RTSP,
+// HTTP-FLV, HLS or WebRTC. Packets are in the canonical form of package
+// av, and no protocol knows about another.
+//
+// A protocol's ingest calls Hub.Publish with the stream's tracks, then
+// Publisher.WritePacket for every access unit, and Publisher.Close when
+// the publisher leaves. An egress calls Hub.Subscribe with a Sink, which
+// hears OnTracks, then OnPacket for every packet, and OnClose at the end.
+// Config's hooks (OnPublish, OnSubscribe) are where authentication goes,
+// for every protocol at once.
+//
+// Fan-out is synchronous: each stream has one mutex, and WritePacket calls
+// every sink's OnPacket under it, from the publisher's goroutine, usually
+// a fib worker. A sink therefore must not block (it queues onto its
+// connection and drops when that is too far behind, as NewDropper does)
+// and must not call into the hub, with one exception: Subscription.Close
+// never blocks and may be called from anywhere, a sink's own callbacks
+// included, because it only marks the subscription when the stream's
+// mutex is busy and leaves the unlinking to whoever holds it. The hub's
+// hooks are called without any of its locks held.
+//
+// Each stream keeps a GOP cache so a new subscriber starts at once with a
+// picture rather than waiting for the next keyframe: a stream with video
+// keeps every packet from the last video keyframe on (audio included);
+// an audio-only stream keeps its last second. The cache is bounded by
+// Config.GOPCacheBytes: a GOP that outgrows it is dropped and caching
+// resumes at the next keyframe. Subscribe delivers OnTracks and the cache
+// under the stream's mutex, so the subscriber's packets continue it with
+// nothing lost or out of order. A subscriber without a cache to start
+// from (NoGOPCache, or a cache dropped) gets video from the next keyframe
+// and audio at once.
+//
+// A subscription with SubscribeOptions.Wait may exist before its
+// publisher, which is how a player that connects first, or a relay that
+// reconnects, keeps its place: it hears OnTracks when a publisher
+// arrives, survives the publisher leaving for up to Wait, and hears
+// OnTracks again from the next one. Packet times are the publisher's own;
+// a republish may restart them.
+//
+// Everything is bounded: the cache by GOPCacheBytes, streams by
+// MaxStreams, subscriptions by MaxSubscribersPerStream, and each sink's
+// queue by the sink itself. A stream with neither publisher nor
+// subscription leaves the registry.
+package hub
