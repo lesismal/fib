@@ -473,6 +473,64 @@ func (discardSink) Send([]byte) error { return nil }
 func (discardSink) End() error        { return nil }
 func (discardSink) Fail(error)        {}
 
+// CloseWithTrailer ends the body with its own trailer in place of the
+// request's, unless the body had already been closed.
+func TestPusherCloseWithTrailer(t *testing.T) {
+	fallback := stdhttp.Header{"X-Request": {"1"}}
+	p := NewPusher(0)
+	if got := p.Trailer(fallback); got.Get("X-Request") != "1" {
+		t.Fatalf("Trailer before any = %v", got)
+	}
+	_ = p.CloseWithTrailer(stdhttp.Header{"X-Body": {"2"}})
+	if got := p.Trailer(fallback); got.Get("X-Body") != "2" {
+		t.Fatalf("Trailer = %v, want the body's", got)
+	}
+	p = NewPusher(0)
+	_ = p.Close()
+	_ = p.CloseWithTrailer(stdhttp.Header{"X-Body": {"2"}})
+	if got := p.Trailer(fallback); got.Get("X-Request") != "1" {
+		t.Fatalf("Trailer after a close = %v, want the request's", got)
+	}
+}
+
+// Pieces queued before the sink came are sent from pump: one past the
+// declared length fails the request, and a sink whose Send fails ends the
+// pumping, leaving the failure to the transport.
+func TestPusherQueuedBeforeAttach(t *testing.T) {
+	p := NewPusher(0)
+	_, _ = p.Write([]byte("abc"))
+	sink := &fakeSink{room: true}
+	_ = p.Attach(sink, 2)
+	if got, _, failed, _ := sink.state(); got != "" || failed == nil ||
+		!strings.Contains(failed.Error(), "ContentLength=2 with Body length at least 3") {
+		t.Fatalf("sent %q, failed %v", got, failed)
+	}
+
+	p = NewPusher(0)
+	_, _ = p.Write([]byte("abc"))
+	_, _ = p.Write([]byte("def"))
+	sink = &fakeSink{room: true, sendErr: errors.New("broken pipe")}
+	_ = p.Attach(sink, -1)
+	_ = p.Close()
+	if _, ends, failed, _ := sink.state(); ends != 0 || failed != nil {
+		t.Fatalf("ends %d, failed %v after the transport failed", ends, failed)
+	}
+}
+
+// A Write that finds the body stopped once the sink has said it has room
+// sends nothing.
+func TestPusherWriteStoppedAtRoom(t *testing.T) {
+	p := NewPusher(0)
+	stopper := &stopOnRoom{p: p}
+	_ = p.Attach(stopper, -1)
+	if _, err := p.Write([]byte("abc")); err != nil {
+		t.Fatal(err)
+	}
+	if stopper.sent != 0 {
+		t.Fatalf("sent %d bytes of a stopped body", stopper.sent)
+	}
+}
+
 // BenchmarkPusherWrite is a producer whose transport keeps up, writing
 // 64 KiB at a time.
 func BenchmarkPusherWrite(b *testing.B) {
