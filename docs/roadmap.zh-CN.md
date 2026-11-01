@@ -58,7 +58,7 @@
 | 项 | 状态 | 原因 | 成本 | 何时重估 |
 | --- | --- | --- | --- | --- |
 | transport-wide 拥塞控制反馈与带宽估计 | 有意不做 | PeerConnection 只转发 RTP，没有可调节的编码器；SFU 把码率控制交给两端的浏览器，REMB 可以经 `WriteRTCP` 发送 | L | 有自带编码器的 Go 发送端，或需要按观看者自适应的 SFU |
-| RTX、FEC 与应答 NACK | 有意不做 | 修复需要每条流保存已发送的包，有大量对端的服务端要为每一个都付这份内存；不提供 RTX | M | 丢包路径上靠 PLI 恢复关键帧太慢时 |
+| FEC，以及 fib 接收端发送 NACK | 有意不做 | NACK 已由每个 track 的发送历史应答，协商了 RTX 时用 RTX 重传（`Configuration.Retransmit`，默认关闭；media/rtc 的 WHEP 默认开启，每个 track 256 个包）。不提供 FEC（ulpfec、flexfec、red），fib 也不为收到的流发送 NACK（应用可以用 `rtp.NACK` 和 `WriteRTCP` 自己发） | M | 丢包太高或往返太长、重传来不及的路径 |
 | 发送 simulcast | 有意不做 | 按 RID 接收已支持，这正是 SFU 需要的；发送多层意味着每层一个编码器 | M | 有发送 simulcast 的 Go 发布端 |
 | 基于 TCP 的 ICE（RFC 6544） | 有意不做 | 服务端有公网 UDP 端口时浏览器用不到；封锁 UDP 的网络里的浏览器可经 TCP 或 TLS 上的 TURN 连到服务端（turnserver 两者都支持，PeerConnection 自己的 TURN 客户端也支持 UDP、TCP 与 TLS） | M | 部署在封锁 UDP 的防火墙之后 |
 | DTLS 1.3 | 有意不做 | 所有浏览器都支持 DTLS 1.2，这也是 WebRTC 目前的要求 | L | 浏览器要求 DTLS 1.3 |
