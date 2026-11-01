@@ -846,19 +846,29 @@ func TestServerRecordUDP(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer uc.Close()
+	// The client's RTCP port is a socket of its own, named in the Transport:
+	// left to be RTP+1, it may be the very port the kernel gives nat below
+	// (Windows hands ephemeral ports out in order), whose RTP would then be
+	// taken for the client's RTCP.
+	ucRTCP, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ucRTCP.Close()
 	nat, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer nat.Close()
 	port := uc.LocalAddr().(*net.UDPAddr).Port
+	rtcpPort := ucRTCP.LocalAddr().(*net.UDPAddr).Port
 	r := dialRaw(t, base)
 	expect(t, r.do(MethodAnnounce, base+"udp", "Content-Type: application/sdp", "Body: "+testSDP), StatusOK)
 	expect(t, r.do(MethodSetup, base+"udp/streamid=0", "Transport: RTP/AVP;unicast;client_port=1-2;mode=record"), StatusOK)
-	resp := r.do(MethodSetup, base+"udp/streamid=1", "Transport: RTP/AVP;unicast;client_port="+strconv.Itoa(port)+";ssrc=000000AA;mode=record")
+	resp := r.do(MethodSetup, base+"udp/streamid=1", "Transport: RTP/AVP;unicast;client_port="+strconv.Itoa(port)+"-"+strconv.Itoa(rtcpPort)+";ssrc=000000AA;mode=record")
 	expect(t, resp, StatusOK)
 	ts := ParseTransports(resp.Header.Get("Transport"))
-	if ts[0].ServerPort[0] != rtpPort || ts[0].ClientPort != [2]int{port, port + 1} {
+	if ts[0].ServerPort[0] != rtpPort || ts[0].ClientPort != [2]int{port, rtcpPort} {
 		t.Fatal(resp.Header)
 	}
 	expect(t, r.do(MethodRecord, base+"udp"), StatusOK)
