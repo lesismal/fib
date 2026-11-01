@@ -44,12 +44,16 @@
 // publisher, which is how a player that connects first, or a relay that
 // reconnects, keeps its place: it hears OnTracks when a publisher
 // arrives, survives the publisher leaving for up to Wait, and hears
-// OnTracks again from the next one. Packet times are the publisher's own;
-// a republish may restart them.
+// OnTracks again from the next one. SubscribeOptions.StartWait, when set,
+// bounds the wait for the first publisher apart from Wait, as an egress
+// that waits for a stream to start and for it to come back for different
+// times does. Packet times are the publisher's own; a republish may
+// restart them.
 //
 // Everything is bounded: the cache by GOPCacheBytes, streams by
 // MaxStreams, subscriptions by MaxSubscribersPerStream, and each sink's
 // queue by the sink itself. A stream with neither publisher nor
 // subscription leaves the registry. Hub.Streams returns a snapshot of
-// every stream, and Hub.Close ends them all.
+// every stream, Hub.Stream one of a single path, and Hub.Close ends them
+// all.
 package hub
