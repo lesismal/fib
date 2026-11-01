@@ -587,7 +587,7 @@ jobs:
   # supports. This checks the container contract the runner relies on
   # (ROLE, TESTCASE, /www, /downloads, /certs, /logs) without the runner's
   # Python, simulator, tshark or peer images, so it is deterministic and
-  # deterministic. It takes a few minutes because the image has to build.
+  # repeatable. It takes a few minutes because the image has to build.
   # local-test.sh retries the build and falls back to a registry mirror, and
   # the job is non-blocking because a Docker Hub rate limit on the base image
   # pulls is a registry failure, not a fib failure.
