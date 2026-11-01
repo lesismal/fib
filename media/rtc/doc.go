@@ -38,9 +38,18 @@
 // PCMU and PCMA, whatever the publisher offers of them, and publishes one
 // hub track per media section: the depacketizer of each, behind a reorder
 // buffer, follows the parameter sets sent in band, and the publisher's
-// tracks change (Publisher.SetTracks) when they do. Packets are timed from
-// when they arrive, a track's first at the session's start, which keeps
-// the tracks in step to within the network's jitter. The publisher is
+// tracks change (Publisher.SetTracks) when they do. A track's first packet
+// is timed from when it arrives, from the session's start, and the rest by
+// their RTP timestamps from it. The publisher's RTCP sender reports then
+// line the tracks up, which arrival alone keeps in step only to within the
+// network's jitter and however differently the encoders delayed them: the
+// first track to report anchors the session, and each other track is
+// moved to where its reports place it from the anchor, slewed in at most
+// half the time between two of its packets at each, so that its times
+// never jump or go back. A move larger than 100 ms after the first, as a
+// jump of the publisher's clock makes, is taken only when the track's
+// next report confirms it, and one of more than 10 s never; a publisher
+// that sends no reports keeps the arrival times. The publisher is
 // asked for a keyframe (a PLI) when a track starts, after a loss until a
 // keyframe comes, when a viewer asks for one, and every
 // Config.KeyFrameInterval if set, at most once a Config.PLIInterval.
@@ -53,9 +62,12 @@
 // cannot carry the first two and rtpcodec has no AV1 payload format. A
 // viewer starts at the hub's cached GOP, held while it connects; its RTP
 // times are continuous for as long as it plays, across a republish of the
-// stream (which it waits Config.RepublishWait for), and a keyframe
-// request it makes goes to the stream's publisher when that is a WHIP
-// session of the same server, or to Config.OnKeyFrameRequest otherwise.
+// stream (which it waits Config.RepublishWait for), and the sender reports
+// of every track map them to one clock, the first packet's time at when
+// it went and the wall clock on from there, as RTSP's player has, so that
+// a browser lines the tracks up. A keyframe request it makes goes to the
+// stream's publisher when that is a WHIP session of the same server, or to
+// Config.OnKeyFrameRequest otherwise.
 //
 // Nothing waits on a viewer. Fib's WebRTC sends RTP straight to the
 // socket, with no queue to measure and no congestion control, so a slow
@@ -75,6 +87,5 @@
 // Left out: ICE restarts, simulcast (only the first layer of a section is
 // received), sending more than one stream per kind than the offer has
 // sections for, RTX and FEC, transcoding, renegotiation when a stream's
-// codec changes (the track of the old codec stops), and A/V
-// synchronization from RTCP sender reports.
+// codec changes (the track of the old codec stops).
 package rtc

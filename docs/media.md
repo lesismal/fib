@@ -290,7 +290,7 @@ the one ISO BMFF (MP4) uses ([`media/av`](../media/av)):
 | Protocol | Into `av` | Out of `av` |
 | --- | --- | --- |
 | RTMP, HTTP-FLV | FLV tag bodies already hold AVCC and the config records; sequence headers become `Track.Config`, the composition time offset gives `PTS`, 32-bit millisecond timestamps are unwrapped; packets are held (up to 512 packets or 1 s) until every track `onMetaData` announced has its sequence header | `onMetaData` and a sequence header per track first, then a tag body per packet; H.265 enhanced (hvc1) unless `EncoderConfig.LegacyHEVC`, AV1 and Opus always enhanced |
-| RTSP, WHIP (RTP) | The depacketizer reassembles access units into AVCC, takes the configuration from `sprop-*`/`config=` in the SDP and follows parameter sets sent in band, replacing the track when they change it; since RTP has presentation times only, decode times are recovered from the reordering depth the SPS signals; WHIP times packets from their arrival | The packetizer cuts access units to the MTU (STAP-A/FU-A, AP/FU), sends the parameter sets ahead of every keyframe, and stamps from a random sequence number and timestamp; RTSP adds RTCP sender reports on one clock for every track |
+| RTSP, WHIP (RTP) | The depacketizer reassembles access units into AVCC, takes the configuration from `sprop-*`/`config=` in the SDP and follows parameter sets sent in band, replacing the track when they change it; since RTP has presentation times only, decode times are recovered from the reordering depth the SPS signals; a track starts at the arrival of its first packet and goes on by its RTP timestamps, and the sender's RTCP sender reports line the tracks up (RTSP when each track starts; WHIP, whose browsers report only after their first packets, as each report comes, the move slewed in so times never jump or go back) | The packetizer cuts access units to the MTU (STAP-A/FU-A, AP/FU), sends the parameter sets ahead of every keyframe, and stamps from a random sequence number and timestamp; RTSP and WHEP add RTCP sender reports on one clock for every track |
 | SRT, HLS-TS (MPEG-TS) | Annex B becomes AVCC with the config records built from the parameter sets in band; ADTS is stripped, its header giving the AudioSpecificConfig; Opus gets an OpusHead from its descriptor; 33-bit PTS and DTS are unwrapped; tracks are announced once every stream of the program has its configuration | Annex B with an access unit delimiter and the parameter sets before every keyframe that lacks them; AAC in ADTS; Opus as a private stream with ffmpeg's descriptors and control header; PAT and PMT before each keyframe and every 100 ms; PCR every 40 ms |
 | HLS fMP4 | — (the `fmp4` reader is for tests and future ingests) | The configs go into avcC, hvcC, av1C, esds and dOps unchanged, the AVCC samples into mdat as they are |
 
@@ -832,9 +832,10 @@ a codec fib does not have, or because it belongs to the application.
 - **WHIP/WHEP**: ICE restarts (answered 422); simulcast (only a section's
   first layer is received); more streams per kind than the offer has
   sections; RTX and FEC; renegotiation when a stream's codec changes (the old
-  codec's track stops); A/V synchronization from RTCP sender reports (WHIP
-  times packets by arrival, which keeps tracks in step to within the network's
-  jitter).
+  codec's track stops). WHIP lines the tracks up by the publisher's sender
+  reports: until the first ones come (a browser sends them a second or more
+  in), and for a publisher that sends none, the tracks are in step only to
+  within the network's jitter and how differently the encoders delayed them.
 - **Codec helpers**: the H.264 PPS, slice headers, SVC/MVC and the subset SPS;
   the H.265 SPS beyond the bit depths and reordering (no frame rate or aspect
   ratio), and SHVC/MV-HEVC; AAC program config elements, LATM in the codec

@@ -716,6 +716,11 @@ func (sess *session) startIngest(c *fibhttp.Context, offer *sdp.SessionDescripti
 			r.onTrack(tr)
 		}
 	})
+	sess.pc.OnRTCP(func(pkt []byte) {
+		if r := sess.rcv.Load(); r != nil {
+			r.onRTCP(pkt)
+		}
+	})
 	if err := sess.negotiate(offer, desc); err != nil {
 		return err
 	}

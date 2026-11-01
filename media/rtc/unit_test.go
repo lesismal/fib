@@ -386,6 +386,9 @@ func TestReceiver(t *testing.T) {
 	if _, n2, _, _, _ := snapshot(); n2 != n {
 		t.Fatal("unknown payload type depacketized")
 	}
+	// RTCP other than sender reports, or that does not parse, is passed by.
+	rr, _ := rtp.AppendRTCP(nil, &rtp.ReceiverReport{SSRC: 1})
+	r.onRTCP(append(rr, 0x80, rtp.TypeSR, 0, 9))
 	r.requestKeyFrame()
 	r.startPeriodic()
 	r.onTimer()

@@ -404,7 +404,10 @@ sender.OnKeyFrameRequest(func() {
 ### RTCP
 
 媒体流动期间，PeerConnection 每隔 `RTCPReportInterval`（1 秒；设为负数则不发）为发送的流
-发 sender report、为接收的流发 receiver report。对端针对本端发送的流发来的 PLI 或 FIR，会
+发 sender report、为接收的流发 receiver report。sender report 按 track 的
+`SetReportClock(wall, ts)` 把墙上时间映射为 RTP 时间，它表示时间戳 `ts` 采样于 `wall`；发送
+多个 track 的一方给同一媒体时间设同一个墙上时间，接收方才能对齐它们。没有设置时，report 把
+最近一个包的时间戳当作在该包发出时采样。对端针对本端发送的流发来的 PLI 或 FIR，会
 调用对应 `RTPSender` 的 `OnKeyFrameRequest`；`TrackRemote.RequestKeyFrame` 发 PLI，
 `RequestFIR` 发 FIR。对端发来的每个复合 RTCP 包解密后也会交给 `OnRTCP`，`WriteRTCP` 则可以
 发送 `rtp` package 构造的任何 RTCP：

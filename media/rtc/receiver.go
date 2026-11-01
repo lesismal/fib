@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/lesismal/fib/media/av"
+	"github.com/lesismal/fib/media/internal/lipsync"
 	"github.com/lesismal/fib/media/rtpcodec"
 	"github.com/lesismal/fib/webrtc"
 	"github.com/lesismal/fib/webrtc/rtp"
@@ -24,12 +25,14 @@ type inStream struct {
 	video bool
 	tr    *webrtc.TrackRemote
 	// codecs are the section's codecs the package can receive, and pt
-	// the payload type dp reads.
+	// the payload type dp reads, of a clock of rate Hz.
 	codecs    []webrtc.Codec
 	pt        uint8
+	rate      int
 	dp        *rtpcodec.Depacketizer
 	reorder   *rtpcodec.Reorder
 	originSet bool
+	sync      lipsync.Track
 	pkt       rtp.Packet
 	// lost is the depacketizer's loss count last seen; needKey says the
 	// stream lost something or has not had a keyframe yet, and lastPLI is
@@ -50,7 +53,9 @@ type recvConfig struct {
 // receiver turns the RTP a PeerConnection receives into av.Packets: the
 // ingest of a WHIP session and of a WHEP client. Each media section is a
 // track, depacketized from the TrackRemote that arrives on it, through a
-// reorder buffer, and timed from when the receiver started.
+// reorder buffer. A track's first packet is timed from when the receiver
+// started, and the rest by their RTP timestamps from it; the sender's
+// RTCP sender reports then line the tracks up (lipsync.Live).
 //
 // Its callbacks, onTracks and onPacket, are called under its lock, one at
 // a time. A PeerConnection's methods are never called with the lock held,
@@ -63,6 +68,7 @@ type receiver struct {
 	tracks  []*av.Track
 	streams []*inStream
 	byMid   map[string]*inStream
+	sync    lipsync.Live
 	closed  bool
 	// timer is armed for timerAt, under the lock, or to fire at once
 	// by requestKeyFrame, without it.
@@ -147,7 +153,7 @@ func (r *receiver) use(st *inStream, pt uint8) bool {
 		}
 		f, _ := formatOf(c)                                                 // receivable: cannot fail
 		dp, _ := rtpcodec.NewDepacketizer(f, rtpcodec.DepacketizerConfig{}) // nor can this
-		st.dp, st.pt, st.originSet, st.lost, st.needKey = dp, pt, false, 0, st.video
+		st.dp, st.pt, st.rate, st.originSet, st.lost, st.needKey = dp, pt, f.ClockRate, false, 0, st.video
 		if r.tracks[st.index].Codec != f.Track.Codec {
 			r.tracks[st.index] = f.Track
 			r.emitTracks()
@@ -189,8 +195,11 @@ func (r *receiver) depacketize(st *inStream, now time.Time, p *rtp.Packet) {
 	}
 	if !st.originSet {
 		st.originSet = true
-		st.dp.SetOrigin(p.Timestamp, recvEpoch+now.Sub(r.start))
+		at := recvEpoch + now.Sub(r.start)
+		st.dp.SetOrigin(p.Timestamp, at)
+		r.sync.Start(&st.sync, p.Timestamp, at, st.rate)
 	}
+	st.sync.Next(p.Timestamp)
 	_ = st.dp.Depacketize(p, func(pkt *av.Packet) { r.emit(st, pkt) })
 	if lost := st.dp.Lost(); lost != st.lost {
 		st.lost = lost
@@ -206,9 +215,33 @@ func (r *receiver) emit(st *inStream, pkt *av.Packet) {
 	if st.video && pkt.Keyframe {
 		st.needKey = false
 	}
+	st.sync.Shift(pkt)
 	pkt.Track = st.index
 	if r.onPacket != nil {
 		r.onPacket(pkt)
+	}
+}
+
+// onRTCP takes a compound RTCP packet of the PeerConnection: the sender
+// reports of the streams received.
+func (r *receiver) onRTCP(b []byte) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	var sr rtp.SenderReport
+	for len(b) > 0 && !r.closed {
+		h, pkt, rest, err := rtp.NextRTCP(b)
+		if err != nil {
+			return
+		}
+		b = rest
+		if h.Type != rtp.TypeSR || sr.Unmarshal(pkt) != nil || sr.NTPTime == 0 {
+			continue
+		}
+		for _, st := range r.streams {
+			if st.tr != nil && st.tr.SSRC() == sr.SSRC {
+				r.sync.Report(&st.sync, rtp.TimeFromNTP(sr.NTPTime), sr.RTPTime)
+			}
+		}
 	}
 }
 

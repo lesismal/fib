@@ -113,59 +113,6 @@ func TestRecordLipSyncUDP(t *testing.T) {
 	}
 }
 
-func TestLipSyncOrigin(t *testing.T) {
-	wall := time.Unix(1700000000, 0)
-	var none senderClock
-	var l lipSync
-	if at := l.origin(none, 5, 8000, 7*time.Second); at != 7*time.Second || l.set {
-		t.Fatal("no report: fallback, no anchor", at)
-	}
-	a := senderClock{ok: true, ntp: wall, rtp: 1000}
-	if at := l.origin(a, 1000, 0, time.Second); at != time.Second || l.set {
-		t.Fatal("no clock rate: fallback", at)
-	}
-	// The first stream with a report anchors at its fallback.
-	if at := l.origin(a, 1000+8000, 8000, 3*time.Second); at != 3*time.Second || !l.set {
-		t.Fatal("anchor", at)
-	}
-	// RTP timestamps before the report's, and wrapping, count backwards.
-	b := senderClock{ok: true, ntp: wall.Add(500 * time.Millisecond), rtp: 10}
-	if at := l.origin(b, 10-90000+1<<32, 90000, 9*time.Second); at != 1500*time.Millisecond {
-		t.Fatal("placed", at)
-	}
-	// Reports placing a stream before zero or too far off are ignored.
-	far := senderClock{ok: true, ntp: wall.Add(-time.Hour), rtp: 0}
-	if at := l.origin(far, 0, 8000, time.Second); at != time.Second {
-		t.Fatal("before zero", at)
-	}
-	late := senderClock{ok: true, ntp: wall.Add(time.Hour), rtp: 0}
-	if at := l.origin(late, 0, 8000, time.Second); at != time.Second {
-		t.Fatal("too late", at)
-	}
-	early := senderClock{ok: true, ntp: wall.Add(-time.Second), rtp: 0}
-	if at := l.origin(early, 0, 8000, 20*time.Second); at != 20*time.Second {
-		t.Fatal("too early", at)
-	}
-}
-
-func TestSenderClockUpdate(t *testing.T) {
-	var c senderClock
-	rr, _ := rtp.AppendRTCP(nil, &rtp.ReceiverReport{SSRC: 1})
-	c.update(rr)
-	c.update([]byte{0x80, 200, 0, 9})             // length past the end
-	c.update([]byte{0x80, 200, 0, 1, 0, 0, 0, 1}) // too short a report
-	zero, _ := rtp.AppendRTCP(nil, &rtp.SenderReport{SSRC: 1})
-	c.update(zero)
-	if c.ok {
-		t.Fatal("no sender report taken", c)
-	}
-	wall := time.Unix(1700000000, 0)
-	c.update(append(rr, testSR(t, wall, 77)...))
-	if !c.ok || c.rtp != 77 || !c.ntp.Equal(wall) {
-		t.Fatal(c)
-	}
-}
-
 // A client playing from a server that sends no RTP-Info lines the
 // streams up by the server's sender reports, rather than starting each at
 // the same time whenever its first packet comes.

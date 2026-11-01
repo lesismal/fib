@@ -16,6 +16,7 @@ import (
 	fib "github.com/lesismal/fib"
 	"github.com/lesismal/fib/internal/outputwait"
 	"github.com/lesismal/fib/media/av"
+	"github.com/lesismal/fib/media/internal/lipsync"
 	"github.com/lesismal/fib/media/rtpcodec"
 	"github.com/lesismal/fib/webrtc/rtp"
 	"github.com/lesismal/fib/webrtc/sdp"
@@ -148,7 +149,7 @@ type Client struct {
 	events  []func()
 	// sync lines the played streams up by the server's sender reports
 	// when RTP-Info did not.
-	sync lipSync
+	sync lipsync.Session
 	// A publishing client's packets share one media clock from its first
 	// packet, whose DTS is originAt and went at wall0.
 	origin   bool
@@ -189,7 +190,7 @@ type clientStream struct {
 	dp        *rtpcodec.Depacketizer
 	reorder   *rtpcodec.Reorder
 	originSet bool
-	sr        senderClock
+	sr        lipsync.Clock
 	pkt       rtp.Packet
 	pk        *rtpcodec.Packetizer
 	ssrc      uint32
@@ -895,7 +896,7 @@ func (c *Client) deliver(st *clientStream, pkt *av.Packet) {
 func (c *Client) depacketize(st *clientStream, now time.Time, p *rtp.Packet) {
 	if !st.originSet {
 		st.originSet = true
-		st.dp.SetOrigin(p.Timestamp, c.sync.origin(st.sr, p.Timestamp, st.format.ClockRate, recordEpoch))
+		st.dp.SetOrigin(p.Timestamp, c.sync.Origin(st.sr, p.Timestamp, st.format.ClockRate, recordEpoch))
 	}
 	_ = st.dp.Depacketize(p, func(pkt *av.Packet) { c.deliver(st, pkt) })
 }
@@ -904,7 +905,7 @@ func (c *Client) depacketize(st *clientStream, now time.Time, p *rtp.Packet) {
 // reports line the streams up.
 func (c *Client) receiveRTCP(st *clientStream, b []byte) {
 	if !c.publish && st.dp != nil {
-		st.sr.update(b)
+		st.sr.Update(b)
 	}
 }
 

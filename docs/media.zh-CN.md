@@ -238,7 +238,7 @@ rtcServer, _ := rtc.NewServer(rtc.Config{Hub: h,
 | 协议 | 转入 `av` | 从 `av` 转出 |
 | --- | --- | --- |
 | RTMP、HTTP-FLV | FLV tag body 本身就是 AVCC 和配置记录；sequence header 成为 `Track.Config`，composition time offset 给出 `PTS`，32 位毫秒时间戳被展开；在 `onMetaData` 声明的每个 track 都收到 sequence header 之前，包会被暂存（最多 512 个包或 1 秒） | 先发 `onMetaData` 和每个 track 的 sequence header，再每个包一个 tag body；H.265 用 enhanced 形式（hvc1），除非设置了 `EncoderConfig.LegacyHEVC`，AV1 与 Opus 总是 enhanced |
-| RTSP、WHIP（RTP） | depacketizer 把 access unit 重组为 AVCC，从 SDP 的 `sprop-*`/`config=` 取配置，并跟随带内发送的参数集，参数集改变配置时替换 track；RTP 只有显示时间，解码时间由 SPS 给出的重排深度恢复；WHIP 按包到达的时间打时间戳 | packetizer 按 MTU 切分 access unit（STAP-A/FU-A、AP/FU），在每个关键帧前发送参数集，序号与时间戳从随机值开始；RTSP 另外为所有 track 在同一时钟上发送 RTCP sender report |
+| RTSP、WHIP（RTP） | depacketizer 把 access unit 重组为 AVCC，从 SDP 的 `sprop-*`/`config=` 取配置，并跟随带内发送的参数集，参数集改变配置时替换 track；RTP 只有显示时间，解码时间由 SPS 给出的重排深度恢复；每个 track 从第一个包到达的时间开始，之后按 RTP 时间戳推进，再由发送端的 RTCP sender report 对齐各 track（RTSP 在每个 track 开始时对齐；WHIP 的浏览器在发出头几个包之后才发 report，所以每收到一个 report 就调整一次，调整量逐步摊入，时间戳既不跳变也不回退） | packetizer 按 MTU 切分 access unit（STAP-A/FU-A、AP/FU），在每个关键帧前发送参数集，序号与时间戳从随机值开始；RTSP 和 WHEP 另外为所有 track 在同一时钟上发送 RTCP sender report |
 | SRT、HLS-TS（MPEG-TS） | Annex B 转为 AVCC，配置记录由带内参数集构造；去掉 ADTS，由其头部得出 AudioSpecificConfig；Opus 由描述符构造 OpusHead；33 位 PTS 与 DTS 被展开；节目中每路流都有了配置之后才宣布 track | Annex B，带 access unit delimiter，缺参数集的关键帧前补上参数集；AAC 用 ADTS；Opus 作为私有流，带 ffmpeg 的描述符和控制头；每个关键帧前以及每 100 ms 发送 PAT 和 PMT；每 40 ms 一个 PCR |
 | HLS fMP4 | —（`fmp4` 的读取器用于测试和将来的接入） | 配置原样放入 avcC、hvcC、av1C、esds 和 dOps，AVCC 采样原样放入 mdat |
 
@@ -718,8 +718,9 @@ HTTP/2 和 HTTP/3 上，积压指流控压住超过 64 KiB 的数据，且只有
   间隔大于 `TargetDuration`），`EXT-X-TARGETDURATION` 会被调高，严格来说规范不允许这样做。
 - **WHIP/WHEP**：ICE restart（回 422）；simulcast（每个 media section 只接收第一层）；每种
   媒体超过 offer 中 section 数量的流；RTX 与 FEC；流的编码变化时重新协商（旧编码的 track
-  停止）；基于 RTCP sender report 的音视频同步（WHIP 按到达时间打时间戳，各 track 之间的
-  偏差不超过网络抖动）。
+  停止）。WHIP 按发布者的 sender report 对齐各 track：在第一批 report 到达之前（浏览器要
+  一秒多之后才发），以及对从不发 report 的发布者，各 track 之间的偏差只能保证在网络抖动和
+  各编码器延迟之差以内。
 - **编码工具**：H.264 的 PPS、slice header、SVC/MVC 与 subset SPS；H.265 SPS 中位深和重排之后
   的部分（因此没有帧率和宽高比），以及 SHVC/MV-HEVC；AAC 的 program config element、codec
   package 中的 LATM、含多个 raw data block 的 ADTS 帧、CRC 校验；OpusTags 与 multistream 的
