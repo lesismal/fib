@@ -50,9 +50,9 @@ func TestConfigurationErrors(t *testing.T) {
 	}
 
 	// Two PeerConnections may share a certificate, and a TURN server over
-	// TLS, which is not supported, is left out rather than refused.
+	// DTLS, which is not supported, is left out rather than refused.
 	a := newPC(t, Configuration{Mux: mux, Certificates: []stdtls.Certificate{cert},
-		ICEServers: []ICEServer{{URLs: []string{"turns:127.0.0.1", "stun:127.0.0.1:3478"}}}})
+		ICEServers: []ICEServer{{URLs: []string{"turns:127.0.0.1?transport=udp", "stun:127.0.0.1:3478"}}}})
 	b := newPC(t, Configuration{Mux: mux, Certificates: []stdtls.Certificate{cert}})
 	if a.fingerprint != b.fingerprint || a.fingerprint != tls.CertificateFingerprint(cert.Certificate[0]) {
 		t.Fatal("a shared certificate gave two fingerprints")

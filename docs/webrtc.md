@@ -41,7 +41,7 @@ standard library: there is no dependency on pion or any other module.
 | Mux | One UDP port of a fib engine shared by any number of PeerConnections, as a server wants; a PeerConnection without one opens a port of its own, as a client does |
 | ICE | RFC 8445 full and lite agents, both roles, role conflicts, frozen/waiting pairs, paced and triggered checks, peer-reflexive candidates, regular nomination, restarts; trickle (RFC 8838); consent freshness (RFC 7675); server-reflexive candidates from STUN servers; relay candidates from TURN servers |
 | STUN | RFC 8489 messages decoded in place, the attributes of STUN, ICE and TURN, short- and long-term MESSAGE-INTEGRITY, MESSAGE-INTEGRITY-SHA256, FINGERPRINT, and a client transaction with RFC 8489's retransmissions |
-| TURN | A client (RFC 8656 over UDP, TCP or TLS: allocations, refreshes, permissions, channels, 300/401/438 handling) and a server core safe for concurrent use, with long-term credentials, stateless nonces, quotas per server, user and allocation, a relay policy that refuses internal addresses, events and statistics, limits and credentials changed in place, and draining; `turnserver` runs the server on a fib engine over UDP, TCP and TLS. The PeerConnection reaches TURN servers over UDP |
+| TURN | A client (RFC 8656 over UDP, TCP or TLS: allocations, refreshes, permissions, channels, 300/401/438 handling) and a server core safe for concurrent use, with long-term credentials, stateless nonces, quotas per server, user and allocation, a relay policy that refuses internal addresses, events and statistics, limits and credentials changed in place, and draining; `turnserver` runs the server on a fib engine over UDP, TCP and TLS. The PeerConnection reaches TURN servers over UDP, TCP and TLS |
 | DTLS | DTLS 1.2 (RFC 6347) with use_srtp (RFC 5764), sans-IO, sharing fib's TLS 1.2 handshake code: ECDHE with AES-GCM and ChaCha20-Poly1305, ECDSA, Ed25519 and RSA keys, X25519, P-256 and P-384, flights cut to the MTU and retransmitted, a 64-record replay window, a stateless cookie, and certificates checked by SDP fingerprint |
 | SRTP | SRTP and SRTCP (RFC 3711) keyed from DTLS-SRTP: AES_CM_128_HMAC_SHA1_80 and _32, AEAD_AES_128_GCM and AEAD_AES_256_GCM (RFC 7714), rollover counters and replay windows per SSRC; no allocation per packet once an SSRC is known |
 | RTP and RTCP | RTP parsed in place, RFC 8285 header extensions in both forms, helpers for MID, RID, abs-send-time, transport-wide sequence numbers and audio level; RTCP SR, RR, SDES, BYE, APP, NACK, PLI, FIR, REMB and transport-cc feedback, compound packets walked without allocating |
@@ -503,7 +503,11 @@ pc, err := webrtc.NewPeerConnection(webrtc.Configuration{
 	Engine: engine, // a port of its own: TURN cannot share a Mux
 	ICEServers: []webrtc.ICEServer{
 		{URLs: []string{"stun:stun.example.com"}},
-		{URLs: []string{"turn:turn.example.com:3478"}, Username: "1793480000:alice", Credential: "base64-hmac"},
+		{URLs: []string{
+			"turn:turn.example.com:3478",
+			"turn:turn.example.com:3478?transport=tcp",
+			"turns:turn.example.com:443",
+		}, Username: "1793480000:alice", Credential: "base64-hmac"},
 	},
 	// Relay candidates only: the peer never learns this side's addresses.
 	ICETransportPolicy: webrtc.ICETransportPolicyRelay,
@@ -520,18 +524,36 @@ pc, err := webrtc.NewPeerConnection(webrtc.Configuration{
   `ErrConfiguration`, with a Mux or a port of its own: it could never gather
   the relay candidate they ask for.
 - URLs are `stun:host[:port]` and `turn:host[:port]`, port 3478 by default,
-  resolved when the PeerConnection is made. The PeerConnection reaches TURN
-  servers over UDP only: `turns:`, `stuns:` and `?transport=tcp` URLs are
-  skipped by a full PeerConnection.
+  `turn:host[:port]?transport=tcp` for TURN over TCP, and
+  `turns:host[:port]`, port 5349 by default, for TURN over TLS, resolved when
+  the PeerConnection is made. `stuns:` and `turns:...?transport=udp` (DTLS)
+  URLs are skipped.
+- Over TCP or TLS only the leg to the server is a stream: the allocation
+  still relays UDP to the peer (RFC 8656), so the peer's side is the same.
+  The connection is dialed on the PeerConnection's engine without blocking,
+  when gathering starts, and its TLS handshake runs in fib's `tls` package.
+  `Configuration.TURNTLSConfig` is the TLS configuration, for private roots
+  or a client certificate; nil means the system's roots, and without a
+  `ServerName` the URL's host is the name verified.
+- An allocation that cannot be made, over any transport, ends that server's
+  part of gathering without a candidate: a refused or timed-out connect
+  (10s), a failed TLS handshake, a stream that does not frame as TURN, or an
+  error response. One lost later, with its connection or a failed refresh,
+  has its relay candidate withdrawn from the ICE agent: its pairs fail, and
+  a selected pair on it is given up, after which a controlling agent
+  nominates another pair that works, and ICE fails, after
+  `ICEFailedTimeout`, if none does. The other servers' candidates go on.
 - The client handles the 401 challenge, 438 with a fresh nonce and 300 to an
-  alternate server, refreshes the allocation, a permission per peer address
+  alternate server (over UDP; on a stream every message goes on the one
+  connection), refreshes the allocation, a permission per peer address
   (every 4 minutes) and the channels it binds, sends again a request that
-  goes unanswered, and deallocates on `Close`.
+  goes unanswered, and deallocates on `Close`, which also closes a TCP or
+  TLS connection once the deallocation is sent.
 
-`turn.Client` itself also speaks to a server over TCP or TLS:
-`ClientConfig.Stream` pads its ChannelData messages to four bytes and sends
-each request once, and the host frames what the stream brings with
-`turn.FrameLen` before passing each message to `HandlePacket`.
+`turn.Client` is the same client used on its own: `ClientConfig.Stream`
+pads its ChannelData messages to four bytes and sends each request once,
+and the host frames what the stream brings with `turn.FrameLen` before
+passing each message to `HandlePacket`, as the PeerConnection does.
 
 Browsers are the usual TURN clients, though: a fib server on a shared Mux is
 reached through the browser's relay, and needs no TURN of its own.
@@ -739,7 +761,8 @@ of a binding on `:0` from `Engine.BindingAddrs`.
 | --- | --- | --- |
 | `Mux` / `Engine`, `ListenAddr` | — / `:0` | Share a Mux, or open a port of its own on the engine |
 | `Certificates` | a fresh ECDSA P-256 certificate | The DTLS certificate; share one among a server's PeerConnections |
-| `ICEServers`, `ICETransportPolicy` | none, all | STUN and TURN servers; relay-only gathering, which needs a TURN server |
+| `ICEServers`, `ICETransportPolicy` | none, all | STUN and TURN servers (TURN over UDP, TCP or TLS); relay-only gathering, which needs a TURN server |
+| `TURNTLSConfig` | nil: system roots, the URL's host | TLS configuration for `turns:` servers |
 | `ICELite` | false | Answer checks only, always controlled, host candidates only; STUN servers unused, TURN servers and the relay policy refused |
 | `Codecs`, `HeaderExtensions` | `DefaultCodecs()`, `DefaultHeaderExtensions()` | What is offered and accepted |
 | `MaxMessageSize` | 256 KiB | Largest data channel message received |
@@ -785,7 +808,7 @@ browsers speak it does not need it, or because it belongs to the application.
   control feedback and bandwidth estimation; sending simulcast (receiving it,
   by RID, works); the RTP packetization of codecs; DTLS 1.3; SDES keying;
   statistics beyond the RTCP reports; TURN on a shared Mux, and TURN over
-  TCP or TLS (`turns:` and `?transport=tcp` URLs).
+  DTLS (`turns:...?transport=udp`).
 - **ICE**: ICE over TCP (RFC 6544); aggressive nomination, which RFC 8445
   deprecates; components other than the one bundled data stream.
 - **DTLS**: DTLS 1.3, and suites other than ECDHE with an AEAD.

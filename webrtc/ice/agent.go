@@ -502,6 +502,46 @@ func (a *Agent) AddLocalCandidate(c Candidate, now time.Time) error {
 	return nil
 }
 
+// RemoveLocalCandidates withdraws the local candidates of the transport
+// id, a TURN allocation that failed or was lost: its pairs fail and its
+// checks stop, while those of the other transports go on. A selected pair
+// on it is given up: a controlling agent nominates the best pair that
+// still works, a controlled one waits for the peer to nominate one, and
+// either fails after FailedTimeout without one. The peer is not told; its
+// checks to the candidate go unanswered.
+func (a *Agent) RemoveLocalCandidates(id LocalID, now time.Time) {
+	if a.state == StateClosed {
+		return
+	}
+	a.locals = slices.DeleteFunc(a.locals, func(l *Candidate) bool { return l.LocalID == id })
+	for tid, p := range a.txs {
+		if p.local == id && p.kind != txGather {
+			delete(a.txs, tid)
+		}
+	}
+	for _, p := range a.pairs {
+		if p.key.local == id {
+			a.failPair(p)
+		}
+	}
+	a.triggered = slices.DeleteFunc(a.triggered, func(p *pair) bool {
+		if p.key.local != id {
+			return false
+		}
+		p.queued = false
+		return true
+	})
+	if a.selected != nil && a.selected.key.local == id {
+		a.selected = nil
+		a.consentPaused = false
+		a.checkingSince = now
+		if a.state == StateConnected {
+			a.setState(StateDisconnected)
+		}
+	}
+	a.checkFailed(now)
+}
+
 // SetRemoteCredentials sets the peer's ufrag and password. Checks start once
 // they are known; until then the agent answers the peer's checks and keeps
 // the candidates they reveal. New credentials after earlier ones mean the

@@ -433,3 +433,87 @@ func TestConfigErrors(t *testing.T) {
 		}
 	}
 }
+
+// TestRemoveLocalCandidates withdraws A's transports one at a time: one
+// while checks run, then the one of the selected pair, after which A
+// nominates the pair still working, and the last, after which A, with
+// every pair failed and the peer's candidates all known, fails.
+func TestRemoveLocalCandidates(t *testing.T) {
+	n := newSimNet(t, 7)
+	a := n.newPeer("A", Config{Controlling: true}, 1)
+	b := n.newPeer("B", Config{}, 2)
+	addrs := map[LocalID]netip.AddrPort{
+		1: addrA,
+		3: netip.MustParseAddrPort("10.0.0.3:1000"),
+		5: netip.MustParseAddrPort("10.0.0.5:1000"),
+	}
+	var socks []Socket
+	for _, id := range []LocalID{1, 3, 5} {
+		socks = append(socks, a.addSock(id, addrs[id], netip.AddrPort{}))
+	}
+	sb := b.addSock(2, addrB, netip.AddrPort{})
+	if err := a.a.Gather(socks, n.now); err != nil {
+		t.Fatal(err)
+	}
+	if err := b.a.Gather([]Socket{sb}, n.now); err != nil {
+		t.Fatal(err)
+	}
+	exchangeCredentials(t, n.now, a, b)
+	signalCandidates(t, n.now, a, b)
+	a.a.EndOfRemoteCandidates()
+	remove := func(id LocalID) {
+		t.Helper()
+		delete(n.socks, addrs[id])
+		a.a.RemoveLocalCandidates(id, n.now)
+		for _, c := range a.a.LocalCandidates() {
+			if c.LocalID == id {
+				t.Fatalf("candidate %v of removed transport %d kept", c.AddrPort(), id)
+			}
+		}
+	}
+	// Transport 5 goes while a check of its pair is in flight and another
+	// is queued.
+	n.run(time.Second, func() bool {
+		for _, p := range a.a.txs {
+			if p.local == 5 {
+				return true
+			}
+		}
+		return false
+	})
+	p5 := a.a.pairIndex[pairKey{5, addrB}]
+	a.a.enqueueTriggered(p5)
+	remove(5)
+	if p5.state != pairFailed || p5.queued || slices.Contains(a.a.triggered, p5) {
+		t.Fatalf("pair of the removed transport: state %v, queued %v", p5.state, p5.queued)
+	}
+	for _, p := range a.a.txs {
+		if p.local == 5 {
+			t.Fatal("check of the removed transport kept")
+		}
+	}
+	if !n.run(5*time.Second, bothConnected(a, b)) {
+		t.Fatalf("not connected: %v %v", a.a.State(), b.a.State())
+	}
+	checkSelected(t, a, b)
+	p, _ := a.a.SelectedPair()
+	first := p.Local.LocalID
+	remove(first)
+	if a.a.State() != StateDisconnected {
+		t.Fatalf("state %v after the selected transport went, want disconnected", a.a.State())
+	}
+	if !n.run(5*time.Second, bothConnected(a, b)) {
+		t.Fatalf("not connected again: %v %v", a.a.State(), b.a.State())
+	}
+	checkSelected(t, a, b)
+	p, _ = a.a.SelectedPair()
+	if p.Local.LocalID == first || p.Local.LocalID == 5 {
+		t.Fatalf("selected the removed transport %d", p.Local.LocalID)
+	}
+	remove(p.Local.LocalID)
+	if a.a.State() != StateFailed {
+		t.Fatalf("state %v with no transport left, want failed", a.a.State())
+	}
+	a.a.Close()
+	a.a.RemoveLocalCandidates(1, n.now)
+}
