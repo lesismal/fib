@@ -34,8 +34,8 @@
 //	srv, _ := rtc.NewServer(rtc.Config{Hub: h, WebRTC: webrtc.Configuration{Mux: mux, ICELite: true}})
 //	router.Handle("/*", srv)
 //
-// A WHIP session accepts H.264 (packetization mode 0 or 1), H.265, Opus,
-// PCMU and PCMA, whatever the publisher offers of them, and publishes one
+// A WHIP session accepts H.264 (packetization mode 0 or 1), H.265, AV1,
+// Opus, PCMU and PCMA, whatever the publisher offers of them, and publishes one
 // hub track per media section: the depacketizer of each, behind a reorder
 // buffer, follows the parameter sets sent in band, and the publisher's
 // tracks change (Publisher.SetTracks) when they do. Packets are timed from
@@ -48,9 +48,9 @@
 // A WHEP session sends the hub stream's tracks WebRTC carries: H.264,
 // negotiated in packetization mode 1 with the browser's profile-level-id
 // that decodes the stream's profile (its own, or one containing it),
-// H.265 when the browser offers it, Opus, PCMU and PCMA. AAC, MP3 and AV1
-// are left out, with a log line the first time each is met, as WebRTC
-// cannot carry the first two and rtpcodec has no AV1 payload format. A
+// H.265 when the browser offers it, AV1 when it offers the stream's
+// profile, Opus, PCMU and PCMA. AAC and MP3 are left out, with a log line
+// the first time each is met, as WebRTC cannot carry them. A
 // viewer starts at the hub's cached GOP, held while it connects; its RTP
 // times are continuous for as long as it plays, across a republish of the
 // stream (which it waits Config.RepublishWait for), and a keyframe

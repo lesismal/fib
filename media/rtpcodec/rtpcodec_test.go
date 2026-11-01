@@ -166,8 +166,8 @@ func TestPacketizerH264(t *testing.T) {
 	if _, err := NewPacketizer(f, PacketizerConfig{MTU: 20}); err == nil {
 		t.Fatal("tiny MTU taken")
 	}
-	if _, err := NewPacketizer(&Format{Track: &av.Track{Codec: av.CodecAV1}}, PacketizerConfig{}); err != ErrUnsupported {
-		t.Fatalf("AV1: %v", err)
+	if _, err := NewPacketizer(&Format{Track: &av.Track{Codec: av.CodecMP3}}, PacketizerConfig{}); err != ErrUnsupported {
+		t.Fatalf("MP3: %v", err)
 	}
 	// Random initial values.
 	q, _ := NewPacketizer(f, PacketizerConfig{})
@@ -681,7 +681,7 @@ func TestOpusG711(t *testing.T) {
 
 func TestFormat(t *testing.T) {
 	fixtures(t)
-	if _, err := NewFormat(&av.Track{Codec: av.CodecAV1}, 96); err != ErrUnsupported {
+	if _, err := NewFormat(&av.Track{Codec: av.CodecMP3}, 96); err != ErrUnsupported {
 		t.Fatal(err)
 	}
 	if _, err := NewFormat(&av.Track{Codec: av.CodecAAC}, 96); err != ErrUnsupported {
@@ -700,7 +700,7 @@ func TestFormat(t *testing.T) {
 		t.Fatal(f.ClockRate)
 	}
 	for _, tr := range []*av.Track{
-		{Codec: av.CodecAV1},
+		{Codec: av.CodecMP3},
 		{Codec: av.CodecAAC, Config: []byte{0}},
 	} {
 		f := &Format{Track: tr}
@@ -894,7 +894,7 @@ func TestTimestampWrap(t *testing.T) {
 	if len(out) != 3 || out[0].PTS != time.Second || out[1].PTS != time.Second+av.FromTicks(0x200, 8000) || out[2].PTS != time.Second+av.FromTicks(0x80, 8000) {
 		t.Fatalf("%v %v %v", out[0].PTS, out[1].PTS, out[2].PTS)
 	}
-	if _, err := NewDepacketizer(&Format{Track: &av.Track{Codec: av.CodecAV1}}, DepacketizerConfig{}); err != ErrUnsupported {
+	if _, err := NewDepacketizer(&Format{Track: &av.Track{Codec: av.CodecMP3}}, DepacketizerConfig{}); err != ErrUnsupported {
 		t.Fatal(err)
 	}
 }

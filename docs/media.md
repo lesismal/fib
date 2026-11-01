@@ -19,6 +19,7 @@ They meet in [`media/hub`](../media/hub) and share the types of
 [`media/av`](../media/av) and the bitstream helpers of
 [`media/codec/h264`](../media/codec/h264),
 [`media/codec/h265`](../media/codec/h265),
+[`media/codec/av1`](../media/codec/av1),
 [`media/codec/aac`](../media/codec/aac) and
 [`media/codec/opus`](../media/codec/opus). All of it is written on the
 standard library and fib: there is no dependency on any other module, and
@@ -35,8 +36,8 @@ nothing decodes or encodes audio or video.
 | HLS, LL-HLS | `media/hls` | play | — | RFC 8216 with fMP4 or MPEG-TS segments held in memory, chosen per request (`?format=ts`), and the Low-Latency extensions: partial segments, preload hints, blocking playlist reloads |
 | WHIP, WHEP | `media/rtc` | WHIP ingest, WHEP egress | WHIP push, WHEP pull, and relays | RFC 9725 and draft-ietf-wish-whep: 201 with a Location, trickle by PATCH, DELETE, CORS, Link headers for ICE servers, bearer tokens; every PeerConnection on one UDP port |
 | Hub | `media/hub` | — | — | Streams by path, one publisher and any number of subscribers each; GOP cache; reservations for ingests that learn their tracks late; subscribers that wait for a publisher and survive a republish; one place for publish and play authentication |
-| Containers and payloads | `media/flv`, `media/mpegts`, `media/fmp4`, `media/rtpcodec`, `media/amf` | — | — | FLV with Enhanced RTMP tags; MPEG-TS mux and demux; fragmented MP4 writer and reader; RTP payload formats for H.264, H.265, AAC, Opus and G.711 with SDP; AMF0 both ways and AMF3 decoding |
-| Codecs | `media/codec/...` | — | — | H.264 and H.265 framing, SPS, configuration records and keyframes; AAC AudioSpecificConfig and ADTS; OpusHead and packet durations |
+| Containers and payloads | `media/flv`, `media/mpegts`, `media/fmp4`, `media/rtpcodec`, `media/amf` | — | — | FLV with Enhanced RTMP tags; MPEG-TS mux and demux; fragmented MP4 writer and reader; RTP payload formats for H.264, H.265, AV1, AAC, Opus and G.711 with SDP; AMF0 both ways and AMF3 decoding |
+| Codecs | `media/codec/...` | — | — | H.264 and H.265 framing, SPS, configuration records and keyframes; AV1 OBUs, sequence header, AV1CodecConfigurationRecord and keyframes; AAC AudioSpecificConfig and ADTS; OpusHead and packet durations |
 
 There is no transcoding anywhere. A stream is published in the codecs its
 publisher chose, and each egress carries the tracks its protocol can and
@@ -288,7 +289,7 @@ the one ISO BMFF (MP4) uses ([`media/av`](../media/av)):
 | Protocol | Into `av` | Out of `av` |
 | --- | --- | --- |
 | RTMP, HTTP-FLV | FLV tag bodies already hold AVCC and the config records; sequence headers become `Track.Config`, the composition time offset gives `PTS`, 32-bit millisecond timestamps are unwrapped; packets are held (up to 512 packets or 1 s) until every track `onMetaData` announced has its sequence header | `onMetaData` and a sequence header per track first, then a tag body per packet; H.265 enhanced (hvc1) unless `EncoderConfig.LegacyHEVC`, AV1 and Opus always enhanced |
-| RTSP, WHIP (RTP) | The depacketizer reassembles access units into AVCC, takes the configuration from `sprop-*`/`config=` in the SDP and follows parameter sets sent in band, replacing the track when they change it; since RTP has presentation times only, decode times are recovered from the reordering depth the SPS signals; WHIP times packets from their arrival | The packetizer cuts access units to the MTU (STAP-A/FU-A, AP/FU), sends the parameter sets ahead of every keyframe, and stamps from a random sequence number and timestamp; RTSP adds RTCP sender reports on one clock for every track |
+| RTSP, WHIP (RTP) | The depacketizer reassembles access units into AVCC (AV1 temporal units into OBUs with their sizes), takes the configuration from `sprop-*`/`config=` in the SDP and follows parameter sets and AV1 sequence headers sent in band, replacing the track when they change it; since RTP has presentation times only, decode times are recovered from the reordering depth the SPS signals (AV1 needs none); WHIP times packets from their arrival | The packetizer cuts access units to the MTU (STAP-A/FU-A, AP/FU, AV1 OBU elements), sends the parameter sets or the sequence header ahead of every keyframe, and stamps from a random sequence number and timestamp; RTSP adds RTCP sender reports on one clock for every track |
 | SRT, HLS-TS (MPEG-TS) | Annex B becomes AVCC with the config records built from the parameter sets in band; ADTS is stripped, its header giving the AudioSpecificConfig; Opus gets an OpusHead from its descriptor; 33-bit PTS and DTS are unwrapped; tracks are announced once every stream of the program has its configuration | Annex B with an access unit delimiter and the parameter sets before every keyframe that lacks them; AAC in ADTS; Opus as a private stream with ffmpeg's descriptors and control header; PAT and PMT before each keyframe and every 100 ms; PCR every 40 ms |
 | HLS fMP4 | — (the `fmp4` reader is for tests and future ingests) | The configs go into avcC, hvcC, av1C, esds and dOps unchanged, the AVCC samples into mdat as they are |
 
@@ -302,7 +303,7 @@ it. FLV, and so RTMP and HTTP-FLV, carry one video and one audio track.
 | --- | --- | --- | --- | --- | --- |
 | H.264 | ✓ | ✓ RFC 6184 (mode 1 sent; STAP-B, MTAP and FU-B read too) | ✓ stream type 0x1B | ✓ avc1 | ✓ in: modes 0 and 1; out: mode 1 at a profile-level-id the browser decodes |
 | H.265 | ✓ Enhanced RTMP (hvc1) in and out; legacy codec id 12 in, and out with `LegacyHEVC` | ✓ RFC 7798, without DONL | ✓ 0x24 | ✓ hvc1 | ✓ in; out when the browser offers it |
-| AV1 | ✓ Enhanced RTMP (av01) | — no payload format | — | ✓ av01 | — |
+| AV1 | ✓ Enhanced RTMP (av01) | ✓ AV1 RTP payload format (AOM v1.0) | — | ✓ av01 | ✓ in; out when the browser offers the stream's profile |
 | AAC | ✓ | ✓ mpeg4-generic (AAC-hbr sent; AAC-lbr and MP4A-LATM read) | ✓ ADTS, 0x0F | ✓ mp4a | — dropped: WebRTC has no AAC |
 | Opus | ✓ Enhanced RTMP | ✓ RFC 7587 | ✓ private stream with the Opus registration | ✓ Opus (dOps) | ✓ |
 | G.711 (PCMU, PCMA) | ✓ sound formats 8 and 7 | ✓ | — | — | ✓ |
@@ -320,12 +321,15 @@ What this means in practice, with the usual encoders:
 - **H.265** needs Enhanced RTMP or legacy codec id 12 on RTMP and HTTP-FLV
   (ffmpeg 7.1 reads the enhanced form, 5.1 neither), and a browser that offers
   H.265 on WHEP.
+- **AV1** is carried by Enhanced RTMP, HTTP-FLV, HLS fMP4, RTSP and WebRTC,
+  and dropped from SRT and HLS-TS. Players of AV1 over RTSP are rare: ffmpeg
+  before 8.0 has no AV1 RTP payload format.
 - **G.711** (IP cameras) is carried by RTMP, HTTP-FLV, RTSP and WebRTC, and
   dropped from SRT and HLS, which play the video alone.
 - A track a protocol cannot take in is dropped at ingest: the FLV decoder drops
   tags of codecs it does not know (VP6, Speex, Nellymoser...), and the MPEG-TS
   demuxer skips MP3, MPEG-2 video and AC-3. On the way out, the WHEP endpoint
-  logs AAC, MP3 and AV1 the first time it leaves each out.
+  logs AAC and MP3 the first time it leaves each out.
 
 ## One server, every protocol
 
@@ -793,8 +797,9 @@ a codec fib does not have, or because it belongs to the application.
   a PLAY Range that seeks, Scale and Speed; sessions that outlive their
   connection; RTCP receiver reports to recorders.
 - **RTP payloads**: H.264's interleaved mode (read, not reordered by decoding
-  order number); DONL in H.265; MP3 and AV1 payload formats; mpeg4-generic
-  modes other than AAC's.
+  order number); DONL in H.265; AV1's scalability structures beyond passing
+  their OBUs through; the MP3 payload format; mpeg4-generic modes other than
+  AAC's.
 - **SRT**: rendezvous mode; file (message and stream) mode and its congestion
   control; AES-GCM; packet filters (FEC); socket groups (bonding); the HSv4
   handshake of SRT before 1.3; starting a key refresh (the key a Conn begins
@@ -819,7 +824,8 @@ a codec fib does not have, or because it belongs to the application.
   jitter).
 - **Codec helpers**: the H.264 PPS, slice headers, SVC/MVC and the subset SPS;
   the H.265 SPS beyond the bit depths and reordering (no frame rate or aspect
-  ratio), and SHVC/MV-HEVC; AAC program config elements, LATM in the codec
+  ratio), and SHVC/MV-HEVC; AV1 frame headers beyond the frame type, tile
+  data and metadata OBUs; AAC program config elements, LATM in the codec
   package, ADTS frames of several raw data blocks, CRC checks; OpusTags and
   multistream self-delimited framing.
 

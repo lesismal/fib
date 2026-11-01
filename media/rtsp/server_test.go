@@ -449,7 +449,7 @@ func TestClientErrors(t *testing.T) {
 			t.Errorf("%s taken", u)
 		}
 	}
-	if _, err := Publish(ClientConfig{Engine: ce}, "rtsp://127.0.0.1:1/s", []*av.Track{nil, {Codec: av.CodecAV1}}); err != ErrNoTracks {
+	if _, err := Publish(ClientConfig{Engine: ce}, "rtsp://127.0.0.1:1/s", []*av.Track{nil, {Codec: av.CodecMP3}}); err != ErrNoTracks {
 		t.Fatal(err)
 	}
 	if _, err := Play(ClientConfig{Engine: ce}, "rtsp://[::1:1/s"); err == nil {
@@ -521,12 +521,12 @@ func TestClientErrors(t *testing.T) {
 	if !errors.As(s.closed[0], &se) || se.Code != StatusNotFound {
 		t.Fatal(s.closed[0])
 	}
-	pub, _ := h.Publish("av1", []*av.Track{{Codec: av.CodecAV1}}, hub.PublishInfo{})
+	pub, _ := h.Publish("mp3", []*av.Track{{Codec: av.CodecMP3}}, hub.PublishInfo{})
 	defer pub.Close()
 	s = newSink()
 	cfg = s.config()
 	cfg.Engine = ce
-	if _, err := Play(cfg, base+"av1"); err != nil {
+	if _, err := Play(cfg, base+"mp3"); err != nil {
 		t.Fatal(err)
 	}
 	s.wait(t, "415", func(s *sink) bool { return len(s.closed) > 0 })

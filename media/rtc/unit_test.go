@@ -79,7 +79,7 @@ func TestSendCodec(t *testing.T) {
 			t.Fatalf("%v: matched nothing", codec)
 		}
 	}
-	for _, codec := range []av.CodecID{av.CodecAAC, av.CodecAV1, av.CodecMP3} {
+	for _, codec := range []av.CodecID{av.CodecAAC, av.CodecMP3} {
 		if _, ok := sendCodec(&av.Track{Codec: codec}, nil); ok {
 			t.Fatalf("%v sendable", codec)
 		}

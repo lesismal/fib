@@ -29,16 +29,30 @@ func fuzzFormats(t testing.TB) []*Format {
 	bare264 := &Format{PayloadType: 96, ClockRate: 90000, Track: &av.Track{Codec: av.CodecH264}}
 	bare265 := &Format{PayloadType: 96, ClockRate: 90000, Track: &av.Track{Codec: av.CodecH265}}
 	opus := &Format{PayloadType: 96, ClockRate: 48000, Track: &av.Track{Codec: av.CodecOpus}}
-	return []*Format{h264f, h265f, bare264, bare265, generic, &full, latm, inband, opus}
+	av1Track, _ := av1Fixture(t)
+	av1f, _ := NewFormat(av1Track, 96)
+	bareAV1 := &Format{PayloadType: 96, ClockRate: 90000, Track: &av.Track{Codec: av.CodecAV1}}
+	return []*Format{h264f, h265f, bare264, bare265, generic, &full, latm, inband, opus, av1f, bareAV1}
 }
 
 // FuzzDepacketize feeds packets made of the input to a Depacketizer of
 // every format. The input is a sequence of [flags][2-byte length][payload]:
 // flags carry the marker, a sequence number step and a timestamp step.
 func FuzzDepacketize(f *testing.F) {
-	for _, name := range []string{"h264", "h265", "aac", "latm", "opus"} {
+	av1Track, av1TUs := av1Fixture(f)
+	av1f, _ := NewFormat(av1Track, 96)
+	var av1Seed [][]byte
+	for _, rp := range av1Packets(f, av1f, 300, av1TUs[:3]...) {
+		b, _ := rp.Append(nil)
+		av1Seed = append(av1Seed, b)
+	}
+	for _, name := range []string{"h264", "h265", "aac", "latm", "opus", "av1"} {
 		var seed []byte
-		for i, p := range readPackets(f, name) {
+		pkts := av1Seed
+		if name != "av1" {
+			pkts = readPackets(f, name)
+		}
+		for i, p := range pkts {
 			if i == 12 {
 				break
 			}
@@ -91,6 +105,9 @@ func FuzzPacketize(f *testing.F) {
 	f.Add(h264Fix.aus[1].Data, false, uint16(1400))
 	f.Add(h265Fix.aus[0].Data, true, uint16(100))
 	f.Add([]byte{1, 2, 3}, true, uint16(30))
+	_, av1TUs := av1Fixture(f)
+	f.Add(av1TUs[0].Data, true, uint16(100))
+	f.Add(av1TUs[1].Data, false, uint16(60))
 	formats := fuzzFormats(f)
 	f.Fuzz(func(t *testing.T, data []byte, key bool, mtu uint16) {
 		for _, fm := range formats {
@@ -126,6 +143,8 @@ func FuzzParseMedia(f *testing.F) {
 	}
 	f.Add("v=0\r\no=- 0 0 IN IP4 0.0.0.0\r\ns=-\r\nt=0 0\r\nm=video 0 RTP/AVP 96\r\na=rtpmap:96 H264/90000\r\n" +
 		"a=fmtp:96 packetization-mode=1;sprop-parameter-sets=Z2QAFazZQUH7ARAAAAMAEAAAAwPI8UKZYA==,aOvssiw=\r\n")
+	f.Add("v=0\r\no=- 0 0 IN IP4 0.0.0.0\r\ns=-\r\nt=0 0\r\nm=video 0 RTP/AVP 45\r\na=rtpmap:45 AV1/90000\r\n" +
+		"a=fmtp:45 level-idx=5;profile=0;tier=0\r\n")
 	f.Fuzz(func(t *testing.T, s string) {
 		sd, err := sdp.ParseString(s)
 		if err != nil {

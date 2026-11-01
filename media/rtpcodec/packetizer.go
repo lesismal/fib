@@ -77,6 +77,8 @@ func NewPacketizer(f *Format, config PacketizerConfig) (*Packetizer, error) {
 		p.pl = &h264Payloader{}
 	case av.CodecH265:
 		p.pl = &h265Payloader{}
+	case av.CodecAV1:
+		p.pl = &av1Payloader{}
 	case av.CodecAAC:
 		if f.LATM {
 			p.pl = latmPayloader{}
