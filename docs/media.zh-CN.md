@@ -737,6 +737,7 @@ libx265、libopus、libsrt）、ffmpeg 7.1（Debian trixie，能读 Enhanced RTM
 | 所有接入 × 所有出口 | ffmpeg 5.1、7.1 | 见下面的[矩阵](#接入与出口矩阵) |
 | WHIP、WHEP | ffmpeg 5.1、fib 的客户端 | ffmpeg 经 RTSP 推 H.264+Opus；fib 的 WHEP 客户端从 WHEP 端点把它拉进一个路径，fib 的 WHIP 客户端把它推到 WHIP 端点成为另一个路径；ffmpeg 经 RTSP 播放两者，解码没有错误 |
 | WHIP、WHEP | headless Chromium | WHEP 播放 ffmpeg 的 H.264+Opus：连接成功，640×360，解码 244 帧，没有丢包；Chromium 用虚拟摄像头和麦克风经 WHIP 推流（OpenH264 Constrained Baseline 与 Opus），ffmpeg 随后经 RTSP 播放并解码，没有错误 |
+| WHIP、WHEP（AV1） | headless Chromium 156 | WHEP 播放 libaom 编码的 AV1 流（160×120，带隐藏帧）：解码 132 帧，没有丢包和丢帧；Chromium 用虚拟摄像头以 AV1（libaom，L1T1）经 WHIP 推流，收到的 202 个 temporal unit 由 ffmpeg 7.1 解码没有错误，再经 WHEP 播放回来：640×360，dav1d 解码 201 帧，没有丢包。ffmpeg 7.1 没有 AV1 的 RTP 载荷格式，所以经 RTSP 传 AV1 只在 fib 自己的客户端与服务端之间验证 |
 | 上面的示例 | ffmpeg 5.1、7.1，fib 的 WHEP 客户端 | 原样编译；ffmpeg 同时经 RTMP 和 SRT 推 H.264+AAC、经 RTSP 推 H.264+Opus。RTMP 的流经 RTMP、TCP 与 UDP 的 RTSP、SRT、HTTP-FLV、HLS fMP4 与 TS、LL-HLS 播放；SRT 的流经 HLS 和 RTMP 播放；RTSP 的流经 SRT 和 HLS 播放；ffmpeg 对每一路解码 4 秒没有错误，fib 的 WHEP 客户端收到 RTSP 流的 H.264 与 Opus（5 秒约 400 个包）。WebSocket-FLV 的升级请求得到 101，向 `live/` 之外推流被钩子拒绝 |
 
 ### 接入与出口矩阵
