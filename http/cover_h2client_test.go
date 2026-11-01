@@ -821,6 +821,27 @@ func TestCoverH2ClientNewResponseRejects(t *testing.T) {
 	}
 }
 
+// The bandwidth-delay estimate ignores an acknowledgement with no PING out,
+// and smooths the round trip over the samples after the first.
+func TestCoverH2BDPSamples(t *testing.T) {
+	b := &h2BDP{window: 1000, limit: 8000}
+	if got := b.ack(); got != 0 {
+		t.Fatalf("an ack with no PING out grew to %d", got)
+	}
+	_ = b.data(900)
+	if got := b.ack(); got != 1800 {
+		t.Fatalf("first sample grew to %d, want 1800", got)
+	}
+	b.next = time.Time{} // the next PING is due now
+	if ping := b.data(1700); ping == nil {
+		t.Fatal("no PING for the second sample")
+	}
+	_ = b.ack()
+	if b.rtt <= 0 {
+		t.Fatalf("round trip %v", b.rtt)
+	}
+}
+
 // With AdaptiveWindow, the client measures what arrives in a round trip
 // with a PING, and a server that filled the stream window within it has the
 // windows grown, with SETTINGS and a WINDOW_UPDATE; the response still
