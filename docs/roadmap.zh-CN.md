@@ -74,7 +74,6 @@
 | 基于 TLS、HTTP 隧道的 RTSP，RTSP 2.0，组播 | 有意不做 | 摄像头和播放器用的是基于 TCP 或 UDP 单播的普通 RTSP 1.0 | M | 部署要求 rtsps，或必须穿过 HTTP 代理 |
 | SRT 的 rendezvous、file 模式、AES-GCM、FEC、bonding | 有意不做 | ffmpeg、OBS 和编码器接入与分发用的是带 AES-CTR 的 live 模式 | L | 有编码器或网络需要其中之一 |
 | WHIP/WHEP 的 ICE restart、simulcast 多层 | 已知限制 | ICE restart 按 RFC 9725 的要求回 422；每个 section 只接收 simulcast 的第一层 | M | 会切换网络的移动端发布者，或 SFU 式的分层选择 |
-| 基于 RTP 的 AV1（RTSP、WHEP） | 已知限制 | rtpcodec 没有 AV1 载荷格式；AV1 可经 Enhanced RTMP、HTTP-FLV 和 HLS fMP4 传输 | M | 有 AV1 发布者，而观众用 WebRTC 或 RTSP |
 | 录制、DVR 与点播 | 有意不做 | 所有流都是直播；录制器就是应用自己写的一个 hub 订阅者（fmp4 和 mpegts 既能输出分片也能输出文件） | M | 录制成为常见需求 |
 | HLS 增量播放列表、rendition report、PROGRAM-DATE-TIME、加密 | 有意不做 | 每路流一个 variant，不转码，播放器不需要它们也能播放 | M | 播放列表很长、增量更新能省带宽，或需要 DRM |
 | CI 中的互通测试 | 部分完成 | `media/interop`（CI job `media-interop`，不阻塞）跑 ffmpeg 7.1 矩阵：H.264/H.265 配 AAC/Opus，4 种推流 × 8 种播放，外加 WHEP；ffmpeg 5.1、G.711、Chromium、音视频同步、重新推流、压测和卡住的播放者仍手工验证 | M | 宣布 API 稳定之前；job 稳定运行一段时间后改为阻塞 |
