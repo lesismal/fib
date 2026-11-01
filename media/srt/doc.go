@@ -48,13 +48,18 @@
 // authentication goes. A publisher (m=publish) reserves its path in the
 // handshake (hub.Hub.Reserve), so a second publisher of a busy path is
 // rejected there with RejectConflict, and is demuxed (package mpegts) into
-// the hub, going live once the program's tracks are known; a player (m=request, the default) subscribes to the hub
-// and receives the stream muxed into MPEG-TS, 7 transport packets per SRT
-// packet, from the next keyframe (ServerConfig.PlayGOPCache), dropped
-// (hub.NewDropper) while the peer acknowledges too little.
+// the hub, going live once the program's tracks are known; a player
+// (m=request, the default) subscribes to the hub and receives the stream
+// muxed into MPEG-TS, 7 transport packets per SRT packet, from the next
+// keyframe (ServerConfig.PlayGOPCache), dropped (hub.NewDropper) while the
+// peer acknowledges too little.
+//
 // Dial, Publish and Play are the caller side on Engine.OpenUDPPeer: a raw
 // session, a push of a hub stream to a listener (an SRT server, or ffmpeg
-// with mode=listener), and a pull from one into a hub.
+// with mode=listener), and a pull from one into a hub, which reserves its
+// path before dialing as a publisher of the server does. A query in a
+// plain stream ID ("live/s?token=x") reaches the hub's OnPublish and
+// OnSubscribe hooks as PublishInfo.Query and SubscribeInfo.Query.
 //
 // Left out: rendezvous mode, file (message and stream) mode and the
 // congestion control it needs, AES-GCM, packet filters (FEC), socket
@@ -66,7 +71,10 @@
 // Usage, a server:
 //
 //	h := hub.New(hub.Config{})
-//	srv, err := srt.NewServer(srt.ServerConfig{Hub: h, Latency: 200 * time.Millisecond})
+//	srv, err := srt.NewServer(srt.ServerConfig{
+//		Hub:     h,
+//		Latency: 200 * time.Millisecond,
+//	})
 //	engine, err := fib.New(fib.DefaultConfig(),
 //		fib.Binding{Network: "udp", Addr: ":9000", Handler: srv})
 //	go engine.Run()

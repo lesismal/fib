@@ -47,14 +47,18 @@
 // parameter on the playlist URL, as index.m3u8?format=ts, each format
 // played running a Muxer of its own:
 //
-//	h := hls.NewHandler(hls.HandlerConfig{Hub: hb, Formats: []hls.Format{hls.MPEGTS}})
+//	h := hls.NewHandler(hls.HandlerConfig{
+//		Hub:     hb,
+//		Formats: []hls.Format{hls.MPEGTS},
+//	})
 //	// /live/s/index.m3u8 is fMP4, /live/s/index.m3u8?format=ts MPEG-TS
 //
 // Left out: delta playlist updates (_HLS_skip, EXT-X-SKIP) and rendition
 // reports, byte-range parts, EXT-X-PROGRAM-DATE-TIME, multiple variants
-// (no transcoding), I-frame playlists, and encryption. EXT-X-TARGETDURATION is not known
-// before the segments are: it starts at TargetDuration rounded up and is
-// raised if a segment comes out longer (a keyframe interval longer than
-// the target), which strictly the specification does not allow; set
-// TargetDuration to the keyframe interval to avoid it.
+// (no transcoding), I-frame playlists, and encryption.
+// EXT-X-TARGETDURATION is not known before the segments are: it starts at
+// TargetDuration rounded up and is raised if a segment comes out longer (a
+// keyframe interval longer than the target), which strictly the
+// specification does not allow; set TargetDuration to the keyframe
+// interval to avoid it.
 package hls
