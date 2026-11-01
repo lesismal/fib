@@ -56,6 +56,7 @@ type session struct {
 	pub         *hub.Publisher
 	pubTracks   []*av.Track
 	recordStart time.Time
+	sync        lipSync
 }
 
 // stream is one stream of a session, as SETUP set it up.
@@ -82,6 +83,7 @@ type stream struct {
 	reorder   *rtpcodec.Reorder
 	pubIndex  int
 	originSet bool
+	sr        senderClock
 	pkt       rtp.Packet
 }
 
@@ -336,9 +338,20 @@ func (s *session) onInterleaved(now time.Time, m *Interleaved) {
 			s.receiveRTP(st, now, m.Data)
 			return
 		}
+		if st.tcp && m.Channel == st.channel+1 {
+			s.receiveRTCP(st, m.Data)
+			return
+		}
 	}
-	// RTCP, receiver reports of a player or sender reports of a recorder,
-	// only shows the client is there.
+}
+
+// receiveRTCP takes an RTCP packet of a stream. A recorder's sender
+// reports line its streams up (lipSync); the rest, and a player's receiver
+// reports, only show the client is there.
+func (s *session) receiveRTCP(st *stream, b []byte) {
+	if st.dp != nil {
+		st.sr.update(b)
+	}
 }
 
 // receiveRTP takes an RTP packet of a recorded stream.
@@ -362,7 +375,8 @@ func (s *session) receiveRTP(st *stream, now time.Time, b []byte) {
 func (s *session) depacketize(st *stream, now time.Time, p *rtp.Packet) {
 	if !st.originSet {
 		st.originSet = true
-		st.dp.SetOrigin(p.Timestamp, recordEpoch+now.Sub(s.recordStart))
+		at := s.sync.origin(st.sr, p.Timestamp, st.format.ClockRate, recordEpoch+now.Sub(s.recordStart))
+		st.dp.SetOrigin(p.Timestamp, at)
 	}
 	_ = st.dp.Depacketize(p, func(pkt *av.Packet) {
 		if t := st.dp.Track(); t != s.pubTracks[st.pubIndex] {
