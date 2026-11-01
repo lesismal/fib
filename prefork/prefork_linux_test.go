@@ -247,6 +247,14 @@ func TestAChildEndedBySIGTERMStoppedAsAsked(t *testing.T) {
 	}
 }
 
+// BalanceReusePort runs the children as usual where it can hand them a bpffs
+// directory, and where it cannot.
+func TestBalanceReusePortRuns(t *testing.T) {
+	if err := runUntilReady(t, "sigterm", 1, prefork.Config{Children: 1, ProcsPerChild: 1, BalanceReusePort: true}); err != nil {
+		t.Fatalf("RunContext = %v", err)
+	}
+}
+
 // A child that returns before it was asked to stop, even without an error,
 // ends the run: the master cannot serve with fewer children than it started.
 // The default sizing starts at least one.

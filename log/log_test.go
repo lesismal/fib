@@ -185,6 +185,26 @@ func TestLineWithAttrsAndGroups(t *testing.T) {
 	}
 }
 
+// TestLineValues covers the values TestLineLayout does not: a time, an empty
+// group, a value of a type of its own, a key that is not ASCII, a message
+// with control characters, and the handler's no-op With calls.
+func TestLineValues(t *testing.T) {
+	var buf bytes.Buffer
+	h := NewHandler(Config{Output: &buf})
+	if h.WithAttrs(nil) != h || h.WithGroup("") != h {
+		t.Fatal("an empty WithAttrs or WithGroup made a new handler")
+	}
+	// slog drops an empty group from a record, but not from WithAttrs.
+	h = h.WithAttrs([]slog.Attr{{Key: "none", Value: slog.GroupValue()}, slog.String("k", "v")})
+	at := time.Date(2026, 1, 2, 3, 4, 5, 6e6, time.UTC)
+	slog.New(h).Info("a\x01b\x7f", "at", at, "pt", struct{ X int }{1},
+		"ключ", "значение", "bad", "\xff", "tab", "\t")
+	want := ` INFO  a\x01b\x7f k=v at=2026-01-02T03:04:05.006Z pt={1} ключ=значение bad="\xff" tab="\t"` + "\n"
+	if got := buf.String(); !strings.HasSuffix(got, want) {
+		t.Fatalf("got %q, want it to end %q", got, want)
+	}
+}
+
 func TestFormats(t *testing.T) {
 	var buf bytes.Buffer
 	New(Config{Format: FormatJSON, Output: &buf}).Info("hello", "n", 1)
