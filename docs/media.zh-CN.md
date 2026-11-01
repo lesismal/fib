@@ -737,8 +737,26 @@ HTTP/2 和 HTTP/3 上，积压指流控压住超过 64 KiB 的数据，且只有
 
 互通测试用的是真实实现，在 Docker 中经环回地址进行：ffmpeg 5.1（Debian bookworm，libx264、
 libx265、libopus、libsrt）、ffmpeg 7.1（Debian trixie，能读 Enhanced RTMP 的 H.265 和 AV1），
-以及 headless Chromium。测试程序是仓库之外的临时模块，因为 fib 的 `go.mod` 不引入任何依赖，
-仓库内的测试也必须在没有 ffmpeg 的情况下通过。
+以及 headless Chromium。大部分测试程序当时是仓库之外的临时模块。其核心部分现在放在
+[`media/interop`](../media/interop)，它是一个独立的模块，因此 fib 的 `go.mod` 仍然不引入
+任何依赖，根模块的测试也仍然不需要 ffmpeg 就能通过。
+
+CI 在每次 push 和 pull request 时运行 `media/interop`，即 `media-interop` 任务（目前不阻塞
+合并）。它原样运行上面的示例服务端。ffmpeg 7.1 经 RTMP、TCP 与 UDP 的 RTSP、SRT 推
+H.264+AAC、H.265+AAC 和 H.264+Opus，再经下面[矩阵](#接入与出口矩阵)中的八种出口逐一播放回来，
+检查条件与矩阵相同。fib 的 WHEP 客户端也播放每一路，必须收到视频，音频为 Opus 时还必须收到
+音频。ffmpeg 自身无法推或读的组合（FLV 中的 Opus）会被跳过，并在日志中列出。在本地用
+Docker 运行：
+
+```sh
+./media/interop/run.sh                                  # 整个矩阵，镜像拉取之后不到两分钟
+./media/interop/run.sh -run 'TestMatrix/h264-aac/rtmp'  # 一种编码组合的一种接入
+```
+
+`run.sh` 在 `golang:1.27` 中安装 Debian trixie 的 ffmpeg；`IMAGE=` 可以指定一个已经装好 Go 和
+ffmpeg 的镜像，`CPUS=` 限制容器可用的 CPU。PATH 中有 ffmpeg 时，在 `media/interop` 中执行
+`go test ./...` 会直接运行这些检查；没有 ffmpeg 时则跳过。下表中的其余各行，以及 ffmpeg 5.1、
+G.711、音画同步、重新推流、负载和卡住播放者的测试，都是手工完成的。
 
 | 方面 | 对端 | 验证内容 |
 | --- | --- | --- |

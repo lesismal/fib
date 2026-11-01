@@ -856,9 +856,31 @@ coverage floor (96%) holds with them in it.
 The interop runs used real implementations in Docker over loopback: ffmpeg
 5.1 (Debian bookworm, libx264, libx265, libopus, libsrt) and ffmpeg 7.1
 (Debian trixie, which reads Enhanced RTMP's H.265 and AV1), and headless
-Chromium. The harnesses are scratch modules outside the repository, since
-fib's `go.mod` takes no dependency and the in-repo tests must pass without
-ffmpeg.
+Chromium. Most of the harnesses were scratch modules outside the
+repository. Their core now lives in [`media/interop`](../media/interop), a
+module of its own, so fib's `go.mod` still takes no dependency and the root
+module's tests still pass without ffmpeg.
+
+CI runs `media/interop` on every push and pull request, in the
+`media-interop` job (non-blocking for now). It serves the example above as it
+is. ffmpeg 7.1 publishes H.264+AAC, H.265+AAC and H.264+Opus over RTMP, RTSP
+over TCP and UDP, and SRT, and plays each back over the eight egresses of
+[the matrix](#every-ingest-by-every-egress) below, with the same checks.
+fib's WHEP client plays each too and must receive the video, and the audio
+when it is Opus. Pairs that ffmpeg itself cannot publish or read (Opus in
+FLV) are skipped and named in the log. To run it locally with Docker:
+
+```sh
+./media/interop/run.sh                                  # the whole matrix, under two minutes once the image is pulled
+./media/interop/run.sh -run 'TestMatrix/h264-aac/rtmp'  # one ingest of one codec pair
+```
+
+`run.sh` installs Debian trixie's ffmpeg into `golang:1.27`; `IMAGE=` names
+an image that has Go and ffmpeg already, and `CPUS=` limits the container.
+With ffmpeg on the PATH, `go test ./...` in `media/interop` runs the checks
+directly; without it, they are skipped. The other rows of the table below
+were run by hand, as were ffmpeg 5.1, G.711, and the A/V sync, republish,
+load and stalled-player runs.
 
 | Area | Peer | What it checks |
 | --- | --- | --- |

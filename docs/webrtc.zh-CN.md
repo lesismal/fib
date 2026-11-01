@@ -738,6 +738,27 @@ ICE-lite PeerConnection 共用一个 Mux，每个都和自己的客户端在 dat
 临时模块、经环回地址完成的，因为 fib 的 `go.mod` 不引入任何依赖；所用版本即提交说明中记录
 的版本。
 
+与 pion 的 PeerConnection、TURN 和 DTLS 互通检查现在放在 [`webrtc/interop`](../webrtc/interop)，
+这是一个可以依赖 pion 的独立模块。CI 在每次 push 和 pull request 时运行它们，即
+`webrtc-interop` 任务（目前不阻塞合并）：
+
+- fib 发起 offer、pion 应答，不用 trickle；pion 发起 offer、fib 应答，使用 trickle。两种情况下
+  都有一个数据通道回显最大 60 KiB 的消息，fib 发出的 VP8 轨道和 pion 发出的 Opus 轨道到达时，
+  SSRC 和 payload type 与双方信令中的一致。
+- 同样的流程，但双方都只收集经 fib `turnserver` 的 relay 候选：选中的候选对是 relay 到 relay，
+  服务端上有两个 allocation。
+- fib 的 DTLS 对接 pion/dtls，fib 分别作为客户端和服务端，使用 ECDSA 和 RSA 证书：use_srtp
+  选中 AES-128-GCM，双方导出的密钥材料相同，数据能回显。
+
+它们只需要 Go，在 macOS 和 Linux 上都能运行：
+
+```sh
+cd webrtc/interop && go test -race ./...
+```
+
+下表中的其余各行（pion/ice、srtp、rtp 与 rtcp、sctp 与 datachannel、sdp、作为库使用的 turn、
+OpenSSL 和 Chromium）是手工完成的。
+
 | 对端 | 验证内容 |
 | --- | --- |
 | pion/webrtc v4.2.26 | pion 发 offer、fib 应答，以及反过来，trickle 与非 trickle 两种方式：data channel 上最大 60 KiB 的消息回显，伪造的 VP8 和 Opus RTP 双向回环，SSRC 和 payload type 与各自 answer 中给出的一致；两端都只收集 relay candidate、经 `turnserver` 中转 |
