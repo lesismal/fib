@@ -555,11 +555,12 @@ func (p *player) OnPacket(pkt *av.Packet) {
 	if p.restart {
 		p.restart = false
 		if d := pkt.DTS + p.offset; d <= p.lastDTS || d > p.lastDTS+maxClockJump {
+			// As long after the last packet as the stream was quiet:
+			// the sender reports' mapping of wall time to media time,
+			// which a player stamps packets by (ffmpeg does), stays as
+			// true as it was.
 			at := p.lastDTS + max(min(now.Sub(p.lastAt), maxClockJump), minRestartGap)
 			p.offset = at - pkt.DTS
-			// Sender reports place the new clock at the wall time it
-			// starts.
-			p.wall0 = now.Add(p.originAt - at)
 		}
 	}
 	if p.offset != 0 {
