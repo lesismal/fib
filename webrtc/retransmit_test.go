@@ -89,7 +89,7 @@ func newRTXBench(t *testing.T, rc RetransmitConfig) *rtxBench {
 	pc := &PeerConnection{cfg: Configuration{Retransmit: rc}, srtpOut: out, senders: map[uint32]*RTPSender{}}
 	pc.cfg.Retransmit.defaults()
 	tr := &Transceiver{pc: pc, kind: MediaKindVideo, extIDs: map[string]uint8{rtp.ExtensionURIAbsSendTime: 3, rtp.ExtensionURIMid: 1}, midBytes: []byte("0")}
-	s := &RTPSender{pc: pc, t: tr, ssrc: 1, pt: 96}
+	s := &RTPSender{pc: pc, t: tr, ssrc: 1, pt: 96, hasPT: true}
 	tr.sender = s
 	pc.senders[1] = s
 	b.track = NewTrackLocal(Codec{MimeType: "video/VP8"}, "", "")
@@ -191,7 +191,7 @@ func TestRetransmitHistory(t *testing.T) {
 	}
 	binary.BigEndian.PutUint32(p[8:], 2)
 	b.pc.nacked(h, p, time.Now())
-	b.s.pt = 0
+	b.s.clearPayloadType()
 	binary.BigEndian.PutUint32(p[8:], 1)
 	b.pc.nacked(h, p, time.Now())
 	if len(b.sent) != 1 {

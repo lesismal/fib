@@ -450,7 +450,7 @@ func TestReportClock(t *testing.T) {
 	out, _ := srtpPair(t)
 	wall := time.Unix(1700000000, 0)
 	track := NewTrackLocal(Codec{MimeType: "audio/opus", ClockRate: 48000}, "a", "s")
-	s := &RTPSender{ssrc: 7, pt: 111, clockRate: 48000, packets: 1, lastTS: 5, lastAt: wall, track: track}
+	s := &RTPSender{ssrc: 7, pt: 111, hasPT: true, clockRate: 48000, packets: 1, lastTS: 5, lastAt: wall, track: track}
 	pc := &PeerConnection{srtpOut: out, transceivers: []*Transceiver{{sender: s}}}
 	report := func(now time.Time) uint32 {
 		t.Helper()
