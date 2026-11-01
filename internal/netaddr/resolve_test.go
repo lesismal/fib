@@ -18,7 +18,7 @@ func TestResolveNetworks(t *testing.T) {
 	if family, sa, err := ResolveListen("tcp4", "127.0.0.1:80"); err != nil || family != syscall.AF_INET || ToAddr(sa).String() != "127.0.0.1:80" {
 		t.Errorf("ResolveListen(tcp4) = %d, %v, %v", family, sa, err)
 	}
-	if family, sa, err := ResolveListen("udp","127.0.0.1:53"); err != nil || family != syscall.AF_INET || ToAddr(sa).String() != "127.0.0.1:53" {
+	if family, sa, err := ResolveListen("udp", "127.0.0.1:53"); err != nil || family != syscall.AF_INET || ToAddr(sa).String() != "127.0.0.1:53" {
 		t.Errorf("ResolveListen(udp) = %d, %v, %v", family, sa, err)
 	}
 	if family, sa, err := ResolveListen("unix", "/tmp/fib.sock"); err != nil || family != syscall.AF_UNIX || ToAddr(sa).String() != "/tmp/fib.sock" {

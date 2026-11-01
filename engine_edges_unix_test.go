@@ -92,21 +92,27 @@ func TestAttachSocketsAfterListenersStopped(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	var st syscall.Stat_t
+	if err := syscall.Fstat(fd, &st); err != nil {
+		t.Fatal(err)
+	}
 	err = server.attachSockets([]placement{{loop: server, stream: streamListener{fd: fd}}})
 	if !errors.Is(err, net.ErrClosed) {
 		syscall.Close(fd)
 		t.Fatalf("attachSockets after Stop = %v, want net.ErrClosed", err)
 	}
-	if fdOpenUnix(fd) {
+	// A goroutine left by an earlier test may reuse the number, so the
+	// socket counts as open only while fd is still the same one.
+	if sameFile(fd, st) {
 		syscall.Close(fd)
 		t.Fatal("the socket handed over was left open")
 	}
 }
 
-// fdOpenUnix reports whether fd is an open descriptor.
-func fdOpenUnix(fd int) bool {
-	var st syscall.Stat_t
-	return syscall.Fstat(fd, &st) != syscall.EBADF
+// sameFile reports whether fd is open on the file st describes.
+func sameFile(fd int, st syscall.Stat_t) bool {
+	var now syscall.Stat_t
+	return syscall.Fstat(fd, &now) == nil && now.Dev == st.Dev && now.Ino == st.Ino
 }
 
 // addrKey names an address by its family and port, and falls back to a

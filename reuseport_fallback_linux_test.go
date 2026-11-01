@@ -12,10 +12,14 @@ import (
 	"time"
 )
 
-// fdOpen reports whether fd is an open descriptor.
-func fdOpen(fd int) bool {
-	_, _, errno := syscall.Syscall(syscall.SYS_FCNTL, uintptr(fd), syscall.F_GETFD, 0)
-	return errno != syscall.EBADF
+// fdInode returns the inode fd refers to.
+func fdInode(t *testing.T, fd int) uint64 {
+	t.Helper()
+	var st syscall.Stat_t
+	if err := syscall.Fstat(fd, &st); err != nil {
+		t.Fatal(err)
+	}
+	return st.Ino
 }
 
 // The loader turns down what it cannot balance before it asks the kernel
@@ -148,11 +152,16 @@ func TestReusePortBalancerClose(t *testing.T) {
 		t.Fatal(err)
 	}
 	b, fds := pipeBalancer(t)
-	// Nothing else in the test opens a descriptor in between, so the
-	// numbers Close freed are not yet reused.
+	// A goroutine left by an earlier test may reuse a number Close freed, so
+	// a descriptor counts as still open only while it is the same pipe.
+	inodes := make([]uint64, len(fds))
+	for i, fd := range fds {
+		inodes[i] = fdInode(t, fd)
+	}
 	b.Close()
-	for _, fd := range fds {
-		if fdOpen(fd) {
+	for i, fd := range fds {
+		var st syscall.Stat_t
+		if syscall.Fstat(fd, &st) == nil && st.Ino == inodes[i] {
 			t.Errorf("descriptor %d is still open", fd)
 		}
 	}
