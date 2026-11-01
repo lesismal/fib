@@ -56,6 +56,7 @@ type session struct {
 	pub         *hub.Publisher
 	pubTracks   []*av.Track
 	recordStart time.Time
+	sync        lipSync
 }
 
 // stream is one stream of a session, as SETUP set it up.
@@ -82,6 +83,7 @@ type stream struct {
 	reorder   *rtpcodec.Reorder
 	pubIndex  int
 	originSet bool
+	sr        senderClock
 	pkt       rtp.Packet
 }
 
@@ -279,7 +281,11 @@ func (s *session) afterResponse(method string) {
 		c := s.sc.c
 		sink = hub.NewDropper(s.player, func() int64 { return outputwait.Queued(c) }, cfg.MaxQueuedBytes)
 	}
-	sub, err := cfg.Hub.Subscribe(s.path, sink, hub.SubscribeOptions{Info: s.sc.subscribeInfo(s.query)})
+	// Over UDP, nothing paces or resends the cached GOP's burst: a
+	// 4 Mbit/s stream's megabyte overflows the player's socket buffer and
+	// its start is lost. UDP players start at the next keyframe instead.
+	udp := slices.ContainsFunc(s.streams, func(st *stream) bool { return !st.tcp })
+	sub, err := cfg.Hub.Subscribe(s.path, sink, hub.SubscribeOptions{Info: s.sc.subscribeInfo(s.query), Wait: cfg.PlayWait, NoGOPCache: udp})
 	if err != nil {
 		// The stream went between DESCRIBE and PLAY.
 		s.sc.closeLocked()
@@ -336,9 +342,20 @@ func (s *session) onInterleaved(now time.Time, m *Interleaved) {
 			s.receiveRTP(st, now, m.Data)
 			return
 		}
+		if st.tcp && m.Channel == st.channel+1 {
+			s.receiveRTCP(st, m.Data)
+			return
+		}
 	}
-	// RTCP, receiver reports of a player or sender reports of a recorder,
-	// only shows the client is there.
+}
+
+// receiveRTCP takes an RTCP packet of a stream. A recorder's sender
+// reports line its streams up (lipSync); the rest, and a player's receiver
+// reports, only show the client is there.
+func (s *session) receiveRTCP(st *stream, b []byte) {
+	if st.dp != nil {
+		st.sr.update(b)
+	}
 }
 
 // receiveRTP takes an RTP packet of a recorded stream.
@@ -362,7 +379,8 @@ func (s *session) receiveRTP(st *stream, now time.Time, b []byte) {
 func (s *session) depacketize(st *stream, now time.Time, p *rtp.Packet) {
 	if !st.originSet {
 		st.originSet = true
-		st.dp.SetOrigin(p.Timestamp, recordEpoch+now.Sub(s.recordStart))
+		at := s.sync.origin(st.sr, p.Timestamp, st.format.ClockRate, recordEpoch+now.Sub(s.recordStart))
+		st.dp.SetOrigin(p.Timestamp, at)
 	}
 	_ = st.dp.Depacketize(p, func(pkt *av.Packet) {
 		if t := st.dp.Track(); t != s.pubTracks[st.pubIndex] {
@@ -451,9 +469,26 @@ type player struct {
 	originAt time.Duration
 	wall0    time.Time
 	lastPTS  time.Duration
-	closed   bool
-	buf      []byte
+	// After a republish (restart), the next publisher's clock may start
+	// anywhere: offset moves its times on from lastDTS, the largest sent
+	// (at lastAt), into shifted, as flv.Timeline does for RTMP.
+	restart bool
+	offset  time.Duration
+	lastDTS time.Duration
+	lastAt  time.Time
+	shifted av.Packet
+	closed  bool
+	buf     []byte
 }
+
+// maxClockJump is how far past the last packet the first one after a
+// republish may be and still be taken as the same clock carrying on. A
+// new clock starts after the last packet by as long as the stream was
+// quiet, at least minRestartGap and at most maxClockJump.
+const (
+	maxClockJump  = 10 * time.Second
+	minRestartGap = 20 * time.Millisecond
+)
 
 func newPlayer(s *session) *player {
 	p := &player{c: s.sc.c, tracks: s.desc.tracks, streams: make([]*stream, len(s.desc.tracks)),
@@ -499,6 +534,7 @@ func (p *player) OnTracks(tracks []*av.Track) {
 			return
 		}
 	}
+	p.restart = p.origin
 }
 
 func (p *player) OnPacket(pkt *av.Packet) {
@@ -509,13 +545,31 @@ func (p *player) OnPacket(pkt *av.Packet) {
 	}
 	now := time.Now()
 	if !p.origin {
-		p.origin, p.originAt, p.wall0 = true, pkt.DTS, now
+		p.origin, p.originAt, p.wall0, p.lastDTS = true, pkt.DTS, now, pkt.DTS
 		for _, st := range p.streams {
 			if st != nil {
 				st.pk.SetOrigin(pkt.DTS)
 			}
 		}
 	}
+	if p.restart {
+		p.restart = false
+		if d := pkt.DTS + p.offset; d <= p.lastDTS || d > p.lastDTS+maxClockJump {
+			// As long after the last packet as the stream was quiet:
+			// the sender reports' mapping of wall time to media time,
+			// which a player stamps packets by (ffmpeg does), stays as
+			// true as it was.
+			at := p.lastDTS + max(min(now.Sub(p.lastAt), maxClockJump), minRestartGap)
+			p.offset = at - pkt.DTS
+		}
+	}
+	if p.offset != 0 {
+		p.shifted = *pkt
+		p.shifted.DTS += p.offset
+		p.shifted.PTS += p.offset
+		pkt = &p.shifted
+	}
+	p.lastDTS, p.lastAt = max(p.lastDTS, pkt.DTS), now
 	st := p.streams[pkt.Track]
 	p.lastPTS = pkt.PTS
 	defer func() {

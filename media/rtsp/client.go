@@ -146,6 +146,9 @@ type Client struct {
 	nextKA  time.Time
 	lastRx  time.Time
 	events  []func()
+	// sync lines the played streams up by the server's sender reports
+	// when RTP-Info did not.
+	sync lipSync
 	// A publishing client's packets share one media clock from its first
 	// packet, whose DTS is originAt and went at wall0.
 	origin   bool
@@ -186,6 +189,7 @@ type clientStream struct {
 	dp        *rtpcodec.Depacketizer
 	reorder   *rtpcodec.Reorder
 	originSet bool
+	sr        senderClock
 	pkt       rtp.Packet
 	pk        *rtpcodec.Packetizer
 	ssrc      uint32
@@ -886,9 +890,17 @@ func (c *Client) deliver(st *clientStream, pkt *av.Packet) {
 func (c *Client) depacketize(st *clientStream, now time.Time, p *rtp.Packet) {
 	if !st.originSet {
 		st.originSet = true
-		st.dp.SetOrigin(p.Timestamp, recordEpoch)
+		st.dp.SetOrigin(p.Timestamp, c.sync.origin(st.sr, p.Timestamp, st.format.ClockRate, recordEpoch))
 	}
 	_ = st.dp.Depacketize(p, func(pkt *av.Packet) { c.deliver(st, pkt) })
+}
+
+// receiveRTCP takes an RTCP packet of a played stream, whose sender
+// reports line the streams up.
+func (c *Client) receiveRTCP(st *clientStream, b []byte) {
+	if !c.publish && st.dp != nil {
+		st.sr.update(b)
+	}
 }
 
 // receiveRTP takes an RTP packet of a played stream.
@@ -918,6 +930,10 @@ func (c *Client) handle(msg any) error {
 		for _, st := range c.streams {
 			if st.tcp && st.ch == m.Channel {
 				c.receiveRTP(st, time.Now(), m.Data)
+				break
+			}
+			if st.tcp && st.ch+1 == m.Channel {
+				c.receiveRTCP(st, m.Data)
 				break
 			}
 		}
@@ -983,6 +999,7 @@ func (h *clientUDPHandler) OnData(conn *fib.Connection, data []byte) {
 	now := time.Now()
 	if h.rtcp {
 		c.lastRx = now
+		c.receiveRTCP(h.st, data)
 		return
 	}
 	c.receiveRTP(h.st, now, data)

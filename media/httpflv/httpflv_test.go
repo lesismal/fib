@@ -275,8 +275,11 @@ func TestHTTPFLVLate(t *testing.T) {
 	p = newPlayer()
 	// A track FLV cannot carry is left out, its packets with it.
 	pub.SetTracks([]*av.Track{tracks[0], {Codec: av.CodecUnknown}})
-	pub.WritePacket(&av.Packet{Track: 1, Keyframe: true, DTS: time.Hour, Data: []byte{1}})
-	pub.WritePacket(&av.Packet{Track: 0, Keyframe: true, DTS: time.Hour, PTS: time.Hour, Data: packets[0].Data})
+	// The timeline carries on: a codec change is no new publisher, and
+	// five seconds on is no restart of its clock (flv.Timeline).
+	later := packets[len(packets)-1].DTS + 5*time.Second
+	pub.WritePacket(&av.Packet{Track: 1, Keyframe: true, DTS: later, Data: []byte{1}})
+	pub.WritePacket(&av.Packet{Track: 0, Keyframe: true, DTS: later, PTS: later, Data: packets[0].Data})
 	for {
 		n, err := resp.Body.Read(buf)
 		p.feed(buf[:n])
@@ -284,7 +287,7 @@ func TestHTTPFLVLate(t *testing.T) {
 			t.Fatal(err)
 		}
 		p.mu.Lock()
-		ok := len(p.packets) > 0 && p.packets[len(p.packets)-1].DTS > time.Minute
+		ok := len(p.packets) > 0 && p.packets[len(p.packets)-1].DTS > later-packets[0].DTS-time.Second
 		p.mu.Unlock()
 		if ok {
 			break

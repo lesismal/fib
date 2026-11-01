@@ -165,8 +165,8 @@ func (h *udpHandler) OnPriorityData(*fib.Connection, []byte) {}
 func (h *udpHandler) OnClose(*fib.Connection, error)         {}
 
 // OnData takes a datagram of a client: RTP of a stream it records, or RTCP,
-// which shows it is there. Datagrams from addresses no session set up are
-// dropped.
+// which shows it is there and, from a recorder, lines its streams up.
+// Datagrams from addresses no session set up are dropped.
 func (h *udpHandler) OnData(c *fib.Connection, data []byte) {
 	r := h.s.route(c.RemoteAddrPort(), h.rtcp, data)
 	if r == nil {
@@ -180,7 +180,9 @@ func (h *udpHandler) OnData(c *fib.Connection, data []byte) {
 	}
 	now := time.Now()
 	sc.touch(now)
-	if !r.rtcp {
+	if r.rtcp {
+		r.sess.receiveRTCP(r.st, data)
+	} else {
 		r.sess.receiveRTP(r.st, now, data)
 	}
 }

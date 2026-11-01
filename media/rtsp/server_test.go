@@ -294,6 +294,15 @@ func TestPublishAndPlay(t *testing.T) {
 				t.Fatalf("tracks %+v %+v", tracks[0], tracks[1])
 			}
 			checkSame(t, pkts, got)
+			// Over TCP the player starts with the cached GOP; over UDP,
+			// which cannot take its burst, at the next keyframe.
+			first := got[0]
+			cached := slices.ContainsFunc(pkts[:len(pkts)/2], func(p *av.Packet) bool {
+				return p.Track == first.Track && bytes.Equal(p.Data, first.Data)
+			})
+			if cached != (tc.play == TransportTCP) {
+				t.Fatalf("player over %v started with a cached packet: %v", tc.play, cached)
+			}
 			if len(player.Tracks()) != 2 {
 				t.Fatal("Tracks")
 			}
@@ -857,7 +866,10 @@ func TestServerRecordUDP(t *testing.T) {
 	for _, seq := range []uint16{1, 3, 2, 2, 5} {
 		_, _ = uc.WriteToUDP(pkt(seq, byte(seq)), server)
 	}
-	// From another port of the same IP: found by SSRC.
+	// From another port of the same IP: found by SSRC. Datagrams of two
+	// sockets may be read in either order, so this one waits for the rest:
+	// were it first, the others would be late.
+	s.wait(t, "udp packets", func(s *sink) bool { return len(s.pkts) == 4 })
 	_, _ = nat.WriteToUDP(pkt(6, 6), server)
 	// Unknown sources are dropped.
 	other, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})

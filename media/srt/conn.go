@@ -628,6 +628,11 @@ func (c *Conn) Handle(b []byte, now time.Time) {
 	case ctrlACKACK:
 		c.handleACKACK(h.info, now)
 	case ctrlShutdown:
+		// What has come is all there will be: hand it over now rather
+		// than at its TSBPD time, which the closing would not wait for.
+		// A sender's last frames come in a burst, as an encoder with
+		// lookahead flushes them before it closes: ffmpeg's last 1.6 s.
+		c.deliverAll()
 		c.closeWith(ErrPeerClosed)
 	case ctrlDropReq:
 		if len(cif) >= 8 {
@@ -1132,7 +1137,13 @@ func (c *Conn) sendPeriodicNAK(now time.Time) {
 
 // deliver hands over the packets whose time has come, in order, skipping
 // the missing ones before a packet that is due.
-func (c *Conn) deliver(now time.Time) {
+func (c *Conn) deliver(now time.Time) { c.deliverUntil(now, false) }
+
+// deliverAll delivers every packet received, whatever its TSBPD time,
+// skipping the missing ones.
+func (c *Conn) deliverAll() { c.deliverUntil(time.Time{}, true) }
+
+func (c *Conn) deliverUntil(now time.Time, all bool) {
 	c.nextDeliver = time.Time{}
 	for c.rcvCount > 0 && c.state == StateConnected {
 		p := c.rcv[c.rcvHead]
@@ -1150,7 +1161,7 @@ func (c *Conn) deliver(now time.Time) {
 			}
 		}
 		at := c.base.Add(time.Duration(p.ts)*time.Microsecond + c.rcvLatency)
-		if now.Before(at) {
+		if !all && now.Before(at) {
 			c.nextDeliver = at
 			return
 		}

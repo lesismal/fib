@@ -50,7 +50,8 @@
 // rejected there with RejectConflict, and is demuxed (package mpegts) into
 // the hub, going live once the program's tracks are known; a player (m=request, the default) subscribes to the hub
 // and receives the stream muxed into MPEG-TS, 7 transport packets per SRT
-// packet, dropped (hub.NewDropper) while the peer acknowledges too little.
+// packet, from the next keyframe (ServerConfig.PlayGOPCache), dropped
+// (hub.NewDropper) while the peer acknowledges too little.
 // Dial, Publish and Play are the caller side on Engine.OpenUDPPeer: a raw
 // session, a push of a hub stream to a listener (an SRT server, or ffmpeg
 // with mode=listener), and a pull from one into a hub.

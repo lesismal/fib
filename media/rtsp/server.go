@@ -79,6 +79,14 @@ type ServerConfig struct {
 	MaxHeaderBytes int
 	MaxBodyBytes   int
 
+	// PlayWait lets a player outlive the publisher of its stream by this
+	// long, waiting for the next one (hub.SubscribeOptions.Wait): when it
+	// comes with the codecs the player set up, the player carries on, its
+	// RTP timestamps going on from where they were; with others it ends.
+	// DESCRIBE still needs a publisher, for the tracks. Zero ends a player
+	// with its publisher.
+	PlayWait time.Duration
+
 	// MaxQueuedBytes is how much a player may have queued and not yet sent
 	// before its packets are dropped, video until the next keyframe (see
 	// hub.NewDropper); twice as much closes it. Zero means

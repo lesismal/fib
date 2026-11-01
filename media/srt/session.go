@@ -71,7 +71,25 @@ type Session struct {
 	pending  []*av.Packet
 	waitKey  bool
 	isPlayer bool
+	// After new tracks (a republish, restart), the next publisher's clock
+	// may start anywhere, and MPEG-TS players take a step back for a
+	// discontinuity: offset moves its times on from lastDTS, the largest
+	// sent (at lastAt), into shifted, as flv.Timeline does for RTMP.
+	restart bool
+	offset  time.Duration
+	lastDTS time.Duration
+	lastAt  time.Time
+	shifted av.Packet
 }
+
+// maxClockJump is how far past the last packet the first one after new
+// tracks may be and still be taken as the same clock carrying on. A new
+// clock starts after the last packet by as long as the stream was quiet,
+// at least minRestartGap and at most maxClockJump.
+const (
+	maxClockJump  = 10 * time.Second
+	minRestartGap = 20 * time.Millisecond
+)
 
 func newSession(remote netip.AddrPort, maxBacklog int64) *Session {
 	s := &Session{remote: remote, maxBacklog: maxBacklog}
@@ -241,6 +259,11 @@ func (s *Session) closedConn(err error) {
 	if s.closed {
 		return
 	}
+	if s.demux != nil && s.pub != nil {
+		// The last frame of each stream waits in the demuxer for the
+		// next PES to start, which will not come now.
+		s.demux.Flush()
+	}
 	s.closed = true
 	if s.pub != nil {
 		s.pub.Close()
@@ -307,6 +330,7 @@ func (p playSink) OnTracks(tracks []*av.Track) {
 	s.tracks = tracks
 	s.mux = nil
 	s.pending = s.pending[:0]
+	s.restart = !s.lastAt.IsZero()
 	if s.ready {
 		s.newMuxer()
 	}
@@ -372,6 +396,23 @@ func (s *Session) sendPacket(pkt *av.Packet, now time.Time) {
 	if s.mux == nil || !s.mux.Supported(pkt.Track) {
 		return
 	}
+	if s.restart {
+		s.restart = false
+		if d := pkt.DTS + s.offset; d <= s.lastDTS || d > s.lastDTS+maxClockJump {
+			at := s.lastDTS + max(min(now.Sub(s.lastAt), maxClockJump), minRestartGap)
+			s.offset = at - pkt.DTS
+		}
+	}
+	if s.offset != 0 {
+		s.shifted = *pkt
+		s.shifted.DTS += s.offset
+		s.shifted.PTS += s.offset
+		pkt = &s.shifted
+	}
+	if s.lastAt.IsZero() || pkt.DTS > s.lastDTS {
+		s.lastDTS = pkt.DTS
+	}
+	s.lastAt = now
 	var err error
 	if s.ts, err = s.mux.WritePacket(s.ts[:0], pkt); err != nil {
 		return

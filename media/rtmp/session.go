@@ -147,7 +147,9 @@ type egress struct {
 	tracks  []*av.Track
 	pending []*av.Packet
 	started bool
-	lastTS  uint32
+	// tl keeps the timestamps increasing when a republish restarts the
+	// publisher's clock.
+	tl      flv.Timeline
 	buf     []byte
 	onClose func(err error)
 }
@@ -193,6 +195,7 @@ func (e *egress) OnTracks(tracks []*av.Track) {
 
 func (e *egress) sendTracksLocked() {
 	e.enc.SetTracks(e.tracks)
+	e.tl.Restart()
 	if video, audio := e.enc.Tracks(); video == nil && audio == nil {
 		// A stream published before its tracks are known: they come in a
 		// second OnTracks.
@@ -214,7 +217,7 @@ func (e *egress) sendTracksLocked() {
 				body = append(amf.AppendString(nil, "@setDataFrame"), body...)
 			}
 		}
-		err = e.s.conn.WriteMessage(&Message{Type: mt, StreamID: e.streamID, Timestamp: e.lastTS, Payload: body})
+		err = e.s.conn.WriteMessage(&Message{Type: mt, StreamID: e.streamID, Timestamp: e.tl.Last(), Payload: body})
 	})
 	if err != nil {
 		_ = e.s.c.Close()
@@ -247,12 +250,11 @@ func (e *egress) sendPacketLocked(pkt *av.Packet) {
 		return
 	}
 	e.buf = b
-	ts := flv.Millis(pkt.DTS)
+	ts := e.tl.Stamp(typ == TypeVideo, pkt.DTS)
 	if err := e.s.conn.WriteMessage(&Message{Type: typ, StreamID: e.streamID, Timestamp: ts, Payload: b}); err != nil {
 		_ = e.s.c.Close()
 		return
 	}
-	e.lastTS = ts
 	e.s.touchWriteLocked()
 }
 
