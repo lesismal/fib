@@ -26,7 +26,10 @@
 // UDP, which cannot take its burst, at the next keyframe) and gets RTCP
 // sender reports so it can line the tracks up. A player over TCP is cut
 // back to keyframes (hub.NewDropper) when it falls behind, and dropped
-// when it falls further; over UDP its RTP goes to the socket as it comes.
+// when it falls further. Over UDP its RTP goes to the socket as it comes;
+// once the socket refuses a video datagram, video waits for the next
+// keyframe, and a player whose RTCP receiver reports keep saying it loses
+// more than ServerConfig.MaxPlayerLoss is closed.
 // With ServerConfig.PlayWait a player outlives its publisher and carries
 // on with the next one of the same codecs, its RTP times going on from
 // where they were. A recorder's packets go through a reorder buffer when

@@ -24,6 +24,8 @@ const (
 	DefaultSessionTimeout       = 60 * time.Second
 	DefaultIdleTimeout          = 60 * time.Second
 	DefaultMaxQueuedBytes       = 4 << 20
+	DefaultMaxPlayerLoss        = 0.5
+	DefaultPlayerLossWindow     = 10 * time.Second
 	DefaultSenderReportInterval = 5 * time.Second
 	DefaultUDPRTPAddr           = ":8000"
 	DefaultUDPRTCPAddr          = ":8001"
@@ -89,10 +91,19 @@ type ServerConfig struct {
 
 	// MaxQueuedBytes is how much a player over TCP may have queued and not
 	// yet sent before its packets are dropped, video until the next
-	// keyframe (see hub.NewDropper); twice as much closes it. Players over
-	// UDP send RTP as it comes and are never dropped or closed for falling
-	// behind. Zero means DefaultMaxQueuedBytes.
-	MaxQueuedBytes int64
+	// keyframe (see hub.NewDropper); twice as much closes it. Zero means
+	// DefaultMaxQueuedBytes.
+	//
+	// Over UDP nothing queues: a datagram the server's socket refuses is
+	// lost, and the player's video then waits for the next keyframe, as a
+	// TCP player's does. MaxPlayerLoss closes a UDP player whose RTCP
+	// receiver reports say it lost more than this share of a stream's
+	// packets in every report for PlayerLossWindow. Zero means
+	// DefaultMaxPlayerLoss, or DefaultPlayerLossWindow; a negative
+	// MaxPlayerLoss, or one of 1 or more, never closes a player for loss.
+	MaxQueuedBytes   int64
+	MaxPlayerLoss    float64
+	PlayerLossWindow time.Duration
 
 	// MTU bounds the RTP packets sent, header included; zero means
 	// rtpcodec.DefaultMTU.
@@ -145,6 +156,12 @@ func NewServer(config ServerConfig) *Server {
 	}
 	if config.MaxQueuedBytes <= 0 {
 		config.MaxQueuedBytes = DefaultMaxQueuedBytes
+	}
+	if config.MaxPlayerLoss == 0 {
+		config.MaxPlayerLoss = DefaultMaxPlayerLoss
+	}
+	if config.PlayerLossWindow <= 0 {
+		config.PlayerLossWindow = DefaultPlayerLossWindow
 	}
 	if config.MTU <= 0 {
 		config.MTU = rtpcodec.DefaultMTU

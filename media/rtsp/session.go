@@ -3,6 +3,7 @@ package rtsp
 import (
 	"crypto/rand"
 	"encoding/binary"
+	"errors"
 	"net/netip"
 	"slices"
 	"strconv"
@@ -76,6 +77,11 @@ type stream struct {
 	pk     *rtpcodec.Packetizer
 	ts     uint32
 	srSent bool
+	// Over UDP, videoWait holds video back until the next keyframe once a
+	// datagram of it was lost, and lossSince is when the receiver reports
+	// began saying the player loses more than MaxPlayerLoss.
+	videoWait bool
+	lossSince time.Time
 
 	// dp receives a recorded stream, through reorder over UDP; pubIndex
 	// is its track in the hub.
@@ -343,7 +349,7 @@ func (s *session) onInterleaved(now time.Time, m *Interleaved) {
 			return
 		}
 		if st.tcp && m.Channel == st.channel+1 {
-			s.receiveRTCP(st, m.Data)
+			s.receiveRTCP(st, now, m.Data)
 			return
 		}
 	}
@@ -352,9 +358,11 @@ func (s *session) onInterleaved(now time.Time, m *Interleaved) {
 // receiveRTCP takes an RTCP packet of a stream. A recorder's sender
 // reports line its streams up (lipSync); the rest, and a player's receiver
 // reports, only show the client is there.
-func (s *session) receiveRTCP(st *stream, b []byte) {
+func (s *session) receiveRTCP(st *stream, now time.Time, b []byte) {
 	if st.dp != nil {
 		st.sr.update(b)
+	} else if s.player != nil && !st.tcp {
+		s.player.receiverReport(st, b, now)
 	}
 }
 
@@ -461,6 +469,11 @@ type player struct {
 	streams   []*stream // by track index
 	tracks    []*av.Track
 	hardLimit int64
+	// maxLoss is MaxPlayerLoss as RTCP's fraction lost, out of 256, and
+	// lossWindow PlayerLossWindow; maxLoss is 0 when loss closes nothing.
+	maxLoss    int
+	lossWindow time.Duration
+	rr         rtp.ReceiverReport
 	// origin is set by the first packet: its DTS is media time originAt,
 	// and it went at wall time wall0. Sender reports map wall time to
 	// media time from there for every stream alike, which is all a
@@ -491,8 +504,12 @@ const (
 )
 
 func newPlayer(s *session) *player {
+	cfg := &s.sc.s.config
 	p := &player{c: s.sc.c, tracks: s.desc.tracks, streams: make([]*stream, len(s.desc.tracks)),
-		hardLimit: 2 * s.sc.s.config.MaxQueuedBytes}
+		hardLimit: 2 * cfg.MaxQueuedBytes, lossWindow: cfg.PlayerLossWindow}
+	if cfg.MaxPlayerLoss > 0 && cfg.MaxPlayerLoss < 1 {
+		p.maxLoss = int(cfg.MaxPlayerLoss * 256)
+	}
 	for _, st := range s.streams {
 		p.streams[st.index] = st
 	}
@@ -602,13 +619,66 @@ func (p *player) OnPacket(pkt *av.Packet) {
 		}
 		return
 	}
+	video := p.tracks[pkt.Track] != nil && p.tracks[pkt.Track].Codec.IsVideo()
+	if video && st.videoWait {
+		if !pkt.Keyframe {
+			return
+		}
+		st.videoWait = false
+	}
 	_ = st.pk.Packetize(pkt, func(rp *rtp.Packet) error {
 		b, err := rp.Append(make([]byte, 0, rp.MarshalSize()))
-		if err == nil {
-			st.rtpOut.send(b)
+		if err != nil {
+			return err
 		}
-		return err
+		if !st.rtpOut.send(b) && video {
+			// The frames after this one need it: wait for a keyframe,
+			// and send no more of this one.
+			st.videoWait = true
+			return errDatagramLost
+		}
+		return nil
 	})
+}
+
+// errDatagramLost stops packetizing a frame one of whose datagrams the
+// socket refused.
+var errDatagramLost = errors.New("rtsp: datagram lost")
+
+// receiverReport takes a compound RTCP packet from the client of st, a UDP
+// stream it plays, and closes the player once its receiver reports have
+// said for lossWindow that it loses more than maxLoss of the stream.
+func (p *player) receiverReport(st *stream, b []byte, now time.Time) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.closed || p.maxLoss == 0 {
+		return
+	}
+	for len(b) > 0 {
+		h, pkt, rest, err := rtp.NextRTCP(b)
+		if err != nil {
+			return
+		}
+		b = rest
+		if h.Type != rtp.TypeRR || p.rr.Unmarshal(pkt) != nil {
+			continue
+		}
+		for _, r := range p.rr.Reports {
+			if r.SSRC != st.pk.SSRC() {
+				continue
+			}
+			if int(r.FractionLost) <= p.maxLoss {
+				st.lossSince = time.Time{}
+				continue
+			}
+			if st.lossSince.IsZero() {
+				st.lossSince = now
+			} else if now.Sub(st.lossSince) >= p.lossWindow {
+				p.closeLocked()
+				return
+			}
+		}
+	}
 }
 
 // OnClose ends the client's connection: the stream is gone.

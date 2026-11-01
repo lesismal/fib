@@ -132,7 +132,7 @@ moved for an idle timeout.
 | RTMP | the connection's queued bytes | `WriteQueueLimit` (2 MiB) | past `MaxWriteQueue` (16 MiB), or output still for `IdleTimeout` (30 s) |
 | HTTP-FLV, WebSocket-FLV | queued bytes; on HTTP/2 and HTTP/3, flow control holding more than 64 KiB | `WriteQueueLimit` (2 MiB) | HTTP/1 past `MaxWriteQueue` (16 MiB); any player whose output is still for `IdleTimeout` (30 s) |
 | RTSP player over TCP | the connection's queued bytes | `MaxQueuedBytes` (4 MiB) | past twice `MaxQueuedBytes` |
-| RTSP player over UDP | — (datagrams go to the socket as they come) | — | `SessionTimeout` (60 s) without a request or RTCP |
+| RTSP player over UDP | — (datagrams go to the socket as they come); the loss its receiver reports | a datagram the socket refuses: video waits for the next keyframe | receiver reports above `MaxPlayerLoss` (50%) for `PlayerLossWindow` (10 s); `SessionTimeout` (60 s) without a request or RTCP |
 | SRT player | unacknowledged payload | `MaxSendBacklog` (4 MiB) | a peer silent for `PeerIdleTimeout` (5 s) |
 | WHEP viewer | the loss its receiver reports | `MaxLoss` (25%) | ICE consent lost |
 | HLS | — (one Muxer per stream and format, not per player) | the Muxer's `MaxBytes` (64 MiB) drops old segments | — |
@@ -638,7 +638,8 @@ value accepts every origin).
 | `SessionTimeout`, `IdleTimeout` | 60 s, 60 s | A session without a request, RTCP or (recording) RTP; a connection without a session |
 | `MaxHeaderBytes`, `MaxBodyBytes` | 16 KiB, 256 KiB | Bounds of a request |
 | `PlayWait` | 0 | How long a player outlives its publisher, waiting for the next one with the same codecs; 0 ends players with their publisher |
-| `MaxQueuedBytes` | 4 MiB | A TCP player's backlog past which packets drop; twice as much closes it. A UDP player's RTP goes to the socket as it comes |
+| `MaxQueuedBytes` | 4 MiB | A TCP player's backlog past which packets drop; twice as much closes it. A UDP player's RTP goes to the socket as it comes; once the socket refuses a video datagram, video waits for the next keyframe |
+| `MaxPlayerLoss`, `PlayerLossWindow` | 0.5, 10 s | A UDP player whose RTCP receiver reports say it lost more than this share of a stream in every report for the window is closed; a report under it starts the window again. A negative `MaxPlayerLoss`, or 1 and up, closes no one for loss |
 | `MTU`, `SenderReportInterval` | 1400, 5 s | RTP packet size, RTCP sender reports |
 | `ReorderSize`, `ReorderDelay` | 128 packets, 100 ms | The reorder buffer of each stream recorded over UDP |
 | `OnRequest` | none | Sees, and may answer, every authenticated request |

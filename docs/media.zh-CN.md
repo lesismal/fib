@@ -106,7 +106,7 @@ RTMP 推上来的流能用 RTSP、SRT、HTTP-FLV、HLS 和 WHEP 播放，是因�
 | RTMP | 连接排队的字节 | `WriteQueueLimit`（2 MiB） | 超过 `MaxWriteQueue`（16 MiB），或输出在 `IdleTimeout`（30 s）内一直不动 |
 | HTTP-FLV、WebSocket-FLV | 排队的字节；HTTP/2 与 HTTP/3 上为流控压住超过 64 KiB 的数据 | `WriteQueueLimit`（2 MiB） | HTTP/1 超过 `MaxWriteQueue`（16 MiB）；任何输出在 `IdleTimeout`（30 s）内一直不动的播放者 |
 | 走 TCP 的 RTSP 播放者 | 连接排队的字节 | `MaxQueuedBytes`（4 MiB） | 超过 `MaxQueuedBytes` 的两倍 |
-| 走 UDP 的 RTSP 播放者 | —（数据报来一个就发一个给 socket） | — | `SessionTimeout`（60 s）内没有请求或 RTCP |
+| 走 UDP 的 RTSP 播放者 | —（数据报来一个就发一个给 socket）；其接收端报告的丢包率 | socket 拒收一个数据报：视频等到下一个关键帧 | 接收端报告的丢包率在 `PlayerLossWindow`（10 s）内一直高于 `MaxPlayerLoss`（50%）；`SessionTimeout`（60 s）内没有请求或 RTCP |
 | SRT 播放者 | 未确认的载荷 | `MaxSendBacklog`（4 MiB） | 对端在 `PeerIdleTimeout`（5 s）内不发任何数据 |
 | WHEP 观众 | 其接收端报告的丢包率 | `MaxLoss`（25%） | ICE consent 丢失 |
 | HLS | —（每路流每种格式一个 Muxer，而不是每个播放者一个） | Muxer 的 `MaxBytes`（64 MiB）淘汰旧分片 | — |
@@ -554,7 +554,8 @@ HTTP/2 和 HTTP/3 上，积压指流控压住超过 64 KiB 的数据，且只有
 | `SessionTimeout`、`IdleTimeout` | 60 s、60 s | 会话没有请求、RTCP 或（录制时）RTP 的时长；连接没有会话的时长 |
 | `MaxHeaderBytes`、`MaxBodyBytes` | 16 KiB、256 KiB | 请求的上限 |
 | `PlayWait` | 0 | 播放者在发布者离开后继续存在、等待编码相同的下一个发布者的时长；0 表示播放者随发布者一起结束 |
-| `MaxQueuedBytes` | 4 MiB | 走 TCP 的播放者积压超过它就丢包；超过两倍就关闭。走 UDP 的播放者，RTP 来一个就发一个给 socket |
+| `MaxQueuedBytes` | 4 MiB | 走 TCP 的播放者积压超过它就丢包；超过两倍就关闭。走 UDP 的播放者，RTP 来一个就发一个给 socket；socket 拒收一个视频数据报后，视频等到下一个关键帧再发 |
+| `MaxPlayerLoss`、`PlayerLossWindow` | 0.5、10 s | 走 UDP 的播放者，RTCP 接收端报告在整个窗口内每次都说某路流丢包超过这个比例，就关闭它；有一次低于它，窗口重新计算。`MaxPlayerLoss` 为负数或不小于 1 时不因丢包关闭任何人 |
 | `MTU`、`SenderReportInterval` | 1400、5 s | RTP 包大小，RTCP sender report 间隔 |
 | `ReorderSize`、`ReorderDelay` | 128 个包、100 ms | 每路经 UDP 录制的流的重排缓冲区 |
 | `OnRequest` | 无 | 查看每个已认证的请求，也可以代为应答 |

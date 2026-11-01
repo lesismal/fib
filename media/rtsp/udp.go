@@ -51,20 +51,22 @@ func (u *udpSender) open(e *fib.Engine, binding int, addr netip.AddrPort) {
 	}
 }
 
-// send sends b, which it takes ownership of.
-func (u *udpSender) send(b []byte) {
+// send sends b, which it takes ownership of, and reports false when b is
+// lost: the socket was full, or the queue while the peer opens was.
+func (u *udpSender) send(b []byte) bool {
 	u.mu.Lock()
 	c := u.c
 	if c == nil {
-		if u.opening && !u.closed && u.queued+len(b) <= u.limit {
+		ok := u.opening && !u.closed && u.queued+len(b) <= u.limit
+		if ok {
 			u.queue = append(u.queue, b)
 			u.queued += len(b)
 		}
 		u.mu.Unlock()
-		return
+		return ok
 	}
 	u.mu.Unlock()
-	_ = c.SendOwned(b)
+	return c.SendOwned(b) == nil
 }
 
 // close closes the connection once open, or as soon as it opens.
@@ -181,7 +183,7 @@ func (h *udpHandler) OnData(c *fib.Connection, data []byte) {
 	now := time.Now()
 	sc.touch(now)
 	if r.rtcp {
-		r.sess.receiveRTCP(r.st, data)
+		r.sess.receiveRTCP(r.st, now, data)
 	} else {
 		r.sess.receiveRTP(r.st, now, data)
 	}
