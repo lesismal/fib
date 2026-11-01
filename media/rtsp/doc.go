@@ -22,7 +22,8 @@
 // The server answers OPTIONS, DESCRIBE (the SDP of the stream's tracks),
 // SETUP, PLAY (with Range and RTP-Info), PAUSE, TEARDOWN, GET_PARAMETER and
 // SET_PARAMETER (keep-alives), and ANNOUNCE, SETUP with mode=record and
-// RECORD for publishers. A player starts with the hub's cached GOP, gets
+// RECORD for publishers. A player starts with the hub's cached GOP (over
+// UDP, which cannot take its burst, at the next keyframe), gets
 // RTCP sender reports so it can line the tracks up, and is cut back to
 // keyframes (hub.NewDropper) when it falls behind, and dropped when it
 // falls further. With ServerConfig.PlayWait a player outlives its

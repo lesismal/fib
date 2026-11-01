@@ -281,7 +281,11 @@ func (s *session) afterResponse(method string) {
 		c := s.sc.c
 		sink = hub.NewDropper(s.player, func() int64 { return outputwait.Queued(c) }, cfg.MaxQueuedBytes)
 	}
-	sub, err := cfg.Hub.Subscribe(s.path, sink, hub.SubscribeOptions{Info: s.sc.subscribeInfo(s.query), Wait: cfg.PlayWait})
+	// Over UDP, nothing paces or resends the cached GOP's burst: a
+	// 4 Mbit/s stream's megabyte overflows the player's socket buffer and
+	// its start is lost. UDP players start at the next keyframe instead.
+	udp := slices.ContainsFunc(s.streams, func(st *stream) bool { return !st.tcp })
+	sub, err := cfg.Hub.Subscribe(s.path, sink, hub.SubscribeOptions{Info: s.sc.subscribeInfo(s.query), Wait: cfg.PlayWait, NoGOPCache: udp})
 	if err != nil {
 		// The stream went between DESCRIBE and PLAY.
 		s.sc.closeLocked()

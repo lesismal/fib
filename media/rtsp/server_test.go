@@ -294,6 +294,15 @@ func TestPublishAndPlay(t *testing.T) {
 				t.Fatalf("tracks %+v %+v", tracks[0], tracks[1])
 			}
 			checkSame(t, pkts, got)
+			// Over TCP the player starts with the cached GOP; over UDP,
+			// which cannot take its burst, at the next keyframe.
+			first := got[0]
+			cached := slices.ContainsFunc(pkts[:len(pkts)/2], func(p *av.Packet) bool {
+				return p.Track == first.Track && bytes.Equal(p.Data, first.Data)
+			})
+			if cached != (tc.play == TransportTCP) {
+				t.Fatalf("player over %v started with a cached packet: %v", tc.play, cached)
+			}
 			if len(player.Tracks()) != 2 {
 				t.Fatal("Tracks")
 			}
