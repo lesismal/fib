@@ -276,6 +276,12 @@ func TestSettingsSpellings(t *testing.T) {
 	if got := AcceptPlacement(7).String(); got != "AcceptPlacement(7)" {
 		t.Errorf("AcceptPlacement(7) = %q", got)
 	}
+	if got := AcceptKernelHash.String(); got != "kernel-hash" {
+		t.Errorf("AcceptKernelHash = %q", got)
+	}
+	if validAcceptPlacement(7) == nil {
+		t.Error("AcceptPlacement(7) passed as valid")
+	}
 	if got := floorInt64(1234, 0); got != 1234 {
 		t.Errorf("floorInt64(1234, 0) = %d", got)
 	}

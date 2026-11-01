@@ -24,6 +24,8 @@ func TestKqueueExceptNeedsOOB(t *testing.T) {
 		{"read", syscall.Kevent_t{Filter: syscall.EVFILT_READ}, evIn},
 		{"read to an error", syscall.Kevent_t{Filter: syscall.EVFILT_READ, Flags: syscall.EV_EOF,
 			Fflags: uint32(syscall.ECONNRESET)}, evIn | evRdHup | evErr},
+		{"write", syscall.Kevent_t{Filter: syscall.EVFILT_WRITE}, evOut},
+		{"a filter fib never asks for", syscall.Kevent_t{Filter: syscall.EVFILT_TIMER}, 0},
 	} {
 		if got := kqueueEvents(&tc.ev); got != tc.events {
 			t.Errorf("%s: events %#x, want %#x", tc.name, got, tc.events)
