@@ -14,8 +14,8 @@ const (
 	CodecUnknown CodecID = iota
 	CodecH264
 	CodecH265
-	// CodecAV1 is carried where the container allows it; nothing in the
-	// media stack parses it.
+	// CodecAV1 is carried where the container allows it, and over RTP;
+	// package media/codec/av1 reads its sequence header.
 	CodecAV1
 	CodecAAC
 	CodecOpus

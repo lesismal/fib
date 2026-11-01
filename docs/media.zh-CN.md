@@ -14,7 +14,8 @@
 [`media/fmp4`](../media/fmp4)），以及 [`media/rtc`](../media/rtc)，即基于 fib 自己的
 [WebRTC](webrtc.zh-CN.md) 实现的 WHIP 与 WHEP。它们在 [`media/hub`](../media/hub) 中汇合，
 共用 [`media/av`](../media/av) 的类型，以及 [`media/codec/h264`](../media/codec/h264)、
-[`media/codec/h265`](../media/codec/h265)、[`media/codec/aac`](../media/codec/aac)、
+[`media/codec/h265`](../media/codec/h265)、[`media/codec/av1`](../media/codec/av1)、
+[`media/codec/aac`](../media/codec/aac)、
 [`media/codec/opus`](../media/codec/opus) 的码流工具函数。全部基于标准库和 fib 实现，不依赖
 任何其它模块，也没有任何代码对音视频做解码或编码。
 
@@ -29,8 +30,8 @@
 | HLS、LL-HLS | `media/hls` | 播放 | — | RFC 8216，分片放在内存中，格式为 fMP4 或 MPEG-TS，按请求选择（`?format=ts`）；以及低延迟扩展：partial segment、preload hint、blocking playlist reload |
 | WHIP、WHEP | `media/rtc` | WHIP 接入、WHEP 分发 | WHIP 推流、WHEP 拉流，以及转发 | RFC 9725 与 draft-ietf-wish-whep：201 加 Location，PATCH 做 trickle，DELETE，CORS，用 Link 头下发 ICE 服务器，bearer token；所有 PeerConnection 共用一个 UDP 端口 |
 | Hub | `media/hub` | — | — | 按路径登记的流，每路一个发布者、任意多个订阅者；GOP 缓存；为较晚才知道 track 的接入预占路径；订阅者可以等待发布者，并在重新推流后继续；推流与播放的认证集中在一处 |
-| 容器与载荷 | `media/flv`、`media/mpegts`、`media/fmp4`、`media/rtpcodec`、`media/amf` | — | — | 带 Enhanced RTMP tag 的 FLV；MPEG-TS 复用与解复用；fragmented MP4 的写入与读取；H.264、H.265、AAC、Opus、G.711 的 RTP 载荷格式及 SDP；AMF0 双向，AMF3 解码 |
-| 编码工具 | `media/codec/...` | — | — | H.264 与 H.265 的分帧、SPS、配置记录与关键帧判断；AAC 的 AudioSpecificConfig 与 ADTS；OpusHead 与包时长 |
+| 容器与载荷 | `media/flv`、`media/mpegts`、`media/fmp4`、`media/rtpcodec`、`media/amf` | — | — | 带 Enhanced RTMP tag 的 FLV；MPEG-TS 复用与解复用；fragmented MP4 的写入与读取；H.264、H.265、AV1、AAC、Opus、G.711 的 RTP 载荷格式及 SDP；AMF0 双向，AMF3 解码 |
+| 编码工具 | `media/codec/...` | — | — | H.264 与 H.265 的分帧、SPS、配置记录与关键帧判断；AV1 的 OBU、sequence header、AV1CodecConfigurationRecord 与关键帧判断；AAC 的 AudioSpecificConfig 与 ADTS；OpusHead 与包时长 |
 
 任何地方都不做转码。流以发布者选定的编码发布，每个出口承载其协议能承载的 track，其余的
 不发；具体见[编码矩阵](#各协议支持的编码)。
@@ -238,7 +239,7 @@ rtcServer, _ := rtc.NewServer(rtc.Config{Hub: h,
 | 协议 | 转入 `av` | 从 `av` 转出 |
 | --- | --- | --- |
 | RTMP、HTTP-FLV | FLV tag body 本身就是 AVCC 和配置记录；sequence header 成为 `Track.Config`，composition time offset 给出 `PTS`，32 位毫秒时间戳被展开；在 `onMetaData` 声明的每个 track 都收到 sequence header 之前，包会被暂存（最多 512 个包或 1 秒） | 先发 `onMetaData` 和每个 track 的 sequence header，再每个包一个 tag body；H.265 用 enhanced 形式（hvc1），除非设置了 `EncoderConfig.LegacyHEVC`，AV1 与 Opus 总是 enhanced |
-| RTSP、WHIP（RTP） | depacketizer 把 access unit 重组为 AVCC，从 SDP 的 `sprop-*`/`config=` 取配置，并跟随带内发送的参数集，参数集改变配置时替换 track；RTP 只有显示时间，解码时间由 SPS 给出的重排深度恢复；每个 track 从第一个包到达的时间开始，之后按 RTP 时间戳推进，再由发送端的 RTCP sender report 对齐各 track（RTSP 在每个 track 开始时对齐；WHIP 的浏览器在发出头几个包之后才发 report，所以每收到一个 report 就调整一次，调整量逐步摊入，时间戳既不跳变也不回退） | packetizer 按 MTU 切分 access unit（STAP-A/FU-A、AP/FU），在每个关键帧前发送参数集，序号与时间戳从随机值开始；RTSP 和 WHEP 另外为所有 track 在同一时钟上发送 RTCP sender report |
+| RTSP、WHIP（RTP） | depacketizer 把 access unit 重组为 AVCC（AV1 的 temporal unit 重组为带 size 字段的 OBU），从 SDP 的 `sprop-*`/`config=` 取配置，并跟随带内发送的参数集和 AV1 sequence header，它们改变配置时替换 track；RTP 只有显示时间，解码时间由 SPS 给出的重排深度恢复（AV1 不需要）；每个 track 从第一个包到达的时间开始，之后按 RTP 时间戳推进，再由发送端的 RTCP sender report 对齐各 track（RTSP 在每个 track 开始时对齐；WHIP 的浏览器在发出头几个包之后才发 report，所以每收到一个 report 就调整一次，调整量逐步摊入，时间戳既不跳变也不回退） | packetizer 按 MTU 切分 access unit（STAP-A/FU-A、AP/FU、AV1 的 OBU element），在每个关键帧前发送参数集或 sequence header，序号与时间戳从随机值开始；RTSP 和 WHEP 另外为所有 track 在同一时钟上发送 RTCP sender report |
 | SRT、HLS-TS（MPEG-TS） | Annex B 转为 AVCC，配置记录由带内参数集构造；去掉 ADTS，由其头部得出 AudioSpecificConfig；Opus 由描述符构造 OpusHead；33 位 PTS 与 DTS 被展开；节目中每路流都有了配置之后才宣布 track | Annex B，带 access unit delimiter，缺参数集的关键帧前补上参数集；AAC 用 ADTS；Opus 作为私有流，带 ffmpeg 的描述符和控制头；每个关键帧前以及每 100 ms 发送 PAT 和 PMT；每 40 ms 一个 PCR |
 | HLS fMP4 | —（`fmp4` 的读取器用于测试和将来的接入） | 配置原样放入 avcC、hvcC、av1C、esds 和 dOps，AVCC 采样原样放入 mdat |
 
@@ -251,7 +252,7 @@ rtcServer, _ := rtc.NewServer(rtc.Config{Hub: h,
 | --- | --- | --- | --- | --- | --- |
 | H.264 | ✓ | ✓ RFC 6184（发送用 mode 1；STAP-B、MTAP、FU-B 也能读） | ✓ stream type 0x1B | ✓ avc1 | ✓ 接入：mode 0 与 1；分发：mode 1，profile-level-id 取浏览器能解码的 |
 | H.265 | ✓ Enhanced RTMP（hvc1）收发；旧式 codec id 12 可接入，设置 `LegacyHEVC` 时也可发出 | ✓ RFC 7798，不含 DONL | ✓ 0x24 | ✓ hvc1 | ✓ 接入；浏览器提供时分发 |
-| AV1 | ✓ Enhanced RTMP（av01） | — 无载荷格式 | — | ✓ av01 | — |
+| AV1 | ✓ Enhanced RTMP（av01） | ✓ AV1 RTP 载荷格式（AOM v1.0） | — | ✓ av01 | ✓ 接入；浏览器提供流的 profile 时分发 |
 | AAC | ✓ | ✓ mpeg4-generic（发送 AAC-hbr；AAC-lbr 与 MP4A-LATM 可读） | ✓ ADTS，0x0F | ✓ mp4a | — 去掉：WebRTC 没有 AAC |
 | Opus | ✓ Enhanced RTMP | ✓ RFC 7587 | ✓ 带 Opus registration 的私有流 | ✓ Opus（dOps） | ✓ |
 | G.711（PCMU、PCMA） | ✓ sound format 8 与 7 | ✓ | — | — | ✓ |
@@ -266,11 +267,13 @@ rtcServer, _ := rtc.NewServer(rtc.Config{Hub: h,
   HTTP-FLV 播放器例外，而这样的播放器占大多数：ffmpeg 5.1 和 7.1 也读不了 FLV 中的 Opus。
 - **H.265** 在 RTMP 和 HTTP-FLV 上需要 Enhanced RTMP 或旧式 codec id 12（ffmpeg 7.1 能读
   enhanced 形式，5.1 两种都不能），在 WHEP 上需要浏览器提供 H.265。
+- **AV1** 由 Enhanced RTMP、HTTP-FLV、HLS fMP4、RTSP 和 WebRTC 承载，在 SRT 和 HLS-TS 上
+  被去掉。经 RTSP 播放 AV1 的播放器很少：8.0 之前的 ffmpeg 没有 AV1 的 RTP 载荷格式。
 - **G.711**（IP 摄像头）由 RTMP、HTTP-FLV、RTSP 和 WebRTC 承载，在 SRT 和 HLS 上被去掉，
   这两者只播视频。
 - 协议接入不了的 track 在接入时就被丢弃：FLV 解码器丢弃它不认识的编码的 tag（VP6、Speex、
   Nellymoser……），MPEG-TS demuxer 跳过 MP3、MPEG-2 视频和 AC-3。分发方向上，WHEP 端点在
-  第一次去掉 AAC、MP3、AV1 时各记一行日志。
+  第一次去掉 AAC、MP3 时各记一行日志。
 
 ## 一个服务跑全部协议
 
@@ -712,8 +715,8 @@ WHEP 观众若在 offer 中要求 NACK（浏览器对视频都会这样做），
 - **HTTP-FLV**：提供录制文件；自动重连的拉流（`OnClose` 告知已结束，再拉一次只需一次调用）。
 - **RTSP**：RTSP 2.0；基于 TLS（rtsps）和 HTTP 隧道的 RTSP；组播；用于跳转的 PLAY Range、
   Scale 与 Speed；比连接活得更久的会话；向录制端发送 RTCP receiver report。
-- **RTP 载荷**：H.264 的 interleaved 模式（能读，但不按解码顺序号重排）；H.265 的 DONL；MP3 和
-  AV1 的载荷格式；AAC 以外的 mpeg4-generic 模式。
+- **RTP 载荷**：H.264 的 interleaved 模式（能读，但不按解码顺序号重排）；H.265 的 DONL；AV1 的
+  可伸缩结构（其 OBU 只是原样传递）；MP3 的载荷格式；AAC 以外的 mpeg4-generic 模式。
 - **SRT**：rendezvous 模式；file（message 与 stream）模式及其拥塞控制；AES-GCM；包过滤器
   （FEC）；socket group（bonding）；SRT 1.3 之前的 HSv4 握手；主动发起密钥更新（Conn 起始的
   密钥可用约 2^31 个包，按 20 Mbit/s 算超过一天；对端发起的密钥更新会被跟随）。
@@ -730,7 +733,8 @@ WHEP 观众若在 offer 中要求 NACK（浏览器对视频都会这样做），
   对齐各 track：在第一批 report 到达之前（浏览器要一秒多之后才发），以及对从不发 report 的发布
   者，各 track 之间的偏差只能保证在网络抖动和各编码器延迟之差以内。
 - **编码工具**：H.264 的 PPS、slice header、SVC/MVC 与 subset SPS；H.265 SPS 中位深和重排之后
-  的部分（因此没有帧率和宽高比），以及 SHVC/MV-HEVC；AAC 的 program config element、codec
+  的部分（因此没有帧率和宽高比），以及 SHVC/MV-HEVC；AV1 frame header 中帧类型之后的部分、
+  tile 数据与 metadata OBU；AAC 的 program config element、codec
   package 中的 LATM、含多个 raw data block 的 ADTS 帧、CRC 校验；OpusTags 与 multistream 的
   self-delimited 分帧。
 
@@ -778,6 +782,7 @@ G.711、音画同步、重新推流、负载和卡住播放者的测试，都是
 | 所有接入 × 所有出口 | ffmpeg 5.1、7.1 | 见下面的[矩阵](#接入与出口矩阵) |
 | WHIP、WHEP | ffmpeg 5.1、fib 的客户端 | ffmpeg 经 RTSP 推 H.264+Opus；fib 的 WHEP 客户端从 WHEP 端点把它拉进一个路径，fib 的 WHIP 客户端把它推到 WHIP 端点成为另一个路径；ffmpeg 经 RTSP 播放两者，解码没有错误 |
 | WHIP、WHEP | headless Chromium | WHEP 播放 ffmpeg 的 H.264+Opus：连接成功，640×360，解码 244 帧，没有丢包；Chromium 用虚拟摄像头和麦克风经 WHIP 推流（OpenH264 Constrained Baseline 与 Opus），ffmpeg 随后经 RTSP 播放并解码，没有错误 |
+| WHIP、WHEP（AV1） | headless Chromium 156 | WHEP 播放 libaom 编码的 AV1 流（160×120，带隐藏帧）：解码 132 帧，没有丢包和丢帧；Chromium 用虚拟摄像头以 AV1（libaom，L1T1）经 WHIP 推流，收到的 202 个 temporal unit 由 ffmpeg 7.1 解码没有错误，再经 WHEP 播放回来：640×360，dav1d 解码 201 帧，没有丢包。ffmpeg 7.1 没有 AV1 的 RTP 载荷格式，所以经 RTSP 传 AV1 只在 fib 自己的客户端与服务端之间验证 |
 | 上面的示例 | ffmpeg 5.1、7.1，fib 的 WHEP 客户端 | 原样编译；ffmpeg 同时经 RTMP 和 SRT 推 H.264+AAC、经 RTSP 推 H.264+Opus。RTMP 的流经 RTMP、TCP 与 UDP 的 RTSP、SRT、HTTP-FLV、HLS fMP4 与 TS、LL-HLS 播放；SRT 的流经 HLS 和 RTMP 播放；RTSP 的流经 SRT 和 HLS 播放；ffmpeg 对每一路解码 4 秒没有错误，fib 的 WHEP 客户端收到 RTSP 流的 H.264 与 Opus（5 秒约 400 个包）。WebSocket-FLV 的升级请求得到 101，向 `live/` 之外推流被钩子拒绝 |
 
 ### 接入与出口矩阵

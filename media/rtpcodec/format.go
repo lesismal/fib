@@ -9,6 +9,7 @@ import (
 
 	"github.com/lesismal/fib/media/av"
 	"github.com/lesismal/fib/media/codec/aac"
+	"github.com/lesismal/fib/media/codec/av1"
 	"github.com/lesismal/fib/media/codec/h264"
 	"github.com/lesismal/fib/media/codec/h265"
 	"github.com/lesismal/fib/webrtc/sdp"
@@ -77,7 +78,8 @@ type Format struct {
 
 // NewFormat returns the format a track is sent in with payload type pt,
 // which a G.711 track ignores for its static type. H.264 is sent in
-// packetization mode 1, H.265 per RFC 7798 without DONL, AAC as
+// packetization mode 1, H.265 per RFC 7798 without DONL, AV1 per the AV1
+// RTP payload format, AAC as
 // mpeg4-generic AAC-hbr, Opus per RFC 7587 and G.711 per RFC 3551. Other
 // codecs report ErrUnsupported, as does an AAC track without a valid
 // AudioSpecificConfig, which the format cannot do without.
@@ -86,7 +88,7 @@ func NewFormat(track *av.Track, pt uint8) (*Format, error) {
 	switch track.Codec {
 	case av.CodecH264:
 		f.ClockRate, f.PacketizationMode = 90000, 1
-	case av.CodecH265:
+	case av.CodecH265, av.CodecAV1:
 		f.ClockRate = 90000
 	case av.CodecAAC:
 		var c aac.Config
@@ -131,7 +133,8 @@ func NewLATMFormat(track *av.Track, pt uint8) (*Format, error) {
 // Media returns the media section that describes the format: its m= line
 // with port 0 and RTP/AVP, as RTSP writes them, its a=rtpmap and a=fmtp,
 // and a=control when Control is set. An H.264 or H.265 track's parameter
-// sets go into sprop-parameter-sets or sprop-vps/sps/pps, an AAC track's
+// sets go into sprop-parameter-sets or sprop-vps/sps/pps, an AV1 track's
+// profile, level and tier into profile, level-idx and tier, an AAC track's
 // AudioSpecificConfig into config=.
 func (f *Format) Media() (*sdp.MediaDescription, error) {
 	kind := "audio"
@@ -147,6 +150,9 @@ func (f *Format) Media() (*sdp.MediaDescription, error) {
 	case av.CodecH265:
 		c.Name = "H265"
 		c.Fmtp = h265Fmtp(f.Track.Config)
+	case av.CodecAV1:
+		c.Name = "AV1"
+		c.Fmtp = av1Fmtp(f.Track.Config)
 	case av.CodecAAC:
 		var cfg aac.Config
 		if err := cfg.Unmarshal(f.Track.Config); err != nil {
@@ -222,6 +228,17 @@ func h265Fmtp(config []byte) string {
 	return strings.Join(parts, ";")
 }
 
+// av1Fmtp returns the format parameters of an AV1 track, as browsers
+// write them, or none when its configuration is not known.
+func av1Fmtp(config []byte) string {
+	var c av1.Config
+	if c.Unmarshal(config) != nil {
+		return ""
+	}
+	return "level-idx=" + strconv.Itoa(int(c.Level)) + ";profile=" + strconv.Itoa(int(c.Profile)) +
+		";tier=" + strconv.Itoa(int(c.Tier))
+}
+
 // ParseSession returns the format of every media section of sd the package
 // can carry, in order, skipping the others.
 func ParseSession(sd *sdp.SessionDescription) []*Format {
@@ -276,6 +293,8 @@ func parseCodec(c sdp.Codec) (*Format, error) {
 		return f, parseH264(f, c)
 	case "H265":
 		return f, parseH265(f, c)
+	case "AV1":
+		return f, parseAV1(f, c)
 	case "MPEG4-GENERIC":
 		return f, parseGeneric(f, c, channels)
 	case "MP4A-LATM":
@@ -394,6 +413,24 @@ func setH265Config(t *av.Track, vps, sps, pps [][]byte) bool {
 	}
 	t.Config, t.Width, t.Height = b, s.Width, s.Height
 	return true
+}
+
+// parseAV1 reads the format parameters of AV1, which give no configuration:
+// the track's comes from the sequence headers sent in band.
+func parseAV1(f *Format, c sdp.Codec) error {
+	f.Track = &av.Track{Codec: av.CodecAV1}
+	for _, p := range []struct {
+		name string
+		max  int
+	}{{"profile", 2}, {"level-idx", 31}, {"tier", 1}} {
+		if v, ok := c.Param(p.name); ok {
+			n, err := strconv.Atoi(v)
+			if err != nil || n < 0 || n > p.max {
+				return ErrFormat
+			}
+		}
+	}
+	return nil
 }
 
 func parseGeneric(f *Format, c sdp.Codec, channels int) error {

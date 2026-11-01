@@ -131,7 +131,7 @@ func Pull(config ClientConfig, rawURL string) (*Client, error) {
 }
 
 // Push publishes a stream of tracks to the WHIP endpoint at rawURL: it
-// offers to send the tracks WebRTC can carry (H.264, H.265, Opus and
+// offers to send the tracks WebRTC can carry (H.264, H.265, AV1, Opus and
 // G.711; the others are left out), and sends what WritePacket is given
 // once it is connected, holding the latest GOP until then. It returns at
 // once; the offer is made and sent on a goroutine of its own.

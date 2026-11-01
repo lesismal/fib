@@ -80,6 +80,8 @@ func NewDepacketizer(f *Format, config DepacketizerConfig) (*Depacketizer, error
 	case av.CodecH265:
 		d.video = newVideoAssembler(d, h265Codec{})
 		d.dp = &h265Depayloader{v: d.video}
+	case av.CodecAV1:
+		d.dp = newAV1Depayloader(d)
 	case av.CodecAAC:
 		if f.LATM {
 			d.dp = &latmDepayloader{d: d}
@@ -142,11 +144,18 @@ func (d *Depacketizer) Depacketize(p *rtp.Packet, emit func(*av.Packet)) error {
 // Flush emits what is held of an access unit whose marker never came, as
 // at the end of a stream.
 func (d *Depacketizer) Flush(emit func(*av.Packet)) {
-	if d.video != nil {
-		d.emit = emit
-		d.video.flush()
-		d.emit = nil
+	var f interface{ flush() }
+	switch {
+	case d.video != nil:
+		f = d.video
+	case d.f.Track.Codec == av.CodecAV1:
+		f = d.dp.(*av1Depayloader)
+	default:
+		return
 	}
+	d.emit = emit
+	f.flush()
+	d.emit = nil
 }
 
 // time returns the media time of RTP timestamp ts.

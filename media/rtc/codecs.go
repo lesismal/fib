@@ -6,6 +6,7 @@ import (
 	"strings"
 
 	"github.com/lesismal/fib/media/av"
+	"github.com/lesismal/fib/media/codec/av1"
 	"github.com/lesismal/fib/media/rtpcodec"
 	"github.com/lesismal/fib/webrtc"
 	"github.com/lesismal/fib/webrtc/sdp"
@@ -96,7 +97,7 @@ func formatOf(c webrtc.Codec) (*rtpcodec.Format, error) {
 }
 
 // receivable reports whether a codec the peer sends can be published:
-// H.264 in packetization mode 0 or 1, H.265, Opus and G.711.
+// H.264 in packetization mode 0 or 1, H.265, AV1, Opus and G.711.
 func receivable(c webrtc.Codec) bool {
 	f, err := formatOf(c)
 	if err != nil {
@@ -105,7 +106,7 @@ func receivable(c webrtc.Codec) bool {
 	switch f.Track.Codec {
 	case av.CodecH264:
 		return f.PacketizationMode < 2
-	case av.CodecH265, av.CodecOpus, av.CodecPCMU, av.CodecPCMA:
+	case av.CodecH265, av.CodecAV1, av.CodecOpus, av.CodecPCMU, av.CodecPCMA:
 		return true
 	}
 	return false
@@ -145,7 +146,7 @@ func containsCodec(list []webrtc.Codec, c webrtc.Codec) bool {
 
 // DefaultReceiveCodecs are the codecs a client that plays a stream (Pull)
 // offers: H.264 in packetization mode 1 in the profiles browsers send,
-// H.265, Opus and G.711.
+// H.265, AV1 in its main profile, Opus and G.711.
 func DefaultReceiveCodecs() []webrtc.Codec {
 	h264 := func(pt uint8, profile string) webrtc.Codec {
 		return webrtc.Codec{MimeType: "video/H264", ClockRate: 90000, PayloadType: pt, Feedback: videoFeedback,
@@ -160,15 +161,29 @@ func DefaultReceiveCodecs() []webrtc.Codec {
 		h264(112, "64001f"),
 		h264(127, "4d001f"),
 		{MimeType: "video/H265", ClockRate: 90000, PayloadType: 49, Feedback: videoFeedback},
+		{MimeType: "video/AV1", ClockRate: 90000, PayloadType: 45, Feedback: videoFeedback, Fmtp: av1Fmtp(nil)},
 	}
 }
 
+// av1Fmtp returns the fmtp of AV1 for a track, from the profile, level and
+// tier of its AV1CodecConfigurationRecord, or main profile, level 3.1 (the
+// default of the payload format), when it has none.
+func av1Fmtp(t *av.Track) string {
+	profile, level, tier := 0, 5, 0
+	var c av1.Config
+	if t != nil && c.Unmarshal(t.Config) == nil {
+		profile, level, tier = int(c.Profile), int(c.Level), int(c.Tier)
+	}
+	return "level-idx=" + strconv.Itoa(level) + ";profile=" + strconv.Itoa(profile) + ";tier=" + strconv.Itoa(tier)
+}
+
 // sendCodec returns the codec a track is sent in, when WebRTC can carry it
-// and rtpcodec packetize it: H.264, H.265, Opus and G.711. offered, when
-// not nil, are the codecs of the peer's media section of the track's kind:
-// the codec is then the one among them that suits the track (for H.264,
-// a profile whose decoder decodes the track's), with the peer's payload
-// type and parameters, and none when the peer offers none that does.
+// and rtpcodec packetize it: H.264, H.265, AV1, Opus and G.711. offered,
+// when not nil, are the codecs of the peer's media section of the track's
+// kind: the codec is then the one among them that suits the track (for
+// H.264, a profile whose decoder decodes the track's; for AV1, the track's
+// profile), with the peer's payload type and parameters, and none when the
+// peer offers none that does.
 func sendCodec(t *av.Track, offered []webrtc.Codec) (webrtc.Codec, bool) {
 	var c webrtc.Codec
 	switch t.Codec {
@@ -177,6 +192,9 @@ func sendCodec(t *av.Track, offered []webrtc.Codec) (webrtc.Codec, bool) {
 			Fmtp: h264Fmtp(profileLevelID(t))}
 	case av.CodecH265:
 		c = webrtc.Codec{MimeType: "video/H265", ClockRate: 90000, PayloadType: 49, Feedback: videoFeedback}
+	case av.CodecAV1:
+		c = webrtc.Codec{MimeType: "video/AV1", ClockRate: 90000, PayloadType: 45, Feedback: videoFeedback,
+			Fmtp: av1Fmtp(t)}
 	case av.CodecOpus:
 		c = webrtc.Codec{MimeType: "audio/opus", ClockRate: 48000, Channels: 2, PayloadType: 111,
 			Fmtp: "minptime=10;useinbandfec=1"}
@@ -193,10 +211,21 @@ func sendCodec(t *av.Track, offered []webrtc.Codec) (webrtc.Codec, bool) {
 	if t.Codec == av.CodecH264 {
 		return pickH264(offered, h264Class(profileLevelID(t)))
 	}
+	profile, _ := sdp.FmtpParam(c.Fmtp, "profile")
 	for _, o := range offered {
-		if strings.EqualFold(o.MimeType, c.MimeType) && o.ClockRate == c.ClockRate {
-			return o, true
+		if !strings.EqualFold(o.MimeType, c.MimeType) || o.ClockRate != c.ClockRate {
+			continue
 		}
+		if t.Codec == av.CodecAV1 {
+			p, ok := sdp.FmtpParam(o.Fmtp, "profile")
+			if !ok {
+				p = "0" // the payload format's default, main
+			}
+			if p != profile {
+				continue
+			}
+		}
+		return o, true
 	}
 	return webrtc.Codec{}, false
 }
