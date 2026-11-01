@@ -526,7 +526,21 @@ Done:
   payload behind the room its header takes, so sealing a datagram copies
   nothing. Receiving copies in the engine, into a
   pooled buffer, and in the HTTP/3 frame parser only a frame split across
-  pieces and the request body. Packet protection allocates nothing now: the
+  pieces and the request body. Removing the engine's copy as well was
+  measured and is deliberately not done. A datagram is decrypted in place in
+  that pooled buffer, and stream data that continues where delivery left off,
+  as nearly all of it does, goes to HTTP/3 as a slice of it; only data that
+  arrives ahead of a gap is copied. A buffered request body is then gathered
+  into one buffer, since it must be whole and outlive the datagrams, and a
+  streamed one goes to an `OnBody` sink straight from the datagram when
+  nothing waits ahead of it. Under `BenchmarkHTTP3Upload` on Linux (256 KiB bodies over loopback, client and
+  server in one process, 25s of CPU samples) the engine's copy was 0.68% of
+  the CPU, the body's gathering 0.76%, the frame parser's copies too few to
+  show, and AES-GCM decryption 3.9%. Reading into pooled buffers and handing
+  them over would save only the copy itself, since each read still needs a
+  buffer from the pool; it would cost a reference count on every read, whose
+  GRO segments share one 64 KiB slot, and queued datagrams would each hold a
+  whole slot instead of their own size. Packet protection allocates nothing now: the
   ChaCha20-Poly1305 authenticator was one heap allocation per packet and is a
   value. QUIC streams are deliberately not pooled: a `*Stream` is handed to
   the application and its lifetime is the application's, so reusing one would
