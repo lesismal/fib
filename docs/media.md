@@ -331,7 +331,12 @@ What this means in practice, with the usual encoders:
 - A track a protocol cannot take in is dropped at ingest: the FLV decoder drops
   tags of codecs it does not know (VP6, Speex, Nellymoser...), and the MPEG-TS
   demuxer skips MP3, MPEG-2 video and AC-3. On the way out, the WHEP endpoint
-  logs AAC and MP3 the first time it leaves each out.
+  logs AAC and MP3 the first time it leaves each out. WHEP sends each track in
+  a media section of the viewer's offer of its own, the first of its kind left
+  that offers a codec suiting the track: a stream of Opus and PCMU, or of two
+  video codecs, reaches a viewer whole only when its offer has two sections of
+  that kind (fib's `rtc.Pull` offers one of each). A track no section is left
+  for is not sent, logged the first time for each codec.
 
 ## One server, every protocol
 
@@ -846,8 +851,8 @@ a codec fib does not have, or because it belongs to the application.
   out longer than the target (a keyframe interval longer than
   `TargetDuration`), which the specification does not strictly allow.
 - **WHIP/WHEP**: ICE restarts (answered 422); simulcast (only a section's
-  first layer is received); more streams per kind than the offer has
-  sections; FEC, and NACKs from WHIP sessions and clients (only WHEP sessions
+  first layer is received); more streams of a kind than the offer has
+  sections (the rest are logged and not sent); FEC, and NACKs from WHIP sessions and clients (only WHEP sessions
   answer them); renegotiation when a stream's codec changes (the old codec's
   track stops). WHIP lines the tracks up by the publisher's sender reports:
   until the first ones come (a browser sends them a second or more in), and

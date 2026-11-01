@@ -260,18 +260,12 @@ func pickH264(offered []webrtc.Codec, class string) (webrtc.Codec, bool) {
 	return webrtc.Codec{}, false
 }
 
-// offeredCodecs returns the codecs of every media section of kind in the
-// offer.
-func offeredCodecs(offer *sdp.SessionDescription, kind webrtc.MediaKind) []webrtc.Codec {
+// sectionCodecs returns the codecs of a media section.
+func sectionCodecs(md *sdp.MediaDescription) []webrtc.Codec {
 	out := []webrtc.Codec{}
-	for _, md := range offer.Media {
-		if md.Kind() != string(kind) || md.Rejected() {
-			continue
-		}
-		for _, sc := range md.Codecs() {
-			if sc.Name != "" {
-				out = append(out, fromSDP(md.Kind(), sc))
-			}
+	for _, sc := range md.Codecs() {
+		if sc.Name != "" {
+			out = append(out, fromSDP(md.Kind(), sc))
 		}
 	}
 	return out

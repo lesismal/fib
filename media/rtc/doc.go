@@ -59,7 +59,12 @@
 // that decodes the stream's profile (its own, or one containing it),
 // H.265 when the browser offers it, AV1 when it offers the stream's
 // profile, Opus, PCMU and PCMA. AAC and MP3 are left out, with a log line
-// the first time each is met, as WebRTC cannot carry them. A
+// the first time each is met, as WebRTC cannot carry them. Each track goes
+// in a media section of the viewer's offer of its own: the first of its
+// kind left that receives and offers a codec suiting the track, so a
+// stream of Opus and PCMU needs an offer of two audio sections. A track no
+// section is left for is not sent, with a log line the first time each
+// codec is. Pull offers one section of each kind. A
 // viewer starts at the hub's cached GOP, held while it connects; its RTP
 // times are continuous for as long as it plays, across a republish of the
 // stream (which it waits Config.RepublishWait for), and the sender reports
@@ -88,8 +93,8 @@
 // goroutine of their own, and their callbacks report what follows.
 //
 // Left out: ICE restarts, simulcast (only the first layer of a section is
-// received), sending more than one stream per kind than the offer has
-// sections for, FEC, sending NACKs (a WHEP session answers a viewer's,
+// received), sending more streams of a kind than the offer has sections
+// for, FEC, sending NACKs (a WHEP session answers a viewer's,
 // see Config.RetransmitPackets), transcoding, renegotiation when a
 // stream's codec changes (the track of the old codec stops).
 package rtc

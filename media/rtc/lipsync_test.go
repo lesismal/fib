@@ -30,6 +30,13 @@ func frameOf(b []byte) int { return int(b[0])<<8 | int(b[1]) }
 // or play the env's path by WHIP or WHEP, and waits until it connects.
 func (ev *env) connect(t *testing.T, pc *webrtc.PeerConnection, path string) {
 	t.Helper()
+	ev.connectWith(t, pc, path, nil)
+}
+
+// connectWith is connect with the offer edited by edit, when not nil,
+// before it is sent.
+func (ev *env) connectWith(t *testing.T, pc *webrtc.PeerConnection, path string, edit func(string) string) {
+	t.Helper()
 	connected := make(chan struct{})
 	var once sync.Once
 	pc.OnConnectionStateChange(func(s webrtc.PeerConnectionState) {
@@ -42,6 +49,9 @@ func (ev *env) connect(t *testing.T, pc *webrtc.PeerConnection, path string) {
 	offer, err := webrtc.Offer(ctx, pc, nil)
 	if err != nil {
 		t.Fatal(err)
+	}
+	if edit != nil {
+		offer.SDP = edit(offer.SDP)
 	}
 	resp, answer := ev.request(t, "POST", path, "application/sdp", offer.SDP, nil)
 	if resp.StatusCode != 201 {
