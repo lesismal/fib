@@ -211,6 +211,14 @@ func TestCoverH2ClientConnectionErrors(t *testing.T) {
 		{"DATA on stream 0", nil, false, func(p *cvH2cPeer) {
 			p.frame(h2FrameData, h2FlagEndStream, 0, 'x')
 		}, H2ProtocolError},
+		{"DATA past the connection window", func(c *ClientConfig) {
+			// Frames larger than the window, which never drops below half
+			// of it otherwise.
+			c.HTTP2.ConnWindow, c.HTTP2.MaxFrameSize = h2DefaultWindow, 1<<17
+		}, false, func(p *cvH2cPeer) {
+			p.headers(1, false, ":status", "200")
+			p.frame(h2FrameData, 0, 1, make([]byte, h2DefaultWindow+1)...)
+		}, H2FlowControlError},
 		{"bad HPACK", nil, false, func(p *cvH2cPeer) {
 			p.frame(h2FrameHeaders, h2FlagEndHeaders|h2FlagEndStream, 1, 0x80)
 		}, H2CompressionError},
@@ -290,6 +298,12 @@ func TestCoverH2ClientStreamErrors(t *testing.T) {
 			p.headers(id, false, ":status", "200")
 			p.frame(h2FrameData, 0, id, make([]byte, 20)...)
 		}, H2Cancel, ErrResponseBodyTooLarge},
+		{"DATA past the stream window", func(c *ClientConfig) {
+			c.HTTP2.StreamWindow, c.HTTP2.MaxFrameSize = h2DefaultWindow, 1<<17
+		}, func(p *cvH2cPeer, id uint32) {
+			p.headers(id, false, ":status", "200")
+			p.frame(h2FrameData, 0, id, make([]byte, h2DefaultWindow+1)...)
+		}, H2FlowControlError, nil},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -804,5 +818,70 @@ func TestCoverH2ClientNewResponseRejects(t *testing.T) {
 		if resp, err := h2NewResponse(fields, req); err == nil {
 			t.Fatalf("%v: got %v, want an error", fields, resp)
 		}
+	}
+}
+
+// With AdaptiveWindow, the client measures what arrives in a round trip
+// with a PING, and a server that filled the stream window within it has the
+// windows grown, with SETTINGS and a WINDOW_UPDATE; the response still
+// arrives whole.
+func TestCoverH2ClientAdaptiveWindow(t *testing.T) {
+	grown := make(chan uint32, 1)
+	url := cvH2cServe(t, func(p *cvH2cPeer, _ int) {
+		p.settings()
+		id, _, ok := p.request()
+		if !ok {
+			return
+		}
+		p.headers(id, false, ":status", "200")
+		chunk := make([]byte, h2DefaultMaxFrameSize)
+		for sent := 0; sent+len(chunk) <= h2DefaultWindow; sent += len(chunk) {
+			p.frame(h2FrameData, 0, id, chunk...)
+		}
+		// The client's measurement started with the first DATA; the window
+		// is all but full, so the acknowledgement shows that the window held
+		// the server back.
+		for {
+			f, ok := p.next()
+			if !ok {
+				return
+			}
+			if f.typ == h2FramePing && !f.has(h2FlagAck) {
+				p.frame(h2FramePing, h2FlagAck, 0, f.payload...)
+				break
+			}
+		}
+		for {
+			f, ok := p.next()
+			if !ok {
+				return
+			}
+			if f.typ != h2FrameSettings || f.has(h2FlagAck) {
+				continue
+			}
+			_ = h2ParseSettings(f.payload, func(id h2SettingID, value uint32) error {
+				if id == h2SettingInitialWindowSize {
+					grown <- value
+				}
+				return nil
+			})
+			break
+		}
+		p.frame(h2FrameData, h2FlagEndStream, id, chunk[:10]...)
+		p.drain()
+	})
+	client := cvH2cClient(t, func(c *ClientConfig) {
+		c.HTTP2 = HTTP2Config{StreamWindow: h2DefaultWindow, AdaptiveWindow: true}
+	})
+	resp, err := client.Go(mustRequest(t, "GET", url, nil)).Wait()
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := h2DefaultWindow/h2DefaultMaxFrameSize*h2DefaultMaxFrameSize + 10
+	if n := len(readBody(t, resp)); n != want {
+		t.Fatalf("body of %d bytes, want %d", n, want)
+	}
+	if window := cvCliWait(t, grown, "the grown window"); window <= h2DefaultWindow {
+		t.Fatalf("window set to %d", window)
 	}
 }
