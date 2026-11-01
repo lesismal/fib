@@ -857,7 +857,10 @@ func TestServerRecordUDP(t *testing.T) {
 	for _, seq := range []uint16{1, 3, 2, 2, 5} {
 		_, _ = uc.WriteToUDP(pkt(seq, byte(seq)), server)
 	}
-	// From another port of the same IP: found by SSRC.
+	// From another port of the same IP: found by SSRC. Datagrams of two
+	// sockets may be read in either order, so this one waits for the rest:
+	// were it first, the others would be late.
+	s.wait(t, "udp packets", func(s *sink) bool { return len(s.pkts) == 4 })
 	_, _ = nat.WriteToUDP(pkt(6, 6), server)
 	// Unknown sources are dropped.
 	other, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
