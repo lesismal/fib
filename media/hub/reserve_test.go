@@ -221,3 +221,33 @@ func TestReserveRace(t *testing.T) {
 		t.Fatal(tr, len(dts))
 	}
 }
+
+func TestOnPublishSkippedWhenBusy(t *testing.T) {
+	var pubs, unpubs int
+	h := New(Config{
+		OnPublish:   func(string, PublishInfo) error { pubs++; return nil },
+		OnUnpublish: func(string) { unpubs++ },
+	})
+	defer h.Close()
+	p, err := h.Reserve("live/s", PublishInfo{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := h.Publish("live/s", nil, PublishInfo{}); err != ErrStreamBusy {
+		t.Fatalf("Publish = %v, want ErrStreamBusy", err)
+	}
+	if _, err := h.Reserve("live/s", PublishInfo{}); err != ErrStreamBusy {
+		t.Fatalf("Reserve = %v, want ErrStreamBusy", err)
+	}
+	p.Close()
+	if pubs != 1 || unpubs != 1 {
+		t.Fatalf("OnPublish %d, OnUnpublish %d; want 1 and 1", pubs, unpubs)
+	}
+	h.Close()
+	if _, err := h.Publish("live/s", nil, PublishInfo{}); err != ErrClosed {
+		t.Fatalf("Publish after Close = %v, want ErrClosed", err)
+	}
+	if pubs != 1 {
+		t.Fatalf("OnPublish ran on a closed hub")
+	}
+}

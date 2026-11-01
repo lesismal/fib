@@ -374,6 +374,22 @@ func (h *Hub) Reserve(path string, info PublishInfo) (*Publisher, error) {
 // the stream's mutex held on success.
 func (h *Hub) claim(path string, info PublishInfo) (*Publisher, *stream, error) {
 	if h.cfg.OnPublish != nil {
+		// A path that already has a publisher is refused before the hook
+		// runs, so OnPublish and OnUnpublish stay paired for everything but
+		// two publishers racing for a free path, where the loser's
+		// OnPublish has no OnUnpublish. The hook runs without any lock,
+		// since it may be slow (authentication), hence the check again
+		// below.
+		h.mu.Lock()
+		if st, err := h.lockStream(path, false); err == nil {
+			busy := st.pub != nil
+			st.unlock()
+			if busy {
+				return nil, nil, ErrStreamBusy
+			}
+		} else if err == ErrClosed {
+			return nil, nil, err
+		}
 		if err := h.cfg.OnPublish(path, info); err != nil {
 			return nil, nil, err
 		}
