@@ -1,7 +1,10 @@
 package webrtc
 
 import (
+	stdtls "crypto/tls"
+	"errors"
 	"fmt"
+	"net/netip"
 	"strings"
 	"testing"
 	"time"
@@ -9,6 +12,7 @@ import (
 	"github.com/lesismal/fib/tls"
 	"github.com/lesismal/fib/webrtc/ice"
 	"github.com/lesismal/fib/webrtc/sdp"
+	"github.com/lesismal/fib/webrtc/srtp"
 	"github.com/lesismal/fib/webrtc/stun"
 )
 
@@ -71,7 +75,7 @@ func TestCodecMatches(t *testing.T) {
 			t.Errorf("%v matches %v = %v", tc.l, tc.r, got)
 		}
 	}
-	got := intersectCodecs("video", []sdp.Codec{{PayloadType: 120, Name: "VP9", ClockRate: 90000, Fmtp: "profile-id=2"}, {PayloadType: 97, Name: "VP8", ClockRate: 90000}, {PayloadType: 98, Name: "rtx", ClockRate: 90000}}, DefaultCodecs())
+	got := intersectCodecs("video", []sdp.Codec{{PayloadType: 120, Name: "VP9", ClockRate: 90000, Fmtp: "profile-id=2"}, {PayloadType: 97, Name: "VP8", ClockRate: 90000}, {PayloadType: 98, Name: "rtx", ClockRate: 90000}, {PayloadType: 99}}, DefaultCodecs())
 	if len(got) != 1 || got[0].sendPT != 97 || got[0].Name() != "VP8" {
 		t.Fatalf("intersection %+v", got)
 	}
@@ -218,5 +222,215 @@ func TestLiteDeadline(t *testing.T) {
 	pc.iceState = ICEConnectionStateDisconnected
 	if d := pc.liteDeadline().Sub(at); d != 30*time.Second {
 		t.Fatalf("disconnected: %v", d)
+	}
+}
+
+// TestRejectedSectionWithoutRemote has nothing to reject a mid with when
+// there is no remote description, no section of that mid in it, or one
+// whose m= line does not parse; such a mid is left out of a description.
+func TestRejectedSectionWithoutRemote(t *testing.T) {
+	pc := &PeerConnection{midOrder: []string{"0"}}
+	if pc.rejectedSection("0") != nil {
+		t.Fatal("a section rejected with no remote description")
+	}
+	pc.remoteDesc = sdp.New(1, 1)
+	if pc.rejectedSection("0") != nil {
+		t.Fatal("a section rejected for a mid the remote lacks")
+	}
+	md := &sdp.MediaDescription{Lines: []sdp.Line{{Type: 'm', Value: "audio x"}}}
+	md.SetMid("0")
+	pc.remoteDesc.AddMedia(md)
+	if pc.rejectedSection("0") != nil {
+		t.Fatal("a section rejected for a malformed m= line")
+	}
+	if sd := pc.buildDescription(SDPTypeAnswer, "ufrag", "pwd"); len(sd.Media) != 0 {
+		t.Fatalf("a description with %d sections", len(sd.Media))
+	}
+}
+
+// TestSCTPCloseClosesChannels closes each data channel, once, when the
+// association closes.
+func TestSCTPCloseClosesChannels(t *testing.T) {
+	pc := &PeerConnection{}
+	d := &DataChannel{pc: pc, onClose: func() {}}
+	pc.channels = []*DataChannel{d}
+	pc.onSCTPClose(nil)
+	d.closedLocked()
+	if !d.closed || len(pc.channels) != 0 || len(pc.events) != 1 {
+		t.Fatalf("closed %v, %d channels, %d events", d.closed, len(pc.channels), len(pc.events))
+	}
+}
+
+// TestStateNoops covers the calls that change nothing: a timer firing
+// after Close, gathering not yet done, and a gathering state set again.
+func TestStateNoops(t *testing.T) {
+	(&PeerConnection{closed: true}).onTimer()
+	pc := &PeerConnection{}
+	pc.checkGathering()
+	pc.setGathering(pc.gathering)
+	if pc.gathering != ICEGatheringStateNew || len(pc.events) != 0 {
+		t.Fatalf("gathering %v, %d events", pc.gathering, len(pc.events))
+	}
+}
+
+// TestLiteHeardAgain has a lite PeerConnection that thought its peer gone
+// connected again once it hears from it.
+func TestLiteHeardAgain(t *testing.T) {
+	from := netip.MustParseAddrPort("127.0.0.1:9")
+	pc := &PeerConnection{
+		cfg:      Configuration{ICELite: true},
+		iceState: ICEConnectionStateDisconnected,
+		bound:    map[netip.AddrPort]struct{}{from: {}},
+	}
+	pc.heard(from, time.Now())
+	if pc.iceState != ICEConnectionStateConnected {
+		t.Fatalf("ICE state %v", pc.iceState)
+	}
+}
+
+// dtlsClient is a DTLS client that counts the datagrams it sends.
+func dtlsClient(t *testing.T, sends *int) *tls.DTLSConn {
+	t.Helper()
+	cert, err := tls.GenerateWebRTCCertificate()
+	if err != nil {
+		t.Fatal(err)
+	}
+	c, err := tls.NewDTLSClient(&stdtls.Config{Certificates: []stdtls.Certificate{cert}, InsecureSkipVerify: true},
+		tls.DTLSOptions{Output: func([]byte) { *sends++ }})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return c
+}
+
+// TestDTLSFailedBeforeStart has the client's DTLS connection fail, on a
+// fatal alert from the peer, before ICE selects a pair: starting it then
+// fails the PeerConnection, and later datagrams are dropped.
+func TestDTLSFailedBeforeStart(t *testing.T) {
+	var sends int
+	pc := &PeerConnection{
+		dtls:       dtlsClient(t, &sends),
+		dtlsRole:   sdp.SetupActive,
+		iceState:   ICEConnectionStateConnected,
+		remoteAddr: netip.MustParseAddrPort("127.0.0.1:9"),
+	}
+	alert := []byte{21, 0xfe, 0xfd, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2, 2, 40}
+	if err := pc.dtls.HandleDatagram(alert, time.Now()); err == nil {
+		t.Fatal("a fatal alert did not fail the connection")
+	}
+	pc.startDTLS(time.Now())
+	if !pc.dtlsFailed || pc.connState != PeerConnectionStateFailed || sends != 0 {
+		t.Fatalf("failed %v, state %v, %d sends", pc.dtlsFailed, pc.connState, sends)
+	}
+	pc.handleDTLS(alert, time.Now())
+}
+
+// TestDTLSBeforeAnyPair takes the peer's first DTLS datagram before ICE
+// has selected a pair: its address is where DTLS replies go, and it waits
+// for the DTLS connection.
+func TestDTLSBeforeAnyPair(t *testing.T) {
+	from := netip.MustParseAddrPort("127.0.0.1:9")
+	pc := &PeerConnection{}
+	pc.demux(localID, from, []byte{22, 0xfe, 0xfd}, time.Now())
+	if pc.remoteAddr != from || pc.remoteLocal != localID || len(pc.earlyDTLS) != 1 {
+		t.Fatalf("remote %v by %d, %d early datagrams", pc.remoteAddr, pc.remoteLocal, len(pc.earlyDTLS))
+	}
+}
+
+// TestTimerRetransmitsDTLS has the timer resend a ClientHello that went
+// unanswered past its timeout.
+func TestTimerRetransmitsDTLS(t *testing.T) {
+	var sends int
+	pc := &PeerConnection{dtls: dtlsClient(t, &sends), timer: time.AfterFunc(time.Hour, func() {})}
+	t.Cleanup(func() { pc.timer.Stop() })
+	if err := pc.dtls.Start(time.Now().Add(-time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	pc.onTimer()
+	if sends != 2 {
+		t.Fatalf("%d ClientHellos, want 2", sends)
+	}
+}
+
+// srtpPair returns the contexts of the two ends of an SRTP session: the
+// sender's outgoing one and the receiver's incoming one.
+func srtpPair(t *testing.T) (out, in *srtp.Context) {
+	t.Helper()
+	p := srtp.ProfileAES128CMHMACSHA1_80
+	km := make([]byte, p.KeyingMaterialLen())
+	out, _, err := srtp.NewContexts(km, p, true, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, in, err = srtp.NewContexts(km, p, false, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return out, in
+}
+
+// TestRTPOfNoTransceiver drops packets that are too short, of an SSRC no
+// transceiver takes, or of one whose transceiver lacks their payload type.
+func TestRTPOfNoTransceiver(t *testing.T) {
+	out, in := srtpPair(t)
+	tr := &Transceiver{mid: "0", current: DirectionRecvOnly}
+	pc := &PeerConnection{
+		srtpIn:       in,
+		tracks:       map[uint32]*TrackRemote{},
+		remoteSSRCs:  map[uint32]string{2: "0"},
+		transceivers: []*Transceiver{tr},
+		cfg:          Configuration{MaxRemoteSSRCs: 8},
+	}
+	pc.handleRTP(make([]byte, 4), time.Now())
+	for _, ssrc := range []byte{1, 2} {
+		b, err := out.ProtectRTP(nil, []byte{0x80, 96, 0, 1, 0, 0, 0, 1, 0, 0, 0, ssrc, 0xaa})
+		if err != nil {
+			t.Fatal(err)
+		}
+		pc.handleRTP(b, time.Now())
+	}
+	if len(pc.tracks) != 0 || len(tr.tracks) != 0 || len(pc.events) != 0 {
+		t.Fatalf("%d tracks, %d events", len(pc.tracks), len(pc.events))
+	}
+}
+
+// TestMalformedRTCP drops SRTCP that does not authenticate, and stops at
+// a compound packet whose RTCP header runs past it.
+func TestMalformedRTCP(t *testing.T) {
+	out, in := srtpPair(t)
+	pc := &PeerConnection{srtpIn: in, onRTCP: func([]byte) {}}
+	pc.handleRTCP(make([]byte, 40), time.Now())
+	b, err := out.ProtectRTCP(nil, []byte{0x80, 201, 0, 5, 0, 0, 0, 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	pc.handleRTCP(b, time.Now())
+	if len(pc.events) != 1 {
+		t.Fatalf("%d events, want the one OnRTCP", len(pc.events))
+	}
+	// WriteRTCP refuses a packet SRTCP cannot protect.
+	pc = &PeerConnection{srtpOut: out}
+	if err := pc.WriteRTCP([]byte{0x80}); !errors.Is(err, srtp.ErrShortPacket) {
+		t.Fatalf("a short RTCP packet: %v", err)
+	}
+}
+
+// TestReceiverReportLimit reports on 31 streams at most, the most one
+// receiver report holds.
+func TestReceiverReportLimit(t *testing.T) {
+	out, _ := srtpPair(t)
+	pc := &PeerConnection{srtpOut: out, tracks: map[uint32]*TrackRemote{}}
+	for i := range 32 {
+		pc.tracks[uint32(i+1)] = &TrackRemote{ssrc: uint32(i + 1)}
+	}
+	pc.sendReports(time.Now())
+	reported := 0
+	for _, tr := range pc.tracks {
+		if tr.expectedPrior != 0 {
+			reported++
+		}
+	}
+	if reported != 31 {
+		t.Fatalf("%d streams reported", reported)
 	}
 }

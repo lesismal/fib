@@ -395,8 +395,11 @@ func (a *Association) maybeForwardTSN() {
 	if adv == a.cumAck || adv == a.fwdSentFor {
 		return
 	}
-	a.fwdSentFor = adv
-	// One stream and SSN for each ordered stream skipped, its highest.
+	// One stream and SSN for each ordered stream skipped, its highest. When
+	// the chunk has no room to name them all, it skips only as far as the
+	// streams it names, and the next one, once the peer has that, the rest:
+	// a stream the peer is not told of would wait for its skipped SSN.
+	maxPairs := (a.mtu - headerSize - chunkHeaderSize - 4) / 4
 	pairs := a.fwdPairs[:0]
 	for i := a.inflHead; i < a.inflHead+int(adv-a.cumAck); i++ {
 		c := &a.infl[i]
@@ -415,14 +418,18 @@ func (a *Association) maybeForwardTSN() {
 			}
 		}
 		if !found {
+			if len(pairs) == maxPairs {
+				adv = a.cumAck + uint32(i-a.inflHead)
+				break
+			}
 			pairs = append(pairs, p)
 		}
 	}
 	a.fwdPairs = pairs
-	maxPairs := (a.mtu - headerSize - chunkHeaderSize - 4) / 4
-	if len(pairs) > maxPairs {
-		pairs = pairs[:maxPairs]
+	if adv == a.fwdSentFor {
+		return
 	}
+	a.fwdSentFor = adv
 	b := a.reserve(chunkForwardTSN, 0, 4+4*len(pairs))
 	binary.BigEndian.PutUint32(b, adv)
 	for i, p := range pairs {

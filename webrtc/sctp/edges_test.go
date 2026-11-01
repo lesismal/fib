@@ -423,6 +423,7 @@ func TestMalformedParameters(t *testing.T) {
 		p    []byte
 	}{
 		{"chunk header cut", rawPacket(b.localTag, []byte{chunkSack, 0})},
+		{"second chunk header cut", rawPacket(b.localTag, rawChunk(chunkHeartbeat, 0, 0, 1, 0, 4), []byte{chunkSack, 0})},
 		{"parameter header cut", rawPacket(b.localTag, rawChunk(chunkReconfig, 0, 0, 13))},
 		{"short response", rawPacket(b.localTag, rawChunk(chunkReconfig, 0, 0, 16, 0, 8, 0, 0, 0, 0))},
 		{"short incoming reset", rawPacket(b.localTag, rawChunk(chunkReconfig, 0, 0, 14, 0, 6, 0, 0))},
@@ -434,5 +435,269 @@ func TestMalformedParameters(t *testing.T) {
 	}
 	if !l.established() {
 		t.Fatal("malformed packets broke the association")
+	}
+}
+
+// TestChunksBeforeEstablishment checks that a HEARTBEAT, SACK, FORWARD TSN
+// or RE-CONFIG that comes before the association is up is ignored.
+func TestChunksBeforeEstablishment(t *testing.T) {
+	l := newLink(t, 1, nil)
+	a := l.ends[1]
+	sack := append(be32(1), 0, 1, 0, 0, 0, 0, 0, 0)
+	p := rawPacket(a.localTag,
+		rawChunk(chunkHeartbeat, 0, 0, 1, 0, 4),
+		rawChunk(chunkSack, 0, sack...),
+		rawChunk(chunkForwardTSN, 0, be32(5)...),
+		rawResetRequest(1, 1, 0))
+	if err := a.HandlePacket(p, l.now); err != nil {
+		t.Fatal(err)
+	}
+	if l.sent[1] != 0 || a.State() != StateClosed || a.peerCum != 0 {
+		t.Fatalf("sent %d, state %v, cum %d", l.sent[1], a.State(), a.peerCum)
+	}
+}
+
+// TestHeartbeatAcksSplit answers HEARTBEATs too large to answer in one
+// packet with a packet each, one of them larger than the MTU.
+func TestHeartbeatAcksSplit(t *testing.T) {
+	l := newLink(t, 1, nil)
+	l.connect(false)
+	b := l.ends[1]
+	heartbeat := func(n int) []byte {
+		info := make([]byte, n)
+		binary.BigEndian.PutUint16(info, paramHeartbeatInfo)
+		binary.BigEndian.PutUint16(info[2:], uint16(n))
+		return rawChunk(chunkHeartbeat, 0, info...)
+	}
+	var sizes []int
+	b.cfg.Output = func(p []byte) { sizes = append(sizes, len(p)) }
+	if err := b.HandlePacket(rawPacket(b.localTag, heartbeat(600), heartbeat(600), heartbeat(2*b.mtu)), l.now); err != nil {
+		t.Fatal(err)
+	}
+	if len(sizes) != 3 || sizes[2] <= b.mtu {
+		t.Fatalf("packets of %v bytes", sizes)
+	}
+}
+
+// TestSackGapIgnored checks that a SACK gap block that starts at zero, or
+// ends before it starts, acknowledges nothing.
+func TestSackGapIgnored(t *testing.T) {
+	l := newLink(t, 1, nil)
+	l.connect(false)
+	a := l.ends[0]
+	l.drop = func(from int, _ []byte) bool { return from == 0 }
+	if err := a.Send(0, PPIDBinary, []byte{1}, SendOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	sack := append(be32(a.cumAck), 0, 1, 0, 0, 0, 2, 0, 0, 0, 0, 0, 1, 0, 3, 0, 2)
+	if err := a.HandlePacket(rawPacket(a.localTag, rawChunk(chunkSack, 0, sack...)), l.now); err != nil {
+		t.Fatal(err)
+	}
+	if c := a.infl[a.inflHead]; c.acked || a.flight == 0 {
+		t.Fatalf("acked %v, flight %d", c.acked, a.flight)
+	}
+}
+
+// TestAbortFromCallback aborts the association from inside a callback it
+// runs: from OnMessage, and from OnBufferedAmountLow as an expired message
+// is given up. What the callback sends goes out once the call returns.
+func TestAbortFromCallback(t *testing.T) {
+	t.Run("OnMessage", func(t *testing.T) {
+		var l *testLink
+		l = newLink(t, 1, func(i int, c *Config) {
+			if i == 1 {
+				c.OnMessage = func(uint16, uint32, []byte) { l.ends[1].Abort() }
+			}
+		})
+		l.connect(false)
+		_ = l.ends[0].Send(0, PPIDBinary, []byte("bye"), SendOptions{})
+		l.run(time.Second, func() bool { return l.closed[0] })
+		if !l.closed[1] || l.closeEr[1] != nil || !errors.Is(l.closeEr[0], ErrAborted) {
+			t.Fatalf("closed %v, %v and %v", l.closed, l.closeEr[0], l.closeEr[1])
+		}
+		sent := l.sent[1]
+		l.ends[1].Abort()
+		if l.sent[1] != sent {
+			t.Fatal("a closed association sent ABORT")
+		}
+	})
+	t.Run("OnBufferedAmountLow", func(t *testing.T) {
+		var e chanEnds
+		l := newLink(t, 1, e.configure)
+		l.connect(false)
+		a := l.ends[0]
+		ch, err := a.OpenChannel(ChannelOptions{Label: "timed", Type: ChannelPartialReliableTimed, ReliabilityParameter: 10})
+		if err != nil {
+			t.Fatal(err)
+		}
+		l.run(time.Second, func() bool { return len(e.opened[1]) == 1 })
+		l.drop = func(from int, p []byte) bool { return from == 0 && p[headerSize] == chunkData }
+		ch.OnBufferedAmountLow = a.Abort
+		if err := ch.Send([]byte("lost")); err != nil {
+			t.Fatal(err)
+		}
+		l.run(time.Minute, func() bool { return l.closed[1] })
+		if !l.closed[0] || l.closeEr[0] != nil || !errors.Is(l.closeEr[1], ErrAborted) {
+			t.Fatalf("closed %v, %v and %v", l.closed, l.closeEr[0], l.closeEr[1])
+		}
+	})
+}
+
+// TestReassemblyLimits feeds fragments out of order: a middle one ahead of
+// its message's start, and messages that grow past MaxMessageSize as the
+// fragments joining them arrive.
+func TestReassemblyLimits(t *testing.T) {
+	setup := func(t *testing.T) (*testLink, *Association, func(tsn uint32, flags byte, n int)) {
+		var got []gotMsg
+		l := newLink(t, 1, func(i int, c *Config) {
+			collect(&got)(i, c)
+			c.MaxMessageSize = 1000
+		})
+		l.connect(false)
+		b := l.ends[1]
+		cum := b.peerCum
+		return l, b, func(tsn uint32, flags byte, n int) {
+			t.Helper()
+			if err := b.HandlePacket(rawPacket(b.localTag, rawData(cum+tsn, 0, 0, PPIDBinary, flags, make([]byte, n))), l.now); err != nil {
+				t.Fatal(err)
+			}
+			if len(got) != 0 {
+				t.Fatalf("%d delivered", len(got))
+			}
+		}
+	}
+	t.Run("middle first", func(t *testing.T) {
+		l, b, deliver := setup(t)
+		deliver(3, 0, 1)
+		deliver(2, flagBegin, 1)
+		if st := b.stream(0); st.headN != 2 {
+			t.Fatalf("head of %d chunks", st.headN)
+		}
+		deliver(1, 0, 1)
+		if st := b.stream(0); st.headN != 0 || len(st.ordered) != 3 || !l.established() {
+			t.Fatalf("head of %d chunks, %d queued", st.headN, len(st.ordered))
+		}
+	})
+	t.Run("ordered", func(t *testing.T) {
+		l, _, deliver := setup(t)
+		deliver(2, 0, 600)
+		deliver(1, flagBegin, 600)
+		if !errors.Is(l.closeEr[1], ErrMessageTooLarge) {
+			t.Fatalf("receiver: %v", l.closeEr[1])
+		}
+	})
+	t.Run("unordered", func(t *testing.T) {
+		l, _, deliver := setup(t)
+		deliver(1, flagBegin|flagUnordered, 600)
+		deliver(4, flagEnd|flagUnordered, 10)
+		deliver(3, flagUnordered, 600)
+		deliver(2, flagUnordered, 600)
+		if !errors.Is(l.closeEr[1], ErrMessageTooLarge) {
+			t.Fatalf("receiver: %v", l.closeEr[1])
+		}
+	})
+}
+
+// TestPeerWithoutExtensions has a peer that supports neither FORWARD TSN
+// nor stream reset: a message whose lifetime is over is sent all the same,
+// since the peer cannot be told to skip it, and a stream reset completes
+// on this side alone.
+func TestPeerWithoutExtensions(t *testing.T) {
+	var got []gotMsg
+	l := newLink(t, 1, collect(&got))
+	l.connect(false)
+	a := l.ends[0]
+	a.peerForwardTSN, a.peerReconfig = false, false
+	l.loss = 1
+	if err := a.Send(1, PPIDBinary, []byte("late"), SendOptions{PR: PRLifetime, Limit: 1}); err != nil {
+		t.Fatal(err)
+	}
+	l.run(100*time.Millisecond, nil)
+	l.loss = 0
+	if !l.run(time.Minute, func() bool { return len(got) == 1 }) {
+		t.Fatal("the expired message never came")
+	}
+	sent := l.sent[0]
+	if err := a.ResetStream(1); err != nil {
+		t.Fatal(err)
+	}
+	if st := a.stream(1); st.ssn != 0 || st.resetting || a.reqActive || l.sent[0] != sent {
+		t.Fatalf("ssn %d, resetting %v, request %v, %d packets", st.ssn, st.resetting, a.reqActive, l.sent[0]-sent)
+	}
+}
+
+// TestForwardTSNManyStreams gives up messages on more ordered streams than
+// one FORWARD TSN has room to name, at the smallest MTU.
+func TestForwardTSNManyStreams(t *testing.T) {
+	var got []gotMsg
+	l := newLink(t, 1, func(i int, c *Config) {
+		collect(&got)(i, c)
+		c.MTU = 256
+	})
+	l.connect(false)
+	a := l.ends[0]
+	const streams = 80
+	var fwd [][]byte
+	l.drop = func(from int, p []byte) bool {
+		if from == 0 && p[headerSize] == chunkForwardTSN {
+			fwd = append(fwd, append([]byte(nil), p...))
+		}
+		return from == 0 && p[headerSize] == chunkData && len(fwd) == 0
+	}
+	for i := range streams {
+		if err := a.Send(uint16(i), PPIDBinary, []byte{byte(i)}, SendOptions{PR: PRRetransmits, Limit: 0}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if !l.run(time.Minute, func() bool { return len(fwd) > 0 }) {
+		t.Fatal("no FORWARD TSN")
+	}
+	if n := (len(fwd[0]) - headerSize - chunkHeaderSize - 4) / 4; n != (256-headerSize-chunkHeaderSize-4)/4 {
+		t.Fatalf("FORWARD TSN names %d streams", n)
+	}
+	// Every stream goes on, the ones the first FORWARD TSN had no room for
+	// too. What is sent before the peer acknowledges it does not repeat it.
+	for i := range streams {
+		if err := a.Send(uint16(i), PPIDBinary, []byte{byte(i)}, SendOptions{}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if !l.run(time.Minute, func() bool { return len(got) == streams }) {
+		t.Fatalf("%d of %d messages after the FORWARD TSN", len(got), streams)
+	}
+	if len(fwd) != 2 {
+		t.Fatalf("%d FORWARD TSNs, want 2", len(fwd))
+	}
+}
+
+// TestShutdownAcksData has the peer acknowledge data only by the
+// cumulative TSN of its SHUTDOWN, its SACKs lost: the retransmission timer
+// still set then finds nothing outstanding.
+func TestShutdownAcksData(t *testing.T) {
+	var got []gotMsg
+	l := newLink(t, 1, collect(&got))
+	l.connect(false)
+	a := l.ends[0]
+	if err := a.Send(0, PPIDBinary, []byte("x"), SendOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	l.run(time.Second, func() bool { return len(got) == 1 })
+	shutdowns := 0
+	l.drop = func(from int, p []byte) bool {
+		if from == 1 && p[headerSize] == chunkShutdown && shutdowns == 0 {
+			shutdowns++
+			return false
+		}
+		return from == 1
+	}
+	t3 := a.t3
+	l.ends[1].Shutdown()
+	l.run(time.Second, func() bool { return shutdowns == 1 && !a.outstanding() })
+	if t3.IsZero() || a.t3 != t3 {
+		t.Fatalf("T3 %v, was %v", a.t3, t3)
+	}
+	l.run(t3.Sub(l.now)+time.Millisecond, nil)
+	if a.State() != StateShutdownAckSent || !a.t3.IsZero() {
+		t.Fatalf("state %v, T3 %v", a.State(), a.t3)
 	}
 }

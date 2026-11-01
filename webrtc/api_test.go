@@ -14,6 +14,7 @@ import (
 
 	"github.com/lesismal/fib"
 	"github.com/lesismal/fib/tls"
+	"github.com/lesismal/fib/webrtc/ice"
 	"github.com/lesismal/fib/webrtc/rtp"
 	"github.com/lesismal/fib/webrtc/sctp"
 )
@@ -619,5 +620,201 @@ func TestMuxRebind(t *testing.T) {
 	m.mu.RUnlock()
 	if got != second || n != 1 {
 		t.Fatalf("address routed to %p, want %p; %d PeerConnections", got, second, n)
+	}
+}
+
+// TestMuxWithoutUDPAddress refuses a binding that has no UDP address to
+// advertise, and a binding the engine does not have.
+func TestMuxWithoutUDPAddress(t *testing.T) {
+	e := startEngine(t)
+	if _, err := NewMux(e, MuxConfig{Network: "tcp", Addr: "127.0.0.1:0"}); err == nil {
+		t.Fatal("a TCP binding accepted")
+	}
+	if _, err := hostAddrs(e, 1<<20, nil); err == nil {
+		t.Fatal("addresses of no binding")
+	}
+	// The handler ignores priority data and empty datagrams.
+	muxHandler{}.OnPriorityData(nil, nil)
+	muxHandler{}.OnData(nil, nil)
+}
+
+// TestMuxSendOnClosedConnection sends to an address whose connection has
+// closed: the Mux opens another and sends there. A connection opened while
+// another for the address came in sends by that one, and one that cannot be
+// opened, on a closed Mux, sends nothing.
+func TestMuxSendOnClosedConnection(t *testing.T) {
+	m := loopbackMux(t, startEngine(t))
+	peer, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer peer.Close()
+	to := peer.LocalAddr().(*net.UDPAddr).AddrPort()
+	buf := make([]byte, 16)
+	read := func(want byte) {
+		t.Helper()
+		_ = peer.SetReadDeadline(time.Now().Add(waitTimeout))
+		if n, err := peer.Read(buf); err != nil || n != 1 || buf[0] != want {
+			t.Fatalf("read %x, %v; want %x", buf[:n], err, want)
+		}
+	}
+	conn := func() *fib.Connection {
+		m.mu.RLock()
+		defer m.mu.RUnlock()
+		return m.conns[to]
+	}
+	m.send(to, []byte{1})
+	read(1)
+	c := conn()
+	if c == nil {
+		t.Fatal("no connection after sending")
+	}
+	_ = c.Close()
+	for deadline := time.Now().Add(waitTimeout); conn() != nil; time.Sleep(time.Millisecond) {
+		if time.Now().After(deadline) {
+			t.Fatal("the closed connection was kept")
+		}
+	}
+	m.mu.Lock()
+	m.conns[to] = c
+	m.mu.Unlock()
+	m.send(to, []byte{2})
+	read(2)
+	if c2 := conn(); c2 == nil || c2 == c {
+		t.Fatal("no new connection")
+	}
+	m.mu.Lock()
+	m.opening[to] = [][]byte{{3}}
+	m.mu.Unlock()
+	m.open(to)
+	read(3)
+	_ = m.Close()
+	m.mu.Lock()
+	m.opening[to] = [][]byte{{4}}
+	m.mu.Unlock()
+	m.open(to)
+	_ = peer.SetReadDeadline(time.Now().Add(100 * time.Millisecond))
+	if n, err := peer.Read(buf); err == nil {
+		t.Fatalf("a closed Mux sent %x", buf[:n])
+	}
+}
+
+// replaceUfrag rewrites the ICE ufrag of a description.
+func replaceUfrag(t *testing.T, s, ufrag string) string {
+	t.Helper()
+	old, _ := sessionCredentialsOf(t, s)
+	return strings.ReplaceAll(s, "a=ice-ufrag:"+old+"\r\n", "a=ice-ufrag:"+ufrag+"\r\n")
+}
+
+// TestBadICECredentials sets descriptions whose ICE credentials the agent
+// refuses: a local ufrag too short, before the agent is made and when it
+// restarts, and a remote one with a character ICE does not allow.
+func TestBadICECredentials(t *testing.T) {
+	src := sharedPC(t, Configuration{})
+	if _, err := src.CreateDataChannel("x", nil); err != nil {
+		t.Fatal(err)
+	}
+	remote, err := src.CreateOffer(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	pc := sharedPC(t, Configuration{})
+	if _, err := pc.CreateDataChannel("x", nil); err != nil {
+		t.Fatal(err)
+	}
+	offer, err := pc.CreateOffer(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	offer.SDP = replaceUfrag(t, offer.SDP, "abc")
+	if err := pc.SetLocalDescription(offer); !errors.Is(err, ice.ErrCredentials) {
+		t.Fatalf("a short local ufrag: %v", err)
+	}
+	// The ufrag stays this side's, and so no agent can be made for a
+	// remote offer either.
+	if err := pc.SetRemoteDescription(remote); !errors.Is(err, ice.ErrCredentials) {
+		t.Fatalf("a remote offer after a short local ufrag: %v", err)
+	}
+
+	pc = sharedPC(t, Configuration{})
+	if _, err := pc.CreateDataChannel("x", nil); err != nil {
+		t.Fatal(err)
+	}
+	offer, err = pc.CreateOffer(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := pc.SetLocalDescription(offer); err != nil {
+		t.Fatal(err)
+	}
+	offer, err = pc.CreateOffer(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	offer.SDP = replaceUfrag(t, offer.SDP, "abc")
+	if err := pc.SetLocalDescription(offer); !errors.Is(err, ice.ErrCredentials) {
+		t.Fatalf("a restart to a short local ufrag: %v", err)
+	}
+
+	pc = sharedPC(t, Configuration{})
+	bad := remote
+	bad.SDP = replaceUfrag(t, remote.SDP, "ab$d")
+	if err := pc.SetRemoteDescription(bad); !errors.Is(err, ice.ErrCredentials) {
+		t.Fatalf("a remote ufrag with a $: %v", err)
+	}
+}
+
+// TestRemoteOfferOddities takes an offer with a candidate of a component
+// this side does not have and a header extension id no RTP header can
+// carry: both are skipped, and the offer is set.
+func TestRemoteOfferOddities(t *testing.T) {
+	src := sharedPC(t, Configuration{})
+	if _, err := src.AddTransceiver(MediaKindAudio, DirectionSendRecv); err != nil {
+		t.Fatal(err)
+	}
+	offer, err := src.CreateOffer(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	offer.SDP = insertAfter(t, offer.SDP, "a=mid:",
+		"a=extmap:300 "+rtp.ExtensionURIMid,
+		"a=candidate:1 2 udp 2130706431 127.0.0.1 5000 typ host")
+	pc := sharedPC(t, Configuration{})
+	if err := pc.SetRemoteDescription(offer); err != nil {
+		t.Fatalf("%v\n%s", err, offer.SDP)
+	}
+	src.mu.Lock()
+	want := src.extIDs[rtp.ExtensionURIMid]
+	src.mu.Unlock()
+	pc.mu.Lock()
+	got := pc.extIDs[rtp.ExtensionURIMid]
+	pc.mu.Unlock()
+	if got != want || want == 0 {
+		t.Fatalf("the mid extension has id %d, want %d", got, want)
+	}
+}
+
+// TestRemoteRestartOnClosedMux has the peer restart ICE once this side's
+// Mux has closed: the offer cannot be routed, and is refused.
+func TestRemoteRestartOnClosedMux(t *testing.T) {
+	a, b := sharedPC(t, Configuration{}), sharedPC(t, Configuration{})
+	if _, err := a.CreateDataChannel("x", nil); err != nil {
+		t.Fatal(err)
+	}
+	negotiate(t, a, b, nil)
+	offer, err := a.CreateOffer(&OfferOptions{ICERestart: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := b.mux.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := b.SetRemoteDescription(offer); !errors.Is(err, errMuxClosed) {
+		t.Fatalf("a remote restart on a closed Mux: %v", err)
+	}
+	// Offer fails the same way when it restarts ICE itself.
+	if _, err := Offer(context.Background(), b, &OfferOptions{ICERestart: true}); !errors.Is(err, errMuxClosed) {
+		t.Fatalf("Offer restarting on a closed Mux: %v", err)
 	}
 }

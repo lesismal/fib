@@ -654,6 +654,39 @@ func TestPermissionRefreshRetried(t *testing.T) {
 	}
 }
 
+// SendTo a peer the server refused a permission for reports the refusal
+// and sends nothing.
+func TestSendToRefusedPeer(t *testing.T) {
+	n := newSimNet(t, 23)
+	fakeServer(n, func(m, r *stun.Message) bool {
+		if m.Type.Method == stun.MethodAllocate {
+			allocated(m, r)
+			return true
+		}
+		r.Build(stun.MessageType{Method: m.Type.Method, Class: stun.ClassErrorResponse}, m.TransactionID)
+		r.AddErrorCode(stun.CodeForbidden, "Forbidden")
+		return true
+	})
+	c := newSimClient(n, clientAddr, ClientConfig{})
+	c.allocate(t)
+	if err := c.c.SendTo(peerAddr, []byte("first")); err != nil {
+		t.Fatal(err)
+	}
+	n.run(time.Second, nil)
+	sent := 0
+	n.drop = func(from, to netip.AddrPort, b []byte) bool {
+		sent++
+		return false
+	}
+	var e *Error
+	if err := c.c.SendTo(peerAddr, []byte("second")); !errors.As(err, &e) || e.Code != stun.CodeForbidden {
+		t.Fatalf("SendTo a refused peer: %v", err)
+	}
+	if sent != 0 {
+		t.Fatalf("%d packets sent", sent)
+	}
+}
+
 func TestICERelayIgnoresOthers(t *testing.T) {
 	c, _ := NewClient(ClientConfig{Server: serverAddr, Send: func(netip.AddrPort, []byte) {}})
 	r := NewICERelay(nil, 2, c)

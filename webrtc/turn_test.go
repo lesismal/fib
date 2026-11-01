@@ -66,6 +66,28 @@ func TestTURNRelay(t *testing.T) {
 	}
 }
 
+// TestTURNAndHost connects two PeerConnections that gather host and relay
+// candidates: what comes from the peer's host address, not the TURN
+// server, goes past the relay to the PeerConnection.
+func TestTURNAndHost(t *testing.T) {
+	url, _ := startTURN(t)
+	e := startEngine(t)
+	cfg := Configuration{
+		Engine:     e,
+		ListenAddr: "127.0.0.1:0",
+		ICEServers: []ICEServer{{URLs: []string{url}, Username: "user", Credential: "pass"}},
+	}
+	a, b := newPC(t, cfg), newPC(t, cfg)
+	trickle(a, b)
+	echoChannels(b)
+	d := openChannel(t, a, "either")
+	ca := connectedCh(a)
+	negotiate(t, a, b, nil)
+	wait(t, ca, "connected")
+	waitOpen(t, d)
+	roundTrip(t, d, [][]byte{[]byte("host or relay")})
+}
+
 func TestTURNWithSharedMuxRefused(t *testing.T) {
 	e := startEngine(t)
 	_, err := NewPeerConnection(Configuration{Mux: loopbackMux(t, e), ICEServers: []ICEServer{{URLs: []string{"turn:127.0.0.1:3478"}}}})

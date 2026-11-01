@@ -26,4 +26,17 @@ func TestPoolBytes(t *testing.T) {
 	if a := NewAssociation(Config{PoolBytes: 1 << 10}); a.pool.keepSize != 1<<10 {
 		t.Fatalf("NewAssociation kept PoolBytes %d", a.pool.keepSize)
 	}
+	// A buffer larger than the largest class is not pooled, nor is one
+	// whose size is not a power of two.
+	var p bufPool
+	if b := p.get(1 << 20); len(b) != 1<<20 {
+		t.Fatalf("get of 1 MiB: %d bytes", len(b))
+	}
+	p.put(make([]byte, 1<<20))
+	p.put(make([]byte, 100))
+	for c, l := range p.classes {
+		if len(l) != 0 {
+			t.Fatalf("class %d kept %d", c, len(l))
+		}
+	}
 }
