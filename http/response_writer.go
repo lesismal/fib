@@ -997,8 +997,10 @@ func (c *Context) finishResponse() error {
 	if b := w.asyncBody(); b != nil && c.finishAsync(b) {
 		return nil
 	}
-	var err error
-	if w.filtered() && w.err == nil {
+	// A body that failed, in its filters or as it was sent, cannot be ended
+	// as if it were whole: the request is abandoned instead.
+	err := w.err
+	if w.filtered() && err == nil {
 		// What the filters hold back goes before the end of the body.
 		var tail []byte
 		if tail, err = w.hooks.endFilters(false); err == nil && len(tail) > 0 {
@@ -1010,7 +1012,6 @@ func (c *Context) finishResponse() error {
 	}
 	w.finished = true
 	if err == nil {
-		// A body its filters failed cannot be ended as if it were whole.
 		err = c.finish(w)
 	}
 	if err != nil && !c.wrote {

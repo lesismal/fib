@@ -261,11 +261,15 @@ func TestBodyFilterChainAndSkips(t *testing.T) {
 			t.Errorf("%s 204: %d %v", client.proto, resp.StatusCode, resp.Header)
 		}
 		// The body cannot be carried on: the client gets an error or a
-		// response cut short, and Write the filter's error.
+		// response cut short, never one that looks whole, and Write the
+		// filter's error.
 		req, _ := stdhttp.NewRequest("GET", "http://"+addr+"/fail", nil)
 		if resp, err := client.Do(req); err == nil {
-			_, _ = io.ReadAll(resp.Body)
+			body, err := io.ReadAll(resp.Body)
 			resp.Body.Close()
+			if err == nil {
+				t.Errorf("%s fail: answered %d %q as if whole", client.proto, resp.StatusCode, body)
+			}
 		}
 		select {
 		case err := <-failed:
