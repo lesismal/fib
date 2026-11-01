@@ -8,12 +8,24 @@ import (
 
 // streamPath returns the hub path of an RTSP URL, its path without the
 // slashes around it, and its query.
+//
+// A "trackID=N" segment after the query is taken as the path's: a player
+// of "rtsp://h/live/s?token=x" resolves the controls of the server's
+// description against that URL as its base, and so sets up
+// "rtsp://h/live/s?token=x/trackID=0", which ffmpeg and fib's own client
+// both do.
 func streamPath(raw string) (path, query string, ok bool) {
 	u, err := url.Parse(raw)
 	if err != nil || (u.Scheme != "" && !strings.EqualFold(u.Scheme, "rtsp") && !strings.EqualFold(u.Scheme, "rtsps")) {
 		return "", "", false
 	}
-	return strings.Trim(u.Path, "/"), u.RawQuery, true
+	path, query = strings.Trim(u.Path, "/"), u.RawQuery
+	if i := strings.LastIndexByte(query, '/'); i >= 0 {
+		if _, n := splitTrackID(query[i:]); n >= 0 {
+			path, query = path+query[i:], query[:i]
+		}
+	}
+	return path, query, true
 }
 
 // splitTrackID splits a path ending in the "trackID=N" segment the server

@@ -245,6 +245,13 @@ func TestURL(t *testing.T) {
 	if p, q, ok := streamPath("rtsp://h:1/live/s/?tok=1"); !ok || p != "live/s" || q != "tok=1" {
 		t.Fatal(p, q, ok)
 	}
+	// A control resolved against a base URL with a query.
+	if p, q, ok := streamPath("rtsp://h:1/live/s?tok=1/trackID=2"); !ok || p != "live/s/trackID=2" || q != "tok=1" {
+		t.Fatal(p, q, ok)
+	}
+	if p, q, ok := streamPath("rtsp://h:1/live/s?tok=a/b"); !ok || p != "live/s" || q != "tok=a/b" {
+		t.Fatal(p, q, ok)
+	}
 	if _, _, ok := streamPath("http://h/x"); ok {
 		t.Fatal("http taken")
 	}
