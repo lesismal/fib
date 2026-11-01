@@ -23,7 +23,7 @@
 | 协议 | package | 服务端 | 客户端 | 内容 |
 | --- | --- | --- | --- | --- |
 | RTMP、RTMPS | `media/rtmp` | 推流与播放 | 推流、播放、转推与拉流转发 | simple 与 Flash digest 两种握手，支持全部四种头部格式和扩展时间戳的 chunk stream，aggregate 消息，确认窗口；Enhanced RTMP（以 FourCC 表示的 H.265、AV1、Opus），以及旧式 codec id 12 的 H.265；经 fib/tls 提供 RTMPS |
-| HTTP-FLV、WebSocket-FLV | `media/httpflv` | 播放 | — | 一个永不结束的 FLV 文件，走 HTTP/1.1、HTTP/2 或 HTTP/3，或者把同样的字节放进二进制 WebSocket 消息（也支持 RFC 8441 与 RFC 9220 的 extended CONNECT）；供 flv.js、mpegts.js 和 ffmpeg 播放 |
+| HTTP-FLV、WebSocket-FLV | `media/httpflv` | 播放 | 拉流转发 | 一个永不结束的 FLV 文件，走 HTTP/1.1、HTTP/2 或 HTTP/3，或者把同样的字节放进二进制 WebSocket 消息（也支持 RFC 8441 与 RFC 9220 的 extended CONNECT）；供 flv.js、mpegts.js 和 ffmpeg 播放。拉流转发经 HTTP/1.1 或 HTTP/2（http 与 https）播放 HTTP-FLV 源站，或播放 WebSocket-FLV 源站（ws 与 wss），发布进 hub |
 | RTSP 1.0 | `media/rtsp` | 录制（ANNOUNCE/RECORD）与播放 | 播放、推流、转推与拉流转发 | 基于 TCP interleaved 和 UDP 单播的 RFC 2326，所有会话共用一对 RTP/RTCP 端口，RTCP sender report，Digest 与 Basic 认证，GET_PARAMETER 保活，会话超时 |
 | SRT | `media/srt` | 推流与播放 | 推流、播放、原始会话 | live 模式：带 SYN cookie 的 v5 握手，stream ID 及其访问控制语法，ACK/ACKACK/NAK，重传，TSBPD 与过晚丢弃，128、192、256 位密钥的 AES-CTR 加密以及带内的密钥更新；MPEG-TS 与 hub 互转 |
 | HLS、LL-HLS | `media/hls` | 播放 | — | RFC 8216，分片放在内存中，格式为 fMP4 或 MPEG-TS，按请求选择（`?format=ts`）；以及低延迟扩展：partial segment、preload hint、blocking playlist reload |
@@ -64,6 +64,7 @@ fuzz，一个会话也可以在一把锁下驱动它的核心。
 | `rtmp.Publish`/`Play`、`rtsp.Client` | 经 engine 拨号（`DialWithHandler`），回调驱动 |
 | `srt.Dial`/`Publish`/`Play` | 在自己的 binding 上用 `Engine.OpenUDPPeer` |
 | `rtc.Pull`/`Push` | 自带端口的 PeerConnection，信令走 fib/http 客户端 |
+| `httpflv.Pull` | 响应 body 流式交付（`OnBody`）的 fib/http 客户端，或 fib/websocket 的 Dialer，在读连接的 worker 上直接送进 `flv.Demuxer` |
 
 ### hub
 
@@ -147,9 +148,10 @@ worker。
 
 `hub.Config.OnPublish` 和 `OnSubscribe` 能看到每一次推流和播放，不论协议，参数是
 `PublishInfo`/`SubscribeInfo`：协议名（`rtmp`、`rtsp`、`srt`、`whip`、`whep`、`http-flv`、
-`ws-flv`、`hls`；RTMP 的转发是 `rtmp-pull` 和 `rtmp-push`，其它协议的转发用协议名本身）、
+`ws-flv`、`hls`；RTMP 的转发是 `rtmp-pull` 和 `rtmp-push`，HTTP-FLV 的是 `http-flv-pull` 和
+`ws-flv-pull`，其它协议的转发用协议名本身）、
 远端地址，以及 URL 的 query，token 通常放在这里。返回错误即拒绝这次推流或播放。转发同样会
-填写这些信息：`rtmp.Pull` 与 `rtsp.PlayToHub` 填远端服务器的地址和其 URL 的 query，
+填写这些信息：`rtmp.Pull`、`rtsp.PlayToHub` 与 `httpflv.Pull` 填远端服务器的地址和其 URL 的 query，
 `rtc.PullToHub` 填其 URL 的 query，`srt.Play` 与 `srt.Publish` 填服务器地址和普通 stream ID
 中的 query（`live/s?token=...`）。URL 带 query 的 RTSP 播放者会像 ffmpeg 那样以该
 URL 为基准 SETUP 各 track（`rtsp://host/live/s?token=x/trackID=0`），服务端会把 `trackID`
@@ -450,10 +452,15 @@ srt.Play(engine, "origin.example.com:9000", h, "live/remote",
 cc := rtc.ClientConfig{Engine: engine, Token: "bearer-token"}
 rtc.PushFromHub(cc, "https://edge.example.com/whip/live/cam", h, "live/cam", hub.SubscribeOptions{Wait: 30 * time.Second})
 rtc.PullToHub(cc, "https://origin.example.com/whep/live/webrtc", h, "live/webrtc")
+
+// HTTP-FLV: pull from an origin or a CDN (ws:// and wss:// pull WebSocket-FLV).
+httpflv.Pull(httpflv.PullConfig{Engine: engine, OnClose: func(err error) { log.Println("pull ended:", err) }},
+	"https://cdn.example.com/live/cam.flv?token=t", h, "live/cdn")
 ```
 
-- 拉流转发在得知远端的 track 后发布路径（`rtmp.Pull` 与 `srt.Play` 会先预占路径，所以路径
-  已被占用时立即以 `hub.ErrStreamBusy` 失败），把 track 的变化以 `SetTracks` 传下去，远端流结束时取消发布。
+- 拉流转发在得知远端的 track 后发布路径（`rtmp.Pull`、`srt.Play` 与 `httpflv.Pull` 会先预占
+  路径，所以路径已被占用时立即以 `hub.ErrStreamBusy` 失败；`httpflv.Pull` 在源站回 200 OK 时
+  预占），把 track 的变化以 `SetTracks` 传下去，远端流结束时取消发布。
   发布被拒绝会关闭客户端。
 - 转推从流的第一组 track 开始，远端跟不上的包按 `hub.NewDropper` 的方式丢弃，流结束时转推
   也结束。track 变化时，RTMP 转推发送新的 sequence header，SRT 转推发送新的 PMT；WHIP 转推
@@ -544,6 +551,19 @@ NAK 只有一个延迟（120 ms）的时间去找回几百个包，结果找不�
 `Wait`（0 表示缺席的流回 404）、`WriteQueueLimit` 与 `MaxWriteQueue`（2 MiB 与 16 MiB；在
 HTTP/2 和 HTTP/3 上，积压指流控压住超过 64 KiB 的数据，且只有 HTTP/1 的播放者会被断开）、
 `IdleTimeout`（30 s）、`Encoder`，以及 `WebSocket`（零值接受任何 origin）。
+
+**httpflv.PullConfig**
+
+| 字段 | 默认值 | 含义 |
+| --- | --- | --- |
+| `Engine` | 必填 | 拨号源站并读取；必须已在运行 |
+| `TLSConfig`、`Header`、`Dial` | 无 | 用于 https:// 和 wss://（源站选择时走 HTTP/2）；随请求发送的头；代替 engine 拨号的函数，例如 SOCKS 代理的 |
+| `DialTimeout`、`HeaderTimeout` | 10 s、10 s | 建立连接，以及等待响应头（WebSocket-FLV 时两者之和限定握手） |
+| `IdleTimeout` | 30 s | 从响应头起，源站这么久什么都没发就结束拉流；负值表示不限 |
+| `MaxRedirects` | 5 | 跟随的 301、302、303、307 和 308 次数；负值表示不跟随 |
+| `BufferSize` | 256 KiB | 等待解封装的 body 达到这么多时，连接暂停读取 |
+| `MaxTagSize` | 8 MiB | 最大的 FLV tag |
+| `OnTracks`、`OnPacket`、`OnClose` | 无 | 在 hub 拿到 track 或包之后调用；`OnClose` 只调用一次：源站结束流时为 nil，`Close` 之后为 `ErrClosed`，源站不回 200 OK 时为 `StatusError`，或 hub 拒绝的错误 |
 
 **rtsp.ServerConfig**
 
@@ -660,9 +680,7 @@ HTTP/2 和 HTTP/3 上，积压指流控压住超过 64 KiB 的数据，且只有
 - **FLV 与 AMF**：VP8、VP9，以及原规范中除上面矩阵所列之外的编码（Sorenson H.263、VP6、
   Screen Video、Nellymoser、Speex、ADPCM：能解析，随后丢弃）；FLV 加密头；AMF3 编码、其
   externalizable 对象，以及 AMF0 的保留标记。
-- **HTTP-FLV**：拉流客户端（`rtmp.Pull` 从 RTMP 转发）。它还没有写：做法是把 fib/http
-  客户端的响应 body（`ClientConfig.StreamResponseBody`、`ClientResponse.OnBody`）送进
-  `flv.Demuxer`。提供录制文件。
+- **HTTP-FLV**：提供录制文件；自动重连的拉流（`OnClose` 告知已结束，再拉一次只需一次调用）。
 - **RTSP**：RTSP 2.0；基于 TLS（rtsps）和 HTTP 隧道的 RTSP；组播；用于跳转的 PLAY Range、
   Scale 与 Speed；比连接活得更久的会话；向录制端发送 RTCP receiver report。
 - **RTP 载荷**：H.264 的 interleaved 模式（能读，但不按解码顺序号重排）；H.265 的 DONL；MP3 和
