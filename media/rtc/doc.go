@@ -20,6 +20,10 @@
 // see the request's query. A publish to a path that has a publisher is
 // answered 409 Conflict, a play of a path that has none 404, an offer with
 // nothing to send or receive 406, and one past Config.MaxSessions 503.
+// With Config.PlayWait a play of a path not yet published waits for its
+// publisher, its request retained and nothing else made for it yet, and is
+// answered once one arrives, or 404 when none does in time; at most
+// Config.MaxPlayWaiters offers wait at once, and one past them is 503.
 //
 // Every PeerConnection of a server shares one UDP port, a webrtc.Mux the
 // application makes on its fib engine and gives in Config.WebRTC, with

@@ -314,6 +314,13 @@ func (m *Muxer) Close() {
 	m.wake()
 }
 
+// unstarted reports whether the Muxer has had no stream: no OnTracks yet.
+func (m *Muxer) unstarted() bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.tracks == nil
+}
+
 // Ended reports whether the stream has ended.
 func (m *Muxer) Ended() bool {
 	m.mu.Lock()
@@ -516,18 +523,19 @@ func (m *Muxer) wake() {
 
 // status is what a request needs to know about the stream to be answered.
 type status struct {
-	next   uint64 // the msn after the last complete segment
-	parts  int64  // the parts of the open segment
-	any    bool   // a segment is complete
-	ended  bool
-	hasAV  bool
-	codecs string
+	next      uint64 // the msn after the last complete segment
+	parts     int64  // the parts of the open segment
+	any       bool   // a segment is complete
+	ended     bool
+	unstarted bool // no stream yet: waiting for a publisher
+	hasAV     bool
+	codecs    string
 }
 
 func (m *Muxer) status() status {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	st := status{next: m.next, any: len(m.segs) > 0, ended: m.ended, codecs: m.codecs}
+	st := status{next: m.next, any: len(m.segs) > 0, ended: m.ended, unstarted: m.tracks == nil && !m.ended, codecs: m.codecs}
 	if m.open != nil {
 		st.parts = int64(len(m.open.parts))
 	}

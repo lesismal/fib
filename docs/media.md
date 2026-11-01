@@ -101,7 +101,10 @@ each of them subscribes to the hub, not to RTMP.
   its publisher and survives the publisher leaving for up to `Wait`, hearing
   `OnTracks` again from the next one: that is how a player that connects
   first, an HLS playlist across a reconnecting encoder, or a push relay waiting
-  for its source keep their place. Packet times are the publisher's own, and a
+  for its source keep their place. `SubscribeOptions.StartWait` bounds the wait
+  for the first publisher apart from `Wait`, for an egress that waits for a
+  stream to start and for it to come back for different times (HLS and WHEP:
+  `PlayWait`, then `RepublishWait`). Packet times are the publisher's own, and a
   republish may restart them; the egresses keep their players' times
   increasing across it (see [Republishes](#where-players-start-and-republishes)).
 
@@ -137,6 +140,12 @@ moved for an idle timeout.
 | WHEP viewer | the loss its receiver reports | `MaxLoss` (25%) | ICE consent lost |
 | HLS | — (one Muxer per stream and format, not per player) | the Muxer's `MaxBytes` (64 MiB) drops old segments | — |
 
+Players waiting for a stream's first publisher hold no media, only their
+place: RTMP, HTTP-FLV and SRT players a hub subscription each, an HLS playlist
+request a retained request (`MaxPlayWaiters`, 1024, of them across the
+handler, and `Muxer.MaxWaiters` on one stream), a WHEP offer a retained
+request and a session with no PeerConnection yet (`MaxPlayWaiters`, 1024).
+
 Push relays drop the same way: `rtmp.Push` past `ClientConfig.WriteQueueLimit`,
 `rtsp.PublishFromHub` past `ClientConfig.MaxQueuedBytes`, `srt.Publish` past
 `ClientConfig.MaxSendBacklog`, and `rtc.PushFromHub` while the server reports
@@ -148,7 +157,8 @@ more than 25% lost.
 neither publisher nor subscription leaves the registry. `Hub.Streams` returns
 a snapshot of every stream, sorted by path: path, tracks, whether it is live
 or only reserved, its publisher's `PublishInfo` and since when, subscribers,
-bytes and packets in. `Hub.Close` ends every subscription with `ErrClosed`,
+bytes and packets in; `Hub.Stream(path)` the same of one path, without
+walking the others. `Hub.Close` ends every subscription with `ErrClosed`,
 drops what publishers still write, and fails later `Publish`, `Reserve` and
 `Subscribe`.
 
@@ -247,7 +257,8 @@ rtcServer, _ := rtc.NewServer(rtc.Config{Hub: h,
 runs after the hub's `OnSubscribe`. RTSP asks `OnSubscribe` at DESCRIBE and
 again at PLAY. WHIP and WHEP ask `rtc.Config.Authorize` first, then the hub's
 hooks. `Authorize` refusing is answered 401 without a token and 403 with
-one, a hook refusing 403, a busy path 409, a missing stream 404. HLS
+one, a hook refusing 403, a busy path 409, a missing stream 404 (after
+`PlayWait`, when set, has run out). HLS
 subscribes once per stream and format, for the first playlist request, so
 `OnSubscribe` sees that request only; checking every HLS request belongs in
 an HTTP middleware in front of the handler.
@@ -553,6 +564,19 @@ small streams or receivers with large buffers and latencies. RTMP, HTTP-FLV,
 RTSP over TCP, HLS and WHEP (unless `rtc.Config.NoGOPCache`) start with the
 cache.
 
+**Before the first publisher.** A player may ask for a stream before anyone
+publishes it, as a monitor wall or a test rig started before the encoder does.
+RTMP's and SRT's `PlayWait` and HTTP-FLV's `Wait` let such a player wait
+(`hub.SubscribeOptions.Wait`); RTSP cannot, since DESCRIBE needs the tracks.
+HLS's and WHEP's `PlayWait` (`hub.SubscribeOptions.StartWait`) let a
+playlist request or a WHEP offer wait, with the request retained so no fib
+worker is held: the playlist is answered once the first segment is cut (at
+most `PlayWait` plus `WaitTimeout`), the offer once the publisher's tracks are
+known, and either 404 when no publisher comes within `PlayWait`. A player
+past `MaxPlayWaiters` is answered 503, and one that hangs up while waiting is
+let go. With every one of them 0 (the default), a play of a missing stream is
+refused at once.
+
 **Across a republish.** A player that waits through a republish (RTMP's and
 SRT's `PlayWait`, HTTP-FLV's `Wait`, RTSP's `PlayWait`, HLS's and WHEP's
 `RepublishWait`) hears `OnTracks` from the next publisher, whose clock may
@@ -600,7 +624,8 @@ everywhere, and every buffer a peer can fill is bounded.
 | `OnPublish`, `OnUnpublish`, `OnSubscribe` | none | Authentication and observation, called without the hub's locks |
 
 `hub.SubscribeOptions` has `Info` (what `OnSubscribe` sees), `Wait` (0: no
-waiting, `ErrNotFound` without a publisher and the end with it) and
+waiting, `ErrNotFound` without a publisher and the end with it), `StartWait`
+(the wait for the first publisher, in place of `Wait`, when set) and
 `NoGOPCache` (start at the next keyframe).
 
 **rtmp.ServerConfig**
@@ -691,6 +716,8 @@ stream to the `Demuxer`'s `OnTracks` and `OnPacket`.
 | `Prefix` | `/` | URL path before the stream's path |
 | `IdleTimeout`, `WaitTimeout` | 30 s, 10 s | A Muxer without requests is stopped; a request waits at most this long |
 | `RepublishWait` | 10 s | The playlist continues after a discontinuity when a publisher returns within it |
+| `PlayWait` | 0 | How long a playlist request waits for a stream with no publisher yet; 0 answers it 404 at once |
+| `MaxPlayWaiters` | 1024 | Requests waiting for a publisher at once; 503 past it |
 | `AllowOrigin`, `MaxStreams` | none, unlimited | CORS, and Muxers running at once |
 
 **rtc.Config** (WHIP/WHEP server)
@@ -703,6 +730,8 @@ stream to the `Demuxer`'s `OnTracks` and `OnPacket`.
 | `Authorize`, `AllowOrigin`, `LinkICEServers` | none | Bearer tokens, CORS, ICE servers sent as Link headers |
 | `GatherTimeout`, `ConnectTimeout` | 5 s, 15 s | Gathering before the answer, connecting after it |
 | `RepublishWait` | 10 s | How long a viewer waits for the next publisher |
+| `PlayWait` | 0 | How long an offer waits for a stream with no publisher yet; 0 answers it 404 at once |
+| `MaxPlayWaiters` | 1024 | Offers waiting for a publisher at once; 503 past it |
 | `NoGOPCache`, `MaxHeldBytes` | false, 8 MiB | Start viewers at the next keyframe instead of the cached GOP; what a viewer holds while it connects |
 | `MaxLoss` | 0.25 | Reported loss past which a viewer's packets drop (video to the next keyframe) |
 | `MTU`, `ReorderSize`, `ReorderDelay` | 1200, 128, 100 ms | RTP size, and a WHIP track's reorder buffer |

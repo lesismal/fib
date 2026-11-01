@@ -101,6 +101,12 @@ type SubscribeOptions struct {
 	// fails with ErrNotFound when the stream has no publisher, and the
 	// subscription ends when the publisher leaves.
 	Wait time.Duration
+	// StartWait, when > 0, lets the subscription exist before the
+	// publisher arrives and is how long it waits for the first one, in
+	// place of Wait, which goes on bounding the wait for each next one: a
+	// player may wait longer for a stream to start than for it to come
+	// back, or the other way round.
+	StartWait time.Duration
 	// NoGOPCache starts the subscription from the next keyframe instead
 	// of the cached GOP, trading start-up delay for latency.
 	NoGOPCache bool
@@ -443,13 +449,14 @@ func (h *Hub) Subscribe(path string, sink Sink, opts SubscribeOptions) (*Subscri
 			return nil, err
 		}
 	}
+	waits := opts.Wait > 0 || opts.StartWait > 0
 	h.mu.Lock()
-	st, err := h.lockStream(path, opts.Wait > 0)
+	st, err := h.lockStream(path, waits)
 	if err != nil {
 		return nil, err
 	}
 	st.compact()
-	if !st.live() && opts.Wait <= 0 {
+	if !st.live() && !waits {
 		st.unlock()
 		return nil, ErrNotFound
 	}
@@ -457,7 +464,7 @@ func (h *Hub) Subscribe(path string, sink Sink, opts SubscribeOptions) (*Subscri
 		st.unlock()
 		return nil, ErrLimit
 	}
-	s := &Subscription{st: st, sink: sink, wait: opts.Wait}
+	s := &Subscription{st: st, sink: sink, wait: opts.Wait, startWait: opts.StartWait}
 	st.subs = append(st.subs, s)
 	if !st.live() {
 		s.armTimer()
@@ -487,32 +494,49 @@ func (h *Hub) Streams() []StreamInfo {
 	h.mu.Unlock()
 	infos := make([]StreamInfo, 0, len(list))
 	for _, st := range list {
-		st.mu.Lock()
-		info := StreamInfo{
-			Path:       st.path,
-			Tracks:     st.tracks,
-			Publishing: st.live(),
-			Reserved:   st.pub != nil && st.pub.reserved,
-			BytesIn:    st.bytesIn,
-			PacketsIn:  st.packetsIn,
-		}
-		if st.pub != nil {
-			info.Publisher = st.pubInfo
-			info.Since = st.since
-		}
-		for _, s := range st.subs {
-			if !s.closed.Load() {
-				info.Subscribers++
-			}
-		}
-		removed := st.removed
-		st.unlock()
-		if !removed {
+		if info, ok := st.info(); ok {
 			infos = append(infos, info)
 		}
 	}
 	slices.SortFunc(infos, func(a, b StreamInfo) int { return strings.Compare(a.Path, b.Path) })
 	return infos
+}
+
+// Stream returns a snapshot of the stream at path, and false when the hub
+// has none: a lookup of one path, where Streams lists them all.
+func (h *Hub) Stream(path string) (StreamInfo, bool) {
+	h.mu.Lock()
+	st := h.streams[path]
+	h.mu.Unlock()
+	if st == nil {
+		return StreamInfo{}, false
+	}
+	return st.info()
+}
+
+// info returns a snapshot of st, and false when it has left the registry.
+func (st *stream) info() (StreamInfo, bool) {
+	st.mu.Lock()
+	info := StreamInfo{
+		Path:       st.path,
+		Tracks:     st.tracks,
+		Publishing: st.live(),
+		Reserved:   st.pub != nil && st.pub.reserved,
+		BytesIn:    st.bytesIn,
+		PacketsIn:  st.packetsIn,
+	}
+	if st.pub != nil {
+		info.Publisher = st.pubInfo
+		info.Since = st.since
+	}
+	for _, s := range st.subs {
+		if !s.closed.Load() {
+			info.Subscribers++
+		}
+	}
+	removed := st.removed
+	st.unlock()
+	return info, !removed
 }
 
 // Close closes the hub: every subscription hears OnClose(ErrClosed),
@@ -646,7 +670,9 @@ func (p *Publisher) Close() {
 		if s.closed.Load() {
 			continue
 		}
-		if s.wait > 0 {
+		// One that has not started was waiting on a reservation, for
+		// a first publisher: it stays too.
+		if s.wait > 0 || !s.started {
 			if !wasReserved {
 				// A subscription waiting on a reservation keeps
 				// the timer it has.
@@ -666,10 +692,10 @@ func (p *Publisher) Close() {
 
 // Subscription is one sink's subscription to a stream.
 type Subscription struct {
-	st     *stream
-	sink   Sink
-	wait   time.Duration
-	closed atomic.Bool
+	st              *stream
+	sink            Sink
+	wait, startWait time.Duration
+	closed          atomic.Bool
 
 	// Under st.mu: waitKey holds video back until the next keyframe;
 	// started says a publisher has been seen; timer and timerGen expire
@@ -684,7 +710,11 @@ func (s *Subscription) armTimer() {
 	s.stopTimer()
 	s.timerGen++
 	gen := s.timerGen
-	s.timer = time.AfterFunc(s.wait, func() { s.expire(gen) })
+	d := s.wait
+	if !s.started && s.startWait > 0 {
+		d = s.startWait
+	}
+	s.timer = time.AfterFunc(d, func() { s.expire(gen) })
 }
 
 func (s *Subscription) stopTimer() {

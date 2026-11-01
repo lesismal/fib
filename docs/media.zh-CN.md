@@ -84,7 +84,9 @@ RTMP 推上来的流能用 RTSP、SRT、HTTP-FLV、HLS 和 WHEP 播放，是因�
   `OnTracks`，然后每个包一次 `OnPacket`，结束时收到 `OnClose`（`ErrUnpublished`、等待落空的
   `ErrNotFound`、`ErrClosed`）。设置 `SubscribeOptions.Wait` 后，订阅可以早于发布者存在，
   发布者离开后最多再保留 `Wait`，并从下一个发布者那里再次收到 `OnTracks`：先连上来的播放器、
-  编码器重连期间的 HLS 播放列表、等待源流的转推，都是这样保住位置的。包的时间是发布者自己的
+  编码器重连期间的 HLS 播放列表、等待源流的转推，都是这样保住位置的。`SubscribeOptions.StartWait`
+  把等待第一个发布者的时长与 `Wait` 分开限制，供等待流开始与等待流回来时长不同的出口使用（HLS 与
+  WHEP：先 `PlayWait`，之后 `RepublishWait`）。包的时间是发布者自己的
   时间，重新推流可能让它从头开始；各出口会让播放者看到的时间在重新推流前后保持递增（见
   [重新推流](#播放起点与重新推流)）。
 
@@ -111,6 +113,11 @@ RTMP 推上来的流能用 RTSP、SRT、HTTP-FLV、HLS 和 WHEP 播放，是因�
 | WHEP 观众 | 其接收端报告的丢包率 | `MaxLoss`（25%） | ICE consent 丢失 |
 | HLS | —（每路流每种格式一个 Muxer，而不是每个播放者一个） | Muxer 的 `MaxBytes`（64 MiB）淘汰旧分片 | — |
 
+等待流的第一个发布者的播放者不持有媒体，只占一个位置：RTMP、HTTP-FLV 和 SRT 播放者各占一个
+hub 订阅；HLS 播放列表请求占一个被 retain 的请求（整个 handler 最多 `MaxPlayWaiters` 个，默认
+1024，单路流上还受 `Muxer.MaxWaiters` 限制）；WHEP offer 占一个被 retain 的请求和一个尚未创建
+PeerConnection 的会话（最多 `MaxPlayWaiters` 个，默认 1024）。
+
 转推也以同样的方式丢包：`rtmp.Push` 超过 `ClientConfig.WriteQueueLimit`，
 `rtsp.PublishFromHub` 超过 `ClientConfig.MaxQueuedBytes`，`srt.Publish` 超过
 `ClientConfig.MaxSendBacklog`，`rtc.PushFromHub` 在服务端报告丢包超过 25% 期间。
@@ -118,7 +125,8 @@ RTMP 推上来的流能用 RTSP、SRT、HTTP-FLV、HLS 和 WHEP 播放，是因�
 **上限。** 流数由 `MaxStreams` 限制，订阅数由 `MaxSubscribersPerStream` 限制（超过任一个返回
 `ErrLimit`），缓存由 `GOPCacheBytes` 限制，每个 sink 的队列由 sink 自己限制。既没有发布者也
 没有订阅的流会从流表中移除。`Hub.Streams` 返回按路径排序的每路流快照：路径、track、已经在直播
-还是仅被预占、发布者的 `PublishInfo` 及开始时间、订阅者数，以及流入的字节数与包数。
+还是仅被预占、发布者的 `PublishInfo` 及开始时间、订阅者数，以及流入的字节数与包数；
+`Hub.Stream(path)` 给出单个路径的同样快照，不必遍历其他流。
 `Hub.Close` 以 `ErrClosed` 结束所有订阅，丢弃发布者之后写入的内容，并让之后的 `Publish`、
 `Reserve` 和 `Subscribe` 失败。
 
@@ -203,7 +211,7 @@ rtcServer, _ := rtc.NewServer(rtc.Config{Hub: h,
 执行），`httpflv.Config` 有 `OnPlay`，在 hub 的 `OnSubscribe` 之后执行。RTSP 在 DESCRIBE
 和 PLAY 时各询问一次 `OnSubscribe`。WHIP 与 WHEP 先询问 `rtc.Config.Authorize`，再询问 hub
 的钩子：`Authorize` 拒绝时，没有 token 回 401，有 token 回 403；钩子拒绝回 403，路径已被
-占用回 409，流不存在回 404。HLS 对每路流的每种
+占用回 409，流不存在回 404（设置了 `PlayWait` 时，在它耗尽之后）。HLS 对每路流的每种
 格式只订阅一次，发生在第一个播放列表请求时，所以 `OnSubscribe` 只能看到那一个请求；要检查
 每个 HLS 请求，应在 handler 前面加一层 HTTP 中间件。
 
@@ -483,6 +491,14 @@ NAK 只有一个延迟（120 ms）的时间去找回几百个包，结果找不�
 较大的接收端。RTMP、HTTP-FLV、走 TCP 的 RTSP、HLS 和 WHEP（除非设置 `rtc.Config.NoGOPCache`）
 都从缓存开始。
 
+**第一个发布者到来之前。** 播放者可能在任何人发布之前就请求一路流，比如比编码器先启动的监控墙
+或测试台。RTMP 和 SRT 的 `PlayWait`、HTTP-FLV 的 `Wait` 让这样的播放者等待
+（`hub.SubscribeOptions.Wait`）；RTSP 做不到，因为 DESCRIBE 需要 track。HLS 和 WHEP 的
+`PlayWait`（`hub.SubscribeOptions.StartWait`）让播放列表请求或 WHEP offer 等待，请求被 retain，
+不占用 fib worker：播放列表在第一个分片切出后回复（最多 `PlayWait` 加 `WaitTimeout`），offer 在
+发布者的 track 确定后回复；`PlayWait` 内没有发布者到来时两者都回 404。超过 `MaxPlayWaiters`
+的播放者回 503，等待中挂断的播放者会被放掉。这些字段都为 0（默认）时，播放缺席的流会被立即拒绝。
+
 **重新推流前后。** 在重新推流期间等待的播放者（RTMP 和 SRT 的 `PlayWait`、HTTP-FLV 的
 `Wait`、RTSP 的 `PlayWait`、HLS 和 WHEP 的 `RepublishWait`）会从下一个发布者那里收到
 `OnTracks`，而它的时钟可能从任何地方开始：RTMP 或 ffmpeg 发布者会重新从 0 开始。播放者需要
@@ -520,7 +536,8 @@ NAK 只有一个延迟（120 ms）的时间去找回几百个包，结果找不�
 | `OnPublish`、`OnUnpublish`、`OnSubscribe` | 无 | 认证与观察，调用时不持有 hub 的锁 |
 
 `hub.SubscribeOptions` 有 `Info`（`OnSubscribe` 看到的内容）、`Wait`（0 表示不等待：没有
-发布者时返回 `ErrNotFound`，发布者离开时订阅结束）和 `NoGOPCache`（从下一个关键帧开始）。
+发布者时返回 `ErrNotFound`，发布者离开时订阅结束）、`StartWait`（设置时代替 `Wait` 作为等待第一个
+发布者的时长）和 `NoGOPCache`（从下一个关键帧开始）。
 
 **rtmp.ServerConfig**
 
@@ -603,6 +620,8 @@ HTTP/2 和 HTTP/3 上，积压指流控压住超过 64 KiB 的数据，且只有
 | `Prefix` | `/` | 流路径之前的 URL 路径 |
 | `IdleTimeout`、`WaitTimeout` | 30 s、10 s | 没有请求的 Muxer 被停止；请求最多等待这么久 |
 | `RepublishWait` | 10 s | 发布者在此时间内回来，播放列表在 discontinuity 之后继续 |
+| `PlayWait` | 0 | 播放列表请求等待尚无发布者的流的时长；0 表示立即回 404 |
+| `MaxPlayWaiters` | 1024 | 同时等待发布者的请求数；超过时回 503 |
 | `AllowOrigin`、`MaxStreams` | 无、不限 | CORS，以及同时运行的 Muxer 数 |
 
 **rtc.Config**（WHIP/WHEP 服务端）
@@ -615,6 +634,8 @@ HTTP/2 和 HTTP/3 上，积压指流控压住超过 64 KiB 的数据，且只有
 | `Authorize`、`AllowOrigin`、`LinkICEServers` | 无 | bearer token、CORS、以 Link 头下发的 ICE 服务器 |
 | `GatherTimeout`、`ConnectTimeout` | 5 s、15 s | 应答前的 candidate 收集，应答后的连接 |
 | `RepublishWait` | 10 s | 观众等待下一个发布者的时长 |
+| `PlayWait` | 0 | offer 等待尚无发布者的流的时长；0 表示立即回 404 |
+| `MaxPlayWaiters` | 1024 | 同时等待发布者的 offer 数；超过时回 503 |
 | `NoGOPCache`、`MaxHeldBytes` | false、8 MiB | 观众从下一个关键帧而不是缓存的 GOP 开始；观众连接期间暂存的数据上限 |
 | `MaxLoss` | 0.25 | 观众报告的丢包率超过它就丢包（视频丢到下一个关键帧） |
 | `MTU`、`ReorderSize`、`ReorderDelay` | 1200、128、100 ms | RTP 包大小，以及 WHIP track 的重排缓冲区 |
