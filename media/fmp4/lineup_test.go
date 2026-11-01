@@ -7,6 +7,43 @@ import (
 	"github.com/lesismal/fib/media/av"
 )
 
+// A Writer carrying on another's timeline starts where it ended, its
+// tracks lined up as from 0.
+func TestWriterStartAt(t *testing.T) {
+	w, _ := NewWriter([]*av.Track{h264Track(t), aacTrack(t, 48000)})
+	if w.End() != 0 {
+		t.Fatal(w.End())
+	}
+	w.WritePacket(pkt(0, 100, 0, true, "v0"))
+	w.WritePacket(pkt(0, 140, 0, false, "v1"))
+	_, _ = w.Flush(nil, nil)
+	end := w.End()
+	if end != 80*time.Millisecond {
+		t.Fatal("end", end)
+	}
+	w2, _ := NewWriter([]*av.Track{h264Track(t), aacTrack(t, 48000)})
+	w2.StartAt(-time.Second) // ignored
+	w2.StartAt(end)
+	init, _ := ParseInit(w2.Init())
+	w2.WritePacket(pkt(0, 0, 0, true, "v0"))
+	w2.WritePacket(pkt(1, -20, 0, true, "a0"))
+	w2.StartAt(time.Hour) // too late
+	f, _ := w2.Flush(nil, nil)
+	_, pkts, _, err := init.ParseFragment(f)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, p := range pkts {
+		want := end + 20*time.Millisecond
+		if p.Track == 1 {
+			want = end
+		}
+		if p.DTS != want {
+			t.Fatalf("track %d at %v, want %v", p.Track, p.DTS, want)
+		}
+	}
+}
+
 // A stream joined at a keyframe has audio a little earlier than the
 // keyframe come after it (a B-frame encoder's video DTS trails its PTS):
 // the audio keeps its place before the video rather than starting with it,

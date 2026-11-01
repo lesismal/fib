@@ -41,6 +41,7 @@ type Writer struct {
 	init    []byte
 	seq     uint32
 	epoch   time.Duration
+	startAt time.Duration
 	started bool
 	// buffered counts the bytes of samples held or pending.
 	buffered int
@@ -121,14 +122,36 @@ func (w *Writer) WritePacket(pkt *av.Packet) {
 			d = 0
 		}
 		t.started = true
-		if d > 0 {
-			t.dec = uint64(av.ToTicks(d, int(t.info.timescale)))
-		}
+		t.dec = uint64(av.ToTicks(w.startAt+max(d, 0), int(t.info.timescale)))
 	} else if t.held != nil {
 		t.complete(w.ticks(t, pkt.DTS))
 	}
 	t.held = pkt
 	w.buffered += len(pkt.Data)
+}
+
+// StartAt makes decode times start at t rather than 0, for a Writer that
+// carries on the timeline of another, as HLS does after a discontinuity:
+// a player that keeps its demuxer across it, as ffmpeg does with the same
+// init section, takes decode times going back for samples to discard.
+// It has no effect once a packet has been written.
+func (w *Writer) StartAt(t time.Duration) {
+	if !w.started && t > 0 {
+		w.startAt = t
+	}
+}
+
+// End returns the decode time where the samples flushed and pending end,
+// the latest of the tracks'; held samples, whose durations are not known,
+// are not counted.
+func (w *Writer) End() time.Duration {
+	var end time.Duration
+	for _, t := range w.tracks {
+		if t != nil && t.started {
+			end = max(end, av.FromTicks(int64(t.dec), int(t.info.timescale)))
+		}
+	}
+	return end
 }
 
 // rebase moves the start of decode times by d earlier: the tracks started
