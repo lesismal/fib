@@ -346,7 +346,7 @@ func (sc *ServerConn) publish(cmd *Command) error {
 	}
 	target := &publisherSink{also: also}
 	if cfg.Hub != nil {
-		pub, err := cfg.Hub.Publish(path, nil, hub.PublishInfo{Protocol: "rtmp", Remote: sc.c.RemoteAddrPort(), Query: query})
+		pub, err := cfg.Hub.Reserve(path, hub.PublishInfo{Protocol: "rtmp", Remote: sc.c.RemoteAddrPort(), Query: query})
 		if err != nil {
 			if also != nil {
 				also.OnClose(err)

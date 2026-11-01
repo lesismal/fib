@@ -11,6 +11,14 @@
 // Config's hooks (OnPublish, OnSubscribe) are where authentication goes,
 // for every protocol at once.
 //
+// An ingest that learns its tracks only from what it receives (SRT's
+// MPEG-TS, an RTMP publisher before its metadata) calls Hub.Reserve
+// instead, while it can still refuse its peer: the path is claimed, and
+// OnPublish heard, at once, so a second publisher is turned away in the
+// handshake; the stream goes live, as Publish would make it, at the
+// reserved Publisher's first SetTracks, and until then subscribers either
+// wait (SubscribeOptions.Wait) or find nothing.
+//
 // Fan-out is synchronous: each stream has one mutex, and WritePacket calls
 // every sink's OnPacket under it, from the publisher's goroutine, usually
 // a fib worker. A sink therefore must not block (it queues onto its

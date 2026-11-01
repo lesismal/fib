@@ -111,7 +111,10 @@ type StreamInfo struct {
 	Path       string
 	Tracks     []*av.Track
 	Publishing bool
-	Publisher  PublishInfo
+	// Reserved says the path is claimed by a publisher whose tracks are
+	// not known yet (Hub.Reserve); Publishing is false meanwhile.
+	Reserved  bool
+	Publisher PublishInfo
 	// Since is when the current publisher started.
 	Since       time.Time
 	Subscribers int
@@ -330,29 +333,77 @@ func (st *stream) cache(pkt *av.Packet, video bool) {
 }
 
 // Publish makes the caller the publisher of path with the given tracks.
-// It fails with ErrStreamBusy when the path has a publisher, with the
-// error OnPublish returns, or with ErrLimit or ErrClosed. Subscriptions
-// waiting on the path start.
+// It fails with ErrStreamBusy when the path has a publisher, reserved or
+// not, with the error OnPublish returns, or with ErrLimit or ErrClosed.
+// Subscriptions waiting on the path start.
 func (h *Hub) Publish(path string, tracks []*av.Track, info PublishInfo) (*Publisher, error) {
+	p, st, err := h.claim(path, info)
+	if err != nil {
+		return nil, err
+	}
+	st.goLive(tracks)
+	st.unlock()
+	return p, nil
+}
+
+// Reserve claims path for a publisher whose tracks are not known yet: an
+// ingest that learns them only by demuxing what it receives (SRT, an RTMP
+// publisher before its metadata) reserves the path while it can still
+// refuse the peer, so a second publisher is turned away in the handshake
+// rather than accepted and then shut down. It fails as Publish does, and
+// runs OnPublish now, not when the stream goes live.
+//
+// The returned Publisher's first SetTracks makes the stream live, as
+// Publish would: until then the stream is not Publishing (StreamInfo
+// says Reserved), WritePacket drops what it is given, Subscribe fails
+// with ErrNotFound unless SubscribeOptions.Wait lets the subscription wait
+// (and Wait's timer keeps running meanwhile), and Publish of the same path
+// fails with ErrStreamBusy. Close releases the reservation; OnUnpublish is
+// called for it as for any publisher, since OnPublish was.
+func (h *Hub) Reserve(path string, info PublishInfo) (*Publisher, error) {
+	p, st, err := h.claim(path, info)
+	if err != nil {
+		return nil, err
+	}
+	p.reserved = true
+	st.unlock()
+	return p, nil
+}
+
+// claim runs OnPublish and makes a new Publisher the one of path, with
+// the stream's mutex held on success.
+func (h *Hub) claim(path string, info PublishInfo) (*Publisher, *stream, error) {
 	if h.cfg.OnPublish != nil {
 		if err := h.cfg.OnPublish(path, info); err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 	}
 	h.mu.Lock()
 	st, err := h.lockStream(path, true)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	if st.pub != nil {
 		st.unlock()
-		return nil, ErrStreamBusy
+		return nil, nil, ErrStreamBusy
 	}
 	p := &Publisher{st: st}
 	st.pub = p
 	st.pubInfo = info
 	st.since = time.Now()
 	st.bytesIn, st.packetsIn = 0, 0
+	return p, st, nil
+}
+
+// live reports whether the stream has a publisher with tracks, under mu.
+func (st *stream) live() bool {
+	return st.pub != nil && !st.pub.reserved
+}
+
+// goLive installs the publisher's first tracks and starts the
+// subscriptions waiting for it, under mu.
+func (st *stream) goLive(tracks []*av.Track) {
+	st.pub.reserved = false
 	st.setTracks(tracks)
 	for _, s := range st.subs {
 		if s.closed.Load() {
@@ -363,8 +414,6 @@ func (h *Hub) Publish(path string, tracks []*av.Track, info PublishInfo) (*Publi
 		s.waitKey = st.hasVideo
 		s.sink.OnTracks(tracks)
 	}
-	st.unlock()
-	return p, nil
 }
 
 // Subscribe adds sink to the subscribers of path. When the stream has a
@@ -384,7 +433,7 @@ func (h *Hub) Subscribe(path string, sink Sink, opts SubscribeOptions) (*Subscri
 		return nil, err
 	}
 	st.compact()
-	if st.pub == nil && opts.Wait <= 0 {
+	if !st.live() && opts.Wait <= 0 {
 		st.unlock()
 		return nil, ErrNotFound
 	}
@@ -394,7 +443,7 @@ func (h *Hub) Subscribe(path string, sink Sink, opts SubscribeOptions) (*Subscri
 	}
 	s := &Subscription{st: st, sink: sink, wait: opts.Wait}
 	st.subs = append(st.subs, s)
-	if st.pub == nil {
+	if !st.live() {
 		s.armTimer()
 		st.unlock()
 		return s, nil
@@ -426,7 +475,8 @@ func (h *Hub) Streams() []StreamInfo {
 		info := StreamInfo{
 			Path:       st.path,
 			Tracks:     st.tracks,
-			Publishing: st.pub != nil,
+			Publishing: st.live(),
+			Reserved:   st.pub != nil && st.pub.reserved,
 			BytesIn:    st.bytesIn,
 			PacketsIn:  st.packetsIn,
 		}
@@ -493,8 +543,10 @@ func (h *Hub) Close() {
 // Publisher feeds one stream. Its methods are serialized by the caller,
 // usually a protocol session's own mutex.
 type Publisher struct {
-	st     *stream
-	closed bool // under st.mu
+	st *stream
+	// Under st.mu: closed once unpublished; reserved until the first
+	// SetTracks of a Publisher from Reserve.
+	closed, reserved bool
 }
 
 // WritePacket hands pkt to the stream: it goes into the GOP cache and to
@@ -530,11 +582,17 @@ func (p *Publisher) WritePacket(pkt *av.Packet) {
 
 // SetTracks replaces the stream's tracks, as when the codec configuration
 // changes mid-stream: the GOP cache is dropped and every subscriber hears
-// OnTracks again, then video from the next keyframe.
+// OnTracks again, then video from the next keyframe. The first SetTracks
+// of a reserved Publisher makes the stream live, as Publish does.
 func (p *Publisher) SetTracks(tracks []*av.Track) {
 	st := p.st
 	st.mu.Lock()
 	if st.pub != p {
+		st.unlock()
+		return
+	}
+	if p.reserved {
+		st.goLive(tracks)
 		st.unlock()
 		return
 	}
@@ -560,6 +618,8 @@ func (p *Publisher) Close() {
 		return
 	}
 	p.closed = true
+	wasReserved := p.reserved
+	p.reserved = false
 	st.pub = nil
 	st.pubInfo = PublishInfo{}
 	st.tracks = nil
@@ -571,7 +631,11 @@ func (p *Publisher) Close() {
 			continue
 		}
 		if s.wait > 0 {
-			s.armTimer()
+			if !wasReserved {
+				// A subscription waiting on a reservation keeps
+				// the timer it has.
+				s.armTimer()
+			}
 			continue
 		}
 		s.closed.Store(true)
@@ -618,7 +682,7 @@ func (s *Subscription) stopTimer() {
 func (s *Subscription) expire(gen uint64) {
 	st := s.st
 	st.mu.Lock()
-	if gen != s.timerGen || st.pub != nil || !s.closed.CompareAndSwap(false, true) {
+	if gen != s.timerGen || st.live() || !s.closed.CompareAndSwap(false, true) {
 		st.unlock()
 		return
 	}

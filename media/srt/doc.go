@@ -45,8 +45,10 @@
 // call emits go out in one fib SendDatagrams batch. The stream ID names
 // the stream, plainly ("app/stream") or in the access control syntax
 // ("#!::r=app/stream,m=publish,u=user"); ServerConfig.OnConnect is where
-// authentication goes. A publisher (m=publish) is demuxed (package mpegts)
-// into the hub; a player (m=request, the default) subscribes to the hub
+// authentication goes. A publisher (m=publish) reserves its path in the
+// handshake (hub.Hub.Reserve), so a second publisher of a busy path is
+// rejected there with RejectConflict, and is demuxed (package mpegts) into
+// the hub, going live once the program's tracks are known; a player (m=request, the default) subscribes to the hub
 // and receives the stream muxed into MPEG-TS, 7 transport packets per SRT
 // packet, dropped (hub.NewDropper) while the peer acknowledges too little.
 // Dial, Publish and Play are the caller side on Engine.OpenUDPPeer: a raw

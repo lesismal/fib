@@ -519,8 +519,9 @@ func Push(engine *fib.Engine, h *hub.Hub, path, rawURL string, wait time.Duratio
 }
 
 // Pull plays rawURL and publishes it to the hub at path, which is how a
-// server relays a stream from another. done runs once the stream is
-// published, or with the error that stopped it (hub.ErrStreamBusy when the
+// server relays a stream from another. done runs once the path is
+// reserved (hub.Hub.Reserve; the stream goes live when the tracks are
+// known), or with the error that stopped it (hub.ErrStreamBusy when the
 // path has a publisher); the hub stream is unpublished when the play ends.
 func Pull(engine *fib.Engine, h *hub.Hub, rawURL, path string, config ClientConfig, done func(error)) (*Relay, error) {
 	r := &Relay{}
@@ -528,7 +529,7 @@ func Pull(engine *fib.Engine, h *hub.Hub, rawURL, path string, config ClientConf
 	cc, err := Play(engine, rawURL, config, target, func(cc *ClientConn, err error) {
 		if err == nil {
 			var pub *hub.Publisher
-			pub, err = h.Publish(path, nil, hub.PublishInfo{Protocol: "rtmp-pull", Remote: cc.c.RemoteAddrPort(), Query: cc.url.Query})
+			pub, err = h.Reserve(path, hub.PublishInfo{Protocol: "rtmp-pull", Remote: cc.c.RemoteAddrPort(), Query: cc.url.Query})
 			if err != nil {
 				_ = cc.Close()
 			} else {

@@ -14,8 +14,11 @@ import (
 // ServerConfig configures a Server.
 type ServerConfig struct {
 	// Hub is where publishers' streams go and players' come from, by the
-	// stream ID's resource. It may be nil when OnSession takes every
-	// session.
+	// stream ID's resource. A publisher reserves its path in the
+	// handshake (hub.Hub.Reserve), so one of a path that has a publisher
+	// is rejected with RejectConflict, and one the hub's OnPublish hook
+	// refuses with the RejectReason it returns, or RejectForbidden. It may
+	// be nil when OnSession takes every session.
 	Hub *hub.Hub
 	// Latency is the TSBPD latency the server asks for; the caller's wins
 	// when larger. DefaultLatency when zero.
@@ -161,6 +164,9 @@ func (s *Server) handshake(c *fib.Connection, remote netip.AddrPort, b []byte) {
 			if sess.sub != nil {
 				sess.sub.Close()
 			}
+			if sess.pub != nil {
+				sess.pub.Close()
+			}
 			sess.mu.Unlock()
 		}
 		return
@@ -191,6 +197,10 @@ func (s *Server) handshake(c *fib.Connection, remote netip.AddrPort, b []byte) {
 		if sess.sub != nil {
 			sess.sub.Close()
 			sess.sub = nil
+		}
+		if sess.pub != nil {
+			sess.pub.Close()
+			sess.pub = nil
 		}
 		sess.demux = nil
 	} else if sess.isPlayer {
@@ -243,7 +253,15 @@ func (s *Server) accept(req *Request) (Config, error) {
 	if s.cfg.Hub != nil {
 		switch id.Mode {
 		case ModePublish:
-			sess.startPublish(s.cfg.Hub, id.Resource, hub.PublishInfo{Protocol: "srt", Remote: req.Remote, Query: id.Query}, s.cfg.Demuxer)
+			// The path is claimed now, while the caller can still be
+			// refused; it goes live once the demuxer knows the tracks.
+			info := hub.PublishInfo{Protocol: "srt", Remote: req.Remote, Query: id.Query}
+			pub, err := s.cfg.Hub.Reserve(id.Resource, info)
+			if err != nil {
+				return Config{}, publishReject(err)
+			}
+			sess.startPublish(s.cfg.Hub, id.Resource, info, s.cfg.Demuxer)
+			sess.pub = pub
 		case ModeRequest:
 			sub, err := s.cfg.Hub.Subscribe(id.Resource, sess.sink(), hub.SubscribeOptions{
 				Info: hub.SubscribeInfo{Protocol: "srt", Remote: req.Remote, Query: id.Query},
@@ -304,4 +322,25 @@ func (s *Server) OnEngineClose(c *fib.Connection) {
 	if sess != nil {
 		sess.Close()
 	}
+}
+
+// publishReject is the rejection of a publisher the hub refused: the path
+// has one (RejectConflict, SRT_REJX_CONFLICT, which the access control
+// guidelines give a publish of a resource already locked for
+// modification), the hub is full or closed, or
+// its OnPublish hook said no, with a RejectReason of its own or as
+// RejectForbidden.
+func publishReject(err error) RejectReason {
+	var r RejectReason
+	switch {
+	case errors.Is(err, hub.ErrStreamBusy):
+		return RejectConflict
+	case errors.Is(err, hub.ErrLimit):
+		return RejectOverload
+	case errors.Is(err, hub.ErrClosed):
+		return RejectClose
+	case errors.As(err, &r):
+		return r
+	}
+	return RejectForbidden
 }

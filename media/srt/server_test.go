@@ -282,19 +282,45 @@ func TestRejected(t *testing.T) {
 		t.Fatal(err)
 	}
 	first.Close()
-	// A publisher of a busy stream is closed once it has tracks.
+	// A publisher of a busy stream is rejected in the handshake.
 	_, err = serverHub.Publish("busy", []*av.Track{{Codec: av.CodecAAC}}, hub.PublishInfo{})
 	if err != nil {
 		t.Fatal(err)
 	}
 	cw = newCloseWait()
-	ok = make(chan struct{})
-	tracks, pkts := source(t)
-	busy, err := Dial(client, addr, ClientConfig{StreamID: "#!::r=busy,m=publish", OnClose: cw.fn, OnConnect: func(*Session) { close(ok) }})
+	if _, err := Dial(client, addr, ClientConfig{StreamID: "#!::r=busy,m=publish", OnClose: cw.fn}); err != nil {
+		t.Fatal(err)
+	}
+	if err := cw.wait(t); err != RejectConflict {
+		t.Fatal(err)
+	}
+}
+
+// TestPublishReserved covers a second SRT publisher of a path whose first
+// has not sent its tracks yet: the first reserved the path in its
+// handshake, so the second is rejected in its own, and the first goes
+// live once it sends.
+func TestPublishReserved(t *testing.T) {
+	serverHub := hub.New(hub.Config{})
+	_, addr, _ := startServer(t, ServerConfig{Hub: serverHub})
+	client := startEngine(t)
+	ok := make(chan struct{})
+	first, err := Dial(client, addr, ClientConfig{StreamID: "#!::r=live/r,m=publish", OnConnect: func(*Session) { close(ok) }})
 	if err != nil {
 		t.Fatal(err)
 	}
 	<-ok
+	if infos := serverHub.Streams(); len(infos) != 1 || !infos[0].Reserved || infos[0].Publishing {
+		t.Fatalf("%+v", infos)
+	}
+	cw := newCloseWait()
+	if _, err := Dial(client, addr, ClientConfig{StreamID: "#!::r=live/r,m=publish", OnClose: cw.fn}); err != nil {
+		t.Fatal(err)
+	}
+	if err := cw.wait(t); err != RejectConflict {
+		t.Fatal(err)
+	}
+	tracks, pkts := source(t)
 	m, _ := mpegts.NewMuxer(tracks, mpegts.MuxerConfig{})
 	var ts []byte
 	for _, p := range pkts {
@@ -302,11 +328,67 @@ func TestRejected(t *testing.T) {
 	}
 	for len(ts) > 0 {
 		n := min(len(ts), TSPayloadSize)
-		_ = busy.Write(ts[:n])
+		_ = first.Write(ts[:n])
 		ts = ts[n:]
 	}
-	if err := cw.wait(t); err != ErrPeerClosed {
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		infos := serverHub.Streams()
+		if len(infos) == 1 && infos[0].Publishing && len(infos[0].Tracks) == len(tracks) {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("%+v", infos)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	first.Close()
+	deadline = time.Now().Add(5 * time.Second)
+	for len(serverHub.Streams()) != 0 {
+		if time.Now().After(deadline) {
+			t.Fatalf("%+v", serverHub.Streams())
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+// TestPublishTaken covers a publisher OnSession takes: the path it
+// reserved is released.
+func TestPublishTaken(t *testing.T) {
+	serverHub := hub.New(hub.Config{})
+	taken := make(chan struct{})
+	_, addr, _ := startServer(t, ServerConfig{Hub: serverHub, OnSession: func(*Session) bool {
+		close(taken)
+		return true
+	}})
+	client := startEngine(t)
+	if _, err := Dial(client, addr, ClientConfig{StreamID: "#!::r=t,m=publish"}); err != nil {
 		t.Fatal(err)
+	}
+	<-taken
+	deadline := time.Now().Add(5 * time.Second)
+	for len(serverHub.Streams()) != 0 {
+		if time.Now().After(deadline) {
+			t.Fatalf("%+v", serverHub.Streams())
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
+func TestPublishReject(t *testing.T) {
+	for _, tc := range []struct {
+		err  error
+		want RejectReason
+	}{
+		{hub.ErrStreamBusy, RejectConflict},
+		{hub.ErrLimit, RejectOverload},
+		{hub.ErrClosed, RejectClose},
+		{RejectUnauthorized, RejectUnauthorized},
+		{errors.New("no"), RejectForbidden},
+	} {
+		if got := publishReject(tc.err); got != tc.want {
+			t.Fatal(tc.err, got)
+		}
 	}
 }
 
