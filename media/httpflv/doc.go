@@ -24,8 +24,17 @@
 // or for the next publisher after its own leaves; its FLV timestamps keep
 // increasing across the republish (flv.Timeline).
 //
-// Left out: an HTTP-FLV pull client (rtmp.Pull relays from RTMP), which
-// is not written yet: it would feed the body of a fib/http client
-// response (ClientConfig.StreamResponseBody, ClientResponse.OnBody) into
-// flv.Demuxer. Serving recorded files is left out too.
+// Pull relays the other way: it plays an HTTP-FLV origin (http:// or
+// https://, HTTP/1.1 or HTTP/2) or a WebSocket-FLV one (ws://, wss://)
+// and publishes the stream into a hub, as rtmp.Pull does for RTMP. The
+// response body streams through the fib/http client
+// (ClientConfig.StreamResponseBody, ClientResponse.OnBody) into
+// flv.Demuxer and flv.Decoder on the worker reading it, never waiting:
+// a hub that is slow to take it is paid for by StreamResponseBodyBuffer
+// and then TCP flow control. The path is reserved (hub.Hub.Reserve) once
+// the origin answers 200 OK, redirects are followed, and an origin that
+// sends nothing for PullConfig.IdleTimeout ends the pull.
+//
+// Left out: serving recorded files, and reconnecting a pull that ended
+// (pull again; players that wait follow the republish).
 package httpflv

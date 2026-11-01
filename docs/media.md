@@ -29,7 +29,7 @@ nothing decodes or encodes audio or video.
 | Protocol | Package | Server | Client | Content |
 | --- | --- | --- | --- | --- |
 | RTMP, RTMPS | `media/rtmp` | publish and play | publish, play, push and pull relays | Simple and Flash digest handshakes, the chunk stream with all four header formats and extended timestamps, aggregate messages, acknowledgement windows; Enhanced RTMP (H.265, AV1 and Opus by FourCC) and H.265 with the legacy codec id 12; RTMPS through fib/tls |
-| HTTP-FLV, WebSocket-FLV | `media/httpflv` | play | — | An FLV file that never ends, over HTTP/1.1, HTTP/2 and HTTP/3, or the same bytes in binary WebSocket messages (also over RFC 8441 and RFC 9220 extended CONNECT); for flv.js, mpegts.js and ffmpeg |
+| HTTP-FLV, WebSocket-FLV | `media/httpflv` | play | pull relay | An FLV file that never ends, over HTTP/1.1, HTTP/2 and HTTP/3, or the same bytes in binary WebSocket messages (also over RFC 8441 and RFC 9220 extended CONNECT); for flv.js, mpegts.js and ffmpeg. The pull relay plays an HTTP-FLV origin over HTTP/1.1 or HTTP/2 (http and https) or a WebSocket-FLV one (ws and wss) into the hub |
 | RTSP 1.0 | `media/rtsp` | record (ANNOUNCE/RECORD) and play | play, publish, push and pull relays | RFC 2326 over TCP interleaved and UDP unicast, one RTP/RTCP port pair shared by every session, RTCP sender reports, Digest and Basic authentication, GET_PARAMETER keep-alives, session timeouts |
 | SRT | `media/srt` | publish and play | publish, play, raw sessions | Live mode: the version 5 handshake with SYN cookies, the stream ID and its access control syntax, ACK/ACKACK/NAK, retransmission, TSBPD and too-late drop, AES-CTR encryption with 128-, 192- and 256-bit keys and in-band key refreshes; MPEG-TS bridged to the hub |
 | HLS, LL-HLS | `media/hls` | play | — | RFC 8216 with fMP4 or MPEG-TS segments held in memory, chosen per request (`?format=ts`), and the Low-Latency extensions: partial segments, preload hints, blocking playlist reloads |
@@ -73,6 +73,7 @@ and what lets one session run its core under one mutex.
 | `rtmp.Publish`/`Play`, `rtsp.Client` | dial through the engine (`DialWithHandler`), callback-driven |
 | `srt.Dial`/`Publish`/`Play` | `Engine.OpenUDPPeer` from a binding of their own |
 | `rtc.Pull`/`Push` | a PeerConnection with a port of its own, signaling over the fib/http client |
+| `httpflv.Pull` | the fib/http client with a streamed response body (`OnBody`), or the fib/websocket dialer, feeding `flv.Demuxer` on the worker that reads |
 
 ### The hub
 
@@ -196,11 +197,12 @@ lock, so no fib worker is held by a waiting player.
 `hub.Config.OnPublish` and `OnSubscribe` see every publish and play, whatever
 the protocol, with `PublishInfo`/`SubscribeInfo`: the protocol (`rtmp`,
 `rtsp`, `srt`, `whip`, `whep`, `http-flv`, `ws-flv`, `hls`; RTMP's relays
-are `rtmp-pull` and `rtmp-push`, the others' their protocol's name), the
+are `rtmp-pull` and `rtmp-push`, HTTP-FLV's `http-flv-pull` and
+`ws-flv-pull`, the others' their protocol's name), the
 remote address, and the query of the URL, where tokens usually travel.
 Returning an error refuses the publish or play. The relays fill it in too:
-`rtmp.Pull` and `rtsp.PlayToHub` with the remote server's address and its
-URL's query, `rtc.PullToHub` with its URL's query, `srt.Play` and
+`rtmp.Pull`, `rtsp.PlayToHub` and `httpflv.Pull` with the remote server's
+address and its URL's query, `rtc.PullToHub` with its URL's query, `srt.Play` and
 `srt.Publish` with the server's address and the query of a plain stream ID
 (`live/s?token=...`). An RTSP player whose URL
 carries a query sets its tracks up against that URL, as ffmpeg does
@@ -518,11 +520,16 @@ srt.Play(engine, "origin.example.com:9000", h, "live/remote",
 cc := rtc.ClientConfig{Engine: engine, Token: "bearer-token"}
 rtc.PushFromHub(cc, "https://edge.example.com/whip/live/cam", h, "live/cam", hub.SubscribeOptions{Wait: 30 * time.Second})
 rtc.PullToHub(cc, "https://origin.example.com/whep/live/webrtc", h, "live/webrtc")
+
+// HTTP-FLV: pull from an origin or a CDN (ws:// and wss:// pull WebSocket-FLV).
+httpflv.Pull(httpflv.PullConfig{Engine: engine, OnClose: func(err error) { log.Println("pull ended:", err) }},
+	"https://cdn.example.com/live/cam.flv?token=t", h, "live/cdn")
 ```
 
 - A pull relay publishes the path when the remote's tracks are known
-  (`rtmp.Pull` and `srt.Play` reserve it first, so a busy path fails at once
-  with `hub.ErrStreamBusy`), passes a change of tracks on as `SetTracks`, and
+  (`rtmp.Pull`, `srt.Play` and `httpflv.Pull` reserve it first, so a busy
+  path fails at once with `hub.ErrStreamBusy`; `httpflv.Pull` once the
+  origin answers 200 OK), passes a change of tracks on as `SetTracks`, and
   unpublishes when the remote stream ends. A refused publish closes the
   client.
 - A push relay starts with the stream's first tracks, drops packets the
@@ -653,6 +660,19 @@ servers that check digests refuse the simple one) and `OnClose`.
 stream's flow control holding more than 64 KiB, and only HTTP/1 players are
 disconnected), `IdleTimeout` (30 s), `Encoder`, and `WebSocket` (whose zero
 value accepts every origin).
+
+**httpflv.PullConfig**
+
+| Field | Default | Meaning |
+| --- | --- | --- |
+| `Engine` | required | Dials the origin and reads it; must be running |
+| `TLSConfig`, `Header`, `Dial` | none | For https:// and wss:// (HTTP/2 when the origin chooses it); headers sent with the request; a dialer in place of the engine's, as a SOCKS proxy's |
+| `DialTimeout`, `HeaderTimeout` | 10 s, 10 s | The connect, and the wait for the response's header (for WebSocket-FLV the two bound the handshake) |
+| `IdleTimeout` | 30 s | An origin that sends nothing this long, from its header on, ends the pull; negative means none |
+| `MaxRedirects` | 5 | 301, 302, 303, 307 and 308 answers followed; negative means none |
+| `BufferSize` | 256 KiB | Body waiting to be demuxed before the connection stops being read |
+| `MaxTagSize` | 8 MiB | Largest FLV tag |
+| `OnTracks`, `OnPacket`, `OnClose` | none | Called after the hub has the tracks or packet; `OnClose` once, with nil when the origin ended the stream, `ErrClosed` after `Close`, a `StatusError` for an answer other than 200 OK, or the hub's refusal |
 
 **rtsp.ServerConfig**
 
@@ -785,10 +805,8 @@ a codec fib does not have, or because it belongs to the application.
   matrix (Sorenson H.263, VP6, Screen Video, Nellymoser, Speex, ADPCM: parsed,
   then dropped); FLV encryption headers; encoding AMF3, its externalizable
   objects, and AMF0's reserved markers.
-- **HTTP-FLV**: a pull client (`rtmp.Pull` relays from RTMP). It is not
-  written yet: it would feed a fib/http client response body
-  (`ClientConfig.StreamResponseBody`, `ClientResponse.OnBody`) into
-  `flv.Demuxer`. Serving recorded files.
+- **HTTP-FLV**: serving recorded files; a pull that reconnects by itself
+  (`OnClose` says it ended, and pulling again is one call).
 - **RTSP**: RTSP 2.0; RTSP over TLS (rtsps) and over HTTP tunnels; multicast;
   a PLAY Range that seeks, Scale and Speed; sessions that outlive their
   connection; RTCP receiver reports to recorders.
