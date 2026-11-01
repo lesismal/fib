@@ -161,7 +161,7 @@ func TestWebSocketOverExtendedConnect(t *testing.T) {
 		t.Fatalf("frame %d, want HEADERS", typ)
 	}
 	var decoder qpack.Decoder
-	fields, err := decodeFields(&decoder, nil, payload, 1<<16)
+	fields, err := decoder.AppendFields(nil, payload, 1<<16)
 	if err != nil || len(fields) == 0 || fields[0].Name != ":status" || fields[0].Value != "200" {
 		t.Fatalf("response %v %v", fields, err)
 	}

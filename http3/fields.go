@@ -11,6 +11,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/lesismal/fib/bufferpool"
 	fibhttp "github.com/lesismal/fib/http"
 	"github.com/lesismal/fib/http3/qpack"
 )
@@ -84,19 +85,35 @@ func checkHeader(header stdhttp.Header) error {
 	return nil
 }
 
-// appendHeader encodes header's fields, leaving out what HTTP/3 does not
-// carry and what skip names.
-func appendHeader(block []byte, header stdhttp.Header, skip func(string) bool) []byte {
+// appendHeader encodes header's fields in sec, leaving out what HTTP/3 does
+// not carry and what skip names.
+func appendHeader(sec *qpack.Section, block []byte, header stdhttp.Header, skip func(string) bool) []byte {
 	for key, values := range header {
 		name := lowerKey(key)
 		if connectionHeaders[name] || skip != nil && skip(name) {
 			continue
 		}
 		for _, value := range values {
-			block = qpack.AppendField(block, name, value, sensitive(name))
+			block = sec.Append(block, name, value, sensitive(name))
 		}
 	}
 	return block
+}
+
+// beginFields starts the field section of streamID in a buffer from the
+// pool, encoded with enc, which may be nil.
+func beginFields(enc *qpack.Encoder, streamID uint64) (qpack.Section, []byte) {
+	return enc.Begin(bufferpool.Grow(nil, len(qpack.Prefix)), streamID)
+}
+
+// appendFields encodes fields in a section of its own for streamID, in a
+// buffer from the pool.
+func appendFields(enc *qpack.Encoder, fields []qpack.HeaderField, streamID uint64) []byte {
+	sec, block := beginFields(enc, streamID)
+	for _, f := range fields {
+		block = sec.Append(block, f.Name, f.Value, sensitive(f.Name))
+	}
+	return sec.End(block)
 }
 
 // lowerKeys are the lowercase names of the header keys messages nearly always
@@ -374,13 +391,6 @@ func responseLength(req *stdhttp.Request, response fibhttp.Response) int64 {
 		}
 	}
 	return int64(len(response.Body))
-}
-
-// decodeFields decodes a field section.
-// decodeFields decodes a field section onto dst, remembering its strings in
-// d for the connection's next one.
-func decodeFields(d *qpack.Decoder, dst []qpack.HeaderField, block []byte, maxSize int) ([]qpack.HeaderField, error) {
-	return d.AppendFields(dst, block, maxSize)
 }
 
 // validTrailer reports whether a response may send name, in lower case, as

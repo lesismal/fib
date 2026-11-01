@@ -736,6 +736,9 @@ jobs:
             ./http3:FuzzNewRequest \
             ./http3/qpack:FuzzDecode \
             ./http3/qpack:FuzzRoundTrip \
+            ./http3/qpack:FuzzEncoderStream \
+            ./http3/qpack:FuzzDecoderStream \
+            ./http3/qpack:FuzzDynamicRoundTrip \
             ./http3/quic:FuzzParseHeader \
             ./http3/quic:FuzzParseParams \
             ./http3/quic:FuzzFrames; do

@@ -1421,8 +1421,11 @@ QUIC 层的实现要点：
   STREAM_DATA_BLOCKED 或 STREAMS_BLOCKED；接收方向默认每个 stream 窗口 1MB、连接窗口
   16MB（`TransportConfig` 可调），按消费量自动补充；并发 stream 数用 MAX_STREAMS 动态放开。
 - 关闭：本端关闭后有 closing 期，对端关闭后有同样长的 draining 期（不再发送，但保留路径）。
-- QPACK 两端都声明动态表容量为 0：编码只用静态表和字面量（字面量在更短时使用
+- QPACK 默认两端都声明动态表容量为 0：编码只用静态表和字面量（字面量在更短时使用
   Huffman 编码），解码拒绝任何动态表引用，因此编码器流和解码器流无需内容。
+  `Config.QPACKTableCapacity` / `ClientConfig.QPACKTableCapacity` 可打开动态表，重复的大
+  字段（较长的 cookie、RPC 自定义头；`authorization` 从不进表）之后只发索引，详见
+  [`docs/http3.zh-CN.md`](http3.zh-CN.md#qpack-动态表)。
 - 已与 quic-go 做双向互通测试（包括 5% 随机丢包下的 20MB 双向传输），客户端也验证过
   Cloudflare、Google、nginx、Facebook、Varnish、quiche 的线上 HTTP/3 服务。
 
@@ -1431,7 +1434,7 @@ QUIC 层的实现要点：
 HTTP/3 的一致性测试（与 quic-go 客户端、服务端的双向互通，以及用手写帧构造的协议错误
 用例，CI 中在三个平台运行；quic-go 放在 `http3/interop` 这个独立 module 里，fib 本身
 不增加依赖）、当前的限制（只跟随 NAT 重绑定、不支持主动迁移等）、0-RTT 的做法与防重放、
-有意未实现的功能及原因（QPACK 动态表、server push 等），以及待优化项（拥塞控制、批量收发等）见
+有意未实现的功能及原因（server push 等），以及待优化项（拥塞控制、批量收发等）见
 [`docs/http3.zh-CN.md`](http3.zh-CN.md)。
 
 ### 异步 HTTP/3 client

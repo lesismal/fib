@@ -1,8 +1,10 @@
-// Package qpack implements the parts of QPACK (RFC 9204) that HTTP/3 needs
-// without a dynamic table: field sections encoded with the static table and
-// literals, and decoded likewise. Both sides here advertise a dynamic table
-// capacity of zero, so a peer may not refer to one, and neither the encoder
-// nor the decoder stream carries anything.
+// Package qpack implements QPACK (RFC 9204) for HTTP/3: field sections
+// encoded with the static table and literals, and decoded likewise, and,
+// when a connection opts in, the dynamic table, which the Encoder fills on
+// the encoder stream and the Decoder follows. Without it, which is the
+// default, both sides advertise a dynamic table capacity of zero, so a peer
+// may not refer to one, and neither the encoder nor the decoder stream
+// carries anything.
 package qpack
 
 import (
@@ -22,6 +24,16 @@ var (
 	ErrDecompression = errors.New("qpack: decompression failed")
 	// ErrTooLarge is a field section beyond the decoder's limit.
 	ErrTooLarge = errors.New("qpack: field section too large")
+	// ErrBlocked is a field section that refers to dynamic table entries
+	// the encoder stream has not brought yet: the stream it came on waits
+	// for them, and the section is decoded again once they are in.
+	ErrBlocked = errors.New("qpack: field section blocked on the encoder stream")
+	// ErrEncoderStream is an encoder stream instruction that cannot be
+	// carried out, which HTTP/3 treats as QPACK_ENCODER_STREAM_ERROR.
+	ErrEncoderStream = errors.New("qpack: encoder stream error")
+	// ErrDecoderStream is a decoder stream instruction that cannot be
+	// carried out, which HTTP/3 treats as QPACK_DECODER_STREAM_ERROR.
+	ErrDecoderStream = errors.New("qpack: decoder stream error")
 )
 
 // AppendField appends one field line; a section starts with Prefix.
@@ -60,7 +72,7 @@ var Prefix = []byte{0, 0}
 // 4.2.2 does, would pass maxSize, if maxSize is positive.
 func Decode(block []byte, maxSize int, emit func(HeaderField) error) error {
 	var d *Decoder
-	return d.decode(block, maxSize, emit, nil)
+	return d.decode(block, maxSize, emit, nil, 0)
 }
 
 // Decoder decodes the field sections of one connection. A connection's
@@ -75,6 +87,8 @@ type Decoder struct {
 	recent [recentStrings]recentString
 	// place is the place in its section of the next string read.
 	place int
+	// dyn is the dynamic table, once EnableDynamic has allowed one.
+	dyn *decoderTable
 }
 
 // recentString is a string as a field line encoded it, with a prefix of n
@@ -101,26 +115,66 @@ const (
 // AppendFields decodes a field section as Decode does, appending its fields
 // to dst.
 func (d *Decoder) AppendFields(dst []HeaderField, block []byte, maxSize int) ([]HeaderField, error) {
-	err := d.decode(block, maxSize, nil, &dst)
+	err := d.decode(block, maxSize, nil, &dst, 0)
+	return dst, err
+}
+
+// AppendSection is AppendFields for the field section of a stream, which
+// may refer to the dynamic table: one that refers to entries still to come
+// fails with ErrBlocked, and decodes when given again once they have come.
+// A section that referred to the table is acknowledged on the decoder
+// stream; see AppendInstructions.
+func (d *Decoder) AppendSection(dst []HeaderField, block []byte, maxSize int, streamID uint64) ([]HeaderField, error) {
+	err := d.decode(block, maxSize, nil, &dst, streamID)
 	return dst, err
 }
 
 // decode decodes a field section into emit, or onto dst when emit is nil.
-func (d *Decoder) decode(block []byte, maxSize int, emit func(HeaderField) error, dst *[]HeaderField) error {
-	ric, rest, err := readInt(block, 8)
+func (d *Decoder) decode(block []byte, maxSize int, emit func(HeaderField) error, dst *[]HeaderField, streamID uint64) error {
+	encoded, rest, err := readInt(block, 8)
 	if err != nil {
 		return err
 	}
-	if ric != 0 {
-		// A reference to a dynamic table this side said it does not have.
+	var dyn *decoderTable
+	var ric, base uint64
+	if encoded != 0 {
+		if d == nil || d.dyn == nil {
+			// A reference to a dynamic table this side said it does not
+			// have.
+			return ErrDecompression
+		}
+		dyn = d.dyn
+		if ric, err = dyn.requiredInsertCount(encoded); err != nil {
+			return err
+		}
+	}
+	if len(rest) == 0 {
 		return ErrDecompression
 	}
-	if _, rest, err = readInt(rest, 7); err != nil {
+	sign := rest[0]&0x80 != 0
+	var delta uint64
+	if delta, rest, err = readInt(rest, 7); err != nil {
 		return err
+	}
+	if dyn != nil {
+		switch {
+		case !sign:
+			base = ric + delta
+		case delta >= ric:
+			return ErrDecompression
+		default:
+			base = ric - delta - 1
+		}
+		if ric > dyn.inserted {
+			return dyn.block(streamID)
+		}
 	}
 	if d != nil {
 		d.place = 0
 	}
+	// largest is one past the largest absolute index referred to, which
+	// has to be the required insert count the prefix declared.
+	var largest uint64
 	size := 0
 	for len(rest) > 0 {
 		var f HeaderField
@@ -128,12 +182,15 @@ func (d *Decoder) decode(block []byte, maxSize int, emit func(HeaderField) error
 		switch {
 		case b&0x80 != 0:
 			// Indexed field line.
-			if b&0x40 == 0 {
-				return ErrDecompression
-			}
 			var i uint64
 			if i, rest, err = readInt(rest, 6); err != nil {
 				return err
+			}
+			if b&0x40 == 0 {
+				if f, err = dyn.relative(base, i, ric, &largest); err != nil {
+					return err
+				}
+				break
 			}
 			if i >= uint64(len(staticTable)) {
 				return ErrDecompression
@@ -141,17 +198,22 @@ func (d *Decoder) decode(block []byte, maxSize int, emit func(HeaderField) error
 			f = staticTable[i]
 		case b&0xc0 == 0x40:
 			// Literal field line with a name reference.
-			if b&0x10 == 0 {
-				return ErrDecompression
-			}
 			var i uint64
 			if i, rest, err = readInt(rest, 4); err != nil {
 				return err
 			}
-			if i >= uint64(len(staticTable)) {
-				return ErrDecompression
+			if b&0x10 == 0 {
+				var e HeaderField
+				if e, err = dyn.relative(base, i, ric, &largest); err != nil {
+					return err
+				}
+				f.Name = e.Name
+			} else {
+				if i >= uint64(len(staticTable)) {
+					return ErrDecompression
+				}
+				f.Name = staticTable[i].Name
 			}
-			f.Name = staticTable[i].Name
 			if f.Value, rest, err = d.readString(rest, 7, maxSize); err != nil {
 				return err
 			}
@@ -163,12 +225,35 @@ func (d *Decoder) decode(block []byte, maxSize int, emit func(HeaderField) error
 			if f.Value, rest, err = d.readString(rest, 7, maxSize); err != nil {
 				return err
 			}
+		case b&0xf0 == 0x10:
+			// Indexed field line with a post-base index.
+			var i uint64
+			if i, rest, err = readInt(rest, 4); err != nil {
+				return err
+			}
+			if f, err = dyn.postBase(base, i, ric, &largest); err != nil {
+				return err
+			}
 		default:
-			// Post-base references, which need a dynamic table.
-			return ErrDecompression
+			// Literal field line with a post-base name reference.
+			var i uint64
+			if i, rest, err = readInt(rest, 3); err != nil {
+				return err
+			}
+			var e HeaderField
+			if e, err = dyn.postBase(base, i, ric, &largest); err != nil {
+				return err
+			}
+			f.Name = e.Name
+			if f.Value, rest, err = d.readString(rest, 7, maxSize); err != nil {
+				return err
+			}
 		}
 		size += len(f.Name) + len(f.Value) + 32
 		if maxSize > 0 && size > maxSize {
+			// Given up on, as one decoded whole would be: the encoder
+			// hears the section is done with either way.
+			dyn.acknowledge(streamID, ric)
 			return ErrTooLarge
 		}
 		if emit == nil {
@@ -177,6 +262,12 @@ func (d *Decoder) decode(block []byte, maxSize int, emit func(HeaderField) error
 			return err
 		}
 	}
+	if largest != ric {
+		// A required insert count above what the section refers to
+		// (RFC 9204 section 4.5.1.1).
+		return ErrDecompression
+	}
+	dyn.acknowledge(streamID, ric)
 	return nil
 }
 

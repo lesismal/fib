@@ -74,6 +74,24 @@ type ClientConfig struct {
 	// MaxStreamedBodyBytes instead.
 	MaxResponseHeaderBytes int
 	MaxResponseBodyBytes   int64
+	// QPACKTableCapacity turns QPACK's dynamic table on (RFC 9204), both ways,
+	// at up to this many bytes: the peer's encoder may fill a table of that
+	// size, which costs the client as much memory per connection, and the
+	// client's encoder fills one of the lesser of it and what the peer allows.
+	// A field that repeats, such as a large cookie or a custom field of an RPC,
+	// is then sent as an index of a byte or two once it has been seen twice;
+	// authorization and proxy-authorization are never indexed, nor a cookie or
+	// set-cookie shorter than 20 bytes. The encoder refers to entries the peer
+	// has not acknowledged, which may have its stream wait for them, on no more
+	// streams than the peer's blocked streams allow. QPACKBlockedStreams is
+	// that number for the client's own streams: how many the peer's encoder may
+	// have wait for entries its encoder stream has yet to bring, each holding
+	// what arrives meanwhile up to the field section limit and 1 MiB more.
+	// Zero, the default, keeps the table off: both sides then send every field
+	// whole, and the QPACK streams carry nothing. The gain is bandwidth, and
+	// the CPU of coding large values again; 4096 suits most uses.
+	QPACKTableCapacity  int
+	QPACKBlockedStreams int
 	// StreamResponseBody runs the callback of a response before its body has
 	// all arrived, as http.ClientConfig.StreamResponseBody does for HTTP/1
 	// and HTTP/2: once the header has, for a body with a content-length,
@@ -791,8 +809,11 @@ type clientConn struct {
 	serverName string
 	peer       peerStreams
 	// decoder decodes the connection's field sections. Only the goroutine
-	// QUIC calls the connection's handler on uses it.
+	// QUIC calls the connection's handler on uses it, and held, the
+	// streams whose field sections wait on the server's QPACK encoder
+	// stream; see ClientConfig.QPACKBlockedStreams.
 	decoder qpack.Decoder
+	held    map[uint64]heldResponse
 
 	mu       sync.Mutex
 	fc       *fib.Connection
@@ -811,6 +832,17 @@ type clientConn struct {
 	waiting   []*clientRequest
 	streams   map[uint64]*clientStream
 	idleTimer *time.Timer
+	// abandoned are the streams given up on before their response was all
+	// read, which the server's QPACK encoder is to be told of, from the
+	// goroutine the decoder is used on; see cancelAbandoned.
+	abandoned []uint64
+}
+
+// heldResponse is a stream whose field section waits on the server's
+// encoder stream, and whether the stream's end has arrived behind it.
+type heldResponse struct {
+	st  *clientStream
+	fin bool
 }
 
 // newTLS is how a connection's TLS handshake is made: by this module's state
@@ -979,7 +1011,9 @@ func (cc *clientConn) openControlOnce(qc *quic.Conn) bool {
 	if opened {
 		return true
 	}
-	if _, err := openControl(qc, cc.client.config.MaxResponseHeaderBytes); err != nil {
+	config := &cc.client.config
+	if _, err := cc.peer.openStreams(qc, config.MaxResponseHeaderBytes, config.QPACKTableCapacity, config.QPACKBlockedStreams,
+		&cc.decoder, cc.resumeHeld); err != nil {
 		closeWith(qc, connErr(ErrCodeStreamCreationError, "cannot open the control stream"))
 		return false
 	}
@@ -1063,6 +1097,9 @@ func (cc *clientConn) startWaiting() {
 }
 
 func (cc *clientConn) OnStreamData(s *quic.Stream, data []byte, fin bool) {
+	// Streams given up on, here or elsewhere, are told of after the
+	// delivery.
+	defer cc.cancelAbandoned()
 	switch st := s.Context.(type) {
 	case *clientStream:
 		st.feed(data, fin)
@@ -1080,9 +1117,66 @@ func (cc *clientConn) OnStreamData(s *quic.Stream, data []byte, fin bool) {
 	}
 }
 
+// abandon notes that the response of a stream will not all be read, for
+// cancelAbandoned to tell the server's encoder, when the connection has a
+// dynamic table.
+func (cc *clientConn) abandon(st *clientStream) {
+	if cc.peer.qpack.Load() == nil {
+		return
+	}
+	cc.mu.Lock()
+	cc.abandoned = append(cc.abandoned, st.s.ID())
+	cc.mu.Unlock()
+}
+
+// cancelAbandoned tells the server's encoder of the streams given up on
+// since it last did, which no longer wait on its encoder stream; it runs on
+// the goroutine the decoder is used on.
+func (cc *clientConn) cancelAbandoned() {
+	q := cc.peer.qpack.Load()
+	if q == nil {
+		return
+	}
+	cc.mu.Lock()
+	abandoned := cc.abandoned
+	cc.abandoned = nil
+	cc.mu.Unlock()
+	for _, id := range abandoned {
+		delete(cc.held, id)
+		q.dec.Cancel(id)
+	}
+	if len(abandoned) > 0 {
+		q.flush()
+	}
+}
+
+// resumeHeld decodes again the field sections of the streams that waited on
+// the server's encoder stream, which has brought more; those that still
+// need more wait on.
+func (cc *clientConn) resumeHeld() {
+	cc.cancelAbandoned()
+	if len(cc.held) == 0 {
+		return
+	}
+	held := make([]heldResponse, 0, len(cc.held))
+	for id, h := range cc.held {
+		held = append(held, h)
+		delete(cc.held, id)
+	}
+	for _, h := range held {
+		if !h.st.done {
+			h.st.deliver(nil, h.fin, true)
+		}
+	}
+}
+
 func (cc *clientConn) OnStreamReset(s *quic.Stream, code uint64) {
 	switch st := s.Context.(type) {
 	case *clientStream:
+		if !st.done {
+			cc.abandon(st)
+			cc.cancelAbandoned()
+		}
 		st.reset(ErrorCode(code))
 	case *uniStream:
 		if st.typ == streamControl || st.typ == streamQPACKEncoder || st.typ == streamQPACKDecoder {
@@ -1230,6 +1324,10 @@ type clientStream struct {
 	fedBody int
 	// uploading says the request's body, which streams, is still being sent.
 	uploading atomic.Bool
+	// skip is how much of the body that streams was given back as it
+	// arrived, while a field section ahead of it waited on the server's
+	// encoder stream, and is not given back again as it is consumed.
+	skip atomic.Int64
 	// gate holds back the body of a request that expects 100-continue.
 	gate *reqbody.Gate
 }
@@ -1245,10 +1343,7 @@ func (st *clientStream) send() {
 		return
 	}
 	if r.upload != nil || r.expect {
-		block := bufferpool.Append(nil, qpack.Prefix)
-		for _, f := range r.fields {
-			block = qpack.AppendField(block, f.Name, f.Value, sensitive(f.Name))
-		}
+		block := appendFields(st.cc.peer.qpackEncoder(), r.fields, st.s.ID())
 		out := appendHeadersFrame(bufferpool.Get(len(block) + 16)[:0], block)
 		bufferpool.Put(block)
 		if r.expect {
@@ -1270,10 +1365,7 @@ func (st *clientStream) send() {
 	}
 	// The stream copies what it is written, so every buffer built here goes
 	// back to the pool once the frames are on it.
-	block := bufferpool.Append(nil, qpack.Prefix)
-	for _, f := range r.fields {
-		block = qpack.AppendField(block, f.Name, f.Value, sensitive(f.Name))
-	}
+	block := appendFields(st.cc.peer.qpackEncoder(), r.fields, st.s.ID())
 	out := bufferpool.Get(len(block) + len(r.body) + 16)[:0]
 	out = appendHeadersFrame(out, block)
 	bufferpool.Put(block)
@@ -1293,10 +1385,7 @@ func (st *clientStream) appendBody(out []byte) []byte {
 		out = append(out, r.body...)
 	}
 	if len(r.trailer) > 0 {
-		trailer := bufferpool.Append(nil, qpack.Prefix)
-		for _, f := range r.trailer {
-			trailer = qpack.AppendField(trailer, f.Name, f.Value, sensitive(f.Name))
-		}
+		trailer := appendFields(st.cc.peer.qpackEncoder(), r.trailer, st.s.ID())
 		out = appendHeadersFrame(out, trailer)
 		bufferpool.Put(trailer)
 	}
@@ -1368,10 +1457,7 @@ func (st *clientStream) sendBody() {
 			err = &reqbody.BodyError{Err: terr}
 		}
 		if terr == nil && len(trailer) > 0 {
-			block := bufferpool.Append(nil, qpack.Prefix)
-			for _, f := range trailer {
-				block = qpack.AppendField(block, f.Name, f.Value, sensitive(f.Name))
-			}
+			block := appendFields(st.cc.peer.qpackEncoder(), trailer, st.s.ID())
 			out = appendHeadersFrame(bufferpool.Get(len(block) + 16)[:0], block)
 			bufferpool.Put(block)
 		}
@@ -1401,12 +1487,54 @@ func (st *clientStream) feed(data []byte, fin bool) {
 	if st.done {
 		return
 	}
+	if _, ok := st.cc.held[st.s.ID()]; ok {
+		st.hold(data, fin)
+		return
+	}
+	st.deliver(data, fin, false)
+}
+
+// hold keeps what arrives behind a field section that waits on the server's
+// encoder stream, giving it back to the server as it arrives, up to
+// maxHeldBytes past the section limit.
+func (st *clientStream) hold(data []byte, fin bool) {
+	st.parser.buf = append(st.parser.buf, data...)
+	if fin {
+		st.cc.held[st.s.ID()] = heldResponse{st: st, fin: true}
+	}
+	if st.paced {
+		st.s.Credit(len(data))
+	}
+	if len(st.parser.buf) > int(st.parser.maxFrame)+maxHeldBytes {
+		delete(st.cc.held, st.s.ID())
+		st.fail(errHeaderTooLarge)
+	}
+}
+
+// deliver reads what has arrived on the stream, or with replay set, what
+// arrived while a field section waited on the server's encoder stream, which
+// was given back as it arrived.
+func (st *clientStream) deliver(data []byte, fin, replay bool) {
 	st.fedBody = 0
 	err := st.parser.feed(data, st.onData, st.onFrame)
+	held := err == qpack.ErrBlocked
+	if held {
+		// The section, and whatever follows it, waits in the parser.
+		cc := st.cc
+		if cc.held == nil {
+			cc.held = make(map[uint64]heldResponse)
+		}
+		cc.held[st.s.ID()] = heldResponse{st: st, fin: fin}
+		err = nil
+	}
 	if st.paced {
 		// What of this delivery is not body that streams is given back now;
 		// the body is, as the callback consumes it.
-		st.s.Credit(len(data) - st.fedBody)
+		if replay {
+			st.skip.Add(int64(st.fedBody))
+		} else {
+			st.s.Credit(len(data) - st.fedBody)
+		}
 	}
 	if err != nil {
 		var ce *connError
@@ -1420,7 +1548,7 @@ func (st *clientStream) feed(data []byte, fin bool) {
 		st.fail(err)
 		return
 	}
-	if !fin || st.done {
+	if !fin || held || st.done {
 		return
 	}
 	if st.parser.midFrame() {
@@ -1475,7 +1603,15 @@ func (st *clientStream) onFrame(typ uint64, payload []byte) error {
 	if st.trailers {
 		return connErr(ErrCodeFrameUnexpected, "HEADERS after trailers")
 	}
-	fields, err := decodeFields(&st.cc.decoder, nil, payload, st.cc.client.config.MaxResponseHeaderBytes)
+	cc := st.cc
+	fields, err := cc.decoder.AppendSection(nil, payload, cc.client.config.MaxResponseHeaderBytes, st.s.ID())
+	if q := cc.peer.qpack.Load(); q != nil {
+		// A section that referred to the table is acknowledged.
+		q.flush()
+	}
+	if err == qpack.ErrBlocked {
+		return err
+	}
 	if errors.Is(err, qpack.ErrTooLarge) {
 		st.fail(errHeaderTooLarge)
 		return nil
@@ -1539,11 +1675,28 @@ func (st *clientStream) onFrame(typ uint64, payload []byte) error {
 			Whole:    func(resp *stdhttp.Response) { r.finish(resp, nil) },
 			Done:     r.markDone,
 			Abort:    r.abort,
-			Credit:   func(n int64) { st.s.Credit(int(n)) },
+			Credit:   st.credit,
 		})
 		st.stream.Start()
 	}
 	return nil
+}
+
+// credit gives the server back the room n bytes of the body the callback
+// consumed took, less what was given back as it arrived.
+func (st *clientStream) credit(n int64) {
+	for {
+		skip := st.skip.Load()
+		if skip == 0 {
+			break
+		}
+		take := min(skip, n)
+		if st.skip.CompareAndSwap(skip, skip-take) {
+			n -= take
+			break
+		}
+	}
+	st.s.Credit(int(n))
 }
 
 // tooEarly gives up on the stream of a request the server answered 425, and
@@ -1554,6 +1707,7 @@ func (st *clientStream) tooEarly() {
 	st.done = true
 	st.body = nil
 	abortStream(st.s, ErrCodeRequestCancelled)
+	st.cc.abandon(st)
 	r, cc := st.r, st.cc
 	cc.client.tooEarly.Add(1)
 	r.mu.Lock()
@@ -1613,6 +1767,7 @@ func (st *clientStream) fail(err error) {
 	st.done = true
 	st.body = nil
 	abortStream(st.s, ErrCodeRequestCancelled)
+	st.cc.abandon(st)
 	st.cc.streamDone(st)
 	st.r.finish(nil, err)
 }
@@ -1621,6 +1776,7 @@ func (st *clientStream) fail(err error) {
 func (st *clientStream) cancel() {
 	st.gate.Shut()
 	abortStream(st.s, ErrCodeRequestCancelled)
+	st.cc.abandon(st)
 	st.cc.streamDone(st)
 }
 

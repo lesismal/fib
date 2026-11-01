@@ -51,7 +51,7 @@ func TestCeRequestStreamRefusals(t *testing.T) {
 	if isContinue(nil) {
 		t.Fatal("no fields read as a 100 Continue")
 	}
-	if out := appendTrailer(nil, nil); len(out) != 0 {
+	if out := appendTrailer(nil, 0, nil, nil); len(out) != 0 {
 		t.Fatalf("an empty trailer appended %x", out)
 	}
 	// What has nothing to act on does nothing.

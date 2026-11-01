@@ -63,13 +63,14 @@ func (rs *requestStream) BeginResponse(req *stdhttp.Request, status int, header 
 	}
 	rs.responded, rs.streaming = true, true
 	rs.mu.Unlock()
-	block := bufferpool.Append(nil, qpack.Prefix)
+	sec, block := beginFields(rs.encoder(), rs.s.ID())
 	var digits [20]byte
-	block = qpack.AppendField(block, ":status", string(strconv.AppendInt(digits[:0], int64(status), 10)), false)
+	block = sec.Append(block, ":status", string(strconv.AppendInt(digits[:0], int64(status), 10)), false)
 	if n := declaredLength(header); n >= 0 && status != stdhttp.StatusNoContent && status != stdhttp.StatusNotModified {
-		block = qpack.AppendField(block, "content-length", string(strconv.AppendInt(digits[:0], n, 10)), false)
+		block = sec.Append(block, "content-length", string(strconv.AppendInt(digits[:0], n, 10)), false)
 	}
-	block = appendHeader(block, header, func(name string) bool { return name == "content-length" })
+	block = appendHeader(&sec, block, header, func(name string) bool { return name == "content-length" })
+	block = sec.End(block)
 	// The stream takes out over, as the buffer it sends from until the
 	// client has acknowledged it.
 	out := appendHeadersFrame(bufferpool.Get(len(block) + 16)[:0], block)
@@ -177,7 +178,7 @@ func (rs *requestStream) EndResponse(trailer stdhttp.Header, complete bool) erro
 		if len(trailer) > 0 {
 			// The stream takes out over, as WriteFinal has it, if the
 			// trailer has anything a trailer may carry.
-			if out = appendTrailer(bufferpool.Get(256)[:0], trailer); len(out) == 0 {
+			if out = appendTrailer(rs.encoder(), rs.s.ID(), bufferpool.Get(256)[:0], trailer); len(out) == 0 {
 				bufferpool.Put(out)
 				out = nil
 			}
@@ -213,6 +214,10 @@ func declaredLength(header stdhttp.Header) int64 {
 	}
 	return -1
 }
+
+// encoder is the connection's QPACK encoder, or nil when its dynamic table
+// is off.
+func (rs *requestStream) encoder() *qpack.Encoder { return rs.sc.peer.qpackEncoder() }
 
 // fieldLimit is the client's limit on a field section; see
 // peerStreams.fieldLimit.

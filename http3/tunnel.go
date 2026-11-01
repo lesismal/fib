@@ -11,7 +11,6 @@ import (
 
 	"github.com/lesismal/fib/bufferpool"
 	fibhttp "github.com/lesismal/fib/http"
-	"github.com/lesismal/fib/http3/qpack"
 	"github.com/lesismal/fib/http3/quic"
 	"github.com/lesismal/fib/sidepool"
 )
@@ -86,9 +85,10 @@ func (rs *requestStream) Upgrade(req *stdhttp.Request, protocol string, header s
 	}
 	rs.responded, rs.upgraded = true, true
 	rs.mu.Unlock()
-	block := bufferpool.Append(nil, qpack.Prefix)
-	block = qpack.AppendField(block, ":status", "200", false)
-	block = appendHeader(block, header, func(name string) bool { return name == "content-length" })
+	sec, block := beginFields(rs.encoder(), rs.s.ID())
+	block = sec.Append(block, ":status", "200", false)
+	block = appendHeader(&sec, block, header, func(name string) bool { return name == "content-length" })
+	block = sec.End(block)
 	err := rs.s.Write(appendHeadersFrame(nil, block), false)
 	bufferpool.Put(block)
 	if err != nil {

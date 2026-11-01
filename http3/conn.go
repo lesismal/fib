@@ -41,6 +41,100 @@ type peerStreams struct {
 	maxPushID uint64
 	// onGoAway receives the peer's GOAWAY.
 	onGoAway func(id uint64) error
+	// qpack is the connection's QPACK dynamic table, both ways, or nil
+	// when it is off, which is the default. It is set as the connection
+	// opens its control stream, which may be on another goroutine than
+	// the one the peer's streams are read on, and peerTable and
+	// peerBlocked, the table and the blocked streams the peer's SETTINGS
+	// allow, as they arrive: whichever comes second starts the encoder.
+	qpack                  atomic.Pointer[dynamicQPACK]
+	peerTable, peerBlocked atomic.Uint64
+}
+
+// dynamicQPACK is what a connection whose QPACK dynamic table is on keeps;
+// see Config.QPACKTableCapacity. The decoder and its stream are used on the
+// goroutine QUIC calls the connection's handler on, as everything the peer
+// sends is; the encoder by whatever goroutine sends a field section.
+type dynamicQPACK struct {
+	dec *qpack.Decoder
+	enc *qpack.Encoder
+	// decoderStream is this side's decoder stream, and out the buffer
+	// decoder instructions are sent on it from.
+	decoderStream *quic.Stream
+	out           []byte
+	// resume decodes again the streams whose field sections were waiting
+	// for what the peer's encoder stream has just brought.
+	resume func()
+}
+
+// maxHeldBytes bounds what may arrive behind a field section that waits on
+// the encoder stream, beyond the section limit, before its stream is given
+// up on: QUIC gives the room back as data arrives, so nothing else would.
+const maxHeldBytes = 1 << 20
+
+// openStreams opens this side's control stream and sends SETTINGS on it,
+// with extra settings of the side's own. A capacity above zero turns QPACK's
+// dynamic table on: the QPACK encoder and decoder streams are opened first,
+// dec decodes with the table from then on, allowing blocked streams to wait
+// on it, and resume is what decodes them again; see dynamicQPACK.
+func (p *peerStreams) openStreams(qc *quic.Conn, maxFieldSection, capacity, blocked int, dec *qpack.Decoder, resume func(), extra ...[2]uint64) (*quic.Stream, error) {
+	if capacity > 0 {
+		encoder, encErr := openUni(qc, streamQPACKEncoder)
+		decoder, decErr := openUni(qc, streamQPACKDecoder)
+		if err := errors.Join(encErr, decErr); err != nil {
+			return nil, err
+		}
+		dec.EnableDynamic(uint64(capacity), max(blocked, 0))
+		p.setQPACK(&dynamicQPACK{
+			dec:           dec,
+			enc:           qpack.NewEncoder(uint64(capacity), func(b []byte) error { return encoder.Write(b, false) }),
+			decoderStream: decoder,
+			resume:        resume,
+		})
+		extra = append(extra, [2]uint64{settingQPACKMaxTableCapacity, uint64(capacity)}, [2]uint64{settingQPACKBlockedStreams, uint64(max(blocked, 0))})
+	}
+	return openControl(qc, maxFieldSection, extra...)
+}
+
+// setQPACK turns the connection's dynamic table on, and starts the encoder
+// if the peer's SETTINGS have allowed it a table already.
+func (p *peerStreams) setQPACK(q *dynamicQPACK) {
+	p.qpack.Store(q)
+	if c := p.peerTable.Load(); c > 0 {
+		q.enc.SetPeerSettings(c, p.peerBlocked.Load())
+	}
+}
+
+// openUni opens a unidirectional stream of type typ.
+func openUni(qc *quic.Conn, typ byte) (*quic.Stream, error) {
+	s, err := qc.OpenUniStream()
+	if err == nil {
+		err = s.Write([]byte{typ}, false)
+	}
+	return s, err
+}
+
+// flush sends what the decoder owes the peer's encoder.
+func (q *dynamicQPACK) flush() {
+	if q.out = q.dec.AppendInstructions(q.out[:0]); len(q.out) > 0 {
+		_ = q.decoderStream.Write(q.out, false)
+	}
+}
+
+// cancel tells the peer's encoder that the field sections of a stream will
+// not all be decoded; see qpack.Decoder.Cancel.
+func (q *dynamicQPACK) cancel(streamID uint64) {
+	q.dec.Cancel(streamID)
+	q.flush()
+}
+
+// qpackEncoder is the connection's QPACK encoder, or nil when its dynamic
+// table is off.
+func (p *peerStreams) qpackEncoder() *qpack.Encoder {
+	if q := p.qpack.Load(); q != nil {
+		return q.enc
+	}
+	return nil
 }
 
 // openControl opens this side's control stream and sends SETTINGS on it,
@@ -125,6 +219,14 @@ func (u *uniStream) handle(data []byte, fin bool) error {
 			return err
 		}
 	case streamQPACKEncoder:
+		if q := u.peer.qpack.Load(); q != nil {
+			if err := q.dec.FeedEncoder(data); err != nil {
+				return connErr(ErrCodeQPACKEncoderStreamError, err.Error())
+			}
+			q.flush()
+			q.resume()
+			break
+		}
 		// This side allows no dynamic table, so the peer may only set the
 		// capacity to zero; anything it inserts is an error (RFC 9204
 		// section 4.3).
@@ -132,8 +234,13 @@ func (u *uniStream) handle(data []byte, fin bool) error {
 			return err
 		}
 	case streamQPACKDecoder:
-		// Every field section sent from here is encoded without the
-		// dynamic table, so the peer has nothing to acknowledge.
+		if q := u.peer.qpack.Load(); q != nil {
+			if err := q.enc.FeedDecoder(data); err != nil {
+				return connErr(ErrCodeQPACKDecoderStreamError, err.Error())
+			}
+		}
+		// Without a dynamic table, every field section sent from here is
+		// encoded without it, so the peer has nothing to acknowledge.
 	default:
 		return nil
 	}
@@ -206,6 +313,14 @@ func (u *uniStream) controlFrame(typ uint64, payload []byte) error {
 		if limited {
 			p.maxFieldSection.Store(maxField)
 			p.fieldLimited.Store(true)
+		}
+		if c := settingValue(payload, settingQPACKMaxTableCapacity); err == nil && c > 0 {
+			blocked := settingValue(payload, settingQPACKBlockedStreams)
+			p.peerBlocked.Store(blocked)
+			p.peerTable.Store(c)
+			if q := p.qpack.Load(); q != nil {
+				q.enc.SetPeerSettings(c, blocked)
+			}
 		}
 		return err
 	}
