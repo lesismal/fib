@@ -250,8 +250,11 @@ trace and its three repeats are marked as retransmissions.
 `.github/workflows/ci.yml` has two jobs:
 
 - `http3-interop-image` builds the image and runs `local-test.sh` on every
-  push and pull request. It is blocking, deterministic and needs no peer
-  image beyond the endpoint base image.
+  push and pull request. It is deterministic and needs no peer image
+  beyond the endpoint base image. `local-test.sh` retries the build with a
+  backoff and then falls back to `mirror.gcr.io` for the Go base image, and
+  the job is `continue-on-error`, so a Docker Hub rate limit never blocks a
+  pull request.
 - `http3-interop-runner` runs the real runner against quic-go. It is
   `workflow_dispatch` only and `continue-on-error`, because it pulls the
   simulator and peer images, needs `tshark`, and the runner is slower and

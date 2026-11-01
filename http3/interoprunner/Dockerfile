@@ -8,7 +8,10 @@
 # The runtime is the runner's standard endpoint base image: it carries
 # /setup.sh, which configures the routes the simulator needs, and the tools
 # the runner expects an endpoint to have.
-FROM golang:1.27.3 AS build
+# GO_IMAGE lets local-test.sh fall back to a registry mirror when Docker Hub
+# rate-limits the pull.
+ARG GO_IMAGE=golang:1.27.3
+FROM ${GO_IMAGE} AS build
 
 ENV CGO_ENABLED=0 GOTOOLCHAIN=local
 WORKDIR /src
