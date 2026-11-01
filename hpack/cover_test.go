@@ -89,6 +89,11 @@ func TestCoverHuffmanErrors(t *testing.T) {
 	if _, err := HuffmanDecode([]byte{0xff, 0xff, 0xff, 0xff}, 0); !errors.Is(err, ErrInvalidHuffman) {
 		t.Fatalf("EOS decoded: %v", err)
 	}
+	// '0', five bits, then EOS's thirty ones, which end in the high half
+	// of the fifth byte.
+	if _, err := HuffmanDecode([]byte{0x07, 0xff, 0xff, 0xff, 0xff}, 0); !errors.Is(err, ErrInvalidHuffman) {
+		t.Fatalf("EOS ending in a byte's high half decoded: %v", err)
+	}
 	if _, err := HuffmanDecode(AppendHuffman(nil, "abc"), 2); !errors.Is(err, ErrStringTooLong) {
 		t.Fatalf("3 bytes under a bound of 2: %v", err)
 	}
