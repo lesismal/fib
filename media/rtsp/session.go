@@ -281,7 +281,7 @@ func (s *session) afterResponse(method string) {
 		c := s.sc.c
 		sink = hub.NewDropper(s.player, func() int64 { return outputwait.Queued(c) }, cfg.MaxQueuedBytes)
 	}
-	sub, err := cfg.Hub.Subscribe(s.path, sink, hub.SubscribeOptions{Info: s.sc.subscribeInfo(s.query)})
+	sub, err := cfg.Hub.Subscribe(s.path, sink, hub.SubscribeOptions{Info: s.sc.subscribeInfo(s.query), Wait: cfg.PlayWait})
 	if err != nil {
 		// The stream went between DESCRIBE and PLAY.
 		s.sc.closeLocked()
@@ -465,9 +465,24 @@ type player struct {
 	originAt time.Duration
 	wall0    time.Time
 	lastPTS  time.Duration
-	closed   bool
-	buf      []byte
+	// After a republish (restart), the next publisher's clock may start
+	// anywhere: offset moves its times on from lastDTS, the largest sent,
+	// into shifted, as flv.Timeline does for RTMP.
+	restart bool
+	offset  time.Duration
+	lastDTS time.Duration
+	shifted av.Packet
+	closed  bool
+	buf     []byte
 }
+
+// maxClockJump is how far past the last packet the first one after a
+// republish may be and still be taken as the same clock carrying on, and
+// restartGap how far after the last packet a new clock starts.
+const (
+	maxClockJump = 10 * time.Second
+	restartGap   = 20 * time.Millisecond
+)
 
 func newPlayer(s *session) *player {
 	p := &player{c: s.sc.c, tracks: s.desc.tracks, streams: make([]*stream, len(s.desc.tracks)),
@@ -513,6 +528,7 @@ func (p *player) OnTracks(tracks []*av.Track) {
 			return
 		}
 	}
+	p.restart = p.origin
 }
 
 func (p *player) OnPacket(pkt *av.Packet) {
@@ -523,13 +539,30 @@ func (p *player) OnPacket(pkt *av.Packet) {
 	}
 	now := time.Now()
 	if !p.origin {
-		p.origin, p.originAt, p.wall0 = true, pkt.DTS, now
+		p.origin, p.originAt, p.wall0, p.lastDTS = true, pkt.DTS, now, pkt.DTS
 		for _, st := range p.streams {
 			if st != nil {
 				st.pk.SetOrigin(pkt.DTS)
 			}
 		}
 	}
+	if p.restart {
+		p.restart = false
+		if d := pkt.DTS + p.offset; d < p.lastDTS || d > p.lastDTS+maxClockJump {
+			at := p.lastDTS + restartGap
+			p.offset = at - pkt.DTS
+			// Sender reports place the new clock at the wall time it
+			// starts.
+			p.wall0 = now.Add(p.originAt - at)
+		}
+	}
+	if p.offset != 0 {
+		p.shifted = *pkt
+		p.shifted.DTS += p.offset
+		p.shifted.PTS += p.offset
+		pkt = &p.shifted
+	}
+	p.lastDTS = max(p.lastDTS, pkt.DTS)
 	st := p.streams[pkt.Track]
 	p.lastPTS = pkt.PTS
 	defer func() {

@@ -25,9 +25,11 @@
 // RECORD for publishers. A player starts with the hub's cached GOP, gets
 // RTCP sender reports so it can line the tracks up, and is cut back to
 // keyframes (hub.NewDropper) when it falls behind, and dropped when it
-// falls further. A recorder's packets go through a reorder buffer when
-// they come over UDP; the parameter sets it sends in band update the
-// hub's tracks. Sessions end with their connection, on TEARDOWN, or after
+// falls further. With ServerConfig.PlayWait a player outlives its
+// publisher and carries on with the next one of the same codecs. A
+// recorder's packets go through a reorder buffer when they come over UDP,
+// and its streams are lined up by its RTCP sender reports; the parameter
+// sets it sends in band update the hub's tracks. Sessions end with their connection, on TEARDOWN, or after
 // ServerConfig.SessionTimeout without a request or RTCP. Authentication is
 // Digest (RFC 2617 with MD5, as RTSP clients speak it) or Basic, through
 // ServerConfig.Password; the hub's OnPublish and OnSubscribe hooks decide
