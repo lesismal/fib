@@ -715,13 +715,9 @@ func TestShutdown(t *testing.T) {
 	h := hub.New(hub.Config{})
 	defer h.Close()
 	server := NewServer(ServerConfig{Hub: h, HandshakeTimeout: -1, IdleTimeout: -1})
-	config := fib.DefaultConfig()
-	engine, err := fib.New(config, fib.Binding{Addr: "127.0.0.1:0", Handler: server})
-	if err != nil {
-		t.Fatal(err)
-	}
-	go func() { _ = engine.Run() }()
-	defer engine.Close()
+	// run's cleanup closes the engine only once Run has returned, as
+	// Engine.Close requires.
+	engine := run(t, fib.Binding{Addr: "127.0.0.1:0", Handler: server})
 	r := dialRaw(t, "rtmp://"+addrOf(t, engine, 0)+"/a/b")
 	r.connect("a")
 	ctx, cancel := context.WithTimeout(context.Background(), testTimeout)
