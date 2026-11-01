@@ -85,7 +85,8 @@ RTMP 推上来的流能用 RTSP、SRT、HTTP-FLV、HLS 和 WHEP 播放，是因�
   `ErrNotFound`、`ErrClosed`）。设置 `SubscribeOptions.Wait` 后，订阅可以早于发布者存在，
   发布者离开后最多再保留 `Wait`，并从下一个发布者那里再次收到 `OnTracks`：先连上来的播放器、
   编码器重连期间的 HLS 播放列表、等待源流的转推，都是这样保住位置的。包的时间是发布者自己的
-  时间，重新推流可能让它从头开始。
+  时间，重新推流可能让它从头开始；各出口会让播放者看到的时间在重新推流前后保持递增（见
+  [重新推流](#播放起点与重新推流)）。
 
 **GOP 缓存。** 每路流保留新订阅者从一幅完整画面开始所需的内容：从最近一个视频关键帧起的
 所有包（含音频），纯音频流则保留最近一秒。`Subscribe` 在流的锁下把 `OnTracks` 和缓存交给
@@ -131,8 +132,11 @@ worker。
 `hub.Config.OnPublish` 和 `OnSubscribe` 能看到每一次推流和播放，不论协议，参数是
 `PublishInfo`/`SubscribeInfo`：协议名（`rtmp`、`rtsp`、`srt`、`whip`、`whep`、`http-flv`、
 `ws-flv`、`hls`，RTMP 的转发是 `rtmp-pull`/`rtmp-push`）、远端地址，以及 URL 的 query，
-token 通常放在这里。返回错误即拒绝这次推流或播放。每个协议还有自己的钩子，处理只有它才知道
-的信息：
+token 通常放在这里。返回错误即拒绝这次推流或播放。拉流转发同样会填写这些信息：
+`rtsp.PlayToHub` 填 RTSP 服务端的地址和其 URL 的 query，`srt.Play` 与 `srt.Publish` 填普通
+stream ID 中的 query（`live/s?token=...`）。URL 带 query 的 RTSP 播放者会像 ffmpeg 那样以该
+URL 为基准 SETUP 各 track（`rtsp://host/live/s?token=x/trackID=0`），服务端会把 `trackID`
+从 query 中取回。每个协议还有自己的钩子，处理只有它才知道的信息：
 
 ```go
 h := hub.New(hub.Config{
@@ -428,8 +432,8 @@ rtc.PushFromHub(cc, "https://edge.example.com/whip/live/cam", h, "live/cam", hub
 rtc.PullToHub(cc, "https://origin.example.com/whep/live/webrtc", h, "live/webrtc")
 ```
 
-- 拉流转发在得知远端的 track 后发布路径（`rtmp.Pull` 会先预占路径，所以路径已被占用时立即以
-  `hub.ErrStreamBusy` 失败），把 track 的变化以 `SetTracks` 传下去，远端流结束时取消发布。
+- 拉流转发在得知远端的 track 后发布路径（`rtmp.Pull` 与 `srt.Play` 会先预占路径，所以路径
+  已被占用时立即以 `hub.ErrStreamBusy` 失败），把 track 的变化以 `SetTracks` 传下去，远端流结束时取消发布。
   发布被拒绝会关闭客户端。
 - 转推从流的第一组 track 开始，远端跟不上的包按 `hub.NewDropper` 的方式丢弃，流结束时转推
   也结束。RTSP 在一个会话内无法重新 announce track，所以 track 变化会关闭 RTSP 转推；WHIP
@@ -443,6 +447,41 @@ rtc.PullToHub(cc, "https://origin.example.com/whep/live/webrtc", h, "live/webrtc
 - 走 UDP 的 RTSP 客户端为每路流在自己的 engine 上添加一对 UDP binding；SRT 客户端用
   `Engine.OpenUDPPeer` 打开自己的 binding；WHIP/WHEP 客户端打开一个自带端口的
   PeerConnection，除非 `ClientConfig.WebRTC` 指定了 Mux 或 engine。
+
+## 播放起点与重新推流
+
+**播放从哪里开始。** 播放者通常从 hub 缓存的 GOP 开始，这样立刻就有画面。SRT 播放者，以及
+有流走 UDP 的 RTSP 播放者，则从下一个关键帧开始。缓存的 GOP 是一次性突发发出的，一路
+4 Mbit/s 的 720p 流的 GOP 约有 1 MB，超过接收端 socket 缓冲区的容量（Linux 默认 208 KiB）。
+RTSP 的 UDP 没有任何机制重发缓冲区丢掉的数据；SRT 中这次突发的每个包都打上发送时刻的时间戳，
+NAK 只有一个延迟（120 ms）的时间去找回几百个包，结果找不回来。加入这样一路流的每个 ffmpeg
+播放器开头都有 H.264 解码错误（SRT 还报告 RCV-DROPPED），一个播放器和五十个都一样。从下一个
+关键帧开始，代价是最多等待一个关键帧间隔，之后平稳的码流 TSBPD 和 NAK 都能应付。
+`srt.ServerConfig.PlayGOPCache` 可以重新打开从缓存开始的方式，适合小码流，或缓冲区与延迟都
+较大的接收端。RTMP、HTTP-FLV、走 TCP 的 RTSP、HLS 和 WHEP（除非设置 `rtc.Config.NoGOPCache`）
+都从缓存开始。
+
+**重新推流前后。** 在重新推流期间等待的播放者（RTMP 和 SRT 的 `PlayWait`、HTTP-FLV 的
+`Wait`、RTSP 的 `PlayWait`、HLS 和 WHEP 的 `RepublishWait`）会从下一个发布者那里收到
+`OnTracks`，而它的时钟可能从任何地方开始：RTMP 或 ffmpeg 发布者会重新从 0 开始。播放者需要
+持续递增的时间（ffmpeg 对时间回退之后的每个包都报错，flv.js 和 MSE 播放器会卡住），所以每个
+出口都让自己的时间线接着往下走：
+
+- **`flv.Timeline`** 为 RTMP 和 HTTP-FLV 出口（以及 `flv.Muxer`）的 RTMP 消息和 FLV tag
+  打时间戳。`Restart` 之后，落在最后一个时间戳之前、或超出它十秒以上的包，会在最后一个时间戳
+  之后开始一个新时钟，间隔等于流中断的时长（20 ms 到十秒），这样时间戳与播放者等待所依据的
+  墙上时钟保持同步，两个时钟也不会共用同一个时间戳；落在本 track 最后一个时间戳之前的包取那个
+  时间戳。自己写 FLV 的应用也可以使用它。
+- **RTSP** 播放者（`rtsp.ServerConfig.PlayWait`）用同样的方式推进 RTP 时间，SSRC 不变，并
+  保持 RTCP sender report 的映射不变——ffmpeg 正是按它给 RTSP 包定时的。下一个发布者编码不同
+  时 RTSP 播放者结束，因为它的 SDP 无法改变；DESCRIBE 仍然需要有发布者。
+- **SRT** 播放者用同样的方式推进 MPEG-TS 时间。
+- **HLS** 在 `EXT-X-DISCONTINUITY` 之后启动新的分片写入器，两种格式都让它从上一个写入器结束
+  的地方开始（`fmp4.Writer.StartAt` 与 `End`，以及 TS 写入器自己的同名方法）。RFC 8216 允许
+  时间在 discontinuity 处跳变，但 ffmpeg 在 init 分片相同时会跨 discontinuity 沿用同一个 MP4
+  解复用器，曾因此丢弃之后的第一个 fMP4 分片；它对 TS 时间回退的修正也曾让一个解码时间重复。
+  TS 写入器在 discontinuity 之后暂存最初的包（直到每个 track 都有一个，或 256 个包、一秒），
+  使比关键帧稍早一点的音频不会落到上一个写入器结束的位置之前。
 
 ## 配置与限制
 
@@ -463,7 +502,7 @@ rtc.PullToHub(cc, "https://origin.example.com/whep/live/webrtc", h, "live/webrtc
 | --- | --- | --- |
 | `HandshakeTimeout` | 10 s | 从连接到开始推流或播放（客户端另有 `DialTimeout`，10 s） |
 | `IdleTimeout` | 30 s | 不发任何数据的发布者，或输出不动的播放者 |
-| `PlayWait` | 0 | 播放等待缺席发布者的时长；0 表示立即回 `StreamNotFound` |
+| `PlayWait` | 0 | 播放等待缺席发布者、或自己的发布者离开后等待下一个发布者的时长；0 表示立即回 `StreamNotFound` |
 | `MaxMessageSize` | 8 MiB | 对端可发送的最大消息 |
 | `ChunkSize`、`WindowAckSize` | 4096、2,500,000 | 服务端写出的 chunk 大小，以及要求客户端使用的确认窗口 |
 | `WriteQueueLimit`、`MaxWriteQueue` | 2 MiB、16 MiB | 超过前者丢包（视频丢到下一个关键帧），超过后者断开 |
@@ -483,6 +522,7 @@ HTTP/2 和 HTTP/3 上，积压指流控压住超过 64 KiB 的数据，且只有
 | `Password`、`Realm`、`AuthMethods` | 无、`fib`、Digest | 认证；Basic 以明文发送密码。Digest 的 nonce 无状态，有效期 5 分钟 |
 | `SessionTimeout`、`IdleTimeout` | 60 s、60 s | 会话没有请求、RTCP 或（录制时）RTP 的时长；连接没有会话的时长 |
 | `MaxHeaderBytes`、`MaxBodyBytes` | 16 KiB、256 KiB | 请求的上限 |
+| `PlayWait` | 0 | 播放者在发布者离开后继续存在、等待编码相同的下一个发布者的时长；0 表示播放者随发布者一起结束 |
 | `MaxQueuedBytes` | 4 MiB | 播放者积压超过它就丢包；超过两倍就关闭 |
 | `MTU`、`SenderReportInterval` | 1400、5 s | RTP 包大小，RTCP sender report 间隔 |
 | `ReorderSize`、`ReorderDelay` | 128 个包、100 ms | 每路经 UDP 录制的流的重排缓冲区 |
@@ -501,7 +541,8 @@ HTTP/2 和 HTTP/3 上，积压指流控压住超过 64 KiB 的数据，且只有
 | `HandshakeTimeout`、`PeerIdleTimeout` | 3 s、5 s | 握手超时，以及对端不发任何数据的超时 |
 | `FlowWindow`、`SendBufferPackets` | 8192、8192 个包 | 接收缓冲区与对端在途包数；未确认加待发的包数 |
 | `MaxSendBacklog` | 4 MiB | 播放者未确认的载荷超过它就丢包 |
-| `PlayWait` | 0 | 播放者等待缺席流的时长；0 表示以 `RejectNotFound` 拒绝 |
+| `PlayWait` | 0 | 播放者等待缺席流、或自己的发布者离开后等待下一个发布者的时长；0 表示以 `RejectNotFound` 拒绝缺席流的播放者 |
+| `PlayGOPCache` | false | 播放者从缓存的 GOP 而不是下一个关键帧开始（见[播放从哪里开始](#播放起点与重新推流)） |
 | `MaxConns` | 不限 | 会话数；超过时 caller 收到 `RejectOverload` |
 | `OnConnect`、`OnSession`、`ParseStreamID` | 无 | 认证、把会话从 hub 手里接管过来、自定义 stream ID 语法 |
 | `Muxer`、`Demuxer` | MPEG-TS 默认值 | 每 100 ms 发送一次 PAT/PMT、每 40 ms 一个 PCR，PES 上限 4 MiB，得知 track 期间最多暂存 256 个包 |
@@ -553,6 +594,7 @@ HTTP/2 和 HTTP/3 上，积压指流控压住超过 64 KiB 的数据，且只有
 | MPEG-TS PES | 4 MiB，更大的丢弃 |
 | SRT 收发缓冲区 | `FlowWindow` 与 `SendBufferPackets` |
 | 每个 HLS Muxer 的媒体数据 | `MaxBytes`，先淘汰旧分片 |
+| discontinuity 之后为确定新时钟而暂存的 HLS-TS 包 | 256 个包或 1 秒 |
 
 ## 有意没有实现的功能
 
@@ -599,8 +641,9 @@ HTTP/2 和 HTTP/3 上，积压指流控压住超过 64 KiB 的数据，且只有
 每个 package 都有自己的测试并在 CI 中运行，不需要 ffmpeg：sans-IO 核心彼此对接、或对接抓取的
 字节（`testdata/` 中由 ffmpeg 5.1 和 7.1 为每种编码写出的样本，其中包括 H.264 的 4:4:4、
 4:2:2 10-bit、隔行和带裁剪的流，以及 H.265 Main 10），每个接收不可信字节的解析器都有 fuzz
-目标，服务端和客户端在 fib engine 上经环回地址对接。整个 `media` 目录在下面的 Linux 容器中
-通过 `go test -race`。
+目标，服务端和客户端在 fib engine 上经环回地址对接。每个 media package 都在下面的 Linux
+容器中和 macOS 上通过 `go test -race`，加入它们之后，CI 对整个模块的覆盖率下限（96%）依然
+满足。
 
 互通测试用的是真实实现，在 Docker 中经环回地址进行：ffmpeg 5.1（Debian bookworm，libx264、
 libx265、libopus、libsrt）、ffmpeg 7.1（Debian trixie，能读 Enhanced RTMP 的 H.265 和 AV1），
@@ -611,15 +654,68 @@ libx265、libopus、libsrt）、ffmpeg 7.1（Debian trixie，能读 Enhanced RTM
 | --- | --- | --- |
 | RTMP、HTTP-FLV | ffmpeg 5.1、7.1 | ffmpeg 推 H.264+AAC（5.1），以及经 Enhanced RTMP 推 H.265+AAC 和 AV1+AAC（7.1）；ffprobe 与 ffmpeg 经 RTMP 和 HTTP-FLV 播放回来，四个播放器同时进行，DTS 单调；fib 的客户端播放并写成 FLV 文件，ffmpeg 能解码；fib 的客户端向 ffmpeg 的 `-listen 1` 推流、并从中播放（5.1 上用 H.264，7.1 上用 H.265）；RTMPS 推流与拉流 |
 | RTMP、HTTP-FLV 慢播放者 | ffmpeg 5.1 | 一个 RTMP 和一个 HTTP-FLV 播放者在 6 Mbit/s 的 720p 流上停止读取，被断开，旁边正常的播放者照常解码；服务端堆内存全程在 11 到 20 MB 之间 |
-| RTSP | ffmpeg 5.1、7.1 | ffmpeg 经 TCP 和 UDP 录制；ffprobe 与 ffmpeg 经 TCP 和 UDP 播放：H.264+AAC、H.265+Opus、H.264+PCMA；经 fib 客户端转发（TCP 与 UDP，H.264 与 H.265）；fib 客户端向 ffmpeg 的 listen 模式推流（TCP 与 UDP）；Digest 与 Basic，没有凭据和凭据错误都被拒绝；一个播放者卡住而另一个正常解码，堆内存平稳 |
+| RTSP | ffmpeg 5.1、7.1 | ffmpeg 经 TCP 和 UDP 录制；ffprobe 与 ffmpeg 经 TCP 和 UDP 播放：H.264+AAC、H.265+Opus、H.264+PCMA；经 fib 客户端转发（TCP 与 UDP，H.264 与 H.265）；fib 客户端向 ffmpeg 的 listen 模式推流（TCP 与 UDP）；Digest 与 Basic，没有凭据和凭据错误都被拒绝；URL 带 query（`?token=...`）的播放者经 TCP 和 UDP 播放；一个播放者卡住而另一个正常解码，堆内存平稳 |
 | SRT | ffmpeg 5.1、7.1（libsrt） | ffmpeg 推流并播放回 H.264+AAC 与 H.265+Opus，不加密以及 pbkeylen 为 16、24、32，也经过一个双向丢弃 2–10% 数据报的中继，解码干净；fib 的客户端向 listener 模式的 ffmpeg 推流、并从中拉流 |
 | MPEG-TS | ffmpeg 5.1、7.1 | ffmpeg 生成的 H.264+AAC、H.265+Opus 和纯 AAC 流能解复用，重新复用后解码没有警告 |
 | fMP4 | ffmpeg 5.1、7.1 | H.264+AAC、H.265+AAC、H.264+Opus 的 init 分片和 fragment，来源包括原始码流和 ffmpeg 自己带 B 帧的 fMP4，解码没有错误，重新复用后每个包的时间戳和关键帧标志保持不变 |
 | HLS | ffmpeg 5.1、7.1 | fMP4：H.264+AAC、H.265+AAC、H.264+Opus、纯 AAC，以及 500 ms part 的 LL-HLS，播放 10 秒没有错误；同编码重新推流后跨 discontinuity 继续播放；播放列表检查程序确认 target duration、序号、discontinuity、part、blocking reload 和 preload hint 均符合规范。MPEG-TS：RTMP 推上来的 H.264+AAC（5.1）和 H.265+AAC（7.1）从 TS 变体播放，普通与 LL-HLS 均可 |
-| 所有接入 × 所有出口 | ffmpeg 5.1、7.1 | ffmpeg 经 RTMP、RTSP/TCP、RTSP/UDP 和 SRT 推流，编码为 H.264+AAC、H.265+AAC、H.264+Opus、H.264+PCMA，每路流再经 RTMP、RTSP/TCP、RTSP/UDP、SRT、HTTP-FLV、HLS fMP4、HLS TS 和 LL-HLS 播放：复制并解码 6 秒没有错误，编码与画面尺寸正确，120–180 个视频帧，DTS 单调，SRT 和 HLS 上去掉了 G.711（只有视频）。两个版本上，ffmpeg 能推、能读的组合全部通过；其余是 ffmpeg 本身做不到的（FLV 中的 Opus 无论收发、5.1 上的 Enhanced RTMP、MPEG-TS 中的 G.711） |
+| 所有接入 × 所有出口 | ffmpeg 5.1、7.1 | 见下面的[矩阵](#接入与出口矩阵) |
 | WHIP、WHEP | ffmpeg 5.1、fib 的客户端 | ffmpeg 经 RTSP 推 H.264+Opus；fib 的 WHEP 客户端从 WHEP 端点把它拉进一个路径，fib 的 WHIP 客户端把它推到 WHIP 端点成为另一个路径；ffmpeg 经 RTSP 播放两者，解码没有错误 |
 | WHIP、WHEP | headless Chromium | WHEP 播放 ffmpeg 的 H.264+Opus：连接成功，640×360，解码 244 帧，没有丢包；Chromium 用虚拟摄像头和麦克风经 WHIP 推流（OpenH264 Constrained Baseline 与 Opus），ffmpeg 随后经 RTSP 播放并解码，没有错误 |
 | 上面的示例 | ffmpeg 5.1、7.1，fib 的 WHEP 客户端 | 原样编译；ffmpeg 同时经 RTMP 和 SRT 推 H.264+AAC、经 RTSP 推 H.264+Opus。RTMP 的流经 RTMP、TCP 与 UDP 的 RTSP、SRT、HTTP-FLV、HLS fMP4 与 TS、LL-HLS 播放；SRT 的流经 HLS 和 RTMP 播放；RTSP 的流经 SRT 和 HLS 播放；ffmpeg 对每一路解码 4 秒没有错误，fib 的 WHEP 客户端收到 RTSP 流的 H.264 与 Opus（5 秒约 400 个包）。WebSocket-FLV 的升级请求得到 101，向 `live/` 之外推流被钩子拒绝 |
+
+### 接入与出口矩阵
+
+所有服务端共用一个 hub，与上面的示例相同。每个格子里，ffmpeg 经一种接入推 15 秒 640×360、
+25 fps 的测试图案加单音（x264 或 x265，两个 B 帧，两秒一个 GOP；AAC、Opus 或 G.711 A-law），
+三秒后八种出口同时各启动一个播放器，各自复制 6 秒到文件并解码。通过的条件是：ffmpeg 正常退出、
+没有错误行，ffprobe 看到的编码、画面尺寸和采样率与推流一致，视频有 120 到 180 帧（SRT 和
+走 UDP 的 RTSP 播放者从下一个关键帧开始，为 90 到 180 帧），每路视频流的 DTS 严格递增、每路
+音频流的 DTS 不回退。
+
+| 接入 | 编码 | 出口：RTMP、RTSP/TCP、RTSP/UDP、SRT、HTTP-FLV、HLS fMP4、HLS TS、LL-HLS |
+| --- | --- | --- |
+| RTMP、RTSP/TCP、RTSP/UDP、SRT | H.264 + AAC | 7.1 与 5.1 全部通过 |
+| RTMP | H.265 + AAC | 7.1 全部通过；5.1 为 N/A（没有 Enhanced RTMP 可用于推流） |
+| RTSP/TCP、RTSP/UDP、SRT | H.265 + AAC | 7.1 全部通过；5.1 除 RTMP 和 HTTP-FLV 为 N/A 外全部通过（5.1 读不了 FLV 中的 H.265） |
+| RTMP | H.264 + Opus | N/A（ffmpeg 无法把 Opus 写进 FLV） |
+| RTSP/TCP、RTSP/UDP、SRT | H.264 + Opus | RTSP、SRT 与各种 HLS 通过；RTMP 与 HTTP-FLV 为 N/A（ffmpeg 读不了 FLV 中的 Opus） |
+| RTMP、RTSP/TCP、RTSP/UDP | H.264 + PCMA | RTMP、RTSP 与 HTTP-FLV 通过；SRT 与各种 HLS 无法承载 G.711，按设计只有视频并通过 |
+| SRT | H.264 + PCMA | N/A（MPEG-TS 没有 G.711） |
+
+合计：ffmpeg 7.1 通过 94 个、只含视频通过 12 个、N/A 22 个；ffmpeg 5.1 通过 80 个、只含视频
+通过 12 个、N/A 36 个；没有失败。N/A 一律表示 ffmpeg 本身无法推或播这种组合，而不是 fib 拒绝了
+它。
+
+在同一个服务端上、用两个 ffmpeg 版本做的其它测试：
+
+- **音视频同步。** 每两秒闪一次白屏并响一声的源，经 RTMP、RTSP/TCP 和 SRT 推流，经每种出口
+  播放：每一对的响声减闪屏中位数都是 0 ms，与直接解码本地文件中的同一份编码相同。7.1 上每一对
+  都在 −21 到 +26 ms 之内，不到一个 40 ms 的帧；5.1 有个别单次离群值，出现在录制开始或结束于
+  响声中间的时候。在这项测试发现的问题修复之前（用 RTCP sender report 对齐录制的 RTSP 流，
+  fMP4 中早于第一个包开始的 track 保住自己的位置），RTSP 接入在每种出口上音频都晚 260 ms，
+  HLS-fMP4 和 LL-HLS 晚 128 ms（SRT 接入）到 341 ms（RTSP 接入）。
+- **重新推流。** 发布者推 8 秒、离开 2 秒、再推 8 秒，每种出口一个在第一次推流期间启动的播放者
+  运行 20 秒。7.1 上每种接入（RTMP、RTSP/TCP、SRT）× 每种出口都播放到结束（24–25 秒），没有
+  错误行：350 帧，SRT 和走 UDP 的 RTSP 为 300 帧，因为它们从关键帧重新开始。服务端在
+  `PlayWait` 之后结束会话时，SRT 播放者会打印一行 "Input/output error"，ffmpeg 的 libsrt 对
+  任何对端关闭都这样报告。5.1 上相同，只是从 SRT 接入到 HLS-TS 在 discontinuity 处有一行重复的
+  音频 DTS，TS 写入器延续时间线（见上文）之后已经消除：在两个版本上重新运行，任何接入的 HLS
+  播放者都没有错误行。这些修复之前，RTMP 和 HTTP-FLV 播放者
+  报告 500 多行非单调 DTS，RTSP 播放者 4.6 秒后随发布者一起结束，HLS-fMP4 和 LL-HLS 丢掉重新
+  推流后的第一个分片，SRT 和 RTSP 播放者的时间回退，SRT 发布者最后 1.6 秒（x264 的 lookahead，
+  在关闭时一次性冲出）在服务端被丢弃。
+- **负载。** 50 个 ffmpeg 播放者播放一路 4 Mbit/s、720p25 的 RTMP 流 30 秒（RTMP 7 个、
+  RTSP/TCP 7 个，RTSP/UDP、SRT、HTTP-FLV、HLS fMP4、HLS TS、LL-HLS 各 6 个），全部解码：每个
+  播放者都没有错误行，各 748 帧（RTSP/UDP 和 SRT 从下一个关键帧开始，为 712–728 帧）。服务端在
+  34 秒内用了约 1.8 秒 CPU，约为单核的 5%，涵盖接入、50 个出口和 3 个 HLS muxer；堆在 10 秒时
+  为 25 MB，峰值 35–37 MB，播放者离开后为 34 MB，因为 HLS muxer 在 `IdleTimeout` 之前保留各自
+  的分片窗口。
+- **卡住的播放者。** 在一路 4 Mbit/s 的 720p 流上，每种出口各有一个播放者被 SIGSTOP 暂停
+  30 秒：RTSP（TCP 与 UDP；UDP 的第一个对端一次性增加 4 MB，四轮暂停再杀掉也没有再增长）、SRT
+  和 HTTP-FLV 的堆保持平稳；RTMP 播放者先被丢包、随后被断开（`MaxWriteQueue`、
+  `IdleTimeout`）；HLS 每种格式增长一个分片窗口（4 Mbit/s 时约 9 MB）后保持不变，这是窗口本身，
+  而不是卡住造成的。
 
 没有与其它实现验证过的：codec id 12 的旧式 FLV H.265（上游 ffmpeg 7.1 把它识别为 unknown，
 所以只有 fib 自己的测试覆盖）、RTMP 或 HTTP-FLV 上的 Opus（ffmpeg 5.1 和 7.1 都读不了 FLV 中

@@ -102,7 +102,8 @@ each of them subscribes to the hub, not to RTMP.
   `OnTracks` again from the next one: that is how a player that connects
   first, an HLS playlist across a reconnecting encoder, or a push relay waiting
   for its source keep their place. Packet times are the publisher's own, and a
-  republish may restart them.
+  republish may restart them; the egresses keep their players' times
+  increasing across it (see [Republishes](#where-players-start-and-republishes)).
 
 **GOP cache.** Each stream keeps what a new subscriber needs to start with a
 picture: every packet from the last video keyframe on, audio included, or the
@@ -168,8 +169,14 @@ lock, so no fib worker is held by a waiting player.
 the protocol, with `PublishInfo`/`SubscribeInfo`: the protocol (`rtmp`,
 `rtsp`, `srt`, `whip`, `whep`, `http-flv`, `ws-flv`, `hls`, and
 `rtmp-pull`/`rtmp-push` for RTMP's relays), the remote address, and the
-query of the URL, where tokens usually travel. Returning an error refuses the publish or
-play. Each protocol also has a hook of its own for what only it knows:
+query of the URL, where tokens usually travel. Returning an error refuses the
+publish or play. The pull relays fill it in too: `rtsp.PlayToHub` with the
+RTSP server's address and its URL's query, `srt.Play` and `srt.Publish` with
+the query of a plain stream ID (`live/s?token=...`). An RTSP player whose URL
+carries a query sets its tracks up against that URL, as ffmpeg does
+(`rtsp://host/live/s?token=x/trackID=0`), and the server takes the
+`trackID` back out of the query. Each protocol also has a hook of its own for
+what only it knows:
 
 ```go
 h := hub.New(hub.Config{
@@ -480,8 +487,8 @@ rtc.PullToHub(cc, "https://origin.example.com/whep/live/webrtc", h, "live/webrtc
 ```
 
 - A pull relay publishes the path when the remote's tracks are known
-  (`rtmp.Pull` reserves it first, so a busy path fails at once with
-  `hub.ErrStreamBusy`), passes a change of tracks on as `SetTracks`, and
+  (`rtmp.Pull` and `srt.Play` reserve it first, so a busy path fails at once
+  with `hub.ErrStreamBusy`), passes a change of tracks on as `SetTracks`, and
   unpublishes when the remote stream ends. A refused publish closes the
   client.
 - A push relay starts with the stream's first tracks, drops packets the
@@ -503,6 +510,54 @@ rtc.PullToHub(cc, "https://origin.example.com/whep/live/webrtc", h, "live/webrtc
   WHIP/WHEP clients open a PeerConnection with a port of their own unless
   `ClientConfig.WebRTC` names a Mux or an engine.
 
+## Where players start, and republishes
+
+**Where a player starts.** A player usually starts with the hub's cached GOP,
+so it has a picture at once. SRT players, and RTSP players with a stream over
+UDP, start at the next keyframe instead. The cached GOP goes out in one burst,
+and a 4 Mbit/s 720p stream's is about a megabyte, more than a receiver's
+socket buffer holds (Linux's default is 208 KiB). Over RTSP's UDP nothing
+resends what the buffer drops; over SRT every packet of the burst is stamped
+with the time it was sent, so NAKs have one latency (120 ms) to bring back
+hundreds of packets, and lose. Every ffmpeg player that joined such a stream
+had H.264 decode errors at its start (SRT's also reported RCV-DROPPED), with
+one player or fifty. Starting at the next keyframe costs up to one keyframe
+interval of waiting, and TSBPD and NAKs handle the steady stream that
+follows. `srt.ServerConfig.PlayGOPCache` turns the cached start back on, for
+small streams or receivers with large buffers and latencies. RTMP, HTTP-FLV,
+RTSP over TCP, HLS and WHEP (unless `rtc.Config.NoGOPCache`) start with the
+cache.
+
+**Across a republish.** A player that waits through a republish (RTMP's and
+SRT's `PlayWait`, HTTP-FLV's `Wait`, RTSP's `PlayWait`, HLS's and WHEP's
+`RepublishWait`) hears `OnTracks` from the next publisher, whose clock may
+start anywhere: an RTMP or ffmpeg publisher's starts from 0 again. Players
+need times that keep increasing (ffmpeg reports every packet after a step
+back, and flv.js and MSE players stall on it), so each egress carries its own
+timeline on:
+
+- **`flv.Timeline`** stamps the RTMP messages and FLV tags of the RTMP and
+  HTTP-FLV egress (and `flv.Muxer`). After `Restart`, a packet behind the last
+  timestamp, or more than ten seconds past it, starts a new clock after the
+  last timestamp by as long as the stream was quiet (20 ms to ten seconds), so
+  timestamps keep pace with the wall clock players wait by and the two
+  clocks never share a timestamp; a packet behind its own track's last
+  timestamp is given that one. An application writing FLV itself can use it.
+- **RTSP** players (`rtsp.ServerConfig.PlayWait`) move their RTP times on the
+  same way, on the same SSRCs, and keep their RTCP sender reports' mapping, by
+  which ffmpeg times RTSP packets. A next publisher with other codecs ends an
+  RTSP player, whose SDP cannot change; DESCRIBE still needs a publisher.
+- **SRT** players move their MPEG-TS times on the same way.
+- **HLS** starts a new segment writer after an `EXT-X-DISCONTINUITY`, and both
+  formats start it where the last one ended (`fmp4.Writer.StartAt` and `End`,
+  and the TS writer's own). RFC 8216 lets times jump at a discontinuity, but
+  ffmpeg keeps its MP4 demuxer across one whose init section is the same and
+  discarded the first fMP4 segment after it, and its correction of a TS step
+  back repeated a decode time. The TS writer holds the first packets after a
+  discontinuity (until every track has one, 256 packets or a second) so that
+  audio a little behind the keyframe does not land before where the last
+  writer ended.
+
 ## Configuration and limits
 
 Every field is optional but the `Hub` (and, for `rtc.Config`, a `WebRTC` with
@@ -523,7 +578,7 @@ everywhere, and every buffer a peer can fill is bounded.
 | --- | --- | --- |
 | `HandshakeTimeout` | 10 s | From connect until publish or play (client: plus `DialTimeout`, 10 s) |
 | `IdleTimeout` | 30 s | A publisher that sends nothing, or a player whose output does not move |
-| `PlayWait` | 0 | How long a play waits for a missing publisher; 0 answers `StreamNotFound` at once |
+| `PlayWait` | 0 | How long a play waits for a missing publisher, or for the next one after its own leaves; 0 answers `StreamNotFound` at once |
 | `MaxMessageSize` | 8 MiB | Largest message a peer may send |
 | `ChunkSize`, `WindowAckSize` | 4096, 2,500,000 | What the server writes and asks of its clients |
 | `WriteQueueLimit`, `MaxWriteQueue` | 2 MiB, 16 MiB | Drop past the first (video to the next keyframe), disconnect past the second |
@@ -545,6 +600,7 @@ value accepts every origin).
 | `Password`, `Realm`, `AuthMethods` | none, `fib`, Digest | Authentication; Basic sends passwords in the clear. Digest nonces are stateless and last 5 minutes |
 | `SessionTimeout`, `IdleTimeout` | 60 s, 60 s | A session without a request, RTCP or (recording) RTP; a connection without a session |
 | `MaxHeaderBytes`, `MaxBodyBytes` | 16 KiB, 256 KiB | Bounds of a request |
+| `PlayWait` | 0 | How long a player outlives its publisher, waiting for the next one with the same codecs; 0 ends players with their publisher |
 | `MaxQueuedBytes` | 4 MiB | A player's backlog past which packets drop; twice as much closes it |
 | `MTU`, `SenderReportInterval` | 1400, 5 s | RTP packet size, RTCP sender reports |
 | `ReorderSize`, `ReorderDelay` | 128 packets, 100 ms | The reorder buffer of each stream recorded over UDP |
@@ -564,7 +620,8 @@ reorder buffer's size and delay.
 | `HandshakeTimeout`, `PeerIdleTimeout` | 3 s, 5 s | Handshake, and a peer that sends nothing |
 | `FlowWindow`, `SendBufferPackets` | 8192, 8192 packets | Receive buffer and peer's in-flight packets; unacknowledged plus waiting packets |
 | `MaxSendBacklog` | 4 MiB | Unacknowledged payload past which a player's packets drop |
-| `PlayWait` | 0 | How long a player waits for a missing stream; 0 rejects it with `RejectNotFound` |
+| `PlayWait` | 0 | How long a player waits for a missing stream, or for the next publisher after its own leaves; 0 rejects a player of a missing stream with `RejectNotFound` |
+| `PlayGOPCache` | false | Start players with the cached GOP rather than the next keyframe (see [Where a player starts](#where-players-start-and-republishes)) |
 | `MaxConns` | unlimited | Sessions; past it callers get `RejectOverload` |
 | `OnConnect`, `OnSession`, `ParseStreamID` | none | Authentication, taking a session out of the hub's hands, a stream ID syntax of one's own |
 | `Muxer`, `Demuxer` | MPEG-TS defaults | Tables every 100 ms, PCR every 40 ms, a PES bounded at 4 MiB, 256 packets held while tracks are learned |
@@ -617,6 +674,7 @@ Fixed bounds inside the cores:
 | MPEG-TS PES | 4 MiB, larger ones dropped |
 | SRT receive and send buffers | `FlowWindow` and `SendBufferPackets` |
 | HLS media per Muxer | `MaxBytes`, old segments first |
+| HLS-TS packets held after a discontinuity to place the new clock | 256 packets or 1 s |
 
 ## Intentionally not implemented
 
@@ -682,8 +740,9 @@ sans-IO cores against each other and against captured bytes (`testdata/`
 fixtures that ffmpeg 5.1 and 7.1 wrote for every codec, among them H.264
 4:4:4, 4:2:2 10-bit, interlaced and cropped streams and H.265 Main 10), with
 fuzz targets for every parser that takes untrusted bytes, and the servers and
-clients over loopback on fib engines. The whole `media` tree passes
-`go test -race` in the Linux container below.
+clients over loopback on fib engines. Every media package passes `go test
+-race` in the Linux container below and on macOS, and CI's whole-module
+coverage floor (96%) holds with them in it.
 
 The interop runs used real implementations in Docker over loopback: ffmpeg
 5.1 (Debian bookworm, libx264, libx265, libopus, libsrt) and ffmpeg 7.1
@@ -696,15 +755,83 @@ ffmpeg.
 | --- | --- | --- |
 | RTMP, HTTP-FLV | ffmpeg 5.1, 7.1 | ffmpeg publishes H.264+AAC (5.1), H.265+AAC and AV1+AAC by Enhanced RTMP (7.1); ffprobe and ffmpeg play them back over RTMP and HTTP-FLV, four players at once, with monotonic DTS; fib's client plays into an FLV file ffmpeg decodes; fib's client publishes to and plays from ffmpeg's `-listen 1` (H.264 on 5.1, H.265 on 7.1); RTMPS push and pull |
 | RTMP, HTTP-FLV slow players | ffmpeg 5.1 | An RTMP and an HTTP-FLV player that stop reading a 6 Mbit/s 720p stream are disconnected, while healthy players beside them decode; the server's heap stays between 11 and 20 MB throughout |
-| RTSP | ffmpeg 5.1, 7.1 | ffmpeg records over TCP and UDP; ffprobe and ffmpeg play over TCP and UDP: H.264+AAC, H.265+Opus, H.264+PCMA; a relay through fib's client (TCP and UDP, H.264 and H.265); fib's client pushing to ffmpeg's listen mode (TCP and UDP); Digest and Basic, with no and wrong credentials refused; a stalled player while another decodes, with the heap flat |
+| RTSP | ffmpeg 5.1, 7.1 | ffmpeg records over TCP and UDP; ffprobe and ffmpeg play over TCP and UDP: H.264+AAC, H.265+Opus, H.264+PCMA; a relay through fib's client (TCP and UDP, H.264 and H.265); fib's client pushing to ffmpeg's listen mode (TCP and UDP); Digest and Basic, with no and wrong credentials refused; players of a URL with a query (`?token=...`) over TCP and UDP; a stalled player while another decodes, with the heap flat |
 | SRT | ffmpeg 5.1, 7.1 (libsrt) | ffmpeg publishes and plays back H.264+AAC and H.265+Opus, unencrypted and with pbkeylen 16, 24 and 32, also through a relay dropping 2–10% of datagrams both ways, with clean decodes; fib's client pushes to and pulls from ffmpeg in listener mode |
 | MPEG-TS | ffmpeg 5.1, 7.1 | ffmpeg-made H.264+AAC, H.265+Opus and AAC-only streams demux, and remuxing them decodes without warnings |
 | fMP4 | ffmpeg 5.1, 7.1 | Init segments and fragments of H.264+AAC, H.265+AAC and H.264+Opus, from raw feeds and from ffmpeg's own fMP4 with B-frames, decode without errors, and remuxes keep every packet's timestamps and keyframe flags |
 | HLS | ffmpeg 5.1, 7.1 | fMP4: H.264+AAC, H.265+AAC, H.264+Opus, AAC only and LL-HLS with 500 ms parts play 10 s with no errors; a same-codec republish plays across the discontinuity; a playlist checker finds target durations, sequence numbers, discontinuities, parts, blocking reloads and preload hints as the specification has them. MPEG-TS: H.264+AAC (5.1) and H.265+AAC (7.1) from an RTMP push play from the TS variant, plain and LL-HLS |
-| Every ingest × every egress | ffmpeg 5.1, 7.1 | ffmpeg publishes over RTMP, RTSP/TCP, RTSP/UDP and SRT, in H.264+AAC, H.265+AAC, H.264+Opus and H.264+PCMA, and plays each stream over RTMP, RTSP/TCP, RTSP/UDP, SRT, HTTP-FLV, HLS fMP4, HLS TS and LL-HLS: 6 s copied and decoded with no errors, the codecs and picture size right, 120–180 video frames, monotonic DTS, and G.711 left out (video alone) on SRT and HLS. Every combination ffmpeg can publish and read passed on both versions; the rest are those ffmpeg cannot do (Opus in FLV either way, Enhanced RTMP on 5.1, G.711 in MPEG-TS) |
+| Every ingest × every egress | ffmpeg 5.1, 7.1 | See [the matrix](#every-ingest-by-every-egress) below |
 | WHIP, WHEP | ffmpeg 5.1, fib's clients | ffmpeg publishes H.264+Opus over RTSP; fib's WHEP client pulls it from the WHEP endpoint into one path and fib's WHIP client pushes it to the WHIP endpoint as another; ffmpeg plays both over RTSP and decodes them with no errors |
 | WHIP, WHEP | headless Chromium | WHEP playback of ffmpeg's H.264+Opus: connected, 640×360, 244 frames decoded, no packets lost; WHIP publish from Chromium's fake camera and microphone (OpenH264 Constrained Baseline and Opus), which ffmpeg then plays over RTSP and decodes with no errors |
 | The example above | ffmpeg 5.1, 7.1, fib's WHEP client | Built as it is here; ffmpeg publishes H.264+AAC over RTMP and SRT and H.264+Opus over RTSP at once. The RTMP stream plays over RTMP, RTSP over TCP and UDP, SRT, HTTP-FLV, HLS fMP4 and TS, and LL-HLS; the SRT stream over HLS and RTMP; the RTSP stream over SRT and HLS; ffmpeg decodes 4 s of each with no errors, and fib's WHEP client receives the RTSP stream's H.264 and Opus (some 400 packets in 5 s). The WebSocket-FLV upgrade is answered 101, and a publish outside `live/` is refused by the hook |
+
+### Every ingest by every egress
+
+One hub behind every server, as in the example above. For each cell ffmpeg
+publishes 15 s of a 640×360, 25 fps test pattern with a tone (x264 or x265
+with two B-frames and a two-second GOP; AAC, Opus or G.711 A-law) over one
+ingest, and three seconds in, all eight egresses start a player at once,
+each copying 6 s to a file and decoding it. A cell passes when ffmpeg exits
+cleanly with no error lines, ffprobe finds the codecs, picture size and
+sample rate that were published, the video has 120 to 180 frames (90 to 180
+for SRT and RTSP-over-UDP players, which start at the next keyframe), and DTS
+increases strictly per video stream and never goes back per audio stream.
+
+| Ingest | Codecs | Egress: RTMP, RTSP/TCP, RTSP/UDP, SRT, HTTP-FLV, HLS fMP4, HLS TS, LL-HLS |
+| --- | --- | --- |
+| RTMP, RTSP/TCP, RTSP/UDP, SRT | H.264 + AAC | all pass on 7.1 and 5.1 |
+| RTMP | H.265 + AAC | all pass on 7.1; N/A on 5.1 (no Enhanced RTMP to publish with) |
+| RTSP/TCP, RTSP/UDP, SRT | H.265 + AAC | all pass on 7.1; on 5.1 all but RTMP and HTTP-FLV, N/A (5.1 reads no H.265 from FLV) |
+| RTMP | H.264 + Opus | N/A (ffmpeg cannot write Opus into FLV) |
+| RTSP/TCP, RTSP/UDP, SRT | H.264 + Opus | pass on RTSP, SRT and every HLS; N/A on RTMP and HTTP-FLV (ffmpeg reads no Opus from FLV) |
+| RTMP, RTSP/TCP, RTSP/UDP | H.264 + PCMA | pass on RTMP, RTSP and HTTP-FLV; pass video-only on SRT and every HLS, which cannot carry G.711, as designed |
+| SRT | H.264 + PCMA | N/A (MPEG-TS has no G.711) |
+
+Totals: ffmpeg 7.1, 94 pass, 12 pass video-only, 22 N/A; ffmpeg 5.1, 80
+pass, 12 pass video-only, 36 N/A; no failures. N/A always means ffmpeg
+itself cannot publish or play the combination, never that fib refused it.
+
+Further runs on the same server, with both ffmpeg versions:
+
+- **A/V sync.** A source that flashes and beeps every two seconds, published
+  over RTMP, RTSP/TCP and SRT and played over every egress: the median beep
+  minus flash is 0 ms for every pair, as for the same encode decoded from a
+  local file. On 7.1 every single pair is within −21 to +26 ms, under one
+  40 ms frame; 5.1 has a few single outliers where a recording starts or ends
+  mid-beep. Before the fixes this found (RTCP sender reports lining up
+  recorded RTSP streams, fMP4 tracks that start before the first packet
+  keeping their place), RTSP ingest played audio 260 ms late on every egress,
+  and HLS-fMP4 and LL-HLS 128 ms (SRT ingest) to 341 ms (RTSP ingest) late.
+- **Republish.** The publisher pushes 8 s, leaves for 2 s and pushes 8 s
+  again, while a player per egress, started in the first push, runs 20 s.
+  On 7.1 every ingest (RTMP, RTSP/TCP, SRT) by every egress plays to the end
+  (24–25 s) with no error lines: 350 frames, 300 for SRT and RTSP over UDP,
+  which restart at a keyframe. SRT players print one "Input/output error"
+  when the server ends the session after `PlayWait`, as ffmpeg's libsrt
+  reports any close by the peer. On 5.1 the same, except for one duplicated
+  audio DTS line from SRT ingest to HLS-TS at the discontinuity, which the
+  TS writer's continuing timeline (above) has since removed: run again on
+  both versions, no HLS player of any ingest prints an error line. Before these
+  fixes, RTMP and HTTP-FLV players reported 500+ non-monotonic DTS lines,
+  RTSP players ended with their publisher after 4.6 s, HLS-fMP4 and LL-HLS
+  lost the first segment after the republish, SRT and RTSP players saw times
+  go back, and an SRT publisher's last 1.6 s (x264's lookahead, flushed
+  as it closes) was dropped at the server.
+- **Load.** 50 ffmpeg players of one 4 Mbit/s 720p25 RTMP stream for 30 s
+  (7 RTMP, 7 RTSP/TCP, 6 each of RTSP/UDP, SRT, HTTP-FLV, HLS fMP4, HLS TS and
+  LL-HLS), every one decoding: no error lines on any player, 748 frames each
+  (712–728 for RTSP/UDP and SRT, from the next keyframe). The server used
+  about 1.8 s of CPU in 34 s, some 5% of one core for the ingest, 50 egresses
+  and three HLS muxers; its heap was 25 MB at 10 s, peaked at 35–37 MB, and
+  stayed at 34 MB after the players left, as HLS muxers keep their segment
+  windows until `IdleTimeout`.
+- **Stalled players.** A player of each egress stopped with SIGSTOP on a
+  4 Mbit/s 720p stream for 30 s: the heap stays flat for RTSP (TCP and UDP;
+  UDP's first peer adds 4 MB once, and four rounds of stalling and killing
+  add nothing), SRT and HTTP-FLV; an RTMP player is dropped to and then
+  disconnected (`MaxWriteQueue`, `IdleTimeout`); HLS grows by its segment
+  window per format (about 9 MB at 4 Mbit/s) and stays there, which is the
+  window and not the stall.
 
 Not checked against another implementation: H.265 with FLV's legacy codec id
 12 (upstream ffmpeg 7.1 reports the stream as unknown, so only fib's own tests
