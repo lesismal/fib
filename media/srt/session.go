@@ -241,6 +241,11 @@ func (s *Session) closedConn(err error) {
 	if s.closed {
 		return
 	}
+	if s.demux != nil && s.pub != nil {
+		// The last frame of each stream waits in the demuxer for the
+		// next PES to start, which will not come now.
+		s.demux.Flush()
+	}
 	s.closed = true
 	if s.pub != nil {
 		s.pub.Close()
