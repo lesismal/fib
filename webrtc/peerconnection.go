@@ -89,16 +89,21 @@ type Configuration struct {
 	// allocation is made on for a relay candidate, with the server's
 	// Username and Credential. TURN needs a PeerConnection with a port of
 	// its own, without a Mux: a TURN server tells its clients apart by
-	// their address, which the PeerConnections of one Mux share.
+	// their address, which the PeerConnections of one Mux share. A lite
+	// PeerConnection asks no STUN server, and a TURN URL ("turn:" or
+	// "turns:") makes NewPeerConnection return ErrConfiguration.
 	ICEServers []ICEServer
 	// ICETransportPolicy ICETransportPolicyRelay gathers relay candidates
 	// only, so that media goes through a TURN server and the peer never
-	// learns this side's addresses.
+	// learns this side's addresses. It needs a TURN server and a full ICE
+	// agent: NewPeerConnection returns ErrConfiguration otherwise.
 	ICETransportPolicy ICETransportPolicy
 	// ICELite makes the PeerConnection a lite ICE agent (RFC 8445 section
 	// 2.5), as a server with a public address is: it only answers the
 	// peer's checks, is always controlled, and gathers host candidates
-	// only. Its peer must be a full agent, as every browser is.
+	// only. Its peer must be a full agent, as every browser is. STUN
+	// servers are not asked; TURN servers and ICETransportPolicyRelay are
+	// refused, with or without a Mux.
 	ICELite bool
 	// BundlePolicy must be BundlePolicyMaxBundle, its zero value.
 	BundlePolicy BundlePolicy
@@ -338,6 +343,8 @@ func NewPeerConnection(config Configuration) (*PeerConnection, error) {
 				return nil, err
 			}
 			switch {
+			case isTURN && config.ICELite:
+				return nil, fmt.Errorf("%w: a lite PeerConnection gathers no relay candidate: %q", ErrConfiguration, u)
 			case !addr.IsValid():
 			case isTURN:
 				pc.turnServers = append(pc.turnServers, turnServer{addr, s.Username, s.Credential})
@@ -346,7 +353,10 @@ func NewPeerConnection(config Configuration) (*PeerConnection, error) {
 			}
 		}
 	}
-	if len(pc.turnServers) > 0 && config.Mux != nil && !config.ICELite {
+	if config.ICELite && config.ICETransportPolicy == ICETransportPolicyRelay {
+		return nil, fmt.Errorf("%w: a lite PeerConnection gathers no relay candidate", ErrConfiguration)
+	}
+	if len(pc.turnServers) > 0 && config.Mux != nil {
 		return nil, fmt.Errorf("%w: TURN needs a PeerConnection without a shared Mux", ErrConfiguration)
 	}
 	if config.ICETransportPolicy == ICETransportPolicyRelay && len(pc.turnServers) == 0 {
@@ -378,7 +388,8 @@ type turnServer struct {
 }
 
 // iceServer parses a "stun:" or "turn:" URL and resolves its host. One
-// this side cannot use, TLS or TCP, reports an invalid address.
+// this side cannot use, TLS or TCP, reports an invalid address; isTURN
+// still tells a TURN server ("turn:" or "turns:") apart.
 func iceServer(u string) (addr netip.AddrPort, isTURN bool, err error) {
 	scheme, rest, ok := strings.Cut(u, ":")
 	if !ok {
@@ -392,7 +403,9 @@ func iceServer(u string) (addr netip.AddrPort, isTURN bool, err error) {
 			return addr, true, nil
 		}
 	case "stun":
-	case "turns", "stuns":
+	case "turns":
+		return addr, true, nil
+	case "stuns":
 		return addr, false, nil
 	default:
 		return addr, false, fmt.Errorf("%w: ICE server URL %q", ErrConfiguration, u)

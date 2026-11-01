@@ -93,7 +93,8 @@ type Config struct {
 	// empty.
 	Ufrag, Pwd string
 	// STUNServers are asked for server-reflexive candidates from each
-	// socket Gather is given, those of the socket's address family.
+	// socket Gather is given, those of the socket's address family. A
+	// lite agent asks none of them.
 	STUNServers []netip.AddrPort
 
 	// Send sends b from the transport local to the address to. b is valid

@@ -456,11 +456,14 @@ pc, err := webrtc.NewPeerConnection(webrtc.Configuration{
 
 - TURN 要求 PeerConnection 有自己的端口：TURN 服务器靠地址区分客户端，而同一个 Mux 上的
   PeerConnection 共用一个地址。`NewPeerConnection` 遇到"有 Mux 又配了 TURN"，或"relay 策略
-  却没有 TURN 服务器"，都返回 `ErrConfiguration`。lite PeerConnection 只收集 host
-  candidate，会忽略 `ICEServers`。
+  却没有 TURN 服务器"，都返回 `ErrConfiguration`。
+- lite PeerConnection 只收集 host candidate。它不向 STUN 服务器请求，所以 `stun:` URL
+  会被接受但不使用；而任何 TURN URL（`turn:` 或 `turns:`）以及 relay 策略都会让它返回
+  `ErrConfiguration`，无论用 Mux 还是自己的端口：它永远收集不到这些配置所要的 relay
+  candidate。
 - URL 形如 `stun:host[:port]` 和 `turn:host[:port]`，端口默认 3478，在创建 PeerConnection
   时解析。PeerConnection 只经 UDP 访问 TURN 服务器：`turns:`、`stuns:` 和带
-  `?transport=tcp` 的 URL 会被跳过。
+  `?transport=tcp` 的 URL 在 full PeerConnection 上会被跳过。
 - 客户端处理 401 质询、带新 nonce 的 438、转向备用服务器的 300，刷新 allocation、每个对端
   地址的 permission（每 4 分钟）以及它绑定的 channel，没得到应答的请求会重发，`Close` 时
   释放 allocation。
@@ -649,8 +652,8 @@ _ = server.Shutdown(ctx)
 | --- | --- | --- |
 | `Mux` / `Engine`、`ListenAddr` | — / `:0` | 共用一个 Mux，或在 engine 上开自己的端口 |
 | `Certificates` | 新生成的 ECDSA P-256 证书 | DTLS 证书；服务端的各个 PeerConnection 可共用一个 |
-| `ICEServers`、`ICETransportPolicy` | 无、all | STUN 与 TURN 服务器；只收集 relay candidate |
-| `ICELite` | false | 只应答检查，始终 controlled，只有 host candidate |
+| `ICEServers`、`ICETransportPolicy` | 无、all | STUN 与 TURN 服务器；只收集 relay candidate，需要有 TURN 服务器 |
+| `ICELite` | false | 只应答检查，始终 controlled，只有 host candidate；不使用 STUN 服务器，拒绝 TURN 服务器与 relay 策略 |
 | `Codecs`、`HeaderExtensions` | `DefaultCodecs()`、`DefaultHeaderExtensions()` | 提供与接受的内容 |
 | `MaxMessageSize` | 256 KiB | 能接收的最大 data channel 消息 |
 | `SCTPReceiveWindow` | 1 MiB | SCTP 接收窗口 |
