@@ -20,12 +20,16 @@
 // segments of the last three target durations and EXT-X-PRELOAD-HINT for
 // the next part.
 //
-// Segments are written by a SegmentWriter of a Format. FMP4 is the
-// implementation here, fragmented MP4 segments of package fmp4 with an
-// EXT-X-MAP initialization section and a version 7 playlist, for H.264,
-// H.265, AV1, AAC and Opus; other tracks are left out. MPEG-TS segments
-// plug in as another Format whose SegmentWriter wraps package mpegts; see
-// SegmentWriter for what it has to do.
+// Segments are written by a SegmentWriter of a Format, of which there are
+// two. FMP4 (the default) writes fragmented MP4 segments of package fmp4
+// with an EXT-X-MAP initialization section and a version 7 playlist, for
+// H.264, H.265, AV1, AAC and Opus. MPEGTS writes MPEG-2 transport stream
+// segments of package mpegts, each starting with its PAT and PMT and
+// standing alone, in a version 3 playlist, for H.264, H.265, AAC and
+// Opus: the format of players and devices older than fMP4 in HLS. Either
+// leaves out the tracks it cannot carry, and either may be written in
+// Low-Latency parts. Another format plugs in by implementing
+// SegmentWriter.
 //
 // When a stream has both audio and video, its index.m3u8 is a multivariant
 // playlist of one variant whose CODECS come from the tracks (CodecString),
@@ -38,11 +42,17 @@
 // segment, a blocking reload, a hinted part) from the goroutine that
 // completes what they wait for, with the request retained rather than a
 // worker held, and sets Content-Type, Cache-Control and optionally CORS.
+// HandlerConfig.Muxer.Format is the format a stream is served in;
+// HandlerConfig.Formats lists others a player may pick with a format query
+// parameter on the playlist URL, as index.m3u8?format=ts, each format
+// played running a Muxer of its own:
+//
+//	h := hls.NewHandler(hls.HandlerConfig{Hub: hb, Formats: []hls.Format{hls.MPEGTS}})
+//	// /live/s/index.m3u8 is fMP4, /live/s/index.m3u8?format=ts MPEG-TS
 //
 // Left out: delta playlist updates (_HLS_skip, EXT-X-SKIP) and rendition
 // reports, byte-range parts, EXT-X-PROGRAM-DATE-TIME, multiple variants
-// (no transcoding), I-frame playlists, encryption, and TS segments until
-// package mpegts provides the writer. EXT-X-TARGETDURATION is not known
+// (no transcoding), I-frame playlists, and encryption. EXT-X-TARGETDURATION is not known
 // before the segments are: it starts at TargetDuration rounded up and is
 // raised if a segment comes out longer (a keyframe interval longer than
 // the target), which strictly the specification does not allow; set

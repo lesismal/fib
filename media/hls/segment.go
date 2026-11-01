@@ -23,14 +23,15 @@ import (
 // Flush whose next packet starts the next segment, and BeginSegment again.
 // Flush(dst, nil) ends the stream.
 //
-// fMP4 (FMP4) is the first implementation. MPEG-TS plugs in the same way:
-// Tracks are the tracks it carries (H.264, H.265, AAC as ADTS, Opus with
+// fMP4 (FMP4) and MPEG-TS (MPEGTS) are the implementations. MPEGTS shows
+// what a format without an initialization section does: Tracks are the
+// tracks it carries (H.264, H.265, AAC as ADTS, Opus with
 // its registration descriptor), Init returns nil since every TS segment
 // stands alone, BeginSegment makes the next Flush start with PAT and PMT,
 // WritePacket packs a PES (parameter sets in band before keyframes) and
 // keeps the TS packets, and Flush appends what it keeps and reports
-// whether that holds a keyframe, ignoring next since TS has no durations
-// to complete. Format.Version is then 3, Format.Extension ".ts" and
+// whether a player can start at it, ignoring next since TS has no
+// durations to complete. Format.Version is then 3, Format.Extension ".ts" and
 // Format.ContentType "video/mp2t".
 type SegmentWriter interface {
 	// Tracks returns the indexes of the stream's tracks the writer carries;
@@ -66,7 +67,8 @@ type SegmentWriter interface {
 // Format is a segment format: how to make its SegmentWriter and how the
 // playlist and the HTTP handler present its segments.
 type Format struct {
-	// Name names the format, as "fmp4".
+	// Name names the format, as "fmp4" or "ts": the value of the format
+	// query parameter that picks it among HandlerConfig.Formats.
 	Name string
 	// Extension is the file extension of media segments and parts, as
 	// ".m4s"; InitExtension that of the initialization section.

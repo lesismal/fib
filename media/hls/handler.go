@@ -5,6 +5,7 @@ package hls
 import (
 	"errors"
 	stdhttp "net/http"
+	"net/url"
 	"strconv"
 	"strings"
 	"sync"
@@ -29,8 +30,17 @@ const PlaylistContentType = "application/vnd.apple.mpegurl"
 type HandlerConfig struct {
 	// Hub is where the streams come from.
 	Hub *hub.Hub
-	// Muxer configures the Muxer of every stream.
+	// Muxer configures the Muxer of every stream. Its Format (FMP4 when
+	// zero, or MPEGTS) is the segment format of requests that do not ask
+	// for another.
 	Muxer Config
+	// Formats are further segment formats a player may ask for with the
+	// format query parameter of a playlist URL naming one (Format.Name):
+	// with Formats: []Format{MPEGTS}, index.m3u8?format=ts serves MPEG-TS
+	// segments while index.m3u8 serves Muxer.Format's. Each format a
+	// stream is played in runs a Muxer of its own, which counts against
+	// MaxStreams.
+	Formats []Format
 	// Prefix is the part of the URL path before the stream's path: with
 	// "/hls/", /hls/live/s/index.m3u8 is the playlist of stream "live/s".
 	// Default "/".
@@ -72,13 +82,21 @@ type HandlerConfig struct {
 // max-age of an hour, since the Muxer's file names are never reused.
 type Handler struct {
 	config  HandlerConfig
+	formats []Format // Muxer.Format, then Formats
 	mu      sync.Mutex
-	streams map[string]*entry
+	streams map[streamKey]*entry
 	closed  bool
 }
 
+// streamKey names the Muxer of a stream in one format, an index into
+// Handler.formats.
+type streamKey struct {
+	path   string
+	format int
+}
+
 type entry struct {
-	path  string
+	key   streamKey
 	m     *Muxer
 	sub   *hub.Subscription
 	last  atomic.Int64
@@ -104,14 +122,18 @@ func NewHandler(config HandlerConfig) *Handler {
 	} else if config.RepublishWait < 0 {
 		config.RepublishWait = 0
 	}
-	return &Handler{config: config, streams: map[string]*entry{}}
+	h := &Handler{config: config, streams: map[streamKey]*entry{}}
+	first := config.Muxer
+	first.defaults()
+	h.formats = append([]Format{first.Format}, config.Formats...)
+	return h
 }
 
 // Close stops every Muxer and closes its subscription.
 func (h *Handler) Close() {
 	h.mu.Lock()
 	streams := h.streams
-	h.streams, h.closed = map[string]*entry{}, true
+	h.streams, h.closed = map[streamKey]*entry{}, true
 	h.mu.Unlock()
 	for _, e := range streams {
 		e.stop()
@@ -124,34 +146,57 @@ func (e *entry) stop() {
 	e.m.Close()
 }
 
-// Muxer returns the Muxer serving the stream at path, or nil.
+// Muxer returns the Muxer serving the stream at path in
+// HandlerConfig.Muxer's format, or nil; FormatMuxer that of another
+// format.
 func (h *Handler) Muxer(path string) *Muxer {
+	return h.FormatMuxer(path, "")
+}
+
+// FormatMuxer returns the Muxer serving the stream at path in the format
+// named format (Format.Name, "" for HandlerConfig.Muxer's), or nil.
+func (h *Handler) FormatMuxer(path, format string) *Muxer {
+	i, ok := h.format(format)
+	if !ok {
+		return nil
+	}
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	if e := h.streams[path]; e != nil {
+	if e := h.streams[streamKey{path, i}]; e != nil {
 		return e.m
 	}
 	return nil
 }
 
+// format returns the index of the format named name, 0 for "".
+func (h *Handler) format(name string) (int, bool) {
+	if name == "" {
+		return 0, true
+	}
+	for i, f := range h.formats {
+		if f.Name == name {
+			return i, true
+		}
+	}
+	return 0, false
+}
+
 // errNoStream is the hub not having the stream.
 var errNoStream = errors.New("hls: no such stream")
 
-// muxer returns the entry of path, starting one when start is set.
-func (h *Handler) muxer(path string, start bool, c *http.Context) (*entry, error) {
+// muxer returns the entry of path in format, starting one.
+func (h *Handler) muxer(path string, format int, c *http.Context) (*entry, error) {
+	key := streamKey{path, format}
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	e := h.streams[path]
-	if e != nil && e.m.Ended() && start && h.publishing(path) {
+	e := h.streams[key]
+	if e != nil && e.m.Ended() && h.publishing(path) {
 		// A playlist that ended while its publisher came back: start over.
-		delete(h.streams, path)
+		delete(h.streams, key)
 		e.stop()
 		e = nil
 	}
-	if e != nil || !start {
-		if e == nil {
-			return nil, errNoStream
-		}
+	if e != nil {
 		e.last.Store(time.Now().UnixNano())
 		return e, nil
 	}
@@ -161,7 +206,9 @@ func (h *Handler) muxer(path string, start bool, c *http.Context) (*entry, error
 	if h.config.MaxStreams > 0 && len(h.streams) >= h.config.MaxStreams {
 		return nil, hub.ErrLimit
 	}
-	m := NewMuxer(h.config.Muxer)
+	mc := h.config.Muxer
+	mc.Format = h.formats[format]
+	m := NewMuxer(mc)
 	info := hub.SubscribeInfo{Protocol: "hls"}
 	if c.Conn != nil {
 		info.Remote = c.Conn.RemoteAddrPort()
@@ -173,11 +220,27 @@ func (h *Handler) muxer(path string, start bool, c *http.Context) (*entry, error
 	if err != nil {
 		return nil, err
 	}
-	e = &entry{path: path, m: m, sub: sub}
+	e = &entry{key: key, m: m, sub: sub}
 	e.last.Store(time.Now().UnixNano())
 	e.timer = time.AfterFunc(h.config.IdleTimeout, func() { h.idle(e) })
-	h.streams[path] = e
+	h.streams[key] = e
 	return e, nil
+}
+
+// file returns the entry of path whose Muxer named the file name, in
+// whichever format: file names are the Muxer's own.
+func (h *Handler) file(path, name string) (*entry, error) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	for i := range h.formats {
+		if e := h.streams[streamKey{path, i}]; e != nil {
+			if kind, _, _ := e.m.parseName(name); kind != fileNone {
+				e.last.Store(time.Now().UnixNano())
+				return e, nil
+			}
+		}
+	}
+	return nil, errNoStream
 }
 
 // publishing reports whether the hub has a publisher on path.
@@ -203,8 +266,8 @@ func (h *Handler) idle(e *entry) {
 		return
 	}
 	h.mu.Lock()
-	if h.streams[e.path] == e {
-		delete(h.streams, e.path)
+	if h.streams[e.key] == e {
+		delete(h.streams, e.key)
 	}
 	h.mu.Unlock()
 	e.stop()
@@ -229,7 +292,19 @@ func (h *Handler) ServeHTTP(c *http.Context) {
 	}
 	stream, name := path[:i], path[i+1:]
 	playlist := name == "index.m3u8" || name == "media.m3u8"
-	e, err := h.muxer(stream, playlist, c)
+	var e *entry
+	var err error
+	format := c.Query("format")
+	if playlist {
+		fi, ok := h.format(format)
+		if !ok {
+			h.notFound(c)
+			return
+		}
+		e, err = h.muxer(stream, fi, c)
+	} else {
+		e, err = h.file(stream, name)
+	}
 	switch {
 	case err == hub.ErrLimit:
 		h.respond(c, stdhttp.StatusServiceUnavailable, "", "", nil)
@@ -240,7 +315,13 @@ func (h *Handler) ServeHTTP(c *http.Context) {
 		return
 	}
 	if playlist {
-		h.servePlaylist(c, e.m, name == "index.m3u8")
+		media := "media.m3u8"
+		if format != "" {
+			// The format the player asked for goes on to the media
+			// playlist; segments and parts are found by name.
+			media += "?format=" + url.QueryEscape(format)
+		}
+		h.servePlaylist(c, e.m, name == "index.m3u8", media)
 		return
 	}
 	h.serveFile(c, e.m, name)
@@ -281,7 +362,7 @@ const (
 
 // servePlaylist answers a playlist request, once what it waits for is
 // there.
-func (h *Handler) servePlaylist(c *http.Context, m *Muxer, index bool) {
+func (h *Handler) servePlaylist(c *http.Context, m *Muxer, index bool, media string) {
 	st := m.status()
 	msn, part := int64(-1), int64(-1)
 	if !index || !st.hasAV {
@@ -306,7 +387,7 @@ func (h *Handler) servePlaylist(c *http.Context, m *Muxer, index bool) {
 		var body []byte
 		var ok bool
 		if index && m.status().hasAV {
-			body, ok = m.MultivariantPlaylist(nil, "media.m3u8")
+			body, ok = m.MultivariantPlaylist(nil, media)
 		} else {
 			body, ok = m.MediaPlaylist(nil)
 		}
