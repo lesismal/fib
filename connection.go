@@ -1116,7 +1116,11 @@ func (c *Connection) send(data []byte, mode sendMode) error {
 		c.pushLocked(sendItem{data: data, offset: sent, pooled: true})
 	}
 	c.addPending(int64(len(queued)))
-	c.traceLocked("send queued %d direct=%v mode=%d", len(queued), direct, mode)
+	if traceOn.Load() {
+		// Checked here as well: boxing the length for the call allocates
+		// whether it traces or not, on every send the socket did not take.
+		c.traceLocked("send queued %d direct=%v mode=%d", len(queued), direct, mode)
+	}
 	// Write interest stays armed, so queueing alone changes nothing; only a
 	// watermark crossing does. While corked the flush at the end of the read
 	// round settles the pause instead.
@@ -2182,7 +2186,9 @@ func (c *Connection) flushLocked() error {
 				c.chargeLocked()
 				armErr := c.awaitWritableLocked()
 				refresh := c.settlePauseLocked(false)
-				c.traceLocked("flush short %d/%d armErr=%v", n, attempted, armErr)
+				if traceOn.Load() {
+					c.traceLocked("flush short %d/%d armErr=%v", n, attempted, armErr)
+				}
 				c.mu.Unlock()
 				if armErr != nil {
 					c.closeWithError(armErr)

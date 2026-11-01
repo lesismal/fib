@@ -203,6 +203,13 @@ type h2ServerConn struct {
 	lengthOf    int64
 	lengthValue string
 
+	// frameHeads is where the frame headers of bodies sent beside their
+	// frames are written, each handed to the connection as it is; see
+	// sendSharedLocked. It is only ever appended to, and replaced when full,
+	// since the connection reads what it was given until the socket has
+	// taken it. Guarded by mu.
+	frameHeads []byte
+
 	// flushPending says flusher is on its way to write what the connection
 	// has queued, and flushPool is the pool it is sent to; see sendLocked.
 	flushPending atomic.Bool
@@ -280,7 +287,11 @@ type h2ServerStream struct {
 	weight, turn uint8
 	// timedOut marks a stream reset because its response outlasted
 	// Config.WriteTimeout, which writing to it then reports.
-	timedOut   bool
+	timedOut bool
+	// shared says pending is a whole response's body the connection may
+	// keep as it is, rather than a copy of it: its frames are sent beside
+	// it; see sendSharedLocked. Guarded by the connection's mu.
+	shared     bool
 	sendWindow int64
 	pending    []byte
 	// writeTimer resets the stream once Config.WriteTimeout has passed, or
@@ -457,11 +468,17 @@ func (sc *h2ServerConn) sendPooledLocked(out []byte) {
 // sendPooledPartsLocked sends first, a buffer from the pool, and second
 // beside it, as sendPooledLocked does, and gives first back: the connection
 // copies what it queues, so the two parts reach the socket as one write
-// without being joined here first. It is for a connection with no layer.
-func (sc *h2ServerConn) sendPooledPartsLocked(first, second []byte) {
+// without being joined here first, and keeps second as it is instead when
+// shared is set, as HTTP/1 keeps a large body. It is for a connection with no
+// layer.
+func (sc *h2ServerConn) sendPooledPartsLocked(first, second []byte, shared bool) {
 	if len(first)+len(second) > 0 && !sc.closed {
 		sc.conn.Cork()
-		_ = sc.conn.SendParts(first, second)
+		if shared {
+			_ = sc.conn.SendPartsShared(first, second)
+		} else {
+			_ = sc.conn.SendParts(first, second)
+		}
 		sc.scheduleFlush()
 	}
 	bufferpool.Put(first)
@@ -1881,15 +1898,23 @@ func (st *h2ServerStream) respond(req *stdhttp.Request, response Response, owned
 		sc.sendWindow -= sendable
 		st.sendWindow -= sendable
 		st.localDone = true
-		// SendParts copies the body into the queue or the socket.
-		sc.sendPooledPartsLocked(out, body)
+		// SendParts copies the body into the queue or the socket, unless
+		// the connection may keep it as it is.
+		sc.sendPooledPartsLocked(out, body, owned == nil && len(body) > maxCopiedResponseBody && !st.block.BodyWithin(body))
 		sc.finishStreamLocked(st)
 		sc.closeFinishedLocked()
 		return nil
 	}
+	// A whole body the connection has no layer to transform, and which
+	// neither the request nor the pool will take back, is sent beside its
+	// frames, as the connection may keep it; see sendSharedLocked.
+	st.shared = owned == nil && sc.conn.Layer() == nil && !st.block.BodyWithin(body)
 	size := len(block) + h2FrameHeaderLen*(1+len(block)/sc.peerMaxFrame)
 	if sendable > 0 {
-		size += int(sendable) + h2FrameHeaderLen*(1+int(sendable)/sc.peerMaxFrame)
+		size += h2FrameHeaderLen * (1 + int(sendable)/sc.peerMaxFrame)
+		if !st.shared {
+			size += int(sendable)
+		}
 	}
 	out := bufferpool.Get(size)[:0]
 	out = h2AppendHeaderBlock(out, st.id, block, len(body) == 0 && st.trailer == nil, sc.peerMaxFrame)
@@ -2181,7 +2206,7 @@ func (st *h2ServerStream) recycle() {
 	st.remoteDone, st.responded, st.trailer, st.localDone, st.reset, st.queued = false, false, nil, false, false, false
 	st.weight, st.turn = 0, 0
 	st.timedOut, st.writeTimer = false, nil
-	st.sendWindow, st.pending, st.out, st.tunnel = 0, nil, nil, nil
+	st.sendWindow, st.pending, st.shared, st.out, st.tunnel = 0, nil, false, nil, nil
 	st.pooled, st.nextDead, st.headerFromPool = false, nil, nil
 	st.refs.Store(0)
 }
@@ -2487,8 +2512,12 @@ func (sc *h2ServerConn) flushStreamUpToLocked(out []byte, st *h2ServerStream, qu
 				flags = h2FlagEndStream
 			}
 		}
-		out = h2AppendFrameHeader(out, h2FrameData, flags, st.id, len(chunk))
-		out = append(out, chunk...)
+		if st.shared && len(chunk) > maxCopiedResponseBody {
+			out = sc.sendSharedLocked(out, st.id, flags, chunk)
+		} else {
+			out = h2AppendFrameHeader(out, h2FrameData, flags, st.id, len(chunk))
+			out = append(out, chunk...)
+		}
 		sc.sendWindow -= n
 		st.sendWindow -= n
 		if last {
@@ -2497,6 +2526,38 @@ func (sc *h2ServerConn) flushStreamUpToLocked(out []byte, st *h2ServerStream, qu
 	}
 	return out
 }
+
+// sendSharedLocked sends out, what has been framed so far, and then a DATA
+// frame on stream id with flags whose payload is chunk, a part of a body the
+// connection may keep as it is, and returns out emptied for what is framed
+// next. out is copied into the connection's queue, as sendPooledLocked copies
+// it, and chunk is queued as it is, beside its frame's header: a body of many
+// frames reaches the socket in writes of many parts, rather than copied into
+// its frames and then into the queue. The header is written into frameHeads,
+// which the connection keeps until the socket has taken it.
+func (sc *h2ServerConn) sendSharedLocked(out []byte, id uint32, flags uint8, chunk []byte) []byte {
+	if sc.closed {
+		return out[:0]
+	}
+	if len(sc.frameHeads)+h2FrameHeaderLen > cap(sc.frameHeads) {
+		sc.frameHeads = make([]byte, 0, h2FrameHeadsSize)
+	}
+	start := len(sc.frameHeads)
+	sc.frameHeads = h2AppendFrameHeader(sc.frameHeads, h2FrameData, flags, id, len(chunk))
+	sc.conn.Cork()
+	if len(out) > 0 {
+		_ = sc.conn.Send(out)
+	}
+	_ = sc.conn.SendOwned(sc.frameHeads[start:len(sc.frameHeads):len(sc.frameHeads)])
+	_ = sc.conn.SendShared(chunk)
+	sc.scheduleFlush()
+	return out[:0]
+}
+
+// h2FrameHeadsSize is how many bytes of frame headers sendSharedLocked
+// writes into one array before it takes another: those of 64 frames, a
+// megabyte of body in frames of the default size.
+const h2FrameHeadsSize = 64 * h2FrameHeaderLen
 
 // endStreamLocked marks the response on st sent, sending its trailers, which
 // end the stream, if it has any. They are encoded only now, as they go out,

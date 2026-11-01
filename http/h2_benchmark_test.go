@@ -49,6 +49,24 @@ func BenchmarkH2ServerStatic(b *testing.B) {
 	}
 }
 
+// BenchmarkH2ServerLarge answers with bodies that take many DATA frames each,
+// whole in memory as a handler or FileCache hands them over, and reports the
+// body bytes a second.
+func BenchmarkH2ServerLarge(b *testing.B) {
+	for _, tls := range []bool{false, true} {
+		for _, size := range []int{64 << 10, 256 << 10, 1 << 20, 4 << 20} {
+			name := "h2c/" + strconv.Itoa(size>>10) + "KB"
+			if tls {
+				name = "TLS/" + strconv.Itoa(size>>10) + "KB"
+			}
+			b.Run(name, func(b *testing.B) {
+				b.SetBytes(int64(size))
+				benchmarkH2Server(b, h2BenchOptions{handler: h2BenchStatic(size), tls: tls})
+			})
+		}
+	}
+}
+
 // BenchmarkH2ServerStaticTLS is BenchmarkH2ServerStatic over TLS, where the
 // body is also sealed into records.
 func BenchmarkH2ServerStaticTLS(b *testing.B) {

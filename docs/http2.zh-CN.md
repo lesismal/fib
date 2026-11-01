@@ -262,6 +262,26 @@ socket 上（系统调用，TLS 上还有 AES-GCM），拷贝占比不大：memm
 去掉一次拷贝只值几个百分点的原因。其余分配主要来自客户端和测试框架（task pool 的环形
 队列、定时器，以及 benchmark 自己的读取）。
 
+`BenchmarkH2ServerLarge` 用 64KB 到 4MB 的整体 body 应答，覆盖 h2c 与 TLS，并报告每秒
+body 字节数。在 Linux（Docker，14 个 arm64 CPU）上做 profile，h2c 多帧路径有四分之一的
+采样在 memmove：一半是把 body 拷进帧，一半是把帧拷进连接的发送队列。改为把 body 放在帧
+旁边发送后（前后各跑 10 次取中位数）：
+
+| Benchmark | 之前 | 之后 |
+| --- | --- | --- |
+| Large h2c 64KB | 7.55 µs | 4.99 µs（-34%） |
+| Large h2c 256KB | 28.4 µs | 19.2 µs（-32%） |
+| Large h2c 1MB | 112.5 µs | 60.6 µs（-46%） |
+| Large h2c 4MB | 430 µs | 252 µs（-42%） |
+| Static 64KB | 7.74 µs | 5.85 µs（-24%） |
+| Large TLS 64KB-4MB | | ±3% 以内，路径未变 |
+
+走单帧路径的 Static 1KB 和 16KB 没有超出噪声的变化。端到端用 h2load（8 条连接 x 16 个
+stream，4 个线程，与服务端分开绑核）在同一容器里压 `benchmark/loadtest` 的 `/big`，每种
+情况交替跑三对、每次 10 秒，h2c 的请求速率每一对都有提升：中位数 64KB 从每秒 65,801 到
+84,401（这一项噪声较大），256KB 从 80,444 到 85,123，1MB 从 21,523 到 25,476，4MB 从
+5,210 到 6,814。TLS 上两边的速率在噪声范围内一致。
+
 ## 压测
 
 `benchmark/loadtest` 每次压 30 秒，覆盖 4 条连接 512 个 stream 与 64 条连接 512 个
@@ -323,13 +343,17 @@ HTTP/3 比 HTTP/2 明显。更长时间的 soak 和带丢包的网络路径仍�
 - **HPACK 编码器动态表索引**：已完成，动态表超过 16 项后按名字和名字-值的哈希索引查找，不再逐项搜索；
   表也可以长到 `HeaderTableSize` 与对端允许的范围。
 - **基准测试**：已完成。`http/h2_benchmark_test.go` 像 h2load 一样在单连接上保持 100 个请求并发，
-  覆盖 h2c 与 TLS、GET、POST、1KB/16KB/64KB 静态 body、流式上传和 server push；`hpack` 有编码与
+  覆盖 h2c 与 TLS、GET、POST、1KB/16KB/64KB 静态 body、64KB 到 4MB 的整体 body、流式上传和 server push；`hpack` 有编码与
   解码 benchmark。数字见下文[基准测试](#基准测试)。
 - **push 的 stream**：已完成，和服务端 client stream 一样复用，连同它持有的 `Request`、`URL` 和
   `Context`。body 流式交付的 stream 仍然分配，因为它的回调可能在响应结束之后发生。
-- **发送路径的拷贝**：h2c 上 body 能装进一帧的整体响应已经从两次拷贝降到一次；更大的 body
-  以及 TLS 上的响应仍要先拷进帧，再拷进连接或 record，要再减少需要协议层支持分散写
-  （vectored send），当前没有。
+- **发送路径的拷贝**：h2c 上已完成：整体响应超过 4KB 的 body 完全不拷贝。连接像 HTTP/1
+  保留大 body 那样直接保留 handler 给的切片，把每个 DATA 帧的帧头和 payload 作为同一次
+  `writev` 的不同部分写出；能装进一帧的 body 也同样放在帧旁边发送。收益见
+  [基准测试](#基准测试)。body 是请求自己的缓冲区、是 `*Copy` 调用从池里拿的副本，或者响应
+  通过 `ResponseWriter` 流式写出时，仍会拷进帧，因为这些字节活不过调用本身。TLS 上 body
+  仍先拷进帧再加密：layer 每次发送都封成独立的 record，帧头和 payload 分开交过去，每帧就要
+  多一个 record；而且这条路径的时间主要花在 AES-GCM 上，不在拷贝上。
 
 ### 5. 请求 trailer（低）
 
