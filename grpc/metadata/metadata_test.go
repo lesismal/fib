@@ -29,6 +29,9 @@ func TestMetadata(t *testing.T) {
 	if !ok || fmt.Sprint(out["k"]) != "[v v3]" || fmt.Sprint(out["k2"]) != "[v2]" {
 		t.Fatalf("outgoing = %v", out)
 	}
+	if out, ok := FromOutgoingContext(context.Background()); ok || out != nil {
+		t.Fatalf("outgoing of a bare context = %v, %v", out, ok)
+	}
 	in := NewIncomingContext(context.Background(), Pairs("k", "v"))
 	got, _ := FromIncomingContext(in)
 	got["k"][0] = "changed"

@@ -9,6 +9,9 @@ import (
 // when none does, and moves the built pool with it.
 func TestCeilingFollowsTheWidestEngine(t *testing.T) {
 	const engine = "ceiling"
+	if got := Ceiling(engine); got != 0 {
+		t.Fatalf("Ceiling() = %d before the pool is built, want 0", got)
+	}
 	pool := Get(engine, 100, 64)
 	if Get(engine, 1, 1) != pool {
 		t.Fatal("a second Get built another pool")
