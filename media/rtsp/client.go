@@ -202,7 +202,7 @@ type clientStream struct {
 // OnPacket until the stream or the client ends, which OnClose hears. It
 // returns once the dial has started.
 func Play(config ClientConfig, rawURL string) (*Client, error) {
-	return start(config, rawURL, false, nil)
+	return start(config, rawURL, false, nil, nil)
 }
 
 // Publish publishes tracks to the stream at rawURL: it ANNOUNCEs them,
@@ -210,10 +210,12 @@ func Play(config ClientConfig, rawURL string) (*Client, error) {
 // may send. Tracks RTP cannot carry are left out: their packets are
 // dropped.
 func Publish(config ClientConfig, rawURL string, tracks []*av.Track) (*Client, error) {
-	return start(config, rawURL, true, tracks)
+	return start(config, rawURL, true, tracks, nil)
 }
 
-func start(config ClientConfig, rawURL string, publish bool, tracks []*av.Track) (*Client, error) {
+// start makes the client and dials; created, when set, is given the client
+// before the dial, so it has it before any callback runs.
+func start(config ClientConfig, rawURL string, publish bool, tracks []*av.Track, created func(*Client)) (*Client, error) {
 	if config.Engine == nil {
 		return nil, errors.New("rtsp: ClientConfig.Engine is nil")
 	}
@@ -269,6 +271,9 @@ func start(config ClientConfig, rawURL string, publish bool, tracks []*av.Track)
 		c.tracks = tracks
 	}
 	c.timer = time.AfterFunc(time.Hour, c.onTimer)
+	if created != nil {
+		created(c)
+	}
 	err = config.Engine.DialWithHandler("tcp", host, config.DialTimeout, (*clientHandler)(c), c.dialed)
 	if err != nil {
 		c.timer.Stop()

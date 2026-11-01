@@ -327,15 +327,23 @@ func TestRelay(t *testing.T) {
 		pub.WritePacket(p)
 	}
 	ce := run(t)
-	local := hub.New(hub.Config{})
+	infos := make(chan hub.PublishInfo, 1)
+	local := hub.New(hub.Config{OnPublish: func(_ string, info hub.PublishInfo) error {
+		infos <- info
+		return nil
+	}})
 	user := newSink()
 	cfg := user.config()
 	cfg.Engine = ce
-	relay, err := PlayToHub(cfg, base+"src", local, "copy")
+	relay, err := PlayToHub(cfg, base+"src?token=abc", local, "copy")
 	if err != nil {
 		t.Fatal(err)
 	}
 	user.wait(t, "relay tracks", func(s *sink) bool { return len(s.tracks) > 0 })
+	// The hub hears where the stream comes from, and the URL's query.
+	if info := <-infos; info.Protocol != "rtsp" || info.Query != "token=abc" || info.Remote.String() != strings.TrimSuffix(strings.TrimPrefix(base, "rtsp://"), "/") {
+		t.Fatalf("publish info %+v, base %s", info, base)
+	}
 	s := newSink()
 	if _, err := local.Subscribe("copy", s, hub.SubscribeOptions{}); err != nil {
 		t.Fatal(err)

@@ -1,6 +1,7 @@
 package rtsp
 
 import (
+	"net/url"
 	"slices"
 	"sync"
 
@@ -12,18 +13,15 @@ import (
 // a relay or a pull proxy does: the first tracks publish the stream, a
 // change of them goes to the publisher's SetTracks, and the end of the
 // client unpublishes it. config's own callbacks are called too, after the
-// hub has the tracks or packet. A refused publish closes the client.
+// hub has the tracks or packet. A refused publish closes the client. The
+// PublishInfo is protocol "rtsp", the server's address, and rawURL's
+// query, for the hub's OnPublish hook.
 func PlayToHub(config ClientConfig, rawURL string, h *hub.Hub, path string) (*Client, error) {
 	r := &relay{h: h, path: path, user: config}
 	config.OnTracks, config.OnPacket, config.OnClose = r.onTracks, r.onPacket, r.onClose
-	c, err := Play(config, rawURL)
-	if err != nil {
-		return nil, err
-	}
-	r.mu.Lock()
-	r.c = c
-	r.mu.Unlock()
-	return c, nil
+	// The relay has the client before the dial, so the first tracks,
+	// however soon they come, find it and its connection.
+	return start(config, rawURL, false, nil, func(c *Client) { r.c = c })
 }
 
 // relay publishes what a playing client gives. The client serializes its
@@ -33,29 +31,24 @@ type relay struct {
 	path string
 	user ClientConfig
 	pub  *hub.Publisher
-
-	mu sync.Mutex
-	c  *Client
+	c    *Client
 }
 
 func (r *relay) onTracks(tracks []*av.Track) {
 	if r.pub == nil {
-		r.mu.Lock()
 		c := r.c
-		r.mu.Unlock()
 		info := hub.PublishInfo{Protocol: "rtsp"}
-		if c != nil {
-			c.mu.Lock()
-			if c.conn != nil {
-				info.Remote = c.conn.RemoteAddrPort()
-			}
-			c.mu.Unlock()
+		if u, err := url.Parse(c.url); err == nil {
+			info.Query = u.RawQuery
 		}
+		c.mu.Lock()
+		if c.conn != nil {
+			info.Remote = c.conn.RemoteAddrPort()
+		}
+		c.mu.Unlock()
 		pub, err := r.h.Publish(r.path, slices.Clone(tracks), info)
 		if err != nil {
-			if c != nil {
-				c.Close()
-			}
+			c.Close()
 			return
 		}
 		r.pub = pub
