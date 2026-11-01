@@ -186,14 +186,14 @@ func (m *Muxer) OnTracks(tracks []*av.Track) {
 	m.wake()
 }
 
-// continuer is a SegmentWriter whose timeline starts at 0 and can carry
-// on another's, as fMP4's does: after a discontinuity the next writer
-// starts where the last one ended, so that decode times never go back.
-// Players need not keep them going (RFC 8216 section 4.3.2.3), but ffmpeg
-// keeps its MP4 demuxer across a discontinuity with the same init section
-// and discards samples whose decode times went back: a republish lost its
-// first segment. MPEG-TS segments keep the publisher's own times, which
-// players expect to jump at a discontinuity.
+// continuer is a SegmentWriter whose timeline can carry on another's, as
+// fMP4's and MPEG-TS's do: after a discontinuity the next writer starts
+// where the last one ended, so that decode times never go back. Players
+// need not keep them going (RFC 8216 section 4.3.2.3), but ffmpeg keeps
+// its MP4 demuxer across a discontinuity with the same init section and
+// discards samples whose decode times went back: a republish lost its
+// first segment; and its correction of a transport stream's jump back
+// repeated a decode time.
 type continuer interface {
 	End() time.Duration
 	StartAt(time.Duration)
