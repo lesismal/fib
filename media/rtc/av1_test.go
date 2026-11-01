@@ -129,6 +129,9 @@ func TestAV1Codecs(t *testing.T) {
 	if !receivable(offered[0]) {
 		t.Fatal("AV1 not receivable")
 	}
+	if receivable(webrtc.Codec{MimeType: "audio/MP4A-LATM", ClockRate: 44100}) {
+		t.Fatal("AAC receivable")
+	}
 	var found bool
 	for _, c := range DefaultReceiveCodecs() {
 		found = found || c.Name() == "AV1"
