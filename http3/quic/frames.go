@@ -133,11 +133,13 @@ func (c *Conn) handleFrames(space int, payload []byte, now time.Time) (bool, err
 	r := reader{b: payload}
 	ackEliciting := false
 	c.nonProbing = false
-	// pinged says the packet has a PING, or a BLOCKED frame that reports
-	// nothing new, and asked that it has another frame that elicits an
-	// acknowledgement; dataRaised that MAX_DATA let more be sent, which the
-	// streams waiting for it learn of once, after the last.
+	// pinged says the packet has a PING, or a frame that raises or reports
+	// no limit (see flood.go), and asked that it has another frame that
+	// elicits an acknowledgement; dataRaised that MAX_DATA let more be sent,
+	// which the streams waiting for it learn of once, after the last.
 	pinged, asked, dataRaised := false, false, false
+	// cryptoNew says the packet carried handshake data not received before.
+	cryptoNew := false
 	c.ackedNew = false
 	for len(r.b) > 0 && !c.closed {
 		typ := r.varint()
@@ -212,6 +214,7 @@ func (c *Conn) handleFrames(space int, payload []byte, now time.Time) (bool, err
 			if r.bad {
 				break
 			}
+			cryptoNew = cryptoNew || off+uint64(len(data)) > c.spaces[space].cryptoRecv.offset
 			err = c.handleCrypto(space, off, data)
 		case typ == frameNewToken:
 			token := r.bytes(r.varint())
@@ -259,8 +262,8 @@ func (c *Conn) handleFrames(space int, payload []byte, now time.Time) (bool, err
 			if max := r.varint(); max > c.peerMaxData {
 				c.peerMaxData = max
 				dataRaised = true
-			} else if !r.bad {
-				err = c.glitch()
+			} else {
+				asking = false
 			}
 		case typ == frameMaxStreamData:
 			id, max := r.varint(), r.varint()
@@ -276,7 +279,7 @@ func (c *Conn) handleFrames(space int, payload []byte, now time.Time) (bool, err
 				s.sendMax = max
 				c.queueStream(s)
 			} else if !s.reset && !s.finQueued {
-				err = c.glitch()
+				asking = false
 			}
 		case typ == frameMaxStreamsBidi || typ == frameMaxStreamsUni:
 			max := r.varint()
@@ -291,8 +294,8 @@ func (c *Conn) handleFrames(space int, payload []byte, now time.Time) (bool, err
 			if max > *limit {
 				*limit = max
 				c.events = append(c.events, event{kind: evStreamsAvailable})
-			} else if !r.bad {
-				err = c.glitch()
+			} else {
+				asking = false
 			}
 		case typ == frameDataBlocked:
 			if at := r.varint(); !r.bad {
@@ -379,7 +382,8 @@ func (c *Conn) handleFrames(space int, payload []byte, now time.Time) (bool, err
 			return false, transportErr(errFrameEncoding, "malformed frame")
 		}
 		if eliciting && !asking {
-			// A BLOCKED frame that reports nothing new is a PING.
+			// A limit that raises nothing, or a BLOCKED frame that reports
+			// nothing new, is a PING.
 			pinged = true
 		}
 		asked = asked || asking
@@ -391,9 +395,13 @@ func (c *Conn) handleFrames(space int, payload []byte, now time.Time) (bool, err
 			}
 		}
 	}
+	if space == spaceInitial && !c.isClient && ackEliciting && !cryptoNew && !c.closed {
+		c.speedUpHandshakeLocked()
+	}
 	if pinged && !asked && !c.ackedNew && !c.closed {
-		// A PING alone asks for an acknowledgement and nothing else, and
-		// so does a BLOCKED frame that repeats what the peer said before.
+		// A PING alone asks for an acknowledgement and nothing else, and so
+		// does a limit that raises nothing, or a BLOCKED frame that repeats
+		// what the peer said before.
 		if err := c.glitch(); err != nil {
 			return false, err
 		}

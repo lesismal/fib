@@ -22,18 +22,24 @@ import "time"
 // for.
 //
 // Glitches count the frames that ask for work and carry nothing: a packet
-// that elicits an acknowledgement with nothing but PING, or BLOCKED frames
+// that elicits an acknowledgement with nothing but PING, MAX_DATA,
+// MAX_STREAM_DATA and MAX_STREAMS that raise no limit, or BLOCKED frames
 // that report no new limit, unless an acknowledgement in it acknowledged
 // something new, as the acknowledgements a busy receiver bundles a PING
-// with do; PATH_CHALLENGE, which is answered; MAX_DATA, MAX_STREAM_DATA and
-// MAX_STREAMS that raise no limit; DATA_BLOCKED, STREAM_DATA_BLOCKED and
-// STREAMS_BLOCKED for a limit this side never gave; a STREAM frame with no
-// data that ends nothing; and
+// with do; PATH_CHALLENGE, which is answered; DATA_BLOCKED,
+// STREAM_DATA_BLOCKED and STREAMS_BLOCKED for a limit this side never gave;
+// a STREAM frame with no data that ends nothing; and
 // NEW_CONNECTION_ID for a connection ID already retired, which is answered
 // with RETIRE_CONNECTION_ID. Frames that cost no more than their bytes to
 // read, and those a peer may send in flight for a stream that has ended,
 // such as MAX_STREAM_DATA or RESET_STREAM for one this side has forgotten,
 // are not counted.
+//
+// A limit that raises nothing is counted only that way, as a PING is, since
+// a peer may send many in one packet next to what it asks for, and some do:
+// quic-go raises MAX_STREAMS once for each stream that ends, and when
+// several end at once, the frames for them can be queued out of order, so
+// that most of a packet's raise nothing past the largest of them.
 //
 // A sender blocked by flow control says so once for each limit it reaches
 // (RFC 9000 section 4.1), and one uploading fast against small windows

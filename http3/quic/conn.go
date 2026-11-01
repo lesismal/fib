@@ -483,6 +483,9 @@ type Conn struct {
 	// before, which a PING bundled with it does not count against glitches.
 	glitches, resets floodBudget
 	ackedNew         bool
+	// handshakeSpeedups counts the times a server sent its Initial data
+	// again ahead of its probe timeout (see speedUpHandshakeLocked).
+	handshakeSpeedups int
 	// ackFreq is what the peer asked of this side's acknowledgements, and
 	// ackFreqRequested and ackFreqPending what this side asked of the
 	// peer's: whether it has, and whether the frame is still to go out,
