@@ -86,12 +86,47 @@ func TestSendCodec(t *testing.T) {
 	}
 	var dropped []av.CodecID
 	outs, codecs := planEgress([]*av.Track{nil, {Codec: av.CodecAAC}, cb, {Codec: av.CodecOpus}}, nil, 1200,
-		func(c av.CodecID) { dropped = append(dropped, c) })
+		func(c av.CodecID, _ bool) { dropped = append(dropped, c) })
 	if len(outs) != 2 || len(codecs) != 2 || len(dropped) != 1 || outs[0].hub != 2 {
 		t.Fatalf("plan: %d %d %v", len(outs), len(codecs), dropped)
 	}
 	if outs, _ := planEgress([]*av.Track{cb}, nil, 10, nil); len(outs) != 0 {
 		t.Fatal("tiny MTU accepted")
+	}
+}
+
+// TestPlanEgressSections checks each track goes in a section of its own,
+// the first of its kind left that receives and takes its codec, and that
+// a track no section is left for is reported as carried.
+func TestPlanEgressSections(t *testing.T) {
+	audio := func(dir string, codecs ...webrtc.Codec) *sdp.MediaDescription {
+		md := sdp.NewMedia("audio", 9, "UDP/TLS/RTP/SAVPF")
+		for _, c := range codecs {
+			md.AddCodec(toSDP(c))
+		}
+		md.AddFlag(dir)
+		return md
+	}
+	pcmu := webrtc.Codec{MimeType: "audio/PCMU", ClockRate: 8000, PayloadType: 0}
+	sd := sdp.New(1, 1)
+	sd.AddMedia(sdp.NewMedia("video", 0, "UDP/TLS/RTP/SAVPF", "96")) // rejected
+	sd.AddMedia(audio("sendonly", opusCodec, pcmu))
+	sd.AddMedia(audio("recvonly", pcmu))
+	sd.AddMedia(sdp.NewDataChannelMedia())
+	sd.AddMedia(audio("sendrecv", opusCodec, pcmu))
+	opus := &av.Track{Codec: av.CodecOpus}
+	streams := []*av.Track{opus, {Codec: av.CodecPCMU}, opus, {Codec: av.CodecAAC}}
+	type drop struct {
+		c       av.CodecID
+		carried bool
+	}
+	var dropped []drop
+	outs, codecs := planEgress(streams, sd, 1200, func(c av.CodecID, carried bool) { dropped = append(dropped, drop{c, carried}) })
+	if len(outs) != 2 || outs[0].hub != 0 || outs[0].section != 4 || outs[1].hub != 1 || outs[1].section != 2 || len(codecs) != 2 {
+		t.Fatalf("%+v %+v", outs, codecs)
+	}
+	if len(dropped) != 2 || dropped[0] != (drop{av.CodecOpus, true}) || dropped[1] != (drop{av.CodecAAC, false}) {
+		t.Fatalf("%+v", dropped)
 	}
 }
 
@@ -192,6 +227,25 @@ func testSender(t *testing.T, limit int) (*sender, []*av.Track) {
 	s.OnTracks(streams)
 	s.setTracks(outs)
 	return s, streams
+}
+
+// TestSenderKeepsPlannedTracks checks each outTrack sends the stream
+// track it was planned for, not the one of its own index, and goes on
+// with it when the stream's tracks change.
+func TestSenderKeepsPlannedTracks(t *testing.T) {
+	opus := &av.Track{Codec: av.CodecOpus, SampleRate: 48000, Channels: 2}
+	streams := []*av.Track{{Codec: av.CodecAAC}, opus, opus}
+	outs, _ := planEgress(streams, nil, 1200, nil)
+	s := newSender(100)
+	s.OnTracks(streams)
+	s.setTracks(outs)
+	if outs[0].hub != 1 || outs[1].hub != 2 {
+		t.Fatalf("hubs %d %d", outs[0].hub, outs[1].hub)
+	}
+	s.OnTracks([]*av.Track{opus, opus, opus})
+	if outs[0].hub != 1 || outs[1].hub != 2 || s.byHub[0] != -1 {
+		t.Fatalf("hubs %d %d %v", outs[0].hub, outs[1].hub, s.byHub)
+	}
 }
 
 func avcc(n int) []byte {

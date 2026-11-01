@@ -33,6 +33,9 @@ type outTrack struct {
 	pk    *rtpcodec.Packetizer
 	// hub is the index of the stream track it sends, -1 for none.
 	hub int
+	// section is the index of the offer's media section it is sent in,
+	// -1 when it was planned without an offer.
+	section int
 }
 
 // sender sends a stream of av.Packets over a PeerConnection: the
@@ -103,9 +106,10 @@ func (s *sender) Streams() []*av.Track {
 	return s.streams
 }
 
-// mapTracks gives each outTrack the stream track it sends: the one of the
-// same index if it has the same codec, or else the first unclaimed one of
-// that codec. A track of a codec the stream no longer has sends nothing.
+// mapTracks gives each outTrack the stream track it sends: the one it
+// sent, or was planned for, if it still has the same codec, or else the
+// first unclaimed one of that codec. A track of a codec the stream no
+// longer has sends nothing.
 func (s *sender) mapTracks(streams []*av.Track) {
 	s.streams = streams
 	s.hasVideo = false
@@ -124,9 +128,10 @@ func (s *sender) mapTracks(streams []*av.Track) {
 		_ = s.tracks[i].pk.SetTrack(streams[j]) // same codec: cannot fail
 	}
 	for i, t := range s.tracks {
+		j := t.hub
 		t.hub = -1
-		if i < len(streams) && streams[i] != nil && streams[i].Codec == t.codec {
-			claim(i, i)
+		if j >= 0 && j < len(streams) && streams[j] != nil && streams[j].Codec == t.codec && s.byHub[j] < 0 {
+			claim(i, j)
 		}
 	}
 	for i, t := range s.tracks {

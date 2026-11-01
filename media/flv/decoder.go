@@ -7,6 +7,7 @@ import (
 	"github.com/lesismal/fib/media/amf"
 	"github.com/lesismal/fib/media/av"
 	"github.com/lesismal/fib/media/codec/aac"
+	"github.com/lesismal/fib/media/codec/av1"
 	"github.com/lesismal/fib/media/codec/h264"
 	"github.com/lesismal/fib/media/codec/h265"
 	"github.com/lesismal/fib/media/codec/opus"
@@ -337,7 +338,8 @@ func (d *Decoder) Flush() {
 }
 
 // videoTrack builds the track a video sequence header describes, and the
-// NAL unit length size of its frames.
+// NAL unit length size of its frames. The picture size comes from the
+// H.264 or H.265 SPS, or the AV1 sequence header.
 func videoTrack(codec av.CodecID, config []byte) (*av.Track, int, error) {
 	t := &av.Track{Codec: codec, Config: append([]byte(nil), config...)}
 	switch codec {
@@ -363,6 +365,12 @@ func videoTrack(codec av.CodecID, config []byte) (*av.Track, int, error) {
 			}
 		}
 		return t, c.LengthSize, nil
+	case av.CodecAV1:
+		var c av1.Config
+		var s av1.SequenceHeader
+		if c.Unmarshal(config) == nil && s.Unmarshal(c.SequenceHeader()) == nil {
+			t.Width, t.Height = s.Width, s.Height
+		}
 	}
 	return t, 0, nil
 }

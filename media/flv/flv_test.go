@@ -80,7 +80,7 @@ func TestFixtures(t *testing.T) {
 	}{
 		{"h264_aac.flv", []av.Track{{Codec: av.CodecH264, Width: 160, Height: 120}, {Codec: av.CodecAAC, SampleRate: 44100, Channels: 1}}, Header{true, true}},
 		{"hevc_aac.flv", []av.Track{{Codec: av.CodecH265, Width: 160, Height: 120}, {Codec: av.CodecAAC, SampleRate: 44100, Channels: 1}}, Header{true, true}},
-		{"av1.flv", []av.Track{{Codec: av.CodecAV1}}, Header{false, true}},
+		{"av1.flv", []av.Track{{Codec: av.CodecAV1, Width: 160, Height: 120}}, Header{false, true}},
 		{"mp3.flv", []av.Track{{Codec: av.CodecMP3, SampleRate: 44100, Channels: 1}}, Header{true, false}},
 		{"pcma.flv", []av.Track{{Codec: av.CodecPCMA, SampleRate: 8000, Channels: 1}}, Header{true, false}},
 	}
@@ -661,6 +661,11 @@ func TestDecoderLengthSize(t *testing.T) {
 	d.Flush()
 	if got == nil || !bytes.Equal(got.Data, []byte{0, 0, 0, 2, 0x65, 1}) {
 		t.Fatalf("%+v", got)
+	}
+	// An AV1 record without a readable sequence header keeps the track,
+	// without a size.
+	if tr, _, err := videoTrack(av.CodecAV1, []byte{0x81, 0, 0, 0}); err != nil || tr.Width != 0 || tr.Height != 0 {
+		t.Fatal(tr, err)
 	}
 	if audLen(av.CodecH265, []byte{0, 0, 0, 2, 35 << 1, 1}) != 6 || audLen(av.CodecH264, nil) != 0 {
 		t.Fatal("audLen")

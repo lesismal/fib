@@ -273,7 +273,11 @@ rtcServer, _ := rtc.NewServer(rtc.Config{Hub: h,
   这两者只播视频。
 - 协议接入不了的 track 在接入时就被丢弃：FLV 解码器丢弃它不认识的编码的 tag（VP6、Speex、
   Nellymoser……），MPEG-TS demuxer 跳过 MP3、MPEG-2 视频和 AC-3。分发方向上，WHEP 端点在
-  第一次去掉 AAC、MP3 时各记一行日志。
+  第一次去掉 AAC、MP3 时各记一行日志。WHEP 把每个 track 放进观看者 offer 中各自独占的一个
+  media section：同类型里第一个还空着、且提供了适合该 track 的编码的 section。所以 Opus 加
+  PCMU、或两种视频编码的流，只有当 offer 里该类型有两个 section 时才能完整送到观看者（fib 的
+  `rtc.Pull` 每种类型只 offer 一个）。分不到 section 的 track 不发送，每种编码第一次时记一行
+  日志。
 
 ## 一个服务跑全部协议
 
@@ -728,7 +732,7 @@ WHEP 观众若在 offer 中要求 NACK（浏览器对视频都会这样做），
   `EXT-X-PROGRAM-DATE-TIME`；多 variant；I 帧播放列表；加密。分片比目标时长更长时（关键帧
   间隔大于 `TargetDuration`），`EXT-X-TARGETDURATION` 会被调高，严格来说规范不允许这样做。
 - **WHIP/WHEP**：ICE restart（回 422）；simulcast（每个 media section 只接收第一层）；每种
-  媒体超过 offer 中 section 数量的流；FEC，以及 WHIP 会话与客户端发送 NACK（只有 WHEP 会话
+  媒体超过 offer 中 section 数量的流（多出的记日志、不发送）；FEC，以及 WHIP 会话与客户端发送 NACK（只有 WHEP 会话
   应答 NACK）；流的编码变化时重新协商（旧编码的 track 停止）。WHIP 按发布者的 sender report
   对齐各 track：在第一批 report 到达之前（浏览器要一秒多之后才发），以及对从不发 report 的发布
   者，各 track 之间的偏差只能保证在网络抖动和各编码器延迟之差以内。

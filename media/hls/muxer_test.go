@@ -13,6 +13,7 @@ import (
 
 	"github.com/lesismal/fib/media/av"
 	"github.com/lesismal/fib/media/codec/aac"
+	"github.com/lesismal/fib/media/codec/av1"
 	"github.com/lesismal/fib/media/fmp4"
 )
 
@@ -31,6 +32,25 @@ func h264Track(t testing.TB) *av.Track {
 
 func h265Track(t testing.TB) *av.Track {
 	return &av.Track{Codec: av.CodecH265, Config: readFile(t, "h265_main_720.hvcc")}
+}
+
+// av1Track is the 160x120 profile 0 stream of the av1 package's fixture.
+func av1Track(t testing.TB) *av.Track {
+	b, err := os.ReadFile("../codec/av1/testdata/av1.obu")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for o := range av1.SplitOBUs(b) {
+		if o.Type() == av1.OBUSequenceHeader {
+			c, err := av1.NewConfig(av1.AppendOBU(nil, o, true))
+			if err != nil {
+				t.Fatal(err)
+			}
+			return &av.Track{Codec: av.CodecAV1, Config: c.Append(nil)}
+		}
+	}
+	t.Fatal("no sequence header")
+	return nil
 }
 
 func aacTrack(t testing.TB) *av.Track {
@@ -528,6 +548,9 @@ func TestCodecString(t *testing.T) {
 		{&av.Track{Codec: av.CodecAV1, Config: []byte{0x81, 0x4d, 0xc0, 0}}, "av01.2.13H.10"},
 		{&av.Track{Codec: av.CodecAV1, Config: []byte{0x81, 0x4d, 0xe0, 0}}, "av01.2.13H.12"},
 		{&av.Track{Codec: av.CodecAV1, Config: []byte{0x81}}, ""},
+		{&av.Track{Codec: av.CodecAV1, Config: []byte{0x81, 0x08, 0x0c}}, ""},
+		{&av.Track{Codec: av.CodecAV1, Config: []byte{0x82, 0x08, 0x0c, 0}}, ""},
+		{av1Track(t), "av01.0.00M.08"},
 	} {
 		if got := CodecString(c.t); got != c.want {
 			t.Errorf("%+v: %q, want %q", c.t, got, c.want)
@@ -541,6 +564,7 @@ func TestCodecString(t *testing.T) {
 		{h265Track(t), 1280, 720},
 		{&av.Track{Codec: av.CodecH264, Width: 3, Height: 4}, 3, 4},
 		{&av.Track{Codec: av.CodecAV1}, 0, 0},
+		{av1Track(t), 160, 120},
 	} {
 		if w, h := videoSize(c.t); w != c.w || h != c.h {
 			t.Errorf("%+v: %dx%d", c.t, w, h)

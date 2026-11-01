@@ -109,6 +109,7 @@ func TestAppendInitErrors(t *testing.T) {
 		{Codec: av.CodecH264, Config: []byte{1}},
 		{Codec: av.CodecH265, Config: []byte{1}},
 		{Codec: av.CodecAV1, Config: []byte{1, 2, 3, 4}},
+		{Codec: av.CodecAV1, Config: []byte{0x82, 0x08, 0x0c, 0}},
 		{Codec: av.CodecAAC, Config: []byte{0xff}},
 		{Codec: av.CodecOpus, Config: []byte("OpusHead")},
 	}

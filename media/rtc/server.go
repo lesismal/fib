@@ -234,7 +234,10 @@ type Server struct {
 	sessions   map[string]*session
 	publishers map[string]*session
 	closed     bool
-	logged     [256]atomic.Bool
+	// logged and loggedNoSection say a dropped track of a codec has been
+	// logged, for each of the two reasons.
+	logged          [256]atomic.Bool
+	loggedNoSection [256]atomic.Bool
 	// playWaiters counts the WHEP offers waiting for a publisher.
 	playWaiters atomic.Int64
 }
@@ -606,10 +609,15 @@ func (s *Server) keyFrame(path string) {
 	}
 }
 
-// dropped logs, once per codec, a track WebRTC does not carry.
-func (s *Server) dropped(codec av.CodecID) {
-	if !s.logged[codec].Swap(true) {
+// dropped logs, once per codec and reason, a track a viewer is not sent:
+// one WebRTC does not carry, or one carried that the viewer's offer has no
+// media section left for, in a codec that suits it.
+func (s *Server) dropped(codec av.CodecID, carried bool) {
+	switch {
+	case !carried && !s.logged[codec].Swap(true):
 		log.Info("rtc: track not sent over WebRTC, which cannot carry it without transcoding", "codec", codec.String())
+	case carried && !s.loggedNoSection[codec].Swap(true):
+		log.Info("rtc: track not sent to a WHEP viewer whose offer has no media section left that takes its codec", "codec", codec.String())
 	}
 }
 
@@ -819,13 +827,11 @@ func (sess *session) startEgress(offer *sdp.SessionDescription, desc webrtc.Sess
 	if err := sess.newPeerConnection(codecs, s.config.RetransmitPackets); err != nil {
 		return err
 	}
+	if err := sess.addTracks(offer, outs); err != nil {
+		return err
+	}
 	for _, o := range outs {
-		rs, err := sess.pc.AddTrack(o.local)
-		if err != nil {
-			return fmt.Errorf("%w: %v", errInternal, err)
-		}
-		o.rtp = rs
-		rs.OnKeyFrameRequest(func() { s.keyFrame(sess.path) })
+		o.rtp.OnKeyFrameRequest(func() { s.keyFrame(sess.path) })
 	}
 	sess.pc.OnRTCP(func(pkt []byte) {
 		snd.onRTCP(func(ssrc uint32) bool {
@@ -854,24 +860,63 @@ func (sess *session) startEgress(offer *sdp.SessionDescription, desc webrtc.Sess
 	return nil
 }
 
-// planEgress returns the tracks a viewer is sent, each in the codec the
-// offer has for it, and those codecs; a stream track WebRTC cannot carry,
-// or the offer has no codec for, is left out and reported to dropped.
-func planEgress(streams []*av.Track, offer *sdp.SessionDescription, mtu int, dropped func(av.CodecID)) ([]*outTrack, []webrtc.Codec) {
+// addTracks gives the PeerConnection a transceiver for each audio and
+// video section of the offer, in their order, so that each claims its
+// section when the offer is set: those of outs send their track, the
+// others nothing.
+func (sess *session) addTracks(offer *sdp.SessionDescription, outs []*outTrack) error {
+	bySection := map[int]*outTrack{}
+	for _, o := range outs {
+		bySection[o.section] = o
+	}
+	for i, md := range offer.Media {
+		kind := webrtc.MediaKind(md.Kind())
+		if kind != webrtc.MediaKindAudio && kind != webrtc.MediaKindVideo || md.Rejected() {
+			continue
+		}
+		o := bySection[i]
+		dir := webrtc.DirectionInactive
+		if o != nil {
+			dir = webrtc.DirectionSendOnly
+		}
+		tr, err := sess.pc.AddTransceiver(kind, dir)
+		if err == nil && o != nil {
+			o.rtp = tr.Sender()
+			err = o.rtp.ReplaceTrack(o.local)
+		}
+		if err != nil {
+			return fmt.Errorf("%w: %v", errInternal, err)
+		}
+	}
+	return nil
+}
+
+// planEgress returns the tracks a viewer is sent and the codecs they are
+// sent in. With an offer, each track goes in a media section of its own,
+// the first of its kind left that receives and offers a codec that suits
+// the track, in that codec. A stream track WebRTC cannot carry, or that no
+// section is left for, is left out and reported to dropped, with whether
+// WebRTC carries its codec.
+func planEgress(streams []*av.Track, offer *sdp.SessionDescription, mtu int, dropped func(c av.CodecID, carried bool)) ([]*outTrack, []webrtc.Codec) {
 	var outs []*outTrack
 	var codecs []webrtc.Codec
+	var used []bool
+	if offer != nil {
+		used = make([]bool, len(offer.Media))
+	}
 	for i, t := range streams {
 		if t == nil {
 			continue
 		}
-		var offered []webrtc.Codec
-		if offer != nil {
-			offered = offeredCodecs(offer, kindOf(t.Codec))
+		codec, carried := sendCodec(t, nil)
+		ok, section := carried, -1
+		if ok && offer != nil {
+			codec, section = pickSection(t, offer, used)
+			ok = section >= 0
 		}
-		codec, ok := sendCodec(t, offered)
 		if !ok {
 			if dropped != nil {
-				dropped(t.Codec)
+				dropped(t.Codec, carried)
 			}
 			continue
 		}
@@ -884,12 +929,35 @@ func planEgress(streams []*av.Track, offer *sdp.SessionDescription, mtu int, dro
 			continue
 		}
 		local := webrtc.NewTrackLocal(codec, "fib-"+kindName(t.Codec)+"-"+strconv.Itoa(i), "fib")
-		outs = append(outs, &outTrack{codec: t.Codec, local: local, pk: pk, hub: i})
+		if section >= 0 {
+			used[section] = true
+		}
+		outs = append(outs, &outTrack{codec: t.Codec, local: local, pk: pk, hub: i, section: section})
 		if !containsCodec(codecs, codec) {
 			codecs = append(codecs, codec)
 		}
 	}
 	return outs, codecs
+}
+
+// pickSection returns the first media section of the offer, not used yet,
+// in which a track can be sent, and the codec it is sent in there: one of
+// the track's kind that receives and offers a codec suiting the track. The
+// section is -1 when there is none.
+func pickSection(t *av.Track, offer *sdp.SessionDescription, used []bool) (webrtc.Codec, int) {
+	kind := kindOf(t.Codec)
+	for i, md := range offer.Media {
+		if used[i] || md.Kind() != string(kind) || md.Rejected() {
+			continue
+		}
+		if d := offer.MediaDirection(md); d != sdp.RecvOnly && d != sdp.SendRecv {
+			continue
+		}
+		if c, ok := sendCodec(t, sectionCodecs(md)); ok {
+			return c, i
+		}
+	}
+	return webrtc.Codec{}, -1
 }
 
 func kindName(c av.CodecID) string { return string(kindOf(c)) }

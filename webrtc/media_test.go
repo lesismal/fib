@@ -12,6 +12,32 @@ import (
 	"github.com/lesismal/fib/webrtc/rtp"
 )
 
+// TestStaticPayloadTypeZero sends G.711 µ-law, whose static payload type
+// is 0: the sender writes it like any other.
+func TestStaticPayloadTypeZero(t *testing.T) {
+	pcmu := Codec{MimeType: "audio/PCMU", ClockRate: 8000, PayloadType: 0}
+	e := startEngine(t)
+	a := newPC(t, Configuration{Engine: e, ListenAddr: "127.0.0.1:0", Codecs: []Codec{pcmu}})
+	b := newPC(t, Configuration{Engine: e, ListenAddr: "127.0.0.1:0", Codecs: []Codec{pcmu}})
+	trickle(a, b)
+	track := NewTrackLocal(pcmu, "a", "s")
+	s, err := a.AddTrack(track)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rb := collect(b)
+	ca := connectedCh(a)
+	negotiate(t, a, b, nil)
+	wait(t, ca, "a connected")
+	stop := make(chan struct{})
+	defer close(stop)
+	go fakeRTP(track, 0, stop)
+	got := nextTrack(t, rb)
+	if got.ssrc != s.SSRC() || got.pt != 0 || got.track.Codec().Name() != "PCMU" {
+		t.Fatalf("ssrc %x pt %d codec %+v", got.ssrc, got.pt, got.track.Codec())
+	}
+}
+
 // forwarded writes packets to track as a forwarder would: with header
 // extensions of a source's ids, padding, and every other sequence number
 // missing, as if lost on the way in. The payload's first byte is mark.

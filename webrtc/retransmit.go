@@ -299,7 +299,7 @@ func (s *RTPSender) Retransmitted() (packets, bytes uint64) {
 func (pc *PeerConnection) nacked(h rtp.RTCPHeader, p []byte, now time.Time) {
 	ssrc := binary.BigEndian.Uint32(p[8:])
 	s := pc.senders[ssrc]
-	if s == nil || s.ssrc != ssrc || s.sent == nil || pc.closed || pc.srtpOut == nil || s.pt == 0 {
+	if s == nil || s.ssrc != ssrc || s.sent == nil || pc.closed || pc.srtpOut == nil || !s.hasPT {
 		return
 	}
 	if pad := int(p[len(p)-1]); h.Padding && pad <= len(p)-12 {

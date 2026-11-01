@@ -100,7 +100,7 @@ func (pc *PeerConnection) resolve(t *Transceiver) {
 		t.current = DirectionInactive
 	}
 	t.midBytes = []byte(t.mid)
-	t.sender.setPayloadType(0)
+	t.sender.clearPayloadType()
 	t.sender.rtxPT = 0
 	nack := false
 	if t.current.sends() {
@@ -172,7 +172,7 @@ func (t *Transceiver) Stop() {
 		t.stopped = true
 		t.direction = DirectionInactive
 		t.current = DirectionInactive
-		t.sender.setPayloadType(0)
+		t.sender.clearPayloadType()
 		t.sender.setHistory(false)
 		t.pc.negotiationNeeded()
 	}
@@ -256,8 +256,11 @@ type RTPSender struct {
 	t         *Transceiver
 	track     *TrackLocal
 	ssrc      uint32
-	pt        uint8
 	clockRate uint32
+	// pt is the payload type the sender writes, when hasPT: G.711 has
+	// the static payload type 0.
+	pt    uint8
+	hasPT bool
 
 	packets, octets uint32
 	lastTS          uint32
@@ -335,7 +338,10 @@ func (s *RTPSender) reportClock() *reportClock {
 	return s.track.clock.Load()
 }
 
-func (s *RTPSender) setPayloadType(pt uint8) { s.pt = pt }
+func (s *RTPSender) setPayloadType(pt uint8) { s.pt, s.hasPT = pt, true }
+
+// clearPayloadType leaves the sender with no codec to send in.
+func (s *RTPSender) clearPayloadType() { s.pt, s.hasPT = 0, false }
 
 // detach stops sending the track. It runs under the PeerConnection's
 // mutex.
@@ -345,7 +351,7 @@ func (s *RTPSender) detach() {
 		s.track.removeSender(s)
 		s.track = nil
 	}
-	s.pt = 0
+	s.clearPayloadType()
 }
 
 // TrackLocal is a track of RTP packets the application writes: from a
@@ -491,7 +497,7 @@ func (t *TrackLocal) WritePacket(p *rtp.Packet) error {
 // writeRTP sends p on the sender s, recording it under id, the track's
 // history id for it, if the sender answers NACKs.
 func (pc *PeerConnection) writeRTP(s *RTPSender, p *rtp.Packet, src *[256]string, id uint64) {
-	if pc.closed || pc.srtpOut == nil || s.pt == 0 || s.track == nil {
+	if pc.closed || pc.srtpOut == nil || !s.hasPT || s.track == nil {
 		return
 	}
 	now := time.Now()
@@ -895,7 +901,7 @@ func (pc *PeerConnection) sendReports(now time.Time) {
 	buf := pc.rtcpBuf[:0]
 	for _, t := range pc.transceivers {
 		s := t.sender
-		if s.packets == 0 || s.pt == 0 {
+		if s.packets == 0 || !s.hasPT {
 			continue
 		}
 		rtpTime := s.lastTS + uint32(now.Sub(s.lastAt).Seconds()*float64(s.clockRate))
