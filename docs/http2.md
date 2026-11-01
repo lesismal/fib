@@ -357,6 +357,30 @@ the samples, which is why the copy removed below is worth a few percent.
 The client and the test harness account for most of the remaining
 allocations (the task pool's ring, timers, and the benchmark's own reads).
 
+`BenchmarkH2ServerLarge` answers with whole bodies of 64KB to 4MB, over h2c
+and TLS, and reports their bytes a second. Profiled on Linux (Docker, 14
+arm64 CPUs), the multi-frame h2c path spent a quarter of its samples in
+memmove: half framing the body, half copying the frames into the
+connection's queue. Sending the body beside its frames instead (medians of
+10 runs, before and after):
+
+| Benchmark | before | after |
+| --- | --- | --- |
+| Large h2c 64KB | 7.55 µs | 4.99 µs (-34%) |
+| Large h2c 256KB | 28.4 µs | 19.2 µs (-32%) |
+| Large h2c 1MB | 112.5 µs | 60.6 µs (-46%) |
+| Large h2c 4MB | 430 µs | 252 µs (-42%) |
+| Static 64KB | 7.74 µs | 5.85 µs (-24%) |
+| Large TLS 64KB-4MB | | within ±3%, unchanged path |
+
+Static 1KB and 16KB, which take the one-frame path, did not move outside
+noise. End to end, h2load (8 connections x 16 streams, 4 threads, pinned
+apart from the server) against `benchmark/loadtest`'s `/big` in the same
+container, three interleaved 10-second pairs per case, the h2c request rate
+rose with every pair: medians 65,801 to 84,401 a second at 64KB (a noisy
+case), 80,444 to 85,123 at 256KB, 21,523 to 25,476 at 1MB and 5,210 to 6,814
+at 4MB. Over TLS the rates stayed within the noise of each other.
+
 ## Load testing
 
 `benchmark/loadtest` drives the server for 30 seconds at a time with 512
@@ -442,18 +466,27 @@ still open.
   peer allow.
 - **Benchmarks** are done: `http/h2_benchmark_test.go` drives one connection
   with 100 requests in flight, as h2load does, over h2c and TLS, for GET,
-  POST, static bodies of 1KB, 16KB and 64KB, streamed uploads and server push;
+  POST, static bodies of 1KB, 16KB and 64KB, whole bodies of 64KB to 4MB,
+  streamed uploads and server push;
   `hpack` has encode and decode benchmarks. See
   [Benchmarks](#benchmarks) above.
 - **Pushed streams** are done: a pushed stream and the `Request`, `URL` and
   `Context` it holds come from the same recycling as a client's stream's. A
   stream whose body streams still allocates, since its callbacks can outlive
   the response.
-- **Copies on the send path** are cut for a whole response whose body fits
-  one frame over h2c: it is copied once rather than twice. A larger body, and
-  one over TLS, is still copied into the frames and then into the connection
-  or record; cutting the rest needs a vectored send the protocol layer does
-  not have.
+- **Copies on the send path** are done over h2c: a whole response's body
+  larger than 4KB is not copied at all. The connection keeps it as the
+  handler gave it, as HTTP/1 keeps a large body, and writes each DATA
+  frame's header and payload as separate parts of one `writev`; a body that
+  fits one frame goes beside its frames the same way. See
+  [Benchmarks](#benchmarks) for what it gained. A body that is the request's
+  own buffer, a `*Copy` call's pooled copy, and a response that streams
+  through `ResponseWriter` are still copied into their frames, since their
+  bytes do not outlive the call. Over TLS the body is still copied into the
+  frames and then sealed: the layer seals each send into records of its own,
+  so a frame header and its payload handed over apart would cost a second
+  record per frame, and AES-GCM, not the copy, is what that path spends its
+  time on.
 
 ### 5. Request trailers (low)
 
