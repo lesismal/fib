@@ -1,9 +1,9 @@
 # fib 路线图：计划中但未做，以及有意不做
 
-各协议的文档（`http1*.md`、`http2*.md`、`http3*.md`、`webrtc*.md`）各有一节"有意没有实现的功能"和"待优化"。这份文档把它们、以及散在 `guide.zh-CN.md` 里的取舍，汇总成一页，每项给出**原因**、**成本量级**和**什么情况下该重新评估**。
+各协议的文档（`http1*.md`、`http2*.md`、`http3*.md`、`webrtc*.md`、`media*.md`）各有一节"有意没有实现的功能"和"待优化"。这份文档把它们、以及散在 `guide.zh-CN.md` 里的取舍，汇总成一页，每项给出**原因**、**成本量级**和**什么情况下该重新评估**。
 
 - 表里的"成本"是量级估计：S（一两天内）／M（几天）／L（一两周以上，需要新的测试手段）
-- 标"有意不做"的，是权衡后的结论，不是遗漏；需求变了就按第 7 节重新评估
+- 标"有意不做"的，是权衡后的结论，不是遗漏；需求变了就按第 8 节重新评估
 - 各项的权威细节仍在原协议文档里，本页只做索引与理由，行尾给出出处
 
 ## 1. QUIC 与 HTTP/3
@@ -67,7 +67,21 @@
 | provisional answer 与 rollback | 有意不做 | glare 处理属于信令；WHIP、WHEP 都用不到 | S | 应用需要双方同时发起协商 |
 | CI 中的互通测试 | 计划中 | 与 pion、OpenSSL、Chromium 的互通在仓库外完成；CI 跑的是 fib 对 fib 与 RFC 向量 | M | 宣布 API 稳定之前 |
 
-## 6. 测试与基础设施
+## 6. 流媒体
+
+| 项 | 状态 | 原因 | 成本 | 何时重估 |
+| --- | --- | --- | --- | --- |
+| 转码（为 WHEP 把 AAC 转成 Opus，为 HLS 生成多码率） | 有意不做 | 需要音视频解码器和编码器，意味着 cgo 或引入依赖，还要为每路流付出转封装服务器本不需要的 CPU；hub 承载发布者发来的内容，每个出口去掉自己承载不了的 track | L | fib 本身永远不做：由外部转码器订阅后再发布回 hub |
+| HTTP-FLV 拉流客户端 | 计划中 | 需要一个能把响应 body 流式送进 `flv.Demuxer` 的 fib/http 客户端；从 RTMP 源站转发已由 `rtmp.Pull` 覆盖 | M | 需要从只提供 HTTP-FLV 的源站或 CDN 转发 |
+| 基于 TLS、HTTP 隧道的 RTSP，RTSP 2.0，组播 | 有意不做 | 摄像头和播放器用的是基于 TCP 或 UDP 单播的普通 RTSP 1.0 | M | 部署要求 rtsps，或必须穿过 HTTP 代理 |
+| SRT 的 rendezvous、file 模式、AES-GCM、FEC、bonding | 有意不做 | ffmpeg、OBS 和编码器接入与分发用的是带 AES-CTR 的 live 模式 | L | 有编码器或网络需要其中之一 |
+| WHIP/WHEP 的 ICE restart、simulcast 多层、基于 sender report 的音视频同步 | 已知限制 | ICE restart 按 RFC 9725 的要求回 422；每个 section 只接收 simulcast 的第一层；WHIP 按到达时间打时间戳，各 track 偏差不超过网络抖动 | M | 会切换网络的移动端发布者，或 SFU 式的分层选择 |
+| 基于 RTP 的 AV1（RTSP、WHEP） | 已知限制 | rtpcodec 没有 AV1 载荷格式；AV1 可经 Enhanced RTMP、HTTP-FLV 和 HLS fMP4 传输 | M | 有 AV1 发布者，而观众用 WebRTC 或 RTSP |
+| 录制、DVR 与点播 | 有意不做 | 所有流都是直播；录制器就是应用自己写的一个 hub 订阅者（fmp4 和 mpegts 既能输出分片也能输出文件） | M | 录制成为常见需求 |
+| HLS 增量播放列表、rendition report、PROGRAM-DATE-TIME、加密 | 有意不做 | 每路流一个 variant，不转码，播放器不需要它们也能播放 | M | 播放列表很长、增量更新能省带宽，或需要 DRM |
+| CI 中的互通测试 | 计划中 | 与 ffmpeg、Chromium 的互通在仓库外完成（仓库内的测试不依赖 ffmpeg）；CI 跑的是 fib 对 fib 与抓取的样本 | M | 宣布 API 稳定之前 |
+
+## 7. 测试与基础设施
 
 | 项 | 状态 | 原因 | 成本 | 何时重估 |
 | --- | --- | --- | --- | --- |
@@ -78,13 +92,13 @@
 | `arpc` 重连用例的临时端口竞态 | 已知边界 | `TestReconnectGivesUp` 依赖服务端端口在重连窗口内保持关闭；理论上别的进程抢占该临时端口会让它误判，6600+ 次运行未出现 | S | 出现误报时改成用固定端口或连接拒绝注入 |
 | HTTP/3 带 trailer 的整段响应多一次列表分配 | 已知成本 | send buffer 内联只放两个 piece；给每条 stream 加槽位要多 ~56 字节，判断不值得 | S | trailer 变成常态时 |
 
-## 7. 如何重新评估一项
+## 8. 如何重新评估一项
 
 1. 先量：有没有证据说明它现在是瓶颈（pprof、压测、真实流量）——`docs/loadtest*.md` 里的方法可以复用
 2. 再看成本量级：S／M 的项可以直接排；L 的项（BBR、WebTransport、主动迁移、汇编）应当有明确的验证手段再动手
 3. 改完删掉这里的对应行，并把理由写进提交信息与原协议文档；本页不保留历史
 
-## 8. 各项在协议文档里的出处
+## 9. 各项在协议文档里的出处
 
 | 内容 | 中文 | 英文 |
 | --- | --- | --- |
@@ -92,6 +106,7 @@
 | HTTP/2 限制／有意不做／待优化 | `docs/http2.zh-CN.md` "当前限制"、"有意没有实现的功能"、"待优化项" | `docs/http2.md` "Current limitations"、"Intentionally not implemented"、"Planned improvements" |
 | HTTP/3 限制／有意不做／待优化 | `docs/http3.zh-CN.md` "当前限制"、"有意没有实现的功能"、"待优化项" | `docs/http3.md` "Current limitations"、"Intentionally not implemented"、"Planned improvements" |
 | WebRTC 限制与有意不做 | `docs/webrtc.zh-CN.md` "配置与限制"、"有意没有实现的功能" | `docs/webrtc.md` "Configuration and limits"、"Intentionally not implemented" |
+| 流媒体限制与有意不做 | `docs/media.zh-CN.md` "配置与限制"、"有意没有实现的功能" | `docs/media.md` "Configuration and limits"、"Intentionally not implemented" |
 | 引擎、TLS、WebSocket 的取舍 | `docs/guide.zh-CN.md` 对应小节 | 同左（guide 只有中文） |
 | 压测方法与结论 | `docs/loadtest.zh-CN.md` | `docs/loadtest.md` |
 | Interop 逐 case 结果 | `http3/interoprunner/README.md` | 同左 |
