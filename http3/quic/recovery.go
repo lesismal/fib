@@ -13,6 +13,9 @@ const (
 	initialRTT       = 333 * time.Millisecond
 	// maxProbes is how many probe packets a PTO sends.
 	maxProbes = 2
+	// maxHandshakeSpeedups is how many times a server sends its Initial
+	// data again ahead of its probe timeout (see speedUpHandshakeLocked).
+	maxHandshakeSpeedups = 4
 )
 
 // initialWindow is the initial congestion window, in bytes, of a connection
@@ -595,6 +598,25 @@ func (c *Conn) onLossDetectionTimeout(now time.Time) {
 		c.probe(space)
 	}
 	c.ptoCount++
+}
+
+// speedUpHandshakeLocked has a server send what its Initial packets in
+// flight carried again, now rather than at its probe timeout, for a client
+// Initial that elicits an acknowledgement and brings no handshake data the
+// server lacks: the ClientHello again, or a PING, which is what a client
+// sends when its own probe timeout fires. Either says the client did not
+// get all of the server's Initial data, the ServerHello it cannot go on
+// without, or got it and its acknowledgement was lost (RFC 9002 section
+// 6.2.3). It does so a few times a connection: what it sends is held to
+// three times what the client sent, as everything before the client's
+// address is validated is, and its probe timeout still backs off as it
+// would. Callers hold c.mu.
+func (c *Conn) speedUpHandshakeLocked() {
+	if c.handshakeSpeedups >= maxHandshakeSpeedups || c.spaces[spaceInitial].ackElicitingInFlight == 0 {
+		return
+	}
+	c.handshakeSpeedups++
+	c.probe(spaceInitial)
 }
 
 // probe gets a space ready to send probe packets, carrying again what its

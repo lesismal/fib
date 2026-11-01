@@ -2,6 +2,7 @@ package quic
 
 import (
 	"errors"
+	"slices"
 	"testing"
 	"time"
 )
@@ -72,6 +73,8 @@ func TestFloodGlitchesCounted(t *testing.T) {
 			payload: func(i int) []byte { return frame(framePathChallenge, "12345678") }},
 		{name: "MAX_DATA not raised", counted: true,
 			payload: func(int) []byte { return frame(frameMaxData, 0) }},
+		{name: "MAX_STREAM_DATA not raised", counted: true,
+			payload: func(int) []byte { return frame(frameMaxStreamData, 0, 0) }},
 		{name: "MAX_STREAMS not raised", counted: true,
 			payload: func(int) []byte { return frame(frameMaxStreamsBidi, 0) }},
 		{name: "DATA_BLOCKED", counted: true,
@@ -97,6 +100,26 @@ func TestFloodGlitchesCounted(t *testing.T) {
 			payload: func(i int) []byte { return frame(frameStreamDataBlocked, 0, i+1) }},
 		{name: "STREAMS_BLOCKED at new limits",
 			payload: func(i int) []byte { return frame(frameStreamsBlockedBidi, i+1) }},
+		{name: "DATA_BLOCKED repeated alone", counted: true,
+			payload: func(int) []byte { return frame(frameDataBlocked, 1) }},
+		{name: "STREAM_DATA_BLOCKED repeated with PING", counted: true,
+			payload: func(int) []byte {
+				return append(frame(frameStreamDataBlocked, 0, 1), frame(framePing)...)
+			}},
+		// quiche repeats DATA_BLOCKED and STREAM_DATA_BLOCKED in every
+		// packet while it is blocked, next to the data it still may send.
+		{name: "BLOCKED repeated with a STREAM frame",
+			payload: func(i int) []byte {
+				return slices.Concat(frame(frameDataBlocked, 1), frame(frameStreamDataBlocked, 0, 1),
+					frame(frameStreamsBlockedBidi, 1), frame(frameStream|0x06, 0, i, 1, "x"))
+			}},
+		// quic-go raises MAX_STREAMS once for each stream that ends, out of
+		// order when several end at once.
+		{name: "limits not raised with a STREAM frame",
+			payload: func(i int) []byte {
+				return slices.Concat(frame(frameMaxStreamsBidi, 0), frame(frameMaxStreamsUni, 0),
+					frame(frameMaxData, 0), frame(frameStream|0x06, 0, i, 1, "x"))
+			}},
 		{name: "PING with a STREAM frame",
 			payload: func(i int) []byte {
 				return append(frame(framePing), frame(frameStream|0x06, 0, i, 1, "x")...)

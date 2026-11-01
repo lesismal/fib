@@ -31,16 +31,19 @@ To run the real runner against another implementation:
 git clone --depth 1 https://github.com/quic-interop/quic-interop-runner /tmp/quic-interop-runner
 python3 -m pip install -r /tmp/quic-interop-runner/requirements.txt
 
-./run-runner.sh                           # fib vs quic-go, both directions
+./run-runner.sh                           # fib vs quic-go, quiche and ngtcp2, both directions
 TESTCASES=http3 ./run-runner.sh           # just the HTTP/3 testcase
-PEER=quiche ./run-runner.sh               # target another published endpoint
+PEERS=quiche ./run-runner.sh              # one peer; any name in implementations_quic.json
+PEERS=quic-go,mvfst ./run-runner.sh       # several
 DIRECTION=server TESTCASES=chacha20 ./run-runner.sh
 ```
 
 `run-runner.sh` clones the runner into `$RUNNER_DIR` (default
 `/tmp/quic-interop-runner`) if needed, registers the image as `fib` in the
-runner's `implementations_quic.json`, and runs the matrix. Build the image
-first, from the repository root:
+runner's `implementations_quic.json`, and runs the matrix against each peer
+in `PEERS` (default `quic-go,quiche,ngtcp2`; `PEER`, one name, still
+works). It goes on after a failed run and exits non-zero if any run had a
+failed testcase. Build the image first, from the repository root:
 
 ```sh
 docker build -f http3/interoprunner/Dockerfile -t fib-interop:local .
@@ -49,7 +52,22 @@ docker build -f http3/interoprunner/Dockerfile -t fib-interop:local .
 The runner needs `docker compose`, `tshark` (4.5.0 or newer, as its README
 says; older versions cannot follow a migrated connection) and these Python
 modules: `pycryptodome`, `random-slugs`, `termcolor`, `prettytable`,
-`pyshark`.
+`pyshark`. `pyshark` does not run on Python 3.14; use 3.12, as the runner's
+own CI does.
+
+The runner's compose file names the containers' interfaces
+(`interface_name`), which needs Docker Engine 28.1 and Compose 2.36 or newer.
+On a machine with an older Docker, Docker Desktop on macOS for one, it can
+run inside a `docker:29-dind` container instead, with `tshark`, Python 3.12
+and the runner's requirements installed in it and the images loaded with
+`docker save | docker exec -i … docker load`. Two things are needed there:
+`sysctl -w net.bridge.bridge-nf-call-iptables=0
+net.bridge.bridge-nf-call-ip6tables=0` inside the dind container, or Docker's
+own rules drop the client's packets to the server's address on the
+simulator's bridge (they are routed through the simulator, so their
+destination is not on the bridge they arrive on), and an `amd64` peer image
+on an `arm64` host runs emulated, slowly enough to change some results (see
+below).
 
 ## The container contract
 
@@ -77,11 +95,13 @@ docker network, as `local-test.sh` does.
 
 ## Testcases
 
-A "✓" is a run that passed against quic-go's published endpoint image
+This table is what the endpoint does in each role; the results against
+quic-go, quiche and ngtcp2 side by side are in
+[Against quiche and ngtcp2](#against-quiche-and-ngtcp2). A "✓" here is a run
+that passed against quic-go's published endpoint image
 (`martenseemann/quic-go-interop:latest`, commit `d961427`) on Linux with
-Docker 29.1.3 and tshark 4.6.6, on 2026-10-26; "supported" means the
-endpoint implements the testcase, but it was not re-run in this change. The
-runner names a testcase to a role through `TestCase.testname`: most of its
+Docker 29.1.3 and tshark 4.6.6, on 2026-10-26, or on 2026-11-01 where the
+row says so. The runner names a testcase to a role through `TestCase.testname`: most of its
 matrix reaches the endpoint as `transfer`, `handshake` or `multiconnect`,
 which is why those names cover more than their own testcase. In particular
 the loss and corruption cases all map to a raw path: `handshakeloss` and
@@ -107,13 +127,13 @@ four names directly, as aliases of those paths.
 | `amplificationlimit` | ✓ | ✓ | |
 | `handshakeloss` | ✓ | ✓ | 50 connections at 30% loss |
 | `transferloss` | ✓ | ✓ | 2 MiB at 2% loss |
-| `handshakecorruption` | supported | supported | 50 connections at 30% corruption; same endpoint path as `handshakeloss` (the runner passes `multiconnect`, and the endpoint accepts the name too); not re-run in this change |
-| `transfercorruption` | supported | supported | 2 MiB at 2% corruption; same endpoint path as `transferloss` (the runner passes `transfer`, and the endpoint accepts the name too); not re-run in this change |
+| `handshakecorruption` | ✓ | ✓ | 50 connections at 30% corruption; same endpoint path as `handshakeloss` (the runner passes `multiconnect`, and the endpoint accepts the name too); passed on 2026-11-01 |
+| `transfercorruption` | ✓ | ✓ | 2 MiB at 2% corruption; same endpoint path as `transferloss` (the runner passes `transfer`, and the endpoint accepts the name too); passed on 2026-11-01 |
 | `ipv6` | ✓ | ✓ | the client resolves `server6`; the server listens on both families |
 | `v2` | unsupported | unsupported | fib speaks QUIC version 1 only |
 | `rebind-port` | ✓ | ✓ | the server follows the NAT rebinding and answers with its own PATH_CHALLENGE |
 | `rebind-addr` | ✓ | ✓ | the server follows the rebinding and its PATH_CHALLENGE is in the first packet it sends to the new address, even though the congestion window the old path filled has no room for it |
-| `connectionmigration` | unsupported | not run | the server has no `preferred_address` to offer; quic-go's server exits 127 for it too, so the pair is unsupported. The client's role is `transfer`, and fib cannot perform the active migration the check wants |
+| `connectionmigration` | unsupported | fails | the server has no `preferred_address` to offer; quic-go's and quiche's servers exit 127 for it too, so those pairs are unsupported. The client's role is `transfer`, and fib cannot perform the active migration the check wants, so it fails against ngtcp2's server, which offers one |
 | `versionnegotiation` | unsupported | unsupported | disabled by the runner; fib's client cannot start with a reserved version |
 
 The entries above are what the endpoint's two roles do, not what the
@@ -155,10 +175,9 @@ Ubuntu 24.04's package, cannot follow the migrated connection and makes
 - Both roles exit 127 for `ecn`, `v2` and the server side of
   `connectionmigration`; the runner reports those as unsupported.
 
-`handshakecorruption` and `transfercorruption` are supported by the endpoint
-but were not re-run in this change: the runner needs Docker, `tshark` and its
-Python dependencies. The runner does not hand any of the four loss or
-corruption names to an endpoint: `TestCaseHandshakeLoss.testname` returns
+`handshakecorruption` and `transfercorruption` were not in these runs; they
+passed against all three peers on 2026-11-01 (see below). The runner does
+not hand any of the four loss or corruption names to an endpoint: `TestCaseHandshakeLoss.testname` returns
 `multiconnect` and `TestCaseTransferLoss.testname` returns `transfer`, for
 the loss cases and, inherited, for the corruption cases, while the simulator
 drops or corrupts the packets. The `handshakeloss` and `transferloss` runs
@@ -233,6 +252,105 @@ trace and its three repeats are marked as retransmissions.
 `local-test.sh` runs `http3`, `handshake`, `transfer`, `retry`,
 `resumption`, `zerortt` and `multiconnect` with fib on both sides; all pass.
 
+### Against quiche and ngtcp2
+
+The whole matrix was run on 2026-11-01 against quic-go, quiche and ngtcp2,
+each in both roles, with the runner at commit `a224e5e`, tshark 4.6.6 and
+Docker 29.9.2 inside a `docker:29-dind` container on an Apple-silicon Mac
+(see [Running it locally](#running-it-locally)). The peers are their
+published endpoint images: `martenseemann/quic-go-interop:latest`,
+`ghcr.io/ngtcp2/ngtcp2-interop:latest` and `cloudflare/quiche-qns:latest`.
+quic-go's and ngtcp2's are `arm64` images; quiche's is `amd64` only, so it
+ran emulated, several times slower, which matters below.
+
+```sh
+TESTCASES=handshake,transfer,longrtt,chacha20,multiplexing,retry,resumption,\
+zerortt,http3,amplificationlimit,blackhole,keyupdate,handshakeloss,\
+transferloss,handshakecorruption,transfercorruption,ecn,rebind-port,\
+rebind-addr,ipv6,connectionmigration,v2 ./run-runner.sh
+```
+
+"✓" passed, "✕" failed, "–" one side or both exit 127 (unsupported).
+"fib ⇢ X" is fib's server with X's client; "X ⇢ fib" is X's server with
+fib's client.
+
+| Testcase | fib ⇢ quic-go | quic-go ⇢ fib | fib ⇢ ngtcp2 | ngtcp2 ⇢ fib | fib ⇢ quiche | quiche ⇢ fib |
+| --- | --- | --- | --- | --- | --- | --- |
+| `handshake` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
+| `transfer` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
+| `longrtt` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
+| `chacha20` | ✓ | ✓ | ✓ | ✓ | – | ✓ |
+| `multiplexing` | ✓ | ✓ | ✓ | ✓ | ✕ (1) | ✓ |
+| `retry` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
+| `resumption` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
+| `zerortt` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
+| `http3` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
+| `amplificationlimit` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
+| `blackhole` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
+| `keyupdate` | ✓ | ✓ | ✓ | ✓ | – | ✓ |
+| `handshakeloss` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ (2) |
+| `transferloss` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
+| `handshakecorruption` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
+| `transfercorruption` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
+| `ecn` | – | – | – | – | – | – |
+| `rebind-port` | ✓ | ✓ | ✓ | ✓ | ✕ (3) | ✕ (4) |
+| `rebind-addr` | ✓ | ✓ | ✓ | ✓ | ✓ (3) | ✕ (4) |
+| `ipv6` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
+| `connectionmigration` | – | – | – | ✕ (5) | – | – |
+| `v2` | – | – | – | – | – | – |
+
+None of the failures left is fib's to fix, or none that the runner shows:
+
+1. quiche's client wrote a few of its ~2000 requests only in part, without
+   the end of the stream, and never sent the rest, so fib's server waited
+   for the end of a request line that never came; the client gave up idle.
+   The same client fails `multiplexing` against ngtcp2's server the same
+   way.
+2. Failed once in the full run and passed in three reruns. In the failing
+   connection quiche's server sent HANDSHAKE_DONE once, in a packet the
+   simulator dropped, and its probes after that were bare PINGs; fib's
+   client, its handshake not confirmed, may only probe with Handshake
+   packets, which quiche had stopped reading, and the acknowledgements it
+   sent of quiche's PINGs were dropped too. Sending its unacknowledged 1-RTT
+   data along with those Handshake probes (RFC 9002 section 6.2.4 allows
+   it) would give quiche something to acknowledge, and is a possible
+   improvement.
+3. The emulated quiche client starts late enough that its handshake can
+   span the simulator's first rebinding, a second into the run. fib's
+   server then follows it to the new port with handshake packets, which
+   have no room for a PATH_CHALLENGE, and the runner fails the run because
+   the first packet on the new path has none. Both passed in another run in
+   which the handshake ended first.
+4. quiche's server does not keep up with the rebinding: ngtcp2's client
+   fails both against it as fib's does.
+5. ngtcp2's server offers a `preferred_address`, and the testcase checks
+   that the client moves to it. fib's client does not migrate. Against
+   quic-go and quiche the server side is unsupported.
+
+Three fixes in `http3/quic` and one in the endpoint came out of these
+runs; the three have tests in `http3/quic`:
+
+- quiche repeats DATA_BLOCKED and STREAM_DATA_BLOCKED in every packet while
+  it is blocked, and quic-go raises MAX_STREAMS once per finished stream,
+  out of order when several finish together. Both counted as frames that
+  ask for nothing, so fib's client closed the connection with "too many
+  frames that ask for nothing" (`transfer` and `blackhole` against quiche,
+  `multiplexing` against quic-go). A BLOCKED frame that repeats a limit,
+  and a MAX_DATA, MAX_STREAM_DATA or MAX_STREAMS that raises none, now count
+  only as a PING does: when nothing else in the packet asks for anything.
+- A server now follows a client whose address changes during the handshake,
+  on an Initial or Handshake packet numbered above the ones before it; it
+  used to answer the old address until the handshake timed out.
+- A server now sends its Initial data in flight again as soon as the client
+  sends an Initial with nothing new in it, a PING or the ClientHello again,
+  up to four times a connection (RFC 9002 section 6.2.3), instead of
+  waiting for its own backed-off probe timeout; `handshakecorruption`
+  against quic-go's client, whose handshake deadline is ten seconds, failed
+  without it.
+- The endpoint's server allows a 60-second handshake, as its client does:
+  under `handshakeloss` ngtcp2's client took more than 30 seconds to get its
+  Finished through, and the server's stateless reset ended the connection.
+
 ## Layout
 
 - `main.go` — `ROLE`/`TESTCASE` dispatch; unsupported cases exit 127
@@ -242,7 +360,7 @@ trace and its three repeats are marked as retransmissions.
 - `tlsutil.go` — the runner's certificate, key log and directories
 - `Dockerfile`, `run_endpoint.sh` — the image and its entrypoint
 - `local-test.sh` — fib against fib on a docker network, no runner needed
-- `run-runner.sh` — the real runner, both directions against a peer
+- `run-runner.sh` — the real runner, both directions against each peer
 - `go.mod` — this module, with `replace ../..` to the fib in this checkout
 
 ## CI
@@ -255,7 +373,8 @@ trace and its three repeats are marked as retransmissions.
   backoff and then falls back to `mirror.gcr.io` for the Go base image, and
   the job is `continue-on-error`, so a Docker Hub rate limit never blocks a
   pull request.
-- `http3-interop-runner` runs the real runner against quic-go. It is
-  `workflow_dispatch` only and `continue-on-error`, because it pulls the
-  simulator and peer images, needs `tshark`, and the runner is slower and
-  more brittle than the rest of the suite.
+- `http3-interop-runner` runs the real runner against quic-go, quiche and
+  ngtcp2, both directions. It is `workflow_dispatch` only and
+  `continue-on-error`, because it pulls the simulator and peer images, needs
+  `tshark`, and the runner is slower and more brittle than the rest of the
+  suite.

@@ -85,11 +85,14 @@ type arrival struct {
 // path current names, as a NAT in front of the client would have them, or
 // nowhere while it names none. replay, while set, gets a copy of each of
 // them first, as an attacker on the path that raced the client would.
+// rebindAfter, while set, becomes current once one datagram has gone, as a
+// NAT that rebinds the client during its handshake would have it.
 type rebindNet struct {
-	toServer chan arrival
-	toClient chan []byte
-	current  atomic.Pointer[serverPath]
-	replay   atomic.Pointer[serverPath]
+	toServer    chan arrival
+	toClient    chan []byte
+	current     atomic.Pointer[serverPath]
+	replay      atomic.Pointer[serverPath]
+	rebindAfter atomic.Pointer[serverPath]
 }
 
 // clientSide is the client's PacketConn on a rebindNet.
@@ -101,6 +104,9 @@ func (c clientSide) Send(d []byte) error {
 	}
 	if p := c.n.current.Load(); p != nil {
 		c.n.toServer <- arrival{bytes.Clone(d), p}
+	}
+	if p := c.n.rebindAfter.Swap(nil); p != nil {
+		c.n.current.Store(p)
 	}
 	return nil
 }
@@ -283,6 +289,27 @@ func TestServerFollowsRebinding(t *testing.T) {
 	p.n.current.Store(p.b)
 	p.echo(t, "across")
 	p.waitPath(t, p.b)
+	waitClosed(t, p.a)
+	if got := p.server.RemoteAddr().String(); got != p.b.addr.String() {
+		t.Fatalf("RemoteAddr %s, want %s", got, p.b.addr)
+	}
+	p.waitChanges(t, 1)
+	p.echo(t, "after")
+}
+
+// A client whose address changes before its handshake is done is followed
+// there too: what the server sends to the address it started on is lost,
+// and the handshake ends on the new one, which the old one is left for.
+// The new address is another host's, whose path starts afresh.
+func TestServerFollowsRebindingDuringHandshake(t *testing.T) {
+	p := newRebindPairWith(t, func(p *rebindPair) {
+		p.b.addr = &net.UDPAddr{IP: net.IPv4(192, 0, 2, 2), Port: 2000}
+		p.a.black.Store(true)
+		p.n.rebindAfter.Store(p.b)
+	})
+	if !p.server.SendsOn(p.b) {
+		t.Fatal("the server does not send on the client's new address")
+	}
 	waitClosed(t, p.a)
 	if got := p.server.RemoteAddr().String(); got != p.b.addr.String() {
 		t.Fatalf("RemoteAddr %s, want %s", got, p.b.addr)

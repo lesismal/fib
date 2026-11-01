@@ -483,6 +483,9 @@ type Conn struct {
 	// before, which a PING bundled with it does not count against glitches.
 	glitches, resets floodBudget
 	ackedNew         bool
+	// handshakeSpeedups counts the times a server sent its Initial data
+	// again ahead of its probe timeout (see speedUpHandshakeLocked).
+	handshakeSpeedups int
 	// ackFreq is what the peer asked of this side's acknowledgements, and
 	// ackFreqRequested and ackFreqPending what this side asked of the
 	// peer's: whether it has, and whether the frame is still to go out,
@@ -1687,6 +1690,10 @@ func (c *Conn) handlePacket(pkt []byte, h header, now time.Time) bool {
 	if c.rxPC != c.pc && !c.isClient && c.handshakeConfirmed && h.typ == packet1RTT &&
 		c.nonProbing && int64(pn) > largest {
 		c.migrateLocked(now, firstEvent)
+	}
+	if c.rxPC != c.pc && !c.isClient && !c.handshakeConfirmed &&
+		(h.typ == packetInitial || h.typ == packetHandshake) && int64(pn) > largest {
+		c.rebindHandshakeLocked(now, firstEvent)
 	}
 	if int64(pn) >= largest {
 		s.largestRecvTime = now

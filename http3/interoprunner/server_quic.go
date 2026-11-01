@@ -35,9 +35,12 @@ func serveRaw(testcase string) error {
 	tokenKey := quic.NewTokenKey()
 	resetKey := quic.NewResetKey()
 	config := quic.Config{
-		TLSConfig:          tlsConfig,
-		MaxIdleTimeout:     120 * time.Second,
-		HandshakeTimeout:   30 * time.Second,
+		TLSConfig:      tlsConfig,
+		MaxIdleTimeout: 120 * time.Second,
+		// As long as the client's: under handshakeloss a client's backed-off
+		// probes can take more than 30 seconds to get its Finished through,
+		// and a server that gave up first answers it with a stateless reset.
+		HandshakeTimeout:   60 * time.Second,
 		MaxIncomingStreams: 200,
 		TokenKey:           tokenKey,
 		ResetKey:           &resetKey,

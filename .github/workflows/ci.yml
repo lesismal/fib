@@ -612,10 +612,11 @@ jobs:
       - name: Build the image and run the endpoint against itself
         run: ./http3/interoprunner/local-test.sh fib-interop:ci
 
-  # The real QUIC Interop Runner, with fib and quic-go as each other's peer.
-  # Opt-in (workflow_dispatch only) and non-blocking: it pulls the runner's
-  # network simulator and peer images, needs tshark and the runner's Python
-  # dependencies, and is slower and more brittle than the rest of the suite.
+  # The real QUIC Interop Runner, with fib against quic-go, quiche and
+  # ngtcp2 in both roles. Opt-in (workflow_dispatch only) and non-blocking:
+  # it pulls the runner's network simulator and peer images, needs tshark
+  # and the runner's Python dependencies, and is slower and more brittle
+  # than the rest of the suite.
   # The endpoint's supported testcases and the ones that exit 127 are listed
   # in http3/interoprunner/README.md; fib's missing ECN, QUIC v2, cipher
   # suite restriction and preferred_address are reported, not hidden.
@@ -624,7 +625,7 @@ jobs:
     if: github.event_name == 'workflow_dispatch'
     continue-on-error: true
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@v5
       - uses: actions/setup-go@v6
@@ -643,10 +644,11 @@ jobs:
           docker compose version
       - name: Build the endpoint image
         run: docker build -f http3/interoprunner/Dockerfile -t fib-interop:ci .
-      - name: Run fib and quic-go against each other
+      - name: Run fib against quic-go, quiche and ngtcp2
         env:
           RUNNER_DIR: ${{ runner.temp }}/quic-interop-runner
           IMAGE: fib-interop:ci
+          PEERS: quic-go,quiche,ngtcp2
           # The core matrix: the HTTP/3 testcase plus the QUIC-level ones
           # over HTTP/0.9. chacha20 and keyupdate are server-only here and
           # multiplexing, handshakeloss and the rebinding tests are slower;

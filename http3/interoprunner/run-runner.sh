@@ -4,15 +4,19 @@
 # Needs docker with the compose plugin, tshark, and the runner's Python
 # dependencies (`pip3 install -r requirements.txt`). It clones the runner if
 # RUNNER_DIR is empty, registers fib's image in its implementations file, and
-# runs both directions against quic-go by default.
+# runs both directions against quic-go, quiche and ngtcp2 by default.
 #
 # Usage:
-#   ./run-runner.sh                         # the supported matrix, fib vs quic-go
+#   ./run-runner.sh                         # the supported matrix, every peer
 #   TESTCASES=http3 ./run-runner.sh         # one testcase
 #   DIRECTION=server TESTCASES=chacha20 ./run-runner.sh
-#   PEER=quiche IMAGE=fib-interop:latest ./run-runner.sh
+#   PEERS=quiche IMAGE=fib-interop:latest ./run-runner.sh
 #
-# Environment: RUNNER_DIR, IMAGE, TESTCASES, PEER, DIRECTION, RUNNER.
+# PEERS is a comma- or space-separated list of names from the runner's
+# implementations_quic.json; PEER, a single name, is still accepted.
+# The script exits non-zero if any run had a failed testcase.
+#
+# Environment: RUNNER_DIR, IMAGE, TESTCASES, PEERS (or PEER), DIRECTION.
 set -euo pipefail
 
 here=$(cd "$(dirname "$0")" && pwd)
@@ -20,7 +24,8 @@ repo=$(cd "$here/../.." && pwd)
 runner=${RUNNER_DIR:-/tmp/quic-interop-runner}
 image=${IMAGE:-fib-interop:local}
 testcases=${TESTCASES:-http3,handshake,transfer,retry,resumption,zerortt,multiplexing,keyupdate}
-peer=${PEER:-quic-go}
+peers=${PEERS:-${PEER:-quic-go,quiche,ngtcp2}}
+peers=${peers//,/ }
 direction=${DIRECTION:-both}
 
 if ! docker compose version >/dev/null 2>&1; then
@@ -57,18 +62,25 @@ PY
 
 cd "$runner"
 case "$direction" in
-    both)
-        python3 run.py -s fib -c "$peer" -t "$testcases" -m
-        python3 run.py -s "$peer" -c fib -t "$testcases" -m
-        ;;
-    server)
-        python3 run.py -s fib -c "$peer" -t "$testcases" -m
-        ;;
-    client)
-        python3 run.py -s "$peer" -c fib -t "$testcases" -m
-        ;;
+    both | server | client) ;;
     *)
         echo "DIRECTION must be both, server or client" >&2
         exit 1
         ;;
 esac
+
+# run <server> <client> runs one direction and keeps going after a failure,
+# so one peer's failure still shows the other peers' results.
+status=0
+run() {
+    python3 run.py -s "$1" -c "$2" -t "$testcases" -m || status=1
+}
+for peer in $peers; do
+    if [ "$direction" != client ]; then
+        run fib "$peer"
+    fi
+    if [ "$direction" != server ]; then
+        run "$peer" fib
+    fi
+done
+exit "$status"
