@@ -430,8 +430,9 @@ sender.OnKeyFrameRequest(func() {
   packetization-mode=1 in the four profiles browsers offer, and AV1, at
   Chrome's payload types. A forwarder that cannot transcode must make every
   peer agree on what it forwards; the simplest way is to list just those
-  codecs, VP8 and Opus say, which every browser has. RTX and FEC are not
-  offered: nothing keeps the history to repair from.
+  codecs, VP8 and Opus say, which every browser has. FEC is not offered;
+  RTX is, for the codecs with NACK feedback, when `Configuration.Retransmit`
+  keeps a history to repair from (see [Loss repair](#loss-repair-nack-and-rtx)).
 - **Header extensions.** The MID, the RID of simulcast layers,
   abs-send-time and the audio level are negotiated
   (`DefaultHeaderExtensions`). The PeerConnection writes the MID and
@@ -488,8 +489,50 @@ remb, _ := rtp.AppendRTCP(nil, &rtp.REMB{Bitrate: 500_000, SSRCs: []uint32{remot
 _ = pc.WriteRTCP(remb)
 ```
 
-NACKs reach `OnRTCP` too, and go unanswered unless the application answers
-them: the PeerConnection keeps no packets to resend.
+NACKs reach `OnRTCP` too. They are answered when `Configuration.Retransmit`
+keeps a history; otherwise the application may answer them itself.
+
+### Loss repair (NACK and RTX)
+
+`Configuration.Retransmit` turns on repair for what the PeerConnection sends.
+Its zero value keeps nothing, as before: no NACK is answered and RTX is not
+offered.
+
+```go
+pc, _ := webrtc.NewPeerConnection(webrtc.Configuration{
+	Mux:        mux,
+	Retransmit: webrtc.RetransmitConfig{Packets: 512}, // MaxAge 1s, 256 KiB/s
+})
+```
+
+- **History.** Each `TrackLocal` keeps its latest `Packets` packets (a power of
+  two, at most 4096) as they were written, in buffers from a pool, once a
+  sender of it negotiated `nack` with its peer. The history is the track's,
+  shared by every PeerConnection it is sent on: an SFU that forwards one
+  `TrackRemote` to many viewers through one `TrackLocal` keeps one history,
+  not one per viewer. Each sender adds a 24-byte record per packet of what it
+  sent. Only codecs whose negotiated feedback has `nack` keep anything:
+  browsers ask it for video, not for Opus.
+- **NACK.** A generic NACK (RTCP RTPFB, FMT 1) for a stream this side sends
+  resends each packet it lists that the history still has, that is younger
+  than `MaxAge` (1s), that was not resent within the last round trip (from the
+  peer's receiver reports, 100 ms until they measure it), and that fits the
+  sender's `MaxBytesPerSecond` (256 KiB/s, bursts of a quarter second; negative
+  is unbounded). A packet over the rate is skipped, never queued: resending
+  never blocks. `RTPSender.Retransmitted` counts what was resent.
+- **RTX.** With `Retransmit` set, offers carry an RTX format (`rtx/90000`,
+  `apt=`) after each codec with `nack`, at the payload type after the codec's
+  as Chrome numbers them, and an `a=ssrc-group:FID` of the sender's SSRC and an
+  RTX SSRC of its own; answers accept the RTX formats the offer pairs with
+  the codecs negotiated. A peer that negotiated RTX gets retransmissions on the
+  RTX stream (RFC 4588): its own sequence numbers, the original one ahead of
+  the payload. One that did not gets the packet again as it was, the very
+  bytes first sent, so SRTP protects it under the same index. Packets that
+  arrive on a peer's RTX stream are turned back into the packets they repair
+  and delivered to that stream's `TrackRemote`.
+- **Not done.** The PeerConnection does not send NACKs for what it receives:
+  an application can build them with `rtp.NACK` and `WriteRTCP`. FEC is not
+  offered.
 
 ## TURN
 
@@ -776,6 +819,7 @@ of a binding on `:0` from `Engine.BindingAddrs`.
 | `RTCPReportInterval` | 1s | Sender and receiver reports; negative sends none |
 | `MaxRemoteSSRCs` | 64 | Media streams received, each costing SRTP state and a TrackRemote |
 | `MaxRemoteCandidates` | 64 | Trickled candidates held until the remote description arrives |
+| `Retransmit` | none | `Packets` kept per track to answer NACKs (rounded to a power of two, at most 4096), `MaxAge` (1s), `MaxBytesPerSecond` (256 KiB/s per sender); RTX is offered when set |
 
 `webrtc.MuxConfig`: `Network` (`udp`, `udp4` or `udp6`), `Addr` (`:0`),
 `PublicAddrs` and `IdleTimeout` (45s, `DefaultMuxIdleTimeout`). The Mux sets
@@ -808,7 +852,8 @@ browsers speak it does not need it, or because it belongs to the application.
 - **PeerConnection**: the provisional answer (`pranswer`) and rollback;
   BundlePolicy other than max-bundle; ICE over TCP; resolving the mDNS names
   of browsers' host candidates (a peer's checks reveal its address as a
-  peer-reflexive candidate anyway); RTX and FEC; transport-wide congestion
+  peer-reflexive candidate anyway); FEC, and sending NACKs for what is
+  received (NACKs from the peer are answered, see `Retransmit`); transport-wide congestion
   control feedback and bandwidth estimation; sending simulcast (receiving it,
   by RID, works); the RTP packetization of codecs; DTLS 1.3; SDES keying;
   statistics beyond the RTCP reports; TURN on a shared Mux, and TURN over
@@ -879,7 +924,7 @@ sdp, turn as a library, OpenSSL and Chromium) were run by hand.
 | pion/turn v4 | fib's client through pion's server, and pion's client through `turnserver`, allocating, refreshing, permitting, binding and relaying |
 | Chromium | The fib-examples pages against their servers: data channel echo, a canvas video track sent as VP8 and decoded back from the server, relay-only ICE through `turnserver` on the same engine, and the SFU forwarding video and audio to a viewer with its PLI passed to the publisher |
 | RFC test vectors | STUN (RFC 5769), SRTP key derivation and key stream (RFC 3711, RFC 6188), SRTP and SRTCP with AES-GCM (RFC 7714) |
-| fib against fib | Two PeerConnections on one engine and on two: data channels up to 200 KiB both ways, VP8 and Opus with SRTP, PLI and RTCP reports, renegotiation from either side, ICE restarts with data still flowing, close seen by the peer; 200 ICE-lite PeerConnections on one Mux; a relay-only pair through `turnserver`; `turn.Client` over TCP and TLS through `turnserver`, with and without channels |
+| fib against fib | Two PeerConnections on one engine and on two: data channels up to 200 KiB both ways, VP8 and Opus with SRTP, PLI and RTCP reports, NACKs over simulated loss answered as RTX or as the packets were until every one arrives, renegotiation from either side, ICE restarts with data still flowing, close seen by the peer; 200 ICE-lite PeerConnections on one Mux; a relay-only pair through `turnserver`; `turn.Client` over TCP and TLS through `turnserver`, with and without channels |
 
 fib's SCTP moved 64 KiB messages fib to fib at 240 MB/s over loopback where
 pion to pion managed 163 MB/s; in memory, two associations move them at about

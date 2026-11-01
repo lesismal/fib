@@ -29,7 +29,9 @@
 // TrackRemote, and the PeerConnection rewrites SSRCs, payload types and
 // header extension ids, protects and unprotects them, answers with
 // receiver and sender reports, and passes on key frame requests: what an
-// SFU forwards, with no codec of its own. Codecs are negotiated by their
+// SFU forwards, with no codec of its own. With Configuration.Retransmit it
+// also answers the peer's NACKs from a history each TrackLocal keeps, as
+// RTX when the peer negotiated it. Codecs are negotiated by their
 // SDP description against Configuration.Codecs.
 //
 // Callbacks from fib's workers and from timers are serialized by a mutex
@@ -40,7 +42,7 @@
 // Left out: the provisional answer and rollback, BundlePolicy other than
 // max-bundle, ICE over TCP, resolving the mDNS names of browsers' host
 // candidates (a peer's checks reveal its address as a peer-reflexive
-// candidate anyway), RTX and FEC, transport-wide congestion control
+// candidate anyway), FEC, sending NACKs, transport-wide congestion control
 // feedback and bandwidth estimation, simulcast sending (receiving it, by
 // RID, is supported), the RTP packetization of codecs, DTLS 1.3, SDES
 // keying, and statistics beyond the RTCP reports. A TURN relay needs a

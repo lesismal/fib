@@ -73,7 +73,10 @@
 // socket, with no queue to measure and no congestion control, so a slow
 // viewer is told by its receiver reports instead: while the fraction of
 // packets it reports lost is over Config.MaxLoss, its packets are dropped,
-// video until the next keyframe (hub.NewDropper). What a viewer holds
+// video until the next keyframe (hub.NewDropper). The packets a viewer
+// reports lost in NACKs are sent again from the latest
+// Config.RetransmitPackets of each track, as RTX when its offer has RTX,
+// within a rate that never makes a resend wait. What a viewer holds
 // while it connects is bounded by Config.MaxHeldBytes, each session by
 // Config.ConnectTimeout until it connects and by ICE consent after, and
 // the sessions by Config.MaxSessions.
@@ -86,6 +89,7 @@
 //
 // Left out: ICE restarts, simulcast (only the first layer of a section is
 // received), sending more than one stream per kind than the offer has
-// sections for, RTX and FEC, transcoding, renegotiation when a stream's
-// codec changes (the track of the old codec stops).
+// sections for, FEC, sending NACKs (a WHEP session answers a viewer's,
+// see Config.RetransmitPackets), transcoding, renegotiation when a
+// stream's codec changes (the track of the old codec stops).
 package rtc

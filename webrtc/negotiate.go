@@ -204,17 +204,27 @@ func (pc *PeerConnection) dataSection(typ SDPType) *sdp.MediaDescription {
 }
 
 // mediaSection writes a transceiver's section: in an offer its own codecs,
-// or those negotiated before, and in an answer those both sides support.
+// or those negotiated before, and in an answer those both sides support,
+// each followed by its RTX format if it has one.
 func (pc *PeerConnection) mediaSection(typ SDPType, t *Transceiver) *sdp.MediaDescription {
 	var codecs []sdp.Codec
+	rtx := false
 	if typ == SDPTypeAnswer || len(t.codecs) > 0 {
 		for _, c := range t.codecs {
 			codecs = append(codecs, c.toSDP(c.recvPT))
+			if c.rtxRecv != 0 {
+				codecs = append(codecs, rtxSDP(c.rtxRecv, c.recvPT, c.ClockRate))
+				rtx = true
+			}
 		}
 	} else {
 		for _, c := range pc.codecs {
 			if c.Kind() == t.kind {
 				codecs = append(codecs, c.toSDP(c.PayloadType))
+				if pt, ok := pc.rtxPTs[c.PayloadType]; ok {
+					codecs = append(codecs, rtxSDP(pt, c.PayloadType, c.ClockRate))
+					rtx = true
+				}
 			}
 		}
 	}
@@ -273,9 +283,15 @@ func (pc *PeerConnection) mediaSection(typ SDPType, t *Transceiver) *sdp.MediaDe
 		md.SetSimulcast(sdp.Simulcast{Recv: alts})
 	}
 	if dir.sends() && tr != nil {
-		ssrc := t.sender.ssrc
-		md.AddSSRC(sdp.SSRC{SSRC: ssrc, Attribute: "cname", Value: pc.cname})
-		md.AddSSRC(sdp.SSRC{SSRC: ssrc, Attribute: "msid", Value: tr.streamID + " " + tr.id})
+		ssrcs := []uint32{t.sender.ssrc}
+		if rtx && t.sender.rtxSSRC != 0 {
+			ssrcs = append(ssrcs, t.sender.rtxSSRC)
+			md.AddSSRCGroup(sdp.SSRCGroup{Semantics: "FID", SSRCs: ssrcs})
+		}
+		for _, ssrc := range ssrcs {
+			md.AddSSRC(sdp.SSRC{SSRC: ssrc, Attribute: "cname", Value: pc.cname})
+			md.AddSSRC(sdp.SSRC{SSRC: ssrc, Attribute: "msid", Value: tr.streamID + " " + tr.id})
+		}
 	}
 	return md
 }
@@ -684,26 +700,50 @@ func (pc *PeerConnection) applyRemoteMedia(sd *sdp.SessionDescription, md *sdp.M
 		return
 	}
 	kind := md.Kind()
+	remote := md.Codecs()
+	// The RTX formats of the remote codecs, by the payload type they
+	// repair, when this side answers NACKs.
+	var remoteRtx map[uint8]uint8
+	if pc.cfg.Retransmit.Packets > 0 {
+		remoteRtx = remoteRTX(remote)
+	}
 	if offer {
 		local := t.codecsOffered(pc.codecs)
-		t.codecs = intersectCodecs(kind, md.Codecs(), local)
+		t.codecs = intersectCodecs(kind, remote, local)
+		for i := range t.codecs {
+			if pt, ok := remoteRtx[t.codecs[i].sendPT]; ok {
+				t.codecs[i].rtxSend, t.codecs[i].rtxRecv = pt, pt
+			}
+		}
 	} else {
 		var offered []Codec
+		offeredRtx := pc.rtxPTs
 		if len(t.codecs) > 0 {
+			offeredRtx = make(map[uint8]uint8)
 			for _, c := range t.codecs {
 				cc := c.Codec
 				cc.PayloadType = c.recvPT
 				offered = append(offered, cc)
+				if c.rtxRecv != 0 {
+					offeredRtx[c.recvPT] = c.rtxRecv
+				}
 			}
 		} else {
 			offered = t.codecsOffered(pc.codecs)
 		}
 		var out []negotiatedCodec
-		for _, rc := range md.Codecs() {
+		for _, rc := range remote {
+			if isRTX(rc.Name) {
+				continue
+			}
 			r := codecFromSDP(kind, rc)
 			for _, l := range offered {
 				if l.matches(r) {
-					out = append(out, negotiatedCodec{Codec: r, sendPT: r.PayloadType, recvPT: l.PayloadType})
+					nc := negotiatedCodec{Codec: r, sendPT: r.PayloadType, recvPT: l.PayloadType}
+					if pt, ok := remoteRtx[r.PayloadType]; ok && offeredRtx[l.PayloadType] != 0 {
+						nc.rtxSend, nc.rtxRecv = pt, offeredRtx[l.PayloadType]
+					}
+					out = append(out, nc)
 					break
 				}
 			}
@@ -731,6 +771,13 @@ func (pc *PeerConnection) applyRemoteMedia(sd *sdp.SessionDescription, md *sdp.M
 		if s.Attribute == "msid" && t.remoteStream == "" {
 			stream, track, _ := strings.Cut(s.Value, " ")
 			t.remoteStream, t.remoteTrack = stream, track
+		}
+	}
+	if pc.cfg.Retransmit.Packets > 0 {
+		for _, g := range md.SSRCGroups() {
+			if g.Semantics == "FID" && len(g.SSRCs) == 2 && len(pc.rtxPrimary) < pc.cfg.MaxRemoteSSRCs {
+				pc.rtxPrimary[g.SSRCs[1]] = g.SSRCs[0]
+			}
 		}
 	}
 	if ms := md.MSIDs(); len(ms) > 0 {

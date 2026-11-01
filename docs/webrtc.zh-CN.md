@@ -386,7 +386,8 @@ sender.OnKeyFrameRequest(func() {
   用于与对端取交集：Opus、VP8、VP9 profile 0、浏览器会提供的四种 profile 的 H.264
   （packetization-mode=1），以及 AV1，payload type 与 Chrome 相同。不做转码的转发服务必须
   让所有对端在转发的编解码器上达成一致，最简单的办法就是只列这几个，比如每个浏览器都支持的
-  VP8 和 Opus。不提供 RTX 和 FEC：没有保留可供修复的历史包。
+  VP8 和 Opus。不提供 FEC；`Configuration.Retransmit` 保留可供修复的历史包时，会为带 NACK
+  反馈的编解码器提供 RTX（见[丢包修复](#丢包修复nack-与-rtx)）。
 - **头部扩展。** 协商 MID、simulcast 层的 RID、abs-send-time 和 audio level
   （`DefaultHeaderExtensions`）。MID 和 abs-send-time 由 PeerConnection 自己写；其余按 URI
   透传，所以转发用的 track 要用 `SetHeaderExtensions` 接收远端的 id 映射。没被告知 id 的
@@ -434,7 +435,40 @@ remb, _ := rtp.AppendRTCP(nil, &rtp.REMB{Bitrate: 500_000, SSRCs: []uint32{remot
 _ = pc.WriteRTCP(remb)
 ```
 
-NACK 也会到达 `OnRTCP`，除非应用自己处理，否则没人应答：PeerConnection 不保存可供重发的包。
+NACK 也会到达 `OnRTCP`。`Configuration.Retransmit` 保留历史包时由 PeerConnection 应答；
+否则应用可以自己应答。
+
+### 丢包修复（NACK 与 RTX）
+
+`Configuration.Retransmit` 为 PeerConnection 发送的流开启修复。它的零值什么都不保留，与以前
+相同：不应答 NACK，也不提供 RTX。
+
+```go
+pc, _ := webrtc.NewPeerConnection(webrtc.Configuration{
+	Mux:        mux,
+	Retransmit: webrtc.RetransmitConfig{Packets: 512}, // MaxAge 1s, 256 KiB/s
+})
+```
+
+- **历史包。** 一旦某个 sender 与对端协商了 `nack`，它的 `TrackLocal` 就按写入的原样保留最近
+  `Packets` 个包（取 2 的幂，最多 4096），缓冲区取自池。历史属于 track，由发送它的所有
+  PeerConnection 共用：SFU 通过一个 `TrackLocal` 把一个 `TrackRemote` 转发给许多观众时，只
+  保留一份历史，而不是每个观众一份。每个 sender 另为每个包记录 24 字节，说明自己发了什么。
+  只有协商出的反馈里有 `nack` 的编解码器才保留：浏览器对视频要求它，对 Opus 不要求。
+- **NACK。** 针对本端发送的流的 generic NACK（RTCP RTPFB，FMT 1）列出的每个包，只要历史里
+  还有、比 `MaxAge`（1 秒）新、在最近一个往返时间内没重发过（往返时间取自对端的 receiver
+  report，测出之前按 100 ms 算），并且在 sender 的 `MaxBytesPerSecond`（256 KiB/s，突发为
+  四分之一秒的量；负数不限）之内，就重发。超出速率的包直接跳过，不排队：重发从不阻塞。
+  `RTPSender.Retransmitted` 统计重发了多少。
+- **RTX。** 设置了 `Retransmit` 时，offer 在每个带 `nack` 的编解码器之后列出其 RTX 格式
+  （`rtx/90000`、`apt=`），payload type 按 Chrome 的编号取该编解码器的下一个，并用
+  `a=ssrc-group:FID` 把 sender 的 SSRC 与它自己的 RTX SSRC 配对；answer 接受 offer 中与已协商
+  编解码器配对的 RTX 格式。协商了 RTX 的对端在 RTX 流上收到重传（RFC 4588）：序号是 RTX 流
+  自己的，原序号放在载荷前面。没有协商的对端收到原样的包，与第一次发出的字节完全相同，所以
+  SRTP 用同一个 index 保护它。从对端 RTX 流收到的包会还原成它所修复的包，交给那个流的
+  `TrackRemote`。
+- **没有做的。** PeerConnection 不为自己接收的流发送 NACK：应用可以用 `rtp.NACK` 构造，再用
+  `WriteRTCP` 发出。不提供 FEC。
 
 ## TURN
 
@@ -682,6 +716,7 @@ _ = server.Shutdown(ctx)
 | `RTCPReportInterval` | 1 秒 | sender/receiver report 的间隔；负数表示不发 |
 | `MaxRemoteSSRCs` | 64 | 接收的媒体流数，每条占用 SRTP 状态和一个 TrackRemote |
 | `MaxRemoteCandidates` | 64 | 远端 description 到达前暂存的 trickle candidate 数 |
+| `Retransmit` | 无 | 每个 track 为应答 NACK 保留的 `Packets`（取 2 的幂，最多 4096）、`MaxAge`（1 秒）、`MaxBytesPerSecond`（每个 sender 256 KiB/s）；设置后提供 RTX |
 
 `webrtc.MuxConfig`：`Network`（`udp`、`udp4` 或 `udp6`）、`Addr`（`:0`）、`PublicAddrs`
 以及 `IdleTimeout`（45 秒，`DefaultMuxIdleTimeout`）。Mux 自己给它的每个连接设置空闲超时，
@@ -711,7 +746,8 @@ ICE-lite PeerConnection 共用一个 Mux，每个都和自己的客户端在 dat
 
 - **PeerConnection**：provisional answer（`pranswer`）与 rollback；max-bundle 以外的
   BundlePolicy；基于 TCP 的 ICE；解析浏览器 host candidate 的 mDNS 名字（对端的检查本来就
-  会以 peer-reflexive candidate 的形式暴露它的地址）；RTX 与 FEC；transport-wide 拥塞控制
+  会以 peer-reflexive candidate 的形式暴露它的地址）；FEC，以及为接收的流发送 NACK（对端的
+  NACK 会应答，见 `Retransmit`）；transport-wide 拥塞控制
   反馈与带宽估计；发送 simulcast（按 RID 接收是支持的）；编解码器的 RTP 打包；DTLS 1.3；
   SDES 密钥交换；RTCP report 以外的统计；在共用的 Mux 上使用 TURN，以及经 DTLS 的
   TURN（`turns:...?transport=udp`）。
@@ -771,7 +807,7 @@ OpenSSL 和 Chromium）是手工完成的。
 | pion/turn v4 | fib 的客户端经 pion 的服务器，pion 的客户端经 `turnserver`：allocate、refresh、permission、channel 绑定与中继 |
 | Chromium | fib-examples 的网页对接各自的服务端：data channel 回显；canvas 生成的视频 track 以 VP8 发出，从服务端回来后被成功解码；经同一个 engine 上的 `turnserver` 只走 relay 的 ICE；SFU 把视频和音频转发给观看者，观看者的 PLI 被转交给发布者 |
 | RFC 测试向量 | STUN（RFC 5769）、SRTP 密钥派生与密钥流（RFC 3711、RFC 6188）、AES-GCM 的 SRTP 与 SRTCP（RFC 7714） |
-| fib 对 fib | 两个 PeerConnection 在同一个 engine 上或两个 engine 上：双向最大 200 KiB 的 data channel 消息，带 SRTP 的 VP8 与 Opus，PLI 与 RTCP report，任一端发起的重新协商，ICE restart 期间数据不断，对端能看到关闭；200 个 ICE-lite PeerConnection 共用一个 Mux；一对只走 relay、经 `turnserver` 中转的 PeerConnection；`turn.Client` 经 TCP 与 TLS 通过 `turnserver` 中继，带或不带 channel |
+| fib 对 fib | 两个 PeerConnection 在同一个 engine 上或两个 engine 上：双向最大 200 KiB 的 data channel 消息，带 SRTP 的 VP8 与 Opus，PLI 与 RTCP report，模拟丢包下按 NACK 以 RTX 或原样重发直到收齐，任一端发起的重新协商，ICE restart 期间数据不断，对端能看到关闭；200 个 ICE-lite PeerConnection 共用一个 Mux；一对只走 relay、经 `turnserver` 中转的 PeerConnection；`turn.Client` 经 TCP 与 TLS 通过 `turnserver` 中继，带或不带 channel |
 
 fib 的 SCTP 在环回地址上 fib 对 fib 传 64 KiB 消息达到 240 MB/s，同样条件下 pion 对 pion 是
 163 MB/s；在内存中，两个 association 传这样的消息约 1.9 GB/s，每条消息不分配内存。在 M4 Pro

@@ -758,10 +758,21 @@ stream to the `Demuxer`'s `OnTracks` and `OnPacket`.
 | `PLIInterval`, `KeyFrameInterval` | 500 ms, 0 | Least time between keyframe requests; periodic requests |
 | `MaxOfferBytes` | 64 KiB | An offer or a PATCH body |
 | `OnKeyFrameRequest` | none | A viewer's keyframe request for a stream no WHIP session of this server publishes |
+| `RetransmitPackets` | 256 | Latest RTP packets of each track a viewer is sent that are kept to answer its NACKs; negative keeps none |
 
 `rtc.Config.WebRTC.Codecs` is ignored: each session takes the codecs of its
 stream or of the offer. One certificate is made for every PeerConnection
 when `Certificates` is empty.
+
+A WHEP viewer that asks for NACKs in its offer, as browsers do for video, has
+the packets it reports lost sent again: as RTX (RFC 4588) when the offer has
+RTX, which browsers' offers do, or else as they were. Each viewer's video track
+keeps `RetransmitPackets` packets for it, about 1.2 s of a 2 Mbit/s stream and
+some 1.5 KiB each, so 256 cost up to about 384 KiB per viewer; a server with
+many viewers on a clean network may turn it off with a negative value.
+`WebRTC.Retransmit.MaxAge` (1 s) and `MaxBytesPerSecond` (256 KiB/s per track)
+bound what is resent, and a packet is resent at most once per round trip.
+WHIP sessions keep nothing and send no NACKs.
 
 `rtc.ClientConfig` has `Engine` (a running one, which sends the requests
 unless `HTTPClient` is set and opens the PeerConnection's port unless
@@ -831,11 +842,12 @@ a codec fib does not have, or because it belongs to the application.
   `TargetDuration`), which the specification does not strictly allow.
 - **WHIP/WHEP**: ICE restarts (answered 422); simulcast (only a section's
   first layer is received); more streams per kind than the offer has
-  sections; RTX and FEC; renegotiation when a stream's codec changes (the old
-  codec's track stops). WHIP lines the tracks up by the publisher's sender
-  reports: until the first ones come (a browser sends them a second or more
-  in), and for a publisher that sends none, the tracks are in step only to
-  within the network's jitter and how differently the encoders delayed them.
+  sections; FEC, and NACKs from WHIP sessions and clients (only WHEP sessions
+  answer them); renegotiation when a stream's codec changes (the old codec's
+  track stops). WHIP lines the tracks up by the publisher's sender reports:
+  until the first ones come (a browser sends them a second or more in), and
+  for a publisher that sends none, the tracks are in step only to within the
+  network's jitter and how differently the encoders delayed them.
 - **Codec helpers**: the H.264 PPS, slice headers, SVC/MVC and the subset SPS;
   the H.265 SPS beyond the bit depths and reordering (no frame rate or aspect
   ratio), and SHVC/MV-HEVC; AAC program config elements, LATM in the codec

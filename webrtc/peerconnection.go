@@ -154,6 +154,11 @@ type Configuration struct {
 	// MaxRemoteCandidates bounds the trickled candidates held until the
 	// remote description arrives; 64 when zero.
 	MaxRemoteCandidates int
+
+	// Retransmit, when its Packets is set, answers the peer's NACKs from a
+	// history of what each track sent, and offers and accepts RTX for the
+	// codecs with NACK feedback. Its zero value keeps no history.
+	Retransmit RetransmitConfig
 }
 
 const (
@@ -270,6 +275,19 @@ type PeerConnection struct {
 	wbuf, sbuf   []byte
 	rtcpBuf      []byte
 
+	// Retransmission: the RTX payload type of each codec this side
+	// offers, the remote RTX streams by the primary streams the remote
+	// description pairs them with and as they arrive, and the buffer and
+	// packet a retransmission is read into.
+	rtxPTs     map[uint8]uint8
+	rtxPrimary map[uint32]uint32
+	rtxIn      map[uint32]*TrackRemote
+	hbuf       []byte
+	hpkt       rtp.Packet
+	// sendHook, set by tests, sees each datagram sent to the peer and
+	// drops those it returns false for.
+	sendHook func([]byte) bool
+
 	// Descriptions.
 	sessionID      uint64
 	sessionVersion uint64
@@ -305,6 +323,8 @@ func NewPeerConnection(config Configuration) (*PeerConnection, error) {
 		remoteSSRCs: make(map[uint32]string),
 		tracks:      make(map[uint32]*TrackRemote),
 		senders:     make(map[uint32]*RTPSender),
+		rtxPrimary:  make(map[uint32]uint32),
+		rtxIn:       make(map[uint32]*TrackRemote),
 		extIDs:      make(map[string]uint8),
 		sessionID:   sdp.NewSessionID(),
 		cname:       randomString(16),
@@ -334,6 +354,10 @@ func NewPeerConnection(config Configuration) (*PeerConnection, error) {
 	}
 	if pc.cfg.RTCPReportInterval == 0 {
 		pc.cfg.RTCPReportInterval = defaultReportInterval
+	}
+	pc.cfg.Retransmit.defaults()
+	if pc.cfg.Retransmit.Packets > 0 {
+		pc.rtxPTs = rtxPayloadTypes(pc.codecs)
 	}
 	if len(config.Certificates) > 0 {
 		pc.cert = config.Certificates[0]
@@ -793,6 +817,9 @@ func (pc *PeerConnection) sendTo(addr netip.AddrPort, b []byte) {
 
 // sendPeer sends a datagram on the selected pair.
 func (pc *PeerConnection) sendPeer(b []byte) {
+	if pc.sendHook != nil && !pc.sendHook(b) {
+		return
+	}
 	if pc.remoteAddr.IsValid() {
 		pc.sendOn(pc.remoteLocal, pc.remoteAddr, b)
 	}

@@ -52,8 +52,9 @@ var videoFeedback = []string{"goog-remb", "ccm fir", "nack", "nack pli"}
 // unless its Configuration names others: Opus, VP8, VP9 profile 0, H.264
 // with packetization-mode=1 in the constrained baseline, baseline, main and
 // high profiles browsers offer, and AV1, at the payload types Chrome gives
-// them. Retransmission (RTX) and FEC formats are left out: the
-// PeerConnection forwards RTP and keeps no history to repair it from.
+// them. FEC formats are left out, and so are RTX formats, which a
+// PeerConnection adds for the codecs with NACK feedback when its
+// Configuration.Retransmit keeps a history to repair from.
 func DefaultCodecs() []Codec {
 	h264 := func(pt uint8, profile string) Codec {
 		return Codec{MimeType: "video/H264", ClockRate: 90000, PayloadType: pt, Feedback: videoFeedback,
@@ -164,9 +165,11 @@ func h264Profile(id string) string {
 
 // negotiatedCodec is a codec both sides accepted, with the payload type
 // each side receives it on: the remote one is what this side sends with.
+// rtxSend and rtxRecv are those of its RTX format, 0 when there is none.
 type negotiatedCodec struct {
 	Codec
-	sendPT, recvPT uint8
+	sendPT, recvPT   uint8
+	rtxSend, rtxRecv uint8
 }
 
 // intersectCodecs returns the remote codecs, in the remote's order of
@@ -174,7 +177,7 @@ type negotiatedCodec struct {
 func intersectCodecs(kind string, remote []sdp.Codec, local []Codec) []negotiatedCodec {
 	var out []negotiatedCodec
 	for _, rc := range remote {
-		if rc.Name == "" {
+		if rc.Name == "" || isRTX(rc.Name) {
 			continue
 		}
 		r := codecFromSDP(kind, rc)

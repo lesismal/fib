@@ -12,8 +12,9 @@ import (
 )
 
 // The rtcp-fb values the codecs this package sends and receives are
-// offered with. There is no "nack": neither side keeps the history a
-// retransmission would come from.
+// offered with. There is no "nack": a client neither sends NACKs nor keeps
+// the history a retransmission would come from. A WHEP session answers
+// the NACKs a viewer's offer asks for (Config.RetransmitPackets).
 var (
 	videoFeedback = []string{"ccm fir", "nack pli"}
 	audioFeedback []string

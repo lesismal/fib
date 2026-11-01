@@ -37,6 +37,9 @@ const (
 	DefaultPLIInterval    = 500 * time.Millisecond
 	DefaultMaxOfferBytes  = 64 << 10
 	DefaultMaxPlayWaiters = 1024
+	// DefaultRetransmitPackets is the history of each track a WHEP viewer
+	// is sent: about 1.2 s of a 2 Mbit/s video in 1200-byte packets.
+	DefaultRetransmitPackets = 256
 )
 
 const (
@@ -165,6 +168,14 @@ type Config struct {
 	// MaxOfferBytes bounds an offer or a PATCH body; zero or less means
 	// DefaultMaxOfferBytes (64 KiB).
 	MaxOfferBytes int
+	// RetransmitPackets is how many of the latest RTP packets of each
+	// track a WHEP viewer is sent are kept to answer its NACKs, as RTX
+	// when its offer has RTX (webrtc.RetransmitConfig, whose MaxAge and
+	// MaxBytesPerSecond WebRTC.Retransmit gives); zero means
+	// DefaultRetransmitPackets (256), about 1.5 KiB each once sent, and
+	// a negative value keeps none. Only the tracks the viewer asks NACKs
+	// for, as browsers do for video, keep any. WHIP sessions keep none.
+	RetransmitPackets int
 }
 
 func (c *Config) defaults() {
@@ -203,6 +214,9 @@ func (c *Config) defaults() {
 	}
 	if c.MaxPlayWaiters <= 0 {
 		c.MaxPlayWaiters = DefaultMaxPlayWaiters
+	}
+	if c.RetransmitPackets == 0 {
+		c.RetransmitPackets = DefaultRetransmitPackets
 	}
 }
 
@@ -632,11 +646,13 @@ type session struct {
 	closeOnce sync.Once
 }
 
-// newPeerConnection makes the session's PeerConnection with codecs, and
-// has its state close the session when it fails.
-func (sess *session) newPeerConnection(codecs []webrtc.Codec) error {
+// newPeerConnection makes the session's PeerConnection with codecs, which
+// keeps the latest retransmit packets of each track it sends, and has its
+// state close the session when it fails.
+func (sess *session) newPeerConnection(codecs []webrtc.Codec, retransmit int) error {
 	cfg := sess.s.config.WebRTC
 	cfg.Codecs = codecs
+	cfg.Retransmit.Packets = max(retransmit, 0)
 	pc, err := webrtc.NewPeerConnection(cfg)
 	if err != nil {
 		return fmt.Errorf("%w: %v", errInternal, err)
@@ -708,7 +724,7 @@ func (sess *session) startIngest(c *fibhttp.Context, offer *sdp.SessionDescripti
 	if len(codecs) == 0 {
 		return ErrNoMedia
 	}
-	if err := sess.newPeerConnection(codecs); err != nil {
+	if err := sess.newPeerConnection(codecs, 0); err != nil {
 		return err
 	}
 	sess.pc.OnTrack(func(tr *webrtc.TrackRemote) {
@@ -800,7 +816,7 @@ func (sess *session) startEgress(offer *sdp.SessionDescription, desc webrtc.Sess
 	if len(outs) == 0 {
 		return ErrNoMedia
 	}
-	if err := sess.newPeerConnection(codecs); err != nil {
+	if err := sess.newPeerConnection(codecs, s.config.RetransmitPackets); err != nil {
 		return err
 	}
 	for _, o := range outs {
