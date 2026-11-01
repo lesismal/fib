@@ -426,4 +426,10 @@ func TestConfigErrors(t *testing.T) {
 	if err := a.SetRemoteCredentials("bad ufrag", "x", now); !errors.Is(err, ErrCredentials) {
 		t.Fatal(err)
 	}
+	// The same credentials set again change nothing.
+	for range 2 {
+		if err := a.SetRemoteCredentials(testRufrag, testRpwd, now); err != nil {
+			t.Fatal(err)
+		}
+	}
 }

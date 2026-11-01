@@ -192,6 +192,9 @@ func TestServerDrainAndLimits(t *testing.T) {
 	u := c.user(clientAddr, testUser, testPass)
 	_ = u.do(stun.MethodAllocate, allocateReq)
 	c.s.SetLimits(Limits{DefaultLifetime: time.Minute, MaxLifetime: 2 * time.Minute})
+	if l := c.s.Limits(); l.DefaultLifetime != time.Minute || l.MaxLifetime != 2*time.Minute {
+		t.Fatalf("limits %+v", l)
+	}
 	if r := u.do(stun.MethodRefresh, func(m *stun.Message) { m.AddLifetime(time.Hour) }); code(r) != 0 {
 		t.Fatal(code(r))
 	} else if l, _ := r.Lifetime(); l != 2*time.Minute {

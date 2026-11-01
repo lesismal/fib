@@ -242,6 +242,21 @@ func TestStreamBounds(t *testing.T) {
 	// Idle without an allocation.
 	c = dialStream(t, addr, false)
 	closedSoon(c, "idle")
+	// Kept while it holds an allocation, however long.
+	held := dialStream(t, addr, false)
+	u := newStreamClient(t, held, addr, false)
+	u.do(func(c *turn.Client) { _ = c.Allocate(time.Now()) })
+	select {
+	case <-u.allocated:
+	case err := <-u.failed:
+		t.Fatal(err)
+	case <-time.After(10 * time.Second):
+		t.Fatal("no allocation")
+	}
+	time.Sleep(3 * cfg.StreamIdleTimeout)
+	if s.Allocations() != 1 || countStreams(s) != 1 {
+		t.Fatalf("%d allocations, %d streams after the idle timeout", s.Allocations(), countStreams(s))
+	}
 	// Closed with the server.
 	c = dialStream(t, addr, false)
 	deadline := time.Now().Add(5 * time.Second)
@@ -269,6 +284,12 @@ func TestStreamBounds(t *testing.T) {
 	s2.sendToClient(turn.FiveTuple{Transport: turn.TransportTCP}, []byte("x"))
 	if s2.Unsent() != 1 {
 		t.Fatal("a datagram to a gone stream client not counted")
+	}
+	// Nor is a UDP client, with no engine to reopen its connection on.
+	s2.OnPriorityData(nil, nil)
+	s2.sendToClient(turn.FiveTuple{Transport: turn.TransportUDP}, []byte("x"))
+	if s2.Unsent() != 1 {
+		t.Fatal("a datagram before Start counted as unsent")
 	}
 }
 

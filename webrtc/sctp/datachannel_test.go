@@ -278,6 +278,49 @@ func TestChannelsBeforeEstablishment(t *testing.T) {
 	if far.State() != ChannelClosed || e.closes[0] != 2 || len(e.opened[1]) != 0 {
 		t.Fatalf("far %v, %d closes, peer opened %d", far.State(), e.closes[0], len(e.opened[1]))
 	}
+	// The channel closed already does not close again with the association.
+	a.Abort()
+	if e.closes[0] != 2 {
+		t.Fatalf("%d closes after Abort", e.closes[0])
+	}
+}
+
+// TestOpenTooLargeOnceEstablished makes a channel before the association is
+// up and then learns the peer takes messages too small for its OPEN: the
+// channel is not announced and stays connecting.
+func TestOpenTooLargeOnceEstablished(t *testing.T) {
+	var e chanEnds
+	l := newLink(t, 1, e.configure)
+	a := l.ends[0]
+	ch, err := a.OpenChannel(ChannelOptions{Label: "longer than the peer takes"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	a.SetRemoteMaxMessageSize(20)
+	l.connect(false)
+	l.run(time.Second, nil)
+	if ch.State() != ChannelConnecting || len(e.opened[1]) != 0 {
+		t.Fatalf("state %v, peer opened %d", ch.State(), len(e.opened[1]))
+	}
+}
+
+// TestOpenWhileShuttingDown has an OPEN reach a peer that has begun to shut
+// down: it cannot send the ACK, and does not announce the channel.
+func TestOpenWhileShuttingDown(t *testing.T) {
+	var e chanEnds
+	l := newLink(t, 1, e.configure)
+	l.connect(false)
+	if _, err := l.ends[0].OpenChannel(ChannelOptions{Label: "late"}); err != nil {
+		t.Fatal(err)
+	}
+	l.ends[1].Shutdown()
+	if l.ends[1].State() != StateShutdownSent {
+		t.Fatalf("peer state %v", l.ends[1].State())
+	}
+	l.run(time.Second, func() bool { return l.closed[0] && l.closed[1] })
+	if len(e.opened[1]) != 0 || l.closeEr[0] != nil || l.closeEr[1] != nil {
+		t.Fatalf("peer opened %d; %v and %v", len(e.opened[1]), l.closeEr[0], l.closeEr[1])
+	}
 }
 
 // TestDCEPIgnored checks that DCEP messages that make no sense, and data on
@@ -344,7 +387,7 @@ func TestChannelAckedByData(t *testing.T) {
 		t.Fatalf("opened %d, acked %v", len(e.opened[1]), ch.acked)
 	}
 	peer := e.opened[1][0]
-	if peer.Type() != ChannelPartialReliableTimedUnordered || peer.ReliabilityParameter() != 1000 {
+	if peer.Type() != ChannelPartialReliableTimedUnordered || peer.ReliabilityParameter() != 1000 || peer.Ordered() || peer.Negotiated() {
 		t.Fatalf("type %v, parameter %d", peer.Type(), peer.ReliabilityParameter())
 	}
 	_ = ch.SendText("timed")

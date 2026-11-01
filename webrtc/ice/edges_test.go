@@ -666,4 +666,72 @@ func TestPairing(t *testing.T) {
 			t.Fatalf("kept %d pairs", len(a.pairs))
 		}
 	})
+
+	t.Run("MaxPairs keeps a pair in progress", func(t *testing.T) {
+		// The pair being checked stays however low its priority; a
+		// peer-reflexive one above it goes instead.
+		a, sent := newAgent(Config{MaxPairs: 1})
+		_ = a.Gather([]Socket{{ID: 1, Addrs: []netip.AddrPort{addrA}}}, now)
+		_ = a.AddRemoteCandidate(remote(2000, 1, "a"), now)
+		lastCheck(t, a, sent, &now)
+		if err := a.HandlePacket(1, netip.MustParseAddrPort("10.0.0.3:3000"), peerCheck(a, Priority(Host, 65535, 1), nil), now); err != nil {
+			t.Fatal(err)
+		}
+		if len(a.pairs) != 1 || a.pairs[0].key.remote.Port() != 2000 || a.pairs[0].state != pairInProgress {
+			t.Fatalf("kept %d pairs", len(a.pairs))
+		}
+	})
+
+	t.Run("MaxPairs prunes a triggered pair", func(t *testing.T) {
+		// A pair whose check the peer's cancelled is pruned off the
+		// triggered queue, and the response to that check comes too late
+		// to count.
+		a, sent := newAgent(Config{MaxPairs: 2})
+		_ = a.Gather([]Socket{{ID: 1, Addrs: []netip.AddrPort{addrA}}}, now)
+		low := remote(2000, 1, "a")
+		_ = a.AddRemoteCandidate(low, now)
+		first := lastCheck(t, a, sent, &now)
+		if err := a.HandlePacket(1, low.AddrPort(), peerCheck(a, 1, nil), now); err != nil {
+			t.Fatal(err)
+		}
+		for i, prio := range []uint32{Priority(Host, 65535, 1), Priority(Host, 100, 1)} {
+			from := netip.AddrPortFrom(addrB.Addr(), uint16(3000+i))
+			if err := a.HandlePacket(1, from, peerCheck(a, prio, nil), now); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if len(a.pairs) != 2 || a.pairIndex[pairKey{1, low.AddrPort()}] != nil {
+			t.Fatalf("kept %d pairs", len(a.pairs))
+		}
+		for _, p := range a.triggered {
+			if p.key.remote == low.AddrPort() {
+				t.Fatal("the pruned pair is still triggered")
+			}
+		}
+		if err := a.HandlePacket(1, low.AddrPort(), peerResponse(first.TransactionID, addrA, 0, testRpwd), now); err != nil {
+			t.Fatal(err)
+		}
+		if a.selected != nil || len(a.pairs) != 2 {
+			t.Fatalf("selected %v, %d pairs", a.selected, len(a.pairs))
+		}
+	})
+}
+
+// TestLocalPreferenceFloor ranks candidates past the 4096th all at the
+// lowest local preference.
+func TestLocalPreferenceFloor(t *testing.T) {
+	var last Candidate
+	a, err := NewAgent(Config{Send: func(LocalID, netip.AddrPort, []byte) {}, OnCandidate: func(c Candidate) { last = c }})
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Unix(0, 0)
+	for i := range 4097 {
+		if err := a.AddLocalCandidate(Candidate{Type: Host, Address: addrA.Addr(), Port: uint16(i + 1), LocalID: 1}, now); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if want := Priority(Host, 0, 1); last.Priority != want {
+		t.Fatalf("priority %d, want %d", last.Priority, want)
+	}
 }
