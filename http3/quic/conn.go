@@ -609,9 +609,11 @@ type Conn struct {
 	// wantFlush that there may be something to send, which the sending one
 	// sends too before it stops. flushDeadline bounds how long what was
 	// written while the handler was being called may wait for its calls to
-	// end (see flush).
+	// end (see flush); ackHold says that it holds back nothing but an
+	// acknowledgement, for as long as the peer lets one wait.
 	sending       bool
 	wantFlush     bool
+	ackHold       bool
 	flushDeadline time.Time
 	// awaited counts the writes ExpectWrite said are on their way.
 	awaited int
@@ -1370,13 +1372,26 @@ const flushHold = time.Millisecond
 func (c *Conn) flush() {
 	c.mu.Lock()
 	held := c.heldLocked()
-	if held && c.wantFlush && !c.closed && c.flushDeadline.IsZero() {
+	if held && c.wantFlush && !c.closed && (c.flushDeadline.IsZero() || c.ackHold) {
 		// Nothing to hold back but an acknowledgement that is not due is
 		// nothing to hold: the acknowledgement has a deadline of its own,
-		// which the timer keeps (see armAckLocked).
-		if c.sendableLocked() {
+		// which the timer keeps (see armAckLocked). One that is due, as the
+		// second packet of a burst makes it, and the credit that the
+		// burst's acknowledgements of earlier answers give back (MAX_STREAMS,
+		// MAX_DATA), wait for the answers to the burst as long as the peer
+		// lets an acknowledgement wait, its max_ack_delay; flushHold starts
+		// with the first answer. The answers are not late for waiting
+		// behind other connections' for a worker, and an acknowledgement
+		// sent alone once flushHold had passed would leave each of them to
+		// go in a packet of its own as it came.
+		switch {
+		case c.dataSendableLocked():
 			now := c.now()
-			c.flushDeadline = now.Add(flushHold)
+			c.flushDeadline, c.ackHold = now.Add(flushHold), false
+			c.armTimerLocked(now)
+		case c.flushDeadline.IsZero() && c.sendableLocked():
+			now := c.now()
+			c.flushDeadline, c.ackHold = now.Add(max(c.ackDelay(), flushHold)), true
 			c.armTimerLocked(now)
 		}
 	}
@@ -1406,6 +1421,38 @@ func (c *Conn) sendableLocked() bool {
 		}
 	}
 	return false
+}
+
+// dataSendableLocked is sendableLocked for something other than an
+// acknowledgement of 1-RTT packets or the credit given with one (see
+// urgentControlPending): those of the handshake are never held for longer
+// than flushHold. Callers hold c.mu.
+func (c *Conn) dataSendableLocked() bool {
+	for space := range c.spaces {
+		s := &c.spaces[space]
+		if s.tx == nil || s.discarded {
+			continue
+		}
+		if s.probes > 0 || space != spaceApp && s.ackPending && s.ackNow {
+			return true
+		}
+		if cs := &s.cryptoSend; cs.next < cs.end() || cs.hasLost() {
+			return true
+		}
+		if space == spaceApp && (len(c.sendQueue) > 0 || c.urgentControlPending()) {
+			return true
+		}
+	}
+	return false
+}
+
+// ackDelay is how long an acknowledgement may wait: the delay this side
+// advertised, or the one the peer asked for.
+func (c *Conn) ackDelay() time.Duration {
+	if c.ackFreq.valid {
+		return c.ackFreq.maxDelay
+	}
+	return c.local.maxAckDelay
 }
 
 // sendLocked sends until there is nothing left to send, unless another

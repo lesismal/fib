@@ -169,7 +169,7 @@ func (c *Conn) sendRoundLocked() {
 		lens[n] = uint16(len(buf) - start)
 		n++
 	}
-	c.flushDeadline = time.Time{}
+	c.flushDeadline, c.ackHold = time.Time{}, false
 	if c.paced && !c.wantFlush && c.sendableLocked() {
 		c.sendAt = c.paceNext(now)
 	}
@@ -499,8 +499,15 @@ func (c *Conn) framesWaiting(space int) bool {
 // waits to be sent, which appendControlFrames finds out for sure: false
 // means it has none, as nearly every packet of a transfer finds.
 func (c *Conn) controlPending() bool {
-	return c.handshakeDonePending || c.newTokenPending || c.challengePending || c.maxDataPending ||
-		c.maxStreamsBidiPending || c.maxStreamsUniPending || len(c.pathResponses) > 0 ||
+	return c.maxDataPending || c.maxStreamsBidiPending || c.maxStreamsUniPending || c.urgentControlPending()
+}
+
+// urgentControlPending is controlPending without the credit this side gives
+// the peer: it is given while the peer still has half of what it had (see
+// maybeFinish), and can wait as an acknowledgement does for what goes with
+// it (see flush).
+func (c *Conn) urgentControlPending() bool {
+	return c.handshakeDonePending || c.newTokenPending || c.challengePending || len(c.pathResponses) > 0 ||
 		len(c.retireCIDs) > 0 || c.cidsPending || c.blockedPending() || c.pingPending || c.ackFreqPending
 }
 
