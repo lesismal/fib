@@ -361,6 +361,19 @@ HTTP/1 客户端像 server 读请求、写响应那样，自己写请求头、�
 gzip 或 deflate 编码的 body 也一并解码（见 [Transfer coding](#transfer-coding)）。写一个代理请求只分配一次，
 读一个普通响应头五次，经 `net/http` 分别是八次和十三次。
 
+代理可以在两侧都把头部块按行而不是按 map 转发。`Context.RequestHeaderBlock()` 是请求经 HTTP/1
+到达时的字段行（字段名保持客户端的大小写，每行都经解析器检查；HTTP/2、HTTP/3 上或交给
+`net/http` 解析的请求头为 `""`）；它不随 `Request.Header` 的修改而变，所以只适合在它之前没有
+任何东西改过头部的 handler。`Client.StartFramed(req, Framing{HeaderBlock, ResponseHeaderBlock}, callback)`
+把这样的行（由调用方编辑过，不含 `Host`、`Content-Length`、`Transfer-Encoding`、`Trailer`）
+原样写在请求行、`Host` 和 `Content-Length` 之后，代替 `req.Header`；走 HTTP/2、带流式 body
+或交给 `net/http` 的请求则先把这些字段加进 `req.Header`。设置 `ResponseHeaderBlock` 时，客户端
+自己读的响应头以 `ClientResponse.HeaderBlock()` 给出，每行保持到达时的样子，`Header` 为 nil，
+不建 map。`Response.HeaderBlock` 在 HTTP/1 上把这些行写在 `Header` 的字段之后，不排序、不检查，
+块里有 `Date` 时 server 不再加自己的；HTTP/2、HTTP/3 以及 `OnHeader`、`OnResponse` hook 得到的是
+加入了这些字段的 `Header` 副本，`OnFinish` hook 只拿到 `Header` 本身。这样代理的请求在客户端一侧
+不建头部 map，两侧都不排序：fit 的 HTTP/1 代理仅请求一侧就测得每秒请求数多 5-6%。
+
 ### 客户端与 `Expect: 100-continue`
 
 客户端带 body 和 `Expect: 100-continue` 的请求先单独发送请求头，等服务端回 100 Continue，

@@ -204,8 +204,9 @@ func (c *Context) OnHeaderAsync(fn func(status int, header stdhttp.Header, resum
 // OnFinish registers fn to run once the response has been handed to the
 // connection, with the status and header it was sent with and the length of
 // the body it carried: none for a response to HEAD, or one whose status has
-// no body. header must not be changed or kept past the call. The finish
-// hooks run in the reverse of the order they were registered.
+// no body. header must not be changed or kept past the call; it does not
+// hold the fields of a Response.HeaderBlock. The finish hooks run in the
+// reverse of the order they were registered.
 //
 // fn runs on the goroutine that finished the response, and not at all for a
 // response that is never written, such as one whose connection went first.

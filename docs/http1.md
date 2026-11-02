@@ -482,6 +482,26 @@ on top of chunked is decoded as it is read or buffered (see
 allocation and reading a plain response head five, against eight and thirteen
 through `net/http`.
 
+A proxy can pass header blocks through as lines rather than maps, on both
+sides. `Context.RequestHeaderBlock()` is a request's field lines as they
+arrived over HTTP/1 (names in the client's case, every line checked by the
+parser; `""` over HTTP/2 and HTTP/3, or for a head left to `net/http`); it does
+not follow changes to `Request.Header`, so it is for a handler nothing before
+it has changed the header for. `Client.StartFramed(req, Framing{HeaderBlock,
+ResponseHeaderBlock}, callback)` writes such lines, edited by the caller (no
+`Host`, `Content-Length`, `Transfer-Encoding` or `Trailer`), as they are after
+the request line, `Host` and `Content-Length`, in place of `req.Header`; a
+request that goes out on HTTP/2, with a streamed body, or through `net/http`
+has them added to `req.Header` instead. With `ResponseHeaderBlock`, a response
+head the client reads itself comes as `ClientResponse.HeaderBlock()`, every
+line as it arrived, with a nil `Header` and no map built. `Response.HeaderBlock`
+writes lines after `Header`'s fields on HTTP/1, unsorted and unchecked, with no
+`Date` of the server's when it carries one; HTTP/2, HTTP/3 and an `OnHeader` or
+`OnResponse` hook get its fields added to a copy of `Header`, and an `OnFinish`
+hook is handed `Header` alone. A proxied request then costs no header map on
+the client side and no sort on either: fit's HTTP/1 proxy measured 5-6% more
+requests a second from the request side.
+
 ### The client and `Expect: 100-continue`
 
 A client request with a body and `Expect: 100-continue` sends its head alone

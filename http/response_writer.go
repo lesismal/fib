@@ -3,6 +3,7 @@
 package http
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
 	"io"
@@ -1186,6 +1187,8 @@ func hasPrefixedTrailers(header stdhttp.Header) bool {
 type responseHead struct {
 	status int
 	header stdhttp.Header
+	// block is Response.HeaderBlock, written after header.
+	block []byte
 	// contentLength is sent unless it is negative. chunked sends
 	// Transfer-Encoding: chunked, with trailers announced in a Trailer
 	// header. close says the connection ends after the response.
@@ -1226,7 +1229,7 @@ func appendResponseHead(out []byte, req *stdhttp.Request, head responseHead) ([]
 	out = append(out, ' ')
 	out = append(out, statusText...)
 	out = append(out, crlf...)
-	if _, ok := head.header["Date"]; !ok {
+	if _, ok := head.header["Date"]; !ok && !blockHasField(head.block, "Date") {
 		out = appendDate(out)
 	}
 	if head.contentLength >= 0 {
@@ -1256,6 +1259,7 @@ func appendResponseHead(out []byte, req *stdhttp.Request, head responseHead) ([]
 		out = append(out, crlf...)
 	}
 	if len(head.header) == 0 {
+		out = append(out, head.block...)
 		return append(out, crlf...), nil
 	}
 	out, err := appendHeaderLines(out, head.header, func(key string) bool {
@@ -1271,7 +1275,24 @@ func appendResponseHead(out []byte, req *stdhttp.Request, head responseHead) ([]
 	if err != nil {
 		return nil, err
 	}
+	out = append(out, head.block...)
 	return append(out, crlf...), nil
+}
+
+// blockHasField reports whether block, as Response.HeaderBlock holds it, has
+// a field named name, in any case.
+func blockHasField(block []byte, name string) bool {
+	for len(block) > len(name) {
+		if block[len(name)] == ':' && asciiEqualFold(string(block[:len(name)]), name) {
+			return true
+		}
+		end := bytes.IndexByte(block, '\n')
+		if end < 0 {
+			break
+		}
+		block = block[end+1:]
+	}
+	return false
 }
 
 // cachedDate is the Date header value for one second, formatted once.
