@@ -174,7 +174,7 @@ func (s *Section) Append(dst []byte, name, value string, neverIndex bool) []byte
 	if e == nil || e.t.capacity == 0 {
 		return AppendField(dst, name, value, neverIndex)
 	}
-	static := staticNameIndex[name]
+	static, _ := staticNameIndex.Get(name)
 	if !neverIndex {
 		for _, i := range static {
 			if staticTable[i].Value == value {

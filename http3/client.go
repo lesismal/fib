@@ -736,7 +736,7 @@ func requestFields(req *stdhttp.Request, bodyLen int64) (fields, trailer []qpack
 	userAgent := false
 	for key, values := range req.Header {
 		name := strings.ToLower(key)
-		if connectionHeaders[name] || name == "host" || name == "content-length" || name == "te" || name == ":protocol" {
+		if connectionHeader(name) || name == "host" || name == "content-length" || name == "te" || name == ":protocol" {
 			continue
 		}
 		if !validName(name) {
@@ -778,7 +778,7 @@ func requestFields(req *stdhttp.Request, bodyLen int64) (fields, trailer []qpack
 func trailerFields(fields stdhttp.Header) (declared []string, trailer []qpack.HeaderField, err error) {
 	for key, values := range fields {
 		name := strings.ToLower(key)
-		if !validName(name) || strings.HasPrefix(name, ":") || connectionHeaders[name] {
+		if !validName(name) || strings.HasPrefix(name, ":") || connectionHeader(name) {
 			return nil, nil, errors.New("http3: invalid request trailer name " + strconv.Quote(key))
 		}
 		declared = append(declared, name)

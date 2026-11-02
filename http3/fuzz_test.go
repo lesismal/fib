@@ -6,6 +6,7 @@ import (
 	"net/textproto"
 	"net/url"
 	"reflect"
+	"strings"
 	"testing"
 
 	fibhttp "github.com/lesismal/fib/http"
@@ -111,9 +112,13 @@ func headerFields(method, scheme, authority, path, name, value string) []qpack.H
 
 // canonicalKey makes of a lowercase name what textproto does.
 func TestCanonicalKey(t *testing.T) {
-	for name := range canonicalKeys {
+	for _, key := range commonKeys {
+		name := strings.ToLower(key)
 		if got, want := canonicalKey(name), textproto.CanonicalMIMEHeaderKey(name); got != want {
 			t.Fatalf("%q: %q, textproto makes %q", name, got, want)
+		}
+		if got := lowerKey(key); got != name {
+			t.Fatalf("%q: lowerKey makes %q", key, got)
 		}
 	}
 	if got := canonicalKey("x-unknown-field"); got != "X-Unknown-Field" {

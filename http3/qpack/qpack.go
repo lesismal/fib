@@ -11,6 +11,7 @@ import (
 	"errors"
 
 	"github.com/lesismal/fib/hpack"
+	"github.com/lesismal/fib/internal/strtab"
 )
 
 // HeaderField is one field line, with its name lowercased.
@@ -38,7 +39,7 @@ var (
 
 // AppendField appends one field line; a section starts with Prefix.
 func AppendField(dst []byte, name, value string, neverIndex bool) []byte {
-	if entries := staticNameIndex[name]; len(entries) > 0 {
+	if entries, _ := staticNameIndex.Get(name); len(entries) > 0 {
 		if !neverIndex {
 			for _, i := range entries {
 				if staticTable[i].Value == value {
@@ -383,13 +384,21 @@ func appendString(dst []byte, first byte, n uint8, s string) []byte {
 // staticNameIndex maps a name to the static table's entries with it, in
 // order: one lookup finds both the entry a field can be indexed as, among a
 // few values, and the first one, which a literal refers to for its name.
-var staticNameIndex = make(map[string][]uint8, len(staticTable))
-
-func init() {
+var staticNameIndex = func() *strtab.Table[[]uint8] {
+	var names []string
+	entries := make(map[string][]uint8)
 	for i, f := range staticTable {
-		staticNameIndex[f.Name] = append(staticNameIndex[f.Name], uint8(i))
+		if entries[f.Name] == nil {
+			names = append(names, f.Name)
+		}
+		entries[f.Name] = append(entries[f.Name], uint8(i))
 	}
-}
+	vals := make([][]uint8, len(names))
+	for i, name := range names {
+		vals[i] = entries[name]
+	}
+	return strtab.New(names, vals)
+}()
 
 // staticTable is RFC 9204 appendix A.
 var staticTable = [...]HeaderField{

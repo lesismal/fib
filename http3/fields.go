@@ -14,18 +14,20 @@ import (
 	"github.com/lesismal/fib/bufferpool"
 	fibhttp "github.com/lesismal/fib/http"
 	"github.com/lesismal/fib/http3/qpack"
+	"github.com/lesismal/fib/internal/strtab"
 )
 
 // HTTP/3 carries fields as HTTP/2 does (RFC 9114 section 4.2): names
 // lowercase, pseudo-headers first, and no connection-specific fields.
 
-// connectionHeaders are HTTP/1 hop-by-hop fields, which HTTP/3 forbids.
-var connectionHeaders = map[string]bool{
-	"connection":        true,
-	"keep-alive":        true,
-	"proxy-connection":  true,
-	"transfer-encoding": true,
-	"upgrade":           true,
+// connectionHeader reports whether name is one of the HTTP/1 hop-by-hop
+// fields, which HTTP/3 forbids.
+func connectionHeader(name string) bool {
+	switch name {
+	case "connection", "keep-alive", "proxy-connection", "transfer-encoding", "upgrade":
+		return true
+	}
+	return false
 }
 
 // validName reports whether name is a valid lowercase field name.
@@ -95,7 +97,7 @@ func checkHeaderSize(header stdhttp.Header, skip func(string) bool) (uint64, err
 				return 0, errors.New("http3: invalid header value for " + key)
 			}
 		}
-		if connectionHeaders[name] || skip != nil && skip(name) {
+		if connectionHeader(name) || skip != nil && skip(name) {
 			continue
 		}
 		for _, value := range values {
@@ -110,7 +112,7 @@ func checkHeaderSize(header stdhttp.Header, skip func(string) bool) (uint64, err
 func appendHeader(sec *qpack.Section, block []byte, header stdhttp.Header, skip func(string) bool) []byte {
 	for key, values := range header {
 		name := lowerKey(key)
-		if connectionHeaders[name] || skip != nil && skip(name) {
+		if connectionHeader(name) || skip != nil && skip(name) {
 			continue
 		}
 		for _, value := range values {
@@ -136,39 +138,31 @@ func appendFields(enc *qpack.Encoder, fields []qpack.HeaderField, streamID uint6
 	return sec.End(block)
 }
 
-// lowerKeys are the lowercase names of the header keys messages nearly always
-// carry, which lowerKey looks up rather than builds.
-var lowerKeys = func() map[string]string {
-	keys := make(map[string]string)
-	for _, key := range []string{
-		"Accept", "Accept-Encoding", "Accept-Language", "Accept-Ranges",
-		"Access-Control-Allow-Headers", "Access-Control-Allow-Methods", "Access-Control-Allow-Origin",
-		"Age", "Allow", "Authorization", "Cache-Control", "Content-Disposition", "Content-Encoding",
-		"Content-Language", "Content-Length", "Content-Location", "Content-Range", "Content-Type",
-		"Cookie", "Date", "Etag", "Expires", "Last-Modified", "Link", "Location", "Origin",
-		"Referer", "Retry-After", "Server", "Set-Cookie", "Strict-Transport-Security",
-		"Trailer", "User-Agent", "Vary", "Via", "Www-Authenticate", "X-Content-Type-Options",
-		"X-Forwarded-For", "X-Frame-Options", "X-Request-Id",
-	} {
-		keys[key] = strings.ToLower(key)
-	}
-	return keys
-}()
+// commonKeys are the header keys messages nearly always carry, whose
+// lowercase names lowerKeys looks up rather than builds, and canonicalKeys
+// the other way.
+var commonKeys = []string{
+	"Accept", "Accept-Encoding", "Accept-Language", "Accept-Ranges",
+	"Access-Control-Allow-Headers", "Access-Control-Allow-Methods", "Access-Control-Allow-Origin",
+	"Age", "Allow", "Authorization", "Cache-Control", "Content-Disposition", "Content-Encoding",
+	"Content-Language", "Content-Length", "Content-Location", "Content-Range", "Content-Type",
+	"Cookie", "Date", "Etag", "Expires", "Last-Modified", "Link", "Location", "Origin",
+	"Referer", "Retry-After", "Server", "Set-Cookie", "Strict-Transport-Security",
+	"Trailer", "User-Agent", "Vary", "Via", "Www-Authenticate", "X-Content-Type-Options",
+	"X-Forwarded-For", "X-Frame-Options", "X-Request-Id",
+}
 
-// canonicalKeys maps the lowercase names of lowerKeys back to their keys,
-// which is what textproto.CanonicalMIMEHeaderKey makes of them, for the
-// fields of a request to be looked up rather than rebuilt.
-var canonicalKeys = func() map[string]string {
-	keys := make(map[string]string, len(lowerKeys))
-	for key, name := range lowerKeys {
-		keys[name] = key
+var lowerKeys, canonicalKeys = func() (*strtab.Table[string], *strtab.Table[string]) {
+	names := make([]string, len(commonKeys))
+	for i, key := range commonKeys {
+		names[i] = strings.ToLower(key)
 	}
-	return keys
+	return strtab.New(commonKeys, names), strtab.New(names, commonKeys)
 }()
 
 // canonicalKey is textproto.CanonicalMIMEHeaderKey of a lowercase field name.
 func canonicalKey(name string) string {
-	if key, ok := canonicalKeys[name]; ok {
+	if key, ok := canonicalKeys.Get(name); ok {
 		return key
 	}
 	return textproto.CanonicalMIMEHeaderKey(name)
@@ -178,7 +172,7 @@ func canonicalKey(name string) string {
 // allocation strings.ToLower makes of a canonical key for the keys messages
 // nearly always carry.
 func lowerKey(key string) string {
-	if name, ok := lowerKeys[key]; ok {
+	if name, ok := lowerKeys.Get(key); ok {
 		return name
 	}
 	return strings.ToLower(key)
@@ -230,7 +224,7 @@ func newRequest(fields []qpack.HeaderField, block *fibhttp.StreamRequest, header
 			continue
 		}
 		regular = true
-		if !validName(f.Name) || !validValue(f.Value) || connectionHeaders[f.Name] {
+		if !validName(f.Name) || !validValue(f.Value) || connectionHeader(f.Name) {
 			return nil, fmt.Errorf("invalid header %q", f.Name)
 		}
 		if f.Name == "te" && f.Value != "trailers" {
@@ -336,7 +330,7 @@ func headerValue(header stdhttp.Header, key string) string {
 func trailerFrom(fields []qpack.HeaderField) (stdhttp.Header, error) {
 	trailer := make(stdhttp.Header, len(fields))
 	for _, f := range fields {
-		if strings.HasPrefix(f.Name, ":") || !validName(f.Name) || !validValue(f.Value) || connectionHeaders[f.Name] {
+		if strings.HasPrefix(f.Name, ":") || !validName(f.Name) || !validValue(f.Value) || connectionHeader(f.Name) {
 			return nil, fmt.Errorf("invalid trailer %q", f.Name)
 		}
 		key := textproto.CanonicalMIMEHeaderKey(f.Name)
@@ -369,7 +363,7 @@ func newResponse(fields []qpack.HeaderField, req *stdhttp.Request) (*stdhttp.Res
 			status = f.Value
 			continue
 		}
-		if !validName(f.Name) || connectionHeaders[f.Name] {
+		if !validName(f.Name) || connectionHeader(f.Name) {
 			return nil, fmt.Errorf("invalid header %q", f.Name)
 		}
 		key := textproto.CanonicalMIMEHeaderKey(f.Name)
@@ -435,7 +429,7 @@ func validTrailer(name string, values []string) bool {
 		"authorization", "set-cookie":
 		return false
 	}
-	if name == "" || connectionHeaders[name] || !validName(name) {
+	if name == "" || connectionHeader(name) || !validName(name) {
 		return false
 	}
 	for _, value := range values {

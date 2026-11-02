@@ -407,7 +407,7 @@ func headerSize(header stdhttp.Header, skip func(string) bool) uint64 {
 	var n uint64
 	for key, values := range header {
 		name := lowerKey(key)
-		if connectionHeaders[name] || skip != nil && skip(name) {
+		if connectionHeader(name) || skip != nil && skip(name) {
 			continue
 		}
 		for _, value := range values {
