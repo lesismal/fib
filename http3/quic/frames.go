@@ -264,6 +264,11 @@ func (c *Conn) handleFrames(space int, payload []byte, now time.Time) (bool, err
 				}
 			}
 			err = s.onStreamFrame(off, data, typ&0x01 != 0)
+			if s.recvFin < 0 && (isBidi(id) || len(data) >= minBulkFrame) {
+				// Data of a stream still arriving: no answer the handler
+				// writes goes with its acknowledgement (see flush).
+				c.rxPartial = true
+			}
 		case typ == frameMaxData:
 			if max := r.varint(); max > c.peerMaxData {
 				c.peerMaxData = max

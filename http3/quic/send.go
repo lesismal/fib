@@ -169,7 +169,7 @@ func (c *Conn) sendRoundLocked() {
 		lens[n] = uint16(len(buf) - start)
 		n++
 	}
-	c.flushDeadline, c.ackHold = time.Time{}, false
+	c.flushDeadline, c.ackHold, c.rxPartial = time.Time{}, false, false
 	if c.paced && !c.wantFlush && c.sendableLocked() {
 		c.sendAt = c.paceNext(now)
 	}

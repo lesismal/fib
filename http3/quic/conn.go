@@ -610,10 +610,12 @@ type Conn struct {
 	// sends too before it stops. flushDeadline bounds how long what was
 	// written while the handler was being called may wait for its calls to
 	// end (see flush); ackHold says that it holds back nothing but an
-	// acknowledgement, for as long as the peer lets one wait.
+	// acknowledgement, for as long as the peer lets one wait, which
+	// rxPartial, set by data of a stream still arriving, rules out.
 	sending       bool
 	wantFlush     bool
 	ackHold       bool
+	rxPartial     bool
 	flushDeadline time.Time
 	// awaited counts the writes ExpectWrite said are on their way.
 	awaited int
@@ -1383,9 +1385,12 @@ func (c *Conn) flush() {
 		// with the first answer. The answers are not late for waiting
 		// behind other connections' for a worker, and an acknowledgement
 		// sent alone once flushHold had passed would leave each of them to
-		// go in a packet of its own as it came.
+		// go in a packet of its own as it came. Data of a stream still
+		// arriving, an upload's, has no answer to wait for, and its
+		// acknowledgement and credit, which the peer's sending waits on, wait
+		// flushHold at most (see rxPartial).
 		switch {
-		case c.dataSendableLocked():
+		case c.dataSendableLocked(), c.rxPartial && c.sendableLocked():
 			now := c.now()
 			c.flushDeadline, c.ackHold = now.Add(flushHold), false
 			c.armTimerLocked(now)
@@ -1445,6 +1450,12 @@ func (c *Conn) dataSendableLocked() bool {
 	}
 	return false
 }
+
+// minBulkFrame is the least data in a STREAM frame of a unidirectional
+// stream that counts as data still arriving for rxPartial: what an
+// application protocol's own streams carry beside its requests, as HTTP/3's
+// QPACK encoder stream does, is smaller, and has no answer of its own.
+const minBulkFrame = 256
 
 // ackDelay is how long an acknowledgement may wait: the delay this side
 // advertised, or the one the peer asked for.
