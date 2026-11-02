@@ -116,7 +116,9 @@ func testRecycledStreams(t *testing.T, loss float64) {
 	waitFor(t, "the server's streams to finish", func() bool {
 		server.mu.Lock()
 		defer server.mu.Unlock()
-		return len(server.streams) == 0
+		open := 0
+		server.eachStream(func(*Stream) bool { open++; return true })
+		return open == 0
 	})
 	server.mu.Lock()
 	defer server.mu.Unlock()

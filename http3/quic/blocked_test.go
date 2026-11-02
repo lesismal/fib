@@ -25,7 +25,7 @@ func TestBlockedFramesSent(t *testing.T) {
 		waitFor(t, "STREAM_DATA_BLOCKED", func() bool {
 			server.mu.Lock()
 			defer server.mu.Unlock()
-			st := server.streams[s.ID()]
+			st := server.streamByID(s.ID())
 			return st != nil && st.blockedAt == 4096
 		})
 	})

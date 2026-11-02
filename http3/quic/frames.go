@@ -403,11 +403,12 @@ func (c *Conn) handleFrames(space int, payload []byte, now time.Time) (bool, err
 		asked = asked || asking
 	}
 	if dataRaised {
-		for _, s := range c.streams {
+		c.eachStream(func(s *Stream) bool {
 			if s.sendable() {
 				c.queueStream(s)
 			}
-		}
+			return true
+		})
 	}
 	if space == spaceInitial && !c.isClient && ackEliciting && !cryptoNew && !c.closed {
 		c.speedUpHandshakeLocked()

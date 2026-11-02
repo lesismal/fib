@@ -529,7 +529,13 @@ type Conn struct {
 	recvConsumed   uint64
 	maxDataPending bool
 
+	// The open streams: each in bySeq, in the slot of its sequence number
+	// modulo the slots, when the slot was free as it opened, and otherwise
+	// in streams. The streams a peer has open at once, numbered one after
+	// another, then come and go without the map, which would hash each
+	// one's ID to add it, find it and delete it (see streamByID).
 	streams               map[uint64]*Stream
+	bySeq                 [bySeqSlots]*Stream
 	openedBidi, openedUni uint64
 	peerMaxBidi           uint64
 	peerMaxUni            uint64
@@ -1112,15 +1118,17 @@ func (c *Conn) closeIfDoneLocked() {
 	if c.closeWhenDone == nil || c.closed {
 		return
 	}
-	unacked := false
-	for id, s := range c.streams {
-		if isBidi(id) {
-			// One the peer opened since, to be refused, starts the wait
-			// again once it is finished.
-			c.closeDeadline = time.Time{}
-			return
-		}
+	unacked, bidi := false, false
+	c.eachStream(func(s *Stream) bool {
+		bidi = isBidi(s.id)
 		unacked = unacked || s.unacked()
+		return !bidi
+	})
+	if bidi {
+		// One the peer opened since, to be refused, starts the wait again
+		// once it is finished.
+		c.closeDeadline = time.Time{}
+		return
 	}
 	if unacked {
 		// What is written is sent after the handler's calls, or by the
@@ -1211,8 +1219,37 @@ func (c *Conn) newStream(id uint64) *Stream {
 	if s.hasRecv {
 		s.recvMax = c.config.StreamReceiveWindow
 	}
-	c.streams[id] = s
+	if slot := &c.bySeq[id>>2&(bySeqSlots-1)]; *slot == nil {
+		*slot = s
+	} else {
+		c.streams[id] = s
+	}
 	return s
+}
+
+// bySeqSlots is the size of Conn.bySeq, a power of two.
+const bySeqSlots = 64
+
+// streamByID is the open stream with ID id, or nil.
+func (c *Conn) streamByID(id uint64) *Stream {
+	if s := c.bySeq[id>>2&(bySeqSlots-1)]; s != nil && s.id == id {
+		return s
+	}
+	return c.streams[id]
+}
+
+// eachStream calls f with each open stream until it returns false.
+func (c *Conn) eachStream(f func(s *Stream) bool) {
+	for _, s := range c.bySeq {
+		if s != nil && !f(s) {
+			return
+		}
+	}
+	for _, s := range c.streams {
+		if !f(s) {
+			return
+		}
+	}
 }
 
 // streamSendMax is how much the peer lets this side send on a stream, to
@@ -1239,7 +1276,7 @@ func (c *Conn) peerStream(id uint64, recvSide bool) (*Stream, error) {
 	if !isBidi(id) && local == recvSide {
 		return nil, transportErr(errStreamState, "frame for the wrong direction of a unidirectional stream")
 	}
-	if s := c.streams[id]; s != nil {
+	if s := c.streamByID(id); s != nil {
 		return s, nil
 	}
 	seq := id >> 2
@@ -1266,7 +1303,7 @@ func (c *Conn) peerStream(id uint64, recvSide bool) (*Stream, error) {
 	for ; *opened <= seq; *opened++ {
 		c.newStream(*opened<<2 | id&3)
 	}
-	return c.streams[id], nil
+	return c.streamByID(id), nil
 }
 
 // maybeFinish forgets a stream once both of its sides are done, and gives
@@ -1276,7 +1313,11 @@ func (c *Conn) maybeFinish(s *Stream) {
 		return
 	}
 	s.done = true
-	delete(c.streams, s.id)
+	if slot := &c.bySeq[s.id>>2&(bySeqSlots-1)]; *slot == s {
+		*slot = nil
+	} else {
+		delete(c.streams, s.id)
+	}
 	c.queueReuseLocked(s)
 	c.closeIfDoneLocked()
 	if s.local() {
@@ -2070,11 +2111,12 @@ func (c *Conn) handlePeerParams(data []byte) error {
 	c.peerMaxUni = p.maxStreamsUni
 	if c.remembered != nil {
 		// Streams opened under the limits remembered take the real ones.
-		for id, s := range c.streams {
+		c.eachStream(func(s *Stream) bool {
 			if s.hasSend {
-				s.sendMax = c.streamSendMax(id)
+				s.sendMax = c.streamSendMax(s.id)
 			}
-		}
+			return true
+		})
 	}
 	if p.maxIdleTimeout > 0 && p.maxIdleTimeout < c.idleTimeout {
 		c.idleTimeout = p.maxIdleTimeout
@@ -2365,10 +2407,12 @@ func (c *Conn) terminateLocked(err error) {
 		c.blocked = nil
 	}
 	c.wakeWritersLocked()
-	for _, s := range c.streams {
+	c.eachStream(func(s *Stream) bool {
 		s.done = true
-	}
+		return true
+	})
 	c.streams = nil
+	clear(c.bySeq[:])
 	c.sendQueue = nil
 	c.buffered = nil
 	c.events = append(c.events, event{kind: evClose})

@@ -136,7 +136,7 @@ func TestMalformedFrames(t *testing.T) {
 			setup:   func(c *Conn) { c.peerOpenedBidi = 1 },
 			payload: frame(frameStream, peerBidi, "late"),
 			check: func(t *testing.T, c *Conn) {
-				if c.streams[peerBidi] != nil {
+				if c.streamByID(peerBidi) != nil {
 					t.Fatal("a finished stream came back")
 				}
 			}},
@@ -164,7 +164,7 @@ func TestMalformedFrames(t *testing.T) {
 			},
 			payload: frame(frameStream|0x03, peerBidi, 3, "end"),
 			check: func(t *testing.T, c *Conn) {
-				if c.streams[peerBidi] != nil {
+				if c.streamByID(peerBidi) != nil {
 					t.Fatal("the stopped stream was not finished by its fin")
 				}
 			}},
