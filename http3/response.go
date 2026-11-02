@@ -39,11 +39,12 @@ func (rs *requestStream) BeginResponse(req *stdhttp.Request, status int, header 
 	if status < 200 || status > 999 {
 		return fmt.Errorf("http3: invalid status code %d", status)
 	}
-	if err := checkHeader(header); err != nil {
+	weight, err := checkHeaderSize(header, isContentLength)
+	if err != nil {
 		return err
 	}
 	if max, limited := rs.fieldLimit(); limited {
-		size := uint64(statusSize) + headerSize(header, func(name string) bool { return name == "content-length" })
+		size := uint64(statusSize) + weight
 		if n := declaredLength(header); n >= 0 && status != stdhttp.StatusNoContent && status != stdhttp.StatusNotModified {
 			size += lengthSize(n)
 		}
@@ -69,7 +70,7 @@ func (rs *requestStream) BeginResponse(req *stdhttp.Request, status int, header 
 	if n := declaredLength(header); n >= 0 && status != stdhttp.StatusNoContent && status != stdhttp.StatusNotModified {
 		block = sec.Append(block, "content-length", string(strconv.AppendInt(digits[:0], n, 10)), false)
 	}
-	block = appendHeader(&sec, block, header, func(name string) bool { return name == "content-length" })
+	block = appendHeader(&sec, block, header, isContentLength)
 	block = sec.End(block)
 	// The stream takes out over, as the buffer it sends from until the
 	// client has acknowledged it.

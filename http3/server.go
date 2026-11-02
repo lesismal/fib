@@ -937,6 +937,11 @@ type serverConn struct {
 	// client's QPACK encoder stream, by stream ID, which only that
 	// goroutine touches too; see Config.QPACKBlockedStreams.
 	held map[uint64]heldRequest
+	// callTime is when the run of QUIC's calls under way first asked the
+	// time, which the rest of the run takes as its own: the requests of a
+	// burst arrive together, and each would otherwise read the clock twice.
+	// That goroutine alone touches it, and OnCallsDone clears it.
+	callTime time.Time
 
 	mu sync.Mutex
 	// streams are the requests not yet answered.
@@ -1125,7 +1130,7 @@ func (sc *serverConn) newRequestStream(s *quic.Stream) *requestStream {
 	}
 	sc.nextID = max(sc.nextID, id+4)
 	if sc.idleTimer != nil {
-		sc.lastRequest = time.Now()
+		sc.lastRequest = sc.now()
 	}
 	sc.mu.Unlock()
 	// Every request starts out recyclable, whatever Config.StreamRequestBody
@@ -1232,8 +1237,18 @@ func (sc *serverConn) OnConnectionID(qc *quic.Conn, cid []byte, active bool) {
 // OnCallsDone hands the requests that arrived whole during the run of calls
 // to the handler pool, together.
 func (sc *serverConn) OnCallsDone(*quic.Conn) {
+	sc.callTime = time.Time{}
 	sc.h.streams.Submit(&sc.batch)
 	sc.recycleDead()
+}
+
+// now is the time of the run of QUIC's calls under way; see callTime. Only
+// those calls use it.
+func (sc *serverConn) now() time.Time {
+	if sc.callTime.IsZero() {
+		sc.callTime = time.Now()
+	}
+	return sc.callTime
 }
 
 func (sc *serverConn) OnClose(qc *quic.Conn, _ error) {
@@ -1770,7 +1785,7 @@ func (rs *requestStream) onFrame(typ uint64, payload []byte) error {
 		rs.unref()
 	}
 	if b := rs.streamed; b != nil && (sc.h.config.ReadTimeout > 0 || sc.h.config.ReadBodyTimeout > 0) {
-		b.headerAt = time.Now()
+		b.headerAt = sc.now()
 	}
 	var header stdhttp.Header
 	values := rs.values[:]
@@ -1805,7 +1820,7 @@ func (rs *requestStream) onFrame(typ uint64, payload []byte) error {
 	}
 	atHeader := rs.streamed != nil && rs.sc.h.config.StreamRequestBodyAtHeader != nil &&
 		rs.sc.h.config.StreamRequestBodyAtHeader(req)
-	if cl := req.Header.Get("Content-Length"); cl != "" {
+	if cl := headerValue(req.Header, "Content-Length"); cl != "" {
 		n, err := strconv.ParseInt(cl, 10, 64)
 		if err != nil || n < 0 {
 			rs.abort(ErrCodeMessageError)
@@ -1831,7 +1846,7 @@ func (rs *requestStream) onFrame(typ uint64, payload []byte) error {
 		rs.startStream(nil)
 		return nil
 	}
-	if strings.EqualFold(req.Header.Get("Expect"), "100-continue") {
+	if strings.EqualFold(headerValue(req.Header, "Expect"), "100-continue") {
 		// The body is read whole before the handler runs, so there is no
 		// reason to keep the client waiting for permission to send it.
 		_ = rs.WriteInterim(stdhttp.StatusContinue, nil)
@@ -1852,7 +1867,7 @@ func (rs *requestStream) startStream(buffered []byte) {
 	rs.pooled = false
 	sc, b := rs.sc, rs.streamed
 	var sendContinue func()
-	if len(buffered) == 0 && strings.EqualFold(rs.req.Header.Get("Expect"), "100-continue") {
+	if len(buffered) == 0 && strings.EqualFold(headerValue(rs.req.Header, "Expect"), "100-continue") {
 		// Asked for once the handler asks for the body, so that one which
 		// refuses the request answers it before the upload starts.
 		sendContinue = func() { _ = rs.WriteInterim(stdhttp.StatusContinue, nil) }
@@ -2072,11 +2087,12 @@ func (rs *requestStream) writeResponse(req *stdhttp.Request, response fibhttp.Re
 	if status < 200 || status > 999 {
 		return fmt.Errorf("http3: invalid status code %d", status)
 	}
-	if err := checkHeader(response.Header); err != nil {
+	weight, err := checkHeaderSize(response.Header, isContentLength)
+	if err != nil {
 		return err
 	}
 	if max, limited := rs.fieldLimit(); limited {
-		size := uint64(statusSize) + headerSize(response.Header, func(name string) bool { return name == "content-length" })
+		size := uint64(statusSize) + weight
 		if status != stdhttp.StatusNoContent && status != stdhttp.StatusNotModified {
 			size += lengthSize(responseLength(req, response))
 		}
@@ -2118,7 +2134,7 @@ func (rs *requestStream) writeResponse(req *stdhttp.Request, response fibhttp.Re
 	if statusBody {
 		block = sec.Append(block, "content-length", string(strconv.AppendInt(digits[:0], responseLength(req, response), 10)), false)
 	}
-	block = appendHeader(&sec, block, response.Header, func(name string) bool { return name == "content-length" })
+	block = appendHeader(&sec, block, response.Header, isContentLength)
 	block = sec.End(block)
 	body := response.Body
 	if !bodyAllowed(req, status) {
@@ -2165,7 +2181,7 @@ func (rs *requestStream) writeResponse(req *stdhttp.Request, response fibhttp.Re
 		{Data: body, Owned: owned},
 		{Data: tail, Owned: true},
 	}
-	err := rs.s.WriteFinalParts(parts[:], expected)
+	err = rs.s.WriteFinalParts(parts[:], expected)
 	if released != nil {
 		// The connection owns the body now, whether it writes it or drops it
 		// on a stream that ended: it goes back to the pool from there.

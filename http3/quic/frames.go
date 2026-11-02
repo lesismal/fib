@@ -39,6 +39,12 @@ const (
 )
 
 func (p *sentPacket) add(f sentFrame) {
+	if n := len(p.frames); n == cap(p.frames) && n < maxPooledFrames {
+		// Past the record's inline room: an array from framesPool, which
+		// releaseSent gives back.
+		a := framesPool.Get().(*[maxPooledFrames]sentFrame)
+		p.frames = append(a[:0], p.frames...)
+	}
 	p.frames = append(p.frames, f)
 	p.ackEliciting = true
 }
@@ -258,6 +264,11 @@ func (c *Conn) handleFrames(space int, payload []byte, now time.Time) (bool, err
 				}
 			}
 			err = s.onStreamFrame(off, data, typ&0x01 != 0)
+			if s.recvFin < 0 && (isBidi(id) || len(data) >= minBulkFrame) {
+				// Data of a stream still arriving: no answer the handler
+				// writes goes with its acknowledgement (see flush).
+				c.rxPartial = true
+			}
 		case typ == frameMaxData:
 			if max := r.varint(); max > c.peerMaxData {
 				c.peerMaxData = max

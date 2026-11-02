@@ -93,6 +93,16 @@ const (
 	maxFreeFrames = 16
 )
 
+// maxPooledFrames is the room of the arrays in framesPool.
+const maxPooledFrames = 64
+
+// framesPool holds the frame arrays of records whose packets carry more
+// frames than fit inline: a packet of the answers to a burst of small
+// requests carries a STREAM frame for each, 25 for a client that keeps 25
+// in flight, and an array grown for it by doubling cost four allocations a
+// packet, the largest of which no record kept (see maxFreeFrames).
+var framesPool = sync.Pool{New: func() any { return new([maxPooledFrames]sentFrame) }}
+
 // sentPool holds the sent packet records the connections let go of past
 // their own maxFreeSent: a connection sending a large response has hundreds
 // of packets in flight, each needing a record until it is acknowledged, and
@@ -125,10 +135,14 @@ func (c *Conn) newSentPacket(pn uint64) *sentPacket {
 // c.mu.
 func (c *Conn) releaseSent(p *sentPacket) {
 	frames := p.frames[:0]
-	if cap(frames) > maxFreeFrames {
+	clear(p.frames)
+	switch {
+	case cap(frames) == maxPooledFrames:
+		framesPool.Put((*[maxPooledFrames]sentFrame)(frames[:maxPooledFrames]))
+		frames = p.inline[:0]
+	case cap(frames) > maxFreeFrames:
 		frames = p.inline[:0]
 	}
-	clear(p.frames)
 	*p = sentPacket{frames: frames}
 	if len(c.freeSent) >= maxFreeSent {
 		sentPool.Put(p)

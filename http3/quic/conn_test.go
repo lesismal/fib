@@ -1044,6 +1044,100 @@ func stillAwaited(c *Conn) bool {
 	return c.awaited > 0
 }
 
+// The acknowledgement of an upload's data, a stream still arriving, is not
+// held for the answers the connection waits for as long as the peer lets an
+// acknowledgement wait: the upload has no answer of its own to go with it,
+// and its sender waits on the acknowledgement and the credit with it. It
+// waits flushHold at most, as one held back for an answer does.
+func TestUploadAckNotHeldForAnswers(t *testing.T) {
+	// A busy runner can delay the acknowledgement past the bound now and
+	// then; held for the max_ack_delay, it never comes that soon.
+	bound := (DefaultMaxAckDelay + flushHold) / 2
+	var delays []time.Duration
+	for range 3 {
+		d := uploadAckDelay(t)
+		if d < bound {
+			return
+		}
+		delays = append(delays, d)
+	}
+	t.Fatalf("the upload's data was acknowledged after %v, never within %v", delays, bound)
+}
+
+// uploadAckDelay has the server wait for the answer to one request, which
+// never comes, while the client uploads on another stream, and returns how
+// long after the server took the upload's first burst it sent anything.
+func uploadAckDelay(t *testing.T) time.Duration {
+	p := newTestPair(t, 0, nil)
+	waitQuiet(t, p)
+	took := make(chan time.Time, 1)
+	p.serverH.onData = func(s *Stream, data []byte, fin bool) {
+		if fin {
+			s.Conn().ExpectWrite()
+			return
+		}
+		select {
+		case took <- time.Now():
+		default:
+		}
+	}
+	req, err := p.client.OpenStream()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := req.Write([]byte("request"), true); err != nil {
+		t.Fatal(err)
+	}
+	server := p.serverConn(t)
+	for deadline := time.Now().Add(5 * time.Second); !stillAwaited(server); time.Sleep(time.Millisecond) {
+		if time.Now().After(deadline) {
+			t.Fatal("the request never arrived")
+		}
+	}
+	// The request's own acknowledgement goes once it is due.
+	waitQuiet(t, p)
+	var mu sync.Mutex
+	var sent []time.Time
+	p.serverEnd.mu.Lock()
+	p.serverEnd.drop = func([]byte) bool {
+		mu.Lock()
+		sent = append(sent, time.Now())
+		mu.Unlock()
+		return false
+	}
+	p.serverEnd.mu.Unlock()
+	// Three packets of the upload, in one burst, call for an
+	// acknowledgement at once.
+	p.gather.Store(3)
+	upload, err := p.client.OpenStream()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := upload.Write(make([]byte, 3000), false); err != nil {
+		t.Fatal(err)
+	}
+	var at time.Time
+	select {
+	case at = <-took:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the upload never arrived")
+	}
+	for deadline := time.Now().Add(5 * time.Second); time.Now().Before(deadline); time.Sleep(100 * time.Microsecond) {
+		mu.Lock()
+		n := len(sent)
+		var first time.Time
+		if n > 0 {
+			first = sent[0]
+		}
+		mu.Unlock()
+		if n > 0 {
+			return max(first.Sub(at), 0)
+		}
+	}
+	t.Fatal("the server never acknowledged the upload")
+	return 0
+}
+
 // A timer that fires with nothing of its own due, as one set for the probe
 // timeout of packets the request has just acknowledged does when its
 // goroutine runs late, leaves what waits for an expected write waiting: the
