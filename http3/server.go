@@ -1817,7 +1817,25 @@ func (rs *requestStream) onFrame(typ uint64, payload []byte) error {
 			return nil
 		}
 	}
-	if _, ok := req.Header[":protocol"]; ok || req.Method == stdhttp.MethodConnect {
+	// What the server reads of the header it finds among the fields, which
+	// are few and at hand, rather than looking each up in the map.
+	var cl, expect string
+	hasCL, expects, protocol := false, 0, false
+	for i := range fields {
+		switch f := &fields[i]; f.Name {
+		case "content-length":
+			if !hasCL {
+				cl, hasCL = f.Value, true
+			}
+		case "expect":
+			if expects++; expects == 1 {
+				expect = f.Value
+			}
+		case ":protocol":
+			protocol = true
+		}
+	}
+	if protocol || req.Method == stdhttp.MethodConnect {
 		// A CONNECT, extended or to a host and port: its handler runs now,
 		// and may switch the stream to a tunnel.
 		rs.serveTunnel()
@@ -1825,7 +1843,7 @@ func (rs *requestStream) onFrame(typ uint64, payload []byte) error {
 	}
 	atHeader := rs.streamed != nil && rs.sc.h.config.StreamRequestBodyAtHeader != nil &&
 		rs.sc.h.config.StreamRequestBodyAtHeader(req)
-	if cl := headerValue(req.Header, "Content-Length"); cl != "" {
+	if cl != "" {
 		n, err := strconv.ParseInt(cl, 10, 64)
 		if err != nil || n < 0 {
 			rs.abort(ErrCodeMessageError)
@@ -1839,8 +1857,7 @@ func (rs *requestStream) onFrame(typ uint64, payload []byte) error {
 		}
 		rs.declared = n
 	}
-	if expect, ok := req.Header["Expect"]; ok &&
-		(len(expect) != 1 || !strings.EqualFold(strings.TrimSpace(expect[0]), "100-continue")) {
+	if expects > 0 && (expects != 1 || !strings.EqualFold(strings.TrimSpace(expect), "100-continue")) {
 		// An expectation this server cannot meet (RFC 9110 section 10.1.1).
 		rs.reject(stdhttp.StatusExpectationFailed)
 		return nil
@@ -1851,7 +1868,7 @@ func (rs *requestStream) onFrame(typ uint64, payload []byte) error {
 		rs.startStream(nil)
 		return nil
 	}
-	if strings.EqualFold(headerValue(req.Header, "Expect"), "100-continue") {
+	if strings.EqualFold(expect, "100-continue") {
 		// The body is read whole before the handler runs, so there is no
 		// reason to keep the client waiting for permission to send it.
 		_ = rs.WriteInterim(stdhttp.StatusContinue, nil)

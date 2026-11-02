@@ -196,6 +196,7 @@ func newRequest(fields []qpack.HeaderField, block *fibhttp.StreamRequest, header
 	}
 	var cookies []string
 	regular := false
+	host, hosts := "", 0
 	for _, f := range fields {
 		if strings.HasPrefix(f.Name, ":") {
 			if regular {
@@ -232,6 +233,14 @@ func newRequest(fields []qpack.HeaderField, block *fibhttp.StreamRequest, header
 		}
 		if f.Name == "cookie" {
 			cookies = append(cookies, f.Value)
+			continue
+		}
+		if f.Name == "host" {
+			// Kept out of the header, as net/http keeps it, and so never
+			// looked up there.
+			if hosts++; hosts == 1 {
+				host = f.Value
+			}
 			continue
 		}
 		key := canonicalKey(f.Name)
@@ -295,13 +304,8 @@ func newRequest(fields []qpack.HeaderField, block *fibhttp.StreamRequest, header
 	req.URL = u
 	// A request for a scheme with a mandatory authority has to name it,
 	// once, either way and with one value (RFC 9114 section 4.3.1).
-	hosts := header["Host"]
-	if len(hosts) > 1 {
+	if hosts > 1 {
 		return nil, errors.New("multiple Host fields")
-	}
-	host := ""
-	if len(hosts) == 1 {
-		host = hosts[0]
 	}
 	switch {
 	case authority != "" && host != "" && !strings.EqualFold(authority, host):
@@ -313,7 +317,6 @@ func newRequest(fields []qpack.HeaderField, block *fibhttp.StreamRequest, header
 	if req.Host == "" {
 		req.Host = host
 	}
-	delete(header, "Host")
 	return req, nil
 }
 
