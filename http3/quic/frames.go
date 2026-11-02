@@ -39,6 +39,12 @@ const (
 )
 
 func (p *sentPacket) add(f sentFrame) {
+	if n := len(p.frames); n == cap(p.frames) && n < maxPooledFrames {
+		// Past the record's inline room: an array from framesPool, which
+		// releaseSent gives back.
+		a := framesPool.Get().(*[maxPooledFrames]sentFrame)
+		p.frames = append(a[:0], p.frames...)
+	}
 	p.frames = append(p.frames, f)
 	p.ackEliciting = true
 }
