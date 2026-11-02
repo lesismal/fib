@@ -1820,7 +1820,7 @@ func (rs *requestStream) onFrame(typ uint64, payload []byte) error {
 	}
 	atHeader := rs.streamed != nil && rs.sc.h.config.StreamRequestBodyAtHeader != nil &&
 		rs.sc.h.config.StreamRequestBodyAtHeader(req)
-	if cl := req.Header.Get("Content-Length"); cl != "" {
+	if cl := headerValue(req.Header, "Content-Length"); cl != "" {
 		n, err := strconv.ParseInt(cl, 10, 64)
 		if err != nil || n < 0 {
 			rs.abort(ErrCodeMessageError)
@@ -1846,7 +1846,7 @@ func (rs *requestStream) onFrame(typ uint64, payload []byte) error {
 		rs.startStream(nil)
 		return nil
 	}
-	if strings.EqualFold(req.Header.Get("Expect"), "100-continue") {
+	if strings.EqualFold(headerValue(req.Header, "Expect"), "100-continue") {
 		// The body is read whole before the handler runs, so there is no
 		// reason to keep the client waiting for permission to send it.
 		_ = rs.WriteInterim(stdhttp.StatusContinue, nil)
@@ -1867,7 +1867,7 @@ func (rs *requestStream) startStream(buffered []byte) {
 	rs.pooled = false
 	sc, b := rs.sc, rs.streamed
 	var sendContinue func()
-	if len(buffered) == 0 && strings.EqualFold(rs.req.Header.Get("Expect"), "100-continue") {
+	if len(buffered) == 0 && strings.EqualFold(headerValue(rs.req.Header, "Expect"), "100-continue") {
 		// Asked for once the handler asks for the body, so that one which
 		// refuses the request answers it before the upload starts.
 		sendContinue = func() { _ = rs.WriteInterim(stdhttp.StatusContinue, nil) }

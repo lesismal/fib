@@ -305,7 +305,10 @@ func newRequest(fields []qpack.HeaderField, block *fibhttp.StreamRequest, header
 	if len(hosts) > 1 {
 		return nil, errors.New("multiple Host fields")
 	}
-	host := header.Get("Host")
+	host := ""
+	if len(hosts) == 1 {
+		host = hosts[0]
+	}
 	switch {
 	case authority != "" && host != "" && !strings.EqualFold(authority, host):
 		return nil, errors.New(":authority and Host disagree")
@@ -316,8 +319,17 @@ func newRequest(fields []qpack.HeaderField, block *fibhttp.StreamRequest, header
 	if req.Host == "" {
 		req.Host = host
 	}
-	header.Del("Host")
+	delete(header, "Host")
 	return req, nil
+}
+
+// headerValue is header.Get for a key already in canonical form, which it
+// does not canonicalize again.
+func headerValue(header stdhttp.Header, key string) string {
+	if values := header[key]; len(values) > 0 {
+		return values[0]
+	}
+	return ""
 }
 
 // trailerFrom builds a trailer section, which may hold no pseudo-headers.
@@ -383,7 +395,7 @@ func newResponse(fields []qpack.HeaderField, req *stdhttp.Request) (*stdhttp.Res
 		Request:       req,
 		Body:          stdhttp.NoBody,
 	}
-	if cl := header.Get("Content-Length"); cl != "" {
+	if cl := headerValue(header, "Content-Length"); cl != "" {
 		n, err := strconv.ParseInt(cl, 10, 64)
 		if err != nil || n < 0 {
 			return nil, errors.New("malformed content-length")
