@@ -1151,8 +1151,13 @@ func (sc *serverConn) newRequestStream(s *quic.Stream) *requestStream {
 	if sc.h.config.StreamRequestBody {
 		// The stream's flow control is given back by the request from here,
 		// so that a body that streams paces the client; see streamedBody.
-		rs.streamed = &streamedBody{}
+		// A recycled stream comes with the one it had, cleared.
+		if rs.streamed == nil {
+			rs.streamed = &streamedBody{}
+		}
 		s.HoldCredit()
+	} else {
+		rs.streamed = nil
 	}
 	return rs
 }
@@ -1413,7 +1418,9 @@ type requestStream struct {
 	// nextDead; see serverConn.recycleDead. A request whose body streams to
 	// its handler, or that becomes a tunnel, sets it back to false, and is
 	// left to the collector. A request header taken from the pool is
-	// headerFromPool. Both fields sit higher up, where they pack.
+	// headerFromPool, which a recycled stream keeps, cleared, for its next
+	// request, as it keeps streamed. Both fields sit higher up, where they
+	// pack.
 	nextDead       *requestStream
 	headerFromPool *pooledHeader
 }
@@ -1479,20 +1486,26 @@ func (sc *serverConn) recycleDead() {
 // recycle clears rs for another request. TestRequestStreamRecycleResets
 // holds it to clearing every field.
 func (rs *requestStream) recycle() {
+	// The request's header and the body's state stay with the stream,
+	// cleared, for the next request it serves: nothing else refers to them
+	// once nothing refers to the stream, a body that streamed having kept
+	// its stream out of the pool.
 	if h := rs.headerFromPool; h != nil {
 		clear(h.header)
 		clear(h.values[:])
-		headerPool.Put(h)
+	}
+	if b := rs.streamed; b != nil {
+		*b = streamedBody{}
 	}
 	rs.block.Recycle()
 	rs.sc, rs.s, rs.req, rs.body = nil, nil, nil, nil
 	rs.parser = frameParser{}
 	rs.declared, rs.trailers, rs.done = 0, false, false
-	rs.streamed, rs.tunnel = nil, nil
+	rs.tunnel = nil
 	rs.remoteDone, rs.responded, rs.closed, rs.upgraded, rs.expected = false, false, false, false, false
 	rs.streaming, rs.timedOut, rs.writeTimer, rs.collectTimer = false, false, nil, nil
 	rs.values = [requestValues]string{}
-	rs.pooled, rs.nextDead, rs.headerFromPool = false, nil, nil
+	rs.pooled, rs.nextDead = false, nil
 	rs.refs.Store(0)
 }
 
@@ -1795,8 +1808,11 @@ func (rs *requestStream) onFrame(typ uint64, payload []byte) error {
 	var header stdhttp.Header
 	values := rs.values[:]
 	if rs.pooled {
-		pooled := headerPool.Get().(*pooledHeader)
-		rs.headerFromPool = pooled
+		pooled := rs.headerFromPool
+		if pooled == nil {
+			pooled = headerPool.Get().(*pooledHeader)
+			rs.headerFromPool = pooled
+		}
 		header, values = pooled.header, pooled.values[:]
 	}
 	req, err := newRequest(fields, &rs.block, header, values)
