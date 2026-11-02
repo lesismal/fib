@@ -937,6 +937,11 @@ type serverConn struct {
 	// client's QPACK encoder stream, by stream ID, which only that
 	// goroutine touches too; see Config.QPACKBlockedStreams.
 	held map[uint64]heldRequest
+	// callTime is when the run of QUIC's calls under way first asked the
+	// time, which the rest of the run takes as its own: the requests of a
+	// burst arrive together, and each would otherwise read the clock twice.
+	// That goroutine alone touches it, and OnCallsDone clears it.
+	callTime time.Time
 
 	mu sync.Mutex
 	// streams are the requests not yet answered.
@@ -1125,7 +1130,7 @@ func (sc *serverConn) newRequestStream(s *quic.Stream) *requestStream {
 	}
 	sc.nextID = max(sc.nextID, id+4)
 	if sc.idleTimer != nil {
-		sc.lastRequest = time.Now()
+		sc.lastRequest = sc.now()
 	}
 	sc.mu.Unlock()
 	// Every request starts out recyclable, whatever Config.StreamRequestBody
@@ -1232,8 +1237,18 @@ func (sc *serverConn) OnConnectionID(qc *quic.Conn, cid []byte, active bool) {
 // OnCallsDone hands the requests that arrived whole during the run of calls
 // to the handler pool, together.
 func (sc *serverConn) OnCallsDone(*quic.Conn) {
+	sc.callTime = time.Time{}
 	sc.h.streams.Submit(&sc.batch)
 	sc.recycleDead()
+}
+
+// now is the time of the run of QUIC's calls under way; see callTime. Only
+// those calls use it.
+func (sc *serverConn) now() time.Time {
+	if sc.callTime.IsZero() {
+		sc.callTime = time.Now()
+	}
+	return sc.callTime
 }
 
 func (sc *serverConn) OnClose(qc *quic.Conn, _ error) {
@@ -1770,7 +1785,7 @@ func (rs *requestStream) onFrame(typ uint64, payload []byte) error {
 		rs.unref()
 	}
 	if b := rs.streamed; b != nil && (sc.h.config.ReadTimeout > 0 || sc.h.config.ReadBodyTimeout > 0) {
-		b.headerAt = time.Now()
+		b.headerAt = sc.now()
 	}
 	var header stdhttp.Header
 	values := rs.values[:]
