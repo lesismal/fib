@@ -1835,12 +1835,20 @@ func (rs *requestStream) onFrame(typ uint64, payload []byte) error {
 	if err == qpack.ErrBlocked {
 		return err
 	}
+	err = rs.onFields(fields, err)
 	// What was decoded is copied out before the next section is, so the
 	// array can take that one.
-	defer func() {
-		clear(fields)
-		sc.fields = fields[:0]
-	}()
+	clear(fields)
+	sc.fields = fields[:0]
+	return err
+}
+
+// onFields is onFrame for the fields of a HEADERS frame, decoded with err,
+// which it sees to. It is a function of its own so that the array the
+// fields are in goes back to the connection without a deferred call, of
+// which the runtime keeps a record in a function with as many returns.
+func (rs *requestStream) onFields(fields []qpack.HeaderField, err error) error {
+	sc := rs.sc
 	if errors.Is(err, qpack.ErrTooLarge) {
 		rs.reject(stdhttp.StatusRequestHeaderFieldsTooLarge)
 		return nil
@@ -2181,25 +2189,30 @@ func (rs *requestStream) WriteResponseOwned(req *stdhttp.Request, response fibht
 
 func (rs *requestStream) writeResponse(req *stdhttp.Request, response fibhttp.Response, released []byte) error {
 	// After the response is written, so that what was held leaves with it.
+	// The work is sendResponse's, whose many returns would otherwise make
+	// every deferred call here one the runtime keeps a record of.
 	defer rs.writeDone()
-	// A body the caller gave up is the stream's whether or not it goes out:
-	// what the connection does not take over, and acknowledge, comes back to
-	// the pool here.
-	if released != nil {
-		defer func() {
-			if released != nil {
-				bufferpool.Put(released)
-			}
-		}()
+	taken, err := rs.sendResponse(req, response, released)
+	if released != nil && !taken {
+		// A body the caller gave up is the stream's whether or not it goes
+		// out: what the connection does not take over, and acknowledge,
+		// comes back to the pool here.
+		bufferpool.Put(released)
 	}
+	return err
+}
+
+// sendResponse is writeResponse's work, which reports whether the stream
+// took released over.
+func (rs *requestStream) sendResponse(req *stdhttp.Request, response fibhttp.Response, released []byte) (taken bool, err error) {
 	status := response.StatusCode
 	if status < 200 || status > 999 {
-		return fmt.Errorf("http3: invalid status code %d", status)
+		return false, fmt.Errorf("http3: invalid status code %d", status)
 	}
 	var list headerList
 	weight, err := checkHeaderSize(response.Header, isContentLength, &list)
 	if err != nil {
-		return err
+		return false, err
 	}
 	if max, limited := rs.fieldLimit(); limited {
 		size := uint64(statusSize) + weight
@@ -2207,18 +2220,18 @@ func (rs *requestStream) writeResponse(req *stdhttp.Request, response fibhttp.Re
 			size += lengthSize(responseLength(req, response))
 		}
 		if size > max || bodyAllowed(req, status) && trailerSize(response.Trailer) > max {
-			return errFieldSectionTooLarge
+			return false, errFieldSectionTooLarge
 		}
 	}
 	rs.mu.Lock()
 	switch {
 	case rs.responded:
 		rs.mu.Unlock()
-		return errors.New("http: response already written")
+		return false, errors.New("http: response already written")
 	case rs.closed:
 		err := rs.closedErrLocked()
 		rs.mu.Unlock()
-		return err
+		return false, err
 	}
 	rs.responded = true
 	// The write the connection was told to expect ends that as it is made.
@@ -2234,7 +2247,6 @@ func (rs *requestStream) writeResponse(req *stdhttp.Request, response fibhttp.Re
 	// The field sections go back to the pool once the frames are built from
 	// them; the frames' own buffer the stream takes over.
 	sec, block := beginFields(rs.encoder(), rs.s.ID())
-	defer func() { bufferpool.Put(block) }()
 	// The numbers are formatted on the stack: Append keeps nothing of what
 	// it is given unless it inserts it, which copies it, so the strings
 	// made of them need no allocation.
@@ -2276,6 +2288,7 @@ func (rs *requestStream) writeResponse(req *stdhttp.Request, response fibhttp.Re
 	// another.
 	head := bufferpool.Get(len(block) + 16)[:0]
 	head = appendHeadersFrame(head, block)
+	bufferpool.Put(block)
 	if len(body) > 0 {
 		head = appendFrameHeader(head, frameData, len(body))
 	}
@@ -2292,11 +2305,10 @@ func (rs *requestStream) writeResponse(req *stdhttp.Request, response fibhttp.Re
 		{Data: tail, Owned: true},
 	}
 	err = rs.s.WriteFinalParts(parts[:], expected)
-	if released != nil {
-		// The connection owns the body now, whether it writes it or drops it
-		// on a stream that ended: it goes back to the pool from there.
-		released = nil
-	}
+	// The connection owns a released body now, whether it writes it or drops
+	// it on a stream that ended: it goes back to the pool from there, and
+	// what is left returns that it was taken.
+	//
 	// The response is all this stream sends, and a request whose response
 	// is written wants nothing more of what arrives for it, so QUIC is told
 	// to forget the request as it takes the response rather than once the
@@ -2320,9 +2332,9 @@ func (rs *requestStream) writeResponse(req *stdhttp.Request, response fibhttp.Re
 		rs.sc.untrack(rs)
 	}
 	if err != nil {
-		return errStreamClosed
+		return true, errStreamClosed
 	}
-	return nil
+	return true, nil
 }
 
 // appendTrailer appends a HEADERS frame carrying what of trailer HTTP/3 can
