@@ -1973,7 +1973,11 @@ func (c *Connection) readLoop() error {
 			return nil
 		}
 		n, err := c.sysRead(buf)
-		c.traceStep("read n=%d err=%v", n, err)
+		if traceOn.Load() {
+			// Checked here as well: boxing the count for the call allocates
+			// on every read whether it traces or not.
+			c.traceStep("read n=%d err=%v", n, err)
+		}
 		if n > 0 {
 			total += n
 			if !c.flags.has(flagLingering) {
