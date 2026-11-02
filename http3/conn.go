@@ -420,6 +420,9 @@ func headerSize(header stdhttp.Header, skip func(string) bool) uint64 {
 // trailerSize is the weight of the fields appendTrailer sends of trailer.
 func trailerSize(trailer stdhttp.Header) uint64 {
 	var n uint64
+	if len(trailer) == 0 {
+		return 0
+	}
 	for key, values := range trailer {
 		name := strings.ToLower(key)
 		if !validTrailer(name, values) {

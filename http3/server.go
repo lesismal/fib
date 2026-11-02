@@ -2196,7 +2196,8 @@ func (rs *requestStream) writeResponse(req *stdhttp.Request, response fibhttp.Re
 	if status < 200 || status > 999 {
 		return fmt.Errorf("http3: invalid status code %d", status)
 	}
-	weight, err := checkHeaderSize(response.Header, isContentLength)
+	var list headerList
+	weight, err := checkHeaderSize(response.Header, isContentLength, &list)
 	if err != nil {
 		return err
 	}
@@ -2243,7 +2244,7 @@ func (rs *requestStream) writeResponse(req *stdhttp.Request, response fibhttp.Re
 	if statusBody {
 		block = sec.Append(block, "content-length", string(strconv.AppendInt(digits[:0], responseLength(req, response), 10)), false)
 	}
-	block = appendHeader(&sec, block, response.Header, isContentLength)
+	block = appendHeaderList(&sec, block, response.Header, isContentLength, &list)
 	block = sec.End(block)
 	body := response.Body
 	if !bodyAllowed(req, status) {

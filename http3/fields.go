@@ -74,7 +74,7 @@ func sensitive(name string) bool {
 // checkHeader checks the fields of a message about to be sent, before any
 // is encoded.
 func checkHeader(header stdhttp.Header) error {
-	_, err := checkHeaderSize(header, nil)
+	_, err := checkHeaderSize(header, nil, nil)
 	return err
 }
 
@@ -84,8 +84,8 @@ func isContentLength(name string) bool { return name == "content-length" }
 
 // checkHeaderSize is checkHeader that also returns the weight of the fields
 // appendHeader sends of header, as headerSize does, in the same pass over
-// it.
-func checkHeaderSize(header stdhttp.Header, skip func(string) bool) (uint64, error) {
+// it, and lists them in list, if it is not nil, for appendHeaderList.
+func checkHeaderSize(header stdhttp.Header, skip func(string) bool, list *headerList) (uint64, error) {
 	var n uint64
 	for key, values := range header {
 		name := lowerKey(key)
@@ -103,8 +103,45 @@ func checkHeaderSize(header stdhttp.Header, skip func(string) bool) (uint64, err
 		for _, value := range values {
 			n += fieldSize(name, value)
 		}
+		if list != nil {
+			if list.n < len(list.fields) {
+				list.fields[list.n] = listedField{name, values}
+				list.n++
+			} else {
+				list.more = true
+			}
+		}
 	}
 	return n, nil
+}
+
+// headerList is what checkHeaderSize lists of a header for appendHeaderList
+// to encode, so that a response's header is gone over, and its keys
+// lowercased, once rather than twice: the names and values of the fields
+// sent, as far as there is room for them, and whether there were more.
+type headerList struct {
+	n      int
+	more   bool
+	fields [12]listedField
+}
+
+type listedField struct {
+	name   string
+	values []string
+}
+
+// appendHeaderList is appendHeader of the header list was listed from, with
+// the same skip, which it takes from list when list has all of it.
+func appendHeaderList(sec *qpack.Section, block []byte, header stdhttp.Header, skip func(string) bool, list *headerList) []byte {
+	if list.more {
+		return appendHeader(sec, block, header, skip)
+	}
+	for _, f := range list.fields[:list.n] {
+		for _, value := range f.values {
+			block = sec.Append(block, f.name, value, sensitive(f.name))
+		}
+	}
+	return block
 }
 
 // appendHeader encodes header's fields in sec, leaving out what HTTP/3 does
