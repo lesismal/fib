@@ -25,9 +25,10 @@ import (
 // tests hold both to net/http's output.
 
 // appendRequestStart appends the request line and the Host and User-Agent
-// fields of req as Request.Write writes them, as HTTP/1.0 when http10 is set.
-// It reports false for a request it leaves to net/http.
-func appendRequestStart(dst []byte, req *stdhttp.Request, http10 bool) ([]byte, bool) {
+// fields of req as Request.Write writes them, as HTTP/1.0 when http10 is set,
+// and no User-Agent when framed is, for a request whose fields are a block of
+// the caller's. It reports false for a request it leaves to net/http.
+func appendRequestStart(dst []byte, req *stdhttp.Request, http10, framed bool) ([]byte, bool) {
 	if req.URL == nil || req.Close || req.Method == stdhttp.MethodConnect ||
 		httptrace.ContextClientTrace(req.Context()) != nil {
 		return dst, false
@@ -61,6 +62,9 @@ func appendRequestStart(dst []byte, req *stdhttp.Request, http10 bool) ([]byte, 
 	}
 	dst = append(dst, host...)
 	dst = append(dst, "\r\n"...)
+	if framed {
+		return dst, true
+	}
 
 	// The default unless the header has one, which may be empty to send none.
 	userAgent := "Go-http-client/1.1"
@@ -231,6 +235,13 @@ func validToken(s string) bool {
 // marshalRequest does, in a buffer from package bufferpool, or reports false
 // for a request it leaves to net/http.
 func fastRequest(req *stdhttp.Request, body []byte, http10 bool) ([]byte, bool) {
+	return fastFramedRequest(req, body, http10, nil)
+}
+
+// fastFramedRequest is fastRequest, with fields, when it is not nil, the
+// request's header lines as Client.StartFramed takes them, written as they are
+// in place of req.Header's, after the request line, Host and Content-Length.
+func fastFramedRequest(req *stdhttp.Request, body []byte, http10 bool, fields []byte) ([]byte, bool) {
 	hasBody := req.Body != nil && req.Body != stdhttp.NoBody
 	if len(req.TransferEncoding) != 0 || len(req.Trailer) != 0 {
 		return nil, false
@@ -253,12 +264,16 @@ func fastRequest(req *stdhttp.Request, body []byte, http10 bool) ([]byte, bool) 
 		return nil, false
 	}
 	var stack [16]headerField
-	fields, size := collectRequestFields(req.Header, &stack)
-	size += 64 + len(body)
+	var collected []headerField
+	size := len(fields)
+	if fields == nil {
+		collected, size = collectRequestFields(req.Header, &stack)
+	}
+	size += 64 + len(req.Host) + len(body)
 	// The framing is the pool's, and goes back to it once the response has
 	// arrived (clientRequest.releaseData).
 	buf := bufferpool.Get(size)
-	dst, ok := appendRequestStart(buf[:0], req, http10)
+	dst, ok := appendRequestStart(buf[:0], req, http10, fields != nil)
 	if !ok {
 		bufferpool.Put(buf)
 		return nil, false
@@ -268,7 +283,11 @@ func fastRequest(req *stdhttp.Request, body []byte, http10 bool) ([]byte, bool) 
 		dst = strconv.AppendInt(dst, int64(length), 10)
 		dst = append(dst, "\r\n"...)
 	}
-	dst = appendCollectedFields(dst, fields)
+	if fields != nil {
+		dst = append(dst, fields...)
+	} else {
+		dst = appendCollectedFields(dst, collected)
+	}
 	dst = append(dst, "\r\n"...)
 	return append(dst, body...), true
 }
@@ -278,7 +297,7 @@ func fastRequest(req *stdhttp.Request, body []byte, http10 bool) ([]byte, bool) 
 func fastStreamedHead(req *stdhttp.Request) ([]byte, bool) {
 	var stack [16]headerField
 	fields, size := collectRequestFields(req.Header, &stack)
-	dst, ok := appendRequestStart(make([]byte, 0, 64+size), req, false)
+	dst, ok := appendRequestStart(make([]byte, 0, 64+size), req, false, false)
 	if !ok {
 		return nil, false
 	}
@@ -361,9 +380,19 @@ const (
 // read, an announced Trailer on a chunked body, or a Transfer-Encoding on
 // HTTP/1.0.
 func parseResponseHead(head []byte, req *stdhttp.Request) (*stdhttp.Response, bool) {
+	resp, _, ok := parseResponseHeadBlock(head, req, false)
+	return resp, ok
+}
+
+// parseResponseHeadBlock is parseResponseHead, and with block set returns the
+// response with a nil Header, and its field lines, as ClientResponse.
+// HeaderBlock reports them, in place of the map: the fields that frame the
+// response are noted as they pass, and every line is checked as it is for
+// the map.
+func parseResponseHeadBlock(head []byte, req *stdhttp.Request, block bool) (*stdhttp.Response, string, bool) {
 	if len(head) < 14 || head[0] != 'H' || string(head[:7]) != "HTTP/1." || head[8] != ' ' ||
 		head[7] != '0' && head[7] != '1' {
-		return nil, false
+		return nil, "", false
 	}
 	// One string for the whole head: the status, the field names that are
 	// not interned and the values are pieces of it.
@@ -378,29 +407,29 @@ func parseResponseHead(head []byte, req *stdhttp.Request) (*stdhttp.Response, bo
 		}
 		at += i
 		if s[at-1] != '\r' {
-			return nil, false
+			return nil, "", false
 		}
 		at++
 		n++
 	}
 	lineEnd := strings.IndexByte(s, '\n') - 1
 	if lineEnd < 0 {
-		return nil, false
+		return nil, "", false
 	}
 	status := s[9:lineEnd]
 	if len(status) < 3 || len(status) > 3 && status[3] != ' ' {
-		return nil, false
+		return nil, "", false
 	}
 	for i := 0; i < len(status); i++ {
 		if c := status[i]; c < ' ' && c != '\t' || c == 0x7f {
-			return nil, false
+			return nil, "", false
 		}
 	}
 	code := 0
 	for i := range 3 {
 		c := status[i]
 		if c < '0' || c > '9' {
-			return nil, false
+			return nil, "", false
 		}
 		code = code*10 + int(c-'0')
 	}
@@ -414,29 +443,38 @@ func parseResponseHead(head []byte, req *stdhttp.Request) (*stdhttp.Response, bo
 		Body:       stdhttp.NoBody,
 	}
 	fields := s[lineEnd+2:]
+	lines := fields
 	n--
-	header := make(stdhttp.Header, n)
-	values := make([]string, n)
+	var header stdhttp.Header
+	var values []string
+	if !block {
+		header = make(stdhttp.Header, n)
+		values = make([]string, n)
+	}
 	// The fields read after the loop, noted as they pass so that one a
-	// response does not have costs no lookup.
+	// response does not have costs no lookup; for a block, with the values
+	// read of them.
 	var special uint8
+	var te, length string
+	var teCount, lengthCount int
+	hasClose, hasKeepAlive := false, false
 	for fields != "" {
 		end := strings.IndexByte(fields, '\n') - 1
 		if end < 0 {
-			return nil, false
+			return nil, "", false
 		}
 		line := fields[:end]
 		fields = fields[end+2:]
 		colon := strings.IndexByte(line, ':')
 		if colon <= 0 {
-			return nil, false
+			return nil, "", false
 		}
 		key := line[:colon]
 		upper, canonical := true, true
 		for i := 0; i < len(key); i++ {
 			c := key[i]
 			if !tokenByte[c] {
-				return nil, false
+				return nil, "", false
 			}
 			if upper && 'a' <= c && c <= 'z' || !upper && 'A' <= c && c <= 'Z' {
 				canonical = false
@@ -446,18 +484,20 @@ func parseResponseHead(head []byte, req *stdhttp.Request) (*stdhttp.Response, bo
 		if !canonical {
 			key = canonicalKey(key)
 		}
+		var this uint8
 		switch key {
 		case "Pragma":
-			special |= sawPragma
+			this = sawPragma
 		case "Transfer-Encoding":
-			special |= sawTransferEncoding
+			this = sawTransferEncoding
 		case "Connection":
-			special |= sawConnection
+			this = sawConnection
 		case "Content-Length":
-			special |= sawContentLength
+			this = sawContentLength
 		case "Trailer":
-			special |= sawTrailer
+			this = sawTrailer
 		}
+		special |= this
 		v := line[colon+1:]
 		start, stop := 0, len(v)
 		for start < stop && (v[start] == ' ' || v[start] == '\t') {
@@ -468,7 +508,21 @@ func parseResponseHead(head []byte, req *stdhttp.Request) (*stdhttp.Response, bo
 		}
 		v = v[start:stop]
 		if !plainFieldValue(v) {
-			return nil, false
+			return nil, "", false
+		}
+		if block {
+			switch this {
+			case sawTransferEncoding:
+				te = v
+				teCount++
+			case sawContentLength:
+				length = v
+				lengthCount++
+			case sawConnection:
+				hasClose = hasClose || headerValueHasToken(v, "close")
+				hasKeepAlive = hasKeepAlive || headerValueHasToken(v, "keep-alive")
+			}
+			continue
 		}
 		if prior := header[key]; prior != nil {
 			header[key] = append(prior, v)
@@ -480,30 +534,45 @@ func parseResponseHead(head []byte, req *stdhttp.Request) (*stdhttp.Response, bo
 	}
 	resp.Header = header
 
-	if special&sawPragma != 0 {
-		if hp := header["Pragma"]; len(hp) > 0 && hp[0] == "no-cache" {
-			if _, ok := header["Cache-Control"]; !ok {
-				header["Cache-Control"] = []string{"no-cache"}
+	if !block {
+		if special&sawPragma != 0 {
+			if hp := header["Pragma"]; len(hp) > 0 && hp[0] == "no-cache" {
+				if _, ok := header["Cache-Control"]; !ok {
+					header["Cache-Control"] = []string{"no-cache"}
+				}
 			}
+		}
+		if special&sawTransferEncoding != 0 {
+			tes := header["Transfer-Encoding"]
+			teCount = len(tes)
+			if teCount > 0 {
+				te = tes[0]
+			}
+		}
+		if special&sawContentLength != 0 {
+			cl := header["Content-Length"]
+			lengthCount = len(cl)
+			if lengthCount > 0 {
+				length = cl[0]
+			}
+		}
+		if special&sawConnection != 0 {
+			connection := header["Connection"]
+			hasClose = headerValuesHaveToken(connection, "close")
+			hasKeepAlive = headerValuesHaveToken(connection, "keep-alive")
 		}
 	}
 
 	chunked := false
 	if special&sawTransferEncoding != 0 {
-		te := header["Transfer-Encoding"]
-		if resp.ProtoMinor == 0 || len(te) != 1 || !asciiEqualFold(te[0], "chunked") {
-			return nil, false
+		if resp.ProtoMinor == 0 || teCount != 1 || !asciiEqualFold(te, "chunked") {
+			return nil, "", false
 		}
 		delete(header, "Transfer-Encoding")
 		chunked = true
 	}
-	var connection []string
-	if special&sawConnection != 0 {
-		connection = header["Connection"]
-	}
-	hasClose := headerValuesHaveToken(connection, "close")
 	if resp.ProtoMinor == 0 {
-		resp.Close = hasClose || !headerValuesHaveToken(connection, "keep-alive")
+		resp.Close = hasClose || !hasKeepAlive
 	} else {
 		resp.Close = hasClose
 		if hasClose {
@@ -513,40 +582,52 @@ func parseResponseHead(head []byte, req *stdhttp.Request) (*stdhttp.Response, bo
 
 	declared := int64(-1)
 	if special&sawContentLength != 0 {
-		cl := header["Content-Length"]
-		if len(cl) != 1 {
-			return nil, false
+		if lengthCount != 1 {
+			return nil, "", false
 		}
-		v := strings.Trim(cl[0], " \t\r\n")
+		v := strings.Trim(length, " \t\r\n")
 		n, err := strconv.ParseUint(v, 10, 63)
 		if err != nil {
-			return nil, false
+			return nil, "", false
 		}
 		declared = int64(n)
 	}
 	head1 := req != nil && req.Method == stdhttp.MethodHead
-	var length int64
+	var length64 int64
 	switch {
 	case head1 || code/100 == 1 || code == 204 || code == 304:
-		length = 0
+		length64 = 0
 	case chunked:
 		delete(header, "Content-Length")
-		length = -1
+		length64 = -1
 	default:
-		length = declared
+		length64 = declared
 	}
-	resp.ContentLength = length
+	resp.ContentLength = length64
 	if head1 {
 		resp.ContentLength = declared
 	}
 	if special&sawTrailer != 0 && chunked {
-		return nil, false
+		return nil, "", false
 	}
 	if chunked {
 		resp.TransferEncoding = []string{"chunked"}
 	}
-	if length == -1 && !chunked && code/100 != 1 && code != 204 && code != 304 {
+	if length64 == -1 && !chunked && code/100 != 1 && code != 204 && code != 304 {
 		resp.Close = true
 	}
-	return resp, true
+	if !block {
+		lines = ""
+	}
+	return resp, lines, true
+}
+
+// headerValueHasToken is headerValuesHaveToken for one value.
+func headerValueHasToken(value, token string) bool {
+	for element := range strings.SplitSeq(value, ",") {
+		if asciiEqualFold(strings.Trim(element, " \t"), token) {
+			return true
+		}
+	}
+	return false
 }

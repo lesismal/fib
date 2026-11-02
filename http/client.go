@@ -368,6 +368,45 @@ func (c *Client) Start(req *stdhttp.Request, callback func(*ClientResponse, erro
 	return Call{r: c.do(req, callback, false, nil)}
 }
 
+// Framing is the header framing a request sent with Client.StartFramed
+// leaves to its caller, on HTTP/1, which spares the request a header map
+// built, sorted and written out again, and its response one built and read
+// through, as a proxy's would be twice over. Either side may be left to the
+// client, as Start frames it: a nil HeaderBlock, or ResponseHeaderBlock false.
+type Framing struct {
+	// HeaderBlock, when it is not nil, is the request's header as lines of
+	// "Name: value", each ended by CRLF, as a proxy has them from
+	// Context.RequestHeaderBlock, which stand for req.Header. On an HTTP/1
+	// connection they are written as they are, after the request line,
+	// Host and the Content-Length the body takes, and no User-Agent of the
+	// client's own is added. A request that goes out another way — on
+	// HTTP/2, with a body that streams, or one the client leaves to
+	// net/http, as it does a Close — has them added to req.Header first,
+	// which must then not be shared, and goes as Start sends it.
+	//
+	// The block must not hold Host, Content-Length, Transfer-Encoding or
+	// Trailer, whose framing is the client's, and each name must be a token
+	// and each value hold no control byte but a tab: they are not checked on
+	// HTTP/1, where they are written as they are, and a request whose block
+	// is not so fails when it is added to its header. The block is read
+	// before StartFramed returns, and the caller may use it again once it
+	// has.
+	HeaderBlock []byte
+	// ResponseHeaderBlock asks for the response's header as the lines it
+	// arrived in, ClientResponse.HeaderBlock, with a nil Header, rather than
+	// as a map, when it comes over HTTP/1 in a shape the client reads itself.
+	// One that comes over HTTP/2, or that the client leaves to net/http, has
+	// its Header as ever, and no block: the caller takes whichever it is
+	// given.
+	ResponseHeaderBlock bool
+}
+
+// StartFramed is Start for a request whose header framing, on one side or
+// both, is the caller's; see Framing.
+func (c *Client) StartFramed(req *stdhttp.Request, framing Framing, callback func(*ClientResponse, error)) Call {
+	return Call{r: c.doFramed(req, callback, false, nil, framing)}
+}
+
 // StartUpgrade is Start for a request that asks the server to switch to
 // another protocol, as a WebSocket handshake does, with its Connection and
 // Upgrade fields. If the server answers 101 Switching Protocols, the
@@ -415,6 +454,13 @@ func (c Call) Cancel(err error) {
 // client's configuration says. It returns the request, or nil for one it
 // rejected outright.
 func (c *Client) do(req *stdhttp.Request, callback func(*ClientResponse, error), whole bool, tunnel TunnelHandler) *clientRequest {
+	return c.doFramed(req, callback, whole, tunnel, Framing{})
+}
+
+// doFramed is do for a request whose framing is partly framing's, as
+// StartFramed takes it.
+func (c *Client) doFramed(req *stdhttp.Request, callback func(*ClientResponse, error), whole bool, tunnel TunnelHandler, framing Framing) *clientRequest {
+	fields := framing.HeaderBlock
 	if callback == nil {
 		callback = func(*ClientResponse, error) {}
 	}
@@ -446,10 +492,24 @@ func (c *Client) do(req *stdhttp.Request, callback func(*ClientResponse, error),
 		}
 		req.Body = &bufferedBody{data: body}
 	}
+	if fields != nil && (upload != nil || c.mayMultiplex(target)) {
+		// Only HTTP/1 takes the fields as they are, and only for a body read
+		// whole; the request may go out on HTTP/2.
+		if err = addFieldLines(req, fields); err != nil {
+			if upload != nil {
+				upload.Close()
+			}
+			callback(nil, err)
+			return nil
+		}
+		fields = nil
+	}
 	var data []byte
 	pooled := false
 	declared, chunked := int64(-1), false
-	if upload != nil {
+	if fields != nil {
+		data, pooled, err = marshalFramed(req, body, fields)
+	} else if upload != nil {
 		declared = reqbody.Declared(req)
 		chunked = declared < 0 || len(req.Trailer) > 0
 		data, err = marshalStreamedHead(req, declared, chunked)
@@ -466,7 +526,8 @@ func (c *Client) do(req *stdhttp.Request, callback func(*ClientResponse, error),
 		return nil
 	}
 	r := &clientRequest{req: req, data: data, body: body, borrowed: borrowed, upload: upload, declared: declared,
-		chunked: chunked, callback: callback, whole: whole, tunnel: tunnel, headerWait: c.config.ResponseHeaderTimeout}
+		chunked: chunked, callback: callback, whole: whole, tunnel: tunnel, headerWait: c.config.ResponseHeaderTimeout,
+		wantBlock: framing.ResponseHeaderBlock}
 	r.headLen = len(data)
 	if c.config.ExpectContinueTimeout > 0 && reqbody.ExpectsContinue(req, len(body) > 0 || upload != nil) {
 		r.expect = true
@@ -567,6 +628,47 @@ func marshalRequest(req *stdhttp.Request, body []byte) ([]byte, bool, error) {
 		data[lineEnd-1] = '0'
 	}
 	return data, false, nil
+}
+
+// marshalFramed is marshalRequest for a request whose header is fields, as
+// Framing.HeaderBlock holds them; one it leaves to net/http has them added to its
+// header first.
+func marshalFramed(req *stdhttp.Request, body []byte, fields []byte) ([]byte, bool, error) {
+	http10 := req.ProtoMajor == 1 && req.ProtoMinor == 0
+	if data, ok := fastFramedRequest(req, body, http10, fields); ok {
+		return data, true, nil
+	}
+	if err := addFieldLines(req, fields); err != nil {
+		return nil, false, err
+	}
+	return marshalRequest(req, body)
+}
+
+// addFieldLines adds the fields of lines, as Framing.HeaderBlock holds them, to
+// req.Header, making it if it is nil, with an empty User-Agent unless they
+// hold one, as framed fields send none of the client's.
+func addFieldLines(req *stdhttp.Request, lines []byte) error {
+	if req.Header == nil {
+		req.Header = make(stdhttp.Header)
+	}
+	text := string(lines)
+	for text != "" {
+		end := strings.Index(text, "\r\n")
+		if end < 0 {
+			return errors.New("http: framed header line not ended by CRLF")
+		}
+		key, value, ok := simpleField(text[:end])
+		if !ok {
+			return fmt.Errorf("http: invalid framed header line %q", text[:end])
+		}
+		req.Header[key] = append(req.Header[key], value)
+		text = text[end+2:]
+	}
+	if _, ok := req.Header["User-Agent"]; !ok {
+		// Present and empty, so that none of the client's own is sent.
+		req.Header["User-Agent"] = []string{}
+	}
+	return nil
 }
 
 // marshalStreamedHead frames the header of req, whose body streams, for an
@@ -1267,7 +1369,11 @@ type clientRequest struct {
 	// connection to.
 	whole  bool
 	tunnel TunnelHandler
-	done   atomic.Bool
+	// wantBlock is Framing.ResponseHeaderBlock, and block the response's
+	// header lines when they came so, which deliver hands on.
+	wantBlock bool
+	block     string
+	done      atomic.Bool
 	// waitingIn is the host whose queue the request waits in, or nil: set
 	// as it is queued, and cleared by whichever comes first of its leaving
 	// the queue and its ending, which then counts it in the host's ended.
@@ -1335,7 +1441,7 @@ func (r *clientRequest) deliver(resp *stdhttp.Response, err error) {
 		r.callback(nil, err)
 		return
 	}
-	DeliverResponse(resp, r.abort, r.callback)
+	deliverResponse(resp, r.block, r.abort, r.callback)
 }
 
 // markDone settles the request, once, and stops what would abandon it.
@@ -1918,6 +2024,7 @@ func (cc *clientConn) OnData(conn *fib.Connection, data []byte) {
 	// The end of a streamed body reaches its callback after the connection is
 	// released or discarded (see bodyEnd).
 	cc.feeding = true
+	cc.parser.wantBlock = r.wantBlock
 	resp, err := cc.parser.feed(data, r.req)
 	cc.feeding = false
 	if err != nil {
@@ -1994,6 +2101,7 @@ func (cc *clientConn) OnData(conn *fib.Connection, data []byte) {
 	r.detach()
 	// Read before the connection is released: its next request resets it.
 	streamed := cc.parser.streamedDone
+	r.block = cc.parser.block
 	if cc.isClosed() {
 		// The callback of a streaming response gave up on it already.
 		reusable = false
@@ -2059,10 +2167,14 @@ func newClientStream(cc *clientConn, r *clientRequest, head *stdhttp.Response, c
 	if credit == nil {
 		hooks.Hold = cc.conn.HoldReads
 	}
-	return NewResponseStream(head, r.req, StreamOptions{
+	// The head is the parser's latest, whose lines are its block.
+	r.block = cc.parser.block
+	s := NewResponseStream(head, r.req, StreamOptions{
 		Threshold: streamThreshold(config.StreamResponseBodyThreshold, config.StreamUnknownLengthAtHeader, head),
 		Buffer:    config.StreamResponseBodyBuffer,
 	}, hooks)
+	s.cr.block = r.block
+	return s
 }
 
 // streamThreshold is how much of head's body a stream collects before its

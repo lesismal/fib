@@ -45,6 +45,11 @@ type responseParser struct {
 	head      *stdhttp.Response
 	headerEnd int
 	framing   bodyFraming
+	// wantBlock asks for the head of the response to come as its field
+	// lines, block, rather than as a Header map, which a head left to
+	// net/http still comes as (see Framing.ResponseHeaderBlock).
+	wantBlock bool
+	block     string
 
 	// sink receives bodies that stream instead of being buffered, when
 	// streamOK says this exchange may stream: those larger than threshold, by
@@ -397,7 +402,8 @@ func (p *responseParser) parseHead(req *stdhttp.Request) (bool, error) {
 			chunked = list[len(list)-1] == "chunked"
 		}
 	}
-	head, ok := parseResponseHead(raw, req)
+	head, block, ok := parseResponseHeadBlock(raw, req, p.wantBlock)
+	p.block = block
 	if !ok {
 		var err error
 		head, err = stdhttp.ReadResponse(bufio.NewReader(bytes.NewReader(raw)), req)

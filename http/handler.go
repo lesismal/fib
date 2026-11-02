@@ -34,6 +34,19 @@ func (f HandlerFunc) ServeHTTP(c *Context) { f(c) }
 type Response struct {
 	StatusCode int
 	Header     stdhttp.Header
+	// HeaderBlock is more of the header, as lines of "Name: value", each
+	// ended by CRLF, which HTTP/1 writes as they are after Header's fields,
+	// as a proxy passes on the fields of ClientResponse.HeaderBlock without
+	// a map built and sorted for them. Like Header's, its fields must not
+	// frame the response — no Content-Length, Transfer-Encoding, Trailer or
+	// Connection — and each name must be a token and each value hold no
+	// control byte but a tab: they are written unchecked. The server adds no
+	// Date when it holds one. A response written over HTTP/2 or HTTP/3, or
+	// one an OnHeader or OnResponse hook may change, has the block's fields
+	// added to a copy of Header instead; an OnFinish hook is handed Header
+	// alone, without them. It is read before the call that writes the
+	// response returns, and is the caller's again then.
+	HeaderBlock []byte
 	// Body is the response body. The response may keep the slice itself until
 	// it is finished: sent on HTTP/1 and HTTP/2, acknowledged by the peer on
 	// HTTP/3, which can be after WriteResponse or Respond returns. Whatever
@@ -404,6 +417,23 @@ func (c *Context) RequestBody() *BodyStream {
 	return stream
 }
 
+// RequestHeaderBlock is the request's header as it arrived over HTTP/1: its
+// field lines, each ended by CRLF, without the request line before them or
+// the blank line after, Host and Transfer-Encoding among them. Every name in
+// it is a token and every value plain, as the server checked them, but the
+// names are as the client wrote them, not canonical. It is "" for a request
+// that came over HTTP/2 or HTTP/3, and for one whose header the server left
+// to net/http to parse (see Config); and it is what arrived, which changes to
+// Request.Header do not change. A proxy whose request goes on as it came
+// passes it on from here, through Client.StartFramed, rather than writing the
+// header out of the map again.
+func (c *Context) RequestHeaderBlock() string {
+	if c.block == nil {
+		return ""
+	}
+	return c.block.fields
+}
+
 // HoldBody pauses, with hold set, the body that OnBody delivers, and resumes it
 // without: while it is held, the callback is not called, and what arrives
 // waits in the server's buffer, which paces the client as an unread body
@@ -721,6 +751,14 @@ func (c *Context) writeResponse(response Response, copied []byte) error {
 	if c.wrote {
 		releaseBody(copied)
 		return ErrResponseWritten
+	}
+	if response.HeaderBlock != nil && (c.external != nil || c.stream != nil || c.hooked() != nil && c.hooked().changes) {
+		header, err := headerWithBlock(response.Header, response.HeaderBlock)
+		if err != nil {
+			releaseBody(copied)
+			return err
+		}
+		response.Header, response.HeaderBlock = header, nil
 	}
 	if response.StatusCode == 0 {
 		response.StatusCode = stdhttp.StatusOK
@@ -1877,7 +1915,7 @@ func (c *Context) sendResponse(response Response, contentType string, closeConne
 		}
 		return c.Conn.SendOwned(data)
 	}
-	pooled := bufferpool.Get(headCapacity(response.Header) + len(contentType))
+	pooled := bufferpool.Get(headCapacity(response.Header) + len(response.HeaderBlock) + len(contentType))
 	head, err := appendResponseHead(pooled[:0], c.Request, framing)
 	if err == nil {
 		// A body from a *Copy call is a buffer of this call's, from the pool,
@@ -1912,7 +1950,7 @@ func marshalResponse(request *stdhttp.Request, response Response, closeConnectio
 	if framing.chunked {
 		return marshalChunked(request, framing, body, trailer)
 	}
-	out, err := appendResponseHead(make([]byte, 0, len(body)+headCapacity(response.Header)), request, framing)
+	out, err := appendResponseHead(make([]byte, 0, len(body)+headCapacity(response.Header)+len(response.HeaderBlock)), request, framing)
 	if err != nil {
 		return nil, err
 	}
@@ -1935,7 +1973,7 @@ func headCapacity(header stdhttp.Header) int {
 
 // marshalChunked builds a chunked response, which ends with trailer.
 func marshalChunked(request *stdhttp.Request, framing responseHead, body []byte, trailer stdhttp.Header) ([]byte, error) {
-	out, err := appendResponseHead(make([]byte, 0, len(body)+headCapacity(framing.header)+32), request, framing)
+	out, err := appendResponseHead(make([]byte, 0, len(body)+headCapacity(framing.header)+len(framing.block)+32), request, framing)
 	if err != nil {
 		return nil, err
 	}
@@ -1953,7 +1991,7 @@ func marshalChunked(request *stdhttp.Request, framing responseHead, body []byte,
 // which part of its body is sent, and for a chunked one, its trailer.
 func responseFraming(request *stdhttp.Request, response Response, closeConnection bool) (framing responseHead, body []byte, trailer stdhttp.Header) {
 	status := response.StatusCode
-	framing = responseHead{status: status, header: response.Header, contentLength: -1, close: closeConnection}
+	framing = responseHead{status: status, header: response.Header, block: response.HeaderBlock, contentLength: -1, close: closeConnection}
 	hasBody := statusHasBody(status)
 	isHead := request.Method == stdhttp.MethodHead
 	switch {
@@ -1986,6 +2024,30 @@ func responseFraming(request *stdhttp.Request, response Response, closeConnectio
 		return framing, nil, trailer
 	}
 	return framing, response.Body, trailer
+}
+
+// headerWithBlock returns a copy of header with the fields of block, as
+// Response.HeaderBlock holds them, added.
+func headerWithBlock(header stdhttp.Header, block []byte) (stdhttp.Header, error) {
+	out := make(stdhttp.Header, len(header)+bytes.Count(block, crlf))
+	for key, values := range header {
+		out[key] = values
+	}
+	text := string(block)
+	for text != "" {
+		end := strings.Index(text, "\r\n")
+		if end < 0 {
+			return nil, errors.New("http: header block line not ended by CRLF")
+		}
+		key, value, ok := simpleField(text[:end])
+		if !ok {
+			return nil, errors.New("http: invalid header block line")
+		}
+		values := out[key]
+		out[key] = append(values[:len(values):len(values)], value)
+		text = text[end+2:]
+	}
+	return out, nil
 }
 
 // responseLength is the Content-Length a stream reports for response to

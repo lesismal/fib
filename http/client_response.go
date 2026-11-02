@@ -56,7 +56,19 @@ type ClientResponse struct {
 	abort func(error)
 	// tunnel is what a 101 to StartUpgrade's request switched to.
 	tunnel *Tunnel
+	// block is the header's lines, when they came in place of Header.
+	block string
 }
+
+// HeaderBlock is the response's header as the lines it arrived in, each ended
+// by CRLF, without the status line before them or the blank line after, for
+// a request sent with Framing.ResponseHeaderBlock whose response came so:
+// Header is nil then. It holds every field as it arrived, Content-Length,
+// Transfer-Encoding and Connection among them, which the client has framed
+// the response by; every name in it is a token, as the server wrote it, and
+// every value plain. It is "" for any other response, whose fields are in
+// Header.
+func (c *ClientResponse) HeaderBlock() string { return c.block }
 
 // Tunnel returns the tunnel the connection became when the server answered
 // a request sent with Client.StartUpgrade with 101 Switching Protocols, and
@@ -83,7 +95,13 @@ func NewBufferedBody(data []byte) io.ReadCloser {
 // exchange. It is for the clients of other transports, such as package http3,
 // to deliver their responses the way this package's Client does.
 func DeliverResponse(resp *stdhttp.Response, abort func(error), callback func(*ClientResponse, error)) {
-	cr := &ClientResponse{Response: resp, abort: abort}
+	deliverResponse(resp, "", abort, callback)
+}
+
+// deliverResponse is DeliverResponse for a response whose header lines are
+// block, when they came in place of its Header.
+func deliverResponse(resp *stdhttp.Response, block string, abort func(error), callback func(*ClientResponse, error)) {
+	cr := &ClientResponse{Response: resp, abort: abort, block: block}
 	cr.whole, _ = resp.Body.(*bufferedBody)
 	cr.mu.Lock()
 	cr.inCallback = true

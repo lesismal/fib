@@ -45,6 +45,9 @@ type requestBlock struct {
 	values [4]string
 	// transferEncoding is the request's TransferEncoding, for a chunked one.
 	transferEncoding [1]string
+	// fields are the header's lines as they arrived, for
+	// Context.RequestHeaderBlock.
+	fields string
 	// body is the request's body when it arrived whole.
 	body wholeBody
 	// pooled records that the block came from blockPool, and headerFromPool
@@ -108,6 +111,7 @@ func (b *requestBlock) recycle() bool {
 	b.url = url.URL{}
 	b.values = [len(b.values)]string{}
 	b.transferEncoding = [1]string{}
+	b.fields = ""
 	b.body = wholeBody{}
 	b.recycleServerState()
 	blockPool.Put(b)
@@ -207,6 +211,7 @@ func parseSimpleRequestHead(head []byte, reuse reuseOptions) *requestBlock {
 		fieldLine := text[at : at+n-1]
 		at += n + 1
 		if fieldLine == "" {
+			block.fields = text[lineEnd+1 : at-2]
 			break
 		}
 		key, value, ok := simpleField(fieldLine)
