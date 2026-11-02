@@ -2014,20 +2014,22 @@ func declaredLength(header stdhttp.Header) int64 {
 // appendHeaderLines appends header as HTTP/1 lines in key order, leaving out
 // the keys skip reports.
 func appendHeaderLines(out []byte, header stdhttp.Header, skip func(string) bool) ([]byte, error) {
-	// Room on the stack for the keys of any ordinary header.
-	var stack [16]string
-	keys := stack[:0]
-	for key := range header {
+	// Room on the stack for the fields of any ordinary header, gathered with
+	// their values so that writing them looks nothing up in the map again.
+	var stack [16]headerField
+	fields := stack[:0]
+	for key, values := range header {
 		if skip == nil || !skip(key) {
-			keys = append(keys, key)
+			fields = append(fields, headerField{key, values})
 		}
 	}
-	sort.Strings(keys)
-	for _, key := range keys {
+	sortHeaderFields(fields)
+	for _, f := range fields {
+		key := f.key
 		if !validHeaderName(key) {
 			return nil, errors.New("http: invalid response header name")
 		}
-		for _, value := range header[key] {
+		for _, value := range f.values {
 			if !validHeaderValue(value) {
 				return nil, errors.New("http: invalid response header value")
 			}
