@@ -69,7 +69,7 @@ func (rs *requestStream) Upgrade(req *stdhttp.Request, protocol string, header s
 		return nil, err
 	}
 	if max, limited := rs.fieldLimit(); limited {
-		size := uint64(statusSize) + headerSize(header, func(name string) bool { return name == "content-length" })
+		size := uint64(statusSize) + headerSize(header, isContentLength)
 		if size > max {
 			return nil, errFieldSectionTooLarge
 		}
@@ -87,7 +87,7 @@ func (rs *requestStream) Upgrade(req *stdhttp.Request, protocol string, header s
 	rs.mu.Unlock()
 	sec, block := beginFields(rs.encoder(), rs.s.ID())
 	block = sec.Append(block, ":status", "200", false)
-	block = appendHeader(&sec, block, header, func(name string) bool { return name == "content-length" })
+	block = appendHeader(&sec, block, header, isContentLength)
 	block = sec.End(block)
 	err := rs.s.Write(appendHeadersFrame(nil, block), false)
 	bufferpool.Put(block)

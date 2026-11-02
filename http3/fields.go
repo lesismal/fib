@@ -72,17 +72,37 @@ func sensitive(name string) bool {
 // checkHeader checks the fields of a message about to be sent, before any
 // is encoded.
 func checkHeader(header stdhttp.Header) error {
+	_, err := checkHeaderSize(header, nil)
+	return err
+}
+
+// isContentLength is the skip of the fields a response with a length of its
+// own leaves out.
+func isContentLength(name string) bool { return name == "content-length" }
+
+// checkHeaderSize is checkHeader that also returns the weight of the fields
+// appendHeader sends of header, as headerSize does, in the same pass over
+// it.
+func checkHeaderSize(header stdhttp.Header, skip func(string) bool) (uint64, error) {
+	var n uint64
 	for key, values := range header {
-		if key == "" || textproto.CanonicalMIMEHeaderKey(key) == "" || !validName(lowerKey(key)) {
-			return errors.New("http3: invalid header name " + strconv.Quote(key))
+		name := lowerKey(key)
+		if key == "" || !validName(name) {
+			return 0, errors.New("http3: invalid header name " + strconv.Quote(key))
 		}
 		for _, value := range values {
 			if !sendableValue(value) {
-				return errors.New("http3: invalid header value for " + key)
+				return 0, errors.New("http3: invalid header value for " + key)
 			}
 		}
+		if connectionHeaders[name] || skip != nil && skip(name) {
+			continue
+		}
+		for _, value := range values {
+			n += fieldSize(name, value)
+		}
 	}
-	return nil
+	return n, nil
 }
 
 // appendHeader encodes header's fields in sec, leaving out what HTTP/3 does

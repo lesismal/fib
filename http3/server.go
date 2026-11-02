@@ -2072,11 +2072,12 @@ func (rs *requestStream) writeResponse(req *stdhttp.Request, response fibhttp.Re
 	if status < 200 || status > 999 {
 		return fmt.Errorf("http3: invalid status code %d", status)
 	}
-	if err := checkHeader(response.Header); err != nil {
+	weight, err := checkHeaderSize(response.Header, isContentLength)
+	if err != nil {
 		return err
 	}
 	if max, limited := rs.fieldLimit(); limited {
-		size := uint64(statusSize) + headerSize(response.Header, func(name string) bool { return name == "content-length" })
+		size := uint64(statusSize) + weight
 		if status != stdhttp.StatusNoContent && status != stdhttp.StatusNotModified {
 			size += lengthSize(responseLength(req, response))
 		}
@@ -2118,7 +2119,7 @@ func (rs *requestStream) writeResponse(req *stdhttp.Request, response fibhttp.Re
 	if statusBody {
 		block = sec.Append(block, "content-length", string(strconv.AppendInt(digits[:0], responseLength(req, response), 10)), false)
 	}
-	block = appendHeader(&sec, block, response.Header, func(name string) bool { return name == "content-length" })
+	block = appendHeader(&sec, block, response.Header, isContentLength)
 	block = sec.End(block)
 	body := response.Body
 	if !bodyAllowed(req, status) {
@@ -2165,7 +2166,7 @@ func (rs *requestStream) writeResponse(req *stdhttp.Request, response fibhttp.Re
 		{Data: body, Owned: owned},
 		{Data: tail, Owned: true},
 	}
-	err := rs.s.WriteFinalParts(parts[:], expected)
+	err = rs.s.WriteFinalParts(parts[:], expected)
 	if released != nil {
 		// The connection owns the body now, whether it writes it or drops it
 		// on a stream that ended: it goes back to the pool from there.
