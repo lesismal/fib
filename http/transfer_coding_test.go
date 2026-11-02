@@ -15,6 +15,40 @@ import (
 	"testing"
 )
 
+// TestTransferEncodingFields holds transferEncodingFields, which looks only
+// where lines start, to cutting every CRLF-separated line at its colon.
+func TestTransferEncodingFields(t *testing.T) {
+	byLine := func(head []byte) ([]string, bool) {
+		var values []string
+		for line := range bytes.SplitSeq(head, []byte("\r\n")) {
+			if name, value, ok := bytes.Cut(line, []byte(":")); ok && strings.EqualFold(string(name), "Transfer-Encoding") {
+				values = append(values, string(value))
+			}
+		}
+		return values, values != nil
+	}
+	heads := []string{
+		"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\n",
+		"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n",
+		"HTTP/1.1 200 OK\r\ntransfer-encoding:gzip, chunked\r\nX: 1\r\nTRANSFER-ENCODING: chunked\r\n\r\n",
+		"HTTP/1.1 200 OK\r\nX: a\nTransfer-Encoding: hidden\r\n\r\n",
+		"HTTP/1.1 200 OK\r\nX: a\r\r\nTransfer-Encoding: x\r\n\r\n",
+		"HTTP/1.1 200 OK\r\n\nTransfer-Encoding: y\r\n\r\n",
+		"HTTP/1.1 200 OK\r\nTransfer-Encoding : z\r\nTransfer-Encodings: w\r\nUransfer-Encoding: v\r\n\r\n",
+		"Transfer-Encoding: first\r\n\r\n",
+		"HTTP/1.1 200 OK\r\nTransfer-Encoding:",
+		"HTTP/1.1 200 OK\r\nTransfer-Encoding",
+		"",
+	}
+	for _, head := range heads {
+		got, gotOK := transferEncodingFields([]byte(head))
+		want, wantOK := byLine([]byte(head))
+		if gotOK != wantOK || strings.Join(got, "|") != strings.Join(want, "|") || len(got) != len(want) {
+			t.Errorf("transferEncodingFields(%q) = %q, %v; want %q, %v", head, got, gotOK, want, wantOK)
+		}
+	}
+}
+
 // codingCase is a transfer coding's name and how to send a body in it.
 type codingCase struct {
 	name   string

@@ -112,14 +112,34 @@ func splitTransferCodings(head []byte, request bool) (rewritten []byte, coding t
 
 // transferEncodingFields returns the values of head's Transfer-Encoding
 // fields, as they were written, and whether head has any.
+//
+// Every response head the client reads is looked through, and nearly none
+// has one: a line is looked at only where it starts, for a name of the length
+// and first letter, rather than cut at its colon.
 func transferEncodingFields(head []byte) ([]string, bool) {
+	const name = "transfer-encoding"
 	var values []string
-	for line := range bytes.SplitSeq(head, []byte("\r\n")) {
-		if name, value, ok := bytes.Cut(line, []byte(":")); ok && strings.EqualFold(string(name), "Transfer-Encoding") {
+	for at := 0; ; {
+		if rest := head[at:]; len(rest) > len(name) && rest[len(name)] == ':' && rest[0]|0x20 == 't' &&
+			strings.EqualFold(string(rest[:len(name)]), name) {
+			value := rest[len(name)+1:]
+			if end := bytes.Index(value, []byte("\r\n")); end >= 0 {
+				value = value[:end]
+			}
 			values = append(values, string(value))
 		}
+		// The next line starts after the next CRLF; a bare LF ends none.
+		for {
+			i := bytes.IndexByte(head[at:], '\n')
+			if i < 0 {
+				return values, values != nil
+			}
+			at += i + 1
+			if at >= 2 && head[at-2] == '\r' {
+				break
+			}
+		}
 	}
-	return values, values != nil
 }
 
 // plainChunked reports whether head's Transfer-Encoding is the one field
