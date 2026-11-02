@@ -1,6 +1,7 @@
 package quic
 
 import (
+	"sync"
 	"sync/atomic"
 
 	"github.com/lesismal/fib/bufferpool"
@@ -77,6 +78,73 @@ type Stream struct {
 	// its handler calls stop (see WriteFinal). Only the goroutine making
 	// them uses it.
 	released bool
+	// recycled says the application has given the stream up for good (see
+	// Recycle), and reusable that the handler calls queued for it have all
+	// been made since: the connection takes it back for a later stream once
+	// sentRefs, the frames of sent packets' records that refer to it, have
+	// all been acknowledged or declared lost. Guarded by the connection's mu.
+	recycled bool
+	reusable bool
+	sentRefs int32
+}
+
+// maxFreeStreams bounds the streams a connection keeps to reuse, which
+// covers the requests a client has in flight at once; the rest go to
+// streamPool, which the connections share.
+const maxFreeStreams = 32
+
+var streamPool = sync.Pool{New: func() any { return new(Stream) }}
+
+// Recycle tells the connection that the application is done with the stream
+// for good: it neither calls the stream's methods nor keeps the stream after
+// Recycle returns, and its handler passes over any call still made for it,
+// which it can tell by the stream's Context. Once both sides of the stream
+// are finished, and what the connection sent on it needs no more of it, the
+// connection reuses the stream's memory for a later one: a server answering
+// many small requests then allocates no stream for each. A stream the
+// application never recycles is left to the garbage collector.
+func (s *Stream) Recycle() {
+	c := s.conn
+	c.mu.Lock()
+	if !s.recycled {
+		s.recycled = true
+		c.queueReuseLocked(s)
+	}
+	c.mu.Unlock()
+}
+
+// queueReuseLocked queues the stream to be taken back once it is finished
+// and recycled both: no frame reaches it then, nor any call of the
+// application's, so no handler call for it can be queued after this one,
+// and by the time this one comes up no call queued before it refers to it.
+// Calls held back for the end of the handshake might, and a stream with any
+// is left to the collector. Callers hold c.mu.
+func (c *Conn) queueReuseLocked(s *Stream) {
+	if s.done && s.recycled && !c.closed && len(c.heldEarly) == 0 {
+		c.events = append(c.events, event{kind: evReuse, stream: s})
+	}
+}
+
+// reuseLocked takes a recycled stream back once nothing refers to it: no
+// queued handler call, which evReuse has seen to, no record of a sent
+// packet, and not the queue of streams with something to send, which drops
+// a finished one the next time it is looked at. A stream with a
+// NotifySendable callback still waiting is left to the collector. Callers
+// hold c.mu.
+func (c *Conn) reuseLocked(s *Stream) {
+	if !s.reusable || s.sentRefs != 0 || s.queued {
+		return
+	}
+	s.reusable = false
+	if s.roomFn != nil || c.closed {
+		return
+	}
+	*s = Stream{}
+	if len(c.freeStreams) < maxFreeStreams {
+		c.freeStreams = append(c.freeStreams, s)
+		return
+	}
+	streamPool.Put(s)
 }
 
 // ID is the stream's ID.

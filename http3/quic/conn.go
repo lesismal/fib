@@ -626,6 +626,11 @@ type Conn struct {
 	// roomStreams are the streams with a callback waiting in
 	// NotifySendable.
 	roomStreams []*Stream
+	// freeStreams are recycled streams to reuse (see Stream.Recycle), and
+	// reuseNext those whose evReuse the batch of handler calls being made
+	// has come to, which only the goroutine making them uses.
+	freeStreams []*Stream
+	reuseNext   []*Stream
 	// buffered are packets that arrived before their keys.
 	buffered [][]byte
 
@@ -1190,7 +1195,15 @@ func (c *Conn) openStreamLocked(bidi bool) (*Stream, error) {
 
 // newStream sets up a stream's state from the limits of both sides.
 func (c *Conn) newStream(id uint64) *Stream {
-	s := &Stream{conn: c, id: id, recvFin: -1}
+	var s *Stream
+	if n := len(c.freeStreams); n > 0 {
+		s = c.freeStreams[n-1]
+		c.freeStreams[n-1] = nil
+		c.freeStreams = c.freeStreams[:n-1]
+	} else {
+		s = streamPool.Get().(*Stream)
+	}
+	s.conn, s.id, s.recvFin = c, id, -1
 	local := isClientStream(id) == c.isClient
 	s.hasSend = isBidi(id) || local
 	s.hasRecv = isBidi(id) || !local
@@ -1264,6 +1277,7 @@ func (c *Conn) maybeFinish(s *Stream) {
 	}
 	s.done = true
 	delete(c.streams, s.id)
+	c.queueReuseLocked(s)
 	c.closeIfDoneLocked()
 	if s.local() {
 		return
@@ -1318,6 +1332,12 @@ func (c *Conn) dispatch() {
 		if c.spareEvents == nil {
 			c.spareEvents = events[:0]
 		}
+		for i, s := range c.reuseNext {
+			s.reusable = true
+			c.reuseLocked(s)
+			c.reuseNext[i] = nil
+		}
+		c.reuseNext = c.reuseNext[:0]
 	}
 	c.dispatching = false
 	c.mu.Unlock()

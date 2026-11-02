@@ -1462,8 +1462,13 @@ func (rs *requestStream) RequestEnded() { rs.unref() }
 func (sc *serverConn) recycleDead() {
 	for rs := sc.dead.Swap(nil); rs != nil; {
 		next := rs.nextDead
-		if s := rs.s; s != nil && s.Context == rs {
-			s.Context = retiredStream{}
+		if s := rs.s; s != nil {
+			if s.Context == rs {
+				s.Context = retiredStream{}
+			}
+			// Nothing reaches the QUIC stream but through rs either, so the
+			// connection may have it for a later request.
+			s.Recycle()
 		}
 		rs.recycle()
 		requestStreamPool.Put(rs)

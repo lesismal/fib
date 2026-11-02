@@ -47,6 +47,9 @@ func (p *sentPacket) add(f sentFrame) {
 	}
 	p.frames = append(p.frames, f)
 	p.ackEliciting = true
+	if f.stream != nil {
+		f.stream.sentRefs++
+	}
 }
 
 func appendStopSending(b []byte, id, code uint64) []byte {

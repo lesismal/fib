@@ -32,6 +32,10 @@ const (
 	// peer retired.
 	evIssueCID
 	evRetireCID
+	// evReuse is no call: it comes up once the calls queued ahead of it,
+	// some of which may refer to a recycled stream, have run, and none can
+	// be queued for the stream after it (see queueReuseLocked).
+	evReuse
 )
 
 // event is a handler call waiting for dispatch. It is a value rather than a
@@ -47,7 +51,7 @@ type event struct {
 
 // run makes the call an event is. Callers hold no lock.
 func (c *Conn) run(e *event) {
-	if e.stream != nil && e.stream.released {
+	if e.stream != nil && e.stream.released && e.kind != evReuse {
 		return
 	}
 	switch e.kind {
@@ -100,6 +104,8 @@ func (c *Conn) run(e *event) {
 	case evRelease:
 		e.stream.Context = nil
 		e.stream.released = true
+	case evReuse:
+		c.reuseNext = append(c.reuseNext, e.stream)
 	case evIssueCID:
 		c.issueCID()
 	case evRetireCID:

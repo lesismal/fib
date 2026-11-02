@@ -666,6 +666,7 @@ func (c *Conn) appendStreams(b []byte, max int, sp *sentPacket) []byte {
 		if s.done || !s.sendable() {
 			s.queued = false
 			c.sendQueue = append(c.sendQueue[:i], c.sendQueue[i+1:]...)
+			c.reuseLocked(s)
 			continue
 		}
 		i++

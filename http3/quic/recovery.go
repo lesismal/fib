@@ -134,6 +134,13 @@ func (c *Conn) newSentPacket(pn uint64) *sentPacket {
 // releaseSent takes back a record nothing refers to any more. Callers hold
 // c.mu.
 func (c *Conn) releaseSent(p *sentPacket) {
+	for i := range p.frames {
+		if s := p.frames[i].stream; s != nil {
+			if s.sentRefs--; s.sentRefs == 0 && s.reusable {
+				c.reuseLocked(s)
+			}
+		}
+	}
 	frames := p.frames[:0]
 	clear(p.frames)
 	switch {
