@@ -168,7 +168,7 @@ func TestOnWritableHoldsTheStream(t *testing.T) {
 	deadline := time.Now().Add(5 * time.Second)
 	for {
 		sc.mu.Lock()
-		open := len(sc.streams)
+		open := sc.streams.n
 		sc.mu.Unlock()
 		if open == 0 && rs.refs.Load() <= 1 || time.Now().After(deadline) {
 			break

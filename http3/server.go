@@ -515,7 +515,7 @@ func (h *ServerHandler) admit(c *fib.Connection, data []byte) bool {
 // of its own on the peer's address.
 func (h *ServerHandler) accept(peer *udpPeer, data []byte) {
 	c := peer.c
-	sc := &serverConn{h: h, conn: c, streams: make(map[uint64]*requestStream)}
+	sc := &serverConn{h: h, conn: c}
 	if addr := c.RemoteAddr(); addr != nil {
 		sc.remoteAddr = addr.String()
 	}
@@ -945,7 +945,7 @@ type serverConn struct {
 
 	mu sync.Mutex
 	// streams are the requests not yet answered.
-	streams map[uint64]*requestStream
+	streams requestTable
 
 	// dead is the list of the connection's recycled request streams that
 	// nothing can reach any more, which recycleDead hands back to the pool.
@@ -1037,7 +1037,7 @@ func headerTimeout(config *Config) time.Duration {
 // no request. Callers hold sc.mu.
 func (sc *serverConn) armIdleLocked() {
 	d := idleTimeout(&sc.h.config)
-	if d <= 0 || sc.goingAway || sc.streams == nil {
+	if d <= 0 || sc.goingAway || sc.streams.closed {
 		return
 	}
 	sc.idleSince = time.Now()
@@ -1065,7 +1065,7 @@ func (sc *serverConn) busyLocked() {
 func (sc *serverConn) idleExpired() {
 	d := idleTimeout(&sc.h.config)
 	sc.mu.Lock()
-	if sc.goingAway || sc.streams == nil || len(sc.streams) > 0 {
+	if sc.goingAway || sc.streams.closed || sc.streams.n > 0 {
 		sc.mu.Unlock()
 		return
 	}
@@ -1260,8 +1260,8 @@ func (sc *serverConn) OnClose(qc *quic.Conn, _ error) {
 	sc.handshakeOver()
 	sc.h.removeRoute(qc, nil)
 	sc.mu.Lock()
-	streams := sc.streams
-	sc.streams = nil
+	streams := sc.streams.all()
+	sc.streams = requestTable{closed: true}
 	sc.busyLocked()
 	sc.mu.Unlock()
 	for _, rs := range streams {
@@ -1285,8 +1285,8 @@ func (sc *serverConn) OnClose(qc *quic.Conn, _ error) {
 // track records a request as open until it is answered.
 func (sc *serverConn) track(rs *requestStream) {
 	sc.mu.Lock()
-	if sc.streams != nil {
-		sc.streams[rs.s.ID()] = rs
+	if !sc.streams.closed && sc.streams.add(rs.s.ID(), rs) && sc.streams.n == 1 {
+		// The idle timer runs only while no request is open.
 		sc.busyLocked()
 	}
 	sc.mu.Unlock()
@@ -1296,11 +1296,9 @@ func (sc *serverConn) track(rs *requestStream) {
 // once the last one is gone.
 func (sc *serverConn) untrack(rs *requestStream) {
 	sc.mu.Lock()
-	id := rs.s.ID()
-	tracked := sc.streams[id] == rs
-	delete(sc.streams, id)
-	done := sc.goingAway && len(sc.streams) == 0
-	if tracked && len(sc.streams) == 0 {
+	tracked := sc.streams.remove(rs.s.ID(), rs)
+	done := sc.goingAway && sc.streams.n == 0
+	if tracked && sc.streams.n == 0 {
 		sc.armIdleLocked()
 	}
 	sc.mu.Unlock()
@@ -1339,7 +1337,7 @@ func (sc *serverConn) retire(qc *quic.Conn) {
 	sc.goAway()
 	var tunnels []*fibhttp.TunnelFeed
 	sc.mu.Lock()
-	for _, rs := range sc.streams {
+	for _, rs := range sc.streams.all() {
 		if rs.tunnel != nil {
 			tunnels = append(tunnels, rs.tunnel.TunnelFeed)
 		}
@@ -1423,6 +1421,79 @@ type requestStream struct {
 	// pack.
 	nextDead       *requestStream
 	headerFromPool *pooledHeader
+}
+
+// requestTable is the requests a connection has not answered yet, by their
+// streams' IDs: a request's slot is its stream's sequence number modulo
+// requestSlots, which the requests a client has in flight at once, numbered
+// one after another, fill without meeting, and a request whose slot is taken
+// goes in more, a map. A burst of requests is then tracked without hashing
+// an ID, or growing and clearing a map, for each.
+type requestTable struct {
+	slots []*requestStream
+	more  map[uint64]*requestStream
+	// n is how many requests the table holds, and closed says the
+	// connection has ended, and tracks no more.
+	n      int
+	closed bool
+}
+
+const requestSlots = 64
+
+// add puts rs in the table as the request of stream id, and reports whether
+// it was not there already.
+func (t *requestTable) add(id uint64, rs *requestStream) bool {
+	if t.slots == nil {
+		t.slots = make([]*requestStream, requestSlots)
+	}
+	slot := &t.slots[id>>2&(requestSlots-1)]
+	switch {
+	case *slot == rs || t.more[id] == rs:
+		return false
+	case *slot == nil:
+		*slot = rs
+	default:
+		if t.more == nil {
+			t.more = make(map[uint64]*requestStream)
+		}
+		t.more[id] = rs
+	}
+	t.n++
+	return true
+}
+
+// remove takes rs, the request of stream id, out of the table, and reports
+// whether it was there.
+func (t *requestTable) remove(id uint64, rs *requestStream) bool {
+	if t.slots == nil {
+		return false
+	}
+	if slot := &t.slots[id>>2&(requestSlots-1)]; *slot == rs {
+		*slot = nil
+	} else if t.more[id] == rs {
+		delete(t.more, id)
+	} else {
+		return false
+	}
+	t.n--
+	return true
+}
+
+// all returns the requests in the table.
+func (t *requestTable) all() []*requestStream {
+	if t.n == 0 {
+		return nil
+	}
+	all := make([]*requestStream, 0, t.n)
+	for _, rs := range t.slots {
+		if rs != nil {
+			all = append(all, rs)
+		}
+	}
+	for _, rs := range t.more {
+		all = append(all, rs)
+	}
+	return all
 }
 
 // requestStreamPool holds the request streams connections have recycled.

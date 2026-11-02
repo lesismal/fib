@@ -330,12 +330,13 @@ func TestHTTP3TimeoutSettings(t *testing.T) {
 func TestIdleExpiredStale(t *testing.T) {
 	config := DefaultConfig()
 	config.IdleTimeout = time.Hour
-	sc := &serverConn{h: NewHandlerWithConfig(config, nil), streams: map[uint64]*requestStream{}}
+	sc := &serverConn{h: NewHandlerWithConfig(config, nil)}
 	sc.idleTimer = time.AfterFunc(time.Hour, func() {})
 	defer sc.idleTimer.Stop()
-	sc.streams[0] = &requestStream{}
+	held := &requestStream{}
+	sc.streams.add(0, held)
 	sc.idleExpired()
-	delete(sc.streams, 0)
+	sc.streams.remove(0, held)
 	sc.goingAway = true
 	sc.idleExpired()
 	sc.goingAway = false

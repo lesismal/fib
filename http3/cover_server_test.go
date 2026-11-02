@@ -561,7 +561,7 @@ func csStreamOf(c *fibhttp.Context) *requestStream {
 		}
 		sc := path.qc.Handler().(*serverConn)
 		sc.mu.Lock()
-		for _, rs := range sc.streams {
+		for _, rs := range sc.streams.all() {
 			if rs.req == c.Request {
 				sc.mu.Unlock()
 				return rs
