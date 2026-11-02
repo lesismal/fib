@@ -111,11 +111,26 @@ func requestStartExcluded(key string) bool {
 type headerField struct {
 	key    string
 	values []string
+	// prefix is the key's first eight bytes, big-endian and padded with
+	// zeros, which orders two keys as the keys do wherever they differ.
+	prefix uint64
+}
+
+// newHeaderField returns key's field, with its prefix.
+func newHeaderField(key string, values []string) headerField {
+	var prefix uint64
+	for i := range 8 {
+		prefix <<= 8
+		if i < len(key) {
+			prefix |= uint64(key[i])
+		}
+	}
+	return headerField{key: key, values: values, prefix: prefix}
 }
 
 // sortHeaderFields orders fields by name. A header has a dozen fields or so,
-// which an insertion sort orders with the fewest moves and no calls; a longer
-// one is left to slices.
+// which an insertion sort orders with the fewest moves and no calls, telling
+// most names apart by their prefixes alone; a longer one is left to slices.
 func sortHeaderFields(fields []headerField) {
 	if len(fields) > 16 {
 		slices.SortFunc(fields, func(a, b headerField) int { return strings.Compare(a.key, b.key) })
@@ -124,8 +139,12 @@ func sortHeaderFields(fields []headerField) {
 	for i := 1; i < len(fields); i++ {
 		f := fields[i]
 		j := i
-		for ; j > 0 && fields[j-1].key > f.key; j-- {
-			fields[j] = fields[j-1]
+		for ; j > 0; j-- {
+			prior := &fields[j-1]
+			if prior.prefix < f.prefix || prior.prefix == f.prefix && prior.key <= f.key {
+				break
+			}
+			fields[j] = *prior
 		}
 		fields[j] = f
 	}
@@ -144,7 +163,7 @@ func collectRequestFields(h stdhttp.Header, stack *[16]headerField) ([]headerFie
 			size += len(key) + len(v) + 4
 		}
 		if !requestStartExcluded(key) {
-			fields = append(fields, headerField{key, values})
+			fields = append(fields, newHeaderField(key, values))
 		}
 	}
 	sortHeaderFields(fields)

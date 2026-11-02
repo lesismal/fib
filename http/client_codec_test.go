@@ -20,6 +20,32 @@ import (
 	"github.com/lesismal/fib/bufferpool"
 )
 
+// TestSortHeaderFields holds sortHeaderFields, which tells names apart by
+// their first eight bytes where it can, to sorting the names as strings: for
+// names that share prefixes of every length up to and past eight, are
+// shorter than eight, or hold a zero byte, and for more of them than the
+// insertion sort takes.
+func TestSortHeaderFields(t *testing.T) {
+	names := []string{"Accept", "Accept-Encoding", "Accept-Language", "Accept-L", "Accept-", "A", "",
+		"X-Forwarded-For", "X-Forwarded-Host", "X-Forwarded-Proto", "X-Forwar", "X-Forwarde", "X",
+		"Content-Length", "Content-Type", "Content-", "Content", "Ab\x00", "Ab", "Ab\x00c", "Ab\x01",
+		"User-Agent", "Cookie", "Te", "Zz", "\xff", "\xff\xff\xff\xff\xff\xff\xff\xff\x01"}
+	for n := 1; n <= len(names); n++ {
+		for shift := range names {
+			var fields []headerField
+			for i := range n {
+				fields = append(fields, newHeaderField(names[(i*7+shift)%len(names)], nil))
+			}
+			sortHeaderFields(fields)
+			for i := 1; i < len(fields); i++ {
+				if fields[i-1].key > fields[i].key {
+					t.Fatalf("n=%d shift=%d: %q before %q", n, shift, fields[i-1].key, fields[i].key)
+				}
+			}
+		}
+	}
+}
+
 // stdResponseHead is what ReadResponse makes of head, as parseHead used it
 // before the client parsed heads itself.
 func stdResponseHead(head []byte, req *stdhttp.Request) (*stdhttp.Response, error) {

@@ -2020,7 +2020,7 @@ func appendHeaderLines(out []byte, header stdhttp.Header, skip func(string) bool
 	fields := stack[:0]
 	for key, values := range header {
 		if skip == nil || !skip(key) {
-			fields = append(fields, headerField{key, values})
+			fields = append(fields, newHeaderField(key, values))
 		}
 	}
 	sortHeaderFields(fields)
