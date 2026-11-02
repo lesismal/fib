@@ -436,10 +436,8 @@ func simpleField(line string) (key, value string, ok bool) {
 		key = canonicalKey(key)
 	}
 	value = line[colon+1:]
-	for i := 0; i < len(value); i++ {
-		if c := value[i]; c < ' ' && c != '\t' || c == 0x7f {
-			return "", "", false
-		}
+	if !plainFieldValue(value) {
+		return "", "", false
 	}
 	// A value nearly always has one space before it and none after.
 	if len(value) > 0 && value[0] == ' ' {
@@ -450,6 +448,33 @@ func simpleField(line string) (key, value string, ok bool) {
 		value = strings.Trim(value, " \t")
 	}
 	return key, value, true
+}
+
+// plainFieldValue reports whether v holds no control byte but a tab: nothing
+// below a space but HTAB, and no DEL, as a field's value may hold. Values
+// are most of a head's bytes, so it looks at eight at a time, and at each of
+// the eight only when one of them is below a space or DEL, which a tab is
+// too.
+func plainFieldValue(v string) bool {
+	const ones, highs = 0x0101010101010101, 0x8080808080808080
+	i := 0
+	for ; len(v)-i >= 8; i += 8 {
+		b := v[i : i+8]
+		w := uint64(b[0]) | uint64(b[1])<<8 | uint64(b[2])<<16 | uint64(b[3])<<24 |
+			uint64(b[4])<<32 | uint64(b[5])<<40 | uint64(b[6])<<48 | uint64(b[7])<<56
+		// A byte below 0x20, or one equal to 0x7f, sets its high bit in one
+		// of these; a byte of 0x80 or more sets none.
+		del := w ^ 0x7f*ones
+		if (w-0x20*ones)&^w&highs != 0 || (del-ones)&^del&highs != 0 {
+			break
+		}
+	}
+	for ; i < len(v); i++ {
+		if c := v[i]; c < ' ' && c != '\t' || c == 0x7f {
+			return false
+		}
+	}
+	return true
 }
 
 // canonicalKey is textproto.CanonicalMIMEHeaderKey for a key already known to

@@ -448,10 +448,8 @@ func parseResponseHead(head []byte, req *stdhttp.Request) (*stdhttp.Response, bo
 			stop--
 		}
 		v = v[start:stop]
-		for i := 0; i < len(v); i++ {
-			if c := v[i]; c < ' ' && c != '\t' || c == 0x7f {
-				return nil, false
-			}
+		if !plainFieldValue(v) {
+			return nil, false
 		}
 		if prior := header[key]; prior != nil {
 			header[key] = append(prior, v)

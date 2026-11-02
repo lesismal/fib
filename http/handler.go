@@ -2058,12 +2058,7 @@ func validHeaderName(name string) bool {
 }
 
 func validHeaderValue(value string) bool {
-	for i := 0; i < len(value); i++ {
-		if (value[i] < ' ' && value[i] != '\t') || value[i] == 0x7f {
-			return false
-		}
-	}
-	return true
+	return plainFieldValue(value)
 }
 
 var (

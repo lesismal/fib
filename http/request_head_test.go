@@ -8,6 +8,32 @@ import (
 	"testing"
 )
 
+// TestPlainFieldValue holds plainFieldValue, which looks at eight bytes at a
+// time, to the rule it implements a byte at a time, for every byte at every
+// position of values long enough to take the word loop and its tail.
+func TestPlainFieldValue(t *testing.T) {
+	plain := func(v string) bool {
+		for i := 0; i < len(v); i++ {
+			if c := v[i]; c < ' ' && c != '\t' || c == 0x7f {
+				return false
+			}
+		}
+		return true
+	}
+	base := []byte("application/json, text/plain; q=0.9 \xc3\xa9")
+	for n := 0; n <= len(base); n++ {
+		for at := 0; at < n; at++ {
+			for c := 0; c < 256; c++ {
+				v := append([]byte(nil), base[:n]...)
+				v[at] = byte(c)
+				if got, want := plainFieldValue(string(v)), plain(string(v)); got != want {
+					t.Fatalf("plainFieldValue(%q) = %v, want %v", v, got, want)
+				}
+			}
+		}
+	}
+}
+
 // requestHeadCorpus is requests in and around the shape parseSimpleRequestHead
 // takes on, each ending where the parser hands it over: after the blank line.
 var requestHeadCorpus = []string{
