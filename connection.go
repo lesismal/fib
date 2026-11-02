@@ -2577,9 +2577,18 @@ func (c *Connection) closeReasonLocked() error {
 // A timer that fires while the deadline is moving finds at later than now,
 // or zero, so a connection given more time is not closed by the deadline it
 // has outlived.
+//
+// A deadline that is removed or only moves later leaves its timer where it
+// is: the timer fires at due, finds at zero or still ahead, and stops or is
+// set again for the rest, so a server that clears its read deadline for each
+// request and pushes it on once the request is answered moves a timer once
+// per timeout rather than twice per request.
 type deadline struct {
 	timer *time.Timer
 	at    time.Time
+	// due is when the timer is set to fire, while it is set; zero once it
+	// has fired or been stopped.
+	due time.Time
 }
 
 // SetDeadline sets both the read and the write deadline. A deadline here does
@@ -2670,25 +2679,33 @@ func (c *Connection) armDeadlineLocked(d *deadline, t time.Time, write bool) {
 	d.at = t
 	switch {
 	case t.IsZero():
-		if d.timer != nil {
-			d.timer.Stop()
-		}
+		// A timer still set is left to fire and find no deadline, so that
+		// one put back before then, as an HTTP server clears its read
+		// deadline while a request is served and sets it again once it has
+		// been answered, finds the timer set already.
+	case !d.due.IsZero() && !t.Before(d.due):
+		// Later than the timer is set for: it fires first and sets itself
+		// again for the rest (expireDeadline).
 	case d.timer == nil:
+		d.due = t
 		d.timer = time.AfterFunc(max(time.Until(t), 0), func() { c.expireDeadline(d, write) })
 	default:
+		d.due = t
 		d.timer.Reset(max(time.Until(t), 0))
 	}
 }
 
 // expireDeadline closes a connection whose deadline has passed, unless the
 // deadline moved while the timer was on its way or the connection is already
-// going. A deadline still ahead, which a timer reaches early when the wall
-// clock steps back under a t without a monotonic reading, has its timer set
-// again for the rest.
+// going. A deadline still ahead, which a timer reaches early when the deadline
+// was moved later without it, or when the wall clock steps back under a t
+// without a monotonic reading, has its timer set again for the rest.
 func (c *Connection) expireDeadline(d *deadline, write bool) {
 	c.mu.Lock()
+	d.due = time.Time{}
 	stale := d.at.IsZero() || c.closing || c.closed
 	if wait := time.Until(d.at); !stale && wait > 0 {
+		d.due = d.at
 		d.timer.Reset(wait)
 		stale = true
 	}
@@ -2719,7 +2736,7 @@ func (c *Connection) stopDeadlinesLocked() {
 		return
 	}
 	for _, d := range [...]*deadline{&c.deadlines.read, &c.deadlines.write} {
-		d.at = time.Time{}
+		d.at, d.due = time.Time{}, time.Time{}
 		if d.timer != nil {
 			d.timer.Stop()
 		}
