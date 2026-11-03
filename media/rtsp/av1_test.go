@@ -43,6 +43,22 @@ func av1Stream(t *testing.T) (*av.Track, []*av.Packet) {
 	return &av.Track{Codec: av.CodecAV1, Config: cfg.Append(nil), Width: 160, Height: 120}, pkts
 }
 
+// waitConfigured waits until every track of the stream at path has its
+// configuration.
+func waitConfigured(t *testing.T, h *hub.Hub, path string) {
+	t.Helper()
+	deadline := time.Now().Add(testTimeout)
+	for time.Now().Before(deadline) {
+		for _, st := range h.Streams() {
+			if st.Path == path && len(st.Tracks) > 0 && !slices.ContainsFunc(st.Tracks, func(tr *av.Track) bool { return len(tr.Config) == 0 }) {
+				return
+			}
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Fatalf("%s has a track with no configuration", path)
+}
+
 // TestAV1Session records AV1 into a Server with a Client and plays it back
 // with another: the SDP names it AV1/90000 with the track's profile, level
 // and tier, and the temporal units and the track's config come through.
@@ -68,6 +84,10 @@ func TestAV1Session(t *testing.T) {
 		}
 	}
 	waitPublished(t, h, "av1")
+	// AV1's configuration comes in band, with the first keyframe, which the
+	// server may not have read yet when the stream is published; until it
+	// has, DESCRIBE rightly has no fmtp to give.
+	waitConfigured(t, h, "av1")
 
 	r := dialRaw(t, base)
 	resp := r.do("DESCRIBE", base+"av1", "Accept: application/sdp")
