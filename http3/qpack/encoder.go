@@ -43,8 +43,12 @@ type Encoder struct {
 	unacked map[uint64][]sentSection
 	pending int
 	// seen remembers the fields encoded lately, by hash, which is how a
-	// field is inserted only once it repeats.
-	seen [seenSlots]uint64
+	// field is inserted only once it repeats: a hash may be kept in either
+	// of its set's two ways, and a field seen for the first time takes the
+	// place of one picked by evict, pseudo-randomly, so that no fields that
+	// repeat in step can keep pushing each other out.
+	seen  [seenSets][2]uint64
+	evict uint64
 	// out is what is to be written on the encoder stream, which flushing
 	// says a goroutine is doing; write writes it. in holds the start of a
 	// decoder instruction that has not all arrived.
@@ -61,8 +65,9 @@ type sentSection struct {
 }
 
 const (
-	// seenSlots is how many fields an Encoder remembers having seen.
-	seenSlots = 256
+	// seenSets is how many sets of two fields an Encoder remembers having
+	// seen.
+	seenSets = 128
 	// maxPending bounds the sections a connection has unacknowledged that
 	// refer to the table; past it, sections refer to none until the peer
 	// acknowledges some, which bounds what a peer that never does costs.
@@ -273,11 +278,21 @@ func (s *Section) End(dst []byte) []byte {
 // repeated reports whether the field was seen lately, and remembers it.
 func (e *Encoder) repeated(name, value string) bool {
 	h := seenHash(name, value)
-	slot := &e.seen[h%seenSlots]
-	if *slot == h {
+	set := &e.seen[h%seenSets]
+	if set[0] == h || set[1] == h {
 		return true
 	}
-	*slot = h
+	// A free way first, else one by the top bit of a linear congruential
+	// generator's next value.
+	way := 0
+	if set[0] != 0 {
+		way = 1
+		if set[1] != 0 {
+			e.evict = e.evict*6364136223846793005 + 1442695040888963407
+			way = int(e.evict >> 63)
+		}
+	}
+	set[way] = h
 	return false
 }
 

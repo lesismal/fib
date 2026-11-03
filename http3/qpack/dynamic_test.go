@@ -6,6 +6,7 @@ import (
 	"errors"
 	"hash/maphash"
 	"slices"
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -29,25 +30,44 @@ func newPair(capacity uint64, blocked int) *pair {
 	return p
 }
 
-// distinctSeenSlots sets seenSeed, for the rest of t, to one under which the
-// fields each take a slot of their own in an Encoder's seen, so that a test
-// that counts on every repeated field being indexed does not depend on the
+// seenSeedWhere sets seenSeed, for the rest of t, to one under which the
+// fields fall into the sets of an Encoder's seen as want reports, given
+// how many of them each set takes, so that a test does not depend on the
 // seed the package started with.
-func distinctSeenSlots(t *testing.T, fields []HeaderField) {
+func seenSeedWhere(t *testing.T, fields []HeaderField, want func(sets map[uint64]int) bool) {
 	t.Helper()
 	old := seenSeed
 	t.Cleanup(func() { seenSeed = old })
-	for range 1000 {
-		slots := make(map[uint64]bool, len(fields))
+	for range 100000 {
+		sets := make(map[uint64]int, len(fields))
 		for _, f := range fields {
-			slots[seenHash(f.Name, f.Value)%seenSlots] = true
+			sets[seenHash(f.Name, f.Value)%seenSets]++
 		}
-		if len(slots) == len(fields) {
+		if want(sets) {
 			return
 		}
 		seenSeed = maphash.MakeSeed()
 	}
-	t.Fatal("no seed found that keeps the fields apart")
+	t.Fatal("no seed found that puts the fields into sets as wanted")
+}
+
+// distinctSeenSets has seenSeedWhere keep each of the fields in a set of
+// its own, so that a test that counts on every repeated field being
+// indexed by the third section does not wait on evictions.
+func distinctSeenSets(t *testing.T, fields []HeaderField) {
+	t.Helper()
+	seenSeedWhere(t, fields, func(sets map[uint64]int) bool { return len(sets) == len(fields) })
+}
+
+// sharedSeenSet has seenSeedWhere put the fields first and second into one
+// set, which the rest share neither with them nor with each other.
+func sharedSeenSet(t *testing.T, fields []HeaderField, first, second int) {
+	t.Helper()
+	seenSeedWhere(t, fields, func(sets map[uint64]int) bool {
+		a := seenHash(fields[first].Name, fields[first].Value) % seenSets
+		b := seenHash(fields[second].Name, fields[second].Value) % seenSets
+		return a == b && sets[a] == 2 && len(sets) == len(fields)-1
+	})
 }
 
 // sensitive is what package http3 marks never-indexed.
@@ -212,14 +232,14 @@ func TestDynamicRoundTrip(t *testing.T) {
 		{"x-request-id", "1"},
 		{"user-agent", "Go-http-client/3"},
 	}
-	// The encoder remembers what it has seen in one slot a hash, so a
-	// field whose slot the changing request ID shares is never seen twice
-	// and never indexed, as the seed falls.
+	// A field whose set of the encoder's seen two others share, the
+	// changing request ID among them, may be pushed out before it is seen
+	// again, and indexed sections later, as the seed falls.
 	seen := slices.Clone(fields)
 	for i := 0; i < 5; i++ {
 		seen = append(seen, HeaderField{"x-request-id", string(rune('a' + i))})
 	}
-	distinctSeenSlots(t, seen)
+	distinctSeenSets(t, seen)
 	p := newPair(4096, 0)
 	plain := encode(fields)
 	var sizes []int
@@ -245,6 +265,74 @@ func TestDynamicRoundTrip(t *testing.T) {
 	}
 	if inserted, known := p.enc.Counts(); inserted == 0 || known != inserted {
 		t.Fatalf("%d entries inserted, %d acknowledged", inserted, known)
+	}
+}
+
+// TestDynamicSeenCollision: two fields of every request whose hashes fall
+// into one set of the encoder's seen are both indexed by the third
+// section, which they were not, under such a seed, when a set held one.
+func TestDynamicSeenCollision(t *testing.T) {
+	fields := []HeaderField{
+		{":authority", "api.example.com"},
+		{"cookie", "session=" + strings.Repeat("c", 200)},
+		{"x-rpc-service", "inventory.v1.Items/List"},
+	}
+	sharedSeenSet(t, fields, 1, 2)
+	p := newPair(4096, 0)
+	var sizes []int
+	for i := 0; i < 3; i++ {
+		id := uint64(4 * i)
+		block := p.encode(fields, id)
+		sizes = append(sizes, len(block))
+		sameFields(t, p.decode(t, block, id), fields)
+		p.carry(t)
+	}
+	// A prefix and an index a field.
+	if sizes[2] > 2+len(fields) {
+		t.Fatalf("sections take %v bytes, want the third all indexed", sizes)
+	}
+	if inserted, _ := p.enc.Counts(); inserted != uint64(len(fields)) {
+		t.Fatalf("%d entries inserted, want %d", inserted, len(fields))
+	}
+}
+
+// TestDynamicSeenCrowded: more fields that repeat than a set of the
+// encoder's seen holds, with a changing one among them, are all indexed
+// in a few sections, however they push each other out.
+func TestDynamicSeenCrowded(t *testing.T) {
+	fields := []HeaderField{
+		{"x-a", "steady"},
+		{"x-b", ""},
+		{"x-c", ""},
+		{"x-request-id", ""},
+	}
+	set := seenHash(fields[0].Name, fields[0].Value) % seenSets
+	// shared sets field j to a value, the nth or later, that shares the set.
+	shared := func(j, n int) {
+		for ; ; n++ {
+			fields[j].Value = strconv.Itoa(n)
+			if seenHash(fields[j].Name, fields[j].Value)%seenSets == set {
+				return
+			}
+		}
+	}
+	shared(1, 0)
+	shared(2, 0)
+	steady := uint64(3)
+	p := newPair(4096, 0)
+	for i := 0; ; i++ {
+		// A request ID that shares the set, to push out what it can.
+		shared(3, i<<20)
+		id := uint64(4 * i)
+		sameFields(t, p.decode(t, p.encode(fields, id), id), fields)
+		p.carry(t)
+		inserted, _ := p.enc.Counts()
+		if inserted == steady {
+			break
+		}
+		if i == 64 {
+			t.Fatalf("%d of %d fields indexed after %d sections", inserted, steady, i+1)
+		}
 	}
 }
 
