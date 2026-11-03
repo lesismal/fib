@@ -148,14 +148,36 @@ func TestMaxPendingPerHostMaybeHTTP2(t *testing.T) {
 // hostQueue reports how many requests wait in the client's queue for the
 // host of u, and how many of them ended while they waited.
 func hostQueue(c *Client, u string) (waiting, ended int) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	for target, h := range c.hosts {
-		if strings.HasSuffix(u, target.addr) {
+	for _, h := range hostsOf(c) {
+		if strings.HasSuffix(u, h.target.addr) {
+			h.mu.Lock()
+			defer h.mu.Unlock()
 			return len(h.waiting), int(h.ended.Load())
 		}
 	}
 	return 0, 0
+}
+
+// hostsOf returns the hosts the client keeps a pool for.
+func hostsOf(c *Client) []*hostPool {
+	var hosts []*hostPool
+	c.hosts.Range(func(_, h any) bool {
+		hosts = append(hosts, h.(*hostPool))
+		return true
+	})
+	return hosts
+}
+
+// idleConnsOf returns the connections the client keeps idle, over all its
+// hosts.
+func idleConnsOf(c *Client) []*clientConn {
+	var idle []*clientConn
+	for _, h := range hostsOf(c) {
+		h.mu.Lock()
+		idle = append(idle, h.idle...)
+		h.mu.Unlock()
+	}
+	return idle
 }
 
 // Requests that ended while they waited are counted as they end, not found
@@ -234,9 +256,9 @@ func TestMaxPendingPerHostAsTheDialEnds(t *testing.T) {
 	results := sendAll(t, client, u, 1)
 	cc := <-dialed
 	h := hostPoolOf(t, client, u)
-	// The client's lock keeps dialed from going past settling the dial, which
+	// The host's lock keeps dialed from going past settling the dial, which
 	// it does under the connection's, until the test holds that one.
-	client.mu.Lock()
+	h.mu.Lock()
 	close(settle)
 	for {
 		cc.mu.Lock()
@@ -246,13 +268,13 @@ func TestMaxPendingPerHostAsTheDialEnds(t *testing.T) {
 		cc.mu.Unlock()
 		time.Sleep(time.Millisecond)
 	}
-	client.mu.Unlock()
+	h.mu.Unlock()
 	// dialed now stops at the connection's lock, either having let the
-	// client's go there or holding it, which TryLock tells.
+	// host's go there or holding it, which TryLock tells.
 	for deadline := time.Now().Add(200 * time.Millisecond); time.Now().Before(deadline); time.Sleep(time.Millisecond) {
-		if client.mu.TryLock() {
+		if h.mu.TryLock() {
 			dialing := h.dialing
-			client.mu.Unlock()
+			h.mu.Unlock()
 			if dialing == 0 {
 				break
 			}
@@ -269,7 +291,7 @@ func TestMaxPendingPerHostAsTheDialEnds(t *testing.T) {
 	// go only once it has: a slow runner whose burst came in after the first
 	// request had finished would find room, and none of it be turned away.
 	// The burst may wait for the connection's lock, which the dial takes
-	// under the client's, so the test lets go of it first, once the burst
+	// under the host's, so the test lets go of it first, once the burst
 	// has had time to come in where the dial's gap was.
 	time.Sleep(50 * time.Millisecond)
 	refused := 0
@@ -295,10 +317,8 @@ func TestMaxPendingPerHostAsTheDialEnds(t *testing.T) {
 // hostPoolOf finds the pool the client keeps for u's host.
 func hostPoolOf(t *testing.T, c *Client, u string) *hostPool {
 	t.Helper()
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	for target, h := range c.hosts {
-		if strings.HasSuffix(u, target.addr) || strings.Contains(u, target.addr+"/") {
+	for _, h := range hostsOf(c) {
+		if strings.HasSuffix(u, h.target.addr) || strings.Contains(u, h.target.addr+"/") {
 			return h
 		}
 	}

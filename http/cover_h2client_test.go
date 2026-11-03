@@ -734,9 +734,10 @@ func TestCoverH2ClientSendGuards(t *testing.T) {
 	if _, err := client.Go(mustRequest(t, "GET", url, nil)).Wait(); err != nil {
 		t.Fatal(err)
 	}
-	client.mu.Lock()
-	cc := client.hosts[hostTarget{addr: strings.TrimPrefix(url, "http://")}].h2[0]
-	client.mu.Unlock()
+	h := hostPoolOf(t, client, url)
+	h.mu.Lock()
+	cc := h.h2[0]
+	h.mu.Unlock()
 	hc := cc.h2
 
 	// A stream the connection does not have.
@@ -745,13 +746,13 @@ func TestCoverH2ClientSendGuards(t *testing.T) {
 	// A request settled while it waited gives its stream back unsent.
 	settled := &clientRequest{req: mustRequest(t, "GET", url, nil)}
 	settled.done.Store(true)
-	client.mu.Lock()
+	h.mu.Lock()
 	cc.streams++
-	client.mu.Unlock()
+	h.mu.Unlock()
 	hc.send(settled)
-	client.mu.Lock()
+	h.mu.Lock()
 	streams := cc.streams
-	client.mu.Unlock()
+	h.mu.Unlock()
 	if streams != 0 {
 		t.Fatalf("streams = %d after a settled request, want 0", streams)
 	}
@@ -767,9 +768,9 @@ func TestCoverH2ClientSendGuards(t *testing.T) {
 		}
 		result <- cr.Header.Get("X-Conn")
 	}}
-	client.mu.Lock()
+	h.mu.Lock()
 	cc.streams++
-	client.mu.Unlock()
+	h.mu.Unlock()
 	hc.send(r)
 	if got := <-result; got != "1" {
 		t.Fatalf("resent request: %q, want an answer on connection 1", got)
@@ -794,9 +795,10 @@ func TestCoverH2ClientIdleTimeout(t *testing.T) {
 		t.Fatal(err)
 	}
 	<-closed
-	client.mu.Lock()
-	n := len(client.hosts[hostTarget{addr: strings.TrimPrefix(url, "http://")}].h2)
-	client.mu.Unlock()
+	h := hostPoolOf(t, client, url)
+	h.mu.Lock()
+	n := len(h.h2)
+	h.mu.Unlock()
 	if n != 0 {
 		t.Fatalf("%d HTTP/2 connections pooled after the idle timeout", n)
 	}

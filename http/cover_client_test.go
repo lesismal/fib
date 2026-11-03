@@ -242,12 +242,8 @@ func TestCvCliIdleConnTimeoutHTTP1(t *testing.T) {
 		t.Fatal(err)
 	}
 	cvCliWait(t, closed, "the idle connection to close")
-	client.mu.Lock()
-	defer client.mu.Unlock()
-	for _, h := range client.hosts {
-		if len(h.idle) != 0 {
-			t.Fatalf("%d idle connections left", len(h.idle))
-		}
+	if idle := idleConnsOf(client); len(idle) != 0 {
+		t.Fatalf("%d idle connections left", len(idle))
 	}
 }
 
@@ -283,20 +279,16 @@ func TestCvCliIdleTimerReused(t *testing.T) {
 		readBody(t, resp)
 		var idle *clientConn
 		for deadline := time.Now().Add(time.Second); idle == nil && time.Now().Before(deadline); time.Sleep(time.Millisecond) {
-			client.mu.Lock()
-			for _, h := range client.hosts {
-				if len(h.idle) == 1 {
-					idle = h.idle[0]
-				}
+			if conns := idleConnsOf(client); len(conns) == 1 {
+				idle = conns[0]
 			}
-			client.mu.Unlock()
 		}
 		if idle == nil {
 			t.Fatal("the connection was not kept idle")
 		}
-		client.mu.Lock()
+		idle.host.mu.Lock()
 		got := idle.idleTimer
-		client.mu.Unlock()
+		idle.host.mu.Unlock()
 		if timer == nil {
 			timer = got
 		} else if got != timer {
@@ -568,12 +560,8 @@ func TestCvCliStreamGivenUpInCallbackDropsConn(t *testing.T) {
 	})
 	cvCliWait(t, called, "the callback")
 	cvCliWait(t, closed, "the connection to close")
-	client.mu.Lock()
-	defer client.mu.Unlock()
-	for _, h := range client.hosts {
-		if len(h.idle) != 0 {
-			t.Fatal("a given up connection was kept")
-		}
+	if len(idleConnsOf(client)) != 0 {
+		t.Fatal("a given up connection was kept")
 	}
 }
 

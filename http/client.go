@@ -272,9 +272,14 @@ type Client struct {
 	// sessions holds the TLS sessions 0-RTT resumes from; see
 	// ClientConfig.SessionCache.
 	sessions fibtls.QUICSessionCache
-	mu       sync.Mutex
-	hosts    map[hostTarget]*hostPool
-	closed   bool
+	// hosts maps each target to its hostPool, which has a lock of its own,
+	// so that requests to one host never wait on another's. mu is taken only
+	// to add a host and by Close, which sets closed under it: a host added
+	// after Close has looked is added by a request that then finds closed
+	// set.
+	hosts  sync.Map // hostTarget -> *hostPool
+	mu     sync.Mutex
+	closed atomic.Bool
 }
 
 // NewClient returns a client that dials through engine. Zero limits in config
@@ -306,8 +311,7 @@ func NewClient(engine *fib.Engine, config ClientConfig) *Client {
 	if sessions == nil && config.EarlyData {
 		sessions = fibtls.NewQUICSessionCache(64)
 	}
-	return &Client{engine: engine, config: config, tlsConfig: tlsConfig, sessions: sessions,
-		hosts: make(map[hostTarget]*hostPool)}
+	return &Client{engine: engine, config: config, tlsConfig: tlsConfig, sessions: sessions}
 }
 
 // Do sends req and calls callback exactly once with its response or the
@@ -772,14 +776,22 @@ func (f *Future) Done() <-chan struct{} { return f.done }
 // Requests already on a connection finish as they would have.
 func (c *Client) Close() {
 	c.mu.Lock()
-	if c.closed {
+	if c.closed.Load() {
 		c.mu.Unlock()
 		return
 	}
-	c.closed = true
+	c.closed.Store(true)
+	var hosts []*hostPool
+	c.hosts.Range(func(_, h any) bool {
+		hosts = append(hosts, h.(*hostPool))
+		return true
+	})
+	c.mu.Unlock()
+	// Whoever takes a host's lock after this has, finds closed set.
 	var idle []*clientConn
 	var waiting []*clientRequest
-	for _, h := range c.hosts {
+	for _, h := range hosts {
+		h.mu.Lock()
 		idle = append(idle, h.idle...)
 		h.idle = nil
 		waiting = append(waiting, h.waiting...)
@@ -789,8 +801,8 @@ func (c *Client) Close() {
 				idle = append(idle, cc)
 			}
 		}
+		h.mu.Unlock()
 	}
-	c.mu.Unlock()
 	for _, cc := range idle {
 		cc.discard()
 	}
@@ -835,8 +847,9 @@ func requestTarget(req *stdhttp.Request) (hostTarget, error) {
 	return target, nil
 }
 
-// hostPool is the client's state for one target. Guarded by Client.mu.
+// hostPool is the client's state for one target. Guarded by mu.
 type hostPool struct {
+	mu     sync.Mutex
 	target hostTarget
 	// open counts connections open or dialing, and dialing the second kind.
 	open    int
@@ -846,7 +859,7 @@ type hostPool struct {
 	// ended counts the requests in waiting that ended while they waited,
 	// which stay there until they reach its head or are swept out, so that
 	// the requests still waiting are counted without walking the queue.
-	// Requests end without the client's lock, so it is atomic.
+	// Requests end without the host's lock, so it is atomic.
 	ended atomic.Int64
 	// h2 holds the HTTP/2 connections that take new streams, busy or not.
 	// multiplexed records that the host has spoken HTTP/2, and probed that a
@@ -858,7 +871,7 @@ type hostPool struct {
 }
 
 // assignment pairs a request with the connection that will carry it. They are
-// collected under the client's lock and carried out after it is released.
+// collected under the host's lock and carried out after it is released.
 type assignment struct {
 	conn *clientConn
 	req  *clientRequest
@@ -870,16 +883,16 @@ func (c *Client) enqueue(target hostTarget, r *clientRequest, retry bool) {
 	if retry {
 		r.requeued()
 	}
-	c.mu.Lock()
-	if c.closed {
-		c.mu.Unlock()
+	h := c.host(target)
+	if h != nil {
+		h.mu.Lock()
+	}
+	if h == nil || c.closed.Load() {
+		if h != nil {
+			h.mu.Unlock()
+		}
 		r.finish(nil, ErrClientClosed)
 		return
-	}
-	h := c.hosts[target]
-	if h == nil {
-		h = &hostPool{target: target}
-		c.hosts[target] = h
 	}
 	if retry {
 		// A request sent again was not waiting when it was let in, so the
@@ -891,11 +904,26 @@ func (c *Client) enqueue(target hostTarget, r *clientRequest, retry bool) {
 	r.queued(h)
 	work, dials := c.dispatchLocked(h)
 	refused := !retry && c.overPendingLocked(h, r)
-	c.mu.Unlock()
+	h.mu.Unlock()
 	c.carryOut(h, work, dials)
 	if refused {
 		r.finish(nil, ErrTooManyPending)
 	}
+}
+
+// host returns target's hostPool, adding it if there is none, or nil once
+// the client is closed.
+func (c *Client) host(target hostTarget) *hostPool {
+	if h, ok := c.hosts.Load(target); ok {
+		return h.(*hostPool)
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.closed.Load() {
+		return nil
+	}
+	h, _ := c.hosts.LoadOrStore(target, &hostPool{target: target})
+	return h.(*hostPool)
 }
 
 // overPendingLocked reports whether r, just queued and dispatched, waits
@@ -907,7 +935,7 @@ func (c *Client) enqueue(target hostTarget, r *clientRequest, retry bool) {
 // would be were the host to answer in HTTP/1.
 //
 // It costs the same however long the queue: past the cap, every request a
-// host sends is turned away here, under the client's lock, which the
+// host sends is turned away here, under the host's lock, which the
 // connections' responses need too.
 func (c *Client) overPendingLocked(h *hostPool, r *clientRequest) bool {
 	limit, conns := c.config.MaxPendingPerHost, c.config.MaxConnsPerHost
@@ -953,7 +981,7 @@ func sweepLocked(h *hostPool) {
 }
 
 // dequeued settles the count of ended requests for r, just taken out of
-// h's queue. The client's lock is held.
+// h's queue. h's lock is held.
 func (h *hostPool) dequeued(r *clientRequest) {
 	if r.waitingIn.Swap(nil) == nil {
 		// It ended while it waited, and markDone counted it.
@@ -1022,8 +1050,8 @@ func (c *Client) dispatchLocked(h *hostPool) (work []assignment, dials int) {
 // dialed once every one is full, so spreading over them costs nothing while
 // one suffices; once there are several, they all stay in use while the
 // requests keep them busy, and close once the host goes quiet for
-// IdleConnTimeout. It returns nil when none has room. Callers hold
-// Client.mu.
+// IdleConnTimeout. It returns nil when none has room. Callers hold the
+// host's lock.
 func leastLoadedLocked(conns []*clientConn) *clientConn {
 	var best *clientConn
 	room := 0
@@ -1105,7 +1133,7 @@ func (c *Client) dialed(cc *clientConn, err error) {
 	if settled {
 		return
 	}
-	c.mu.Lock()
+	h.mu.Lock()
 	h.dialing--
 	h.probed = h.probed || err == nil
 	if err == nil && cc.h2 != nil {
@@ -1115,7 +1143,7 @@ func (c *Client) dialed(cc *clientConn, err error) {
 		}
 		work, dials := c.dispatchLocked(h)
 		discard := c.idleH2Locked(cc)
-		c.mu.Unlock()
+		h.mu.Unlock()
 		if discard {
 			cc.discard()
 		}
@@ -1130,7 +1158,7 @@ func (c *Client) dialed(cc *clientConn, err error) {
 		if cc.inFlight() {
 			// Its first request went as early data and is still being
 			// answered; the response's release hands the connection on.
-			c.mu.Unlock()
+			h.mu.Unlock()
 			return
 		}
 		c.releaseLocked(cc)
@@ -1144,7 +1172,7 @@ func (c *Client) dialed(cc *clientConn, err error) {
 		}
 	}
 	work, dials := c.dispatchLocked(h)
-	c.mu.Unlock()
+	h.mu.Unlock()
 	if failed != nil {
 		// Dial callbacks run on the event loop, which a request's callback must
 		// never be allowed to hold up, so it runs on the client pool.
@@ -1156,31 +1184,31 @@ func (c *Client) dialed(cc *clientConn, err error) {
 // release hands a connection with nothing in flight to the next waiting
 // request, or keeps it idle, or closes it if there is room for neither.
 func (c *Client) release(cc *clientConn) {
-	c.mu.Lock()
+	cc.host.mu.Lock()
 	c.releaseLocked(cc)
 }
 
-// releaseLocked is release with the client's lock held, which it lets go.
+// releaseLocked is release with the host's lock held, which it lets go.
 func (c *Client) releaseLocked(cc *clientConn) {
 	h := cc.host
 	if cc.isClosed() {
-		c.mu.Unlock()
+		h.mu.Unlock()
 		return
 	}
 	for len(h.waiting) > 0 {
 		r := h.popLocked()
 		if !r.done.Load() {
-			c.mu.Unlock()
+			h.mu.Unlock()
 			cc.send(r)
 			return
 		}
 	}
-	keep := !c.closed && len(h.idle) < c.config.MaxIdleConnsPerHost
+	keep := !c.closed.Load() && len(h.idle) < c.config.MaxIdleConnsPerHost
 	if keep {
 		h.idle = append(h.idle, cc)
 		c.idleLocked(cc)
 	}
-	c.mu.Unlock()
+	h.mu.Unlock()
 	if !keep {
 		cc.discard()
 	}
@@ -1191,7 +1219,7 @@ func (c *Client) releaseLocked(cc *clientConn) {
 // set only when none is pending, so that a connection taken and given back on
 // every request, as a busy one is, does not reset it each time: one pending
 // fires, finds the connection taken or idle until later, and is set again for
-// what is left then. Callers hold c.mu.
+// what is left then. Callers hold the host's lock.
 func (c *Client) idleLocked(cc *clientConn) {
 	d := c.config.IdleConnTimeout
 	if d <= 0 {
@@ -1208,14 +1236,14 @@ func (c *Client) idleLocked(cc *clientConn) {
 }
 
 // takeIdleLocked stops the idle clock on a connection a request has taken,
-// leaving a pending timer to find it taken when it fires. Callers hold
-// Client.mu.
+// leaving a pending timer to find it taken when it fires. Callers hold the
+// host's lock.
 func (cc *clientConn) takeIdleLocked() {
 	cc.idleUntil = time.Time{}
 }
 
 // stopIdleLocked stops the idle clock and its timer on a connection that has
-// closed. Callers hold Client.mu.
+// closed. Callers hold the host's lock.
 func (cc *clientConn) stopIdleLocked() {
 	cc.idleUntil = time.Time{}
 	if cc.idlePending {
@@ -1228,10 +1256,11 @@ func (cc *clientConn) stopIdleLocked() {
 // request took it in the meantime. One that went idle again after the timer
 // was set is idle until later, and the timer is set again for then.
 func (c *Client) expireIdle(cc *clientConn) {
-	c.mu.Lock()
+	h := cc.host
+	h.mu.Lock()
 	if !cc.idlePending {
 		// Stopped as the connection closed, after this call had begun.
-		c.mu.Unlock()
+		h.mu.Unlock()
 		return
 	}
 	cc.idlePending = false
@@ -1239,19 +1268,19 @@ func (c *Client) expireIdle(cc *clientConn) {
 	if !cc.idleUntil.IsZero() && now.Before(cc.idleUntil) {
 		cc.idlePending = true
 		cc.idleTimer.Reset(cc.idleUntil.Sub(now))
-		c.mu.Unlock()
+		h.mu.Unlock()
 		return
 	}
 	idle := !cc.idleUntil.IsZero()
 	if idle && cc.h2 != nil {
-		idle = cc.streams == 0 && removeConn(&cc.host.h2, cc)
+		idle = cc.streams == 0 && removeConn(&h.h2, cc)
 	} else if idle {
-		idle = removeConn(&cc.host.idle, cc)
+		idle = removeConn(&h.idle, cc)
 	}
 	if idle {
 		cc.idleUntil = time.Time{}
 	}
-	c.mu.Unlock()
+	h.mu.Unlock()
 	if idle {
 		cc.discard()
 	}
@@ -1261,11 +1290,11 @@ func (c *Client) expireIdle(cc *clientConn) {
 // the room to a waiting request.
 func (c *Client) streamDone(cc *clientConn) {
 	h := cc.host
-	c.mu.Lock()
+	h.mu.Lock()
 	cc.streams--
 	work, dials := c.dispatchLocked(h)
 	discard := c.idleH2Locked(cc)
-	c.mu.Unlock()
+	h.mu.Unlock()
 	if discard {
 		cc.discard()
 	}
@@ -1286,7 +1315,7 @@ func (c *Client) idleH2Locked(cc *clientConn) bool {
 			idle++
 		}
 	}
-	if c.closed || idle > c.config.MaxIdleConnsPerHost {
+	if c.closed.Load() || idle > c.config.MaxIdleConnsPerHost {
 		return removeConn(&h.h2, cc)
 	}
 	c.idleLocked(cc)
@@ -1296,9 +1325,10 @@ func (c *Client) idleH2Locked(cc *clientConn) bool {
 // retire stops an HTTP/2 connection taking new streams, once the server has
 // said it is going away.
 func (c *Client) retire(cc *clientConn) {
-	c.mu.Lock()
-	removeConn(&cc.host.h2, cc)
-	c.mu.Unlock()
+	h := cc.host
+	h.mu.Lock()
+	removeConn(&h.h2, cc)
+	h.mu.Unlock()
 }
 
 // forget drops a closed connection from its host and lets waiting requests
@@ -1306,9 +1336,9 @@ func (c *Client) retire(cc *clientConn) {
 // it closes it (see discard), and OnClose, which comes later, finds it gone.
 func (c *Client) forget(cc *clientConn) {
 	h := cc.host
-	c.mu.Lock()
+	h.mu.Lock()
 	if cc.forgotten {
-		c.mu.Unlock()
+		h.mu.Unlock()
 		return
 	}
 	cc.forgotten = true
@@ -1317,7 +1347,7 @@ func (c *Client) forget(cc *clientConn) {
 	cc.stopIdleLocked()
 	h.open--
 	work, dials := c.dispatchLocked(h)
-	c.mu.Unlock()
+	h.mu.Unlock()
 	c.carryOut(h, work, dials)
 }
 
@@ -1703,7 +1733,7 @@ type clientConn struct {
 	// idleUntil is when the connection, idle, is to close, and zero while it
 	// is not idle; idleTimer, made the first time it goes idle, fires then or
 	// earlier, and idlePending says it is set (see idleLocked). Guarded by
-	// Client.mu.
+	// the host's lock.
 	idleUntil   time.Time
 	idleTimer   *time.Timer
 	idlePending bool
@@ -1716,12 +1746,12 @@ type clientConn struct {
 	// h2 is set once the connection is known to speak HTTP/2, before it
 	// carries anything, and never changes after. streams counts the streams
 	// it carries or has been given, and maxStreams how many the server
-	// allows. Both are guarded by Client.mu.
+	// allows. Both are guarded by the host's lock.
 	h2         *h2ClientConn
 	streams    int
 	maxStreams int
 	// forgotten records that the connection no longer counts against its
-	// host's MaxConnsPerHost (see forget). Guarded by Client.mu.
+	// host's MaxConnsPerHost (see forget). Guarded by the host's lock.
 	forgotten bool
 }
 
@@ -1962,18 +1992,18 @@ func (cc *clientConn) OnOpen(conn *fib.Connection) {
 // and one that answers 425 has it sent again too.
 func (c *Client) sendEarly(cc *clientConn) {
 	h := cc.host
-	c.mu.Lock()
+	h.mu.Lock()
 	if len(h.waiting) == 0 {
-		c.mu.Unlock()
+		h.mu.Unlock()
 		return
 	}
 	r := h.waiting[0]
 	if r.done.Load() || !r.canSendEarly() {
-		c.mu.Unlock()
+		h.mu.Unlock()
 		return
 	}
 	h.popLocked()
-	c.mu.Unlock()
+	h.mu.Unlock()
 	cc.send(r)
 }
 
