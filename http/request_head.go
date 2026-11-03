@@ -56,6 +56,10 @@ type requestBlock struct {
 	pooled         bool
 	headerFromPool *pooledHeader
 	urlFromPool    *url.URL
+	// keptHeader is the pooled Header a recycled block keeps from one
+	// request to the next, when headers are recycled too, rather than
+	// giving it back to headerPool and taking another.
+	keptHeader *pooledHeader
 	// blockServerState is what only a server serves the request with, which
 	// is built only on the platforms that have one.
 	blockServerState
@@ -97,7 +101,11 @@ func (b *requestBlock) recycle() bool {
 		b.headerFromPool = nil
 		clear(h.header)
 		clear(h.values[:])
-		headerPool.Put(h)
+		if b.pooled {
+			b.keptHeader = h
+		} else {
+			headerPool.Put(h)
+		}
 	}
 	if u := b.urlFromPool; u != nil {
 		b.urlFromPool = nil
@@ -117,6 +125,12 @@ func (b *requestBlock) recycle() bool {
 	blockPool.Put(b)
 	return true
 }
+
+// headEnd is the blank line that ends a head, for bytes.Index to look for:
+// a variable rather than a conversion at the call, which escapes, and
+// costs an allocation, wherever the call is inlined into a caller, as
+// profile-guided builds inline the parsers' calls.
+var headEnd = []byte("\r\n\r\n")
 
 // maxSimpleHeaderFields bounds the header parseSimpleRequestHead takes on,
 // which is well past what ordinary requests carry. A longer one goes to
@@ -187,7 +201,11 @@ func parseSimpleRequestHead(head []byte, reuse reuseOptions) *requestBlock {
 	values := block.values[:]
 	switch {
 	case reuse.headers:
-		pooled := headerPool.Get().(*pooledHeader)
+		pooled := block.keptHeader
+		if pooled == nil {
+			pooled = headerPool.Get().(*pooledHeader)
+		}
+		block.keptHeader = nil
 		block.headerFromPool = pooled
 		header, values = pooled.header, pooled.values[:]
 	case reuse.requests:

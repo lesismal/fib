@@ -780,7 +780,7 @@ func (p *Parser) frameLength() (frameInfo, bool, error) {
 		}
 		return frame, true, nil
 	}
-	headerAt := bytes.Index(p.buffer[p.headerScan:], []byte("\r\n\r\n"))
+	headerAt := bytes.Index(p.buffer[p.headerScan:], headEnd)
 	if headerAt < 0 {
 		if len(p.buffer) > p.config.MaxHeaderBytes {
 			return frameInfo{}, false, ErrHeaderTooLarge
@@ -977,7 +977,7 @@ func chunkedEnd(data []byte, offset, maxTrailer int, maxBody int64) (int, bool, 
 			if len(data[offset:]) >= 2 && bytes.Equal(data[offset:offset+2], []byte("\r\n")) {
 				return offset + 2, true, nil
 			}
-			trailerEnd := bytes.Index(data[offset:], []byte("\r\n\r\n"))
+			trailerEnd := bytes.Index(data[offset:], headEnd)
 			if trailerEnd >= 0 {
 				if trailerEnd+4 > maxTrailer {
 					return 0, false, ErrHeaderTooLarge

@@ -369,7 +369,7 @@ func (p *responseParser) endStream(trailer stdhttp.Header) *stdhttp.Response {
 // the body that follows it is framed. It reports false while the header is
 // still arriving.
 func (p *responseParser) parseHead(req *stdhttp.Request) (bool, error) {
-	headerAt := bytes.Index(p.buffer[p.headerScan:], []byte("\r\n\r\n"))
+	headerAt := bytes.Index(p.buffer[p.headerScan:], headEnd)
 	if headerAt < 0 {
 		if len(p.buffer) > p.maxHeader {
 			return false, ErrResponseHeaderTooLarge
