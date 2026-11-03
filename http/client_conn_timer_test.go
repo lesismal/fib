@@ -168,3 +168,30 @@ func TestClientConnTimerParts(t *testing.T) {
 		t.Fatal("a closed connection's timer was set again")
 	}
 }
+
+// TestClientOwnTimerForHeaderAlone checks that a request over HTTP/2, which
+// no connection's timer bounds, with ResponseHeaderTimeout and no Timeout,
+// gets a timer of its own once it is sent, and fails with the header's
+// error.
+func TestClientOwnTimerForHeaderAlone(t *testing.T) {
+	const wait = 150 * time.Millisecond
+	ts := httptest.NewUnstartedServer(stdhttp.HandlerFunc(func(w stdhttp.ResponseWriter, r *stdhttp.Request) {
+		time.Sleep(4 * wait)
+		_, _ = w.Write([]byte("ok"))
+	}))
+	ts.Config.Protocols = new(stdhttp.Protocols)
+	ts.Config.Protocols.SetUnencryptedHTTP2(true)
+	ts.Start()
+	t.Cleanup(ts.Close)
+	config := DefaultClientConfig()
+	config.UnencryptedHTTP2 = true
+	config.Timeout, config.ResponseHeaderTimeout = 0, wait
+	client := newTestClient(t, config)
+	start := time.Now()
+	if _, err := client.Go(mustRequest(t, "GET", ts.URL+"/", nil)).Wait(); !errors.Is(err, ErrResponseHeaderTimeout) {
+		t.Fatalf("err = %v, want ErrResponseHeaderTimeout", err)
+	}
+	if took := time.Since(start); took < wait*9/10 || took > 3*wait {
+		t.Fatalf("failed after %v, want about %v", took, wait)
+	}
+}
