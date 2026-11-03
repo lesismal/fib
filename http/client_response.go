@@ -52,8 +52,11 @@ type ClientResponse struct {
 	// s is the stream of a response whose body was still arriving when the
 	// callback ran, and nil for one that arrived whole.
 	s *ResponseStream
-	// abort gives the response up; see Close.
+	// abort gives the response up; see Close. req is the Client's request
+	// it answers, which gives it up in abort's place, saving the function
+	// value a request's abort would take an allocation for.
 	abort func(error)
+	req   *clientRequest
 	// tunnel is what a 101 to StartUpgrade's request switched to.
 	tunnel *Tunnel
 	// block is the header's lines, when they came in place of Header.
@@ -95,14 +98,13 @@ func NewBufferedBody(data []byte) io.ReadCloser {
 // exchange. It is for the clients of other transports, such as package http3,
 // to deliver their responses the way this package's Client does.
 func DeliverResponse(resp *stdhttp.Response, abort func(error), callback func(*ClientResponse, error)) {
-	deliverResponse(resp, "", abort, callback)
+	deliverArrived(&ClientResponse{Response: resp, abort: abort}, callback)
 }
 
-// deliverResponse is DeliverResponse for a response whose header lines are
-// block, when they came in place of its Header.
-func deliverResponse(resp *stdhttp.Response, block string, abort func(error), callback func(*ClientResponse, error)) {
-	cr := &ClientResponse{Response: resp, abort: abort, block: block}
-	cr.whole, _ = resp.Body.(*bufferedBody)
+// deliverArrived runs callback with cr, a response whose body has arrived
+// whole, and then OnBody's function if the callback registered one.
+func deliverArrived(cr *ClientResponse, callback func(*ClientResponse, error)) {
+	cr.whole, _ = cr.Body.(*bufferedBody)
 	cr.mu.Lock()
 	cr.inCallback = true
 	cr.mu.Unlock()
@@ -294,7 +296,10 @@ func (c *ClientResponse) Consumed() int64 {
 // is closed and OnBody's function, if it has one, hears ErrResponseAbandoned.
 // It does nothing once the body has all arrived.
 func (c *ClientResponse) Close() {
-	if c.abort != nil {
+	switch {
+	case c.req != nil:
+		c.req.abort(ErrResponseAbandoned)
+	case c.abort != nil:
 		c.abort(ErrResponseAbandoned)
 	}
 }

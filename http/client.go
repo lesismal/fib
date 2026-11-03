@@ -989,10 +989,22 @@ func (h *hostPool) dequeued(r *clientRequest) {
 	}
 }
 
+// maxKeptQueue is the longest array an empty queue keeps for the requests
+// to come.
+const maxKeptQueue = 16
+
 // popLocked takes the request at the head of h's queue out.
 func (h *hostPool) popLocked() *clientRequest {
 	r := h.waiting[0]
-	h.waiting = h.waiting[1:]
+	h.waiting[0] = nil
+	if len(h.waiting) == 1 {
+		// The queue is empty again, as it nearly always is once a request
+		// has found a connection: its array is kept from the start for
+		// the next, rather than left to append to allocate one.
+		h.waiting = h.waiting[:0]
+	} else {
+		h.waiting = h.waiting[1:]
+	}
 	h.dequeued(r)
 	return r
 }
@@ -1032,7 +1044,7 @@ func (c *Client) dispatchLocked(h *hostPool) (work []assignment, dials int) {
 		h.dialing++
 		dials++
 	}
-	if len(h.waiting) == 0 {
+	if len(h.waiting) == 0 && cap(h.waiting) > maxKeptQueue {
 		// Let the queue's array go instead of keeping the longest it has been.
 		h.waiting = nil
 	}
@@ -1471,7 +1483,7 @@ func (r *clientRequest) deliver(resp *stdhttp.Response, err error) {
 		r.callback(nil, err)
 		return
 	}
-	deliverResponse(resp, r.block, r.abort, r.callback)
+	deliverArrived(&ClientResponse{Response: resp, req: r, block: r.block}, r.callback)
 }
 
 // markDone settles the request, once, and stops what would abandon it.
