@@ -119,6 +119,8 @@ var responseHeads = []string{
 	"HTTP/1.1 200 OK\r\nX-A: 1\x00\r\n\r\n",
 	"HTTP/1.1 200 OK\nContent-Length: 1\n\n",
 	"HTTP/1.1 200 OK\r\nX-A: 1\nX-B: 2\r\n\r\n",
+	"HTTP/1.1 200 OK\nX-A: 1\r\n\r\n",
+	"HTTP/1.1 200 OK\r\nX-A: 1\r\nX-B: 2\n\r\n",
 	"HTTP/1.1  200 OK\r\n\r\n",
 	"HTTP/1.1 2000 OK\r\n\r\n",
 	"HTTP/1.1 20x OK\r\n\r\n",
@@ -157,6 +159,34 @@ func TestParseResponseHead(t *testing.T) {
 			if got.Body != stdhttp.NoBody {
 				t.Errorf("%s %q: Body %v", method, head, got.Body)
 			}
+		}
+	}
+}
+
+// TestParseResponseHeadBlockTakesTheSame holds parseResponseHeadBlock with
+// a block to parseResponseHead: it takes the heads the map takes, and none
+// besides, frames them the same, and hands over their field lines.
+func TestParseResponseHeadBlockTakesTheSame(t *testing.T) {
+	for _, head := range responseHeads {
+		req := &stdhttp.Request{Method: stdhttp.MethodGet}
+		want, ok := parseResponseHead([]byte(head), req)
+		got, block, okBlock := parseResponseHeadBlock([]byte(head), req, true)
+		if ok != okBlock {
+			t.Errorf("%q: taken %v with a block, %v with a map", head, okBlock, ok)
+			continue
+		}
+		if !ok {
+			continue
+		}
+		if got.Header != nil {
+			t.Errorf("%q: Header %v with a block", head, got.Header)
+		}
+		got.Header = want.Header
+		if d := sameResponseHead(got, want); d != "" {
+			t.Errorf("%q: %s differs with a block:\n got %+v\nwant %+v", head, d, got, want)
+		}
+		if wantBlock := head[strings.Index(head, "\r\n")+2 : len(head)-2]; block != wantBlock {
+			t.Errorf("%q: block %q, want %q", head, block, wantBlock)
 		}
 	}
 }

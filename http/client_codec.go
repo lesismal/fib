@@ -397,10 +397,12 @@ func parseResponseHeadBlock(head []byte, req *stdhttp.Request, block bool) (*std
 	// One string for the whole head: the status, the field names that are
 	// not interned and the values are pieces of it.
 	s := string(head[:len(head)-2])
-	// textproto ends a line at a bare LF too; such a head is left to it. Every
-	// LF found here has its CR, so a line ends at its LF below.
+	// textproto ends a line at a bare LF too; such a head is left to it.
+	// Every line found here ends with CRLF, so a line ends at its LF below.
+	// The map is sized by the lines, which are counted, and their ends
+	// checked, before it is made; a block's are checked as they are read.
 	n := 0
-	for at := 0; ; {
+	for at := 0; !block; {
 		i := strings.IndexByte(s[at:], '\n')
 		if i < 0 {
 			break
@@ -413,7 +415,7 @@ func parseResponseHeadBlock(head []byte, req *stdhttp.Request, block bool) (*std
 		n++
 	}
 	lineEnd := strings.IndexByte(s, '\n') - 1
-	if lineEnd < 0 {
+	if lineEnd < 0 || s[lineEnd] != '\r' {
 		return nil, "", false
 	}
 	status := s[9:lineEnd]
@@ -460,7 +462,7 @@ func parseResponseHeadBlock(head []byte, req *stdhttp.Request, block bool) (*std
 	hasClose, hasKeepAlive := false, false
 	for fields != "" {
 		end := strings.IndexByte(fields, '\n') - 1
-		if end < 0 {
+		if end < 0 || fields[end] != '\r' {
 			return nil, "", false
 		}
 		line := fields[:end]
