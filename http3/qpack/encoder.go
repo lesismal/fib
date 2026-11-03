@@ -272,13 +272,18 @@ func (s *Section) End(dst []byte) []byte {
 
 // repeated reports whether the field was seen lately, and remembers it.
 func (e *Encoder) repeated(name, value string) bool {
-	h := maphash.String(seenSeed, name)*31 ^ maphash.String(seenSeed, value)
+	h := seenHash(name, value)
 	slot := &e.seen[h%seenSlots]
 	if *slot == h {
 		return true
 	}
 	*slot = h
 	return false
+}
+
+// seenHash is the hash a field is remembered by in an Encoder's seen.
+func seenHash(name, value string) uint64 {
+	return maphash.String(seenSeed, name)*31 ^ maphash.String(seenSeed, value)
 }
 
 // insert adds f to the table, if room can be made for it by evicting

@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"encoding/hex"
 	"errors"
+	"hash/maphash"
+	"slices"
 	"strings"
 	"testing"
 )
@@ -25,6 +27,27 @@ func newPair(capacity uint64, blocked int) *pair {
 	p.dec.EnableDynamic(capacity, blocked)
 	p.enc.SetPeerSettings(capacity, uint64(blocked))
 	return p
+}
+
+// distinctSeenSlots sets seenSeed, for the rest of t, to one under which the
+// fields each take a slot of their own in an Encoder's seen, so that a test
+// that counts on every repeated field being indexed does not depend on the
+// seed the package started with.
+func distinctSeenSlots(t *testing.T, fields []HeaderField) {
+	t.Helper()
+	old := seenSeed
+	t.Cleanup(func() { seenSeed = old })
+	for range 1000 {
+		slots := make(map[uint64]bool, len(fields))
+		for _, f := range fields {
+			slots[seenHash(f.Name, f.Value)%seenSlots] = true
+		}
+		if len(slots) == len(fields) {
+			return
+		}
+		seenSeed = maphash.MakeSeed()
+	}
+	t.Fatal("no seed found that keeps the fields apart")
 }
 
 // sensitive is what package http3 marks never-indexed.
@@ -178,7 +201,6 @@ func TestDynamicExample(t *testing.T) {
 // over and over: the third and later sections refer to the table, and each
 // decodes to what was encoded.
 func TestDynamicRoundTrip(t *testing.T) {
-	p := newPair(4096, 0)
 	fields := []HeaderField{
 		{":method", "GET"},
 		{":scheme", "https"},
@@ -190,6 +212,15 @@ func TestDynamicRoundTrip(t *testing.T) {
 		{"x-request-id", "1"},
 		{"user-agent", "Go-http-client/3"},
 	}
+	// The encoder remembers what it has seen in one slot a hash, so a
+	// field whose slot the changing request ID shares is never seen twice
+	// and never indexed, as the seed falls.
+	seen := slices.Clone(fields)
+	for i := 0; i < 5; i++ {
+		seen = append(seen, HeaderField{"x-request-id", string(rune('a' + i))})
+	}
+	distinctSeenSlots(t, seen)
+	p := newPair(4096, 0)
 	plain := encode(fields)
 	var sizes []int
 	for i := 0; i < 5; i++ {
