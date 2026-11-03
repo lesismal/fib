@@ -252,18 +252,23 @@ func parseSimpleRequestHead(head []byte, reuse reuseOptions) *requestBlock {
 		case "Pragma":
 			sawPragma = true
 		}
-		if existing, ok := header[key]; ok {
-			header[key] = append(existing, value)
-			continue
-		}
+		// The field is stored without looking for one of its name first,
+		// which a header nearly never repeats: a map that did not grow had
+		// one, which the store replaced, and the values are gathered again
+		// from the lines before.
+		size := len(header)
+		var vv []string
 		if len(values) == 0 {
-			header[key] = []string{value}
-			continue
+			vv = []string{value}
+		} else {
+			vv = values[:1:1]
+			values = values[1:]
+			vv[0] = value
 		}
-		vv := values[:1:1]
-		values = values[1:]
-		vv[0] = value
 		header[key] = vv
+		if len(header) == size {
+			header[key] = append(fieldValues(text[lineEnd+1:at-n-1], key), value)
+		}
 	}
 
 	if sawChunked {
@@ -453,6 +458,21 @@ func simpleField(line string) (key, value string, ok bool) {
 		value = strings.Trim(value, " \t")
 	}
 	return key, value, true
+}
+
+// fieldValues returns the values of the fields named key among lines, header
+// lines each ended by CRLF that simpleField has taken already, in order.
+func fieldValues(lines, key string) []string {
+	var vv []string
+	for lines != "" {
+		n := strings.IndexByte(lines, '\n')
+		k, v, _ := simpleField(lines[:n-1])
+		if k == key {
+			vv = append(vv, v)
+		}
+		lines = lines[n+1:]
+	}
+	return vv
 }
 
 // plainFieldValue reports whether v holds no control byte but a tab: nothing

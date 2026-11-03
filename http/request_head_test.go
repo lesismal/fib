@@ -67,6 +67,7 @@ var requestHeadCorpus = []string{
 	"GET / HTTP/1.1\r\nHost:   spaced \t \r\n\r\n",
 	"GET / HTTP/1.1\r\nHost: a\r\nX-Empty:\r\nX-Tab:\tv\t\r\n\r\n",
 	"GET / HTTP/1.1\r\nHost: a\r\nX-Multi: 1\r\nX-Multi: 2\r\nx-multi: 3\r\n\r\n",
+	"GET / HTTP/1.1\r\nA: 1\r\nB: 2\r\nHost: a\r\nC: 3\r\nD: 4\r\nE: 5\r\nb: 6\r\nF: 7\r\nA: 8\r\nE: 9\r\nG: 10\r\nA: 11\r\n\r\n",
 	"GET / HTTP/1.1\r\nHost: a\r\nX-Obs: caf\xc3\xa9\r\n\r\n",
 	"GET / HTTP/1.1\r\nHost: a\r\nX-Ctl: a\x01b\r\n\r\n",
 	"GET / HTTP/1.1\r\nHost: a\r\nX-Del: a\x7fb\r\n\r\n",
