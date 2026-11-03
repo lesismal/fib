@@ -286,9 +286,10 @@ func TestCvCliIdleTimerReused(t *testing.T) {
 		if idle == nil {
 			t.Fatal("the connection was not kept idle")
 		}
-		idle.host.mu.Lock()
+		s := &idle.host.idle[idle.shard]
+		s.mu.Lock()
 		got := idle.idleTimer
-		idle.host.mu.Unlock()
+		s.mu.Unlock()
 		if timer == nil {
 			timer = got
 		} else if got != timer {
@@ -599,19 +600,19 @@ func TestCvCliSendGuards(t *testing.T) {
 	config := DefaultClientConfig()
 	config.IdleConnTimeout = 0
 	c := NewClient(nil, config)
-	h := &hostPool{target: hostTarget{addr: "x:80"}}
+	h := newHostPool(hostTarget{addr: "x:80"})
 
 	settled := &clientRequest{req: mustRequest(t, "GET", "http://x/", nil), callback: func(*ClientResponse, error) {}}
 	settled.done.Store(true)
 	cc := &clientConn{client: c, host: h}
 	cc.send(settled)
-	if len(h.idle) != 1 || h.idle[0] != cc || cc.current != nil {
-		t.Fatalf("connection not kept idle: %d idle", len(h.idle))
+	if idle := h.idleList(); len(idle) != 1 || idle[0] != cc || cc.current != nil {
+		t.Fatalf("connection not kept idle: %d idle", len(idle))
 	}
 
 	closedConn := &clientConn{client: c, host: h, closed: true}
 	c.release(closedConn)
-	if len(h.idle) != 1 {
+	if len(h.idleList()) != 1 {
 		t.Fatal("a closed connection was kept")
 	}
 

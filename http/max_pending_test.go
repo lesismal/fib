@@ -173,9 +173,19 @@ func hostsOf(c *Client) []*hostPool {
 func idleConnsOf(c *Client) []*clientConn {
 	var idle []*clientConn
 	for _, h := range hostsOf(c) {
-		h.mu.Lock()
-		idle = append(idle, h.idle...)
-		h.mu.Unlock()
+		idle = append(idle, h.idleList()...)
+	}
+	return idle
+}
+
+// idleList returns the connections h keeps idle.
+func (h *hostPool) idleList() []*clientConn {
+	var idle []*clientConn
+	for i := range h.idle {
+		s := &h.idle[i]
+		s.mu.Lock()
+		idle = append(idle, s.conns...)
+		s.mu.Unlock()
 	}
 	return idle
 }

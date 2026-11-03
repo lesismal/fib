@@ -468,6 +468,65 @@ func TestClientConcurrentRequestsRespectConnectionCap(t *testing.T) {
 	}
 }
 
+// Requests sent from many goroutines at once, each as the last is answered,
+// take and give back idle connections without the host's lock while none
+// wait, and queue when all are busy: none is lost between the two, and the
+// idle ones are counted as they are kept, at most MaxIdleConnsPerHost of
+// them, which with fewer than MaxConnsPerHost closes some as they go idle.
+func TestClientConcurrentIdleHandOff(t *testing.T) {
+	const (
+		senders  = 32
+		each     = 50
+		maxConns = 8
+		maxIdle  = 3
+	)
+	server := httptest.NewServer(stdhttp.HandlerFunc(func(w stdhttp.ResponseWriter, r *stdhttp.Request) {
+		_, _ = io.WriteString(w, r.URL.Query().Get("i"))
+	}))
+	defer server.Close()
+
+	config := DefaultClientConfig()
+	config.MaxConnsPerHost = maxConns
+	config.MaxIdleConnsPerHost = maxIdle
+	client := newTestClient(t, config)
+	var wg sync.WaitGroup
+	errs := make(chan error, senders)
+	for g := range senders {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for i := range each {
+				want := fmt.Sprint(g*each + i)
+				resp, err := client.Go(mustRequest(t, "GET", server.URL+"/?i="+want, nil)).Wait()
+				if err != nil {
+					errs <- err
+					return
+				}
+				if got, _ := io.ReadAll(resp.Body); string(got) != want {
+					errs <- fmt.Errorf("got the response %q, want %q", got, want)
+					return
+				}
+			}
+		}()
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		t.Fatal(err)
+	}
+	h := hostPoolOf(t, client, server.URL)
+	idle := h.idleList()
+	h.mu.Lock()
+	open, queued := h.open, h.queued.Load()
+	h.mu.Unlock()
+	if len(idle) > maxIdle || int(h.nidle.Load()) != len(idle) {
+		t.Fatalf("%d connections kept idle, counted as %d, want at most %d", len(idle), h.nidle.Load(), maxIdle)
+	}
+	if open > maxConns || open < len(idle) || queued != 0 {
+		t.Fatalf("%d connections open, %d idle and %d requests queued after all were answered", open, len(idle), queued)
+	}
+}
+
 // A client can share an engine with a fib server, and even call that server:
 // the client's connections carry their own handler, so neither side sees the
 // other's traffic.
