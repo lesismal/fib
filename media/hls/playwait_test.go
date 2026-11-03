@@ -69,9 +69,9 @@ func TestHandlerPlayWaitExpires(t *testing.T) {
 	if m == nil || !m.Ended() {
 		t.Fatal("wait did not end the muxer", m)
 	}
-	if n := h.playWaiters.Load(); n != 0 {
-		t.Fatal(n)
-	}
+	// A waiter is let go once it has been answered, so its count falls just
+	// after the answer arrives.
+	until(t, "the waiter not let go", func() bool { return h.playWaiters.Load() == 0 })
 	// The next request waits again, on a new Muxer.
 	got := start(t, h, base+"s/media.m3u8", "s")
 	until(t, "not restarted", func() bool { return h.Muxer("s") != m })
