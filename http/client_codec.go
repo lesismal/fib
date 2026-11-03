@@ -467,14 +467,15 @@ func parseResponseHeadBlock(head []byte, req *stdhttp.Request, block bool) (*std
 		}
 		line := fields[:end]
 		fields = fields[end+2:]
-		colon := strings.IndexByte(line, ':')
-		if colon <= 0 {
-			return nil, "", false
-		}
-		key := line[:colon]
+		// The key is read up to the colon as it is checked, as simpleField
+		// reads it.
 		upper, canonical := true, true
-		for i := 0; i < len(key); i++ {
-			c := key[i]
+		colon := 0
+		for ; colon < len(line); colon++ {
+			c := line[colon]
+			if c == ':' {
+				break
+			}
 			if !tokenByte[c] {
 				return nil, "", false
 			}
@@ -483,6 +484,10 @@ func parseResponseHeadBlock(head []byte, req *stdhttp.Request, block bool) (*std
 			}
 			upper = c == '-'
 		}
+		if colon == 0 || colon == len(line) {
+			return nil, "", false
+		}
+		key := line[:colon]
 		if !canonical {
 			key = canonicalKey(key)
 		}

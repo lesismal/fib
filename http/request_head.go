@@ -444,13 +444,16 @@ var pathByte = func() (table [256]bool) {
 // nothing net/textproto refuses. The key is a slice of line when it is
 // already canonical, as it nearly always is, and the value always is.
 func simpleField(line string) (key, value string, ok bool) {
-	colon := strings.IndexByte(line, ':')
-	if colon <= 0 {
-		return "", "", false
-	}
+	// The key is read up to the colon in the same loop that checks it,
+	// which a key, a few bytes, costs less than a search for the colon
+	// first: a colon is not a token byte, so the first one ends the key.
 	upper, canonical := true, true
-	for i := 0; i < colon; i++ {
-		c := line[i]
+	colon := 0
+	for ; colon < len(line); colon++ {
+		c := line[colon]
+		if c == ':' {
+			break
+		}
 		if !tokenByte[c] {
 			return "", "", false
 		}
@@ -458,6 +461,9 @@ func simpleField(line string) (key, value string, ok bool) {
 			canonical = false
 		}
 		upper = c == '-'
+	}
+	if colon == 0 || colon == len(line) {
+		return "", "", false
 	}
 	key = line[:colon]
 	if !canonical {
