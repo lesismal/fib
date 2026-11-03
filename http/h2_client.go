@@ -902,10 +902,10 @@ func (hc *h2ClientConn) handleSettings(f *h2Frame) error {
 	}
 	if maxStreams >= 0 {
 		c, h := hc.client, hc.cc.host
-		c.mu.Lock()
+		h.mu.Lock()
 		hc.cc.maxStreams = maxStreams
 		work, dials := c.dispatchLocked(h)
-		c.mu.Unlock()
+		h.mu.Unlock()
 		c.carryOut(h, work, dials)
 	}
 	return nil
