@@ -545,12 +545,12 @@ func (c *Client) doFramed(req *stdhttp.Request, callback func(*ClientResponse, e
 		// Held for the response; see releaseData.
 		r.dataRefs.Store(1)
 	}
-	// Either hook can fire before it has been stored, so both are stored under
-	// the lock finish reads them under.
+	// The hook can fire before it has been stored, so it is stored under the
+	// lock finish reads it under. The timer that bounds the request is set
+	// once it is known what carries it (see armOwn and clientConn.timer).
 	r.mu.Lock()
 	if c.config.Timeout > 0 {
 		r.timeoutAt = time.Now().Add(c.config.Timeout)
-		r.timer = time.AfterFunc(c.config.Timeout, r.expire)
 	}
 	if ctx := req.Context(); ctx.Done() != nil {
 		r.stopContext = context.AfterFunc(ctx, func() { r.abort(ctx.Err()) })
@@ -908,6 +908,11 @@ func (c *Client) enqueue(target hostTarget, r *clientRequest, retry bool) {
 	c.carryOut(h, work, dials)
 	if refused {
 		r.finish(nil, ErrTooManyPending)
+		return
+	}
+	if r.waitingIn.Load() != nil {
+		// It waits for a connection, which no connection's timer bounds.
+		r.armOwn()
 	}
 }
 
@@ -1434,7 +1439,9 @@ type clientRequest struct {
 	mu       sync.Mutex
 	// conn is the connection carrying the request, so that abandoning the
 	// request can also abandon its half-finished exchange. timer and
-	// stopContext are the hooks that abandon it. Guarded by mu.
+	// stopContext are the hooks that abandon it: timer is the request's own,
+	// set only while no HTTP/1 connection's timer bounds the request (see
+	// armOwn). Guarded by mu.
 	conn        *clientConn
 	timer       *time.Timer
 	stopContext func() bool
@@ -1520,19 +1527,65 @@ func (r *clientRequest) requestSent() {
 		return
 	}
 	r.mu.Lock()
-	defer r.mu.Unlock()
 	if r.headerDone || r.done.Load() {
+		r.mu.Unlock()
 		return
 	}
 	r.headerAt = time.Now().Add(r.headerWait)
+	at, cc := r.headerAt, r.conn
 	switch {
 	case !r.timeoutAt.IsZero() && !r.headerAt.Before(r.timeoutAt):
 		// Timeout ends the request first.
+		cc = nil
+	case cc != nil && cc.h2 == nil:
+		// The connection's timer bounds it, below.
 	case r.timer == nil:
 		r.timer = time.AfterFunc(r.headerWait, r.expire)
+		cc = nil
 	default:
 		r.timer.Reset(r.headerWait)
+		cc = nil
 	}
+	r.mu.Unlock()
+	if cc != nil {
+		cc.arm(at)
+	}
+}
+
+// armOwn gives r a timer of its own, if it has a deadline and is not settled:
+// a request no HTTP/1 connection's timer bounds, because it waits for a
+// connection or is on an HTTP/2 one, which carries many.
+func (r *clientRequest) armOwn() {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.timer != nil || r.done.Load() {
+		return
+	}
+	if next := r.nextDeadlineLocked(); !next.IsZero() {
+		r.timer = time.AfterFunc(time.Until(next), r.expire)
+	}
+}
+
+// nextDeadlineLocked is the earlier of the request's deadlines, or zero when
+// it has none. Callers hold mu.
+func (r *clientRequest) nextDeadlineLocked() time.Time {
+	next := r.timeoutAt
+	if next.IsZero() || !r.headerAt.IsZero() && r.headerAt.Before(next) {
+		next = r.headerAt
+	}
+	return next
+}
+
+// overdueLocked reports the deadline of the request's that has passed by
+// now, as the error it fails with, or nil. Callers hold mu.
+func (r *clientRequest) overdueLocked(now time.Time) error {
+	switch {
+	case !r.headerAt.IsZero() && !now.Before(r.headerAt):
+		return ErrResponseHeaderTimeout
+	case !r.timeoutAt.IsZero() && !now.Before(r.timeoutAt):
+		return errRequestTimeout
+	}
+	return nil
 }
 
 // queued records that r waits in h's queue, where enqueue has just put it.
@@ -1603,17 +1656,8 @@ func (r *clientRequest) releaseData() {
 func (r *clientRequest) expire() {
 	r.mu.Lock()
 	now := time.Now()
-	var err error
-	next := r.timeoutAt
-	switch {
-	case !r.headerAt.IsZero() && !now.Before(r.headerAt):
-		err = ErrResponseHeaderTimeout
-	case !r.timeoutAt.IsZero() && !now.Before(r.timeoutAt):
-		err = errRequestTimeout
-	case next.IsZero() || !r.headerAt.IsZero() && r.headerAt.Before(next):
-		next = r.headerAt
-	}
-	if err == nil && !next.IsZero() && !r.done.Load() {
+	err := r.overdueLocked(now)
+	if next := r.nextDeadlineLocked(); err == nil && !next.IsZero() && !r.done.Load() {
 		r.timer.Reset(next.Sub(now))
 	}
 	r.mu.Unlock()
@@ -1765,6 +1809,67 @@ type clientConn struct {
 	// forgotten records that the connection no longer counts against its
 	// host's MaxConnsPerHost (see forget). Guarded by the host's lock.
 	forgotten bool
+	// timer bounds the request in flight on an HTTP/1 connection, by its
+	// Timeout and ResponseHeaderTimeout, in place of a timer of the
+	// request's own, which cost every request one set and one stop: made
+	// for the connection's first request, it stays set from one request to
+	// the next, firing at due or earlier, when it sets itself again for
+	// whatever is then in flight, so that a request that ends in time costs
+	// it no more than a look at due. due is zero while it is not set, and
+	// the connection's close stops it. Guarded by mu.
+	timer *time.Timer
+	due   time.Time
+}
+
+// arm has the connection's timer fire by at, for the request in flight.
+func (cc *clientConn) arm(at time.Time) {
+	cc.mu.Lock()
+	switch {
+	case cc.closed || !cc.due.IsZero() && !at.Before(cc.due):
+		// It will fire by then already.
+	case cc.timer == nil:
+		cc.due = at
+		cc.timer = time.AfterFunc(time.Until(at), cc.expire)
+	default:
+		cc.due = at
+		cc.timer.Reset(time.Until(at))
+	}
+	cc.mu.Unlock()
+}
+
+// expire fails the request in flight if one of its deadlines has passed, or
+// sets the timer again for the next, if it has one.
+func (cc *clientConn) expire() {
+	cc.mu.Lock()
+	cc.due = time.Time{}
+	r := cc.current
+	cc.mu.Unlock()
+	if r == nil {
+		// The next request sets it again.
+		return
+	}
+	r.mu.Lock()
+	var err error
+	var next time.Time
+	if !r.done.Load() {
+		err, next = r.overdueLocked(time.Now()), r.nextDeadlineLocked()
+	}
+	r.mu.Unlock()
+	switch {
+	case err != nil:
+		r.abort(err)
+	case !next.IsZero():
+		cc.arm(next)
+	}
+}
+
+// stopTimerLocked stops the timer of a connection that has closed or left
+// the client, which carries no request for it to bound. Callers hold mu.
+func (cc *clientConn) stopTimerLocked() {
+	if cc.timer != nil {
+		cc.timer.Stop()
+	}
+	cc.due = time.Time{}
 }
 
 func (cc *clientConn) isClosed() bool {
@@ -1777,6 +1882,7 @@ func (cc *clientConn) isClosed() bool {
 // hands r back to the queue.
 func (cc *clientConn) send(r *clientRequest) {
 	if cc.h2 != nil {
+		r.armOwn()
 		cc.h2.send(r)
 		return
 	}
@@ -1820,6 +1926,10 @@ func (cc *clientConn) send(r *clientRequest) {
 		}
 		cc.client.release(cc)
 		return
+	}
+	if !r.timeoutAt.IsZero() {
+		// Set once, before the request was queued.
+		cc.arm(r.timeoutAt)
 	}
 	if r.upload != nil {
 		cc.mu.Lock()
@@ -1973,6 +2083,7 @@ func (cc *clientConn) sendBody(r *clientRequest) {
 func (cc *clientConn) discard() {
 	cc.mu.Lock()
 	cc.closed = true
+	cc.stopTimerLocked()
 	cc.current = nil
 	cc.uploading = nil
 	gate := cc.gate
@@ -2170,6 +2281,7 @@ func (cc *clientConn) switchTunnel(conn *fib.Connection, r *clientRequest, resp 
 	cc.mu.Lock()
 	cc.current = nil
 	cc.feed = feed
+	cc.stopTimerLocked()
 	cc.mu.Unlock()
 	r.detach()
 	cc.client.forget(cc)
@@ -2277,6 +2389,7 @@ func (cc *clientConn) OnClose(_ *fib.Connection, err error) {
 		// A TLS handshake that failed: the dial failed.
 		cc.mu.Lock()
 		cc.closed = true
+		cc.stopTimerLocked()
 		cc.mu.Unlock()
 		if err == nil {
 			err = io.ErrUnexpectedEOF
@@ -2296,6 +2409,7 @@ func (cc *clientConn) OnClose(_ *fib.Connection, err error) {
 	r := cc.current
 	cc.current = nil
 	cc.closed = true
+	cc.stopTimerLocked()
 	retry := r != nil && cc.reused && !cc.received
 	cc.mu.Unlock()
 	cc.client.forget(cc)
