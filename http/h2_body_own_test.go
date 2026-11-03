@@ -107,9 +107,9 @@ func TestH2RespondKeepsAHandlerBody(t *testing.T) {
 		} else {
 			st := c.stream
 			sc := st.sc
-			sc.mu.Lock()
+			sc.lock()
 			pending := st.pending
-			sc.mu.Unlock()
+			sc.unlock()
 			h = held{unsafe.Pointer(unsafe.SliceData(body)), unsafe.Pointer(unsafe.SliceData(pending)), len(pending)}
 		}
 		done <- h

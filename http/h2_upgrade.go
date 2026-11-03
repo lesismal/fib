@@ -44,9 +44,9 @@ func (h *ServerHandler) h2cUpgrade(c *fib.Connection, request *stdhttp.Request) 
 // preface onwards, is HTTP/2.
 func (h *ServerHandler) upgradeH2C(c *fib.Connection, parser *Parser, request *stdhttp.Request, settings []byte) {
 	sc := newH2ServerConn(h, c, parser.remoteAddr)
-	sc.mu.Lock()
+	sc.lock()
 	err := sc.applySettingsLocked(settings)
-	sc.mu.Unlock()
+	sc.unlock()
 	if err != nil {
 		// Settings the server cannot accept: carry on in HTTP/1.1, which
 		// the client has to be ready for anyway.
@@ -73,12 +73,12 @@ func (h *ServerHandler) upgradeH2C(c *fib.Connection, parser *Parser, request *s
 	request.Proto, request.ProtoMajor, request.ProtoMinor = "HTTP/2.0", 2, 0
 	st := &h2ServerStream{sc: sc, id: 1, req: request, recvWindow: sc.local.streamWindow, declared: -1, remoteDone: true}
 	sc.maxClientID = 1
-	sc.mu.Lock()
+	sc.lock()
 	st.sendWindow = sc.peerWindow
 	sc.streams[1] = st
 	sc.lastStreamID.Store(1)
 	sc.busyLocked()
-	sc.mu.Unlock()
+	sc.unlock()
 	sc.armWriteTimeout(st)
 	// The server preface has gone out, so the response to this request may
 	// now be framed from wherever it is served.

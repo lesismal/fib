@@ -69,9 +69,9 @@ func testH2SharedBody(t *testing.T, size int, open, trailer bool) {
 			t.Error(err)
 		}
 		sc := c.stream.sc
-		sc.mu.Lock()
+		sc.lock()
 		shared <- c.stream.shared
-		sc.mu.Unlock()
+		sc.unlock()
 	})))
 	var tc *h2TestConn
 	if open {
@@ -172,9 +172,9 @@ func TestH2SharedBodyOnlyWhereKept(t *testing.T) {
 					t.Error(err)
 				}
 				sc := c.stream.sc
-				sc.mu.Lock()
+				sc.lock()
 				shared <- c.stream.shared
-				sc.mu.Unlock()
+				sc.unlock()
 			}))
 			if !tt.tls {
 				addr := serve(t, handler)

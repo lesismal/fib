@@ -81,24 +81,24 @@ func (st *h2ServerStream) push(parent *stdhttp.Request, target string, opts *std
 	if err = h2CheckHeader(header); err != nil {
 		return err
 	}
-	sc.mu.Lock()
+	sc.lock()
 	switch {
 	case !sc.pushEnabled:
-		sc.mu.Unlock()
+		sc.unlock()
 		return stdhttp.ErrNotSupported
 	case sc.closed || sc.goAway || sc.peerGoingAway || st.reset:
-		sc.mu.Unlock()
+		sc.unlock()
 		return errH2StreamClosed
 	case st.localDone:
-		sc.mu.Unlock()
+		sc.unlock()
 		return errPushAfterResponse
 	case sc.pushedStreams >= sc.peerMaxPush || sc.nextPushID > h2MaxStreamID:
-		sc.mu.Unlock()
+		sc.unlock()
 		return ErrPushLimit
 	case sc.limitsHeaderListLocked() && h2FieldSize(":method", method)+h2FieldSize(":scheme", scheme)+
 		h2FieldSize(":authority", authority)+h2FieldSize(":path", path)+h2HeaderSize(header) > sc.peerMaxHeaderList:
 		// The promised request is a header list the client takes too.
-		sc.mu.Unlock()
+		sc.unlock()
 		return errH2HeaderListTooLarge
 	}
 	id := sc.nextPushID
@@ -153,7 +153,7 @@ func (st *h2ServerStream) push(parent *stdhttp.Request, target string, opts *std
 	sc.pushedStreams++
 	sc.busyLocked()
 	sc.sendLocked(h2AppendPushPromise(nil, st.id, id, block, sc.peerMaxFrame))
-	sc.mu.Unlock()
+	sc.unlock()
 
 	sc.armWriteTimeout(promised)
 

@@ -186,14 +186,14 @@ func connDebugState(c *fib.Connection) string {
 	}
 	out := "conn: " + debughook.ConnState(c)
 	if sc, ok := c.Attachment().(*h2ServerConn); ok {
-		sc.mu.Lock()
+		sc.lock()
 		out += fmt.Sprintf("\nh2: streams=%d closed=%v goAway=%v peerGoingAway=%v sendWindow=%d",
 			len(sc.streams), sc.closed, sc.goAway, sc.peerGoingAway, sc.sendWindow)
 		for id, st := range sc.streams {
 			out += fmt.Sprintf("\nstream %d: pending=%d sendWindow=%d reset=%v localDone=%v remoteDone=%v writable=%v",
 				id, len(st.pending), st.sendWindow, st.reset, st.localDone, st.remoteDone, st.out != nil && st.out.writable != nil)
 		}
-		sc.mu.Unlock()
+		sc.unlock()
 	} else {
 		out += fmt.Sprintf("\nattachment %T", c.Attachment())
 	}

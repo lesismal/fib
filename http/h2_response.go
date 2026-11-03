@@ -65,8 +65,8 @@ func (st *h2ServerStream) beginResponse(req *stdhttp.Request, status int, header
 		return err
 	}
 	sc := st.sc
-	sc.mu.Lock()
-	defer sc.mu.Unlock()
+	sc.lock()
+	defer sc.unlock()
 	if sc.closed || st.reset {
 		return st.closedErrLocked()
 	}
@@ -84,7 +84,7 @@ func (st *h2ServerStream) beginResponse(req *stdhttp.Request, status int, header
 	}
 	st.responded = true
 	st.out = &h2Output{}
-	st.out.room.L = &sc.mu
+	st.out.room.L = (*h2ConnLock)(sc)
 	block := sc.enc.Begin(sc.headerBlock[:0])
 	block = sc.enc.AppendField(block, ":status", h2Status(status), false)
 	if n := declaredLength(header); n >= 0 && statusHasBody(status) {
@@ -109,8 +109,8 @@ func (st *h2ServerStream) beginResponse(req *stdhttp.Request, status int, header
 // writes until the client's window lets it go.
 func (st *h2ServerStream) writeBody(p []byte, wait bool) error {
 	sc := st.sc
-	sc.mu.Lock()
-	defer sc.mu.Unlock()
+	sc.lock()
+	defer sc.unlock()
 	for {
 		if sc.closed || st.reset || st.out == nil || st.out.ending {
 			return st.closedErrLocked()
@@ -172,16 +172,16 @@ func (st *h2ServerStream) writeBodyNoWait(p []byte) (bool, error) {
 		return false, err
 	}
 	sc := st.sc
-	sc.mu.Lock()
-	defer sc.mu.Unlock()
+	sc.lock()
+	defer sc.unlock()
 	return len(st.pending) > h2MaxPendingOutput, nil
 }
 
 // onWritable is Context.OnWritable for a response on st.
 func (st *h2ServerStream) onWritable(fn func(error)) bool {
 	sc := st.sc
-	sc.mu.Lock()
-	defer sc.mu.Unlock()
+	sc.lock()
+	defer sc.unlock()
 	o := st.out
 	switch {
 	case o == nil:
@@ -215,8 +215,8 @@ func (st *h2ServerStream) runWritableLocked(err error) {
 // a whole one; the stream is gone either way once this returns.
 func (st *h2ServerStream) endResponse(trailer stdhttp.Header, complete bool) error {
 	sc := st.sc
-	sc.mu.Lock()
-	defer sc.mu.Unlock()
+	sc.lock()
+	defer sc.unlock()
 	if sc.closed || st.reset || st.out == nil || st.out.ending {
 		return st.closedErrLocked()
 	}

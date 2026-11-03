@@ -127,16 +127,16 @@ func TestH2ServerPingKeepalive(t *testing.T) {
 // while that output backs up, is not taken for gone.
 func TestH2ServerPingKeepaliveCountsDrainingOutput(t *testing.T) {
 	sc := newH2ServerConn(NewHandlerWithConfig(Config{PingInterval: time.Hour}, nil), nil, "")
-	sc.mu.Lock()
+	sc.lock()
 	sc.armLivenessLocked()
 	sc.pingPending = 1000
 	sc.pingOut = true
-	sc.mu.Unlock()
+	sc.unlock()
 	// Nothing read, but output shrank (to none, without a connection):
 	// alive, and no PING goes out to a connection that has none.
 	sc.pingTick()
-	sc.mu.Lock()
-	defer sc.mu.Unlock()
+	sc.lock()
+	defer sc.unlock()
 	if sc.closed || sc.pingOut {
 		t.Fatalf("closed %v, PING out %v", sc.closed, sc.pingOut)
 	}

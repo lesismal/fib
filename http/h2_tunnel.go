@@ -82,12 +82,12 @@ func (sc *h2ServerConn) serveTunnel(st *h2ServerStream) {
 	st.pooled = false
 	tunnel := &h2Tunnel{feed: TunnelFeed{tunnel: Tunnel{conn: sc.conn, w: (*h2TunnelWriter)(st),
 		limit: int(sc.handler.config.MaxBodyBytes)}}}
-	tunnel.room.L = &sc.mu
+	tunnel.room.L = (*h2ConnLock)(sc)
 	// Set under the lock, where a shutdown retiring the connection looks for
 	// its tunnels. One that began before this is told here instead.
-	sc.mu.Lock()
+	sc.lock()
 	st.tunnel = tunnel
-	sc.mu.Unlock()
+	sc.unlock()
 	if sc.retiring.Load() {
 		tunnel.feed.Shutdown()
 	}
@@ -102,9 +102,9 @@ func (sc *h2ServerConn) serveTunnel(st *h2ServerStream) {
 // has its stream reset.
 func (sc *h2ServerConn) handleTunnelData(st *h2ServerStream, f *h2Frame) error {
 	length := int64(f.length)
-	sc.mu.Lock()
+	sc.lock()
 	if length > st.recvWindow {
-		sc.mu.Unlock()
+		sc.unlock()
 		return &H2StreamError{StreamID: f.streamID, Code: H2FlowControlError}
 	}
 	st.recvWindow -= length
@@ -112,7 +112,7 @@ func (sc *h2ServerConn) handleTunnelData(st *h2ServerStream, f *h2Frame) error {
 	if !st.tunnel.held {
 		sc.creditTunnelLocked(st)
 	}
-	sc.mu.Unlock()
+	sc.unlock()
 	if err := st.tunnel.feed.Write(f.payload); err != nil {
 		return &H2StreamError{StreamID: f.streamID, Code: H2EnhanceYourCalm}
 	}
@@ -122,7 +122,7 @@ func (sc *h2ServerConn) handleTunnelData(st *h2ServerStream, f *h2Frame) error {
 	// The peer has ended its side, which ends the tunnel; this side ends
 	// once what is pending has gone. A handler that has not accepted it yet
 	// cannot any more, and answers the request as it would any other.
-	sc.mu.Lock()
+	sc.lock()
 	st.remoteDone = true
 	told := st.tunnel.ended
 	st.tunnel.ended = true
@@ -135,7 +135,7 @@ func (sc *h2ServerConn) handleTunnelData(st *h2ServerStream, f *h2Frame) error {
 	if st.localDone {
 		sc.forgetLocked(st)
 	}
-	sc.mu.Unlock()
+	sc.unlock()
 	sc.closeIfDone()
 	if !told {
 		st.tunnel.feed.End(io.EOF)
@@ -182,8 +182,8 @@ func (st *h2ServerStream) upgrade(req *stdhttp.Request, protocol string, header 
 		return nil, err
 	}
 	sc := st.sc
-	sc.mu.Lock()
-	defer sc.mu.Unlock()
+	sc.lock()
+	defer sc.unlock()
 	if sc.closed || st.reset || st.remoteDone || st.tunnel.ended {
 		return nil, errH2StreamClosed
 	}
@@ -209,8 +209,8 @@ func (st *h2ServerStream) upgrade(req *stdhttp.Request, protocol string, header 
 // set it then ends this side of the stream.
 func (st *h2ServerStream) sendTunnel(first, second []byte, end bool) error {
 	sc := st.sc
-	sc.mu.Lock()
-	defer sc.mu.Unlock()
+	sc.lock()
+	defer sc.unlock()
 	if sc.closed || st.reset || !st.upgraded() || st.tunnel.ending || st.localDone {
 		return errH2StreamClosed
 	}
@@ -262,13 +262,13 @@ func (sc *h2ServerConn) endTunnelStreamLocked(st *h2ServerStream) []byte {
 // abortTunnel resets the stream of a tunnel closed from this side.
 func (st *h2ServerStream) abortTunnel() {
 	sc := st.sc
-	sc.mu.Lock()
+	sc.lock()
 	if sc.streams[st.id] == st {
 		sc.endTunnelLocked(st, net.ErrClosed)
 		sc.sendLocked(h2AppendRSTStream(nil, st.id, H2Cancel))
 		sc.forgetLocked(st)
 	}
-	sc.mu.Unlock()
+	sc.unlock()
 	sc.closeIfDone()
 }
 
@@ -297,8 +297,8 @@ func (w *h2TunnelWriter) Close() error {
 func (w *h2TunnelWriter) HoldReads(hold bool) {
 	st := (*h2ServerStream)(w)
 	sc := st.sc
-	sc.mu.Lock()
-	defer sc.mu.Unlock()
+	sc.lock()
+	defer sc.unlock()
 	st.tunnel.held = hold
 	if !hold && !st.remoteDone && !sc.closed && sc.streams[st.id] == st {
 		sc.creditTunnelLocked(st)
@@ -308,8 +308,8 @@ func (w *h2TunnelWriter) HoldReads(hold bool) {
 // Unsent is what the windows hold back of what the tunnel was sent.
 func (w *h2TunnelWriter) Unsent() int {
 	st := (*h2ServerStream)(w)
-	st.sc.mu.Lock()
-	defer st.sc.mu.Unlock()
+	st.sc.lock()
+	defer st.sc.unlock()
 	return len(st.pending)
 }
 
@@ -319,8 +319,8 @@ func (w *h2TunnelWriter) Unsent() int {
 func (w *h2TunnelWriter) NotifySendable(limit int, fn func(error)) bool {
 	st := (*h2ServerStream)(w)
 	sc := st.sc
-	sc.mu.Lock()
-	defer sc.mu.Unlock()
+	sc.lock()
+	defer sc.unlock()
 	if sc.closed || st.reset || st.tunnel.ending || st.localDone || st.tunnel.ended {
 		sidepool.Post(func() { fn(errH2StreamClosed) })
 		return true
@@ -338,8 +338,8 @@ func (w *h2TunnelWriter) NotifySendable(limit int, fn func(error)) bool {
 func (w *h2TunnelWriter) WaitSendable(limit int) error {
 	st := (*h2ServerStream)(w)
 	sc := st.sc
-	sc.mu.Lock()
-	defer sc.mu.Unlock()
+	sc.lock()
+	defer sc.unlock()
 	for {
 		if sc.closed || st.reset || st.tunnel.ending || st.localDone {
 			return errH2StreamClosed

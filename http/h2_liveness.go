@@ -88,9 +88,9 @@ func (sc *h2ServerConn) settingsAckedLocked() {
 // server's SETTINGS in time (RFC 9113 section 6.5.3). An acknowledgement
 // that arrived as the timer fired leaves the connection alone.
 func (sc *h2ServerConn) settingsExpired() {
-	sc.mu.Lock()
+	sc.lock()
 	expired := !sc.settingsAcked && !sc.closed
-	sc.mu.Unlock()
+	sc.unlock()
 	if expired {
 		sc.fail(h2ConnErr(H2SettingsTimeout, "SETTINGS not acknowledged"))
 	}
@@ -109,9 +109,9 @@ func (sc *h2ServerConn) settingsExpired() {
 // reaches a client that has gone, so the connection is closed at once, what
 // it has queued dropped, rather than retired with GOAWAY.
 func (sc *h2ServerConn) pingTick() {
-	sc.mu.Lock()
+	sc.lock()
 	if sc.closed || sc.pingTimer == nil {
-		sc.mu.Unlock()
+		sc.unlock()
 		return
 	}
 	reads, pending := sc.reads.Load(), sc.pendingOutput()
@@ -131,11 +131,11 @@ func (sc *h2ServerConn) pingTick() {
 		sc.pingTimer = nil
 		sc.failBodiesLocked(ErrH2PingTimeout)
 		clear(sc.streams)
-		sc.mu.Unlock()
+		sc.unlock()
 		sc.conn.CloseWithError(ErrH2PingTimeout)
 		return
 	}
-	sc.mu.Unlock()
+	sc.unlock()
 }
 
 // pendingOutput is how much of what the connection sent waits for its

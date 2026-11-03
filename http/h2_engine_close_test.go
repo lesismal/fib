@@ -142,7 +142,7 @@ func TestH2EngineCloseTakesNoConnectionLock(t *testing.T) {
 	if !ok {
 		t.Fatal("the connection is not HTTP/2")
 	}
-	sc.mu.Lock()
+	sc.lock()
 	done := make(chan struct{})
 	go func() {
 		handler.OnEngineClose(sc.conn)
@@ -151,9 +151,9 @@ func TestH2EngineCloseTakesNoConnectionLock(t *testing.T) {
 	select {
 	case <-done:
 	case <-time.After(5 * time.Second):
-		sc.mu.Unlock()
+		sc.unlock()
 		t.Fatal("OnEngineClose waited for the connection's lock")
 	}
 	checkEngineCloseGoAway(t, tc, 1)
-	sc.mu.Unlock()
+	sc.unlock()
 }

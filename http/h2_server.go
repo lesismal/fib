@@ -126,7 +126,9 @@ type h2ServerConn struct {
 
 	// mu guards the write side and the streams, which writers and the reader
 	// share. Frames are sent while holding it, so header blocks leave in the
-	// order the encoder produced them.
+	// order the encoder produced them. It is taken with lock and let go with
+	// unlock, which send the responses queued while it was held; see
+	// postAnswer.
 	mu           sync.Mutex
 	streams      map[uint32]*h2ServerStream
 	enc          *hpack.Encoder
@@ -231,6 +233,10 @@ type h2ServerConn struct {
 	reuseStreams bool
 	reuseHeaders bool
 	dead         atomic.Pointer[h2ServerStream]
+
+	// answers holds, newest first, the responses that found mu taken, for
+	// whoever holds it to send before letting go; see postAnswer.
+	answers atomic.Pointer[h2Answer]
 }
 
 // h2Flusher writes out what a connection's frames queued, all at once; see
@@ -383,13 +389,13 @@ func (sc *h2ServerConn) start() {
 		[2]uint32{uint32(h2SettingEnablePush), 0},
 		[2]uint32{uint32(h2SettingEnableConnectProtocol), 1},
 	)
-	sc.mu.Lock()
+	sc.lock()
 	sc.sendLocked(out)
 	// A connection that opens and then asks for nothing is idle, and bounded
 	// like any other idle connection, as on HTTP/1.
 	sc.armIdleLocked()
 	sc.armLivenessLocked()
-	sc.mu.Unlock()
+	sc.unlock()
 }
 
 // armIdleLocked starts timing the connection's idleness, now that it carries
@@ -423,8 +429,8 @@ func (sc *h2ServerConn) busyLocked() {
 // that ended and began again since, finds the connection busy or idle for
 // less, and leaves it alone.
 func (sc *h2ServerConn) idleExpired() {
-	sc.mu.Lock()
-	defer sc.mu.Unlock()
+	sc.lock()
+	defer sc.unlock()
 	if sc.closed || sc.goAway || len(sc.streams) > 0 || time.Since(sc.idleSince) < sc.handler.idleTimeout() {
 		return
 	}
@@ -568,16 +574,16 @@ func (sc *h2ServerConn) handleError(err error) {
 }
 
 func (sc *h2ServerConn) isClosed() bool {
-	sc.mu.Lock()
-	defer sc.mu.Unlock()
+	sc.lock()
+	defer sc.unlock()
 	return sc.closed
 }
 
 // fail ends the connection with GOAWAY.
 func (sc *h2ServerConn) fail(err *H2ConnError) {
-	sc.mu.Lock()
+	sc.lock()
 	if sc.closed {
-		sc.mu.Unlock()
+		sc.unlock()
 		return
 	}
 	sc.sendLocked(h2AppendGoAway(nil, sc.lastStreamID.Load(), err.Code, err.Reason))
@@ -585,7 +591,7 @@ func (sc *h2ServerConn) fail(err *H2ConnError) {
 	sc.goAway = true
 	sc.failBodiesLocked(err)
 	clear(sc.streams)
-	sc.mu.Unlock()
+	sc.unlock()
 	sc.closeAfterGoAway()
 }
 
@@ -610,7 +616,7 @@ func (sc *h2ServerConn) closeAfterGoAway() {
 // handler is told to do; see TunnelShutdownHandler.
 func (sc *h2ServerConn) retire() {
 	var tunnels []*TunnelFeed
-	sc.mu.Lock()
+	sc.lock()
 	if !sc.closed && !sc.goAway {
 		sc.goAway = true
 		sc.sendLocked(h2AppendGoAway(nil, sc.lastStreamID.Load(), H2NoError, ""))
@@ -621,7 +627,7 @@ func (sc *h2ServerConn) retire() {
 		}
 	}
 	sc.closeFinishedLocked()
-	sc.mu.Unlock()
+	sc.unlock()
 	// The handlers send from their calls, which takes the lock.
 	for _, feed := range tunnels {
 		feed.Shutdown()
@@ -648,13 +654,13 @@ func (sc *h2ServerConn) engineClose() {
 
 // shutdown is the connection closing underneath.
 func (sc *h2ServerConn) shutdown() {
-	sc.mu.Lock()
+	sc.lock()
 	sc.closed = true
 	sc.busyLocked()
 	sc.stopLivenessLocked()
 	sc.failBodiesLocked(net.ErrClosed)
 	clear(sc.streams)
-	sc.mu.Unlock()
+	sc.unlock()
 }
 
 func (sc *h2ServerConn) handleFrame(f *h2Frame) error {
@@ -705,9 +711,9 @@ func (sc *h2ServerConn) handleFrame(f *h2Frame) error {
 			}
 			out := h2AppendFrameHeader(nil, h2FramePing, h2FlagAck, 0, 8)
 			out = append(out, f.payload...)
-			sc.mu.Lock()
+			sc.lock()
 			sc.sendLocked(out)
-			sc.mu.Unlock()
+			sc.unlock()
 		} else if isBDPAck(f.payload) {
 			sc.bdpAck()
 		}
@@ -720,9 +726,9 @@ func (sc *h2ServerConn) handleFrame(f *h2Frame) error {
 			return h2ConnErr(H2FrameSizeError, "GOAWAY length %d", len(f.payload))
 		}
 		// The client opens nothing more; finish what is open, then close.
-		sc.mu.Lock()
+		sc.lock()
 		sc.peerGoingAway = true
-		sc.mu.Unlock()
+		sc.unlock()
 		sc.closeIfDone()
 		return nil
 	case h2FrameWindowUpdate:
@@ -740,9 +746,9 @@ func (sc *h2ServerConn) handleSettings(f *h2Frame) error {
 		if len(f.payload) != 0 {
 			return h2ConnErr(H2FrameSizeError, "SETTINGS ack with payload")
 		}
-		sc.mu.Lock()
+		sc.lock()
 		sc.settingsAckedLocked()
-		sc.mu.Unlock()
+		sc.unlock()
 		sc.local.settingsAck(sc.dec)
 		return nil
 	}
@@ -752,8 +758,8 @@ func (sc *h2ServerConn) handleSettings(f *h2Frame) error {
 		}
 	}
 	sc.settingsSeen = true
-	sc.mu.Lock()
-	defer sc.mu.Unlock()
+	sc.lock()
+	defer sc.unlock()
 	if err := sc.applySettingsLocked(f.payload); err != nil {
 		return err
 	}
@@ -773,8 +779,8 @@ func (sc *h2ServerConn) bdpAck() {
 	if window == 0 {
 		return
 	}
-	sc.mu.Lock()
-	defer sc.mu.Unlock()
+	sc.lock()
+	defer sc.unlock()
 	out, streamDelta, connDelta := sc.local.grow(window)
 	for _, st := range sc.streams {
 		st.recvWindow += streamDelta
@@ -836,8 +842,8 @@ func (sc *h2ServerConn) handleWindowUpdate(f *h2Frame) error {
 		return h2ConnErr(H2FrameSizeError, "WINDOW_UPDATE length %d", len(f.payload))
 	}
 	increment := int64(binary.BigEndian.Uint32(f.payload) & 0x7fffffff)
-	sc.mu.Lock()
-	defer sc.mu.Unlock()
+	sc.lock()
+	defer sc.unlock()
 	if f.streamID == 0 {
 		if increment == 0 {
 			return h2ConnErr(H2ProtocolError, "WINDOW_UPDATE of 0")
@@ -874,9 +880,9 @@ func (sc *h2ServerConn) handleRSTStream(f *h2Frame) error {
 	if len(f.payload) != 4 {
 		return h2ConnErr(H2FrameSizeError, "RST_STREAM length %d", len(f.payload))
 	}
-	sc.mu.Lock()
+	sc.lock()
 	if sc.idleLocked(f.streamID) {
-		sc.mu.Unlock()
+		sc.unlock()
 		return h2ConnErr(H2ProtocolError, "RST_STREAM on idle stream %d", f.streamID)
 	}
 	st := sc.streams[f.streamID]
@@ -884,7 +890,7 @@ func (sc *h2ServerConn) handleRSTStream(f *h2Frame) error {
 		sc.failBodyLocked(st, errH2RequestReset)
 		sc.forgetLocked(st)
 	}
-	sc.mu.Unlock()
+	sc.unlock()
 	sc.closeIfDone()
 	if st != nil {
 		return sc.resetCounted()
@@ -906,9 +912,9 @@ func (sc *h2ServerConn) handleData(f *h2Frame) error {
 	if b := sc.local.bdp; b != nil {
 		out = b.data(length)
 	}
-	sc.mu.Lock()
+	sc.lock()
 	if length > sc.recvWindow {
-		sc.mu.Unlock()
+		sc.unlock()
 		return h2ConnErr(H2FlowControlError, "DATA exceeds connection window")
 	}
 	sc.recvWindow -= length
@@ -926,7 +932,7 @@ func (sc *h2ServerConn) handleData(f *h2Frame) error {
 	}
 	out = sc.creditConnLocked(out, length-held)
 	sc.sendLocked(out)
-	sc.mu.Unlock()
+	sc.unlock()
 	if idle {
 		// Nothing has opened this stream: DATA on it is a connection error
 		// (RFC 9113 section 5.1).
@@ -975,9 +981,9 @@ func (sc *h2ServerConn) handleData(f *h2Frame) error {
 		increment := st.recvUnacked
 		st.recvWindow += increment
 		st.recvUnacked = 0
-		sc.mu.Lock()
+		sc.lock()
 		sc.sendLocked(h2AppendWindowUpdate(nil, st.id, uint32(increment)))
-		sc.mu.Unlock()
+		sc.unlock()
 	}
 	return nil
 }
@@ -1074,9 +1080,9 @@ func (sc *h2ServerConn) handleHeaderBlock(id uint32, block []byte, endStream boo
 		return h2ConnErr(H2CompressionError, "%v", err)
 	}
 
-	sc.mu.Lock()
+	sc.lock()
 	st := sc.streams[id]
-	sc.mu.Unlock()
+	sc.unlock()
 	if st != nil {
 		return sc.handleTrailers(st, fields, endStream, tooLarge)
 	}
@@ -1088,13 +1094,13 @@ func (sc *h2ServerConn) handleHeaderBlock(id uint32, block []byte, endStream boo
 	}
 	sc.maxClientID = id
 
-	sc.mu.Lock()
+	sc.lock()
 	switch {
 	case sc.closed || sc.goAway || sc.peerGoingAway:
-		sc.mu.Unlock()
+		sc.unlock()
 		return nil
 	case uint32(len(sc.streams))-sc.pushedStreams >= sc.maxStreams:
-		sc.mu.Unlock()
+		sc.unlock()
 		return &H2StreamError{StreamID: id, Code: H2RefusedStream}
 	}
 	st = sc.newStream(id)
@@ -1102,7 +1108,7 @@ func (sc *h2ServerConn) handleHeaderBlock(id uint32, block []byte, endStream boo
 	sc.streams[id] = st
 	sc.lastStreamID.Store(id)
 	sc.busyLocked()
-	sc.mu.Unlock()
+	sc.unlock()
 
 	if tooLarge {
 		sc.reject(st, stdhttp.StatusRequestHeaderFieldsTooLarge)
@@ -1160,9 +1166,9 @@ func (sc *h2ServerConn) handleHeaderBlock(id uint32, block []byte, endStream boo
 	// the handler runs: the read timeouts bound that too, from here, and go
 	// on bounding a body that then streams.
 	if at := streamBodyDeadline(config, time.Now()); !at.IsZero() {
-		sc.mu.Lock()
+		sc.lock()
 		sc.armReadTimerLocked(st, at)
-		sc.mu.Unlock()
+		sc.unlock()
 	}
 	if strings.EqualFold(req.Header.Get("Expect"), "100-continue") {
 		// The body is read, whole or up to the streaming threshold, before
@@ -1174,9 +1180,9 @@ func (sc *h2ServerConn) handleHeaderBlock(id uint32, block []byte, endStream boo
 }
 
 func (sc *h2ServerConn) handleTrailers(st *h2ServerStream, fields []hpack.HeaderField, endStream, tooLarge bool) error {
-	sc.mu.Lock()
+	sc.lock()
 	remoteDone := st.remoteDone
-	sc.mu.Unlock()
+	sc.unlock()
 	if remoteDone {
 		return &H2StreamError{StreamID: st.id, Code: H2StreamClosed}
 	}
@@ -1341,11 +1347,11 @@ func (sc *h2ServerConn) finishRequest(st *h2ServerStream) error {
 	}
 	// The stream's response has not all gone: one that has is forgotten by
 	// then, unless it is a tunnel's, whose DATA and trailers never get here.
-	sc.mu.Lock()
+	sc.lock()
 	st.remoteDone = true
 	// The body has all arrived in time.
 	sc.stopReadTimerLocked(st)
-	sc.mu.Unlock()
+	sc.unlock()
 	if st.req == nil {
 		// Rejected with its header: the answer has been sent.
 		return nil
@@ -1383,7 +1389,7 @@ func (sc *h2ServerConn) streamRequest(st *h2ServerStream, buffered, arrived []by
 	}
 	c := st.block.bind(sc.conn, nil)
 	c.stream = st
-	sc.mu.Lock()
+	sc.lock()
 	if st.recvUnacked > 0 {
 		sc.sendLocked(h2AppendWindowUpdate(nil, st.id, uint32(st.recvUnacked)))
 		st.recvWindow += st.recvUnacked
@@ -1406,7 +1412,7 @@ func (sc *h2ServerConn) streamRequest(st *h2ServerStream, buffered, arrived []by
 			sc.armReadTimerLocked(st, at)
 		}
 	}
-	sc.mu.Unlock()
+	sc.unlock()
 	_ = st.feed.Write(buffered)
 	_ = st.feed.Write(arrived)
 	bufferpool.Put(buffered)
@@ -1419,14 +1425,14 @@ func (sc *h2ServerConn) streamRequest(st *h2ServerStream, buffered, arrived []by
 // consumed it.
 func (sc *h2ServerConn) handleStreamedData(st *h2ServerStream, f *h2Frame) error {
 	length := int64(f.length)
-	sc.mu.Lock()
+	sc.lock()
 	if length > st.recvWindow {
-		sc.mu.Unlock()
+		sc.unlock()
 		return &H2StreamError{StreamID: f.streamID, Code: H2FlowControlError}
 	}
 	st.recvWindow -= length
 	st.recvUnacked += length - int64(len(f.payload))
-	sc.mu.Unlock()
+	sc.unlock()
 	if st.feed.Overruns(len(f.payload)) {
 		// Longer than its content-length (RFC 9113 section 8.1.1). The stream
 		// is reset in the same breath as the handler is told, so nothing it
@@ -1456,13 +1462,13 @@ func (sc *h2ServerConn) endStreamed(st *h2ServerStream, trailer stdhttp.Header) 
 		sc.resetStreamWith(st.id, H2ProtocolError, ErrBodyShort)
 		return nil
 	}
-	sc.mu.Lock()
+	sc.lock()
 	st.remoteDone = true
 	sc.stopReadTimerLocked(st)
 	if st.localDone {
 		sc.forgetLocked(st)
 	}
-	sc.mu.Unlock()
+	sc.unlock()
 	if err := st.feed.End(trailer); err != nil {
 		return &H2StreamError{StreamID: st.id, Code: H2ProtocolError}
 	}
@@ -1474,8 +1480,8 @@ func (sc *h2ServerConn) endStreamed(st *h2ServerStream, trailer stdhttp.Header) 
 // took, once the handler has consumed them: the stream's half a window at a
 // time, and the connection's as creditConnLocked has it.
 func (sc *h2ServerConn) creditBody(st *h2ServerStream, n int) {
-	sc.mu.Lock()
-	defer sc.mu.Unlock()
+	sc.lock()
+	defer sc.unlock()
 	skip := min(int64(n), st.creditSkip)
 	st.creditSkip -= skip
 	rest := int64(n) - skip
@@ -1557,12 +1563,12 @@ func (sc *h2ServerConn) armWriteTimeout(st *h2ServerStream) {
 	if d <= 0 {
 		return
 	}
-	sc.mu.Lock()
+	sc.lock()
 	if !sc.closed && sc.streams[st.id] == st {
 		st.refs.Add(1)
 		st.writeTimer = time.AfterFunc(d, st.writeTimedOut)
 	}
-	sc.mu.Unlock()
+	sc.unlock()
 }
 
 // setWriteDeadline replaces the clock armWriteTimeout started on st's
@@ -1571,8 +1577,8 @@ func (sc *h2ServerConn) armWriteTimeout(st *h2ServerStream) {
 // on its way to being reset, which it reports.
 func (st *h2ServerStream) setWriteDeadline(t time.Time) error {
 	sc := st.sc
-	sc.mu.Lock()
-	defer sc.mu.Unlock()
+	sc.lock()
+	defer sc.unlock()
 	if sc.closed || st.reset {
 		return st.closedErrLocked()
 	}
@@ -1611,8 +1617,8 @@ func (st *h2ServerStream) setWriteDeadline(t time.Time) error {
 // failed the body, or is about to, which it reports.
 func (st *h2ServerStream) setReadDeadline(t time.Time) error {
 	sc := st.sc
-	sc.mu.Lock()
-	defer sc.mu.Unlock()
+	sc.lock()
+	defer sc.unlock()
 	if sc.closed || st.reset {
 		return st.closedErrLocked()
 	}
@@ -1662,7 +1668,7 @@ func (sc *h2ServerConn) startReadTimerLocked(st *h2ServerStream, t time.Time) {
 func (st *h2ServerStream) readTimedOut() {
 	sc := st.sc
 	reset := false
-	sc.mu.Lock()
+	sc.lock()
 	if _, ok := sc.readTimers[st]; ok {
 		delete(sc.readTimers, st)
 		if !sc.closed && !st.reset && !st.remoteDone {
@@ -1673,7 +1679,7 @@ func (st *h2ServerStream) readTimedOut() {
 			}
 		}
 	}
-	sc.mu.Unlock()
+	sc.unlock()
 	if reset {
 		sc.resetStream(st.id, H2Cancel)
 	}
@@ -1707,7 +1713,7 @@ func (sc *h2ServerConn) stopWriteTimerLocked(st *h2ServerStream) {
 // see armWriteTimeout.
 func (st *h2ServerStream) writeTimedOut() {
 	sc := st.sc
-	sc.mu.Lock()
+	sc.lock()
 	if !sc.closed && sc.streams[st.id] == st {
 		st.writeTimer = nil
 		st.timedOut = true
@@ -1716,7 +1722,7 @@ func (st *h2ServerStream) writeTimedOut() {
 		sc.forgetLocked(st)
 		sc.closeFinishedLocked()
 	}
-	sc.mu.Unlock()
+	sc.unlock()
 	st.unref()
 }
 
@@ -1761,13 +1767,13 @@ func (sc *h2ServerConn) resetStream(id uint32, code H2ErrorCode) {
 // resetStreamWith is resetStream with the error the stream's body and
 // handler hear.
 func (sc *h2ServerConn) resetStreamWith(id uint32, code H2ErrorCode, err error) {
-	sc.mu.Lock()
+	sc.lock()
 	if st := sc.streams[id]; st != nil {
 		sc.failBodyLocked(st, err)
 		sc.forgetLocked(st)
 	}
 	sc.sendLocked(h2AppendRSTStream(nil, id, code))
-	sc.mu.Unlock()
+	sc.unlock()
 	sc.closeIfDone()
 }
 
@@ -1775,9 +1781,9 @@ func (sc *h2ServerConn) resetStreamWith(id uint32, code H2ErrorCode, err error) 
 // ended already, so that its client hears of it rather than waiting on it.
 func (st *h2ServerStream) abandon() {
 	sc := st.sc
-	sc.mu.Lock()
+	sc.lock()
 	live := !sc.closed && !st.reset && sc.streams[st.id] == st
-	sc.mu.Unlock()
+	sc.unlock()
 	if live {
 		sc.resetStream(st.id, H2InternalError)
 	}
@@ -1786,9 +1792,9 @@ func (st *h2ServerStream) abandon() {
 // closeIfDone closes a connection that is going away once its last stream
 // has finished.
 func (sc *h2ServerConn) closeIfDone() {
-	sc.mu.Lock()
+	sc.lock()
 	sc.closeFinishedLocked()
-	sc.mu.Unlock()
+	sc.unlock()
 }
 
 func (sc *h2ServerConn) closeFinishedLocked() {
@@ -1807,9 +1813,9 @@ func (sc *h2ServerConn) closeFinishedLocked() {
 		// connection here too and leaves the wait with nothing to do.
 		sc.closeScheduled = true
 		time.AfterFunc(h2PeerGoAwayGrace, func() {
-			sc.mu.Lock()
+			sc.lock()
 			sc.closed = true
-			sc.mu.Unlock()
+			sc.unlock()
 			sc.closeAfterGoAway()
 		})
 		return
@@ -1821,70 +1827,219 @@ func (sc *h2ServerConn) closeFinishedLocked() {
 // respond sends a response on the stream. Its body goes out as flow control
 // allows; what does not fit yet waits for the client's WINDOW_UPDATE. A body
 // that is the request's own is copied where it would wait past the handler's
-// return, as HTTP/1's send copies one; see the slow path below.
+// return, as HTTP/1's send copies one; see the slow path of answerLocked.
 //
 // owned, when it is not nil, is response.Body as a buffer from package
 // bufferpool, which the call takes over. Framing copies the body, so the
-// buffer goes back to the pool before the call returns, unless the windows
-// keep some of it back: the stream then holds that tail past the call, with
-// no room left in it to remember the buffer, and the collector frees it.
+// buffer goes back to the pool once it is framed, unless the windows keep
+// some of it back: the stream then holds that tail, with no room left in it
+// to remember the buffer, and the collector frees it.
+//
+// A response that finds the connection's mu taken does not wait for it: it
+// is queued for whoever holds mu to send as it lets go; see postAnswer. What
+// the stream or the connection has come to by then is then the holder's to
+// meet, and the call reports nothing of it, as a send the socket took reports
+// nothing of a client that went away after.
 func (st *h2ServerStream) respond(req *stdhttp.Request, response Response, owned []byte) error {
-	keep := false
-	defer func() {
-		if !keep {
-			bufferpool.Put(owned)
-		}
-	}()
 	status := response.StatusCode
 	if status < 200 || status > 999 {
 		// Interim responses go through writeInterim.
+		bufferpool.Put(owned)
 		return fmt.Errorf("http: invalid status code %d", status)
 	}
-	bodyAllowed := status != stdhttp.StatusNoContent && status != stdhttp.StatusNotModified
-	body := response.Body
-	if !bodyAllowed || req.Method == stdhttp.MethodHead {
-		body = nil
-	}
 	if err := h2CheckHeader(response.Header); err != nil {
+		bufferpool.Put(owned)
 		return err
 	}
-
+	r := h2Answer{st: st, status: status, header: response.Header, body: response.Body, owned: owned, close: response.Close}
+	r.bodyAllowed = status != stdhttp.StatusNoContent && status != stdhttp.StatusNotModified
+	if r.bodyAllowed {
+		r.length = responseLength(req, response)
+	}
+	if !r.bodyAllowed || req.Method == stdhttp.MethodHead {
+		r.body = nil
+	} else {
+		r.trailer = h2Trailer(response.Trailer)
+		r.within = st.block.BodyWithin(r.body)
+	}
 	sc := st.sc
+	if !sc.mu.TryLock() {
+		sc.postAnswer(&r)
+		return nil
+	}
+	err := sc.answerLocked(&r)
+	sc.unlock()
+	return err
+}
+
+// h2Answer is a response sent whole, as respond takes it apart: from the
+// caller's arguments while it sends at once, and from a copy of its own,
+// pooled, while it waits in the connection's answers; see postAnswer. header
+// is the caller's header, or nil once fields holds what is sent of it, by
+// name and value in turn. within says body is the request's own; see
+// StreamRequest.BodyWithin.
+type h2Answer struct {
+	st          *h2ServerStream
+	next        *h2Answer
+	status      int
+	bodyAllowed bool
+	close       bool
+	within      bool
+	length      int64
+	header      stdhttp.Header
+	fields      []string
+	body        []byte
+	owned       []byte
+	trailer     stdhttp.Header
+}
+
+var h2AnswerPool = sync.Pool{New: func() any { return new(h2Answer) }}
+
+// h2MaxAnswerFields is how many names and values a pooled h2Answer keeps room
+// for once its response has gone; a larger header's array goes with it.
+const h2MaxAnswerFields = 64
+
+// postAnswer queues r, which found mu taken, for whoever holds mu to send as
+// it lets go of it, rather than waiting for mu: with many streams a
+// connection, the handlers answering them at once would otherwise queue on
+// mu one behind another, each parked while the ones before it send. What r
+// borrows from the caller past the call is copied: the fields of its header,
+// whose map the caller may reuse, and a body that is the request's own, which
+// the server takes back once the handler returns. The queue holds a
+// reference to the stream until the response is sent. It is bounded by the
+// streams the connection has open, which answer once each.
+//
+// The holder sends what is queued before it lets go, in unlock, and looks
+// again once it has: an answer queued after it last looked found mu still
+// taken, by it or by whoever took mu next, and is sent by them. Every lock
+// of mu sends what is queued first, so a handler that goes on to touch its
+// stream finds its response sent.
+func (sc *h2ServerConn) postAnswer(r *h2Answer) {
+	q := h2AnswerPool.Get().(*h2Answer)
+	fields := q.fields[:0]
+	*q = *r
+	q.header, q.fields = nil, h2AppendFields(fields, r.header)
+	if q.within {
+		q.owned = bufferpool.Get(len(q.body))
+		copy(q.owned, q.body)
+		q.body = q.owned
+		q.within = false
+	}
+	q.st.refs.Add(1)
+	for {
+		head := sc.answers.Load()
+		q.next = head
+		if sc.answers.CompareAndSwap(head, q) {
+			break
+		}
+	}
+	if sc.mu.TryLock() {
+		sc.unlock()
+	}
+}
+
+// sendAnswersLocked sends the answers postAnswer queued, in the order they
+// came. Callers hold mu.
+func (sc *h2ServerConn) sendAnswersLocked() {
+	var q *h2Answer
+	for r := sc.answers.Swap(nil); r != nil; {
+		next := r.next
+		r.next, q = q, r
+		r = next
+	}
+	for q != nil {
+		next := q.next
+		st := q.st
+		_ = sc.answerLocked(q)
+		st.unref()
+		fields := q.fields
+		clear(fields)
+		if cap(fields) > h2MaxAnswerFields {
+			fields = nil
+		}
+		*q = h2Answer{fields: fields[:0]}
+		h2AnswerPool.Put(q)
+		q = next
+	}
+}
+
+// lock takes mu and sends what postAnswer queued meanwhile.
+func (sc *h2ServerConn) lock() {
 	sc.mu.Lock()
-	defer sc.mu.Unlock()
+	if sc.answers.Load() != nil {
+		sc.sendAnswersLocked()
+	}
+}
+
+// unlock sends what postAnswer queued and lets go of mu, then takes it again
+// for any answer queued while it did, unless another holder has taken it, who
+// sends that answer instead.
+func (sc *h2ServerConn) unlock() {
+	for {
+		if sc.answers.Load() != nil {
+			sc.sendAnswersLocked()
+		}
+		sc.mu.Unlock()
+		if sc.answers.Load() == nil || !sc.mu.TryLock() {
+			return
+		}
+	}
+}
+
+// h2ConnLock is a connection as the Locker the conditions its writers wait on
+// wait with, which locks and unlocks mu as lock and unlock do.
+type h2ConnLock h2ServerConn
+
+func (l *h2ConnLock) Lock()   { (*h2ServerConn)(l).lock() }
+func (l *h2ConnLock) Unlock() { (*h2ServerConn)(l).unlock() }
+
+// answerLocked sends r, giving r.owned back unless the stream keeps some of
+// it. Callers hold mu.
+func (sc *h2ServerConn) answerLocked(r *h2Answer) error {
+	st := r.st
+	keep := false
+	defer func() {
+		if !keep {
+			bufferpool.Put(r.owned)
+		}
+	}()
 	if sc.closed || st.reset {
 		return st.closedErrLocked()
 	}
 	if st.responded {
 		return errors.New("http: response already written")
 	}
-	var trailer stdhttp.Header
-	if bodyAllowed && req.Method != stdhttp.MethodHead {
-		trailer = h2Trailer(response.Trailer)
-	}
+	body, owned := r.body, r.owned
 	if sc.limitsHeaderListLocked() {
-		size := h2FieldSize(":status", "200") + h2HeaderSize(response.Header)
-		if bodyAllowed {
-			size += h2FieldSize("content-length", sc.lengthLocked(responseLength(req, response)))
+		size := h2FieldSize(":status", "200") + r.headerSize()
+		if r.bodyAllowed {
+			size += h2FieldSize("content-length", sc.lengthLocked(r.length))
 		}
-		if size > sc.peerMaxHeaderList || h2HeaderSize(trailer) > sc.peerMaxHeaderList {
+		if size > sc.peerMaxHeaderList || h2HeaderSize(r.trailer) > sc.peerMaxHeaderList {
 			return sc.refuseHeaderLocked(st)
 		}
 	}
 	st.responded = true
 
 	block := sc.enc.Begin(sc.headerBlock[:0])
-	block = sc.enc.AppendField(block, ":status", h2Status(status), false)
-	if bodyAllowed {
-		block = sc.enc.AppendField(block, "content-length", sc.lengthLocked(responseLength(req, response)), false)
+	block = sc.enc.AppendField(block, ":status", h2Status(r.status), false)
+	if r.bodyAllowed {
+		block = sc.enc.AppendField(block, "content-length", sc.lengthLocked(r.length), false)
 	}
-	block = sc.appendHeaderLocked(block, response.Header)
-	st.trailer = trailer
+	if r.header != nil {
+		block = sc.appendHeaderLocked(block, r.header)
+	} else {
+		for i := 0; i+1 < len(r.fields); i += 2 {
+			name := r.fields[i]
+			block = sc.enc.AppendField(block, name, r.fields[i+1], name == "set-cookie" || name == "authorization")
+		}
+	}
+	st.trailer = r.trailer
 	// Framed in one buffer from the pool: the header block, and as much of
 	// the body as the windows let go now, each behind its frame headers.
 	sendable := sc.sendableLocked(st, int64(len(body)), nil)
 	if sendable == int64(len(body)) && sendable > 0 && sendable <= int64(sc.peerMaxFrame) &&
-		st.trailer == nil && st.out == nil && sc.conn.Layer() == nil && !(response.Close && !sc.goAway) {
+		st.trailer == nil && st.out == nil && sc.conn.Layer() == nil && !(r.close && !sc.goAway) {
 		// The whole body goes in one frame and the connection has no layer:
 		// the body is handed to it beside the frames rather than joined
 		// after them, which copies it into the queue once instead of twice.
@@ -1900,7 +2055,7 @@ func (st *h2ServerStream) respond(req *stdhttp.Request, response Response, owned
 		st.localDone = true
 		// SendParts copies the body into the queue or the socket, unless
 		// the connection may keep it as it is.
-		sc.sendPooledPartsLocked(out, body, owned == nil && len(body) > maxCopiedResponseBody && !st.block.BodyWithin(body))
+		sc.sendPooledPartsLocked(out, body, owned == nil && len(body) > maxCopiedResponseBody && !r.within)
 		sc.finishStreamLocked(st)
 		sc.closeFinishedLocked()
 		return nil
@@ -1908,7 +2063,7 @@ func (st *h2ServerStream) respond(req *stdhttp.Request, response Response, owned
 	// A whole body the connection has no layer to transform, and which
 	// neither the request nor the pool will take back, is sent beside its
 	// frames, as the connection may keep it; see sendSharedLocked.
-	st.shared = owned == nil && sc.conn.Layer() == nil && !st.block.BodyWithin(body)
+	st.shared = owned == nil && sc.conn.Layer() == nil && !r.within
 	size := len(block) + h2FrameHeaderLen*(1+len(block)/sc.peerMaxFrame)
 	if sendable > 0 {
 		size += h2FrameHeaderLen * (1 + int(sendable)/sc.peerMaxFrame)
@@ -1924,7 +2079,7 @@ func (st *h2ServerStream) respond(req *stdhttp.Request, response Response, owned
 	} else {
 		st.pending = body
 		out = sc.flushStreamLocked(out, st)
-		if len(st.pending) > 0 && st.block.BodyWithin(body) {
+		if len(st.pending) > 0 && r.within {
 			// What the windows kept back waits here past the handler's return,
 			// when the server takes the request's buffer back: the body is the
 			// request's own, as Context.Body is, so what is left of it is
@@ -1937,7 +2092,7 @@ func (st *h2ServerStream) respond(req *stdhttp.Request, response Response, owned
 		// kept back is the body's own tail still, unless it was copied.
 		keep = len(st.pending) > 0 && &st.pending[len(st.pending)-1] == &body[len(body)-1]
 	}
-	if response.Close && !sc.goAway {
+	if r.close && !sc.goAway {
 		// HTTP/2 cannot close one request's connection under the others, so
 		// Close retires it gracefully: nothing new is taken, what is open
 		// finishes, and then the connection closes.
@@ -2035,6 +2190,34 @@ func (sc *h2ServerConn) appendHeaderLocked(block []byte, header stdhttp.Header) 
 	return block
 }
 
+// h2AppendFields appends to fields the names and values appendHeaderLocked
+// would encode from header, in turn, for an answer that encodes them later;
+// see postAnswer.
+func h2AppendFields(fields []string, header stdhttp.Header) []string {
+	for key, values := range header {
+		name := h2LowerKey(key)
+		if h2ConnectionHeaders[name] || name == "content-length" {
+			continue
+		}
+		for _, value := range values {
+			fields = append(fields, name, value)
+		}
+	}
+	return fields
+}
+
+// headerSize is h2HeaderSize of the header r sends.
+func (r *h2Answer) headerSize() int64 {
+	if r.header != nil {
+		return h2HeaderSize(r.header)
+	}
+	var size int64
+	for i := 0; i+1 < len(r.fields); i += 2 {
+		size += h2FieldSize(r.fields[i], r.fields[i+1])
+	}
+	return size
+}
+
 // h2HeaderSize is the size of the header list appendHeaderLocked encodes
 // from header, as SETTINGS_MAX_HEADER_LIST_SIZE measures it.
 func h2HeaderSize(header stdhttp.Header) int64 {
@@ -2080,8 +2263,8 @@ func (st *h2ServerStream) writeInterim(status int, header stdhttp.Header) error 
 		return err
 	}
 	sc := st.sc
-	sc.mu.Lock()
-	defer sc.mu.Unlock()
+	sc.lock()
+	defer sc.unlock()
 	if sc.closed || st.reset {
 		return st.closedErrLocked()
 	}
@@ -2324,8 +2507,8 @@ func (sc *h2ServerConn) armDrainLocked() {
 // the connection's queue, now that the socket has taken most of it, unless
 // the connection has ended.
 func (sc *h2ServerConn) drained(err error) {
-	sc.mu.Lock()
-	defer sc.mu.Unlock()
+	sc.lock()
+	defer sc.unlock()
 	sc.drainArmed = false
 	if err != nil || sc.closed || sc.sendHead == len(sc.sendQueue) {
 		return
