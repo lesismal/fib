@@ -701,6 +701,10 @@ type Config struct {
 	// recvfrom, sendto and sendmsg rather than read, write and writev. This
 	// backend reads and writes through the net package, and ignores it.
 	SocketSyscalls bool
+	// BlockingWait has a Linux engine's event loops wait for events blocked
+	// in epoll_wait rather than parked in the runtime's network poller. This
+	// backend has no loops, and ignores it.
+	BlockingWait bool
 	// TaskPoolMode picks the scheduler the workers run under. Prefer
 	// SetTaskPoolMode over assigning it, so that WorkerCount and MaxEvents
 	// follow the mode rather than staying at numbers tuned for the other one.

@@ -139,6 +139,7 @@ type Engine struct {
 	pollBatchSize      int // see Config.PollBatchSize
 	useWritev          bool
 	socketSyscalls     bool // see Config.SocketSyscalls
+	blockingWait       bool // see Config.BlockingWait
 	coalesceWrites     bool // see Config.CoalesceWrites
 	writeHighWatermark int
 	writeLowWatermark  int
@@ -315,6 +316,7 @@ func newEngine(config Config, bindings []Binding) (*Engine, error) {
 		acceptPlacement:    config.AcceptPlacement,
 		useWritev:          config.UseWritev,
 		socketSyscalls:     config.SocketSyscalls,
+		blockingWait:       config.BlockingWait,
 		coalesceWrites:     config.CoalesceWrites,
 		writeHighWatermark: config.WriteBufferHighWatermark,
 		// Resume at a quarter of the budget rather than at the budget itself,
@@ -374,7 +376,7 @@ func (e *Engine) openPollers(config Config) error {
 	for i := 0; i < n; i++ {
 		p := &Engine{parent: e, name: e.name, logStatus: e.logStatus, logSettings: e.logSettings, maxEvents: e.maxEvents, bindConfig: config, configCustom: e.configCustom,
 			pollBatchSize: e.pollBatchSize, useWritev: e.useWritev,
-			socketSyscalls: e.socketSyscalls, coalesceWrites: e.coalesceWrites,
+			socketSyscalls: e.socketSyscalls, blockingWait: e.blockingWait, coalesceWrites: e.coalesceWrites,
 			writeHighWatermark: e.writeHighWatermark,
 			writeLowWatermark:  e.writeLowWatermark, maxPendingBytes: e.maxPendingBytes,
 			budgetResumeBytes: e.budgetResumeBytes, writeQueueLimit: e.writeQueueLimit, sendBufferSize: e.sendBufferSize,
@@ -1318,6 +1320,27 @@ type Config struct {
 	// reaches the socket calls only through socketcall, nor in a race, memory
 	// or address sanitizer build.
 	SocketSyscalls bool
+	// BlockingWait has each epoll event loop wait for events blocked in
+	// epoll_wait, rather than parked in the runtime's network poller (see
+	// epollWaiter), whenever it finds none ready. Parked, a loop gives its P
+	// up at once, but the runtime looks for its events only when a P runs
+	// out of work, or every 10ms, so on a busy server the loop learns of
+	// them late, and the requests it serves wait with them. Blocked, the
+	// kernel wakes the loop as soon as an event arrives, and the runtime
+	// takes back the P it holds once the call has lasted one of its
+	// monitor's ticks while other goroutines wait for one.
+	//
+	// fit proxying a JSON API to nginx on 6 CPUs (500 connections, 200,000
+	// requests a second, HTTP/1.1) answered with its 99th percentile at
+	// 2.96-3.85ms blocked against 4.70-5.32ms parked, and the 99.9th at
+	// 4.43-5.69ms against 6.09-7.13ms; at 30,000 a second it spent 5% less
+	// CPU a request over HTTP/1.1 and 12% less over h2, without the relay
+	// armed and disarmed around every wait. Parking keeps an edge at
+	// saturation, where a blocked loop's P waits for the monitor: the same
+	// proxy unpaced served h2 0.9% slower blocked, HTTP/1.1 the same; and
+	// with one P, or a loop woken once for every connection it accepts; see
+	// epollWaiter. Only Linux honours it.
+	BlockingWait bool
 	// TaskPoolMode picks the scheduler the workers run under. Prefer
 	// SetTaskPoolMode over assigning it, so that WorkerCount and MaxEvents
 	// follow the mode rather than staying at numbers tuned for the other one.

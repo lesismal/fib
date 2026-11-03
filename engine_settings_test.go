@@ -63,6 +63,7 @@ func TestEngineSettings(t *testing.T) {
 		"coalesceWrites=true",
 		"useWritev=true",
 		"socketSyscalls=true",
+		"blockingWait=false",
 		"udpIdleTimeout=1m0s",
 		"logStatus=false",
 		"logSettings=true",

@@ -84,7 +84,11 @@ func (e *Engine) runLoop() error {
 	events := make([]syscall.EpollEvent, batch)
 	var ready []*Connection
 	var tasks []taskpool.Task
-	waiter := newEpollWaiter(e.epollFD)
+	// A nil waiter blocks in epoll_wait; see Config.BlockingWait.
+	var waiter *epollWaiter
+	if !e.blockingWait {
+		waiter = newEpollWaiter(e.epollFD)
+	}
 	defer waiter.close()
 	for !e.stopping.Load() {
 		n, err := waiter.wait(e.epollFD, events)
@@ -202,7 +206,8 @@ func (e *Engine) runLoop() error {
 // the kernel walk every descriptor it holds.
 //
 // Where the relay cannot be set up, wait blocks in epoll_wait as the loop
-// always did.
+// always did, as every loop does with Config.BlockingWait, which trades
+// these for a loop that hears of its events at once on a busy server.
 type epollWaiter struct {
 	file *os.File
 	conn syscall.RawConn

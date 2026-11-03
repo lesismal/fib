@@ -30,6 +30,7 @@ type Settings struct {
 	UseWritev                bool
 	CoalesceWrites           bool
 	SocketSyscalls           bool
+	BlockingWait             bool
 	TaskPool                 string
 	TaskPoolMode             taskpool.Mode
 	MinWorkerCount           int
@@ -78,6 +79,7 @@ func (e *Engine) Settings() Settings {
 		UseWritev:                c.UseWritev,
 		CoalesceWrites:           c.CoalesceWrites,
 		SocketSyscalls:           c.SocketSyscalls,
+		BlockingWait:             c.BlockingWait,
 		TaskPool:                 pool,
 		TaskPoolMode:             c.TaskPoolMode,
 		MinWorkerCount:           c.MinWorkerCount,
@@ -109,8 +111,8 @@ func (s Settings) String() string {
 		s.TaskPool, s.TaskPoolMode, s.MinWorkerCount, s.SharedTaskPool)
 	fmt.Fprintf(&b, "ioPollers=%t ioPollerCount=%d pollers=%d engineLoop=%t reusePort=%t balanceReusePort=%t ",
 		s.IOPollers, s.IOPollerCount, s.Pollers, s.EngineLoop, s.ReusePort, s.BalanceReusePort)
-	fmt.Fprintf(&b, "accept=%s coalesceWrites=%t useWritev=%t socketSyscalls=%t udpIdleTimeout=%s logStatus=%t logSettings=%t",
-		s.AcceptPlacement, s.CoalesceWrites, s.UseWritev, s.SocketSyscalls, s.UDPIdleTimeout, s.LogStatus, s.LogSettings)
+	fmt.Fprintf(&b, "accept=%s coalesceWrites=%t useWritev=%t socketSyscalls=%t blockingWait=%t udpIdleTimeout=%s logStatus=%t logSettings=%t",
+		s.AcceptPlacement, s.CoalesceWrites, s.UseWritev, s.SocketSyscalls, s.BlockingWait, s.UDPIdleTimeout, s.LogStatus, s.LogSettings)
 	return b.String()
 }
 
@@ -157,6 +159,7 @@ func (s Settings) Parameters() []Parameter {
 		{"useWritev", boolValue(s.UseWritev), source("useWritev"), "send several buffers in one writev where the platform has it"},
 		{"coalesceWrites", boolValue(s.CoalesceWrites), source("coalesceWrites"), "cork a read round's replies and write them together"},
 		{"socketSyscalls", boolValue(s.SocketSyscalls), source("socketSyscalls"), "read and write with recvfrom and sendto rather than read and write"},
+		{"blockingWait", boolValue(s.BlockingWait), source("blockingWait"), "loops wait blocked in epoll_wait rather than parked in the runtime's poller"},
 		{"taskPool", s.TaskPool, source("taskPool"), "the pool connections run on; built from the settings unless supplied"},
 		{"taskPoolMode", s.TaskPoolMode.String(), source("taskPoolMode"), "how the pool grows and shrinks: elastic, adaptive or inline"},
 		{"minWorkers", intValue(int64(s.MinWorkerCount)), source("minWorkers"), "resident workers an adaptive pool retires down to; zero retires all"},
@@ -202,6 +205,7 @@ func customConfig(c Config) map[string]bool {
 	set("useWritev", c.UseWritev != base.UseWritev)
 	set("coalesceWrites", c.CoalesceWrites != base.CoalesceWrites)
 	set("socketSyscalls", c.SocketSyscalls != base.SocketSyscalls)
+	set("blockingWait", c.BlockingWait != base.BlockingWait)
 	set("taskPool", c.TaskPool != nil)
 	set("taskPoolMode", c.TaskPoolMode != 0 && c.TaskPoolMode != base.TaskPoolMode)
 	set("minWorkers", c.MinWorkerCount != 0)

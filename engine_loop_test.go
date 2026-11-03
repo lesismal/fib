@@ -405,3 +405,32 @@ func TestAcceptPlacementLogged(t *testing.T) {
 		})
 	}
 }
+
+// With BlockingWait every loop, the engine's and its pollers', waits in
+// epoll_wait rather than on the relay, and serves the same.
+func TestBlockingWaitServes(t *testing.T) {
+	config := pollerConfig("blocking-wait", 3)
+	config.BlockingWait = true
+	server, err := New(config, Binding{Addr: "127.0.0.1:0", Handler: prefixEcho("b:")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	runEngine(t, server)
+	if !server.blockingWait || !server.Settings().BlockingWait {
+		t.Fatal("the engine does not block in its waits")
+	}
+	for i, p := range server.pollers {
+		if !p.blockingWait {
+			t.Fatalf("poller %d does not block in its waits", i)
+		}
+	}
+	addrs, err := server.BindingAddrs(0)
+	if err != nil || len(addrs) != 1 {
+		t.Fatalf("BindingAddrs(0) = %v, %v", addrs, err)
+	}
+	for round := 0; round < 200; round++ {
+		if got := exchange(t, addrs[0], "ping"); got != "b:ping" {
+			t.Fatalf("round %d answered %q", round, got)
+		}
+	}
+}
