@@ -264,7 +264,11 @@ func TestH2ServerFloodLimitsFollowConfig(t *testing.T) {
 // client end its connection with GOAWAY(ENHANCE_YOUR_CALM) and fail the
 // request on it with that connection error.
 func TestH2ClientEndsServerFloods(t *testing.T) {
-	const past = DefaultControlFrameBurst + 100
+	// The bucket refills at DefaultControlFrameRate a second, for as long
+	// as the client takes over the flood: past what it can give back in the
+	// 10 seconds the request has (see cvH2cClient), so that a runner slow
+	// to read the frames still runs out, rather than refilling as it goes.
+	const past = DefaultControlFrameBurst + DefaultControlFrameRate*10 + 100
 	for _, tt := range []struct {
 		name  string
 		flood func(p *cvH2cPeer, id uint32) []byte
