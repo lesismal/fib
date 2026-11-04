@@ -96,7 +96,7 @@ func (st *h2ServerStream) push(parent *stdhttp.Request, target string, opts *std
 		sc.unlock()
 		return ErrPushLimit
 	case sc.limitsHeaderListLocked() && h2FieldSize(":method", method)+h2FieldSize(":scheme", scheme)+
-		h2FieldSize(":authority", authority)+h2FieldSize(":path", path)+h2HeaderSize(header) > sc.peerMaxHeaderList:
+		h2FieldSize(":authority", authority)+h2FieldSize(":path", path)+h2HeaderSize(header) > sc.peerMaxHeaderList.Load():
 		// The promised request is a header list the client takes too.
 		sc.unlock()
 		return errH2HeaderListTooLarge

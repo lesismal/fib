@@ -276,6 +276,9 @@ func TestClientHTTP2StreamCloseKeepsConnection(t *testing.T) {
 func TestClientHTTP2StreamTimeoutMidBody(t *testing.T) {
 	release := make(chan struct{})
 	ts, _, tlsConfig := newH2TestServer(t, func(w stdhttp.ResponseWriter, r *stdhttp.Request) {
+		if r.URL.Path == "/warm" {
+			return
+		}
 		_, _ = w.Write([]byte("start"))
 		w.(stdhttp.Flusher).Flush()
 		select {
@@ -289,10 +292,23 @@ func TestClientHTTP2StreamTimeoutMidBody(t *testing.T) {
 	config.Timeout = 300 * time.Millisecond
 	client := newTestClient(t, config)
 
+	// Timeout bounds the dial and the TLS handshake too, which a loaded
+	// runner can take longer than it over: the connection is made first, so
+	// that the request below spends its time waiting mid-body.
+	for i := 0; ; i++ {
+		resp, err := client.Go(mustRequest(t, "GET", ts.URL+"/warm", nil)).Wait()
+		if err == nil {
+			readBody(t, resp)
+			break
+		}
+		if i == 20 {
+			t.Fatalf("no connection: %v", err)
+		}
+	}
 	var run streamRun
 	run.run(t, client, mustRequest(t, "GET", ts.URL, nil))
 	if !errors.Is(run.err, os.ErrDeadlineExceeded) || string(run.data) != "start" || run.fins != 1 {
-		t.Fatalf("err %v, data %q, fins %d", run.err, run.data, run.fins)
+		t.Fatalf("err %v, call err %v, data %q, fins %d", run.err, run.callErr, run.data, run.fins)
 	}
 }
 

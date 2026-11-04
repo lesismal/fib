@@ -137,7 +137,7 @@ type h2ServerConn struct {
 	// peerMaxHeaderList is the largest header list the client said it would
 	// take, with SETTINGS_MAX_HEADER_LIST_SIZE, or math.MaxInt64 for no
 	// limit, which is what it is until the client says otherwise.
-	peerMaxHeaderList int64
+	peerMaxHeaderList atomic.Int64
 	sendWindow        int64
 	// sendQueue holds the streams whose pending bytes the windows keep back,
 	// in the order they take turns at the connection's window, from
@@ -349,25 +349,24 @@ func newH2ServerConn(h *ServerHandler, c *fib.Connection, remoteAddr string) *h2
 	enc := hpack.NewEncoder()
 	local.encoderLimit(enc)
 	sc := &h2ServerConn{
-		handler:           h,
-		conn:              c,
-		remoteAddr:        remoteAddr,
-		maxStreams:        maxStreams,
-		dec:               dec,
-		recvWindow:        local.connWindow,
-		local:             local,
-		streams:           make(map[uint32]*h2ServerStream),
-		enc:               enc,
-		peerMaxFrame:      h2DefaultMaxFrameSize,
-		peerWindow:        h2DefaultWindow,
-		sendWindow:        h2DefaultWindow,
-		peerMaxHeaderList: math.MaxInt64,
-		pushEnabled:       true,
-		nextPushID:        2,
-		peerMaxPush:       math.MaxUint32,
-		flushPool:         handlerPool(c),
-		reuseStreams:      h.config.ReuseRequests && h.config.ReuseURLs && h.config.ReuseContexts,
-		reuseHeaders:      h.config.ReuseHeaders,
+		handler:      h,
+		conn:         c,
+		remoteAddr:   remoteAddr,
+		maxStreams:   maxStreams,
+		dec:          dec,
+		recvWindow:   local.connWindow,
+		local:        local,
+		streams:      make(map[uint32]*h2ServerStream),
+		enc:          enc,
+		peerMaxFrame: h2DefaultMaxFrameSize,
+		peerWindow:   h2DefaultWindow,
+		sendWindow:   h2DefaultWindow,
+		pushEnabled:  true,
+		nextPushID:   2,
+		peerMaxPush:  math.MaxUint32,
+		flushPool:    handlerPool(c),
+		reuseStreams: h.config.ReuseRequests && h.config.ReuseURLs && h.config.ReuseContexts,
+		reuseHeaders: h.config.ReuseHeaders,
 		maxContFrames: h2MaxContinuations(h.config.MaxContinuationFrames,
 			DefaultMaxContinuationFrames),
 		resets: h2NewBudget(h.config.StreamResetBurst, h.config.StreamResetRate,
@@ -375,6 +374,7 @@ func newH2ServerConn(h *ServerHandler, c *fib.Connection, remoteAddr string) *h2
 		glitches: h2NewBudget(h.config.ControlFrameBurst, h.config.ControlFrameRate,
 			DefaultControlFrameBurst, DefaultControlFrameRate),
 	}
+	sc.peerMaxHeaderList.Store(math.MaxInt64)
 	sc.flusher.sc = sc
 	sc.gate.ownFlush = true
 	return sc
@@ -821,7 +821,7 @@ func (sc *h2ServerConn) applySettingsLocked(payload []byte) error {
 			}
 			sc.peerMaxFrame = int(value)
 		case h2SettingMaxHeaderListSize:
-			sc.peerMaxHeaderList = int64(value)
+			sc.peerMaxHeaderList.Store(int64(value))
 		}
 		return nil
 	})
@@ -1839,7 +1839,9 @@ func (sc *h2ServerConn) closeFinishedLocked() {
 // is queued for whoever holds mu to send as it lets go; see postAnswer. What
 // the stream or the connection has come to by then is then the holder's to
 // meet, and the call reports nothing of it, as a send the socket took reports
-// nothing of a client that went away after.
+// nothing of a client that went away after. One with a header or trailer
+// larger than the client's SETTINGS_MAX_HEADER_LIST_SIZE is not queued but
+// waits for mu, and reports errH2HeaderListTooLarge as it would have.
 func (st *h2ServerStream) respond(req *stdhttp.Request, response Response, owned []byte) error {
 	status := response.StatusCode
 	if status < 200 || status > 999 {
@@ -1864,8 +1866,13 @@ func (st *h2ServerStream) respond(req *stdhttp.Request, response Response, owned
 	}
 	sc := st.sc
 	if !sc.mu.TryLock() {
-		sc.postAnswer(&r)
-		return nil
+		if r.fits(sc.peerMaxHeaderList.Load()) {
+			sc.postAnswer(&r)
+			return nil
+		}
+		// One the client would refuse waits for mu instead, so that the
+		// handler hears it was refused, as it does when mu was free.
+		sc.lock()
 	}
 	err := sc.answerLocked(&r)
 	sc.unlock()
@@ -2010,14 +2017,8 @@ func (sc *h2ServerConn) answerLocked(r *h2Answer) error {
 		return errors.New("http: response already written")
 	}
 	body, owned := r.body, r.owned
-	if sc.limitsHeaderListLocked() {
-		size := h2FieldSize(":status", "200") + r.headerSize()
-		if r.bodyAllowed {
-			size += h2FieldSize("content-length", sc.lengthLocked(r.length))
-		}
-		if size > sc.peerMaxHeaderList || h2HeaderSize(r.trailer) > sc.peerMaxHeaderList {
-			return sc.refuseHeaderLocked(st)
-		}
+	if !r.fits(sc.peerMaxHeaderList.Load()) {
+		return sc.refuseHeaderLocked(st)
 	}
 	st.responded = true
 
@@ -2207,6 +2208,22 @@ func h2AppendFields(fields []string, header stdhttp.Header) []string {
 }
 
 // headerSize is h2HeaderSize of the header r sends.
+// fits reports whether r's header and trailer are each a header list no
+// larger than limit, the client's SETTINGS_MAX_HEADER_LIST_SIZE, as
+// answerLocked would send them. It reads nothing of the connection's, so
+// respond asks it before queuing r without mu.
+func (r *h2Answer) fits(limit int64) bool {
+	if limit == math.MaxInt64 {
+		return true
+	}
+	size := h2FieldSize(":status", "200") + r.headerSize()
+	if r.bodyAllowed {
+		var digits [20]byte
+		size += int64(len("content-length")+len(strconv.AppendInt(digits[:0], r.length, 10))) + 32
+	}
+	return size <= limit && h2HeaderSize(r.trailer) <= limit
+}
+
 func (r *h2Answer) headerSize() int64 {
 	if r.header != nil {
 		return h2HeaderSize(r.header)
@@ -2237,7 +2254,7 @@ func h2HeaderSize(header stdhttp.Header) int64 {
 // limitsHeaderListLocked reports whether the client has bounded the header
 // lists it takes, which only then are measured before they are sent.
 func (sc *h2ServerConn) limitsHeaderListLocked() bool {
-	return sc.peerMaxHeaderList < math.MaxInt64
+	return sc.peerMaxHeaderList.Load() < math.MaxInt64
 }
 
 // refuseHeaderLocked resets st, whose response has a header, or a trailer,
@@ -2271,7 +2288,7 @@ func (st *h2ServerStream) writeInterim(status int, header stdhttp.Header) error 
 	if st.responded {
 		return errors.New("http: interim response after the final one")
 	}
-	if sc.limitsHeaderListLocked() && h2FieldSize(":status", "100")+h2HeaderSize(header) > sc.peerMaxHeaderList {
+	if sc.limitsHeaderListLocked() && h2FieldSize(":status", "100")+h2HeaderSize(header) > sc.peerMaxHeaderList.Load() {
 		// An interim response is a hint the client can do without, and the
 		// final one may still fit.
 		return errH2HeaderListTooLarge

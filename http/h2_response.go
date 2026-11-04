@@ -78,7 +78,7 @@ func (st *h2ServerStream) beginResponse(req *stdhttp.Request, status int, header
 		if n := declaredLength(header); n >= 0 && statusHasBody(status) {
 			size += h2FieldSize("content-length", sc.lengthLocked(n))
 		}
-		if size > sc.peerMaxHeaderList {
+		if size > sc.peerMaxHeaderList.Load() {
 			return sc.refuseHeaderLocked(st)
 		}
 	}
@@ -230,7 +230,7 @@ func (st *h2ServerStream) endResponse(trailer stdhttp.Header, complete bool) err
 		return nil
 	}
 	st.trailer = h2Trailer(trailer)
-	if sc.limitsHeaderListLocked() && h2HeaderSize(st.trailer) > sc.peerMaxHeaderList {
+	if sc.limitsHeaderListLocked() && h2HeaderSize(st.trailer) > sc.peerMaxHeaderList.Load() {
 		// The header and the body have gone; a response without its trailer
 		// would read as whole, which it is not.
 		st.trailer = nil
