@@ -1289,6 +1289,14 @@ func (h *ServerHandler) drive(c *fib.Connection, parser *Parser, data []byte) {
 	// before then. Deferred after armRead so that it runs first, and the
 	// timeout is chosen by what the parser really holds.
 	defer parser.own()
+	h.serveParsed(c, parser, data)
+}
+
+// serveParsed is drive's work once the parser's lock is held and its
+// deferred calls are set: kept apart because it returns from many places,
+// and the compiler open-codes a function's defers only when it returns from
+// few, which spares drive the cost of recording them on every round.
+func (h *ServerHandler) serveParsed(c *fib.Connection, parser *Parser, data []byte) {
 	if !parser.sniffed {
 		if h.config.DisableHTTP2 {
 			parser.sniffed = true
