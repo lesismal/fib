@@ -141,8 +141,11 @@ func (a *Agent) handleRequest(local LocalID, from netip.AddrPort, m *stun.Messag
 	if a.cfg.Lite {
 		// A lite agent checks nothing: the pair the controlling peer
 		// nominates is valid by its check alone (RFC 8445 section 7.3.1.5).
+		// It selects the first pair that works, so it is not left waiting
+		// for a nomination a peer may not send, and takes the nominated
+		// pair when it comes.
 		p.state = pairSucceeded
-		if useCandidate {
+		if useCandidate || a.selected == nil {
 			a.selectPair(p, now)
 		}
 		return nil
