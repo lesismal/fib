@@ -509,3 +509,32 @@ func TestNewTokenSkipsRetry(t *testing.T) {
 		t.Fatal("the token was not kept")
 	}
 }
+
+// TestLostNewTokenGoesAgain checks that the NEW_TOKEN frame a server sends is
+// recorded with its packet, and that its loss has a new token sent: a client
+// that never gets one is retried on its next connection.
+func TestLostNewTokenGoesAgain(t *testing.T) {
+	c := frameConn(t)
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.config.TokenKey = NewTokenKey()
+	c.newTokenPending = true
+	sp := &sentPacket{}
+	b := c.appendControlFrames(nil, 1200, sp)
+	if c.newTokenPending || len(b) == 0 || b[0] != frameNewToken {
+		t.Fatalf("NEW_TOKEN not sent: pending %v, frames %x", c.newTokenPending, b)
+	}
+	var lost *sentFrame
+	for i := range sp.frames {
+		if sp.frames[i].kind == sfNewToken {
+			lost = &sp.frames[i]
+		}
+	}
+	if lost == nil {
+		t.Fatal("NEW_TOKEN not recorded with its packet")
+	}
+	c.frameLost(spaceApp, lost)
+	if !c.newTokenPending {
+		t.Fatal("a lost NEW_TOKEN is not sent again")
+	}
+}

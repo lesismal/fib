@@ -54,6 +54,7 @@ const (
 	sfStreamsBlockedBidi
 	sfStreamsBlockedUni
 	sfAckFrequency
+	sfNewToken
 )
 
 type sentFrame struct {
@@ -505,6 +506,10 @@ func (c *Conn) frameLost(space int, f *sentFrame) {
 		// The challenge of the path being validated goes again, whichever
 		// path the lost one was for.
 		c.challengePending = !c.pathValidated
+	case sfNewToken:
+		// A lost token goes again, freshly made: a client without one is
+		// retried on its next connection (RFC 9000 section 13.3).
+		c.newTokenPending = true
 	case sfAckFrequency:
 		// The peer may not have the request, so it goes again with the
 		// same sequence number, which a peer that had it ignores.

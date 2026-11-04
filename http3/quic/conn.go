@@ -549,9 +549,10 @@ type Conn struct {
 	sendQueue                     []*Stream
 
 	handshakeDonePending bool
-	// newTokenPending says a NEW_TOKEN frame is to go out, once, with the
-	// first 1-RTT packet after the handshake (RFC 9000 section 8.1.3): a
-	// server arms it only for a client whose address is validated.
+	// newTokenPending says a NEW_TOKEN frame is to go out with the first
+	// 1-RTT packet after the handshake, or again after the packet that
+	// carried it was lost (RFC 9000 section 8.1.3): a server arms it only
+	// for a client whose address is validated.
 	newTokenPending bool
 	pingPending     bool
 	pathResponses   [][8]byte
@@ -2212,8 +2213,8 @@ func (c *Conn) confirmHandshake() {
 // queueNewTokenLocked has a server send the client one token for a later
 // connection, if it can: not before the client's address is validated, since
 // the token is proof of it (RFC 9000 section 8.1.3). The frame goes with the
-// first 1-RTT packet, once, and is not sent again if that is lost: a client
-// without a token connects as it always did. Callers hold c.mu.
+// first 1-RTT packet, and a new one again if that is lost (see frameLost).
+// Callers hold c.mu.
 func (c *Conn) queueNewTokenLocked() {
 	c.newTokenPending = c.config.TokenKey != nil && !c.config.DisableNewTokens && c.addressValidated
 }

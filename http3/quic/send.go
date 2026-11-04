@@ -536,9 +536,8 @@ func (c *Conn) appendControlFrames(b []byte, max int, sp *sentPacket) []byte {
 	}
 	if c.newTokenPending {
 		// One token for a later connection, with its address in it (RFC
-		// 9000 section 8.1.3). It is not sent again if lost: the client
-		// then connects as one without a token, by its handshake and the
-		// amplification limit, or by a Retry.
+		// 9000 section 8.1.3), sent again, as a new one, if it is lost
+		// (section 13.3).
 		token := c.config.TokenKey.NewToken(c.remote)
 		if n := 1 + VarintLen(uint64(len(token))) + len(token); fits(n) {
 			b = append(b, frameNewToken)
@@ -546,6 +545,7 @@ func (c *Conn) appendControlFrames(b []byte, max int, sp *sentPacket) []byte {
 			b = append(b, token...)
 			c.newTokenPending = false
 			sp.ackEliciting = true
+			sp.add(sentFrame{kind: sfNewToken})
 		}
 	}
 	if c.maxDataPending && fits(1+VarintLen(c.recvMaxData)) {
