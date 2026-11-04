@@ -110,15 +110,27 @@ func init() {
 		c.mu.Lock()
 		defer c.mu.Unlock()
 		var fileBytes int64
+		splice := ""
 		if d := c.deadlines; d != nil {
 			fileBytes = d.fileBytes
+			if j := d.spliceOut; j != nil {
+				dst := j.dst
+				splice += fmt.Sprintf(" spliceOut{live=%v begun=%v left=%d taken=%d inPipe=%d srcDone=%v queued=%v waiting=%v err=%v"+
+					" dst{queue=%d/%d corked=%v flushing=%v closing=%v sched=%v pev=%#x}}",
+					j.live.Load(), j.begun, j.left, j.taken, j.inPipe, j.srcDone, j.queued, j.waiting, j.err,
+					dst.sendHead, len(dst.sends), dst.corked, dst.flushing, dst.closing, dst.scheduled, dst.pendingEvents)
+			}
+			if j := d.spliceIn; j != nil {
+				splice += fmt.Sprintf(" spliceIn{inPipe=%d srcDone=%v queued=%v waiting=%v err=%v}",
+					j.inPipe, j.srcDone, j.queued, j.waiting, j.err)
+			}
 		}
 		return fmt.Sprintf("queue=%d/%d pendingBytes=%d corkedBytes=%d fileBytes=%d corked=%v flushing=%v "+
 			"readPaused=%v budgetPaused=%v readStalled=%v readDeferred=%v scheduled=%v pendingEvents=%#x "+
-			"closing=%v closed=%v closePending=%v hangupNoted=%v closeAfterSend=%v writeShut=%v flags=%#x %s",
+			"closing=%v closed=%v closePending=%v hangupNoted=%v closeAfterSend=%v writeShut=%v flags=%#x %s%s",
 			c.sendHead, len(c.sends), c.pendingBytes.Load(), c.corkedBytes, fileBytes, c.corked, c.flushing,
 			c.readPaused, c.budgetPaused, c.readStalled, c.readDeferred, c.scheduled, c.pendingEvents,
 			c.closing, c.closed, c.closePending, c.hangupNoted, c.closeAfterSend, c.writeShut, c.flags.bits.Load(),
-			c.platformStateLocked())
+			c.platformStateLocked(), splice)
 	}
 }

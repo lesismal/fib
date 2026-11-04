@@ -71,6 +71,9 @@ func (e *Engine) openBackend() error {
 }
 
 func (e *Engine) closeBackend() error {
+	// The pipes the engine's splices are done with; those still in use are
+	// closed as they come back.
+	e.splicePipes.close()
 	err := syscall.Close(e.wakeFD)
 	if closeErr := syscall.Close(e.epollFD); err == nil {
 		err = closeErr

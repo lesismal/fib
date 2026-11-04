@@ -202,6 +202,43 @@ func (s *h2Sink) End() error {
 
 func (s *h2Sink) Fail(err error) { s.st.r.abort(err) }
 
+// spliceUpload moves r's pushed body to the connection with splice(2), when
+// its producer offered where to move it from (see Context.SpliceBody), and
+// reports whether it does. An offer it cannot take up it declines, and the
+// body is pushed as ever: a body framed in chunks, or one the engine cannot
+// splice, on a connection with TLS or off Linux.
+func (cc *clientConn) spliceUpload(r *clientRequest, push *reqbody.Pusher) bool {
+	s := push.TakeSplice()
+	if s == nil {
+		return false
+	}
+	if !r.chunked && r.declared > 0 {
+		// Set first: the response may be read as soon as the body has gone.
+		r.spliced.Store(true)
+		if s.SpliceTo(cc.conn, r.declared, func(err error) { cc.spliceWritten(r, err) }) {
+			return true
+		}
+		r.spliced.Store(false)
+	}
+	s.Decline()
+	return false
+}
+
+// spliceWritten is told that r's spliced body has all reached the socket, or
+// why it will not, as a pushed body's sink is told by End and Fail.
+func (cc *clientConn) spliceWritten(r *clientRequest, err error) {
+	cc.mu.Lock()
+	if cc.uploading == r {
+		cc.uploading = nil
+	}
+	cc.mu.Unlock()
+	if err != nil {
+		r.abort(err)
+		return
+	}
+	r.requestSent()
+}
+
 // attachPush starts sending r's pushed body through sink, or fails r when it
 // cannot be sent again.
 func attachPush(r *clientRequest, push *reqbody.Pusher, sink reqbody.Sink) {

@@ -239,6 +239,11 @@ const (
 	// flagKernelTLS marks a socket whose sends the kernel's TLS seals; see
 	// SetKernelTLS.
 	flagKernelTLS
+	// flagSplicing marks a connection whose reads a splice has taken over
+	// (see SpliceTo), and flagSpliceWait one whose splice waits for room in
+	// its pipe, which pauses its reads as a hold does.
+	flagSplicing
+	flagSpliceWait
 )
 
 // attachSeq is the unit of the sequence count kept in the upper half of
@@ -609,7 +614,7 @@ func (c *Connection) resetQueueLocked() {
 func (c *Connection) releaseItemLocked(item *sendItem) {
 	if item.pooled {
 		c.engine.releaseSendBuffer(item.data)
-	} else if item.record != 0 {
+	} else if item.record != 0 && item.record != spliceRecord {
 		bufferpool.Put(item.data)
 	}
 	if item.file != nil {
@@ -679,6 +684,11 @@ func (c *Connection) consumeLocked(n int) {
 	left := int64(n)
 	for c.sendHead < len(c.sends) {
 		item := &c.sends[c.sendHead]
+		if item.record == spliceRecord {
+			// A splice holds no bytes of its own to take: it ends where its
+			// pipe's last byte goes (see flushSpliceLocked).
+			break
+		}
 		if item.file != nil && item.data == nil {
 			// Sent from the file itself, by sendfile.
 			if left < item.file.remaining {
@@ -851,6 +861,11 @@ func (c *Connection) pauseDecision(readPaused bool) (pause, byBudget bool) {
 		// Datagrams are never queued for sending, so there is nothing to wait
 		// for, and a flood is bounded by the receive queue instead.
 		return false, false
+	}
+	if c.flags.has(flagSplicing) {
+		// A splice has the reads, which move no memory: only its pipe,
+		// full, paces them, and a hold the splice's Begin lets go of.
+		return c.flags.has(flagSpliceWait), false
 	}
 	if c.flags.has(flagReadHeld) {
 		// The application asked for the socket to be left alone; only it can
@@ -1434,6 +1449,7 @@ func (c *Connection) finishClose() {
 	c.mu.Lock()
 	err := c.closeReasonLocked()
 	c.mu.Unlock()
+	c.endSpliceOnClose(err)
 	c.handler.OnClose(c, err)
 	c.mu.Lock()
 	c.closeDue = false
@@ -1962,6 +1978,15 @@ func (c *Connection) readLoop() error {
 			// CloseRead, perhaps from inside OnData, ended input.
 			return nil
 		}
+		if c.flags.has(flagSplicing) {
+			// A splice has the reads, perhaps since OnData's last call: it
+			// takes what arrives until it has all it is to move, and the
+			// round reads for OnData again from the byte after.
+			if more, err := c.spliceRound(); !more || err != nil {
+				return err
+			}
+			continue
+		}
 		if c.flags.has(flagReadHeld) {
 			// The application is holding reads until it has worked through
 			// what it already has. Leave the rest in the socket, where TCP
@@ -2141,7 +2166,13 @@ func (c *Connection) flushLocked() error {
 		// never counted as pending since they occupied no memory.
 		fromFile := false
 		pending := len(c.sends) - c.sendHead
-		if head := &c.sends[c.sendHead]; head.file != nil {
+		if head := &c.sends[c.sendHead]; head.record == spliceRecord {
+			// A splice's bytes, from its pipe; see SpliceTo.
+			var progressed bool
+			if progressed, err = c.flushSpliceLocked(); progressed {
+				continue
+			}
+		} else if head.file != nil {
 			n, attempted, fromFile, err = c.sysSendFileLocked(head)
 		} else if head.record != 0 {
 			data := head.data[head.offset:]
@@ -2511,6 +2542,9 @@ type connectionDeadlines struct {
 	// waitOutput and notifyOutput, and the write deadline, count them with
 	// it; see queuedLocked.
 	fileBytes int64
+	// spliceOut is the splice this connection's reads go to, and spliceIn
+	// the one writing to its socket; see SpliceTo.
+	spliceOut, spliceIn *spliceJob
 }
 
 // drainNotice is a callback waiting for the connection's queued output to

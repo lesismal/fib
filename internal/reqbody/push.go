@@ -84,6 +84,8 @@ type Pusher struct {
 	readable sync.Cond
 	// reading is the piece a Read has taken part of.
 	reading []byte
+	// splice is what OfferSplice offered, until it is taken or declined.
+	splice Splicer
 }
 
 // NewPusher returns an empty body that lets limit bytes wait to be sent
@@ -266,6 +268,8 @@ func (p *Pusher) takeDrainsLocked() []func() {
 // ErrNotReplayable when another sink was given some of the body already, as
 // when a request is sent again after its connection failed.
 func (p *Pusher) Attach(sink Sink, declared int64) error {
+	// A body sent through a sink is written by its producer.
+	p.declineSplice()
 	p.mu.Lock()
 	if p.taken {
 		p.mu.Unlock()
@@ -288,6 +292,7 @@ func (p *Pusher) Stop() {
 	}
 	p.stopped = ErrPushStopped
 	p.sink = nil
+	p.splice = nil
 	for _, piece := range p.queue {
 		bufferpool.Put(piece)
 	}
@@ -437,6 +442,8 @@ func (p *Pusher) pump(sink Sink) {
 // it waits for what is written, and reports io.EOF once the body is closed
 // and read, the error CloseWithError was given, or ErrPushStopped.
 func (p *Pusher) Read(b []byte) (int, error) {
+	// A body read is written by its producer.
+	p.declineSplice()
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	for {

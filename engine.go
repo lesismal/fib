@@ -194,7 +194,10 @@ type Engine struct {
 	redeliver []*Connection
 	// cut holds the connections Close cut, whose OnClose release runs once
 	// no round does; see cutConnection. Close's, once the loop has stopped.
-	cut             []*Connection
+	cut []*Connection
+	// splicePipes are the pipes the splices from the engine's connections
+	// move their bytes through; see Connection.SpliceTo.
+	splicePipes     splicePool
 	taskPool        TaskPool
 	releaseTaskPool func()
 	taskWG          sync.WaitGroup
@@ -1106,6 +1109,8 @@ func (e *Engine) markClosedLocked(c *Connection, closeErr error) {
 	}
 	c.sends = nil
 	c.sendHead = 0
+	// A splice into the connection, its item dropped with the queue, ends.
+	c.dropSpliceInLocked(closeErr)
 	c.budgetPaused = false
 	// Drop this connection's share of the server-wide budget in the same step
 	// that abandons its queue, so a closed connection cannot hold the budget
@@ -1177,6 +1182,7 @@ func (e *Engine) closeCut() {
 		c.mu.Lock()
 		err := c.closeReasonLocked()
 		c.mu.Unlock()
+		c.endSpliceOnClose(err)
 		c.handler.OnClose(c, err)
 	}
 }

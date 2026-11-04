@@ -215,6 +215,11 @@ type BodyStream struct {
 	codingDone   bool
 	codingFailed bool
 	piece        []byte
+	// splicing says a client is moving the rest of the body to its own
+	// connection, which Context.SpliceBody offered it: from the splice's
+	// start until it hands the connection back, what arrives is not the
+	// body's to buffer, and a reader finds the body taken.
+	splicing bool
 }
 
 // setSink hands the body to fn as it arrives rather than buffering it for
@@ -489,8 +494,8 @@ func (s *BodyStream) Read(p []byte) (int, error) {
 	}
 	s.grantContinue()
 	s.mu.Lock()
-	if s.sink != nil {
-		// What is buffered is the sink's now.
+	if s.sink != nil || s.splicing {
+		// What is buffered is the sink's now, or the splice's.
 		s.mu.Unlock()
 		return 0, ErrBodyAbandoned
 	}

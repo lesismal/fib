@@ -1428,6 +1428,9 @@ type clientRequest struct {
 	upload   *reqbody.Source
 	declared int64
 	chunked  bool
+	// spliced says the body is being moved to the connection with splice(2),
+	// from the connection it arrives on; see Context.SpliceBody.
+	spliced atomic.Bool
 	// expect says the request asked for 100-continue, and has a body to hold
 	// back until the server answers it (see ClientConfig.
 	// ExpectContinueTimeout). headLen is how much of data is the header,
@@ -2002,6 +2005,9 @@ func (cc *clientConn) send(r *clientRequest) {
 // startUpload starts sending the body of r, which streams.
 func (cc *clientConn) startUpload(r *clientRequest) {
 	if push := r.upload.Pusher(); push != nil {
+		if cc.spliceUpload(r, push) {
+			return
+		}
 		// A pushed body is sent as it is written and as the connection
 		// drains, with nothing waiting for either.
 		attachPush(r, push, &h1Sink{cc: cc, r: r, push: push})
@@ -2268,6 +2274,10 @@ func (cc *clientConn) OnData(conn *fib.Connection, data []byte) {
 	reusable := !resp.Close && !r.req.Close && !cc.parser.buffered() &&
 		resp.StatusCode != stdhttp.StatusSwitchingProtocols &&
 		(r.req.ProtoAtLeast(1, 1) || headerHasToken(r.req.Header, "Connection", "keep-alive"))
+	// A spliced body whose last bytes have reached the socket has gone,
+	// whether or not its writer has said so yet: the response, which answers
+	// them, may be read before it does.
+	spliceSent := r.spliced.Load() && !conn.Splicing()
 	cc.mu.Lock()
 	cc.current = nil
 	cc.gate = nil
@@ -2279,9 +2289,10 @@ func (cc *clientConn) OnData(conn *fib.Connection, data []byte) {
 	if cc.uploading == r {
 		// The server answered before the body had all gone: it does not want
 		// the rest, and the connection, part way through the body, cannot
-		// carry another request. Closing it ends the sending.
+		// carry another request. Closing it ends the sending. A spliced body
+		// that has all gone, its writer yet to say so, is no such body.
 		cc.uploading = nil
-		reusable = false
+		reusable = reusable && spliceSent
 	}
 	cc.mu.Unlock()
 	r.detach()
