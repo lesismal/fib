@@ -251,6 +251,31 @@ func (c *Context) writeAsync(b *asyncBody, p []byte, wait bool) (n int, above bo
 	return len(p), above, nil
 }
 
+// startAsync turns on b, the asynchronous body of a response whose held
+// header has just resumed, with held, what was written while it was held,
+// queued first.
+func (c *Context) startAsync(b *asyncBody, held []byte) error {
+	w := c.w
+	b.mu.Lock()
+	b.on.Store(true)
+	if len(held) == 0 {
+		b.mu.Unlock()
+		return nil
+	}
+	q := held
+	if w.hooks.filters != nil {
+		var err error
+		if q, err = w.hooks.filter(held); err != nil {
+			err = w.fail(err)
+			c.failAsync(b)
+			return err
+		}
+	}
+	b.pending = append(b.pending, q...)
+	c.pump(b)
+	return nil
+}
+
 // cancelled is the OnCancel callback of a response whose Write waits for
 // room: it ends the wait with err.
 func (b *asyncBody) cancelled(err error) {

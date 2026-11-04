@@ -295,11 +295,17 @@ func (c *Context) resumeHeader(a *asyncHeader, err error) {
 			fn(w.status, w.sent, c.resumer(a, at))
 			return
 		}
-		c.settleHeader()
+		b := c.settleHeaderAsync()
 		a.active = false
 		raw := a.raw
 		a.raw = nil
-		if len(raw) > 0 {
+		switch {
+		case b != nil:
+			// A Write does not wait on a.mu once the body is on: what was
+			// held goes into it before that, or a Write made meanwhile
+			// from another goroutine would go ahead of it.
+			err = c.startAsync(b, raw)
+		case len(raw) > 0:
 			_, err = c.writeNoWait(raw)
 		}
 		if err == nil && a.finish {

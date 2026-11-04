@@ -6,6 +6,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	stdhttp "net/http"
@@ -389,6 +390,57 @@ func TestWriteResponseOwnedThroughHooks(t *testing.T) {
 	for path, want := range map[string]string{"/async": "OWNED", "/replaced": "replaced"} {
 		if _, body := do(t, client, mustRequest(t, "GET", "http://"+addr+path, nil)); body != want {
 			t.Errorf("%s: %q, want %q", path, body, want)
+		}
+	}
+}
+
+// TestOnBodyFilterAsyncHeldPartGoesFirst writes a body in numbered pieces
+// while an OnHeaderAsync hook resumes the held header from another goroutine,
+// through an asynchronous filter, and checks that the pieces arrive in order:
+// what was written while the header was held goes into the filter before a
+// piece written as the resume turns the body on.
+func TestOnBodyFilterAsyncHeldPartGoesFirst(t *testing.T) {
+	const pieces = 256
+	addr := serve(t, NewHandler(HandlerFunc(func(c *Context) {
+		// The resume starts as the handler goes on writing, past the
+		// piece the held header kept.
+		start := make(chan struct{})
+		c.OnHeaderAsync(func(_ int, _ stdhttp.Header, resume func(error)) {
+			go func() {
+				<-start
+				resume(nil)
+			}()
+		})
+		c.OnBodyFilterAsync(func(int, stdhttp.Header) AsyncBodyFilter { return &upperLater{} })
+		c.WriteHeader(stdhttp.StatusAccepted)
+		for i := range pieces {
+			if _, err := c.WriteNoWait(fmt.Appendf(nil, "%04d,", i)); err != nil {
+				return
+			}
+			if i == 0 {
+				close(start)
+			}
+		}
+		_ = c.Finish()
+	})))
+	var want strings.Builder
+	for i := range pieces {
+		fmt.Fprintf(&want, "%04d,", i)
+	}
+	for _, client := range hookClients(t) {
+		for range 500 {
+			resp, err := client.Get("http://" + addr + "/")
+			if err != nil {
+				t.Fatal(err)
+			}
+			body, err := io.ReadAll(resp.Body)
+			resp.Body.Close()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if string(body) != want.String() {
+				t.Fatalf("%s: the pieces out of order: %.60q", client.proto, body)
+			}
 		}
 	}
 }

@@ -201,6 +201,15 @@ func (c *Context) WriteHeader(status int) {
 // ResponseWriter methods settled, once its hooks have run: the length it
 // declares, and what filtering its body changes.
 func (c *Context) settleHeader() {
+	if b := c.settleHeaderAsync(); b != nil {
+		b.on.Store(true)
+	}
+}
+
+// settleHeaderAsync is settleHeader, but for a body that goes through an
+// asynchronous filter, which it returns rather than turns on: the resume of a
+// held header queues what was written meanwhile first (see resumeHeader).
+func (c *Context) settleHeaderAsync() (async *asyncBody) {
 	w := c.w
 	if w.hooks != nil && !w.hooks.whole {
 		if w.hooks.filters != nil {
@@ -211,7 +220,7 @@ func (c *Context) settleHeader() {
 				// The length declared is the body's before the filters.
 				delete(w.sent, "Content-Length")
 				if w.hooks.splitAsync() {
-					w.hooks.body.on.Store(true)
+					async = w.hooks.body
 				}
 			}
 		}
@@ -224,6 +233,7 @@ func (c *Context) settleHeader() {
 	if w.declared < 0 {
 		delete(w.sent, "Content-Length")
 	}
+	return async
 }
 
 // Write adds p to the response body, as http.ResponseWriter's does, sending
