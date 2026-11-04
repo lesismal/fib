@@ -420,3 +420,63 @@ func TestDataSectionRejectedLater(t *testing.T) {
 		t.Fatalf("answer to the data section rejected:\n%s", answer.SDP)
 	}
 }
+
+// TestInactiveSectionBundled answers an offer that bundles an audio and a
+// video section with an audio transceiver this side keeps inactive, as a
+// WHEP viewer of a stream whose audio WebRTC cannot carry has: the audio
+// section stays in the BUNDLE group, inactive with a port, where a
+// rejected one makes browsers fail with "Failed to setup RTCP mux".
+func TestInactiveSectionBundled(t *testing.T) {
+	vp8 := Codec{MimeType: "video/VP8", ClockRate: 90000, PayloadType: 96}
+	opus := Codec{MimeType: "audio/opus", ClockRate: 48000, Channels: 2, PayloadType: 111}
+	offerer := sharedPC(t, Configuration{Codecs: []Codec{opus, vp8}})
+	if _, err := offerer.AddTransceiver(MediaKindAudio, DirectionRecvOnly); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := offerer.AddTransceiver(MediaKindVideo, DirectionSendRecv); err != nil {
+		t.Fatal(err)
+	}
+	offer, err := offerer.CreateOffer(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := offerer.SetLocalDescription(offer); err != nil {
+		t.Fatal(err)
+	}
+	// The answerer carries video only, as the WHEP viewer does, and keeps
+	// audio inactive: its audio transceiver has no codecs to send.
+	answerer := sharedPC(t, Configuration{Codecs: []Codec{vp8}})
+	if _, err := answerer.AddTransceiver(MediaKindAudio, DirectionInactive); err != nil {
+		t.Fatal(err)
+	}
+	if err := answerer.SetRemoteDescription(offer); err != nil {
+		t.Fatal(err)
+	}
+	answer, err := answerer.CreateAnswer()
+	if err != nil {
+		t.Fatal(err)
+	}
+	sd, err := sdp.ParseString(answer.SDP)
+	if err != nil {
+		t.Fatal(err)
+	}
+	audio := sd.MediaByMid("0")
+	if audio == nil {
+		t.Fatalf("no audio section:\n%s", answer.SDP)
+	}
+	if audio.Rejected() {
+		t.Fatalf("the audio section was rejected, not kept inactive:\n%s", answer.SDP)
+	}
+	if !audio.RTCPMux() {
+		t.Fatalf("the inactive audio section dropped the offer's rtcp-mux:\n%s", answer.SDP)
+	}
+	if d := sd.MediaDirection(audio); d != sdp.Inactive {
+		t.Fatalf("the audio section is %v, not inactive:\n%s", d, answer.SDP)
+	}
+	if err := answerer.SetLocalDescription(answer); err != nil {
+		t.Fatal(err)
+	}
+	if err := offerer.SetRemoteDescription(answer); err != nil {
+		t.Fatal(err)
+	}
+}

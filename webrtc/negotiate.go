@@ -200,6 +200,33 @@ func (pc *PeerConnection) rejectedSection(mid string) *sdp.MediaDescription {
 	return md
 }
 
+// inactiveSection writes a section this side has no track for, as a WHEP
+// viewer of a stream whose audio WebRTC cannot carry: it keeps the
+// offer's formats and a port, so that it stays in the BUNDLE group and
+// shares the transport. A rejected section makes a browser refuse the
+// answer of a section the offer bundled, "Failed to setup RTCP mux".
+func (pc *PeerConnection) inactiveSection(mid string) *sdp.MediaDescription {
+	if pc.remoteDesc == nil {
+		return nil
+	}
+	rmd := pc.remoteDesc.MediaByMid(mid)
+	if rmd == nil {
+		return nil
+	}
+	m, ok := rmd.MediaName()
+	if !ok || len(m.Formats) == 0 {
+		return nil
+	}
+	m.Port = 9
+	md := &sdp.MediaDescription{}
+	md.Lines = []sdp.Line{{Type: 'm', Value: m.String()}, {Type: 'c', Value: "IN IP4 0.0.0.0"}}
+	md.SetDirection(sdp.Inactive)
+	if rmd.RTCPMux() {
+		md.SetRTCPMux(true)
+	}
+	return md
+}
+
 func (pc *PeerConnection) dataSection(typ SDPType) *sdp.MediaDescription {
 	if typ == SDPTypeAnswer && !pc.dataAccepted {
 		return nil
@@ -236,6 +263,16 @@ func (pc *PeerConnection) mediaSection(typ SDPType, t *Transceiver) *sdp.MediaDe
 	}
 	if len(codecs) == 0 || t.stopped {
 		if typ == SDPTypeAnswer {
+			// A transceiver this side asked to keep inactive, with no
+			// track to send, is inactive, not rejected: it keeps its
+			// place in the BUNDLE group, which browsers refuse to set up
+			// for a section the offer bundled. A section whose codecs
+			// this side cannot take is still rejected.
+			if !t.stopped && t.direction == DirectionInactive {
+				if md := pc.inactiveSection(t.mid); md != nil {
+					return md
+				}
+			}
 			return nil
 		}
 		// An offer's codecs are the configured ones of the kind, so with
