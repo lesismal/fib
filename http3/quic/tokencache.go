@@ -98,6 +98,18 @@ func (t *TokenCache) token(remote net.Addr, now time.Time) []byte {
 	return nil
 }
 
+// Len returns how many addresses the cache has a token for that has not
+// expired.
+func (t *TokenCache) Len() int {
+	if t == nil {
+		return 0
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.pruneLocked(time.Now())
+	return len(t.entries)
+}
+
 // forget drops what the cache has for remote, as a server that answered a
 // Retry, or closed with INVALID_TOKEN, has said the token is not good.
 func (t *TokenCache) forget(remote net.Addr) {

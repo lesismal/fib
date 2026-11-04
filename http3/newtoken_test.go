@@ -198,8 +198,17 @@ func TestNewTokenSkipsRetry(t *testing.T) {
 		case <-time.After(10 * time.Second):
 			t.Fatal("the handshake timed out")
 		}
-		// The server sends NEW_TOKEN with HANDSHAKE_DONE, before the
-		// handshake is over for the client; wait for what it sent.
+		// The server sends NEW_TOKEN with HANDSHAKE_DONE, once it has the
+		// client's Finished, which is after the handshake is over for the
+		// client: wait for the token itself, since a quiet path says
+		// nothing of a server that is slow to answer.
+		deadline := time.Now().Add(10 * time.Second)
+		for tokens.Len() == 0 {
+			if time.Now().After(deadline) {
+				t.Fatal("no NEW_TOKEN from the server")
+			}
+			time.Sleep(5 * time.Millisecond)
+		}
 		path.waitQuiet(t)
 		return qc
 	}
