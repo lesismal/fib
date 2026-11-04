@@ -267,7 +267,10 @@ func TestH2RecycledStreamsKeepRequestsApart(t *testing.T) {
 	describe := func(r *stdhttp.Request, body []byte) string {
 		return fmt.Sprintf("%s %s n=%s x=%s %s", r.Method, r.URL.Path, r.URL.Query().Get("n"), r.Header.Get("X-N"), body)
 	}
-	addr := serve(t, fibtls.NewServer(ConfigureTLS(serverConfig), NewHandler(HandlerFunc(func(c *Context) {
+	// Room for every request on one connection; see the client below.
+	config := DefaultConfig()
+	config.MaxConcurrentStreams = 2000
+	addr := serve(t, fibtls.NewServer(ConfigureTLS(serverConfig), NewHandlerWithConfig(config, HandlerFunc(func(c *Context) {
 		body, _ := io.ReadAll(c.Request.Body)
 		n := strings.TrimPrefix(c.Request.URL.Path, "/r")
 		if len(n)%2 == 0 {
@@ -290,11 +293,24 @@ func TestH2RecycledStreamsKeepRequestsApart(t *testing.T) {
 			c.Release()
 		}()
 	}))))
+	// The requests share one connection, as streams a server recycles do.
+	// Without one open before they start, or with the one open at its
+	// stream limit, the Transport dials another for each request waiting:
+	// a thousand at once, past a listen queue such as macOS's, which
+	// kern.ipc.somaxconn caps at 128 whatever backlog serve asks for, and
+	// which resets the connections it has no room for. So one request
+	// opens the connection, and learns its stream limit, first.
 	client := &stdhttp.Client{
 		Timeout:   20 * time.Second,
 		Transport: &stdhttp.Transport{TLSClientConfig: clientConfig, ForceAttemptHTTP2: true},
 	}
 	defer client.CloseIdleConnections()
+	resp, err := client.Get(fmt.Sprintf("https://%s/r0?n=0", addr))
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _ = io.Copy(io.Discard, resp.Body)
+	resp.Body.Close()
 
 	var wg sync.WaitGroup
 	errs := make(chan error, 1000)
@@ -307,18 +323,9 @@ func TestH2RecycledStreamsKeepRequestsApart(t *testing.T) {
 			if i%3 == 0 {
 				method, body = stdhttp.MethodPost, strings.Repeat(n, 1+i%7)
 			}
-			// A connection the peer reset under this many at once says
-			// nothing about the streams sharing one; the request, which the
-			// server answers the same way twice, goes again on another.
-			var resp *stdhttp.Response
-			var err error
-			for attempt := 0; attempt < 2; attempt++ {
-				req, _ := stdhttp.NewRequest(method, fmt.Sprintf("https://%s/r%s?n=%s", addr, n, n), strings.NewReader(body))
-				req.Header.Set("X-N", n)
-				if resp, err = client.Do(req); err == nil {
-					break
-				}
-			}
+			req, _ := stdhttp.NewRequest(method, fmt.Sprintf("https://%s/r%s?n=%s", addr, n, n), strings.NewReader(body))
+			req.Header.Set("X-N", n)
+			resp, err := client.Do(req)
 			if err != nil {
 				errs <- err
 				return
