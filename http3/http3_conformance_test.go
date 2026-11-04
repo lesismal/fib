@@ -642,7 +642,10 @@ func TestHTTP3ConformanceClient(t *testing.T) {
 	})
 
 	t.Run("Timeout", func(t *testing.T) {
-		quick := newClient(t, func(config *ClientConfig) { config.Timeout = 200 * time.Millisecond })
+		// The timeout bounds the request after it too, which on a loaded
+		// runner can take past 200ms: a second is far below the slow
+		// response's 3, and room enough for the next.
+		quick := newClient(t, func(config *ClientConfig) { config.Timeout = time.Second })
 		_, err := quick.Go(mustRequest(t, stdhttp.MethodGet, url+"/slow?delay=3000", nil)).Wait()
 		if !errors.Is(err, os.ErrDeadlineExceeded) {
 			t.Fatalf("timeout: %v", err)
