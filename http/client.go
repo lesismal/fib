@@ -403,6 +403,22 @@ type Framing struct {
 	// its Header as ever, and no block: the caller takes whichever it is
 	// given.
 	ResponseHeaderBlock bool
+	// Flush has the request written at once on an HTTP/1 connection whose
+	// read round has not ended yet. A connection is given back to the
+	// client as soon as its response has been read, in the middle of that
+	// round, and what is sent on it then is otherwise held, corked, and
+	// written as the round ends, after the response's callback, which for a
+	// proxy is the time it takes to write the response to its own client.
+	//
+	// It suits a request that is all its caller has to send for now, as a
+	// proxy's for a request off an HTTP/1 connection is: the server gets it
+	// sooner. A caller that sends a burst of requests from one goroutine, as
+	// a proxy does for the requests of an HTTP/2 connection, leaves it unset,
+	// so that a request held goes out from the round that ends rather than
+	// from the caller, which goes on to the next sooner, and the responses
+	// come back together rather than spread out, for the caller to write in
+	// fewer writes.
+	Flush bool
 }
 
 // StartFramed is Start for a request whose header framing, on one side or
@@ -531,7 +547,7 @@ func (c *Client) doFramed(req *stdhttp.Request, callback func(*ClientResponse, e
 	}
 	r := &clientRequest{req: req, data: data, body: body, borrowed: borrowed, upload: upload, declared: declared,
 		chunked: chunked, callback: callback, whole: whole, tunnel: tunnel, headerWait: c.config.ResponseHeaderTimeout,
-		wantBlock: framing.ResponseHeaderBlock}
+		wantBlock: framing.ResponseHeaderBlock, flush: framing.Flush}
 	r.headLen = len(data)
 	if c.config.ExpectContinueTimeout > 0 && reqbody.ExpectsContinue(req, len(body) > 0 || upload != nil) {
 		r.expect = true
@@ -1428,7 +1444,10 @@ type clientRequest struct {
 	// header lines when they came so, which deliver hands on.
 	wantBlock bool
 	block     string
-	done      atomic.Bool
+	// flush is Framing.Flush: the request is written at once on a
+	// connection whose round still corks what is sent on it.
+	flush bool
+	done  atomic.Bool
 	// waitingIn is the host whose queue the request waits in, or nil: set
 	// as it is queued, and cleared by whichever comes first of its leaving
 	// the queue and its ending, which then counts it in the host's ended.
@@ -1955,6 +1974,12 @@ func (cc *clientConn) send(r *clientRequest) {
 			return
 		}
 		held = true
+	}
+	if r.flush {
+		// The connection's round, if it has not ended, stops corking, so
+		// that the request is written now rather than copied and held for
+		// the round's end; see Framing.Flush.
+		_ = cc.conn.Flush()
 	}
 	sent := cc.conn.Send(head) == nil
 	if held {
