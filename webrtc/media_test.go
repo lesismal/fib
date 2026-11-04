@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/lesismal/fib/webrtc/rtp"
+	"github.com/lesismal/fib/webrtc/sdp"
 )
 
 // TestStaticPayloadTypeZero sends G.711 µ-law, whose static payload type
@@ -308,6 +309,54 @@ func TestRejectedSections(t *testing.T) {
 	}
 	if offer, err = c.CreateOffer(nil); err != nil || !strings.Contains(offer.SDP, "m=video 0 ") {
 		t.Fatalf("offer for video with no video codec: %v\n%s", err, offer.SDP)
+	}
+}
+
+// TestRejectedSectionRtcpMux answers an offer with a section this side
+// cannot take, as a browser bundles it: the rejected section keeps the
+// offer's rtcp-mux, which RFC 5761 has the answerer answer and browsers
+// refuse when it is dropped.
+func TestRejectedSectionRtcpMux(t *testing.T) {
+	offerer := sharedPC(t, Configuration{Codecs: []Codec{{MimeType: "video/VP8", ClockRate: 90000, PayloadType: 96}}})
+	if _, err := offerer.AddTransceiver(MediaKindVideo, DirectionSendRecv); err != nil {
+		t.Fatal(err)
+	}
+	offer, err := offerer.CreateOffer(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := offerer.SetLocalDescription(offer); err != nil {
+		t.Fatal(err)
+	}
+	offer.SDP = strings.Replace(offer.SDP, "t=0 0\r\n", "t=0 0\r\na=group:BUNDLE 0 1\r\n", 1)
+	offer.SDP += "m=audio 9 UDP/TLS/RTP/SAVPF 111\r\nc=IN IP4 0.0.0.0\r\na=mid:1\r\na=recvonly\r\na=rtcp-mux\r\na=rtpmap:111 opus/48000/2\r\n"
+	answerer := sharedPC(t, Configuration{Codecs: []Codec{{MimeType: "audio/opus", ClockRate: 48000, Channels: 2, PayloadType: 111}}})
+	if err := answerer.SetRemoteDescription(offer); err != nil {
+		t.Fatal(err)
+	}
+	answer, err := answerer.CreateAnswer()
+	if err != nil {
+		t.Fatal(err)
+	}
+	sd, err := sdp.ParseString(answer.SDP)
+	if err != nil {
+		t.Fatal(err)
+	}
+	video := sd.MediaByMid("0")
+	if video == nil || !video.Rejected() {
+		t.Fatalf("the video section was not rejected:\n%s", answer.SDP)
+	}
+	if !video.RTCPMux() {
+		t.Fatalf("the rejected video section dropped the offer's rtcp-mux:\n%s", answer.SDP)
+	}
+	if audio := sd.MediaByMid("1"); audio == nil || !audio.RTCPMux() {
+		t.Fatalf("the audio section lacks rtcp-mux:\n%s", answer.SDP)
+	}
+	if err := answerer.SetLocalDescription(answer); err != nil {
+		t.Fatal(err)
+	}
+	if err := offerer.SetRemoteDescription(answer); err != nil {
+		t.Fatal(err)
 	}
 }
 

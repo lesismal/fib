@@ -191,6 +191,12 @@ func (pc *PeerConnection) rejectedSection(mid string) *sdp.MediaDescription {
 	md := &sdp.MediaDescription{}
 	md.Lines = []sdp.Line{{Type: 'm', Value: m.String()}, {Type: 'c', Value: "IN IP4 0.0.0.0"}}
 	md.SetDirection(sdp.Inactive)
+	// RFC 5761: an answerer that multiplexes answers rtcp-mux, and
+	// browsers refuse an answer that drops it from a section the offer
+	// carried it in, rejected or not.
+	if rmd.RTCPMux() {
+		md.SetRTCPMux(true)
+	}
 	return md
 }
 
