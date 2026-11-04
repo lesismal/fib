@@ -375,7 +375,12 @@ func TestRelay(t *testing.T) {
 	}
 	s.wait(t, "relayed packets", func(s *sink) bool { return len(s.pkts) >= 40 })
 	back.wait(t, "pushed packets", func(s *sink) bool { return len(s.pkts) >= 20 })
-	checkSame(t, pkts, s.pkts)
+	// The relay still delivers while this checks: take what it has so
+	// far under the sink's lock.
+	s.mu.Lock()
+	got := slices.Clone(s.pkts)
+	s.mu.Unlock()
+	checkSame(t, pkts, got)
 	// The source ends: the relay ends, and so does the push.
 	pub.Close()
 	user.wait(t, "relay close", func(s *sink) bool { return len(s.closed) > 0 })
