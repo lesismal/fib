@@ -38,7 +38,7 @@ uSockets, workflow, axum, h2, quiche and rustls.
 
 | Protocol | Server | Client | Notes |
 | --- | --- | --- | --- |
-| TCP / Unix sockets | ✓ | ✓ (async dial) | `SendFile` (sendfile(2)), `writev` batching, corking, half close |
+| TCP / Unix sockets | ✓ | ✓ (async dial) | `SendFile` (sendfile(2)), `SpliceTo` (splice(2) between connections, Linux), `writev` batching, corking, half close |
 | UDP | ✓ | ✓ | batched `recvmmsg`/`sendmmsg` on Linux, one connection per peer |
 | TLS 1.0–1.3 | ✓ | ✓ | crypto/tls handshakes; after the handshake, records are sealed and opened by fib itself (AES-GCM, AES-CBC) |
 | HTTP/1.x | ✓ | ✓ | pipelining, chunked encoding and trailers, streaming bodies, `sendfile` for files |

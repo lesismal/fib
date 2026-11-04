@@ -37,7 +37,7 @@ HTTP/3、WebSocket 和 WebRTC，以及基于 RTMP、RTSP、SRT、HTTP-FLV、HLS 
 
 | 协议 | 服务端 | 客户端 | 说明 |
 | --- | --- | --- | --- |
-| TCP / Unix socket | ✓ | ✓（异步 dial） | `SendFile`（sendfile(2)）、`writev` 批量写、cork、半关闭 |
+| TCP / Unix socket | ✓ | ✓（异步 dial） | `SendFile`（sendfile(2)）、`SpliceTo`（连接之间的 splice(2)，Linux）、`writev` 批量写、cork、半关闭 |
 | UDP | ✓ | ✓ | Linux 上用 `recvmmsg`/`sendmmsg` 批量收发，每个对端一个连接 |
 | TLS 1.0–1.3 | ✓ | ✓ | 握手用 crypto/tls；握手完成后由 fib 自己加解密记录（AES-GCM、AES-CBC） |
 | HTTP/1.x | ✓ | ✓ | pipelining、chunked 与 trailer、流式 body、文件走 `sendfile` |

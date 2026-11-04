@@ -247,6 +247,31 @@ body 单独计时，从它的 HEADERS 算起：流式交给 handler 的 body 以
 超过 writer 的上限时回调暂停 body，由 `BodyWriter.OnDrain` 恢复（见 `BodyWriter` 的
 示例和 [`fib-examples/gateway`](https://github.com/lesismal/fib-examples/tree/main/gateway)）。
 
+在 Linux 上，这样的上传也可以交给内核搬运。`Context.SpliceBody(w, fallback)` 把一个由
+`Content-Length` 定界的 HTTP/1 body 的剩余部分提供给以 `w` 为 body 的那个请求；fib 的 client
+在不带 TLS 的 HTTP/1 连接上发送该请求时接手，用 `splice(2)` 经一个管道把 body 从客户端的 socket
+搬到上游的 socket：先发已经到达的部分，再搬剩下的、不多不少正好那么多字节，页按引用传递，不经用户态
+拷贝，上游的发送缓冲也不需要新分配并清零的页。管道像 writer 的上限一样给两侧限速；body 的最后一个
+字节进入管道后，server 接着读 pipeline 在它后面的请求。不能 splice 的 client（HTTP/2、TLS、它要用
+chunked 发送的 body）会拒绝，在需要 body 之前调用一次 `fallback`，handler 再像上面那样经 `OnBody`
+推送：
+
+```go
+body := fibhttp.NewBodyWriter(64 << 10)
+req.Body, req.ContentLength = body, c.Request.ContentLength
+push := func() { c.OnBody(func(data []byte, fin bool, err error) { /* 同上 */ }) }
+spliced := c.SpliceBody(body, push) // false：TLS、HTTP/2、chunked、非 Linux
+client.Do(req, onResponse)
+if !spliced {
+	push()
+}
+```
+
+客户端在 body 中途离开时，被截断请求的上游连接会关闭；上游在 body 中途失败时，剩下的部分交还
+server，像对待没人接管的 body 一样丢弃，超过 256KB 则关闭连接。底层是 `fib.Connection.SpliceTo`，
+它在任意两个没有 TLS 等 layer 的 TCP 或 Unix 连接之间搬运指定字节数；每个引擎（或 poller）最多池化
+256 个 128KB 的管道，拿不到管道的 splice 会被拒绝，由调用方改用拷贝。
+
 `Config.StreamRequestBodyThreshold` 在开启流式时让较小的 body 仍然整体缓存：只有
 `Content-Length` 超过它的 body，以及已经发来超过这么多字节的 chunked body 才流式交付。
 为 0 时所有 body 都流式交付；不开 `StreamRequestBody` 时它不起作用。
@@ -521,6 +546,12 @@ TLS 1.3 或 1.2 的 AES-GCM、ChaCha20-Poly1305，TLS 1.2 或 1.1 的 AES-CBC）
   中和其他 goroutine 中调用、对端读得慢、文件比声明的范围短；`sendfile_sealed_test.go`
   检查随排空加密的文件（对端不读时内存不超过一块、与前后发送的顺序、文件过短）和
   `ControlIdle`；`sendfile_windows_test.go` 检查 `TransmitFile`、文件过短和拒绝它的 socket。
+- `splice_linux_test.go` 检查 `Connection.SpliceTo`：精确的字节数且之后的字节交给 `OnData`，目标连接在
+  splice 之前排队的字节在前、期间发送的在后，目标读得慢把管道填满、源发得慢，任一方中途离开，`Begin` 放弃
+  或不搬任何字节，各种拒绝，大量并发 splice，管道池，以及引擎在 splice 中途停止；`http/splice_linux_test.go`
+  经代理检查 `Context.SpliceBody`：后面 pipeline 着请求的上传、上游连接复用、退回普通路径的 body（整体
+  收到的、chunked、h2c 上游）、`Expect: 100-continue`、客户端或上游在 body 中途离开、上游提前回复，以及
+  32 个客户端同时上传。
 - `tls/file_test.go` 用 `crypto/tls` 客户端检查 TLS 上的 `SendFile`，覆盖 TLS 1.3、
   TLS 1.2 的 AES-GCM、ChaCha20-Poly1305 与 AES-CBC，有内核 TLS 和没有内核 TLS：在 handler
   内外调用、前后的发送、对端读得慢并检查堆、文件过短、之后的 `close_notify`、留在
@@ -532,5 +563,5 @@ TLS 1.3 或 1.2 的 AES-GCM、ChaCha20-Poly1305，TLS 1.2 或 1.1 的 AES-CBC）
 `FIB_REQUIRE_CURL=1`：缺少 curl 时直接失败而不是跳过 curl 用例。本地运行：
 
 ```sh
-go test -race -run 'TestHTTP1Conformance|TestSendFile|TestSendableFileOf|TestResponseWriter|TestStreamRequestBody|TestChunkedDecoder|TestHoldReads|TestServerRead|TestServerIdle|TestServerTimeout|TestServerWithoutTimeouts|TestReadDeadline|TestWriteDeadline|TestZeroDeadline|TestConnectionAddresses|TestRetain|TestOnBody|TestBodyComplete|TestBodyMatrix|TestOnCancel|TestTransmitFile|TestControlIdle|TestKernelTLS' -v . ./http/ ./http3/ ./tls/
+go test -race -run 'TestHTTP1Conformance|TestSendFile|TestSendableFileOf|TestResponseWriter|TestStreamRequestBody|TestChunkedDecoder|TestHoldReads|TestServerRead|TestServerIdle|TestServerTimeout|TestServerWithoutTimeouts|TestReadDeadline|TestWriteDeadline|TestZeroDeadline|TestConnectionAddresses|TestRetain|TestOnBody|TestBodyComplete|TestBodyMatrix|TestOnCancel|TestTransmitFile|TestControlIdle|TestKernelTLS|TestSplice' -v . ./http/ ./http3/ ./tls/
 ```

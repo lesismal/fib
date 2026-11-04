@@ -327,6 +327,38 @@ the upstream connection has room; past the writer's limit the callback holds
 the body, and `BodyWriter.OnDrain` resumes it (see the `BodyWriter` example,
 and [`fib-examples/gateway`](https://github.com/lesismal/fib-examples/tree/main/gateway)).
 
+On Linux the kernel can move such an upload instead. `Context.SpliceBody(w,
+fallback)` offers the rest of an HTTP/1 body framed by its `Content-Length`
+to the request `w` is the body of; fib's client, sending that request on an
+HTTP/1 connection without TLS, takes it up and moves the body from the
+client's socket to the upstream's with `splice(2)` through a pipe: what had
+already arrived first, then exactly the rest, its pages passed by reference,
+with no copy through user space and no fresh pages for the upstream's send
+buffer. The pipe paces the two sides as the writer's limit does, and the
+server reads the request pipelined behind the body once its last byte is in
+the pipe. A client that cannot splice it (HTTP/2, TLS, a body it frames in
+chunks) declines, calling `fallback` once, before it wants any of the body,
+and the handler pushes it through `OnBody` as above:
+
+```go
+body := fibhttp.NewBodyWriter(64 << 10)
+req.Body, req.ContentLength = body, c.Request.ContentLength
+push := func() { c.OnBody(func(data []byte, fin bool, err error) { /* as above */ }) }
+spliced := c.SpliceBody(body, push) // false: TLS, HTTP/2, chunked, not Linux
+client.Do(req, onResponse)
+if !spliced {
+	push()
+}
+```
+
+A client that goes away mid-body closes the upstream's connection, whose
+request the splice cut short; an upstream that fails mid-body hands the rest
+back to the server, which drops it, or closes the connection past 256KB, as
+it does any body nothing took. Underneath is `fib.Connection.SpliceTo`, which
+splices a given number of bytes between any two TCP or Unix connections that
+have no layer such as TLS; each engine, or poller, pools at most 256 pipes of
+128KB, and a splice that finds none free is refused, for its caller to copy.
+
 `Config.StreamRequestBodyThreshold` keeps the smaller bodies buffered whole
 while streaming is on: only a body whose `Content-Length` is larger than it,
 or a chunked body that has already sent more than it, streams. Zero streams
@@ -755,6 +787,17 @@ are not fib:
   nothing, order with sends around it, a short file) and `ControlIdle`, and
   `sendfile_windows_test.go` checks `TransmitFile`, a short file and a socket
   that refuses it.
+- `splice_linux_test.go` checks `Connection.SpliceTo`: exact byte counts with
+  what follows reaching `OnData`, the destination's queued bytes before the
+  splice and its sends during it after, a slow destination filling the pipe
+  and a slow source, either side going away mid-splice, `Begin` giving up or
+  moving nothing, the refusals, many splices at once, the pipe pool and an
+  engine stopping mid-splice; `http/splice_linux_test.go` checks
+  `Context.SpliceBody` through a proxy: uploads with a request pipelined
+  behind, the upstream's connection reused, the bodies that fall back
+  (whole, chunked, an h2c upstream), `Expect: 100-continue`, the client or
+  the upstream going away mid-body, an upstream's early answer, and 32
+  clients at once.
 - `tls/file_test.go` checks `SendFile` over TLS against `crypto/tls` clients,
   for TLS 1.3, AES-GCM, ChaCha20-Poly1305 and AES-CBC over TLS 1.2, with kernel
   TLS and without: from the handler and outside it, sends before and after, a
@@ -769,5 +812,5 @@ on Linux, macOS and Windows with `FIB_REQUIRE_CURL=1`, which makes a missing
 curl fail the job instead of skipping those cases. To run it locally:
 
 ```sh
-go test -race -run 'TestHTTP1Conformance|TestSendFile|TestSendableFileOf|TestResponseWriter|TestStreamRequestBody|TestChunkedDecoder|TestHoldReads|TestServerRead|TestServerIdle|TestServerTimeout|TestServerWithoutTimeouts|TestReadDeadline|TestWriteDeadline|TestZeroDeadline|TestConnectionAddresses|TestRetain|TestOnBody|TestBodyComplete|TestBodyMatrix|TestOnCancel|TestTransmitFile|TestControlIdle|TestKernelTLS' -v . ./http/ ./http3/ ./tls/
+go test -race -run 'TestHTTP1Conformance|TestSendFile|TestSendableFileOf|TestResponseWriter|TestStreamRequestBody|TestChunkedDecoder|TestHoldReads|TestServerRead|TestServerIdle|TestServerTimeout|TestServerWithoutTimeouts|TestReadDeadline|TestWriteDeadline|TestZeroDeadline|TestConnectionAddresses|TestRetain|TestOnBody|TestBodyComplete|TestBodyMatrix|TestOnCancel|TestTransmitFile|TestControlIdle|TestKernelTLS|TestSplice' -v . ./http/ ./http3/ ./tls/
 ```

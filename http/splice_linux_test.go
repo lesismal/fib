@@ -30,6 +30,9 @@ type spliceFront struct {
 	client   *Client
 	backend  string
 	noSplice bool
+	// unsized sends the upstream request with no length, which the client
+	// frames in chunks, and so cannot splice.
+	unsized bool
 	// offered counts the bodies SpliceBody offered, fallbacks the offers
 	// declined, and failures the requests the client failed.
 	offered, fallbacks, failures atomic.Int64
@@ -72,6 +75,9 @@ func (f *spliceFront) serve(c *Context) {
 	}
 	body := NewBodyWriter(64 << 10)
 	req.Body, req.ContentLength = body, c.Request.ContentLength
+	if f.unsized {
+		req.ContentLength = -1
+	}
 	push := func() {
 		c.OnBody(func(data []byte, fin bool, err error) {
 			switch {
@@ -243,6 +249,19 @@ func TestSpliceBodyFallsBack(t *testing.T) {
 			}
 		}
 		if f.offered.Load() != 2 || f.fallbacks.Load() != 2 {
+			t.Fatalf("%d offered, %d declined", f.offered.Load(), f.fallbacks.Load())
+		}
+	})
+	t.Run("chunked upstream", func(t *testing.T) {
+		f, front := newSpliceFront(t, newTestClient(t, uploadClientConfig()), backend)
+		f.unsized = true
+		raw := dialRaw(t, front)
+		body := genBytes(1 << 20)
+		go func() { _, _ = raw.Write(append([]byte(postHead(len(body), "")), body...)) }()
+		if _, got := raw.response(stdhttp.MethodPost); got != uploadAnswer(body) {
+			t.Fatalf("got %q", got)
+		}
+		if f.offered.Load() != 1 || f.fallbacks.Load() != 1 {
 			t.Fatalf("%d offered, %d declined", f.offered.Load(), f.fallbacks.Load())
 		}
 	})
@@ -435,6 +454,8 @@ func TestSpliceBodyRefuses(t *testing.T) {
 			if ok {
 				// One that does not match the request's length is refused.
 				verdicts = append(verdicts, strconv.FormatBool(s.SpliceTo(c.Conn, 1, nil)))
+				// Nor can a body go to the connection it arrives on.
+				verdicts = append(verdicts, strconv.FormatBool(s.SpliceTo(c.Conn, c.Request.ContentLength, nil)))
 			}
 		}
 		results <- strings.Join(verdicts, " ")
@@ -442,7 +463,7 @@ func TestSpliceBodyRefuses(t *testing.T) {
 	})))
 	raw := dialRaw(t, front)
 	go func() { _, _ = raw.Write(append([]byte(postHead(256<<10, "")), genBytes(256<<10)...)) }()
-	if got := <-results; got != "false false true false" {
+	if got := <-results; got != "false false true false false" {
 		t.Fatalf("got %q", got)
 	}
 }
