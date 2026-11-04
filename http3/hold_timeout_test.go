@@ -104,13 +104,15 @@ func TestReadTimeoutBeforeHandler(t *testing.T) {
 
 // A body that streams after being collected keeps the deadline it had from
 // its header: it fails a pause short of the timeout after it begins to
-// stream, 200ms, and not a whole timeout, 400ms, which it would were the
-// deadline started again. The timeout runs from when the header reaches
+// stream, 300ms, and not a whole timeout, 800ms, which it would were the
+// deadline started again. The two are a pause apart, and the check sits
+// halfway, so that a loaded runner's timers have 250ms either way: with a
+// 200ms pause one waited 302ms against 300ms (macOS CI, run 41838563945). The timeout runs from when the header reaches
 // the server, so the connection is dialed first: on a fresh one the
 // header waits for the QUIC handshake, which on a loaded runner took
 // long enough to push the failure past the old 80ms margin (CI run 203).
 func TestReadTimeoutCarriesIntoStream(t *testing.T) {
-	const timeout, pause = 400 * time.Millisecond, 200 * time.Millisecond
+	const timeout, pause = 800 * time.Millisecond, 500 * time.Millisecond
 	client := uploadClient(t)
 	url := startServer(t, Config{StreamRequestBody: true, StreamRequestBodyThreshold: 4 << 10, ReadBodyTimeout: timeout}, answerFailure(false))
 	if resp, err := client.Go(mustRequest(t, stdhttp.MethodGet, url+"/dial", nil)).Wait(); err != nil {
