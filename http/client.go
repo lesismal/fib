@@ -826,6 +826,7 @@ func requestTarget(req *stdhttp.Request) (hostTarget, error) {
 	}
 	var target hostTarget
 	port := req.URL.Port()
+	named := port != ""
 	switch req.URL.Scheme {
 	case "http":
 		if port == "" {
@@ -842,6 +843,13 @@ func requestTarget(req *stdhttp.Request) (hostTarget, error) {
 	host := req.URL.Hostname()
 	if host == "" {
 		return hostTarget{}, errors.New("http: request URL has no host")
+	}
+	if named && req.URL.Host[0] != '[' && strings.IndexByte(host, ':') < 0 {
+		// The URL names its port and its host needs no brackets, so the URL's
+		// host is the address as JoinHostPort would write it, which every
+		// request to a proxy's backend would otherwise build again.
+		target.addr = req.URL.Host
+		return target, nil
 	}
 	target.addr = net.JoinHostPort(host, port)
 	return target, nil

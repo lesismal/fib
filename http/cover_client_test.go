@@ -73,11 +73,28 @@ func TestCvCliRequestTarget(t *testing.T) {
 		{"http://example.com/", "example.com:80", false},
 		{"https://example.com/", "example.com:443", true},
 		{"https://example.com:8443/", "example.com:8443", true},
+		{"http://127.0.0.1:8080/", "127.0.0.1:8080", false},
+		{"http://[::1]:8080/", "[::1]:8080", false},
+		{"http://[::1]/", "[::1]:80", false},
+		{"http://[fe80::1%25eth0]:81/", "[fe80::1%eth0]:81", false},
 	} {
 		u, _ := url.Parse(tc.url)
 		target, err := requestTarget(&stdhttp.Request{URL: u})
 		if err != nil || target.addr != tc.addr || target.secure != tc.secure {
 			t.Fatalf("%s: %+v %v", tc.url, target, err)
+		}
+	}
+	// A URL built by hand is taken as JoinHostPort would join it, whatever
+	// shape its host is in.
+	for _, host := range []string{"a:b:80", "[a]:80", "example.com:", "x:8080"} {
+		u := &url.URL{Scheme: "http", Host: host, Path: "/"}
+		target, err := requestTarget(&stdhttp.Request{URL: u})
+		port := u.Port()
+		if port == "" {
+			port = "80"
+		}
+		if want := net.JoinHostPort(u.Hostname(), port); err != nil || target.addr != want {
+			t.Fatalf("%s: %+v %v, want %s", host, target, err, want)
 		}
 	}
 	if _, err := requestTarget(&stdhttp.Request{}); err == nil {
