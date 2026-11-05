@@ -238,9 +238,12 @@ func fakeRTP(track *TrackLocal, pt uint8, stop <-chan struct{}) {
 	}
 }
 
+// received is what collect saw of one remote track. Its RTP callback runs on
+// the engine's workers for every packet, so what it records is atomic: a test
+// reads it after the 20th packet, while later ones keep arriving.
 type received struct {
-	ssrc  uint32
-	pt    uint8
+	ssrc  atomic.Uint32
+	pt    atomic.Uint32
 	count atomic.Int64
 	first chan struct{}
 	once  sync.Once
@@ -256,7 +259,8 @@ func collect(pc *PeerConnection) chan *received {
 			if p.Unmarshal(b) != nil {
 				return
 			}
-			r.ssrc, r.pt = p.SSRC, p.PayloadType
+			r.ssrc.Store(p.SSRC)
+			r.pt.Store(uint32(p.PayloadType))
 			if r.count.Add(1) >= 20 {
 				r.once.Do(func() { close(r.first) })
 			}
@@ -305,11 +309,11 @@ func TestMedia(t *testing.T) {
 	go fakeRTP(tb, 100, stop)
 	gotB := nextTrack(t, rb)
 	gotA := nextTrack(t, ra)
-	if gotB.ssrc != sa.SSRC() || gotB.pt != 96 || gotB.track.Kind() != MediaKindVideo || gotB.track.StreamID() != "sa" || gotB.track.ID() != "va" {
-		t.Fatalf("b got ssrc %x pt %d kind %s ids %s/%s; a sends ssrc %x", gotB.ssrc, gotB.pt, gotB.track.Kind(), gotB.track.StreamID(), gotB.track.ID(), sa.SSRC())
+	if gotB.ssrc.Load() != sa.SSRC() || gotB.pt.Load() != 96 || gotB.track.Kind() != MediaKindVideo || gotB.track.StreamID() != "sa" || gotB.track.ID() != "va" {
+		t.Fatalf("b got ssrc %x pt %d kind %s ids %s/%s; a sends ssrc %x", gotB.ssrc.Load(), gotB.pt.Load(), gotB.track.Kind(), gotB.track.StreamID(), gotB.track.ID(), sa.SSRC())
 	}
-	if gotA.ssrc != sb.SSRC() || gotA.pt != 111 || gotA.track.Kind() != MediaKindAudio {
-		t.Fatalf("a got ssrc %x pt %d; b sends ssrc %x", gotA.ssrc, gotA.pt, sb.SSRC())
+	if gotA.ssrc.Load() != sb.SSRC() || gotA.pt.Load() != 111 || gotA.track.Kind() != MediaKindAudio {
+		t.Fatalf("a got ssrc %x pt %d; b sends ssrc %x", gotA.ssrc.Load(), gotA.pt.Load(), sb.SSRC())
 	}
 
 	// RTCP: a PLI from b reaches a's sender, and receiver reports flow.
@@ -362,8 +366,8 @@ func TestRenegotiateAddTrack(t *testing.T) {
 	defer close(stop)
 	go fakeRTP(track, 96, stop)
 	r := nextTrack(t, rb)
-	if r.ssrc != s.SSRC() {
-		t.Fatalf("ssrc %x, want %x", r.ssrc, s.SSRC())
+	if got := r.ssrc.Load(); got != s.SSRC() {
+		t.Fatalf("ssrc %x, want %x", got, s.SSRC())
 	}
 	// A second track, offered by the other side this time.
 	ra := collect(a)

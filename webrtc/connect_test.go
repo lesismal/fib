@@ -363,7 +363,7 @@ func TestTracksWithoutMid(t *testing.T) {
 			time.Sleep(300 * time.Millisecond)
 			select {
 			case r := <-rb:
-				t.Errorf("a second track %x past MaxRemoteSSRCs", r.ssrc)
+				t.Errorf("a second track %x past MaxRemoteSSRCs", r.ssrc.Load())
 			default:
 			}
 		} else {

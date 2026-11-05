@@ -34,8 +34,8 @@ func TestStaticPayloadTypeZero(t *testing.T) {
 	defer close(stop)
 	go fakeRTP(track, 0, stop)
 	got := nextTrack(t, rb)
-	if got.ssrc != s.SSRC() || got.pt != 0 || got.track.Codec().Name() != "PCMU" {
-		t.Fatalf("ssrc %x pt %d codec %+v", got.ssrc, got.pt, got.track.Codec())
+	if got.ssrc.Load() != s.SSRC() || got.pt.Load() != 0 || got.track.Codec().Name() != "PCMU" {
+		t.Fatalf("ssrc %x pt %d codec %+v", got.ssrc.Load(), got.pt.Load(), got.track.Codec())
 	}
 }
 
