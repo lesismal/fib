@@ -63,6 +63,11 @@ func FuzzNewRequest(f *testing.F) {
 			// name one (RFC 9114 section 4.3.1); an extension scheme may
 			// leave it out.
 			t.Fatal("a request for http or https without an authority")
+		case strings.ContainsAny(req.Method, " \t\r\n\x00") || strings.ContainsAny(req.Host, " \t\r\n\x00@") ||
+			strings.ContainsAny(req.RequestURI, " \t\r\n\x00"):
+			// Nothing a handler writes into an HTTP/1 message takes them
+			// for more than a method, a host and a target.
+			t.Fatalf("taken: %q %q %q", req.Method, req.Host, req.RequestURI)
 		}
 		if _, ok := req.Header["Host"]; ok {
 			t.Fatal("a Host field left in the header")

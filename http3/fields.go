@@ -30,6 +30,86 @@ func connectionHeader(name string) bool {
 	return false
 }
 
+// tokenByte and hostByte are the bytes of a token (RFC 9110 section 5.6.2),
+// as :method and :protocol are, and those an authority's host and port may
+// hold (RFC 3986 section 3.2.2): unreserved, sub-delims, percent-encoding,
+// an IP literal's brackets and the port's colon, but no userinfo's '@'.
+var tokenByte, hostByte = func() (token, host [256]bool) {
+	for c := '0'; c <= '9'; c++ {
+		token[c], host[c] = true, true
+	}
+	for c := 'a'; c <= 'z'; c++ {
+		token[c], host[c] = true, true
+		token[c-'a'+'A'], host[c-'a'+'A'] = true, true
+	}
+	for _, c := range "!#$%&'*+-.^_`|~" {
+		token[c] = true
+	}
+	for _, c := range "-._~!$&'()*+,;=%:[]" {
+		host[c] = true
+	}
+	return
+}()
+
+// validToken reports whether s is a token, as a method is.
+func validToken(s string) bool {
+	if s == "" {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		if !tokenByte[s[i]] {
+			return false
+		}
+	}
+	return true
+}
+
+// validScheme reports whether s has a URI scheme's syntax (RFC 3986 section
+// 3.1).
+func validScheme(s string) bool {
+	if s == "" || !(s[0] >= 'a' && s[0] <= 'z' || s[0] >= 'A' && s[0] <= 'Z') {
+		return false
+	}
+	for i := 1; i < len(s); i++ {
+		c := s[i]
+		if !(c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c >= '0' && c <= '9' || c == '+' || c == '-' || c == '.') {
+			return false
+		}
+	}
+	return true
+}
+
+// validAuthority reports whether s, an :authority or the Host standing in
+// for it, holds only what a host and port may: no userinfo, which HTTP/3
+// forbids there (RFC 9114 section 4.3.1), and nothing a handler writing it
+// into an HTTP/1 message or a log could have taken for more than a host.
+func validAuthority(s string) bool {
+	for i := 0; i < len(s); i++ {
+		if !hostByte[s[i]] {
+			return false
+		}
+	}
+	return true
+}
+
+// validPath reports whether s may be a request's :path: an origin-form
+// target, starting with '/' and holding no space or control character, or
+// '*' for OPTIONS alone (RFC 9114 section 4.3.1).
+func validPath(s, method string) bool {
+	if s == "*" {
+		return method == stdhttp.MethodOptions
+	}
+	if s == "" || s[0] != '/' {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		if c := s[i]; c <= ' ' || c == 0x7f {
+			return false
+		}
+	}
+	return true
+}
+
 // validName reports whether name is a valid lowercase field name.
 func validName(name string) bool {
 	if name == "" {
@@ -296,6 +376,22 @@ func newRequest(fields []qpack.HeaderField, block *fibhttp.StreamRequest, header
 	}
 	if method == "" {
 		return nil, errors.New("missing :method")
+	}
+	// What the pseudo-headers hold reaches the handler as a request line's
+	// parts would, and on to whatever it writes them into: each has to have
+	// its own syntax, never a line break, a space or a NUL that could be
+	// taken for more (RFC 9114 section 4.3.1).
+	switch {
+	case !validToken(method):
+		return nil, errors.New("malformed :method")
+	case seen[4] && !validToken(protocol):
+		return nil, errors.New("malformed :protocol")
+	case seen[1] && !validScheme(scheme):
+		return nil, errors.New("malformed :scheme")
+	case !validAuthority(authority) || !validAuthority(host):
+		return nil, errors.New("malformed :authority or Host")
+	case path != "" && !validPath(path, method):
+		return nil, errors.New("malformed :path")
 	}
 	if block == nil {
 		block = new(fibhttp.StreamRequest)

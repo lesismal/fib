@@ -66,6 +66,70 @@ func TestNewRequestRefusesMalformedFields(t *testing.T) {
 	}
 }
 
+// The pseudo-headers' values have their own syntax: a request smuggling a
+// request line, a header or a NUL in one, or userinfo in its authority, is
+// refused before it reaches a handler, which a server answers with
+// H3_MESSAGE_ERROR; what they may hold is still taken.
+func TestNewRequestRefusesMalformedPseudoHeaders(t *testing.T) {
+	f := func(name, value string) qpack.HeaderField { return qpack.HeaderField{Name: name, Value: value} }
+	request := func(method, scheme, authority, path string, extra ...qpack.HeaderField) []qpack.HeaderField {
+		fields := []qpack.HeaderField{f(":method", method)}
+		if scheme != "" {
+			fields = append(fields, f(":scheme", scheme))
+		}
+		if authority != "" {
+			fields = append(fields, f(":authority", authority))
+		}
+		if path != "" {
+			fields = append(fields, f(":path", path))
+		}
+		return append(fields, extra...)
+	}
+	refused := map[string][]qpack.HeaderField{
+		"request line in :method":    request("GET /x HTTP/1.1\r\nX-Evil: 1\r\n", "https", "localhost", "/"),
+		"space in :method":           request("GET /", "https", "localhost", "/"),
+		"header in :authority":       request("GET", "https", "a\r\nInjected: 1\x00", "/"),
+		"userinfo in :authority":     request("GET", "https", "user@localhost", "/"),
+		"space in :authority":        request("GET", "https", "local host", "/"),
+		"header in Host":             request("GET", "https", "", "/", f("host", "a\tInjected: 1")),
+		"userinfo in Host":           request("GET", "https", "", "/", f("host", "user@localhost")),
+		"header in CONNECT target":   request("CONNECT", "", "a:443\r\nX: 1", ""),
+		"bad :scheme":                request("GET", "1https", "localhost", "/"),
+		"header in :scheme":          request("GET", "https\r\nX: 1", "localhost", "/"),
+		"space in :path":             request("GET", "https", "localhost", "/x HTTP/1.1"),
+		"CRLF in :path":              request("GET", "https", "localhost", "/x\r\nX-Evil: 1"),
+		"DEL in :path":               request("GET", "https", "localhost", "/x\x7f"),
+		"absolute :path":             request("GET", "https", "localhost", "http://evil/x"),
+		"asterisk for GET":           request("GET", "https", "localhost", "*"),
+		"header in :protocol":        request("CONNECT", "https", "localhost", "/chat", f(":protocol", "websocket\r\nX: 1")),
+		"asterisk extended CONNECT":  request("CONNECT", "https", "localhost", "*", f(":protocol", "websocket")),
+		"empty :protocol":            request("CONNECT", "https", "localhost", "/chat", f(":protocol", "")),
+		"NUL in :method of CONNECT":  request("CONNECT\x00", "", "localhost:443", ""),
+		"query with a space in path": request("GET", "https", "localhost", "/x?a b"),
+	}
+	for name, fields := range refused {
+		if req, err := newRequest(fields, nil, nil, nil); err == nil {
+			t.Errorf("%s: accepted as %q %q %q", name, req.Method, req.Host, req.RequestURI)
+		}
+	}
+	taken := map[string][]qpack.HeaderField{
+		"extension method":        request("PROPFIND", "https", "localhost", "/"),
+		"IPv6 literal and port":   request("GET", "https", "[::1]:8443", "/a/b?c=d&e=%20"),
+		"percent-encoded host":    request("GET", "https", "ex%41mple.com", "/"),
+		"extension scheme":        request("GET", "coap+tcp", "localhost", "/"),
+		"Host for :authority":     request("GET", "https", "", "/", f("host", "localhost:443")),
+		"OPTIONS *":               request("OPTIONS", "https", "localhost", "*"),
+		"CONNECT":                 request("CONNECT", "", "localhost:443", ""),
+		"extended CONNECT":        request("CONNECT", "https", "localhost", "/chat", f(":protocol", "websocket")),
+		"query of any printables": request("GET", "https", "localhost", "/s?q=\"<a>\"|{}^`"),
+	}
+	for name, fields := range taken {
+		if _, err := newRequest(fields, nil, nil, nil); err != nil {
+			t.Errorf("%s: %v", name, err)
+		}
+	}
+}
+
 // A response's fields are checked as a request's are, and an interim one
 // comes back as nil, except 101, which HTTP/3 has no use for.
 func TestNewResponseRefusesMalformedFields(t *testing.T) {
