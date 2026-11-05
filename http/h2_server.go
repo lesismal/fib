@@ -1026,9 +1026,15 @@ func (sc *h2ServerConn) handleData(f *h2Frame) error {
 		sc.reject(st, stdhttp.StatusRequestEntityTooLarge)
 		return nil
 	}
-	// The body's last frame goes to its handler at once; any other has to
-	// fit beside what the connection holds already.
-	if !f.has(h2FlagEndStream) && !sc.bufferRoom(int64(len(f.payload))) {
+	if f.has(h2FlagEndStream) {
+		// The body's last frame goes to its handler at once, with what came
+		// before it, which the connection holds no longer.
+		sc.buffered -= int64(len(st.body))
+		st.body = bufferpool.Append(st.body, f.payload)
+		return sc.finishRequest(st)
+	}
+	// Any other has to fit beside what the connection holds already.
+	if !sc.bufferRoom(int64(len(f.payload))) {
 		sc.buffered -= int64(len(st.body))
 		bufferpool.Put(st.body)
 		st.body = nil
@@ -1036,9 +1042,6 @@ func (sc *h2ServerConn) handleData(f *h2Frame) error {
 	}
 	st.body = bufferpool.Append(st.body, f.payload)
 	sc.buffered += int64(len(f.payload))
-	if f.has(h2FlagEndStream) {
-		return sc.finishRequest(st)
-	}
 	if st.recvUnacked >= sc.local.streamWindow/2 {
 		increment := st.recvUnacked
 		st.recvWindow += increment
@@ -1269,6 +1272,8 @@ func (sc *h2ServerConn) handleTrailers(st *h2ServerStream, fields []hpack.Header
 		return sc.endStreamed(st, trailer)
 	}
 	st.req.Trailer = trailer
+	// The body collected before the trailers is the handler's now.
+	sc.buffered -= int64(len(st.body))
 	return sc.finishRequest(st)
 }
 
@@ -1296,34 +1301,50 @@ func (sc *h2ServerConn) newRequest(fields []hpack.HeaderField, st *h2ServerStrea
 	var cookies []string
 	regular := false
 	for _, f := range fields {
-		if strings.HasPrefix(f.Name, ":") {
+		if f.Name != "" && f.Name[0] == ':' {
 			if regular {
 				return nil, errors.New("pseudo-header after regular header")
 			}
+			// Each value is checked as it is taken (RFC 9113 section 8.3):
+			// only checked as any field's value is, it would let spaces and
+			// controls through into what a handler, or a proxy writing the
+			// request out as HTTP/1, takes for a method, target or host. The
+			// path is checked as it is parsed, below.
 			var slot int
+			valid := true
 			switch f.Name {
 			case ":method":
 				slot, method = 0, f.Value
+				valid = h2ValidMethod(method)
 			case ":scheme":
 				slot, scheme = 1, f.Value
+				valid = scheme == "" || h2ValidScheme(scheme)
 			case ":authority":
 				slot, authority = 2, f.Value
+				valid = h2ValidAuthority(authority)
 			case ":path":
 				slot, path = 3, f.Value
 			case ":protocol":
 				// Extended CONNECT (RFC 8441), which the server allows.
 				slot, protocol = 4, f.Value
+				valid = validFieldName(protocol)
 			default:
 				return nil, fmt.Errorf("unknown pseudo-header %q", f.Name)
 			}
 			if seen[slot] {
 				return nil, fmt.Errorf("duplicate %s", f.Name)
 			}
+			if !valid {
+				return nil, errors.New("malformed pseudo-header")
+			}
 			seen[slot] = true
 			continue
 		}
 		regular = true
-		if !h2ValidHeaderName(f.Name) || !h2ValidHeaderValue(f.Value) || h2ConnectionHeaders[f.Name] {
+		// One lookup tells a name requests nearly always carry: its key, and
+		// that it is valid. Only the others are looked at byte by byte.
+		known, ok := h2KnownNames[f.Name]
+		if ok && known.hop || !ok && !h2ValidHeaderName(f.Name) || !h2ValidHeaderValue(f.Value) {
 			return nil, fmt.Errorf("invalid header %q", f.Name)
 		}
 		if f.Name == "te" && f.Value != "trailers" {
@@ -1333,7 +1354,10 @@ func (sc *h2ServerConn) newRequest(fields []hpack.HeaderField, st *h2ServerStrea
 			cookies = append(cookies, f.Value)
 			continue
 		}
-		key := h2CanonicalKey(f.Name)
+		key := known.key
+		if !ok {
+			key = textproto.CanonicalMIMEHeaderKey(f.Name)
+		}
 		if existing, ok := header[key]; ok || len(values) == 0 {
 			header[key] = append(existing, f.Value)
 			continue
@@ -1351,14 +1375,6 @@ func (sc *h2ServerConn) newRequest(fields []hpack.HeaderField, st *h2ServerStrea
 	}
 	if method == "" {
 		return nil, errors.New("missing :method")
-	}
-	// The pseudo-headers' values were only checked as any field's value is,
-	// which lets spaces and controls through into what a handler, or a proxy
-	// writing the request out as HTTP/1, takes for a method, target or host.
-	if !h2ValidMethod(method) || scheme != "" && !h2ValidScheme(scheme) ||
-		!h2ValidAuthority(authority) || path != "" && !h2ValidPath(method, path) ||
-		seen[4] && !validFieldName(protocol) {
-		return nil, errors.New("malformed pseudo-header")
 	}
 	req := &st.block.Request
 	*req = stdhttp.Request{
@@ -1378,7 +1394,7 @@ func (sc *h2ServerConn) newRequest(fields []hpack.HeaderField, st *h2ServerStrea
 		if method != stdhttp.MethodConnect || protocol == "" || scheme == "" || path == "" || authority == "" {
 			return nil, errors.New("malformed extended CONNECT")
 		}
-		if err := ParseRequestTarget(u, path); err != nil {
+		if err := h2ParsePath(u, path); err != nil {
 			return nil, err
 		}
 		req.RequestURI = path
@@ -1394,8 +1410,12 @@ func (sc *h2ServerConn) newRequest(fields []hpack.HeaderField, st *h2ServerStrea
 			return nil, errors.New("missing :scheme or :path")
 		}
 		if path == "*" {
+			// The asterisk form is OPTIONS's alone (RFC 9110 section 7.1).
+			if method != stdhttp.MethodOptions {
+				return nil, errH2MalformedPath
+			}
 			*u = url.URL{Path: "*"}
-		} else if err := ParseRequestTarget(u, path); err != nil {
+		} else if err := h2ParsePath(u, path); err != nil {
 			return nil, err
 		}
 		req.RequestURI = path
@@ -1413,10 +1433,10 @@ func (sc *h2ServerConn) newRequest(fields []hpack.HeaderField, st *h2ServerStrea
 }
 
 // finishRequest runs the handler for a stream whose request has arrived
-// whole.
+// whole. Its body, if it has one, is the handler's from here, or goes with
+// the stream: a caller that collected one has taken it out of sc.buffered,
+// and a request that ended with its HEADERS frame has none to count.
 func (sc *h2ServerConn) finishRequest(st *h2ServerStream) error {
-	// The body is the handler's from here, or goes with the stream.
-	sc.buffered -= int64(len(st.body))
 	if st.declared >= 0 && st.declared != int64(len(st.body)) {
 		bufferpool.Put(st.body)
 		st.body = nil
@@ -2259,7 +2279,7 @@ func h2CheckField(key string, values []string) error {
 func (sc *h2ServerConn) appendHeaderLocked(block []byte, header stdhttp.Header) []byte {
 	for key, values := range header {
 		name := h2LowerKey(key)
-		if h2ConnectionHeaders[name] || name == "content-length" {
+		if h2HopField(name) || name == "content-length" {
 			continue
 		}
 		for _, value := range values {
@@ -2275,7 +2295,7 @@ func (sc *h2ServerConn) appendHeaderLocked(block []byte, header stdhttp.Header) 
 func h2AppendFields(fields []string, header stdhttp.Header) []string {
 	for key, values := range header {
 		name := h2LowerKey(key)
-		if h2ConnectionHeaders[name] || name == "content-length" {
+		if h2HopField(name) || name == "content-length" {
 			continue
 		}
 		for _, value := range values {
@@ -2319,7 +2339,7 @@ func h2HeaderSize(header stdhttp.Header) int64 {
 	var size int64
 	for key, values := range header {
 		name := h2LowerKey(key)
-		if h2ConnectionHeaders[name] || name == "content-length" {
+		if h2HopField(name) || name == "content-length" {
 			continue
 		}
 		for _, value := range values {

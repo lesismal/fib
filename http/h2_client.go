@@ -498,7 +498,7 @@ func h2TrailerFields(fields stdhttp.Header) []string {
 	var trailer []string
 	for key, values := range fields {
 		name := strings.ToLower(key)
-		if !h2ValidHeaderName(name) || strings.HasPrefix(name, ":") || h2ConnectionHeaders[name] {
+		if !h2ValidHeaderName(name) || strings.HasPrefix(name, ":") || h2HopField(name) {
 			continue
 		}
 		for _, value := range values {
@@ -543,7 +543,7 @@ func h2RequestFields(r *clientRequest, secure bool) (fields, trailer []string, e
 			te = te || slices.ContainsFunc(values, hasTrailersToken)
 			continue
 		}
-		if h2ConnectionHeaders[name] || name == "host" || name == "content-length" || name == "trailer" {
+		if h2HopField(name) || name == "host" || name == "content-length" || name == "trailer" {
 			continue
 		}
 		if !h2ValidHeaderName(name) {
@@ -576,7 +576,7 @@ func h2RequestFields(r *clientRequest, secure bool) (fields, trailer []string, e
 	var declared []string
 	for key, values := range req.Trailer {
 		name := strings.ToLower(key)
-		if !h2ValidHeaderName(name) || strings.HasPrefix(name, ":") || h2ConnectionHeaders[name] {
+		if !h2ValidHeaderName(name) || strings.HasPrefix(name, ":") || h2HopField(name) {
 			return nil, nil, errors.New("http: invalid request trailer name " + strconv.Quote(key))
 		}
 		declared = append(declared, name)
@@ -1212,7 +1212,7 @@ func h2NewResponse(fields []hpack.HeaderField, req *stdhttp.Request) (*stdhttp.R
 			status = f.Value
 			continue
 		}
-		if h2ConnectionHeaders[f.Name] {
+		if h2HopField(f.Name) {
 			return nil, errors.New("connection-specific header")
 		}
 		key := textproto.CanonicalMIMEHeaderKey(f.Name)

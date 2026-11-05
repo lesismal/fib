@@ -272,14 +272,22 @@ func h2ParseSettings(payload []byte, apply func(id h2SettingID, value uint32) er
 	return nil
 }
 
-// h2ConnectionHeaders are HTTP/1 hop-by-hop headers, which HTTP/2 forbids
-// (RFC 9113 section 8.2.2).
-var h2ConnectionHeaders = map[string]bool{
-	"connection":        true,
-	"keep-alive":        true,
-	"proxy-connection":  true,
-	"transfer-encoding": true,
-	"upgrade":           true,
+// h2HopField reports whether name is one of the HTTP/1 hop-by-hop fields
+// HTTP/2 forbids (RFC 9113 section 8.2.2): connection, keep-alive,
+// proxy-connection, transfer-encoding and upgrade. It compares rather than
+// hashing name for a map, since it is asked of nearly every field.
+func h2HopField(name string) bool {
+	switch len(name) {
+	case len("upgrade"):
+		return name == "upgrade"
+	case len("connection"):
+		return name == "connection" || name == "keep-alive"
+	case len("proxy-connection"):
+		return name == "proxy-connection"
+	case len("transfer-encoding"):
+		return name == "transfer-encoding"
+	}
+	return false
 }
 
 // h2LowerKeys are the lowercase names of the header keys messages nearly
@@ -306,22 +314,41 @@ var h2LowerKeys = func() map[string]string {
 	return keys
 }()
 
-// h2CanonicalKeys maps the lowercase names of h2LowerKeys back to their keys,
-// which is what textproto.CanonicalMIMEHeaderKey makes of them.
-var h2CanonicalKeys = func() map[string]string {
-	keys := make(map[string]string, len(h2LowerKeys))
-	for key, name := range h2LowerKeys {
-		keys[name] = key
+// h2KnownField is what one lookup in h2KnownNames or h2KnownKeys tells of a
+// field: its canonical key, its lowercase name, and whether it is one of the
+// hop-by-hop fields HTTP/2 forbids. A known name is a valid one, and a known
+// key's lowercase name too.
+type h2KnownField struct {
+	key, name string
+	hop       bool
+}
+
+// h2KnownNames maps the lowercase names of h2LowerKeys and of the hop-by-hop
+// fields to what they are, and h2KnownKeys maps their keys alike. A key is
+// what textproto.CanonicalMIMEHeaderKey makes of its name.
+var h2KnownNames, h2KnownKeys = func() (names, keys map[string]h2KnownField) {
+	hop := []string{"Connection", "Keep-Alive", "Proxy-Connection", "Transfer-Encoding", "Upgrade"}
+	names = make(map[string]h2KnownField, len(h2LowerKeys)+len(hop))
+	keys = make(map[string]h2KnownField, len(h2LowerKeys)+len(hop))
+	add := func(key, name string) {
+		known := h2KnownField{key: key, name: name, hop: h2HopField(name)}
+		names[name], keys[key] = known, known
 	}
-	return keys
+	for key, name := range h2LowerKeys {
+		add(key, name)
+	}
+	for _, key := range hop {
+		add(key, strings.ToLower(key))
+	}
+	return names, keys
 }()
 
 // h2LowerKey is a header key in lower case, as HTTP/2 sends it, without the
 // allocation strings.ToLower makes of a canonical key for the keys messages
 // nearly always carry.
 func h2LowerKey(key string) string {
-	if name, ok := h2LowerKeys[key]; ok {
-		return name
+	if known, ok := h2KnownKeys[key]; ok {
+		return known.name
 	}
 	return strings.ToLower(key)
 }
@@ -330,20 +357,20 @@ func h2LowerKey(key string) string {
 // name, looked up rather than rebuilt for the names requests nearly always
 // carry.
 func h2CanonicalKey(name string) string {
-	if key, ok := h2CanonicalKeys[name]; ok {
-		return key
+	if known, ok := h2KnownNames[name]; ok {
+		return known.key
 	}
 	return textproto.CanonicalMIMEHeaderKey(name)
 }
 
-// h2ValidHeaderName reports whether name is a valid lowercase field name.
+// h2ValidHeaderName reports whether name is a valid lowercase field name, or
+// a pseudo-header's.
 func h2ValidHeaderName(name string) bool {
 	if name == "" {
 		return false
 	}
 	for i := 0; i < len(name); i++ {
-		c := name[i]
-		if c >= 'A' && c <= 'Z' || c <= ' ' || c >= 0x7f || c == ':' && i > 0 {
+		if h2ByteClass[name[i]]&h2NameByte == 0 && (name[i] != ':' || i > 0) {
 			return false
 		}
 	}
@@ -353,10 +380,8 @@ func h2ValidHeaderName(name string) bool {
 // h2ValidHeaderValue reports whether value may appear in a field, which rules
 // out NUL, CR, LF and leading or trailing whitespace (RFC 9113 section 8.2.1).
 func h2ValidHeaderValue(value string) bool {
-	for i := 0; i < len(value); i++ {
-		if c := value[i]; c == 0 || c == '\r' || c == '\n' {
-			return false
-		}
+	if !h2Bytes(value, h2ValueByte) {
+		return false
 	}
 	if n := len(value); n > 0 && (value[0] == ' ' || value[0] == '\t' || value[n-1] == ' ' || value[n-1] == '\t') {
 		return false
