@@ -1,6 +1,7 @@
 package quic
 
 import (
+	"bytes"
 	"errors"
 	"slices"
 	"testing"
@@ -185,6 +186,43 @@ func TestFloodPingWithNewAck(t *testing.T) {
 	}
 	if err == nil {
 		t.Fatal("PINGs with an old acknowledgement were not counted")
+	}
+}
+
+// TestFloodRepeatedAcks checks that ACK frames packed into a packet, each
+// spanning packets in flight that were acknowledged before, past the first
+// count as glitches; one to a packet, however often repeated, does not.
+func TestFloodRepeatedAcks(t *testing.T) {
+	c := frameConn(t)
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	s := &c.spaces[spaceApp]
+	now := time.Now()
+	const n = 2000
+	for range n {
+		s.sent.push(&sentPacket{pn: s.nextPN, time: now})
+		s.nextPN++
+	}
+	// Packet 0 is still waiting, so the ones acknowledged after it keep
+	// their slots.
+	ack := frame(frameAck, n-1, 0, 0, n-2)
+	if _, err := c.handleFrames(spaceApp, ack, now); err != nil {
+		t.Fatal(err)
+	}
+	for i := range DefaultControlFrameBurst + 10 {
+		if _, err := c.handleFrames(spaceApp, ack, now); err != nil {
+			t.Fatalf("ACK %d: %v", i, err)
+		}
+	}
+	packed := bytes.Repeat(ack, 200)
+	var err error
+	sent := 0
+	for ; sent < 100 && err == nil; sent++ {
+		_, err = c.handleFrames(spaceApp, packed, now)
+	}
+	var te *TransportError
+	if !errors.As(err, &te) || te.Code != errProtocolViolation || sent > DefaultControlFrameBurst/199+1 {
+		t.Fatalf("closed after %d packets with %v, want PROTOCOL_VIOLATION", sent, err)
 	}
 }
 

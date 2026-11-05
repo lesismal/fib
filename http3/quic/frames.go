@@ -150,6 +150,8 @@ func (c *Conn) handleFrames(space int, payload []byte, now time.Time) (bool, err
 	pinged, asked, dataRaised := false, false, false
 	// cryptoNew says the packet carried handshake data not received before.
 	cryptoNew := false
+	// acks counts the packet's ACK frames.
+	acks := 0
 	c.ackedNew = false
 	for len(r.b) > 0 && !c.closed {
 		typ := r.varint()
@@ -195,6 +197,17 @@ func (c *Conn) handleFrames(space int, payload []byte, now time.Time) (bool, err
 		case typ == framePing:
 			pinged = true
 		case typ == frameAck || typ == frameAckECN:
+			// Each ACK frame goes through the slots of the packets in
+			// flight that its ranges span, the ones acknowledged before
+			// included. A sender has one to a packet; one that packs a
+			// datagram with them, saying the same over and over, asks for
+			// that work again and again, and each after the first counts
+			// as a glitch.
+			if acks++; acks > 1 {
+				if err = c.glitch(); err != nil {
+					break
+				}
+			}
 			err = c.handleAckFrame(space, &r, typ == frameAckECN, now)
 		case typ == frameResetStream:
 			id, code, size := r.varint(), r.varint(), r.varint()
