@@ -9,8 +9,8 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	stdhttp "net/http"
-	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -375,6 +375,9 @@ type Parser struct {
 	// than again on every read until the body is complete.
 	awaiting   frameInfo
 	headerScan int
+	// chunks is how far the chunked body of the request awaiting has been
+	// scanned.
+	chunks chunkScan
 	// conn is the connection being parsed, which a streamed body reads from
 	// and holds back; the server handler fills it in. remoteAddr is the
 	// peer's address, which every request carries as its RemoteAddr.
@@ -769,6 +772,9 @@ func (p *Parser) consume(n int) {
 
 func (p *Parser) frameLength() (frameInfo, bool, error) {
 	if frame := p.awaiting; frame.request != nil {
+		if frame.chunked {
+			return p.chunkedFrame(frame)
+		}
 		if frame.end > len(p.buffer) {
 			return frameInfo{}, false, nil
 		}
@@ -854,24 +860,13 @@ func (p *Parser) frameLength() (frameInfo, bool, error) {
 			// (RFC 9112 section 6.3).
 			req.Close = true
 		}
-		if p.config.StreamRequestBody && (int64(len(p.buffer)-headerEnd) > p.config.StreamRequestBodyThreshold ||
-			p.streamAtHeader(req)) {
-			// More has been sent than this server is willing to hold, and a
-			// chunked body never says how much more is coming. Hand the
-			// request over and decode the rest as it arrives.
-			return frameInfo{end: headerEnd, headerEnd: headerEnd, chunked: true, coding: coding, stream: true, request: req, block: block}, true, nil
+		frame := frameInfo{end: headerEnd, headerEnd: headerEnd, chunked: true, coding: coding, request: req, block: block}
+		if p.config.StreamRequestBody && p.streamAtHeader(req) {
+			frame.stream = true
+			return frame, true, nil
 		}
-		end, complete, err := chunkedEnd(p.buffer, headerEnd, p.config.MaxHeaderBytes, p.config.MaxBodyBytes)
-		if err == nil && !complete {
-			p.expectContinue(req)
-		}
-		if err != nil || !complete {
-			return frameInfo{end: end, headerEnd: headerEnd, chunked: true, coding: coding, request: req, block: block}, complete, err
-		}
-		if int64(end-headerEnd) > p.config.MaxBodyBytes+int64(p.config.MaxHeaderBytes) {
-			return frameInfo{}, false, ErrBodyTooLarge
-		}
-		return frameInfo{end: end, headerEnd: headerEnd, chunked: true, coding: coding, request: req, block: block}, true, nil
+		p.chunks = chunkScan{}
+		return p.chunkedFrame(frame)
 	}
 	if req.ContentLength < 0 {
 		return frameInfo{end: headerEnd, headerEnd: headerEnd, request: req, block: block}, true, nil
@@ -903,6 +898,32 @@ func (p *Parser) frameLength() (frameInfo, bool, error) {
 		p.awaiting = frame
 		return frameInfo{}, false, nil
 	}
+	return frame, true, nil
+}
+
+// chunkedFrame frames a chunked request whose header frame holds, from
+// what has arrived of its body. One still arriving waits in p.awaiting, so
+// that the next read neither parses its header again nor scans its body from
+// the start (see chunkScan).
+func (p *Parser) chunkedFrame(frame frameInfo) (frameInfo, bool, error) {
+	p.awaiting = frameInfo{}
+	if p.config.StreamRequestBody && int64(len(p.buffer)-frame.headerEnd) > p.config.StreamRequestBodyThreshold {
+		// More has been sent than this server is willing to hold, and a
+		// chunked body never says how much more is coming. Hand the request
+		// over and decode the rest as it arrives.
+		frame.end, frame.stream = frame.headerEnd, true
+		return frame, true, nil
+	}
+	end, complete, err := p.chunks.chunkedEnd(p.buffer, frame.headerEnd, p.config.MaxHeaderBytes, p.config.MaxBodyBytes)
+	if err != nil {
+		return frameInfo{}, false, err
+	}
+	if !complete {
+		p.expectContinue(frame.request)
+		p.awaiting = frame
+		return frameInfo{}, false, nil
+	}
+	frame.end = end
 	return frame, true, nil
 }
 
@@ -957,54 +978,156 @@ func validFieldName(name string) bool {
 	return true
 }
 
-func chunkedEnd(data []byte, offset, maxTrailer int, maxBody int64) (int, bool, error) {
-	var decoded uint64
-	for {
-		lineEnd := bytes.Index(data[offset:], []byte("\r\n"))
-		if lineEnd < 0 {
-			return 0, false, nil
+// maxChunkLine bounds a chunk-size line, its chunk extensions and its CRLF
+// included: a longer one is malformed, which keeps a sender from making a
+// peer buffer, and scan, an extension that never ends. It is what the reader
+// net/http decodes a buffered chunked request with holds (see requestReader),
+// so that a line is refused alike whichever path decodes it; net/http's own
+// chunked reader allows a few kilobytes.
+const maxChunkLine = 1024
+
+var (
+	errChunkLine        = fmt.Errorf("%w: invalid chunk size line", ErrMalformed)
+	errChunkLineTooLong = fmt.Errorf("%w: chunk size line too long", ErrMalformed)
+	errChunkTerminator  = fmt.Errorf("%w: invalid chunk terminator", ErrMalformed)
+)
+
+// parseChunkLine parses the chunk-size line at the front of b, reporting the
+// chunk's size and the line's length with its CRLF, or a zero length while
+// the line is still arriving. It takes what net/http's chunked reader takes,
+// and nothing else, so that a body is framed here exactly as it is decoded
+// there: a line ended by CRLF with no other CR in it, of no more than
+// maxChunkLine bytes, of at most 16 hex digits, which optional spaces or tabs, and
+// then any chunk extensions after a ';', may follow. Nothing may come before
+// the digits.
+func parseChunkLine(b []byte) (size uint64, n int, err error) {
+	window := b
+	if len(window) > maxChunkLine {
+		window = window[:maxChunkLine]
+	}
+	lf := bytes.IndexByte(window, '\n')
+	if lf < 0 {
+		if len(b) >= maxChunkLine {
+			return 0, 0, errChunkLineTooLong
 		}
-		line := string(data[offset : offset+lineEnd])
-		if semicolon := strings.IndexByte(line, ';'); semicolon >= 0 {
-			line = line[:semicolon]
+		return 0, 0, nil
+	}
+	if lf == 0 || b[lf-1] != '\r' {
+		// A bare LF ends no chunk line (RFC 9112 section 7.1, erratum 7633).
+		return 0, 0, errChunkLine
+	}
+	line := b[:lf-1]
+	if bytes.IndexByte(line, '\r') >= 0 {
+		return 0, 0, errChunkLine
+	}
+	for len(line) > 0 && (line[len(line)-1] == ' ' || line[len(line)-1] == '\t') {
+		line = line[:len(line)-1]
+	}
+	if semicolon := bytes.IndexByte(line, ';'); semicolon >= 0 {
+		line = line[:semicolon]
+	}
+	if len(line) == 0 || len(line) > 16 {
+		return 0, 0, errChunkLine
+	}
+	for _, c := range line {
+		switch {
+		case '0' <= c && c <= '9':
+			c -= '0'
+		case 'a' <= c && c <= 'f':
+			c -= 'a' - 10
+		case 'A' <= c && c <= 'F':
+			c -= 'A' - 10
+		default:
+			return 0, 0, errChunkLine
 		}
-		size, err := strconv.ParseUint(strings.TrimSpace(line), 16, 63)
+		size = size<<4 | uint64(c)
+	}
+	if size > math.MaxInt64 {
+		// No body this large can be framed, let alone buffered.
+		return 0, 0, errChunkLine
+	}
+	return size, lf + 1, nil
+}
+
+// chunkScan is how far chunkedEnd has got through a chunked body that is
+// still arriving, so that each read scans what it added rather than the
+// whole body again: at is where the next chunk-size line starts, or once
+// trailer is set where the trailer section does, relative to the body's
+// start; decoded is what the chunks so far carry; and trailerScan is how far
+// into the trailer section the search for its end has got.
+type chunkScan struct {
+	at          int
+	decoded     uint64
+	trailer     bool
+	trailerScan int
+}
+
+// chunkedEnd finds the end of the chunked body that starts at start in data,
+// reporting false while it is still arriving, carrying on from where scan
+// left off. The body may carry no more than maxBody bytes, and take no more
+// than maxBody and maxTrailer together on the wire, chunk-size lines,
+// extensions, CRLFs and trailer section all included, so that a sender of
+// many small chunks or long extensions cannot have more than that buffered
+// for a body it limits to maxBody. maxTrailer also bounds the trailer
+// section alone, and maxChunkLine each chunk-size line.
+func (scan *chunkScan) chunkedEnd(data []byte, start, maxTrailer int, maxBody int64) (int, bool, error) {
+	raw := uint64(maxBody) + uint64(maxTrailer)
+	offset := start + scan.at
+	for !scan.trailer {
+		size, n, err := parseChunkLine(data[offset:])
 		if err != nil {
-			return 0, false, fmt.Errorf("%w: invalid chunk size", ErrMalformed)
+			return 0, false, err
 		}
-		offset += lineEnd + 2
-		if size == 0 {
-			if len(data[offset:]) >= 2 && bytes.Equal(data[offset:offset+2], []byte("\r\n")) {
-				return offset + 2, true, nil
-			}
-			trailerEnd := bytes.Index(data[offset:], headEnd)
-			if trailerEnd >= 0 {
-				if trailerEnd+4 > maxTrailer {
-					return 0, false, ErrHeaderTooLarge
-				}
-				return offset + trailerEnd + 4, true, nil
-			}
-			if len(data)-offset > maxTrailer {
-				return 0, false, ErrHeaderTooLarge
+		if n == 0 {
+			if uint64(len(data)-start) > raw {
+				return 0, false, ErrBodyTooLarge
 			}
 			return 0, false, nil
 		}
-		if size > uint64(maxBody)-decoded {
+		if size == 0 {
+			scan.at, scan.trailer = offset+n-start, true
+			offset += n
+			break
+		}
+		if size > uint64(maxBody)-scan.decoded || uint64(offset+n-start)+size+2 > raw {
 			return 0, false, ErrBodyTooLarge
 		}
-		decoded += size
-		if size > uint64(len(data)-offset) {
-			return 0, false, nil
-		}
-		chunkEnd := offset + int(size)
+		chunkEnd := offset + n + int(size)
 		if chunkEnd+2 > len(data) {
 			return 0, false, nil
 		}
-		if !bytes.Equal(data[chunkEnd:chunkEnd+2], []byte("\r\n")) {
-			return 0, false, fmt.Errorf("%w: invalid chunk terminator", ErrMalformed)
+		if data[chunkEnd] != '\r' || data[chunkEnd+1] != '\n' {
+			return 0, false, errChunkTerminator
 		}
+		scan.decoded += size
 		offset = chunkEnd + 2
+		scan.at = offset - start
 	}
+	rest := data[offset:]
+	if len(rest) >= 2 && rest[0] == '\r' && rest[1] == '\n' {
+		return scan.trailerDone(offset+2, start, raw)
+	}
+	at := bytes.Index(rest[scan.trailerScan:], headEnd)
+	if at < 0 {
+		if len(rest) > maxTrailer {
+			return 0, false, ErrHeaderTooLarge
+		}
+		scan.trailerScan = max(len(rest)-3, 0)
+		return 0, false, nil
+	}
+	at += scan.trailerScan
+	if at+4 > maxTrailer {
+		return 0, false, ErrHeaderTooLarge
+	}
+	return scan.trailerDone(offset+at+4, start, raw)
+}
+
+// trailerDone ends a scan at end, the end of the body, within raw.
+func (scan *chunkScan) trailerDone(end, start int, raw uint64) (int, bool, error) {
+	if uint64(end-start) > raw {
+		return 0, false, ErrBodyTooLarge
+	}
+	return end, true, nil
 }
 
 // maxPlainChunkDigits is the longest chunk size decodePlainChunks takes,

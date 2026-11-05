@@ -45,6 +45,9 @@ type responseParser struct {
 	head      *stdhttp.Response
 	headerEnd int
 	framing   bodyFraming
+	// chunks is how far a chunked body buffered whole has been scanned, so
+	// that each read scans only what it added.
+	chunks chunkScan
 	// wantBlock asks for the head of the response to come as its field
 	// lines, block, rather than as a Header map, which a head left to
 	// net/http still comes as (see Framing.ResponseHeaderBlock).
@@ -105,6 +108,7 @@ func (p *responseParser) reset() {
 	p.head = nil
 	p.headerEnd = 0
 	p.streaming, p.started, p.streamedDone = false, false, false
+	p.chunks = chunkScan{}
 	p.continued = false
 	p.remaining, p.passed = 0, 0
 	p.coding, p.codingDec, p.codings = "", nil, nil
@@ -165,7 +169,7 @@ func (p *responseParser) feed(data []byte, req *stdhttp.Request) (*stdhttp.Respo
 			}
 			return p.complete(int(end), p.buffer[p.headerEnd:end]), nil
 		case framingChunked:
-			end, complete, err := chunkedEnd(p.buffer, p.headerEnd, p.maxHeader, p.maxBody)
+			end, complete, err := p.chunks.chunkedEnd(p.buffer, p.headerEnd, p.maxHeader, p.maxBody)
 			if err != nil {
 				return nil, clientParseError(err)
 			}
@@ -424,6 +428,7 @@ func (p *responseParser) parseHead(req *stdhttp.Request) (bool, error) {
 		p.codings = codings
 	}
 	p.head, p.headerEnd = head, headerEnd
+	p.chunks = chunkScan{}
 	switch {
 	case !bodyAllowed(req, head.StatusCode):
 		p.framing = framingNone
