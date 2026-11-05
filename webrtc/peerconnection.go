@@ -11,9 +11,9 @@ import (
 	"io"
 	"net"
 	"net/netip"
+	"runtime/debug"
 	"slices"
 	"strconv"
-	"runtime/debug"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -221,19 +221,19 @@ type PeerConnection struct {
 	gatherFired bool
 
 	// ICE.
-	ufrag, pwd     string
-	agent          *ice.Agent
-	controlling    bool
-	remoteUfrag    string
-	remotePwd      string
-	remoteLite     bool
-	pendingCands   []ice.Candidate
-	localCands     []ice.Candidate
-	localSet       bool
-	bound          map[netip.AddrPort]struct{}
-	remoteAddr     netip.AddrPort
+	ufrag, pwd   string
+	agent        *ice.Agent
+	controlling  bool
+	remoteUfrag  string
+	remotePwd    string
+	remoteLite   bool
+	pendingCands []ice.Candidate
+	localCands   []ice.Candidate
+	localSet     bool
+	bound        map[netip.AddrPort]struct{}
+	remoteAddr   netip.AddrPort
 	// selected is remoteAddr, for the Mux to read without the mutex.
-	selected atomic.Pointer[netip.AddrPort]
+	selected       atomic.Pointer[netip.AddrPort]
 	lastRecv       time.Time
 	pendingCreds   [2]string
 	pendingRestart bool
