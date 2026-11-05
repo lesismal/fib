@@ -4,11 +4,16 @@ package grpc
 
 import (
 	"bytes"
+	"context"
 	"encoding/binary"
 	"fmt"
+	"runtime"
 	"strings"
 	"sync/atomic"
 	"testing"
+
+	"github.com/lesismal/fib/grpc/codes"
+	"github.com/lesismal/fib/grpc/status"
 )
 
 // floodService counts the handlers that ran and, with release set, holds
@@ -217,6 +222,43 @@ func TestWireServerDefaultStreamLimit(t *testing.T) {
 	c.write(frames...)
 	if got := c.reset(2*defaultMaxConcurrentStreams + 1); got != errRefusedStream {
 		t.Fatalf("the stream past the default limit: RST %d", got)
+	}
+}
+
+// TestServeHTTPMessageGrowsAsItArrives reads, from a request body still
+// arriving through package http, a message that declares the largest size
+// the server takes and sends a few bytes of it. The call used to allocate
+// the declared size before any of it had arrived, 4 MiB a stream for a few
+// bytes; now the message grows as it arrives. A message that does arrive in
+// pieces is read whole.
+func TestServeHTTPMessageGrowsAsItArrives(t *testing.T) {
+	hs := &httpStream{server: NewServer(), in: newBodyPipe(), ctx: context.Background()}
+	head := []byte{0, 0, 0, 0, 0}
+	binary.BigEndian.PutUint32(head[1:], defaultMaxRecvMsgSize)
+	hs.in.write(append(head, "only this"...), true, nil)
+	var before, after runtime.MemStats
+	runtime.ReadMemStats(&before)
+	_, _, err := hs.readMsg()
+	runtime.ReadMemStats(&after)
+	if status.Code(err) != codes.Internal {
+		t.Fatalf("a truncated message = %v", err)
+	}
+	if n := after.TotalAlloc - before.TotalAlloc; n > defaultMaxRecvMsgSize/4 {
+		t.Fatalf("reading 9 bytes of a message allocated %d bytes", n)
+	}
+
+	hs = &httpStream{server: NewServer(), in: newBodyPipe(), ctx: context.Background()}
+	msg := bytes.Repeat([]byte("0123456789abcdef"), 20000)
+	body := lengthPrefixed(false, msg)
+	go func() {
+		for len(body) > 0 {
+			n := min(len(body), 70000)
+			hs.in.write(body[:n], n == len(body), nil)
+			body = body[n:]
+		}
+	}()
+	if _, got, err := hs.readMsg(); err != nil || !bytes.Equal(got, msg) {
+		t.Fatalf("a message in pieces: %d bytes, %v", len(got), err)
 	}
 }
 

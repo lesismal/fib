@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	stdhttp "net/http"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -433,6 +434,10 @@ func (hs *httpStream) RecvMsg(m any) error {
 	return nil
 }
 
+// msgReadChunk is the most a message read from a body still arriving
+// allocates before any of it has.
+const msgReadChunk = 64 << 10
+
 // readMsg returns the next message of the request, or io.EOF once the
 // client has sent all of them.
 func (hs *httpStream) readMsg() (bool, []byte, error) {
@@ -466,9 +471,21 @@ func (hs *httpStream) readMsg() (bool, []byte, error) {
 	if int64(n) > int64(limit) {
 		return false, nil, status.Errorf(codes.ResourceExhausted, "grpc: received message larger than max (%d vs. %d)", n, limit)
 	}
-	data := make([]byte, n)
-	if _, err := io.ReadFull(hs.in, data); err != nil {
-		return false, nil, hs.readError(err)
+	// The message grows as it arrives, never past twice what has: a length
+	// the client only declared allocates nothing it has not sent.
+	data := make([]byte, 0, min(int(n), msgReadChunk))
+	for len(data) < int(n) {
+		if len(data) == cap(data) {
+			data = slices.Grow(data, min(int(n)-len(data), len(data)))
+		}
+		end := min(cap(data), int(n))
+		if _, err := io.ReadFull(hs.in, data[len(data):end]); err != nil {
+			if err == io.EOF {
+				err = io.ErrUnexpectedEOF
+			}
+			return false, nil, hs.readError(err)
+		}
+		data = data[:end]
 	}
 	return head[0] == 1, data, nil
 }
