@@ -148,6 +148,13 @@ type Handler struct {
 	// implements EarlyDataOptIn turns it on for itself, as the HTTP server
 	// handler does with http.Config.EarlyData, so that a server configured
 	// at the protocol layer needs no second switch here.
+	//
+	// That a ticket carries early data once is known only to the Handler
+	// that took it: each Handler keeps its own record of the tickets that
+	// have. Handlers that open each other's tickets, by sharing
+	// Config.SessionTicketKey, in one process or across servers behind one
+	// name, each take the same early data once, so it can be replayed to
+	// every one of them.
 	EarlyData bool
 	// MaxEarlyData is the most early data a client may send on a ticket. Zero
 	// means 16 KiB.

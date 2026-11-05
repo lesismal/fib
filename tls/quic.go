@@ -284,7 +284,11 @@ func NewQUICClientWithSessions(config *stdtls.Config, sessions QUICSessionCache)
 }
 
 // QUICServer makes the handshakes of the QUIC connections of one server,
-// which share the keys their session tickets are sealed under.
+// which share the keys their session tickets are sealed under, and the record
+// of the tickets that have carried early data, which each does once: two
+// QUICServers that open each other's tickets, through a shared
+// Config.SessionTicketKey, each take a ticket's early data once, so it can be
+// replayed to each of them.
 type QUICServer struct {
 	config  *stdtls.Config
 	tickets *ticketKeys

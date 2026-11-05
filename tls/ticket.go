@@ -61,7 +61,9 @@ type ticketKeys struct {
 	keys   []*ticketKey
 	// used are the tickets that have carried early data, until they expire:
 	// early data can be replayed, so a ticket gets it once (RFC 8446 section
-	// 8, RFC 9001 section 9.2).
+	// 8, RFC 9001 section 9.2). It is this instance's alone, a Handler's or a
+	// QUICServer's, even where another opens the same tickets with a key
+	// they share; see Handler.EarlyData.
 	used map[[32]byte]time.Time
 }
 
