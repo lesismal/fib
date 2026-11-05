@@ -758,7 +758,8 @@ Run it yourself with `cd taskpool/benchmark && ./bench.sh` (or `bench.ps1` on Wi
 
 | Package | Description |
 | --- | --- |
-| [`fib`](.) | Engine, event loops, TCP / UDP / Unix connections, `SendFile`, async dial |
+| [`fib`](.) | The public API: `Engine`, `Connection`, `Config`, handlers and the rest, re-exported from `core` |
+| [`core`](core) | Engine, event loops, TCP / UDP / Unix connections, `SendFile`, async dial |
 | [`taskpool`](taskpool) | Worker pools: adaptive (default), adaptive-chan, elastic, inline |
 | [`bufferpool`](bufferpool) | Size-classed buffer pool aligned to the Go allocator |
 | [`tls`](tls) | TLS as a layer on a connection, transparent to the protocol above it |

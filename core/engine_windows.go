@@ -1,0 +1,1673 @@
+//go:build windows
+
+package core
+
+import (
+	"io"
+	"net"
+	"net/netip"
+	"os"
+	"sync"
+	"sync/atomic"
+	"syscall"
+	"time"
+	"unsafe"
+
+	"github.com/lesismal/fib/internal/netaddr"
+	"github.com/lesismal/fib/internal/sys"
+	"github.com/lesismal/fib/taskpool"
+)
+
+// The Windows backend drives sockets through an I/O completion port, but keeps
+// the readiness model the rest of the engine is written against, so that the
+// workers, the queueing and the backpressure are the same code on every
+// platform.
+//
+// Readability comes from a zero-byte overlapped WSARecv. It completes when data
+// or a close arrives, without taking any bytes and without pinning a buffer on
+// an idle connection, and the worker then drains the socket with non-blocking
+// receives exactly as it would after an epoll edge. Re-posting it after the
+// drain is what edge-triggering means here.
+//
+// Writability is the other way round. A non-blocking send that cannot finish
+// hands the queued bytes to an overlapped WSASend, and its completion plays the
+// part of the write edge: it says the bytes left, and the worker carries on
+// with whatever was queued behind them.
+// pollersSupported says Config.IOPollers applies. A completion port is
+// already fed by the kernel rather than by a loop that waits on readiness,
+// so the engine keeps its one loop and ignores the setting.
+const pollersSupported = false
+
+// admitAccepted admits a connection a parent engine accepted for this
+// poller. Without pollers nothing ever queues one.
+func (e *Engine) admitAccepted(*Connection) {}
+
+const (
+	// acceptsPerListener is how many AcceptEx calls each listener keeps
+	// outstanding. Connections beyond them wait in the listen backlog, so this
+	// only bounds how many one completion round can admit.
+	acceptsPerListener = 32
+	// closeDrainTimeout bounds how long Close waits for the kernel to report
+	// the operations it cancelled.
+	closeDrainTimeout = 5 * time.Second
+)
+
+const (
+	opAccept uint8 = iota
+	opConnect
+	opRead
+	opWrite
+	// opRecvFrom is a UDP listener's receive, and opRecvDatagram a dialed UDP
+	// connection's. Unlike the zero-byte TCP read, both receive the datagram
+	// itself, since a zero-byte receive would truncate it.
+	opRecvFrom
+	opRecvDatagram
+)
+
+// ioOp is an OVERLAPPED plus what the loop needs to route its completion. The
+// OVERLAPPED comes first, so the pointer the port hands back is the ioOp's own
+// address.
+type ioOp struct {
+	ov       syscall.Overlapped
+	kind     uint8
+	conn     *Connection
+	listener *udpListener
+}
+
+// udpPlatform is a dialed UDP connection's receive buffer, which its
+// overlapped receive fills while the kernel holds it.
+type udpPlatform struct{ buf []byte }
+
+// udpListenerPlatform is a UDP socket and its one overlapped receive: the
+// buffer and the sender's address the kernel writes into, which have to stay
+// put until the receive completes.
+type udpListenerPlatform struct {
+	fd      syscall.Handle
+	op      ioOp
+	buf     []byte
+	from    syscall.RawSockaddrAny
+	fromLen int32
+	flags   uint32
+	closed  bool
+	// posted says a receive is outstanding on the socket, which keeps a
+	// closed one on its engine's retired list; see detachBinding.
+	posted bool
+}
+
+// acceptOp is one outstanding AcceptEx: the socket it will hand over, and the
+// buffer AcceptEx writes both addresses into.
+type acceptOp struct {
+	ioOp
+	listener *winListener
+	socket   syscall.Handle
+	received uint32
+	addrs    [2 * acceptAddrLen]byte
+}
+
+const acceptAddrLen = int(unsafe.Sizeof(syscall.RawSockaddrAny{})) + 16
+
+type winListener struct {
+	fd     syscall.Handle
+	family int
+	// handler serves the connections the listener takes, and binding is the
+	// index of the Binding it was opened for.
+	handler Handler
+	binding int
+	// addr is the address the listener is bound to, kept for once Run has
+	// closed it.
+	addr   syscall.Sockaddr
+	closed bool
+	// accepts holds the listener's AcceptEx operations. The kernel keeps only
+	// their addresses, which the garbage collector does not see, so without
+	// this reference an operation could be freed and its memory reused while
+	// its AcceptEx is still pending. pending counts those still posted.
+	accepts []*acceptOp
+	pending int
+}
+
+type enginePlatform struct {
+	port syscall.Handle
+	// listenMu guards the lists of listeners and UDP sockets, which the loop
+	// changes as bindings come and go and other goroutines read addresses
+	// from.
+	listenMu  sync.Mutex
+	listeners []*winListener
+	// retired and retiredUDP hold the sockets of removed bindings whose
+	// operations, cancelled by their closing, have yet to complete, which
+	// keeps the memory the kernel writes into reachable until they have.
+	// Event-loop ownership.
+	retired    []*winListener
+	retiredUDP []*udpListener
+	// conns holds every connection the engine owns, open or not. The kernel
+	// writes into a connection's OVERLAPPED structures until each operation it
+	// holds completes, so a closed connection stays here, and therefore stays
+	// reachable, until its last completion has arrived. Event-loop ownership.
+	conns map[*Connection]struct{}
+	// accepts counts AcceptEx calls not yet completed, for the same reason.
+	// Event-loop ownership.
+	accepts int
+	// udpRecvs counts UDP listener receives not yet completed, for the same
+	// reason again. Event-loop ownership.
+	udpRecvs int
+}
+
+type connPlatform struct {
+	handle  atomic.Uintptr
+	readOp  ioOp
+	writeOp ioOp
+	// outstanding counts operations posted and not yet completed. It rises
+	// only under mu while the connection is open and falls only on the event
+	// loop, so once the connection is closed the loop alone moves it.
+	outstanding atomic.Int32
+	// readArmed and writeInFlight say which of the two operations is posted.
+	// Guarded by mu.
+	readArmed     bool
+	writeInFlight bool
+	recvFlags     uint32
+	// connectSent receives ConnectEx's byte count, which stays zero since a
+	// dial sends nothing with its connect.
+	connectSent uint32
+	// inFlight keeps the arrays an overlapped send is reading from reachable
+	// until it completes, even if the connection drops its queue meanwhile.
+	inFlight [maxWritevItems][]byte
+	// transmitting is how much of the file at the head of the queue the
+	// TransmitFile in flight was asked for, or zero while what is in flight
+	// is a send from memory. Guarded by mu.
+	transmitting int64
+	// failure is the error a failed zero-byte read reported, which socketError
+	// hands on when the worker asks why the connection broke.
+	failure error
+	// closingSocket holds a detached connection's socket until the operations
+	// it had posted have completed: closing one while an operation is still
+	// posted resets the connection instead of ending it, and a reset throws
+	// away whatever the transport had left to deliver. Zero means none, which
+	// a socket handle never is. Event-loop ownership.
+	closingSocket syscall.Handle
+}
+
+func (c *Connection) socket() syscall.Handle { return syscall.Handle(c.handle.Load()) }
+
+func (c *Connection) initUDPPeer() { c.handle.Store(uintptr(syscall.InvalidHandle)) }
+
+func (l *udpListener) sockname() (syscall.Sockaddr, error) { return syscall.Getsockname(l.fd) }
+
+// udpClosed says the socket is closed, as one on the retired list is.
+func (l *udpListener) udpClosed() bool { return l.closed }
+
+func (c *Connection) peerSockaddr() (syscall.Sockaddr, error) { return syscall.Getpeername(c.socket()) }
+
+func (c *Connection) sockname() (syscall.Sockaddr, error) { return syscall.Getsockname(c.socket()) }
+
+// sysSendDatagrams sends datagrams one at a time, Windows having no batched
+// send that sendmmsg would be, and reports how many it sent. Callers hold
+// c.mu.
+func (c *Connection) sysSendDatagrams(datagrams [][]byte) (int, error) {
+	for i, d := range datagrams {
+		if err := c.sysSendDatagram(d); err != nil {
+			return i, err
+		}
+	}
+	return len(datagrams), nil
+}
+
+// sysSendDatagram sends one datagram without waiting. A socket with no room
+// reports EAGAIN, as it does on the other systems, rather than Winsock's
+// WSAEWOULDBLOCK, so that a sender that keeps what a full socket refused,
+// as QUIC does, knows it here too. Callers hold c.mu.
+func (c *Connection) sysSendDatagram(data []byte) error {
+	bufs := [1]syscall.WSABuf{sys.WSABuf(data)}
+	var n uint32
+	var err error
+	if l := c.udp.listener; l != nil {
+		err = syscall.WSASendto(l.fd, &bufs[0], 1, &n, 0, c.udp.sa, nil, nil)
+	} else {
+		err = syscall.WSASend(c.socket(), &bufs[0], 1, &n, 0, nil, nil)
+	}
+	if sys.IsWouldBlock(err) {
+		return syscall.EAGAIN
+	}
+	return err
+}
+
+// notifyWritable reports false: a completion port says when an operation
+// posted on a socket completes, not when a socket has room, and a UDP send
+// posted to find out would be a datagram sent. A sender that found the
+// socket full tries again on a timer.
+func (c *Connection) notifyWritable(func()) bool { return false }
+
+// FD returns the connection's socket handle, or -1 once it is closed. A UDP
+// peer has no socket of its own and always reports -1.
+func (c *Connection) FD() int {
+	h := c.socket()
+	if h == syscall.InvalidHandle {
+		return -1
+	}
+	return int(h)
+}
+
+func (e *Engine) open(config Config, bindings []Binding) error {
+	port, err := syscall.CreateIoCompletionPort(syscall.InvalidHandle, 0, 0, 1)
+	if err != nil {
+		return err
+	}
+	e.port = port
+	e.conns = make(map[*Connection]struct{})
+	// Every socket is opened before any operation is posted on one, so a
+	// binding that fails leaves nothing outstanding to wait for.
+	for i, b := range bindings {
+		for _, addr := range b.Addrs {
+			l, u, err := e.openListener(config, b, i, addr)
+			if err != nil {
+				e.abandon()
+				return err
+			}
+			if u != nil {
+				e.udpListeners = append(e.udpListeners, u)
+			} else {
+				e.listeners = append(e.listeners, l)
+			}
+		}
+	}
+	if err := e.postListening(e.listeners, e.udpListeners); err != nil {
+		e.abandon()
+		return err
+	}
+	return nil
+}
+
+// postListening posts the operations that take connections and datagrams
+// on listeners and UDP sockets just opened. Callers own the loop's state.
+func (e *Engine) postListening(listeners []*winListener, udpListeners []*udpListener) error {
+	for _, l := range listeners {
+		for i := 0; i < acceptsPerListener; i++ {
+			op := &acceptOp{listener: l}
+			op.kind = opAccept
+			l.accepts = append(l.accepts, op)
+			if err := e.postAccept(op); err != nil {
+				return err
+			}
+		}
+	}
+	for _, l := range udpListeners {
+		if err := e.postRecvFrom(l); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// openListener opens the socket of one of binding b's addresses, the i-th
+// binding, and associates it with the completion port: a TCP or Unix
+// listener, or, for a UDP binding, a UDP socket. Binding.MultipathTCP is
+// ignored: Windows has no Multipath TCP, so a TCP listener here is a plain
+// one.
+func (e *Engine) openListener(config Config, b Binding, i int, addr string) (*winListener, *udpListener, error) {
+	if netaddr.IsUDP(b.Network) {
+		l, err := createUDPListener(b.Network, addr)
+		if err == nil {
+			if _, err = syscall.CreateIoCompletionPort(l.fd, e.port, 0, 0); err != nil {
+				syscall.Closesocket(l.fd)
+			}
+		}
+		if err != nil {
+			return nil, nil, err
+		}
+		l.network, l.handler, l.binding = b.Network, b.Handler, i
+		return nil, l, nil
+	}
+	l, err := createListener(config, b.Network, addr)
+	if err == nil {
+		if _, err = syscall.CreateIoCompletionPort(l.fd, e.port, 0, 0); err != nil {
+			syscall.Closesocket(l.fd)
+		}
+	}
+	if err != nil {
+		return nil, nil, err
+	}
+	l.handler, l.binding = b.Handler, i
+	e.noteUnixPath(b.Network, addr, i)
+	return l, nil, nil
+}
+
+func createUDPListener(network, addr string) (*udpListener, error) {
+	family, bound, err := netaddr.ResolveListen(network, addr)
+	if err != nil {
+		return nil, err
+	}
+	fd, err := sys.NewDatagramSocket(family)
+	if err != nil {
+		return nil, err
+	}
+	if family == syscall.AF_INET6 {
+		v6only := 0
+		if network == "udp6" {
+			v6only = 1
+		}
+		_ = syscall.SetsockoptInt(fd, syscall.IPPROTO_IPV6, syscall.IPV6_V6ONLY, v6only)
+	}
+	if err = syscall.Bind(fd, bound); err != nil {
+		syscall.Closesocket(fd)
+		return nil, err
+	}
+	l := &udpListener{peers: make(map[netip.AddrPort]*Connection)}
+	l.fd = fd
+	l.buf = make([]byte, maxDatagramSize)
+	l.op = ioOp{kind: opRecvFrom, listener: l}
+	return l, nil
+}
+
+// postRecvFrom posts a UDP listener's receive. A receive that fails at once
+// for one datagram, such as one too large for the buffer, is retried rather
+// than leaving the socket unread.
+func (e *Engine) postRecvFrom(l *udpListener) error {
+	var err error
+	for attempt := 0; attempt < 16; attempt++ {
+		l.op.ov = syscall.Overlapped{}
+		l.flags = 0
+		l.fromLen = int32(unsafe.Sizeof(l.from))
+		bufs := [1]syscall.WSABuf{sys.WSABuf(l.buf)}
+		var n uint32
+		err = syscall.WSARecvFrom(l.fd, &bufs[0], 1, &n, &l.flags, &l.from, &l.fromLen, &l.op.ov, nil)
+		if err == nil || err == syscall.ERROR_IO_PENDING {
+			e.udpRecvs++
+			l.posted = true
+			return nil
+		}
+		if err != sys.WSAEMSGSIZE && err != sys.WSAECONNRESET {
+			break
+		}
+	}
+	return err
+}
+
+// completeRecvFrom hands one datagram to its peer's connection, opening one
+// for a new peer, and posts the next receive.
+func (e *Engine) completeRecvFrom(l *udpListener, n int, err error) *Connection {
+	e.udpRecvs--
+	l.posted = false
+	if l.closed {
+		e.retiredUDP = forget(e.retiredUDP, l)
+		return nil
+	}
+	if e.stopping.Load() {
+		return nil
+	}
+	var ready *Connection
+	if err == nil {
+		if c := e.udpPeer(l, &l.from); c != nil {
+			ready = e.deliverDatagram(c, l.buf[:n], time.Now().UnixNano())
+		}
+	}
+	// A failed receive loses only its own datagram. If no receive can be
+	// posted at all the socket is broken, and the peers it serves are left
+	// to their idle timeout.
+	_ = e.postRecvFrom(l)
+	return ready
+}
+
+// completeDatagramRead hands a dialed UDP connection its datagram and posts
+// the next receive.
+func (e *Engine) completeDatagramRead(c *Connection, n int, err error) *Connection {
+	c.outstanding.Add(-1)
+	c.mu.Lock()
+	c.readArmed = false
+	closed := c.closed
+	c.mu.Unlock()
+	if closed {
+		e.forget(c)
+		return nil
+	}
+	if err != nil && err != sys.WSAEMSGSIZE {
+		// A refusal from the peer's host, for one, arrives here.
+		c.closeWithError(err)
+		return nil
+	}
+	var ready *Connection
+	if err == nil {
+		ready = e.deliverDatagram(c, c.udp.buf[:n], time.Now().UnixNano())
+	}
+	c.mu.Lock()
+	armErr := c.armDatagramReadLocked()
+	c.mu.Unlock()
+	if armErr != nil {
+		c.closeWithError(armErr)
+	}
+	return ready
+}
+
+// armDatagramReadLocked posts a dialed UDP connection's receive. Callers hold
+// c.mu.
+func (c *Connection) armDatagramReadLocked() error {
+	if c.readArmed || c.closing || c.closed {
+		return nil
+	}
+	c.readOp.ov = syscall.Overlapped{}
+	c.recvFlags = 0
+	c.readArmed = true
+	c.outstanding.Add(1)
+	bufs := [1]syscall.WSABuf{sys.WSABuf(c.udp.buf)}
+	var n uint32
+	err := syscall.WSARecv(c.socket(), &bufs[0], 1, &n, &c.recvFlags, &c.readOp.ov, nil)
+	if err != nil && err != syscall.ERROR_IO_PENDING {
+		c.readArmed = false
+		c.outstanding.Add(-1)
+		return err
+	}
+	return nil
+}
+
+// abandon tears down a New that failed after its AcceptEx calls went out.
+func (e *Engine) abandon() {
+	e.stopping.Store(true)
+	for _, l := range e.listeners {
+		l.closed = true
+		syscall.Closesocket(l.fd)
+	}
+	for _, l := range e.udpListeners {
+		l.closed = true
+		syscall.Closesocket(l.fd)
+	}
+	e.removeUnixPaths()
+	e.drainPort()
+	syscall.CloseHandle(e.port)
+}
+
+func createListener(config Config, network, addr string) (*winListener, error) {
+	family, bound, err := netaddr.ResolveListen(network, addr)
+	if err != nil {
+		return nil, err
+	}
+	fd, err := sys.NewSocket(family)
+	if err != nil {
+		return nil, err
+	}
+	// No SO_REUSEADDR: on Windows it lets another socket take over a port that
+	// is still in use, rather than just reusing one in TIME_WAIT.
+	if family == syscall.AF_INET6 {
+		// "tcp" accepts both families on one socket; "tcp6" is IPv6 only. This
+		// is the distinction net.Listen draws between the two networks.
+		v6only := 0
+		if network == "tcp6" {
+			v6only = 1
+		}
+		_ = syscall.SetsockoptInt(fd, syscall.IPPROTO_IPV6, syscall.IPV6_V6ONLY, v6only)
+	}
+	if err = syscall.Bind(fd, bound); err == nil {
+		err = syscall.Listen(fd, sys.ListenBacklog(config.Backlog))
+	}
+	var sa syscall.Sockaddr
+	if err == nil {
+		sa, err = syscall.Getsockname(fd)
+	}
+	if err != nil {
+		syscall.Closesocket(fd)
+		return nil, err
+	}
+	return &winListener{fd: fd, family: family, addr: sa}, nil
+}
+
+// postAccept starts one AcceptEx on a fresh socket.
+func (e *Engine) postAccept(op *acceptOp) error {
+	s, err := sys.NewSocket(op.listener.family)
+	if err != nil {
+		return err
+	}
+	op.socket = s
+	op.ov = syscall.Overlapped{}
+	err = syscall.AcceptEx(op.listener.fd, s, &op.addrs[0], 0, uint32(acceptAddrLen), uint32(acceptAddrLen),
+		&op.received, &op.ov)
+	if err != nil && err != syscall.ERROR_IO_PENDING {
+		syscall.Closesocket(s)
+		op.socket = syscall.InvalidHandle
+		return err
+	}
+	e.accepts++
+	op.listener.pending++
+	return nil
+}
+
+// ListenAddrs returns the address of every listener, whatever its network: a
+// *net.TCPAddr, *net.UnixAddr or *net.UDPAddr. The TCP and Unix listeners
+// come first, in configured order, and the UDP ones after them, in theirs.
+// Ports left at zero report the port the kernel chose.
+func (e *Engine) ListenAddrs() ([]net.Addr, error) {
+	return e.listenAddrsOf(-1)
+}
+
+// BindingAddrs returns the addresses of the i-th binding, as New and
+// AddBinding number them, in the order the binding lists them, as ListenAddrs reports them.
+func (e *Engine) BindingAddrs(i int) ([]net.Addr, error) {
+	if i < 0 {
+		return nil, errNoBinding
+	}
+	addrs, err := e.listenAddrsOf(i)
+	if err == nil && len(addrs) == 0 {
+		err = errNoBinding
+	}
+	return addrs, err
+}
+
+// listenAddrsOf returns the addresses of binding's listeners, or of every
+// listener for a binding below zero.
+func (e *Engine) listenAddrsOf(binding int) ([]net.Addr, error) {
+	e.listenMu.Lock()
+	defer e.listenMu.Unlock()
+	addrs := make([]net.Addr, 0, len(e.listeners)+len(e.udpListeners))
+	for _, l := range e.listeners {
+		if binding < 0 || l.binding == binding {
+			addrs = append(addrs, netaddr.ToAddr(l.addr))
+		}
+	}
+	for _, l := range e.udpListeners {
+		if binding >= 0 && l.binding != binding {
+			continue
+		}
+		addr, err := udpListenerAddr(l)
+		if err != nil {
+			return nil, err
+		}
+		addrs = append(addrs, addr)
+	}
+	return addrs, nil
+}
+
+// LocalAddrs returns one address per TCP listener, in configured order,
+// leaving out the Unix ones, which ListenAddrs reports. Ports left at zero
+// report the port the kernel chose.
+func (e *Engine) LocalAddrs() ([]*net.TCPAddr, error) {
+	e.listenMu.Lock()
+	defer e.listenMu.Unlock()
+	addrs := make([]*net.TCPAddr, 0, len(e.listeners))
+	for _, l := range e.listeners {
+		if l.family == syscall.AF_UNIX {
+			continue
+		}
+		addr, err := netaddr.ToTCPAddr(l.addr)
+		if err != nil {
+			return nil, err
+		}
+		addrs = append(addrs, addr)
+	}
+	return addrs, nil
+}
+
+// stopListening is the loop's to do on Windows, as Run returns: closing a
+// listener is what stops it, and the loop may be posting an AcceptEx on it.
+func (e *Engine) stopListening() {}
+
+// beginShutdown starts Shutdown. The listeners are closed by the loop, for
+// the reason stopListening is the loop's, and Shutdown waits for it before
+// ShuttingDown reports true, so that a client connecting once it does is
+// refused, as on the other platforms. Leaving the close to Shutdown's first
+// round let such a client be accepted.
+func (e *Engine) beginShutdown() {
+	_ = e.onLoop(func() { _ = e.closeListeners() })
+	e.draining.Store(true)
+}
+
+// shutdownConnections runs one round of Shutdown on the loop: the listeners
+// stop taking connections, if they have yet to, each open connection is told
+// the engine is shutting down, and the answer is how many of those Shutdown
+// waits for remain. Callers run on the event loop.
+// With a binding of zero or more, the round is ShutdownBinding's, over the
+// connections that binding took, whose listeners it has closed itself.
+func (e *Engine) shutdownConnections(binding int) int {
+	if binding < 0 {
+		_ = e.closeListeners()
+	}
+	n := 0
+	for c := range e.conns {
+		if c.inBinding(binding) && shutdownConnection(c) {
+			n++
+		}
+	}
+	return n + e.shutdownUDPPeers(binding)
+}
+
+// closeListeners closes the TCP listeners, which stops them taking
+// connections, and the AcceptEx calls still pending on them complete with
+// errors that Close collects. Callers run on the event loop, or after it.
+func (e *Engine) closeListeners() error {
+	var closeErr error
+	for _, l := range e.listeners {
+		if l.closed {
+			continue
+		}
+		l.closed = true
+		if err := syscall.Closesocket(l.fd); err != nil && closeErr == nil {
+			closeErr = err
+		}
+	}
+	return closeErr
+}
+
+func (e *Engine) Run() error {
+	e.logRun()
+	e.claimLoop()
+	// A client connecting once the engine stops is refused rather than left
+	// in a backlog nothing accepts from.
+	defer e.closeListeners()
+	batch := e.pollBatchSize
+	entries := make([]sys.OverlappedEntry, batch)
+	var ready []*Connection
+	var tasks []taskpool.Task
+	for !e.stopping.Load() {
+		n, err := sys.GetQueuedCompletionStatusEx(e.port, entries, syscall.INFINITE)
+		if err != nil {
+			if err == syscall.Errno(syscall.WAIT_TIMEOUT) {
+				continue
+			}
+			return err
+		}
+		woken := false
+		for i := 0; i < n; i++ {
+			if entries[i].Overlapped == nil {
+				// Only the wake-up is posted without an OVERLAPPED.
+				woken = true
+				continue
+			}
+			if c := e.complete(&entries[i]); c != nil {
+				ready = append(ready, c)
+			}
+			entries[i] = sys.OverlappedEntry{}
+		}
+		if woken {
+			e.drainWake()
+		}
+		ready, tasks = e.runReady(ready, tasks)
+	}
+	e.drainWake()
+	return nil
+}
+
+// complete routes one completion and reports a connection it made runnable.
+func (e *Engine) complete(entry *sys.OverlappedEntry) *Connection {
+	op := (*ioOp)(unsafe.Pointer(entry.Overlapped))
+	var err error
+	if entry.Status != 0 {
+		err = sys.NtStatusError(entry.Status)
+	}
+	switch op.kind {
+	case opAccept:
+		e.completeAccept((*acceptOp)(unsafe.Pointer(op)), err)
+		return nil
+	case opConnect:
+		e.completeConnect(op.conn, err)
+		return nil
+	case opRead:
+		return e.completeRead(op.conn, err)
+	case opRecvFrom:
+		return e.completeRecvFrom(op.listener, int(entry.Qty), err)
+	case opRecvDatagram:
+		return e.completeDatagramRead(op.conn, int(entry.Qty), err)
+	default:
+		return e.completeWrite(op.conn, int(entry.Qty), err)
+	}
+}
+
+func (e *Engine) completeAccept(op *acceptOp, err error) {
+	e.accepts--
+	l := op.listener
+	if l.pending--; l.closed && l.pending == 0 {
+		e.retired = forget(e.retired, l)
+	}
+	s := op.socket
+	op.socket = syscall.InvalidHandle
+	if e.stopping.Load() || l.closed {
+		// A connection that arrives while the engine shuts down is refused
+		// rather than opened into a loop that no longer runs.
+		syscall.Closesocket(s)
+		return
+	}
+	switch {
+	case err != nil:
+		syscall.Closesocket(s)
+	case !e.accepted.take():
+		// MaxConns are open: refused as it arrives.
+		syscall.Closesocket(s)
+	default:
+		if err = e.adopt(op.listener, s); err != nil {
+			syscall.Closesocket(s)
+			e.accepted.leave()
+		}
+	}
+	// Keep the listener's accepts topped up. A client that resets between
+	// connecting and being accepted fails only its own AcceptEx, so one retry
+	// is worth making before the slot is given up.
+	for attempt := 0; attempt < 2; attempt++ {
+		if e.postAccept(op) == nil {
+			return
+		}
+	}
+}
+
+// adopt turns an accepted socket into a connection and arms its first read.
+func (e *Engine) adopt(l *winListener, s syscall.Handle) error {
+	// Without this the socket does not know its addresses, and shutdown and
+	// getpeername fail on it.
+	lfd := l.fd
+	err := syscall.Setsockopt(s, syscall.SOL_SOCKET, syscall.SO_UPDATE_ACCEPT_CONTEXT,
+		(*byte)(unsafe.Pointer(&lfd)), int32(unsafe.Sizeof(lfd)))
+	if err == nil {
+		err = sys.SetNonblock(s)
+	}
+	if err == nil {
+		_, err = syscall.CreateIoCompletionPort(s, e.port, 0, 0)
+	}
+	if err != nil {
+		return err
+	}
+	if l.family != syscall.AF_UNIX {
+		// Replies are written whole, so Nagle would only hold a small one
+		// back until the peer's delayed ACK.
+		_ = syscall.SetsockoptInt(s, syscall.IPPROTO_TCP, syscall.TCP_NODELAY, 1)
+	}
+	c := &Connection{engine: e, handler: l.handler, bindingID: int32(l.binding + 1)}
+	c.flags.set(flagUnix, l.family == syscall.AF_UNIX)
+	c.handle.Store(uintptr(s))
+	c.readOp = ioOp{kind: opRead, conn: c}
+	c.writeOp = ioOp{kind: opWrite, conn: c}
+	e.conns[c] = struct{}{}
+	c.handler.OnOpen(c)
+	c.rearmRead()
+	return nil
+}
+
+// completeRead handles the zero-byte read: the socket has data, or an EOF or
+// error waiting to be read, so a worker's drain has something to find.
+func (e *Engine) completeRead(c *Connection, err error) *Connection {
+	c.outstanding.Add(-1)
+	c.mu.Lock()
+	c.readArmed = false
+	closed := c.closed
+	if err != nil && !closed && !c.flags.has(flagReadShut) {
+		c.failure = err
+	}
+	c.mu.Unlock()
+	if closed {
+		e.forget(c)
+		return nil
+	}
+	if c.flags.has(flagReadShut) {
+		// CloseRead cancelled the read, or shut the side it was waiting on.
+		return nil
+	}
+	events := evIn
+	if err != nil {
+		events = evErr
+	}
+	return e.noteEvent(c, events)
+}
+
+// completeWrite takes the bytes an overlapped send delivered off the queue and
+// plays the write edge for whatever was queued behind them.
+func (e *Engine) completeWrite(c *Connection, n int, err error) *Connection {
+	c.outstanding.Add(-1)
+	c.mu.Lock()
+	c.writeInFlight = false
+	clear(c.inFlight[:])
+	transmitted := c.transmitting
+	c.transmitting = 0
+	if c.closed {
+		c.mu.Unlock()
+		e.forget(c)
+		return nil
+	}
+	if transmitted > 0 && int64(n) < transmitted && (err == nil || err == syscall.ERROR_HANDLE_EOF) {
+		// TransmitFile ends at the end of the file without an error, or,
+		// asked past it, with one: either way the file has turned out
+		// shorter than the range the peer was promised.
+		err = io.ErrUnexpectedEOF
+	}
+	if err != nil {
+		c.mu.Unlock()
+		c.closeWithError(err)
+		return nil
+	}
+	if n > 0 {
+		if transmitted > 0 {
+			c.fileSentLocked(int64(n))
+		} else {
+			c.subPending(int64(n))
+		}
+		c.consumeLocked(n)
+	}
+	c.traceLocked("write done n=%d", n)
+	closeAfterSend := false
+	events := uint32(evOut)
+	if c.sendHead == len(c.sends) {
+		c.resetQueueLocked()
+		c.finishCloseWriteLocked()
+		closeAfterSend = c.closeAfterSend
+		if c.readDeferred {
+			// A round left its read to this drain; see process.
+			c.readDeferred = false
+			events |= evIn
+		}
+	}
+	refresh := c.pauseStateChangedLocked()
+	if closeAfterSend && c.lingerLocked() {
+		closeAfterSend = false
+	}
+	c.mu.Unlock()
+	if closeAfterSend {
+		c.closeWithError(nil)
+		return nil
+	}
+	if refresh {
+		e.refreshConnection(c)
+	}
+	return e.noteEvent(c, events)
+}
+
+// forget drops a closed connection once the kernel holds nothing of it, and
+// closes the socket detach left behind: with nothing posted on it any more,
+// that close is graceful and what the transport still holds goes out.
+func (e *Engine) forget(c *Connection) {
+	if c.outstanding.Load() != 0 {
+		return
+	}
+	e.closeSocketNow(c)
+	delete(e.conns, c)
+}
+
+// closeSocketNow closes a detached connection's socket, whether or not its
+// operations have all completed. Every close goes through here, so a socket
+// cannot be closed twice.
+func (e *Engine) closeSocketNow(c *Connection) {
+	if h := c.closingSocket; h != 0 {
+		c.closingSocket = 0
+		_ = syscall.Closesocket(h)
+	}
+}
+
+func (e *Engine) wake() {
+	_ = syscall.PostQueuedCompletionStatus(e.port, 0, 0, nil)
+}
+
+// ackWake does nothing: every wake-up is its own completion, already
+// dequeued by the time the loop drains commands.
+func (e *Engine) ackWake() {}
+
+// pausesInPlace is false: a paused connection does not re-arm its zero-byte
+// read, and resuming re-arms it, which reports bytes already waiting.
+const pausesInPlace = false
+
+// setReadPaused re-arms the zero-byte read when reads resume. Pausing needs no
+// call: a read already armed may still complete, but the round it starts finds
+// the output that caused the pause still queued and defers, and it does not
+// re-arm while reads are paused.
+func (e *Engine) setReadPaused(c *Connection, paused bool) error {
+	if paused {
+		return nil
+	}
+	c.mu.Lock()
+	err := c.armReadLocked()
+	c.mu.Unlock()
+	return err
+}
+
+// detach ends a connection's socket. Closing it outright would be abortive
+// while an operation is still posted on it, and this backend keeps a zero-byte
+// read posted on every open connection, so the peer would be sent a reset that
+// throws away the bytes the transport had yet to deliver — a reply the socket
+// accepted whole and has barely started sending. The send side is shut down
+// instead, which puts the FIN behind those bytes, and the posted operations are
+// cancelled so their completions arrive now rather than whenever the peer next
+// says something. forget closes the socket once the last of them has, by which
+// time nothing is posted and the close is the graceful one.
+func (e *Engine) detach(c *Connection) {
+	if c.udp != nil && c.udp.listener != nil {
+		e.detachPeer(c)
+		return
+	}
+	if h := syscall.Handle(c.handle.Swap(uintptr(syscall.InvalidHandle))); h != syscall.InvalidHandle {
+		c.closingSocket = h
+		if c.bindingID != 0 {
+			e.accepted.leave()
+		}
+		if c.udp == nil {
+			// A datagram socket has no stream to end.
+			_ = syscall.Shutdown(h, syscall.SHUT_WR)
+		}
+		if c.outstanding.Load() > 0 {
+			_ = syscall.CancelIoEx(h, nil)
+		}
+	}
+	e.forget(c)
+}
+
+// Close stops the engine and closes every connection it still has, at once,
+// and releases all resources once no handler is running any more; see the
+// epoll and kqueue backends' Close. Run must have returned before Close is
+// called.
+func (e *Engine) Close() error {
+	var closeErr error
+	e.closeOnce.Do(func() {
+		e.Stop()
+		e.stopUDPSweeper()
+		// Whatever a binding opens or closes from here on is Close's to
+		// release, through the loop's queue.
+		e.claimLoop()
+		for c := range e.conns {
+			e.cutConnection(c)
+		}
+		e.cutUDPPeers()
+		closeErr = afterRounds(e.taskWG.Wait, e.release)
+	})
+	return closeErr
+}
+
+// shutdownSocket ends the connection's socket both ways, for a connection
+// cut while a round of it runs, keeping its handle; see cutConnection.
+func (c *Connection) shutdownSocket() {
+	if h := c.socket(); h != syscall.InvalidHandle {
+		_ = syscall.Shutdown(h, syscall.SHUT_RDWR)
+	}
+}
+
+// release is what Close leaves until no round runs: the task pool, the
+// sockets, and the completion port, once the operations closing them
+// cancelled have completed.
+func (e *Engine) release() error {
+	var closeErr error
+	e.closeCut()
+	e.releaseTaskPool()
+	e.closeCommands()
+	for c := range e.conns {
+		e.closeConnection(c, nil, false)
+	}
+	e.closeUDPPeers()
+	e.budgetPaused = nil
+	if err := e.closeListeners(); err != nil && closeErr == nil {
+		closeErr = err
+	}
+	for _, l := range e.udpListeners {
+		l.closed = true
+		if err := syscall.Closesocket(l.fd); err != nil && closeErr == nil {
+			closeErr = err
+		}
+	}
+	e.removeUnixPaths()
+	e.drainPort()
+	// A connection whose completions never arrived still holds its
+	// socket, and the port is about to go with the engine, so nothing
+	// would ever close it. It goes now, orderly close or not.
+	for c := range e.conns {
+		e.closeSocketNow(c)
+	}
+	if err := syscall.CloseHandle(e.port); err != nil && closeErr == nil {
+		closeErr = err
+	}
+	return closeErr
+}
+
+// drainPort collects the completions of the operations closing the sockets
+// cancelled. Until each has arrived the kernel may still write into its
+// OVERLAPPED, so the memory holding it cannot be let go before then.
+func (e *Engine) drainPort() {
+	entries := make([]sys.OverlappedEntry, 64)
+	deadline := time.Now().Add(closeDrainTimeout)
+	for (len(e.conns) > 0 || e.accepts > 0 || e.udpRecvs > 0) && time.Now().Before(deadline) {
+		n, err := sys.GetQueuedCompletionStatusEx(e.port, entries, 100)
+		if err != nil {
+			continue
+		}
+		for i := 0; i < n; i++ {
+			if entries[i].Overlapped != nil {
+				e.complete(&entries[i])
+			}
+			entries[i] = sys.OverlappedEntry{}
+		}
+	}
+}
+
+// rearmRead posts the zero-byte read that reports the socket's next data. It
+// runs after each drain; a connection whose reads are paused is re-armed when
+// they resume instead.
+func (c *Connection) rearmRead() {
+	c.mu.Lock()
+	err := c.armReadLocked()
+	c.mu.Unlock()
+	if err != nil {
+		c.closeWithError(err)
+	}
+}
+
+func (c *Connection) armReadLocked() error {
+	if c.readArmed || c.readPaused || c.closing || c.closed || c.flags.has(flagReadShut) {
+		return nil
+	}
+	c.readOp.ov = syscall.Overlapped{}
+	c.recvFlags = 0
+	c.readArmed = true
+	c.outstanding.Add(1)
+	var buf syscall.WSABuf
+	var n uint32
+	err := syscall.WSARecv(c.socket(), &buf, 1, &n, &c.recvFlags, &c.readOp.ov, nil)
+	if err != nil && err != syscall.ERROR_IO_PENDING {
+		c.readArmed = false
+		c.outstanding.Add(-1)
+		return err
+	}
+	return nil
+}
+
+// writeBusyLocked reports that an overlapped send owns the head of the queue,
+// so nothing else may write or flush until it completes.
+func (c *Connection) writeBusyLocked() bool { return c.writeInFlight }
+
+// awaitWritableLocked hands whatever is still queued to an overlapped send.
+// Its completion is the write edge: it takes the bytes off the queue and
+// schedules the connection for anything queued behind them.
+func (c *Connection) awaitWritableLocked() error {
+	if c.writeInFlight || c.closing || c.closed || c.sendHead == len(c.sends) {
+		return nil
+	}
+	var bufs [maxWritevItems]syscall.WSABuf
+	count := 0
+	var stageErr error
+	for i := c.sendHead; i < len(c.sends) && count < len(bufs); i++ {
+		item := &c.sends[i]
+		if item.file != nil {
+			if c.transmitsLocked(item) {
+				if count == 0 {
+					return c.transmitFileLocked(item)
+				}
+				// The file goes once what is ahead of it has.
+				break
+			}
+			if stageErr = c.stageLocked(item); stageErr != nil {
+				break
+			}
+		}
+		data := item.data[item.offset:]
+		if len(data) == 0 {
+			continue
+		}
+		if len(data) > sys.MaxWSABufLen {
+			data = data[:sys.MaxWSABufLen]
+		}
+		bufs[count] = syscall.WSABuf{Len: uint32(len(data)), Buf: &data[0]}
+		c.inFlight[count] = data
+		count++
+		if len(data) < len(item.data)-item.offset || item.file != nil && item.file.remaining > 0 {
+			// A truncated item has to be the last one, or the bytes after it
+			// would be sent ahead of its remainder, and so does a file whose
+			// next chunk is still to be read.
+			break
+		}
+	}
+	if count == 0 {
+		return stageErr
+	}
+	c.writeOp.ov = syscall.Overlapped{}
+	c.writeInFlight = true
+	c.outstanding.Add(1)
+	var sent uint32
+	c.traceLocked("post send count=%d", count)
+	err := syscall.WSASend(c.socket(), &bufs[0], uint32(count), &sent, 0, &c.writeOp.ov, nil)
+	if err != nil && err != syscall.ERROR_IO_PENDING {
+		c.writeInFlight = false
+		c.outstanding.Add(-1)
+		clear(c.inFlight[:])
+		return err
+	}
+	return nil
+}
+
+func (c *Connection) sysRead(buf []byte) (int, error) {
+	if len(buf) == 0 {
+		return 0, nil
+	}
+	bufs := [1]syscall.WSABuf{sys.WSABuf(buf)}
+	var n, flags uint32
+	if err := syscall.WSARecv(c.socket(), &bufs[0], 1, &n, &flags, nil, nil); err != nil {
+		return 0, err
+	}
+	return int(n), nil
+}
+
+func (c *Connection) sysRecvOOB(buf []byte) (int, error) {
+	bufs := [1]syscall.WSABuf{sys.WSABuf(buf)}
+	var n uint32
+	flags := uint32(sys.MsgOOB)
+	if err := syscall.WSARecv(c.socket(), &bufs[0], 1, &n, &flags, nil, nil); err != nil {
+		if err == sys.WSAEINVAL {
+			err = syscall.EINVAL
+		}
+		return 0, err
+	}
+	return int(n), nil
+}
+
+func (c *Connection) sysWrite(buf []byte) (int, error) {
+	if len(buf) == 0 {
+		return 0, nil
+	}
+	bufs := [1]syscall.WSABuf{sys.WSABuf(buf)}
+	return c.wsaSend(bufs[:])
+}
+
+// sysWrite2 fills its array itself rather than through sys.WSABufs, which
+// would put first, usually a frame header on the caller's stack, on the heap.
+func (c *Connection) sysWrite2(first, second []byte) (int, error) {
+	if len(first) == 0 {
+		return c.sysWrite(second)
+	}
+	bufs := [2]syscall.WSABuf{sys.WSABuf(first)}
+	if len(second) == 0 || len(first) > sys.MaxWSABufLen {
+		// The rest of first has to go before any of second.
+		return c.wsaSend(bufs[:1])
+	}
+	bufs[1] = sys.WSABuf(second)
+	return c.wsaSend(bufs[:])
+}
+
+func (c *Connection) sysWritev(buffers [][]byte) (int, error) {
+	var bufs [maxWritevItems]syscall.WSABuf
+	return c.wsaSend(bufs[:sys.WSABufs(bufs[:], buffers...)])
+}
+
+func (c *Connection) wsaSend(bufs []syscall.WSABuf) (int, error) {
+	if len(bufs) == 0 {
+		return 0, nil
+	}
+	var n uint32
+	if err := syscall.WSASend(c.socket(), &bufs[0], uint32(len(bufs)), &n, 0, nil, nil); err != nil {
+		return 0, err
+	}
+	return int(n), nil
+}
+
+func (c *Connection) socketError() error {
+	c.mu.Lock()
+	failure := c.failure
+	c.mu.Unlock()
+	if failure != nil {
+		return failure
+	}
+	errno, err := syscall.GetsockoptInt(c.socket(), syscall.SOL_SOCKET, sys.SoError)
+	if err != nil {
+		return err
+	}
+	if errno != 0 {
+		return syscall.Errno(errno)
+	}
+	return syscall.ECONNRESET
+}
+
+// dialLoop picks the loop a dial is to run on, which without pollers is
+// always the engine's own.
+func (e *Engine) dialLoop(*dialRequest) *Engine { return e }
+
+// closeDialSocket closes a socket opened for a dial ahead of its loop, which
+// never happens here.
+func closeDialSocket(fd int) { _ = syscall.Closesocket(syscall.Handle(fd)) }
+
+// exclusiveBind binds a dial's socket to the local end DialWith named, with
+// SO_EXCLUSIVEADDRUSE. Without it Winsock lets a bind share a port another
+// socket holds on a different address of the same family, the wildcard next
+// to a specific address or the reverse, and the more specific socket then
+// takes the datagrams and connections meant for this one; the Unix kernels
+// refuse that bind with EADDRINUSE. With it the bind fails with
+// WSAEADDRINUSE whenever any socket holds the port, so a range moves on to
+// the next port as it does elsewhere, and no socket can later bind the port
+// on a more specific address under this one.
+func exclusiveBind(s syscall.Handle) func(syscall.Sockaddr) error {
+	return func(sa syscall.Sockaddr) error {
+		if err := syscall.SetsockoptInt(s, syscall.SOL_SOCKET, sys.SoExclusiveAddrUse, 1); err != nil {
+			return err
+		}
+		return syscall.Bind(s, sa)
+	}
+}
+
+// connectSocket opens a socket and starts an overlapped ConnectEx on it, whose
+// completion reports the connect's outcome. ConnectEx always completes through
+// the port, even when it finishes at once, so connected is always false here.
+// Callers run on the event loop.
+func (e *Engine) connectSocket(d *dialRequest) (c *Connection, connected bool, err error) {
+	if netaddr.IsUDP(d.network) {
+		return e.connectDatagram(d)
+	}
+	if netaddr.IsUnix(d.network) {
+		return e.connectUnix(d)
+	}
+	s, err := sys.NewSocket(d.family)
+	if err != nil {
+		return nil, false, err
+	}
+	// ConnectEx requires a bound socket, and binding the wildcard address leaves
+	// the choice of interface and port to the kernel, as connect() would. A
+	// dial that names its local end is bound there instead.
+	if d.hasLocal {
+		err = d.bindLocal(exclusiveBind(s))
+	} else {
+		var local syscall.Sockaddr = &syscall.SockaddrInet4{}
+		if d.family == syscall.AF_INET6 {
+			local = &syscall.SockaddrInet6{}
+		}
+		err = syscall.Bind(s, local)
+	}
+	if err == nil {
+		err = sys.SetNonblock(s)
+	}
+	if err == nil {
+		_, err = syscall.CreateIoCompletionPort(s, e.port, 0, 0)
+	}
+	if err != nil {
+		syscall.Closesocket(s)
+		return nil, false, err
+	}
+	// As for an accepted connection; see adopt.
+	_ = syscall.SetsockoptInt(s, syscall.IPPROTO_TCP, syscall.TCP_NODELAY, 1)
+	c = &Connection{engine: e, handler: d.handler, dialing: d, dialed: true}
+	c.handle.Store(uintptr(s))
+	c.readOp = ioOp{kind: opRead, conn: c}
+	// The connect borrows the write operation: no write can be posted before
+	// the connection exists, and completeConnect hands it back to writes.
+	c.writeOp = ioOp{kind: opConnect, conn: c}
+	e.conns[c] = struct{}{}
+	c.outstanding.Add(1)
+	err = syscall.ConnectEx(s, d.sa, nil, 0, &c.connectSent, &c.writeOp.ov)
+	if err != nil && err != syscall.ERROR_IO_PENDING {
+		c.outstanding.Add(-1)
+		delete(e.conns, c)
+		syscall.Closesocket(s)
+		return nil, false, err
+	}
+	return c, false, nil
+}
+
+// connectDatagram opens a UDP socket connected to the dialed peer and posts
+// its first receive. Connecting a UDP socket only records the peer, so it is
+// done on the spot; the receive cannot complete before the dial is reported,
+// since its completion is handled on the event loop that is reporting it.
+func (e *Engine) connectDatagram(d *dialRequest) (c *Connection, connected bool, err error) {
+	s, err := sys.NewDatagramSocket(d.family)
+	if err != nil {
+		return nil, false, err
+	}
+	err = d.bindLocal(exclusiveBind(s))
+	if err == nil {
+		err = syscall.Connect(s, d.sa)
+	}
+	if err == nil {
+		_, err = syscall.CreateIoCompletionPort(s, e.port, 0, 0)
+	}
+	if err != nil {
+		syscall.Closesocket(s)
+		return nil, false, err
+	}
+	c = &Connection{engine: e, handler: d.handler, dialing: d, dialed: true,
+		udp: &udpState{raddr: &net.UDPAddr{IP: d.raddr.IP, Port: d.raddr.Port, Zone: d.raddr.Zone}}}
+	c.udp.buf = make([]byte, maxDatagramSize)
+	c.handle.Store(uintptr(s))
+	c.readOp = ioOp{kind: opRecvDatagram, conn: c}
+	c.writeOp = ioOp{kind: opWrite, conn: c}
+	e.conns[c] = struct{}{}
+	c.mu.Lock()
+	err = c.armDatagramReadLocked()
+	c.mu.Unlock()
+	if err != nil {
+		delete(e.conns, c)
+		syscall.Closesocket(s)
+		return nil, false, err
+	}
+	return c, true, nil
+}
+
+// connectUnix connects a Unix socket. ConnectEx only takes TCP, so this is a
+// plain connect, as the net package makes on Windows too; a local connect
+// finishes, or is refused, without waiting on a network.
+func (e *Engine) connectUnix(d *dialRequest) (c *Connection, connected bool, err error) {
+	s, err := sys.NewSocket(d.family)
+	if err != nil {
+		return nil, false, err
+	}
+	err = syscall.Connect(s, d.sa)
+	if err == nil {
+		err = sys.SetNonblock(s)
+	}
+	if err == nil {
+		_, err = syscall.CreateIoCompletionPort(s, e.port, 0, 0)
+	}
+	if err != nil {
+		syscall.Closesocket(s)
+		return nil, false, err
+	}
+	c = &Connection{engine: e, handler: d.handler, dialing: d, dialed: true}
+	c.flags.set(flagUnix, true)
+	c.handle.Store(uintptr(s))
+	c.readOp = ioOp{kind: opRead, conn: c}
+	c.writeOp = ioOp{kind: opWrite, conn: c}
+	e.conns[c] = struct{}{}
+	return c, true, nil
+}
+
+// completeConnect settles a ConnectEx. A dial that was abandoned while the
+// connect was in flight, by its timeout or by the engine closing, has already
+// been reported, and only its memory is left to release.
+func (e *Engine) completeConnect(c *Connection, err error) {
+	c.outstanding.Add(-1)
+	c.writeOp.kind = opWrite
+	if c.dialing == nil {
+		e.forget(c)
+		return
+	}
+	if err == nil {
+		// Without this the socket does not know it is connected, and
+		// shutdown and getpeername fail on it.
+		err = syscall.Setsockopt(c.socket(), syscall.SOL_SOCKET, syscall.SO_UPDATE_CONNECT_CONTEXT, nil, 0)
+	}
+	if err != nil {
+		e.failDial(c, err)
+		return
+	}
+	e.completeDial(c)
+	c.rearmRead()
+}
+
+// fileSegment is the part of a file SendFile has yet to send, read through
+// the connection's own duplicate of the caller's handle. TransmitFile sends it
+// from the file, a call at a time, each posted once the socket has taken what
+// is ahead of it. A file that is sealed on its way, as TLS seals it, or one
+// TransmitFile refuses, as it does for a Unix socket, is read a chunk at a
+// time instead, each chunk once the socket has taken the one before.
+type fileSegment struct {
+	// file owns the duplicate handle. A connection that closes while an
+	// overlapped send still holds a chunk closes it at once, and leaves only
+	// the chunk to the garbage collector; see markClosedLocked.
+	file      *os.File
+	offset    int64
+	remaining int64
+	// size is how long the file was when the segment was made, or -1 when
+	// that could not be learned. TransmitFile is never asked for a byte past
+	// it: Windows ends such a request with an end-of-file error, which stops
+	// it short of the file's own end, so what remains past it is read
+	// instead; see transmitFileLocked.
+	size  int64
+	chunk []byte
+	// noTransmit records that TransmitFile refused the segment, which is
+	// read a chunk at a time from then on.
+	noTransmit bool
+	// sealer, when set, transforms the file on its way, a chunk at a time
+	// sealed into sealed; see stageSealedLocked.
+	sealer FileSealer
+	sealed []byte
+}
+
+// readAt reads the file at off.
+func (s *fileSegment) readAt(p []byte, off int64) (int, error) { return s.file.ReadAt(p, off) }
+
+// newSealBuffer is the buffer a sealed segment seals its chunks into. It is
+// left to the garbage collector rather than given back to the pool, since an
+// overlapped send may still be reading it when the segment ends.
+func newSealBuffer(n int) []byte { return make([]byte, n) }
+
+// maxTransmitFile bounds one TransmitFile call, below the 2GB it takes.
+const maxTransmitFile = 1 << 30
+
+// transmitsLocked reports whether the file item goes by TransmitFile: one
+// sent as it is, over TCP, that TransmitFile has not refused, with no chunk of
+// it staged. Callers hold c.mu.
+func (c *Connection) transmitsLocked(item *sendItem) bool {
+	s := item.file
+	return s.sealer == nil && !s.noTransmit && item.data == nil && !c.flags.has(flagUnix)
+}
+
+// transmitFileLocked posts a TransmitFile for what is left of the file item at
+// the head of the queue, or as much of it as one call takes, and never past the
+// end of the file. Its completion is the write edge, as an overlapped send's
+// is. A socket TransmitFile refuses, or a range the file does not hold, has the
+// file read a chunk at a time instead. Callers hold c.mu.
+func (c *Connection) transmitFileLocked(item *sendItem) error {
+	s := item.file
+	n := min(s.remaining, maxTransmitFile)
+	if s.size >= 0 {
+		n = min(n, s.size-s.offset)
+	}
+	if n <= 0 {
+		// What is left of the range is past the end of the file. Asking
+		// TransmitFile for it ends the request with an end-of-file error,
+		// which stops it short of the file's own end and closes the
+		// connection with that error: the peer is short of bytes the file
+		// did have. Reading the file instead finds the end, and the short
+		// range is reported once what the file holds has gone, as the
+		// platforms whose sendfile stops there report it.
+		s.noTransmit = true
+		return c.awaitWritableLocked()
+	}
+	c.writeOp.ov = syscall.Overlapped{Offset: uint32(s.offset), OffsetHigh: uint32(s.offset >> 32)}
+	c.writeInFlight = true
+	c.transmitting = n
+	c.outstanding.Add(1)
+	c.traceLocked("post transmit n=%d", n)
+	err := transmitFile(c.socket(), syscall.Handle(s.file.Fd()), uint32(n), 0, &c.writeOp.ov, nil, 0)
+	if err == nil || err == syscall.ERROR_IO_PENDING {
+		return nil
+	}
+	c.writeInFlight = false
+	c.transmitting = 0
+	c.outstanding.Add(-1)
+	if err == syscall.ERROR_HANDLE_EOF {
+		// The file ends before what was asked for of it, which is the short
+		// range that Windows reports as the end of the file.
+		return io.ErrUnexpectedEOF
+	}
+	if err == wsaEOPNOTSUPP || err == sys.WSAEINVAL || err == errorNotSupported || err == errorInvalidParameter {
+		s.noTransmit = true
+		return c.awaitWritableLocked()
+	}
+	return err
+}
+
+// transmitFile is syscall.TransmitFile, which a test replaces to have it
+// refuse a socket.
+var transmitFile = syscall.TransmitFile
+
+// What TransmitFile reports for a socket or a file it does not send.
+const (
+	wsaEOPNOTSUPP         = syscall.Errno(10045)
+	errorNotSupported     = syscall.Errno(50)
+	errorInvalidParameter = syscall.Errno(87)
+)
+
+func newFileSegment(f File, offset, count int64) (*fileSegment, error) {
+	rc, err := f.SyscallConn()
+	if err != nil {
+		return nil, err
+	}
+	var dup syscall.Handle
+	var dupErr error
+	err = rc.Control(func(fd uintptr) {
+		process, _ := syscall.GetCurrentProcess()
+		dupErr = syscall.DuplicateHandle(process, syscall.Handle(fd), process, &dup, 0, false, syscall.DUPLICATE_SAME_ACCESS)
+	})
+	if err == nil {
+		err = dupErr
+	}
+	if err != nil {
+		return nil, err
+	}
+	seg := &fileSegment{file: os.NewFile(uintptr(dup), ""), offset: offset, remaining: count, size: -1}
+	// A file whose size cannot be learned still goes by TransmitFile, and
+	// falls back to chunked reads for one it cannot send.
+	if info, statErr := seg.file.Stat(); statErr == nil {
+		seg.size = info.Size()
+	}
+	return seg, nil
+}
+
+func (s *fileSegment) advance(n int64) {
+	s.offset += n
+	s.remaining -= n
+}
+
+func (s *fileSegment) close() {
+	if s.file != nil {
+		_ = s.file.Close()
+		s.file = nil
+	}
+}
+
+// stageLocked reads the file item's next chunk into its data, unless one is
+// already waiting there. Callers hold c.mu.
+func (c *Connection) stageLocked(item *sendItem) error {
+	if item.data != nil {
+		return nil
+	}
+	s := item.file
+	if s.sealer != nil {
+		return c.stageSealedLocked(item)
+	}
+	if s.chunk == nil {
+		s.chunk = make([]byte, min(s.remaining, sendFileChunk))
+	}
+	n, err := s.file.ReadAt(s.chunk[:min(s.remaining, int64(len(s.chunk)))], s.offset)
+	if n == 0 {
+		if err == nil || err == io.EOF {
+			err = io.ErrUnexpectedEOF
+		}
+		return err
+	}
+	item.data, item.offset = s.chunk[:n], 0
+	s.advance(int64(n))
+	// The chunk moves from what is left of the file to what is in memory.
+	c.moveFileLocked(int64(n))
+	c.addPending(int64(n))
+	return nil
+}
+
+// sysSendFileLocked sends what it can of the file item at the head of the
+// queue, from a chunk staged in memory, which counts as pending like any
+// other queued bytes. A file that goes by TransmitFile, which is overlapped,
+// is reported as a full socket, so that the flush hands it to
+// awaitWritableLocked to post. Callers hold c.mu.
+func (c *Connection) sysSendFileLocked(item *sendItem) (n, attempted int, fromFile bool, err error) {
+	if c.transmitsLocked(item) {
+		return 0, 0, true, sys.WSAEWOULDBLOCK
+	}
+	if err = c.stageLocked(item); err != nil {
+		return 0, 0, false, err
+	}
+	data := item.data[item.offset:]
+	n, err = c.sysWrite(data)
+	return n, len(data), false, err
+}
+
+// rawSocket is what the kernel names a socket by: a handle here.
+type rawSocket = syscall.Handle
+
+func (c *Connection) rawSocket() rawSocket { return c.socket() }
+
+// shutdownReadLocked shuts the socket's reading side and cancels the
+// zero-byte read posted on it, whose completion then arms nothing more; see
+// completeRead. Callers hold c.mu.
+func (c *Connection) shutdownReadLocked() error {
+	h := c.socket()
+	err := syscall.Shutdown(h, syscall.SHUT_RD)
+	if c.readArmed {
+		_ = syscall.CancelIoEx(h, &c.readOp.ov)
+	}
+	return err
+}
+
+// The keep-alive options Windows 10 added as socket options, in place of the
+// SIO_KEEPALIVE_VALS control code, which is what older versions have.
+const (
+	tcpKeepIdle     = 3
+	tcpKeepCount    = 16
+	tcpKeepInterval = 17
+)
+
+// setKeepAliveTimes sets the idle time before the first keep-alive probe and
+// the interval between probes; see Connection.SetKeepAliveConfig. A Windows
+// without the socket options sets both at once through SIO_KEEPALIVE_VALS,
+// where one left alone takes the net package's default instead.
+func setKeepAliveTimes(s syscall.Handle, idle, interval time.Duration) error {
+	if idle < 0 && interval < 0 {
+		return nil
+	}
+	var err error
+	if idle >= 0 {
+		err = syscall.SetsockoptInt(s, syscall.IPPROTO_TCP, tcpKeepIdle, keepAliveSeconds(idle))
+	}
+	if err == nil && interval >= 0 {
+		err = syscall.SetsockoptInt(s, syscall.IPPROTO_TCP, tcpKeepInterval, keepAliveSeconds(interval))
+	}
+	if err != syscall.WSAENOPROTOOPT {
+		return err
+	}
+	if idle < 0 {
+		idle = 0
+	}
+	if interval < 0 {
+		interval = 0
+	}
+	vals := syscall.TCPKeepalive{
+		OnOff:    1,
+		Time:     uint32(keepAliveSeconds(idle)) * 1000,
+		Interval: uint32(keepAliveSeconds(interval)) * 1000,
+	}
+	var n uint32
+	return syscall.WSAIoctl(s, syscall.SIO_KEEPALIVE_VALS, (*byte)(unsafe.Pointer(&vals)),
+		uint32(unsafe.Sizeof(vals)), nil, 0, &n, nil, 0)
+}
+
+// setKeepAliveCount sets how many unanswered probes end the connection. A
+// Windows without the option keeps its own count.
+func setKeepAliveCount(s syscall.Handle, count int) error {
+	if count < 0 {
+		return nil
+	}
+	if count == 0 {
+		count = defaultKeepAliveCount
+	}
+	err := syscall.SetsockoptInt(s, syscall.IPPROTO_TCP, tcpKeepCount, count)
+	if err == syscall.WSAENOPROTOOPT {
+		return nil
+	}
+	return err
+}
+
+// usingMultipathTCP is false: Windows has no Multipath TCP.
+func usingMultipathTCP(syscall.Handle) bool { return false }
+
+// File is not available on Windows, where a socket cannot be duplicated into
+// a file; it reports syscall.EWINDOWS, as net.TCPConn.File does there.
+func (c *Connection) File() (*os.File, error) {
+	return nil, os.NewSyscallError("dup", syscall.EWINDOWS)
+}
+
+// pauseStateChangedLocked reports whether queued output has crossed a watermark
+// so that the backend's read registration no longer matches it, where reads do
+// not pause in place. It mirrors the decision refreshConnection makes, so that
+// a refresh is only requested when the event loop actually has a change to
+// make. Callers hold c.mu.
+func (c *Connection) pauseStateChangedLocked() bool {
+	c.foldCorkedLocked()
+	pause, _ := c.pauseDecision(c.readPaused)
+	return pause != c.readPaused
+}
+
+// drainWake answers a wake-up by running the commands it announced, for a
+// loop that has no settle step and so stays asleep between wake-ups, as far
+// as notify can tell.
+func (e *Engine) drainWake() {
+	e.ackWake()
+	e.wakePending.Store(false)
+	e.drainCommands()
+}
+
+// acceptPlacements says the engine's one loop accepts and serves every
+// connection, which Config.AcceptPlacement has no say in.
+func (e *Engine) acceptPlacements() (string, bool) {
+	e.listenMu.Lock()
+	defer e.listenMu.Unlock()
+	if len(e.listeners) == 0 {
+		return "", false
+	}
+	return "engine-loop", false
+}

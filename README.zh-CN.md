@@ -707,7 +707,8 @@ CI 每次 push 都在 Linux、macOS、Windows 上运行 [`taskpool/benchmark`](t
 
 | 包 | 说明 |
 | --- | --- |
-| [`fib`](.) | engine、事件循环、TCP / UDP / Unix 连接、`SendFile`、异步 dial |
+| [`fib`](.) | 公开 API：`Engine`、`Connection`、`Config`、handler 等，从 `core` 重新导出 |
+| [`core`](core) | engine、事件循环、TCP / UDP / Unix 连接、`SendFile`、异步 dial |
 | [`taskpool`](taskpool) | worker 池：adaptive（默认）、adaptive-chan、elastic、inline |
 | [`bufferpool`](bufferpool) | 按 Go 分配器对齐的分级 buffer 池 |
 | [`tls`](tls) | 作为连接上一层的 TLS，对上层协议透明 |
