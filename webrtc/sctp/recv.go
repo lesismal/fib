@@ -44,6 +44,12 @@ const maxGapSpan = 65535
 
 const maxDups = 32
 
+// maxGaps bounds how many gap blocks a receiver tracks, far more than fit
+// in a SACK. A chunk that would start one more is dropped unacknowledged
+// and sent again; one next to a block or at the cumulative point is
+// always taken, so the window still moves.
+const maxGaps = 4096
+
 // chunkOverhead is what each chunk waiting in a stream's queue counts
 // toward the receive window besides its data, for its buffer and entry, as
 // usrsctp counts each chunk's control overhead. It keeps a peer sending
@@ -96,7 +102,10 @@ func (a *Association) handleData(flags uint8, v []byte) error {
 			return nil
 		}
 	}
-	a.mark(tsn)
+	if !a.mark(tsn) {
+		// One more gap block would not fit: dropped unacknowledged.
+		return nil
+	}
 	if st == nil {
 		return nil
 	}
@@ -247,25 +256,43 @@ func insertChunk(q []rchunk, i int, c rchunk) []rchunk {
 	return q
 }
 
+// gapAt returns the index of the first gap block that does not end before
+// tsn, which is past the cumulative point. Gap blocks all lie within
+// maxGapSpan of it, so offsets from it order them.
+func (a *Association) gapAt(tsn uint32) int {
+	off := tsn - a.peerCum
+	g := a.gaps
+	if n := len(g); n == 0 || g[n-1].end-a.peerCum < off {
+		return len(g)
+	}
+	lo, hi := 0, len(g)-1
+	for lo < hi {
+		m := int(uint(lo+hi) >> 1)
+		if g[m].end-a.peerCum < off {
+			lo = m + 1
+		} else {
+			hi = m
+		}
+	}
+	return lo
+}
+
 // received reports whether tsn has arrived before.
 func (a *Association) received(tsn uint32) bool {
 	if !tsnGT(tsn, a.peerCum) {
 		return true
 	}
-	for _, g := range a.gaps {
-		if tsnLT(tsn, g.start) {
-			return false
-		}
-		if tsnLE(tsn, g.end) {
-			return true
-		}
+	if tsn-a.peerCum > maxGapSpan {
+		return false
 	}
-	return false
+	i := a.gapAt(tsn)
+	return i < len(a.gaps) && tsn-a.peerCum >= a.gaps[i].start-a.peerCum
 }
 
-// mark records tsn as received, merging it into the cumulative point or
-// the gap blocks.
-func (a *Association) mark(tsn uint32) {
+// mark records tsn, which has not arrived before, as received, merging it
+// into the cumulative point or the gap blocks. It reports false, recording
+// nothing, when tsn would start a gap block past maxGaps.
+func (a *Association) mark(tsn uint32) bool {
 	if tsn == a.peerCum+1 {
 		a.peerCum = tsn
 		if len(a.gaps) > 0 && a.gaps[0].start == tsn+1 {
@@ -273,34 +300,27 @@ func (a *Association) mark(tsn uint32) {
 			n := copy(a.gaps, a.gaps[1:])
 			a.gaps = a.gaps[:n]
 		}
-		return
+		return true
 	}
-	for i := range a.gaps {
-		g := &a.gaps[i]
-		if tsnLT(tsn, g.start) {
-			if tsn+1 == g.start {
-				g.start = tsn
-				if i > 0 && a.gaps[i-1].end+1 == tsn {
-					a.gaps[i-1].end = g.end
-					a.gaps = append(a.gaps[:i], a.gaps[i+1:]...)
-				}
-				return
-			}
-			if i > 0 && a.gaps[i-1].end+1 == tsn {
-				a.gaps[i-1].end = tsn
-				return
-			}
-			a.gaps = append(a.gaps, tsnRange{})
-			copy(a.gaps[i+1:], a.gaps[i:])
-			a.gaps[i] = tsnRange{tsn, tsn}
-			return
-		}
+	i := a.gapAt(tsn)
+	joinNext := i < len(a.gaps) && a.gaps[i].start == tsn+1
+	joinPrev := i > 0 && a.gaps[i-1].end+1 == tsn
+	switch {
+	case joinPrev && joinNext:
+		a.gaps[i-1].end = a.gaps[i].end
+		a.gaps = append(a.gaps[:i], a.gaps[i+1:]...)
+	case joinPrev:
+		a.gaps[i-1].end = tsn
+	case joinNext:
+		a.gaps[i].start = tsn
+	case len(a.gaps) >= maxGaps:
+		return false
+	default:
+		a.gaps = append(a.gaps, tsnRange{})
+		copy(a.gaps[i+1:], a.gaps[i:])
+		a.gaps[i] = tsnRange{tsn, tsn}
 	}
-	if n := len(a.gaps); n > 0 && a.gaps[n-1].end+1 == tsn {
-		a.gaps[n-1].end = tsn
-		return
-	}
-	a.gaps = append(a.gaps, tsnRange{tsn, tsn})
+	return true
 }
 
 // deliver hands one whole message to its data channel or OnMessage.

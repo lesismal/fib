@@ -3,6 +3,7 @@ package sctp
 import (
 	"encoding/binary"
 	"errors"
+	"math/rand/v2"
 	"strings"
 	"testing"
 	"time"
@@ -328,6 +329,66 @@ func TestReceiveWindowHeld(t *testing.T) {
 		if len(got) != queued+1 || b.held != 0 {
 			t.Fatalf("size %d: %d delivered of %d, held %d", size, len(got), queued+1, b.held)
 		}
+	}
+}
+
+// TestGapBlocks checks the gap blocks against a set of the TSNs received,
+// in random order, and that a peer leaving a hole at every other TSN
+// gets no more than maxGaps of them tracked while the holes still fill.
+func TestGapBlocks(t *testing.T) {
+	a := NewAssociation(Config{})
+	a.peerCum = 0xffffff00 // wraps
+	base := a.peerCum
+	rng := rand.New(rand.NewPCG(1, 2))
+	seen := map[uint32]bool{}
+	for range 20000 {
+		tsn := base + 1 + uint32(rng.IntN(3000))
+		want := !tsnGT(tsn, a.peerCum) || seen[tsn]
+		if got := a.received(tsn); got != want {
+			t.Fatalf("received(%d) = %v, want %v", tsn-base, got, want)
+		}
+		if !want && a.mark(tsn) {
+			seen[tsn] = true
+		}
+		cum := base
+		for seen[cum+1] {
+			cum++
+		}
+		if a.peerCum != cum {
+			t.Fatalf("cum %d, want %d", a.peerCum-base, cum-base)
+		}
+		for i, g := range a.gaps {
+			if !tsnGT(g.start, a.peerCum) || tsnLT(g.end, g.start) || i > 0 && !tsnGT(g.start, a.gaps[i-1].end+1) {
+				t.Fatalf("gaps %v at cum %d", a.gaps, a.peerCum)
+			}
+		}
+	}
+
+	var got []gotMsg
+	l := newLink(t, 1, collect(&got))
+	l.connect(false)
+	b := l.ends[1]
+	cum := b.peerCum
+	one := []byte{1}
+	send := func(tsn uint32) {
+		t.Helper()
+		c := rawData(tsn, 0, 0, PPIDBinary, flagBegin|flagEnd|flagUnordered, one)
+		if err := b.HandlePacket(rawPacket(b.localTag, c), l.now); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// Every other TSN, from the far end down so each is a new first block.
+	for off := uint32(maxGapSpan - 1); off >= 2; off -= 2 {
+		send(cum + off)
+	}
+	if len(b.gaps) != maxGaps || len(got) != maxGaps {
+		t.Fatalf("%d gap blocks, %d delivered", len(b.gaps), len(got))
+	}
+	for off := uint32(1); off < maxGapSpan; off++ {
+		send(cum + off)
+	}
+	if b.peerCum != cum+maxGapSpan-1 || len(b.gaps) != 0 {
+		t.Fatalf("cum %d, %d gap blocks", b.peerCum-cum, len(b.gaps))
 	}
 }
 
