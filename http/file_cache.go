@@ -10,6 +10,7 @@ import (
 	"os"
 	"path"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -186,7 +187,7 @@ func (fc *FileCache) ServeFile(c *Context, name string) {
 	if !cleanName(name) {
 		name = strings.TrimPrefix(path.Clean("/"+name), "/")
 	}
-	if name == "" || strings.HasSuffix(name, ".br") && fc.precompressed || strings.HasSuffix(name, ".gz") && fc.precompressed {
+	if name == "" || !localName(name, runtime.GOOS == "windows") || strings.HasSuffix(name, ".br") && fc.precompressed || strings.HasSuffix(name, ".gz") && fc.precompressed {
 		c.Respond(stdhttp.StatusNotFound, "text/plain; charset=utf-8", []byte("404 page not found\n"))
 		return
 	}
@@ -249,6 +250,27 @@ func cleanName(name string) bool {
 		name = rest
 	}
 	return true
+}
+
+// localName reports whether name, a clean slash-separated path within the
+// root, still names a file within it once it is a path on the disk, as
+// net/http.Dir.Open checks: never one holding a NUL, and on Windows, which
+// windows says this is, neither one holding a backslash, which is a
+// separator there, so that "..\\x" would climb out of the root, nor a colon,
+// which names a drive or a stream, nor, as filepath.IsLocal says, a device
+// name such as NUL or COM1.
+func localName(name string, windows bool) bool {
+	for i := 0; i < len(name); i++ {
+		switch name[i] {
+		case 0:
+			return false
+		case '\\', ':':
+			if windows {
+				return false
+			}
+		}
+	}
+	return !windows || filepath.IsLocal(filepath.FromSlash(name))
 }
 
 // hasConditions reports whether r asks for anything but the whole file as it
