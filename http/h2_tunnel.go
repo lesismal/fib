@@ -97,6 +97,17 @@ func (sc *h2ServerConn) recoverCallback() {
 	}
 }
 
+// queued is how much of what the peer sent waits in the tunnel for its
+// handler: all of it before the handler accepts the tunnel, and what arrives
+// while the handler is busy with an earlier piece.
+func (t *h2Tunnel) queued() int {
+	tunnel := &t.feed.tunnel
+	tunnel.mu.Lock()
+	n := len(tunnel.queued)
+	tunnel.mu.Unlock()
+	return n
+}
+
 // upgraded reports whether the stream carries an accepted tunnel. Callers hold
 // the connection's mu.
 func (st *h2ServerStream) upgraded() bool { return st.tunnel != nil && st.tunnel.upgraded }
@@ -142,6 +153,14 @@ func (sc *h2ServerConn) handleTunnelData(st *h2ServerStream, f *h2Frame) error {
 	sc.unlock()
 	if err := st.tunnel.feed.Write(f.payload); err != nil {
 		return &H2StreamError{StreamID: f.streamID, Code: H2EnhanceYourCalm}
+	}
+	// What the tunnel could not hand its handler yet waits in it, and counts
+	// against what the connection may hold, as a body collected whole does.
+	if sc.maxBuffered > 0 && len(f.payload) > 0 && st.tunnel.queued() > 0 {
+		sc.buffered += int64(len(f.payload))
+		if !sc.bufferRoom(0) {
+			return &H2StreamError{StreamID: f.streamID, Code: H2EnhanceYourCalm}
+		}
 	}
 	if !f.has(h2FlagEndStream) {
 		return nil

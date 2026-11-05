@@ -122,6 +122,7 @@ HEADERS 这样到达的 stream 带 `Early-Data: 1`（RFC 8470），只有 GET、
 | `AdaptiveWindow` | 关闭 | 像 gRPC 那样把窗口涨到连接的带宽时延积：统计一个 PING 到其确认之间到达的 DATA，若对端在一个往返里填满了窗口，就把窗口翻倍。PING 至少间隔 25ms，窗口只增不减，stream 窗口受 `MaxAdaptiveWindow` 限制。 |
 | `MaxAdaptiveWindow` | 16MB | `AdaptiveWindow` 可涨到的 stream 窗口上限。 |
 | `InitialMaxStreams` | 100 | 客户端在收到服务端 `SETTINGS_MAX_CONCURRENT_STREAMS` 之前，在新连接上假定可并发的 stream 数。服务端忽略。 |
+| `MaxBufferedBodyBytes` | 4 × `MaxBodyBytes`（64MB） | 一条连接上在 handler 运行前整块收集的请求 body，加上各 tunnel 为尚未就绪的 handler 暂存的数据，合计可占用的上限。某个 stream 的 DATA 会超出时，该 stream 以 `REFUSED_STREAM` 重置（tunnel 用 `ENHANCE_YOUR_CALM`）；body 的最后一帧总会放行。不低于 `MaxBodyBytes`；设为负数关闭。客户端忽略。 |
 
 ```go
 config := fibhttp.DefaultConfig()

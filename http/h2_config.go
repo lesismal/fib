@@ -4,6 +4,7 @@ package http
 
 import (
 	"encoding/binary"
+	"math"
 	"time"
 
 	"github.com/lesismal/fib/hpack"
@@ -69,9 +70,30 @@ type HTTP2Config struct {
 	// means 100, the number RFC 9113 recommends a server allow at least. A
 	// server ignores it.
 	InitialMaxStreams int
+	// MaxBufferedBodyBytes bounds what one connection holds of the request
+	// bodies it collects whole before their handlers run (and of the part
+	// of a streamed body that arrives before StreamRequestBodyThreshold),
+	// together with what its tunnels hold for handlers not ready for it.
+	// Each body is bounded by Config.MaxBodyBytes, and the connection's
+	// window is given back as such a body arrives, so without this a client
+	// could have every stream it may open (MaxConcurrentStreams) hold a body
+	// just short of MaxBodyBytes for as long as Config.ReadBodyTimeout lets
+	// it. A stream whose DATA would take the connection past it is reset
+	// with REFUSED_STREAM, which a client may retry once the others are
+	// done, and a tunnel with ENHANCE_YOUR_CALM; nothing is held back, so a
+	// client is never left waiting on bodies that cannot finish. Zero means
+	// DefaultH2BufferedBodies times Config.MaxBodyBytes (64MB with the
+	// defaults); a value below MaxBodyBytes is taken as MaxBodyBytes, so
+	// that a body of any size the server takes still fits; below zero, no
+	// limit. A client ignores it.
+	MaxBufferedBodyBytes int64
 }
 
 const (
+	// DefaultH2BufferedBodies is how many bodies of Config.MaxBodyBytes one
+	// HTTP/2 connection may hold while they arrive when
+	// HTTP2Config.MaxBufferedBodyBytes is zero.
+	DefaultH2BufferedBodies = 4
 	// DefaultH2StreamWindow is HTTP2Config.StreamWindow's default, and
 	// DefaultH2ConnWindow ConnWindow's.
 	DefaultH2StreamWindow = 1 << 20
@@ -140,6 +162,22 @@ func (c *HTTP2Config) initialMaxStreams() int {
 		return c.InitialMaxStreams
 	}
 	return h2DefaultInitialMaxStreams
+}
+
+// maxBufferedBodies is MaxBufferedBodyBytes with its default for a server
+// whose bodies are bounded by maxBody, or zero for no limit.
+func (c *HTTP2Config) maxBufferedBodies(maxBody int64) int64 {
+	maxBody = max(maxBody, 0)
+	switch limit := c.MaxBufferedBodyBytes; {
+	case limit < 0:
+		return 0
+	case limit > 0:
+		return max(limit, maxBody, 1)
+	case maxBody > math.MaxInt64/DefaultH2BufferedBodies:
+		return math.MaxInt64
+	default:
+		return max(maxBody*DefaultH2BufferedBodies, 1)
+	}
 }
 
 // h2WindowSetting is a configured window, or def for zero, kept within what

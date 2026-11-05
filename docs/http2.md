@@ -167,6 +167,7 @@ Behaviour to be aware of when using it.
 | `AdaptiveWindow` | off | Grow the windows to the connection's bandwidth-delay product, as gRPC does, by measuring DATA between a PING and its acknowledgement and doubling a window that the peer fills within a round trip. The PINGs are at least 25ms apart, the windows never shrink, and the stream window is bounded by `MaxAdaptiveWindow`. |
 | `MaxAdaptiveWindow` | 16MB | The bound on the stream window `AdaptiveWindow` grows. |
 | `InitialMaxStreams` | 100 | How many streams a client opens on a new connection before the server's `SETTINGS_MAX_CONCURRENT_STREAMS` arrives. Ignored by a server. |
+| `MaxBufferedBodyBytes` | 4 × `MaxBodyBytes` (64MB) | What one connection may hold of the request bodies it collects whole before their handlers run, together with what its tunnels hold for handlers not ready for it. A stream whose DATA would go past it is reset with `REFUSED_STREAM` (a tunnel with `ENHANCE_YOUR_CALM`); a body's last frame always passes. Never below `MaxBodyBytes`; negative turns it off. Ignored by a client. |
 
 ```go
 config := fibhttp.DefaultConfig()

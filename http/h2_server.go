@@ -121,6 +121,14 @@ type h2ServerConn struct {
 	// its body's share back as it consumes it.
 	recvWindow  int64
 	recvUnacked int64
+	// buffered is what the request bodies being collected whole, and the
+	// tunnels' queues, hold on this connection, as the reader counts it, and
+	// maxBuffered what they may, or zero for no limit; see
+	// HTTP2Config.MaxBufferedBodyBytes. buffered may run high, since a body
+	// can also go with its stream from other goroutines, which leave it to
+	// the reader to count again; see bufferRoom. Only the reader touches it.
+	buffered    int64
+	maxBuffered int64
 	// local is what the server lets the client send; see HTTP2Config.
 	local h2Local
 
@@ -355,6 +363,7 @@ func newH2ServerConn(h *ServerHandler, c *fib.Connection, remoteAddr string) *h2
 		maxStreams:   maxStreams,
 		dec:          dec,
 		recvWindow:   local.connWindow,
+		maxBuffered:  h.config.HTTP2.maxBufferedBodies(h.config.MaxBodyBytes),
 		local:        local,
 		streams:      make(map[uint32]*h2ServerStream),
 		enc:          enc,
@@ -893,9 +902,38 @@ func (sc *h2ServerConn) handleRSTStream(f *h2Frame) error {
 	sc.unlock()
 	sc.closeIfDone()
 	if st != nil {
+		// What of a body it was collecting goes with it. Only the reader,
+		// which this is, touches the body, and recycles the stream.
+		sc.buffered -= int64(len(st.body))
+		bufferpool.Put(st.body)
+		st.body = nil
 		return sc.resetCounted()
 	}
 	return nil
+}
+
+// bufferRoom reports whether the connection has room for n more bytes of the
+// bodies it collects whole, and of its tunnels' queues, within maxBuffered.
+// What the reader counts runs high when those went with their streams from
+// other goroutines — a read timeout, a reset of the server's — so before
+// it says no it counts again what the connection's streams hold. That is the
+// slow path, which a connection takes only when it is near its limit.
+func (sc *h2ServerConn) bufferRoom(n int64) bool {
+	if sc.maxBuffered <= 0 || sc.buffered+n <= sc.maxBuffered {
+		return true
+	}
+	var held int64
+	sc.lock()
+	for _, st := range sc.streams {
+		// Only the reader, which this is, touches a stream's body.
+		held += int64(len(st.body))
+		if st.tunnel != nil {
+			held += int64(st.tunnel.queued())
+		}
+	}
+	sc.unlock()
+	sc.buffered = held
+	return held+n <= sc.maxBuffered
 }
 
 func (sc *h2ServerConn) handleData(f *h2Frame) error {
@@ -963,6 +1001,7 @@ func (sc *h2ServerConn) handleData(f *h2Frame) error {
 		// that for one of no declared length, as a chunked HTTP/1 body does.
 		buffered := st.body
 		st.body = nil
+		sc.buffered -= int64(len(buffered))
 		sc.streamRequest(st, buffered, f.payload)
 		if f.has(h2FlagEndStream) {
 			return sc.endStreamed(st, nil)
@@ -973,7 +1012,16 @@ func (sc *h2ServerConn) handleData(f *h2Frame) error {
 		sc.reject(st, stdhttp.StatusRequestEntityTooLarge)
 		return nil
 	}
+	// The body's last frame goes to its handler at once; any other has to
+	// fit beside what the connection holds already.
+	if !f.has(h2FlagEndStream) && !sc.bufferRoom(int64(len(f.payload))) {
+		sc.buffered -= int64(len(st.body))
+		bufferpool.Put(st.body)
+		st.body = nil
+		return &H2StreamError{StreamID: f.streamID, Code: H2RefusedStream}
+	}
 	st.body = bufferpool.Append(st.body, f.payload)
+	sc.buffered += int64(len(f.payload))
 	if f.has(h2FlagEndStream) {
 		return sc.finishRequest(st)
 	}
@@ -1353,7 +1401,11 @@ func (sc *h2ServerConn) newRequest(fields []hpack.HeaderField, st *h2ServerStrea
 // finishRequest runs the handler for a stream whose request has arrived
 // whole.
 func (sc *h2ServerConn) finishRequest(st *h2ServerStream) error {
+	// The body is the handler's from here, or goes with the stream.
+	sc.buffered -= int64(len(st.body))
 	if st.declared >= 0 && st.declared != int64(len(st.body)) {
+		bufferpool.Put(st.body)
+		st.body = nil
 		return &H2StreamError{StreamID: st.id, Code: H2ProtocolError}
 	}
 	// The stream's response has not all gone: one that has is forgotten by
@@ -1757,6 +1809,7 @@ func (sc *h2ServerConn) serve(context *Context) {
 // reject answers a stream with an error status before its request is
 // complete, and stops reading it.
 func (sc *h2ServerConn) reject(st *h2ServerStream, status int) {
+	sc.buffered -= int64(len(st.body))
 	bufferpool.Put(st.body)
 	st.body = nil
 	req := st.req
