@@ -86,7 +86,15 @@ type Config struct {
 	// HTTP/2 both its encoded block and its decoded size as RFC 9113
 	// counts it.
 	MaxHeaderBytes int
-	MaxBodyBytes   int64
+	// MaxBodyBytes bounds a request's body that is buffered whole before its
+	// handler runs, as it decodes; a larger one is answered 413. An HTTP/1
+	// chunked body may take no more than MaxBodyBytes and MaxHeaderBytes
+	// together on the wire, chunk-size lines and extensions, CRLFs and
+	// trailer section included, and is refused as soon as it has, so that
+	// many small chunks or long extensions cannot make the server buffer
+	// more than that; a chunk-size line, extensions and all, is at most
+	// 1 KiB. A body that streams is bounded by MaxStreamedBodyBytes instead.
+	MaxBodyBytes int64
 	// EarlyData lets clients that resume a TLS session send requests in
 	// their first flight, 0-RTT data (RFC 8446 section 2.3), which saves
 	// them a round trip. Such data is not protected against replay: an

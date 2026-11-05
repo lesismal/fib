@@ -130,8 +130,11 @@ type ClientConfig struct {
 	IdleConnTimeout time.Duration
 	// MaxResponseHeaderBytes and MaxResponseBodyBytes bound what one response
 	// may hold. The body is buffered whole before the callback runs, so the
-	// second is also the memory one response can take. A body that streams
-	// (see StreamResponseBody) is bounded by MaxStreamedBodyBytes instead.
+	// second is also the memory one response can take. An HTTP/1 chunked
+	// body may take no more than the two together on the wire, chunk-size
+	// lines, which are at most 1 KiB each, and trailer included. A body that
+	// streams (see StreamResponseBody) is bounded by MaxStreamedBodyBytes
+	// instead.
 	MaxResponseHeaderBytes int
 	MaxResponseBodyBytes   int64
 	// StreamResponseBody runs the callback of a response before its body has
