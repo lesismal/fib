@@ -3,6 +3,7 @@
 package websocket
 
 import (
+	"bytes"
 	"errors"
 	stdhttp "net/http"
 	"strings"
@@ -89,7 +90,7 @@ func (h *ServerHandler) validateExtendedConnect(request *stdhttp.Request) (hands
 		request.Header.Get("Sec-Websocket-Version") != "13" {
 		return handshakeResult{}, ErrProtocol
 	}
-	if h.config.CheckOrigin != nil && !h.config.CheckOrigin(request) {
+	if !h.checkOrigin(request) {
 		return handshakeResult{}, errOriginRejected
 	}
 	var result handshakeResult
@@ -99,6 +100,51 @@ func (h *ServerHandler) validateExtendedConnect(request *stdhttp.Request) (hands
 	}
 	h.negotiateExtensions(&result, request.Header.Values("Sec-Websocket-Extensions"))
 	return result, nil
+}
+
+// checkOrigin reports whether the handshake request may open a WebSocket:
+// what Config.CheckOrigin says, or, when it is nil, whether the request is
+// same-origin.
+func (h *ServerHandler) checkOrigin(request *stdhttp.Request) bool {
+	if h.config.CheckOrigin != nil {
+		return h.config.CheckOrigin(request)
+	}
+	return CheckSameOrigin(request)
+}
+
+// CheckSameOrigin is what a ServerHandler whose Config.CheckOrigin is nil
+// accepts, as gorilla/websocket does: a request with no Origin header, which
+// is not from a browser, or one whose single Origin names the host the
+// request is for, compared without regard to case. It keeps a page of another
+// site from opening a WebSocket with the cookies and credentials a browser
+// sends along (cross-site WebSocket hijacking).
+func CheckSameOrigin(request *stdhttp.Request) bool {
+	origin := request.Header["Origin"]
+	switch len(origin) {
+	case 0:
+		return true
+	case 1:
+		return sameOrigin([]byte(origin[0]), []byte(request.Host))
+	}
+	return false
+}
+
+// sameOrigin reports whether origin, an Origin header's value of the form
+// scheme://host[:port], names host. "null", what a browser sends for an
+// opaque origin, names none.
+func sameOrigin(origin, host []byte) bool {
+	i := bytes.Index(origin, []byte("://"))
+	if i <= 0 {
+		return false
+	}
+	authority := origin[i+3:]
+	if end := bytes.IndexAny(authority, "/?#"); end >= 0 {
+		authority = authority[:end]
+	}
+	if at := bytes.LastIndexByte(authority, '@'); at >= 0 {
+		authority = authority[at+1:]
+	}
+	return len(authority) != 0 && bytes.EqualFold(authority, host)
 }
 
 // refuse answers a request that is not a handshake the server accepts.

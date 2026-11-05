@@ -27,7 +27,18 @@ type Config struct {
 	// when the handler implements FrameHandler.
 	MaxMessageBytes int64
 	Subprotocols    []string
-	CheckOrigin     func(*stdhttp.Request) bool
+	// CheckOrigin decides whether a handshake request may open a WebSocket.
+	// When it is nil, CheckSameOrigin decides: a request with no Origin
+	// header, or whose Origin names the request's Host, is accepted, and a
+	// browser page of another site is refused with 403 Forbidden. To accept
+	// every origin, as before this default, set
+	//
+	//	CheckOrigin: func(*http.Request) bool { return true },
+	//
+	// knowing that a page of any site can then open a WebSocket carrying
+	// the user's cookies. A non-nil CheckOrigin makes every handshake parse
+	// into an *http.Request, which the default does not need.
+	CheckOrigin func(*stdhttp.Request) bool
 	// EnableCompression accepts a client's offer of permessage-deflate (RFC
 	// 7692). Messages are then sent compressed, and a client may send its own
 	// compressed. MaxMessageBytes bounds a message once decompressed.
@@ -432,7 +443,7 @@ func (h *ServerHandler) OnData(c *fib.Connection, data []byte) {
 	if !h.needsRequest && state.handshake == nil {
 		key, result, remainder, complete, err := h.validateMinimalHandshake(data)
 		if err != nil {
-			h.reject(c, nil, stdhttp.StatusBadRequest)
+			h.reject(c, nil, rejectStatus(err))
 			return
 		}
 		if complete {
@@ -462,7 +473,7 @@ func (h *ServerHandler) OnData(c *fib.Connection, data []byte) {
 	}
 	result, err := h.validateHandshake(request)
 	if err != nil {
-		h.reject(c, request, stdhttp.StatusBadRequest)
+		h.reject(c, request, rejectStatus(err))
 		return
 	}
 	key := []byte(request.Header.Get("Sec-Websocket-Key"))
@@ -608,7 +619,7 @@ func (h *ServerHandler) validateHandshakeRequest(request *stdhttp.Request) (stri
 	if err != nil || len(key) != base64.StdEncoding.EncodedLen(len(decodedKey)) || n != len(decodedKey) {
 		return "", ErrProtocol
 	}
-	if h.config.CheckOrigin != nil && !h.config.CheckOrigin(request) {
+	if !h.checkOrigin(request) {
 		return "", errOriginRejected
 	}
 	return h.selectSubprotocol(request)
@@ -659,10 +670,11 @@ func (h *ServerHandler) validateMinimalHandshake(data []byte) ([]byte, handshake
 		return nil, handshakeResult{}, nil, false, errMalformedHandshake
 	}
 
-	var key []byte
+	var key, host, origin []byte
 	var subprotocol string
 	var offers []string
 	hostSeen, connectionUpgrade, upgradeWebsocket, version13 := false, false, false, false
+	origins := 0
 	for offset := lineEnd + 2; offset < headerAt; {
 		// The line ends at the latest at headerAt, and is not empty, since
 		// headerAt is where the first empty line is.
@@ -682,7 +694,10 @@ func (h *ServerHandler) validateMinimalHandshake(data []byte) ([]byte, handshake
 			if hostSeen || len(value) == 0 {
 				return nil, handshakeResult{}, nil, false, errMalformedHandshake
 			}
-			hostSeen = true
+			hostSeen, host = true, value
+		case bytes.EqualFold(name, []byte("Origin")):
+			origins++
+			origin = value
 		case bytes.EqualFold(name, []byte("Connection")):
 			connectionUpgrade = connectionUpgrade || byteHeaderHasToken(value, []byte("upgrade"))
 		case bytes.EqualFold(name, []byte("Upgrade")):
@@ -716,6 +731,10 @@ func (h *ServerHandler) validateMinimalHandshake(data []byte) ([]byte, handshake
 	if !hostSeen || !connectionUpgrade || !upgradeWebsocket || !version13 ||
 		decodeErr != nil || len(key) != 24 || n != len(decodedKey) {
 		return nil, handshakeResult{}, nil, false, ErrProtocol
+	}
+	// CheckOrigin is nil on this path: the default of CheckSameOrigin.
+	if origins > 1 || origins == 1 && !sameOrigin(origin, host) {
+		return nil, handshakeResult{}, nil, false, errOriginRejected
 	}
 	result := handshakeResult{subprotocol: subprotocol}
 	h.negotiateExtensions(&result, offers)
@@ -778,6 +797,15 @@ func validMinimalRequestURI(uri []byte) bool {
 
 func isHex(c byte) bool {
 	return c >= '0' && c <= '9' || c >= 'a' && c <= 'f' || c >= 'A' && c <= 'F'
+}
+
+// rejectStatus is the status a handshake refused for err is answered with:
+// 403 Forbidden for an origin CheckOrigin refuses, 400 Bad Request otherwise.
+func rejectStatus(err error) int {
+	if errors.Is(err, errOriginRejected) {
+		return stdhttp.StatusForbidden
+	}
+	return stdhttp.StatusBadRequest
 }
 
 func (h *ServerHandler) reject(c *fib.Connection, request *stdhttp.Request, status int) {
