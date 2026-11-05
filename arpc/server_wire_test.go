@@ -11,6 +11,7 @@ import (
 	"time"
 
 	fib "github.com/lesismal/fib"
+	"github.com/lesismal/fib/bufferpool"
 )
 
 // TestContextInHandlers pins down what a handler sees of its Context: the
@@ -149,6 +150,67 @@ func TestWireCloseMidMessage(t *testing.T) {
 	waitArpc(t, "the connection to be served", func() bool { return s.CurrLoad() == 1 })
 	conn.Close()
 	waitArpc(t, "the Client to end", func() bool { return s.CurrLoad() == 0 })
+}
+
+// TestWireLongBodyGrowsAsItArrives pins down that a message whose header
+// announces a long body is not given a buffer of that length before the body
+// arrives: one that announces 32 MiB and sends a few bytes costs about
+// recvChunk, and the buffer grows as the rest comes, ending up whole, with
+// buffers from make or from the pool.
+func TestWireLongBodyGrowsAsItArrives(t *testing.T) {
+	for _, pool := range []bool{false, true} {
+		t.Run(map[bool]string{false: "make", true: "pool"}[pool], func(t *testing.T) {
+			testWireLongBody(t, pool)
+		})
+	}
+}
+
+func testWireLongBody(t *testing.T, pool bool) {
+	const bodyLen = 32 << 20
+	s := NewServer()
+	var largest atomic.Int64
+	if pool {
+		s.Handler.EnablePool(true)
+	}
+	s.Handler.HandleMalloc(func(size int) []byte {
+		for {
+			cur := largest.Load()
+			if int64(size) <= cur || largest.CompareAndSwap(cur, int64(size)) {
+				break
+			}
+		}
+		if pool {
+			return bufferpool.Get(size)
+		}
+		return make([]byte, size)
+	})
+	got := make(chan string, 1)
+	s.Handler.Handle("/big", func(ctx *Context) { got <- string(ctx.Message.Data()) })
+	addr := startServer(t, s)
+	conn, err := net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+
+	payload := make([]byte, bodyLen-len("/big"))
+	for i := range payload {
+		payload[i] = byte(i % 251)
+	}
+	msg := frame(CmdNotify, 0, 1, "/big", string(payload))
+	if _, err := conn.Write(msg[:HeadLen+100]); err != nil {
+		t.Fatal(err)
+	}
+	waitArpc(t, "the header to be read", func() bool { return largest.Load() > 0 })
+	if n := largest.Load(); n > int64(HeadLen+recvChunk) {
+		t.Fatalf("a header announcing %d bytes allocated %d before the body arrived", bodyLen, n)
+	}
+	if _, err := conn.Write(msg[HeadLen+100:]); err != nil {
+		t.Fatal(err)
+	}
+	if data := recvArpc(t, got, "the long message"); data != string(payload) {
+		t.Fatalf("the long message arrived with %d bytes, not as sent", len(data))
+	}
 }
 
 // TestPriorityDataIgnored pins down that arpc ignores out-of-band data on

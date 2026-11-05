@@ -249,7 +249,8 @@ func (h *Handler) MaxBodyLen() int { return h.maxBodyLen }
 
 // SetMaxBodyLen sets the longest body a received message may have,
 // DefaultMaxBodyLen by default. A connection that sends a longer one is
-// closed.
+// closed. A message's buffer grows as its body arrives, so a header that
+// announces a long body costs only what the peer actually sends.
 func (h *Handler) SetMaxBodyLen(l int) { h.maxBodyLen = l }
 
 // Malloc returns a buffer for a message, from make unless HandleMalloc or

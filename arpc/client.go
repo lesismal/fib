@@ -905,9 +905,13 @@ type connState struct {
 	head   [HeadLen]byte
 	// headLen is how much of a header that arrived split is in head.
 	headLen int
-	// msg is the message being received, filled up to filled.
+	// msg is the message being received, filled up to filled, whose whole
+	// length is need. Its Buffer is grown as the body arrives rather than
+	// allocated at the length the header announces, so a peer that announces
+	// a long body and sends none of it holds no more memory than it sent.
 	msg    *Message
 	filled int
+	need   int
 
 	outMu   sync.Mutex
 	out     []byte
@@ -938,26 +942,55 @@ func (st *connState) feed(conn *fib.Connection, data []byte) {
 				conn.CloseWithError(fmt.Errorf("%w: %d bytes", ErrBodyTooLarge, bodyLen))
 				return
 			}
+			need := HeadLen + int(bodyLen)
 			msg := messagePool.Get().(*Message)
 			msg.handler = h
-			msg.Buffer = h.Malloc(HeadLen + int(bodyLen))
+			// A message that has arrived whole, or is short, gets its whole
+			// buffer now; a longer one only what has arrived, at least
+			// recvChunk, and grows as the rest comes.
+			msg.Buffer = h.Malloc(min(need, HeadLen+max(len(data), recvChunk)))
 			copy(msg.Buffer, head)
 			if bodyLen == 0 {
 				h.onMessage(c, msg)
 				continue
 			}
-			st.msg, st.filled = msg, HeadLen
+			st.msg, st.filled, st.need = msg, HeadLen, need
+		}
+		if st.filled == len(st.msg.Buffer) {
+			st.grow(len(data))
 		}
 		n := copy(st.msg.Buffer[st.filled:], data)
 		st.filled += n
 		data = data[n:]
-		if st.filled < len(st.msg.Buffer) {
-			return
+		if st.filled < st.need {
+			// Either all that was read is in, or the buffer is full and
+			// grows for the rest.
+			continue
 		}
 		msg := st.msg
 		st.msg = nil
 		h.onMessage(c, msg)
 	}
+}
+
+// recvChunk is the least buffer a message being received is given, or grown
+// by, before its body has arrived.
+const recvChunk = 64 * 1024
+
+// grow makes room in the message being received for more of its body, n
+// bytes of which have arrived: at least those, and at least double what it
+// has, but no more than the whole message.
+func (st *connState) grow(n int) {
+	h, old := st.client.Handler, st.msg.Buffer
+	if c := min(st.need, cap(old)); c > len(old) {
+		st.msg.Buffer = old[:c]
+		return
+	}
+	size := min(st.need, max(st.filled+n, 2*len(old)))
+	buf := h.Malloc(size)
+	copy(buf, old[:st.filled])
+	st.msg.Buffer = buf
+	h.Free(old)
 }
 
 // release frees a message the connection closed in the middle of.
