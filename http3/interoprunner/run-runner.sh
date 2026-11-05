@@ -71,9 +71,43 @@ esac
 
 # run <server> <client> runs one direction and keeps going after a failure,
 # so one peer's failure still shows the other peers' results.
+#
+# A testcase that fails is run once more, alone, and counts as failed only if
+# it fails again. The runner judges several testcases (resumption, zerortt,
+# retry) by the packets in the simulator's captures, and stops every
+# container as soon as the client exits; the simulator's capture can then
+# end before it has written its last packets, which on 2026-11-05 left the
+# server side's trace with the first of resumption's two handshakes only
+# (fib_quic-go, "Expected exactly 2 handshake. Got: 1") while the client's
+# side showed both. A testcase that fails twice is a real failure.
 status=0
 run() {
-    python3 run.py -s "$1" -c "$2" -t "$testcases" -m || status=1
+    local results failed
+    results=$(mktemp)
+    if python3 run.py -s "$1" -c "$2" -t "$testcases" -m -j "$results"; then
+        rm -f "$results"
+        return
+    fi
+    failed=$(python3 - "$results" <<'PY'
+import json
+import sys
+
+try:
+    data = json.load(open(sys.argv[1]))
+except (OSError, ValueError):
+    sys.exit(0)
+names = [t["name"] for row in data.get("results", []) for t in row if t.get("result") == "failed"]
+print(",".join(dict.fromkeys(names)))
+PY
+)
+    rm -f "$results"
+    if [ -z "$failed" ]; then
+        # The runner failed without a testcase to blame: nothing to rerun.
+        status=1
+        return
+    fi
+    echo "run-runner: $1 (server) vs $2 (client) failed $failed; running it once more" >&2
+    python3 run.py -s "$1" -c "$2" -t "$failed" -m || status=1
 }
 for peer in $peers; do
     if [ "$direction" != client ]; then

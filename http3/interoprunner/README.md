@@ -377,4 +377,7 @@ runs; the three have tests in `http3/quic`:
   ngtcp2, both directions, on every push and pull request. It is
   `continue-on-error`, because it pulls the simulator and peer images, needs
   `tshark`, and the runner is slower and more brittle than the rest of the
-  suite.
+  suite. `run-runner.sh` runs a failed testcase once more and
+  reports it only if it fails again: the runner stops the simulator as soon
+  as the client exits, and a capture cut short then has the runner count
+  fewer handshakes than went over the wire.
