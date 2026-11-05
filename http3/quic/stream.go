@@ -674,7 +674,10 @@ func (s *Stream) onStreamFrame(off uint64, data []byte, fin bool) error {
 	// its own: most requests arrive whole in one frame, and the handler
 	// then hears of each in one call instead of a call for the data and
 	// another, which finds nothing more to do, for the end.
-	last := s.recv.take(off, data)
+	last, ok := s.recv.take(off, data, recvSegmentLimit(c.config.StreamReceiveWindow))
+	if !ok {
+		return c.floodErr("stream data in too many pieces")
+	}
 	for {
 		chunk := s.recv.pop()
 		if chunk == nil {

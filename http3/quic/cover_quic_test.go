@@ -393,13 +393,13 @@ func TestCqPathEdges(t *testing.T) {
 	})
 }
 
-// The receive buffer drops a stored segment that data delivered since has
-// covered, and stores only the part past what was delivered of one that
-// overlaps it.
+// The receive buffer drops a stored segment that later data covers whole,
+// and stores only the part past what was delivered of data that overlaps
+// it.
 func TestCqRecvBufferCoveredSegment(t *testing.T) {
 	var r recvBuffer
-	r.push(1, []byte("12"))
-	r.push(0, []byte("0123"))
+	r.push(1, []byte("12"), minRecvSegments)
+	r.push(0, []byte("0123"), minRecvSegments)
 	if got := r.pop(); string(got) != "0123" {
 		t.Fatalf("popped %q", got)
 	}
@@ -407,7 +407,7 @@ func TestCqRecvBufferCoveredSegment(t *testing.T) {
 		t.Fatalf("popped %q, %d segments left", got, len(r.segments))
 	}
 	// Data that overlaps what was delivered is stored less the overlap.
-	r.push(2, []byte("2345"))
+	r.push(2, []byte("2345"), minRecvSegments)
 	if got := r.pop(); string(got) != "45" || r.buffered != 0 {
 		t.Fatalf("popped %q, %d bytes left", got, r.buffered)
 	}

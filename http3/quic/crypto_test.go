@@ -178,12 +178,12 @@ func TestSendBuffer(t *testing.T) {
 
 func TestRecvBuffer(t *testing.T) {
 	var r recvBuffer
-	r.push(5, []byte("56789"))
+	r.push(5, []byte("56789"), minRecvSegments)
 	if r.pop() != nil {
 		t.Fatal("delivered past a gap")
 	}
-	r.push(0, []byte("0123"))
-	r.push(2, []byte("2345"))
+	r.push(0, []byte("0123"), minRecvSegments)
+	r.push(2, []byte("2345"), minRecvSegments)
 	var got []byte
 	for d := r.pop(); d != nil; d = r.pop() {
 		got = append(got, d...)

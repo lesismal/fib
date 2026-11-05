@@ -317,11 +317,31 @@ type segment struct {
 	data []byte
 }
 
+func (s *segment) end() uint64 { return s.off + uint64(len(s.data)) }
+
+// minRecvSegments is the fewest segments a receive buffer holds before it
+// gives up on its peer; see recvSegmentLimit.
+const minRecvSegments = 1024
+
+// recvSegmentLimit is how many segments a receive buffer over window bytes
+// may hold: one for every half kilobyte of it, so that a peer losing every
+// other full packet stays well inside the limit, and never fewer than
+// minRecvSegments. Each segment holds a byte at least, and the window
+// bounds the bytes already; what the limit bounds is the cost of the
+// segments themselves, which a peer sending a byte here and a byte there
+// would otherwise make one of for every other byte of the window.
+func recvSegmentLimit(window uint64) int {
+	return int(min(max(window>>9, minRecvSegments), 1<<20))
+}
+
 // recvBuffer reassembles a stream from frames that may arrive out of order,
 // overlap or repeat.
 type recvBuffer struct {
 	// offset is how far the data has been delivered in order.
-	offset   uint64
+	offset uint64
+	// segments are ascending and disjoint, and all past offset: a byte is
+	// held once however often it arrives, so what they hold is bounded by
+	// the flow control window that bounds the frames' ends.
 	segments []segment
 	// buffered is how many bytes the segments hold.
 	buffered int
@@ -330,58 +350,111 @@ type recvBuffer struct {
 // take hands on a frame's data at once, less what has been delivered already,
 // when it continues the stream where delivery left off and nothing waits
 // ahead of it, which is how nearly every frame arrives. Otherwise it stores
-// the data for pop and returns nil.
-func (r *recvBuffer) take(off uint64, data []byte) []byte {
+// the data for pop and returns nil. It reports false when storing the data
+// would take more than limit segments, which only a peer cutting its data
+// into ever more pieces asks for.
+func (r *recvBuffer) take(off uint64, data []byte, limit int) ([]byte, bool) {
 	if len(r.segments) > 0 || off > r.offset {
-		r.push(off, data)
-		return nil
+		return nil, r.push(off, data, limit)
 	}
 	end := off + uint64(len(data))
 	if end <= r.offset {
-		return nil
+		return nil, true
 	}
 	data = data[r.offset-off:]
 	r.offset = end
-	return data
+	return data, true
 }
 
-// push stores a copy of a frame's data, less what has been delivered
-// already, since it outlives the datagram it arrived in; pop then hands it
-// on in order.
-func (r *recvBuffer) push(off uint64, data []byte) {
+// push stores a copy of what a frame's data adds to what has been delivered
+// and stored already, since it outlives the datagram it arrived in; pop then
+// hands it on in order. A stored segment keeps what it holds, and segments
+// the data covers whole give way to it, so a frame sent again, or ever larger
+// ones over the same bytes, hold them no more than once. Data that continues
+// a segment is added to it. It reports false, storing nothing, when the data
+// would make more than limit segments.
+func (r *recvBuffer) push(off uint64, data []byte, limit int) bool {
 	end := off + uint64(len(data))
 	if end <= r.offset || len(data) == 0 {
-		return
+		return true
 	}
 	if off < r.offset {
 		data = data[r.offset-off:]
 		off = r.offset
 	}
-	i := sort.Search(len(r.segments), func(i int) bool { return r.segments[i].off > off })
-	r.segments = append(r.segments, segment{})
-	copy(r.segments[i+1:], r.segments[i:])
-	r.segments[i] = segment{off: off, data: bytes.Clone(data)}
+	segs := r.segments
+	// i is the first segment that ends past off.
+	i := sort.Search(len(segs), func(i int) bool { return segs[i].end() > off })
+	if i < len(segs) && segs[i].off <= off {
+		// The data starts inside segment i, which has those bytes already.
+		e := segs[i].end()
+		if e >= end {
+			return true
+		}
+		data = data[e-off:]
+		off = e
+		i++
+	}
+	// Segments i up to j lie inside [off, end), and give way to the data.
+	j := i
+	for j < len(segs) && segs[j].end() <= end {
+		j++
+	}
+	if j < len(segs) && segs[j].off < end {
+		// The data ends inside segment j, which has those bytes already.
+		end = segs[j].off
+		data = data[:end-off]
+		if len(data) == 0 {
+			return true
+		}
+	}
+	for k := i; k < j; k++ {
+		r.buffered -= len(segs[k].data)
+	}
+	switch {
+	case i > 0 && segs[i-1].end() == off:
+		segs[i-1].data = append(segs[i-1].data, data...)
+		r.segments = cutSegments(segs, i, j)
+	case i < j:
+		segs[i] = segment{off: off, data: bytes.Clone(data)}
+		r.segments = cutSegments(segs, i+1, j)
+	default:
+		if len(segs) >= limit {
+			return false
+		}
+		segs = append(segs, segment{})
+		copy(segs[i+1:], segs[i:])
+		segs[i] = segment{off: off, data: bytes.Clone(data)}
+		r.segments = segs
+	}
 	r.buffered += len(data)
+	return true
+}
+
+// cutSegments drops segs[i:j], whose bytes the caller has taken out of
+// buffered, and lets go of what they held.
+func cutSegments(segs []segment, i, j int) []segment {
+	if i == j {
+		return segs
+	}
+	n := len(segs)
+	segs = append(segs[:i], segs[j:]...)
+	clear(segs[len(segs):n])
+	return segs
 }
 
 // pop returns the next data in order, or nil when there is a gap first.
 func (r *recvBuffer) pop() []byte {
-	for len(r.segments) > 0 {
-		s := r.segments[0]
-		if s.off > r.offset {
-			return nil
-		}
-		r.segments = r.segments[1:]
-		r.buffered -= len(s.data)
-		end := s.off + uint64(len(s.data))
-		if end <= r.offset {
-			continue
-		}
-		data := s.data[r.offset-s.off:]
-		r.offset = end
-		return data
+	if len(r.segments) == 0 || r.segments[0].off > r.offset {
+		return nil
 	}
-	return nil
+	s := r.segments[0]
+	r.segments[0] = segment{}
+	r.segments = r.segments[1:]
+	r.buffered -= len(s.data)
+	data := s.data[r.offset-s.off:]
+	r.offset = s.end()
+	return data
 }
 
 // pnRange is the packet numbers [lo, hi].

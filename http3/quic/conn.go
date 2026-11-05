@@ -191,8 +191,9 @@ type Config struct {
 	DisableNewTokens bool
 	// ExcessiveLoadCode is the application error code a connection closes
 	// with once its peer has made it do more work without asking for
-	// anything than it allows: PING after PING, say, or streams opened and
-	// reset at once (see flood.go). HTTP/3 has H3_EXCESSIVE_LOAD for it.
+	// anything than it allows: PING after PING, say, streams opened and reset
+	// at once, or stream data cut into ever more pieces with gaps between
+	// (see flood.go and recvSegmentLimit). HTTP/3 has H3_EXCESSIVE_LOAD for it.
 	// Zero closes it with the transport error PROTOCOL_VIOLATION instead.
 	ExcessiveLoadCode uint64
 	// StreamResetBurst and StreamResetRate bound the streams a server's
@@ -1946,7 +1947,11 @@ func (c *Conn) feedCrypto(space int, off uint64, data []byte) error {
 		tls.QUICEncryptionLevelHandshake,
 		tls.QUICEncryptionLevelApplication,
 	}[space]
-	for chunk := s.cryptoRecv.take(off, data); ; chunk = nil {
+	first, ok := s.cryptoRecv.take(off, data, recvSegmentLimit(maxCryptoBuffer))
+	if !ok {
+		return transportErr(errCryptoBufferExceeds, "handshake data in too many pieces")
+	}
+	for chunk := first; ; chunk = nil {
 		if chunk == nil {
 			chunk = s.cryptoRecv.pop()
 		}

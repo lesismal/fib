@@ -282,9 +282,9 @@ func TestBuffersIgnoreNothing(t *testing.T) {
 		t.Fatalf("spans %v", spans)
 	}
 	var r recvBuffer
-	r.take(0, []byte("abc"))
-	r.push(1, []byte("b"))
-	r.push(3, nil)
+	r.take(0, []byte("abc"), minRecvSegments)
+	r.push(1, []byte("b"), minRecvSegments)
+	r.push(3, nil, minRecvSegments)
 	if len(r.segments) != 0 || r.buffered != 0 {
 		t.Fatalf("%d segments of %d bytes", len(r.segments), r.buffered)
 	}
