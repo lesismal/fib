@@ -6,7 +6,6 @@ import (
 	stdhttp "net/http"
 	"os"
 	"path/filepath"
-	"runtime"
 	"testing"
 )
 
@@ -35,11 +34,17 @@ func TestFileCacheLocalName(t *testing.T) {
 	if localName("a\x00b", false) {
 		t.Error("a name with a NUL is local")
 	}
-	if runtime.GOOS == "windows" {
-		for _, name := range []string{"NUL", "sub/CON", "COM1.txt"} {
-			if localName(name, true) {
-				t.Errorf("device name %q is local", name)
-			}
+	for _, name := range []string{"NUL", "sub/CON", "COM1.txt", "com\u00b9", "lpt9.tar.gz", "aux ", "CONOUT$", "nul .txt"} {
+		if localName(name, true) {
+			t.Errorf("device name %q is local on Windows", name)
+		}
+		if !localName(name, false) {
+			t.Errorf("%q is not local where it names no device", name)
+		}
+	}
+	for _, name := range []string{"COM10", "console", "nul2.txt", "lpt", "auxiliary/x"} {
+		if !localName(name, true) {
+			t.Errorf("%q is not local on Windows", name)
 		}
 	}
 }

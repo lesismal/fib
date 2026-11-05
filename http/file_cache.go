@@ -267,8 +267,8 @@ func cleanName(name string) bool {
 // net/http.Dir.Open checks: never one holding a NUL, and on Windows, which
 // windows says this is, neither one holding a backslash, which is a
 // separator there, so that "..\\x" would climb out of the root, nor a colon,
-// which names a drive or a stream, nor, as filepath.IsLocal says, a device
-// name such as NUL or COM1.
+// which names a drive or a stream, nor a segment that names a device, such as
+// NUL, COM1 or COM1.txt.
 func localName(name string, windows bool) bool {
 	for i := 0; i < len(name); i++ {
 		switch name[i] {
@@ -280,7 +280,39 @@ func localName(name string, windows bool) bool {
 			}
 		}
 	}
-	return !windows || filepath.IsLocal(filepath.FromSlash(name))
+	if !windows {
+		return true
+	}
+	for segment := range strings.SplitSeq(name, "/") {
+		if windowsDevice(segment) {
+			return false
+		}
+	}
+	return filepath.IsLocal(filepath.FromSlash(name))
+}
+
+// windowsDevice reports whether Windows may open segment as a device rather
+// than a file: a reserved name, whatever its case, alone or before an
+// extension or trailing spaces. Windows 11 no longer treats "COM1.txt" as a
+// device, and filepath.IsLocal follows it, but earlier Windows does.
+func windowsDevice(segment string) bool {
+	base, _, _ := strings.Cut(segment, ".")
+	base = strings.TrimRight(base, " ")
+	switch strings.ToUpper(base) {
+	case "CON", "PRN", "AUX", "NUL", "CONIN$", "CONOUT$":
+		return true
+	}
+	if len(base) < 4 {
+		return false
+	}
+	switch strings.ToUpper(base[:3]) {
+	case "COM", "LPT":
+		switch digit := base[3:]; digit {
+		case "0", "1", "2", "3", "4", "5", "6", "7", "8", "9", "\u00b9", "\u00b2", "\u00b3":
+			return true
+		}
+	}
+	return false
 }
 
 // hasConditions reports whether r asks for anything but the whole file as it
