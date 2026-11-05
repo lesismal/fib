@@ -2018,7 +2018,9 @@ func responseFraming(request *stdhttp.Request, response Response, closeConnectio
 		framing.chunked = true
 		trailer = make(stdhttp.Header, len(response.Trailer))
 		for key, values := range response.Trailer {
-			if !forbiddenTrailer(key) {
+			// A key that is not a token cannot be a field's name, and would
+			// go out raw in the Trailer field that announces it.
+			if validHeaderName(key) && !forbiddenTrailer(key) {
 				key = stdhttp.CanonicalHeaderKey(key)
 				trailer[key] = values
 				framing.trailers = append(framing.trailers, key)

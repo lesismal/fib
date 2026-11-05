@@ -1171,12 +1171,15 @@ func (w *responseWriter) trailer() stdhttp.Header {
 	return trailer
 }
 
-// announcedTrailers lists the names a "Trailer" header announces.
+// announcedTrailers lists the names a "Trailer" header announces. A name
+// that is not a token is left out, as one a trailer may not carry is: it
+// cannot be a field's name, and the Trailer field it goes back out in would
+// carry whatever it holds, a CRLF and a field of its own among it.
 func announcedTrailers(header stdhttp.Header) []string {
 	var names []string
 	for _, value := range header["Trailer"] {
 		for _, name := range strings.Split(value, ",") {
-			if name = strings.TrimSpace(name); name != "" && !forbiddenTrailer(name) {
+			if name = strings.TrimSpace(name); validHeaderName(name) && !forbiddenTrailer(name) {
 				names = append(names, stdhttp.CanonicalHeaderKey(name))
 			}
 		}
@@ -1251,7 +1254,15 @@ func appendResponseHead(out []byte, req *stdhttp.Request, head responseHead) ([]
 		out = append(out, "Transfer-Encoding: chunked\r\n"...)
 		if len(head.trailers) > 0 {
 			out = append(out, "Trailer: "...)
-			out = append(out, strings.Join(head.trailers, ", ")...)
+			for i, name := range head.trailers {
+				if !validHeaderName(name) {
+					return nil, errors.New("http: invalid trailer name")
+				}
+				if i > 0 {
+					out = append(out, ", "...)
+				}
+				out = append(out, name...)
+			}
 			out = append(out, crlf...)
 		}
 	}
