@@ -41,6 +41,13 @@ type stream struct {
 	// been read since the window was last given back.
 	recvWindow int64
 	unacked    int64
+	// held is how much of buf[off:], its last bytes, has not been given
+	// back to the connection's window; the rest was given back while a
+	// reader waited for it. removed is set once the transport has
+	// forgotten the stream, which gives back what it held, and keeps no
+	// more of what arrives.
+	held    int64
+	removed bool
 	// ready has a token once something has changed for a reader.
 	ready chan struct{}
 	// onEnd, if set, runs once the peer's side has ended, before readers
@@ -60,18 +67,24 @@ func (s *stream) signal() {
 	}
 }
 
-// onData takes a DATA frame's payload, which took length of the window.
-func (s *stream) onData(payload []byte, length int64, end bool) error {
+// onData takes a DATA frame's payload, which took length of the window, and
+// returns how much of it was dropped rather than kept to be read: what the
+// connection's window gets back at once.
+func (s *stream) onData(payload []byte, length int64, end bool) (int64, error) {
 	s.mu.Lock()
 	if length > s.recvWindow {
 		s.mu.Unlock()
-		return &streamError{id: s.id, code: errFlowControl}
+		return int64(len(payload)), &streamError{id: s.id, code: errFlowControl}
 	}
 	s.recvWindow -= length
 	// Padding is never read, so it is given back with what is.
 	s.unacked += length - int64(len(payload))
-	if s.err == nil {
+	dropped := int64(0)
+	if s.err == nil && !s.removed {
 		s.buf = append(s.buf, payload...)
+		s.held += int64(len(payload))
+	} else {
+		dropped = int64(len(payload))
 	}
 	// A unary call waiting for its request is served once the request has
 	// arrived, or once the window is full and the handler has to make room
@@ -90,7 +103,7 @@ func (s *stream) onData(payload []byte, length int64, end bool) error {
 		onEnd()
 	}
 	s.signal()
-	return nil
+	return dropped, nil
 }
 
 // abort fails the stream with err.
@@ -100,6 +113,9 @@ func (s *stream) abort(err error) {
 		s.err = err
 	}
 	s.onEnd = nil
+	// Nothing reads it now. What it held goes back to the connection's
+	// window when the transport forgets the stream.
+	s.buf, s.off = nil, 0
 	s.mu.Unlock()
 	s.signal()
 	if s.ss != nil {
@@ -142,6 +158,10 @@ func (s *stream) readMsg(maxSize int) (bool, []byte, error) {
 					s.buf = s.buf[:copy(s.buf, s.buf[s.off:])]
 					s.off = 0
 				}
+				// What was read goes back to the connection's window, but
+				// for what was given back while the reader waited.
+				connInc := max(0, int64(need)-int64(avail)+s.held)
+				s.held -= connInc
 				s.unacked += int64(need)
 				inc := int64(0)
 				if s.unacked >= streamWindow/4 && !s.remoteEnd {
@@ -149,7 +169,7 @@ func (s *stream) readMsg(maxSize int) (bool, []byte, error) {
 					s.recvWindow += inc
 				}
 				s.mu.Unlock()
-				s.credit(inc)
+				s.credit(inc, connInc)
 				return compressed, msg, nil
 			}
 		}
@@ -168,8 +188,13 @@ func (s *stream) readMsg(maxSize int) (bool, []byte, error) {
 			s.unacked = 0
 			s.recvWindow += inc
 		}
+		// Nor could messages that other streams' readers wait for too, once
+		// what they hold of them filled the connection's window: what a
+		// reader waits on is given back to it, bounded by the message.
+		connInc := s.held
+		s.held = 0
 		s.mu.Unlock()
-		s.credit(inc)
+		s.credit(inc, connInc)
 		select {
 		case <-s.ready:
 		case <-s.ctx.Done():
@@ -178,16 +203,18 @@ func (s *stream) readMsg(maxSize int) (bool, []byte, error) {
 	}
 }
 
-// credit gives inc back to the peer's window.
-func (s *stream) credit(inc int64) {
-	if inc <= 0 {
+// credit gives inc back to the stream's window, and connInc to the
+// connection's.
+func (s *stream) credit(inc, connInc int64) {
+	if inc <= 0 && connInc <= 0 {
 		return
 	}
 	t := s.t
 	t.mu.Lock()
-	if t.streams[s.id] == s {
+	if inc > 0 && t.streams[s.id] == s {
 		t.out = appendWindowUpdate(t.out, s.id, uint32(inc))
 	}
+	t.creditConnLocked(connInc)
 	t.mu.Unlock()
 	t.flush()
 }

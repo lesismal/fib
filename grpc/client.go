@@ -620,7 +620,7 @@ func (cs *clientStream) onHeaders(fields []hpack.HeaderField, end bool) error {
 	t.removeLocked(s)
 	t.mu.Unlock()
 	t.flush()
-	if err := s.onData(nil, 0, true); err != nil {
+	if _, err := s.onData(nil, 0, true); err != nil {
 		return err
 	}
 	cs.ended()

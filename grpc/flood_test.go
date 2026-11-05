@@ -6,6 +6,7 @@ import (
 	"bytes"
 	"encoding/binary"
 	"fmt"
+	"strings"
 	"sync/atomic"
 	"testing"
 )
@@ -111,6 +112,84 @@ func TestWireServerRapidReset(t *testing.T) {
 			t.Fatalf("%d handlers ran", n)
 		}
 	})
+}
+
+// TestWireServerConnectionWindow fills the windows of streams whose
+// handlers read nothing. The server used to give the connection's window
+// back as DATA arrived, so its streams could hold their windows each, as
+// many as the client opened; now it gives it back only as the streams' data
+// is read or dropped, so what they hold unread is bounded by the
+// connection's window, and DATA past it ends the connection.
+func TestWireServerConnectionWindow(t *testing.T) {
+	f := &floodService{}
+	_, addr := startServer(t, &echoImpl{}, UnknownServiceHandler(f.handle))
+	c := dialWire(t, addr, true)
+	c.expect(frameWindowUpdate, 0)
+	chunk := make([]byte, defaultMaxFrame)
+	streams := uint32(connWindow / streamWindow)
+	for i := range streams {
+		id := 2*i + 1
+		frames := [][]byte{headersFrame(id, c.request("/flood/x"), false)}
+		for range streamWindow / defaultMaxFrame {
+			frames = append(frames, dataFrame(id, chunk, false))
+		}
+		c.write(frames...)
+	}
+	c.write(appendPing(nil, false, []byte("syncsync")))
+	for {
+		fr, err := c.read()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if fr.typ == frameWindowUpdate && fr.streamID == 0 {
+			t.Fatalf("the connection's window grew by %d with nothing read", binary.BigEndian.Uint32(fr.payload))
+		}
+		if fr.typ == framePing && fr.has(flagAck) {
+			break
+		}
+	}
+	id := 2*streams + 1
+	c.write(headersFrame(id, c.request("/flood/x"), false), dataFrame(id, []byte("x"), false))
+	if got := c.goAway(); got != errFlowControl {
+		t.Fatalf("DATA past the connection's window: GOAWAY %d", got)
+	}
+}
+
+// TestConnectionWindowReadersWait sends, at once on one connection, large
+// messages that together need more than the connection's window: a reader
+// waiting for the rest of its message gets back what it holds of it, so no
+// call waits on the others for room they never give back. The replies are
+// small: a connection whose replies back up stops reading, and both ends of
+// one doing so at once is another matter.
+func TestConnectionWindowReadersWait(t *testing.T) {
+	sizeOf := func(_ any, stream ServerStream) error {
+		var in Req
+		if err := stream.RecvMsg(&in); err != nil {
+			return err
+		}
+		return stream.SendMsg(&Rsp{N: len(in.Msg)})
+	}
+	_, addr := startServer(t, &echoImpl{}, UnknownServiceHandler(sizeOf))
+	cc, _ := dial(t, addr)
+	ctx := testCtx(t)
+	big := strings.Repeat("b", 3<<20)
+	const calls = 3 * connWindow / (3 << 20)
+	results := make(chan error, calls)
+	for range calls {
+		go func() {
+			var out Rsp
+			err := cc.Invoke(ctx, "/big/x", &Req{Msg: big}, &out)
+			if err == nil && out.N != len(big) {
+				err = fmt.Errorf("the server read %d bytes", out.N)
+			}
+			results <- err
+		}()
+	}
+	for range calls {
+		if err := <-results; err != nil {
+			t.Fatal(err)
+		}
+	}
 }
 
 // TestWireServerDefaultStreamLimit checks that a server left without

@@ -36,7 +36,6 @@ type transport struct {
 	block        []byte
 	blockID      uint32
 	blockEnd     bool
-	connUnacked  int64
 	// resets is a server's budget of streams a client may cost it; see
 	// streamResetBurst.
 	resets budget
@@ -55,6 +54,12 @@ type transport struct {
 	peerInitialWindow int64
 	peerMaxFrame      int
 	peerMaxStreams    uint32
+	// connRecv is how much more the peer may send on the connection, and
+	// connUnacked what of it the streams have taken and not yet given
+	// back. The connection's window is given back as what arrived is read,
+	// not as it arrives, so that it bounds what the streams hold unread.
+	connRecv    int64
+	connUnacked int64
 	// running counts a server's handlers that have not returned, whether
 	// or not their streams have ended, a reset ending them most often;
 	// queued holds the calls waiting for one of them to return, so that
@@ -91,6 +96,7 @@ func newTransport(client bool) *transport {
 		peerInitialWindow: defaultWindow,
 		peerMaxFrame:      defaultMaxFrame,
 		peerMaxStreams:    ^uint32(0),
+		connRecv:          connWindow,
 		changed:           make(chan struct{}),
 		awaitPreface:      !client,
 		nextID:            1,
@@ -421,29 +427,61 @@ func (t *transport) handleData(f *frame) error {
 		return protocolError("DATA on stream 0")
 	}
 	length := int64(len(f.payload))
-	t.connUnacked += length
-	if t.connUnacked >= connWindow/2 {
-		t.mu.Lock()
-		t.out = appendWindowUpdate(t.out, 0, uint32(t.connUnacked))
-		t.mu.Unlock()
-		t.connUnacked = 0
-		t.flush()
-	}
 	if err := stripPadding(f); err != nil {
 		return err
 	}
 	t.mu.Lock()
+	if length > t.connRecv {
+		t.mu.Unlock()
+		return &connError{code: errFlowControl, msg: "DATA past the connection window"}
+	}
+	t.connRecv -= length
 	s := t.streams[f.streamID]
-	idle := t.idleLocked(f.streamID)
-	t.mu.Unlock()
 	if s == nil {
+		// A stream that has ended here, whose data in flight is dropped, or
+		// an idle one, which ends the connection.
+		idle := t.idleLocked(f.streamID)
+		credited := t.creditConnLocked(length)
+		t.mu.Unlock()
+		if credited {
+			t.flush()
+		}
 		if idle {
 			return protocolError("DATA on an idle stream")
 		}
-		// A stream that has ended here; what was in flight is dropped.
 		return nil
 	}
-	return s.onData(f.payload, length, f.has(flagEndStream))
+	// Padding is never read, so it is given back at once.
+	credited := t.creditConnLocked(length - int64(len(f.payload)))
+	t.mu.Unlock()
+	dropped, err := s.onData(f.payload, length, f.has(flagEndStream))
+	if dropped > 0 {
+		t.mu.Lock()
+		credited = t.creditConnLocked(dropped) || credited
+		t.mu.Unlock()
+	}
+	if credited {
+		t.flush()
+	}
+	return err
+}
+
+// creditConnLocked gives n bytes the streams have done with back to the
+// connection's window, in a WINDOW_UPDATE once there is enough of them for
+// one, and reports whether it framed one. Callers hold mu, and flush once
+// they have let it go.
+func (t *transport) creditConnLocked(n int64) bool {
+	if n <= 0 {
+		return false
+	}
+	t.connUnacked += n
+	if t.connUnacked < connWindow/4 {
+		return false
+	}
+	t.out = appendWindowUpdate(t.out, 0, uint32(t.connUnacked))
+	t.connRecv += t.connUnacked
+	t.connUnacked = 0
+	return true
 }
 
 // idleLocked reports whether id names a stream not yet opened.
@@ -495,7 +533,8 @@ func (t *transport) handleHeaderBlock(id uint32, block []byte, endStream bool) e
 		if !endStream {
 			return &streamError{id: id, code: errProtocol}
 		}
-		return s.onData(nil, 0, true)
+		_, err := s.onData(nil, 0, true)
+		return err
 	}
 	return t.server.openStream(t, id, fields, endStream)
 }
@@ -515,6 +554,7 @@ func (t *transport) onReset(id uint32, code errCode) error {
 	if s == nil {
 		return nil
 	}
+	t.flush()
 	c := codes.Internal
 	switch code {
 	case errCancel:
@@ -569,6 +609,7 @@ func (t *transport) onGoAway(lastID uint32) {
 	idle := len(t.streams) == 0
 	t.broadcastLocked()
 	t.mu.Unlock()
+	t.flush()
 	for _, s := range refused {
 		s.abort(status.New(codes.Unavailable, "grpc: the connection is draining").Err())
 	}
@@ -580,13 +621,20 @@ func (t *transport) onGoAway(lastID uint32) {
 	}
 }
 
-// removeLocked forgets a stream, and closes a draining connection once it
-// has no stream left. Callers hold mu.
+// removeLocked forgets a stream, gives what it holds unread back to the
+// connection's window, and closes a draining connection once it has no
+// stream left. Callers hold mu, and flush once they have let it go.
 func (t *transport) removeLocked(s *stream) {
 	if t.streams[s.id] != s {
 		return
 	}
 	delete(t.streams, s.id)
+	s.mu.Lock()
+	s.removed = true
+	held := s.held
+	s.held = 0
+	s.mu.Unlock()
+	t.creditConnLocked(held)
 	t.broadcastLocked()
 	if t.goingAway && len(t.streams) == 0 && t.conn != nil {
 		// Closed after what was framed has gone, which flush hands over.
