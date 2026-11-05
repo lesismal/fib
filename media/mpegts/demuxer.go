@@ -20,6 +20,9 @@ const (
 	// DefaultMaxPending bounds the packets a Demuxer holds while it waits
 	// for the configuration of every track.
 	DefaultMaxPending = 256
+	// DefaultMaxPESBuffers bounds the buffers of all a Demuxer's streams'
+	// PES together.
+	DefaultMaxPESBuffers = 16 << 20
 )
 
 // maxSection is the largest PSI section: 1021 bytes of section_length and
@@ -37,6 +40,11 @@ type DemuxerConfig struct {
 	OnPacket func(pkt *av.Packet)
 	// MaxPESSize is DefaultMaxPESSize when zero; a larger PES is dropped.
 	MaxPESSize int
+	// MaxPESBuffers bounds the bytes the buffers of all streams' PES take
+	// together, since a PMT may list some two hundred streams: a PES that
+	// would need more is dropped. It is the larger of DefaultMaxPESBuffers
+	// and twice MaxPESSize when zero.
+	MaxPESBuffers int
 	// MaxPending is DefaultMaxPending when zero: once that many packets
 	// (or MaxPESSize bytes) wait for the configuration of a track still
 	// without one, the tracks that have one are announced without it, and
@@ -59,6 +67,10 @@ type Demuxer struct {
 
 	streams map[uint16]*demuxStream
 	order   []*demuxStream
+
+	// pesBufs is the capacity of every stream's PES buffer, which
+	// MaxPESBuffers bounds.
+	pesBufs int
 
 	tracks    []*av.Track
 	announced bool
@@ -114,6 +126,9 @@ func NewDemuxer(cfg DemuxerConfig) *Demuxer {
 	}
 	if cfg.MaxPending <= 0 {
 		cfg.MaxPending = DefaultMaxPending
+	}
+	if cfg.MaxPESBuffers <= 0 {
+		cfg.MaxPESBuffers = max(DefaultMaxPESBuffers, 2*cfg.MaxPESSize)
 	}
 	if cfg.OnTracks == nil {
 		cfg.OnTracks = func([]*av.Track) {}
@@ -331,8 +346,10 @@ func (d *Demuxer) readPMT(b []byte) {
 		return
 	}
 	d.streams = make(map[uint16]*demuxStream, len(order))
+	d.pesBufs = 0
 	for _, s := range order {
 		d.streams[s.pid] = s
+		d.pesBufs += cap(s.pes)
 	}
 	d.order = order
 	if d.announced {
@@ -396,10 +413,24 @@ func (d *Demuxer) pesPacket(s *demuxStream, pusi bool, cc int, discontinuity boo
 	if !s.inPES || s.broken {
 		return
 	}
-	if len(s.pes)+len(payload) > d.cfg.MaxPESSize {
+	n := len(s.pes) + len(payload)
+	if n > d.cfg.MaxPESSize {
 		s.broken = true
 		s.pes = s.pes[:0]
 		return
+	}
+	if n > cap(s.pes) {
+		c := min(max(2*cap(s.pes), n, 1024), d.cfg.MaxPESSize)
+		if d.pesBufs-cap(s.pes)+c > d.cfg.MaxPESBuffers {
+			// The other streams hold too much: this PES is dropped, and
+			// its buffer let go.
+			s.broken = true
+			d.pesBufs -= cap(s.pes)
+			s.pes = nil
+			return
+		}
+		d.pesBufs += c - cap(s.pes)
+		s.pes = append(make([]byte, 0, c), s.pes...)
 	}
 	s.pes = append(s.pes, payload...)
 	if s.pesLen == 0 && len(s.pes) >= 6 {

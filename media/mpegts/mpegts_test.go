@@ -702,6 +702,65 @@ func TestConfigChange(t *testing.T) {
 	}
 }
 
+// TestMaxPESBuffers checks that a PMT listing some two hundred streams,
+// each sent a PES that never ends, cannot have the demuxer hold more than
+// MaxPESBuffers in all, and that the buffers of streams a new PMT drops
+// stop counting.
+func TestMaxPESBuffers(t *testing.T) {
+	const streams, maxPES, maxBufs = 200, 64 << 10, 256 << 10
+	var c capture
+	cfg := c.config()
+	cfg.MaxPESSize, cfg.MaxPESBuffers = maxPES, maxBufs
+	d := NewDemuxer(cfg)
+	m, _ := NewMuxer([]*av.Track{aacTrack()}, MuxerConfig{})
+	patLen := int(m.tables[1]&0x0f)<<8 | int(m.tables[2]) + 3
+	d.Write(tsPacket(0, true, 0, append([]byte{0}, m.tables[:patLen]...)))
+	sec := []byte{2, 0xb0, 0, 0, 1, 0xc3, 0, 0, 0xe1, 0x00, 0xf0, 0x00}
+	for i := range streams {
+		pid := 0x100 + i
+		sec = append(sec, StreamTypeH264, 0xe0|byte(pid>>8), byte(pid), 0xf0, 0)
+	}
+	pmt := append([]byte{0}, finishSectionRaw(sec)...)
+	for cc := byte(0); len(pmt) > 0; cc++ {
+		n := min(len(pmt), 184)
+		d.Write(tsPacket(DefaultPMTPID, cc == 0, cc, pmt[:n]))
+		pmt = pmt[n:]
+	}
+	if len(d.order) != streams {
+		t.Fatalf("%d streams", len(d.order))
+	}
+	start := []byte{0, 0, 1, 0xe0, 0, 0, 0x80, 0x80, 5, 0, 0, 0, 0, 0}
+	putTS(start[9:], 0x20, 9000)
+	fill := bytes.Repeat([]byte{0xff}, 184)
+	ccs := make([]byte, streams)
+	for i := range streams {
+		pid := uint16(0x100 + i)
+		d.Write(tsPacket(pid, true, ccs[i], start))
+		for range maxPES / 184 {
+			ccs[i]++
+			d.Write(tsPacket(pid, false, ccs[i]&0x0f, fill))
+		}
+		ccs[i]++
+		held := 0
+		for _, s := range d.order {
+			held += cap(s.pes)
+		}
+		if held != d.pesBufs || held > maxBufs {
+			t.Fatalf("after stream %d: buffers of %d bytes, counted %d", i, held, d.pesBufs)
+		}
+	}
+	if d.pesBufs < maxBufs-maxPES {
+		t.Fatalf("buffers of %d bytes: the limit was never reached", d.pesBufs)
+	}
+	// A new PMT that keeps one stream lets the others' buffers go.
+	sec = append(sec[:12], StreamTypeH264, 0xe1, 0x00+streams-1, 0xf0, 0)
+	sec[5] = 0xc5
+	d.Write(tsPacket(DefaultPMTPID, true, 0, append([]byte{0}, finishSectionRaw(sec)...)))
+	if len(d.order) != 1 || d.pesBufs > maxPES {
+		t.Fatalf("%d streams, %d bytes of buffers", len(d.order), d.pesBufs)
+	}
+}
+
 // TestMaxPESSize drops an access unit larger than the bound.
 func TestMaxPESSize(t *testing.T) {
 	src := demux(t, fixture(t, "h264_aac.ts"), 1<<20)
