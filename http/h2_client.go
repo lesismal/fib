@@ -1098,9 +1098,19 @@ func (hc *h2ClientConn) credit(st *h2ClientStream, n int64) {
 func (hc *h2ClientConn) handleHeaderBlock(id uint32, block []byte, endStream bool) error {
 	var fields []hpack.HeaderField
 	listSize := 0
+	maxList := hc.client.config.MaxResponseHeaderBytes
+	// The block is always decoded whole, so that the dynamic table stays in
+	// step with the server's, but the fields stop being kept once the list
+	// is past the limit: a block of one-byte references to the static table
+	// would otherwise become a field for each byte, tens of megabytes of
+	// them from one frame, even for a stream this side never opened.
 	err := hc.dec.Decode(block, func(f hpack.HeaderField) error {
-		listSize += len(f.Name) + len(f.Value) + 32
-		fields = append(fields, f)
+		if listSize <= maxList {
+			listSize += len(f.Name) + len(f.Value) + 32
+			if listSize <= maxList {
+				fields = append(fields, f)
+			}
+		}
 		return nil
 	})
 	if err != nil {
@@ -1115,7 +1125,7 @@ func (hc *h2ClientConn) handleHeaderBlock(id uint32, block []byte, endStream boo
 	if st == nil {
 		return nil
 	}
-	if listSize > hc.client.config.MaxResponseHeaderBytes {
+	if listSize > maxList {
 		hc.resetStream(id, H2Cancel, ErrResponseHeaderTooLarge)
 		return nil
 	}

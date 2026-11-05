@@ -3,13 +3,17 @@
 package http
 
 import (
+	"bytes"
 	stdtls "crypto/tls"
 	"crypto/x509"
 	"errors"
 	stdhttp "net/http"
 	"net/http/httptest"
+	"runtime"
 	"strings"
 	"testing"
+
+	"github.com/lesismal/fib/hpack"
 )
 
 // TestH2ServerHonoursTheClientsHeaderListSize checks that a response whose
@@ -140,5 +144,44 @@ func TestH2ClientHonoursTheServersHeaderListSize(t *testing.T) {
 	}
 	if n := counter.n.Load(); n != 1 {
 		t.Fatalf("%d connections, want 1", n)
+	}
+}
+
+// TestH2ClientHeaderBlockBomb checks that the client keeps no more of a
+// header block's fields than its MaxResponseHeaderBytes allows: a 1 MiB block
+// of one-byte references to the static table decodes to a million fields,
+// which it used to collect, some 40 MB of them, before looking at the list's
+// size, even for a stream it never opened. The block is still decoded whole,
+// which keeps the dynamic table in step: an indexed entry the block adds is
+// there for the next one.
+func TestH2ClientHeaderBlockBomb(t *testing.T) {
+	config := DefaultClientConfig()
+	config.MaxResponseHeaderBytes = 16 << 10
+	hc := &h2ClientConn{
+		client:  &Client{config: config},
+		dec:     hpack.NewDecoder(hpack.DefaultTableSize),
+		streams: make(map[uint32]*h2ClientStream),
+	}
+	// A literal with incremental indexing, then the bomb: index 2 of the
+	// static table, ":method: GET", a million times.
+	block := []byte{0x40, 3, 'x', '-', 'a', 1, 'b'}
+	block = append(block, bytes.Repeat([]byte{0x82}, 1<<20)...)
+	var before, after runtime.MemStats
+	runtime.GC()
+	runtime.ReadMemStats(&before)
+	if err := hc.handleHeaderBlock(99, block, true); err != nil {
+		t.Fatal(err)
+	}
+	runtime.ReadMemStats(&after)
+	if got := after.TotalAlloc - before.TotalAlloc; got > 1<<20 {
+		t.Fatalf("decoding the block allocated %d bytes", got)
+	}
+	// The literal went into the table: index 62 is it.
+	var got []hpack.HeaderField
+	if err := hc.dec.Decode([]byte{0xbe}, func(f hpack.HeaderField) error {
+		got = append(got, f)
+		return nil
+	}); err != nil || len(got) != 1 || got[0].Name != "x-a" || got[0].Value != "b" {
+		t.Fatalf("the dynamic table after the block: %v, %v", got, err)
 	}
 }
