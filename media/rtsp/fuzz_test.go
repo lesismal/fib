@@ -82,7 +82,7 @@ func FuzzDigest(f *testing.F) {
 	f.Add(c.authorization("DESCRIBE", "rtsp://h/s"))
 	f.Add("Basic dTp4")
 	f.Fuzz(func(t *testing.T, authz string) {
-		if _, ok, _ := a.verify("DESCRIBE", authz, now, func(string) (string, bool) { return "secret password", true }); ok {
+		if _, ok, _ := a.verify("DESCRIBE", "rtsp://h/s", authz, now, func(string) (string, bool) { return "secret password", true }); ok {
 			t.Fatalf("%q passed", authz)
 		}
 	})

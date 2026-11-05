@@ -94,11 +94,13 @@ func (a *authServer) challenges(now time.Time, stale bool) []string {
 	return vs
 }
 
-// verify checks the Authorization value authz of a request of method,
-// looking up the password of the user it names. It returns the user once
-// the credentials check out, and stale when they would but for an expired
-// nonce.
-func (a *authServer) verify(method, authz string, now time.Time, password func(user string) (string, bool)) (user string, ok, stale bool) {
+// verify checks the Authorization value authz of a request of method for
+// the Request-URI uri, looking up the password of the user it names. It
+// returns the user once the credentials check out, and stale when they
+// would but for an expired nonce. Digest credentials must name the request's
+// URI, so that ones seen on the wire for one stream do not open another
+// whose password is the same.
+func (a *authServer) verify(method, uri, authz string, now time.Time, password func(user string) (string, bool)) (user string, ok, stale bool) {
 	scheme, rest, _ := strings.Cut(strings.TrimSpace(authz), " ")
 	switch {
 	case strings.EqualFold(scheme, "Basic") && a.methods&AuthBasic != 0:
@@ -116,7 +118,7 @@ func (a *authServer) verify(method, authz string, now time.Time, password func(u
 		p := parseAuthParams(rest)
 		u := p["username"]
 		ours, fresh := a.nonceValid(p["nonce"], now)
-		if !ours || p["realm"] != a.realm {
+		if !ours || p["realm"] != a.realm || !sameURI(p["uri"], uri) {
 			return "", false, false
 		}
 		if alg := p["algorithm"]; alg != "" && !strings.EqualFold(alg, "MD5") {
@@ -136,6 +138,36 @@ func (a *authServer) verify(method, authz string, now time.Time, password func(u
 		return u, true, false
 	}
 	return "", false, false
+}
+
+// sameURI reports whether the uri of Digest credentials names the
+// Request-URI req: the same string, or the same path and query with one of
+// them absolute (RFC 7616 section 3.4.6 has the server check it; a client
+// may give either form).
+func sameURI(uri, req string) bool {
+	if uri == req {
+		return true
+	}
+	if uri == "" {
+		return false
+	}
+	return uriPathQuery(uri) == uriPathQuery(req)
+}
+
+// uriPathQuery is what follows the authority of an absolute rtsp, rtsps or
+// rtspu URL, "/" if nothing does, and any other uri as it is.
+func uriPathQuery(uri string) string {
+	scheme, rest, ok := strings.Cut(uri, "://")
+	if !ok || !strings.EqualFold(scheme, "rtsp") && !strings.EqualFold(scheme, "rtsps") && !strings.EqualFold(scheme, "rtspu") {
+		return uri
+	}
+	if i := strings.IndexAny(rest, "/?"); i >= 0 {
+		if rest[i] == '?' {
+			return "/" + rest[i:]
+		}
+		return rest[i:]
+	}
+	return "/"
 }
 
 func md5Hex(s string) string {

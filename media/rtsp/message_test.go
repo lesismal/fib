@@ -189,22 +189,43 @@ func TestAuth(t *testing.T) {
 		}
 		c.qop = qop
 		authz := c.authorization("DESCRIBE", "rtsp://h/s")
-		if u, ok, stale := a.verify("DESCRIBE", authz, now, pass); !ok || stale || u != "alice" {
+		if u, ok, stale := a.verify("DESCRIBE", "rtsp://h/s", authz, now, pass); !ok || stale || u != "alice" {
 			t.Fatalf("qop %v: %v %v", qop, ok, stale)
 		}
-		if _, ok, _ := a.verify("PLAY", authz, now, pass); ok {
+		if _, ok, _ := a.verify("PLAY", "rtsp://h/s", authz, now, pass); ok {
 			t.Fatal("method not covered")
 		}
-		if _, ok, stale := a.verify("DESCRIBE", authz, now.Add(time.Hour), pass); ok || !stale {
+		if _, ok, stale := a.verify("DESCRIBE", "rtsp://h/s", authz, now.Add(time.Hour), pass); ok || !stale {
 			t.Fatal("old nonce taken")
 		}
+		// The credentials name their URI: another stream's request, even
+		// one whose password is the same, does not take them; the same
+		// path written another way does.
+		for uri, want := range map[string]bool{
+			"rtsp://h/other": false, "rtsp://h/s/trackID=0": false, "rtsp://h/s?x": false, "/other": false, "*": false,
+			"/s": true, "rtsp://10.0.0.1:554/s": true, "RTSP://h/s": true,
+		} {
+			if _, ok, _ := a.verify("DESCRIBE", uri, authz, now, pass); ok != want {
+				t.Errorf("qop %v: credentials for rtsp://h/s on %s: %v", qop, uri, ok)
+			}
+		}
+		if _, ok, _ := a.verify("DESCRIBE", "rtsp://h/s", c.authorization("DESCRIBE", "/s"), now, pass); !ok {
+			t.Errorf("qop %v: credentials naming the path alone", qop)
+		}
+	}
+	if _, ok, _ := a.verify("DESCRIBE", "rtsp://h", newDigest(t, a, now).authorization("DESCRIBE", "rtsp://h/"), now, pass); !ok {
+		t.Error("a URL without a path and one with /")
+	}
+	noURI := strings.Replace(newDigest(t, a, now).authorization("DESCRIBE", "rtsp://h/s"), `uri="rtsp://h/s"`, `uri=""`, 1)
+	if _, ok, _ := a.verify("DESCRIBE", "rtsp://h/s", noURI, now, pass); ok {
+		t.Error("credentials without a uri")
 	}
 	c, _ := newClientAuth("alice", "wrong", ch)
-	if _, ok, _ := a.verify("DESCRIBE", c.authorization("DESCRIBE", "u"), now, pass); ok {
+	if _, ok, _ := a.verify("DESCRIBE", "rtsp://h/s", c.authorization("DESCRIBE", "rtsp://h/s"), now, pass); ok {
 		t.Fatal("wrong password taken")
 	}
 	c, _ = newClientAuth("bob", "secret", ch)
-	if _, ok, _ := a.verify("DESCRIBE", c.authorization("DESCRIBE", "u"), now, pass); ok {
+	if _, ok, _ := a.verify("DESCRIBE", "rtsp://h/s", c.authorization("DESCRIBE", "rtsp://h/s"), now, pass); ok {
 		t.Fatal("unknown user taken")
 	}
 	for _, authz := range []string{
@@ -214,11 +235,11 @@ func TestAuth(t *testing.T) {
 		`Digest username="alice", realm="r", nonce="` + a.nonce(now) + `", uri="u", response="x", algorithm=SHA-256`,
 		`Basic !!!`, `Basic ` + "YWxpY2U6d3Jvbmc=", `Basic YWxpY2U=`, `Bearer x`, ``,
 	} {
-		if _, ok, _ := a.verify("DESCRIBE", authz, now, pass); ok {
+		if _, ok, _ := a.verify("DESCRIBE", "rtsp://h/s", authz, now, pass); ok {
 			t.Errorf("%q taken", authz)
 		}
 	}
-	if u, ok, _ := a.verify("X", "Basic YWxpY2U6c2VjcmV0", now, pass); !ok || u != "alice" {
+	if u, ok, _ := a.verify("X", "rtsp://h/s", "Basic YWxpY2U6c2VjcmV0", now, pass); !ok || u != "alice" {
 		t.Fatal("basic")
 	}
 	b, ok := newClientAuth("alice", "secret", []string{`Digest realm="r", algorithm=SHA-256`, `Basic realm="r"`})
@@ -281,4 +302,14 @@ func TestURL(t *testing.T) {
 	if _, _, _, err := stripUserinfo("rtsp://h/%zz"); err == nil {
 		t.Fatal("bad URL")
 	}
+}
+
+// newDigest answers a's Digest challenge as alice.
+func newDigest(t *testing.T, a *authServer, now time.Time) *clientAuth {
+	t.Helper()
+	c, ok := newClientAuth("alice", "secret", a.challenges(now, false))
+	if !ok || c.basic {
+		t.Fatal("no digest challenge")
+	}
+	return c
 }

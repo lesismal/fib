@@ -437,7 +437,7 @@ func (sc *ServerConn) serve(req *Request, now time.Time) *Response {
 		if p, n := splitTrackID(path); n >= 0 {
 			lookupPath = p
 		}
-		user, ok, stale := sc.s.auth.verify(req.Method, req.Header.Get("Authorization"), now,
+		user, ok, stale := sc.s.auth.verify(req.Method, req.URL, req.Header.Get("Authorization"), now,
 			func(user string) (string, bool) { return sc.s.config.Password(lookupPath, user) })
 		if !ok {
 			resp := &Response{StatusCode: StatusUnauthorized}
