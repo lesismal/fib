@@ -72,8 +72,10 @@ func parseTransport(spec string) (Transport, bool) {
 		case "server_port":
 			t.ServerPort = parseRange(v, 65535)
 		case "ssrc":
-			n, err := strconv.ParseUint(strings.TrimSpace(v), 16, 32)
-			t.SSRC, t.HasSSRC = uint32(n), err == nil
+			// One that is not 32 bits of hex is ignored, SSRC and all.
+			if n, err := strconv.ParseUint(strings.TrimSpace(v), 16, 32); err == nil {
+				t.SSRC, t.HasSSRC = uint32(n), true
+			}
 		case "mode":
 			t.Mode = strings.ToUpper(strings.Trim(strings.TrimSpace(v), `"`))
 		case "destination":
