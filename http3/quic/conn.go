@@ -1006,6 +1006,8 @@ func (c *Conn) HandleDatagrams(datagrams [][]byte) { c.HandlePathDatagrams(nil, 
 // time. Once the new path is validated, the old one is closed.
 func (c *Conn) HandlePathDatagram(pc PacketConn, remote net.Addr, datagram []byte) {
 	c.mu.Lock()
+	locked := true
+	defer c.unlockPanicked(&locked)
 	if !c.closed {
 		now := c.now()
 		c.setRxPathLocked(pc, remote)
@@ -1017,6 +1019,7 @@ func (c *Conn) HandlePathDatagram(pc PacketConn, remote net.Addr, datagram []byt
 	}
 	c.recycleLocked(datagram)
 	givenUp := c.takeGivenUpLocked()
+	locked = false
 	c.mu.Unlock()
 	closePaths(givenUp)
 	c.dispatch()
@@ -1026,6 +1029,8 @@ func (c *Conn) HandlePathDatagram(pc PacketConn, remote net.Addr, datagram []byt
 // pc from remote; see HandlePathDatagram.
 func (c *Conn) HandlePathDatagrams(pc PacketConn, remote net.Addr, datagrams [][]byte) {
 	c.mu.Lock()
+	locked := true
+	defer c.unlockPanicked(&locked)
 	if !c.closed {
 		now := c.now()
 		c.setRxPathLocked(pc, remote)
@@ -1044,6 +1049,7 @@ func (c *Conn) HandlePathDatagrams(pc PacketConn, remote net.Addr, datagrams [][
 		c.recycleLocked(d)
 	}
 	givenUp := c.takeGivenUpLocked()
+	locked = false
 	c.mu.Unlock()
 	closePaths(givenUp)
 	c.dispatch()
@@ -1364,12 +1370,7 @@ func (c *Conn) dispatch() {
 		events := c.events
 		c.events, c.spareEvents = c.spareEvents[:0], nil
 		c.mu.Unlock()
-		for i := range events {
-			c.run(&events[i])
-		}
-		if h, ok := c.handler.(CallsDoneHandler); ok {
-			h.OnCallsDone(c)
-		}
+		c.runBatch(events)
 		clear(events)
 		c.mu.Lock()
 		if c.spareEvents == nil {
@@ -1385,6 +1386,28 @@ func (c *Conn) dispatch() {
 	c.dispatching = false
 	c.mu.Unlock()
 	c.flush()
+}
+
+// runBatch makes a batch of handler calls, without c.mu. A call that panics
+// closes the connection with INTERNAL_ERROR, and leaves nobody dispatching,
+// before the panic goes on: otherwise the events queued from then on would
+// wait for a dispatch that never ends.
+func (c *Conn) runBatch(events []event) {
+	ran := false
+	defer func() {
+		if !ran {
+			c.mu.Lock()
+			c.dispatching = false
+			c.closePanickedLocked()
+		}
+	}()
+	for i := range events {
+		c.run(&events[i])
+	}
+	if h, ok := c.handler.(CallsDoneHandler); ok {
+		h.OnCallsDone(c)
+	}
+	ran = true
 }
 
 // ExpectWrite tells the connection that a write is on its way from another
@@ -1436,6 +1459,8 @@ const flushHold = time.Millisecond
 // it.
 func (c *Conn) flush() {
 	c.mu.Lock()
+	locked := true
+	defer c.unlockPanicked(&locked)
 	held := c.heldLocked()
 	if held && c.wantFlush && !c.closed && (c.flushDeadline.IsZero() || c.ackHold) {
 		// Nothing to hold back but an acknowledgement that is not due is
@@ -1464,10 +1489,12 @@ func (c *Conn) flush() {
 		}
 	}
 	if held || c.sending {
+		locked = false
 		c.mu.Unlock()
 		return
 	}
 	c.sendLocked()
+	locked = false
 	c.mu.Unlock()
 }
 
@@ -2484,8 +2511,12 @@ func (c *Conn) keepAliveAt() time.Time {
 }
 
 func (c *Conn) onTimer() {
+	locked := false
+	defer c.recoverOwn(&locked)
 	c.mu.Lock()
+	locked = true
 	if c.closed {
+		locked = false
 		c.mu.Unlock()
 		return
 	}
@@ -2548,6 +2579,7 @@ func (c *Conn) onTimer() {
 		}
 	}
 	givenUp := c.takeGivenUpLocked()
+	locked = false
 	c.mu.Unlock()
 	closePaths(givenUp)
 	c.dispatch()
@@ -2556,6 +2588,8 @@ func (c *Conn) onTimer() {
 // endClosing ends the closing period: the CONNECTION_CLOSE is no longer sent
 // again, and the paths it went on close.
 func (c *Conn) endClosing(paths []PacketConn) {
+	locked := false
+	defer c.recoverOwn(&locked)
 	c.mu.Lock()
 	c.closePacket = nil
 	c.mu.Unlock()

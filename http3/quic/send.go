@@ -181,9 +181,7 @@ func (c *Conn) sendRoundLocked() {
 		// The path is read with the lock held, since a datagram handled
 		// meanwhile may move the connection to another.
 		pc := c.pc
-		c.mu.Unlock()
-		sent, err := sendDatagrams(pc, buf, lens[:n])
-		c.mu.Lock()
+		sent, err := c.sendUnlocked(pc, buf, lens[:n])
 		if sent < n && wouldBlock(err) && !c.closed {
 			c.keepBlockedLocked(pc, mem, sent, n, err)
 			return
@@ -247,11 +245,14 @@ func (c *Conn) awaitRoomLocked(pc PacketConn, err error) bool {
 // the timer would have, whether or not the handler is being called.
 func (c *Conn) roomAvailable() {
 	c.mu.Lock()
+	locked := true
+	defer c.unlockPanicked(&locked)
 	c.awaitingRoom = false
 	if c.blocked != nil && !c.closed {
 		c.wantFlush = true
 		c.sendLocked()
 	}
+	locked = false
 	c.mu.Unlock()
 }
 
@@ -266,9 +267,7 @@ func (c *Conn) sendBlockedLocked() bool {
 		return false
 	}
 	pc := c.pc
-	c.mu.Unlock()
-	sent, err := sendDatagrams(pc, mem[c.blockedOff:], c.roundLens[:n])
-	c.mu.Lock()
+	sent, err := c.sendUnlocked(pc, mem[c.blockedOff:], c.roundLens[:n])
 	if sent < n && wouldBlock(err) && !c.closed {
 		c.keepBlockedLocked(pc, mem, sent, n, err)
 		return false
@@ -283,6 +282,16 @@ func (c *Conn) sendBlockedLocked() bool {
 // BatchSender is an interface, and one kept by each connection would be as
 // large as the rest of an idle connection.
 var roundDatagrams = sync.Pool{New: func() any { return new([maxRoundDatagrams][]byte) }}
+
+// sendUnlocked is sendDatagrams with c.mu, which the caller holds, let go
+// for the write and taken back after it, a panic of the path's included:
+// whoever recovers one finds the lock as the caller had it (see
+// unlockPanicked).
+func (c *Conn) sendUnlocked(pc PacketConn, buf []byte, lens []uint16) (int, error) {
+	c.mu.Unlock()
+	defer c.mu.Lock()
+	return sendDatagrams(pc, buf, lens)
+}
 
 // sendDatagrams sends the datagrams laid one after another in buf through
 // pc, with one call when the path takes several at once, and reports how

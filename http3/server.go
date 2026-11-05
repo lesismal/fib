@@ -27,6 +27,7 @@ import (
 	"net"
 	stdhttp "net/http"
 	"os"
+	"runtime/debug"
 	"slices"
 	"strconv"
 	"strings"
@@ -39,6 +40,7 @@ import (
 	fibhttp "github.com/lesismal/fib/http"
 	"github.com/lesismal/fib/http3/qpack"
 	"github.com/lesismal/fib/http3/quic"
+	"github.com/lesismal/fib/log"
 	fibtls "github.com/lesismal/fib/tls"
 )
 
@@ -683,17 +685,42 @@ func (h *ServerHandler) OnShutdown(c *fib.Connection) {
 	}
 	for _, qc := range conns {
 		if sc, ok := qc.Handler().(*serverConn); ok && sc.retiring.CompareAndSwap(false, true) {
-			elsewhere(c, func() { sc.retire(qc) })
+			elsewhere(c, qc, func() { sc.retire(qc) })
 		}
 	}
 }
 
-// elsewhere runs fn on the engine's handler pool, or on a goroutine of its
-// own once the pool has stopped taking work.
-func elsewhere(c *fib.Connection, fn func()) {
-	if pool := c.Engine().HandlerPool(); pool == nil || !pool.Go(fn) {
-		go fn()
+// elsewhere runs fn, which works on qc, on the engine's handler pool, or on
+// a goroutine of its own once the pool has stopped taking work. If fn
+// panics, qc is closed with H3_INTERNAL_ERROR; the panic then goes on to the
+// pool, whose panic handler sees it, and on a goroutine of its own, where
+// nothing would recover it, is logged instead of taking the process down.
+func elsewhere(c *fib.Connection, qc *quic.Conn, fn func()) {
+	if pool := c.Engine().HandlerPool(); pool != nil && pool.Go(func() {
+		defer closePanicked(qc, true)
+		fn()
+	}) {
+		return
 	}
+	go func() {
+		defer closePanicked(qc, false)
+		fn()
+	}()
+}
+
+// closePanicked, deferred, closes qc with H3_INTERNAL_ERROR if what ran
+// panicked, and then lets the panic go on, or logs it when nothing would
+// recover it.
+func closePanicked(qc *quic.Conn, goOn bool) {
+	r := recover()
+	if r == nil {
+		return
+	}
+	qc.Close(uint64(ErrCodeInternalError), "")
+	if goOn {
+		panic(r)
+	}
+	log.Error("http3: connection goroutine panicked", "panic", fmt.Sprint(r), "stack", log.Lines(debug.Stack()))
 }
 
 // udpPeer is a client address's fib.Connection, shared by the QUIC
