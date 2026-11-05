@@ -179,6 +179,11 @@ func settingValue(payload []byte, id uint64) uint64 {
 	for len(payload) > 0 {
 		key, n := quic.ReadVarint(payload)
 		value, m := quic.ReadVarint(payload[n:])
+		if n == 0 || m == 0 {
+			// Truncated: parseSettings refuses it, and a read of nothing
+			// would never move on.
+			return 0
+		}
 		if key == id {
 			return value
 		}

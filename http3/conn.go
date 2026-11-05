@@ -310,11 +310,15 @@ func (u *uniStream) controlFrame(typ uint64, payload []byte) error {
 		}
 		p.settings = true
 		maxField, limited, err := parseSettings(payload)
+		if err != nil {
+			// Nothing of a malformed SETTINGS frame is taken.
+			return err
+		}
 		if limited {
 			p.maxFieldSection.Store(maxField)
 			p.fieldLimited.Store(true)
 		}
-		if c := settingValue(payload, settingQPACKMaxTableCapacity); err == nil && c > 0 {
+		if c := settingValue(payload, settingQPACKMaxTableCapacity); c > 0 {
 			blocked := settingValue(payload, settingQPACKBlockedStreams)
 			p.peerBlocked.Store(blocked)
 			p.peerTable.Store(c)
@@ -322,7 +326,7 @@ func (u *uniStream) controlFrame(typ uint64, payload []byte) error {
 				q.enc.SetPeerSettings(c, blocked)
 			}
 		}
-		return err
+		return nil
 	}
 	switch typ {
 	case frameSettings:

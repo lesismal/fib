@@ -9,6 +9,7 @@ import (
 	"net/url"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/lesismal/fib/http3/qpack"
 	"github.com/lesismal/fib/http3/quic"
@@ -225,6 +226,39 @@ func TestParseSettingsErrors(t *testing.T) {
 	// An unknown setting is ignored (RFC 9114 section 7.2.4.1).
 	if max, limited, err := parseSettings([]byte{0x21, 0x05, 0x06, 0x40, 0x80}); err != nil || max != 128 || !limited {
 		t.Fatalf("got %d, %v", max, err)
+	}
+}
+
+// A control stream whose SETTINGS frame is cut short inside its own length
+// is a connection error at once, on either side, and nothing of it is read
+// as settings: once, a truncated setting sent the lookup round forever.
+func TestTruncatedSettingsOnControlStream(t *testing.T) {
+	for _, payload := range [][]byte{{0x40}, {0x01, 0x40}, {0x01, 0x05, 0x40}} {
+		for _, isClient := range []bool{false, true} {
+			frame := []byte{streamControl, byte(frameSettings), byte(len(payload))}
+			frame = append(frame, payload...)
+			p := &peerStreams{isClient: isClient}
+			done := make(chan error, 1)
+			go func() { done <- newUniStream(p, nil, nil).handle(frame, false) }()
+			select {
+			case err := <-done:
+				if connErrCode(err) != ErrCodeFrameError {
+					t.Fatalf("% x, client %v: %v", frame, isClient, err)
+				}
+				if p.peerTable.Load() != 0 {
+					t.Fatalf("% x: a dynamic table was taken from bad SETTINGS", frame)
+				}
+			case <-time.After(5 * time.Second):
+				t.Fatalf("% x, client %v: SETTINGS never finished", frame, isClient)
+			}
+		}
+	}
+	// The lookup itself stops at a truncated entry.
+	if v := settingValue([]byte{0x40}, settingQPACKMaxTableCapacity); v != 0 {
+		t.Fatalf("settingValue of a truncated payload: %d", v)
+	}
+	if v := settingValue([]byte{0x01, 0x05, 0x07, 0x40}, settingQPACKBlockedStreams); v != 0 {
+		t.Fatalf("settingValue past a truncated entry: %d", v)
 	}
 }
 
