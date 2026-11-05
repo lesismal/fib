@@ -6,9 +6,11 @@ import (
 	"errors"
 	"io"
 	stdhttp "net/http"
+	"runtime/debug"
 	"sync"
 
 	"github.com/lesismal/fib/bufferpool"
+	"github.com/lesismal/fib/log"
 	"github.com/lesismal/fib/sidepool"
 )
 
@@ -696,11 +698,39 @@ func (s *ResponseStream) kick() {
 	}
 	s.delivering = true
 	s.mu.Unlock()
-	// Not a pool's goroutine: fn may take as long as it likes.
+	// Not a pool's goroutine: fn may take as long as it likes. Nor one that
+	// recovers what it panics with, so this one does, as a handler's are
+	// recovered from: a callback that panics ends its exchange, not the
+	// process.
 	go func() {
+		defer func() {
+			if recovered := recover(); recovered != nil {
+				log.Error("http: response body callback panicked",
+					"panic", recovered, "stack", log.Lines(debug.Stack()))
+				s.callbackPanicked()
+			}
+		}()
 		s.mu.Lock()
 		s.drainLocked()
 	}()
+}
+
+// callbackPanicked gives up a stream whose detached callback panicked, which
+// it did with s.mu released: fn hears nothing more, the body still waiting
+// is thrown away, reads go on, and the request fails, abandoning the
+// exchange.
+func (s *ResponseStream) callbackPanicked() {
+	s.mu.Lock()
+	s.delivering, s.discarding, s.finSent = false, true, true
+	if s.err == nil {
+		s.err = ErrResponseAbandoned
+	}
+	c := s.takeLocked(s.buffered)
+	s.dropLocked()
+	s.unholdLocked()
+	s.mu.Unlock()
+	s.give(c)
+	s.hooks.Abort(ErrResponseAbandoned)
 }
 
 // drain hands fn what has arrived, then the end, one call at a time. Whoever
