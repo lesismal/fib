@@ -36,6 +36,21 @@ type Config struct {
 	// everything, which leaves the proxy open to whoever can reach it. It
 	// runs on the connection's worker, and should not block for long.
 	Allow func(r *Request) error
+	// AllowResolved, when set, decides each destination the proxy connects
+	// to by the IP address it resolved to, right before it connects: a nil
+	// error grants it, and an error refuses it as Allow's does. Allow sees
+	// the destination as the client named it, a name that may resolve to an
+	// address Allow would have refused, such as a loopback, private or
+	// link-local one, or resolve to another by the time it is dialed (DNS
+	// rebinding); a rule about addresses belongs here. The proxy resolves the
+	// name itself, asks AllowResolved about each address in turn, and dials
+	// the first it grants, by its address. It applies to CONNECT and to each
+	// destination of a UDP association, and only when Dial is nil: a Dial of
+	// the caller's own, such as a Dialer's chaining to another proxy,
+	// resolves names itself, and AllowResolved is then never called. It runs
+	// on the connection's worker or on the goroutine that resolved the name,
+	// and should not block for long.
+	AllowResolved func(r *Request, addr netip.AddrPort) error
 	// Dial reaches the destinations of CONNECT requests and UDP
 	// associations. Nil means DialDirect; a Dialer's Dial chains this proxy to
 	// another.
@@ -96,6 +111,9 @@ type Request struct {
 // relayed connections to their peers, or to the shutdown's context.
 type Server struct {
 	config Config
+	// direct says Dial is DialDirect because Config.Dial was nil, which
+	// AllowResolved needs; see Server.dial.
+	direct bool
 
 	// associations are the UDP associations open, by their clients' IP.
 	mu           sync.Mutex
@@ -109,7 +127,8 @@ var (
 
 // NewServer returns a Server, with the defaults in place of config's zeros.
 func NewServer(config Config) *Server {
-	if config.Dial == nil {
+	direct := config.Dial == nil
+	if direct {
 		config.Dial = DialDirect
 	}
 	if config.HandshakeTimeout == 0 {
@@ -129,7 +148,7 @@ func NewServer(config Config) *Server {
 	if config.MaxUDPTargets <= 0 {
 		config.MaxUDPTargets = DefaultMaxUDPTargets
 	}
-	return &Server{config: config, associations: make(map[netip.Addr][]*association)}
+	return &Server{config: config, direct: direct, associations: make(map[netip.Addr][]*association)}
 }
 
 // serverConn is a client's connection, from its greeting until it is
@@ -481,7 +500,7 @@ func (s *Server) serve(sc *serverConn, req *Request) {
 // the client once it is open, before it can relay anything.
 func (s *Server) connect(sc *serverConn, req *Request) {
 	t := &tunnel{sc: sc, client: sc.c, limit: int64(s.config.MaxQueuedBytes), idle: s.config.IdleTimeout}
-	err := s.config.Dial(sc.c.Engine(), "tcp", req.Addr, s.config.DialTimeout, (*tunnelTarget)(t),
+	err := s.dial(sc.c.Engine(), "tcp", req, (*tunnelTarget)(t),
 		func(_ *fib.Connection, err error) {
 			if err != nil {
 				sc.dialFailed(err)

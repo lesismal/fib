@@ -1,6 +1,7 @@
 package socks
 
 import (
+	"errors"
 	"net"
 	"net/netip"
 	"strconv"
@@ -105,6 +106,8 @@ type udpTarget struct {
 	// header the client's datagrams to it came with.
 	header []byte
 	seq    uint64
+	// denied says Allow or AllowResolved refused the destination, whose
+	// datagrams are dropped; it changes under the association's lock.
 	denied bool
 	// conn is the socket to it, once open, and waiting what arrived for it
 	// before.
@@ -207,11 +210,11 @@ func (a *association) fromClient(c *fib.Connection, data []byte) {
 	a.mu.Unlock()
 	var evicted *fib.Connection
 	if t == nil {
-		addr := net.JoinHostPort(host, strconv.Itoa(int(port)))
+		req := &Request{Version: Version5, Command: CommandUDPAssociate,
+			Addr: net.JoinHostPort(host, strconv.Itoa(int(port))), Username: a.username, Conn: a.control}
 		denied := false
 		if allow := a.s.config.Allow; allow != nil {
-			denied = allow(&Request{Version: Version5, Command: CommandUDPAssociate, Addr: addr,
-				Username: a.username, Conn: a.control}) != nil
+			denied = allow(req) != nil
 		}
 		// Only this peer's rounds add targets, one at a time, so the target
 		// is still missing.
@@ -230,14 +233,15 @@ func (a *association) fromClient(c *fib.Connection, data []byte) {
 			evicted.Close()
 		}
 		if !denied {
-			a.dial(t, addr)
+			a.dial(t, req)
 		}
 		return
 	}
+	a.mu.Lock()
 	if t.denied {
+		a.mu.Unlock()
 		return
 	}
-	a.mu.Lock()
 	conn := t.conn
 	if conn == nil {
 		if len(t.waiting) < maxWaitingDatagrams {
@@ -272,16 +276,31 @@ func (a *association) addLocked(t *udpTarget) *fib.Connection {
 }
 
 // dial opens the socket to a target.
-func (a *association) dial(t *udpTarget, addr string) {
-	err := a.s.config.Dial(a.control.Engine(), "udp", addr, a.s.config.DialTimeout, (*udpTargetHandler)(t),
+func (a *association) dial(t *udpTarget, req *Request) {
+	err := a.s.dial(a.control.Engine(), "udp", req, (*udpTargetHandler)(t),
 		func(_ *fib.Connection, err error) {
 			if err != nil {
-				a.drop(t)
+				a.failed(t, err)
 			}
 		})
 	if err != nil {
-		a.drop(t)
+		a.failed(t, err)
 	}
+}
+
+// failed forgets a target whose socket failed to open, or, when
+// AllowResolved refused it, keeps it denied, so that its datagrams are
+// dropped rather than resolved again.
+func (a *association) failed(t *udpTarget, err error) {
+	var refused *ReplyError
+	if !errors.As(err, &refused) {
+		a.drop(t)
+		return
+	}
+	a.mu.Lock()
+	t.denied = true
+	t.waiting = nil
+	a.mu.Unlock()
 }
 
 // drop forgets a target whose socket failed to open or has closed, so that
