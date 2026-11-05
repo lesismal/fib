@@ -853,12 +853,12 @@ func (h *clientHS) record(record []byte, out *[]byte) *hsError {
 			if inner != recordTypeHandshake {
 				return fail(alertUnexpectedMessage, "unexpected record type")
 			}
-			return h.handshakeData(plain, out)
+			return h.handshakeRecord(plain, out)
 		}
 		if h.rxOn {
 			return fail(alertUnexpectedMessage, "unprotected handshake record after ServerHello")
 		}
-		return h.handshakeData(body, out)
+		return h.handshakeRecord(body, out)
 	case recordTypeApplicationData:
 		if !h.rxOn || tls12 {
 			return fail(alertUnexpectedMessage, "protected record before it is expected")
@@ -869,7 +869,7 @@ func (h *clientHS) record(record []byte, out *[]byte) *hsError {
 		}
 		switch inner {
 		case recordTypeHandshake:
-			return h.handshakeData(plain, out)
+			return h.handshakeRecord(plain, out)
 		case recordTypeAlert:
 			return remoteAlert(plain)
 		}
@@ -886,6 +886,15 @@ func remoteAlert(body []byte) *hsError {
 		return &hsError{err: io.ErrUnexpectedEOF}
 	}
 	return &hsError{err: &net.OpError{Op: "remote error", Err: stdtls.AlertError(body[1])}}
+}
+
+// handshakeRecord is handshakeData for the body of a handshake record, which
+// may not be empty (RFC 8446 section 5.1), as crypto/tls holds too.
+func (h *clientHS) handshakeRecord(data []byte, out *[]byte) *hsError {
+	if len(data) == 0 {
+		return fail(alertUnexpectedMessage, "empty handshake record")
+	}
+	return h.handshakeData(data, out)
 }
 
 // handshakeData adds handshake bytes to the messages being reassembled and

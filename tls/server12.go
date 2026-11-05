@@ -466,7 +466,7 @@ func (h *serverHS) record12(record []byte, out *[]byte) *hsError {
 			if typ == recordTypeAlert {
 				return remoteAlert(body)
 			}
-			return h.handshakeData(body, out)
+			return h.handshakeRecord(body, out)
 		}
 		inner, plain, alert, ok := h.rx.open(record)
 		if !ok {
@@ -478,7 +478,7 @@ func (h *serverHS) record12(record []byte, out *[]byte) *hsError {
 		if typ == recordTypeAlert {
 			return remoteAlert(plain)
 		}
-		return h.handshakeData(plain, out)
+		return h.handshakeRecord(plain, out)
 	}
 	return fail(alertUnexpectedMessage, "unexpected record type %d during the handshake", typ)
 }

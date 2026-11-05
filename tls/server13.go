@@ -120,7 +120,12 @@ type serverHS struct {
 	conn   net.Conn
 	state  srvState
 	// decided says the ClientHello has been read and is one this serves.
-	decided bool
+	// Until then peekAt, peekMsg and peekHello are how far peek has read;
+	// see peek.
+	decided   bool
+	peekAt    int
+	peekMsg   []byte
+	peekHello *clientHelloMsg
 
 	ch      *clientHelloMsg
 	random  [32]byte
@@ -547,36 +552,50 @@ func (h *serverHS) suite13(id uint16) (suite, bool) {
 }
 
 // peek reads the ClientHello at the start of in without consuming anything,
-// and decides whether to serve the connection.
+// and decides whether to serve the connection. in starts where it did the
+// call before, with what has arrived since behind it, so the records already
+// read are not read again: peekAt is how far they go, and peekMsg what they
+// held of the ClientHello, until it is whole and peekHello.
 func (h *serverHS) peek(in []byte) (status int) {
 	const (
 		needMore = peekMore
 		fallback = peekFallback
 	)
-	var msg []byte
-	for len(in) >= recordHeaderLen {
-		if in[0] != recordTypeHandshake || in[1] != 3 {
+	if h.peekHello != nil {
+		// Read already, and waiting for GetCertificate.
+		return h.serves(h.peekHello)
+	}
+	for len(in)-h.peekAt >= recordHeaderLen {
+		rec := in[h.peekAt:]
+		if rec[0] != recordTypeHandshake || rec[1] != 3 {
 			return fallback
 		}
-		length := int(in[3])<<8 | int(in[4])
+		length := int(rec[3])<<8 | int(rec[4])
 		if length > maxPlaintext {
 			return fallback
 		}
-		if len(in) < recordHeaderLen+length {
+		if length == 0 {
+			// A handshake record may not be empty (RFC 8446 section 5.1),
+			// and crypto/tls refuses one too; nothing else would bound the
+			// stream of them a client could send ahead of its hello.
+			return peekEmpty
+		}
+		if len(rec) < recordHeaderLen+length {
 			return needMore
 		}
-		msg = append(msg, in[recordHeaderLen:recordHeaderLen+length]...)
-		in = in[recordHeaderLen+length:]
-		if len(msg) >= 4 {
-			size := 4 + (int(msg[1])<<16 | int(msg[2])<<8 | int(msg[3]))
+		h.peekMsg = append(h.peekMsg, rec[recordHeaderLen:recordHeaderLen+length]...)
+		h.peekAt += recordHeaderLen + length
+		if len(h.peekMsg) >= 4 {
+			size := 4 + (int(h.peekMsg[1])<<16 | int(h.peekMsg[2])<<8 | int(h.peekMsg[3]))
 			if size > maxHandshakeMessage {
 				return fallback
 			}
-			if len(msg) >= size {
-				ch, ok := parseClientHello(msg[:size])
+			if len(h.peekMsg) >= size {
+				ch, ok := parseClientHello(h.peekMsg[:size])
 				if !ok {
 					return fallback
 				}
+				h.peekHello, h.peekMsg = ch, nil
 				return h.serves(ch)
 			}
 		}
@@ -590,6 +609,7 @@ const (
 	peekMore = iota
 	peekServe
 	peekFallback
+	peekEmpty
 )
 
 // process consumes the records in in that are complete, as clientHS.process
@@ -605,8 +625,11 @@ func (h *serverHS) process(in []byte) (consumed int, out []byte, done bool, err 
 			return 0, nil, false, nil
 		case peekFallback:
 			return 0, nil, false, errFallback
+		case peekEmpty:
+			return 0, nil, false, fail(alertUnexpectedMessage, "empty handshake record")
 		}
 		h.decided = true
+		h.peekHello, h.peekMsg = nil, nil
 	}
 	if waiting, herr := h.pick.proceed(&out); waiting || herr != nil {
 		return 0, out, false, herr
@@ -674,7 +697,7 @@ func (h *serverHS) record(record []byte, out *[]byte) *hsError {
 		if h.rxOn {
 			return fail(alertUnexpectedMessage, "unprotected handshake record after the ServerHello")
 		}
-		return h.handshakeData(body, out)
+		return h.handshakeRecord(body, out)
 	case recordTypeApplicationData:
 		if !h.rxOn {
 			if h.skipEarlyRecord(record) {
@@ -692,7 +715,7 @@ func (h *serverHS) record(record []byte, out *[]byte) *hsError {
 		}
 		switch inner {
 		case recordTypeHandshake:
-			return h.handshakeData(plain, out)
+			return h.handshakeRecord(plain, out)
 		case recordTypeAlert:
 			return remoteAlert(plain)
 		case recordTypeApplicationData:
@@ -707,6 +730,15 @@ func (h *serverHS) record(record []byte, out *[]byte) *hsError {
 		return fail(alertUnexpectedMessage, "unexpected record type %d during the handshake", inner)
 	}
 	return fail(alertUnexpectedMessage, "unexpected record type %d", typ)
+}
+
+// handshakeRecord is handshakeData for the body of a handshake record, which
+// may not be empty (RFC 8446 section 5.1), as crypto/tls holds too.
+func (h *serverHS) handshakeRecord(data []byte, out *[]byte) *hsError {
+	if len(data) == 0 {
+		return fail(alertUnexpectedMessage, "empty handshake record")
+	}
+	return h.handshakeData(data, out)
 }
 
 func (h *serverHS) handshakeData(data []byte, out *[]byte) *hsError {

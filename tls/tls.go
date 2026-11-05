@@ -400,6 +400,8 @@ func (h *Handler) openNative(c *fib.Connection, t *layer) {
 		shs.pick.async = t.async(h.inner())
 		if _, ok := h.inner().(EarlyDataHandler); ok && h.takesEarlyData() {
 			shs.tcpEarly, shs.maxEarly = true, cmpOr(h.MaxEarlyData, 16<<10)
+			// Early data in records, and its share of their overhead.
+			t.earlyLimit = int(min(uint64(shs.maxEarly)*2, 1<<30)) + maxCiphertext13
 		}
 		hs = shs
 	}
@@ -597,6 +599,13 @@ type layer struct {
 	nbuf    []byte
 	hsTimer *time.Timer
 	nfailed bool
+	// earlyLimit is how much more than maxHandshakeBuffer a server that
+	// takes early data may hold; see nativeLimit.
+	earlyLimit int
+	// hsReturned says crypto/tls's handshake has returned: from then on what
+	// feed collects is the peer's application data, which drainLocked
+	// delivers, and no longer bounded by maxHandshakeBuffer.
+	hsReturned bool
 	// early is a client's early data, guarded by wmu; sink takes the tickets
 	// that follow the handshake, and is readMu's.
 	early *earlyWrites
@@ -653,6 +662,9 @@ func (t *layer) handshake(handler fib.Handler, timeout time.Duration) {
 		defer cancel()
 	}
 	err := t.conn.HandshakeContext(ctx)
+	t.mu.Lock()
+	t.hsReturned = true
+	t.mu.Unlock()
 
 	t.wmu.Lock()
 	if err == nil {
@@ -744,6 +756,24 @@ func (t *layer) feed(handler fib.Handler, data []byte) {
 		return
 	}
 	if t.handshaking {
+		if !t.hsReturned {
+			if len(t.in)-t.inHead+len(data) > maxHandshakeBuffer {
+				// crypto/tls is not reading, in a callback, while the peer
+				// goes on sending.
+				if t.failErr == nil {
+					t.failErr = errHandshakeBuffer
+				}
+				t.mu.Unlock()
+				t.c.CloseWithError(errHandshakeBuffer)
+				return
+			}
+			if t.inHead > 0 {
+				// What crypto/tls has read goes, so that in holds only what
+				// it has not.
+				t.in = t.in[:copy(t.in, t.in[t.inHead:])]
+				t.inHead = 0
+			}
+		}
 		t.in = bufferpool.Append(t.in, data)
 		t.cond.Signal()
 		t.mu.Unlock()
@@ -1181,6 +1211,14 @@ func (t *layer) feedNative(handler fib.Handler, hs nativeHandshake, data []byte)
 	}
 	rest := buf[consumed:]
 	if !done {
+		if len(rest) > t.nativeLimit() {
+			// A peer may send no more than a handshake message's worth ahead
+			// of what the handshake can take: the records of a ClientHello not
+			// yet whole, or what arrives while a certificate callback or a
+			// check of the chain has not answered.
+			t.nativeFailed(hs, nil, errHandshakeBuffer)
+			return
+		}
 		if len(t.nbuf) > 0 {
 			t.nbuf = t.nbuf[:copy(t.nbuf, rest)]
 		} else if len(rest) > 0 {
@@ -1189,6 +1227,26 @@ func (t *layer) feedNative(handler fib.Handler, hs nativeHandshake, data []byte)
 		return
 	}
 	t.completeNative(handler, hs, rest)
+}
+
+// maxHandshakeBuffer bounds what a handshake holds of what the peer has sent
+// and the handshake has not taken yet: a handshake message at its largest, in
+// records as small as a client would send, and a record of what follows it.
+// A handshake without a worker, which consumes nothing while the ClientHello
+// is incomplete or a certificate callback or a check of the peer's chain has
+// not answered, and one crypto/tls runs, which reads nothing while such a
+// callback runs, fail rather than hold more. A server that takes early data
+// may hold that much more.
+const maxHandshakeBuffer = 2*maxHandshakeMessage + maxCiphertext12 + recordHeaderLen
+
+// errHandshakeBuffer closes a connection whose peer sent more than
+// maxHandshakeBuffer ahead of its handshake.
+var errHandshakeBuffer = errors.New("fib: tls peer sent too much ahead of the handshake")
+
+// nativeLimit is maxHandshakeBuffer for the handshake without a worker, with
+// the early data a server may take on top.
+func (t *layer) nativeLimit() int {
+	return maxHandshakeBuffer + t.earlyLimit
 }
 
 // async is how a handshake that runs without a worker calls a certificate
