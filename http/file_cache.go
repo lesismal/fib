@@ -42,6 +42,12 @@ const (
 	DefaultMaxCacheBytes = 64 << 20
 )
 
+// maxMissingEntries bounds how many names a FileCache remembers finding no
+// file under, which every request for a name that is not there would
+// otherwise add one more of, and which nothing else bounds: past it, one of
+// them is forgotten, picked at random, for each new one.
+const maxMissingEntries = 4096
+
 // FileCache serves the files under a directory from memory, following the
 // disk: a file is read the first time it is asked for, and read again once it
 // has changed. On Linux an inotify watch on each directory a cached file is
@@ -54,8 +60,10 @@ const (
 // A file served from memory leaves on a GET or HEAD without conditions or a
 // range, with its Content-Type, Content-Length and Last-Modified, and without
 // allocating; a conditional or ranged request goes through
-// net/http.ServeContent over the same bytes. The cache is safe for concurrent
-// use.
+// net/http.ServeContent over the same bytes. A name with no file under it is
+// remembered too, so that asking again stats nothing where a watch stands,
+// but no more than 4096 such names, whatever names clients make up. The cache
+// is safe for concurrent use.
 type FileCache struct {
 	root          string
 	precompressed bool
@@ -65,6 +73,9 @@ type FileCache struct {
 	mu      sync.RWMutex
 	entries map[fileKey]*cachedFile
 	bytes   int64
+	// missing counts the entries that record a file not there, which hold
+	// no bytes for MaxBytes to bound; maxMissingEntries does.
+	missing int
 	// generation moves on with every change the watch reports, so that a
 	// file read while one arrived is not cached as if it were current.
 	generation atomic.Uint64
@@ -161,7 +172,7 @@ func (fc *FileCache) changed(name string) {
 	fc.mu.Lock()
 	if name == "" {
 		clear(fc.entries)
-		fc.bytes = 0
+		fc.bytes, fc.missing = 0, 0
 	} else {
 		keys := [...]fileKey{{name, noTwin}, {name, brTwin}, {name, gzTwin}, {}}
 		// A twin that changed is its original's twin.
@@ -172,8 +183,7 @@ func (fc *FileCache) changed(name string) {
 		}
 		for _, key := range keys {
 			if e := fc.entries[key]; e != nil {
-				fc.bytes -= int64(len(e.data))
-				delete(fc.entries, key)
+				fc.removeLocked(key, e)
 			}
 		}
 	}
@@ -370,13 +380,39 @@ func (fc *FileCache) load(key fileKey, name, full string, watch *fileWatch) *cac
 	fc.mu.Lock()
 	if fc.generation.Load() == generation && fc.bytes+int64(len(e.data)) <= fc.maxBytes {
 		if old := fc.entries[key]; old != nil {
-			fc.bytes -= int64(len(old.data))
+			fc.removeLocked(key, old)
+		}
+		if e.missing {
+			if fc.missing >= maxMissingEntries {
+				fc.forgetMissingLocked()
+			}
+			fc.missing++
 		}
 		fc.entries[key] = e
 		fc.bytes += int64(len(e.data))
 	}
 	fc.mu.Unlock()
 	return e
+}
+
+// removeLocked drops e, the entry of key, from the cache.
+func (fc *FileCache) removeLocked(key fileKey, e *cachedFile) {
+	fc.bytes -= int64(len(e.data))
+	if e.missing {
+		fc.missing--
+	}
+	delete(fc.entries, key)
+}
+
+// forgetMissingLocked drops one of the entries that record a file not
+// there: the first a range over the map comes to, which starts at random.
+func (fc *FileCache) forgetMissingLocked() {
+	for key, e := range fc.entries {
+		if e.missing {
+			fc.removeLocked(key, e)
+			return
+		}
+	}
 }
 
 // fileHeader is what a response carrying name, or its twin, says of it: the
