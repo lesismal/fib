@@ -4,11 +4,11 @@ package websocket
 
 import (
 	"bytes"
+	"crypto/rand"
 	"crypto/sha1"
 	"encoding/base64"
 	"encoding/binary"
 	"errors"
-	"math/rand/v2"
 	stdhttp "net/http"
 	"strings"
 	"sync"
@@ -325,7 +325,10 @@ func (c *Connection) sendMaskedFrame(opcode Opcode, payload []byte, compressed b
 	copy(frame, header[:headerLen])
 	frame[1] |= 0x80
 	mask := frame[headerLen : headerLen+4]
-	binary.LittleEndian.PutUint32(mask, rand.Uint32())
+	// RFC 6455 section 5.3 wants the key from a strong source of entropy.
+	// crypto/rand.Read never fails: it crashes the program rather than
+	// return an error.
+	_, _ = rand.Read(mask)
 	copy(frame[headerLen+4:], payload)
 	applyMask(frame[headerLen+4:], mask)
 	return c.conn.SendOwned(frame)
