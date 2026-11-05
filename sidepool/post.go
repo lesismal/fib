@@ -34,8 +34,13 @@ type backlog struct {
 }
 
 // post is Post on pool, with b as its backlog.
+//
+// Each callback runs through pool.Call, which recovers a panic in it as the
+// pool does any task's, reporting it to the pool's panic handler or the log:
+// one that panics must not keep the backlog behind it from being emptied,
+// which nothing else would do until the next callback ran.
 func post(pool *taskpool.TaskPool, b *backlog, fn func()) {
-	if pool.TryGo(func() { fn(); b.drain() }) {
+	if pool.TryGo(func() { pool.Call(fn); b.drain(pool) }) {
 		return
 	}
 	b.mu.Lock()
@@ -46,11 +51,12 @@ func post(pool *taskpool.TaskPool, b *backlog, fn func()) {
 	// before fn joined it, though, so one more look is asked for: a pool
 	// that takes it runs it, and one whose queue is still full has, in that
 	// queue, callbacks that start after fn joined, and look then.
-	pool.TryGo(b.drain)
+	pool.TryGo(func() { b.drain(pool) })
 }
 
-// drain runs the callbacks waiting in the backlog until it is empty.
-func (b *backlog) drain() {
+// drain runs the callbacks waiting in the backlog until it is empty, each
+// through pool.Call.
+func (b *backlog) drain(pool *taskpool.TaskPool) {
 	for {
 		b.mu.Lock()
 		if len(b.fns) == 0 {
@@ -61,6 +67,6 @@ func (b *backlog) drain() {
 		b.fns[0] = nil
 		b.fns = b.fns[1:]
 		b.mu.Unlock()
-		fn()
+		pool.Call(fn)
 	}
 }
