@@ -678,8 +678,14 @@ it refuses permissions and channels, with 403, for every address
 unique local), link-local, multicast and broadcast, shared address space (RFC
 6598), the reserved and special-purpose IPv4 ranges, and the IPv6 prefixes that
 reach IPv4 through a translator (NAT64, 6to4), site-local and discard-only
-ones. `AllowedPeers` lets prefixes through before that check, `DeniedPeers`
-refuses more, and `PeerAllowed`, when set, decides alone. A deployment whose
+ones. The server's own addresses (`OwnAddrs`, which `turnserver` fills with
+`RelayIP` and `PublicIP`, its relayed addresses and those clients reach it at)
+are allowed on relayed ports alone, so two of its clients reach each other
+through their relays but not its listener or other services, and an Allocate
+whose source is one of its relays is refused. Without `PeerAllowed` every
+relayed datagram is checked again, with its port. `AllowedPeers` lets
+prefixes through before those checks, `DeniedPeers` refuses more, and
+`PeerAllowed`, when set, decides alone. A deployment whose
 WebRTC servers sit on a private network lists exactly their prefixes in
 `AllowedPeers`; the fib-examples `webrtc` program allows only its own Mux's
 addresses and its relay address.
@@ -687,8 +693,9 @@ addresses and its relay address.
 `PeerAllowed` takes a `netip.AddrPort`. A CreatePermission asks with port 0,
 since a permission is for an address alone; a ChannelBind asks with its peer,
 and every datagram relayed either way asks again with its port. With
-`HoldsRelay` a server can let two of its own clients relay to each other
-through its relayed ports while every other port of its address stays closed:
+`HoldsRelay` a custom policy, as the default one does, can let two of the
+server's own clients relay to each other through its relayed ports while
+every other port of its address stays closed:
 
 ```go
 var server *turnserver.Server // set from Listen before any request comes
@@ -704,10 +711,12 @@ cfg.PeerAllowed = func(p netip.AddrPort) bool {
 **Other limits.** Allocations last `DefaultLifetime` (600s) unless the client
 asks for more, up to `MaxLifetime` (3600s); permissions last 300s and channel
 bindings 600s, and a channel number or peer is quarantined for five minutes
-before it is bound anew. `MaxAllocations` (refused with 508) and
-`MaxAllocationsPerUser` (486) cap allocations, and `MaxPermissions` and
-`MaxChannels` what one allocation holds (508 past either, a permission a
-channel installs counting); zero means no cap. These are `turn.Limits`,
+before it is bound anew. `MaxAllocations` (refused with 508, 16384 by
+default), `MaxAllocationsPerUser` (486, 1024) and `MaxAllocationsPerIP` (486,
+256 from one client address) cap allocations, and `MaxPermissions` and
+`MaxChannels` what one allocation holds (508 past either, 256 each by default,
+a permission a channel installs counting); zero means the default and a
+negative value no cap. These are `turn.Limits`,
 which `ServerConfig` embeds. `OnRelay` sees every relayed datagram's size and
 user before it goes, and returning false drops it: that is the hook for
 bandwidth limits and accounting. Binding requests are answered without

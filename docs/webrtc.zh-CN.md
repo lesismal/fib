@@ -589,15 +589,19 @@ HMAC-SHA1(secret, username) 的 base64。Web 服务与 TURN 服务器之间只�
 `turn.DeniedByDefault` 所列的每一类地址，permission 和 channel 都以 403 拒绝：未指定地址、
 环回、私有地址（RFC 1918 与 unique local）、link-local、组播与广播、共享地址空间
 （RFC 6598）、保留与特殊用途的 IPv4 段，以及经转换器通往 IPv4 的 IPv6 前缀（NAT64、
-6to4）、site-local 与 discard-only 地址。`AllowedPeers` 中的前缀在这项检查之前放行，
+6to4）、site-local 与 discard-only 地址。服务器自己的地址（`OwnAddrs`，`turnserver` 会填入
+`RelayIP` 和 `PublicIP`，以及它分配的中继地址和客户端连到的地址）只在中继端口上放行，于是
+它的两个客户端能经各自的中继互通，却到不了它的监听端口和其它服务；源地址是它某个中继地址的
+Allocate 会被拒绝。没有设置 `PeerAllowed` 时，每个中继的数据报还会带上端口再检查一次。
+`AllowedPeers` 中的前缀在这些检查之前放行，
 `DeniedPeers` 额外拒绝更多，设置了 `PeerAllowed` 则完全由它决定。WebRTC 服务器位于私有网络
 的部署，应在 `AllowedPeers` 中恰好列出这些服务器的前缀；fib-examples 的 `webrtc` 程序只放行
 它自己 Mux 的地址和它的中继地址。
 
 `PeerAllowed` 接受 `netip.AddrPort`。permission 只针对地址，所以 CreatePermission 以端口 0
 询问；ChannelBind 以它的对端询问，双向中继的每个数据报还会带上端口再问一次。借助
-`HoldsRelay`，服务器可以让自己的两个客户端经各自的中继端口互相中继，而本机地址的其它端口
-依然对中继关闭：
+`HoldsRelay`，自定义策略也能像默认策略一样，让服务器自己的两个客户端经各自的中继端口互相
+中继，而本机地址的其它端口依然对中继关闭：
 
 ```go
 var server *turnserver.Server // set from Listen before any request comes
@@ -612,10 +616,11 @@ cfg.PeerAllowed = func(p netip.AddrPort) bool {
 
 **其它限制。** allocation 的存活时间是 `DefaultLifetime`（600 秒），客户端可以要求更长，
 上限 `MaxLifetime`（3600 秒）；permission 存活 300 秒，channel 绑定 600 秒，一个 channel 号
-或对端在重新绑定前要隔离 5 分钟。`MaxAllocations`（超出以 508 拒绝）和
-`MaxAllocationsPerUser`（486）限制 allocation 数量，`MaxPermissions` 和 `MaxChannels`
-限制单个 allocation 持有的数量（超出任一项以 508 拒绝，channel 顺带装上的 permission 也算
-在内）；0 表示不限。这些字段属于 `turn.Limits`，内嵌在 `ServerConfig` 中。`OnRelay` 在每个
+或对端在重新绑定前要隔离 5 分钟。`MaxAllocations`（超出以 508 拒绝，默认 16384）、
+`MaxAllocationsPerUser`（486，默认 1024）和 `MaxAllocationsPerIP`（486，同一客户端地址默认
+256）限制 allocation 数量，`MaxPermissions` 和 `MaxChannels` 限制单个 allocation 持有的数量
+（超出任一项以 508 拒绝，默认各 256，channel 顺带装上的 permission 也算在内）；0 表示默认值，
+负数表示不限。这些字段属于 `turn.Limits`，内嵌在 `ServerConfig` 中。`OnRelay` 在每个
 数据报中继之前看到它的大小和所属用户，返回 false 即丢弃：带宽限制和流量统计就挂在这里。
 Binding request 无需凭据即可应答，供 ICE 获取 server-reflexive candidate。
 

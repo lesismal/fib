@@ -126,16 +126,27 @@ type ServerConfig struct {
 	// Server.HoldsRelay) while its other ports stay closed to the relay.
 	// It may be called from several goroutines at once.
 	//
-	// If nil, an address in AllowedPeers is allowed, then one in
+	// If nil, an address in AllowedPeers is allowed, whatever the port;
+	// then one of the server's own (OwnAddrs, the relayed addresses and the
+	// addresses clients allocated through) is allowed on its relayed ports
+	// alone, so that two clients of the server reach each other through
+	// their relays but not its listener or other services; then one in
 	// DeniedPeers or that DeniedByDefault reports is refused, and any other
-	// is allowed, whatever the port. The default keeps the server from
-	// relaying into the network it runs in, its loopback and private
-	// ranges, which would make it a proxy into them for anyone with
-	// credentials (an SSRF hole): a deployment whose peers are on a
-	// private network lists its prefixes in AllowedPeers.
+	// is allowed, whatever the port. Every datagram is checked again, with
+	// its port. The default keeps the server from relaying into the
+	// network it runs in, its loopback and private ranges and itself, which
+	// would make it a proxy into them for anyone with credentials (an SSRF
+	// hole): a deployment whose peers are on a private network lists its
+	// prefixes in AllowedPeers.
 	PeerAllowed  func(peer netip.AddrPort) bool
 	AllowedPeers []netip.Prefix
 	DeniedPeers  []netip.Prefix
+	// OwnAddrs are the server's own addresses, which the default peer
+	// policy allows only on relayed ports, besides those it learns: the
+	// relayed addresses it hands out and the addresses clients reach it
+	// at. A host lists the addresses it listens on and any it is reached
+	// at through a NAT; package turnserver adds RelayIP and PublicIP.
+	OwnAddrs []netip.Addr
 
 	// SweepInterval is how often HandleTimeout looks for expired
 	// allocations, permissions and channels to free; expired ones are
@@ -161,21 +172,46 @@ type Limits struct {
 
 	// MaxAllocations caps the allocations the server holds in all, which
 	// it refuses beyond with 508 (Insufficient Capacity); and
-	// MaxAllocationsPerUser those of one username, refused with 486
-	// (Allocation Quota Reached). Zero means no limit.
-	MaxAllocations, MaxAllocationsPerUser int
+	// MaxAllocationsPerUser those of one username, and
+	// MaxAllocationsPerIP those of one client IP address, each refused
+	// with 486 (Allocation Quota Reached). Zero means the default,
+	// DefaultMaxAllocations, DefaultMaxAllocationsPerUser and
+	// DefaultMaxAllocationsPerIP; a negative value means no limit.
+	MaxAllocations, MaxAllocationsPerUser, MaxAllocationsPerIP int
 	// MaxPermissions caps the permissions one allocation holds, and
 	// MaxChannels its channel bindings, so that a client with credentials
 	// cannot have the server keep memory without bound: a CreatePermission
 	// or ChannelBind that would go past either is refused with 508
 	// (Insufficient Capacity), as RFC 8656 section 9 allows, once the
 	// allocation's expired ones are forgotten. A permission a channel
-	// installs counts. Zero means no limit beyond the 4096 channel numbers.
+	// installs counts. Zero means the default, DefaultMaxPermissions and
+	// DefaultMaxChannels; a negative value means no limit beyond the 4096
+	// channel numbers.
 	MaxPermissions, MaxChannels int
 }
 
-// withDefaults is l with its zero lifetimes set to their defaults.
+// The quotas Limits defaults to.
+const (
+	DefaultMaxAllocations        = 16384
+	DefaultMaxAllocationsPerUser = 1024
+	DefaultMaxAllocationsPerIP   = 256
+	DefaultMaxPermissions        = 256
+	DefaultMaxChannels           = 256
+)
+
+// withDefaults is l with its zero lifetimes and quotas set to their
+// defaults.
 func (l Limits) withDefaults() Limits {
+	quota := func(q *int, v int) {
+		if *q == 0 {
+			*q = v
+		}
+	}
+	quota(&l.MaxAllocations, DefaultMaxAllocations)
+	quota(&l.MaxAllocationsPerUser, DefaultMaxAllocationsPerUser)
+	quota(&l.MaxAllocationsPerIP, DefaultMaxAllocationsPerIP)
+	quota(&l.MaxPermissions, DefaultMaxPermissions)
+	quota(&l.MaxChannels, DefaultMaxChannels)
 	def := func(d *time.Duration, v time.Duration) {
 		if *d <= 0 {
 			*d = v
@@ -296,6 +332,9 @@ type Server struct {
 	draining atomic.Bool
 
 	shards [shardCount]shard
+	// own is the server's own addresses, OwnAddrs and those learned since;
+	// it is replaced, never changed, under mu.
+	own atomic.Pointer[[]netip.Addr]
 
 	// What freed allocations relayed, and the datagrams, requests and
 	// credentials refused, for Stats.
@@ -307,6 +346,7 @@ type Server struct {
 	mu        sync.Mutex
 	count     int
 	perUser   map[string]int
+	perIP     map[netip.Addr]int
 	pending   map[FiveTuple]*pendingAlloc
 	nextSweep time.Time
 	closed    bool
@@ -340,8 +380,16 @@ func NewServer(config ServerConfig) (*Server, error) {
 	s := &Server{
 		cfg:     config,
 		perUser: make(map[string]int),
+		perIP:   make(map[netip.Addr]int),
 		pending: make(map[FiveTuple]*pendingAlloc),
 	}
+	var own []netip.Addr
+	for _, ip := range config.OwnAddrs {
+		if ip = ip.Unmap(); ip.IsValid() && !ip.IsUnspecified() && !slices.Contains(own, ip) {
+			own = append(own, ip)
+		}
+	}
+	s.own.Store(&own)
 	for i := range s.shards {
 		s.shards[i].allocs = make(map[FiveTuple]*allocation)
 		s.shards[i].byRelay = make(map[netip.AddrPort]*allocation)
@@ -451,15 +499,20 @@ var deniedPrefixes = []netip.Prefix{
 	netip.MustParsePrefix("100::/64"),
 }
 
+// peerAllowed applies ServerConfig.PeerAllowed, or the default policy, to
+// peer; port 0 asks whether any of the address's ports is allowed.
 func (s *Server) peerAllowed(peer netip.AddrPort) bool {
 	if s.cfg.PeerAllowed != nil {
 		return s.cfg.PeerAllowed(peer)
 	}
-	ip := peer.Addr()
+	ip := peer.Addr().Unmap()
 	for _, p := range s.cfg.AllowedPeers {
 		if p.Contains(ip) {
 			return true
 		}
+	}
+	if slices.Contains(*s.own.Load(), ip) {
+		return peer.Port() == 0 || s.HoldsRelay(peer)
 	}
 	for _, p := range s.cfg.DeniedPeers {
 		if p.Contains(ip) {
@@ -467,6 +520,17 @@ func (s *Server) peerAllowed(peer netip.AddrPort) bool {
 		}
 	}
 	return !DeniedByDefault(ip)
+}
+
+// learnOwn adds ip to the server's own addresses. Callers hold s.mu.
+func (s *Server) learnOwn(ip netip.Addr) {
+	ip = ip.Unmap()
+	old := *s.own.Load()
+	if !ip.IsValid() || ip.IsUnspecified() || slices.Contains(old, ip) {
+		return
+	}
+	own := append(slices.Clip(old), ip)
+	s.own.Store(&own)
 }
 
 // HandlePacket processes a datagram b the listening socket received, from
@@ -570,9 +634,7 @@ func (s *Server) unlinkLocked(a *allocation) bool {
 	}
 	rs.mu.Unlock()
 	s.count--
-	if s.perUser[a.user]--; s.perUser[a.user] <= 0 {
-		delete(s.perUser, a.user)
-	}
+	s.unquota(a.user, a.tuple.Client.Addr())
 	return true
 }
 
@@ -947,9 +1009,22 @@ func (s *Server) reserve(p *pendingAlloc) (code int, reason string, gone []*allo
 	if s.draining.Load() {
 		return stun.CodeInsufficientCapacity, "Insufficient Capacity", nil
 	}
+	if s.HoldsRelay(p.tuple.Client) {
+		// An allocation made through another's relayed address would nest
+		// relays, each costing the server for one client.
+		return stun.CodeForbidden, "Forbidden", nil
+	}
+	s.learnOwn(p.tuple.Server.Addr())
+	ip := p.tuple.Client.Addr()
 	lim := s.limits.Load()
 	if q := lim.MaxAllocationsPerUser; q > 0 && s.perUser[p.user] >= q {
 		if gone = s.sweepLocked(p.now); s.perUser[p.user] >= q {
+			return stun.CodeAllocationQuotaReached, "Allocation Quota Reached", gone
+		}
+	}
+	if q := lim.MaxAllocationsPerIP; q > 0 && s.perIP[ip] >= q {
+		gone = append(gone, s.sweepLocked(p.now)...)
+		if s.perIP[ip] >= q {
 			return stun.CodeAllocationQuotaReached, "Allocation Quota Reached", gone
 		}
 	}
@@ -961,7 +1036,19 @@ func (s *Server) reserve(p *pendingAlloc) (code int, reason string, gone []*allo
 	}
 	s.pending[p.tuple] = p
 	s.perUser[p.user]++
+	s.perIP[ip]++
 	return 0, "", gone
+}
+
+// unquota takes one allocation of user's, from client IP ip, off the
+// quotas. Callers hold s.mu.
+func (s *Server) unquota(user string, ip netip.Addr) {
+	if s.perUser[user]--; s.perUser[user] <= 0 {
+		delete(s.perUser, user)
+	}
+	if s.perIP[ip]--; s.perIP[ip] <= 0 {
+		delete(s.perIP, ip)
+	}
 }
 
 // relayReady is the done of an AllocateRelay: it makes the allocation and
@@ -1016,9 +1103,7 @@ func (s *Server) admit(p *pendingAlloc, r Relay, err error) (a *allocation, refu
 		}
 	}
 	if gone || err != nil || r == nil {
-		if s.perUser[p.user]--; s.perUser[p.user] <= 0 {
-			delete(s.perUser, p.user)
-		}
+		s.unquota(p.user, p.tuple.Client.Addr())
 		return nil, !gone
 	}
 	a = &allocation{
@@ -1043,6 +1128,7 @@ func (s *Server) admit(p *pendingAlloc, r Relay, err error) (a *allocation, refu
 	rs.byRelay[relayAddr] = a
 	rs.mu.Unlock()
 	s.count++
+	s.learnOwn(relayAddr.Addr())
 	if s.nextSweep.IsZero() || s.nextSweep.After(p.now.Add(s.cfg.SweepInterval)) {
 		s.nextSweep = p.now.Add(s.cfg.SweepInterval)
 	}
@@ -1306,7 +1392,7 @@ func (s *Server) handleChannelData(t FiveTuple, b []byte, now time.Time) error {
 }
 
 func (s *Server) toPeer(a *allocation, peer netip.AddrPort, data []byte) error {
-	if s.cfg.PeerAllowed != nil && !s.cfg.PeerAllowed(peer) {
+	if !s.peerAllowed(peer) {
 		return ErrDropped
 	}
 	if s.cfg.OnRelay != nil && !s.cfg.OnRelay(a.user, true, len(data)) {
@@ -1341,7 +1427,7 @@ func (s *Server) handleRelayPacket(relay, from netip.AddrPort, b []byte, now tim
 		ch = c.number
 	}
 	a.mu.Unlock()
-	if !ok || s.cfg.PeerAllowed != nil && !s.cfg.PeerAllowed(from) {
+	if !ok || !s.peerAllowed(from) {
 		return ErrDropped
 	}
 	if s.cfg.OnRelay != nil && !s.cfg.OnRelay(a.user, false, len(b)) {

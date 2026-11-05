@@ -212,3 +212,91 @@ func TestServerDrainAndLimits(t *testing.T) {
 		t.Fatalf("Refresh while draining: %d", code(r))
 	}
 }
+
+// The default peer policy lets clients reach the server's own addresses on
+// its relayed ports alone, checks every datagram again, and refuses an
+// allocation made through a relay.
+func TestServerOwnAddresses(t *testing.T) {
+	other := netip.MustParseAddr("192.0.2.99")
+	c := newCore(t, ServerConfig{OwnAddrs: []netip.Addr{other}})
+	u := c.user(clientAddr, testUser, testPass)
+	_ = u.do(stun.MethodAllocate, allocateReq)
+	v := c.user(netip.MustParseAddrPort("198.51.100.10:40300"), testUser, testPass)
+	_ = v.do(stun.MethodAllocate, allocateReq)
+	vRelay, _ := c.s.RelayFor(v.tuple())
+	if r := u.do(stun.MethodCreatePermission, permissionReq(serverAddr)); code(r) != 0 {
+		t.Fatalf("a permission for the server's address: %d", code(r))
+	}
+	for _, p := range []netip.AddrPort{serverAddr, netip.AddrPortFrom(relayIP, 53), netip.AddrPortFrom(other, 80)} {
+		if r := u.do(stun.MethodChannelBind, channelReq(MinChannel, p)); code(r) != stun.CodeForbidden {
+			t.Fatalf("a channel to the server's %v: %d", p, code(r))
+		}
+	}
+	if r := u.do(stun.MethodChannelBind, channelReq(MinChannel, vRelay)); code(r) != 0 {
+		t.Fatalf("a channel to another client's relay: %d", code(r))
+	}
+	send := func(peer netip.AddrPort) error {
+		var m stun.Message
+		m.Build(stun.MessageType{Method: stun.MethodSend, Class: stun.ClassIndication}, stun.NewTransactionID())
+		m.AddXORAddress(stun.AttrXORPeerAddress, peer)
+		m.Add(stun.AttrData, []byte("x"))
+		return c.s.HandlePacket(u.tuple(), m.Raw, c.now)
+	}
+	if err := send(serverAddr); err != ErrDropped {
+		t.Fatalf("Send to the listening port: %v", err)
+	}
+	if err := send(vRelay); err != nil {
+		t.Fatalf("Send to another client's relay: %v", err)
+	}
+	relayed, _ := c.s.RelayFor(u.tuple())
+	if err := c.s.HandleRelayPacket(relayed, serverAddr, []byte("x"), c.now); err != ErrDropped {
+		t.Fatalf("from the listening port: %v", err)
+	}
+	// A client whose source is a relay would nest allocations.
+	nested := c.user(vRelay, testUser, testPass)
+	if r := nested.do(stun.MethodAllocate, allocateReq); code(r) != stun.CodeForbidden {
+		t.Fatalf("an allocation through a relay: %d", code(r))
+	}
+	// A peer denied after its permission is installed gets nothing more.
+	if r := u.do(stun.MethodCreatePermission, permissionReq(peerAddr)); code(r) != 0 {
+		t.Fatal(code(r))
+	}
+	if err := send(peerAddr); err != nil {
+		t.Fatal(err)
+	}
+	c.s.cfg.DeniedPeers = []netip.Prefix{netip.PrefixFrom(peerAddr.Addr(), 32)}
+	if err := send(peerAddr); err != ErrDropped {
+		t.Fatalf("Send to a peer denied since: %v", err)
+	}
+	if err := c.s.HandleRelayPacket(relayed, peerAddr, []byte("x"), c.now); err != ErrDropped {
+		t.Fatalf("from a peer denied since: %v", err)
+	}
+}
+
+// The quotas have defaults, a negative one is no limit, and one client IP
+// address holds no more than MaxAllocationsPerIP.
+func TestServerQuotaDefaults(t *testing.T) {
+	c := newCore(t, ServerConfig{Limits: Limits{MaxChannels: -1, MaxAllocationsPerIP: 2}})
+	l := c.s.Limits()
+	if l.MaxAllocations != DefaultMaxAllocations || l.MaxAllocationsPerUser != DefaultMaxAllocationsPerUser ||
+		l.MaxPermissions != DefaultMaxPermissions || l.MaxChannels != -1 || l.MaxAllocationsPerIP != 2 {
+		t.Fatalf("limits %+v", l)
+	}
+	for i := range 3 {
+		u := c.user(netip.AddrPortFrom(clientAddr.Addr(), uint16(1000+i)), testUser, testPass)
+		want := 0
+		if i == 2 {
+			want = stun.CodeAllocationQuotaReached
+		}
+		if r := u.do(stun.MethodAllocate, allocateReq); code(r) != want {
+			t.Fatalf("allocation %d from one address: %d", i, code(r))
+		}
+	}
+	if r := c.user(netip.MustParseAddrPort("198.51.100.11:1000"), testUser, testPass).do(stun.MethodAllocate, allocateReq); code(r) != 0 {
+		t.Fatalf("from another address: %d", code(r))
+	}
+	c.s.SetLimits(Limits{})
+	if l := c.s.Limits(); l.MaxAllocationsPerIP != DefaultMaxAllocationsPerIP || l.MaxChannels != DefaultMaxChannels {
+		t.Fatalf("limits after SetLimits: %+v", l)
+	}
+}

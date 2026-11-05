@@ -42,6 +42,7 @@ import (
 	"math/rand/v2"
 	"net"
 	"net/netip"
+	"slices"
 	"strconv"
 	"sync"
 	"sync/atomic"
@@ -168,6 +169,12 @@ func New(config Config) (*Server, error) {
 		done:  make(chan struct{}),
 	}
 	sc := config.ServerConfig
+	// The relay's own addresses are reachable through it on relayed ports
+	// alone under the default peer policy.
+	sc.OwnAddrs = append(slices.Clip(sc.OwnAddrs), config.RelayIP)
+	if config.PublicIP.IsValid() {
+		sc.OwnAddrs = append(sc.OwnAddrs, config.PublicIP)
+	}
 	sc.Send = s.sendToClient
 	sc.AllocateRelay = s.allocateRelay
 	core, err := turn.NewServer(sc)
