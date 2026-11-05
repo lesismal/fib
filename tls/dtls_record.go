@@ -34,6 +34,11 @@ const (
 	// dtlsMaxHello bounds a ClientHello a server reassembles before it has
 	// checked its cookie.
 	dtlsMaxHello = 8 << 10
+	// dtlsMaxSpans bounds the separate parts of a message a reassembly
+	// keeps: a fragment that would start another one past it is dropped, to
+	// come again. A message cut to fit a path's MTU, its fragments come in
+	// any order, has far fewer.
+	dtlsMaxSpans = 256
 	// dtlsMinFragment is the smallest fragment a datagram is filled with
 	// before the next is started.
 	dtlsMinFragment = 64
@@ -89,24 +94,35 @@ type dtlsMessage struct {
 	spans [][2]int
 }
 
+// add takes the fragment frag at off. The span it covers is merged into the
+// spans it overlaps or touches where it falls among them, found by a binary
+// search, rather than the spans sorted and merged again, so a fragment costs
+// a search and a move of the spans after it. A fragment that would make more
+// than dtlsMaxSpans spans is dropped.
 func (m *dtlsMessage) add(off int, frag []byte) {
-	copy(m.body[off:], frag)
-	m.got = true
 	if len(frag) == 0 {
+		m.got = true
 		return
 	}
-	m.spans = append(m.spans, [2]int{off, off + len(frag)})
-	slices.SortFunc(m.spans, func(a, b [2]int) int { return a[0] - b[0] })
-	merged := m.spans[:1]
-	for _, s := range m.spans[1:] {
-		last := &merged[len(merged)-1]
-		if s[0] <= last[1] {
-			last[1] = max(last[1], s[1])
-		} else {
-			merged = append(merged, s)
-		}
+	end := off + len(frag)
+	// The first span that ends at or after off, and the first after it that
+	// starts past end: the ones from i to j meet the fragment.
+	i, _ := slices.BinarySearchFunc(m.spans, off, func(s [2]int, off int) int { return s[1] - off })
+	j := i
+	for j < len(m.spans) && m.spans[j][0] <= end {
+		j++
 	}
-	m.spans = merged
+	if i == j {
+		if len(m.spans) >= dtlsMaxSpans {
+			return
+		}
+		m.spans = slices.Insert(m.spans, i, [2]int{off, end})
+	} else {
+		merged := [2]int{min(off, m.spans[i][0]), max(end, m.spans[j-1][1])}
+		m.spans = slices.Replace(m.spans, i, j, merged)
+	}
+	copy(m.body[off:], frag)
+	m.got = true
 }
 
 func (m *dtlsMessage) complete() bool {
