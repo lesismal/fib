@@ -178,3 +178,57 @@ func TestResponseParserChunkLimits(t *testing.T) {
 		}
 	})
 }
+
+// The decoder a streamed body goes through takes exactly the chunk-size
+// lines the buffered path does: no bare LF inside an extension, no bare CR,
+// no whitespace before the size or between it and its extensions, nothing
+// but a space or a tab after it, and no line past maxChunkLine.
+func TestChunkedDecoderAsStrictAsBuffered(t *testing.T) {
+	lines := []string{
+		"1", "01", "1 ", "1\t", "1;a", "1;a=b ", "1;a=\"q\"",
+		"1;a\nb", "1\n", "1\r;a", " 1", "\t1", "1 ;a", "\v1", "1\v", "1\f", "\f1", "+1", "0x1", "",
+		strings.Repeat("0", 16) + "1", strings.Repeat("0", 15) + "1",
+		"1;" + strings.Repeat("x", maxChunkLine-4), "1;" + strings.Repeat("x", maxChunkLine-3),
+	}
+	for _, line := range lines {
+		body := line + "\r\na\r\n0\r\n\r\n"
+		var scan chunkScan
+		_, complete, scanErr := scan.chunkedEnd([]byte(body), 0, 1<<20, 1<<20)
+		buffered := scanErr == nil && complete
+		parser := NewParser(DefaultConfig())
+		_, _, feedErr := parser.FeedOne([]byte(chunkedHead + body))
+		if buffered != (feedErr == nil) {
+			t.Errorf("chunk line %.40q: framed %v, but the parser says %v", line, buffered, feedErr)
+		}
+		for _, step := range []int{1, 5, len(body)} {
+			decoder := &chunkedDecoder{maxTrailer: 1 << 20}
+			var decoded, pending []byte
+			var err error
+			done := false
+			for i := 0; i < len(body) && !done && err == nil; i += step {
+				pending = append(pending, body[i:min(i+step, len(body))]...)
+				var used int
+				decoded, used, _, done, err = decoder.decode(decoded, pending)
+				pending = append(pending[:0], pending[used:]...)
+			}
+			streamed := err == nil && done && string(decoded) == "a"
+			if streamed != buffered {
+				t.Errorf("chunk line %.40q, step %d: streamed %v (%v), buffered %v (%v)",
+					line, step, streamed, err, buffered, scanErr)
+			}
+		}
+	}
+	// What the streamed body of a request takes, end to end.
+	config := DefaultConfig()
+	config.StreamRequestBody = true
+	for _, line := range []string{"1;a\nb", " 1", "1\v"} {
+		parser := NewParser(config)
+		_, complete, err := parser.FeedOne([]byte(chunkedHead + line + "\r\na\r\n0\r\n\r\n"))
+		if err != nil || !complete || parser.stream == nil {
+			t.Fatalf("FeedOne = %v, %v", complete, err)
+		}
+		if _, _, err := parser.stream.absorb(parser.buffer); !errors.Is(err, ErrMalformed) {
+			t.Errorf("streamed chunk line %q: error = %v, want ErrMalformed", line, err)
+		}
+	}
+}

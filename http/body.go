@@ -8,7 +8,6 @@ import (
 	"io"
 	stdhttp "net/http"
 	"net/textproto"
-	"strconv"
 	"sync"
 	"time"
 
@@ -1063,11 +1062,15 @@ func parseTrailer(block []byte) (stdhttp.Header, error) {
 // which waits for the whole body and lets net/http decode it, it consumes what
 // it has and keeps enough state to carry on from the next read. A partial
 // chunk line, a partial terminator and a partial trailer section are left
-// unconsumed rather than held here, since the parser buffer keeps them anyway.
+// unconsumed rather than held here, since the parser buffer keeps them anyway;
+// trailerScan is how far into the trailer section left so the search for its
+// end has got. It takes exactly the chunk-size lines chunkedEnd does (see
+// parseChunkLine), so a body is framed alike whether it streams or not.
 type chunkedDecoder struct {
-	state      uint8
-	remaining  int64
-	maxTrailer int
+	state       uint8
+	remaining   int64
+	maxTrailer  int
+	trailerScan int
 }
 
 const (
@@ -1086,24 +1089,16 @@ func (d *chunkedDecoder) decode(dst, src []byte) (out []byte, used int, trailer 
 	for {
 		switch d.state {
 		case chunkStateSize:
-			at := bytes.Index(src[used:], crlf)
-			if at < 0 {
-				if len(src)-used > d.maxTrailer {
-					return dst, used, nil, false, ErrHeaderTooLarge
-				}
+			size, n, lineErr := parseChunkLine(src[used:])
+			if lineErr != nil {
+				return dst, used, nil, false, lineErr
+			}
+			if n == 0 {
 				return dst, used, nil, false, nil
 			}
-			line := src[used : used+at]
-			if semicolon := bytes.IndexByte(line, ';'); semicolon >= 0 {
-				line = line[:semicolon]
-			}
-			size, parseErr := strconv.ParseUint(string(bytes.TrimSpace(line)), 16, 63)
-			if parseErr != nil {
-				return dst, used, nil, false, fmt.Errorf("%w: invalid chunk size", ErrMalformed)
-			}
-			used += at + 2
+			used += n
 			if size == 0 {
-				d.state = chunkStateTrailer
+				d.state, d.trailerScan = chunkStateTrailer, 0
 				continue
 			}
 			d.remaining = int64(size)
@@ -1127,7 +1122,7 @@ func (d *chunkedDecoder) decode(dst, src []byte) (out []byte, used int, trailer 
 				return dst, used, nil, false, nil
 			}
 			if !bytes.Equal(src[used:used+2], crlf) {
-				return dst, used, nil, false, fmt.Errorf("%w: invalid chunk terminator", ErrMalformed)
+				return dst, used, nil, false, errChunkTerminator
 			}
 			used += 2
 			d.state = chunkStateSize
@@ -1136,13 +1131,15 @@ func (d *chunkedDecoder) decode(dst, src []byte) (out []byte, used int, trailer 
 			if len(rest) >= 2 && bytes.Equal(rest[:2], crlf) {
 				return dst, used + 2, nil, true, nil
 			}
-			at := bytes.Index(rest, crlfcrlf)
+			at := bytes.Index(rest[min(d.trailerScan, len(rest)):], crlfcrlf)
 			if at < 0 {
 				if len(rest) > d.maxTrailer {
 					return dst, used, nil, false, ErrHeaderTooLarge
 				}
+				d.trailerScan = max(len(rest)-3, 0)
 				return dst, used, nil, false, nil
 			}
+			at += min(d.trailerScan, len(rest))
 			if at+4 > d.maxTrailer {
 				return dst, used, nil, false, ErrHeaderTooLarge
 			}

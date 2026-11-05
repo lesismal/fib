@@ -256,22 +256,26 @@ func TestBodyStreamTrailer(t *testing.T) {
 	}
 }
 
-// The streaming chunk decoder bounds a chunk-size line and a trailer section
-// by MaxHeaderBytes, whether they have ended or not.
+// The streaming chunk decoder bounds a chunk-size line by maxChunkLine, as
+// the buffered path does, and a trailer section by MaxHeaderBytes, whether
+// they have ended or not.
 func TestBodyStreamChunkedLimits(t *testing.T) {
 	const head = "POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n"
 	config := immediateStreamingConfig()
 	config.MaxHeaderBytes = 64
-	for name, body := range map[string]string{
-		"size":             "1;" + strings.Repeat("x", 80),
-		"trailer-growing":  "0\r\nX-T: " + strings.Repeat("x", 80),
-		"trailer-complete": "0\r\nX-T: " + strings.Repeat("x", 80) + "\r\n\r\n",
+	for name, c := range map[string]struct {
+		body string
+		want error
+	}{
+		"size":             {"1;" + strings.Repeat("x", maxChunkLine), ErrMalformed},
+		"trailer-growing":  {"0\r\nX-T: " + strings.Repeat("x", 80), ErrHeaderTooLarge},
+		"trailer-complete": {"0\r\nX-T: " + strings.Repeat("x", 80) + "\r\n\r\n", ErrHeaderTooLarge},
 	} {
 		t.Run(name, func(t *testing.T) {
 			// A chunked body streams once some of it is past the header.
-			parser, _ := cvParseStreamed(t, config, head+body[:1])
-			if _, err := parser.pumpBody([]byte(body[1:])); !errors.Is(err, ErrHeaderTooLarge) {
-				t.Fatalf("pumpBody error = %v, want ErrHeaderTooLarge", err)
+			parser, _ := cvParseStreamed(t, config, head+c.body[:1])
+			if _, err := parser.pumpBody([]byte(c.body[1:])); !errors.Is(err, c.want) {
+				t.Fatalf("pumpBody error = %v, want %v", err, c.want)
 			}
 		})
 	}
