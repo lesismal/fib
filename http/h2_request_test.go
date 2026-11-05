@@ -43,6 +43,74 @@ func TestH2HeaderKeyTables(t *testing.T) {
 	}
 }
 
+// TestH2KnownFields holds the one lookup a known name or key costs to the
+// checks it stands in for: that the name is valid and lowercase, its key
+// canonical, and whether it is hop-by-hop.
+func TestH2KnownFields(t *testing.T) {
+	for name, known := range h2KnownNames {
+		if known.name != name || !h2ValidHeaderName(name) || known.key != textproto.CanonicalMIMEHeaderKey(name) ||
+			known.hop != h2HopField(name) || h2KnownKeys[known.key] != known {
+			t.Errorf("h2KnownNames[%q] = %+v", name, known)
+		}
+	}
+	if len(h2KnownKeys) != len(h2KnownNames) {
+		t.Errorf("%d known keys, %d known names", len(h2KnownKeys), len(h2KnownNames))
+	}
+	for _, name := range []string{"connection", "keep-alive", "proxy-connection", "transfer-encoding", "upgrade"} {
+		if !h2HopField(name) || !h2KnownNames[name].hop {
+			t.Errorf("%q is not hop-by-hop", name)
+		}
+	}
+	for _, name := range []string{"", "te", "connectio", "keep-alivE", "upgrades", "Connection", "transfer-encodinG"} {
+		if h2HopField(name) {
+			t.Errorf("h2HopField(%q) = true", name)
+		}
+	}
+	for _, key := range []string{"Content-Type", "Last-Modified", "Connection", "X-Mine", "x-lower", ":status"} {
+		if err := h2CheckField(key, []string{"v"}); err != nil {
+			t.Errorf("h2CheckField(%q): %v", key, err)
+		}
+	}
+	for _, key := range []string{"", "Bad Name", "X:Y", "X\x00", "X\xc3\xa9"} {
+		if h2CheckField(key, []string{"v"}) == nil {
+			t.Errorf("h2CheckField(%q) passed", key)
+		}
+	}
+	if h2CheckField("Content-Type", []string{"a\r\nb"}) == nil {
+		t.Error("h2CheckField passed a value with CRLF")
+	}
+}
+
+// TestH2ByteClasses holds each class of h2ByteClass to the test of a byte it
+// stands in for.
+func TestH2ByteClasses(t *testing.T) {
+	for i := 0; i < 256; i++ {
+		c := byte(i)
+		s := string([]byte{'a', c})
+		for _, tt := range []struct {
+			name      string
+			got, want bool
+		}{
+			{"token", h2ValidMethod(s), tokenByte[c]},
+			{"scheme", h2ValidScheme(s), c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c >= '0' && c <= '9' || c == '+' || c == '-' || c == '.'},
+			{"host", h2ValidAuthority(s), c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c >= '0' && c <= '9' || strings.IndexByte("!$%&'()*+,-.:;=[]_~", c) >= 0},
+			{"name", h2ValidHeaderName(s), !(c >= 'A' && c <= 'Z' || c <= ' ' || c >= 0x7f || c == ':')},
+			{"value", h2ValidHeaderValue(s), c != 0 && c != '\r' && c != '\n' && c != ' ' && c != '\t'},
+			{"path", h2ParsePath(&url.URL{}, "/"+s) == nil, c > ' ' && c != 0x7f && c != '%'},
+		} {
+			if tt.got != tt.want {
+				t.Errorf("%s of %q: %v, want %v", tt.name, s, tt.got, tt.want)
+			}
+		}
+	}
+	if !h2ValidHeaderName(":path") || h2ValidHeaderName("::") {
+		t.Error("a pseudo-header's leading colon is not told apart from another")
+	}
+	if h2ValidScheme("1a") || h2ValidScheme("+a") || !h2ValidScheme("a1+-.") {
+		t.Error("a scheme's first byte is not held to a letter")
+	}
+}
+
 func testH2Fields(path string, regular ...hpack.HeaderField) []hpack.HeaderField {
 	return append([]hpack.HeaderField{
 		{Name: ":method", Value: "POST"}, {Name: ":scheme", Value: "http"},
@@ -153,6 +221,24 @@ func TestH2NewRequestRejectsMalformedPseudoHeaders(t *testing.T) {
 			{Name: ":path", Value: "/"}, {Name: "host", Value: "a b"}}},
 		{"protocol with a space", []hpack.HeaderField{{Name: ":method", Value: "CONNECT"}, {Name: ":protocol", Value: "web socket"},
 			{Name: ":scheme", Value: "http"}, {Name: ":authority", Value: "a"}, {Name: ":path", Value: "/"}}},
+		// A path simpleTarget does not take is checked before it is parsed.
+		{"path with a space in its query", set(":path", "/a?b c")},
+		{"escaped path with a space", set(":path", "/%41 b")},
+		{"path with a CR past a byte beyond ASCII", set(":path", "/\xc3\xa9\r")},
+		{"extended CONNECT path with a space", []hpack.HeaderField{{Name: ":method", Value: "CONNECT"}, {Name: ":protocol", Value: "websocket"},
+			{Name: ":scheme", Value: "http"}, {Name: ":authority", Value: "a"}, {Name: ":path", Value: "/a b"}}},
+		{"extended CONNECT path of an asterisk", []hpack.HeaderField{{Name: ":method", Value: "CONNECT"}, {Name: ":protocol", Value: "websocket"},
+			{Name: ":scheme", Value: "http"}, {Name: ":authority", Value: "a"}, {Name: ":path", Value: "*"}}},
+		{"empty method", set(":method", "")},
+		{"empty protocol", []hpack.HeaderField{{Name: ":method", Value: "CONNECT"}, {Name: ":protocol", Value: ""},
+			{Name: ":scheme", Value: "http"}, {Name: ":authority", Value: "a"}, {Name: ":path", Value: "/"}}},
+		// A regular field's name, known or not.
+		{"hop-by-hop field", testH2Fields("/", hpack.HeaderField{Name: "connection", Value: "close"})},
+		{"hop-by-hop upgrade", testH2Fields("/", hpack.HeaderField{Name: "upgrade", Value: "h2c"})},
+		{"known field with a CR", testH2Fields("/", hpack.HeaderField{Name: "accept", Value: "a\rb"})},
+		{"unknown field in upper case", testH2Fields("/", hpack.HeaderField{Name: "X-Mine", Value: "1"})},
+		{"unknown field with a colon", testH2Fields("/", hpack.HeaderField{Name: "x:mine", Value: "1"})},
+		{"empty field name", testH2Fields("/", hpack.HeaderField{Name: "", Value: "1"})},
 	} {
 		if req, err := sc.newRequest(tt.fields, &h2ServerStream{sc: sc}); err == nil {
 			t.Errorf("%s: accepted, Method %q Host %q RequestURI %q", tt.name, req.Method, req.Host, req.RequestURI)
@@ -169,6 +255,10 @@ func TestH2NewRequestRejectsMalformedPseudoHeaders(t *testing.T) {
 		{"scheme with marks", set(":scheme", "svn+ssh")},
 		{"path with a query", set(":path", "/a?b=c%20d&e=/f")},
 		{"asterisk for OPTIONS", append(set(":path", "*")[1:], hpack.HeaderField{Name: ":method", Value: "OPTIONS"})},
+		{"path with an escape and a byte beyond ASCII", set(":path", "/%41/\xc3\xa9?q=\xc3\xa9")},
+		{"scheme in upper case", set(":scheme", "HTTPS")},
+		{"known and unknown fields", testH2Fields("/", hpack.HeaderField{Name: "accept", Value: "*/*"},
+			hpack.HeaderField{Name: "x-mine", Value: "1"}, hpack.HeaderField{Name: "keep-alive-ish", Value: "1"})},
 	} {
 		if _, err := sc.newRequest(tt.fields, &h2ServerStream{sc: sc}); err != nil {
 			t.Errorf("%s: %v", tt.name, err)
