@@ -1722,6 +1722,10 @@ func (rs *requestStream) deliver(data []byte, fin, replay bool) {
 	rs.finish()
 }
 
+// maxBodyReserve is the most of a request body's declared length set aside
+// before it arrives.
+const maxBodyReserve = 64 << 10
+
 func (rs *requestStream) onData(chunk []byte) error {
 	if rs.done {
 		return nil
@@ -1773,8 +1777,12 @@ func (rs *requestStream) onData(chunk []byte) error {
 		// The datagram the body arrives in goes back to the pool once QUIC
 		// has done with it, so the body is gathered in a pooled buffer of
 		// its own, sized once when its length is known, which the Context
-		// gives back once the response is finished.
-		rs.body = bufferpool.Get(int(rs.declared))[:0]
+		// gives back once the response is finished. No more than
+		// maxBodyReserve is set aside before the body arrives, which grows
+		// it as it does: a client declaring the most MaxBodyBytes allows on
+		// stream after stream, and sending a byte of each, would otherwise
+		// have all of it held for nothing.
+		rs.body = bufferpool.Get(int(min(rs.declared, maxBodyReserve)))[:0]
 	}
 	rs.body = bufferpool.Append(rs.body, chunk)
 	return nil
