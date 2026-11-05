@@ -129,6 +129,12 @@ type h2ServerConn struct {
 	// the reader to count again; see bufferRoom. Only the reader touches it.
 	buffered    int64
 	maxBuffered int64
+	// authority is the last :authority newRequest found valid. A client
+	// sends the same one with every request, as a rule from its dynamic
+	// table, which makes it the same string: comparing them costs next to
+	// nothing, and only another is checked byte by byte. Only the reader
+	// touches it.
+	authority string
 	// local is what the server lets the client send; see HTTP2Config.
 	local h2Local
 
@@ -1321,7 +1327,12 @@ func (sc *h2ServerConn) newRequest(fields []hpack.HeaderField, st *h2ServerStrea
 				valid = scheme == "" || h2ValidScheme(scheme)
 			case ":authority":
 				slot, authority = 2, f.Value
-				valid = h2ValidAuthority(authority)
+				if authority != sc.authority {
+					valid = h2ValidAuthority(authority)
+					if valid {
+						sc.authority = authority
+					}
+				}
 			case ":path":
 				slot, path = 3, f.Value
 			case ":protocol":
