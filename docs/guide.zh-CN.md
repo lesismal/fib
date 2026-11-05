@@ -1166,6 +1166,8 @@ client.Do(req, func(resp *fibhttp.ClientResponse, err error) {
   阻塞 worker；`Body.Close` 不做任何事，放弃剩余 body 用 `resp.Close()`。
 - 流式 body 的上限是 `MaxStreamedBodyBytes`（0 为不限），不受 `MaxResponseBodyBytes` 约束；
   `Timeout` 仍覆盖到 body 结束，长下载需要调大或设为 0。`Client.Go` 始终等完整响应。
+- `Client.StartUpgrade` 的请求如果没有得到 101（服务端拒绝切换），回复按上面的设置整收或流式交付，
+  大 body 同样受背压，不会先整个缓存；101 没有 body，切换连接的行为不变。
 - HTTP/2：同一连接上多个 stream 各自流控。stream 的接收窗口（1MB）只在 body 被 `OnBody`/`Read`
   消费之后才还给服务端，一个读得慢的 stream 只会让自己的发送方等待，不影响同连接上的其他请求；
   阈值之前累积的 body 会立即还窗口，所以阈值可以大于 1MB。

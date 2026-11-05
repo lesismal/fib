@@ -667,6 +667,8 @@ not such a CONNECT.
   `MaxResponseBodyBytes`. Setting `ClientConfig.StreamResponseBody` hands a
   large body to the callback as it arrives instead, bounded by
   `MaxStreamedBodyBytes`; see the [guide](guide.zh-CN.md#http-子-package).
+  So is a server's refusal of `Client.StartUpgrade`, any answer but a 101,
+  which has no body and switches the connection as before.
 - **The client does not pipeline**: one request per HTTP/1 connection at a
   time.
 - **A response is ended when the last hold on it goes**, which for a handler

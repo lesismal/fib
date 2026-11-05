@@ -463,6 +463,8 @@ TLS 1.3 或 1.2 的 AES-GCM、ChaCha20-Poly1305，TLS 1.2 或 1.1 的 AES-CBC）
 - **客户端响应 body 默认整体缓存**：受 `MaxResponseBodyBytes` 限制。设置
   `ClientConfig.StreamResponseBody` 后大 body 边到边交给回调，受
   `MaxStreamedBodyBytes` 限制，见[使用指南](guide.zh-CN.md#http-子-package)。
+  服务端拒绝 `Client.StartUpgrade` 的回复（101 以外的任何回复）同样如此；101 没有 body，
+  照旧切换连接。
 - **客户端不做 pipelining**：一个 HTTP/1 连接同时只有一个请求。
 - **响应在最后一个引用释放时结束**：什么都不 Retain 的 handler 就是它自己返回的时候，
   与 `net/http` 一致。要稍后回复、或者要在其他 goroutine 里接着写的 handler 先

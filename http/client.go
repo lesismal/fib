@@ -438,7 +438,10 @@ func (c *Client) StartFramed(req *stdhttp.Request, framing Framing, callback fun
 // callback, is it, and handler takes what the server sends through it,
 // beginning with OnTunnelOpen once the callback has returned and what
 // arrived behind the 101 queued till then. Any other answer is an ordinary
-// response, with no tunnel, and handler is never called.
+// response, with no tunnel, and handler is never called: its body arrives
+// as Start's would, streamed when ClientConfig.StreamResponseBody says so,
+// so that a server that refuses the switch with a large body is read with
+// backpressure rather than buffered whole.
 //
 // The switch needs an HTTP/1.1 connection: a request that would go out on a
 // multiplexed one, HTTP/2's, fails with ErrNotUpgradable.
@@ -449,7 +452,7 @@ func (c *Client) StartUpgrade(req *stdhttp.Request, handler TunnelHandler, callb
 		}
 		return Call{}
 	}
-	return Call{r: c.do(req, callback, true, handler)}
+	return Call{r: c.do(req, callback, false, handler)}
 }
 
 // Call is a request Start sent, for abandoning it while it is in flight.
@@ -1442,8 +1445,8 @@ type clientRequest struct {
 	headLen  int
 	callback func(*ClientResponse, error)
 	// whole asks for the response to arrive whole even when the client would
-	// stream it. tunnel is StartUpgrade's handler, for a 101 to switch the
-	// connection to.
+	// stream it, as Go's does. tunnel is StartUpgrade's handler, for a 101 to
+	// switch the connection to; a 101 has no body, so it always arrives whole.
 	whole  bool
 	tunnel TunnelHandler
 	// wantBlock is Framing.ResponseHeaderBlock, and block the response's
