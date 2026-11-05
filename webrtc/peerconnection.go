@@ -12,11 +12,13 @@ import (
 	"net/netip"
 	"slices"
 	"strconv"
+	"runtime/debug"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/lesismal/fib"
+	"github.com/lesismal/fib/log"
 	"github.com/lesismal/fib/tls"
 	"github.com/lesismal/fib/webrtc/ice"
 	"github.com/lesismal/fib/webrtc/rtp"
@@ -558,16 +560,26 @@ func (pc *PeerConnection) queue(fn func()) {
 // unlock rearms the timer, releases the mutex, and runs the queued
 // callbacks unless another goroutine is running them already, in which
 // case that one runs these too.
-func (pc *PeerConnection) unlock() {
+func (pc *PeerConnection) unlock() { pc.unlockAt(nil) }
+
+// unlockAt is unlock for a caller that guards against panics with
+// afterPanic: *locked says whether the mutex is held throughout.
+func (pc *PeerConnection) unlockAt(locked *bool) {
 	pc.rearm()
 	for {
 		if pc.dispatching || len(pc.events) == 0 {
+			if locked != nil {
+				*locked = false
+			}
 			pc.mu.Unlock()
 			return
 		}
 		pc.dispatching = true
 		evs := pc.events
 		pc.events = pc.spare[:0]
+		if locked != nil {
+			*locked = false
+		}
 		pc.mu.Unlock()
 		for i := range evs {
 			e := &evs[i]
@@ -581,9 +593,51 @@ func (pc *PeerConnection) unlock() {
 			*e = event{}
 		}
 		pc.mu.Lock()
+		if locked != nil {
+			*locked = true
+		}
 		pc.spare = evs[:0]
 		pc.dispatching = false
 	}
+}
+
+// afterPanic is deferred by the Mux's datagrams and the timer, which run
+// the protocols under the mutex: a panic there would leave the mutex held,
+// and every worker that later has a datagram for pc waiting on it, and pc
+// half changed. It takes the panic, lets the mutex go and closes pc, and
+// then panics again if rethrow, for fib to close the connection the
+// datagram came on; the timer's goroutine has no one to take it, so its
+// panic is logged instead. locked says whether the mutex is held.
+func (pc *PeerConnection) afterPanic(locked *bool, rethrow bool) {
+	r := recover()
+	if r == nil {
+		return
+	}
+	if !*locked {
+		pc.mu.Lock()
+	}
+	func() {
+		// Closing may trip on what the panic left behind.
+		defer func() { _ = recover() }()
+		pc.closeLocked(false)
+	}()
+	pc.closed = true
+	pc.timer.Stop()
+	evs := pc.events
+	pc.events, pc.dispatching = nil, false
+	pc.mu.Unlock()
+	for i := range evs {
+		if fn := evs[i].fn; fn != nil {
+			func() {
+				defer func() { _ = recover() }()
+				fn()
+			}()
+		}
+	}
+	if rethrow {
+		panic(r)
+	}
+	log.Error("webrtc: PeerConnection closed after a panic in its timer", "panic", r, "stack", string(debug.Stack()))
 }
 
 // rearm sets the timer to the earliest deadline of ICE, DTLS, SCTP and the
@@ -636,6 +690,8 @@ func (pc *PeerConnection) onTimer() {
 		pc.mu.Unlock()
 		return
 	}
+	locked := true
+	defer pc.afterPanic(&locked, false)
 	now := time.Now()
 	pc.timerAt = time.Time{}
 	for _, r := range pc.relays {
@@ -665,7 +721,7 @@ func (pc *PeerConnection) onTimer() {
 	if !pc.nextReport.IsZero() && !pc.nextReport.After(now) {
 		pc.sendReports(now)
 	}
-	pc.unlock()
+	pc.unlockAt(&locked)
 }
 
 // liteDeadline is when a lite agent's silent peer is next due a change of
@@ -708,16 +764,18 @@ func (pc *PeerConnection) handleDatagram(from netip.AddrPort, b []byte) {
 		pc.mu.Unlock()
 		return
 	}
+	locked := true
+	defer pc.afterPanic(&locked, true)
 	now := time.Now()
 	for _, r := range pc.relays {
 		if !r.stream && r.r.Client.Server() == from && pc.relayPacket(r, b, now) {
-			pc.unlock()
+			pc.unlockAt(&locked)
 			return
 		}
 	}
 	pc.heard(from, now)
 	pc.demux(localID, from, b, now)
-	pc.unlock()
+	pc.unlockAt(&locked)
 }
 
 // demux sorts a datagram from the peer by its first byte: STUN, DTLS, or
