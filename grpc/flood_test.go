@@ -4,6 +4,8 @@ package grpc
 
 import (
 	"bytes"
+	"encoding/binary"
+	"fmt"
 	"sync/atomic"
 	"testing"
 )
@@ -109,4 +111,32 @@ func TestWireServerRapidReset(t *testing.T) {
 			t.Fatalf("%d handlers ran", n)
 		}
 	})
+}
+
+// TestWireServerDefaultStreamLimit checks that a server left without
+// MaxConcurrentStreams bounds the calls of a connection by 100, says so in
+// its SETTINGS, and refuses the stream past it. It used to send no limit
+// and keep none.
+func TestWireServerDefaultStreamLimit(t *testing.T) {
+	f := &floodService{}
+	_, addr := startServer(t, &echoImpl{}, UnknownServiceHandler(f.handle))
+	c := dialWire(t, addr, true)
+	settings := c.expect(frameSettings, 0)
+	limit := uint32(0)
+	for p := settings.payload; len(p) >= 6; p = p[6:] {
+		if binary.BigEndian.Uint16(p) == settingMaxConcurrentStreams {
+			limit = binary.BigEndian.Uint32(p[2:])
+		}
+	}
+	if limit != defaultMaxConcurrentStreams {
+		t.Fatalf("SETTINGS_MAX_CONCURRENT_STREAMS %d, want %d", limit, defaultMaxConcurrentStreams)
+	}
+	var frames [][]byte
+	for i := range defaultMaxConcurrentStreams + 1 {
+		frames = append(frames, headersFrame(uint32(2*i+1), c.request(fmt.Sprintf("/flood/%d", i)), false))
+	}
+	c.write(frames...)
+	if got := c.reset(2*defaultMaxConcurrentStreams + 1); got != errRefusedStream {
+		t.Fatalf("the stream past the default limit: RST %d", got)
+	}
 }

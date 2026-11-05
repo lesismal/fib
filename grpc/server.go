@@ -30,6 +30,9 @@ import (
 const (
 	defaultMaxRecvMsgSize = 4 << 20
 	defaultMaxSendMsgSize = math.MaxInt32
+	// defaultMaxConcurrentStreams is the stream limit of a server whose
+	// MaxConcurrentStreams is left at zero, grpc-go's.
+	defaultMaxConcurrentStreams = 100
 )
 
 type serverOptions struct {
@@ -80,7 +83,8 @@ func MaxRecvMsgSize(n int) ServerOption { return func(o *serverOptions) { o.maxR
 func MaxSendMsgSize(n int) ServerOption { return func(o *serverOptions) { o.maxSendMsgSize = n } }
 
 // MaxConcurrentStreams bounds the calls one connection may have open at
-// once; zero, the default, leaves them unbounded. A stream past the limit is
+// once, 100 by default, as grpc-go's; zero means the default, and
+// math.MaxUint32 leaves them all but unbounded. A stream past the limit is
 // refused, and counted against the connection's budget of resets, which a
 // client that resets the streams it opens spends too, and the limit bounds
 // the handlers running at once: a call whose stream the client reset counts
@@ -138,6 +142,9 @@ func NewServer(opts ...ServerOption) *Server {
 	o := serverOptions{maxRecvMsgSize: defaultMaxRecvMsgSize, maxSendMsgSize: defaultMaxSendMsgSize}
 	for _, opt := range opts {
 		opt(&o)
+	}
+	if o.maxStreams == 0 {
+		o.maxStreams = defaultMaxConcurrentStreams
 	}
 	o.unaryInt = chainUnaryServer(o.unaryInts)
 	o.streamInt = chainStreamServer(o.streamInts)
