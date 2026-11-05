@@ -492,6 +492,14 @@ func (c *Context) OnWritable(fn func(error)) bool {
 	if a := c.w.asyncHeader(); a != nil && a.deferWritable(fn) {
 		return true
 	}
+	return c.writableSettled(fn)
+}
+
+// writableSettled is OnWritable once the header is settled. A body that goes
+// through an asynchronous filter is asked first, under its lock: while a
+// filter call is under way, its goroutine may be committing the header, and
+// the callback waits for that call instead.
+func (c *Context) writableSettled(fn func(error)) bool {
 	if b := c.w.asyncBody(); b != nil && b.writableAsync(fn) {
 		return true
 	}

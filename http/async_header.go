@@ -326,7 +326,7 @@ func (c *Context) resumeHeader(a *asyncHeader, err error) {
 		switch {
 		case err != nil:
 			sidepool.Post(func() { fn(err) })
-		case !c.onWritable(fn):
+		case !c.writableSettled(fn):
 			sidepool.Post(func() { fn(nil) })
 		}
 	}
