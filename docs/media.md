@@ -258,7 +258,12 @@ rtcServer, _ := rtc.NewServer(rtc.Config{Hub: h,
 `rtmp.ServerConfig` has `OnConnect`, `OnPublish` and `OnPlay` (its
 `OnPublish` runs before the hub's), and `httpflv.Config` has `OnPlay`, which
 runs after the hub's `OnSubscribe`. RTSP asks `OnSubscribe` at DESCRIBE and
-again at PLAY. WHIP and WHEP ask `rtc.Config.Authorize` first, then the hub's
+again at PLAY. An RTSP session plays or records the stream its ANNOUNCE or
+first SETUP named, which `ServerConn.SessionPath` returns: a PLAY or RECORD
+whose URL names another stream (by its path without the slashes around it,
+a trailing `trackID=N` taken off; host, port and query aside) is answered
+455, so an `OnRequest` hook that authorizes PLAY and RECORD checks
+`SessionPath`, not the request's URL. WHIP and WHEP ask `rtc.Config.Authorize` first, then the hub's
 hooks. `Authorize` refusing is answered 401 without a token and 403 with
 one, a hook refusing 403, a busy path 409, a missing stream 404 (after
 `PlayWait`, when set, has run out). HLS
@@ -696,7 +701,7 @@ value accepts every origin).
 | `MaxPlayerLoss`, `PlayerLossWindow` | 0.5, 10 s | A UDP player whose RTCP receiver reports say it lost more than this share of a stream in every report for the window is closed; a report under it starts the window again. A negative `MaxPlayerLoss`, or 1 and up, closes no one for loss |
 | `MTU`, `SenderReportInterval` | 1400, 5 s | RTP packet size, RTCP sender reports |
 | `ReorderSize`, `ReorderDelay` | 128 packets, 100 ms | The reorder buffer of each stream recorded over UDP |
-| `OnRequest` | none | Sees, and may answer, every authenticated request |
+| `OnRequest` | none | Sees, and may answer, every authenticated request; `ServerConn.SessionPath` is the stream the session plays or records |
 
 `rtsp.ClientConfig` has `Engine` (required and running), `Transport` (TCP
 or UDP) and `UDPHost` (the local host of UDP's bindings), `Username` and

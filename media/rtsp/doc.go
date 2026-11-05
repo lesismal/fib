@@ -35,6 +35,10 @@
 // where they were. A recorder's packets go through a reorder buffer when
 // they come over UDP, and its streams are lined up by its RTCP sender
 // reports; the parameter sets it sends in band update the hub's tracks.
+// A session plays or records the stream its ANNOUNCE or first SETUP named
+// (ServerConn.SessionPath): a PLAY or RECORD whose URL names another, by
+// its path without the slashes around it and a trailing trackID=N, is
+// answered 455 Method Not Valid in This State.
 // Sessions end with their connection, on TEARDOWN, or after
 // ServerConfig.SessionTimeout without a request or RTCP. Authentication is
 // Digest (RFC 2617 with MD5, as RTSP clients speak it) or Basic, through

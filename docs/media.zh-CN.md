@@ -212,7 +212,10 @@ rtcServer, _ := rtc.NewServer(rtc.Config{Hub: h,
 
 `rtmp.ServerConfig` 有 `OnConnect`、`OnPublish` 和 `OnPlay`（其 `OnPublish` 先于 hub 的钩子
 执行），`httpflv.Config` 有 `OnPlay`，在 hub 的 `OnSubscribe` 之后执行。RTSP 在 DESCRIBE
-和 PLAY 时各询问一次 `OnSubscribe`。WHIP 与 WHEP 先询问 `rtc.Config.Authorize`，再询问 hub
+和 PLAY 时各询问一次 `OnSubscribe`。RTSP 会话播放或录制的是它的 ANNOUNCE 或第一个 SETUP
+指定的流，即 `ServerConn.SessionPath` 返回的路径：PLAY 或 RECORD 的 URL 指向别的流时（比较
+去掉首尾斜杠、去掉末尾 `trackID=N` 之后的路径，不看主机、端口和 query），回 455；所以授权
+PLAY 和 RECORD 的 `OnRequest` 钩子应检查 `SessionPath`，而不是请求的 URL。WHIP 与 WHEP 先询问 `rtc.Config.Authorize`，再询问 hub
 的钩子：`Authorize` 拒绝时，没有 token 回 401，有 token 回 403；钩子拒绝回 403，路径已被
 占用回 409，流不存在回 404（设置了 `PlayWait` 时，在它耗尽之后）。HLS 对每路流的每种
 格式只订阅一次，发生在第一个播放列表请求时，所以 `OnSubscribe` 只能看到那一个请求；要检查
@@ -602,7 +605,7 @@ HTTP/2 和 HTTP/3 上，积压指流控压住超过 64 KiB 的数据，且只有
 | `MaxPlayerLoss`、`PlayerLossWindow` | 0.5、10 s | 走 UDP 的播放者，RTCP 接收端报告在整个窗口内每次都说某路流丢包超过这个比例，就关闭它；有一次低于它，窗口重新计算。`MaxPlayerLoss` 为负数或不小于 1 时不因丢包关闭任何人 |
 | `MTU`、`SenderReportInterval` | 1400、5 s | RTP 包大小，RTCP sender report 间隔 |
 | `ReorderSize`、`ReorderDelay` | 128 个包、100 ms | 每路经 UDP 录制的流的重排缓冲区 |
-| `OnRequest` | 无 | 查看每个已认证的请求，也可以代为应答 |
+| `OnRequest` | 无 | 查看每个已认证的请求，也可以代为应答；`ServerConn.SessionPath` 是会话播放或录制的流 |
 
 `rtsp.ClientConfig` 有 `Engine`（必填，且已在运行）、`Transport`（TCP 或 UDP）与
 `UDPHost`（UDP binding 的本地地址）、`Username` 与 `Password`（不设置时取 URL 中的用户

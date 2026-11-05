@@ -251,6 +251,16 @@ func (s *session) addRoutes(st *stream) {
 	s.sc.s.addRoute(st.clientRTCP, &udpRoute{sc: s.sc, sess: s, st: st, rtcp: true})
 }
 
+// names reports whether path, the stream path of a PLAY or RECORD URL
+// (streamPath), is the session's stream: the session's path, or one of its
+// tracks, the path with a "trackID=N" segment, which SETUP strips the same
+// way. Whether the URL is the aggregate one or a track's, and with or
+// without slashes around the path, its query, host and port do not matter.
+func (s *session) names(path string) bool {
+	p, _ := splitTrackID(path)
+	return p == s.path
+}
+
 // play starts playing; the subscription starts once the response has
 // gone, in afterResponse, so that the packets follow it.
 func (s *session) play(req *Request) *Response {

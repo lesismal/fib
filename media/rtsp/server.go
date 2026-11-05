@@ -66,6 +66,12 @@ type ServerConfig struct {
 	// the server handles it, and answers it instead by returning a
 	// response; nil lets the server go on. It runs under the connection's
 	// lock and must not block.
+	//
+	// A session plays or records the stream its ANNOUNCE or first SETUP
+	// named by its URL, ServerConn.SessionPath, and a PLAY or RECORD whose
+	// URL names another is answered 455 after the hook has run: a hook
+	// authorizing PLAY and RECORD should check SessionPath, the stream
+	// they act on, rather than the request's URL.
 	OnRequest func(c *ServerConn, req *Request) *Response
 
 	// SessionTimeout ends a session, and its connection, after this long
@@ -241,6 +247,9 @@ type ServerConn struct {
 	// which runs under mu, may ask.
 	user atomic.Pointer[string]
 	sess *session
+	// sessPath is the stream path of sess, nil without one: atomic, as
+	// user is.
+	sessPath atomic.Pointer[string]
 	// described is the stream a DESCRIBE described, for the SETUPs after
 	// it.
 	described *description
@@ -259,6 +268,27 @@ func (sc *ServerConn) User() string {
 		return *u
 	}
 	return ""
+}
+
+// SessionPath returns the hub path of the stream the client's session
+// plays or records, and false while it has no session. The session's path
+// is the one its ANNOUNCE, or its first SETUP, named: it is the stream
+// played or recorded whatever a later request's URL says, and a PLAY or
+// RECORD whose URL names another is answered 455 Method Not Valid in This
+// State. An OnRequest hook authorizing a PLAY or RECORD should check this
+// path; see ServerConfig.OnRequest.
+func (sc *ServerConn) SessionPath() (string, bool) {
+	if p := sc.sessPath.Load(); p != nil {
+		return *p, true
+	}
+	return "", false
+}
+
+// setSessionLocked makes sess the client's session, ending the one it had.
+func (sc *ServerConn) setSessionLocked(sess *session) {
+	sc.endSessionLocked()
+	sc.sess = sess
+	sc.sessPath.Store(&sess.path)
 }
 
 // description is a stream's tracks as a DESCRIBE gave them, with the
@@ -345,6 +375,7 @@ func (sc *ServerConn) closeLocked() {
 func (sc *ServerConn) endSessionLocked() {
 	if sess := sc.sess; sess != nil {
 		sc.sess = nil
+		sc.sessPath.Store(nil)
 		sess.close()
 	}
 }
@@ -469,9 +500,19 @@ func (sc *ServerConn) serve(req *Request, now time.Time) *Response {
 	case MethodSetup:
 		return sc.setup(req, path, query)
 	case MethodPlay:
-		return sc.withSession(func(s *session) *Response { return s.play(req) })
+		return sc.withSession(func(s *session) *Response {
+			if !s.names(path) {
+				return &Response{StatusCode: StatusMethodNotValidInState}
+			}
+			return s.play(req)
+		})
 	case MethodRecord:
-		return sc.withSession(func(s *session) *Response { return s.record(req, now) })
+		return sc.withSession(func(s *session) *Response {
+			if !s.names(path) {
+				return &Response{StatusCode: StatusMethodNotValidInState}
+			}
+			return s.record(req, now)
+		})
 	case MethodPause:
 		return sc.withSession(func(s *session) *Response { return s.pause() })
 	case MethodTeardown:
@@ -607,11 +648,11 @@ func (sc *ServerConn) announce(req *Request, path, query string) *Response {
 	if v := req.Header.Get("Content-Base"); v != "" {
 		base = v
 	}
-	sc.endSessionLocked()
-	sc.sess = newSession(sc, path, query)
-	sc.sess.mode = modeAnnounced
-	sc.sess.announced = formats
-	sc.sess.base = base
+	sess := newSession(sc, path, query)
+	sess.mode = modeAnnounced
+	sess.announced = formats
+	sess.base = base
+	sc.setSessionLocked(sess)
 	return &Response{StatusCode: StatusOK}
 }
 
@@ -658,9 +699,10 @@ func (sc *ServerConn) setup(req *Request, path, query string) *Response {
 		return &Response{StatusCode: StatusNotFound}
 	}
 	if sc.sess == nil {
-		sc.sess = newSession(sc, streamPath, d.query)
-		sc.sess.mode = modePlayReady
-		sc.sess.desc = d
+		sess := newSession(sc, streamPath, d.query)
+		sess.mode = modePlayReady
+		sess.desc = d
+		sc.setSessionLocked(sess)
 	}
 	return sc.sess.setupPlay(req, transports, track)
 }
