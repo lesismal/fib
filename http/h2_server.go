@@ -2261,9 +2261,11 @@ func h2CheckHeader(header stdhttp.Header) error {
 	return nil
 }
 
-// h2CheckField is h2CheckHeader for one field.
+// h2CheckField is h2CheckHeader for one field. A key responses nearly always
+// carry is valid, which one lookup tells; any other's name is checked as it
+// goes out, in lower case.
 func h2CheckField(key string, values []string) error {
-	if key == "" || textproto.CanonicalMIMEHeaderKey(key) == "" || !h2ValidHeaderName(h2LowerKey(key)) {
+	if _, known := h2KnownKeys[key]; !known && (key == "" || !h2ValidHeaderName(strings.ToLower(key))) {
 		return errors.New("http: invalid header name " + strconv.Quote(key))
 	}
 	for _, value := range values {
