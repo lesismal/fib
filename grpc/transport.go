@@ -6,6 +6,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"io"
+	"slices"
 	"sync"
 
 	fib "github.com/lesismal/fib"
@@ -36,6 +37,9 @@ type transport struct {
 	blockID      uint32
 	blockEnd     bool
 	connUnacked  int64
+	// resets is a server's budget of streams a client may cost it; see
+	// streamResetBurst.
+	resets budget
 
 	mu      sync.Mutex
 	enc     *hpack.Encoder
@@ -51,7 +55,13 @@ type transport struct {
 	peerInitialWindow int64
 	peerMaxFrame      int
 	peerMaxStreams    uint32
-	closed            bool
+	// running counts a server's handlers that have not returned, whether
+	// or not their streams have ended, a reset ending them most often;
+	// queued holds the calls waiting for one of them to return, so that
+	// no more than the stream limit run at once.
+	running uint32
+	queued  []*serverStream
+	closed  bool
 	closeErr          error
 	// goingAway is set once a GOAWAY has gone either way: no stream is
 	// opened on the connection after it.
@@ -84,6 +94,7 @@ func newTransport(client bool) *transport {
 		changed:           make(chan struct{}),
 		awaitPreface:      !client,
 		nextID:            1,
+		resets:            newBudget(streamResetBurst, streamResetRate),
 	}
 	t.dec.MaxStringLength = maxHeaderBlock
 	return t
@@ -237,6 +248,9 @@ func (t *transport) read(data []byte) error {
 				return err
 			}
 			t.resetStream(se.id, se.code, status.New(codes.Internal, se.Error()).Err())
+			if err := t.resetCounted(); err != nil {
+				return err
+			}
 		}
 	}
 	// Keep what is left of an incomplete frame. When data is the tail of
@@ -300,8 +314,7 @@ func (t *transport) handleFrame(f *frame) error {
 		if len(f.payload) != 4 || f.streamID == 0 {
 			return protocolError("bad RST_STREAM")
 		}
-		t.onReset(f.streamID, errCode(binary.BigEndian.Uint32(f.payload)))
-		return nil
+		return t.onReset(f.streamID, errCode(binary.BigEndian.Uint32(f.payload)))
 	case frameSettings:
 		return t.handleSettings(f)
 	case framePushPromise:
@@ -484,14 +497,15 @@ func (t *transport) handleHeaderBlock(id uint32, block []byte, endStream bool) e
 		}
 		return s.onData(nil, 0, true)
 	}
-	t.server.openStream(t, id, fields, endStream)
-	return nil
+	return t.server.openStream(t, id, fields, endStream)
 }
 
 var errHeaderListTooLarge = errors.New("grpc: header list too large")
 
-// onReset ends a stream the peer reset.
-func (t *transport) onReset(id uint32, code errCode) {
+// onReset ends a stream the peer reset. A stream that had ended already,
+// which a peer may reset in flight, costs nothing; one still open counts
+// against a server's reset budget.
+func (t *transport) onReset(id uint32, code errCode) error {
 	t.mu.Lock()
 	s := t.streams[id]
 	if s != nil {
@@ -499,7 +513,7 @@ func (t *transport) onReset(id uint32, code errCode) {
 	}
 	t.mu.Unlock()
 	if s == nil {
-		return
+		return nil
 	}
 	c := codes.Internal
 	switch code {
@@ -518,6 +532,7 @@ func (t *transport) onReset(id uint32, code errCode) {
 		}
 	}
 	s.abort(status.Newf(c, "grpc: stream reset by the peer with code %d", code).Err())
+	return t.resetCounted()
 }
 
 // resetStream resets a stream from this side.
@@ -587,6 +602,49 @@ func (t *transport) taskPool() fib.TaskPool {
 	}
 	if t.pool != nil {
 		return t.pool
+	}
+	return nil
+}
+
+// dispatch runs the handler of a call whose stream is still open, or, with
+// as many handlers running as the stream limit allows, queues it until one
+// of them returns. A handler counts until it returns, even once its stream
+// has ended: a client resetting its streams cannot have more run at once.
+func (t *transport) dispatch(ss *serverStream) {
+	t.mu.Lock()
+	if t.streams[ss.s.id] != ss.s {
+		// Reset before its handler ran: there is nothing left to serve.
+		t.mu.Unlock()
+		return
+	}
+	if limit := t.server.opts.maxStreams; limit > 0 && t.running >= limit {
+		if len(t.queued) >= int(limit) {
+			// Drop the calls that ended while they waited.
+			t.queued = slices.DeleteFunc(t.queued, func(q *serverStream) bool { return t.streams[q.s.id] != q.s })
+		}
+		t.queued = append(t.queued, ss)
+		t.mu.Unlock()
+		return
+	}
+	t.running++
+	ss.running = true
+	t.mu.Unlock()
+	t.run(ss)
+}
+
+// handlerDoneLocked counts a handler that has returned, and returns the
+// queued call to run in its place, if any. Callers hold mu.
+func (t *transport) handlerDoneLocked() *serverStream {
+	t.running--
+	for len(t.queued) > 0 {
+		next := t.queued[0]
+		t.queued[0] = nil
+		t.queued = t.queued[1:]
+		if t.streams[next.s.id] == next.s {
+			t.running++
+			next.running = true
+			return next
+		}
 	}
 	return nil
 }

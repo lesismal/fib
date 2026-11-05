@@ -80,7 +80,11 @@ func MaxRecvMsgSize(n int) ServerOption { return func(o *serverOptions) { o.maxR
 func MaxSendMsgSize(n int) ServerOption { return func(o *serverOptions) { o.maxSendMsgSize = n } }
 
 // MaxConcurrentStreams bounds the calls one connection may have open at
-// once; zero, the default, leaves them unbounded.
+// once; zero, the default, leaves them unbounded. A stream past the limit is
+// refused, and counted against the connection's budget of resets, which a
+// client that resets the streams it opens spends too, and the limit bounds
+// the handlers running at once: a call whose stream the client reset counts
+// until its handler returns, and a call opened meanwhile waits for one to.
 func MaxConcurrentStreams(n uint32) ServerOption { return func(o *serverOptions) { o.maxStreams = n } }
 
 // TaskPool sets the pool every call's handler runs on. Without it, a call
@@ -353,8 +357,9 @@ func (s *Server) GracefulStop() {
 	s.Stop()
 }
 
-// openStream starts a call the client opened with a header block.
-func (s *Server) openStream(t *transport, id uint32, fields []hpack.HeaderField, endStream bool) {
+// openStream starts a call the client opened with a header block, and
+// returns the error the client made of it, if any.
+func (s *Server) openStream(t *transport, id uint32, fields []hpack.HeaderField, endStream bool) error {
 	ss := &serverStream{server: s, header: metadata.MD{}}
 	st := &stream{t: t, id: id, ss: ss, recvWindow: streamWindow, ready: make(chan struct{}, 1)}
 	ss.s = st
@@ -377,8 +382,7 @@ func (s *Server) openStream(t *transport, id uint32, fields []hpack.HeaderField,
 		default:
 			if !reservedHeader(f.Name) {
 				if err := addMetadata(md, f.Name, f.Value); err != nil {
-					t.resetStream(id, errProtocol, err)
-					return
+					return &streamError{id: id, code: errProtocol}
 				}
 			}
 		}
@@ -386,7 +390,7 @@ func (s *Server) openStream(t *transport, id uint32, fields []hpack.HeaderField,
 	subtype, ok := contentSubtype(ctype)
 	if !ok || method != "POST" {
 		ss.rejectHTTP(t, id, ok, endStream)
-		return
+		return nil
 	}
 	ss.method = path
 	ss.codec = s.opts.codec
@@ -424,19 +428,19 @@ func (s *Server) openStream(t *transport, id uint32, fields []hpack.HeaderField,
 	case t.closed:
 		t.mu.Unlock()
 		ss.cancelCtx()
-		return
+		return nil
 	case t.goingAway:
 		t.out = appendRSTStream(t.out, id, errRefusedStream)
 		t.mu.Unlock()
 		t.flush()
 		ss.cancelCtx()
-		return
+		return nil
 	case s.opts.maxStreams > 0 && uint32(len(t.streams)) >= s.opts.maxStreams:
-		t.out = appendRSTStream(t.out, id, errRefusedStream)
+		// Refused, and counted as a reset: a client that heeds SETTINGS
+		// never opens it.
 		t.mu.Unlock()
-		t.flush()
 		ss.cancelCtx()
-		return
+		return &streamError{id: id, code: errRefusedStream}
 	}
 	st.sendWindow = t.peerInitialWindow
 	st.remoteEnd = endStream
@@ -444,17 +448,18 @@ func (s *Server) openStream(t *transport, id uint32, fields []hpack.HeaderField,
 	t.mu.Unlock()
 	if fail != nil {
 		ss.finish(fail)
-		return
+		return nil
 	}
 	if ss.unary != nil && !endStream {
 		// A unary call is served once its request has arrived whole, so that
 		// it never holds a worker of the pool waiting for it.
 		st.mu.Lock()
-		st.onEnd = func() { t.run(ss) }
+		st.onEnd = func() { t.dispatch(ss) }
 		st.mu.Unlock()
-		return
+		return nil
 	}
-	t.run(ss)
+	t.dispatch(ss)
+	return nil
 }
 
 // streamKey keys the call a handler's context is for, which SetHeader and
@@ -491,6 +496,8 @@ type serverStream struct {
 	trailer    metadata.MD
 	headerSent bool
 	done       bool
+	// running is set while the handler runs; see transport.running.
+	running bool
 }
 
 func (ss *serverStream) cancel() {
@@ -727,6 +734,13 @@ func (ss *serverStream) finish(st *status.Status) {
 	defer ss.cancel()
 	t := ss.s.t
 	t.mu.Lock()
+	if ss.running {
+		// The handler has returned; a call waiting for it to runs now.
+		ss.running = false
+		if next := t.handlerDoneLocked(); next != nil {
+			defer t.run(next)
+		}
+	}
 	if ss.done || t.closed || t.streams[ss.s.id] != ss.s {
 		ss.done = true
 		t.mu.Unlock()
