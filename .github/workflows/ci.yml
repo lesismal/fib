@@ -613,16 +613,16 @@ jobs:
         run: ./http3/interoprunner/local-test.sh fib-interop:ci
 
   # The real QUIC Interop Runner, with fib against quic-go, quiche and
-  # ngtcp2 in both roles. Opt-in (workflow_dispatch only) and non-blocking:
-  # it pulls the runner's network simulator and peer images, needs tshark
-  # and the runner's Python dependencies, and is slower and more brittle
-  # than the rest of the suite.
+  # ngtcp2 in both roles, on every push and pull request like every other
+  # job. Non-blocking: it pulls the runner's network simulator and peer
+  # images, needs tshark and the runner's Python dependencies, and a
+  # registry or peer-image failure is not a fib failure; a red job here is
+  # still read before a release.
   # The endpoint's supported testcases and the ones that exit 127 are listed
   # in http3/interoprunner/README.md; fib's missing ECN, QUIC v2, cipher
   # suite restriction and preferred_address are reported, not hidden.
   http3-interop-runner:
-    name: HTTP/3 QUIC Interop Runner (opt-in, non-blocking)
-    if: github.event_name == 'workflow_dispatch'
+    name: HTTP/3 QUIC Interop Runner (non-blocking)
     continue-on-error: true
     runs-on: ubuntu-latest
     timeout-minutes: 90

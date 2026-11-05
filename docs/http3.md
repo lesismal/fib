@@ -758,8 +758,9 @@ cases that exit 127, and the verified results are in
 
 The CI jobs are `HTTP/3 interop endpoint image` (blocking: builds the image
 and runs the supported cases against itself) and `HTTP/3 QUIC Interop
-Runner` (`workflow_dispatch` only and non-blocking: the real runner against
-quic-go, because it pulls the simulator and peer images and needs tshark).
+Runner` (on every push and pull request, non-blocking: the real runner
+against quic-go, quiche and ngtcp2 in both roles, non-blocking because it
+pulls the simulator and peer images and needs tshark).
 
 | Peer | What it checks |
 | --- | --- |

@@ -374,7 +374,7 @@ runs; the three have tests in `http3/quic`:
   the job is `continue-on-error`, so a Docker Hub rate limit never blocks a
   pull request.
 - `http3-interop-runner` runs the real runner against quic-go, quiche and
-  ngtcp2, both directions. It is `workflow_dispatch` only and
+  ngtcp2, both directions, on every push and pull request. It is
   `continue-on-error`, because it pulls the simulator and peer images, needs
   `tshark`, and the runner is slower and more brittle than the rest of the
   suite.

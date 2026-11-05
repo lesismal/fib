@@ -522,9 +522,9 @@ http3/interoprunner/run-runner.sh       # 真正的 runner，fib 对 quic-go
 `http3/interoprunner/README.md`。
 
 CI 里有两个 job：`HTTP/3 interop endpoint image`（阻塞：构建镜像并让端点自己对自己
-跑支持的用例）和 `HTTP/3 QUIC Interop Runner`（只在 `workflow_dispatch` 触发、
-非阻塞：真正的 runner 对 quic-go；它要拉模拟器和对端镜像，还要 tshark，较慢也更容易
-受环境影响）。
+跑支持的用例）和 `HTTP/3 QUIC Interop Runner`（每次 push 和 pull request 都跑、
+非阻塞：真正的 runner 对 quic-go、quiche 和 ngtcp2，双向；它要拉模拟器和对端镜像，
+还要 tshark，较慢也更容易受环境影响）。
 
 | 对端 | 验证内容 |
 | --- | --- |
