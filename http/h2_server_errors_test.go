@@ -189,6 +189,9 @@ func TestH2ServerRejectsMalformedRequests(t *testing.T) {
 		{"extended CONNECT with a bad :path", []string{":method", "CONNECT", ":protocol", "websocket", ":scheme", "http", ":authority", "x", ":path", "relative"}},
 		{"CONNECT with :path", []string{":method", "CONNECT", ":authority", "x:443", ":path", "/"}},
 		{"bad :path", get("relative")},
+		{":method with a request line", []string{":method", "GET /x HTTP/1.1\r\nX-Evil: 1\r\n", ":scheme", "http", ":authority", "t", ":path", "/"}},
+		{":authority with CRLF", []string{":method", "GET", ":scheme", "http", ":authority", "a\r\nInjected: 1\x00", ":path", "/"}},
+		{":path with a space", get("/a b")},
 		{"invalid content-length", append(get("/"), "content-length", "-1")},
 	} {
 		tc.headers(id, true, tt.fields...)

@@ -58,7 +58,12 @@ func TestH2NewRequest(t *testing.T) {
 	for _, path := range []string{"/", "/echo", "/a/b;c=d", "/q?x=1&y=2", "/q?", "/q?a?b", "/%41", "/sp%20ace",
 		"/!x", "/a#frag", "*"} {
 		st := &h2ServerStream{sc: sc}
-		req, err := sc.newRequest(testH2Fields(path), st)
+		fields := testH2Fields(path)
+		if path == "*" {
+			// Only OPTIONS may ask for "*" (RFC 9113 section 8.3.1).
+			fields[0].Value = stdhttp.MethodOptions
+		}
+		req, err := sc.newRequest(fields, st)
 		if err != nil {
 			t.Fatalf("%q: %v", path, err)
 		}
@@ -107,6 +112,67 @@ func TestH2NewRequest(t *testing.T) {
 	req.Header["X-Field-B"] = append(req.Header["X-Field-B"], "appended")
 	if got := req.Header["X-Field-C"]; !reflect.DeepEqual(got, []string{"v"}) {
 		t.Errorf("appending to X-Field-B changed X-Field-C to %q", got)
+	}
+}
+
+// TestH2NewRequestRejectsMalformedPseudoHeaders checks that a pseudo-header's
+// value is held to what its field is (RFC 9113 section 8.3): a method that is
+// a token, a path in origin form, or "*" for OPTIONS, and an authority, or a
+// Host standing in for it, that holds only what a host and port may. Each of
+// these once reached the handler with its CR, LF or NUL.
+func TestH2NewRequestRejectsMalformedPseudoHeaders(t *testing.T) {
+	sc := &h2ServerConn{remoteAddr: "192.0.2.1:1234"}
+	set := func(name, value string) []hpack.HeaderField {
+		fields := testH2Fields("/")
+		for i := range fields {
+			if fields[i].Name == name {
+				fields[i].Value = value
+			}
+		}
+		return fields
+	}
+	for _, tt := range []struct {
+		name   string
+		fields []hpack.HeaderField
+	}{
+		{"method with a request line", set(":method", "GET /x HTTP/1.1\r\nX-Evil: 1\r\n")},
+		{"method with a space", set(":method", "GET /")},
+		{"method with a separator", set(":method", "GE(T")},
+		{"authority with CRLF", set(":authority", "a\r\nInjected: 1\x00")},
+		{"authority with a space", set(":authority", "a b")},
+		{"authority with userinfo", set(":authority", "user@host")},
+		{"authority with a slash", set(":authority", "host/x")},
+		{"path with a space", set(":path", "/a b")},
+		{"path with a tab", set(":path", "/a\tb")},
+		{"path with DEL", set(":path", "/a\x7f")},
+		{"path in absolute form", set(":path", "http://h/")},
+		{"asterisk for GET", set(":path", "*")},
+		{"scheme with a space", set(":scheme", "ht tp")},
+		{"scheme starting with a digit", set(":scheme", "1http")},
+		{"Host with a space", []hpack.HeaderField{{Name: ":method", Value: "GET"}, {Name: ":scheme", Value: "http"},
+			{Name: ":path", Value: "/"}, {Name: "host", Value: "a b"}}},
+		{"protocol with a space", []hpack.HeaderField{{Name: ":method", Value: "CONNECT"}, {Name: ":protocol", Value: "web socket"},
+			{Name: ":scheme", Value: "http"}, {Name: ":authority", Value: "a"}, {Name: ":path", Value: "/"}}},
+	} {
+		if req, err := sc.newRequest(tt.fields, &h2ServerStream{sc: sc}); err == nil {
+			t.Errorf("%s: accepted, Method %q Host %q RequestURI %q", tt.name, req.Method, req.Host, req.RequestURI)
+		}
+	}
+	// What they may hold still passes.
+	for _, tt := range []struct {
+		name   string
+		fields []hpack.HeaderField
+	}{
+		{"extension method", set(":method", "PROPFIND")},
+		{"IPv6 authority with a port", set(":authority", "[::1]:8080")},
+		{"authority with a zone", set(":authority", "[fe80::1%25en0]")},
+		{"scheme with marks", set(":scheme", "svn+ssh")},
+		{"path with a query", set(":path", "/a?b=c%20d&e=/f")},
+		{"asterisk for OPTIONS", append(set(":path", "*")[1:], hpack.HeaderField{Name: ":method", Value: "OPTIONS"})},
+	} {
+		if _, err := sc.newRequest(tt.fields, &h2ServerStream{sc: sc}); err != nil {
+			t.Errorf("%s: %v", tt.name, err)
+		}
 	}
 }
 

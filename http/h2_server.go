@@ -1290,6 +1290,14 @@ func (sc *h2ServerConn) newRequest(fields []hpack.HeaderField, st *h2ServerStrea
 	if method == "" {
 		return nil, errors.New("missing :method")
 	}
+	// The pseudo-headers' values were only checked as any field's value is,
+	// which lets spaces and controls through into what a handler, or a proxy
+	// writing the request out as HTTP/1, takes for a method, target or host.
+	if !h2ValidMethod(method) || scheme != "" && !h2ValidScheme(scheme) ||
+		!h2ValidAuthority(authority) || path != "" && !h2ValidPath(method, path) ||
+		seen[4] && !validFieldName(protocol) {
+		return nil, errors.New("malformed pseudo-header")
+	}
 	req := &st.block.Request
 	*req = stdhttp.Request{
 		Method:     method,
@@ -1334,6 +1342,9 @@ func (sc *h2ServerConn) newRequest(fields []hpack.HeaderField, st *h2ServerStrea
 	req.Host = authority
 	if req.Host == "" {
 		req.Host = header.Get("Host")
+		if !h2ValidAuthority(req.Host) {
+			return nil, errors.New("malformed Host")
+		}
 	}
 	header.Del("Host")
 	return req, nil
