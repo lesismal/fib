@@ -662,12 +662,23 @@ jobs:
           # see README.md for the full list and how to run it.
           TESTCASES: http3,handshake,transfer,retry,resumption,zerortt
         run: ./http3/interoprunner/run-runner.sh
+      # The runner names its log directories by time, with colons, which
+      # upload-artifact refuses in a path; a tarball carries them as they are.
+      - name: Pack the runner logs
+        if: always()
+        working-directory: ${{ runner.temp }}/quic-interop-runner
+        run: |
+          shopt -s nullglob
+          logs=(logs_*)
+          if (( ${#logs[@]} )); then
+            tar -czf "$RUNNER_TEMP/http3-interop-runner-logs.tar.gz" "${logs[@]}"
+          fi
       - name: Upload the runner logs
         if: always()
         uses: actions/upload-artifact@v5
         with:
           name: http3-interop-runner-logs
-          path: ${{ runner.temp }}/quic-interop-runner/logs_*
+          path: ${{ runner.temp }}/http3-interop-runner-logs.tar.gz
           if-no-files-found: ignore
 
   # The media servers against ffmpeg: one engine serves every protocol, as
