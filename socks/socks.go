@@ -91,7 +91,10 @@ const (
 	CommandConnect Command = 1
 	// CommandBind asks the proxy to accept one connection from the
 	// destination, as the data connection of FTP's active mode needs, and
-	// relay it.
+	// relay it. A Server accepts it only from the destination's IP, or from
+	// one of the addresses its name resolves to; a destination of the
+	// unspecified address, 0.0.0.0 or ::, lets any host connect, and an
+	// Allow that refuses such BINDs keeps that from happening.
 	CommandBind Command = 2
 	// CommandUDPAssociate asks the proxy to relay UDP datagrams (SOCKS5
 	// only).

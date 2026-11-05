@@ -1,8 +1,10 @@
 package socks
 
 import (
+	"context"
 	"net"
 	"net/netip"
+	"slices"
 	"sync"
 	"time"
 
@@ -22,9 +24,14 @@ var listenTCP = net.ListenTCP
 
 // binding is a BIND waiting for its peer.
 type binding struct {
-	sc     *serverConn
-	ln     *net.TCPListener
-	expect netip.Addr
+	sc *serverConn
+	ln *net.TCPListener
+	// expect are the addresses the peer may connect from, those of the host
+	// the client named; none means any, when it named the unspecified
+	// address. name is that host when it is a name, resolved before the
+	// peer is accepted.
+	expect []netip.Addr
+	name   string
 }
 
 // bind listens for a BIND's peer, on the address the client reached the
@@ -35,28 +42,75 @@ func (s *Server) bind(sc *serverConn, req *Request) {
 		sc.refuse(ReplyCommandNotSupported)
 		return
 	}
+	host, _, err := splitHostPort(req.Addr)
+	if err != nil {
+		sc.refuse(ReplyAddressNotSupported)
+		return
+	}
+	if !s.startBind() {
+		sc.refuse(ReplyGeneralFailure)
+		return
+	}
 	ln, err := listenTCP("tcp", &net.TCPAddr{IP: local.IP, Zone: local.Zone})
 	if err != nil {
+		s.endBind()
 		sc.refuse(replyCode(err))
 		return
 	}
 	b := &binding{sc: sc, ln: ln}
-	// Only the peer the client named may connect, when it named one by IP.
-	if host, _, err := splitHostPort(req.Addr); err == nil {
-		if ip, err := netip.ParseAddr(host); err == nil && !ip.IsUnspecified() {
-			b.expect = ip.Unmap()
-		}
+	// Only the peer the client named may connect: an IP, or the addresses
+	// a name resolves to. The unspecified address names none.
+	if ip, err := netip.ParseAddr(host); err != nil {
+		b.name = host
+	} else if !ip.IsUnspecified() {
+		b.expect = []netip.Addr{ip.Unmap()}
 	}
 	sc.mu.Lock()
 	sc.binding = b
 	sc.mu.Unlock()
 	sc.reply(ReplySucceeded, ln.Addr())
-	go b.accept(s.config.BindTimeout)
+	go func() {
+		defer s.endBind()
+		b.accept(s.config.BindTimeout)
+	}()
+}
+
+// startBind counts a BIND that is to wait for its peer, unless MaxBinds
+// already are.
+func (s *Server) startBind() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.config.MaxBinds > 0 && s.binds >= s.config.MaxBinds {
+		return false
+	}
+	s.binds++
+	return true
+}
+
+// endBind forgets a BIND that no longer waits.
+func (s *Server) endBind() {
+	s.mu.Lock()
+	s.binds--
+	s.mu.Unlock()
 }
 
 // accept waits for the peer, and relays it.
 func (b *binding) accept(timeout time.Duration) {
-	_ = b.ln.SetDeadline(time.Now().Add(timeout))
+	deadline := time.Now().Add(timeout)
+	_ = b.ln.SetDeadline(deadline)
+	if b.name != "" {
+		ctx, cancel := context.WithDeadline(context.Background(), deadline)
+		ips, err := net.DefaultResolver.LookupNetIP(ctx, "ip", b.name)
+		cancel()
+		if err != nil {
+			_ = b.ln.Close()
+			b.sc.bindFailed(err)
+			return
+		}
+		for _, ip := range ips {
+			b.expect = append(b.expect, ip.Unmap())
+		}
+	}
 	for {
 		conn, err := b.ln.AcceptTCP()
 		if err != nil {
@@ -64,7 +118,7 @@ func (b *binding) accept(timeout time.Duration) {
 			b.sc.bindFailed(err)
 			return
 		}
-		if b.expect.IsValid() && conn.RemoteAddr().(*net.TCPAddr).AddrPort().Addr().Unmap() != b.expect {
+		if len(b.expect) > 0 && !slices.Contains(b.expect, conn.RemoteAddr().(*net.TCPAddr).AddrPort().Addr().Unmap()) {
 			_ = conn.Close()
 			continue
 		}

@@ -18,6 +18,7 @@ const (
 	DefaultBindTimeout      = 2 * time.Minute
 	DefaultMaxQueuedBytes   = 256 << 10
 	DefaultMaxUDPTargets    = 256
+	DefaultMaxBinds         = 64
 )
 
 // Config is how a Server serves its clients.
@@ -66,6 +67,11 @@ type Config struct {
 	// BindTimeout bounds how long a BIND waits for its peer to connect. Zero
 	// means DefaultBindTimeout.
 	BindTimeout time.Duration
+	// MaxBinds bounds the BINDs waiting for their peers at once, across
+	// the server, each of which holds a listening socket and a goroutine for
+	// up to BindTimeout; one more is refused with a general failure. Zero
+	// means DefaultMaxBinds, and a negative value no bound.
+	MaxBinds int
 	// MaxQueuedBytes is how much of what one side of a relayed connection
 	// sends may wait for the other side's socket before the proxy stops
 	// reading the first side, so that a fast sender is held back by TCP flow
@@ -118,6 +124,8 @@ type Server struct {
 	// associations are the UDP associations open, by their clients' IP.
 	mu           sync.Mutex
 	associations map[netip.Addr][]*association
+	// binds counts the BINDs waiting for their peers.
+	binds int
 }
 
 var (
@@ -147,6 +155,9 @@ func NewServer(config Config) *Server {
 	}
 	if config.MaxUDPTargets <= 0 {
 		config.MaxUDPTargets = DefaultMaxUDPTargets
+	}
+	if config.MaxBinds == 0 {
+		config.MaxBinds = DefaultMaxBinds
 	}
 	return &Server{config: config, direct: direct, associations: make(map[netip.Addr][]*association)}
 }
