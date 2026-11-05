@@ -85,7 +85,10 @@ func TestResponseHeaderTimeout(t *testing.T) {
 // by ResponseHeaderTimeout while it waits for a new connection: the wait for
 // the header starts again once it has been sent on that one.
 func TestResponseHeaderTimeoutSkipsRetryWait(t *testing.T) {
-	const wait = 150 * time.Millisecond
+	// The header wait also covers the first try, from its send until the
+	// client sees the hang-up, which a loaded runner under the race detector
+	// can stretch past 150ms; the retry's dial still takes three times it.
+	const wait = 500 * time.Millisecond
 	url := rawServer(t, func(conn net.Conn, _ int) {
 		reader := bufio.NewReader(conn)
 		for served := 0; ; served++ {
