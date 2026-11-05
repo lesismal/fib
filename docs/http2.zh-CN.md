@@ -163,7 +163,8 @@ header block 之间能保留多少。
   `lingerTimeout`（500ms），客户端因此能读到 GOAWAY 而不是 RST。`Engine.Close` 切断的
   连接不会 linger，其中仍有未读输入的可能被 RST。
 - **空闲与保活**：服务端在连接 `Config.IdleTimeout`（未设时用 `ReadTimeout`；`DefaultConfig`
-  中为 2 分钟）内没有任何流时发出 GOAWAY `NO_ERROR` 并关闭。设置 `Config.PingInterval`
+  中为 2 分钟；handler 用 `Context.SetIdleTimeout` 设置过的，用它设的值）内没有任何流时发出
+  GOAWAY `NO_ERROR` 并关闭。设置 `Config.PingInterval`
   后，连接超过一个间隔没有发送任何数据时服务端会发 PING，`Config.PingTimeout` 内没有
   任何回应则关闭连接；默认不发 PING。客户端的 PING 健康检查见[客户端](#客户端)。
 - **SETTINGS 确认超时**：客户端未在 `Config.SettingsTimeout`（默认 10 秒）内确认服务端的

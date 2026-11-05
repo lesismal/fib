@@ -172,6 +172,10 @@ type h2ServerConn struct {
 	// ended; see armIdleLocked. Nil without an IdleTimeout.
 	idleTimer *time.Timer
 	idleSince time.Time
+	// idleOverride is the idle timeout a handler gave the connection with
+	// Context.SetIdleTimeout, in nanoseconds, or zero for Config's; see
+	// idleFor. Atomic because a handler sets it on its own goroutine.
+	idleOverride atomic.Int64
 	// settingsTimer ends the connection unless the client acknowledges the
 	// server's SETTINGS in time, and settingsAcked says it has; see
 	// armLivenessLocked. pingTimer checks on a client that has gone quiet,
@@ -409,11 +413,12 @@ func (sc *h2ServerConn) start() {
 
 // armIdleLocked starts timing the connection's idleness, now that it carries
 // no stream: Config.IdleTimeout (ReadTimeout when it is not set, as on
-// HTTP/1 and in net/http) after this, unless a stream opens first, the
+// HTTP/1 and in net/http), or what a handler set with
+// Context.SetIdleTimeout, after this, unless a stream opens first, the
 // connection is retired as on shutdown — GOAWAY with NO_ERROR, then closed
 // once what it sent is out. Callers hold sc.mu.
 func (sc *h2ServerConn) armIdleLocked() {
-	d := sc.handler.idleTimeout()
+	d := sc.idleFor()
 	if d <= 0 || sc.closed || sc.goAway {
 		return
 	}
@@ -423,6 +428,15 @@ func (sc *h2ServerConn) armIdleLocked() {
 	} else {
 		sc.idleTimer.Reset(d)
 	}
+}
+
+// idleFor is how long the connection may carry no stream: what a handler
+// set with Context.SetIdleTimeout, or else Config's.
+func (sc *h2ServerConn) idleFor() time.Duration {
+	if d := sc.idleOverride.Load(); d != 0 {
+		return time.Duration(d)
+	}
+	return sc.handler.idleTimeout()
 }
 
 // busyLocked stops timing idleness, now that a stream has opened. Callers
@@ -440,7 +454,7 @@ func (sc *h2ServerConn) busyLocked() {
 func (sc *h2ServerConn) idleExpired() {
 	sc.lock()
 	defer sc.unlock()
-	if sc.closed || sc.goAway || len(sc.streams) > 0 || time.Since(sc.idleSince) < sc.handler.idleTimeout() {
+	if sc.closed || sc.goAway || len(sc.streams) > 0 || time.Since(sc.idleSince) < sc.idleFor() {
 		return
 	}
 	sc.goAway = true

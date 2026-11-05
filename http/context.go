@@ -44,10 +44,17 @@ type serverState struct {
 	// retained one apart from what arrives once the handshake is over.
 	// Guarded by the parser's mu.
 	earlyPending int64
+	// idleOverride is the idle timeout a handler gave the connection with
+	// Context.SetIdleTimeout, in nanoseconds, which stands in for Config's
+	// whenever the connection waits for its next request, or zero for
+	// Config's. It is atomic because a handler that retained its request may
+	// set it from any goroutine, while the connection's worker reads it.
+	idleOverride atomic.Int64
 }
 
 func (p *Parser) resetServerState() {
 	p.liveContext.Store(nil)
+	p.idleOverride.Store(0)
 	p.writeDeadline = time.Time{}
 	p.bodyDeadline, p.bodyArmed = nil, false
 	p.quietSince = 0

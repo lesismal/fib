@@ -354,3 +354,63 @@ func TestIdleExpiredStale(t *testing.T) {
 		}
 	}
 }
+
+// A handler's Context.SetIdleTimeout is the connection's idle timeout from
+// when its last request ends, until a handler sets it again: a short one
+// retires the connection though the server's is long, and a long one keeps
+// it past the server's, request after request, until a handler gives it the
+// server's back.
+func TestSetIdleTimeout(t *testing.T) {
+	const short, long = 250 * time.Millisecond, 3 * time.Second
+	handler := func(c *fibhttp.Context) {
+		var err error
+		switch c.Request.URL.Path {
+		case "/short":
+			err = c.SetIdleTimeout(short)
+		case "/long":
+			err = c.SetIdleTimeout(long)
+		case "/reset":
+			err = c.SetIdleTimeout(0)
+		}
+		if err != nil {
+			_ = c.Respond(500, "text/plain", []byte(err.Error()))
+			return
+		}
+		_ = c.Respond(200, "text/plain", []byte("ok"))
+	}
+	t.Run("short", func(t *testing.T) {
+		w := dialIdleWire(t, startServer(t, DefaultConfig(), handler), quic.Config{})
+		if !w.awaitEnd(w.request("/short")) {
+			t.Fatal("the request was reset")
+		}
+		start := time.Now()
+		w.expectRetired(4)
+		if waited := time.Since(start); waited > 3*time.Second {
+			t.Fatalf("retired after %v", waited)
+		}
+	})
+	t.Run("long, kept until reset", func(t *testing.T) {
+		const idle = 250 * time.Millisecond
+		config := DefaultConfig()
+		config.IdleTimeout = idle
+		w := dialIdleWire(t, startServer(t, config, handler), quic.Config{KeepAlivePeriod: 50 * time.Millisecond})
+		for i, path := range []string{"/long", "/", "/reset"} {
+			if i > 0 {
+				time.Sleep(3 * idle)
+			}
+			if !w.awaitEnd(w.request(path)) {
+				t.Fatalf("%s was reset", path)
+			}
+			select {
+			case id := <-w.goAway:
+				t.Fatalf("GOAWAY (%d) within the handler's idle timeout", id)
+			default:
+			}
+		}
+		start := time.Now()
+		w.expectRetired(12)
+		if waited := time.Since(start); waited > long/2 {
+			t.Fatalf("retired after %v", waited)
+		}
+	})
+}

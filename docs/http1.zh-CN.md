@@ -195,6 +195,15 @@ context 一致。它不引用 `Context` 本身，所以即使 Reuse 选项把 `C
 调大 `ReadBodyTimeout`；不经 `DefaultConfig` 构造的 `Config` 没有这些超时。超时的连接会被关闭，
 `OnClose` 收到 `os.ErrDeadlineExceeded`。
 
+handler 可以用 `Context.SetIdleTimeout(d)` 给请求所在的连接单独设一个空闲超时：从这个响应
+结束起，直到后面某个 handler 再次设置为止，这条连接每次等下一个请求时都用它代替
+`IdleTimeout`；`d` 为 0 时恢复 server 的设置。server 没设 `IdleTimeout` 时它同样生效。这样
+server 可以把自己的空闲超时设得很短，留给还没表明身份的连接，再给请求够格的连接（例如带有效
+session 的）换成较长的。排在设置它的请求之后的 pipeline 请求照常先处理完，它约束的是那之后的
+等待。在 HTTP/2 和 HTTP/3 上它属于整条连接，任何一个请求的 handler 都可以设置：约束的是连接
+没有任何流的时长，从最后一个流结束算起（QUIC 在握手时协商的 `MaxIdleTimeout` 不变）。不调用它
+的请求没有任何额外开销。
+
 用哪一个取决于连接在等什么：
 
 | 在等 | 受限于 | 从什么时候算 |

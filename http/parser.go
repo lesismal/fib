@@ -197,7 +197,8 @@ type Config struct {
 	// requests. Zero means ReadTimeout; both zero means no limit.
 	// DefaultConfig sets DefaultIdleTimeout. On HTTP/2 it bounds a
 	// connection that carries no stream, which is then retired with GOAWAY
-	// (NO_ERROR) and closed.
+	// (NO_ERROR) and closed. A handler can give its connection one of its
+	// own with Context.SetIdleTimeout.
 	IdleTimeout time.Duration
 	// WriteTimeout bounds how long a response may take to be written,
 	// measured from when its handler is called, as net/http.Server's does. A

@@ -224,7 +224,8 @@ the table what either side's HPACK encoder may keep between header blocks.
   with unread input may still be reset.
 - **Idle and keep-alive**: the server retires a connection that has carried
   no stream for `Config.IdleTimeout` (`ReadTimeout` when it is not set; 2
-  minutes in `DefaultConfig`) with GOAWAY `NO_ERROR`. With
+  minutes in `DefaultConfig`), or for what a handler set with
+  `Context.SetIdleTimeout`, with GOAWAY `NO_ERROR`. With
   `Config.PingInterval` it also pings a connection that has sent nothing for
   an interval, and closes one that answers nothing within
   `Config.PingTimeout`; the default sends no PING. The client's PING health

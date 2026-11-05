@@ -220,3 +220,43 @@ func TestH2IdleExpiredStale(t *testing.T) {
 		t.Fatal("a stale idle timer retired the connection")
 	}
 }
+
+// On HTTP/2 the idle timeout is the connection's: it bounds how long the
+// connection may carry no stream, from when its last one ends, until a
+// handler sets it again.
+func TestSetIdleTimeoutH2(t *testing.T) {
+	ok := func(tc *h2TestConn, id uint32, path string) {
+		t.Helper()
+		tc.headers(id, true, get(path)...)
+		if _, body := tc.response(id); string(body) != path {
+			t.Fatalf("stream %d: body %q, want %q", id, body, path)
+		}
+	}
+	t.Run("short", func(t *testing.T) {
+		config := DefaultConfig()
+		config.IdleTimeout = time.Minute
+		tc := dialH2(t, serve(t, NewHandlerWithConfig(config, HandlerFunc(idleOverrideHandler))))
+		ok(tc, 1, "/short")
+		ok(tc, 3, "/")
+		start := time.Now()
+		expectIdleGoAway(t, tc, 3)
+		if waited := time.Since(start); waited > 3*time.Second {
+			t.Fatalf("retired after %v", waited)
+		}
+	})
+	t.Run("long, kept until reset", func(t *testing.T) {
+		config := DefaultConfig()
+		config.IdleTimeout = h2TestIdle
+		tc := dialH2(t, serve(t, NewHandlerWithConfig(config, HandlerFunc(idleOverrideHandler))))
+		ok(tc, 1, "/long")
+		time.Sleep(3 * h2TestIdle)
+		ok(tc, 3, "/")
+		time.Sleep(3 * h2TestIdle)
+		ok(tc, 5, "/reset")
+		start := time.Now()
+		expectIdleGoAway(t, tc, 5)
+		if waited := time.Since(start); waited > overrideLong/2 {
+			t.Fatalf("retired after %v", waited)
+		}
+	})
+}

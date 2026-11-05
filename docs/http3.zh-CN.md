@@ -73,7 +73,8 @@
 
 `IdleTimeout` 和 `ReadHeaderTimeout` 未设时用 `ReadTimeout`，与 HTTP/1、HTTP/2 一致；负数表示不限。
 只靠 `MaxIdleTimeout` 约束不了空闲连接：发 PING（QUIC keep-alive）的客户端不发请求也能一直保持
-连接，`IdleTimeout` 就是为此而设。header 和 body 的计时器只在某次投递没能收全请求时才会创建，
+连接，`IdleTimeout` 就是为此而设。handler 可以用 `http.Context.SetIdleTimeout` 给自己所在的连接
+单独设一个，从连接最后一个请求结束起代替 `IdleTimeout`，直到再次设置（0 恢复 server 的设置）。header 和 body 的计时器只在某次投递没能收全请求时才会创建，
 所以一个包就收全的请求（大多数如此）没有这部分开销。
 - Engine 为每个 UDP 连接最多排队 1024 个待处理的数据报，超出的会被丢弃，由 QUIC 按丢包
   处理。

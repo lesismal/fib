@@ -256,6 +256,21 @@ request between them; a server that takes longer uploads raises
 `ReadBodyTimeout`, and a `Config` built without `DefaultConfig` has none. A connection that outstays one is closed, and its
 `OnClose` is given `os.ErrDeadlineExceeded`.
 
+A handler can give the connection its request came on an idle timeout of its
+own with `Context.SetIdleTimeout(d)`: it stands in for `IdleTimeout` every
+time that connection waits for its next request, from the end of this
+response until a later handler sets it again, and a `d` of zero gives the
+connection the server's back. It applies whether or not the server sets an
+`IdleTimeout`. A server can so keep its own idle timeout short, for
+connections that have not shown who they are, and give a longer one to the
+connections whose requests earn it, such as those carrying a valid session.
+Requests pipelined behind the one that sets it are answered first; it bounds
+the wait after them. On HTTP/2 and HTTP/3 it is the connection's, and any of
+its requests' handlers may set it: it bounds how long the connection may carry
+no stream, from when its last one ends (QUIC's `MaxIdleTimeout`, agreed on in
+the handshake, is not changed). A request that does not call it costs nothing
+more.
+
 Which one applies is decided by what the connection is waiting for:
 
 | Waiting for | Bounded by | Measured from |

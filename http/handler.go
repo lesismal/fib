@@ -391,6 +391,17 @@ type StreamDeadliner interface {
 	SetWriteDeadline(t time.Time) error
 }
 
+// StreamIdleTimeouter is implemented by a Stream whose connection can be
+// given an idle timeout of its own, which is what Context.SetIdleTimeout
+// hands on to it once the Context has checked the response is not finished:
+// d, never negative, bounds how long the connection may carry no request
+// from when it next has none, until it is set again, and zero gives it back
+// the server's. A Stream that does not implement it has SetIdleTimeout
+// report http.ErrNotSupported.
+type StreamIdleTimeouter interface {
+	SetIdleTimeout(d time.Duration) error
+}
+
 // ParseRequestTarget parses an origin-form request target into u, as
 // url.ParseRequestURI does, but without allocating for the plain path and
 // query nearly every request has: those are slices of target. It is for
@@ -1027,7 +1038,10 @@ func (h *ServerHandler) armRead(c *fib.Connection, parser *Parser) {
 		h.armBodyRead(c, parser)
 		return
 	}
-	if h.timed {
+	// A server with timeouts has h.timed set, and reads nothing more here;
+	// one without them reads whether a handler gave this connection an idle
+	// timeout of its own.
+	if h.timed || parser.idleOverride.Load() != 0 {
 		_ = c.SetReadDeadline(h.readDeadline(parser))
 	}
 }
@@ -1039,7 +1053,8 @@ func (h *ServerHandler) armRead(c *fib.Connection, parser *Parser) {
 // way to whatever the connection waits for next after that.
 func (h *ServerHandler) armBodyRead(c *fib.Connection, parser *Parser) {
 	var at time.Time
-	if h.timed {
+	timed := h.timed || parser.idleOverride.Load() != 0
+	if timed {
 		at = h.readDeadline(parser)
 	}
 	b := parser.bodyDeadline
@@ -1054,7 +1069,7 @@ func (h *ServerHandler) armBodyRead(c *fib.Connection, parser *Parser) {
 	if own {
 		at = b.at
 	}
-	if h.timed || own || b.applied {
+	if timed || own || b.applied {
 		_ = c.SetReadDeadline(at)
 	}
 	b.applied = own
@@ -1068,7 +1083,11 @@ func (h *ServerHandler) readDeadline(parser *Parser) time.Time {
 	var at time.Time
 	switch state := parser.waitState(); state {
 	case waitIdle:
-		if d := h.idleTimeout(); d > 0 {
+		d := h.idleTimeout()
+		if own := parser.idleOverride.Load(); own != 0 {
+			d = time.Duration(own)
+		}
+		if d > 0 {
 			at = time.Now().Add(d)
 		}
 	case waitHeader, waitBody:
@@ -1122,7 +1141,7 @@ func (h *ServerHandler) releaseTimeouts(c *fib.Connection, parser *Parser) {
 		b.open, b.owner, b.applied = nil, nil, false
 		b.mu.Unlock()
 	}
-	if h.timed || applied {
+	if h.timed || applied || parser.idleOverride.Load() != 0 {
 		_ = c.SetReadDeadline(time.Time{})
 	}
 	if h.config.WriteTimeout > 0 || !parser.writeDeadline.IsZero() {
@@ -1391,7 +1410,7 @@ func (h *ServerHandler) serveParsed(c *fib.Connection, parser *Parser, data []by
 			// a body that came in with its header reads straight to io.EOF.
 			_, bodyErr = parser.pumpBody(nil)
 		}
-		if h.timed && parser.stream == nil {
+		if (h.timed || parser.idleOverride.Load() != 0) && parser.stream == nil {
 			// The request has all arrived, so nothing is waiting on the peer
 			// any more: the handler's time is its own, and the deadline for
 			// whatever comes next is set when this round ends. A request

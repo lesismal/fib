@@ -95,7 +95,10 @@ Behavior users need to be aware of.
 `IdleTimeout` and `ReadHeaderTimeout` fall back to `ReadTimeout`, as on HTTP/1
 and HTTP/2, and a negative value means no limit. `MaxIdleTimeout` alone does
 not bound an idle connection: a client that sends PINGs, QUIC keep-alives,
-keeps it open without a request, which `IdleTimeout` is for. The header and
+keeps it open without a request, which `IdleTimeout` is for. A handler can
+give its connection one of its own with `http.Context.SetIdleTimeout`, which
+stands in for `IdleTimeout` from when the connection's last request ends,
+until it is set again (zero gives back the server's). The header and
 body timers are armed only for a request a delivery left incomplete, so a
 request that arrives whole in one packet, as most do, costs none.
 - The engine queues at most 1024 unprocessed datagrams per UDP connection; more

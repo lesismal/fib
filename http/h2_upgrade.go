@@ -54,6 +54,9 @@ func (h *ServerHandler) upgradeH2C(c *fib.Connection, parser *Parser, request *s
 		return
 	}
 	rest := parser.TakeBuffered()
+	// An idle timeout a handler gave the connection while it was HTTP/1
+	// stays its own.
+	sc.idleOverride.Store(parser.idleOverride.Load())
 	h.releaseTimeouts(c, parser)
 	// The connection is HTTP/2 from here on; see startH2.
 	c.SetAttachment(sc)

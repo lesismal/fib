@@ -672,6 +672,52 @@ func (c *Context) SetReadDeadline(t time.Time) error {
 	return stdhttp.ErrNotSupported
 }
 
+// SetIdleTimeout gives the connection the request came on an idle timeout
+// of its own: how long it may carry no request, in place of
+// Config.IdleTimeout (ReadTimeout when that is not set) for this connection
+// alone, whether or not the server sets one. It applies from the end of
+// this response, and to every time the connection waits for a request
+// after that, until a later request's handler sets it again; a d of zero
+// or less gives the connection the server's back. A server can so keep its
+// own idle timeout short and give a longer one to the connections whose
+// requests earn it, such as those that carry a valid session.
+//
+// On HTTP/1 it bounds the wait for the next request, as IdleTimeout does
+// (and for requests pipelined behind this one, it applies once they have
+// been answered and the connection waits again). On HTTP/2 and HTTP/3,
+// which carry many requests at once, it is the connection's: it bounds how
+// long the connection may carry no stream before it is retired with
+// GOAWAY, from when its last stream ends, and any request's handler may set
+// it. It does not change QUIC's MaxIdleTimeout, which the endpoints agree
+// on in the handshake.
+//
+// It costs a request that does not call it nothing. It reports
+// ErrResponseWritten once the response is finished, and
+// http.ErrNotSupported on a stream served outside this package that is not
+// a StreamIdleTimeouter.
+func (c *Context) SetIdleTimeout(d time.Duration) error {
+	if c.wrote {
+		return ErrResponseWritten
+	}
+	if d < 0 {
+		d = 0
+	}
+	switch {
+	case c.isHTTP1():
+		if c.parser != nil {
+			c.parser.idleOverride.Store(int64(d))
+		}
+		return nil
+	case c.stream != nil:
+		c.stream.sc.idleOverride.Store(int64(d))
+		return nil
+	}
+	if s, ok := c.external.(StreamIdleTimeouter); ok {
+		return s.SetIdleTimeout(d)
+	}
+	return stdhttp.ErrNotSupported
+}
+
 // ReadFrom copies src into the response body, as io.Copy does through
 // io.ReaderFrom. On an HTTP/1 connection a regular file, or an
 // *io.LimitedReader over one as http.ServeContent passes, goes from the file

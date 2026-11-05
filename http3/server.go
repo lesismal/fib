@@ -167,7 +167,8 @@ type Config struct {
 	// on HTTP/2. It differs from MaxIdleTimeout, QUIC's, which only closes a
 	// connection that hears no packet at all, and which a client that pings
 	// keeps open with no request. Zero means ReadTimeout; both zero means no
-	// limit. DefaultConfig sets http.DefaultIdleTimeout.
+	// limit. DefaultConfig sets http.DefaultIdleTimeout. A handler can give
+	// its connection one of its own with http.Context.SetIdleTimeout.
 	IdleTimeout time.Duration
 	// ReadHeaderTimeout bounds how long a request's header may take to
 	// arrive, from the first of its stream's bytes that did not complete it:
@@ -996,6 +997,10 @@ type serverConn struct {
 	idleTimer   *time.Timer
 	idleSince   time.Time
 	lastRequest time.Time
+	// idleOverride is the idle timeout a handler gave the connection with
+	// Context.SetIdleTimeout, in nanoseconds, or zero for Config's; see
+	// idleFor. Atomic because a handler sets it on its own goroutine.
+	idleOverride atomic.Int64
 }
 
 func (sc *serverConn) OnHandshake(qc *quic.Conn) {
@@ -1063,7 +1068,7 @@ func headerTimeout(config *Config) time.Duration {
 // armIdleLocked starts timing the connection's idleness, now that it carries
 // no request. Callers hold sc.mu.
 func (sc *serverConn) armIdleLocked() {
-	d := idleTimeout(&sc.h.config)
+	d := sc.idleFor()
 	if d <= 0 || sc.goingAway || sc.streams.closed {
 		return
 	}
@@ -1073,6 +1078,15 @@ func (sc *serverConn) armIdleLocked() {
 	} else {
 		sc.idleTimer.Reset(d)
 	}
+}
+
+// idleFor is how long the connection may carry no request: what a handler
+// set with Context.SetIdleTimeout, or else Config's.
+func (sc *serverConn) idleFor() time.Duration {
+	if d := sc.idleOverride.Load(); d != 0 {
+		return time.Duration(d)
+	}
+	return idleTimeout(&sc.h.config)
 }
 
 // busyLocked stops timing idleness, now that a request is open. Callers hold
@@ -1090,7 +1104,7 @@ func (sc *serverConn) busyLocked() {
 // request opened, or for an idleness that began again since, finds the
 // connection busy, or idle for less, and leaves it alone.
 func (sc *serverConn) idleExpired() {
-	d := idleTimeout(&sc.h.config)
+	d := sc.idleFor()
 	sc.mu.Lock()
 	if sc.goingAway || sc.streams.closed || sc.streams.n > 0 {
 		sc.mu.Unlock()
@@ -2415,6 +2429,15 @@ func (rs *requestStream) armWriteTimeout() {
 	rs.mu.Unlock()
 }
 
+// SetIdleTimeout gives the stream's connection an idle timeout of its own,
+// which bounds how long it may carry no request from when its last request
+// stream ends, until it is set again; zero gives it back Config's. See
+// http.StreamIdleTimeouter.
+func (rs *requestStream) SetIdleTimeout(d time.Duration) error {
+	rs.sc.idleOverride.Store(int64(d))
+	return nil
+}
+
 // SetWriteDeadline replaces the clock armWriteTimeout started on the
 // response with one that runs out at t, or with none when t is zero; see
 // http.StreamDeadliner. A timer that has fired already has the stream on its
@@ -2596,8 +2619,9 @@ func (rs *requestStream) stopReadTimerLocked() bool {
 }
 
 var (
-	_ fibhttp.StreamDeadliner = (*requestStream)(nil)
-	_ fibhttp.StreamAbandoner = (*requestStream)(nil)
+	_ fibhttp.StreamDeadliner     = (*requestStream)(nil)
+	_ fibhttp.StreamAbandoner     = (*requestStream)(nil)
+	_ fibhttp.StreamIdleTimeouter = (*requestStream)(nil)
 )
 
 // stopWriteTimerLocked stops the write timer, if there is one, and reports
