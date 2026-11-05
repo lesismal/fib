@@ -388,6 +388,9 @@ func TestClientHandshakeFailures(t *testing.T) {
 		{"unoffered subprotocol", func(req *stdhttp.Request) string {
 			return strings.TrimSuffix(upgradeResponse(req), "\r\n") + "Sec-WebSocket-Protocol: surprise\r\n\r\n"
 		}, 101},
+		{"bare LF", func(req *stdhttp.Request) string {
+			return strings.Replace(upgradeResponse(req), "\r\n", "\r\nX-A: 1\nX-B: 2\r\n", 1)
+		}, 0},
 		{"closed early", nil, 0},
 	}
 	for _, tc := range cases {

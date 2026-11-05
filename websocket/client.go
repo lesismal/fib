@@ -350,6 +350,12 @@ func (cc *clientConn) OnData(conn *fib.Connection, data []byte) {
 		return
 	}
 	headerEnd := headerAt + 4
+	if bareLF(cc.response[:headerEnd]) {
+		// net/http would end the head at a bare LF, before the CRLFCRLF
+		// that framed it here, and the bytes between would be lost.
+		cc.fail(nil, fmt.Errorf("%w: bare LF in response header", ErrBadHandshake), false)
+		return
+	}
 	resp, err := stdhttp.ReadResponse(bufio.NewReader(bytes.NewReader(cc.response[:headerEnd])), cc.req)
 	if err != nil {
 		cc.fail(nil, fmt.Errorf("%w: %v", ErrBadHandshake, err), false)
@@ -426,3 +432,18 @@ func (cc *clientConn) OnClose(_ *fib.Connection, err error) {
 }
 
 var _ fib.Handler = (*clientConn)(nil)
+
+// bareLF reports whether head holds an LF that no CR comes right before.
+func bareLF(head []byte) bool {
+	for i := bytes.IndexByte(head, '\n'); i >= 0; {
+		if i == 0 || head[i-1] != '\r' {
+			return true
+		}
+		next := bytes.IndexByte(head[i+1:], '\n')
+		if next < 0 {
+			return false
+		}
+		i += 1 + next
+	}
+	return false
+}
