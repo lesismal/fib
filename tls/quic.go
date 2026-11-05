@@ -143,6 +143,8 @@ type ticketSink struct {
 	alpn       string
 	certs      [][]byte
 	chains     [][]*x509.Certificate
+	// systemRoots says chains were verified against the system's roots.
+	systemRoots bool
 	// quicParams are the server's transport parameters, which a QUIC client
 	// keeps with the session; nil over TCP.
 	quicParams []byte
@@ -156,7 +158,8 @@ func (h *clientHS) sink() *ticketSink {
 		return nil
 	}
 	return &ticketSink{cache: h.sessions, key: h.config.ServerName, hash: h.suite.hash, resumption: h.resumption,
-		suite: h.suiteID, alpn: h.protocol, certs: h.rawCerts, chains: h.chains, quicParams: h.peerParams, quic: h.quic != nil, now: h.now}
+		suite: h.suiteID, alpn: h.protocol, certs: h.rawCerts, chains: h.chains, quicParams: h.peerParams, quic: h.quic != nil, now: h.now,
+		systemRoots: h.chains != nil && h.config.RootCAs == nil && (!h.resumed || h.session.systemRoots)}
 }
 
 // newSessionTicket takes a ticket the server sends after the handshake into the
@@ -203,7 +206,7 @@ func (k *ticketSink) store(msg []byte) *hsError {
 		ticket: bytes.Clone(ticket), psk: psk, suite: k.suite, received: k.now(),
 		lifetime: min(time.Duration(lifetime)*time.Second, ticketLifetime),
 		ageAdd:   ageAdd, alpn: k.alpn, earlyData: maxEarly != 0, maxEarly: maxEarly, certs: k.certs,
-		chains: k.chains,
+		chains: k.chains, systemRoots: k.systemRoots,
 	}
 	if k.quic && maxEarly != 0 {
 		// What the layer works to when it sends early data on this session.
@@ -433,9 +436,14 @@ func (h *clientHS) pickSession() bool {
 // name alone, in a cache that may be shared between Configs. It is not unless
 // the server's chain was verified, its certificates are all still current, the
 // leaf is the ServerName's, and the root is among the RootCAs if the Config
-// names them; the system's roots do not change under a running process, and
-// what this build's crypto/x509 distrusts it did not verify in the first
-// place. Nothing here verifies a signature, so it is cheap enough for the
+// names them, or, if it does not, the chain was verified against the system's
+// roots too: a session that a Config with roots of its own verified is not
+// offered by one that trusts the system's, though its root would be among
+// them no more than it was. The system's roots do not change under a running
+// process, and what this build's crypto/x509 distrusts it did not verify in
+// the first place, so a session the system's roots verified needs no lookup
+// in them, which on some platforms is a verification by the platform's
+// verifier. Nothing here verifies a signature, so it is cheap enough for the
 // goroutine that drives the handshake, which a verification is not (see
 // checkThen).
 func (h *clientHS) sessionTrusted(s *QUICSession) bool {
@@ -456,7 +464,10 @@ func (h *clientHS) sessionTrusted(s *QUICSession) bool {
 			continue
 		}
 		if h.config.RootCAs == nil {
-			return true
+			if s.systemRoots {
+				return true
+			}
+			continue
 		}
 		// A root among the Roots verifies as its own chain without a
 		// signature checked, which is how a pool is asked what it holds.

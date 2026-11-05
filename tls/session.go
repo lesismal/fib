@@ -34,8 +34,10 @@ type QUICSession struct {
 	certs [][]byte
 	// chains are the server's verified chains, nil if they were not
 	// verified, for whether the session may be offered (see sessionTrusted)
-	// and the connection state of one that resumes it.
-	chains [][]*x509.Certificate
+	// and the connection state of one that resumes it. systemRoots says they
+	// were verified against the system's roots, Config.RootCAs being nil.
+	chains      [][]*x509.Certificate
+	systemRoots bool
 }
 
 // usable says whether the session can still be offered at now.
