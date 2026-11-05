@@ -91,11 +91,13 @@ const (
 	maxHandshakeMessage = 65536
 )
 
-// clientSuites12 are the TLS 1.2 suites it offers: the ECDHE ones the record
-// layer protects, AEADs first, in the order crypto/tls offers them where the
-// CPU has AES-GCM. Key exchange by RSA is not offered, as crypto/tls no longer
-// does by default. clientSuites12NoAES puts ChaCha20-Poly1305 first, for a CPU
-// without AES-GCM.
+// clientSuites12 are the TLS 1.2 suites it can offer: the ECDHE ones the
+// record layer protects, AEADs first, in the order crypto/tls offers them where
+// the CPU has AES-GCM. Key exchange by RSA is not offered, as crypto/tls no
+// longer does by default, and the CBC suites with SHA-256 only where
+// Config.CipherSuites names them, as crypto/tls's are: their record MAC cannot
+// be checked in constant time (see cbcSHA256). clientSuites12NoAES puts
+// ChaCha20-Poly1305 first, for a CPU without AES-GCM.
 var clientSuites12 = []uint16{
 	stdtls.TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,
 	stdtls.TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,
@@ -180,14 +182,15 @@ func clientVersions(config *stdtls.Config) []uint16 {
 
 // suites12 are the TLS 1.2 suites a handshake with config offers: those of
 // clientSuites12, or clientSuites12NoAES where the CPU has no AES-GCM, that
-// Config.CipherSuites allows, if it lists any.
+// Config.CipherSuites allows, if it lists any, and if it does not, those but
+// the CBC suites with SHA-256.
 func suites12(config *stdtls.Config) []uint16 {
 	offered := clientSuites12
 	if !aesGCMHardware {
 		offered = clientSuites12NoAES
 	}
 	if len(config.CipherSuites) == 0 {
-		return offered
+		return slices.DeleteFunc(slices.Clone(offered), cbcSHA256)
 	}
 	var out []uint16
 	for _, id := range offered {

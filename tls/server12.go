@@ -62,9 +62,26 @@ type plan12 struct {
 	group stdtls.CurveID
 }
 
-// allowsSuite12 reports whether the Config lets id be used.
+// allowsSuite12 reports whether the Config lets id be used: Config.CipherSuites
+// names it, or names none and it is not a CBC suite with SHA-256, which
+// crypto/tls does not serve by default either.
 func (h *serverHS) allowsSuite12(id uint16) bool {
-	return len(h.config.CipherSuites) == 0 || slices.Contains(h.config.CipherSuites, id)
+	if len(h.config.CipherSuites) == 0 {
+		return !cbcSHA256(id)
+	}
+	return slices.Contains(h.config.CipherSuites, id)
+}
+
+// cbcSHA256 reports whether id is an AES-CBC suite with HMAC-SHA256, whose
+// record MAC, unlike SHA-1's, has no constant-time Sum to check it with
+// (Lucky13), and which crypto/tls therefore leaves out of its defaults.
+func cbcSHA256(id uint16) bool {
+	switch id {
+	case stdtls.TLS_ECDHE_ECDSA_WITH_AES_128_CBC_SHA256, stdtls.TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA256,
+		stdtls.TLS_RSA_WITH_AES_128_CBC_SHA256:
+		return true
+	}
+	return false
 }
 
 // plan12 works out how to serve ch with TLS 1.2, or reports that it cannot,

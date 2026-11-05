@@ -67,7 +67,12 @@ func TestServerHandshakeTLS12Suites(t *testing.T) {
 			if tc.rsa {
 				cert, pool = rsaCert, rsaPool
 			}
-			hs := newSrvHS(&stdtls.Config{Certificates: []stdtls.Certificate{cert}}, nil)
+			config := &stdtls.Config{Certificates: []stdtls.Certificate{cert}}
+			if cbcSHA256(tc.suite) {
+				// Served only when named.
+				config.CipherSuites = []uint16{tc.suite}
+			}
+			hs := newSrvHS(config, nil)
 			state, clientErr, serverErr := pumpServer(t, hs, clientFor(pool, func(c *stdtls.Config) {
 				c.MinVersion, c.MaxVersion = stdtls.VersionTLS12, stdtls.VersionTLS12
 				c.CipherSuites = []uint16{tc.suite}
@@ -302,7 +307,11 @@ func TestClientAndServerHandshakesTogetherTLS12(t *testing.T) {
 		for _, chunk := range []int{1, 100, 1 << 16} {
 			t.Run(strconv.Itoa(int(suite))+"/"+strconv.Itoa(chunk), func(t *testing.T) {
 				cert, pool := issueCert(t, keyOf(t, "ecdsa-p256"))
-				srv := newSrvHS(&stdtls.Config{Certificates: []stdtls.Certificate{cert}, NextProtos: []string{"h2"}}, nil)
+				config := &stdtls.Config{Certificates: []stdtls.Certificate{cert}, NextProtos: []string{"h2"}}
+				if cbcSHA256(suite) {
+					config.CipherSuites = []uint16{suite}
+				}
+				srv := newSrvHS(config, nil)
 				cli := newHS12(t, pool, func(c *stdtls.Config) { c.NextProtos = []string{"h2"}; c.MaxVersion = stdtls.VersionTLS12 })
 				cli.suites12 = []uint16{suite}
 				toServer, toClient := cli.hello(), []byte(nil)

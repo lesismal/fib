@@ -77,7 +77,12 @@ func TestClientHandshakeTLS12Suites(t *testing.T) {
 			}
 			server := &stdtls.Config{Certificates: []stdtls.Certificate{cert}, MaxVersion: stdtls.VersionTLS12,
 				CipherSuites: []uint16{tc.suite}}
-			hs := newHS12(t, pool, nil)
+			// The CBC suites with SHA-256 are offered only when named.
+			hs := newHS12(t, pool, func(c *stdtls.Config) {
+				if cbcSHA256(tc.suite) {
+					c.CipherSuites = []uint16{tc.suite}
+				}
+			})
 			serverErr, clientErr := pump(t, hs, server, 4096)
 			if serverErr != nil || clientErr != nil || hs.connectionState().CipherSuite != tc.suite {
 				t.Fatalf("server %v, client %v, suite %x", serverErr, clientErr, hs.suiteID)

@@ -142,10 +142,10 @@ func lookupSuite(version, id uint16) (suite, bool) {
 		switch id {
 		case stdtls.TLS_ECDHE_ECDSA_WITH_AES_128_CBC_SHA, stdtls.TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA,
 			stdtls.TLS_RSA_WITH_AES_128_CBC_SHA:
-			return suite{mode: modeCBC, keyLen: 16, hash: sha256.New, mac: sha1.New, macLen: sha1.Size}, true
+			return suite{mode: modeCBC, keyLen: 16, hash: sha256.New, mac: sha1ConstantTime, macLen: sha1.Size}, true
 		case stdtls.TLS_ECDHE_ECDSA_WITH_AES_256_CBC_SHA, stdtls.TLS_ECDHE_RSA_WITH_AES_256_CBC_SHA,
 			stdtls.TLS_RSA_WITH_AES_256_CBC_SHA:
-			return suite{mode: modeCBC, keyLen: 32, hash: sha256.New, mac: sha1.New, macLen: sha1.Size}, true
+			return suite{mode: modeCBC, keyLen: 32, hash: sha256.New, mac: sha1ConstantTime, macLen: sha1.Size}, true
 		}
 	}
 	return suite{}, false
@@ -314,6 +314,37 @@ func newKeysFromMaster(version uint16, s suite, master, clientRandom, serverRand
 	}
 	return client, server, nil
 }
+
+// sha1ConstantTime is SHA-1 whose Sum takes the same time whatever the length
+// of what was written, for the record MAC of the CBC suites, as crypto/tls's
+// is: the number of compressions a plain Sum runs tells how long the record's
+// payload was, and so how much padding it had, which openCBC's feeding of the
+// rest to the MAC after its sum does not hide (Lucky13). Where SHA-1 has no
+// ConstantTimeSum, which BoringCrypto's does not, it is plain SHA-1, as
+// crypto/tls's is there.
+func sha1ConstantTime() hash.Hash {
+	h := sha1.New()
+	if ct, ok := h.(constantTimeHash); ok {
+		return &constantTimeSum{ct}
+	}
+	return h
+}
+
+// constantTimeHash is a hash with a Sum that runs in constant time.
+type constantTimeHash interface {
+	hash.Hash
+	ConstantTimeSum(b []byte) []byte
+}
+
+// constantTimeSum is a constantTimeHash whose Sum is its ConstantTimeSum, so
+// that an HMAC over it sums in constant time too.
+type constantTimeSum struct{ h constantTimeHash }
+
+func (c *constantTimeSum) Size() int                   { return c.h.Size() }
+func (c *constantTimeSum) BlockSize() int              { return c.h.BlockSize() }
+func (c *constantTimeSum) Reset()                      { c.h.Reset() }
+func (c *constantTimeSum) Write(p []byte) (int, error) { return c.h.Write(p) }
+func (c *constantTimeSum) Sum(b []byte) []byte         { return c.h.ConstantTimeSum(b) }
 
 // prf12 is the TLS 1.2 PRF, P_hash over HMAC (RFC 5246 section 5).
 func prf12(h func() hash.Hash, secret []byte, label string, seed []byte, length int) []byte {
