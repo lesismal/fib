@@ -27,9 +27,11 @@ import (
 //	)
 //
 // Everything else, the backlog, the buffers, the watermarks, the pollers and
-// ReusePort, is the engine's and applies to every binding alike. With
-// IOPollers, each binding's connections are spread over the same pollers as
-// every other binding's.
+// ReusePort, is the engine's and applies to every binding alike. MultipathTCP
+// is the exception: whether a listener is a Multipath TCP one is a property of
+// the address it listens on, so it stays the binding's, as Network and Handler
+// do. With IOPollers, each binding's connections are spread over the same
+// pollers as every other binding's.
 //
 // Bindings can also be added and removed while the engine runs; see
 // Engine.AddBinding, Engine.RemoveBinding and Engine.ShutdownBinding.
@@ -59,6 +61,13 @@ type Binding struct {
 	// Addrs, when it is not empty, is the complete set of the binding's
 	// addresses and Addr is ignored; they all share Network.
 	Addrs []string
+	// MultipathTCP listens with Multipath TCP where the kernel offers it,
+	// falling back to plain TCP where it does not, as
+	// net.ListenConfig.SetMultipathTCP(true) does: Linux 5.6 and later with
+	// net.mptcp.enabled set. It is off by default, so a binding is a plain
+	// TCP listener. It applies to the TCP networks, so UDP and Unix bindings
+	// are unaffected, and a platform without Multipath TCP listens plain TCP.
+	MultipathTCP bool
 	// Handler serves the binding's connections. Every binding names one.
 	Handler Handler
 }

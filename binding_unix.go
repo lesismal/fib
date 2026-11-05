@@ -50,7 +50,8 @@ func newUDPListener(fd int, b Binding, i int) *udpListener {
 // socket before any loop waits on one, and on failure closes whatever it
 // opened.
 func (e *Engine) openBinding(b Binding, i int) error {
-	opts := listenOptions(e.bindConfig, b.Network)
+	udp := netaddr.IsUDP(b.Network)
+	opts := listenOptions(e.bindConfig, b.Network, b.MultipathTCP && !udp)
 	// held are the engine's own sockets where it has no loop to place them
 	// on: those its pollers share, or that hold an address for them.
 	var held []streamListener
@@ -71,7 +72,7 @@ func (e *Engine) openBinding(b Binding, i int) error {
 	}
 	for _, addr := range b.Addrs {
 		spread := pollersListen(e.bindConfig, b.Network)
-		if netaddr.IsUDP(b.Network) {
+		if udp {
 			fd, err := listener.CreateUDP(opts, addr)
 			if err != nil {
 				return fail(err)
@@ -97,7 +98,7 @@ func (e *Engine) openBinding(b Binding, i int) error {
 			return fail(err)
 		}
 		l := streamListener{fd: fd, network: b.Network, unix: netaddr.IsUnix(b.Network), spread: spread,
-			shared: e.noLoop && !spread, handler: b.Handler, binding: i}
+			shared: e.noLoop && !spread, mptcp: opts.MultipathTCP, handler: b.Handler, binding: i}
 		e.noteUnixPath(b.Network, addr, i)
 		if !e.noLoop {
 			placed = append(placed, placement{loop: e, stream: l})

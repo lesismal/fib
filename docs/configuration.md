@@ -108,11 +108,14 @@ the engine's loops, pools and buffers.
 | `Network` | `Config.Network` (`"tcp"`) | `tcp`, `tcp4`, `tcp6`, `unix`, `udp`, `udp4` or `udp6`, as `net.Listen` and `net.ListenPacket` name them. |
 | `Addr` | `":0"` | `host:port`, a Unix path, or an abstract Unix address with a leading `@`. A zero port asks the kernel to choose one; `BindingAddrs` reports it. |
 | `Addrs` | `nil` | A complete set of addresses for the binding, sharing `Network`. When set, `Addr` is ignored. |
+| `MultipathTCP` | `false` | Listen with Multipath TCP where the kernel offers it: Linux 5.6 and later with `net.mptcp.enabled` set, as `net.ListenConfig.SetMultipathTCP(true)` does. A kernel without it falls back to plain TCP, so the binding always listens. It applies to TCP networks; UDP and Unix bindings are unaffected, and other platforms listen plain TCP. |
 | `Handler` | required | The handler that serves the binding: an HTTP handler, a TLS server, an HTTP/3 server, a WebSocket handler, a gRPC server, a raw connection handler, and so on. |
 
 Everything else — the backlog, buffers, watermarks, pollers and `ReusePort` — belongs to the
-engine and applies to every binding. Bindings may be added and removed while the engine runs with
-`AddBinding`, `RemoveBinding` and `ShutdownBinding`.
+engine and applies to every binding. `MultipathTCP` is the exception: whether a listener is a
+Multipath TCP one is a property of the address it listens on, so it stays the binding's. Bindings
+may be added and removed while the engine runs with `AddBinding`, `RemoveBinding` and
+`ShutdownBinding`.
 
 ## How the machine sizes the defaults
 

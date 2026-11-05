@@ -110,7 +110,10 @@ type streamListener struct {
 	// waits on this socket itself and accepts onto its own loop, and, of a
 	// poller's, that the socket is the engine's, which stops and closes it;
 	// see Config.EngineLoop.
-	shared  bool
+	shared bool
+	// mptcp says the socket was opened for Multipath TCP, so a poller's
+	// socket opened beside it is one too; see Binding.MultipathTCP.
+	mptcp   bool
 	handler Handler
 	// binding is the index of the Binding the socket was opened for.
 	binding int
@@ -295,7 +298,7 @@ func (e *Engine) open(config Config, bindings []Binding) error {
 			case like.shared:
 				e.listeners = append(e.listeners, like)
 			case like.spread:
-				fd, err := listener.CreateLike(listenOptions(config, like.network), like.fd)
+				fd, err := listener.CreateLike(listenOptions(config, like.network, like.mptcp), like.fd)
 				if err != nil {
 					e.closeListeners()
 					return err
@@ -313,7 +316,7 @@ func (e *Engine) open(config Config, bindings []Binding) error {
 		udp := netaddr.IsUDP(b.Network)
 		for _, addr := range b.Addrs {
 			if udp {
-				fd, err := listener.CreateUDP(listenOptions(config, b.Network), addr)
+				fd, err := listener.CreateUDP(listenOptions(config, b.Network, false), addr)
 				if err != nil {
 					e.closeListeners()
 					return err
@@ -331,13 +334,14 @@ func (e *Engine) open(config Config, bindings []Binding) error {
 			// where they cannot each have their own.
 			spread := pollersListen(config, b.Network)
 			shared := e.noLoop && !spread
-			fd, err := listener.Create(listenOptions(config, b.Network), addr, !spread, spread)
+			fd, err := listener.Create(listenOptions(config, b.Network, b.MultipathTCP), addr, !spread, spread)
 			if err != nil {
 				e.closeListeners()
 				return err
 			}
 			e.listeners = append(e.listeners, streamListener{fd: fd, network: b.Network,
-				unix: netaddr.IsUnix(b.Network), spread: spread, shared: shared, handler: b.Handler, binding: i})
+				unix: netaddr.IsUnix(b.Network), spread: spread, shared: shared,
+				mptcp: b.MultipathTCP, handler: b.Handler, binding: i})
 			e.pollersListen = e.pollersListen || spread || shared
 			e.noteUnixPath(b.Network, addr, i)
 		}
@@ -382,7 +386,7 @@ func (e *Engine) openUDPBeside(config Config, parent *Engine) error {
 		return nil
 	}
 	for _, like := range parent.pollers[0].udpListeners {
-		fd, err := listener.CreateUDPLike(listenOptions(config, like.network), like.fd)
+		fd, err := listener.CreateUDPLike(listenOptions(config, like.network, false), like.fd)
 		if err != nil {
 			return err
 		}
@@ -1063,9 +1067,10 @@ func pollersListen(config Config, network string) bool {
 }
 
 // listenOptions is what of config the listening sockets on network are
-// opened by.
-func listenOptions(config Config, network string) listener.Options {
-	return listener.Options{Network: network, Backlog: config.Backlog, ReusePort: config.ReusePort}
+// opened by; multipathTCP is the binding's Binding.MultipathTCP.
+func listenOptions(config Config, network string, multipathTCP bool) listener.Options {
+	return listener.Options{Network: network, Backlog: config.Backlog, ReusePort: config.ReusePort,
+		MultipathTCP: multipathTCP}
 }
 
 // The readiness backends never have a write outstanding in the kernel: a

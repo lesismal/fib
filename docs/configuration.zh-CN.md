@@ -103,9 +103,11 @@ if err := engine.Run(); err != nil {
 | `Network` | `Config.Network`（`"tcp"`） | `tcp`、`tcp4`、`tcp6`、`unix`、`udp`、`udp4`、`udp6`，命名方式同 `net.Listen` 和 `net.ListenPacket`。 |
 | `Addr` | `":0"` | `host:port`、Unix 路径，或 `@` 开头的抽象 Unix 地址。端口 0 让内核选，`BindingAddrs` 返回实际地址。 |
 | `Addrs` | `nil` | 这组地址的完整列表，共享 `Network`；设置后 `Addr` 被忽略。 |
+| `MultipathTCP` | `false` | 内核支持时用 Multipath TCP 监听：Linux 5.6 及以上且开启 `net.mptcp.enabled`，与 `net.ListenConfig.SetMultipathTCP(true)` 相同。内核不支持时回退到普通 TCP，因此 Binding 总能监听成功。只对 TCP 网络生效，UDP 和 Unix Binding 不受影响，其他平台按普通 TCP 监听。 |
 | `Handler` | 必填 | 服务该 Binding 的 handler：HTTP、TLS server、HTTP/3 server、WebSocket、gRPC、裸 TCP 等等。 |
 
 其余配置——backlog、缓冲区、水位线、poller、`ReusePort`——都属于 Engine，对所有 Binding 生效。
+`MultipathTCP` 是例外：监听是不是 Multipath TCP，是监听地址本身的属性，所以它归 Binding 自己。
 Engine 运行期间可以用 `AddBinding`、`RemoveBinding`、`ShutdownBinding` 增删 Binding。
 
 ## 机器如何计算默认值

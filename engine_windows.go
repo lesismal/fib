@@ -298,7 +298,9 @@ func (e *Engine) postListening(listeners []*winListener, udpListeners []*udpList
 
 // openListener opens the socket of one of binding b's addresses, the i-th
 // binding, and associates it with the completion port: a TCP or Unix
-// listener, or, for a UDP binding, a UDP socket.
+// listener, or, for a UDP binding, a UDP socket. Binding.MultipathTCP is
+// ignored: Windows has no Multipath TCP, so a TCP listener here is a plain
+// one.
 func (e *Engine) openListener(config Config, b Binding, i int, addr string) (*winListener, *udpListener, error) {
 	if netaddr.IsUDP(b.Network) {
 		l, err := createUDPListener(b.Network, addr)

@@ -123,6 +123,8 @@ func newEngine(config Config, bindings []Binding) (*Engine, error) {
 
 // listenBindings opens the listeners and UDP sockets of every binding, or
 // none of them. The bindings are the engine's first-th and those after it.
+// Binding.MultipathTCP is ignored: this backend listens through net.Listen,
+// and the platforms it serves have no Multipath TCP.
 func listenBindings(bindings []Binding, first int) ([]boundListener, []*udpListener, error) {
 	var listeners []boundListener
 	var udpListeners []*udpListener

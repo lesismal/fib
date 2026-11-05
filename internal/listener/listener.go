@@ -20,6 +20,10 @@ type Options struct {
 	Backlog int
 	// ReusePort is Config.ReusePort.
 	ReusePort bool
+	// MultipathTCP is Binding.MultipathTCP: open the TCP sockets for
+	// Multipath TCP where the kernel offers it, falling back to plain TCP
+	// where it does not. UDP and Unix sockets are unaffected.
+	MultipathTCP bool
 }
 
 // Create opens a socket bound to addr, and listening on it unless
@@ -56,7 +60,7 @@ func Create(o Options, addr string, listen, spread bool) (int, error) {
 // an engine without it does not, so a second server on the address fails as
 // it would have.
 func claimAddress(o Options, family int, bound syscall.Sockaddr) (syscall.Sockaddr, error) {
-	fd, err := sys.NewSocket(family)
+	fd, err := newSocket(o, family)
 	if err != nil {
 		return nil, err
 	}
@@ -104,7 +108,7 @@ func CreateLike(o Options, like int) (int, error) {
 }
 
 func listenSocket(o Options, family int, bound syscall.Sockaddr, listen, reusePort bool) (int, error) {
-	fd, err := sys.NewSocket(family)
+	fd, err := newSocket(o, family)
 	if err != nil {
 		return -1, err
 	}
