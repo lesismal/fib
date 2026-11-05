@@ -3,13 +3,16 @@
 package http
 
 import (
+	"fmt"
 	"io"
 	"net"
 	stdhttp "net/http"
+	"runtime/debug"
 	"strings"
 	"sync"
 
 	"github.com/lesismal/fib/bufferpool"
+	"github.com/lesismal/fib/log"
 	"github.com/lesismal/fib/sidepool"
 )
 
@@ -56,18 +59,42 @@ type h2TunnelNotice struct {
 // runNoticesLocked runs, on other goroutines, the callbacks registered
 // with NotifySendable whose limit pending is within, or every one of them
 // with err when it is not nil. Callers hold the connection's mu.
-func (t *h2Tunnel) runNoticesLocked(pending int, err error) {
+func (t *h2Tunnel) runNoticesLocked(sc *h2ServerConn, pending int, err error) {
 	kept := t.notices[:0]
 	for _, n := range t.notices {
 		if err == nil && pending > n.limit {
 			kept = append(kept, n)
 			continue
 		}
-		fn := n.fn
-		sidepool.Post(func() { fn(err) })
+		sc.postCallback(n.fn, err)
 	}
 	clear(t.notices[len(kept):])
 	t.notices = kept
+}
+
+// postCallback runs fn with err on the notify pool: a callback a handler
+// registered to hear that it may send again, with OnWritable or
+// NotifySendable, which may not run where it is found ready, under the
+// connection's lock.
+func (sc *h2ServerConn) postCallback(fn func(error), err error) {
+	sidepool.Post(func() {
+		defer sc.recoverCallback()
+		fn(err)
+	})
+}
+
+// recoverCallback, deferred around a call into the handler's code that runs
+// away from both the connection's reader and the handler pool — a callback,
+// or a tunnel's handler told the tunnel has ended — treats a panic there as
+// one in a request's handler: it is logged, and the connection, whose
+// streams may be left half done, is closed, rather than the panic ending the
+// process or leaving the stream waiting for what will not come.
+func (sc *h2ServerConn) recoverCallback() {
+	if recovered := recover(); recovered != nil {
+		log.Error("http: HTTP/2 callback panicked", "panic", fmt.Sprint(recovered),
+			"stack", log.Lines(debug.Stack()))
+		sc.conn.CloseWithError(fmt.Errorf("handler panic: %v", recovered))
+	}
 }
 
 // upgraded reports whether the stream carries an accepted tunnel. Callers hold
@@ -164,12 +191,15 @@ func (sc *h2ServerConn) endTunnelLocked(st *h2ServerStream, err error) {
 	// A writer waiting for room finds the stream gone, even one whose peer
 	// ended the tunnel before.
 	st.tunnel.room.Broadcast()
-	st.tunnel.runNoticesLocked(0, errH2StreamClosed)
+	st.tunnel.runNoticesLocked(sc, 0, errH2StreamClosed)
 	if st.tunnel.ended {
 		return
 	}
 	st.tunnel.ended = true
-	go st.tunnel.feed.End(err)
+	go func(feed *TunnelFeed) {
+		defer sc.recoverCallback()
+		feed.End(err)
+	}(&st.tunnel.feed)
 }
 
 // upgrade accepts an extended CONNECT for protocol with a 200 that leaves the
@@ -322,7 +352,7 @@ func (w *h2TunnelWriter) NotifySendable(limit int, fn func(error)) bool {
 	sc.lock()
 	defer sc.unlock()
 	if sc.closed || st.reset || st.tunnel.ending || st.localDone || st.tunnel.ended {
-		sidepool.Post(func() { fn(errH2StreamClosed) })
+		sc.postCallback(fn, errH2StreamClosed)
 		return true
 	}
 	if len(st.pending) <= limit {

@@ -5,6 +5,7 @@ package http
 import (
 	"bytes"
 	"errors"
+	"net"
 	stdhttp "net/http"
 	"sync/atomic"
 	"testing"
@@ -218,5 +219,86 @@ func TestH2TunnelEndsAndCloses(t *testing.T) {
 	tc.headers(5, true, get("/after")...)
 	for !tc.stream(5).done {
 		tc.read()
+	}
+}
+
+// h2PanicTunnel is a TunnelHandler whose OnTunnelClose panics when panics is
+// set, after recording that it was called.
+type h2PanicTunnel struct {
+	h2covTunnel
+	panics bool
+}
+
+func (h *h2PanicTunnel) OnTunnelClose(t *Tunnel, err error) {
+	h.h2covTunnel.OnTunnelClose(t, err)
+	if h.panics {
+		panic("OnTunnelClose")
+	}
+}
+
+// h2covWaitClosed reads until the server closes the connection, skipping
+// whatever it sends first.
+func h2covWaitClosed(t *testing.T, tc *h2TestConn) {
+	t.Helper()
+	buf := make([]byte, 32<<10)
+	for {
+		_, err := tc.c.Read(buf)
+		if err == nil {
+			continue
+		}
+		var ne net.Error
+		if errors.As(err, &ne) && ne.Timeout() {
+			t.Fatalf("the connection stayed open: %v", err)
+		}
+		return
+	}
+}
+
+// TestH2TunnelCallbackPanics checks that a panic in what a tunnel's handler
+// runs away from the connection's reader and the handler pool — its
+// OnTunnelClose once the client resets the stream, or a NotifySendable
+// callback — is the handler's panic, as one in a request's handler is: it
+// ends the connection, not the process, which a bare goroutine let it do.
+func TestH2TunnelCallbackPanics(t *testing.T) {
+	for _, path := range []string{"/close", "/notify"} {
+		t.Run(path[1:], func(t *testing.T) {
+			tunnel := &h2PanicTunnel{h2covTunnel: h2covTunnel{closed: make(chan error, 1)}, panics: path == "/close"}
+			registered := make(chan bool, 1)
+			addr := serve(t, NewHandler(HandlerFunc(func(c *Context) {
+				tun, err := c.Upgrade("echo", nil, tunnel)
+				if err != nil {
+					registered <- false
+					return
+				}
+				if c.Request.URL.Path == "/notify" {
+					// More than the client's window, so that some waits.
+					_ = tun.Send(make([]byte, 2*h2DefaultWindow))
+					registered <- tun.NotifySendable(1, func(error) { panic("NotifySendable") })
+					return
+				}
+				registered <- true
+			})))
+			tc := dialH2(t, addr)
+			h2covConnect(tc, 1, path)
+			if f := tc.readUntil(h2FrameHeaders); f.fields[":status"] != "200" {
+				t.Fatalf("status %v", f.fields)
+			}
+			if !<-registered {
+				t.Fatal("the handler could not set up its callback")
+			}
+			tc.write(h2AppendRSTStream(nil, 1, H2Cancel))
+			h2covWaitClosed(t, tc)
+			if path == "/close" {
+				if err := h2covWaitErr(t, tunnel.closed); err == nil {
+					t.Fatal("OnTunnelClose heard no error")
+				}
+			}
+			// The server, and the process, go on.
+			tc = dialH2(t, addr)
+			tc.headers(1, true, get("/after")...)
+			for !tc.stream(1).done {
+				tc.read()
+			}
+		})
 	}
 }

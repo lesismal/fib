@@ -8,7 +8,6 @@ import (
 	"sync"
 
 	"github.com/lesismal/fib/bufferpool"
-	"github.com/lesismal/fib/sidepool"
 )
 
 // A response written through Context's ResponseWriter methods streams on
@@ -188,7 +187,7 @@ func (st *h2ServerStream) onWritable(fn func(error)) bool {
 		return false
 	case sc.closed || st.reset:
 		err := st.closedErrLocked()
-		sidepool.Post(func() { fn(err) })
+		st.sc.postCallback(fn, err)
 		return true
 	case sc.streams[st.id] != st || len(st.pending) <= h2MaxPendingOutput/2:
 		// Gone with all of it sent, or near enough to all.
@@ -204,7 +203,7 @@ func (st *h2ServerStream) runWritableLocked(err error) {
 	if o := st.out; o != nil && o.writable != nil {
 		fn := o.writable
 		o.writable = nil
-		sidepool.Post(func() { fn(err) })
+		st.sc.postCallback(fn, err)
 	}
 }
 
@@ -283,7 +282,7 @@ func (st *h2ServerStream) wakeWritersLocked() {
 			t.room.Broadcast()
 		}
 		if len(t.notices) > 0 {
-			t.runNoticesLocked(len(st.pending), nil)
+			t.runNoticesLocked(st.sc, len(st.pending), nil)
 		}
 	}
 }
