@@ -803,6 +803,13 @@ func (p *Parser) frameLength() (frameInfo, bool, error) {
 		return frameInfo{}, false, ErrHeaderTooLarge
 	}
 	req, block, err := parseRequestHead(p.buffer[:headerEnd], p.config.reuse())
+	if block == nil {
+		// net/http read the head, which may end, for it, before the blank
+		// line it was framed by here; the simple parser takes none such.
+		if lineErr := headLineError(p.buffer[:headerEnd], false); lineErr != nil {
+			return frameInfo{}, false, lineErr
+		}
+	}
 	var coding transferCoding
 	if err != nil && transferEncodingError(err) {
 		// net/http takes chunked alone; a coding besides it is taken out
@@ -964,6 +971,40 @@ func readRequest(data []byte, keepBody bool) (*stdhttp.Request, *requestReader, 
 	return req, nil, err
 }
 
+var (
+	errBareLF  = fmt.Errorf("%w: bare LF in the header section", ErrMalformed)
+	errObsFold = fmt.Errorf("%w: obsolete line folding in the header section", ErrMalformed)
+)
+
+// headLineError reports a line in block, a head or a trailer section ending
+// in its blank line, that net/http's reader would read otherwise than the
+// parsers here frame it. They find the end of a head, or of a trailer
+// section, at its first CRLF CRLF, and textproto ends a line at a bare LF too,
+// and the section at the first empty one: given "X: y\n\nGET /admin ...", it
+// stops at the bare LFs and drops what follows them up to the CRLF CRLF, a
+// request a proxy in front would have passed on, which is how requests are
+// smuggled. So a bare LF anywhere in it is refused (RFC 9112 section 2.2 lets
+// a recipient do either). Unless foldOK is set, so is obs-fold, a line that
+// starts with a space or a tab, which net/http joins to the field before it,
+// a Content-Length among them, and which RFC 9112 section 5.2 has a server
+// refuse or replace.
+func headLineError(block []byte, foldOK bool) error {
+	for at := 0; ; {
+		i := bytes.IndexByte(block[at:], '\n')
+		if i < 0 {
+			return nil
+		}
+		at += i
+		if at == 0 || block[at-1] != '\r' {
+			return errBareLF
+		}
+		at++
+		if !foldOK && at < len(block) && (block[at] == ' ' || block[at] == '\t') {
+			return errObsFold
+		}
+	}
+}
+
 // validFieldName reports whether name is a token, as a header field name
 // must be.
 func validFieldName(name string) bool {
@@ -1118,6 +1159,9 @@ func (scan *chunkScan) chunkedEnd(data []byte, start, maxTrailer int, maxBody in
 	at += scan.trailerScan
 	if at+4 > maxTrailer {
 		return 0, false, ErrHeaderTooLarge
+	}
+	if err := headLineError(rest[:at+4], true); err != nil {
+		return 0, false, err
 	}
 	return scan.trailerDone(offset+at+4, start, raw)
 }

@@ -395,6 +395,9 @@ func (p *responseParser) parseHead(req *stdhttp.Request) (bool, error) {
 	chunked := false
 	if len(raw) < 8 || string(raw[:8]) != "HTTP/1.0" {
 		if _, ok := transferEncodingFields(raw); ok && !plainChunked(raw) {
+			if err := headLineError(raw, true); err != nil {
+				return false, clientParseError(err)
+			}
 			rewritten, c, list, err := splitTransferCodings(raw, false)
 			if err != nil {
 				if errors.Is(err, ErrUnsupportedTransferEncoding) {
@@ -409,6 +412,12 @@ func (p *responseParser) parseHead(req *stdhttp.Request) (bool, error) {
 	head, block, ok := parseResponseHeadBlock(raw, req, p.wantBlock)
 	p.block = block
 	if !ok {
+		// net/http's reader ends the head at a bare LF too, and what this
+		// parser framed past it would be lost; see headLineError. A folded
+		// line it is left to join, as a client may (RFC 9112 section 5.2).
+		if err := headLineError(raw, true); err != nil {
+			return false, clientParseError(err)
+		}
 		var err error
 		head, err = stdhttp.ReadResponse(bufio.NewReader(bytes.NewReader(raw)), req)
 		if err != nil {

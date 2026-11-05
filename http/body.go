@@ -1143,6 +1143,9 @@ func (d *chunkedDecoder) decode(dst, src []byte) (out []byte, used int, trailer 
 			if at+4 > d.maxTrailer {
 				return dst, used, nil, false, ErrHeaderTooLarge
 			}
+			if err := headLineError(rest[:at+4], true); err != nil {
+				return dst, used, nil, false, err
+			}
 			return dst, used + at + 4, rest[:at+4], true, nil
 		}
 	}
