@@ -9,6 +9,8 @@ import (
 	"encoding/binary"
 	"errors"
 	"io"
+	"sync"
+	"time"
 )
 
 // The keying material message (section 3.2.2 and section 6.1): a fixed
@@ -49,6 +51,9 @@ type keyMaterial struct {
 	keyLen int
 	even   []byte
 	odd    []byte
+	// wrapKey is the KEK the keys were wrapped with, kept so that keys
+	// sent again under the same salt need no new derivation.
+	wrapKey []byte
 }
 
 // kek derives the key encrypting key of passphrase for km's salt: PBKDF2
@@ -56,6 +61,69 @@ type keyMaterial struct {
 // libsrt's haicrypt does.
 func (km *keyMaterial) kek(passphrase string) ([]byte, error) {
 	return pbkdf2.Key(sha1.New, passphrase, km.salt[kmSaltSize-8:], pbkdf2Iter, km.keyLen)
+}
+
+// errKEKBusy is a derivation refused for want of tokens.
+var errKEKBusy = errors.New("srt: too many key derivations")
+
+// kekCacheSize bounds the KEKs a kekDeriver remembers.
+const kekCacheSize = 256
+
+// kekDeriver derives KEKs for a listener's callers, or a connection's
+// refreshed keys. PBKDF2 is the costliest thing a peer can ask for, and
+// one that knows no passphrase can still ask: a deriver remembers the KEKs
+// of the last salts, so retransmissions cost nothing, and derives new ones
+// at no more than rate a second, burst included. It is safe for
+// concurrent use.
+type kekDeriver struct {
+	mu     sync.Mutex
+	rate   float64 // 0 for no limit
+	tokens float64
+	last   time.Time
+	cache  map[kekKey][]byte
+}
+
+type kekKey struct {
+	passphrase string
+	salt       [8]byte
+	keyLen     int
+}
+
+func newKEKDeriver(rate float64) *kekDeriver {
+	return &kekDeriver{rate: rate, tokens: rate, cache: make(map[kekKey][]byte)}
+}
+
+// kek returns the KEK of passphrase for km's salt, or errKEKBusy.
+func (d *kekDeriver) kek(km *keyMaterial, passphrase string, now time.Time) ([]byte, error) {
+	k := kekKey{passphrase, [8]byte(km.salt[kmSaltSize-8:]), km.keyLen}
+	d.mu.Lock()
+	if v, ok := d.cache[k]; ok {
+		d.mu.Unlock()
+		return v, nil
+	}
+	if d.rate > 0 {
+		if el := now.Sub(d.last); el > 0 {
+			d.tokens = min(d.tokens+el.Seconds()*d.rate, d.rate)
+		}
+		d.last = now
+		if d.tokens < 1 {
+			d.mu.Unlock()
+			return nil, errKEKBusy
+		}
+		d.tokens--
+	}
+	d.mu.Unlock()
+	kek, err := km.kek(passphrase)
+	if err != nil {
+		return nil, err
+	}
+	d.mu.Lock()
+	if len(d.cache) >= kekCacheSize {
+		clear(d.cache)
+	}
+	d.cache[k] = kek
+	d.mu.Unlock()
+	return kek, nil
 }
 
 // newKeyMaterial makes a random salt and even key of keyLen bytes.
@@ -80,6 +148,7 @@ func (km *keyMaterial) marshal(passphrase string) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
+	km.wrapKey = kek
 	var kk byte
 	var keys []byte
 	if km.even != nil {
@@ -107,6 +176,11 @@ func (km *keyMaterial) marshal(passphrase string) ([]byte, error) {
 // unmarshalKM decodes the KM message b with the KEK of passphrase. A key
 // that does not unwrap is errBadSecret.
 func unmarshalKM(b []byte, passphrase string) (*keyMaterial, error) {
+	return unmarshalKMWith(b, func(km *keyMaterial) ([]byte, error) { return km.kek(passphrase) })
+}
+
+// unmarshalKMWith is unmarshalKM with the KEK from kek, which may fail.
+func unmarshalKMWith(b []byte, kek func(km *keyMaterial) ([]byte, error)) (*keyMaterial, error) {
 	if len(b) < kmHeaderSize+kmSaltSize || b[0] != 0x12 || binary.BigEndian.Uint16(b[1:]) != kmSign {
 		return nil, errBadKM
 	}
@@ -128,14 +202,15 @@ func unmarshalKM(b []byte, passphrase string) (*keyMaterial, error) {
 		return nil, errBadKM
 	}
 	wrapped = wrapped[:8+n*km.keyLen]
-	kek, err := km.kek(passphrase)
+	wrapKey, err := kek(km)
 	if err != nil {
 		return nil, err
 	}
-	keys, err := keyUnwrap(kek, wrapped)
+	keys, err := keyUnwrap(wrapKey, wrapped)
 	if err != nil {
 		return nil, err
 	}
+	km.wrapKey = wrapKey
 	if kk&kkEven != 0 {
 		km.even, keys = keys[:km.keyLen], keys[km.keyLen:]
 	}

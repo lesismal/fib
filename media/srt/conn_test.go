@@ -522,6 +522,56 @@ func TestKMRefresh(t *testing.T) {
 	l.handleKMRefresh(msg, s.now)
 }
 
+// TestKeyDerivationLimit checks that a listener derives KEKs at no more
+// than KeyDerivations a second, dropping a conclusion past it for the
+// caller to send again, and that the same salt costs one derivation.
+func TestKeyDerivationLimit(t *testing.T) {
+	pass := "0123456789abc"
+	s := newSim(t, Config{Passphrase: pass}, Config{Passphrase: pass})
+	var err error
+	s.lis, err = NewListener(ListenerConfig{Accept: s.accept, Rand: newRand(1), KeyDerivations: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Another caller's salt takes the second's one token.
+	other, _ := newKeyMaterial(newRand(7), 16)
+	if _, err := s.lis.kek.kek(other, pass, s.now); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.lis.kek.kek(s.caller.conn.km, pass, s.now); err != errKEKBusy {
+		t.Fatalf("a second derivation in the second: %v", err)
+	}
+	if _, err := s.lis.kek.kek(other, pass, s.now); err != nil {
+		t.Fatalf("the same salt again: %v", err)
+	}
+	s.run(500 * time.Millisecond)
+	if s.server.conn != nil || len(s.requests) == 0 {
+		t.Fatalf("accepted past the limit: %d requests", len(s.requests))
+	}
+	s.run(2 * time.Second)
+	if s.caller.connected != 1 || s.server.connected != 1 || !s.server.conn.Encrypted() {
+		t.Fatalf("connected caller %d server %d", s.caller.connected, s.server.connected)
+	}
+	// A refresh under the connection's salt needs no derivation; one under
+	// a new salt takes the connection's one a second.
+	l := s.server.conn
+	km := *s.caller.conn.km
+	km.odd = make([]byte, km.keyLen)
+	msg, _ := km.marshal(pass)
+	l.handleKMRefresh(msg, s.now)
+	if l.kmKEK != nil || l.crypt.odd == nil {
+		t.Fatal("a refresh under the same salt derived its KEK")
+	}
+	for i := range 2 {
+		km2, _ := newKeyMaterial(newRand(byte(20+i)), 16)
+		msg, _ = km2.marshal(pass)
+		l.handleKMRefresh(msg, s.now)
+		if (l.km.salt == km2.salt) != (i == 0) {
+			t.Fatalf("refresh %d under a new salt in one second: taken %v", i, l.km.salt == km2.salt)
+		}
+	}
+}
+
 // TestTimestampWrap runs a connection across the 32-bit timestamp wrap.
 func TestTimestampWrap(t *testing.T) {
 	s := newSim(t, Config{}, Config{})

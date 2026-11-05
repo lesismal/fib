@@ -40,7 +40,18 @@ type ListenerConfig struct {
 	Accept func(req *Request) (Config, error)
 	// Rand is the source of cookies and socket IDs; crypto/rand when nil.
 	Rand io.Reader
+	// KeyDerivations bounds how many key encrypting keys the listener
+	// derives a second from callers' keying material, burst included,
+	// DefaultKeyDerivations if zero and no limit if negative. Each is a
+	// PBKDF2 of 2048 iterations, which any caller at a real address can
+	// ask for, passphrase or not; a conclusion past the bound is dropped
+	// for the caller to send again, and one sent again with the same salt
+	// needs no new derivation.
+	KeyDerivations int
 }
+
+// DefaultKeyDerivations is ListenerConfig.KeyDerivations when zero.
+const DefaultKeyDerivations = 200
 
 // Listener answers the handshakes of callers without keeping any state
 // for them before their conclusion, which a SYN cookie proves comes from
@@ -49,6 +60,7 @@ type ListenerConfig struct {
 type Listener struct {
 	cfg    ListenerConfig
 	secret [32]byte
+	kek    *kekDeriver
 }
 
 // NewListener returns a Listener.
@@ -59,7 +71,10 @@ func NewListener(cfg ListenerConfig) (*Listener, error) {
 	if cfg.Rand == nil {
 		cfg.Rand = rand.Reader
 	}
-	l := &Listener{cfg: cfg}
+	if cfg.KeyDerivations == 0 {
+		cfg.KeyDerivations = DefaultKeyDerivations
+	}
+	l := &Listener{cfg: cfg, kek: newKEKDeriver(float64(max(cfg.KeyDerivations, 0)))}
 	if _, err := io.ReadFull(cfg.Rand, l.secret[:]); err != nil {
 		return nil, err
 	}
@@ -175,7 +190,12 @@ func (l *Listener) conclusion(h *header, hs *handshake, from netip.AddrPort, now
 	case cfg.Passphrase == "" && hs.km != nil, cfg.Passphrase != "" && hs.km == nil:
 		return reject(RejectUnsecure)
 	case hs.km != nil:
-		km, err := unmarshalKM(hs.km, cfg.Passphrase)
+		km, err := unmarshalKMWith(hs.km, func(km *keyMaterial) ([]byte, error) {
+			return l.kek.kek(km, cfg.Passphrase, now)
+		})
+		if err == errKEKBusy {
+			return nil
+		}
 		if err != nil {
 			return reject(RejectBadSecret)
 		}

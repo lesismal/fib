@@ -277,6 +277,9 @@ type Conn struct {
 	kmMsg []byte
 	crypt *cryptor
 	kk    int
+	// kmKEK derives the KEKs of refreshed keys under a new salt, made on
+	// the first.
+	kmKEK *kekDeriver
 
 	// The caller's handshake.
 	isn     uint32
@@ -865,7 +868,19 @@ func (c *Conn) handleKMRefresh(cif []byte, now time.Time) {
 	if c.cfg.Passphrase == "" {
 		return
 	}
-	km, err := unmarshalKM(cif, c.cfg.Passphrase)
+	km, err := unmarshalKMWith(cif, func(km *keyMaterial) ([]byte, error) {
+		if c.km != nil && c.km.wrapKey != nil && km.salt == c.km.salt && km.keyLen == c.km.keyLen {
+			return c.km.wrapKey, nil
+		}
+		// New salts are rare, and each costs a PBKDF2: one a second.
+		if c.kmKEK == nil {
+			c.kmKEK = newKEKDeriver(1)
+		}
+		return c.kmKEK.kek(km, c.cfg.Passphrase, now)
+	})
+	if err == errKEKBusy {
+		return // the peer sends it again
+	}
 	if err != nil {
 		c.sendControl(now, ctrlUser, extKMRsp, 0, binary.BigEndian.AppendUint32(nil, kmStateBadSecret))
 		return
