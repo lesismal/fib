@@ -259,6 +259,7 @@ func (s *stream) writeMsg(compressed bool, payload []byte) error {
 			if m > 0 {
 				t.out = appendFrameHeader(t.out, frameData, 0, s.id, n+m)
 				t.out = append(append(t.out, part...), payload[:m]...)
+				t.sentData = true
 				t.sendWindow -= int64(n + m)
 				s.sendWindow -= int64(n + m)
 				parts[1] = payload[m:]
@@ -268,6 +269,7 @@ func (s *stream) writeMsg(compressed bool, payload []byte) error {
 		}
 		t.out = appendFrameHeader(t.out, frameData, 0, s.id, n)
 		t.out = append(t.out, part[:n]...)
+		t.sentData = true
 		t.sendWindow -= int64(n)
 		s.sendWindow -= int64(n)
 		parts[i] = part[n:]

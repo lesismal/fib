@@ -219,3 +219,122 @@ func TestWireServerDefaultStreamLimit(t *testing.T) {
 		t.Fatalf("the stream past the default limit: RST %d", got)
 	}
 }
+
+// TestWireServerControlFloods sends a server, each on a connection of its
+// own, floods of frames that ask for work and carry nothing, which it used
+// to answer for as long as they came, and checks that each ends the
+// connection with GOAWAY and ENHANCE_YOUR_CALM; and that PINGs following
+// the server's DATA, as grpc-go sends to size its windows, are not counted.
+func TestWireServerControlFloods(t *testing.T) {
+	f := &floodService{}
+	_, addr := startServer(t, &echoImpl{}, UnknownServiceHandler(f.handle))
+	const n = controlFrameBurst + 100
+	repeat := func(frame []byte, n int) [][]byte {
+		frames := make([][]byte, n)
+		for i := range frames {
+			frames[i] = frame
+		}
+		return frames
+	}
+	// The first CONTINUATION frames carry a byte each, so that only their
+	// number is past a limit.
+	tooMany := repeat(rawFrame(frameContinuation, 0, 1, []byte{0x80 | 16}), maxContinuationFrames+1)
+	for _, tc := range []struct {
+		name   string
+		frames [][]byte
+	}{
+		{"PING", repeat(appendPing(nil, false, []byte("floodpng")), n)},
+		{"SETTINGS", repeat(settingsFrame(), n)},
+		{"empty DATA", repeat(dataFrame(1, nil, false), n)},
+		{"empty CONTINUATION", repeat(rawFrame(frameContinuation, 0, 1, nil), n)},
+		{"CONTINUATION frames past the limit", tooMany},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			c := dialWire(t, addr, true)
+			first := headersFrame(1, c.request("/flood/x"), false)
+			if tc.name == "empty CONTINUATION" || tc.name == "CONTINUATION frames past the limit" {
+				first = rawFrame(frameHeaders, 0, 1, c.request("/flood/x"))
+			}
+			// The server may close before it has read them all.
+			b := bytes.Join(append([][]byte{first}, tc.frames...), nil)
+			go func() { _, _ = c.conn.Write(b) }()
+			if got := c.goAway(); got != errEnhanceCalm {
+				t.Fatalf("GOAWAY %d, want ENHANCE_YOUR_CALM", got)
+			}
+			c.closed()
+		})
+	}
+
+	// grpc-go sends a PING a round trip while it receives DATA, to size
+	// its windows by.
+	t.Run("PINGs after the server's DATA", func(t *testing.T) {
+		ticks := make(chan struct{})
+		t.Cleanup(func() { close(ticks) })
+		tick := func(_ any, stream ServerStream) error {
+			for range ticks {
+				if err := stream.SendMsg(&Rsp{N: 1}); err != nil {
+					return err
+				}
+			}
+			return nil
+		}
+		_, addr := startServer(t, &echoImpl{}, UnknownServiceHandler(tick))
+		c := dialWire(t, addr, true)
+		c.write(headersFrame(1, c.request("/tick/x"), false))
+		for range n {
+			ticks <- struct{}{}
+			c.expect(frameData, 1)
+			c.write(appendPing(nil, false, []byte("bdpbdpbd")))
+			for {
+				fr := c.expect(framePing, 0)
+				if fr.has(flagAck) {
+					break
+				}
+			}
+		}
+	})
+}
+
+// TestWireServerInitialWindowOverflow grows a stream's send window to
+// 2^31-1 and then raises SETTINGS_INITIAL_WINDOW_SIZE, which takes it past
+// the limit: a FLOW_CONTROL_ERROR of the connection (RFC 9113 section
+// 6.9.2), which the server used to let wrap.
+func TestWireServerInitialWindowOverflow(t *testing.T) {
+	f := &floodService{}
+	_, addr := startServer(t, &echoImpl{}, UnknownServiceHandler(f.handle))
+	c := dialWire(t, addr, true)
+	c.write(headersFrame(1, c.request("/flood/x"), false),
+		rawFrame(frameWindowUpdate, 0, 1, u32(maxWindow-defaultWindow)))
+	c.sync()
+	c.write(settingsFrame(settingInitialWindowSize, defaultWindow+1))
+	if got := c.goAway(); got != errFlowControl {
+		t.Fatalf("GOAWAY %d, want FLOW_CONTROL_ERROR", got)
+	}
+}
+
+// TestWireServerOversizedHeaderListKeepsHPACK sends a header list over the
+// limit whose block, past the limit, adds a field to the HPACK dynamic
+// table, and then a call naming that field by its index. The server used to
+// stop decoding at the limit, leaving its table without the field and
+// misreading every block after; now it decodes the block to its end,
+// dropping its fields, and resets only that stream.
+func TestWireServerOversizedHeaderListKeepsHPACK(t *testing.T) {
+	_, addr := startServer(t, &echoImpl{})
+	c := dialWire(t, addr, true)
+	const acceptEncoding = 16 // "accept-encoding: gzip, deflate", 60 bytes as listed
+	block := c.enc.Begin(nil)
+	block = append(block, bytes.Repeat([]byte{0x80 | acceptEncoding}, maxHeaderBlock/60+1)...)
+	block = c.enc.AppendField(block, "k", "late", false)
+	c.write(appendHeaderBlock(nil, 1, block, false, defaultMaxFrame))
+	if got := c.reset(1); got != errEnhanceCalm {
+		t.Fatalf("an oversized header list: RST %d", got)
+	}
+	c.write(headersFrame(3, c.request("/test.Echo/Unary", "k", "late"), false),
+		dataFrame(3, grpcMessage(t, Req{Msg: "meta"}), true))
+	if fr := c.expect(frameData, 3); !bytes.Contains(fr.payload, []byte(`"late|`)) {
+		t.Fatalf("the call after it: %q", fr.payload)
+	}
+	if st := c.trailers(3); st["grpc-status"] != "0" {
+		t.Fatalf("the call after it: %v", st)
+	}
+}

@@ -36,9 +36,13 @@ type transport struct {
 	block        []byte
 	blockID      uint32
 	blockEnd     bool
-	// resets is a server's budget of streams a client may cost it; see
-	// streamResetBurst.
-	resets budget
+	// resets is a server's budget of streams a client may cost it, and
+	// glitches either side's of frames that ask for work and carry
+	// nothing; see streamResetBurst and controlFrameBurst. contFrames
+	// counts the CONTINUATION frames of the header block arriving.
+	resets     budget
+	glitches   budget
+	contFrames int
 
 	mu      sync.Mutex
 	enc     *hpack.Encoder
@@ -64,10 +68,13 @@ type transport struct {
 	// or not their streams have ended, a reset ending them most often;
 	// queued holds the calls waiting for one of them to return, so that
 	// no more than the stream limit run at once.
-	running uint32
-	queued  []*serverStream
-	closed  bool
-	closeErr          error
+	running  uint32
+	queued   []*serverStream
+	closed   bool
+	closeErr error
+	// sentData is set when DATA is framed, and cleared by the PING that
+	// follows; see the PING case of handleFrame.
+	sentData bool
 	// goingAway is set once a GOAWAY has gone either way: no stream is
 	// opened on the connection after it.
 	goingAway bool
@@ -101,6 +108,7 @@ func newTransport(client bool) *transport {
 		awaitPreface:      !client,
 		nextID:            1,
 		resets:            newBudget(streamResetBurst, streamResetRate),
+		glitches:          newBudget(controlFrameBurst, controlFrameRate),
 	}
 	t.dec.MaxStringLength = maxHeaderBlock
 	return t
@@ -277,6 +285,11 @@ func (t *transport) handleFrame(f *frame) error {
 	}
 	switch f.typ {
 	case frameData:
+		if len(f.payload) == 0 && !f.has(flagEndStream) {
+			if err := t.glitch(); err != nil {
+				return err
+			}
+		}
 		return t.handleData(f)
 	case frameHeaders:
 		if f.streamID == 0 {
@@ -294,8 +307,14 @@ func (t *transport) handleFrame(f *frame) error {
 		if f.has(flagEndHeaders) {
 			return t.handleHeaderBlock(f.streamID, f.payload, f.has(flagEndStream))
 		}
+		if len(f.payload) == 0 {
+			if err := t.glitch(); err != nil {
+				return err
+			}
+		}
 		t.block = append(t.block[:0], f.payload...)
 		t.blockID, t.blockEnd = f.streamID, f.has(flagEndStream)
+		t.contFrames = 0
 		return nil
 	case frameContinuation:
 		if t.blockID == 0 {
@@ -305,7 +324,14 @@ func (t *transport) handleFrame(f *frame) error {
 		if len(t.block) > maxHeaderBlock {
 			return &connError{code: errEnhanceCalm, msg: "header block too large"}
 		}
+		t.contFrames++
+		if t.contFrames > maxContinuationFrames {
+			return &connError{code: errEnhanceCalm, msg: "header block in too many frames"}
+		}
 		if !f.has(flagEndHeaders) {
+			if len(f.payload) == 0 {
+				return t.glitch()
+			}
 			return nil
 		}
 		id := t.blockID
@@ -331,6 +357,16 @@ func (t *transport) handleFrame(f *frame) error {
 		}
 		if !f.has(flagAck) {
 			t.mu.Lock()
+			// A peer receiving DATA, grpc-go's among them, sends a PING a
+			// round trip to size its windows by: a PING after this side
+			// has sent DATA is not counted, as grpc-go's own server counts
+			// none then.
+			if t.sentData {
+				t.sentData = false
+			} else if err := t.glitch(); err != nil {
+				t.mu.Unlock()
+				return err
+			}
 			t.out = appendPing(t.out, true, f.payload)
 			t.mu.Unlock()
 			t.flush()
@@ -361,6 +397,9 @@ func (t *transport) handleSettings(f *frame) error {
 	if len(f.payload)%6 != 0 {
 		return &connError{code: errFrameSize, msg: "SETTINGS size"}
 	}
+	if err := t.glitch(); err != nil {
+		return err
+	}
 	t.mu.Lock()
 	defer func() {
 		t.mu.Unlock()
@@ -376,6 +415,11 @@ func (t *transport) handleSettings(f *frame) error {
 				return &connError{code: errFlowControl, msg: "initial window too large"}
 			}
 			delta := int64(v) - t.peerInitialWindow
+			for _, s := range t.streams {
+				if s.sendWindow+delta > maxWindow {
+					return &connError{code: errFlowControl, msg: "initial window change overflows a stream's window"}
+				}
+			}
 			t.peerInitialWindow = int64(v)
 			for _, s := range t.streams {
 				s.sendWindow += delta
@@ -495,19 +539,39 @@ func (t *transport) idleLocked(id uint32) bool {
 func (t *transport) handleHeaderBlock(id uint32, block []byte, endStream bool) error {
 	var fields []hpack.HeaderField
 	size := 0
+	tooLarge := false
+	// A header list past the limit is decoded to its end all the same,
+	// dropping its fields: what the block does to the dynamic table, the
+	// blocks after it depend on (RFC 9113 section 4.3).
 	err := t.dec.Decode(block, func(hf hpack.HeaderField) error {
+		if tooLarge {
+			return nil
+		}
 		size += len(hf.Name) + len(hf.Value) + 32
 		if size > maxHeaderBlock {
-			return errHeaderListTooLarge
+			tooLarge, fields = true, nil
+			return nil
 		}
 		fields = append(fields, hf)
 		return nil
 	})
 	if err != nil {
-		if errors.Is(err, errHeaderListTooLarge) {
-			return &streamError{id: id, code: errEnhanceCalm}
-		}
 		return &connError{code: errCompression, msg: err.Error()}
+	}
+	if tooLarge {
+		if !t.client {
+			// The stream is opened, and refused: its id is used.
+			t.mu.Lock()
+			if t.streams[id] == nil {
+				if id%2 == 0 || id <= t.lastPeerID {
+					t.mu.Unlock()
+					return protocolError("bad stream id %d", id)
+				}
+				t.lastPeerID = id
+			}
+			t.mu.Unlock()
+		}
+		return &streamError{id: id, code: errEnhanceCalm}
 	}
 	if t.client {
 		t.mu.Lock()
@@ -538,8 +602,6 @@ func (t *transport) handleHeaderBlock(id uint32, block []byte, endStream bool) e
 	}
 	return t.server.openStream(t, id, fields, endStream)
 }
-
-var errHeaderListTooLarge = errors.New("grpc: header list too large")
 
 // onReset ends a stream the peer reset. A stream that had ended already,
 // which a peer may reset in flight, costs nothing; one still open counts
