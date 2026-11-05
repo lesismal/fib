@@ -499,12 +499,22 @@ func Push(engine *fib.Engine, h *hub.Hub, path, rawURL string, wait time.Duratio
 					Wait: wait,
 				})
 			}
+			if err == nil {
+				// Close may have come while Subscribe ran: it found no
+				// subscription to close, so this one is closed here.
+				r.mu.Lock()
+				closed = r.closed
+				if !closed {
+					r.sub = sub
+				}
+				r.mu.Unlock()
+				if closed {
+					sub.Close()
+					err = ErrClosed
+				}
+			}
 			if err != nil {
 				_ = cc.Close()
-			} else {
-				r.mu.Lock()
-				r.sub = sub
-				r.mu.Unlock()
 			}
 		}
 		if done != nil {
