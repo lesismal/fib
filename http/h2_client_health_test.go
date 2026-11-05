@@ -5,6 +5,7 @@ package http
 import (
 	"bytes"
 	"errors"
+	"fmt"
 	"testing"
 	"time"
 )
@@ -42,12 +43,30 @@ func silentPeer(p *cvH2cPeer, pinged chan<- bool) {
 // repeat fails with ErrPingTimeout, long before its Timeout.
 func TestClientHTTP2HealthCheckFindsDeadConnection(t *testing.T) {
 	pinged := make(chan bool, 1)
-	url := cvH2cServe(t, func(p *cvH2cPeer, _ int) { silentPeer(p, pinged) })
+	peers := make(chan *cvH2cPeer, 1)
+	url := cvH2cServe(t, func(p *cvH2cPeer, _ int) {
+		peers <- p
+		silentPeer(p, pinged)
+	})
 	client := cvH2cClient(t, healthConfig)
 	start := time.Now()
 	_, err := client.Go(mustRequest(t, "POST", url, nil)).Wait()
 	if !errors.Is(err, ErrPingTimeout) {
-		t.Fatalf("err = %v, want ErrPingTimeout", err)
+		// Say what the server's side saw, which tells a connection the
+		// network ended (a reset both sides hear) from one the client did.
+		server := "the server never took the connection"
+		select {
+		case p := <-peers:
+			select {
+			case got := <-pinged:
+				server = fmt.Sprintf("the server saw PING %v, and its read ended %v after the request began with %v",
+					got, p.readAt.Sub(start), p.readErr)
+			case <-time.After(2 * time.Second):
+				server = "the server's read was still going"
+			}
+		default:
+		}
+		t.Fatalf("err = %v after %v, want ErrPingTimeout; %s", err, time.Since(start), server)
 	}
 	if d := time.Since(start); d > 5*time.Second {
 		t.Fatalf("took %v", d)

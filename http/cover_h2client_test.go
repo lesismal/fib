@@ -24,6 +24,10 @@ type cvH2cPeer struct {
 	in   []byte
 	enc  *hpack.Encoder
 	dec  *hpack.Decoder
+	// readErr is the error the server's last read ended with, and readAt
+	// when, for a test to tell what ended the connection on this side.
+	readErr error
+	readAt  time.Time
 }
 
 // cvH2cServe runs a fake HTTP/2 server with prior knowledge: serve gets each
@@ -77,6 +81,7 @@ func (p *cvH2cPeer) next() (h2Frame, bool) {
 		m, err := p.conn.Read(buf)
 		p.in = append(p.in, buf[:m]...)
 		if err != nil && m == 0 {
+			p.readErr, p.readAt = err, time.Now()
 			return h2Frame{}, false
 		}
 	}
