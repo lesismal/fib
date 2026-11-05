@@ -2,6 +2,7 @@ package quic
 
 import (
 	"bytes"
+	"slices"
 	"time"
 )
 
@@ -519,8 +520,15 @@ func (c *Conn) handleNewConnectionID(r *reader) error {
 		return transportErr(errProtocolViolation, "NEW_CONNECTION_ID with a zero-length connection ID")
 	}
 	if seq < c.retiredPrior {
-		c.retireCIDs = append(c.retireCIDs, seq)
-		return c.glitch()
+		// One retired before is retired again, as it may be by now, but
+		// queued once however often it is offered.
+		if !slices.Contains(c.retireCIDs, seq) {
+			c.retireCIDs = append(c.retireCIDs, seq)
+		}
+		if err := c.glitch(); err != nil {
+			return err
+		}
+		return c.retireQueued()
 	}
 	if old, ok := c.peerCIDs[seq]; ok {
 		if !bytes.Equal(old.cid, cid) {
@@ -552,6 +560,19 @@ func (c *Conn) handleNewConnectionID(r *reader) error {
 	}
 	if uint64(len(c.peerCIDs)) > c.local.activeCIDLimit {
 		return transportErr(errConnectionIDLimit, "too many connection IDs")
+	}
+	return c.retireQueued()
+}
+
+// retireQueued reports the error to close the connection with once more
+// RETIRE_CONNECTION_ID frames wait to be sent than a peer that retires its
+// IDs in good faith makes queue: a few times what it may have active, and no
+// fewer than 16. One retiring them faster than this side may send the frames,
+// which it can hold back by not acknowledging, would otherwise queue them
+// without end (CVE-2024-22189 in quic-go). Callers hold c.mu.
+func (c *Conn) retireQueued() error {
+	if len(c.retireCIDs) > int(max(4*min(c.local.activeCIDLimit, 1<<10), 16)) {
+		return transportErr(errConnectionIDLimit, "too many connection IDs to retire")
 	}
 	return nil
 }

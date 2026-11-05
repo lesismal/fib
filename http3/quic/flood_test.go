@@ -296,3 +296,37 @@ func TestFloodClientTakesResets(t *testing.T) {
 		t.Fatalf("echoed %q", got)
 	}
 }
+
+// A peer that offers connection ID after connection ID, each retiring all
+// before it, faster than RETIRE_CONNECTION_ID goes out, as it can make
+// happen by acknowledging nothing, is given up on once a few times its limit
+// wait to be retired, rather than queuing them without end (CVE-2024-22189
+// in quic-go); one whose retirements are sent as they come goes on.
+func TestFloodRetireConnectionIDs(t *testing.T) {
+	cid := func(seq int) []byte {
+		return []byte{byte(seq >> 24), byte(seq >> 16), byte(seq >> 8), byte(seq), 'c', 'i', 'd', '!'}
+	}
+	for _, sent := range []bool{false, true} {
+		c := frameConn(t)
+		c.mu.Lock()
+		var err error
+		seq := 1
+		for ; seq <= 20000 && err == nil; seq++ {
+			_, err = c.handleFrames(spaceApp, newCIDFrame(uint64(seq), uint64(seq), cid(seq)), time.Now())
+			if sent {
+				c.retireCIDs = c.retireCIDs[:0]
+			}
+		}
+		queued := len(c.retireCIDs)
+		c.mu.Unlock()
+		var te *TransportError
+		switch {
+		case sent && err != nil:
+			t.Fatalf("retirements sent: closed at %d with %v", seq, err)
+		case !sent && (!errors.As(err, &te) || te.Code != errConnectionIDLimit):
+			t.Fatalf("closed with %v, want CONNECTION_ID_LIMIT_ERROR", err)
+		case !sent && (seq > 100 || queued > 100):
+			t.Fatalf("closed after %d IDs, %d queued", seq, queued)
+		}
+	}
+}
