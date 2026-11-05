@@ -698,9 +698,6 @@ func (h *ServerHandler) validateMinimalHandshake(data []byte) ([]byte, handshake
 				return nil, handshakeResult{}, nil, false, errMalformedHandshake
 			}
 			hostSeen, host = true, value
-		case bytes.EqualFold(name, []byte("Origin")):
-			origins++
-			origin = value
 		case bytes.EqualFold(name, []byte("Connection")):
 			connectionUpgrade = connectionUpgrade || byteHeaderHasToken(value, []byte("upgrade"))
 		case bytes.EqualFold(name, []byte("Upgrade")):
@@ -723,6 +720,9 @@ func (h *ServerHandler) validateMinimalHandshake(data []byte) ([]byte, handshake
 			if h.config.EnableCompression {
 				offers = append(offers, string(value))
 			}
+		case len(name) == len("Origin") && bytes.EqualFold(name, []byte("Origin")):
+			origins++
+			origin = value
 		case bytes.EqualFold(name, []byte("Content-Length")), bytes.EqualFold(name, []byte("Transfer-Encoding")):
 			if len(value) != 0 {
 				return nil, handshakeResult{}, nil, false, errMalformedHandshake

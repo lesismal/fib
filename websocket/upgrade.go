@@ -138,12 +138,19 @@ func sameOrigin(origin, host []byte) bool {
 		return false
 	}
 	authority := origin[i+3:]
-	if end := bytes.IndexAny(authority, "/?#"); end >= 0 {
-		authority = authority[:end]
+	// One pass: the authority ends at the first '/', '?' or '#', and starts
+	// after its last '@'.
+	start := 0
+	for j, c := range authority {
+		if c == '/' || c == '?' || c == '#' {
+			authority = authority[:j]
+			break
+		}
+		if c == '@' {
+			start = j + 1
+		}
 	}
-	if at := bytes.LastIndexByte(authority, '@'); at >= 0 {
-		authority = authority[at+1:]
-	}
+	authority = authority[start:]
 	return len(authority) != 0 && bytes.EqualFold(authority, host)
 }
 
