@@ -31,7 +31,8 @@ import (
 // call that blocks stalls every connection that goroutine serves. So a
 // callback is not called there, and neither is a client's verification of
 // the server's certificate, nor its VerifyPeerCertificate and VerifyConnection
-// (see clientHS.checkThen): it is handed to a worker of the handshake
+// (see clientHS.checkThen), nor a server's verification of the client's and
+// its VerifyPeerCertificate (see serverHS.acceptClientThen): it is handed to a worker of the handshake
 // pool, the handshake sets the rest aside, and once the callback returns the
 // worker drives the handshake on (see certCall). The cost is a hop to the pool
 // and back for the full handshakes that need a callback, which is small next
@@ -424,6 +425,67 @@ func (h *serverHS) acceptClientCertificates(ders [][]byte) *hsError {
 	return nil
 }
 
+// acceptClientThen runs acceptClientCertificates on ders, and then rest,
+// unless it failed. Verifying a chain takes a while, longer where the
+// platform's verifier does it, and VerifyPeerCertificate is the user's and may
+// block, so where there is one of them to run and a layer to wake the
+// handshake again, it runs as a client's check of the server's does (see
+// clientHS.checkThen): on a worker of the handshake pool, with the messages
+// that came behind the Certificate set aside until it has returned.
+func (h *serverHS) acceptClientThen(ders [][]byte, rest func()) *hsError {
+	verifies := h.config.ClientAuth >= stdtls.VerifyClientCertIfGiven && len(ders) > 0
+	if h.check.async == nil || !verifies && h.config.VerifyPeerCertificate == nil {
+		if herr := h.acceptClientCertificates(ders); herr != nil {
+			return herr
+		}
+		rest()
+		return nil
+	}
+	if _, ok := h.check.ask(func() (*stdtls.Certificate, error) {
+		if herr := h.acceptClientCertificates(ders); herr != nil {
+			return nil, herr
+		}
+		return nil, nil
+	}); !ok {
+		h.check.wait(func(out *[]byte) *hsError {
+			if herr := h.checked(); herr != nil {
+				return herr
+			}
+			rest()
+			if h.quic != nil {
+				// QUIC's layer drains the messages that wait; see
+				// QUICConn.resumePicked.
+				return nil
+			}
+			return h.handshakeData(nil, out)
+		})
+		return nil
+	}
+	if herr := h.checked(); herr != nil {
+		return herr
+	}
+	rest()
+	return nil
+}
+
+// checked is what the check of the client's certificate answered, with the
+// call made ready for the next.
+func (h *serverHS) checked() *hsError {
+	a := h.check.answer.Load()
+	h.check.reset()
+	if a.err == nil {
+		return nil
+	}
+	if herr, ok := a.err.(*hsError); ok {
+		return herr
+	}
+	return &hsError{alert: alertInternalError, err: a.err}
+}
+
+// sessionPeerChecked, set by tests, is told of each ticket whose client
+// certificates sessionPeer reads back.
+var sessionPeerChecked func()
+
 // sessionPeer reads back the client certificates a ticket carries, and
 // reports whether the session can be resumed with them under the Config: not
 // without one if one is required, not with one if none is asked for, not once
@@ -439,6 +501,9 @@ func (h *serverHS) acceptClientCertificates(ders [][]byte) *hsError {
 // root still among the ClientCAs; the cost of more is one verification, what a
 // full handshake with a client certificate pays.
 func (h *serverHS) sessionPeer(raw [][]byte, rawChains [][][]byte) (certs []*x509.Certificate, chains [][]*x509.Certificate, ok bool) {
+	if sessionPeerChecked != nil {
+		sessionPeerChecked()
+	}
 	auth := h.config.ClientAuth
 	if len(raw) == 0 {
 		return nil, nil, !requiresClientCert(auth)
@@ -511,15 +576,13 @@ func (h *serverHS) clientCertificate13(msg []byte) *hsError {
 		}
 		ders = append(ders, der)
 	}
-	if herr := h.acceptClientCertificates(ders); herr != nil {
-		return herr
-	}
-	h.transcript = append(h.transcript, msg...)
-	h.state = srvAwaitFinished
-	if len(h.peerCerts) > 0 {
-		h.state = srvAwaitClientCertVerify
-	}
-	return nil
+	return h.acceptClientThen(ders, func() {
+		h.transcript = append(h.transcript, msg...)
+		h.state = srvAwaitFinished
+		if len(h.peerCerts) > 0 {
+			h.state = srvAwaitClientCertVerify
+		}
+	})
 }
 
 // clientCertificateVerify13 checks the client's CertificateVerify in TLS 1.3,
@@ -550,12 +613,10 @@ func (h *serverHS) clientCertificate12(msg []byte) *hsError {
 	if herr != nil {
 		return herr
 	}
-	if herr := h.acceptClientCertificates(ders); herr != nil {
-		return herr
-	}
-	h.transcript = append(h.transcript, msg...)
-	h.state = srv12AwaitKeyExchange
-	return nil
+	return h.acceptClientThen(ders, func() {
+		h.transcript = append(h.transcript, msg...)
+		h.state = srv12AwaitKeyExchange
+	})
 }
 
 // clientCertificateVerify12 checks the client's CertificateVerify in TLS 1.2,

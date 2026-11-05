@@ -153,8 +153,11 @@ type serverHS struct {
 	cert    *stdtls.Certificate
 	alg     uint16
 	// pick is Config.GetCertificate, called off the handshake's goroutine
-	// where there is a layer to wake it again (see auth.go).
-	pick certCall
+	// where there is a layer to wake it again (see auth.go), and check the
+	// verification of the client's certificate, VerifyPeerCertificate with
+	// it, called the same way (see acceptClientThen).
+	pick  certCall
+	check certCall
 
 	// The client's certificates, if it was asked for them and sent any, as
 	// sent and parsed, and the chains they were verified with.
@@ -631,10 +634,10 @@ func (h *serverHS) process(in []byte) (consumed int, out []byte, done bool, err 
 		h.decided = true
 		h.peekHello, h.peekMsg = nil, nil
 	}
-	if waiting, herr := h.pick.proceed(&out); waiting || herr != nil {
+	if waiting, herr := h.proceed(&out); waiting || herr != nil {
 		return 0, out, false, herr
 	}
-	for h.state != srvDone && !h.pick.waiting() && len(in)-consumed >= recordHeaderLen {
+	for h.state != srvDone && !h.waiting() && len(in)-consumed >= recordHeaderLen {
 		rec := in[consumed:]
 		length := int(rec[3])<<8 | int(rec[4])
 		limit := maxCiphertext13
@@ -763,11 +766,29 @@ func (h *serverHS) handshakeData(data []byte, out *[]byte) *hsError {
 		if h.state == srvDone && len(h.hsBuf) != 0 {
 			return fail(alertUnexpectedMessage, "handshake data after the Finished")
 		}
+		if h.waiting() {
+			// The messages behind it wait with it, and are handled once
+			// it goes on.
+			return nil
+		}
 	}
 	if len(h.hsBuf) == 0 {
 		h.hsBuf = nil
 	}
 	return nil
+}
+
+// waiting reports whether the handshake has set something aside for a
+// callback or a check that has not answered.
+func (h *serverHS) waiting() bool { return h.pick.waiting() || h.check.waiting() }
+
+// proceed goes on with what the handshake set aside, if its callback or check
+// has answered, and reports whether it still waits.
+func (h *serverHS) proceed(out *[]byte) (bool, *hsError) {
+	if h.check.waiting() {
+		return h.check.proceed(out)
+	}
+	return h.pick.proceed(out)
 }
 
 // message handles one handshake message from the client.
@@ -1020,10 +1041,6 @@ func (h *serverHS) resume(ch *clientHelloMsg, prior []byte) (psk []byte, index i
 		if s, valid := h.suite13(state.suite); !valid || s.hash().Size() != f().Size() {
 			continue
 		}
-		certs, chains, usable := h.sessionPeer(state.certs, state.chains)
-		if !usable {
-			continue
-		}
 		early, err := hkdf.Extract(f, state.psk, nil)
 		if err != nil {
 			continue
@@ -1038,10 +1055,19 @@ func (h *serverHS) resume(ch *clientHelloMsg, prior []byte) (psk []byte, index i
 		}
 		mac := hmac.New(f, key)
 		mac.Write(hashed)
-		if hmac.Equal(mac.Sum(nil), ch.binders[i]) {
-			h.peerRaw, h.peerCerts, h.peerChains = state.certs, certs, chains
-			return state.psk, i, state, true
+		if !hmac.Equal(mac.Sum(nil), ch.binders[i]) {
+			continue
 		}
+		// Only once the binder has shown that the client holds the
+		// ticket's secret: anyone who saw a ticket go by can offer it, as
+		// many times over as a ClientHello holds, and each costs a
+		// verification of the chain it carries.
+		certs, chains, usable := h.sessionPeer(state.certs, state.chains)
+		if !usable {
+			continue
+		}
+		h.peerRaw, h.peerCerts, h.peerChains = state.certs, certs, chains
+		return state.psk, i, state, true
 	}
 	return nil, 0, ticketState{}, false
 }

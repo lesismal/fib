@@ -398,6 +398,7 @@ func (h *Handler) openNative(c *fib.Connection, t *layer) {
 	} else {
 		shs := newServerHS(h.Config, c, h.ticketKeys())
 		shs.pick.async = t.async(h.inner())
+		shs.check.async = shs.pick.async
 		if _, ok := h.inner().(EarlyDataHandler); ok && h.takesEarlyData() {
 			shs.tcpEarly, shs.maxEarly = true, cmpOr(h.MaxEarlyData, 16<<10)
 			// Early data in records, and its share of their overhead.

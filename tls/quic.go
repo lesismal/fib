@@ -321,6 +321,7 @@ func (c *QUICConn) SetWake(wake func()) {
 	c.wake = wake
 	if c.server != nil {
 		c.server.pick.async = c.async()
+		c.server.check.async = c.server.pick.async
 	}
 }
 
@@ -532,7 +533,7 @@ func (c *QUICConn) resumePending() {
 // waiting reports whether the handshake waits for a certificate callback, or
 // a client for a check of the server's.
 func (c *QUICConn) waiting() bool {
-	return c.server != nil && c.server.pick.waiting() || c.client != nil && c.client.waiting()
+	return c.server != nil && c.server.waiting() || c.client != nil && c.client.waiting()
 }
 
 // resumePicked goes on with a handshake that waited for a certificate
@@ -545,7 +546,7 @@ func (c *QUICConn) resumePicked() {
 	var waiting bool
 	var herr *hsError
 	if c.server != nil {
-		waiting, herr = c.server.pick.proceed(nil)
+		waiting, herr = c.server.proceed(nil)
 	} else {
 		waiting, herr = c.client.proceed(nil)
 	}
