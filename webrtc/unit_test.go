@@ -290,7 +290,7 @@ func TestLiteHeardAgain(t *testing.T) {
 		iceState: ICEConnectionStateDisconnected,
 		bound:    map[netip.AddrPort]struct{}{from: {}},
 	}
-	pc.heard(from, time.Now())
+	pc.heard(from, time.Now(), true)
 	if pc.iceState != ICEConnectionStateConnected {
 		t.Fatalf("ICE state %v", pc.iceState)
 	}

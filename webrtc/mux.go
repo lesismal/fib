@@ -215,15 +215,25 @@ func (m *Mux) unregister(ufrag string, pc *PeerConnection) {
 	m.mu.Unlock()
 }
 
-// bind routes everything from addr to pc. A PeerConnection binds the
-// addresses it sends to and those its ICE agent has heard a valid request
-// from. The latest PeerConnection to bind an address has it.
-func (m *Mux) bind(addr netip.AddrPort, pc *PeerConnection) {
+// bind routes everything from addr to pc, and reports whether it does. A
+// PeerConnection binds the addresses it sends to, the checks of its ICE
+// agent and the answers to valid requests among them. The latest to bind
+// an address has it, unless another PeerConnection has it as the address
+// it sends its peer to: a request whose source is spoofed is answered
+// like any other, and must not take the address of a peer that is
+// connected. That PeerConnection lets it go when it closes or moves to
+// another.
+func (m *Mux) bind(addr netip.AddrPort, pc *PeerConnection) bool {
 	m.mu.Lock()
-	if !m.closed {
-		m.peers[addr] = pc
+	defer m.mu.Unlock()
+	if m.closed {
+		return false
 	}
-	m.mu.Unlock()
+	if cur := m.peers[addr]; cur != nil && cur != pc && cur.selectedAddr() == addr {
+		return false
+	}
+	m.peers[addr] = pc
+	return true
 }
 
 // release forgets pc's addresses and ufrags and closes the connections of

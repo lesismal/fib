@@ -93,7 +93,10 @@ address the server may never have been told of (its host candidates are mDNS
 names, and NATs rewrite the rest): the request's USERNAME begins with the ICE
 ufrag of the PeerConnection it is for, and the Mux looks that ufrag up. The ICE
 agent there checks the request's MESSAGE-INTEGRITY before the address is
-trusted with anything more. Anything else from an unknown address is dropped.
+trusted with anything more: only a request it answers routes the address to
+that PeerConnection, and never one another PeerConnection is connected to,
+since anyone may send a valid request for a PeerConnection of their own from
+an address they spoof. Anything else from an unknown address is dropped.
 
 Second, inside the PeerConnection, by the first byte, as RFC 7983 lays it out:
 

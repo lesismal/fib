@@ -78,7 +78,9 @@ PeerConnection。来自一个谁都不认识的地址的 STUN Binding request，
 服务端的方式：这个地址服务端可能从未被告知过（浏览器的 host candidate 是 mDNS 名字，其余
 的又被 NAT 改写过）。请求的 USERNAME 以目标 PeerConnection 的 ICE ufrag 开头，Mux 按这个
 ufrag 查找；那边的 ICE agent 先校验请求的 MESSAGE-INTEGRITY，通过之后才会信任这个地址做
-别的事。其它来自未知地址的数据一律丢弃。
+别的事：只有它应答了的请求才会把这个地址路由到该 PeerConnection，而且绝不会抢走另一个
+PeerConnection 已经连上的地址，因为任何人都能从伪造的源地址、为自己的 PeerConnection 发出
+合法的请求。其它来自未知地址的数据一律丢弃。
 
 第二步在 PeerConnection 内部，按首字节分发，规则来自 RFC 7983：
 

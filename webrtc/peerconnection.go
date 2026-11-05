@@ -5,6 +5,7 @@ import (
 	stdtls "crypto/tls"
 	"crypto/x509"
 	"encoding/base64"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
@@ -15,6 +16,7 @@ import (
 	"runtime/debug"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/lesismal/fib"
@@ -230,6 +232,8 @@ type PeerConnection struct {
 	localSet       bool
 	bound          map[netip.AddrPort]struct{}
 	remoteAddr     netip.AddrPort
+	// selected is remoteAddr, for the Mux to read without the mutex.
+	selected atomic.Pointer[netip.AddrPort]
 	lastRecv       time.Time
 	pendingCreds   [2]string
 	pendingRestart bool
@@ -773,9 +777,28 @@ func (pc *PeerConnection) handleDatagram(from netip.AddrPort, b []byte) {
 			return
 		}
 	}
-	pc.heard(from, now)
+	// A STUN request reaches here by the ufrag it names, whatever its
+	// source, and before its MESSAGE-INTEGRITY is checked: its address is
+	// bound only once the agent answers it. What else comes here came by
+	// an address bound already.
+	pc.heard(from, now, b[0] >= 4)
 	pc.demux(localID, from, b, now)
 	pc.unlockAt(&locked)
+}
+
+// setRemote sets the address the peer is sent to, and the transport.
+func (pc *PeerConnection) setRemote(addr netip.AddrPort, local ice.LocalID) {
+	pc.remoteAddr, pc.remoteLocal = addr, local
+	pc.selected.Store(&addr)
+}
+
+// selectedAddr is the address the peer is sent to, if any; it may be
+// called without the mutex.
+func (pc *PeerConnection) selectedAddr() netip.AddrPort {
+	if p := pc.selected.Load(); p != nil {
+		return *p
+	}
+	return netip.AddrPort{}
 }
 
 // demux sorts a datagram from the peer by its first byte: STUN, DTLS, or
@@ -789,7 +812,7 @@ func (pc *PeerConnection) demux(local ice.LocalID, from netip.AddrPort, b []byte
 		}
 	case c >= 20 && c <= 63:
 		if !pc.remoteAddr.IsValid() {
-			pc.remoteAddr, pc.remoteLocal = from, local
+			pc.setRemote(from, local)
 		}
 		pc.handleDTLS(b, now)
 	case c >= 128 && c <= 191:
@@ -849,11 +872,13 @@ func (pc *PeerConnection) relayProgress(r *relay) {
 	}
 }
 
-// heard notes a datagram that came to the Mux from addr: its address is
-// routed here, and a lite agent counts it as a sign of life.
-func (pc *PeerConnection) heard(from netip.AddrPort, now time.Time) {
+// heard notes a datagram that came to the Mux from addr: a lite agent
+// counts it as a sign of life, and its address is routed here if bind.
+func (pc *PeerConnection) heard(from netip.AddrPort, now time.Time, bind bool) {
 	pc.lastRecv = now
-	pc.bind(from)
+	if bind {
+		pc.bind(from)
+	}
 	if pc.cfg.ICELite && pc.iceState == ICEConnectionStateDisconnected {
 		pc.setICEState(ICEConnectionStateConnected)
 	}
@@ -863,13 +888,19 @@ func (pc *PeerConnection) bind(addr netip.AddrPort) {
 	if _, ok := pc.bound[addr]; ok || len(pc.bound) >= maxBoundAddrs {
 		return
 	}
-	pc.bound[addr] = struct{}{}
-	pc.mux.bind(addr, pc)
+	if pc.mux.bind(addr, pc) {
+		pc.bound[addr] = struct{}{}
+	}
 }
 
-// sendTo sends a datagram to addr through the Mux.
+// sendTo sends a datagram to addr through the Mux, routing what addr sends
+// here: the address of a check or of a request the agent answered. An
+// error response, which a request that failed its MESSAGE-INTEGRITY gets,
+// binds nothing.
 func (pc *PeerConnection) sendTo(addr netip.AddrPort, b []byte) {
-	pc.bind(addr)
+	if len(b) < 2 || b[0] >= 4 || binary.BigEndian.Uint16(b)&0x0110 != 0x0110 {
+		pc.bind(addr)
+	}
 	pc.mux.send(addr, b)
 }
 
@@ -1080,7 +1111,7 @@ func (pc *PeerConnection) updateConnState() {
 }
 
 func (pc *PeerConnection) onSelectedPair(p ice.Pair) {
-	pc.remoteAddr, pc.remoteLocal = p.Remote.AddrPort(), p.Local.LocalID
+	pc.setRemote(p.Remote.AddrPort(), p.Local.LocalID)
 	pc.selections++
 	pc.startDTLS(time.Now())
 }
