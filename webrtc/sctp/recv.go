@@ -44,6 +44,12 @@ const maxGapSpan = 65535
 
 const maxDups = 32
 
+// chunkOverhead is what each chunk waiting in a stream's queue counts
+// toward the receive window besides its data, for its buffer and entry, as
+// usrsctp counts each chunk's control overhead. It keeps a peer sending
+// tiny chunks from filling the window with many more entries than bytes.
+const chunkOverhead = 256
+
 func (a *Association) handleData(flags uint8, v []byte) error {
 	if len(v) < 12 {
 		return ErrMalformed
@@ -72,17 +78,29 @@ func (a *Association) handleData(flags uint8, v []byte) error {
 	if tsn-a.peerCum > maxGapSpan {
 		return nil
 	}
-	if tsn != a.peerCum+1 && a.held+len(data) > a.cfg.ReceiveWindow {
-		// No room: dropped unacknowledged, the peer sends it again. The
-		// next TSN is always taken, so a full window still moves.
-		return nil
+	var st *stream
+	if sid < a.inStreams {
+		st = a.stream(sid)
+	}
+	whole := flags&(flagBegin|flagEnd) == flagBegin|flagEnd
+	// A chunk delivered straight from the packet, or on a stream that is
+	// not there, holds nothing. Any other is held and must fit the window:
+	// past it a chunk is dropped unacknowledged and the peer sends it
+	// again. The next TSN may go over, so a full window still moves while
+	// a message larger than it is reassembled, but no further than one
+	// such message: a peer that keeps sending chunks it cannot have
+	// delivered, each the next TSN, holds no more than that.
+	if st != nil && !(whole && (flags&flagUnordered != 0 || ssn == st.nextSSN)) {
+		need := a.held + len(data) + chunkOverhead
+		if need > a.cfg.ReceiveWindow && (tsn != a.peerCum+1 || need > a.cfg.ReceiveWindow+a.cfg.MaxMessageSize) {
+			return nil
+		}
 	}
 	a.mark(tsn)
-	if sid >= a.inStreams {
+	if st == nil {
 		return nil
 	}
-	st := a.stream(sid)
-	if flags&(flagBegin|flagEnd) == flagBegin|flagEnd {
+	if whole {
 		// A whole message: unordered ones and the next ordered one are
 		// delivered straight from the packet.
 		if flags&flagUnordered != 0 {
@@ -172,26 +190,48 @@ func (a *Association) spill(sid uint16, st *stream) {
 }
 
 // queue files a chunk in its stream's ordered or unordered queue and
-// delivers what that completes.
+// delivers what that completes. Each queued chunk counts chunkOverhead
+// toward held besides its data.
 func (a *Association) queue(sid uint16, st *stream, c rchunk) {
+	a.held += chunkOverhead
 	if c.flags&flagUnordered != 0 {
-		i := len(st.unordered)
-		for i > 0 && tsnGT(st.unordered[i-1].tsn, c.tsn) {
-			i--
+		q := st.unordered
+		// Chunks mostly arrive in order: try the end before searching.
+		i := len(q)
+		if i > 0 && tsnGT(q[i-1].tsn, c.tsn) {
+			lo, hi := 0, i-1
+			for lo < hi {
+				m := int(uint(lo+hi) >> 1)
+				if tsnGT(q[m].tsn, c.tsn) {
+					hi = m
+				} else {
+					lo = m + 1
+				}
+			}
+			i = lo
 		}
 		st.unordered = insertChunk(st.unordered, i, c)
 		a.deliverUnordered(sid, st, i)
 		return
 	}
 	key := c.ssn - st.nextSSN
-	i := len(st.ordered)
-	for i > 0 {
-		p := &st.ordered[i-1]
+	after := func(p *rchunk) bool {
 		pk := p.ssn - st.nextSSN
-		if pk < key || pk == key && tsnLT(p.tsn, c.tsn) {
-			break
+		return pk > key || pk == key && tsnGT(p.tsn, c.tsn)
+	}
+	q := st.ordered
+	i := len(q)
+	if i > 0 && after(&q[i-1]) {
+		lo, hi := 0, i-1
+		for lo < hi {
+			m := int(uint(lo+hi) >> 1)
+			if after(&q[m]) {
+				hi = m
+			} else {
+				lo = m + 1
+			}
 		}
-		i--
+		i = lo
 	}
 	if i < st.headN {
 		st.headN, st.headBytes = 0, 0
@@ -371,6 +411,7 @@ func (a *Association) deliverRun(sid uint16, q *[]rchunk, s, e int) {
 // message built from them is delivered.
 func (a *Association) takeRun(q *[]rchunk, s, e int) [][]byte {
 	bufs := a.spare[:0]
+	a.held -= (e - s) * chunkOverhead
 	for i := s; i < e; i++ {
 		bufs = append(bufs, (*q)[i].data)
 	}

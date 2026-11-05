@@ -292,6 +292,45 @@ func TestReceiveLimits(t *testing.T) {
 	}
 }
 
+// TestReceiveWindowHeld checks that a peer sending the next TSN every
+// time, but on an ordered stream each a message ahead of its turn, cannot
+// make the receiver hold more than its window and one message, whether
+// in large chunks or in tiny ones, and that what is held is delivered
+// once the message it waited for arrives.
+func TestReceiveWindowHeld(t *testing.T) {
+	for _, size := range []int{1200, 1} {
+		var got []gotMsg
+		l := newLink(t, 1, collect(&got))
+		l.connect(false)
+		b := l.ends[1]
+		limit := b.cfg.ReceiveWindow + b.cfg.MaxMessageSize
+		data := make([]byte, size)
+		ssn := uint16(1)
+		for i := 0; i < 20000; i++ {
+			c := rawData(b.peerCum+1, 0, ssn, PPIDBinary, flagBegin|flagEnd, data)
+			if err := b.HandlePacket(rawPacket(b.localTag, c), l.now); err != nil {
+				t.Fatal(err)
+			}
+			if b.held > limit {
+				t.Fatalf("size %d: held %d after %d chunks, window %d", size, b.held, i+1, b.cfg.ReceiveWindow)
+			}
+			ssn++
+		}
+		queued := len(b.stream(0).ordered)
+		if b.closed || queued == 0 || queued > limit/chunkOverhead {
+			t.Fatalf("size %d: closed %v, %d queued", size, b.closed, queued)
+		}
+		// The message they wait for drains them all.
+		c := rawData(b.peerCum+1, 0, 0, PPIDBinary, flagBegin|flagEnd, data)
+		if err := b.HandlePacket(rawPacket(b.localTag, c), l.now); err != nil {
+			t.Fatal(err)
+		}
+		if len(got) != queued+1 || b.held != 0 {
+			t.Fatalf("size %d: %d delivered of %d, held %d", size, len(got), queued+1, b.held)
+		}
+	}
+}
+
 // TestMaxMessageSizeEnforced checks that a peer sending a message larger
 // than MaxMessageSize, to be reassembled or held for its turn, is aborted.
 func TestMaxMessageSizeEnforced(t *testing.T) {

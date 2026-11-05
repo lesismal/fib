@@ -207,7 +207,7 @@ func (a *Association) incomingReset(id uint16, st *stream) {
 	st.nextSSN = 0
 	st.headN, st.headBytes = 0, 0
 	for _, c := range st.ordered {
-		a.held -= len(c.data)
+		a.held -= len(c.data) + chunkOverhead
 		a.pool.put(c.data)
 	}
 	clear(st.ordered)
