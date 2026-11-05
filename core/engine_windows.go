@@ -695,13 +695,13 @@ func (e *Engine) complete(entry *sys.OverlappedEntry) *Connection {
 		e.completeConnect(op.conn, err)
 		return nil
 	case opRead:
-		return e.completeRead(op.conn, err)
+		return e.completeRead(op.conn, sys.PortableTransferErrno(err))
 	case opRecvFrom:
 		return e.completeRecvFrom(op.listener, int(entry.Qty), err)
 	case opRecvDatagram:
 		return e.completeDatagramRead(op.conn, int(entry.Qty), err)
 	default:
-		return e.completeWrite(op.conn, int(entry.Qty), err)
+		return e.completeWrite(op.conn, int(entry.Qty), sys.PortableTransferErrno(err))
 	}
 }
 
@@ -1123,7 +1123,7 @@ func (c *Connection) sysRead(buf []byte) (int, error) {
 	bufs := [1]syscall.WSABuf{sys.WSABuf(buf)}
 	var n, flags uint32
 	if err := syscall.WSARecv(c.socket(), &bufs[0], 1, &n, &flags, nil, nil); err != nil {
-		return 0, err
+		return 0, sys.PortableTransferErrno(err)
 	}
 	return int(n), nil
 }
@@ -1175,7 +1175,7 @@ func (c *Connection) wsaSend(bufs []syscall.WSABuf) (int, error) {
 	}
 	var n uint32
 	if err := syscall.WSASend(c.socket(), &bufs[0], uint32(len(bufs)), &n, 0, nil, nil); err != nil {
-		return 0, err
+		return 0, sys.PortableTransferErrno(err)
 	}
 	return int(n), nil
 }
@@ -1192,7 +1192,7 @@ func (c *Connection) socketError() error {
 		return err
 	}
 	if errno != 0 {
-		return syscall.Errno(errno)
+		return sys.PortableTransferErrno(syscall.Errno(errno))
 	}
 	return syscall.ECONNRESET
 }

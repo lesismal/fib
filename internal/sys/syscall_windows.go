@@ -209,6 +209,39 @@ func PortableErrno(errno syscall.Errno) error {
 	return &connectErrno{errno: errno, portable: portable}
 }
 
+// The codes a read or a send on a connection that was reset or aborted ends
+// with: an overlapped one reports the ERROR_ ones, which its NTSTATUS maps to
+// (ERROR_NETNAME_DELETED for STATUS_CONNECTION_RESET, and for a disconnect
+// either side's stack made), and a synchronous WSARecv or WSASend the WSAE
+// ones.
+const (
+	errorNetnameDeleted    = syscall.Errno(64)
+	errorConnectionAborted = syscall.Errno(1236)
+	wsaeConnAborted        = syscall.Errno(10053)
+)
+
+// PortableTransferErrno is err as a read or a send on a connection reports
+// it. A reset or an abort, which Windows names its own way, is wrapped so
+// that errors.Is also matches syscall.ECONNRESET or syscall.ECONNABORTED,
+// as the Unix engines report it; the Windows code is still what it unwraps
+// to, and every other error is returned as it is.
+func PortableTransferErrno(err error) error {
+	errno, ok := err.(syscall.Errno)
+	if !ok {
+		return err
+	}
+	var portable syscall.Errno
+	switch errno {
+	case errorNetnameDeleted, WSAECONNRESET:
+		portable = syscall.ECONNRESET
+	case errorConnectionAborted, wsaeConnAborted:
+		portable = syscall.ECONNABORTED
+	default:
+		return err
+	}
+	return &connectErrno{errno: errno, portable: portable}
+}
+
 // IsAddrInUse reports whether err says a bind found its address taken. A
 // port another socket holds exclusively, or one Windows reserves, fails
 // with WSAEACCES rather than WSAEADDRINUSE, and is just as unavailable.
@@ -216,7 +249,8 @@ func IsAddrInUse(err error) bool {
 	return errors.Is(err, wsaeAddrInUse) || errors.Is(err, wsaeAccess)
 }
 
-// connectErrno is a Windows code that also matches its portable error.
+// connectErrno is a Windows code that also matches its portable error, for a
+// connect (PortableErrno) or a read or send (PortableTransferErrno).
 type connectErrno struct {
 	errno, portable syscall.Errno
 }
