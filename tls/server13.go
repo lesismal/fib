@@ -355,13 +355,27 @@ func parseClientHello(msg []byte) (*clientHelloMsg, bool) {
 		d := newReader(data)
 		switch typ {
 		case extServerName:
+			// As crypto/tls reads it (RFC 6066 section 3): a list that is not
+			// empty, of names that are not, one host_name at most, and that
+			// one without a trailing dot.
 			list := newReader(d.vec16())
+			if len(list.b) == 0 {
+				return nil, false
+			}
+			hostName := false
 			for len(list.b) > 0 && list.ok {
 				nameType := list.u8()
 				name := list.vec16()
-				if nameType == 0 && ch.serverName == "" {
-					ch.serverName = string(name)
+				if !list.ok || len(name) == 0 {
+					return nil, false
 				}
+				if nameType != 0 {
+					continue
+				}
+				if hostName || name[len(name)-1] == '.' {
+					return nil, false
+				}
+				hostName, ch.serverName = true, string(name)
 			}
 			if !d.empty() || !list.ok {
 				return nil, false
