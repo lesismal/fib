@@ -7,6 +7,7 @@ import (
 	"crypto/hkdf"
 	"crypto/hmac"
 	"crypto/rand"
+	"crypto/rsa"
 	_ "crypto/sha256"
 	_ "crypto/sha512"
 	stdtls "crypto/tls"
@@ -1411,6 +1412,11 @@ func (h *clientHS) acceptCertificates(ders [][]byte, out *[]byte) *hsError {
 		cert, err := x509.ParseCertificate(raw)
 		if err != nil {
 			return fail(alertBadCertificate, "failed to parse certificate from server: %v", err)
+		}
+		if key, ok := cert.PublicKey.(*rsa.PublicKey); ok && key.N.BitLen() > maxRSAKeySize {
+			// As crypto/tls bounds it: the cost of verifying a signature
+			// grows with the key, and the server chose it.
+			return fail(alertBadCertificate, "server sent certificate containing RSA key larger than %d bits", maxRSAKeySize)
 		}
 		h.certs = append(h.certs, cert)
 		h.rawCerts = append(h.rawCerts, raw)
