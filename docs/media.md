@@ -643,9 +643,14 @@ since it is decoded before the last audio ends, by the B-frames' delay, and
 moved the video on by that and 20 ms; the publisher needs nothing more than
 times that continue per track. HLS still marks a discontinuity, its new writer
 following the last one's offset (`fmp4.Writer.Offset` and `Follow`, and the TS
-writer's own) so that each track's decode times go on as they ran. RTMP and
-FLV sequence headers for new tracks are stamped with their own track's last
-timestamp (`flv.Timeline.HeaderStamp`).
+writer's own) so that each track's decode times go on as they ran. With
+Low-Latency HLS, the discontinuity and the new `EXT-X-MAP` come before the
+preload hint of the segment they begin, from the moment the tracks change:
+hls.js places the segment to come by the tags before the hint and keeps that
+place once the segment is listed, so a hint after them alone had it append the
+new tracks' parts after the old init section, which the media element failed
+to decode. RTMP and FLV sequence headers for new tracks are stamped with their
+own track's last timestamp (`flv.Timeline.HeaderStamp`).
 
 ## Configuration and limits
 

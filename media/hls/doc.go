@@ -18,7 +18,10 @@
 // media playlist carries EXT-X-SERVER-CONTROL (CAN-BLOCK-RELOAD,
 // PART-HOLD-BACK of three parts), EXT-X-PART-INF, EXT-X-PART for the
 // segments of the last three target durations and EXT-X-PRELOAD-HINT for
-// the next part.
+// the next part. A hint for the first part of a segment comes after that
+// segment's EXT-X-DISCONTINUITY and EXT-X-MAP, once they are known, since
+// players (hls.js) place the segment to come by the tags before the hint
+// and keep that place once it is listed.
 //
 // Segments are written by a SegmentWriter of a Format, of which there are
 // two. FMP4 (the default) writes fragmented MP4 segments of package fmp4

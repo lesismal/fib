@@ -69,9 +69,9 @@ func (m *Muxer) MediaPlaylist(dst []byte) ([]byte, bool) {
 		b = m.segName(b, s.msn)
 		b = append(b, '\n')
 	}
-	if f := m.frontier(); ll && f != nil && f.pubParts > 0 {
-		// The open segment's tags go before its first part; without a
-		// part yet there is nothing for them to apply to.
+	f := m.frontier()
+	if ll && f != nil && f.pubParts > 0 {
+		// The open segment's tags go before its first part.
 		b = m.appendSegmentHead(b, f, &mapped, &keyed)
 		b = m.appendParts(b, f)
 	}
@@ -82,6 +82,23 @@ func (m *Muxer) MediaPlaylist(dst []byte) ([]byte, bool) {
 		return b, true
 	}
 	if ll {
+		if f == nil || f.pubParts == 0 {
+			// The hinted part begins the segment after those listed, and
+			// its tags go before the hint, as they would before the part:
+			// a player makes the segment to come of the hint (hls.js's
+			// fragment hint), with the discontinuity sequence and the
+			// initialization section in force there, and keeps what it
+			// made of it once the segment is listed. Without them, after
+			// new tracks, hls.js appends the new segment's parts after the
+			// last initialization section. The key stays the one in force,
+			// named again after a new EXT-X-MAP: a segment's key is named
+			// once it is encrypted.
+			next := segment{disc: m.discNext, init: m.initID, key: keyed}
+			if f != nil {
+				next.disc, next.init = f.disc, f.init
+			}
+			b = m.appendSegmentHead(b, &next, &mapped, &keyed)
+		}
 		msn, i := m.hinted()
 		b = append(b, "#EXT-X-PRELOAD-HINT:TYPE=PART,URI=\""...)
 		b = m.partName(b, msn, i)

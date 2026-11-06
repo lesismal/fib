@@ -547,7 +547,10 @@ NAK 只有一个延迟（120 ms）的时间去找回几百个包，结果找不�
 最后发出的包比较，把带 B 帧的视频当成了重启——它的解码时间早于上一个节目最后的音频结束，差值为
 B 帧的延迟——于是把视频推后这么多再加 20 ms；发布者只需让每个 track 的时间连续即可。HLS 仍然标出
 discontinuity，新写入器沿用上一个写入器的偏移（`fmp4.Writer.Offset` 与 `Follow`，以及 TS 写入器
-自己的同名方法），使每个 track 的解码时间照常往下走。新 track 的 RTMP 和 FLV sequence header 以
+自己的同名方法），使每个 track 的解码时间照常往下走。低延迟 HLS 中，从 track 变化的那一刻起，
+discontinuity 与新的 `EXT-X-MAP` 就写在它们所开始的分片的 preload hint 之前：hls.js 依 hint 之前的
+标签确定将来那个分片的位置，分片列出后仍沿用这个位置；若这些标签只在 hint 之后才出现，hls.js 会把
+新 track 的 part 接在旧的 init section 之后追加，媒体元素随即解码失败。新 track 的 RTMP 和 FLV sequence header 以
 其所属 track 的最后时间戳打戳（`flv.Timeline.HeaderStamp`）。
 
 ## 配置与限制
