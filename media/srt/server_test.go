@@ -267,14 +267,30 @@ func TestRejected(t *testing.T) {
 			t.Fatalf("%s: %v, want %v", tc.sid, err, tc.want)
 		}
 	}
-	// MaxConns: one publisher holds the only place.
-	cw := newCloseWait()
-	ok := make(chan struct{})
-	first, err := Dial(client, addr, ClientConfig{StreamID: "#!::r=a,m=publish", OnConnect: func(*Session) { close(ok) }})
-	if err != nil {
-		t.Fatal(err)
+	// MaxConns: one publisher holds the only place. The server may not have
+	// let go of the session it refused last yet, so the first publisher is
+	// refused as an overload, or as a conflict on its path, until it has.
+	var first *Session
+	for deadline := time.Now().Add(10 * time.Second); first == nil; {
+		cw := newCloseWait()
+		ok := make(chan struct{})
+		c, err := Dial(client, addr, ClientConfig{StreamID: "#!::r=a,m=publish", OnConnect: func(*Session) { close(ok) }, OnClose: cw.fn})
+		if err != nil {
+			t.Fatal(err)
+		}
+		select {
+		case <-ok:
+			first = c
+		case err := <-cw.ch:
+			if (err != RejectOverload && err != RejectConflict) || time.Now().After(deadline) {
+				t.Fatalf("the first publisher: %v", err)
+			}
+			time.Sleep(20 * time.Millisecond)
+		case <-time.After(10 * time.Second):
+			t.Fatal("the first publisher neither connected nor closed")
+		}
 	}
-	<-ok
+	cw := newCloseWait()
 	if _, err := Dial(client, addr, ClientConfig{StreamID: "#!::r=b,m=publish", OnClose: cw.fn}); err != nil {
 		t.Fatal(err)
 	}
@@ -283,7 +299,7 @@ func TestRejected(t *testing.T) {
 	}
 	first.Close()
 	// A publisher of a busy stream is rejected in the handshake.
-	_, err = serverHub.Publish("busy", []*av.Track{{Codec: av.CodecAAC}}, hub.PublishInfo{})
+	_, err := serverHub.Publish("busy", []*av.Track{{Codec: av.CodecAAC}}, hub.PublishInfo{})
 	if err != nil {
 		t.Fatal(err)
 	}
