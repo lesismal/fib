@@ -665,7 +665,7 @@ HTTP/2 和 HTTP/3 上，积压指流控压住超过 64 KiB 的数据，且只有
 | `PlayWait` | 0 | 播放列表请求等待尚无发布者的流的时长；0 表示立即回 404 |
 | `MaxPlayWaiters` | 1024 | 同时等待发布者的请求数；超过时回 503 |
 | `AllowOrigin`、`MaxStreams` | 无、不限 | CORS，以及同时运行的 Muxer 数 |
-| `Muxer.Encryption`、`Encrypt` | 无 | 用 `Encryption.Key` 返回的密钥对每个分片和 part 做 AES-128 加密（IV 为 media sequence number），每 `Rotation` 个分片换一个密钥（0：只用一个），`EXT-X-KEY` 用调用方给的 URI 指明；初始化段不加密。`Encrypt` 按流选择，出错时回 503。密钥由调用方提供服务（`SessionMuxer`、`Muxer.KeyEpoch`） |
+| `Muxer.Encryption`、`Encrypt` | 无 | 用 `Encryption.Key` 返回的密钥对每个分片和 part 做 AES-128 加密（IV 为 media sequence number），每 `Rotation` 个分片换一个密钥（0：只用一个），`EXT-X-KEY` 用调用方给的 URI 指明；初始化段不加密。加密不持有 Muxer 的锁、也不在发布者的 goroutine 上（而在自己的 goroutine 或 `Encryption.Run` 的池上），分片与 part 加密后才列出。`Encrypt` 按流选择，出错时回 503。密钥由调用方提供服务（`SessionMuxer`、`Muxer.KeyEpoch`） |
 
 **rtc.Config**（WHIP/WHEP 服务端）
 

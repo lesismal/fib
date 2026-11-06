@@ -56,10 +56,14 @@
 //
 // With Config.Encryption (or HandlerConfig.Encrypt, per stream), a Muxer
 // encrypts its segments with AES-128 (METHOD=AES-128: CBC, PKCS#7 padding,
-// the IV the segment's media sequence number) as it cuts them, in place,
-// under keys the caller supplies, a new one every Encryption.Rotation
-// segments; each Low-Latency part is encrypted on its own with its
-// segment's key and IV. Initialization sections stay clear. The media
+// the IV the segment's media sequence number) under keys the caller
+// supplies, a new one every Encryption.Rotation segments; each Low-Latency
+// part is encrypted on its own with its segment's key and IV.
+// Initialization sections stay clear. The encryption, and the asking for
+// keys, run neither under the Muxer's lock nor on the publisher's
+// goroutine, but on one of their own (or Encryption.Run's pool): a segment
+// or part is listed and served once encrypted, a little later than it is
+// cut, and no request waits on a cipher. The media
 // playlist names each key by the caller's URI in an EXT-X-KEY where the key
 // changes, before a segment's first part, with METHOD=NONE before an
 // EXT-X-MAP that follows a key. The Muxer never serves, prints or keeps a

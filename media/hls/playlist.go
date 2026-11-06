@@ -69,20 +69,20 @@ func (m *Muxer) MediaPlaylist(dst []byte) ([]byte, bool) {
 		b = m.segName(b, s.msn)
 		b = append(b, '\n')
 	}
-	if ll && m.open != nil && len(m.open.parts) > 0 {
+	if f := m.frontier(); ll && f != nil && f.pubParts > 0 {
 		// The open segment's tags go before its first part; without a
 		// part yet there is nothing for them to apply to.
-		b = m.appendSegmentHead(b, m.open, &mapped, &keyed)
-		b = m.appendParts(b, m.open)
+		b = m.appendSegmentHead(b, f, &mapped, &keyed)
+		b = m.appendParts(b, f)
 	}
 	if m.ended {
-		return append(b, "#EXT-X-ENDLIST\n"...), true
+		if m.settled() {
+			b = append(b, "#EXT-X-ENDLIST\n"...)
+		}
+		return b, true
 	}
 	if ll {
-		msn, i := m.next, 0
-		if m.open != nil {
-			msn, i = m.open.msn, len(m.open.parts)
-		}
+		msn, i := m.hinted()
 		b = append(b, "#EXT-X-PRELOAD-HINT:TYPE=PART,URI=\""...)
 		b = m.partName(b, msn, i)
 		b = append(b, "\"\n"...)
@@ -138,7 +138,7 @@ func (m *Muxer) appendSegmentHead(b []byte, s *segment, mapped *int, keyed **epo
 }
 
 func (m *Muxer) appendParts(b []byte, s *segment) []byte {
-	for i, p := range s.parts {
+	for i, p := range s.parts[:s.pubParts] {
 		b = append(b, "#EXT-X-PART:DURATION="...)
 		b = appendSeconds(b, p.dur)
 		b = append(b, ",URI=\""...)

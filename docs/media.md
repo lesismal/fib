@@ -772,7 +772,7 @@ stream to the `Demuxer`'s `OnTracks` and `OnPacket`.
 | `PlayWait` | 0 | How long a playlist request waits for a stream with no publisher yet; 0 answers it 404 at once |
 | `MaxPlayWaiters` | 1024 | Requests waiting for a publisher at once; 503 past it |
 | `AllowOrigin`, `MaxStreams` | none, unlimited | CORS, and Muxers running at once |
-| `Muxer.Encryption`, `Encrypt` | none | AES-128 of every segment and part (IV: the media sequence number) under the keys `Encryption.Key` returns, a key every `Rotation` segments (0: one key), named by the caller's URI in `EXT-X-KEY`; init sections stay clear. `Encrypt` picks it per stream, an error answering 503. The caller serves the keys (`SessionMuxer`, `Muxer.KeyEpoch`) |
+| `Muxer.Encryption`, `Encrypt` | none | AES-128 of every segment and part (IV: the media sequence number) under the keys `Encryption.Key` returns, a key every `Rotation` segments (0: one key), named by the caller's URI in `EXT-X-KEY`; init sections stay clear. Encrypted off the Muxer's lock and the publisher's goroutine (on a goroutine, or `Encryption.Run`'s pool), each segment and part listed once encrypted. `Encrypt` picks it per stream, an error answering 503. The caller serves the keys (`SessionMuxer`, `Muxer.KeyEpoch`) |
 
 **rtc.Config** (WHIP/WHEP server)
 

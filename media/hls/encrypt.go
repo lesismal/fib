@@ -25,6 +25,13 @@ import (
 // the first, and says nothing of a part's IV, which players (hls.js) take
 // as their segment's.
 //
+// Nothing is encrypted, nor any key asked for, with the Muxer's lock held,
+// nor on the publisher's goroutine: the Muxer cuts a segment or part clear
+// and hands it to Run, and lists it, and serves it, once Run has encrypted
+// it. Playlist and file requests never wait on a cipher; a segment appears
+// in the playlist as late as its encryption takes. Should the encryption
+// fall behind by more than a few segments, the stream ends.
+//
 // The Muxer serves no key: the caller answers the URIs it names, with
 // whatever access control it has, and may tell a key period's URI from one
 // not yet used with Muxer.Session and Muxer.KeyEpoch.
@@ -36,30 +43,44 @@ type Encryption struct {
 	// Key returns the key of epoch of the Muxer whose session is session
 	// (Muxer.Session), and the URI the media playlist names it by, relative
 	// to the playlist, as "key-<session>-<epoch>.key"; it must not hold a
-	// double quote, a CR or an LF. It is called on the publisher's
-	// goroutine, with the Muxer's lock held, once an epoch, as its first
-	// segment begins; it must not call the Muxer. An error, or a URI it
-	// cannot carry, ends the stream (EXT-X-ENDLIST), clear media never
-	// being served in place of encrypted. The Muxer keeps the key only as
-	// the cipher it makes of it.
+	// double quote, a CR or an LF. It is called where Run runs the
+	// encryption, without the Muxer's lock, once an epoch, before its first
+	// segment or part is encrypted. An error, or a URI it cannot carry,
+	// ends the stream (EXT-X-ENDLIST), clear media never being served in
+	// place of encrypted. The Muxer keeps the key only as the cipher it
+	// makes of it.
 	Key func(session string, epoch uint64) (key [16]byte, uri string, err error)
+	// Run runs job, which encrypts what the Muxer has cut until nothing is
+	// left, and reports whether it will: on a pool of the caller's, say.
+	// It is called by the publisher's goroutine without the Muxer's lock,
+	// and may run job there and then, holding the publisher up for as long.
+	// Nil, or false, runs job on a goroutine of its own.
+	Run func(job func()) bool
 }
 
-// errKeyURI is a URI a playlist cannot carry in a quoted string.
-var errKeyURI = errors.New("hls: an Encryption.Key URI holds a double quote or a line break")
+// maxPending is how many segments may wait for their encryption: one more
+// ends the stream, rather than holding media without bound.
+const maxPending = 4
 
-// errNoKey is an Encryption without a Key.
-var errNoKey = errors.New("hls: Encryption.Key is nil")
+// The errors that end an encrypted stream.
+var (
+	errKeyURI  = errors.New("hls: an Encryption.Key URI holds a double quote or a line break")
+	errNoKey   = errors.New("hls: Encryption.Key is nil")
+	errBacklog = errors.New("hls: the encryption of segments fell behind")
+)
+
+// newCipher makes the cipher of a key; tests make slow ones.
+var newCipher = aes.NewCipher
 
 // epochKey is the key of a key period, as the ciphers made of it: seg
-// encrypts the segment being written, part a part. It neither prints nor
-// keeps the key.
+// encrypts a segment, part a part. It neither prints nor keeps the key.
 type epochKey struct {
 	epoch uint64
 	uri   string
 	block cipher.Block
 	seg   cipher.BlockMode
 	part  cipher.BlockMode
+	iv    [aes.BlockSize]byte // where an IV is set from, which a local would escape
 }
 
 // String names the key period and nothing of its key.
@@ -82,18 +103,126 @@ func msnIV(msn uint64) [aes.BlockSize]byte {
 	return iv
 }
 
-// cbcAt returns mode, or a new CBC encrypter of block, set to IV iv.
-func cbcAt(mode cipher.BlockMode, block cipher.Block, iv [aes.BlockSize]byte) cipher.BlockMode {
+// cbc returns mode, one of k's, or a new CBC encrypter of k's, set to the
+// IV of msn.
+func (k *epochKey) cbc(mode cipher.BlockMode, msn uint64) cipher.BlockMode {
+	k.iv = msnIV(msn)
 	if s, ok := mode.(ivSetter); ok {
-		s.SetIV(iv[:])
+		s.SetIV(k.iv[:])
 		return mode
 	}
-	return cipher.NewCBCEncrypter(block, iv[:])
+	return cipher.NewCBCEncrypter(k.block, k.iv[:])
 }
 
-// epochKey returns the key of segment msn, asking Encryption.Key for it
-// when its epoch is not the last one's. m.mu is held.
-func (m *Muxer) epochKey(msn uint64) (*epochKey, error) {
+// pad appends the PKCS#7 padding of a message n bytes long to b.
+func pad(b []byte, n int) []byte {
+	p := aes.BlockSize - n%aes.BlockSize
+	for range p {
+		b = append(b, byte(p))
+	}
+	return b
+}
+
+// encJob is what is left to encrypt of a segment: its part i, of the clear
+// bytes in data, or, with i < 0, the whole segment, data.
+type encJob struct {
+	s    *segment
+	i    int
+	data []byte
+}
+
+// enqueue queues j, and has the encryption run once the lock is released
+// (unlock) when it is not running. m.mu is held.
+func (m *Muxer) enqueue(j encJob) {
+	m.jobs = append(m.jobs, j)
+	if !m.running {
+		m.running, m.kick = true, true
+	}
+}
+
+// unlock releases m.mu, and starts the encryption of what was cut while it
+// was held.
+func (m *Muxer) unlock() {
+	kick := m.kick
+	m.kick = false
+	m.mu.Unlock()
+	if kick {
+		if run := m.enc.Run; run == nil || !run(m.encryptFn) {
+			go m.encrypt()
+		}
+	}
+}
+
+// encrypt encrypts the queued segments and parts in order, without the
+// lock, publishing each once it is: a part into its segment's ciphertext
+// and the playlist, a segment into the playlist. One runs at a time
+// (m.running), which owns m.key, m.pencSize and the key's ciphers.
+func (m *Muxer) encrypt() {
+	m.mu.Lock()
+	for len(m.jobs) > 0 && m.encErr == nil {
+		j := m.jobs[0]
+		copy(m.jobs, m.jobs[1:])
+		m.jobs[len(m.jobs)-1] = encJob{}
+		m.jobs = m.jobs[:len(m.jobs)-1]
+		penc := j.s.penc
+		m.mu.Unlock()
+
+		k, err := m.keyOf(j.s.msn)
+		var out []byte
+		var off int
+		if err == nil {
+			if j.i >= 0 {
+				off, out = len(penc), m.sealPart(k, j.s.msn, penc, j.data)
+			} else {
+				out = sealSegment(k, j.s.msn, j.data)
+			}
+		}
+
+		m.mu.Lock()
+		if m.encErr != nil {
+			break
+		}
+		if err != nil {
+			m.fail(err)
+			break
+		}
+		s := j.s
+		s.key = k
+		if j.i >= 0 {
+			s.penc = out
+			s.parts[j.i].eoff, s.parts[j.i].en = off, len(out)-off
+			s.pubParts = j.i + 1
+		} else {
+			// m.cut[0] is s: segments are queued in order.
+			s.data = out
+			copy(m.cut, m.cut[1:])
+			m.cut[len(m.cut)-1] = nil
+			m.cut = m.cut[:len(m.cut)-1]
+			m.publish(s)
+		}
+		m.wake()
+	}
+	m.running = false
+	m.mu.Unlock()
+}
+
+// fail ends the stream for err: what is cut and not encrypted is dropped,
+// and every request answered. m.mu is held.
+func (m *Muxer) fail(err error) {
+	m.encErr = err
+	m.ended = true
+	m.open = nil
+	clear(m.cut)
+	m.cut = m.cut[:0]
+	clear(m.jobs)
+	m.jobs = m.jobs[:0]
+	m.wake()
+}
+
+// keyOf returns the key of segment msn, asking Encryption.Key for it when
+// its epoch is not the last one's. The running encryption calls it,
+// without the lock.
+func (m *Muxer) keyOf(msn uint64) (*epochKey, error) {
 	epoch := uint64(0)
 	if r := m.enc.Rotation; r > 0 {
 		epoch = msn / uint64(r)
@@ -113,7 +242,7 @@ func (m *Muxer) epochKey(msn uint64) (*epochKey, error) {
 		clear(key[:])
 		return nil, errKeyURI
 	}
-	block, err := aes.NewCipher(key[:])
+	block, err := newCipher(key[:])
 	clear(key[:])
 	if err != nil {
 		return nil, err
@@ -129,48 +258,38 @@ func (m *Muxer) epochKey(msn uint64) (*epochKey, error) {
 	return m.key, nil
 }
 
-// pad appends the PKCS#7 padding of a message n bytes long to b.
-func pad(b []byte, n int) []byte {
-	p := aes.BlockSize - n%aes.BlockSize
-	for range p {
-		b = append(b, byte(p))
+// sealSegment returns data, a whole segment msn, encrypted in place with
+// its padding, or in a copy when its capacity has no room for the padding
+// or more room than it needs: nobody reads a segment before it is
+// encrypted.
+func sealSegment(k *epochKey, msn uint64, data []byte) []byte {
+	p := aes.BlockSize - len(data)%aes.BlockSize
+	if c := cap(data) - len(data); c < p || c > len(data)/8+aes.BlockSize {
+		data = append(make([]byte, 0, len(data)+p), data...)
 	}
-	return b
+	data = pad(data, len(data))
+	k.seg = k.cbc(k.seg, msn)
+	k.seg.CryptBlocks(data, data)
+	return data
 }
 
-// encryptSegment encrypts, in place, the whole blocks of s's data not yet
-// encrypted, chaining on from the last; final pads the segment first and
-// encrypts it to its end. s is the open segment, whose data nobody reads
-// while it is open: its parts are served from their own ciphertext.
-func encryptSegment(s *segment, final bool) {
-	if final {
-		s.data = pad(s.data, len(s.data))
-	}
-	n := (len(s.data) - s.encN) &^ (aes.BlockSize - 1)
-	if n == 0 {
-		return
-	}
-	b := s.data[s.encN : s.encN+n]
-	s.key.seg.CryptBlocks(b, b)
-	s.encN += n
-}
-
-// appendPart appends clear, a part of s, encrypted on its own with the key
-// and IV of s, to s.penc, and returns where it is; size is what the parts
-// of the last segment took.
-func appendPart(s *segment, clear []byte, size int) (off, n int) {
-	off = len(s.penc)
-	if s.penc == nil && size > 0 {
+// sealPart appends clear, a part of segment msn, encrypted on its own with
+// the key and IV of its segment, to penc, the ciphertext of the parts
+// before it, and returns penc. The bytes of penc already there are not
+// written: requests may be reading them.
+func (m *Muxer) sealPart(k *epochKey, msn uint64, penc, clear []byte) []byte {
+	off := len(penc)
+	if penc == nil && m.pencSize > 0 {
 		// As long as the last segment's, and a little more: one
 		// allocation a segment.
-		s.penc = make([]byte, 0, size+size/4)
+		penc = make([]byte, 0, m.pencSize+m.pencSize/4)
 	}
-	s.penc = append(s.penc, clear...)
-	s.penc = pad(s.penc, len(clear))
-	b := s.penc[off:]
-	s.key.part = cbcAt(s.key.part, s.key.block, msnIV(s.msn))
-	s.key.part.CryptBlocks(b, b)
-	return off, len(b)
+	penc = append(penc, clear...)
+	penc = pad(penc, len(clear))
+	b := penc[off:]
+	k.part = k.cbc(k.part, msn)
+	k.part.CryptBlocks(b, b)
+	return penc
 }
 
 // Session returns the Muxer's session: the part of its file names that

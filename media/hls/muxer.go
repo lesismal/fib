@@ -92,19 +92,20 @@ func (c *Config) defaults() {
 
 // segment is a media segment: whole once complete, else the one being
 // written. Its data only grows, so a slice of it taken under the lock stays
-// valid for as long as a response needs it. An encrypted segment's data is
-// encrypted in place as it grows, and read by nobody until it is complete;
-// its parts are encrypted apart, in penc, which only grows too.
+// valid for as long as a response needs it. An encrypted segment is served
+// once it is encrypted, in place, after it is complete and before it is
+// listed; its parts are encrypted apart, into penc, which only grows too,
+// and served as they are (pubParts).
 type segment struct {
 	msn      uint64
 	dur      time.Duration
 	data     []byte
 	parts    []part
+	pubParts int // the parts listed and served: all but those being encrypted
 	init     int // the initialization section's id, 0 for none
 	disc     bool
-	complete bool
-	key      *epochKey // the key encrypting it, nil for none
-	encN     int       // data[:encN] is encrypted
+	complete bool      // cut: whole, though maybe not encrypted yet
+	key      *epochKey // the key encrypting it once it is, nil for none
 	penc     []byte    // the parts' ciphertext, nil once they are no longer served
 }
 
@@ -186,8 +187,19 @@ type Muxer struct {
 	short       bool // peak is of a short segment, to be replaced
 	ended       bool
 	waiters     []*waiter
-	key         *epochKey // the key of the last segment begun, when encrypting
-	pencSize    int       // the bytes of the last encrypted segment's parts
+
+	// The encryption (Encryption): the segments cut and not yet encrypted,
+	// oldest first, between segs and open; what is left to encrypt, in
+	// order; whether it is running, and is to be started on unlock; the
+	// error that ended it. key and pencSize are the running encryption's.
+	cut       []*segment
+	jobs      []encJob
+	running   bool
+	kick      bool
+	encErr    error
+	key       *epochKey // the key of the last key period
+	pencSize  int       // the bytes of the last encrypted segment's parts
+	encryptFn func()    // m.encrypt, made once
 }
 
 var sessions atomic.Uint64
@@ -200,6 +212,7 @@ func NewMuxer(config Config) *Muxer {
 		c := *e
 		m.enc = &c
 		m.config.Encryption = m.enc
+		m.encryptFn = m.encrypt
 	}
 	// Every Muxer names its files apart, so that a cache holding a segment
 	// of a stream served before does not answer for this one's.
@@ -212,7 +225,7 @@ func NewMuxer(config Config) *Muxer {
 // discontinuity when segments came before.
 func (m *Muxer) OnTracks(tracks []*av.Track) {
 	m.mu.Lock()
-	defer m.mu.Unlock()
+	defer m.unlock()
 	if m.ended {
 		return
 	}
@@ -308,7 +321,7 @@ func (m *Muxer) start(follow bool) {
 // part, first when the packet is where one ends.
 func (m *Muxer) OnPacket(pkt *av.Packet) {
 	m.mu.Lock()
-	defer m.mu.Unlock()
+	defer m.unlock()
 	if m.ended || m.writer == nil || pkt.Track < 0 || pkt.Track >= len(m.carried) || !m.carried[pkt.Track] {
 		return
 	}
@@ -335,9 +348,7 @@ func (m *Muxer) OnPacket(pkt *av.Packet) {
 		m.placeWriter(pkt, kind)
 	}
 	if m.open == nil {
-		if !m.beginSegment(pkt) {
-			return
-		}
+		m.beginSegment(pkt)
 	} else {
 		d := pkt.DTS - m.segStart
 		cut := d >= m.config.TargetDuration
@@ -346,9 +357,11 @@ func (m *Muxer) OnPacket(pkt *av.Packet) {
 		}
 		if cut || int64(len(m.open.data)+m.writer.Buffered()) > m.config.MaxBytes/4 {
 			m.endSegment(pkt, d)
-			if !m.beginSegment(pkt) {
+			if m.ended {
+				// The encryption fell behind.
 				return
 			}
+			m.beginSegment(pkt)
 		} else if p := m.config.PartDuration; p > 0 {
 			// A part ends where the next packet would take it past
 			// PART-TARGET, at the cadence the packets have come at.
@@ -394,7 +407,7 @@ func (m *Muxer) OnClose(error) { m.Close() }
 // Close ends the stream as OnClose does, and wakes every blocked request.
 func (m *Muxer) Close() {
 	m.mu.Lock()
-	defer m.mu.Unlock()
+	defer m.unlock()
 	if m.ended {
 		return
 	}
@@ -417,27 +430,11 @@ func (m *Muxer) Ended() bool {
 	return m.ended
 }
 
-// beginSegment opens the next segment at pkt, encrypted with the key of its
-// epoch when the Muxer encrypts; a key not had ends the stream, and
-// beginSegment reports false.
-func (m *Muxer) beginSegment(pkt *av.Packet) bool {
-	s := &segment{msn: m.next, init: m.initID, disc: m.discNext}
-	if m.enc != nil {
-		k, err := m.epochKey(s.msn)
-		if err != nil {
-			// Nothing clear is served of an encrypted stream: it ends.
-			m.ended = true
-			m.wake()
-			return false
-		}
-		s.key = k
-		k.seg = cbcAt(k.seg, k.block, msnIV(s.msn))
-	}
-	m.open = s
+func (m *Muxer) beginSegment(pkt *av.Packet) {
+	m.open = &segment{msn: m.next, init: m.initID, disc: m.discNext}
 	m.discNext = false
 	m.segStart, m.partStart = pkt.DTS, pkt.DTS
 	m.writer.BeginSegment()
-	return true
 }
 
 // endPart flushes the writer into a part of the open segment, which next
@@ -452,15 +449,14 @@ func (m *Muxer) endPart(next *av.Packet) {
 		if next != nil {
 			dur = next.DTS - m.partStart
 		}
-		p := part{off: before, n: n, dur: dur, independent: independent}
-		if s.key != nil {
-			// Before the segment's encryption reaches its bytes.
-			p.eoff, p.en = appendPart(s, s.data[before:], m.pencSize)
+		s.parts = append(s.parts, part{off: before, n: n, dur: dur, independent: independent})
+		if m.enc != nil {
+			// Served once encrypted; its bytes are never written again,
+			// until the segment's own encryption, queued after it.
+			m.enqueue(encJob{s: s, i: len(s.parts) - 1, data: s.data[before:len(s.data):len(s.data)]})
+		} else {
+			s.pubParts = len(s.parts)
 		}
-		s.parts = append(s.parts, p)
-	}
-	if s.key != nil {
-		encryptSegment(s, false)
 	}
 	if next != nil {
 		m.partStart = next.DTS
@@ -485,15 +481,7 @@ func (m *Muxer) endSegment(next *av.Packet, d time.Duration) {
 	if d <= 0 {
 		d = max(m.gap, time.Millisecond)
 	}
-	if s.key != nil {
-		encryptSegment(s, true)
-		m.pencSize = len(s.penc)
-	}
 	s.dur, s.complete = d, true
-	if cap(s.data)-len(s.data) > len(s.data)/8 {
-		s.data = append([]byte(nil), s.data...)
-	}
-	m.segs = append(m.segs, s)
 	m.next++
 	if r := int(math.Round(d.Seconds())); r > m.target {
 		m.target = r
@@ -505,12 +493,33 @@ func (m *Muxer) endSegment(next *av.Packet, d time.Duration) {
 			m.peak, m.short = bw, d < m.config.TargetDuration/2
 		}
 	}
-	if s.key != nil && m.config.PartDuration > 0 {
-		// The parts' ciphertext doubles what a segment takes: it goes once
-		// the playlist no longer lists them, a segment later for a player
-		// that read it just before.
-		for _, old := range m.segs[:max(0, m.partsFrom(m.first())-1)] {
-			old.penc = nil
+	if m.enc == nil {
+		if cap(s.data)-len(s.data) > len(s.data)/8 {
+			s.data = append([]byte(nil), s.data...)
+		}
+		m.publish(s)
+		return
+	}
+	// Listed once encrypted, without the lock.
+	m.cut = append(m.cut, s)
+	m.enqueue(encJob{s: s, i: -1, data: s.data})
+	if len(m.cut) > maxPending {
+		m.fail(errBacklog)
+	}
+}
+
+// publish lists s, complete (and encrypted), in the playlist. m.mu is held.
+func (m *Muxer) publish(s *segment) {
+	m.segs = append(m.segs, s)
+	if m.enc != nil {
+		m.pencSize = len(s.penc)
+		if m.config.PartDuration > 0 {
+			// The parts' ciphertext doubles what a segment takes: it goes
+			// once the playlist no longer lists them, a segment later for a
+			// player that read it just before.
+			for _, old := range m.segs[:max(0, m.partsFrom(m.first())-1)] {
+				old.penc = nil
+			}
 		}
 	}
 	m.account()
@@ -528,8 +537,17 @@ func (m *Muxer) account() {
 		m.segs = m.segs[1:]
 	}
 	if len(m.inits) > 1 {
+		oldest := m.initID
+		switch {
+		case len(m.segs) > 0:
+			oldest = m.segs[0].init
+		case len(m.cut) > 0:
+			oldest = m.cut[0].init
+		case m.open != nil:
+			oldest = m.open.init
+		}
 		for id := range m.inits {
-			if id != m.initID && (len(m.segs) == 0 || id < m.segs[0].init) {
+			if id != m.initID && id < oldest {
 				delete(m.inits, id)
 			}
 		}
@@ -540,6 +558,9 @@ func (m *Muxer) account() {
 func (m *Muxer) size() int64 {
 	n := int64(0)
 	for _, s := range m.segs {
+		n += int64(cap(s.data) + cap(s.penc))
+	}
+	for _, s := range m.cut {
 		n += int64(cap(s.data) + cap(s.penc))
 	}
 	if m.open != nil {
@@ -563,21 +584,60 @@ func (m *Muxer) first() int {
 	return max(0, len(m.segs)-m.config.PlaylistSize)
 }
 
+// frontier returns the first segment not listed whole: the oldest of those
+// cut and being encrypted, else the open one, or nil. Its pubParts are
+// listed; nothing after it is.
+func (m *Muxer) frontier() *segment {
+	if len(m.cut) > 0 {
+		return m.cut[0]
+	}
+	return m.open
+}
+
+// listedNext returns the msn after the last segment listed whole.
+func (m *Muxer) listedNext() uint64 {
+	if f := m.frontier(); f != nil {
+		return f.msn
+	}
+	return m.next
+}
+
+// hinted returns the part to be listed next, which EXT-X-PRELOAD-HINT
+// names.
+func (m *Muxer) hinted() (msn uint64, part int) {
+	f := m.frontier()
+	switch {
+	case f == nil:
+		return m.next, 0
+	case f.complete && f.pubParts == len(f.parts):
+		// Every part listed, the segment itself being encrypted.
+		return f.msn + 1, 0
+	}
+	return f.msn, f.pubParts
+}
+
+// settled reports whether everything cut is listed: nothing is being
+// encrypted.
+func (m *Muxer) settled() bool { return len(m.cut) == 0 }
+
 // ready reports whether a request for msn and part can be answered: the
-// segment is complete, or it has that part; msn < 0 waits for the first
-// segment. An ended stream answers everything.
+// segment is listed, or that part of it is; msn < 0 waits for the first
+// segment. An ended stream answers everything, once its last segment is
+// listed.
 func (m *Muxer) ready(msn, part int64) bool {
 	switch {
-	case m.ended:
+	case m.ended && m.settled():
 		return true
 	case msn < 0:
 		return len(m.segs) > 0
-	case uint64(msn) < m.next:
+	case uint64(msn) < m.listedNext():
 		return true
-	case part < 0 || m.open == nil || uint64(msn) != m.open.msn:
+	}
+	f := m.frontier()
+	if part < 0 || f == nil || uint64(msn) != f.msn {
 		return false
 	}
-	return int64(len(m.open.parts)) > part
+	return int64(f.pubParts) > part
 }
 
 // wait registers fn to run, on a goroutine of its own, once msn and part
@@ -660,9 +720,9 @@ type status struct {
 func (m *Muxer) status() status {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	st := status{next: m.next, any: len(m.segs) > 0, ended: m.ended, unstarted: m.tracks == nil && !m.ended, codecs: m.codecs}
-	if m.open != nil {
-		st.parts = int64(len(m.open.parts))
+	st := status{next: m.listedNext(), any: len(m.segs) > 0, ended: m.ended, unstarted: m.tracks == nil && !m.ended, codecs: m.codecs}
+	if f := m.frontier(); f != nil {
+		st.parts = int64(f.pubParts)
 	}
 	audio := false
 	for i, ok := range m.carried {
@@ -764,11 +824,11 @@ func (m *Muxer) File(name string) ([]byte, bool) {
 		data, ok := m.inits[int(a)]
 		return data, ok
 	case fileSegment:
-		if s := m.segment(a); s != nil && s.complete {
+		if s := m.segment(a); s != nil && a < m.listedNext() {
 			return s.data, true
 		}
 	case filePart:
-		if s := m.segment(a); s != nil && b < int64(len(s.parts)) {
+		if s := m.segment(a); s != nil && b < int64(s.pubParts) {
 			p := s.parts[b]
 			if s.key != nil {
 				if s.penc == nil {
@@ -782,10 +842,16 @@ func (m *Muxer) File(name string) ([]byte, bool) {
 	return nil, false
 }
 
-// segment returns the segment msn, complete or open, or nil.
+// segment returns the segment msn, listed, being encrypted or open, or nil.
 func (m *Muxer) segment(msn uint64) *segment {
 	if m.open != nil && m.open.msn == msn {
 		return m.open
+	}
+	if len(m.cut) > 0 && msn >= m.cut[0].msn {
+		if i := msn - m.cut[0].msn; i < uint64(len(m.cut)) {
+			return m.cut[i]
+		}
+		return nil
 	}
 	if len(m.segs) == 0 || msn < m.segs[0].msn {
 		return nil
@@ -803,18 +869,18 @@ func (m *Muxer) fileWait(name string) (msn, part int64, ok bool) {
 	kind, a, b := m.parseName(name)
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if m.ended || (kind != filePart && kind != fileSegment) {
+	if m.ended && m.settled() || (kind != filePart && kind != fileSegment) {
 		return 0, 0, false
 	}
 	// Only the next part or segment is worth waiting for; anything
 	// further, or gone, is not.
 	switch kind {
 	case filePart:
-		if m.open != nil && a == m.open.msn && b == int64(len(m.open.parts)) || m.open == nil && a == m.next && b == 0 {
+		if msn, part := m.hinted(); a == msn && b == int64(part) {
 			return int64(a), b, true
 		}
 	case fileSegment:
-		if a == m.next {
+		if a == m.listedNext() {
 			return int64(a), -1, true
 		}
 	}

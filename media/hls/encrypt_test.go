@@ -13,6 +13,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -36,8 +37,26 @@ func keyURI(session string, epoch uint64) string {
 	return "key-" + session + "-" + strconv.FormatUint(epoch, 10) + ".key"
 }
 
+// inline runs the encryption on the publisher's goroutine, as it cuts,
+// so that what a test fed is encrypted when feeding returns.
+func inline(job func()) bool {
+	job()
+	return true
+}
+
+// encryption returns an Encryption run inline; async one run as it is by
+// default, on goroutines of its own.
 func (k *testKeys) encryption(rotation int) *Encryption {
+	e := k.async(rotation)
+	e.Run = inline
+	return e
+}
+
+func (k *testKeys) async(rotation int) *Encryption {
+	var mu sync.Mutex
 	return &Encryption{Rotation: rotation, Key: func(session string, epoch uint64) ([16]byte, string, error) {
+		mu.Lock()
+		defer mu.Unlock()
 		k.asked = append(k.asked, epoch)
 		if k.fail != 0 && epoch == k.fail {
 			return [16]byte{}, "", errors.New("no key")
@@ -413,7 +432,7 @@ func TestMuxerEncryptionKeyError(t *testing.T) {
 		t.Fatal("served")
 	}
 	// A URI the playlist cannot carry is an error too, as is no Key.
-	for _, enc := range []*Encryption{(&testKeys{uri: "a\"b"}).encryption(0), {}} {
+	for _, enc := range []*Encryption{(&testKeys{uri: "a\"b"}).encryption(0), {Run: inline}} {
 		m := NewMuxer(Config{Encryption: enc})
 		m.OnTracks([]*av.Track{h264Track(t)})
 		feed(m, (&source{video: true, audio: -1, gop: 50}).until(5*time.Second))
@@ -491,15 +510,191 @@ func TestMuxerEncryptionAllocs(t *testing.T) {
 	c, n := run(false)
 	e, _ := run(true)
 	t.Logf("%d segments: %d allocations clear, %d encrypted", n, c, e)
-	if e > c+8*n {
+	if e > c+6*n {
 		t.Fatal(c, e, n)
 	}
 }
 
-// BenchmarkMuxerEncryption muxes a 4 Mb/s H.264 and AAC stream, 2 s
-// segments, clear and encrypted, with and without 500 ms parts: an op is
-// a second of media.
-func BenchmarkMuxerEncryption(b *testing.B) {
+// settle waits for m's encryption to have run out of work.
+func settle(t testing.TB, m *Muxer) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		m.mu.Lock()
+		done := !m.running && len(m.jobs) == 0
+		m.mu.Unlock()
+		if done {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("the encryption does not settle")
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
+func TestMuxerEncryptionAsync(t *testing.T) {
+	// Encrypted on goroutines of their own, as by default, while requests
+	// read the playlist and every file it names: everything listed is
+	// encrypted, and the race detector finds nothing shared unguarded.
+	for _, ll := range []time.Duration{0, 200 * time.Millisecond} {
+		tw := newTwin(Config{PartDuration: ll, PlaylistSize: 4}, 2)
+		tw.enc.enc.Run = nil
+		tw.tracks([]*av.Track{h264Track(t), aacTrack(t)})
+		stop := make(chan struct{})
+		done := make(chan struct{})
+		go func() {
+			defer close(done)
+			for {
+				select {
+				case <-stop:
+					return
+				default:
+				}
+				b, ok := tw.enc.MediaPlaylist(nil)
+				if !ok {
+					time.Sleep(time.Millisecond)
+					continue
+				}
+				p := parsePlaylist(t, b)
+				for _, name := range append(append(p.maps, p.segs...), p.parts...) {
+					if data, ok := tw.enc.File(name); ok && !strings.HasPrefix(name, "init-") && len(data)%aes.BlockSize != 0 {
+						t.Error(name, "listed before it is encrypted")
+					}
+				}
+			}
+		}()
+		src := &source{video: true, audio: 1, gop: 25}
+		for to := time.Second; to <= 12*time.Second; to += 100 * time.Millisecond {
+			tw.feed(src.until(to))
+		}
+		settle(t, tw.enc)
+		close(stop)
+		<-done
+		tw.check(t)
+		tw.clear.Close()
+		tw.enc.Close()
+		settle(t, tw.enc)
+		if p := media(t, tw.enc); !p.ended {
+			t.Fatal("not ended")
+		}
+		tw.check(t)
+	}
+}
+
+// gateBlock is a cipher whose blocks wait for gate to close: an encryption
+// as slow as a test wants.
+type gateBlock struct {
+	cipher.Block
+	gate chan struct{}
+}
+
+func (b gateBlock) Encrypt(dst, src []byte) {
+	<-b.gate
+	b.Block.Encrypt(dst, src)
+}
+
+// quick fails unless fn returns within a short while: it held nothing a
+// cipher holds.
+func quick(t *testing.T, what string, fn func()) {
+	t.Helper()
+	done := make(chan struct{})
+	go func() {
+		fn()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal(what, "waits on the encryption")
+	}
+}
+
+func TestMuxerEncryptionNotHeld(t *testing.T) {
+	// A segment being encrypted, however slowly, holds up neither the
+	// publisher nor any request: it is listed once encrypted.
+	for _, slow := range []string{"cipher", "key"} {
+		gate := make(chan struct{})
+		k := &testKeys{}
+		enc := k.async(1)
+		if slow == "cipher" {
+			newCipher = func(key []byte) (cipher.Block, error) {
+				b, err := aes.NewCipher(key)
+				return gateBlock{b, gate}, err
+			}
+		} else {
+			key := enc.Key
+			enc.Key = func(session string, epoch uint64) ([16]byte, string, error) {
+				<-gate
+				return key(session, epoch)
+			}
+		}
+		m := NewMuxer(Config{PartDuration: 500 * time.Millisecond, Encryption: enc})
+		m.OnTracks([]*av.Track{h264Track(t), aacTrack(t)})
+		src := &source{video: true, audio: 1, gop: 50}
+		woke := make(chan struct{})
+		if w, err := m.wait(-1, -1, func() { close(woke) }); w == nil || err != nil {
+			t.Fatal(w, err)
+		}
+		quick(t, "the publisher", func() { feed(m, src.until(5*time.Second)) })
+		quick(t, "a playlist", func() {
+			if _, ok := m.MediaPlaylist(nil); ok {
+				t.Error("listed before encrypted")
+			}
+		})
+		quick(t, "a segment", func() {
+			if _, ok := m.File(string(m.segName(nil, 0))); ok {
+				t.Error("served before encrypted")
+			}
+			if _, ok := m.File(string(m.partName(nil, 0, 0))); ok {
+				t.Error("part served before encrypted")
+			}
+		})
+		quick(t, "the state", func() { _ = m.status(); _ = m.Bytes(); _, _ = m.KeyEpoch() })
+		select {
+		case <-woke:
+			t.Fatal("woken before the segment is listed")
+		default:
+		}
+		close(gate)
+		<-woke
+		settle(t, m)
+		p := media(t, m)
+		if len(p.segs) != 2 || len(p.parts) == 0 {
+			t.Fatalf("%s: %+v", slow, p)
+		}
+		newCipher = aes.NewCipher
+	}
+}
+
+func TestMuxerEncryptionBacklog(t *testing.T) {
+	// An encryption that falls behind by more than maxPending segments
+	// ends the stream: what it held goes.
+	var jobs []func()
+	enc := (&testKeys{}).async(1)
+	enc.Run = func(job func()) bool {
+		jobs = append(jobs, job)
+		return true
+	}
+	m := NewMuxer(Config{Encryption: enc})
+	m.OnTracks([]*av.Track{h264Track(t), aacTrack(t)})
+	feed(m, (&source{video: true, audio: 1, gop: 50}).until(2*(maxPending+1)*time.Second+time.Second))
+	if !m.Ended() || len(m.cut) != 0 || m.Bytes() > 64<<10 || len(jobs) != 1 {
+		t.Fatal(m.Ended(), len(m.cut), m.Bytes(), len(jobs))
+	}
+	// The encryption, run late, finds nothing to do.
+	jobs[0]()
+	if m.running || len(m.segs) != 0 {
+		t.Fatal("ran after the end")
+	}
+	if !m.ready(3, -1) {
+		t.Fatal("not ready after the end")
+	}
+}
+
+// benchStream returns a second of a 4.8 Mb/s H.264 and AAC stream, with a
+// keyframe at its start, and its bytes.
+func benchStream() ([]*av.Packet, int) {
 	video := make([]byte, 20000)
 	key := make([]byte, 100000)
 	audio := make([]byte, 400)
@@ -521,32 +716,118 @@ func BenchmarkMuxerEncryption(b *testing.B) {
 	for _, p := range pkts {
 		size += len(p.Data)
 	}
-	for _, c := range []struct {
-		name string
-		part time.Duration
-		enc  bool
-	}{{"clear", 0, false}, {"aes128", 0, true}, {"clear-ll", 500 * time.Millisecond, false}, {"aes128-ll", 500 * time.Millisecond, true}} {
+	return pkts, size
+}
+
+// feedSecond feeds m second i of pkts, a keyframe every 2 s.
+func feedSecond(m *Muxer, pkts []*av.Packet, i int) {
+	base := time.Duration(i) * time.Second
+	for _, p := range pkts {
+		q := *p
+		q.DTS += base
+		q.PTS += base
+		q.Keyframe = q.Track == 1 || p.Keyframe && i%2 == 0
+		m.OnPacket(&q)
+	}
+}
+
+// benchCases are the Muxers benchmarked: clear, encrypted inline on the
+// publisher's goroutine (all the CPU encryption takes) or on goroutines of
+// their own, as by default (what the publisher spends), without and with
+// 500 ms parts.
+var benchCases = []struct {
+	name string
+	part time.Duration
+	enc  int // 1: inline, 2: on goroutines of their own
+}{{"clear", 0, 0}, {"aes128", 0, 1}, {"aes128-async", 0, 2}, {"clear-ll", 500 * time.Millisecond, 0}, {"aes128-ll", 500 * time.Millisecond, 1}, {"aes128-ll-async", 500 * time.Millisecond, 2}}
+
+func benchMuxer(b *testing.B, part time.Duration, enc int) *Muxer {
+	config := Config{PartDuration: part}
+	switch enc {
+	case 1:
+		config.Encryption = (&testKeys{}).encryption(10)
+	case 2:
+		config.Encryption = (&testKeys{}).async(10)
+	}
+	m := NewMuxer(config)
+	m.OnTracks([]*av.Track{h264Track(b), aacTrack(b)})
+	return m
+}
+
+// BenchmarkMuxerEncryption muxes a 4.8 Mb/s H.264 and AAC stream, 2 s
+// segments: an op is a second of media, and what the publisher's
+// goroutine spends on it. The encryption on goroutines of their own is
+// waited for, untimed, after each second, as a stream in real time would
+// have it done.
+func BenchmarkMuxerEncryption(b *testing.B) {
+	pkts, size := benchStream()
+	for _, c := range benchCases {
 		b.Run(c.name, func(b *testing.B) {
-			config := Config{PartDuration: c.part}
-			if c.enc {
-				config.Encryption = (&testKeys{}).encryption(10)
-			}
-			m := NewMuxer(config)
-			m.OnTracks([]*av.Track{h264Track(b), aacTrack(b)})
+			m := benchMuxer(b, c.part, c.enc)
 			b.SetBytes(int64(size))
 			b.ReportAllocs()
-			b.ResetTimer()
 			for i := 0; b.Loop(); i++ {
-				base := time.Duration(i) * time.Second
-				for _, p := range pkts {
-					q := *p
-					q.DTS += base
-					q.PTS += base
-					// A keyframe every 2 s.
-					q.Keyframe = q.Track == 1 || p.Keyframe && i%2 == 0
-					m.OnPacket(&q)
+				feedSecond(m, pkts, i)
+				if c.enc == 2 {
+					b.StopTimer()
+					settle(b, m)
+					b.StartTimer()
 				}
 			}
+			if m.Ended() {
+				b.Fatal("ended")
+			}
+		})
+	}
+}
+
+// BenchmarkMuxerPlaylistWait muxes as BenchmarkMuxerEncryption does while
+// another goroutine renders the media playlist over and over, and reports
+// the renders over 300 µs a second of media, and the 99.99th percentile:
+// how often, and how long, a request waits on the Muxer's lock (or the GC).
+func BenchmarkMuxerPlaylistWait(b *testing.B) {
+	pkts, _ := benchStream()
+	for _, c := range benchCases {
+		b.Run(c.name, func(b *testing.B) {
+			m := benchMuxer(b, c.part, c.enc)
+			feedSecond(m, pkts, 0)
+			feedSecond(m, pkts, 1)
+			feedSecond(m, pkts, 2)
+			settle(b, m)
+			stop := make(chan struct{})
+			waits := make(chan []time.Duration)
+			go func() {
+				var d []time.Duration
+				buf := make([]byte, 0, 4096)
+				for {
+					select {
+					case <-stop:
+						waits <- d
+						return
+					default:
+					}
+					t := time.Now()
+					buf, _ = m.MediaPlaylist(buf[:0])
+					d = append(d, time.Since(t))
+				}
+			}()
+			for i := 3; b.Loop(); i++ {
+				feedSecond(m, pkts, i)
+				if c.enc == 2 {
+					settle(b, m)
+				}
+			}
+			close(stop)
+			d := <-waits
+			slow := 0
+			for _, w := range d {
+				if w > 300*time.Microsecond {
+					slow++
+				}
+			}
+			slices.Sort(d)
+			b.ReportMetric(float64(slow)/float64(b.N), "slow/op")
+			b.ReportMetric(float64(d[len(d)*9999/10000].Nanoseconds())/1000, "p9999-µs")
 		})
 	}
 }

@@ -63,7 +63,7 @@ func TestHandlerEncryption(t *testing.T) {
 			case "live/refused":
 				return nil, refuse
 			}
-			return (&testKeys{}).encryption(2), nil
+			return (&testKeys{}).async(2), nil
 		},
 	})
 	base := serveHandler(t, h, &keyServer{h: h, prefix: "/hls/"}) + "/hls/"
@@ -144,5 +144,62 @@ func TestHandlerEncryption(t *testing.T) {
 	}
 	if _, ok := h.Muxer("live/clear").KeyEpoch(); ok {
 		t.Fatal("clear stream has keys")
+	}
+}
+
+func TestHandlerEncryptionNotHeld(t *testing.T) {
+	// While a segment's encryption waits (here its key), requests are
+	// answered at once with what is encrypted, and the publisher goes on.
+	hb := hub.New(hub.Config{})
+	defer hb.Close()
+	gate := make(chan struct{})
+	h := NewHandler(HandlerConfig{
+		Hub:     hb,
+		Prefix:  "/hls",
+		Formats: []Format{MPEGTS},
+		Encrypt: func(path string) (*Encryption, error) {
+			enc := (&testKeys{}).async(1)
+			key := enc.Key
+			enc.Key = func(session string, epoch uint64) ([16]byte, string, error) {
+				if epoch > 0 {
+					<-gate
+				}
+				return key(session, epoch)
+			}
+			return enc, nil
+		},
+	})
+	base := serve(t, h) + "/hls/"
+	pub, write := publish(t, hb, "live/s", []*av.Track{h264Track(t), aacTrack(t)})
+	defer pub.Close()
+	got := start(t, h, base+"live/s/media.m3u8", "live/s")
+	write(3 * time.Second)
+	if code := <-got; code != 200 {
+		t.Fatal(code)
+	}
+	quick(t, "the publisher", func() { write(7 * time.Second) })
+	quick(t, "a playlist", func() {
+		resp, body := get(t, "GET", base+"live/s/media.m3u8")
+		if p := parsePlaylist(t, []byte(body)); resp.StatusCode != 200 || len(p.segs) != 1 {
+			t.Error(resp.StatusCode, body)
+		}
+		if code := statusOf(t, base+"live/s/"+string(h.Muxer("live/s").segName(nil, 0))); code != 200 {
+			t.Error(code)
+		}
+	})
+	// Another format's Muxer starts, subscribing to the same publisher.
+	gotTS := make(chan int, 1)
+	quick(t, "a new Muxer", func() {
+		go func() { gotTS <- statusOf(t, base+"live/s/media.m3u8?format=ts") }()
+		until(t, "a TS muxer", func() bool { return h.FormatMuxer("live/s", "ts") != nil })
+	})
+	close(gate)
+	until(t, "the segments encrypted", func() bool {
+		_, body := get(t, "GET", base+"live/s/media.m3u8")
+		return len(parsePlaylist(t, []byte(body)).segs) == 3
+	})
+	write(11 * time.Second)
+	if code := <-gotTS; code != 200 {
+		t.Fatal(code)
 	}
 }
