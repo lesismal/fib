@@ -43,6 +43,9 @@ type Writer struct {
 	epoch   time.Duration
 	startAt time.Duration
 	started bool
+	// follow says decode times are the packets' DTS plus startAt, with
+	// epoch 0 and no rebase (Follow).
+	follow bool
 	// buffered counts the bytes of samples held or pending.
 	buffered int
 	frag     Fragment
@@ -113,16 +116,22 @@ func (w *Writer) WritePacket(pkt *av.Packet) {
 		return
 	}
 	if !w.started {
-		w.started, w.epoch = true, pkt.DTS
+		w.started = true
+		if !w.follow {
+			w.epoch = pkt.DTS
+		}
 	}
 	if !t.started {
 		d := pkt.DTS - w.epoch
-		if d < 0 && w.seq == 0 && d >= -maxGap {
+		if d < 0 && w.seq == 0 && d >= -maxGap && !w.follow {
 			w.rebase(-d)
 			d = 0
 		}
+		if !w.follow {
+			d = max(d, 0)
+		}
 		t.started = true
-		t.dec = uint64(av.ToTicks(w.startAt+max(d, 0), int(t.info.timescale)))
+		t.dec = uint64(av.ToTicks(max(w.startAt+d, 0), int(t.info.timescale)))
 	} else if t.held != nil {
 		t.complete(w.ticks(t, pkt.DTS))
 	}
@@ -137,7 +146,28 @@ func (w *Writer) WritePacket(pkt *av.Packet) {
 // It has no effect once a packet has been written.
 func (w *Writer) StartAt(t time.Duration) {
 	if !w.started && t > 0 {
-		w.startAt = t
+		w.startAt, w.follow = t, false
+	}
+}
+
+// Offset returns what the Writer adds to a packet's DTS to give its decode
+// time, and false before a packet has been written. Until the first Flush
+// it may still change, as a track whose first packet is earlier than the
+// others' moves the start back.
+func (w *Writer) Offset() (time.Duration, bool) {
+	return w.startAt - w.epoch, w.started
+}
+
+// Follow makes decode times the packets' DTS plus off, the Offset of
+// another Writer, rather than starting at StartAt from the first packet:
+// a Writer that carries on another's timeline where the stream's clock
+// runs on, as HLS does after a discontinuity for new tracks on the same
+// clock, so that each track's decode times go on from where they were,
+// however the tracks interleave. A decode time that would be negative is
+// 0. It has no effect once a packet has been written.
+func (w *Writer) Follow(off time.Duration) {
+	if !w.started {
+		w.startAt, w.follow = off, true
 	}
 }
 

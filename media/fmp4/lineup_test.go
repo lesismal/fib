@@ -44,6 +44,60 @@ func TestWriterStartAt(t *testing.T) {
 	}
 }
 
+// A Writer following another's Offset gives each track the decode times
+// the other would have, as the stream's clock runs on: its first video,
+// decoded before the other's last audio, is not moved past it.
+func TestWriterFollow(t *testing.T) {
+	ms := time.Millisecond
+	w, _ := NewWriter([]*av.Track{h264Track(t), aacTrack(t, 48000)})
+	if _, ok := w.Offset(); ok {
+		t.Fatal("offset before a packet")
+	}
+	w.WritePacket(pkt(0, 1000, 80, true, "v0"))
+	w.WritePacket(pkt(1, 980, 0, true, "a0"))
+	w.WritePacket(pkt(0, 1040, 80, false, "v1"))
+	w.WritePacket(pkt(1, 1060, 0, true, "a1"))
+	_, _ = w.Flush(nil, nil)
+	// The audio, earlier, starts the decode times.
+	off, ok := w.Offset()
+	if !ok || off != -980*ms {
+		t.Fatal("offset", off, ok)
+	}
+	w2, _ := NewWriter([]*av.Track{h264Track(t), aacTrack(t, 48000)})
+	w2.StartAt(time.Hour)
+	w2.Follow(off) // the last call before a packet wins
+	init, _ := ParseInit(w2.Init())
+	w2.WritePacket(pkt(0, 1080, 80, true, "v2"))
+	w2.WritePacket(pkt(1, 1100, 0, true, "a2"))
+	w2.Follow(time.Hour) // too late
+	if o, ok := w2.Offset(); !ok || o != off {
+		t.Fatal("offset", o, ok)
+	}
+	f, _ := w2.Flush(nil, nil)
+	_, pkts, _, err := init.ParseFragment(f)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, p := range pkts {
+		want := 100 * ms
+		if p.Track == 1 {
+			want = 120 * ms
+		}
+		if p.DTS != want {
+			t.Fatalf("track %d at %v, want %v", p.Track, p.DTS, want)
+		}
+	}
+	// A decode time that would be negative is 0.
+	w3, _ := NewWriter([]*av.Track{h264Track(t), aacTrack(t, 48000)})
+	w3.Follow(-2 * time.Second)
+	init, _ = ParseInit(w3.Init())
+	w3.WritePacket(pkt(0, 1000, 0, true, "v0"))
+	f, _ = w3.Flush(nil, nil)
+	if _, pkts, _, err = init.ParseFragment(f); err != nil || len(pkts) != 1 || pkts[0].DTS != 0 {
+		t.Fatal(pkts, err)
+	}
+}
+
 // A stream joined at a keyframe has audio a little earlier than the
 // keyframe come after it (a B-frame encoder's video DTS trails its PTS):
 // the audio keeps its place before the video rather than starting with it,

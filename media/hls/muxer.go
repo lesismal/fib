@@ -117,7 +117,10 @@ type waiter struct {
 // playlists that list them. A Muxer serves one stream for as long as its
 // subscription lasts; OnTracks after the first (a republish or a codec
 // change) starts a new timeline after a discontinuity, with a new
-// initialization section when the tracks changed.
+// initialization section when the tracks changed. The new timeline carries
+// on where the last ended or, when the new tracks' first packet carries on
+// the decode times of its kind (video or audio), as a publisher changing
+// its tracks on the same clock sends, with the times as they ran.
 //
 // OnTracks, OnPacket and OnClose come from the hub, the reading methods
 // from any goroutine: a mutex guards the Muxer, held only to copy slice
@@ -142,6 +145,20 @@ type Muxer struct {
 	initID   int
 	last     []time.Duration // per track, the DTS of its last packet
 	seen     []bool
+
+	// Where a new writer's timeline starts, which its first packet
+	// decides (place): at placeEnd, the end of the writers before, or,
+	// for new tracks (follow) whose first packet carries on the DTS of the
+	// last packet written of its kind (kindLast, video at 1, which
+	// kindSeen says there was), with the offset off of the writer before,
+	// as the publisher's clock ran on.
+	place    bool
+	follow   bool
+	placeEnd time.Duration
+	off      time.Duration
+	offKnown bool
+	kindLast [2]time.Duration
+	kindSeen [2]bool
 
 	segs        []*segment // complete, oldest first
 	open        *segment
@@ -182,8 +199,21 @@ func (m *Muxer) OnTracks(tracks []*av.Track) {
 	}
 	m.endSegment(nil, 0)
 	m.tracks = tracks
-	m.start()
+	m.start(true)
 	m.wake()
+}
+
+// follower is a continuer that can also carry on another's timeline on
+// the same clock, as fMP4's and MPEG-TS's can: after a discontinuity for
+// new tracks whose times run on, each track's go on from its own last,
+// though B-frame video's first decode time is behind the last audio's, so
+// that a channel's items, or a codec change, do not jump.
+type follower interface {
+	continuer
+	// Offset is what the writer adds to a packet's DTS, once it knows.
+	Offset() (time.Duration, bool)
+	// Follow makes it add off, as StartAt makes it start at a time.
+	Follow(off time.Duration)
 }
 
 // continuer is a SegmentWriter whose timeline can carry on another's, as
@@ -200,21 +230,30 @@ type continuer interface {
 }
 
 // start makes a writer for m.tracks, after a discontinuity when anything
-// was written before.
-func (m *Muxer) start() {
+// was written before. follow says the tracks are new, and the writer may
+// carry on the last one's times as they ran (place).
+func (m *Muxer) start(follow bool) {
 	var end time.Duration
 	if c, ok := m.writer.(continuer); ok {
 		end = c.End()
 	}
+	if f, ok := m.writer.(follower); ok {
+		if off, ok := f.Offset(); ok {
+			m.off, m.offKnown = off, true
+		}
+	}
+	if m.place {
+		// The last writer placed nothing: the one before it ended the
+		// timeline.
+		end = max(end, m.placeEnd)
+	}
+	m.place, m.follow, m.placeEnd = true, follow && m.offKnown, end
 	m.writer, m.carried, m.video, m.codecs = nil, nil, -1, ""
 	m.discNext = m.next > 0
 	m.last, m.seen = make([]time.Duration, len(m.tracks)), make([]bool, len(m.tracks))
 	w, err := m.config.Format.New(m.tracks)
 	if err != nil {
 		return
-	}
-	if c, ok := w.(continuer); ok {
-		c.StartAt(end)
 	}
 	m.writer = w
 	m.carried = make([]bool, len(m.tracks))
@@ -260,7 +299,7 @@ func (m *Muxer) OnPacket(pkt *av.Packet) {
 			// The publisher's clock jumped: what was written ends, and a
 			// new timeline begins after a discontinuity.
 			m.endSegment(nil, 0)
-			m.start()
+			m.start(false)
 		}
 	}
 	if m.waitKey {
@@ -268,6 +307,13 @@ func (m *Muxer) OnPacket(pkt *av.Packet) {
 			return
 		}
 		m.waitKey = false
+	}
+	kind := 0
+	if m.tracks[pkt.Track].Codec.IsVideo() {
+		kind = 1
+	}
+	if m.place {
+		m.placeWriter(pkt, kind)
 	}
 	if m.open == nil {
 		m.beginSegment(pkt)
@@ -293,9 +339,29 @@ func (m *Muxer) OnPacket(pkt *av.Packet) {
 	}
 	m.prevDTS = pkt.DTS
 	m.last[pkt.Track], m.seen[pkt.Track] = pkt.DTS, true
+	if !m.kindSeen[kind] || pkt.DTS > m.kindLast[kind] {
+		m.kindLast[kind], m.kindSeen[kind] = pkt.DTS, true
+	}
 	m.writer.WritePacket(pkt)
 	m.account()
 	m.wake()
+}
+
+// placeWriter starts the timeline of a new writer, whose first packet is
+// pkt, of kind (video at 1): where the last one's ended, or with the
+// times as they ran when the tracks are new and pkt is past the last
+// packet of its kind, by up to maxJump.
+func (m *Muxer) placeWriter(pkt *av.Packet, kind int) {
+	m.place = false
+	if f, ok := m.writer.(follower); ok && m.follow && m.kindSeen[kind] {
+		if d := pkt.DTS - m.kindLast[kind]; d > 0 && d <= maxJump {
+			f.Follow(m.off)
+			return
+		}
+	}
+	if c, ok := m.writer.(continuer); ok {
+		c.StartAt(m.placeEnd)
+	}
 }
 
 // OnClose ends the stream: the segment being written is finished and the

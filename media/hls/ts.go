@@ -107,7 +107,22 @@ func (w *tsWriter) BeginSegment() { w.tables = true }
 // It has no effect once a packet has been written.
 func (w *tsWriter) StartAt(t time.Duration) {
 	if !w.started && t > 0 {
-		w.startAt, w.holding = t, true
+		w.startAt, w.holding, w.shift = t, true, 0
+	}
+}
+
+// Offset returns what the writer adds to the packets' times, and false
+// until it knows: before a packet, or while it holds them.
+func (w *tsWriter) Offset() (time.Duration, bool) {
+	return w.shift, w.started && !w.holding
+}
+
+// Follow makes the times of the packets written their own plus off, the
+// Offset of the writer before a discontinuity, for new tracks on the same
+// clock. It has no effect once a packet has been written.
+func (w *tsWriter) Follow(off time.Duration) {
+	if !w.started {
+		w.startAt, w.holding, w.shift = 0, false, off
 	}
 }
 
