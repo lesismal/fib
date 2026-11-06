@@ -73,6 +73,14 @@ type HandlerConfig struct {
 	AllowOrigin string
 	// MaxStreams bounds the Muxers running at once; 0 is unlimited.
 	MaxStreams int
+	// Encrypt, when set, returns the Encryption of the stream at path, nil
+	// for none, in place of Muxer.Encryption: asked as a Muxer of it starts,
+	// in each format, with the Handler's lock held (it must not call the
+	// Handler). An error starts no Muxer and answers the playlist request
+	// 503, so that a stream meant to be encrypted is never served clear.
+	// The Handler serves no key: the URIs Encryption.Key names are the
+	// caller's to answer, before the Handler, as with SessionMuxer.
+	Encrypt func(path string) (*Encryption, error)
 }
 
 // Handler serves the streams of a hub over HLS, under fib/http: a request
@@ -202,6 +210,24 @@ func (h *Handler) format(name string) (int, bool) {
 // errNoStream is the hub not having the stream.
 var errNoStream = errors.New("hls: no such stream")
 
+// errEncrypt is HandlerConfig.Encrypt failing.
+var errEncrypt = errors.New("hls: no encryption for the stream")
+
+// SessionMuxer returns the Muxer serving the stream at path, in whichever
+// format, whose session (Muxer.Session) is session, or nil: the Muxer whose
+// playlist named a key URI holding it, for the key server to check the key
+// period with KeyEpoch.
+func (h *Handler) SessionMuxer(path, session string) *Muxer {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	for i := range h.formats {
+		if e := h.streams[streamKey{path, i}]; e != nil && e.m.session == session {
+			return e.m
+		}
+	}
+	return nil
+}
+
 // muxer returns the entry of path in format, starting one.
 func (h *Handler) muxer(path string, format int, c *http.Context) (*entry, error) {
 	key := streamKey{path, format}
@@ -231,6 +257,13 @@ func (h *Handler) muxer(path string, format int, c *http.Context) (*entry, error
 	}
 	mc := h.config.Muxer
 	mc.Format = h.formats[format]
+	if h.config.Encrypt != nil {
+		enc, err := h.config.Encrypt(path)
+		if err != nil {
+			return nil, errEncrypt
+		}
+		mc.Encryption = enc
+	}
 	m := NewMuxer(mc)
 	info := hub.SubscribeInfo{Protocol: "hls"}
 	if c.Conn != nil {
@@ -325,7 +358,7 @@ func (h *Handler) ServeHTTP(c *http.Context) {
 		e, err = h.file(stream, name)
 	}
 	switch {
-	case err == hub.ErrLimit:
+	case err == hub.ErrLimit, err == errEncrypt:
 		h.respond(c, stdhttp.StatusServiceUnavailable, "", "", nil)
 		return
 	case err != nil:

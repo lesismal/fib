@@ -54,9 +54,33 @@
 //	})
 //	// /live/s/index.m3u8 is fMP4, /live/s/index.m3u8?format=ts MPEG-TS
 //
+// With Config.Encryption (or HandlerConfig.Encrypt, per stream), a Muxer
+// encrypts its segments with AES-128 (METHOD=AES-128: CBC, PKCS#7 padding,
+// the IV the segment's media sequence number) as it cuts them, in place,
+// under keys the caller supplies, a new one every Encryption.Rotation
+// segments; each Low-Latency part is encrypted on its own with its
+// segment's key and IV. Initialization sections stay clear. The media
+// playlist names each key by the caller's URI in an EXT-X-KEY where the key
+// changes, before a segment's first part, with METHOD=NONE before an
+// EXT-X-MAP that follows a key. The Muxer never serves, prints or keeps a
+// key but as its cipher: the caller answers the key URIs, with its own
+// access control, checking a request against Handler.SessionMuxer and
+// Muxer.KeyEpoch:
+//
+//	h := hls.NewHandler(hls.HandlerConfig{
+//		Hub: hb,
+//		Encrypt: func(path string) (*hls.Encryption, error) {
+//			return &hls.Encryption{Rotation: 10, Key: func(session string, epoch uint64) ([16]byte, string, error) {
+//				return deriveKey(path, session, epoch), "key-" + session + "-" + strconv.FormatUint(epoch, 10) + ".key", nil
+//			}}, nil
+//		},
+//	})
+//
 // Left out: delta playlist updates (_HLS_skip, EXT-X-SKIP) and rendition
 // reports, byte-range parts, EXT-X-PROGRAM-DATE-TIME, multiple variants
-// (no transcoding), I-frame playlists, and encryption.
+// (no transcoding), I-frame playlists, and encryption other than AES-128
+// (SAMPLE-AES, key formats other than identity, an IV other than the media
+// sequence number).
 // EXT-X-TARGETDURATION is not known before the segments are: it starts at
 // TargetDuration rounded up and is raised if a segment comes out longer (a
 // keyframe interval longer than the target), which strictly the

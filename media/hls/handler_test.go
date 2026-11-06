@@ -20,10 +20,17 @@ import (
 // serve starts a fib/http server for h and returns its base URL.
 func serve(t *testing.T, h *Handler) string {
 	t.Helper()
+	return serveHandler(t, h, h)
+}
+
+// serveHandler serves handler, which h is behind, and returns its base
+// URL.
+func serveHandler(t *testing.T, h *Handler, handler http.Handler) string {
+	t.Helper()
 	config := fib.DefaultConfig()
 	config.ReusePort = false
 	config.LogSettings = false
-	engine, err := fib.New(config, fib.Binding{Addr: "127.0.0.1:0", Handler: http.NewHandler(h)})
+	engine, err := fib.New(config, fib.Binding{Addr: "127.0.0.1:0", Handler: http.NewHandler(handler)})
 	if err != nil {
 		t.Fatal(err)
 	}

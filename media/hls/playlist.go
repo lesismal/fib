@@ -55,19 +55,11 @@ func (m *Muxer) MediaPlaylist(dst []byte) ([]byte, bool) {
 		b = strconv.AppendInt(b, int64(disc), 10)
 		b = append(b, '\n')
 	}
-	// Parts are listed for the segments within three target durations of
-	// the end, which is all a player joining at PART-HOLD-BACK needs.
-	partsFrom := len(m.segs)
-	if ll {
-		var tail time.Duration
-		for partsFrom > first && tail < 3*time.Duration(m.target)*time.Second {
-			partsFrom--
-			tail += m.segs[partsFrom].dur
-		}
-	}
+	partsFrom := m.partsFrom(first)
 	mapped := -1
+	var keyed *epochKey
 	for i, s := range m.segs[first:] {
-		b = m.appendSegmentHead(b, s, &mapped)
+		b = m.appendSegmentHead(b, s, &mapped, &keyed)
 		if first+i >= partsFrom {
 			b = m.appendParts(b, s)
 		}
@@ -80,7 +72,7 @@ func (m *Muxer) MediaPlaylist(dst []byte) ([]byte, bool) {
 	if ll && m.open != nil && len(m.open.parts) > 0 {
 		// The open segment's tags go before its first part; without a
 		// part yet there is nothing for them to apply to.
-		b = m.appendSegmentHead(b, m.open, &mapped)
+		b = m.appendSegmentHead(b, m.open, &mapped, &keyed)
 		b = m.appendParts(b, m.open)
 	}
 	if m.ended {
@@ -98,17 +90,49 @@ func (m *Muxer) MediaPlaylist(dst []byte) ([]byte, bool) {
 	return b, true
 }
 
-// appendSegmentHead appends the tags before a segment: a discontinuity, and
-// EXT-X-MAP when its initialization section is not the one before it.
-func (m *Muxer) appendSegmentHead(b []byte, s *segment, mapped *int) []byte {
+// partsFrom returns the index in segs of the first segment whose parts the
+// playlist lists, len(segs) for none: those within three target durations
+// of the end, which is all a player joining at PART-HOLD-BACK needs.
+func (m *Muxer) partsFrom(first int) int {
+	from := len(m.segs)
+	if m.config.PartDuration <= 0 {
+		return from
+	}
+	var tail time.Duration
+	for from > first && tail < 3*time.Duration(m.target)*time.Second {
+		from--
+		tail += m.segs[from].dur
+	}
+	return from
+}
+
+// appendSegmentHead appends the tags before a segment: a discontinuity,
+// EXT-X-MAP when its initialization section is not the one before it, and
+// EXT-X-KEY when its key is not the one before it. Initialization sections
+// stay clear: an EXT-X-MAP after a key has METHOD=NONE before it.
+func (m *Muxer) appendSegmentHead(b []byte, s *segment, mapped *int, keyed **epochKey) []byte {
 	if s.disc {
 		b = append(b, "#EXT-X-DISCONTINUITY\n"...)
 	}
 	if s.init != 0 && s.init != *mapped {
+		if *keyed != nil {
+			b = append(b, "#EXT-X-KEY:METHOD=NONE\n"...)
+			*keyed = nil
+		}
 		b = append(b, "#EXT-X-MAP:URI=\""...)
 		b = m.initName(b, s.init)
 		b = append(b, "\"\n"...)
 		*mapped = s.init
+	}
+	if s.key != *keyed {
+		if s.key == nil {
+			b = append(b, "#EXT-X-KEY:METHOD=NONE\n"...)
+		} else {
+			b = append(b, "#EXT-X-KEY:METHOD=AES-128,URI=\""...)
+			b = append(b, s.key.uri...)
+			b = append(b, "\"\n"...)
+		}
+		*keyed = s.key
 	}
 	return b
 }
