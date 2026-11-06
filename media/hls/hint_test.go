@@ -224,3 +224,59 @@ func TestMuxerLLHLSHintAfterDiscontinuityEncrypted(t *testing.T) {
 		t.Fatalf("%s\nwant tail\n%s", b, want)
 	}
 }
+
+// A segment ended by new tracks lasts until the earliest of its tracks
+// ends, the parts as long: what a player of muxed audio and video has
+// buffered. hls.js placed the segment after the discontinuity by that
+// duration, the audio's last packet past the last video frame having made
+// it longer than what was buffered, and stalled at the hole.
+func TestMuxerEndCoversEveryTrack(t *testing.T) {
+	for _, tc := range []struct {
+		name         string
+		video, audio time.Duration // where each track's packets stop
+		want         float64       // the last segment's duration
+	}{
+		// Video at 25 fps to 2.96 s, so to 3 s; AAC runs on.
+		{"audio longer", 3 * time.Second, 3100 * time.Millisecond, 1},
+		// AAC to 2.9867 s, ending at 3.008 s, before the video.
+		{"video longer", 3100 * time.Millisecond, 3 * time.Second, 1.008},
+		// The video stopped half a second before the last part: the audio
+		// alone counts, to 3.0933 s and one frame.
+		{"video stopped", 2500 * time.Millisecond, 3100 * time.Millisecond, 1.115},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			m := NewMuxer(Config{TargetDuration: time.Second, PartDuration: 250 * time.Millisecond})
+			m.OnTracks([]*av.Track{h264Track(t), aacTrack(t)})
+			// Keyframes every 2 s: the last segment from 2 s on.
+			src := &source{video: true, audio: 1, gop: 50}
+			for _, p := range src.until(3200 * time.Millisecond) {
+				if p.Track == 0 && p.DTS < tc.video || p.Track == 1 && p.DTS < tc.audio {
+					m.OnPacket(p)
+				}
+			}
+			m.OnTracks([]*av.Track{h265Track(t), aacTrack(t)})
+			p := media(t, m)
+			last := p.durs[len(p.durs)-1]
+			if last != tc.want {
+				t.Fatalf("last segment %.3fs, want %.3fs: %v", last, tc.want, p.durs)
+			}
+			b, _ := m.MediaPlaylist(nil)
+			var parts float64
+			for l := range strings.SplitSeq(string(b), "\n") {
+				d, ok := strings.CutPrefix(l, "#EXT-X-PART:DURATION=")
+				if !ok || !strings.Contains(l, "-"+strconv.Itoa(len(p.durs)-1)+"-") {
+					continue
+				}
+				d, _, _ = strings.Cut(d, ",")
+				f, err := strconv.ParseFloat(d, 64)
+				if err != nil {
+					t.Fatal(l)
+				}
+				parts += f
+			}
+			if parts < last-0.005 || parts > last+0.005 {
+				t.Fatalf("parts %.3fs, the segment %.3fs:\n%s", parts, last, b)
+			}
+		})
+	}
+}

@@ -11,7 +11,8 @@
 // old segments go first, and a segment that outgrows a quarter of the bound
 // (a stream whose keyframes stop coming) is cut without one. A republish or
 // a change of codec configuration (OnTracks again), or a jump in the
-// publisher's clock, ends the segment being written and continues after an
+// publisher's clock, ends the segment being written, which then lasts until
+// the earliest of its tracks ends, and continues after an
 // EXT-X-DISCONTINUITY, with a new EXT-X-MAP when the tracks changed;
 // EXT-X-DISCONTINUITY-SEQUENCE counts those that left the playlist. With
 // Config.PartDuration set, segments are also written in parts, and the

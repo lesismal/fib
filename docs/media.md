@@ -649,7 +649,12 @@ preload hint of the segment they begin, from the moment the tracks change:
 hls.js places the segment to come by the tags before the hint and keeps that
 place once the segment is listed, so a hint after them alone had it append the
 new tracks' parts after the old init section, which the media element failed
-to decode. RTMP and FLV sequence headers for new tracks are stamped with their
+to decode. A segment ended by new tracks (or the stream's end, or a jump in
+the clock) lasts until the earliest of its tracks ends, its last part as long:
+hls.js places the segment after a discontinuity by the duration of the one
+before when it read that one by its parts, and AAC running on past the last
+video frame left a hole there, past what the muxed buffer held, where playback
+stalled. RTMP and FLV sequence headers for new tracks are stamped with their
 own track's last timestamp (`flv.Timeline.HeaderStamp`).
 
 ## Configuration and limits

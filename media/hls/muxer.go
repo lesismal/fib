@@ -157,6 +157,7 @@ type Muxer struct {
 	inits    map[int][]byte
 	initID   int
 	last     []time.Duration // per track, the DTS of its last packet
+	step     []time.Duration // per track, from its packet before the last to the last
 	seen     []bool
 
 	// Where a new writer's timeline starts, which its first packet
@@ -282,7 +283,7 @@ func (m *Muxer) start(follow bool) {
 	m.place, m.follow, m.placeEnd = true, follow && m.offKnown, end
 	m.writer, m.carried, m.video, m.codecs = nil, nil, -1, ""
 	m.discNext = m.next > 0
-	m.last, m.seen = make([]time.Duration, len(m.tracks)), make([]bool, len(m.tracks))
+	m.last, m.step, m.seen = make([]time.Duration, len(m.tracks)), make([]time.Duration, len(m.tracks)), make([]bool, len(m.tracks))
 	w, err := m.config.Format.New(m.tracks)
 	if err != nil {
 		return
@@ -374,6 +375,9 @@ func (m *Muxer) OnPacket(pkt *av.Packet) {
 		m.gap = g
 	}
 	m.prevDTS = pkt.DTS
+	if g := pkt.DTS - m.last[pkt.Track]; m.seen[pkt.Track] && g > 0 && g < m.config.TargetDuration {
+		m.step[pkt.Track] = g
+	}
 	m.last[pkt.Track], m.seen[pkt.Track] = pkt.DTS, true
 	if !m.kindSeen[kind] || pkt.DTS > m.kindLast[kind] {
 		m.kindLast[kind], m.kindSeen[kind] = pkt.DTS, true
@@ -445,9 +449,11 @@ func (m *Muxer) endPart(next *av.Packet) {
 	var independent bool
 	s.data, independent = m.writer.Flush(s.data, next)
 	if n := len(s.data) - before; n > 0 && m.config.PartDuration > 0 {
-		dur := m.prevDTS - m.partStart + m.gap
+		var dur time.Duration
 		if next != nil {
 			dur = next.DTS - m.partStart
+		} else {
+			dur = m.end() - m.partStart
 		}
 		s.parts = append(s.parts, part{off: before, n: n, dur: dur, independent: independent})
 		if m.enc != nil {
@@ -463,6 +469,37 @@ func (m *Muxer) endPart(next *av.Packet) {
 	}
 }
 
+// end returns where the media written ends when no packet comes next to
+// tell (the stream's end, new tracks, a jump in the clock): where the
+// earliest of the tracks in the part being written ends, each at its last
+// packet and the step before it, so that every track covers the segment.
+// A player of muxed audio and video has buffered that far and no further,
+// and one placing the segment after a discontinuity by the duration of the
+// one before (hls.js, after reading it by its parts) found a hole after it
+// where the audio ran on past the last video frame: playback stalled. A
+// track that ended before the part began has stopped, and does not count;
+// with none, it is the last packet and the stream's last step.
+func (m *Muxer) end() time.Duration {
+	var end time.Duration
+	found := false
+	for i, seen := range m.seen {
+		if !seen {
+			continue
+		}
+		step := m.step[i]
+		if step <= 0 {
+			step = m.gap
+		}
+		if e := m.last[i] + step; e > m.partStart && (!found || e < end) {
+			end, found = e, true
+		}
+	}
+	if !found {
+		return m.prevDTS + m.gap
+	}
+	return end
+}
+
 // endSegment completes the open segment, d long, before next, or at the end
 // of the stream when next is nil.
 func (m *Muxer) endSegment(next *av.Packet, d time.Duration) {
@@ -473,7 +510,7 @@ func (m *Muxer) endSegment(next *av.Packet, d time.Duration) {
 	m.endPart(next)
 	m.open = nil
 	if next == nil {
-		d = m.prevDTS - m.segStart + m.gap
+		d = m.end() - m.segStart
 	}
 	if len(s.data) == 0 {
 		return
