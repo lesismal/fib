@@ -331,6 +331,54 @@ func TestSenderTimes(t *testing.T) {
 	at(time.Second, 0)
 }
 
+// TestSenderSameClock keeps the times of a stream whose tracks change on
+// the same clock, as a channel's next item or a codec change makes: B-frame
+// video decoded before the last audio sent ends is not rebased. A
+// republish whose clock goes back, by a little or to 0, still is.
+func TestSenderSameClock(t *testing.T) {
+	s, streams := testSender(t, 1<<20)
+	s.start()
+	ms := time.Millisecond
+	at := func(track int, d time.Duration) {
+		p := &av.Packet{Track: track, DTS: d, PTS: d, Keyframe: true, Data: avcc(10)}
+		if track == 0 {
+			p.PTS += 80 * ms
+		}
+		s.OnPacket(p)
+	}
+	at(0, 920*ms)
+	at(1, 1000*ms)
+	at(0, 1880*ms)
+	at(1, 1980*ms)
+	off := s.offset
+	// The next item: its keyframe is behind the last audio, past the last
+	// video; audio first works the same.
+	s.OnTracks(streams)
+	at(0, 1920*ms)
+	at(1, 2000*ms)
+	s.OnTracks(streams)
+	at(1, 2020*ms)
+	at(0, 1960*ms)
+	if s.offset != off {
+		t.Fatalf("rebased by %v", s.offset-off)
+	}
+	// A republish whose clock is half a second behind.
+	last := s.lastOut
+	s.OnTracks(streams)
+	at(0, 1500*ms)
+	if s.offset == off || s.lastOut <= last || s.lastOut > last+time.Second {
+		t.Fatalf("not rebased: at %v after %v", s.lastOut, last)
+	}
+	// And one from 0.
+	last, off = s.lastOut, s.offset
+	s.OnTracks(streams)
+	at(1, 0)
+	if s.offset == off || s.lastOut <= last || s.lastOut > last+time.Second {
+		t.Fatalf("not rebased: at %v after %v", s.lastOut, last)
+	}
+	s.close()
+}
+
 func TestSenderRTCP(t *testing.T) {
 	s, _ := testSender(t, 1<<20)
 	ours := func(ssrc uint32) bool { return ssrc == 7 }

@@ -18,7 +18,12 @@ const sendEpoch = time.Second
 
 // A republished stream whose times jump by more than these, back or
 // forward, is rebased onto the times already sent, so that what a viewer
-// receives stays continuous.
+// receives stays continuous. The first packet after new tracks is held to
+// the last one sent of its own kind, video or audio, when one was: one
+// not past it is rebased, as is one maxJumpForward past it, while one that
+// carries it on is not, though it may be behind the other kind's last, as
+// B-frame video is behind audio when a publisher changes its tracks on the
+// same clock.
 const (
 	maxJumpBack    = time.Second
 	maxJumpForward = 5 * time.Second
@@ -64,12 +69,16 @@ type sender struct {
 	hasVideo  bool
 
 	// The times sent are the stream's plus offset; lastOut is the
-	// latest sent, at wall time lastWall, and rebase says the stream's
-	// tracks changed, after which a jump in its times is taken out.
+	// latest sent, at wall time lastWall, lastKind the latest of audio
+	// and video (at 1), which sentKind says were sent, and rebase says
+	// the stream's tracks changed, after which a jump in its times is
+	// taken out.
 	started  bool
 	offset   time.Duration
 	lastOut  time.Duration
 	lastWall time.Time
+	lastKind [2]time.Duration
+	sentKind [2]bool
 	rebase   bool
 	pkt      av.Packet
 
@@ -243,6 +252,10 @@ func (s *sender) close() {
 func (s *sender) send(pkt *av.Packet) {
 	t := s.tracks[s.byHub[pkt.Track]]
 	now := time.Now()
+	kind := 0
+	if t.codec.IsVideo() {
+		kind = 1
+	}
 	if !s.started {
 		s.started = true
 		s.offset = sendEpoch - pkt.DTS
@@ -257,7 +270,12 @@ func (s *sender) send(pkt *av.Packet) {
 		// The first packet after a change of tracks, as a republish
 		// makes: a new publisher's times may start anywhere.
 		at := pkt.DTS + s.offset
-		if at < s.lastOut-maxJumpBack || at > s.lastOut+maxJumpForward {
+		jumped := at < s.lastOut-maxJumpBack || at > s.lastOut+maxJumpForward
+		if s.sentKind[kind] {
+			last := s.lastKind[kind]
+			jumped = at <= last || at > last+maxJumpForward
+		}
+		if jumped {
 			gap := min(max(now.Sub(s.lastWall), time.Millisecond), maxJumpForward)
 			s.offset = s.lastOut + gap - pkt.DTS
 		}
@@ -268,6 +286,9 @@ func (s *sender) send(pkt *av.Packet) {
 	s.pkt.PTS += s.offset
 	if s.pkt.DTS > s.lastOut {
 		s.lastOut = s.pkt.DTS
+	}
+	if !s.sentKind[kind] || s.pkt.DTS > s.lastKind[kind] {
+		s.lastKind[kind], s.sentKind[kind] = s.pkt.DTS, true
 	}
 	s.lastWall = now
 	_ = t.pk.Packetize(&s.pkt, func(p *rtp.Packet) error {

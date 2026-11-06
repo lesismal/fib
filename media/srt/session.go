@@ -74,12 +74,17 @@ type Session struct {
 	// After new tracks (a republish, restart), the next publisher's clock
 	// may start anywhere, and MPEG-TS players take a step back for a
 	// discontinuity: offset moves its times on from lastDTS, the largest
-	// sent (at lastAt), into shifted, as flv.Timeline does for RTMP.
-	restart bool
-	offset  time.Duration
-	lastDTS time.Duration
-	lastAt  time.Time
-	shifted av.Packet
+	// sent (at lastAt), into shifted, as flv.Timeline does for RTMP. The
+	// first packet after new tracks starts a new clock when it is not past
+	// the last one sent of its own kind (lastKind, video at 1), so that a
+	// publisher changing its tracks on the same clock is not moved on.
+	restart  bool
+	offset   time.Duration
+	lastDTS  time.Duration
+	lastAt   time.Time
+	lastKind [2]time.Duration
+	sentKind [2]bool
+	shifted  av.Packet
 }
 
 // maxClockJump is how far past the last packet the first one after new
@@ -400,9 +405,17 @@ func (s *Session) sendPacket(pkt *av.Packet, now time.Time) {
 	if s.mux == nil || !s.mux.Supported(pkt.Track) {
 		return
 	}
+	kind := 0
+	if s.tracks[pkt.Track].Codec.IsVideo() {
+		kind = 1
+	}
 	if s.restart {
 		s.restart = false
-		if d := pkt.DTS + s.offset; d <= s.lastDTS || d > s.lastDTS+maxClockJump {
+		ref := s.lastDTS
+		if s.sentKind[kind] {
+			ref = s.lastKind[kind]
+		}
+		if d := pkt.DTS + s.offset; d <= ref || d > ref+maxClockJump {
 			at := s.lastDTS + max(min(now.Sub(s.lastAt), maxClockJump), minRestartGap)
 			s.offset = at - pkt.DTS
 		}
@@ -415,6 +428,9 @@ func (s *Session) sendPacket(pkt *av.Packet, now time.Time) {
 	}
 	if s.lastAt.IsZero() || pkt.DTS > s.lastDTS {
 		s.lastDTS = pkt.DTS
+	}
+	if !s.sentKind[kind] || pkt.DTS > s.lastKind[kind] {
+		s.lastKind[kind], s.sentKind[kind] = pkt.DTS, true
 	}
 	s.lastAt = now
 	var err error

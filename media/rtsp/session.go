@@ -495,14 +495,19 @@ type player struct {
 	lastPTS  time.Duration
 	// After a republish (restart), the next publisher's clock may start
 	// anywhere: offset moves its times on from lastDTS, the largest sent
-	// (at lastAt), into shifted, as flv.Timeline does for RTMP.
-	restart bool
-	offset  time.Duration
-	lastDTS time.Duration
-	lastAt  time.Time
-	shifted av.Packet
-	closed  bool
-	buf     []byte
+	// (at lastAt), into shifted, as flv.Timeline does for RTMP. The first
+	// packet after new tracks starts a new clock when it is not past the
+	// last one sent of its own kind (lastKind, video at 1), so that a
+	// publisher changing its tracks on the same clock is not moved on.
+	restart  bool
+	offset   time.Duration
+	lastDTS  time.Duration
+	lastAt   time.Time
+	lastKind [2]time.Duration
+	sentKind [2]bool
+	shifted  av.Packet
+	closed   bool
+	buf      []byte
 }
 
 // maxClockJump is how far past the last packet the first one after a
@@ -580,9 +585,17 @@ func (p *player) OnPacket(pkt *av.Packet) {
 			}
 		}
 	}
+	kind := 0
+	if t := p.tracks[pkt.Track]; t != nil && t.Codec.IsVideo() {
+		kind = 1
+	}
 	if p.restart {
 		p.restart = false
-		if d := pkt.DTS + p.offset; d <= p.lastDTS || d > p.lastDTS+maxClockJump {
+		ref := p.lastDTS
+		if p.sentKind[kind] {
+			ref = p.lastKind[kind]
+		}
+		if d := pkt.DTS + p.offset; d <= ref || d > ref+maxClockJump {
 			// As long after the last packet as the stream was quiet:
 			// the sender reports' mapping of wall time to media time,
 			// which a player stamps packets by (ffmpeg does), stays as
@@ -598,6 +611,9 @@ func (p *player) OnPacket(pkt *av.Packet) {
 		pkt = &p.shifted
 	}
 	p.lastDTS, p.lastAt = max(p.lastDTS, pkt.DTS), now
+	if !p.sentKind[kind] || pkt.DTS > p.lastKind[kind] {
+		p.lastKind[kind], p.sentKind[kind] = pkt.DTS, true
+	}
 	st := p.streams[pkt.Track]
 	p.lastPTS = pkt.PTS
 	defer func() {
