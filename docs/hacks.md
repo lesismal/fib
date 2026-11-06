@@ -758,9 +758,14 @@ files, _ := fibhttp.NewFileCache(fibhttp.FileCacheConfig{Root: "/data/static", P
 files.ServeFile(c, strings.TrimPrefix(c.Request.URL.Path, "/static/"))
 ```
 
-- A file is read into memory on first request and then **follows the disk**: on Linux an inotify
-  watch on the directory invalidates an entry the instant it is created, written, `mv`ed or
-  deleted, and a request itself does not stat; on other platforms every request stats once.
+- A file is read into memory on first request and then **follows the disk**: on Linux a
+  `filewatch.Watcher` (inotify) on the file's directory and every directory on the way from the
+  root invalidates an entry the instant it is created, written, `mv`ed or deleted, a directory on
+  its way is renamed, or a `current` symlink on the way to the root is pointed elsewhere. On top
+  of that, and alone on other platforms, a file is stat'ed again once `CheckInterval` (5s by
+  default) has passed, and reread when its `filewatch.Stamp` (size, mtime, ctime, inode) moved, so
+  a replacement with the same size and mtime (`rsync -t`, `cp -p`, `tar x`) is seen too. A
+  negative `CheckInterval` stats on every request: the response is always the file on disk.
 - `Precompressed`: picks the on-disk `name.br` / `name.gz` according to `Accept-Encoding` (q
   values included) and sets `Content-Encoding` and `Vary`. **Compression CPU is spent at deploy
   time, not at request time.**

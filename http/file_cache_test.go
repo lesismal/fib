@@ -15,7 +15,8 @@ import (
 )
 
 // newTestFileCache serves a directory holding a.css and its .br and .gz
-// twins, and plain.txt with none.
+// twins, and plain.txt with none: under a watch where the system has one, or
+// with no watch and every request checking its file.
 func newTestFileCache(t *testing.T, watch bool) (*FileCache, string, string) {
 	t.Helper()
 	dir := t.TempDir()
@@ -26,12 +27,14 @@ func newTestFileCache(t *testing.T, watch bool) (*FileCache, string, string) {
 			t.Fatal(err)
 		}
 	}
-	fc, err := NewFileCache(FileCacheConfig{Root: dir, Precompressed: true})
+	config := FileCacheConfig{Root: dir, Precompressed: true}
+	if !watch {
+		// Without a watch, every request checks its file.
+		config.CheckInterval = -1
+	}
+	fc, err := NewFileCache(config)
 	if err != nil {
 		t.Fatal(err)
-	}
-	if !watch {
-		_ = fc.Close()
 	}
 	t.Cleanup(func() { _ = fc.Close() })
 	addr := serveHTTP1(t, func(c *Context) {

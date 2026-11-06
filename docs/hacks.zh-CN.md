@@ -648,8 +648,11 @@ files, _ := fibhttp.NewFileCache(fibhttp.FileCacheConfig{Root: "/data/static", P
 files.ServeFile(c, strings.TrimPrefix(c.Request.URL.Path, "/static/"))
 ```
 
-- 首次请求读入内存，之后**跟随磁盘**：Linux 上 inotify watch 目录，创建/写入/`mv`/删除瞬间让条目失效，
-  请求本身不 stat；其它平台每个请求 stat 一次。
+- 首次请求读入内存，之后**跟随磁盘**：Linux 上用 `filewatch.Watcher`（inotify）监听文件所在目录及从根目录
+  到它的每一级目录，文件创建/写入/`mv`/删除、途经目录改名、根目录路径上的 `current` 软链接改指向时瞬间让
+  条目失效。此外（其它平台则只有这一条），`CheckInterval`（默认 5s）过后再 stat 文件一次，`filewatch.Stamp`
+  （大小、mtime、ctime、inode）变了就重读，所以大小和 mtime 都不变的替换（`rsync -t`、`cp -p`、`tar x`）也能
+  发现。`CheckInterval` 为负数时每个请求都 stat：响应总是磁盘上的文件。
 - `Precompressed`：按 `Accept-Encoding`（含 q 值）选磁盘上预压缩好的 `name.br` / `name.gz`，
   设置 `Content-Encoding` 与 `Vary`——**压缩的 CPU 在部署时花，不在请求时花**。
 - 不带条件、不带 Range 的 GET/HEAD 直接从内存写出，零分配；条件/Range 交给 `net/http.ServeContent`。

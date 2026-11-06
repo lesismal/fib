@@ -16,6 +16,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/lesismal/fib/filewatch"
 )
 
 // FileCacheConfig configures a FileCache.
@@ -34,12 +36,21 @@ type FileCacheConfig struct {
 	// files are served from disk until changes free room. Zero means
 	// DefaultMaxCacheBytes.
 	MaxBytes int64
+	// CheckInterval is how long what the cache holds of a file is trusted
+	// before the file is stat'ed again, to see whether it is still the file
+	// that was read: the longest a change can go unseen where no watch
+	// reports it, and the bound on what a watch misses, such as a change on
+	// a network file system. Zero means DefaultCheckInterval; a negative
+	// interval stats the file on every request, so that a response always
+	// carries the file as it is on disk when the request is served.
+	CheckInterval time.Duration
 }
 
 // The defaults FileCacheConfig's zero values stand for.
 const (
 	DefaultMaxCachedFile = 1 << 20
 	DefaultMaxCacheBytes = 64 << 20
+	DefaultCheckInterval = 5 * time.Second
 )
 
 // maxMissingEntries bounds how many names a FileCache remembers finding no
@@ -50,18 +61,22 @@ const maxMissingEntries = 4096
 
 // FileCache serves the files under a directory from memory, following the
 // disk: a file is read the first time it is asked for, and read again once it
-// has changed. On Linux an inotify watch on each directory a cached file is
-// in tells the cache of a change, created, written, replaced, moved or removed,
-// within moments of it, and a request reads nothing from the disk; elsewhere,
-// or where inotify cannot be had, each request checks the file's size,
-// modification time and inode, one system call, and rereads it when any
-// moved.
+// has changed. On Linux a filewatch.Watcher on each directory a cached file
+// is in, and on the directories on its way from the root, tells the cache of
+// a change, a file created, written, replaced, moved or removed, a directory
+// renamed, or a "current" link on the way to the root pointed elsewhere,
+// within moments of it. Whatever no watch reports, elsewhere than Linux or
+// where inotify cannot be had, is seen when the file is stat'ed again, once
+// CheckInterval has passed since it last was: the cache rereads a file whose
+// filewatch.Stamp moved, its size, modification or status change time, or
+// inode, which tells apart a file replaced by one of the same size and
+// modification time.
 //
 // A file served from memory leaves on a GET or HEAD without conditions or a
 // range, with its Content-Type, Content-Length and Last-Modified, and without
 // allocating; a conditional or ranged request goes through
 // net/http.ServeContent over the same bytes. A name with no file under it is
-// remembered too, so that asking again stats nothing where a watch stands,
+// remembered too, so that asking again stats nothing within CheckInterval,
 // but no more than 4096 such names, whatever names clients make up. The cache
 // is safe for concurrent use.
 type FileCache struct {
@@ -69,6 +84,8 @@ type FileCache struct {
 	precompressed bool
 	maxFile       int64
 	maxBytes      int64
+	// check is how long an entry is trusted without a stat; 0 trusts none.
+	check time.Duration
 
 	mu      sync.RWMutex
 	entries map[fileKey]*cachedFile
@@ -79,7 +96,7 @@ type FileCache struct {
 	// generation moves on with every change the watch reports, so that a
 	// file read while one arrived is not cached as if it were current.
 	generation atomic.Uint64
-	watch      *fileWatch
+	watch      *filewatch.Watcher
 }
 
 // fileKey names a cached file: a path relative to the root, and which of its
@@ -106,9 +123,9 @@ func (t twin) suffix() string { return [...]string{"", ".br", ".gz"}[t] }
 // exist, which a twin that is not on disk is.
 type cachedFile struct {
 	missing bool
-	// watched says a watch on the file's directory reports its changes, so
-	// that the entry stands until one does; otherwise each use checks it.
-	watched bool
+	// checked is when the file's stamp was last found as the entry has it,
+	// in nanoseconds since the Unix epoch.
+	checked atomic.Int64
 	// name is the file's path relative to the root, data its contents, or
 	// nil for one too large to keep, and header what a response carrying
 	// it says of it; see fileHeader.
@@ -116,14 +133,7 @@ type cachedFile struct {
 	data    []byte
 	header  stdhttp.Header
 	modTime time.Time
-	stamp   fileStamp
-}
-
-// fileStamp is what a stat tells of a file's identity and content.
-type fileStamp struct {
-	size    int64
-	modTime time.Time
-	inode   uint64
+	stamp   filewatch.Stamp
 }
 
 // NewFileCache returns a cache of the files under config.Root.
@@ -147,22 +157,60 @@ func NewFileCache(config FileCacheConfig) (*FileCache, error) {
 	if fc.maxBytes <= 0 {
 		fc.maxBytes = DefaultMaxCacheBytes
 	}
-	fc.watch = newFileWatch(fc.root, fc.changed)
+	switch {
+	case config.CheckInterval == 0:
+		fc.check = DefaultCheckInterval
+	case config.CheckInterval > 0:
+		fc.check = config.CheckInterval
+	}
+	if fc.check > 0 {
+		// Without a watch, or with every request checking its file, the
+		// cache does without one.
+		if w, err := filewatch.New(fc.root, fc.event); err == nil {
+			fc.watch = w
+		}
+	}
 	return fc, nil
 }
 
 // Close stops watching the directories. The cache keeps serving, checking
-// each file as it goes.
+// each file once CheckInterval has passed since it last did.
 func (fc *FileCache) Close() error {
 	fc.mu.Lock()
 	w := fc.watch
 	fc.watch = nil
 	fc.mu.Unlock()
 	if w != nil {
-		w.close()
+		_ = w.Close()
 	}
 	fc.changed("")
 	return nil
+}
+
+// event drops what the cache holds of what ev reports changed.
+func (fc *FileCache) event(ev filewatch.Event) {
+	switch {
+	case ev.All:
+		fc.changed("")
+	case ev.Dir:
+		fc.changedDir(ev.Name)
+	default:
+		fc.changed(ev.Name)
+	}
+}
+
+// changedDir drops what the cache holds of dir, a path relative to the root
+// that is or was a directory, and of every path under it.
+func (fc *FileCache) changedDir(dir string) {
+	fc.generation.Add(1)
+	prefix := dir + "/"
+	fc.mu.Lock()
+	for key, e := range fc.entries {
+		if key.name == dir || strings.HasPrefix(key.name, prefix) {
+			fc.removeLocked(key, e)
+		}
+	}
+	fc.mu.Unlock()
 }
 
 // changed drops what the cache holds of name, a path relative to the root,
@@ -364,15 +412,22 @@ func (fc *FileCache) lookup(key fileKey) *cachedFile {
 	fc.mu.RLock()
 	e, watch := fc.entries[key], fc.watch
 	fc.mu.RUnlock()
-	if e != nil && e.watched && watch != nil {
-		return e
+	var now int64
+	if e != nil && fc.check > 0 {
+		now = time.Now().UnixNano()
+		if now-e.checked.Load() < int64(fc.check) {
+			return e
+		}
 	}
 	name := key.name + key.twin.suffix()
 	full := fc.path(name)
 	if e != nil {
-		// Unwatched: the entry stands while the file's stamp does.
+		// The entry stands while the file's stamp does.
 		stamp, exists, err := statStamp(full)
 		if err == nil && exists == !e.missing && (e.missing || stamp == e.stamp) {
+			if now != 0 {
+				e.checked.Store(now)
+			}
 			return e
 		}
 	}
@@ -381,19 +436,21 @@ func (fc *FileCache) lookup(key fileKey) *cachedFile {
 
 // load reads name, the file key stands for, and caches it, unless a change arrived while it was being
 // read, or it is too large.
-func (fc *FileCache) load(key fileKey, name, full string, watch *fileWatch) *cachedFile {
+func (fc *FileCache) load(key fileKey, name, full string, watch *filewatch.Watcher) *cachedFile {
 	generation := fc.generation.Load()
+	checked := time.Now().UnixNano()
 	// Watched from before it is read, so that no change between the two goes
 	// unseen.
-	watched := watch != nil && watch.add(fc.root, path.Dir(name))
+	watch.Watch(path.Dir(name))
 	stamp, exists, err := statStamp(full)
 	if err != nil {
 		return nil
 	}
-	e := &cachedFile{missing: !exists, watched: watched, name: name, stamp: stamp}
+	e := &cachedFile{missing: !exists, name: name, stamp: stamp}
+	e.checked.Store(checked)
 	if exists {
-		e.modTime = stamp.modTime
-		if stamp.size > fc.maxFile {
+		e.modTime = time.Unix(0, stamp.ModTime)
+		if stamp.Size > fc.maxFile {
 			// ServeContent finds the Content-Type of a file served from the
 			// disk, from its name or, failing that, from its bytes.
 			e.header = fileHeader(name, stamp, nil)
@@ -453,7 +510,7 @@ func (fc *FileCache) forgetMissingLocked() {
 // Content-Encoding of a twin's, and the modification time. The length the
 // server works out from the body it is given. The header is shared by every
 // response the file goes out in, which only read it.
-func fileHeader(name string, stamp fileStamp, data []byte) stdhttp.Header {
+func fileHeader(name string, stamp filewatch.Stamp, data []byte) stdhttp.Header {
 	h := make(stdhttp.Header, 4)
 	original := name
 	switch {
@@ -474,8 +531,26 @@ func fileHeader(name string, stamp fileStamp, data []byte) stdhttp.Header {
 		}
 	}
 	h["Content-Type"] = []string{contentType}
-	h["Last-Modified"] = []string{stamp.modTime.UTC().Format(stdhttp.TimeFormat)}
+	h["Last-Modified"] = []string{time.Unix(0, stamp.ModTime).UTC().Format(stdhttp.TimeFormat)}
 	return h
+}
+
+var errIsDir = errors.New("http: is a directory")
+
+// statStamp stats full: its stamp and true, false for a file that does not
+// exist, or an error, a directory's among them.
+func statStamp(full string) (filewatch.Stamp, bool, error) {
+	info, stamp, err := filewatch.Stat(full)
+	if errors.Is(err, os.ErrNotExist) {
+		return filewatch.Stamp{}, false, nil
+	}
+	if err != nil {
+		return filewatch.Stamp{}, false, err
+	}
+	if info.IsDir() {
+		return filewatch.Stamp{}, false, errIsDir
+	}
+	return stamp, true, nil
 }
 
 // acceptQ is the q value fields give coding, 0 when they refuse it or name

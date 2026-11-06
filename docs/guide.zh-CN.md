@@ -819,10 +819,13 @@ files, err := fibhttp.NewFileCache(fibhttp.FileCacheConfig{Root: "/data/static",
 files.ServeFile(c, strings.TrimPrefix(c.Request.URL.Path, "/static/"))
 ```
 
-- 文件第一次被请求时读入内存，之后在它变化时重新读取。Linux 上对缓存文件所在目录加 inotify
-  watch，文件被创建、写入、替换（`mv`）、移动或删除都会在瞬间让对应条目失效，请求本身不访问
-  磁盘；其他平台或拿不到 inotify 时，每个请求 stat 一次（大小、修改时间、inode），变化则重读。
-  读文件期间若有变化，这次读到的内容不进入缓存。
+- 文件第一次被请求时读入内存，之后在它变化时重新读取。Linux 上用 `filewatch.Watcher`（inotify）
+  监听缓存文件所在目录及从根目录到它的每一级目录：文件被创建、写入、替换（`mv`）、移动或删除，
+  途经的目录被改名，或根目录路径上的软链接（如部署用的 `current`）改了指向，都会在瞬间让对应条目
+  失效。watch 看不到的变化（其他平台、拿不到 inotify、网络文件系统上别的机器的写入）在
+  `CheckInterval`（默认 5s）过后再 stat 时发现：比较 `filewatch.Stamp`（大小、修改时间、
+  change time、inode），变了就重读，大小和修改时间都不变的替换也能识别。`CheckInterval` 为负数时
+  每个请求都 stat 一次。读文件期间若有变化，这次读到的内容不进入缓存。
 - `Precompressed` 时按 `Accept-Encoding`（含 q 值）选择磁盘上预压缩的 `name.br`/`name.gz`，
   设置 `Content-Encoding` 和 `Vary`，`Content-Type` 取原文件的扩展名，扩展名不能确定类型时像
   `ServeContent` 一样按内容判断。
