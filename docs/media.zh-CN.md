@@ -27,7 +27,7 @@
 | HTTP-FLV、WebSocket-FLV | `media/httpflv` | 播放 | 拉流转发 | 一个永不结束的 FLV 文件，走 HTTP/1.1、HTTP/2 或 HTTP/3，或者把同样的字节放进二进制 WebSocket 消息（也支持 RFC 8441 与 RFC 9220 的 extended CONNECT）；供 flv.js、mpegts.js 和 ffmpeg 播放。拉流转发经 HTTP/1.1 或 HTTP/2（http 与 https）播放 HTTP-FLV 源站，或播放 WebSocket-FLV 源站（ws 与 wss），发布进 hub |
 | RTSP 1.0 | `media/rtsp` | 录制（ANNOUNCE/RECORD）与播放 | 播放、推流、转推与拉流转发 | 基于 TCP interleaved 和 UDP 单播的 RFC 2326，所有会话共用一对 RTP/RTCP 端口，RTCP sender report，Digest 与 Basic 认证，GET_PARAMETER 保活，会话超时 |
 | SRT | `media/srt` | 推流与播放 | 推流、播放、原始会话 | live 模式：带 SYN cookie 的 v5 握手，stream ID 及其访问控制语法，ACK/ACKACK/NAK，重传，TSBPD 与过晚丢弃，128、192、256 位密钥的 AES-CTR 加密以及带内的密钥更新；MPEG-TS 与 hub 互转 |
-| HLS、LL-HLS | `media/hls` | 播放 | — | RFC 8216，分片放在内存中，格式为 fMP4 或 MPEG-TS，按请求选择（`?format=ts`）；以及低延迟扩展：partial segment、preload hint、blocking playlist reload |
+| HLS、LL-HLS | `media/hls` | 播放 | — | RFC 8216，分片放在内存中，格式为 fMP4 或 MPEG-TS，按请求选择（`?format=ts`）；以及低延迟扩展：partial segment、preload hint、blocking playlist reload；用调用方的密钥做 AES-128 加密，每 N 个分片轮换 |
 | WHIP、WHEP | `media/rtc` | WHIP 接入、WHEP 分发 | WHIP 推流、WHEP 拉流，以及转发 | RFC 9725 与 draft-ietf-wish-whep：201 加 Location，PATCH 做 trickle，DELETE，CORS，用 Link 头下发 ICE 服务器，bearer token；所有 PeerConnection 共用一个 UDP 端口 |
 | Hub | `media/hub` | — | — | 按路径登记的流，每路一个发布者、任意多个订阅者；GOP 缓存；为较晚才知道 track 的接入预占路径；订阅者可以等待发布者，并在重新推流后继续；推流与播放的认证集中在一处 |
 | 容器与载荷 | `media/flv`、`media/mpegts`、`media/fmp4`、`media/mp4`、`media/rtpcodec`、`media/amf` | — | — | 带 Enhanced RTMP tag 的 FLV；MPEG-TS 复用与解复用；fragmented MP4 的写入与读取；通过 `io.ReaderAt` 读取 MP4 文件的轨道与紧凑的采样表（`media/mp4`）；H.264、H.265、AV1、AAC、Opus、G.711 的 RTP 载荷格式及 SDP；AMF0 双向，AMF3 解码 |
@@ -665,6 +665,7 @@ HTTP/2 和 HTTP/3 上，积压指流控压住超过 64 KiB 的数据，且只有
 | `PlayWait` | 0 | 播放列表请求等待尚无发布者的流的时长；0 表示立即回 404 |
 | `MaxPlayWaiters` | 1024 | 同时等待发布者的请求数；超过时回 503 |
 | `AllowOrigin`、`MaxStreams` | 无、不限 | CORS，以及同时运行的 Muxer 数 |
+| `Muxer.Encryption`、`Encrypt` | 无 | 用 `Encryption.Key` 返回的密钥对每个分片和 part 做 AES-128 加密（IV 为 media sequence number），每 `Rotation` 个分片换一个密钥（0：只用一个），`EXT-X-KEY` 用调用方给的 URI 指明；初始化段不加密。`Encrypt` 按流选择，出错时回 503。密钥由调用方提供服务（`SessionMuxer`、`Muxer.KeyEpoch`） |
 
 **rtc.Config**（WHIP/WHEP 服务端）
 
@@ -744,7 +745,7 @@ WHEP 观众若在 offer 中要求 NACK（浏览器对视频都会这样做），
 - **fMP4**：edit list（带 B 帧的流会在 0 之后稍晚才开始显示）；加密（cenc）；sample group、
   subsample 信息与 mfra；G.711 与 MP3 track。
 - **HLS**：增量播放列表（`_HLS_skip`）与 rendition report；byte-range part；
-  `EXT-X-PROGRAM-DATE-TIME`；多 variant；I 帧播放列表；加密。分片比目标时长更长时（关键帧
+  `EXT-X-PROGRAM-DATE-TIME`；多 variant；I 帧播放列表；AES-128（IV 为 media sequence number）以外的加密（SAMPLE-AES、其它 key format）。分片比目标时长更长时（关键帧
   间隔大于 `TargetDuration`），`EXT-X-TARGETDURATION` 会被调高，严格来说规范不允许这样做。
 - **WHIP/WHEP**：ICE restart（回 422）；simulcast（每个 media section 只接收第一层）；每种
   媒体超过 offer 中 section 数量的流（多出的记日志、不发送）；FEC，以及 WHIP 会话与客户端发送 NACK（只有 WHEP 会话

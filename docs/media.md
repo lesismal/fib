@@ -33,7 +33,7 @@ nothing decodes or encodes audio or video.
 | HTTP-FLV, WebSocket-FLV | `media/httpflv` | play | pull relay | An FLV file that never ends, over HTTP/1.1, HTTP/2 and HTTP/3, or the same bytes in binary WebSocket messages (also over RFC 8441 and RFC 9220 extended CONNECT); for flv.js, mpegts.js and ffmpeg. The pull relay plays an HTTP-FLV origin over HTTP/1.1 or HTTP/2 (http and https) or a WebSocket-FLV one (ws and wss) into the hub |
 | RTSP 1.0 | `media/rtsp` | record (ANNOUNCE/RECORD) and play | play, publish, push and pull relays | RFC 2326 over TCP interleaved and UDP unicast, one RTP/RTCP port pair shared by every session, RTCP sender reports, Digest and Basic authentication, GET_PARAMETER keep-alives, session timeouts |
 | SRT | `media/srt` | publish and play | publish, play, raw sessions | Live mode: the version 5 handshake with SYN cookies, the stream ID and its access control syntax, ACK/ACKACK/NAK, retransmission, TSBPD and too-late drop, AES-CTR encryption with 128-, 192- and 256-bit keys and in-band key refreshes; MPEG-TS bridged to the hub |
-| HLS, LL-HLS | `media/hls` | play | — | RFC 8216 with fMP4 or MPEG-TS segments held in memory, chosen per request (`?format=ts`), and the Low-Latency extensions: partial segments, preload hints, blocking playlist reloads |
+| HLS, LL-HLS | `media/hls` | play | — | RFC 8216 with fMP4 or MPEG-TS segments held in memory, chosen per request (`?format=ts`), and the Low-Latency extensions: partial segments, preload hints, blocking playlist reloads; AES-128 encryption under the caller's keys, rotated every N segments |
 | WHIP, WHEP | `media/rtc` | WHIP ingest, WHEP egress | WHIP push, WHEP pull, and relays | RFC 9725 and draft-ietf-wish-whep: 201 with a Location, trickle by PATCH, DELETE, CORS, Link headers for ICE servers, bearer tokens; every PeerConnection on one UDP port |
 | Hub | `media/hub` | — | — | Streams by path, one publisher and any number of subscribers each; GOP cache; reservations for ingests that learn their tracks late; subscribers that wait for a publisher and survive a republish; one place for publish and play authentication |
 | Containers and payloads | `media/flv`, `media/mpegts`, `media/fmp4`, `media/mp4`, `media/rtpcodec`, `media/amf` | — | — | FLV with Enhanced RTMP tags; MPEG-TS mux and demux; fragmented MP4 writer and reader; MP4 files read through an `io.ReaderAt`, their tracks and compact sample tables (`media/mp4`); RTP payload formats for H.264, H.265, AV1, AAC, Opus and G.711 with SDP; AMF0 both ways and AMF3 decoding |
@@ -772,6 +772,7 @@ stream to the `Demuxer`'s `OnTracks` and `OnPacket`.
 | `PlayWait` | 0 | How long a playlist request waits for a stream with no publisher yet; 0 answers it 404 at once |
 | `MaxPlayWaiters` | 1024 | Requests waiting for a publisher at once; 503 past it |
 | `AllowOrigin`, `MaxStreams` | none, unlimited | CORS, and Muxers running at once |
+| `Muxer.Encryption`, `Encrypt` | none | AES-128 of every segment and part (IV: the media sequence number) under the keys `Encryption.Key` returns, a key every `Rotation` segments (0: one key), named by the caller's URI in `EXT-X-KEY`; init sections stay clear. `Encrypt` picks it per stream, an error answering 503. The caller serves the keys (`SessionMuxer`, `Muxer.KeyEpoch`) |
 
 **rtc.Config** (WHIP/WHEP server)
 
@@ -871,7 +872,8 @@ a codec fib does not have, or because it belongs to the application.
   G.711 and MP3 tracks.
 - **HLS**: delta playlist updates (`_HLS_skip`) and rendition reports;
   byte-range parts; `EXT-X-PROGRAM-DATE-TIME`; multiple variants; I-frame
-  playlists; encryption. `EXT-X-TARGETDURATION` is raised when a segment comes
+  playlists; encryption other than AES-128 with the media sequence number as
+  IV (SAMPLE-AES, other key formats). `EXT-X-TARGETDURATION` is raised when a segment comes
   out longer than the target (a keyframe interval longer than
   `TargetDuration`), which the specification does not strictly allow.
 - **WHIP/WHEP**: ICE restarts (answered 422); simulcast (only a section's
