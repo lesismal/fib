@@ -136,6 +136,16 @@ func parseTrak(trak []byte) (InitTrack, error) {
 	return t, nil
 }
 
+// ParseSampleEntry reads the codec of a sample entry, one of the boxes after
+// an stsd's entry count, as ParseInit reads each track's first one: avc1 and
+// avc3, hvc1 and hev1, av01, mp4a and Opus. A format it does not know, or an
+// entry it cannot read, gives a track whose codec is av.CodecUnknown, never
+// an error. The Config refers to e.Data. An audio track's SampleRate is the
+// AudioSpecificConfig's or the entry's; where it is 0 the media's timescale
+// is the rate to take, as ParseInit does. Package media/mp4 reads the sample
+// entries of whole files with it.
+func ParseSampleEntry(e Box) *av.Track { return parseEntry(e) }
+
 // parseEntry reads a sample entry. What it cannot read leaves the track's
 // codec unknown rather than failing, as a player skips a track it cannot
 // play.

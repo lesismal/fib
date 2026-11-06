@@ -25,7 +25,8 @@
 //
 // ParseInit and Init.ParseFragment read init segments and fragments back
 // into av.Tracks and av.Packets, for tests and for ingests that take fMP4;
-// NextBox and Boxes walk boxes. The reader is lenient where players are and
+// ParseSampleEntry reads one sample entry's codec, as media/mp4 does for
+// files that are not fragmented; NextBox and Boxes walk boxes. The reader is lenient where players are and
 // never trusts a size or count beyond the bytes it is given.
 //
 // Left out: edit lists (a stream with B-frames starts presenting a little
