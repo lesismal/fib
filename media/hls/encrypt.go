@@ -29,8 +29,10 @@ import (
 // nor on the publisher's goroutine: the Muxer cuts a segment or part clear
 // and hands it to Run, and lists it, and serves it, once Run has encrypted
 // it. Playlist and file requests never wait on a cipher; a segment appears
-// in the playlist as late as its encryption takes. Should the encryption
-// fall behind by more than a few segments, the stream ends.
+// in the playlist as late as its encryption takes. A burst of packets, as a
+// GOP cache or a slow scheduler hands over, only queues more; should the
+// segments waiting for their encryption come to hold more than half of
+// Config.MaxBytes, the stream ends rather than hold media without bound.
 //
 // The Muxer serves no key: the caller answers the URIs it names, with
 // whatever access control it has, and may tell a key period's URI from one
@@ -57,10 +59,6 @@ type Encryption struct {
 	// Nil, or false, runs job on a goroutine of its own.
 	Run func(job func()) bool
 }
-
-// maxPending is how many segments may wait for their encryption: one more
-// ends the stream, rather than holding media without bound.
-const maxPending = 4
 
 // The errors that end an encrypted stream.
 var (

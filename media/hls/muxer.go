@@ -503,7 +503,13 @@ func (m *Muxer) endSegment(next *av.Packet, d time.Duration) {
 	// Listed once encrypted, without the lock.
 	m.cut = append(m.cut, s)
 	m.enqueue(encJob{s: s, i: -1, data: s.data})
-	if len(m.cut) > maxPending {
+	// Whatever the scheduler does, the media waiting stays bounded: one
+	// segment always may, being at most a quarter of MaxBytes.
+	waiting := int64(0)
+	for _, c := range m.cut {
+		waiting += int64(len(c.data) + len(c.penc))
+	}
+	if len(m.cut) > 1 && waiting > m.config.MaxBytes/2 {
 		m.fail(errBacklog)
 	}
 }

@@ -571,6 +571,9 @@ func TestMuxerEncryptionAsync(t *testing.T) {
 		settle(t, tw.enc)
 		close(stop)
 		<-done
+		if tw.enc.Ended() {
+			t.Fatal("ended:", tw.enc.encErr)
+		}
 		tw.check(t)
 		tw.clear.Close()
 		tw.enc.Close()
@@ -668,18 +671,40 @@ func TestMuxerEncryptionNotHeld(t *testing.T) {
 }
 
 func TestMuxerEncryptionBacklog(t *testing.T) {
-	// An encryption that falls behind by more than maxPending segments
-	// ends the stream: what it held goes.
-	var jobs []func()
+	// An encryption not run until a burst of segments was cut, as when the
+	// scheduler is slow, or the hub hands over its GOP cache, catches up.
+	var later []func()
 	enc := (&testKeys{}).async(1)
 	enc.Run = func(job func()) bool {
-		jobs = append(jobs, job)
+		later = append(later, job)
 		return true
 	}
 	m := NewMuxer(Config{Encryption: enc})
 	m.OnTracks([]*av.Track{h264Track(t), aacTrack(t)})
-	feed(m, (&source{video: true, audio: 1, gop: 50}).until(2*(maxPending+1)*time.Second+time.Second))
-	if !m.Ended() || len(m.cut) != 0 || m.Bytes() > 64<<10 || len(jobs) != 1 {
+	feed(m, (&source{video: true, audio: 1, gop: 25}).until(30*time.Second))
+	if m.Ended() || len(m.cut) < 10 || len(later) != 1 {
+		t.Fatal(m.Ended(), len(m.cut), len(later))
+	}
+	if _, ok := m.MediaPlaylist(nil); ok {
+		t.Fatal("listed before encrypted")
+	}
+	later[0]()
+	if p := media(t, m); len(m.cut) != 0 || len(p.segs) != DefaultPlaylistSize || m.Ended() {
+		t.Fatalf("%d waiting, %+v", len(m.cut), p)
+	}
+
+	// One that falls behind by more than half of MaxBytes ends the
+	// stream: what it held goes.
+	var jobs []func()
+	enc = (&testKeys{}).async(1)
+	enc.Run = func(job func()) bool {
+		jobs = append(jobs, job)
+		return true
+	}
+	m = NewMuxer(Config{Encryption: enc, MaxBytes: 32 << 10})
+	m.OnTracks([]*av.Track{h264Track(t), aacTrack(t)})
+	feed(m, (&source{video: true, audio: 1, gop: 50}).until(30*time.Second))
+	if !m.Ended() || len(m.cut) != 0 || m.Bytes() > 32<<10 || len(jobs) != 1 {
 		t.Fatal(m.Ended(), len(m.cut), m.Bytes(), len(jobs))
 	}
 	// The encryption, run late, finds nothing to do.
