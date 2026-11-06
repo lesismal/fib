@@ -607,12 +607,13 @@ back, and flv.js and MSE players stall on it), so each egress carries its own
 timeline on:
 
 - **`flv.Timeline`** stamps the RTMP messages and FLV tags of the RTMP and
-  HTTP-FLV egress (and `flv.Muxer`). After `Restart`, a packet behind the last
-  timestamp, or more than ten seconds past it, starts a new clock after the
-  last timestamp by as long as the stream was quiet (20 ms to ten seconds), so
-  timestamps keep pace with the wall clock players wait by and the two
-  clocks never share a timestamp; a packet behind its own track's last
-  timestamp is given that one. An application writing FLV itself can use it.
+  HTTP-FLV egress (and `flv.Muxer`). After `Restart`, a packet not past the
+  last timestamp of its own kind of track (video or audio), or more than ten
+  seconds past it, starts a new clock after the last timestamp by as long as
+  the stream was quiet (20 ms to ten seconds), so timestamps keep pace with
+  the wall clock players wait by and the two clocks never share a timestamp;
+  a packet behind its own track's last timestamp is given that one. An
+  application writing FLV itself can use it.
 - **RTSP** players (`rtsp.ServerConfig.PlayWait`) move their RTP times on the
   same way, on the same SSRCs, and keep their RTCP sender reports' mapping, by
   which ffmpeg times RTSP packets. A next publisher with other codecs ends an
@@ -627,6 +628,24 @@ timeline on:
   discontinuity (until every track has one, 256 packets or a second) so that
   audio a little behind the keyframe does not land before where the last
   writer ended.
+- **WHEP** rebases the RTP times of the first packet after new tracks the
+  same way, by as long as the stream was quiet (1 ms to five seconds).
+
+**New tracks on the same clock.** A publisher that changes its tracks and
+keeps its clock (`hub.Publisher.SetTracks` for a codec change, or a channel
+moving to its next item) gives the egresses the same `OnTracks` as a
+republish, so each tells the two apart by kind of track: the first packet
+after new tracks starts a new clock only when it is not past the last packet
+sent of its own kind, video or audio, or is more than ten seconds (WHEP: five)
+past it. Otherwise its times go out as they are. Comparing with the last
+packet of either kind, as the egresses did, took B-frame video for a restart,
+since it is decoded before the last audio ends, by the B-frames' delay, and
+moved the video on by that and 20 ms; the publisher needs nothing more than
+times that continue per track. HLS still marks a discontinuity, its new writer
+following the last one's offset (`fmp4.Writer.Offset` and `Follow`, and the TS
+writer's own) so that each track's decode times go on as they ran. RTMP and
+FLV sequence headers for new tracks are stamped with their own track's last
+timestamp (`flv.Timeline.HeaderStamp`).
 
 ## Configuration and limits
 

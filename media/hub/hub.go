@@ -624,6 +624,16 @@ func (p *Publisher) WritePacket(pkt *av.Packet) {
 // changes mid-stream: the GOP cache is dropped and every subscriber hears
 // OnTracks again, then video from the next keyframe. The first SetTracks
 // of a reserved Publisher makes the stream live, as Publish does.
+//
+// The packets after it may carry on the clock of those before, as a codec
+// change or a channel moving to its next item does, or start another.
+// fib's egresses tell the two apart by each kind of track: a first packet
+// past the last one of its kind (video or audio), by up to ten seconds
+// (WHEP: five), carries the clock on and goes out with its times as they
+// are, though B-frame video is decoded before the last audio ends; one at
+// or before it starts a new clock after the last packet sent. A publisher
+// keeping its clock therefore needs nothing more than continuous times
+// per track.
 func (p *Publisher) SetTracks(tracks []*av.Track) {
 	st := p.st
 	st.mu.Lock()

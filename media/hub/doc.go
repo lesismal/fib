@@ -48,7 +48,9 @@
 // bounds the wait for the first publisher apart from Wait, as an egress
 // that waits for a stream to start and for it to come back for different
 // times does. Packet times are the publisher's own; a republish may
-// restart them.
+// restart them, and SetTracks may keep them or restart them: the egresses
+// keep their timestamps going on across either (Publisher.SetTracks says
+// how they tell the two apart).
 //
 // Everything is bounded: the cache by GOPCacheBytes, streams by
 // MaxStreams, subscriptions by MaxSubscribersPerStream, and each sink's
