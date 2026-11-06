@@ -261,3 +261,48 @@ func waitUntil(t *testing.T, ok func() bool) {
 		time.Sleep(5 * time.Millisecond)
 	}
 }
+
+// A file under a watch is trusted until the watch reports a change, however
+// long past CheckInterval: it is not stat'ed again. A file that is a
+// symbolic link, whose target's changes the watch does not see, is checked
+// once the interval has passed.
+func TestFileCacheWatchedNeedsNoCheck(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("symbolic links need privileges on Windows")
+	}
+	dir := t.TempDir()
+	elsewhere := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "a.txt"), []byte("a"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	target := filepath.Join(elsewhere, "t.txt")
+	if err := os.WriteFile(target, []byte("one"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(target, filepath.Join(dir, "link.txt")); err != nil {
+		t.Fatal(err)
+	}
+	const interval = 50 * time.Millisecond
+	fc, err := NewFileCache(FileCacheConfig{Root: dir, CheckInterval: interval})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer fc.Close()
+	if fc.watch == nil {
+		t.Skip("no watch here")
+	}
+	a := fc.lookup(fileKey{"a.txt", noTwin})
+	link := fc.lookup(fileKey{"link.txt", noTwin})
+	if !a.watched || link.watched {
+		t.Fatalf("watched: a.txt %v, link.txt %v", a.watched, link.watched)
+	}
+	checked := a.checked.Load()
+	time.Sleep(2 * interval)
+	if got := fc.lookup(fileKey{"a.txt", noTwin}); got != a || got.checked.Load() != checked {
+		t.Fatal("a watched file was checked again past the interval")
+	}
+	if err := os.WriteFile(target, []byte("two"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	waitUntil(t, func() bool { return cachedBody(t, fc, "link.txt") == "two" })
+}

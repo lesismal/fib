@@ -761,11 +761,13 @@ files.ServeFile(c, strings.TrimPrefix(c.Request.URL.Path, "/static/"))
 - A file is read into memory on first request and then **follows the disk**: on Linux a
   `filewatch.Watcher` (inotify) on the file's directory and every directory on the way from the
   root invalidates an entry the instant it is created, written, `mv`ed or deleted, a directory on
-  its way is renamed, or a `current` symlink on the way to the root is pointed elsewhere. On top
-  of that, and alone on other platforms, a file is stat'ed again once `CheckInterval` (5s by
-  default) has passed, and reread when its `filewatch.Stamp` (size, mtime, ctime, inode) moved, so
-  a replacement with the same size and mtime (`rsync -t`, `cp -p`, `tar x`) is seen too. A
-  negative `CheckInterval` stats on every request: the response is always the file on disk.
+  its way is renamed, or a `current` symlink on the way to the root is pointed elsewhere, and a
+  request itself does not stat. Where no watch reports (other platforms, no inotify, a file that is
+  a symlink), a file is stat'ed again once `CheckInterval` (5s by default) has passed, and reread
+  when its `filewatch.Stamp` (size, mtime, ctime, inode) moved, so a replacement with the same size
+  and mtime (`rsync -t`, `cp -p`, `tar x`) is seen too. A negative `CheckInterval` drops the watch
+  and stats on every request: the response is always the file on disk, network file systems
+  included.
 - `Precompressed`: picks the on-disk `name.br` / `name.gz` according to `Accept-Encoding` (q
   values included) and sets `Content-Encoding` and `Vary`. **Compression CPU is spent at deploy
   time, not at request time.**

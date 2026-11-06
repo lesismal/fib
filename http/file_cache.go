@@ -36,13 +36,17 @@ type FileCacheConfig struct {
 	// files are served from disk until changes free room. Zero means
 	// DefaultMaxCacheBytes.
 	MaxBytes int64
-	// CheckInterval is how long what the cache holds of a file is trusted
-	// before the file is stat'ed again, to see whether it is still the file
-	// that was read: the longest a change can go unseen where no watch
-	// reports it, and the bound on what a watch misses, such as a change on
-	// a network file system. Zero means DefaultCheckInterval; a negative
-	// interval stats the file on every request, so that a response always
-	// carries the file as it is on disk when the request is served.
+	// CheckInterval is how long what the cache holds of a file no watch
+	// reports changes of is trusted before the file is stat'ed again, to
+	// see whether it is still the file that was read: elsewhere than Linux,
+	// where inotify cannot be had, after Close, and for a file that is a
+	// symbolic link, whose target's changes no watch of its directory sees.
+	// A file under a watch is trusted until the watch reports a change.
+	// Zero means DefaultCheckInterval; a negative interval does without a
+	// watch and stats the file on every request, so that a response always
+	// carries the file as it is on disk when the request is served, also on
+	// a network file system, whose changes from other machines no watch
+	// sees.
 	CheckInterval time.Duration
 }
 
@@ -65,12 +69,13 @@ const maxMissingEntries = 4096
 // is in, and on the directories on its way from the root, tells the cache of
 // a change, a file created, written, replaced, moved or removed, a directory
 // renamed, or a "current" link on the way to the root pointed elsewhere,
-// within moments of it. Whatever no watch reports, elsewhere than Linux or
-// where inotify cannot be had, is seen when the file is stat'ed again, once
-// CheckInterval has passed since it last was: the cache rereads a file whose
-// filewatch.Stamp moved, its size, modification or status change time, or
-// inode, which tells apart a file replaced by one of the same size and
-// modification time.
+// within moments of it, and a request reads nothing from the disk until
+// one does. A file no watch reports on, elsewhere than Linux, where inotify
+// cannot be had, or a symbolic link, is stat'ed again once CheckInterval has
+// passed since it last was: the cache rereads a file whose filewatch.Stamp
+// moved, its size, modification or status change time, or inode, which
+// tells apart a file replaced by one of the same size and modification
+// time.
 //
 // A file served from memory leaves on a GET or HEAD without conditions or a
 // range, with its Content-Type, Content-Length and Last-Modified, and without
@@ -123,6 +128,10 @@ func (t twin) suffix() string { return [...]string{"", ".br", ".gz"}[t] }
 // exist, which a twin that is not on disk is.
 type cachedFile struct {
 	missing bool
+	// watched says a watch reports the file's changes, so that the entry
+	// stands until one does; otherwise it is checked once CheckInterval
+	// has passed.
+	watched bool
 	// checked is when the file's stamp was last found as the entry has it,
 	// in nanoseconds since the Unix epoch.
 	checked atomic.Int64
@@ -412,6 +421,9 @@ func (fc *FileCache) lookup(key fileKey) *cachedFile {
 	fc.mu.RLock()
 	e, watch := fc.entries[key], fc.watch
 	fc.mu.RUnlock()
+	if e != nil && e.watched && watch != nil {
+		return e
+	}
 	var now int64
 	if e != nil && fc.check > 0 {
 		now = time.Now().UnixNano()
@@ -441,12 +453,12 @@ func (fc *FileCache) load(key fileKey, name, full string, watch *filewatch.Watch
 	checked := time.Now().UnixNano()
 	// Watched from before it is read, so that no change between the two goes
 	// unseen.
-	watch.Watch(path.Dir(name))
+	watched := watch.Watch(path.Dir(name)) && !isLink(full)
 	stamp, exists, err := statStamp(full)
 	if err != nil {
 		return nil
 	}
-	e := &cachedFile{missing: !exists, name: name, stamp: stamp}
+	e := &cachedFile{missing: !exists, watched: watched, name: name, stamp: stamp}
 	e.checked.Store(checked)
 	if exists {
 		e.modTime = time.Unix(0, stamp.ModTime)
@@ -536,6 +548,14 @@ func fileHeader(name string, stamp filewatch.Stamp, data []byte) stdhttp.Header 
 }
 
 var errIsDir = errors.New("http: is a directory")
+
+// isLink reports whether full is a symbolic link, which a watch of its
+// directory reports the replacing of but not the changes of the file it
+// leads to.
+func isLink(full string) bool {
+	info, err := os.Lstat(full)
+	return err == nil && info.Mode()&os.ModeSymlink != 0
+}
 
 // statStamp stats full: its stamp and true, false for a file that does not
 // exist, or an error, a directory's among them.

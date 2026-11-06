@@ -67,8 +67,8 @@ HTTP/3、WebSocket 和 WebRTC，以及基于 RTMP、RTSP、SRT、HTTP-FLV、HLS 
 - **异步客户端**：非阻塞 dial（需要时可指定本地地址和端口范围），以及 HTTP/1.x、HTTP/2、HTTP/3、
   WebSocket 客户端，结果通过回调或 future 返回。
 - **静态文件**：`http.FileCache` 从内存提供一个目录下的文件，支持预压缩的 `.br`/`.gz` 文件，并跟随
-  磁盘变化：Linux 上用 inotify（`filewatch`），并在 `CheckInterval`（默认 5s，也可每个请求）过后
-  stat 文件一次，凭 inode 和 change time 识别大小、时间都相同的替换。
+  磁盘变化：Linux 上用 inotify（`filewatch`），请求本身不 stat；其他平台在 `CheckInterval`（默认 5s，
+  也可每个请求）过后 stat 文件一次，凭 inode 和 change time 识别大小、时间都相同的替换。
 - **Router**：[chi](https://github.com/go-chi/chi) 风格的 API，支持参数、正则、通配、分组、
   子路由和挂载，路由过程零分配。
 - **中间件**：compress、cors、csrf、etag、limiter、logger、pprof、recover、requestid、
