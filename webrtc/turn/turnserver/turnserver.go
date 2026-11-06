@@ -83,7 +83,10 @@ type Config struct {
 	PublicIP netip.Addr
 	// PortMin and PortMax bound the relayed ports, as a firewall that
 	// opens a range expects. Zero leaves the choice of each port to the
-	// kernel.
+	// kernel. A port of the range that another socket holds, another
+	// allocation's relayed address or anything else's, is skipped, though
+	// the engine binds with SO_REUSEPORT (Config.ReusePort) and the kernel
+	// would let the relay share it.
 	PortMin, PortMax uint16
 
 	// SetupWorkers is the number of goroutines that bind relayed
@@ -122,6 +125,11 @@ type Server struct {
 	streams sync.Map // *fib.Connection -> *streamConn
 
 	setup chan func()
+	// ports are the ports of the range that this server's relays hold or
+	// are binding, under portsMu: two setup goroutines must not both find a
+	// port free and bind it, which SO_REUSEPORT would let them.
+	portsMu sync.Mutex
+	ports   map[uint16]struct{}
 	// unsent counts the datagrams dropped for want of a connection to send
 	// them on: its open failed, or the setup queue was full.
 	unsent atomic.Uint64
@@ -404,7 +412,10 @@ type relay struct {
 	s       *Server
 	binding int
 	addr    netip.AddrPort
-	closed  atomic.Bool
+	// port is the port of the range the relay holds in s.ports, or 0 for
+	// one the kernel picked.
+	port   uint16
+	closed atomic.Bool
 	// ready is set once binding and addr are: a datagram a peer sends to
 	// a port just bound may come before then, and is dropped.
 	ready atomic.Bool
@@ -443,20 +454,24 @@ func (s *Server) allocateRelay(_ turn.FiveTuple, _ string, ipv6 bool, done func(
 func (s *Server) bindRelay(engine *fib.Engine) (*relay, error) {
 	r := &relay{s: s, peers: make(map[netip.AddrPort]*fib.Connection), backlog: make(map[netip.AddrPort][][]byte)}
 	try := func(port uint16) error {
-		i, err := engine.AddBinding(fib.Binding{
-			Network: "udp",
-			Addr:    net.JoinHostPort(s.cfg.RelayIP.String(), strconv.Itoa(int(port))),
-			Handler: r,
-		})
+		addr := net.JoinHostPort(s.cfg.RelayIP.String(), strconv.Itoa(int(port)))
+		if port != 0 {
+			if err := s.claimPort(port, addr); err != nil {
+				return err
+			}
+		}
+		i, err := engine.AddBinding(fib.Binding{Network: "udp", Addr: addr, Handler: r})
 		if err != nil {
+			s.releasePort(port)
 			return err
 		}
 		addrs, err := engine.BindingAddrs(i)
 		if err != nil || len(addrs) == 0 {
 			_ = engine.RemoveBinding(i)
+			s.releasePort(port)
 			return fmt.Errorf("turnserver: relay binding has no address: %w", err)
 		}
-		r.binding = i
+		r.binding, r.port = i, port
 		r.addr = addrPort(addrs[0])
 		if s.cfg.PublicIP.IsValid() {
 			r.addr = netip.AddrPortFrom(s.cfg.PublicIP.Unmap(), r.addr.Port())
@@ -480,6 +495,47 @@ func (s *Server) bindRelay(engine *fib.Engine) (*relay, error) {
 		}
 	}
 	return nil, turn.ErrNoRelay
+}
+
+// errPortHeld is what claimPort reports for a port another of the server's
+// relays holds or is binding.
+var errPortHeld = errors.New("turnserver: relayed port held by another allocation")
+
+// claimPort reserves port of the range for a relay about to bind addr, and
+// fails if another relay of the server holds it or a socket of anything
+// else does. The engine binds with SO_REUSEPORT, so that its pollers each
+// read an address's datagrams, and the kernel would let the relay join a
+// socket on the port that sets it too, splitting the datagrams of both
+// between them: a bind without it, which such a socket refuses, tells. The
+// reservation covers the window between that bind and the relay's.
+func (s *Server) claimPort(port uint16, addr string) error {
+	s.portsMu.Lock()
+	if _, ok := s.ports[port]; ok {
+		s.portsMu.Unlock()
+		return errPortHeld
+	}
+	if s.ports == nil {
+		s.ports = make(map[uint16]struct{})
+	}
+	s.ports[port] = struct{}{}
+	s.portsMu.Unlock()
+	pc, err := net.ListenPacket("udp", addr)
+	if err != nil {
+		s.releasePort(port)
+		return err
+	}
+	_ = pc.Close()
+	return nil
+}
+
+// releasePort gives back a port claimPort reserved; 0 is none.
+func (s *Server) releasePort(port uint16) {
+	if port == 0 {
+		return
+	}
+	s.portsMu.Lock()
+	delete(s.ports, port)
+	s.portsMu.Unlock()
 }
 
 func (r *relay) Addr() netip.AddrPort { return r.addr }
@@ -541,7 +597,11 @@ func (r *relay) Close() {
 		return
 	}
 	e, i := r.s.run.Load().engine, r.binding
-	go func() { _ = e.RemoveBinding(i) }()
+	go func() {
+		_ = e.RemoveBinding(i)
+		// Only once its sockets are closed may another relay bind it.
+		r.s.releasePort(r.port)
+	}()
 }
 
 func (r *relay) OnOpen(c *fib.Connection) {
