@@ -32,22 +32,23 @@ func (m *Muxer) AppendHeader(dst []byte, tracks []*av.Track) ([]byte, []int) {
 	dropped := m.enc.SetTracks(tracks)
 	video, audio := m.enc.Tracks()
 	dst = AppendHeader(dst, Header{HasAudio: audio != nil, HasVideo: video != nil})
-	return m.appendHeaders(dst, 0), dropped
+	return m.appendHeaders(dst), dropped
 }
 
 // AppendTracks appends the tags that announce tracks that changed
-// mid-stream, at the time of the last packet, and returns the indices of
-// the tracks FLV leaves out. The tracks may come from a new publisher,
-// whose clock the packets after them follow (Timeline.Restart).
+// mid-stream, each at the time of the last packet of its track (metadata
+// at the last of either), and returns the indices of the tracks FLV leaves
+// out. The tracks may come from a new publisher, whose clock the packets
+// after them follow (Timeline.Restart).
 func (m *Muxer) AppendTracks(dst []byte, tracks []*av.Track) ([]byte, []int) {
 	dropped := m.enc.SetTracks(tracks)
 	m.tl.Restart()
-	return m.appendHeaders(dst, m.tl.Last()), dropped
+	return m.appendHeaders(dst), dropped
 }
 
-func (m *Muxer) appendHeaders(dst []byte, ts uint32) []byte {
+func (m *Muxer) appendHeaders(dst []byte) []byte {
 	m.enc.Headers(func(typ uint8, body []byte) {
-		dst = AppendTag(dst, typ, ts, body)
+		dst = AppendTag(dst, typ, m.tl.HeaderStamp(typ), body)
 	})
 	return dst
 }

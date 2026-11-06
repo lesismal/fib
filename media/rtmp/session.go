@@ -217,7 +217,7 @@ func (e *egress) sendTracksLocked() {
 				body = append(amf.AppendString(nil, "@setDataFrame"), body...)
 			}
 		}
-		err = e.s.conn.WriteMessage(&Message{Type: mt, StreamID: e.streamID, Timestamp: e.tl.Last(), Payload: body})
+		err = e.s.conn.WriteMessage(&Message{Type: mt, StreamID: e.streamID, Timestamp: e.tl.HeaderStamp(typ), Payload: body})
 	})
 	if err != nil {
 		_ = e.s.c.Close()
