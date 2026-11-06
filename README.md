@@ -769,7 +769,7 @@ Run it yourself with `cd taskpool/benchmark && ./bench.sh` (or `bench.ps1` on Wi
 | [`arpc`](arpc) | [lesismal/arpc](https://github.com/lesismal/arpc) server and client, wire compatible |
 | [`grpc`](grpc) | gRPC server and client over an HTTP/2 transport of its own, compatible with grpc-go and its generated code |
 | [`webrtc`](webrtc) | WebRTC PeerConnection and a UDP Mux shared by many; `stun`, `ice`, `turn` (and `turnserver`), `sdp`, `sctp`, `srtp` and `rtp` underneath, DTLS 1.2 in `tls` |
-| [`media`](media) | Live streaming: `rtmp`, `rtsp`, `srt`, `httpflv`, `hls` and `rtc` (WHIP/WHEP) on the `hub`; `av`, `flv`, `amf`, `mpegts`, `fmp4`, `rtpcodec` and `codec/{h264,h265,aac,opus}` underneath |
+| [`media`](media) | Live streaming: `rtmp`, `rtsp`, `srt`, `httpflv`, `hls` and `rtc` (WHIP/WHEP) on the `hub`; `av`, `flv`, `amf`, `mpegts`, `fmp4`, `mp4`, `rtpcodec` and `codec/{h264,h265,aac,opus}` underneath |
 | [`middleware`](middleware) | Middleware chain and the common middleware |
 | [`socks`](socks) | SOCKS5, SOCKS4 and SOCKS4a proxy server and non-blocking dialer; `http.ConnectProxy` is the HTTP proxy |
 | [`mux`](mux) | Several protocols on one port, told apart by the first bytes a client sends |

@@ -718,7 +718,7 @@ CI 每次 push 都在 Linux、macOS、Windows 上运行 [`taskpool/benchmark`](t
 | [`arpc`](arpc) | [lesismal/arpc](https://github.com/lesismal/arpc) 服务端和客户端，协议兼容 |
 | [`grpc`](grpc) | gRPC 服务端和客户端，自带 HTTP/2 传输层，与 grpc-go 及其生成代码兼容 |
 | [`webrtc`](webrtc) | WebRTC PeerConnection，以及供多个 PeerConnection 共用的 UDP Mux；其下是 `stun`、`ice`、`turn`（及 `turnserver`）、`sdp`、`sctp`、`srtp`、`rtp`，DTLS 1.2 在 `tls` 中 |
-| [`media`](media) | 直播流媒体：`hub` 之上的 `rtmp`、`rtsp`、`srt`、`httpflv`、`hls` 和 `rtc`（WHIP/WHEP）；其下是 `av`、`flv`、`amf`、`mpegts`、`fmp4`、`rtpcodec` 和 `codec/{h264,h265,aac,opus}` |
+| [`media`](media) | 直播流媒体：`hub` 之上的 `rtmp`、`rtsp`、`srt`、`httpflv`、`hls` 和 `rtc`（WHIP/WHEP）；其下是 `av`、`flv`、`amf`、`mpegts`、`fmp4`、`mp4`、`rtpcodec` 和 `codec/{h264,h265,aac,opus}` |
 | [`middleware`](middleware) | 中间件链和常用中间件 |
 | [`socks`](socks) | SOCKS5、SOCKS4 与 SOCKS4a 代理服务端及非阻塞拨号器；HTTP 代理见 `http.ConnectProxy` |
 | [`mux`](mux) | 按客户端最先发送的字节识别协议，多种协议共用一个端口 |

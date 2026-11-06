@@ -30,7 +30,7 @@
 | HLS、LL-HLS | `media/hls` | 播放 | — | RFC 8216，分片放在内存中，格式为 fMP4 或 MPEG-TS，按请求选择（`?format=ts`）；以及低延迟扩展：partial segment、preload hint、blocking playlist reload |
 | WHIP、WHEP | `media/rtc` | WHIP 接入、WHEP 分发 | WHIP 推流、WHEP 拉流，以及转发 | RFC 9725 与 draft-ietf-wish-whep：201 加 Location，PATCH 做 trickle，DELETE，CORS，用 Link 头下发 ICE 服务器，bearer token；所有 PeerConnection 共用一个 UDP 端口 |
 | Hub | `media/hub` | — | — | 按路径登记的流，每路一个发布者、任意多个订阅者；GOP 缓存；为较晚才知道 track 的接入预占路径；订阅者可以等待发布者，并在重新推流后继续；推流与播放的认证集中在一处 |
-| 容器与载荷 | `media/flv`、`media/mpegts`、`media/fmp4`、`media/rtpcodec`、`media/amf` | — | — | 带 Enhanced RTMP tag 的 FLV；MPEG-TS 复用与解复用；fragmented MP4 的写入与读取；H.264、H.265、AV1、AAC、Opus、G.711 的 RTP 载荷格式及 SDP；AMF0 双向，AMF3 解码 |
+| 容器与载荷 | `media/flv`、`media/mpegts`、`media/fmp4`、`media/mp4`、`media/rtpcodec`、`media/amf` | — | — | 带 Enhanced RTMP tag 的 FLV；MPEG-TS 复用与解复用；fragmented MP4 的写入与读取；通过 `io.ReaderAt` 读取 MP4 文件的轨道与紧凑的采样表（`media/mp4`）；H.264、H.265、AV1、AAC、Opus、G.711 的 RTP 载荷格式及 SDP；AMF0 双向，AMF3 解码 |
 | 编码工具 | `media/codec/...` | — | — | H.264 与 H.265 的分帧、SPS、配置记录与关键帧判断；AV1 的 OBU、sequence header、AV1CodecConfigurationRecord 与关键帧判断；AAC 的 AudioSpecificConfig 与 ADTS；OpusHead 与包时长 |
 
 任何地方都不做转码。流以发布者选定的编码发布，每个出口承载其协议能承载的 track，其余的
@@ -785,6 +785,7 @@ G.711、音画同步、重新推流、负载和卡住播放者的测试，都是
 | SRT | ffmpeg 5.1、7.1（libsrt） | ffmpeg 推流并播放回 H.264+AAC 与 H.265+Opus，不加密以及 pbkeylen 为 16、24、32，也经过一个双向丢弃 2–10% 数据报的中继，解码干净；fib 的客户端向 listener 模式的 ffmpeg 推流、并从中拉流 |
 | MPEG-TS | ffmpeg 5.1、7.1 | ffmpeg 生成的 H.264+AAC、H.265+Opus 和纯 AAC 流能解复用，重新复用后解码没有警告 |
 | fMP4 | ffmpeg 5.1、7.1 | H.264+AAC、H.265+AAC、H.264+Opus 的 init 分片和 fragment，来源包括原始码流和 ffmpeg 自己带 B 帧的 fMP4，解码没有错误，重新复用后每个包的时间戳和关键帧标志保持不变 |
+| MP4 文件 | ffmpeg 7.1 | `media/mp4` 读取 ffmpeg 写出的 H.264、H.265、AV1 搭配 AAC、Opus 的文件，moov 在前和在后，带 B 帧、负的合成偏移、延后开始的音频以及两条音轨：每条轨道的编码、尺寸、采样率与配置，以及每个采样的偏移、大小、时长、时间和同步标志，不论是否应用编辑列表，都与 ffprobe 一致（`media/mp4` 的测试使用仓库中的文件，`media/interop` 的 `TestMP4` 使用它让 ffmpeg 写出的更长的文件） |
 | HLS | ffmpeg 5.1、7.1 | fMP4：H.264+AAC、H.265+AAC、H.264+Opus、纯 AAC，以及 500 ms part 的 LL-HLS，播放 10 秒没有错误；同编码重新推流后跨 discontinuity 继续播放；播放列表检查程序确认 target duration、序号、discontinuity、part、blocking reload 和 preload hint 均符合规范。MPEG-TS：RTMP 推上来的 H.264+AAC（5.1）和 H.265+AAC（7.1）从 TS 变体播放，普通与 LL-HLS 均可 |
 | 所有接入 × 所有出口 | ffmpeg 5.1、7.1 | 见下面的[矩阵](#接入与出口矩阵) |
 | WHIP、WHEP | ffmpeg 5.1、fib 的客户端 | ffmpeg 经 RTSP 推 H.264+Opus；fib 的 WHEP 客户端从 WHEP 端点把它拉进一个路径，fib 的 WHIP 客户端把它推到 WHIP 端点成为另一个路径；ffmpeg 经 RTSP 播放两者，解码没有错误 |
