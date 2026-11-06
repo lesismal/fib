@@ -5,13 +5,15 @@
 //
 // Muxer is a hub.Sink that cuts a stream into segments held in memory: a
 // stream with video at the first keyframe TargetDuration after the
-// segment's start, an audio-only stream on time. It keeps a sliding window
-// of PlaylistSize segments in the playlist and KeepSegments more for clients
-// that read the playlist just before a segment left it, all under MaxBytes:
-// old segments go first, and a segment that outgrows a quarter of the bound
-// (a stream whose keyframes stop coming) is cut without one. A republish or
-// a change of codec configuration (OnTracks again), or a jump in the
-// publisher's clock, ends the segment being written, which then lasts until
+// segment's start, once the other tracks' packets decoding before the
+// keyframe have come (by up to 250 ms), so that no track of a segment
+// begins before its keyframe; an audio-only stream on time. It keeps a
+// sliding window of PlaylistSize segments in the playlist and KeepSegments
+// more for clients that read the playlist just before a segment left it,
+// all under MaxBytes: old segments go first, and a segment that outgrows a
+// quarter of the bound (a stream whose keyframes stop coming) is cut
+// without one. A republish or a change of codec configuration (OnTracks
+// again), or a jump in the publisher's clock, ends the segment being written, which then lasts until
 // the earliest of its tracks ends, and continues after an
 // EXT-X-DISCONTINUITY, with a new EXT-X-MAP when the tracks changed;
 // EXT-X-DISCONTINUITY-SEQUENCE counts those that left the playlist. With

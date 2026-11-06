@@ -3,6 +3,7 @@ package hls
 import (
 	"errors"
 	"math"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -41,7 +42,8 @@ type Config struct {
 	Format Format
 	// TargetDuration is the duration segments are cut at: a stream with
 	// video at the first keyframe at least this far from the segment's
-	// start, an audio-only stream at the first packet. Default 2 s.
+	// start, once the other tracks have reached it, an audio-only stream
+	// at the first packet. Default 2 s.
 	TargetDuration time.Duration
 	// PlaylistSize is how many segments the media playlist lists.
 	// Default 6.
@@ -189,6 +191,14 @@ type Muxer struct {
 	ended       bool
 	waiters     []*waiter
 
+	// A cut at a keyframe waiting for the other tracks to reach it
+	// (hold): the keyframe, the duration of the segment it ends, the
+	// packets that came after it, and the tracks among them.
+	cutKey  *av.Packet
+	cutDur  time.Duration
+	held    []*av.Packet
+	reached []bool
+
 	// The encryption (Encryption): the segments cut and not yet encrypted,
 	// oldest first, between segs and open; what is left to encrypt, in
 	// order; whether it is running, and is to be started on unlock; the
@@ -230,6 +240,7 @@ func (m *Muxer) OnTracks(tracks []*av.Track) {
 	if m.ended {
 		return
 	}
+	m.unhold()
 	m.endSegment(nil, 0)
 	m.tracks = tracks
 	m.start(true)
@@ -326,6 +337,15 @@ func (m *Muxer) OnPacket(pkt *av.Packet) {
 	if m.ended || m.writer == nil || pkt.Track < 0 || pkt.Track >= len(m.carried) || !m.carried[pkt.Track] {
 		return
 	}
+	if m.cutKey != nil {
+		m.hold(pkt)
+		return
+	}
+	m.packet(pkt)
+}
+
+// packet adds pkt, of a track carried, to the segment being written.
+func (m *Muxer) packet(pkt *av.Packet) {
 	isVideo := pkt.Track == m.video
 	if m.open != nil && m.seen[pkt.Track] {
 		if d := pkt.DTS - m.last[pkt.Track]; d > maxJump || d < -maxBack {
@@ -341,11 +361,11 @@ func (m *Muxer) OnPacket(pkt *av.Packet) {
 		}
 		m.waitKey = false
 	}
-	kind := 0
-	if m.tracks[pkt.Track].Codec.IsVideo() {
-		kind = 1
-	}
 	if m.place {
+		kind := 0
+		if m.tracks[pkt.Track].Codec.IsVideo() {
+			kind = 1
+		}
 		m.placeWriter(pkt, kind)
 	}
 	if m.open == nil {
@@ -355,6 +375,14 @@ func (m *Muxer) OnPacket(pkt *av.Packet) {
 		cut := d >= m.config.TargetDuration
 		if m.video >= 0 {
 			cut = cut && isVideo && pkt.Keyframe
+			if cut && m.behind(pkt.DTS) {
+				// The other tracks' packets decoding before the keyframe
+				// are still to come: the cut waits for them (hold).
+				m.cutKey, m.cutDur = pkt, d
+				m.reached = slices.Grow(m.reached[:0], len(m.tracks))[:len(m.tracks)]
+				clear(m.reached)
+				return
+			}
 		}
 		if cut || int64(len(m.open.data)+m.writer.Buffered()) > m.config.MaxBytes/4 {
 			m.endSegment(pkt, d)
@@ -371,6 +399,11 @@ func (m *Muxer) OnPacket(pkt *av.Packet) {
 			}
 		}
 	}
+	m.write(pkt)
+}
+
+// write writes pkt to the segment being written.
+func (m *Muxer) write(pkt *av.Packet) {
 	if g := pkt.DTS - m.prevDTS; g > 0 && g < m.config.TargetDuration {
 		m.gap = g
 	}
@@ -379,12 +412,132 @@ func (m *Muxer) OnPacket(pkt *av.Packet) {
 		m.step[pkt.Track] = g
 	}
 	m.last[pkt.Track], m.seen[pkt.Track] = pkt.DTS, true
+	kind := 0
+	if m.tracks[pkt.Track].Codec.IsVideo() {
+		kind = 1
+	}
 	if !m.kindSeen[kind] || pkt.DTS > m.kindLast[kind] {
 		m.kindLast[kind], m.kindSeen[kind] = pkt.DTS, true
 	}
 	m.writer.WritePacket(pkt)
 	m.account()
 	m.wake()
+}
+
+// The bounds of a cut waiting for the other tracks (hold): it waits no
+// longer than for packets cutWait past the keyframe, nor for more than
+// maxHeld of them, nor for a track whose last packet was further back.
+const (
+	cutWait = 250 * time.Millisecond
+	maxHeld = 256
+)
+
+// behind reports whether a track other than the video segments are cut at
+// has its last packet before dts, by no more than cutWait: a packet of it
+// decoding before dts, or the one after its last, which tells the last's
+// duration (holder), is about to come.
+func (m *Muxer) behind(dts time.Duration) bool {
+	for i, seen := range m.seen {
+		if seen && i != m.video && m.last[i] < dts && dts-m.last[i] <= cutWait {
+			return true
+		}
+	}
+	return false
+}
+
+// hold takes pkt while a segment's cut at the keyframe cutKey waits for
+// the other tracks to reach it: a segment's tracks begin together at its
+// keyframe, none of them earlier. hls.js, reading a whole fMP4 segment,
+// takes it to start at its earliest decode time and to last as long as its
+// video: a segment whose audio began before its keyframe ended that much
+// early for it, and the first segment after a discontinuity, placed there,
+// had its audio decode before the last audio before it. Chrome then starts
+// its tracks over at a keyframe, and dropped the video up to the next one:
+// the new item's video froze for a second at every change of tracks.
+//
+// A packet of another track decoding before the keyframe goes in the
+// segment the keyframe ends; the others wait, in order, until every track
+// near the keyframe has one, or the bounds of cutWait and maxHeld are
+// reached, and then the segment is cut (release).
+func (m *Muxer) hold(pkt *av.Packet) {
+	k := m.cutKey.DTS
+	if pkt.Track != m.video && pkt.DTS < k && m.seen[pkt.Track] {
+		if d := pkt.DTS - m.last[pkt.Track]; d >= 0 && d <= maxJump {
+			m.write(pkt)
+			return
+		}
+	}
+	m.held = append(m.held, pkt)
+	m.reached[pkt.Track] = true
+	if d := pkt.DTS - k; d >= 0 && d < cutWait && len(m.held) < maxHeld {
+		for i, seen := range m.seen {
+			if seen && i != m.video && !m.reached[i] && m.last[i] < k && k-m.last[i] <= cutWait {
+				return
+			}
+		}
+	}
+	m.release()
+}
+
+// release cuts the segment at the keyframe held, and adds the packets held
+// after it as they came.
+func (m *Muxer) release() {
+	key, held := m.cutKey, m.held
+	m.cutKey, m.held = nil, nil
+	if _, ok := m.writer.(holder); ok {
+		// The first packet of each other track after the keyframe tells
+		// the duration of the one before it, which ends the segment.
+		done := m.reached
+		clear(done)
+		for i, p := range held {
+			if p.Track == m.video || done[p.Track] || !m.seen[p.Track] {
+				continue
+			}
+			done[p.Track] = true
+			if d := p.DTS - m.last[p.Track]; d > 0 && d <= maxJump && m.last[p.Track] < key.DTS {
+				m.write(p)
+				held[i] = nil
+			}
+		}
+	}
+	m.endSegment(key, m.cutDur)
+	if m.ended {
+		// The encryption fell behind.
+		return
+	}
+	m.beginSegment(key)
+	m.write(key)
+	for _, p := range held {
+		switch {
+		case p == nil:
+		case m.ended || m.writer == nil:
+			return
+		case m.cutKey != nil:
+			m.hold(p)
+		default:
+			m.packet(p)
+		}
+	}
+	if m.held == nil {
+		// No cut waits again: the next one holds in these.
+		clear(held)
+		m.held = held[:0]
+	}
+}
+
+// unhold adds the keyframe a cut waits at, and the packets held after it,
+// to the segment being written, uncut: the stream ends, or new tracks
+// begin, before the cut.
+func (m *Muxer) unhold() {
+	if m.cutKey == nil {
+		return
+	}
+	m.write(m.cutKey)
+	for _, p := range m.held {
+		m.write(p)
+	}
+	clear(m.held)
+	m.cutKey, m.held = nil, m.held[:0]
 }
 
 // placeWriter starts the timeline of a new writer, whose first packet is
@@ -415,6 +568,7 @@ func (m *Muxer) Close() {
 	if m.ended {
 		return
 	}
+	m.unhold()
 	m.endSegment(nil, 0)
 	m.ended = true
 	m.wake()

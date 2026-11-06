@@ -110,6 +110,15 @@ type fmp4Writer struct{ *fmp4.Writer }
 
 func (fmp4Writer) BeginSegment() {}
 
+func (fmp4Writer) holdsLast() {}
+
+// holder is a SegmentWriter that holds each track's last packet back until
+// the next one of its track is written, as fMP4's does to know its
+// duration: at a segment's cut, the first packet of each other track after
+// the keyframe is written before the cut, so that the one before it, which
+// decodes before the keyframe, ends the segment rather than begins the next.
+type holder interface{ holdsLast() }
+
 // CodecString returns the RFC 6381 codecs parameter of t for a playlist's
 // CODECS attribute, or "" when it cannot be told.
 func CodecString(t *av.Track) string {
