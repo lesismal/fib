@@ -61,8 +61,8 @@ type Config struct {
 	Crypt *Crypt
 	// DataShards and ParityShards turn on kcp-go's forward error
 	// correction, which must match the peer's: kcptun's default is 10 and
-	// 3. Zero turns it off; FEC shards from a peer that sends them are
-	// still read, their parity unused.
+	// 3. Either at zero turns it off, as in kcp-go; FEC shards from a peer
+	// that sends them are still read, their parity unused.
 	DataShards, ParityShards int
 	// IdleTimeout closes a session that hears nothing from its peer for
 	// that long, with ErrIdle; DefaultIdleTimeout when zero, never when

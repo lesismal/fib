@@ -16,7 +16,7 @@ type framer struct {
 
 func newFramer(crypt *Crypt, data, parity int) (*framer, error) {
 	f := &framer{crypt: crypt}
-	if data > 0 || parity > 0 {
+	if data > 0 && parity > 0 { // either at zero turns FEC off, as in kcp-go
 		var err error
 		if f.enc, err = newFECEncoder(data, parity); err != nil {
 			return nil, err

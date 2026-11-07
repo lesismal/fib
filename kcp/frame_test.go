@@ -199,3 +199,12 @@ func TestFECSkipsParityAfterAPause(t *testing.T) {
 		t.Fatalf("next seqid %d, want 6: the skipped parity keeps its seqid", f.enc.next)
 	}
 }
+
+func TestFECOffWhenEitherIsZero(t *testing.T) {
+	for _, dp := range [][2]int{{0, 3}, {10, 0}, {0, 0}} {
+		f, err := newFramer(nil, dp[0], dp[1])
+		if err != nil || f.enc != nil || f.dec != nil {
+			t.Fatalf("%v: FEC on (%v)", dp, err)
+		}
+	}
+}
