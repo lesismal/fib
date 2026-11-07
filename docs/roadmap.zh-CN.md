@@ -51,6 +51,13 @@
 | macOS 上 `ENOBUFS`（socket 写满）的可写通知 | 有意不做 | 同上：`sendmsg_x` 不报"又有空间了"，仍用 1 毫秒重试；`EAGAIN` 已经走可写事件 | S–M | macOS 上跑高吞吐 QUIC 服务端 |
 | kqueue 可写事件只在 darwin/arm64 验证过 | 已知边界 | `EVFILT_WRITE` 路径在 macOS 上跑过，FreeBSD／NetBSD／OpenBSD／DragonFly 只有交叉编译验证 | S | 有 BSD 生产环境时补一次真机测试 |
 | KCP：Salsa20、FEC 自动调整、kcp-go 的带外包、同一地址多个会话 | 有意不做 | Salsa20 需要 `golang.org/x/crypto` 且不是分组密码，kcptun 默认用 AES；自动调整只是掩盖对端配置错误；带外包与按地址复用会话是 kcp-go 与参考实现特有的附加功能，kcp-go 自己的 Listener 也不支持后者 | 各 S | 有用户需要其中某项 |
+| BitTorrent：BEP 33（DHT scrape） | 有意不做 | 它用布隆过滤器估算一个 torrent 的做种者与下载者数量；fib 里没有用到，客户端可从 tracker 的 scrape 和查找返回的 peer 得到计数 | S | 有客户端要为无 tracker 的 torrent 显示 swarm 规模 |
+| BitTorrent：BEP 35（torrent 签名）、BEP 38（本地数据提示） | 有意不做 | BEP 35 还是草案，主流客户端既不签名也不校验；BEP 38 的 `similar`、`collections` 键只对会在已有其他 torrent 的数据里查找的客户端有用 | 各 S–M | 有发布者要给 torrent 签名；客户端有可供查找的共享存储 |
+| BitTorrent tracker：BEP 31（`retry in`）、full scrape | 有意不做 | tracker 客户端把失败作为 `*Error` 返回，何时重试由调用方决定；full scrape（不带 `info_hash`）会把 tracker 上的全部 torrent 一次性给任何来问的人，回复也很大，所以服务端只应答指明哈希的 scrape | 各 S | 有 tracker 依赖 `retry in`；私有 tracker 想给自己的工具开 full scrape |
+| BitTorrent uTP：路径 MTU 探测、时钟漂移惩罚 | 有意不做 | 包大小固定 1400 字节，低于以太网 MTU 减去 IPv6、UDP 和隧道的包头；探测需要发更大的包，并把它们的丢失与拥塞区分开。漂移惩罚防止时钟走快的对端干扰 LEDBAT，libutp 会测，fib 不测 | M | 巨帧链路上包大小限制了吞吐，或出现时钟漂移的对端 |
+| BitTorrent DHT：替另一个地址族应答 | 有意不做 | 一个 `Node` 只属于一个地址族（与 libtorrent 相同），忽略对另一地址族的 `want`；两者都应答需要客户端的 IPv4 与 IPv6 Node 共享路由表 | S–M | 双栈客户端希望两个地址族互相 bootstrap |
+| BitTorrent DHT：put BEP 44 可变数据时带 `cas` | 计划中 | `Node` 存储别人的 put 时会检查 `cas`，但 `Put` 自己不发，同一个键的两个写者可能在 get 与 put 之间覆盖对方更新的数据 | S | 应用里同一个键有多个写者 |
+| BitTorrent peer：用 piece layer 应答 BEP 52 的 hash request，校验 hashes 里的证明 | 待客户端 | `peer` 已能编解码 hash request、hashes、hash reject，`metainfo` 有 `VerifyProof` 与 merkle 辅助函数；由 `peer` 包还是客户端来应答，随客户端一起定 | S–M | 客户端包完成时 |
 | WebSocket 广播的发送队列 | 已缓解 | 默认无上限（只有 `MaxWriteQueueBytes`／`SetWriteQueueLimit` 可开）；对端长期不读要靠应用层心跳断开 | — | 见 `guide.zh-CN.md` 的广播一节 |
 
 ## 5. WebRTC
@@ -104,6 +111,7 @@
 | WebRTC 限制与有意不做 | `docs/webrtc.zh-CN.md` "配置与限制"、"有意没有实现的功能" | `docs/webrtc.md` "Configuration and limits"、"Intentionally not implemented" |
 | 流媒体限制与有意不做 | `docs/media.zh-CN.md` "配置与限制"、"有意没有实现的功能" | `docs/media.md` "Configuration and limits"、"Intentionally not implemented" |
 | KCP 的决定与兼容性 | `docs/kcp.zh-CN.md`，"待审的决定" | `docs/kcp.md`，"Decisions pending review" |
+| BitTorrent 的决定、BEP 覆盖与互通 | `docs/bittorrent.zh-CN.md`，"待审的决定"、"BEP 覆盖" | `docs/bittorrent.md`，"Decisions pending review"、"BEP coverage" |
 | 引擎、TLS、WebSocket 的取舍 | `docs/guide.zh-CN.md` 对应小节 | 同左（guide 只有中文） |
 | 压测方法与结论 | `docs/loadtest.zh-CN.md` | `docs/loadtest.md` |
 | Interop 逐 case 结果 | `http3/interoprunner/README.md` | 同左 |

@@ -52,6 +52,7 @@ uSockets, workflow, axum, h2, quiche and rustls.
 | gRPC | ✓ h2 and h2c | ✓ | unary and streaming both ways, metadata, deadlines, interceptors, gzip; works with protoc-gen-go-grpc code and talks to grpc-go |
 | WebRTC | ✓ | ✓ | PeerConnections sharing one UDP port: ICE (lite and full, trickle), DTLS 1.2-SRTP, data channels, RTP forwarding for SFUs, and a TURN client and server over UDP, TCP and TLS (quotas, events and stats, hot reload, drain), all written from scratch; talks to browsers and pion ([details](docs/webrtc.md)) |
 | Streaming media | ✓ | ✓ | RTMP/RTMPS (Enhanced RTMP), RTSP over TCP and UDP, SRT, HTTP-FLV and WebSocket-FLV, HLS with fMP4 or TS segments and LL-HLS, WHIP and WHEP, joined by a hub that remuxes between them without transcoding; pull and push relays for each; checked against ffmpeg and Chromium ([details](docs/media.md)) |
+| BitTorrent | ✓ | ✓ | bencode, .torrent files and magnet links (v1, v2 and hybrid), HTTP and UDP trackers in both roles, the peer wire protocol with the Fast and extension protocols, ut_metadata, ut_pex and MSE encryption, uTP with LEDBAT, and the mainline DHT with BEP 42/44/51; uTP, the DHT and the UDP tracker client share one UDP port; checked against anacrolix/torrent, anacrolix/dht, libutp and opentracker ([details](docs/bittorrent.md)) |
 
 ### Engine
 
@@ -342,6 +343,39 @@ A session reads each burst of datagrams fib takes from the socket in one go and 
 batch, and keeps a timer only while something is in flight. `kcp.KCP` is the protocol alone, without
 I/O, for a transport of the application's own.
 
+### BitTorrent
+
+```go
+trackers := tracker.NewServer(tracker.ServerConfig{})
+peers := peer.NewServer(peer.Config{Encryption: mse.Prefer})
+peers.AddTorrent(&peer.Torrent{InfoHash: mi.Info.InfoHashV1(), Handler: handler}) // a peer.Handler
+engine, err := fib.New(fib.DefaultConfig(),
+	fib.Binding{Addr: ":6881", Handler: peers},                          // peers over TCP
+	fib.Binding{Addr: ":6969", Handler: fibhttp.NewHandler(trackers)},   // HTTP tracker
+	fib.Binding{Network: "udp", Addr: ":6969", Handler: trackers.UDP()}) // UDP tracker
+go engine.Run()
+
+// One UDP port for uTP, the DHT and the UDP tracker client, sorted by first byte.
+sock, err := utp.Listen(engine, "udp", ":6881", utp.Config{})
+go peers.Serve(sock) // peers over uTP
+node, err := dht.New(dht.Config{Send: func(to netip.AddrPort, b []byte) { _ = sock.WriteTo(b, to) }})
+udp := tracker.NewUDPClient(tracker.UDPClientConfig{
+	Send: func(to netip.AddrPort, b []byte) error { return sock.WriteTo(b, to) },
+})
+sock.OnOther(func(from netip.AddrPort, b []byte) {
+	if !node.HandleDatagram(from, b) {
+		udp.HandleDatagram(from, b)
+	}
+})
+err = node.Bootstrap(ctx)
+err = node.GetPeers(ctx, mi.Info.InfoHashV1(), func(addrs []netip.AddrPort) { /* dial them */ })
+
+// client example: to be filled
+```
+
+The pieces are separate packages under `bittorrent/`: `bencode`, `metainfo`, `tracker`, `peer` (with
+`peer/mse`), `utp` and `dht`, each usable alone; `utp.Mux` and `dht.Node` own no socket.
+
 ### Raw TCP
 
 ```go
@@ -534,6 +568,7 @@ two, and connections are spread over them by fd. A poller parks in Go's own netp
 | WebRTC | reads UDP, sorts datagrams by peer | the Mux routes by sender; ICE, DTLS, SRTP and SCTP under a mutex per PeerConnection, then its callbacks | — (one timer per PeerConnection) |
 | Streaming media | reads UDP for SRT, RTSP and WHIP/WHEP | ingest parsing, then the hub's fan-out: every subscriber muxes and queues its writes on the publisher's worker | — (one timer per SRT session) |
 | KCP | reads UDP, sorts datagrams by peer | decryption, FEC, KCP and `OnMessage` under a mutex per session, then one batch of datagrams out | — (one timer per session while data is in flight) |
+| BitTorrent | reads UDP for uTP, the DHT and UDP trackers, sorts datagrams by peer | peer wire parsing and `peer.Handler` callbacks, one write per callback; uTP under the `Mux`'s mutex, then one batch of datagrams out; DHT and UDP tracker messages | — (one timer per uTP connection, peer connection and DHT query in flight; a peer over a `net.Conn`, such as uTP's, has a reader and a writer goroutine) |
 | arpc | — | framing, responses, handlers registered sync | `<Name>-streams` (async handlers, the default) |
 | gRPC | — | HTTP/2 framing, HPACK, flow control | `<Name>-streams` (every call) |
 
@@ -793,6 +828,7 @@ Run it yourself with `cd taskpool/benchmark && ./bench.sh` (or `bench.ps1` on Wi
 | [`webrtc`](webrtc) | WebRTC PeerConnection and a UDP Mux shared by many; `stun`, `ice`, `turn` (and `turnserver`), `sdp`, `sctp`, `srtp` and `rtp` underneath, DTLS 1.2 in `tls` |
 | [`media`](media) | Live streaming: `rtmp`, `rtsp`, `srt`, `httpflv`, `hls` and `rtc` (WHIP/WHEP) on the `hub`; `av`, `flv`, `amf`, `mpegts`, `fmp4`, `mp4`, `rtpcodec` and `codec/{h264,h265,aac,opus}` underneath |
 | [`kcp`](kcp) | KCP server, client and sans-I/O protocol, compatible with kcp-go's crypts and FEC |
+| [`bittorrent`](bittorrent) | BitTorrent: `bencode`, `metainfo`, `tracker`, `peer` and `peer/mse`, `utp` and `dht` |
 | [`middleware`](middleware) | Middleware chain and the common middleware |
 | [`socks`](socks) | SOCKS5, SOCKS4 and SOCKS4a proxy server and non-blocking dialer; `http.ConnectProxy` is the HTTP proxy |
 | [`mux`](mux) | Several protocols on one port, told apart by the first bytes a client sends |
@@ -816,6 +852,8 @@ Run it yourself with `cd taskpool/benchmark && ./bench.sh` (or `bench.ps1` on Wi
   codecs each carries, a server for every protocol, relays, the limits, and the interop with ffmpeg and Chromium
 - [KCP](docs/kcp.md): the layers, flushing when something is due, the mapping from kcp-go and kcptun,
   the server's session rules, and the interop with kcp-go
+- [BitTorrent](docs/bittorrent.md): the packages, one port for TCP and UDP, each protocol, the BEPs
+  covered, and the interop with anacrolix/torrent, anacrolix/dht, libutp and opentracker
 - [Roadmap](docs/roadmap.md): what is planned but not done, and what is deliberately not done, with the reason, the rough cost and when to reconsider each
 - [Load testing](docs/loadtest.md): the `benchmark/loadtest` campaign, its results and the
   memory cost of whole responses to slow readers
