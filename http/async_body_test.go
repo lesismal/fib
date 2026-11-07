@@ -203,6 +203,98 @@ func TestOnBodyFilterAsync(t *testing.T) {
 	}
 }
 
+// goFilter is an AsyncBodyFilter that upper-cases each part of the body on
+// a goroutine of its own, and closes first once its first call's done has
+// returned. Its first call gives that goroutine a moment before returning,
+// so that the call is likely back before its caller goes on, with nothing
+// that orders the two.
+type goFilter struct {
+	first chan struct{}
+	calls atomic.Int32
+}
+
+func (f *goFilter) FilterAsync(p []byte, end bool, trailer stdhttp.Header, done func([]byte, error)) {
+	n := f.calls.Add(1)
+	go func() {
+		done(bytes.ToUpper(p), nil)
+		if n == 1 {
+			close(f.first)
+		}
+	}()
+	if n == 1 {
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
+// TestOnBodyFilterAsyncWritableHeld checks that an OnWritable callback
+// given while the header is held, which the resume registers as the body
+// goes to the asynchronous filter, waits for the filter's call rather than
+// reading the response beside it, while the call's goroutine commits the
+// header. Nothing orders the two but the body's lock, since the callback
+// here waits for the call to come back before it writes again, so the race
+// detector catches a resume that reads without it.
+func TestOnBodyFilterAsyncWritableHeld(t *testing.T) {
+	chunk := strings.Repeat("n", 16<<10)
+	const chunks = 8
+	addr := serve(t, NewHandler(HandlerFunc(func(c *Context) {
+		registered := make(chan struct{})
+		f := &goFilter{first: make(chan struct{})}
+		c.OnHeaderAsync(func(_ int, _ stdhttp.Header, resume func(error)) {
+			go func() {
+				<-registered
+				resume(nil)
+			}()
+		})
+		c.OnBodyFilterAsync(func(int, stdhttp.Header) AsyncBodyFilter { return f })
+		c.WriteHeader(stdhttp.StatusAccepted)
+		c.Retain()
+		sent := 0
+		var write func()
+		write = func() {
+			for sent < chunks {
+				above, err := c.WriteNoWait([]byte(chunk))
+				sent++
+				if err != nil {
+					break
+				}
+				if above && c.OnWritable(func(err error) {
+					<-f.first
+					if err != nil {
+						c.Release()
+						return
+					}
+					write()
+				}) {
+					return
+				}
+			}
+			_ = c.Finish()
+			c.Release()
+		}
+		write()
+		if sent == chunks {
+			t.Error("the held header took the whole body without reporting above")
+		}
+		close(registered)
+	})))
+	for _, client := range hookClients(t) {
+		for range 2 {
+			resp, err := client.Get("http://" + addr + "/")
+			if err != nil {
+				t.Fatal(err)
+			}
+			body, err := io.ReadAll(resp.Body)
+			resp.Body.Close()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if want := strings.ToUpper(strings.Repeat(chunk, chunks)); string(body) != want {
+				t.Fatalf("%s: body of %d bytes, want %d", client.proto, len(body), len(want))
+			}
+		}
+	}
+}
+
 // TestOnBodyFilterAsyncHead checks that a response to HEAD, which sends no
 // body, aborts the filter rather than calling it.
 func TestOnBodyFilterAsyncHead(t *testing.T) {
