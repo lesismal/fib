@@ -350,10 +350,13 @@ func TestFastRetransmitOnSACK(t *testing.T) {
 
 func TestKeepAliveAndIdle(t *testing.T) {
 	n := newSimNet(t, 10)
-	cfg := Config{KeepAlive: 50 * time.Millisecond, IdleTimeout: 300 * time.Millisecond}
+	// Keepalives every 50ms against a 1s idle timeout: a loaded CI runner
+	// under -race has been seen to hold a timer back past 300ms, so the
+	// margin is wide, and the wait covers three idle timeouts.
+	cfg := Config{KeepAlive: 50 * time.Millisecond, IdleTimeout: time.Second}
 	a, b := n.node(t, 1, cfg), n.node(t, 2, cfg)
 	ca, cb := dialPair(t, a, b)
-	time.Sleep(time.Second)
+	time.Sleep(3 * time.Second)
 	for _, c := range []*Conn{ca, cb} {
 		c.mu.Lock()
 		st := c.state
@@ -365,7 +368,7 @@ func TestKeepAliveAndIdle(t *testing.T) {
 	n.mu.Lock()
 	n.blocked = true
 	n.mu.Unlock()
-	_ = ca.SetReadDeadline(time.Now().Add(3 * time.Second))
+	_ = ca.SetReadDeadline(time.Now().Add(5 * time.Second))
 	if _, err := ca.Read(make([]byte, 1)); !errors.Is(err, ErrIdle) {
 		t.Fatalf("read: %v", err)
 	}
