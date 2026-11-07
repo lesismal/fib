@@ -3,8 +3,10 @@ package dht
 import (
 	"context"
 	"crypto/sha1"
+	"errors"
 	"net/netip"
 	"slices"
+	"time"
 
 	"github.com/lesismal/fib/bittorrent/metainfo"
 )
@@ -43,12 +45,12 @@ type lookupEvent struct {
 
 // lookup is an iterative lookup of BEP 5 as Kademlia has it: it queries
 // the closest nodes it knows of to the target, Alpha at a time, learns
-// closer ones from their answers, and has converged once the K closest it
-// knows of that did not fail have all answered.
+// closer ones from their answers, and has converged once it has answers
+// from the K closest nodes it knows of that are there.
 //
 // It runs on the goroutine that calls run, so its callbacks may take
 // their time; answers reach it through a channel. A query that has not
-// been answered within half the query timeout stops counting against
+// been answered within a quarter of the query timeout stops counting against
 // Alpha, so that a few silent nodes do not stall the lookup.
 type lookup struct {
 	n       *Node
@@ -129,39 +131,46 @@ func (l *lookup) addSeeds(addrs []netip.AddrPort) {
 }
 
 // next returns the next node to query: a seed, else the closest node not
-// queried yet among the K closest that have not failed.
+// queried yet, as long as fewer than K closer ones have answered. Nodes in
+// flight do not count, as libtorrent's lookups have it: while the closest
+// ones are slow to answer, or never will, the lookup goes on past them.
 func (l *lookup) next() *cand {
 	if len(l.unknown) > 0 {
 		c := l.unknown[0]
 		l.unknown = l.unknown[1:]
 		return c
 	}
-	count := 0
+	replied := 0
 	for _, c := range l.cands {
-		if c.state == candFailed {
-			continue
-		}
-		if c.state == candFresh {
+		switch c.state {
+		case candFresh:
 			return c
-		}
-		if count++; count >= K {
-			break
+		case candReplied:
+			if replied++; replied >= K {
+				return nil
+			}
 		}
 	}
 	return nil
 }
 
+// converged reports whether the K closest nodes that answered are known:
+// none closer is left to query, and those closer still in flight are slow,
+// most likely gone.
 func (l *lookup) converged() bool {
-	count := 0
+	replied := 0
 	for _, c := range l.cands {
-		if c.state == candFailed {
-			continue
-		}
-		if c.state != candReplied {
+		switch c.state {
+		case candFresh:
 			return false
-		}
-		if count++; count == K {
-			return true
+		case candInflight:
+			if !c.slow {
+				return false
+			}
+		case candReplied:
+			if replied++; replied == K {
+				return true
+			}
 		}
 	}
 	return false
@@ -179,7 +188,7 @@ func (l *lookup) send(c *cand) {
 	l.inflight++
 	l.active++
 	l.queries++
-	slowAfter := l.n.cfg.QueryTimeout / 2
+	slowAfter := l.n.cfg.QueryTimeout / 4
 	l.n.query(c.Addr, l.q, l.mk(), queryOpts{
 		slowAfter: slowAfter,
 		slow:      func() { l.post(lookupEvent{c: c, slow: true}) },
@@ -296,13 +305,25 @@ func (n *Node) FindNode(ctx context.Context, target ID) ([]NodeInfo, error) {
 func (n *Node) getPeersLookup(ih metainfo.InfoHash, onPeers func([]netip.AddrPort)) *lookup {
 	l := n.newLookup(ID(ih), "get_peers", func() *args { return &args{InfoHash: ih[:]} })
 	seen := map[netip.AddrPort]bool{}
+	// The peers announced to this node come first: it may well be one of
+	// the closest to the torrent, which the lookup never asks.
+	n.mu.Lock()
+	own := n.peers.get(ID(ih), n.maxValues(), n.cfg.IPv6, time.Now())
+	n.mu.Unlock()
+	for _, a := range own {
+		seen[a] = true
+	}
+	if len(own) > 0 && onPeers != nil {
+		onPeers(own)
+	}
 	l.onReply = func(c *cand, m *msg) bool {
 		c.token = m.R.Token
 		var fresh []netip.AddrPort
 		for _, v := range m.R.Values {
-			if a, ok := parseCompactAddr(v); ok && a.Port() != 0 && !seen[a] {
+			a, ok := parseCompactAddr(v)
+			if a = unmap(a); ok && a.Port() != 0 && !seen[a] {
 				seen[a] = true
-				fresh = append(fresh, unmap(a))
+				fresh = append(fresh, a)
 			}
 		}
 		if len(fresh) > 0 && onPeers != nil {
@@ -327,6 +348,9 @@ func (n *Node) GetPeers(ctx context.Context, ih metainfo.InfoHash, onPeers func(
 // the announcement. Peers expire from the nodes after 30 minutes; a
 // client announces again sooner.
 func (n *Node) Announce(ctx context.Context, ih metainfo.InfoHash, port int, impliedPort bool, onPeers func([]netip.AddrPort)) (int, error) {
+	if !impliedPort && (port <= 0 || port > 65535) {
+		return 0, errors.New("dht: announce of an invalid port")
+	}
 	l := n.getPeersLookup(ih, onPeers)
 	if err := l.run(ctx); err != nil {
 		return 0, err
@@ -449,10 +473,13 @@ func (n *Node) Put(ctx context.Context, it *Item) (int, error) {
 		return 0, ErrNoNodes
 	}
 	return n.sendAll(ctx, targets, "put", func(c *cand) *args {
-		a := &args{Token: c.token, V: it.V}
+		// An immutable put carries "seq" 0 as well: BEP 44 leaves it out,
+		// but anacrolix/dht refuses a put without it, and libtorrent
+		// ignores it.
+		seq := it.Seq
+		a := &args{Token: c.token, V: it.V, Seq: &seq}
 		if it.Mutable() {
-			seq := it.Seq
-			a.K, a.Sig, a.Salt, a.Seq = it.K[:], it.Sig[:], it.Salt, &seq
+			a.K, a.Sig, a.Salt = it.K[:], it.Sig[:], it.Salt
 		}
 		return a
 	})

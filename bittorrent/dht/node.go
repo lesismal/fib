@@ -708,7 +708,9 @@ func (n *Node) put(a *args, from netip.AddrPort, now time.Time) *Error {
 		return ErrItemTooBig
 	}
 	it := &Item{V: a.V}
-	if len(a.K) > 0 || len(a.Sig) > 0 {
+	// A key and signature of zeros are absent: some clients send the
+	// zero values of fixed-size fields with an immutable put.
+	if !allZero(a.K) || !allZero(a.Sig) {
 		if len(a.K) != 32 || len(a.Sig) != 64 || a.Seq == nil {
 			return &Error{Code: ErrCodeProtocol, Msg: "invalid k, sig or seq"}
 		}
@@ -775,12 +777,7 @@ func (n *Node) maintain() {
 		n.ping(e.Addr)
 	}
 	if len(refresh) > 0 {
-		go func() {
-			n.findAll(context.Background(), refresh)
-			n.mu.Lock()
-			n.refreshing = false
-			n.mu.Unlock()
-		}()
+		go n.refresh(refresh)
 	}
 	if bootstrap {
 		go func() { _ = n.Bootstrap(context.Background()) }()
@@ -789,7 +786,7 @@ func (n *Node) maintain() {
 
 // findAll runs find_node lookups of targets, a few at a time.
 func (n *Node) findAll(ctx context.Context, targets []ID) {
-	sem := make(chan struct{}, 4)
+	sem := make(chan struct{}, 8)
 	var wg sync.WaitGroup
 	for _, t := range targets {
 		sem <- struct{}{}
@@ -805,8 +802,10 @@ func (n *Node) findAll(ctx context.Context, targets []ID) {
 
 // Bootstrap fills the routing table: it looks up its own ID from the
 // routers, the nodes AddNodes and AddTorrentNodes added and those already
-// in the table, then refreshes each bucket that is not full. The node
-// also bootstraps by itself whenever its table has fewer than K nodes.
+// in the table, and returns once that converges; a lookup of a random ID
+// in each bucket that is not full then goes on in the background. The
+// node also bootstraps by itself whenever its table has fewer than K
+// nodes.
 func (n *Node) Bootstrap(ctx context.Context) error {
 	n.mu.Lock()
 	if n.bootstrapping || n.closed {
@@ -830,10 +829,19 @@ func (n *Node) Bootstrap(ctx context.Context) error {
 	}
 	n.mu.Unlock()
 	seeds = append(seeds, routers...)
-	l := n.findNodeLookup(n.ID())
-	l.addSeeds(seeds)
-	if err := l.run(ctx); err != nil && !errors.Is(err, ErrNoNodes) {
-		return err
+	// The answers may show our external address and give us a new ID
+	// (BEP 42): the lookup of our own ID is then done again, for the new
+	// one, as the table is now arranged around it.
+	for range 3 {
+		id := n.ID()
+		l := n.findNodeLookup(id)
+		l.addSeeds(seeds)
+		if err := l.run(ctx); err != nil && !errors.Is(err, ErrNoNodes) {
+			return err
+		}
+		if n.ID() == id {
+			break
+		}
 	}
 	n.mu.Lock()
 	var targets []ID
@@ -844,21 +852,39 @@ func (n *Node) Bootstrap(ctx context.Context) error {
 		}
 	}
 	size := t.len()
+	refresh := len(targets) > 0 && !n.refreshing && size > 0
+	n.refreshing = n.refreshing || refresh
 	n.mu.Unlock()
 	if size == 0 {
 		return ErrNoNodes
 	}
-	n.findAll(ctx, targets)
-	return ctx.Err()
+	if refresh {
+		go n.refresh(targets)
+	}
+	return nil
 }
 
-// resolve resolves "host:port" strings to addresses of the node's family.
+// refresh looks up a random target in each of the buckets that need it,
+// in the background; one refresh runs at a time.
+func (n *Node) refresh(targets []ID) {
+	n.findAll(context.Background(), targets)
+	n.mu.Lock()
+	n.refreshing = false
+	n.mu.Unlock()
+}
+
+// resolve resolves "host:port" strings to addresses of the node's family,
+// the names all at once.
 func (n *Node) resolve(ctx context.Context, hosts []string) []netip.AddrPort {
 	network := "ip4"
 	if n.cfg.IPv6 {
 		network = "ip6"
 	}
-	var out []netip.AddrPort
+	var (
+		mu  sync.Mutex
+		wg  sync.WaitGroup
+		out []netip.AddrPort
+	)
 	for _, hp := range hosts {
 		host, ps, err := net.SplitHostPort(hp)
 		if err != nil {
@@ -870,20 +896,29 @@ func (n *Node) resolve(ctx context.Context, hosts []string) []netip.AddrPort {
 		}
 		if a, err := netip.ParseAddr(host); err == nil {
 			if a.Unmap().Is4() != n.cfg.IPv6 {
+				mu.Lock()
 				out = append(out, netip.AddrPortFrom(a.Unmap(), uint16(port)))
+				mu.Unlock()
 			}
 			continue
 		}
-		rctx, cancel := context.WithTimeout(ctx, 5*time.Second)
-		addrs, err := net.DefaultResolver.LookupNetIP(rctx, network, host)
-		cancel()
-		if err != nil {
-			continue
-		}
-		for _, a := range addrs {
-			out = append(out, netip.AddrPortFrom(a.Unmap(), uint16(port)))
-		}
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			rctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+			addrs, err := net.DefaultResolver.LookupNetIP(rctx, network, host)
+			cancel()
+			if err != nil {
+				return
+			}
+			mu.Lock()
+			for _, a := range addrs {
+				out = append(out, netip.AddrPortFrom(a.Unmap(), uint16(port)))
+			}
+			mu.Unlock()
+		}()
 	}
+	wg.Wait()
 	return out
 }
 
@@ -968,4 +1003,13 @@ func (n *Node) responseNodes(r *ret) []NodeInfo {
 		nodes, _ = parseCompactNodes(r.Nodes, false)
 	}
 	return nodes
+}
+
+func allZero(b []byte) bool {
+	for _, x := range b {
+		if x != 0 {
+			return false
+		}
+	}
+	return true
 }

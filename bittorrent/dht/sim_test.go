@@ -23,7 +23,10 @@ type simNet struct {
 	loss  float64
 	sent  int
 	queue chan simPacket
+	done  chan struct{}
 	wg    sync.WaitGroup
+	// addrOf is the address of the i-th node build makes.
+	addrOf func(int) netip.AddrPort
 }
 
 type simPacket struct {
@@ -33,15 +36,23 @@ type simPacket struct {
 
 func newSimNet(t testing.TB, seed uint64) *simNet {
 	s := &simNet{
-		nodes: map[netip.AddrPort]*Node{},
-		rng:   rand.New(rand.NewPCG(seed, seed)),
-		queue: make(chan simPacket, 1<<16),
+		nodes:  map[netip.AddrPort]*Node{},
+		rng:    rand.New(rand.NewPCG(seed, seed)),
+		queue:  make(chan simPacket, 1<<16),
+		done:   make(chan struct{}),
+		addrOf: simAddr,
 	}
 	for range 4 {
 		s.wg.Add(1)
 		go func() {
 			defer s.wg.Done()
-			for p := range s.queue {
+			for {
+				var p simPacket
+				select {
+				case p = <-s.queue:
+				case <-s.done:
+					return
+				}
 				s.mu.Lock()
 				n := s.nodes[p.to]
 				s.mu.Unlock()
@@ -59,7 +70,7 @@ func newSimNet(t testing.TB, seed uint64) *simNet {
 		for _, n := range nodes {
 			_ = n.Close()
 		}
-		close(s.queue)
+		close(s.done)
 		s.wg.Wait()
 	})
 	return s
@@ -80,7 +91,10 @@ func (s *simNet) add(t testing.TB, a netip.AddrPort, cfg Config) *Node {
 		s.sent++
 		s.mu.Unlock()
 		if !drop {
-			s.queue <- simPacket{from: a, to: to, b: b}
+			select {
+			case s.queue <- simPacket{from: a, to: to, b: b}:
+			case <-s.done:
+			}
 		}
 	}
 	if cfg.Routers == nil {
@@ -122,12 +136,12 @@ func (s *simNet) setLoss(p float64) {
 func (s *simNet) build(t testing.TB, size int, cfg Config) []*Node {
 	nodes := make([]*Node, size)
 	for i := range nodes {
-		nodes[i] = s.add(t, simAddr(i), cfg)
+		nodes[i] = s.add(t, s.addrOf(i), cfg)
 	}
 	for i := 1; i < size; i++ {
-		seeds := []NodeInfo{{Addr: simAddr(0)}}
+		seeds := []NodeInfo{{Addr: s.addrOf(0)}}
 		for range 2 {
-			seeds = append(seeds, NodeInfo{Addr: simAddr(s.intn(i))})
+			seeds = append(seeds, NodeInfo{Addr: s.addrOf(s.intn(i))})
 		}
 		nodes[i].AddNodes(seeds...)
 	}
@@ -147,7 +161,27 @@ func (s *simNet) build(t testing.TB, size int, cfg Config) []*Node {
 		}
 		wg.Wait()
 	}
+	waitRefreshed(t, nodes)
 	return nodes
+}
+
+// waitRefreshed waits for the bucket refreshes Bootstrap leaves running.
+func waitRefreshed(t testing.TB, nodes []*Node) {
+	deadline := time.Now().Add(30 * time.Second)
+	for _, n := range nodes {
+		for {
+			n.mu.Lock()
+			busy := n.refreshing
+			n.mu.Unlock()
+			if !busy {
+				break
+			}
+			if time.Now().After(deadline) {
+				t.Fatal("refreshes still running")
+			}
+			time.Sleep(time.Millisecond)
+		}
+	}
 }
 
 // trueClosest returns the k IDs of nodes closest to target, but for
@@ -337,7 +371,7 @@ func TestSimItems(t *testing.T) {
 		n.mu.Lock()
 		held := n.items.get(m1.Target(), time.Now())
 		n.mu.Unlock()
-		if held == nil || held.Seq != 2 {
+		if held == nil || held.Seq != 2 || i == 7 {
 			continue
 		}
 		m, err := nodes[7].call(ctx, simAddr(i), "get", &args{Target: m1.Target().Bytes()})
@@ -470,5 +504,41 @@ func TestSimStateRestart(t *testing.T) {
 	}
 	if n.ID() != st.ID || n.Stats().Nodes < K {
 		t.Fatalf("restarted: id %v, %d nodes", n.ID(), n.Stats().Nodes)
+	}
+}
+
+func simAddr6(i int) netip.AddrPort {
+	return netip.AddrPortFrom(netip.AddrFrom16([16]byte{0x20, 0x01, 0x0d, 0xb9, byte(i >> 8), byte(i), 15: 1}), 6881)
+}
+
+// The IPv6 DHT (BEP 32): nodes of one family, "nodes6" in the answers.
+func TestSimIPv6(t *testing.T) {
+	s := newSimNet(t, 10)
+	s.addrOf = simAddr6
+	nodes := s.build(t, 100, Config{IPv6: true})
+	ctx := context.Background()
+	target := nodes[70].ID()
+	found, err := nodes[3].FindNode(ctx, target)
+	if err != nil || len(found) == 0 || found[0].ID != target || found[0].Addr != simAddr6(70) {
+		t.Fatalf("find_node: %v %v", found, err)
+	}
+	ih := metainfo.InfoHash(RandomID())
+	if n, err := nodes[5].Announce(ctx, ih, 4242, false, nil); err != nil || n == 0 {
+		t.Fatalf("announce: %d %v", n, err)
+	}
+	var got []netip.AddrPort
+	if err := nodes[90].GetPeers(ctx, ih, func(p []netip.AddrPort) { got = append(got, p...) }); err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 || got[0] != netip.AddrPortFrom(simAddr6(5).Addr(), 4242) {
+		t.Fatalf("peers %v", got)
+	}
+	// An IPv6 node claims an IPv4 node's dictionary, and drops it.
+	before := nodes[0].Stats().QueriesAnswered
+	if !nodes[0].HandleDatagram(simAddr(1), []byte("d1:ad2:id20:abcdefghij0123456789e1:q4:ping1:t2:aa1:y1:qe")) {
+		t.Fatal("dictionary not claimed")
+	}
+	if nodes[0].Stats().QueriesAnswered != before {
+		t.Fatal("IPv6 node answered an IPv4 query")
 	}
 }
