@@ -600,6 +600,18 @@ func (t *Torrent) onPiece(pc *peerConn, m *peer.Message) {
 	}
 }
 
+// servableLen is how far into piece i a request may reach: the piece's
+// length, but in a v2 torrent the last piece of a file to the end of its
+// last 16 KiB block, which libtorrent requests whole, the bytes past the
+// file being the zeros that align the next file.
+func (t *Torrent) servableLen(i int) int64 {
+	n := t.info.PieceSize(i)
+	if t.info.HasV2() && !t.info.HasV1() {
+		n = min(t.info.PieceLength, (n+blockSize-1)/blockSize*blockSize)
+	}
+	return n
+}
+
 // onRequest queues a peer's request, or rejects it: a piece this side
 // does not have, a block too large, a peer choked that was not allowed
 // the piece fast, or too many queued.
@@ -607,7 +619,7 @@ func (t *Torrent) onRequest(pc *peerConn, r peer.Request) {
 	t.mu.Lock()
 	ok := t.info != nil && !pc.closed && int(r.Index) < len(t.pieces) && t.pieces[r.Index].have &&
 		r.Length > 0 && r.Length <= peer.MaxBlockSize &&
-		int64(r.Begin)+int64(r.Length) <= t.info.PieceSize(int(r.Index)) &&
+		int64(r.Begin)+int64(r.Length) <= t.servableLen(int(r.Index)) &&
 		len(pc.upq) < maxUploadQueue && t.storage != nil
 	if ok && pc.c.AmChoking() && !(pc.c.Fast() && pc.fastSet[r.Index]) {
 		ok = false

@@ -1,6 +1,7 @@
 package interop
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"fmt"
@@ -9,6 +10,7 @@ import (
 	"net"
 	"net/netip"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"sync"
 	"testing"
@@ -16,6 +18,7 @@ import (
 
 	"github.com/lesismal/fib"
 	"github.com/lesismal/fib/bittorrent"
+	"github.com/lesismal/fib/bittorrent/bencode"
 	"github.com/lesismal/fib/bittorrent/metainfo"
 	"github.com/lesismal/fib/bittorrent/tracker"
 	fibhttp "github.com/lesismal/fib/http"
@@ -384,4 +387,152 @@ func TestClientTrackerDiscovery(t *testing.T) {
 		}
 	}
 	t.Fatalf("fib's peers %v are not anacrolix at %v", peers, want)
+}
+
+// libtorrentPeer runs libtorrent_peer.py, a libtorrent-rasterbar peer, and
+// hands its output lines to a channel.
+type libtorrentPeer struct {
+	cmd   *exec.Cmd
+	port  int
+	lines chan string
+}
+
+func startLibtorrent(t *testing.T, args ...string) *libtorrentPeer {
+	t.Helper()
+	cmd := exec.Command("python3", append([]string{"libtorrent_peer.py"}, args...)...)
+	cmd.Stderr = os.Stderr
+	out, err := cmd.StdoutPipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	p := &libtorrentPeer{cmd: cmd, lines: make(chan string, 1024)}
+	t.Cleanup(func() { _ = cmd.Process.Kill(); _ = cmd.Wait() })
+	go func() {
+		sc := bufio.NewScanner(out)
+		for sc.Scan() {
+			p.lines <- sc.Text()
+		}
+		close(p.lines)
+	}()
+	for line := range p.lines {
+		if _, err := fmt.Sscanf(line, "PORT %d", &p.port); err == nil {
+			return p
+		}
+	}
+	t.Fatal("libtorrent_peer.py ended without a port")
+	return nil
+}
+
+// wait waits for the line "DONE", logging the rest.
+func (p *libtorrentPeer) wait(t *testing.T, what string) {
+	t.Helper()
+	deadline := time.After(clientTimeout)
+	for {
+		select {
+		case line, ok := <-p.lines:
+			if !ok {
+				t.Fatalf("libtorrent ended before %s", what)
+			}
+			if line == "DONE" {
+				return
+			}
+			t.Log("libtorrent:", line)
+		case <-deadline:
+			t.Fatalf("libtorrent: no %s", what)
+		}
+	}
+}
+
+// TestClientLibtorrent runs fib's client against libtorrent-rasterbar's,
+// through its Python binding, both ways: it needs python3-libtorrent, so
+// it runs only with FIB_LIBTORRENT set, as libtorrent.sh runs it in a
+// container.
+func TestClientLibtorrent(t *testing.T) {
+	if os.Getenv("FIB_LIBTORRENT") == "" {
+		t.Skip("set FIB_LIBTORRENT=1 with python3-libtorrent installed; libtorrent.sh does")
+	}
+	cases := append(clientCases(),
+		clientCase{name: "v2-magnet-tcp", version: metainfo.V2, magnet: true},
+		clientCase{name: "v2-torrent-utp", version: metainfo.V2, utp: true},
+		clientCase{name: "v2-magnet-utp-rc4-required", version: metainfo.V2, magnet: true, utp: true, require: true},
+	)
+	flags := func(c clientCase) []string {
+		var f []string
+		if c.utp {
+			f = append(f, "--utp")
+		}
+		if c.require {
+			f = append(f, "--require")
+		}
+		return f
+	}
+	writeTorrent := func(t *testing.T, mi *metainfo.MetaInfo) string {
+		enc, err := bencode.Marshal(mi)
+		if err != nil {
+			t.Fatal(err)
+		}
+		p := filepath.Join(t.TempDir(), "t.torrent")
+		if err := os.WriteFile(p, enc, 0o644); err != nil {
+			t.Fatal(err)
+		}
+		return p
+	}
+	magnet := func(mi *metainfo.MetaInfo) string {
+		m := &metainfo.Magnet{}
+		if mi.Info.HasV1() {
+			m.InfoHash = mi.Info.InfoHashV1()
+		} else {
+			m.InfoHashV2 = mi.Info.InfoHashV2()
+		}
+		return m.String()
+	}
+	for _, c := range cases {
+		t.Run("fib-from-libtorrent/"+c.name, func(t *testing.T) {
+			sdir := t.TempDir()
+			files := clientFiles(t, sdir, "content")
+			mi := clientTorrent(t, sdir, "content", c.version)
+			lt := startLibtorrent(t, append([]string{"seed", writeTorrent(t, mi), sdir}, flags(c)...)...)
+			addr := fmt.Sprintf("127.0.0.1:%d", lt.port)
+			ldir := t.TempDir()
+			cl, log := newFibClient(t, ldir, c, false)
+			var tor *bittorrent.Torrent
+			var err error
+			if c.magnet {
+				m, _ := metainfo.ParseMagnet(magnet(mi))
+				m.Peers = []string{addr}
+				tor, err = cl.AddMagnet(m.String(), nil)
+			} else {
+				tor, err = cl.AddTorrent(mi, &bittorrent.AddOptions{Peers: []string{addr}})
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			fibWait(t, tor, log)
+			sameFiles(t, ldir, files)
+			checkPeers(t, log.connected(), c)
+		})
+		t.Run("libtorrent-from-fib/"+c.name, func(t *testing.T) {
+			sdir := t.TempDir()
+			files := clientFiles(t, sdir, "content")
+			mi := clientTorrent(t, sdir, "content", c.version)
+			seeder, log := newFibClient(t, sdir, c, false)
+			st, err := seeder.AddTorrent(mi, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			fibWait(t, st, log)
+			src := writeTorrent(t, mi)
+			if c.magnet {
+				src = magnet(mi)
+			}
+			ldir := t.TempDir()
+			lt := startLibtorrent(t, append([]string{"leech", src, ldir, "--peer", fmt.Sprintf("127.0.0.1:%d", seeder.Port())}, flags(c)...)...)
+			lt.wait(t, "download")
+			sameFiles(t, ldir, files)
+			checkPeers(t, log.connected(), c)
+		})
+	}
 }
