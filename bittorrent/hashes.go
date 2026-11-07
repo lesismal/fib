@@ -201,10 +201,13 @@ func (t *Torrent) kickWaitingLocked() {
 func (t *Torrent) onHashRejectLocked(pc *peerConn, m *peer.Message) {
 	key := hashKey{m.PiecesRoot, m.Index}
 	if req, ok := t.hashReqs[key]; ok && req.pc == pc {
-		// Ask another peer at once.
-		req.at = time.Time{}
-		t.hashReqs[key] = req
-		t.requestHashesLocked()
+		if o := t.hashPeerLocked(pc); o != nil && o != pc {
+			// Ask another peer at once; the same one only after
+			// hashRequestRetry, never in a loop of rejects.
+			req.at = time.Time{}
+			t.hashReqs[key] = req
+			t.requestHashesLocked()
+		}
 	}
 }
 

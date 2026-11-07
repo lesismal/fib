@@ -129,6 +129,10 @@ func (t *Torrent) OnHandshake(c *peer.Conn) {
 		t.dialDoneLocked(rec)
 	}
 	reject := func() {
+		if rec != nil {
+			// Not again for a while: the reason is likely to stand.
+			rec.cand.nextTry = time.Now().Add(time.Minute)
+		}
 		go c.Close()
 	}
 	if !t.running() || cl.closing.Load() {
@@ -151,13 +155,46 @@ func (t *Torrent) OnHandshake(c *peer.Conn) {
 		reject()
 		return
 	}
+	var replaced *peerConn
 	for _, o := range t.peers {
-		if o.c.PeerID() == c.PeerID() {
-			reject()
+		if o.closed || o.c.PeerID() != c.PeerID() {
+			continue
+		}
+		// Two connections to one peer, as when both dial at once: each
+		// side keeps the one the side of the lower peer ID began, so that
+		// they keep the same one rather than each closing the other's.
+		initiator := func(x *peer.Conn) string {
+			if x.Initiator() {
+				return string(cl.peerID[:])
+			}
+			id := x.PeerID()
+			return string(id[:])
+		}
+		if c.Initiator() == o.c.Initiator() || initiator(o.c) < initiator(c) {
+			if rec != nil {
+				if !o.listen.IsValid() {
+					o.listen = rec.cand.addr
+				}
+				rec.cand.connected = true
+				rec.cand.conn = o
+			}
+			go c.Close()
 			return
 		}
+		replaced = o
+		break
 	}
-	if rec == nil && (len(t.peers) >= cl.cfg.MaxConnsPerTorrent || int(cl.conns.Load()) >= cl.cfg.MaxConns) {
+	if replaced != nil {
+		if !listen.IsValid() {
+			listen = replaced.listen
+		}
+		if cand := t.pool[replaced.listen]; cand != nil && cand.conn == replaced {
+			cand.conn = nil
+			rec = &dialAttempt{cand: cand}
+		}
+		go replaced.c.Close()
+	}
+	if rec == nil && replaced == nil && (len(t.peers) >= cl.cfg.MaxConnsPerTorrent || int(cl.conns.Load()) >= cl.cfg.MaxConns) {
 		reject()
 		return
 	}

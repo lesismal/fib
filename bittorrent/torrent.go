@@ -529,9 +529,9 @@ func (t *Torrent) Remove(deleteData bool) error {
 		delete(t.c.torrents, t.key)
 	}
 	t.c.mu.Unlock()
-	t.c.server.RemoveTorrent(t.pt)
 	t.mu.Lock()
 	defer t.mu.Unlock()
+	t.c.server.RemoveTorrent(t.pt)
 	if t.state == StateRemoved {
 		return nil
 	}

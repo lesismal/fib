@@ -46,6 +46,12 @@
 //   - Connections are dialed over uTP first, then TCP, with MSE first and
 //     plaintext after when the peer refuses (Config.Encryption), within
 //     the limits of connections, dials in flight and dials per second.
+//   - Peers come from the trackers (HTTP and UDP, announced to under
+//     both hashes of a hybrid torrent), the DHT (announced to every
+//     fifteen minutes, and every minute while there are no peers), peer
+//     exchange, local service discovery, the magnet link's x.pe and
+//     AddPeers; a private torrent (BEP 27) uses its trackers alone. Web
+//     seeds (BEP 19) serve whole pieces over HTTP range requests.
 //
 // Config.OnEvent hears what happens, and Torrent.Stats and Torrent.Peers
 // tell the state.
