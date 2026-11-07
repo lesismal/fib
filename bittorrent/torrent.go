@@ -286,8 +286,22 @@ func (t *Torrent) setInfoLocked(info *metainfo.Info) error {
 	t.name = info.Name
 	n := info.PieceCount()
 	t.pieces = make([]pieceState, n)
-	t.have = peer.NewBitfield(n)
 	files := info.FileList()
+	for i := range t.pieces {
+		size := info.PieceSize(i)
+		end := int64(0)
+		off := info.PieceOffset(i)
+		for _, seg := range info.Segments(off, size) {
+			if !files[seg.File].IsPad() {
+				end = files[seg.File].Offset + seg.Offset + seg.Length - off
+			}
+		}
+		if end == 0 {
+			end = size
+		}
+		t.pieces[i].dataLen = end
+	}
+	t.have = peer.NewBitfield(n)
 	t.filePrio = make([]int, len(files))
 	for i := range files {
 		t.filePrio[i] = PriorityNormal
@@ -754,19 +768,7 @@ func (t *Torrent) Peers() []PeerInfo {
 	defer t.mu.Unlock()
 	out := make([]PeerInfo, 0, len(t.peers))
 	for _, pc := range t.peers {
-		pi := PeerInfo{
-			Addr: pc.addr, ID: pc.c.PeerID(), Outgoing: pc.outgoing, UTP: pc.utp,
-			Encrypted: pc.c.Encrypted(), Seed: pc.seed,
-			Downloaded: pc.downTotal, Uploaded: pc.upTotal,
-			DownloadRate: pc.down.perSec, UploadRate: pc.up.perSec,
-			AmChoking: pc.c.AmChoking(), PeerChoking: pc.c.PeerChoking(), Snubbed: pc.snubbed,
-		}
-		if h := pc.c.RemoteExtensions(); h != nil {
-			pi.Client = h.Version
-		}
-		if pc.bits != nil {
-			pi.Pieces = pc.bits.Count()
-		}
+		pi := pc.infoLocked()
 		out = append(out, pi)
 	}
 	return out
@@ -805,4 +807,22 @@ func (r *rate) tick(dt time.Duration) {
 		r.perSec = 0
 	}
 	r.cur = 0
+}
+
+// infoLocked describes the connection.
+func (pc *peerConn) infoLocked() PeerInfo {
+	pi := PeerInfo{
+		Addr: pc.addr, ID: pc.c.PeerID(), Outgoing: pc.outgoing, UTP: pc.utp,
+		Encrypted: pc.c.Encrypted(), Seed: pc.seed,
+		Downloaded: pc.downTotal, Uploaded: pc.upTotal,
+		DownloadRate: pc.down.perSec, UploadRate: pc.up.perSec,
+		AmChoking: pc.c.AmChoking(), PeerChoking: pc.c.PeerChoking(), Snubbed: pc.snubbed,
+	}
+	if h := pc.c.RemoteExtensions(); h != nil {
+		pi.Client = h.Version
+	}
+	if pc.bits != nil {
+		pi.Pieces = pc.bits.Count()
+	}
+	return pi
 }

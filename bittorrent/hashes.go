@@ -180,13 +180,20 @@ func (t *Torrent) setLayerLocked(root [32]byte, layer []byte) {
 		t.layers = metainfo.PieceLayers{}
 	}
 	t.layers[root] = layer
+	t.kickWaitingLocked()
+}
+
+// kickWaitingLocked checks the pieces that waited for a piece layer now
+// known.
+func (t *Torrent) kickWaitingLocked() {
 	for i, p := range t.partials {
-		if p.waitHashes {
-			p.waitHashes = false
-			if p.complete() && p.writing == 0 && !p.busy {
-				p.busy = true
-				go t.verifyPiece(i, p)
-			}
+		if !p.waitHashes || t.pieceLayersFor(i) == nil {
+			continue
+		}
+		p.waitHashes = false
+		if p.complete() && p.writing == 0 && !p.busy {
+			p.busy = true
+			go t.verifyPiece(i, p)
 		}
 	}
 }

@@ -281,7 +281,8 @@ func TestLSD(t *testing.T) {
 	sdir, ldir := t.TempDir(), t.TempDir()
 	files := testFiles(t, sdir, "content", 50_000, 20_000)
 	mi := buildTorrent(t, sdir, "content", metainfo.V1, 16<<10)
-	lsd := func(c *Config) { c.DisableLSD = false }
+	// The announce comes from the host's address on the LAN, not loopback.
+	lsd := func(c *Config) { c.DisableLSD = false; c.ListenAddr = "0.0.0.0:0" }
 	seeder, _ := seed(t, sdir, mi, lsd)
 	if seeder.lsd == nil {
 		t.Skip("no multicast here")

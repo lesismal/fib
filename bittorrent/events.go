@@ -53,6 +53,9 @@ type Event struct {
 	Piece   int
 	Peer    netip.AddrPort
 	Err     error
+	// PeerInfo describes the connection of EventPeerConnected and
+	// EventPeerDisconnected.
+	PeerInfo *PeerInfo
 }
 
 // emit queues e for Config.OnEvent; it never blocks, and may be called

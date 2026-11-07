@@ -185,7 +185,8 @@ func (t *Torrent) OnHandshake(c *peer.Conn) {
 			_ = c.Send(&peer.Message{Type: peer.MsgPort, Port: uint16(cl.port)})
 		}
 	})
-	t.c.emit(Event{Type: EventPeerConnected, Torrent: t, Peer: addr})
+	info := pc.infoLocked()
+	t.c.emit(Event{Type: EventPeerConnected, Torrent: t, Peer: addr, PeerInfo: &info})
 }
 
 // extHandshakeLocked is this side's extended handshake (BEP 10).
@@ -300,7 +301,8 @@ func (t *Torrent) OnClose(c *peer.Conn, err error) {
 		}
 		cand.nextTry = now.Add(2 * time.Second << min(cand.fails, 9))
 	}
-	t.c.emit(Event{Type: EventPeerDisconnected, Torrent: t, Peer: pc.addr, Err: err})
+	info := pc.infoLocked()
+	t.c.emit(Event{Type: EventPeerDisconnected, Torrent: t, Peer: pc.addr, Err: err, PeerInfo: &info})
 }
 
 // OnWritable implements peer.WritableHandler: the uploads held back by a

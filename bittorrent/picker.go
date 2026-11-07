@@ -38,6 +38,10 @@ type pieceState struct {
 	prio    int   // effective priority: of the files, or a Reader's
 	filePri int   // the files' priority alone
 	avail   int32 // peers that have it
+	// dataLen is the piece's length without the padding (BEP 47) that
+	// ends it: the bytes requested of peers. The rest is zeros, which
+	// anacrolix and libtorrent do not serve.
+	dataLen int64
 	have    bool
 	partial *partial
 }
@@ -71,7 +75,7 @@ func (p *partial) complete() bool { return p.done == len(p.blocks) }
 
 // blockRequest is block b of piece i as a request.
 func (t *Torrent) blockRequest(i, b int) peer.Request {
-	size := t.info.PieceSize(i)
+	size := t.pieces[i].dataLen
 	begin := int64(b) * blockSize
 	return peer.Request{Index: uint32(i), Begin: uint32(begin), Length: uint32(min(blockSize, size-begin))}
 }
@@ -114,7 +118,7 @@ func (t *Torrent) nextRequest(pc *peerConn, fastOnly bool) (peer.Request, bool) 
 	}
 	// A new piece, when it beats every piece under way.
 	if i, ok := t.pickPiece(can); ok && (best == nil || t.pieces[i].prio > t.pieces[best.index].prio) {
-		p := newPartial(i, t.info.PieceSize(i))
+		p := newPartial(i, t.pieces[i].dataLen)
 		t.pieces[i].partial = p
 		t.partials[i] = p
 		best = p
