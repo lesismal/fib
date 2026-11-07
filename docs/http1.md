@@ -662,6 +662,15 @@ handler := http.HandlerFunc(func(c *http.Context) {
 })
 ```
 
+A proxy that relays one tunnel to another, such as the backend's from
+`Client.StartUpgrade`, paces each side by the other's backlog: it holds the
+side it reads with `Tunnel.HoldReads` while the other's `NotifySendable` says
+it is behind, and calls `Tunnel.SetWriteBackpressure(false)` on both, so that
+a side whose sends back up does not also stop reading its peer. Left on, a
+backend that answers as it reads waits for the proxy, and the proxy for it,
+as soon as their sockets fill, which on Windows' small loopback buffers is a
+few hundred kilobytes in.
+
 `Context.Connect(header, handler)` is `Upgrade` for a classic `CONNECT
 host:port` (RFC 9110 section 9.3.6): over HTTP/1.x it answers 200 and the
 whole connection becomes the tunnel, and over HTTP/2 and HTTP/3 only the

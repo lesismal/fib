@@ -101,6 +101,11 @@ code 最大 12 位，而 `compress(1)` 会增长到 16 位，解不了流的开�
 
 ### CONNECT 隧道
 
+把一个 tunnel 转发到另一个（比如 `Client.StartUpgrade` 得到的后端 tunnel）的代理，要让两侧互相按对方的积压节流：
+对方的 `NotifySendable` 表示落后时，用 `Tunnel.HoldReads` 暂停读本侧；并在两侧都调用
+`Tunnel.SetWriteBackpressure(false)`，免得一侧发送积压时也停止读它的对端。不关的话，边读边答的后端会等代理、
+代理又等后端，socket 一满就死锁；Windows 回环的缓冲很小，几百 KB 就会发生。
+
 `Context.Connect(header, handler)` 接受传统的 `CONNECT host:port`（RFC 9110 第 9.3.6 节）：
 HTTP/1.x 上先回 200，然后把整条连接交给 `TunnelHandler`；HTTP/2 和 HTTP/3 上只切换请求
 自己的 stream，受该 stream 的流控约束。目标地址在 `Request.Host`，如何连到目标由 handler

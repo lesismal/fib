@@ -335,6 +335,22 @@ func (t *Tunnel) HoldReads(hold bool) {
 	}
 }
 
+// SetWriteBackpressure says whether what is waiting to go through the
+// tunnel holds back what it takes in, as it does by default. A relay that
+// passes each of two tunnels on to the other, and paces them with HoldReads
+// and NotifySendable, turns it off on both, as fibhttp.ConnectProxy does:
+// left on, a side whose sends to its peer back up stops reading that peer,
+// and a peer that answers as it reads, waiting to send before it reads
+// more, then waits for it forever. Over HTTP/1.1, where the connection is
+// the tunnel's alone, it is Connection.SetWriteBackpressure; over HTTP/2
+// and HTTP/3 the stream's flow control paces the tunnel and the shared
+// connection is left as it is, so it does nothing there.
+func (t *Tunnel) SetWriteBackpressure(on bool) {
+	if c, ok := t.w.(*fib.Connection); ok && c == t.conn {
+		c.SetWriteBackpressure(on)
+	}
+}
+
 // Unsent reports how many bytes sent through the tunnel are still waiting
 // to go to the peer: queued for the connection's socket over HTTP/1.1, and
 // held back by the peer's flow control or the connection's over HTTP/2 and
