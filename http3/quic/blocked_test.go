@@ -3,7 +3,6 @@ package quic
 import (
 	"errors"
 	"testing"
-	"time"
 )
 
 // A sender held back by flow control says so with a BLOCKED frame for each
@@ -42,11 +41,46 @@ func TestBlockedFramesSent(t *testing.T) {
 			}
 		}
 		server := p.serverConn(t)
-		// A send round has to reach the third stream's limit before the
-		// frame goes; on the Windows runners under -race that can take
-		// longer than the usual five seconds when the package shares the
-		// machine with the rest of ./http3/....
-		waitForWithin(t, 30*time.Second, "DATA_BLOCKED", func() bool {
+		waitFor(t, "DATA_BLOCKED", func() bool {
+			server.mu.Lock()
+			defer server.mu.Unlock()
+			return server.dataBlockedAt == 6000
+		})
+	})
+	t.Run("connection spent before", func(t *testing.T) {
+		// One stream spends the connection's credit to the byte, and all of
+		// it is acknowledged, so nothing is left to send but what the next
+		// stream writes: the round that finds the limit for it has the
+		// frame to send and nothing else.
+		p := newTestPair(t, 0, func(_, server *Config) { server.ConnReceiveWindow = 6000 })
+		p.serverH.onData = hold
+		s, err := p.client.OpenStream()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := s.Write(make([]byte, 6000), true); err != nil {
+			t.Fatal(err)
+		}
+		server := p.serverConn(t)
+		idle := func(c *Conn) bool {
+			c.mu.Lock()
+			defer c.mu.Unlock()
+			return c.cc.bytesInFlight == 0 && !c.sending && len(c.sendQueue) == 0
+		}
+		waitFor(t, "credit spent and acknowledged", func() bool {
+			p.client.mu.Lock()
+			spent := p.client.sentData == 6000
+			p.client.mu.Unlock()
+			return spent && idle(p.client) && idle(server)
+		})
+		s, err = p.client.OpenStream()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := s.Write([]byte{1}, true); err != nil {
+			t.Fatal(err)
+		}
+		waitFor(t, "DATA_BLOCKED", func() bool {
 			server.mu.Lock()
 			defer server.mu.Unlock()
 			return server.dataBlockedAt == 6000

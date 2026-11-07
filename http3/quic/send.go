@@ -529,6 +529,13 @@ func (c *Conn) appendFrames(b []byte, space, max int, sp *sentPacket) []byte {
 	b = c.appendCrypto(b, space, max, sp)
 	if space == spaceApp {
 		b = c.appendStreams(b, max, sp)
+		// A stream finds the connection's limit as its frames are chosen,
+		// after the control frames: the DATA_BLOCKED goes in this packet,
+		// which may have nothing else in it, and would then not be sent,
+		// ending the round with the frame left for a round nothing starts.
+		if c.dataBlocked.pending {
+			b = c.appendBlocked(b, max, sp)
+		}
 	}
 	return b
 }
