@@ -290,6 +290,10 @@ func (c *Client) listen() error {
 	c.engine = engine
 	c.engineDone = make(chan error, 1)
 	go func() { c.engineDone <- engine.Run() }()
+	hcfg := fibhttp.DefaultClientConfig()
+	hcfg.Timeout = time.Minute
+	c.httpClient = fibhttp.NewClient(engine, hcfg)
+	c.trackers = &tracker.Client{HTTP: tracker.NewHTTPClient(c.httpClient)}
 
 	host, portStr, err := net.SplitHostPort(c.cfg.ListenAddr)
 	if err != nil {
@@ -350,10 +354,7 @@ func (c *Client) listen() error {
 	c.udpTracker = tracker.NewUDPClient(tracker.UDPClientConfig{
 		Send: func(to netip.AddrPort, b []byte) error { return c.utp.WriteTo(b, to) },
 	})
-	hcfg := fibhttp.DefaultClientConfig()
-	hcfg.Timeout = time.Minute
-	c.httpClient = fibhttp.NewClient(engine, hcfg)
-	c.trackers = &tracker.Client{HTTP: tracker.NewHTTPClient(c.httpClient), UDP: c.udpTracker}
+	c.trackers.UDP = c.udpTracker
 	if !c.cfg.DisableUTP {
 		go func() { _ = c.server.Serve(c.utp) }()
 	}
@@ -826,6 +827,7 @@ func (t *Torrent) tick(now time.Time, dt time.Duration) {
 		t.requestHashesLocked()
 	}
 	t.connectPeersLocked(now)
+	t.startWebSeedsLocked(now)
 	if now.Sub(t.lastChoke) >= 10*time.Second {
 		t.rechokeLocked(now)
 	}

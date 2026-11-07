@@ -185,6 +185,7 @@ type fileStorage struct {
 	mu     sync.Mutex
 	open   map[int]*openFile
 	clock  uint64
+	stale  []*os.File
 	closed bool
 }
 
@@ -195,6 +196,13 @@ func (s *fileStorage) file(i int, write bool) (*os.File, error) {
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.closed {
+		// Closed for good: what still reads or writes (a check, an
+		// upload) must not open files again, which on Windows would keep
+		// them from being deleted. A torrent started again opens a new
+		// storage.
+		return nil, errStorageClosed
+	}
 	s.clock++
 	if of, ok := s.open[i]; ok && (of.rw || !write) {
 		of.used = s.clock
@@ -222,8 +230,12 @@ func (s *fileStorage) file(i int, write bool) (*os.File, error) {
 		}
 		return nil, err
 	}
-	// A read-only handle this replaces may be in use by a reader: the
-	// collector closes it once it is not.
+	if old, ok := s.open[i]; ok {
+		// A read-only handle this replaces may be in use by a reader: it
+		// is closed with the storage (Windows will not delete an open
+		// file), or by the collector.
+		s.stale = append(s.stale, old.f)
+	}
 	s.open[i] = &openFile{f: f, rw: write, used: s.clock}
 	if len(s.open) > s.opts.MaxOpenFiles {
 		s.evictLocked(i)
@@ -278,9 +290,12 @@ func (s *fileStorage) WriteAt(file int, p []byte, off int64) (int, error) {
 	}
 }
 
+var errStorageClosed = errors.New("bittorrent: storage closed")
+
 func (s *fileStorage) Close() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	s.closed = true
 	var first error
 	for i, of := range s.open {
 		if err := of.f.Close(); err != nil && first == nil {
@@ -288,6 +303,10 @@ func (s *fileStorage) Close() error {
 		}
 		delete(s.open, i)
 	}
+	for _, f := range s.stale {
+		f.Close()
+	}
+	s.stale = nil
 	return first
 }
 

@@ -105,6 +105,7 @@ type Torrent struct {
 	layers     metainfo.PieceLayers
 	trackers   [][]string
 	webSeeds   []string
+	seeds      []*webSeed
 	nodes      []metainfo.Node
 	selection  []metainfo.IndexRange
 	opener     StorageOpener
