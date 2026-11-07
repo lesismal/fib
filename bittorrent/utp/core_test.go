@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"errors"
+	"fmt"
 	"io"
 	"math/rand/v2"
 	"net"
@@ -25,29 +26,38 @@ func randBytes(seed uint64, n int) []byte {
 	return b
 }
 
-// dialPair connects a to b and returns both ends.
+// dialPair connects a to b and returns both ends. An acceptor's
+// connection is accepted on its SYN: when the answers to a SYN are lost,
+// the dialer starts again under another ID, and the connection of the
+// first, accepted already, is not the dialed one; it is closed.
 func dialPair(t *testing.T, a, b *simNode) (*Conn, *Conn) {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
-	type res struct {
-		c   *Conn
-		err error
-	}
-	acc := make(chan res, 1)
-	go func() {
-		c, err := b.mux.AcceptUTP()
-		acc <- res{c, err}
-	}()
 	ca, err := a.mux.Dial(ctx, b.addr)
 	if err != nil {
 		t.Fatal(err)
 	}
-	r := <-acc
-	if r.err != nil {
-		t.Fatal(r.err)
+	for {
+		cb, err := b.mux.AcceptUTP()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if paired(ca, cb) {
+			return ca, cb
+		}
+		cb.Close()
 	}
-	return ca, r.c
+}
+
+// paired reports whether ca and cb are the two ends of one connection.
+func paired(ca, cb *Conn) bool {
+	ca.mu.Lock()
+	recv, send := ca.recvID, ca.sendID
+	ca.mu.Unlock()
+	cb.mu.Lock()
+	defer cb.mu.Unlock()
+	return cb.recvID == send && cb.sendID == recv
 }
 
 // exchange sends n bytes each way at once, half-closing after, and checks
@@ -131,14 +141,33 @@ func TestBulkBothDirections(t *testing.T) {
 func waitGone(t *testing.T, ms ...*Mux) {
 	t.Helper()
 	deadline := time.Now().Add(10 * time.Second)
-	for _, m := range ms {
+	for i, m := range ms {
 		for m.Len() > 0 {
 			if time.Now().After(deadline) {
-				t.Fatalf("%d connections left", m.Len())
+				t.Fatalf("%d connections left on Mux %d: %s", m.Len(), i, connStates(m))
 			}
 			time.Sleep(10 * time.Millisecond)
 		}
 	}
+}
+
+// connStates describes the connections of m, for a test that finds some
+// left.
+func connStates(m *Mux) string {
+	m.mu.Lock()
+	all := make([]*Conn, 0, len(m.conns))
+	for _, c := range m.conns {
+		all = append(all, c)
+	}
+	m.mu.Unlock()
+	s := ""
+	for _, c := range all {
+		c.mu.Lock()
+		s += fmt.Sprintf("[state %d closed %v finQueued %v finSent %v finAcked %v gotFin %v finReached %v lingering %v inflight %d retransmits %d err %v stats %+v] ",
+			c.state, c.closed, c.finQueued, c.finSent, c.finAcked, c.gotFin, c.finReached, c.lingering, c.inflightPkts, c.retransmits, c.err, c.stats)
+		c.mu.Unlock()
+	}
+	return s
 }
 
 func TestConcurrentConns(t *testing.T) {
@@ -408,6 +437,8 @@ func TestSynAnswersLost(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	// The half-open connection of the first ID was accepted first, and
+	// is reset; the dialed one comes after it.
 	orphan, err := b.mux.AcceptUTP()
 	if err != nil {
 		t.Fatal(err)
@@ -415,6 +446,9 @@ func TestSynAnswersLost(t *testing.T) {
 	cb, err := b.mux.AcceptUTP()
 	if err != nil {
 		t.Fatal(err)
+	}
+	if !paired(ca, cb) {
+		t.Fatal("the second connection accepted is not the dialed one")
 	}
 	_ = orphan.SetReadDeadline(time.Now().Add(5 * time.Second))
 	if _, err := orphan.Read(make([]byte, 1)); !errors.Is(err, ErrReset) {

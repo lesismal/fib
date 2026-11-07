@@ -152,6 +152,15 @@ type rstKey struct {
 const (
 	rstInfoTimeout = 10 * time.Second
 	rstInfoLimit   = 1000
+	// rstRepeat is how soon a packet sent again to a connection that is
+	// gone is answered with a RESET again. libutp answers it once in
+	// rst_info's 10 seconds, so that a lost RESET leaves the peer
+	// sending until it gives up on its own: a FIN that comes after the
+	// connection ended, its own FIN acknowledged, would keep the peer's
+	// connection for its whole dead-link timeout. A peer sends a packet
+	// again no sooner than its half-second retransmission timeout, so
+	// this answers each time, and a flood of copies only every 250ms.
+	rstRepeat = 250 * time.Millisecond
 )
 
 // Mux is uTP without a socket (sans-I/O): the connections of one UDP
@@ -349,8 +358,7 @@ func (m *Mux) accept(from netip.AddrPort, h header, now int64) {
 func (m *Mux) sendReset(to netip.AddrPort, h header, now int64) {
 	key := rstKey{to, h.connID, h.seq}
 	m.mu.Lock()
-	if at, ok := m.rsts[key]; ok && now-at < int64(rstInfoTimeout/time.Microsecond) {
-		m.rsts[key] = now
+	if at, ok := m.rsts[key]; ok && now-at < int64(rstRepeat/time.Microsecond) {
 		m.mu.Unlock()
 		return
 	}
@@ -480,6 +488,10 @@ func (m *Mux) freeID(to netip.AddrPort) uint16 {
 }
 
 // Accept waits for the next connection a peer starts, as net.Listener.
+// A connection is handed over on its SYN, as libutp hands it: one whose
+// initiator gave up on it, after the answers to its SYNs were lost, for a
+// SYN of another ID, reads ErrReset once the initiator's RESET arrives,
+// or ErrTimeout after the handshake timeout.
 func (m *Mux) Accept() (net.Conn, error) { return m.AcceptUTP() }
 
 // AcceptUTP is Accept returning the *Conn.
