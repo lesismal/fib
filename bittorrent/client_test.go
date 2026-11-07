@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"sync"
 	"testing"
 	"time"
 
@@ -61,6 +62,44 @@ func buildTorrent(t *testing.T, dir, name string, v metainfo.Version, pieceLengt
 
 type clientOpt func(*Config)
 
+// peerLog records the connections a client's events report: a seed that
+// is done drops the seeds it is connected to, so a look at Peers once a
+// download is done, or every few milliseconds during it, may well find
+// none.
+type peerLog struct {
+	mu    sync.Mutex
+	peers []PeerInfo
+}
+
+func (l *peerLog) option(c *Config) {
+	c.OnEvent = func(e Event) {
+		if e.Type == EventPeerConnected {
+			l.mu.Lock()
+			l.peers = append(l.peers, *e.PeerInfo)
+			l.mu.Unlock()
+		}
+	}
+}
+
+// wait returns the connections seen, waiting a little for the events,
+// which a goroutine of the client's delivers.
+func (l *peerLog) wait(t *testing.T) []PeerInfo {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		l.mu.Lock()
+		peers := append([]PeerInfo(nil), l.peers...)
+		l.mu.Unlock()
+		if len(peers) > 0 {
+			return peers
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("no connection reported")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
 func newTestClient(t *testing.T, dir string, opts ...clientOpt) *Client {
 	t.Helper()
 	cfg := Config{
@@ -85,11 +124,9 @@ func addrOf(c *Client) string {
 	return netip.AddrPortFrom(netip.MustParseAddr("127.0.0.1"), uint16(c.Port())).String()
 }
 
-// waitDone waits for tor's download, and returns the peers it had last
-// before the end, which seeds that are done drop.
-func waitDone(t *testing.T, tor *Torrent) []PeerInfo {
+// waitDone waits for tor's download.
+func waitDone(t *testing.T, tor *Torrent) {
 	t.Helper()
-	var last []PeerInfo
 	deadline := time.After(transferTimeout)
 	tk := time.NewTicker(10 * time.Millisecond)
 	defer tk.Stop()
@@ -102,11 +139,8 @@ func waitDone(t *testing.T, tor *Torrent) []PeerInfo {
 		}
 		select {
 		case <-tor.Done():
-			return last
+			return
 		case <-tk.C:
-			if p := tor.Peers(); len(p) > 0 {
-				last = p
-			}
 		case <-deadline:
 			t.Fatalf("download not done: %+v\n%s", tor.Stats(), tor.debugState())
 		}
@@ -155,17 +189,15 @@ func TestTransfer(t *testing.T) {
 				t.Fatal(err)
 			}
 			waitDone(t, st)
-			leecher := newTestClient(t, ldir, c.leecher...)
+			var log peerLog
+			leecher := newTestClient(t, ldir, append(c.leecher, log.option)...)
 			lt, err := leecher.AddTorrent(mi, &AddOptions{Peers: []string{addrOf(seeder)}})
 			if err != nil {
 				t.Fatal(err)
 			}
-			peers := waitDone(t, lt)
+			waitDone(t, lt)
 			checkFiles(t, ldir, files)
-			if len(peers) == 0 {
-				t.Fatal("no peer left connected")
-			}
-			for _, p := range peers {
+			for _, p := range log.wait(t) {
 				if c.enc == EncryptionRequire && !p.Encrypted {
 					t.Errorf("peer %v not encrypted", p.Addr)
 				}

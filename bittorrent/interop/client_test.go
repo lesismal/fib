@@ -240,6 +240,9 @@ func checkPeers(t *testing.T, peers []bittorrent.PeerInfo, c clientCase) {
 func TestClientFibDownloadsFromAnacrolix(t *testing.T) {
 	for _, c := range clientCases() {
 		t.Run(c.name, func(t *testing.T) {
+			if c.utp && !haveLibutp {
+				t.Skip("anacrolix's uTP is go-libutp only with cgo")
+			}
 			sdir := t.TempDir()
 			files := clientFiles(t, sdir, "content")
 			mi := clientTorrent(t, sdir, "content", c.version)
@@ -280,6 +283,9 @@ func TestClientFibDownloadsFromAnacrolix(t *testing.T) {
 func TestClientAnacrolixDownloadsFromFib(t *testing.T) {
 	for _, c := range clientCases() {
 		t.Run(c.name, func(t *testing.T) {
+			if c.utp && !haveLibutp {
+				t.Skip("anacrolix's uTP is go-libutp only with cgo")
+			}
 			sdir := t.TempDir()
 			files := clientFiles(t, sdir, "content")
 			mi := clientTorrent(t, sdir, "content", c.version)

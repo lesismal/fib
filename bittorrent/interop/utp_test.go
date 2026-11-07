@@ -1,3 +1,5 @@
+//go:build cgo
+
 // Package interop checks fib's BitTorrent packages against other
 // implementations. utp_test.go checks bittorrent/utp against libutp, the
 // reference uTP of BitTorrent Inc. that libtorrent's predecessors,
