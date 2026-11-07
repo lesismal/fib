@@ -4,10 +4,10 @@
 
 The [`bittorrent`](../bittorrent) packages are the BitTorrent protocols on fib: bencoding, .torrent
 files and magnet links (v1, v2 and hybrid), trackers over HTTP and UDP in both roles, the peer wire
-protocol with its extensions and Message Stream Encryption, uTP and the mainline DHT. Each is wire
-compatible with the clients in use (libtorrent, Transmission, anacrolix/torrent), which
-[`bittorrent/interop`](../bittorrent/interop) checks against anacrolix/torrent, anacrolix/dht,
-libutp and opentracker. Like the rest of fib they depend on nothing but the standard library: SHA-1,
+protocol with its extensions and Message Stream Encryption, uTP and the mainline DHT, and a client
+that downloads and seeds with all of them. Each is wire compatible with the clients in use
+(libtorrent, Transmission, anacrolix/torrent), which [`bittorrent/interop`](../bittorrent/interop)
+checks against libtorrent-rasterbar, anacrolix/torrent, anacrolix/dht, libutp and opentracker. Like the rest of fib they depend on nothing but the standard library: SHA-1,
 SHA-256, RC4 and ed25519 come from it, and the 768-bit Diffie-Hellman of MSE is `math/big`.
 
 ## Packages
@@ -21,7 +21,7 @@ SHA-256, RC4 and ed25519 come from it, and the 768-bit Diffie-Hellman of MSE is 
 | [`peer/mse`](../bittorrent/peer/mse) | Message Stream Encryption (MSE/PE) without I/O, and over a `net.Conn` | — |
 | [`utp`](../bittorrent/utp) | uTP (BEP 29) with LEDBAT: `Mux` without a socket, `Socket` on a fib UDP binding | fib UDP |
 | [`dht`](../bittorrent/dht) | A mainline DHT `Node` without a socket, or on a binding of its own | fib UDP |
-| `bittorrent` | The client | see [Client](#client-package-bittorrent) |
+| [`bittorrent`](../bittorrent) | The client: `Client`, `Torrent`, `File`, a streaming `Reader`, file or memory `Storage` ([details](#client-package-bittorrent)) | all of the above, on an engine of its own |
 | [`interop`](../bittorrent/interop) | A module of its own with the interop tests, never a dependency of fib | — |
 
 ## One port for TCP and UDP
@@ -227,16 +227,71 @@ n, err := node.Announce(ctx, infoHash, 0, true, func(peers []netip.AddrPort) {
 
 ## Client (package bittorrent)
 
-<!-- CLIENT SECTION: to be filled -->
+A `Client` is one fib engine and one port: TCP for the peer wire protocol (a `peer.Server`), and
+UDP shared by a `utp.Socket`, a `dht.Node` and a `tracker.UDPClient`, as in
+[One port for TCP and UDP](#one-port-for-tcp-and-udp). Its `Config` zero value is a working client:
+it stores in the working directory, listens on `:6881` (`DefaultListenAddr`; a zero port picks one
+free for both TCP and UDP), and speaks TCP, uTP, MSE, the DHT, PEX, local service discovery and
+trackers, each of which a `Disable*` field turns off.
+
+```go
+c, err := bittorrent.NewClient(bittorrent.Config{DataDir: "downloads"})
+defer c.Close()
+t, err := c.AddMagnet("magnet:?xt=urn:btih:...", nil) // or AddTorrent, AddTorrentFile
+<-t.GotInfo()                                         // the info dictionary, from peers
+r := t.Files()[0].NewReader()                         // io.ReadSeekCloser: streams as it downloads
+defer r.Close()
+_, err = io.Copy(w, r)
+<-t.Done()
+```
+
+- **Torrents** come from .torrent files (v1, v2, hybrid) or magnet links (ut_metadata; `so=` selects
+  files). `AddOptions` start one paused, in sequential order, with file priorities, extra peers and
+  trackers, or on a storage of its own. A `Torrent` has `GotInfo`, `Done` and `Removed` channels,
+  `State` and `Err`, `Start`, `Pause`, `Stop` and `Remove(deleteData)`, `SetSequential`,
+  `SetFilePriority` (`PriorityNone`, `Low`, `Normal`, `High`), `AddPeers`, `Files`, `Stats`, `Peers`
+  and `NewReader`. `Config.OnEvent` hears metadata, checked, piece verified, hash failed, completed,
+  peer connected, disconnected and banned, seed limit, state changes and errors, in order.
+- **Storage** is a `Storage` (`ReadAt` and `WriteAt` by file index, `Close`): files below
+  `DataDir` (`NewFileStorage`, paths made safe for the operating system by `SanitizePath`, BEP 47
+  padding never written) or memory (`NewMemoryStorage`). What storage holds when a torrent is added
+  is hash-checked, so an interrupted download resumes.
+- **Picking**: rarest first with random ties, the first 4 pieces at random; file priorities,
+  sequential mode and the windows of open `Reader`s (the nearest piece most urgent; readahead 4 MiB
+  by default, `SetReadahead`) come first. 16 KiB blocks are pipelined to each peer's `reqq`; in
+  endgame a block goes to a second peer and the slower request is cancelled. A peer that sends
+  nothing for 60 s is snubbed and its requests go to others.
+- **Verification**: SHA-1 for v1, the merkle tree for v2. A v2-only magnet's torrent fetches its
+  piece layers with BEP 52 hash requests, and the client answers peers' hash requests from the
+  layers it has (and computes them after a hybrid magnet download). A peer that sent a whole piece
+  that failed is banned; when several sent it, their blocks are compared with the good piece once
+  it passes and those that sent bad ones are banned.
+- **Choking**: four upload slots (`UploadSlots`) for the peers it downloads most from (that take
+  most, when seeding), plus an optimistic unchoke that moves every 30 s and favours new peers
+  threefold. Fast extension: have all and have none, 10 pieces allowed fast, a choked peer's
+  requests rejected. Uploads pace to the socket (`Congested`, `OnWritable`) and to `UploadRate`.
+- **Connections** dial uTP first, then TCP; MSE first and plaintext after a refusal
+  (`EncryptionPrefer`, the default), the reverse with `EncryptionAllow`, never plaintext with
+  `EncryptionRequire`; bounded by `MaxConns` (200), `MaxConnsPerTorrent` (50), `MaxHalfOpen` (32)
+  and `DialsPerTick` (8), with backoff. Of two connections to one peer, the one the lower peer ID
+  began is kept.
+- **Peers** come from trackers (tiered, started, completed and stopped, under both hashes of a
+  hybrid), the DHT (announce every 15 minutes, every minute while there are none; `PORT` both
+  ways), PEX (a message a minute per peer), local service discovery (BEP 14, IPv4), a magnet's
+  `x.pe`, `AddPeers` and `Config.PeerSources`; a private torrent uses its trackers alone. Web seeds
+  (BEP 19) serve whole pieces through range requests on the fib/http client.
+- **Seeding** pauses a torrent at `SeedRatio` or `SeedTime`; `Ban` bans an address from every torrent.
 
 ## Interop
 
 [`bittorrent/interop`](../bittorrent/interop) is a module of its own (`replace
 github.com/lesismal/fib => ../..`), so that anacrolix/torrent v1.61.0, anacrolix/dht v2.23.0 and
 go-libutp v1.5.1 are never fib's dependencies. go-libutp wraps libutp through cgo, so the module
-needs cgo and a C++ compiler; it runs on Linux and macOS, not Windows. It runs in CI as the
-`bittorrent-interop` job, and the network parsers of every package are fuzzed in the
-`fuzz-bittorrent` job.
+needs cgo and a C++ compiler; it runs on Linux and macOS, not Windows. libtorrent-rasterbar 2.0.11
+is driven through its Python binding (`python3-libtorrent`, `libtorrent_peer.py`), so its test
+runs only with `FIB_LIBTORRENT=1`: `libtorrent.sh` runs it in a container, and the CI job installs
+the package and sets the variable. It all runs in CI as the `bittorrent-interop` job, and the
+network parsers of every package are fuzzed in the `fuzz-bittorrent` job.
 
 | Package | What is checked |
 | --- | --- |
@@ -244,6 +299,8 @@ needs cgo and a C++ compiler; it runs on Linux and macOS, not Windows. It runs i
 | tracker | anacrolix's tracker client announces to and scrapes fib's HTTP and UDP servers on 127.0.0.1 and ::1, with a passkey through BEP 41; fib's clients announce to anacrolix's HTTP and UDP tracker servers; by hand, fib's clients announce to and scrape opentracker (Debian's package, in docker) over HTTP and UDP |
 | peer, mse | over TCP, fib fetches the metadata and every piece, verified, from an anacrolix seeder: plaintext, MSE offering plaintext, and MSE with RC4 required; anacrolix, given only the info hash, downloads 3 MB from a fib seeder with default settings, RC4 forced, RC4 required on both sides and plaintext forced; fib's `mse` against anacrolix's `mse` package in both roles, the SKEY one of 100 |
 | utp | fib against libutp (go-libutp) in both roles: 4 MB each way, checksummed; write, close and read to EOF; through a relay that drops 1 datagram in 20 and holds back 1 in 7, 1 MB each way |
+| client, anacrolix | fib's client downloads from anacrolix's and anacrolix's from fib's, each over TCP and over uTP (go-libutp) separately, from a .torrent and from a btih magnet, with RC4 required, and hybrid torrents; fib's client finds an anacrolix seeder through a fib `tracker.Server`. anacrolix cannot add v2-only torrents, so libtorrent covers those |
+| client, libtorrent | 22 of 22: each downloads from the other v1, hybrid and v2-only torrents, from .torrent files and magnets (btih; btmh for v2, whose piece layers come by BEP 52 hash requests both ways), over TCP and over uTP, with RC4 required |
 | dht | 6 fib and 6 anacrolix nodes on loopback: they bootstrap from each other and hold each other in their tables, ping both ways, find_node converges, announce and get_peers both ways (explicit and implied port), anacrolix asks fib for sample_infohashes, BEP 44 immutable and mutable items both ways, and the two compute the same BEP 42 IDs for 200 addresses; by hand, fib bootstraps from the public DHT (13 s) and finds 240 peers of an Ubuntu image in 2.6 s |
 
 ```sh
@@ -254,6 +311,9 @@ go test -race -count=1 -run Tracker .                                        # t
 go test -race -count=1 -run TestPeer .                                       # peer, mse
 CGO_ENABLED=1 go test -count=1 -timeout 300s -run TestUTP -v .               # utp, 35-65 s
 go test -race -count=1 -run DHT .                                            # dht
+go test -race -count=1 -run TestClient .                                     # client against anacrolix
+./libtorrent.sh                                                              # client against libtorrent, needs docker
+FIB_LIBTORRENT=1 CGO_ENABLED=1 go test -count=1 -run TestClientLibtorrent .  # the same with python3-libtorrent installed
 ./opentracker.sh                                                             # opentracker, needs docker
 FIB_DHT_PUBLIC=1 FIB_DHT_INFOHASH=<40 hex> go test -run TestDHTPublic -v .   # public DHT, needs internet
 ```
@@ -275,26 +335,30 @@ FIB_DHT_PUBLIC=1 FIB_DHT_INFOHASH=<40 hex> go test -run TestDHTPublic -v .   # p
 
 | BEP | Title | Status | Package |
 | --- | --- | --- | --- |
-| 3 | The BitTorrent Protocol Specification | full | `bencode`, `metainfo`, `tracker`, `peer` |
-| 5 | DHT Protocol | full (torrent `nodes` key, `port` message and reserved bit included) | `dht`, `metainfo`, `peer` |
+| 3 | The BitTorrent Protocol Specification | full | `bencode`, `metainfo`, `tracker`, `peer`, `bittorrent` |
+| 5 | DHT Protocol | full (torrent `nodes` key, `port` message and reserved bit included); the client does not yet persist its node state | `dht`, `metainfo`, `peer`, `bittorrent` |
 | 6 | Fast Extension | full (checked against the BEP's test vectors) | `peer` |
-| 7 | IPv6 Tracker Extension | full | `tracker` |
+| 7 | IPv6 Tracker Extension | full | `tracker`, `bittorrent` |
 | 9 | Extension for Peers to Send Metadata Files | full (ut_metadata, magnet links) | `peer`, `metainfo` |
 | 10 | Extension Protocol | full | `peer` |
 | 11 | Peer Exchange (PEX) | full | `peer` |
-| 12 | Multitracker Metadata Extension | full | `metainfo`, `tracker` |
-| 15 | UDP Tracker Protocol | full, client and server | `tracker` |
-| 19 | WebSeed (GetRight style) | partial: `url-list` in torrents and `ws` in magnets | `metainfo` |
-| 21 | Extension for Partial Seeds | partial: `EventPaused`, `upload_only`; no special handling in the server | `tracker`, `peer` |
+| 12 | Multitracker Metadata Extension | full | `metainfo`, `tracker`, `bittorrent` |
+| 14 | Local Service Discovery | partial: IPv4 only | `bittorrent` |
+| 15 | UDP Tracker Protocol | full, client and server | `tracker`, `bittorrent` |
+| 16 | Superseeding | not done | — |
+| 19 | WebSeed (GetRight style) | full: `url-list` and `ws` read, whole pieces fetched by range requests | `metainfo`, `bittorrent` |
+| 21 | Extension for Partial Seeds | full in the client (`upload_only` sent once nothing wanted is missing, and heeded from peers; `EventPaused` in the tracker client); the tracker server gives paused peers no special handling | `tracker`, `peer`, `bittorrent` |
 | 23 | Tracker Returns Compact Peer Lists | full | `tracker` |
 | 24 | Tracker Returns External IP | full | `tracker` |
-| 27 | Private Torrents | partial: the `private` flag, and the server's allow-list and authorization hooks | `metainfo`, `tracker` |
-| 29 | uTorrent transport protocol | full, without path MTU discovery and the clock-drift penalty | `utp` |
+| 27 | Private Torrents | full: the `private` flag, trackers alone in the client, and the server's allow-list and authorization hooks | `metainfo`, `tracker`, `bittorrent` |
+| 29 | uTorrent transport protocol | full, without path MTU discovery and the clock-drift penalty | `utp`, `bittorrent` |
+| 30 | Merkle Hash Torrent Extension | not done (superseded by BEP 52) | — |
 | 31 | Failure Retry Extension | not done | — |
-| 32 | IPv6 extension for DHT | partial: one `Node` per address family, `want` for the other family ignored | `dht` |
+| 32 | IPv6 extension for DHT | partial: one `Node` per address family, `want` for the other family ignored; the client's IPv6 node is optional (`DHTIPv6`) | `dht`, `bittorrent` |
 | 33 | DHT Scrape | not done | — |
 | 35 | Torrent Signing | not done | — |
 | 38 | Finding Local Data Via Torrent File Hints | not done | — |
+| 40 | Canonical Peer Priority | not done | — |
 | 41 | UDP Tracker Protocol Extensions | full | `tracker` |
 | 42 | DHT Security Extension | full | `dht` |
 | 43 | Read-only DHT Nodes | full | `dht` |
@@ -302,11 +366,10 @@ FIB_DHT_PUBLIC=1 FIB_DHT_INFOHASH=<40 hex> go test -run TestDHTPublic -v .   # p
 | 47 | Padding Files and Extended File Attributes | full | `metainfo` |
 | 48 | Tracker Protocol Extension: Scrape | full, without full scrape | `tracker` |
 | 51 | DHT Infohash Indexing | full | `dht` |
-| 52 | The BitTorrent Protocol Specification v2 | full in `metainfo`; partial in `peer`: handshake upgrade and the hash messages' codec, not answering hash requests from piece layers nor verifying the proofs (pending client) | `metainfo`, `peer` |
-| 53 | Magnet URI Extension: Select Specific File Indices | partial: `so` parsed and formatted, applied by the client | `metainfo` |
-| — | Message Stream Encryption (MSE/PE) | full | `peer/mse`, `peer` |
-
-<!-- CLIENT SECTION: to be filled -->
+| 52 | The BitTorrent Protocol Specification v2 | full: torrents, handshake upgrade, hash requests asked and answered from piece layers; proofs served with `proof_layers` > 0 are not interop-tested | `metainfo`, `peer`, `bittorrent` |
+| 53 | Magnet URI Extension: Select Specific File Indices | full | `metainfo`, `bittorrent` |
+| 55 | Holepunch Extension (ut_holepunch) | not done | — |
+| — | Message Stream Encryption (MSE/PE) | full | `peer/mse`, `peer`, `bittorrent` |
 
 ## Decisions pending review
 
@@ -441,4 +504,30 @@ alternative.
 
 ### Client (package bittorrent)
 
-<!-- CLIENT SECTION: to be filled -->
+- **`ListenAddr` defaults to `:6881`**; with port 0 the client takes the port TCP got and tries
+  again if UDP's is taken. Alternative: `:0` by default.
+- **`Encryption`'s zero value is `EncryptionPrefer`** (MSE first, as libtorrent and anacrolix), and
+  there is no mode that disables MSE altogether.
+- **Local service discovery is IPv4 only**, on the standard library's `net.ListenMulticastUDP`,
+  since fib has no multicast bindings; it turns itself off silently if joining the group fails.
+- **Bans** are by IP (a loopback peer by its listen address) and last for the client's lifetime.
+- **Blocks are written straight to storage** and read back to verify the piece; there are no
+  pieces in memory, and smart-ban hashes come from that read-back.
+- **Padding bytes are never requested** (anacrolix refuses requests inside padding).
+- **v2-only torrents serve the whole last 16 KiB block** of a file, zeros past its end, because
+  libtorrent requests whole blocks.
+- **BEP 52 hash requests** ask for up to 512 hashes with `proof_layers` 0, as anacrolix does, and
+  the assembled layer is checked against the file's root. Answers carry uncles for
+  max(0, `proof_layers` − log2(length)) levels, a reading of libtorrent's semantics that only the
+  0-proof path has interop-tested; only the piece layer is served.
+- **Hybrids are dialed with the v1 hash** (and the v2 bit) unless the peer came from a v2
+  announce; hybrids announce both hashes to trackers, the DHT and LSD.
+- **Seeding unchokes by upload rate** (libtorrent's fastest_upload) rather than round robin; a
+  full seed drops seeds and upload-only peers; peer candidates are retried after 2 s << failures
+  and dropped after 6 failures unless added by hand.
+- **A `Reader` that raises pieces of an unselected file** reopens `Done()` until they arrive.
+- **No fast-resume file**: every add hash-checks what storage holds. `Preallocate` truncates
+  files to length (sparse) rather than `fallocate`.
+- **Web seeds**: 4 pieces in flight per seed, a seed dropped after 5 failures, whole pieces only.
+- **Events** are delivered in order on one dispatcher goroutine that never blocks the client;
+  connect and disconnect carry a `PeerInfo` snapshot.

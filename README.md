@@ -52,7 +52,7 @@ uSockets, workflow, axum, h2, quiche and rustls.
 | gRPC | ✓ h2 and h2c | ✓ | unary and streaming both ways, metadata, deadlines, interceptors, gzip; works with protoc-gen-go-grpc code and talks to grpc-go |
 | WebRTC | ✓ | ✓ | PeerConnections sharing one UDP port: ICE (lite and full, trickle), DTLS 1.2-SRTP, data channels, RTP forwarding for SFUs, and a TURN client and server over UDP, TCP and TLS (quotas, events and stats, hot reload, drain), all written from scratch; talks to browsers and pion ([details](docs/webrtc.md)) |
 | Streaming media | ✓ | ✓ | RTMP/RTMPS (Enhanced RTMP), RTSP over TCP and UDP, SRT, HTTP-FLV and WebSocket-FLV, HLS with fMP4 or TS segments and LL-HLS, WHIP and WHEP, joined by a hub that remuxes between them without transcoding; pull and push relays for each; checked against ffmpeg and Chromium ([details](docs/media.md)) |
-| BitTorrent | ✓ | ✓ | bencode, .torrent files and magnet links (v1, v2 and hybrid), HTTP and UDP trackers in both roles, the peer wire protocol with the Fast and extension protocols, ut_metadata, ut_pex and MSE encryption, uTP with LEDBAT, and the mainline DHT with BEP 42/44/51; uTP, the DHT and the UDP tracker client share one UDP port; checked against anacrolix/torrent, anacrolix/dht, libutp and opentracker ([details](docs/bittorrent.md)) |
+| BitTorrent | ✓ | ✓ | bencode, .torrent files and magnet links (v1, v2 and hybrid), HTTP and UDP trackers in both roles, the peer wire protocol with the Fast and extension protocols, ut_metadata, ut_pex and MSE encryption, uTP with LEDBAT, and the mainline DHT with BEP 42/44/51; uTP, the DHT and the UDP tracker client share one UDP port; a client that downloads and seeds v1, v2 and hybrid torrents, streams files as they download, and finds peers through trackers, the DHT, PEX, local discovery and web seeds; checked against libtorrent, anacrolix/torrent, anacrolix/dht, libutp and opentracker ([details](docs/bittorrent.md)) |
 
 ### Engine
 
@@ -370,11 +370,21 @@ sock.OnOther(func(from netip.AddrPort, b []byte) {
 err = node.Bootstrap(ctx)
 err = node.GetPeers(ctx, mi.Info.InfoHashV1(), func(addrs []netip.AddrPort) { /* dial them */ })
 
-// client example: to be filled
+// The client, with an engine and a port of its own.
+c, err := bittorrent.NewClient(bittorrent.Config{DataDir: "downloads", ListenAddr: ":6882"})
+defer c.Close()
+t, err := c.AddMagnet("magnet:?xt=urn:btih:...", nil)
+<-t.GotInfo()                 // the info dictionary, fetched from peers
+r := t.Files()[0].NewReader() // an io.ReadSeekCloser that streams the file as it downloads
+defer r.Close()
+_, err = io.Copy(w, r)
+<-t.Done()
 ```
 
-The pieces are separate packages under `bittorrent/`: `bencode`, `metainfo`, `tracker`, `peer` (with
-`peer/mse`), `utp` and `dht`, each usable alone; `utp.Mux` and `dht.Node` own no socket.
+The client, package `bittorrent`, downloads and seeds v1, v2 and hybrid torrents over TCP and uTP
+with MSE, finding peers through trackers, the DHT, PEX and local service discovery. The pieces it is
+built from are packages under `bittorrent/`, each usable alone: `bencode`, `metainfo`, `tracker`,
+`peer` (with `peer/mse`), `utp` and `dht`; `utp.Mux` and `dht.Node` own no socket.
 
 ### Raw TCP
 
@@ -568,7 +578,7 @@ two, and connections are spread over them by fd. A poller parks in Go's own netp
 | WebRTC | reads UDP, sorts datagrams by peer | the Mux routes by sender; ICE, DTLS, SRTP and SCTP under a mutex per PeerConnection, then its callbacks | — (one timer per PeerConnection) |
 | Streaming media | reads UDP for SRT, RTSP and WHIP/WHEP | ingest parsing, then the hub's fan-out: every subscriber muxes and queues its writes on the publisher's worker | — (one timer per SRT session) |
 | KCP | reads UDP, sorts datagrams by peer | decryption, FEC, KCP and `OnMessage` under a mutex per session, then one batch of datagrams out | — (one timer per session while data is in flight) |
-| BitTorrent | reads UDP for uTP, the DHT and UDP trackers, sorts datagrams by peer | peer wire parsing and `peer.Handler` callbacks, one write per callback; uTP under the `Mux`'s mutex, then one batch of datagrams out; DHT and UDP tracker messages | — (one timer per uTP connection, peer connection and DHT query in flight; a peer over a `net.Conn`, such as uTP's, has a reader and a writer goroutine) |
+| BitTorrent | reads UDP for uTP, the DHT and UDP trackers, sorts datagrams by peer | peer wire parsing and `peer.Handler` callbacks, one write per callback; uTP under the `Mux`'s mutex, then one batch of datagrams out; DHT and UDP tracker messages | — (one timer per uTP connection, peer connection and DHT query in flight; a peer over a `net.Conn`, such as uTP's, has a reader and a writer goroutine; the client adds a tick goroutine for every torrent's upkeep, an event dispatcher, and goroutines for dials in flight, peer sources and hash checks) |
 | arpc | — | framing, responses, handlers registered sync | `<Name>-streams` (async handlers, the default) |
 | gRPC | — | HTTP/2 framing, HPACK, flow control | `<Name>-streams` (every call) |
 
@@ -828,7 +838,7 @@ Run it yourself with `cd taskpool/benchmark && ./bench.sh` (or `bench.ps1` on Wi
 | [`webrtc`](webrtc) | WebRTC PeerConnection and a UDP Mux shared by many; `stun`, `ice`, `turn` (and `turnserver`), `sdp`, `sctp`, `srtp` and `rtp` underneath, DTLS 1.2 in `tls` |
 | [`media`](media) | Live streaming: `rtmp`, `rtsp`, `srt`, `httpflv`, `hls` and `rtc` (WHIP/WHEP) on the `hub`; `av`, `flv`, `amf`, `mpegts`, `fmp4`, `mp4`, `rtpcodec` and `codec/{h264,h265,aac,opus}` underneath |
 | [`kcp`](kcp) | KCP server, client and sans-I/O protocol, compatible with kcp-go's crypts and FEC |
-| [`bittorrent`](bittorrent) | BitTorrent: `bencode`, `metainfo`, `tracker`, `peer` and `peer/mse`, `utp` and `dht` |
+| [`bittorrent`](bittorrent) | BitTorrent client; `bencode`, `metainfo`, `tracker`, `peer` and `peer/mse`, `utp` and `dht` underneath |
 | [`middleware`](middleware) | Middleware chain and the common middleware |
 | [`socks`](socks) | SOCKS5, SOCKS4 and SOCKS4a proxy server and non-blocking dialer; `http.ConnectProxy` is the HTTP proxy |
 | [`mux`](mux) | Several protocols on one port, told apart by the first bytes a client sends |
@@ -852,8 +862,8 @@ Run it yourself with `cd taskpool/benchmark && ./bench.sh` (or `bench.ps1` on Wi
   codecs each carries, a server for every protocol, relays, the limits, and the interop with ffmpeg and Chromium
 - [KCP](docs/kcp.md): the layers, flushing when something is due, the mapping from kcp-go and kcptun,
   the server's session rules, and the interop with kcp-go
-- [BitTorrent](docs/bittorrent.md): the packages, one port for TCP and UDP, each protocol, the BEPs
-  covered, and the interop with anacrolix/torrent, anacrolix/dht, libutp and opentracker
+- [BitTorrent](docs/bittorrent.md): the packages, one port for TCP and UDP, each protocol, the client,
+  the BEPs covered, and the interop with libtorrent, anacrolix/torrent, anacrolix/dht, libutp and opentracker
 - [Roadmap](docs/roadmap.md): what is planned but not done, and what is deliberately not done, with the reason, the rough cost and when to reconsider each
 - [Load testing](docs/loadtest.md): the `benchmark/loadtest` campaign, its results and the
   memory cost of whole responses to slow readers

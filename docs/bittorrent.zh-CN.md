@@ -4,9 +4,9 @@
 
 [`bittorrent`](../bittorrent) 下的各个包在 fib 上实现了 BitTorrent 的协议：bencode 编码、.torrent 文件与磁力链接
 （v1、v2 与 hybrid）、HTTP 与 UDP 的 tracker（客户端与服务端）、带扩展和 Message Stream Encryption 的 peer
-wire 协议、uTP 以及主线 DHT。它们都与现有客户端（libtorrent、Transmission、anacrolix/torrent）线上兼容，
-[`bittorrent/interop`](../bittorrent/interop) 用 anacrolix/torrent、anacrolix/dht、libutp 和 opentracker
-做了互通验证。和 fib 其余部分一样，它们只依赖标准库：SHA-1、SHA-256、RC4、ed25519 都来自标准库，MSE 的
+wire 协议、uTP 以及主线 DHT，还有一个用上述全部协议下载和做种的客户端。它们都与现有客户端（libtorrent、
+Transmission、anacrolix/torrent）线上兼容，[`bittorrent/interop`](../bittorrent/interop) 用
+libtorrent-rasterbar、anacrolix/torrent、anacrolix/dht、libutp 和 opentracker 做了互通验证。和 fib 其余部分一样，它们只依赖标准库：SHA-1、SHA-256、RC4、ed25519 都来自标准库，MSE 的
 768 位 Diffie-Hellman 用 `math/big` 实现。
 
 ## 包
@@ -20,7 +20,7 @@ wire 协议、uTP 以及主线 DHT。它们都与现有客户端（libtorrent、
 | [`peer/mse`](../bittorrent/peer/mse) | Message Stream Encryption（MSE/PE），不带 I/O 的握手，以及 `net.Conn` 上的封装 | — |
 | [`utp`](../bittorrent/utp) | 带 LEDBAT 的 uTP（BEP 29）：不带 socket 的 `Mux`，以及跑在 fib UDP binding 上的 `Socket` | fib UDP |
 | [`dht`](../bittorrent/dht) | 不带 socket 的主线 DHT `Node`，也可跑在自有 binding 上 | fib UDP |
-| `bittorrent` | 客户端 | 见[客户端](#客户端bittorrent-包) |
+| [`bittorrent`](../bittorrent) | 客户端：`Client`、`Torrent`、`File`、流式 `Reader`、文件或内存 `Storage`（[详见](#客户端bittorrent-包)） | 以上全部，跑在自己的 engine 上 |
 | [`interop`](../bittorrent/interop) | 独立模块，放互通测试，永远不会成为 fib 的依赖 | — |
 
 ## TCP 与 UDP 共用一个端口
@@ -196,13 +196,57 @@ n, err := node.Announce(ctx, infoHash, 0, true, func(peers []netip.AddrPort) {
 
 ## 客户端（bittorrent 包）
 
-<!-- CLIENT SECTION: to be filled -->
+一个 `Client` 就是一个 fib engine 加一个端口：TCP 跑 peer wire 协议（一个 `peer.Server`），UDP 由
+`utp.Socket`、`dht.Node` 和 `tracker.UDPClient` 共用，见 [TCP 与 UDP 共用一个端口](#tcp-与-udp-共用一个端口)。
+`Config` 的零值就是能用的客户端：存到当前工作目录，监听 `:6881`（`DefaultListenAddr`；端口为 0 时挑一个 TCP 与 UDP
+都空闲的），支持 TCP、uTP、MSE、DHT、PEX、本地服务发现和 tracker，各项都可用对应的 `Disable*` 字段关闭。
+
+```go
+c, err := bittorrent.NewClient(bittorrent.Config{DataDir: "downloads"})
+defer c.Close()
+t, err := c.AddMagnet("magnet:?xt=urn:btih:...", nil) // 或 AddTorrent、AddTorrentFile
+<-t.GotInfo()                                         // 从 peer 取到 info 字典
+r := t.Files()[0].NewReader()                         // io.ReadSeekCloser：边下载边读
+defer r.Close()
+_, err = io.Copy(w, r)
+<-t.Done()
+```
+
+- **torrent** 来自 .torrent 文件（v1、v2、hybrid）或磁力链接（ut_metadata；`so=` 选择文件）。`AddOptions`
+  可让它以暂停状态、顺序下载、带文件优先级、额外的 peer 和 tracker 或自己的存储加入。`Torrent` 有 `GotInfo`、
+  `Done`、`Removed` 三个 channel，`State` 与 `Err`，`Start`、`Pause`、`Stop`、`Remove(deleteData)`，
+  `SetSequential`，`SetFilePriority`（`PriorityNone`、`Low`、`Normal`、`High`），`AddPeers`、`Files`、`Stats`、
+  `Peers` 和 `NewReader`。`Config.OnEvent` 按顺序收到 metadata、校验完成、分片校验通过、哈希失败、下载完成、
+  peer 连上、断开、被封禁、达到做种上限、状态变化和错误等事件。
+- **存储**是一个 `Storage`（按文件序号的 `ReadAt`、`WriteAt`，以及 `Close`）：`DataDir` 下的文件
+  （`NewFileStorage`，路径经 `SanitizePath` 按操作系统处理安全，BEP 47 的填充从不写入），或内存
+  （`NewMemoryStorage`）。加入 torrent 时会对存储里已有的数据做哈希校验，中断的下载因此可以续传。
+- **选片**：最稀有优先，相同时随机，头 4 个分片随机挑；文件优先级、顺序模式和打开着的 `Reader` 的窗口
+  （最近的分片最急；默认预读 4 MiB，可用 `SetReadahead` 调整）优先。16 KiB 的块按每个 peer 的 `reqq` 流水请求；
+  endgame 时一个块同时向第二个 peer 请求，较慢的那个被取消。60 秒没发任何东西的 peer 被判为 snub，
+  它的请求转给别人。
+- **校验**：v1 用 SHA-1，v2 用 merkle 树。纯 v2 磁力链接的 torrent 用 BEP 52 的 hash request 取 piece layer，
+  客户端也用手里的 layer 应答 peer 的 hash request（hybrid 磁力链接下载完后自行算出 layer）。整个分片都由一个
+  peer 发来却校验失败，该 peer 被封禁；由多个 peer 拼成时，等分片校验通过后逐块比对，发了坏块的被封禁。
+- **choke**：四个上传名额（`UploadSlots`）给下载速度最快的 peer（做种时给拿得最多的），另有每 30 秒轮换一次的
+  optimistic unchoke，新 peer 的机会是三倍。Fast 扩展：have all 与 have none，10 个 allowed fast 分片，
+  被 choke 的 peer 的请求回 reject。上传节奏受 socket（`Congested`、`OnWritable`）和 `UploadRate` 控制。
+- **连接**先拨 uTP 再拨 TCP；先 MSE、被拒后再明文（默认的 `EncryptionPrefer`），`EncryptionAllow` 反过来，
+  `EncryptionRequire` 绝不用明文；受 `MaxConns`（200）、`MaxConnsPerTorrent`（50）、`MaxHalfOpen`（32）和
+  `DialsPerTick`（8）限制，失败后退避。与同一 peer 的两条连接，保留 peer ID 较小的一方发起的那条。
+- **peer** 来自 tracker（分 tier，发 started、completed、stopped，hybrid 用两个哈希都 announce）、DHT（每 15 分钟
+  announce 一次，没有 peer 时每分钟一次；双向 `PORT`）、PEX（每个 peer 每分钟一条）、本地服务发现（BEP 14，
+  IPv4）、磁力链接的 `x.pe`、`AddPeers` 和 `Config.PeerSources`；私有 torrent 只用它的 tracker。web seed（BEP 19）
+  经 fib/http 客户端用 range 请求提供整个分片。
+- **做种**到 `SeedRatio` 或 `SeedTime` 时暂停 torrent；`Ban` 在所有 torrent 中封禁一个地址。
 
 ## 互通验证
 
 [`bittorrent/interop`](../bittorrent/interop) 是独立模块（`replace github.com/lesismal/fib => ../..`），
 anacrolix/torrent v1.61.0、anacrolix/dht v2.23.0 和 go-libutp v1.5.1 永远不会成为 fib 的依赖。go-libutp 通过
-cgo 封装 libutp，所以这个模块需要 cgo 和 C++ 编译器，可在 Linux 与 macOS 上跑，不支持 Windows。CI 中对应
+cgo 封装 libutp，所以这个模块需要 cgo 和 C++ 编译器，可在 Linux 与 macOS 上跑，不支持 Windows。
+libtorrent-rasterbar 2.0.11 经它的 Python 绑定（`python3-libtorrent`、`libtorrent_peer.py`）驱动，因此相应测试只在
+`FIB_LIBTORRENT=1` 时运行：`libtorrent.sh` 在容器里跑它，CI 任务则安装这个包并设置该变量。以上全部在 CI 中对应
 `bittorrent-interop` 任务；各包解析网络数据的函数在 `fuzz-bittorrent` 任务里做 fuzz。
 
 | 包 | 验证内容 |
@@ -211,6 +255,8 @@ cgo 封装 libutp，所以这个模块需要 cgo 和 C++ 编译器，可在 Linu
 | tracker | anacrolix 的 tracker 客户端在 127.0.0.1 与 ::1 上向 fib 的 HTTP、UDP 服务端 announce 和 scrape，passkey 经 BEP 41 传递；fib 的客户端向 anacrolix 的 HTTP、UDP tracker 服务端 announce；手动测试中，fib 的客户端经 HTTP 和 UDP 向 opentracker（Debian 的包，跑在 docker 里）announce 和 scrape |
 | peer、mse | 经 TCP，fib 从 anacrolix 做种端取得 metadata 和全部分片并校验通过：明文、提供明文的 MSE、要求 RC4 的 MSE；anacrolix 只凭 info hash 从 fib 做种端下载 3 MB：默认设置、强制 RC4、双方都要求 RC4、强制明文；fib 的 `mse` 与 anacrolix 的 `mse` 包双向握手，SKEY 是 100 个之一 |
 | utp | fib 与 libutp（go-libutp）双向互为两端：每个方向 4 MB 并校验；写、关闭、读到 EOF；经过每 20 个数据报丢 1 个、每 7 个压后 1 个的转发器，每个方向 1 MB |
+| 客户端，anacrolix | fib 客户端从 anacrolix 下载、anacrolix 从 fib 客户端下载，分别只经 TCP 和只经 uTP（go-libutp），来源为 .torrent 和 btih 磁力链接，含要求 RC4 的情形和 hybrid torrent；fib 客户端经 fib 的 `tracker.Server` 找到 anacrolix 做种端。anacrolix 无法加入纯 v2 torrent，这部分由 libtorrent 覆盖 |
+| 客户端，libtorrent | 22 个用例全过：双方互相下载 v1、hybrid 和纯 v2 torrent，来源为 .torrent 文件和磁力链接（btih；v2 用 btmh，piece layer 双向经 BEP 52 hash request 取得），经 TCP 和经 uTP，含要求 RC4 的情形 |
 | dht | 回环上 6 个 fib 节点与 6 个 anacrolix 节点：互相 bootstrap 并出现在对方路由表中，双向 ping，find_node 收敛，双向 announce 与 get_peers（显式端口与 implied port），anacrolix 向 fib 发 sample_infohashes，双向存取 BEP 44 不可变与可变数据，双方对 200 个地址算出相同的 BEP 42 ID；手动测试中 fib 从公网 DHT bootstrap（13 秒），2.6 秒内为一个 Ubuntu 镜像找到 240 个 peer |
 
 ```sh
@@ -221,6 +267,9 @@ go test -race -count=1 -run Tracker .                                        # t
 go test -race -count=1 -run TestPeer .                                       # peer、mse
 CGO_ENABLED=1 go test -count=1 -timeout 300s -run TestUTP -v .               # utp，35-65 秒
 go test -race -count=1 -run DHT .                                            # dht
+go test -race -count=1 -run TestClient .                                     # 客户端对 anacrolix
+./libtorrent.sh                                                              # 客户端对 libtorrent，需要 docker
+FIB_LIBTORRENT=1 CGO_ENABLED=1 go test -count=1 -run TestClientLibtorrent .  # 同上，本机已装 python3-libtorrent 时
 ./opentracker.sh                                                             # opentracker，需要 docker
 FIB_DHT_PUBLIC=1 FIB_DHT_INFOHASH=<40 位十六进制> go test -run TestDHTPublic -v .   # 公网 DHT，需要联网
 ```
@@ -239,26 +288,30 @@ FIB_DHT_PUBLIC=1 FIB_DHT_INFOHASH=<40 位十六进制> go test -run TestDHTPubli
 
 | BEP | 标题 | 状态 | 包 |
 | --- | --- | --- | --- |
-| 3 | The BitTorrent Protocol Specification | 完整 | `bencode`、`metainfo`、`tracker`、`peer` |
-| 5 | DHT Protocol | 完整（含 torrent 的 `nodes` 键、`port` 消息与保留位） | `dht`、`metainfo`、`peer` |
+| 3 | The BitTorrent Protocol Specification | 完整 | `bencode`、`metainfo`、`tracker`、`peer`、`bittorrent` |
+| 5 | DHT Protocol | 完整（含 torrent 的 `nodes` 键、`port` 消息与保留位）；客户端尚不持久化节点状态 | `dht`、`metainfo`、`peer`、`bittorrent` |
 | 6 | Fast Extension | 完整（用 BEP 的测试向量验证） | `peer` |
-| 7 | IPv6 Tracker Extension | 完整 | `tracker` |
+| 7 | IPv6 Tracker Extension | 完整 | `tracker`、`bittorrent` |
 | 9 | Extension for Peers to Send Metadata Files | 完整（ut_metadata、磁力链接） | `peer`、`metainfo` |
 | 10 | Extension Protocol | 完整 | `peer` |
 | 11 | Peer Exchange (PEX) | 完整 | `peer` |
-| 12 | Multitracker Metadata Extension | 完整 | `metainfo`、`tracker` |
-| 15 | UDP Tracker Protocol | 完整，客户端与服务端 | `tracker` |
-| 19 | WebSeed (GetRight style) | 部分：torrent 的 `url-list` 与磁力链接的 `ws` | `metainfo` |
-| 21 | Extension for Partial Seeds | 部分：`EventPaused`、`upload_only`；服务端不做特殊处理 | `tracker`、`peer` |
+| 12 | Multitracker Metadata Extension | 完整 | `metainfo`、`tracker`、`bittorrent` |
+| 14 | Local Service Discovery | 部分：仅 IPv4 | `bittorrent` |
+| 15 | UDP Tracker Protocol | 完整，客户端与服务端 | `tracker`、`bittorrent` |
+| 16 | Superseeding | 未做 | — |
+| 19 | WebSeed (GetRight style) | 完整：读取 `url-list` 与 `ws`，用 range 请求取整个分片 | `metainfo`、`bittorrent` |
+| 21 | Extension for Partial Seeds | 客户端完整（想要的都齐了就发 `upload_only`，也遵从对端的；tracker 客户端有 `EventPaused`）；tracker 服务端对 paused peer 不做特殊处理 | `tracker`、`peer`、`bittorrent` |
 | 23 | Tracker Returns Compact Peer Lists | 完整 | `tracker` |
 | 24 | Tracker Returns External IP | 完整 | `tracker` |
-| 27 | Private Torrents | 部分：`private` 标志，以及服务端的白名单与鉴权钩子 | `metainfo`、`tracker` |
-| 29 | uTorrent transport protocol | 完整，但没有路径 MTU 探测和时钟漂移惩罚 | `utp` |
+| 27 | Private Torrents | 完整：`private` 标志，客户端只用 tracker，以及服务端的白名单与鉴权钩子 | `metainfo`、`tracker`、`bittorrent` |
+| 29 | uTorrent transport protocol | 完整，但没有路径 MTU 探测和时钟漂移惩罚 | `utp`、`bittorrent` |
+| 30 | Merkle Hash Torrent Extension | 未做（已被 BEP 52 取代） | — |
 | 31 | Failure Retry Extension | 未做 | — |
-| 32 | IPv6 extension for DHT | 部分：每个地址族一个 `Node`，忽略对另一地址族的 `want` | `dht` |
+| 32 | IPv6 extension for DHT | 部分：每个地址族一个 `Node`，忽略对另一地址族的 `want`；客户端的 IPv6 节点可选（`DHTIPv6`） | `dht`、`bittorrent` |
 | 33 | DHT Scrape | 未做 | — |
 | 35 | Torrent Signing | 未做 | — |
 | 38 | Finding Local Data Via Torrent File Hints | 未做 | — |
+| 40 | Canonical Peer Priority | 未做 | — |
 | 41 | UDP Tracker Protocol Extensions | 完整 | `tracker` |
 | 42 | DHT Security Extension | 完整 | `dht` |
 | 43 | Read-only DHT Nodes | 完整 | `dht` |
@@ -266,11 +319,10 @@ FIB_DHT_PUBLIC=1 FIB_DHT_INFOHASH=<40 位十六进制> go test -run TestDHTPubli
 | 47 | Padding Files and Extended File Attributes | 完整 | `metainfo` |
 | 48 | Tracker Protocol Extension: Scrape | 完整，不支持 full scrape | `tracker` |
 | 51 | DHT Infohash Indexing | 完整 | `dht` |
-| 52 | The BitTorrent Protocol Specification v2 | `metainfo` 完整；`peer` 部分：握手升级与 hash 消息的编解码，尚不能用 piece layer 应答 hash request，也不校验证明（待客户端） | `metainfo`、`peer` |
-| 53 | Magnet URI Extension: Select Specific File Indices | 部分：`so` 的解析与生成，由客户端应用 | `metainfo` |
-| — | Message Stream Encryption (MSE/PE) | 完整 | `peer/mse`、`peer` |
-
-<!-- CLIENT SECTION: to be filled -->
+| 52 | The BitTorrent Protocol Specification v2 | 完整：torrent、握手升级、发出 hash request 并用 piece layer 应答；`proof_layers` > 0 时返回的证明未经互通测试 | `metainfo`、`peer`、`bittorrent` |
+| 53 | Magnet URI Extension: Select Specific File Indices | 完整 | `metainfo`、`bittorrent` |
+| 55 | Holepunch Extension (ut_holepunch) | 未做 | — |
+| — | Message Stream Encryption (MSE/PE) | 完整 | `peer/mse`、`peer`、`bittorrent` |
 
 ## 待审的决定
 
@@ -378,4 +430,23 @@ FIB_DHT_PUBLIC=1 FIB_DHT_INFOHASH=<40 位十六进制> go test -run TestDHTPubli
 
 ### 客户端（bittorrent 包）
 
-<!-- CLIENT SECTION: to be filled -->
+- **`ListenAddr` 默认 `:6881`**；端口为 0 时取 TCP 拿到的端口，若 UDP 上该端口被占则重试。备选：默认 `:0`。
+- **`Encryption` 的零值是 `EncryptionPrefer`**（先 MSE，与 libtorrent、anacrolix 相同），没有完全关闭 MSE 的模式。
+- **本地服务发现只支持 IPv4**，用标准库的 `net.ListenMulticastUDP`，因为 fib 没有组播 binding；加入组播组失败时
+  静默关闭。
+- **封禁**按 IP（回环上的 peer 按它的监听地址），在客户端整个生命周期内有效。
+- **块直接写入存储**，校验分片时再读回；内存里不攒分片，smart ban 的哈希也来自读回的数据。
+- **从不请求填充字节**（anacrolix 拒绝落在填充里的请求）。
+- **纯 v2 torrent 提供文件最后一个完整的 16 KiB 块**，超出文件末尾的部分补零，因为 libtorrent 请求整块。
+- **BEP 52 hash request** 每次最多请求 512 个哈希、`proof_layers` 为 0（与 anacrolix 相同），拼好的 layer 与文件的
+  root 比对。应答时附 max(0, `proof_layers` − log2(length)) 层 uncle，这是对 libtorrent 语义的推测，只有
+  不带证明的路径做过互通测试；只提供 piece layer。
+- **hybrid torrent 用 v1 哈希（并设 v2 位）拨号**，除非 peer 来自 v2 的 announce；hybrid 向 tracker、DHT、LSD
+  两个哈希都 announce。
+- **做种时按上传速度 unchoke**（libtorrent 的 fastest_upload），而非轮转；完整做种时断开做种者和只上传的 peer；
+  候选 peer 失败后在 2 秒 << 失败次数后重试，失败 6 次即丢弃（手动加入的除外）。
+- **`Reader` 提升了未选中文件的分片优先级时**，`Done()` 重新打开，直到这些分片到齐。
+- **没有快速续传文件**：每次加入都对存储里的数据做哈希校验。`Preallocate` 用 truncate 把文件设到全长（稀疏文件），
+  而不是 `fallocate`。
+- **web seed**：每个 seed 同时最多 4 个分片在途，失败 5 次即弃用，只取整个分片。
+- **事件**在一个分发 goroutine 上按顺序投递，从不阻塞客户端；连上与断开事件附带 `PeerInfo` 快照。

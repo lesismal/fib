@@ -57,7 +57,11 @@
 | BitTorrent uTP：路径 MTU 探测、时钟漂移惩罚 | 有意不做 | 包大小固定 1400 字节，低于以太网 MTU 减去 IPv6、UDP 和隧道的包头；探测需要发更大的包，并把它们的丢失与拥塞区分开。漂移惩罚防止时钟走快的对端干扰 LEDBAT，libutp 会测，fib 不测 | M | 巨帧链路上包大小限制了吞吐，或出现时钟漂移的对端 |
 | BitTorrent DHT：替另一个地址族应答 | 有意不做 | 一个 `Node` 只属于一个地址族（与 libtorrent 相同），忽略对另一地址族的 `want`；两者都应答需要客户端的 IPv4 与 IPv6 Node 共享路由表 | S–M | 双栈客户端希望两个地址族互相 bootstrap |
 | BitTorrent DHT：put BEP 44 可变数据时带 `cas` | 计划中 | `Node` 存储别人的 put 时会检查 `cas`，但 `Put` 自己不发，同一个键的两个写者可能在 get 与 put 之间覆盖对方更新的数据 | S | 应用里同一个键有多个写者 |
-| BitTorrent peer：用 piece layer 应答 BEP 52 的 hash request，校验 hashes 里的证明 | 待客户端 | `peer` 已能编解码 hash request、hashes、hash reject，`metainfo` 有 `VerifyProof` 与 merkle 辅助函数；由 `peer` 包还是客户端来应答，随客户端一起定 | S–M | 客户端包完成时 |
+| BitTorrent 客户端：`proof_layers` > 0 时返回的 BEP 52 证明 | 已知边界 | 客户端请求哈希时 `proof_layers` 为 0，并用自己的 piece layer 应答 hash request；带证明层的请求所附的 uncle 依据的是对 libtorrent 语义的推测，互通测试里 libtorrent 和 anacrolix 都没有请求过 | S | 出现请求证明的 peer，或有这样的 libtorrent 互通用例 |
+| BitTorrent 客户端：BEP 16（超级做种）、BEP 40（canonical peer priority）、ut_holepunch（BEP 55） | 有意不做 | 超级做种只对 peer 很少的 torrent 的首个做种者有用；canonical priority 决定连接名额紧张时保留哪些 peer，`MaxConns` 与拨号退避已够用；打洞需要双方都能连上的中继 peer，且只对都在 NAT 后的两个 peer 有用；端口可达的客户端用不到它 | 各 M | 冷门内容的首个做种者；受连接名额限制的 swarm；大量互相连不上的 NAT 后 peer |
+| BitTorrent 客户端：BEP 30（merkle torrent） | 有意不做 | 已被 BEP 52 的逐文件 merkle 树取代，客户端支持后者；用过 BEP 30 的 torrent 和客户端都很少 | M | 不会 |
+| BitTorrent 客户端：持久化 DHT 节点状态、快速续传文件 | 计划中 | `dht.Node.State` 与 `AddNodes` 能保存和恢复路由表，但客户端还没把它们存下来，每次启动都要从 router bootstrap；没有续传文件，每个加入的 torrent 都要做哈希校验，即把数据完整读一遍 | 各 S | 需要快速重启，或做种的 torrent 很多 |
+| BitTorrent 客户端：IPv6 的本地服务发现 | 有意不做 | fib 没有组播 binding，LSD 用标准库的 IPv4 `net.ListenMulticastUDP`；IPv6 LSD（ff15::efc0:988f）需要另一个 socket，实际部署也少 | S | 纯 IPv6 的局域网 |
 | WebSocket 广播的发送队列 | 已缓解 | 默认无上限（只有 `MaxWriteQueueBytes`／`SetWriteQueueLimit` 可开）；对端长期不读要靠应用层心跳断开 | — | 见 `guide.zh-CN.md` 的广播一节 |
 
 ## 5. WebRTC

@@ -51,7 +51,7 @@ HTTP/3、WebSocket 和 WebRTC，以及基于 RTMP、RTSP、SRT、HTTP-FLV、HLS 
 | gRPC | ✓ h2 和 h2c | ✓ | unary 与双向 streaming、metadata、deadline、拦截器、gzip；可直接用 protoc-gen-go-grpc 生成的代码，与 grpc-go 互通 |
 | WebRTC | ✓ | ✓ | 多个 PeerConnection 共用一个 UDP 端口：ICE（lite 与 full、trickle）、DTLS 1.2-SRTP、data channel、供 SFU 使用的 RTP 转发、支持 UDP、TCP 与 TLS 的 TURN 客户端与服务端（配额、事件与统计、热加载、drain），全部自行实现；可与浏览器和 pion 互通（[详见](docs/webrtc.zh-CN.md)） |
 | 流媒体 | ✓ | ✓ | RTMP/RTMPS（Enhanced RTMP）、TCP 与 UDP 的 RTSP、SRT、HTTP-FLV 与 WebSocket-FLV、fMP4 或 TS 分片的 HLS 及 LL-HLS、WHIP 与 WHEP，由一个 hub 在它们之间转封装、不转码；每种协议都有拉流转发和转推；与 ffmpeg 和 Chromium 互通验证（[详见](docs/media.zh-CN.md)） |
-| BitTorrent | ✓ | ✓ | bencode、.torrent 文件与磁力链接（v1、v2 与 hybrid）、HTTP 与 UDP tracker 的客户端和服务端、带 Fast 与扩展协议、ut_metadata、ut_pex 和 MSE 加密的 peer wire 协议、带 LEDBAT 的 uTP，以及支持 BEP 42/44/51 的主线 DHT；uTP、DHT 与 UDP tracker 客户端共用一个 UDP 端口；与 anacrolix/torrent、anacrolix/dht、libutp 和 opentracker 互通验证（[详见](docs/bittorrent.zh-CN.md)） |
+| BitTorrent | ✓ | ✓ | bencode、.torrent 文件与磁力链接（v1、v2 与 hybrid）、HTTP 与 UDP tracker 的客户端和服务端、带 Fast 与扩展协议、ut_metadata、ut_pex 和 MSE 加密的 peer wire 协议、带 LEDBAT 的 uTP，以及支持 BEP 42/44/51 的主线 DHT；uTP、DHT 与 UDP tracker 客户端共用一个 UDP 端口；下载和做种 v1、v2、hybrid torrent 的客户端，可边下载边读文件，通过 tracker、DHT、PEX、本地发现和 web seed 找数据源；与 libtorrent、anacrolix/torrent、anacrolix/dht、libutp 和 opentracker 互通验证（[详见](docs/bittorrent.zh-CN.md)） |
 
 ### 引擎
 
@@ -353,11 +353,20 @@ sock.OnOther(func(from netip.AddrPort, b []byte) {
 err = node.Bootstrap(ctx)
 err = node.GetPeers(ctx, mi.Info.InfoHashV1(), func(addrs []netip.AddrPort) { /* 连接它们 */ })
 
-// client example: to be filled
+// 客户端，有自己的 engine 和端口。
+c, err := bittorrent.NewClient(bittorrent.Config{DataDir: "downloads", ListenAddr: ":6882"})
+defer c.Close()
+t, err := c.AddMagnet("magnet:?xt=urn:btih:...", nil)
+<-t.GotInfo()                 // 从 peer 取到 info 字典
+r := t.Files()[0].NewReader() // io.ReadSeekCloser，边下载边读这个文件
+defer r.Close()
+_, err = io.Copy(w, r)
+<-t.Done()
 ```
 
-各部分是 `bittorrent/` 下各自独立、可单独使用的包：`bencode`、`metainfo`、`tracker`、`peer`（及 `peer/mse`）、
-`utp` 和 `dht`；`utp.Mux` 与 `dht.Node` 都不自带 socket。
+客户端即 `bittorrent` 包，经 TCP 和 uTP、带 MSE 下载和做种 v1、v2、hybrid torrent，通过 tracker、DHT、PEX 和本地
+服务发现找 peer。构成它的各部分是 `bittorrent/` 下可单独使用的包：`bencode`、`metainfo`、`tracker`、`peer`
+（及 `peer/mse`）、`utp` 和 `dht`；`utp.Mux` 与 `dht.Node` 都不自带 socket。
 
 ### 裸 TCP
 
@@ -536,7 +545,7 @@ poller 数量（`Config.IOPollers`、`IOPollerCount`）取决于 CPU 数：4 核
 | WebRTC | 读 UDP、按对端分拣数据报 | Mux 按发送方路由；ICE、DTLS、SRTP、SCTP 在每个 PeerConnection 的锁下执行，之后执行它的回调 | —（每个 PeerConnection 一个定时器） |
 | 流媒体 | 为 SRT、RTSP 和 WHIP/WHEP 读 UDP | 接入解析，然后是 hub 的分发：每个订阅者在发布者的 worker 上复用并排队写出 | —（每个 SRT 会话一个定时器） |
 | KCP | 读 UDP、按对端分拣数据报 | 解密、FEC、KCP 与 `OnMessage` 在每个会话的锁下执行，之后一批发出数据报 | —（有数据在途时每个会话一个定时器） |
-| BitTorrent | 为 uTP、DHT 和 UDP tracker 读 UDP，按对端分拣数据报 | peer wire 解析与 `peer.Handler` 回调，每次回调一次写；uTP 在 `Mux` 的锁下执行，之后一批发出数据报；DHT 与 UDP tracker 消息 | —（每个 uTP 连接、peer 连接和在途 DHT 查询各一个定时器；跑在 `net.Conn`（如 uTP）上的 peer 有一读一写两个 goroutine） |
+| BitTorrent | 为 uTP、DHT 和 UDP tracker 读 UDP，按对端分拣数据报 | peer wire 解析与 `peer.Handler` 回调，每次回调一次写；uTP 在 `Mux` 的锁下执行，之后一批发出数据报；DHT 与 UDP tracker 消息 | —（每个 uTP 连接、peer 连接和在途 DHT 查询各一个定时器；跑在 `net.Conn`（如 uTP）上的 peer 有一读一写两个 goroutine；客户端另有一个维护所有 torrent 的 tick goroutine、一个事件分发 goroutine，以及在途拨号、peer 来源和哈希校验各自的 goroutine） |
 | arpc | — | 拆包、响应、注册为同步的 handler | `<Name>-streams`（异步 handler，默认） |
 | gRPC | — | HTTP/2 分帧、HPACK、流控 | `<Name>-streams`（所有调用） |
 
@@ -775,7 +784,7 @@ CI 每次 push 都在 Linux、macOS、Windows 上运行 [`taskpool/benchmark`](t
 | [`webrtc`](webrtc) | WebRTC PeerConnection，以及供多个 PeerConnection 共用的 UDP Mux；其下是 `stun`、`ice`、`turn`（及 `turnserver`）、`sdp`、`sctp`、`srtp`、`rtp`，DTLS 1.2 在 `tls` 中 |
 | [`media`](media) | 直播流媒体：`hub` 之上的 `rtmp`、`rtsp`、`srt`、`httpflv`、`hls` 和 `rtc`（WHIP/WHEP）；其下是 `av`、`flv`、`amf`、`mpegts`、`fmp4`、`mp4`、`rtpcodec` 和 `codec/{h264,h265,aac,opus}` |
 | [`kcp`](kcp) | KCP 服务端、客户端与不带 I/O 的协议实现，兼容 kcp-go 的加密与 FEC |
-| [`bittorrent`](bittorrent) | BitTorrent：`bencode`、`metainfo`、`tracker`、`peer` 与 `peer/mse`、`utp` 和 `dht` |
+| [`bittorrent`](bittorrent) | BitTorrent 客户端；其下是 `bencode`、`metainfo`、`tracker`、`peer` 与 `peer/mse`、`utp` 和 `dht` |
 | [`middleware`](middleware) | 中间件链和常用中间件 |
 | [`socks`](socks) | SOCKS5、SOCKS4 与 SOCKS4a 代理服务端及非阻塞拨号器；HTTP 代理见 `http.ConnectProxy` |
 | [`mux`](mux) | 按客户端最先发送的字节识别协议，多种协议共用一个端口 |
@@ -797,8 +806,8 @@ CI 每次 push 都在 Linux、macOS、Windows 上运行 [`taskpool/benchmark`](t
 - [流媒体](docs/media.zh-CN.md)：一个 hub 上的 RTMP、RTSP、SRT、HTTP-FLV、HLS 与 WHIP/WHEP，各协议承载的编码，
   跑全部协议的服务端、转发、各项限制，以及与 ffmpeg、Chromium 的互通验证
 - [KCP](docs/kcp.zh-CN.md)：分层、按需 flush、与 kcp-go 和 kcptun 的对应、服务端的会话规则，以及与 kcp-go 的互通
-- [BitTorrent](docs/bittorrent.zh-CN.md)：各个包、TCP 与 UDP 共用一个端口、各协议、BEP 覆盖情况，以及与
-  anacrolix/torrent、anacrolix/dht、libutp 和 opentracker 的互通验证
+- [BitTorrent](docs/bittorrent.zh-CN.md)：各个包、TCP 与 UDP 共用一个端口、各协议、客户端、BEP 覆盖情况，以及与
+  libtorrent、anacrolix/torrent、anacrolix/dht、libutp 和 opentracker 的互通验证
 - [路线图](docs/roadmap.zh-CN.md)：计划中但未做、以及有意不做的项，各带原因、成本量级和重新评估的条件
 - [压测](docs/loadtest.zh-CN.md)：`benchmark/loadtest` 压测、结果，以及整体响应发给慢客户端时的内存代价
 
