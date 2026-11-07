@@ -23,16 +23,15 @@ const HandshakeHeaderLen = HandshakeLen - 20
 // extension.
 type Reserved [8]byte
 
-// The reserved bits this package knows, as (byte, mask).
+// The reserved bits this package knows, as a byte and a mask: the
+// extension protocol (BEP 10) is 0x10 in byte 5; the DHT's port message
+// (BEP 5) 0x01, the Fast extension (BEP 6) 0x04 and BEP 52's v2 upgrade
+// 0x10 in byte 7.
 const (
-	// ExtensionBit is BEP 10, the extension protocol: 0x10 in byte 5.
 	reservedExtensionByte, reservedExtensionMask = 5, 0x10
-	// DHT is BEP 5, the port message: 0x01 in byte 7.
-	reservedDHTByte, reservedDHTMask = 7, 0x01
-	// Fast is BEP 6: 0x04 in byte 7.
-	reservedFastByte, reservedFastMask = 7, 0x04
-	// V2 is BEP 52's upgrade bit: 0x10 in byte 7.
-	reservedV2Byte, reservedV2Mask = 7, 0x10
+	reservedDHTByte, reservedDHTMask             = 7, 0x01
+	reservedFastByte, reservedFastMask           = 7, 0x04
+	reservedV2Byte, reservedV2Mask               = 7, 0x10
 )
 
 // Extended reports the extension protocol, BEP 10.

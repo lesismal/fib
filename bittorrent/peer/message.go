@@ -60,8 +60,8 @@ const (
 	// BlockSize is the size of a block nearly every client requests, and
 	// the most many serve.
 	BlockSize = 16 << 10
-	// MaxBlockSize is the largest request this package's Conn serves; BEP
-	// 3 lets a peer close the connection on a larger one.
+	// MaxBlockSize is the largest request a handler need serve: BEP 3
+	// lets a peer close the connection on a larger one.
 	MaxBlockSize = 128 << 10
 )
 

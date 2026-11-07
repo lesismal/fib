@@ -23,8 +23,9 @@ type Handler interface {
 	// it. m and its Data are valid only during the call.
 	OnMessage(c *Conn, m *Message)
 	// OnClose runs once when the connection has closed, with what closed
-	// it; also for a dial that failed, and never before OnHandshake if a
-	// handshake was begun with this torrent's peer.
+	// it, a failed dial's included. An incoming connection becomes the
+	// torrent's when its handshake names it: one that closes before that
+	// is no handler's to hear of.
 	OnClose(c *Conn, err error)
 }
 
@@ -621,7 +622,7 @@ func (c *Conn) sendLocked(m *Message) error {
 		case MsgRequest:
 			c.outstanding[m.Request()] = struct{}{}
 		case MsgCancel:
-			if !c.fastLocked() {
+			if !c.Fast() {
 				// Without a reject to come, a cancelled request is gone; a
 				// piece that crossed the cancel still arrives.
 				delete(c.outstanding, m.Request())
@@ -664,7 +665,7 @@ func (c *Conn) Request(r Request) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if c.peerChoking {
-		if _, ok := c.allowedFast[r.Index]; !ok || !c.fastLocked() {
+		if _, ok := c.allowedFast[r.Index]; !ok || !c.Fast() {
 			return ErrChoked
 		}
 	}
@@ -811,8 +812,6 @@ func (c *Conn) RemoteReserved() Reserved { return c.remote.Reserved }
 
 // Fast reports the Fast extension on both sides.
 func (c *Conn) Fast() bool { return c.local.Fast() && c.remote.Reserved.Fast() }
-
-func (c *Conn) fastLocked() bool { return c.Fast() }
 
 // Extended reports the extension protocol on both sides.
 func (c *Conn) Extended() bool { return c.local.Extended() && c.remote.Reserved.Extended() }

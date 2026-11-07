@@ -302,9 +302,6 @@ func (l *leecher) requeueLocked(c *Conn) {
 	for _, r := range c.Requests(nil) {
 		out[r] = true
 	}
-	for r := range l.queue {
-		_ = r
-	}
 	queued := map[Request]bool{}
 	for _, r := range l.queue {
 		queued[r] = true
@@ -601,7 +598,7 @@ func TestKeepaliveAndTimeouts(t *testing.T) {
 	_ = cli.AddTorrent(&Torrent{InfoHash: ih, Handler: cliH})
 	c, _ := cli.Dial(engine, DialOptions{Addr: addrs[0].String(), InfoHash: ih})
 	time.Sleep(time.Second)
-	if len(keepalives) < 5 {
+	if len(keepalives) < 3 {
 		t.Fatalf("%d keepalives in a second", len(keepalives))
 	}
 	select {

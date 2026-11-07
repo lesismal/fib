@@ -136,7 +136,6 @@ var (
 	ErrHandshakeTimeout = errors.New("peer: handshake timed out")
 	ErrIdleTimeout      = errors.New("peer: connection idle")
 	ErrClosed           = errors.New("peer: connection closed")
-	ErrNotEstablished   = errors.New("peer: handshake not done")
 	ErrChoked           = errors.New("peer: choked by the peer")
 	ErrRequestLimit     = errors.New("peer: too many requests outstanding")
 	ErrNoExtension      = errors.New("peer: peer does not support the extension")
