@@ -390,6 +390,12 @@ func (t *Torrent) updateDoneLocked() {
 		if t.state == StateSeeding {
 			t.state = StateDownloading
 		}
+		// Seeds dropped this side as a partial seed have something to
+		// give again.
+		for _, cand := range t.pool {
+			cand.nextTry = time.Time{}
+			cand.seed = false
+		}
 		for _, pc := range t.peers {
 			t.updateInterestLocked(pc)
 			t.fillRequestsLocked(pc)

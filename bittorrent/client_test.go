@@ -93,7 +93,13 @@ func waitDone(t *testing.T, tor *Torrent) []PeerInfo {
 	deadline := time.After(transferTimeout)
 	tk := time.NewTicker(10 * time.Millisecond)
 	defer tk.Stop()
+	start := time.Now()
+	logged := false
 	for {
+		if !logged && os.Getenv("BTDEBUG") != "" && time.Since(start) > 3*time.Second {
+			logged = true
+			t.Logf("slow: %+v\n%s", tor.Stats(), tor.debugState())
+		}
 		select {
 		case <-tor.Done():
 			return last
@@ -102,7 +108,7 @@ func waitDone(t *testing.T, tor *Torrent) []PeerInfo {
 				last = p
 			}
 		case <-deadline:
-			t.Fatalf("download not done: %+v", tor.Stats())
+			t.Fatalf("download not done: %+v\n%s", tor.Stats(), tor.debugState())
 		}
 	}
 }

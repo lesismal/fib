@@ -20,7 +20,7 @@ const (
 	// libtorrent and anacrolix ask.
 	maxHashesPerRequest = 512
 	// maxHashesServed bounds the hashes one request may ask of this side.
-	maxHashesServed = 8192
+	maxHashesServed  = 8192
 	hashRequestRetry = 10 * time.Second
 )
 

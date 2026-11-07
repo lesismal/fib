@@ -168,7 +168,6 @@ func (t *Torrent) OnHandshake(c *peer.Conn) {
 	}
 	if rec != nil {
 		rec.cand.connected = true
-		rec.cand.fails = 0
 		rec.cand.conn = pc
 	}
 	t.peers[c] = pc
@@ -290,8 +289,16 @@ func (t *Torrent) OnClose(c *peer.Conn, err error) {
 	if cand := t.pool[pc.listen]; cand != nil && cand.conn == pc {
 		cand.connected = false
 		cand.conn = nil
-		cand.nextTry = time.Now().Add(30 * time.Second)
 		cand.seed = pc.seed
+		// A connection that lasted is worth another soon; one that keeps
+		// ending early waits longer each time.
+		now := time.Now()
+		if now.Sub(pc.since) > time.Minute {
+			cand.fails = 0
+		} else {
+			cand.fails++
+		}
+		cand.nextTry = now.Add(2 * time.Second << min(cand.fails, 9))
 	}
 	t.c.emit(Event{Type: EventPeerDisconnected, Torrent: t, Peer: pc.addr, Err: err})
 }
@@ -371,6 +378,10 @@ func (t *Torrent) OnMessage(c *peer.Conn, m *peer.Message) {
 		for i, q := range pc.upq {
 			if q == r {
 				pc.upq = append(pc.upq[:i], pc.upq[i+1:]...)
+				// BEP 6: a cancelled request is answered all the same,
+				// with the piece or a reject, so the peer can count it
+				// gone.
+				_ = c.Reject(r)
 				break
 			}
 		}

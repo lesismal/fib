@@ -193,7 +193,6 @@ func (t *Torrent) dial(att *dialAttempt) {
 		t.dialDoneLocked(att)
 		att.cand.connected = true
 		att.cand.conn = pc
-		att.cand.fails = 0
 		pc.listen = att.cand.addr
 		return
 	}
