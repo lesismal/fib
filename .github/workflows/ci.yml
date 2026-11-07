@@ -135,12 +135,13 @@ jobs:
         run: |
           go vet ./...
           "$(go env GOPATH)/bin/staticcheck" ./...
-      # The media and WebRTC interop checks are modules of their own too,
-      # so that ffmpeg's harness and pion stay out of fib's go.mod.
+      # The media, WebRTC, KCP and BitTorrent interop checks are modules of
+      # their own too, so that ffmpeg's harness, pion, kcp-go and anacrolix
+      # stay out of fib's go.mod.
       - name: Lint the interop checks
         shell: bash
         run: |
-          for module in media/interop webrtc/interop kcp/interop; do
+          for module in media/interop webrtc/interop kcp/interop bittorrent/interop; do
             echo "::group::$module"
             (cd "$module" && go vet ./... && "$(go env GOPATH)/bin/staticcheck" ./...)
             echo "::endgroup::"
@@ -148,7 +149,7 @@ jobs:
       - name: go mod tidy
         shell: bash
         run: |
-          for module in . http3/interop http3/interoprunner taskpool/benchmark media/interop webrtc/interop kcp/interop; do
+          for module in . http3/interop http3/interoprunner taskpool/benchmark media/interop webrtc/interop kcp/interop bittorrent/interop; do
             echo "::group::$module"
             (cd "$module" && go mod tidy -diff)
             echo "::endgroup::"
@@ -748,6 +749,30 @@ jobs:
         working-directory: kcp/interop
         run: go test -race -count=1 -v ./...
 
+  # Package bittorrent and its parts against anacrolix/torrent, anacrolix/dht
+  # and libutp (through go-libutp, so cgo): metainfo both ways, trackers in
+  # both roles, the peer wire protocol plain and under MSE, uTP through a
+  # lossy relay, the DHT on a mixed loopback network, and whole downloads
+  # between fib's client and anacrolix's. A module of its own
+  # (bittorrent/interop) so that none of them is ever fib's dependency.
+  bittorrent-interop:
+    name: BitTorrent interop (anacrolix, libutp)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v6
+        with:
+          go-version: stable
+          cache-dependency-path: |
+            go.mod
+            bittorrent/interop/go.sum
+      - name: Test against anacrolix and libutp
+        working-directory: bittorrent/interop
+        env:
+          CGO_ENABLED: '1'
+        run: go test -race -count=1 -timeout 12m -v ./...
+
   # The parsers all take bytes from the network, so each gets a short fuzz
   # run: HTTP/1 requests, HTTP/2 frames and HPACK, HTTP/3 frames, requests
   # and QPACK, and QUIC packet headers, transport parameters and frames;
@@ -796,6 +821,55 @@ jobs:
         with:
           name: fuzz-failures
           path: "**/testdata/fuzz/**"
+          if-no-files-found: ignore
+
+  # BitTorrent's parsers take bytes from peers, trackers and DHT nodes: a
+  # job of its own, so the two fuzz runs fit their time limits side by side.
+  fuzz-bittorrent:
+    name: Fuzz the BitTorrent parsers
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v6
+        with:
+          go-version: stable
+          cache-dependency-path: go.mod
+      - name: Fuzz
+        shell: bash
+        run: |
+          set -e
+          for entry in \
+            ./bittorrent/bencode:FuzzUnmarshal \
+            ./bittorrent/bencode:FuzzStruct \
+            ./bittorrent/bencode:FuzzDecoder \
+            ./bittorrent/bencode:FuzzLookup \
+            ./bittorrent/metainfo:FuzzParse \
+            ./bittorrent/metainfo:FuzzParseMagnet \
+            ./bittorrent/peer:FuzzParser \
+            ./bittorrent/peer:FuzzHandshake \
+            ./bittorrent/peer:FuzzExtensionMessages \
+            ./bittorrent/peer/mse:FuzzReceiver \
+            ./bittorrent/tracker:FuzzServeUDP \
+            ./bittorrent/tracker:FuzzUDPReply \
+            ./bittorrent/tracker:FuzzHTTPAnnounce \
+            ./bittorrent/tracker:FuzzHTTPResponse \
+            ./bittorrent/utp:FuzzParse \
+            ./bittorrent/utp:FuzzConn \
+            ./bittorrent/dht:FuzzParseMsg \
+            ./bittorrent/dht:FuzzHandleDatagram; do
+            package=${entry%%:*}
+            target=${entry##*:}
+            echo "::group::$package $target"
+            go test -run "^$target$" -fuzz "^$target$" -fuzztime 15s "$package"
+            echo "::endgroup::"
+          done
+      - name: Upload the inputs that failed
+        if: failure()
+        uses: actions/upload-artifact@v5
+        with:
+          name: fuzz-bittorrent-failures
+          path: "bittorrent/**/testdata/fuzz/**"
           if-no-files-found: ignore
 
   # The taskpool comparison against nbio, ants and gopool. It is a module of
