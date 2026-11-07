@@ -627,23 +627,25 @@ func (h *ServerHandler) OnClose(c *fib.Connection, err error) {
 			path.qc.Abort(err)
 		}
 	}
-	// A connection that sends on this address is not always in the paths
-	// above: a datagram can leave it on another udpPeer of the same address,
-	// which peerOf makes when the address's connection was replaced under
-	// it. It is found here by the address it still sends to, so that it ends
-	// with the address as the one above does.
-	if addr := c.RemoteAddr(); addr != nil {
-		h.routesMu.RLock()
-		var same []*quic.Conn
-		for _, qc := range h.routes {
-			if remote := qc.RemoteAddr(); remote != nil && remote.String() == addr.String() {
-				same = append(same, qc)
-			}
+	// A connection that sends on c is not always in the paths above: a
+	// datagram can leave it on another udpPeer of c, which peerOf makes
+	// when the attachment was replaced under it. It is found here by the
+	// path it sends on, so that it ends with c as the one above does. One
+	// that sends on another fib.Connection of the same address is left
+	// alone: the engine opens a new one for the address as soon as c is
+	// let go, before c's OnClose runs, and the client's next connection may
+	// be there already, as the one a Retry has it start is when the Retry
+	// let an unused c go.
+	h.routesMu.RLock()
+	var same []*quic.Conn
+	for _, qc := range h.routes {
+		if path, ok := qc.Path().(*peerPath); ok && path.peer.c == c {
+			same = append(same, qc)
 		}
-		h.routesMu.RUnlock()
-		for _, qc := range same {
-			qc.Abort(err)
-		}
+	}
+	h.routesMu.RUnlock()
+	for _, qc := range same {
+		qc.Abort(err)
 	}
 }
 

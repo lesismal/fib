@@ -16,6 +16,7 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -305,6 +306,84 @@ func TestCsOneDatagramAtATime(t *testing.T) {
 		}
 		w.awaitClosed(t, conn.LocalAddr().String())
 	})
+}
+
+// csLateClose is csSingle on an engine whose first OnClose call it holds
+// back, for the test to make when it likes: late, as a loop that is behind
+// makes it.
+type csLateClose struct {
+	*csSingle
+	held atomic.Bool
+	late chan *fib.Connection
+}
+
+func (w *csLateClose) OnClose(c *fib.Connection, err error) {
+	if w.held.CompareAndSwap(false, true) {
+		w.late <- c
+		return
+	}
+	w.h.OnClose(c, err)
+}
+
+// The address a Retry lets go closes after the engine has opened another for
+// the client's retried connection, which the engine allows: the peer leaves
+// its listener's table at once, and its OnClose runs later. That OnClose
+// ends what sent on the address it closes, not the connection on the new
+// one, which goes on serving.
+func TestCsRetriedConnectionOutlivesLateClose(t *testing.T) {
+	serverTLS, _, err := tlstest.Configs()
+	if err != nil {
+		t.Fatal(err)
+	}
+	config := DefaultConfig()
+	config.TLSConfig = serverTLS
+	config.RetryHandshakes = -1
+	h := NewHandlerWithConfig(config, nil)
+	w := &csLateClose{csSingle: newCsSingle(h), late: make(chan *fib.Connection, 1)}
+	_, addr := csBind(t, w)
+	base := fmt.Sprintf("https://localhost:%d", addr.Port)
+	client := newClient(t, nil)
+	get := func() {
+		t.Helper()
+		resp, err := client.Go(mustRequest(t, stdhttp.MethodGet, base+"/nothing", nil)).Wait()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if body := readBody(t, resp); resp.StatusCode != stdhttp.StatusNotFound {
+			t.Fatalf("%d %q, want the default 404", resp.StatusCode, body)
+		}
+	}
+	get()
+	// The client's first Initial was retried, which let its address go;
+	// the retried one came to a connection the engine opened after.
+	var unused *fib.Connection
+	select {
+	case unused = <-w.late:
+	case <-time.After(csWait):
+		t.Fatal("the address the Retry let go did not close")
+	}
+	var qc *quic.Conn
+	for qc == nil {
+		peer, ok := w.awaitSeen(t, "").Attachment().(*udpPeer)
+		if !ok {
+			continue
+		}
+		peer.mu.Lock()
+		for _, path := range peer.paths {
+			if path.qc != nil {
+				qc = path.qc
+			}
+		}
+		peer.mu.Unlock()
+	}
+	h.OnClose(unused, nil)
+	h.routesMu.RLock()
+	_, routed := h.routes[string(qc.LocalCID())]
+	h.routesMu.RUnlock()
+	if !routed {
+		t.Fatal("the late close of the address the Retry let go ended the retried connection")
+	}
+	get()
 }
 
 // A server without a certificate starts no connection: the address the

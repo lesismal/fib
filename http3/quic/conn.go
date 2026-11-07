@@ -966,6 +966,14 @@ func (c *Conn) SendsOn(pc PacketConn) bool {
 	return pc == c.pc
 }
 
+// Path returns the path the connection sends on: the PacketConn it was
+// dialed or accepted on, or the one it has moved to since.
+func (c *Conn) Path() PacketConn {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.pc
+}
+
 // ConnectionState is the TLS state of the connection.
 func (c *Conn) ConnectionState() tls.ConnectionState {
 	c.mu.Lock()
