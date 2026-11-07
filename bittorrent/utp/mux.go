@@ -410,13 +410,7 @@ func (m *Mux) Dial(ctx context.Context, to netip.AddrPort) (*Conn, error) {
 		m.mu.Unlock()
 		return nil, net.ErrClosed
 	}
-	var id uint16
-	for {
-		id = rand16()
-		if m.conns[connKey{to, id}] == nil && m.conns[connKey{to, id + 1}] == nil {
-			break
-		}
-	}
+	id := m.freeID(to)
 	c := m.newConn(to, id, id+1, true)
 	m.conns[connKey{to, id}] = c
 	m.mu.Unlock()
@@ -455,6 +449,34 @@ func (m *Mux) Dial(ctx context.Context, to netip.AddrPort) (*Conn, error) {
 		return nil, err
 	}
 	return c, nil
+}
+
+// rekey gives a connection being dialed another pair of IDs, under which
+// its SYN goes again. c's mutex is held: taking the Mux's after it is safe,
+// for the Mux holds its own before a connection's only for one that is
+// new, which nothing else knows yet. IDs are read under either mutex.
+func (m *Mux) rekey(c *Conn) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	id := m.freeID(c.remote)
+	if k := (connKey{c.remote, c.recvID}); m.conns[k] == c {
+		delete(m.conns, k)
+	}
+	c.recvID, c.sendID = id, id+1
+	if !m.closed {
+		m.conns[connKey{c.remote, id}] = c
+	}
+}
+
+// freeID picks a receive ID for a connection to to, neither it nor the
+// next in use; m.mu is held.
+func (m *Mux) freeID(to netip.AddrPort) uint16 {
+	for {
+		id := rand16()
+		if m.conns[connKey{to, id}] == nil && m.conns[connKey{to, id + 1}] == nil {
+			return id
+		}
+	}
 }
 
 // Accept waits for the next connection a peer starts, as net.Listener.

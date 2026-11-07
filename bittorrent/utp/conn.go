@@ -1010,6 +1010,16 @@ func (c *Conn) checkTimeouts(now int64) {
 				c.curWindow -= len(p.payload)
 			}
 		}
+		if c.state == stateSynSent && c.retransmits > 0 {
+			// The SYN went twice unanswered. libutp drops a SYN whose
+			// connection it has, and its accepted connection waits for
+			// data forever: once its answer is lost, no SYN of the same
+			// ID gets one. Reset that half-open connection and start
+			// again with another ID; the first SYN again keeps the ID, for
+			// a SYN lost on its way, which is the likelier.
+			c.writePacket(stReset, c.seqNr-1, 0, nil, now)
+			c.m.rekey(c)
+		}
 		c.retransmits++
 		c.fastTimeout = true
 		if p, ok := c.out.get(c.seqNr - uint16(c.inflightPkts)); ok {

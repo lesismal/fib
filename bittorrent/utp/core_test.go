@@ -389,3 +389,36 @@ func TestLostHandshake(t *testing.T) {
 	}
 	<-acc
 }
+
+// TestSynAnswersLost loses the answers to the first two SYNs. libutp
+// answers no SYN again whose connection it has, so the third goes under
+// another ID, and the half-open connection of the first is reset.
+func TestSynAnswersLost(t *testing.T) {
+	n := newSimNet(t, 13)
+	a, b := n.node(t, 1, Config{}), n.node(t, 2, Config{})
+	var answers atomic.Int32
+	n.mu.Lock()
+	n.drop = func(from, to netip.AddrPort, d []byte) bool {
+		return from == b.addr && d[0]>>4 == stState && answers.Add(1) <= 2
+	}
+	n.mu.Unlock()
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	ca, err := a.mux.Dial(ctx, b.addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	orphan, err := b.mux.AcceptUTP()
+	if err != nil {
+		t.Fatal(err)
+	}
+	cb, err := b.mux.AcceptUTP()
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = orphan.SetReadDeadline(time.Now().Add(5 * time.Second))
+	if _, err := orphan.Read(make([]byte, 1)); !errors.Is(err, ErrReset) {
+		t.Fatalf("the half-open connection read %v", err)
+	}
+	exchange(t, ca, cb, 64<<10, 80)
+}

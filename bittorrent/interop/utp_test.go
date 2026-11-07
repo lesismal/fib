@@ -178,16 +178,30 @@ type session struct {
 }
 
 func (s session) run(t *testing.T) {
-	pair := func() (d, a net.Conn) {
-		t.Helper()
-		ac := make(chan net.Conn, 1)
-		go func() {
+	// The acceptor's connections that the dialer's first byte arrives on.
+	// libutp hands its application a connection on the SYN, before the
+	// handshake is through: one whose answer was lost, given up by the
+	// dialer for a SYN of another ID, never gets that byte.
+	ready := make(chan net.Conn, 4)
+	go func() {
+		for {
 			c, err := s.accept()
 			if err != nil {
-				c = nil
+				return
 			}
-			ac <- c
-		}()
+			go func() {
+				_ = c.SetReadDeadline(time.Now().Add(time.Minute))
+				if _, err := io.ReadFull(c, make([]byte, 1)); err != nil {
+					c.Close()
+					return
+				}
+				_ = c.SetReadDeadline(time.Time{})
+				ready <- c
+			}()
+		}
+	}()
+	pair := func() (d, a net.Conn) {
+		t.Helper()
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer cancel()
 		d, err := s.dial(ctx)
@@ -199,11 +213,10 @@ func (s session) run(t *testing.T) {
 		if _, err := d.Write([]byte{1}); err != nil {
 			t.Fatal(err)
 		}
-		if a = <-ac; a == nil {
-			t.Fatal("accept failed")
-		}
-		if _, err := io.ReadFull(a, make([]byte, 1)); err != nil {
-			t.Fatal(err)
+		select {
+		case a = <-ready:
+		case <-time.After(time.Minute):
+			t.Fatal("the acceptor never read the dialer's first byte")
 		}
 		return d, a
 	}
