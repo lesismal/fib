@@ -438,7 +438,14 @@ func TestPeerExpiry(t *testing.T) {
 
 func TestTiers(t *testing.T) {
 	ev := newEnv(t, ServerConfig{}, "127.0.0.1")
-	dead := "udp://127.0.0.1:1/announce"
+	// A tracker that never answers. (A closed port would answer with ICMP,
+	// which Windows reports on the client's socket.)
+	silent, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer silent.Close()
+	dead := "udp://" + silent.LocalAddr().String() + "/announce"
 	tiers := NewTiers([][]string{{dead}, {"http://127.0.0.1:1/announce", ev.udpURL, ev.httpURL, ev.httpURL}, {}})
 	tiers.Timeout = 300 * time.Millisecond
 	if l := tiers.List(); len(l) != 2 || len(l[1]) != 3 {
