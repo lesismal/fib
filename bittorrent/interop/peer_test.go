@@ -97,6 +97,15 @@ func newAnacrolix(t *testing.T, dir string, seed bool, obfuscation torrent.Heade
 	cfg.NoDefaultPortForwarding = true
 	cfg.ListenHost = func(string) string { return "127.0.0.1" }
 	cfg.ListenPort = 0
+	// anacrolix's connection writer can miss a wake-up: when a reason to
+	// request arrives (our unchoke, say) between its filling the write
+	// buffer and its waiting on writeCond, the Broadcast finds no channel
+	// to close and is lost (chansync.BroadcastCond), and nothing requests
+	// until the writer's keepalive timer, KeepAliveTimeout (a minute),
+	// wakes it. A seeder with nothing more to say leaves it there, so that
+	// a download stalled a minute, and the test timed out, a few times in a
+	// hundred. A short keepalive bounds the stall to that.
+	cfg.KeepAliveTimeout = 2 * time.Second
 	cfg.HeaderObfuscationPolicy = obfuscation
 	if provides != 0 {
 		cfg.CryptoProvides = provides
