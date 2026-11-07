@@ -48,6 +48,7 @@ uSockets, workflow, axum, h2, quiche and rustls.
 | arpc | ✓ | ✓ | [lesismal/arpc](https://github.com/lesismal/arpc)'s wire format and API: two-way calls, notify, async calls, streams, broadcast, middleware, reconnect |
 | HTTP CONNECT proxy | ✓ HTTP/1.x, HTTP/2, HTTP/3 | — | `Context.Connect` tunnels, paced both ways; `ConnectProxy` is a ready proxy for curl `-x`, browsers and `HTTPS_PROXY` |
 | SOCKS5 / SOCKS4 / 4a | ✓ | ✓ (async dial) | CONNECT, BIND and UDP ASSOCIATE, username/password; the HTTP, WebSocket and TLS clients dial through it |
+| KCP | ✓ | ✓ | the ARQ protocol of skywind3000/kcp, wire compatible with it and with xtaci/kcp-go (so kcptun): kcp-go's block-cipher, XOR and AES-GCM crypts and its Reed-Solomon FEC, without depending on it; sessions are `net.Conn`s or message callbacks, flushed when something is due rather than every interval ([details](docs/kcp.md)) |
 | gRPC | ✓ h2 and h2c | ✓ | unary and streaming both ways, metadata, deadlines, interceptors, gzip; works with protoc-gen-go-grpc code and talks to grpc-go |
 | WebRTC | ✓ | ✓ | PeerConnections sharing one UDP port: ICE (lite and full, trickle), DTLS 1.2-SRTP, data channels, RTP forwarding for SFUs, and a TURN client and server over UDP, TCP and TLS (quotas, events and stats, hot reload, drain), all written from scratch; talks to browsers and pion ([details](docs/webrtc.md)) |
 | Streaming media | ✓ | ✓ | RTMP/RTMPS (Enhanced RTMP), RTSP over TCP and UDP, SRT, HTTP-FLV and WebSocket-FLV, HLS with fMP4 or TS segments and LL-HLS, WHIP and WHEP, joined by a hub that remuxes between them without transcoding; pull and push relays for each; checked against ffmpeg and Chromium ([details](docs/media.md)) |
@@ -323,6 +324,24 @@ engine, err := fib.New(config, fib.Binding{Addr: ":8000", Handler: mux.New(
 )})
 ```
 
+### KCP
+
+```go
+srv, err := kcp.Listen(engine, ":4000", kcp.ServerConfig{Config: kcp.Config{
+	NoDelay: 1, Interval: 10 * time.Millisecond, Resend: 2, NoCongestion: true, // kcptun's fast3
+	DataShards: 10, ParityShards: 3, // kcp-go's FEC
+}})
+go http.Serve(srv, handler) // a Server is a net.Listener; or ServerConfig.OnSession
+
+conn, err := kcp.Dial(engine, "example.com:4000", kcp.Config{OnMessage: func(s *kcp.Session, msg []byte) {
+	_ = s.Send(msg) // whole messages, on a fib worker
+}})
+```
+
+A session reads each burst of datagrams fib takes from the socket in one go and answers it with one
+batch, and keeps a timer only while something is in flight. `kcp.KCP` is the protocol alone, without
+I/O, for a transport of the application's own.
+
 ### Raw TCP
 
 ```go
@@ -514,6 +533,7 @@ two, and connections are spread over them by fd. A poller parks in Go's own netp
 | WebSocket | — | handshake, frames, `OnMessage`, deflate | over HTTP/2 or HTTP/3: `Upgrade` and `OnOpen` on streams |
 | WebRTC | reads UDP, sorts datagrams by peer | the Mux routes by sender; ICE, DTLS, SRTP and SCTP under a mutex per PeerConnection, then its callbacks | — (one timer per PeerConnection) |
 | Streaming media | reads UDP for SRT, RTSP and WHIP/WHEP | ingest parsing, then the hub's fan-out: every subscriber muxes and queues its writes on the publisher's worker | — (one timer per SRT session) |
+| KCP | reads UDP, sorts datagrams by peer | decryption, FEC, KCP and `OnMessage` under a mutex per session, then one batch of datagrams out | — (one timer per session while data is in flight) |
 | arpc | — | framing, responses, handlers registered sync | `<Name>-streams` (async handlers, the default) |
 | gRPC | — | HTTP/2 framing, HPACK, flow control | `<Name>-streams` (every call) |
 
@@ -772,6 +792,7 @@ Run it yourself with `cd taskpool/benchmark && ./bench.sh` (or `bench.ps1` on Wi
 | [`grpc`](grpc) | gRPC server and client over an HTTP/2 transport of its own, compatible with grpc-go and its generated code |
 | [`webrtc`](webrtc) | WebRTC PeerConnection and a UDP Mux shared by many; `stun`, `ice`, `turn` (and `turnserver`), `sdp`, `sctp`, `srtp` and `rtp` underneath, DTLS 1.2 in `tls` |
 | [`media`](media) | Live streaming: `rtmp`, `rtsp`, `srt`, `httpflv`, `hls` and `rtc` (WHIP/WHEP) on the `hub`; `av`, `flv`, `amf`, `mpegts`, `fmp4`, `mp4`, `rtpcodec` and `codec/{h264,h265,aac,opus}` underneath |
+| [`kcp`](kcp) | KCP server, client and sans-I/O protocol, compatible with kcp-go's crypts and FEC |
 | [`middleware`](middleware) | Middleware chain and the common middleware |
 | [`socks`](socks) | SOCKS5, SOCKS4 and SOCKS4a proxy server and non-blocking dialer; `http.ConnectProxy` is the HTTP proxy |
 | [`mux`](mux) | Several protocols on one port, told apart by the first bytes a client sends |
@@ -793,6 +814,8 @@ Run it yourself with `cd taskpool/benchmark && ./bench.sh` (or `bench.ps1` on Wi
   data channels, media forwarding, TURN, the limits, and the interop with pion, OpenSSL and Chromium
 - [Streaming media](docs/media.md): RTMP, RTSP, SRT, HTTP-FLV, HLS and WHIP/WHEP on one hub, the
   codecs each carries, a server for every protocol, relays, the limits, and the interop with ffmpeg and Chromium
+- [KCP](docs/kcp.md): the layers, flushing when something is due, the mapping from kcp-go and kcptun,
+  the server's session rules, and the interop with kcp-go
 - [Roadmap](docs/roadmap.md): what is planned but not done, and what is deliberately not done, with the reason, the rough cost and when to reconsider each
 - [Load testing](docs/loadtest.md): the `benchmark/loadtest` campaign, its results and the
   memory cost of whole responses to slow readers

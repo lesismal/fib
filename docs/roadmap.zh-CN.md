@@ -50,6 +50,7 @@
 | Windows 上 UDP 的可写事件 | 有意不做 | 完成端口没有"可写"语义（可读靠零字节 `WSARecv`、可写靠 `WSASend` 完成模拟），只能退化成轮询；现在的 1 毫秒重试定时器已经近似，而 Windows 上跑 QUIC 服务端本来就少 | M | Windows 成为 QUIC 的主要部署平台 |
 | macOS 上 `ENOBUFS`（socket 写满）的可写通知 | 有意不做 | 同上：`sendmsg_x` 不报"又有空间了"，仍用 1 毫秒重试；`EAGAIN` 已经走可写事件 | S–M | macOS 上跑高吞吐 QUIC 服务端 |
 | kqueue 可写事件只在 darwin/arm64 验证过 | 已知边界 | `EVFILT_WRITE` 路径在 macOS 上跑过，FreeBSD／NetBSD／OpenBSD／DragonFly 只有交叉编译验证 | S | 有 BSD 生产环境时补一次真机测试 |
+| KCP：Salsa20、FEC 自动调整、kcp-go 的带外包、同一地址多个会话 | 有意不做 | Salsa20 需要 `golang.org/x/crypto` 且不是分组密码，kcptun 默认用 AES；自动调整只是掩盖对端配置错误；带外包与按地址复用会话是 kcp-go 与参考实现特有的附加功能，kcp-go 自己的 Listener 也不支持后者 | 各 S | 有用户需要其中某项 |
 | WebSocket 广播的发送队列 | 已缓解 | 默认无上限（只有 `MaxWriteQueueBytes`／`SetWriteQueueLimit` 可开）；对端长期不读要靠应用层心跳断开 | — | 见 `guide.zh-CN.md` 的广播一节 |
 
 ## 5. WebRTC
@@ -102,6 +103,7 @@
 | HTTP/3 限制／有意不做／待优化 | `docs/http3.zh-CN.md` "当前限制"、"有意没有实现的功能"、"待优化项" | `docs/http3.md` "Current limitations"、"Intentionally not implemented"、"Planned improvements" |
 | WebRTC 限制与有意不做 | `docs/webrtc.zh-CN.md` "配置与限制"、"有意没有实现的功能" | `docs/webrtc.md` "Configuration and limits"、"Intentionally not implemented" |
 | 流媒体限制与有意不做 | `docs/media.zh-CN.md` "配置与限制"、"有意没有实现的功能" | `docs/media.md` "Configuration and limits"、"Intentionally not implemented" |
+| KCP 的决定与兼容性 | `docs/kcp.zh-CN.md`，"待审的决定" | `docs/kcp.md`，"Decisions pending review" |
 | 引擎、TLS、WebSocket 的取舍 | `docs/guide.zh-CN.md` 对应小节 | 同左（guide 只有中文） |
 | 压测方法与结论 | `docs/loadtest.zh-CN.md` | `docs/loadtest.md` |
 | Interop 逐 case 结果 | `http3/interoprunner/README.md` | 同左 |

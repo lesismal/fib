@@ -140,7 +140,7 @@ jobs:
       - name: Lint the interop checks
         shell: bash
         run: |
-          for module in media/interop webrtc/interop; do
+          for module in media/interop webrtc/interop kcp/interop; do
             echo "::group::$module"
             (cd "$module" && go vet ./... && "$(go env GOPATH)/bin/staticcheck" ./...)
             echo "::endgroup::"
@@ -148,7 +148,7 @@ jobs:
       - name: go mod tidy
         shell: bash
         run: |
-          for module in . http3/interop http3/interoprunner taskpool/benchmark media/interop webrtc/interop; do
+          for module in . http3/interop http3/interoprunner taskpool/benchmark media/interop webrtc/interop kcp/interop; do
             echo "::group::$module"
             (cd "$module" && go mod tidy -diff)
             echo "::endgroup::"
@@ -726,6 +726,26 @@ jobs:
             webrtc/interop/go.sum
       - name: Test against pion
         working-directory: webrtc/interop
+        run: go test -race -count=1 -v ./...
+
+  # Package kcp against xtaci/kcp-go in both roles, through a relay that
+  # drops one datagram in 17: every crypt the two share, with and without
+  # FEC, each side recovering the other's losses from parity. A module of
+  # its own (kcp/interop) so that kcp-go is never fib's dependency.
+  kcp-interop:
+    name: KCP interop (kcp-go)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v6
+        with:
+          go-version: stable
+          cache-dependency-path: |
+            go.mod
+            kcp/interop/go.sum
+      - name: Test against kcp-go
+        working-directory: kcp/interop
         run: go test -race -count=1 -v ./...
 
   # The parsers all take bytes from the network, so each gets a short fuzz

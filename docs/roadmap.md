@@ -50,6 +50,7 @@ Each protocol document (`http1*.md`, `http2*.md`, `http3*.md`, `webrtc*.md`, `me
 | UDP writability events on Windows | Deliberately not done | Completion ports have no "writable" notion (readability is a zero-byte `WSARecv`, writability is inferred from a `WSASend` completion), so it would degrade to polling; the 1 ms retry timer already approximates it, and Windows rarely serves QUIC | M | Windows becomes a primary QUIC platform |
 | `ENOBUFS` (a full socket) notification on macOS | Deliberately not done | `sendmsg_x` has no "there is room again" signal, so the 1 ms timer stays; `EAGAIN` already goes through the writable event | S–M | A high-throughput QUIC server on macOS |
 | kqueue writable events verified only on darwin/arm64 | Known limit | The `EVFILT_WRITE` path has run on macOS; FreeBSD, NetBSD, OpenBSD and DragonFly have only cross-compilation behind them | S | A BSD production deployment |
+| KCP: Salsa20, FEC auto-tuning, kcp-go's out-of-band packets, several conversations per address | Deliberately not done | Salsa20 needs `golang.org/x/crypto` and is not a block cipher; kcptun's default is AES. Auto-tuning only papers over a misconfigured peer. Out-of-band packets and per-address multiplexing are kcp-go- and reference-specific extras that kcp-go's own Listener does not offer either | S each | A user who needs one of them |
 | The WebSocket broadcast send queue | Mitigated | Unlimited by default (only `MaxWriteQueueBytes`/`SetWriteQueueLimit` bound it); a peer that never reads must be dropped by application-level heartbeats | — | See the broadcast section of `guide.zh-CN.md` |
 
 ## 5. WebRTC
@@ -102,6 +103,7 @@ Each protocol document (`http1*.md`, `http2*.md`, `http3*.md`, `webrtc*.md`, `me
 | HTTP/3 limits, intentional omissions, planned work | `docs/http3.zh-CN.md`, "当前限制", "有意没有实现的功能", "待优化项" | `docs/http3.md`, "Current limitations", "Intentionally not implemented", "Planned improvements" |
 | WebRTC limits and intentional omissions | `docs/webrtc.zh-CN.md`, "配置与限制", "有意没有实现的功能" | `docs/webrtc.md`, "Configuration and limits", "Intentionally not implemented" |
 | Streaming media limits and intentional omissions | `docs/media.zh-CN.md`, "配置与限制", "有意没有实现的功能" | `docs/media.md`, "Configuration and limits", "Intentionally not implemented" |
+| KCP decisions and compatibility | `docs/kcp.zh-CN.md`, "待审的决定" | `docs/kcp.md`, "Decisions pending review" |
 | Engine, TLS and WebSocket trade-offs | `docs/guide.zh-CN.md`, the relevant sections | The same (the guide is Chinese only) |
 | Load-test method and conclusions | `docs/loadtest.zh-CN.md` | `docs/loadtest.md` |
 | Per-case interop results | `http3/interoprunner/README.md` | The same |
