@@ -137,6 +137,30 @@ func (r *recorder) waitClosed(t *testing.T) error {
 	}
 }
 
+// silentServer accepts TCP connections and never answers them, until the
+// test ends, and returns its address.
+func silentServer(t *testing.T) string {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = ln.Close() })
+	go func() {
+		for {
+			c, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			go func() {
+				defer c.Close()
+				_, _ = io.Copy(io.Discard, c)
+			}()
+		}
+	}()
+	return ln.Addr().String()
+}
+
 func waitReady(t *testing.T, ch chan error) error {
 	t.Helper()
 	select {
@@ -453,9 +477,13 @@ func TestRelays(t *testing.T) {
 	pull.Close()
 	push.Close()
 	got.waitClosed(t)
-	// A relay closed before it starts does not start.
+	// A relay closed before it starts does not start. Its server takes the
+	// connection and never answers, so the push cannot start before Close
+	// however long the test goroutine waits to call it: against a server
+	// that answers, a loaded runner let the handshake finish first.
+	silent := silentServer(t)
 	closedEarly := make(chan error, 1)
-	r, err := Push(e, local, "src", url+"/live/early", 0, ClientConfig{}, func(err error) { closedEarly <- err })
+	r, err := Push(e, local, "src", "rtmp://"+silent+"/live/early", 0, ClientConfig{}, func(err error) { closedEarly <- err })
 	if err != nil {
 		t.Fatal(err)
 	}
