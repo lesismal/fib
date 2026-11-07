@@ -335,7 +335,11 @@ func TestCvCliIdleTimerSetAgain(t *testing.T) {
 			}
 		}
 	})
-	const timeout = 200 * time.Millisecond
+	// The gaps between the requests stay well under the timeout, so that a
+	// loaded runner's late wake-up from the sleep is not taken for the
+	// timeout running out: a 150ms sleep under a 200ms timeout overslept on
+	// a Windows runner and the connection rightly closed in the gap.
+	const timeout = 600 * time.Millisecond
 	config := DefaultClientConfig()
 	config.IdleConnTimeout = timeout
 	client := newTestClient(t, config)
@@ -347,13 +351,13 @@ func TestCvCliIdleTimerSetAgain(t *testing.T) {
 		}
 		readBody(t, resp)
 		last = time.Now()
-		time.Sleep(timeout * 3 / 4)
+		time.Sleep(timeout / 2)
 	}
 	at := cvCliWait(t, closed, "the idle connection to close")
 	// last is taken after the body was read, so the client's own mark came a
 	// little before it, and a runner's timer granularity is coarse: Windows
 	// closed it 13.5ms early. A timer kept from an earlier idle spell would
-	// close it 150ms early, the 3/4 of timeout slept between the requests,
+	// close it 300ms early, the half of timeout slept between the requests,
 	// so timeout/4 tells the two apart.
 	if early := last.Add(timeout).Sub(at); early > timeout/4 {
 		t.Fatalf("closed %v before IdleConnTimeout after it last went idle", early)
@@ -1123,7 +1127,9 @@ func TestCvCliResponseHeaderTimeoutAlone(t *testing.T) {
 	})
 	config := DefaultClientConfig()
 	config.Timeout = 0
-	config.ResponseHeaderTimeout = 100 * time.Millisecond
+	// Long enough for the answered request on a loaded runner: 100ms was not,
+	// on Windows under the race detector.
+	config.ResponseHeaderTimeout = time.Second
 	client := newTestClient(t, config)
 	resp, err := client.Go(mustRequest(t, "GET", u+"/", nil)).Wait()
 	if err != nil {

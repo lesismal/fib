@@ -323,10 +323,17 @@ func play(ctx context.Context, set codecSet, e egress, path string) result {
 }
 
 // errorLines returns the error lines of an ffmpeg log at level+warning,
-// and the warnings about timestamps going back.
+// and the warnings about timestamps going back. ffmpeg's RTSP reader over
+// UDP picks its RTP and RTCP ports at random and logs each pair another
+// process holds as an error before it tries the next; with many players at
+// once that happens, so those lines are left out. A reader that finds no
+// pair at all fails, and plays nothing for checkCRC to pass.
 func errorLines(log string) []string {
 	var out []string
 	for _, l := range strings.Split(log, "\n") {
+		if strings.Contains(l, "[udp @") && strings.Contains(l, "bind failed: Address already in use") {
+			continue
+		}
 		if strings.Contains(l, "[error]") || strings.Contains(l, "[fatal]") || strings.Contains(l, "[panic]") ||
 			strings.Contains(strings.ToLower(l), "monoton") {
 			out = append(out, l)

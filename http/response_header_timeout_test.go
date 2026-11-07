@@ -87,8 +87,9 @@ func TestResponseHeaderTimeout(t *testing.T) {
 func TestResponseHeaderTimeoutSkipsRetryWait(t *testing.T) {
 	// The header wait also covers the first try, from its send until the
 	// client sees the hang-up, which a loaded runner under the race detector
-	// can stretch past 150ms; the retry's dial still takes three times it.
-	const wait = 500 * time.Millisecond
+	// has stretched past 150ms and then past 500ms; the retry's dial still
+	// takes twice it.
+	const wait = 2 * time.Second
 	url := rawServer(t, func(conn net.Conn, _ int) {
 		reader := bufio.NewReader(conn)
 		for served := 0; ; served++ {
@@ -109,7 +110,7 @@ func TestResponseHeaderTimeoutSkipsRetryWait(t *testing.T) {
 		handler fib.Handler, done func(*fib.Connection, error)) error {
 		if dials.Add(1) > 1 {
 			// The retry's connection takes longer than the header may.
-			time.Sleep(3 * wait)
+			time.Sleep(2 * wait)
 		}
 		return engine.DialWithHandler(network, addr, timeout, handler, done)
 	}
