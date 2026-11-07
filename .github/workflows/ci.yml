@@ -749,14 +749,15 @@ jobs:
         working-directory: kcp/interop
         run: go test -race -count=1 -v ./...
 
-  # Package bittorrent and its parts against anacrolix/torrent, anacrolix/dht
-  # and libutp (through go-libutp, so cgo): metainfo both ways, trackers in
-  # both roles, the peer wire protocol plain and under MSE, uTP through a
-  # lossy relay, the DHT on a mixed loopback network, and whole downloads
-  # between fib's client and anacrolix's. A module of its own
-  # (bittorrent/interop) so that none of them is ever fib's dependency.
+  # Package bittorrent and its parts against anacrolix/torrent, anacrolix/dht,
+  # libutp (through go-libutp, so cgo) and libtorrent-rasterbar: metainfo
+  # both ways, trackers in both roles, the peer wire protocol plain and under
+  # MSE, uTP through a lossy relay, the DHT on a mixed loopback network, and
+  # whole downloads between fib's client and anacrolix's and libtorrent's.
+  # A module of its own (bittorrent/interop) so that none of them is ever
+  # fib's dependency.
   bittorrent-interop:
-    name: BitTorrent interop (anacrolix, libutp)
+    name: BitTorrent interop (anacrolix, libutp, libtorrent)
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
@@ -767,10 +768,18 @@ jobs:
           cache-dependency-path: |
             go.mod
             bittorrent/interop/go.sum
-      - name: Test against anacrolix and libutp
+      # libtorrent-rasterbar through Ubuntu's Python binding, for
+      # TestClientLibtorrent: v1, hybrid and v2 torrents both ways.
+      - name: Install libtorrent
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends python3-libtorrent
+          python3 -c 'import libtorrent; print("libtorrent", libtorrent.__version__)'
+      - name: Test against anacrolix, libutp and libtorrent
         working-directory: bittorrent/interop
         env:
           CGO_ENABLED: '1'
+          FIB_LIBTORRENT: '1'
         run: go test -race -count=1 -timeout 12m -v ./...
 
   # The parsers all take bytes from the network, so each gets a short fuzz
