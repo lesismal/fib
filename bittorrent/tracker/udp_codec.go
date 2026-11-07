@@ -206,6 +206,11 @@ func parseUDPReply(b []byte) (r udpReply, ok bool) {
 // parseUDPAnnounceReply reads the body of an announce's reply, whose peers
 // are IPv6 ones when the tracker was asked over IPv6.
 func parseUDPAnnounceReply(body []byte, ipv6 bool) (*AnnounceResponse, error) {
+	if len(body) == 0 {
+		// opentracker answers so an announce of a torrent it does not
+		// track, where an error packet would say why.
+		return nil, &Error{Reason: "announce refused, without a reason"}
+	}
 	if len(body) < udpAnnounceRespLen-udpReplyHeaderLen {
 		return nil, errShortPacket
 	}
