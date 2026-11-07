@@ -330,6 +330,16 @@ FIB_DHT_PUBLIC=1 FIB_DHT_INFOHASH=<40 hex> go test -run TestDHTPublic -v .   # p
   IP and decodes the key as a whole address, so what it returns has a mangled IP and port. The
   interop test gives the anacrolix servers a correct store. (anacrolix in turn rejects an immutable
   BEP 44 put without `seq`, so fib's carries `seq` 0.)
+- **libutp: a lost SYN answer leaves a half-open connection for good.** libutp ignores a repeated
+  SYN for a connection ID it already has, and that half-open connection never times out, so a
+  dialer that only resends its SYN waits forever. fib's dialer resends once under the same ID and
+  then resets and starts again under a new one; libutp may still hand its application the
+  abandoned connection.
+- **anacrolix/torrent v1.61.0: the connection writer can lose a wake-up.** A reason to send
+  requests (an unchoke) that arrives between the writer filling its buffer and its waiting is
+  dropped (`chansync.BroadcastCond`), and nothing is requested until its keepalive timer
+  (`KeepAliveTimeout`, a minute) fires. A seeder with nothing more to say saw downloads stall a
+  minute in 1–2% of runs; the interop tests set the keepalive to 2 s.
 
 ## BEP coverage
 

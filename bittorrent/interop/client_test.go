@@ -119,6 +119,10 @@ func newAnacrolixClient(t *testing.T, dir string, seed bool, c clientCase, track
 	cfg.NoDefaultPortForwarding = true
 	cfg.ListenHost = func(string) string { return "127.0.0.1" }
 	cfg.ListenPort = 0
+	// anacrolix's writer can lose a wake-up and then sends nothing until
+	// its keepalive timer fires (see newAnacrolix in peer_test.go); a short
+	// keepalive bounds that stall.
+	cfg.KeepAliveTimeout = 2 * time.Second
 	if c.require {
 		cfg.HeaderObfuscationPolicy = torrent.HeaderObfuscationPolicy{Preferred: true, RequirePreferred: true}
 		cfg.CryptoProvides = amse.CryptoMethodRC4

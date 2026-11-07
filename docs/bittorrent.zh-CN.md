@@ -283,6 +283,12 @@ FIB_DHT_PUBLIC=1 FIB_DHT_INFOHASH=<40 位十六进制> go test -run TestDHTPubli
 - **anacrolix/dht v2.23.0：`peer_store.InMemory` 从不返回 announce 来的 peer。** 它按 IP 存 peer，取出时却把键
   当完整地址解码，返回的 IP 和端口是错乱的。互通测试给 anacrolix 服务端换了一个正确的 store。（反过来，
   anacrolix 拒绝不带 `seq` 的 BEP 44 不可变 put，所以 fib 的 put 带上 `seq` 0。）
+- **libutp：SYN 的应答丢了，就永远留下一个半开连接。** libutp 对已有的连接 ID 不理重发的 SYN，而那个半开连接
+  从不超时，只会重发 SYN 的发起方会一直等下去。fib 的发起方用同一个 ID 重发一次，之后就重置、换一个新 ID 重来；
+  libutp 仍可能把那个被放弃的连接交给它的应用。
+- **anacrolix/torrent v1.61.0：连接的写协程会丢失唤醒。** 发请求的理由（比如一次 unchoke）若恰好在写协程填满缓冲之后、
+  开始等待之前到来，就被丢掉了（`chansync.BroadcastCond`），直到保活定时器（`KeepAliveTimeout`，一分钟）触发才会
+  发请求。对端是无话可说的做种方时，1–2% 的运行里下载会停一分钟；互通测试把保活设为 2 秒。
 
 ## BEP 覆盖
 
