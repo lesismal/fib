@@ -19,6 +19,9 @@ type transport interface {
 	close(err error)
 	// notifyOutput is fib.Connection.NotifyOutput.
 	notifyOutput(limit int64, fn func(error)) bool
+	// holdReads stops reading from the peer, or resumes; the read in
+	// progress is delivered.
+	holdReads(hold bool)
 	remoteAddr() net.Addr
 	localAddr() net.Addr
 }
@@ -50,6 +53,8 @@ func (t *fibTransport) notifyOutput(limit int64, fn func(error)) bool {
 	return t.fc.NotifyOutput(limit, fn)
 }
 
+func (t *fibTransport) holdReads(hold bool) { t.fc.HoldReads(hold) }
+
 func (t *fibTransport) remoteAddr() net.Addr { return t.fc.RemoteAddr() }
 func (t *fibTransport) localAddr() net.Addr  { return t.fc.LocalAddr() }
 
@@ -61,11 +66,13 @@ type netTransport struct {
 	conn net.Conn
 
 	mu      sync.Mutex
-	cond    sync.Cond
+	cond    sync.Cond // the writer's
 	queue   [][]byte
 	queued  int64
 	closed  bool
 	waiters []outputWaiter
+	held    bool
+	resume  sync.Cond // the reader's, while held
 }
 
 type outputWaiter struct {
@@ -76,6 +83,7 @@ type outputWaiter struct {
 func startNetTransport(c *Conn, conn net.Conn) {
 	t := &netTransport{conn: conn}
 	t.cond.L = &t.mu
+	t.resume.L = &t.mu
 	c.attach(t)
 	go t.writeLoop()
 	go t.readLoop(c)
@@ -84,6 +92,11 @@ func startNetTransport(c *Conn, conn net.Conn) {
 func (t *netTransport) readLoop(c *Conn) {
 	buf := make([]byte, 32<<10)
 	for {
+		t.mu.Lock()
+		for t.held && !t.closed {
+			t.resume.Wait()
+		}
+		t.mu.Unlock()
 		n, err := t.conn.Read(buf)
 		if n > 0 {
 			c.input(buf[:n])
@@ -170,6 +183,7 @@ func (t *netTransport) close(error) {
 	waiters := t.waiters
 	t.waiters = nil
 	t.cond.Broadcast()
+	t.resume.Broadcast()
 	t.mu.Unlock()
 	_ = t.conn.Close()
 	for _, w := range waiters {
@@ -185,6 +199,15 @@ func (t *netTransport) notifyOutput(limit int64, fn func(error)) bool {
 	}
 	t.waiters = append(t.waiters, outputWaiter{limit, fn})
 	return true
+}
+
+func (t *netTransport) holdReads(hold bool) {
+	t.mu.Lock()
+	t.held = hold
+	if !hold {
+		t.resume.Broadcast()
+	}
+	t.mu.Unlock()
 }
 
 func (t *netTransport) remoteAddr() net.Addr { return t.conn.RemoteAddr() }

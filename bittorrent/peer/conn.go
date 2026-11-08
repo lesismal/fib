@@ -652,6 +652,22 @@ func (c *Conn) Batch(fn func()) {
 	fn()
 }
 
+// HoldReads stops reading from the peer, or resumes: a handler whose
+// work on what it received backs up, as a client's disk writes do, holds
+// the peer back with TCP's or uTP's flow control rather than with memory.
+// The read in progress is delivered all the same. It may be called from
+// any goroutine, also from inside OnMessage; holds do not nest, the last
+// call wins, and a hold on a connection that is closed or not yet open
+// does nothing.
+func (c *Conn) HoldReads(hold bool) {
+	c.mu.Lock()
+	tr := c.tr
+	c.mu.Unlock()
+	if tr != nil {
+		tr.holdReads(hold)
+	}
+}
+
 // SendPiece sends a block, a piece message. The block is copied.
 func (c *Conn) SendPiece(index, begin uint32, block []byte) error {
 	return c.Send(&Message{Type: MsgPiece, Index: index, Begin: begin, Data: block})

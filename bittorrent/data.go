@@ -68,20 +68,23 @@ func (t *Torrent) pieceLayersFor(i int) metainfo.PieceLayers {
 	return nil
 }
 
-// verifyPiece checks piece i, whose blocks p holds are all in storage.
+// verifyPiece checks piece i, whose blocks p holds are all in storage. It
+// reads and hashes the whole piece: it runs on the disk pool, or on a
+// goroutine of its own such as a web seed's, never on a fib worker.
 func (t *Torrent) verifyPiece(i int, p *partial) {
-	t.mu.Lock()
-	st, info := t.storage, t.info
-	layers := t.pieceLayersFor(i)
-	t.mu.Unlock()
+	st, info, done := t.useStorage()
 	if st == nil {
 		t.mu.Lock()
 		p.busy = false
 		t.mu.Unlock()
 		return
 	}
+	t.mu.Lock()
+	layers := t.pieceLayersFor(i)
+	t.mu.Unlock()
 	data := make([]byte, info.PieceSize(i))
 	err := readData(st, info, info.PieceOffset(i), data)
+	done()
 	if err == nil {
 		err = info.VerifyPiece(i, data, layers)
 	}
@@ -209,14 +212,19 @@ func (t *Torrent) startCheckLocked() {
 	if prev == StateMetadata || prev == StateDownloading || prev == StateSeeding {
 		t.state = StateChecking
 	}
-	st, info := t.storage, t.info
-	go t.check(st, info)
+	go t.check(t.info)
 }
 
-func (t *Torrent) check(st Storage, info *metainfo.Info) {
+func (t *Torrent) check(info *metainfo.Info) {
 	n := info.PieceCount()
 	buf := make([]byte, info.PieceLength)
-	plan := t.resumePlan(st, info)
+	var plan []int8
+	if st, _, done := t.useStorage(); st != nil {
+		plan = t.resumePlan(st, info)
+		done()
+	} else {
+		done()
+	}
 	for i := range n {
 		select {
 		case <-t.removed:
@@ -227,13 +235,19 @@ func (t *Torrent) check(st Storage, info *metainfo.Info) {
 			continue
 		}
 		data := buf[:info.PieceSize(i)]
-		if err := readData(st, info, info.PieceOffset(i), data); err != nil {
+		st, _, done := t.useStorage()
+		err := errNoStorage
+		if st != nil {
+			err = readData(st, info, info.PieceOffset(i), data)
+		}
+		done()
+		if err != nil {
 			continue
 		}
 		t.mu.Lock()
 		layers := t.pieceLayersFor(i)
 		t.mu.Unlock()
-		err := info.VerifyPiece(i, data, layers)
+		err = info.VerifyPiece(i, data, layers)
 		t.mu.Lock()
 		switch {
 		case err == nil:
@@ -250,6 +264,14 @@ func (t *Torrent) check(st Storage, info *metainfo.Info) {
 			t.partials[i] = p
 		}
 		t.mu.Unlock()
+	}
+	// The wanted empty files, which no piece writes, exist from here,
+	// before the torrent can be done.
+	t.mu.Lock()
+	empty := t.emptyFilesLocked()
+	t.mu.Unlock()
+	if len(empty) > 0 {
+		t.createFiles(empty)
 	}
 	t.mu.Lock()
 	defer t.mu.Unlock()

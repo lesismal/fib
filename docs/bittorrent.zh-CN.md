@@ -136,7 +136,8 @@ engine, err := fib.New(fib.DefaultConfig(),
 `Conn` 跟踪 choke、interest 和未完成的请求：`Request` 让在途请求不超过对端的 `reqq`（以及
 `Config.MaxRequests`，64），并考虑 choke 状态和 allowed fast 分片；没有 Fast 扩展时，choke 会丢弃这些请求。
 它每两分钟发一次 keepalive，静默三分钟后关闭。handler 在回调里发送的内容在回调返回时一次写出；`Congested`
-和 `OnWritable` 按等待写入 socket 的数据量控制上传节奏。在 `net.Conn` 上，读和写各用一个 goroutine，
+和 `OnWritable` 按等待写入 socket 的数据量控制上传节奏；handler 自己的处理积压时，`HoldReads` 暂停从对端读取。
+在 `net.Conn` 上，读和写各用一个 goroutine，
 双方都不会因为对方没读而互相等待。
 
 `mse` 包是 MSE/PE：768 位 Diffie-Hellman，丢弃前 1024 字节的 RC4，两种角色都支持。`Initiator` 与 `Receiver`
@@ -241,6 +242,13 @@ _, err = io.Copy(w, r)
 
   和 libtorrent 一样它信任这些文件戳：大小和修改时间都不变的原地修改发现不了，记为已有的分片发给 peer
   时也不再校验（收到坏分片的 peer 会在自己的校验中失败，并可能封禁本客户端）。
+- **磁盘池**：存储的读写和分片哈希从不在 fib worker 上（也不在读 uTP 连接的 goroutine 上）进行。
+  `Config.DiskWorkers` 个 goroutine（GOMAXPROCS，最多 `DefaultMaxDiskWorkers` = 8）从同一个队列取任务：收到的块
+  拷进池化缓冲区后排队写入，分片的最后一块落盘后在池上校验整个分片；上传的读也在池上，每个 peer 同时只有一个
+  任务，每个任务最多 16 块，节奏仍受 `Congested`、`OnWritable` 和 `UploadRate` 控制；BEP 52 hash request 的应答和
+  取到的 piece layer 的校验也在池上。等待写入的块受 `Config.DiskQueueBytes`（`DefaultDiskQueueBytes`，64 MiB）
+  限制：超过后，发来这些块的连接停止读取（`peer.Conn.HoldReads`，即 `fib.Connection.HoldReads` 或暂停读
+  goroutine），直到写掉一半。`Stop`、`Remove` 和 `Close` 等正在进行的读写结束后才关闭存储；仍在排队的被丢弃。
 - **选片**：最稀有优先，相同时随机，头 4 个分片随机挑；文件优先级、顺序模式和打开着的 `Reader` 的窗口
   （最近的分片最急；默认预读 4 MiB，可用 `SetReadahead` 调整）优先。16 KiB 的块按每个 peer 的 `reqq` 流水请求；
   endgame 时一个块同时向第二个 peer 请求，较慢的那个被取消。60 秒没发任何东西的 peer 被判为 snub，
@@ -425,6 +433,8 @@ FIB_DHT_PUBLIC=1 FIB_DHT_INFOHASH=<40 位十六进制> go test -run TestDHTPubli
 - **BEP 52 升级**：作为接收方，对端设置 v2 位时把 hybrid 的 v1 握手升级为 v2（anacrolix 从不这样做）；
   作为发起方，只在用 v1 哈希拨 hybrid torrent 时设置 v2 位。
 - **IPv6 的 allowed fast 集合**：地址按 /48 掩码，对全部 16 字节做哈希。
+- **`Conn.HoldReads`** 在 `net.Conn` 传输上让读 goroutine 在下一次读之前停住，在 fib 传输上就是
+  `fib.Connection.HoldReads`；不嵌套计数。备选：在 handler 里阻塞，而 fib worker 不能阻塞。
 - **peer 连接不开写背压**，两个互相上传的 peer 不会死锁；上传节奏由 `fib.Connection.NotifyOutput` 和
   `MaxQueuedBytes`（1 MiB）经 `Congested` 与 `OnWritable` 控制。在 `net.Conn` 上，写 goroutine 的队列不设上限。
 - **限制与默认值**：消息最大 1 MiB + 64，metadata 最大 16 MiB，通告的 `reqq` 为 250，在途请求最多 64 个，
@@ -483,7 +493,28 @@ FIB_DHT_PUBLIC=1 FIB_DHT_INFOHASH=<40 位十六进制> go test -run TestDHTPubli
 - **本地服务发现只支持 IPv4**，用标准库的 `net.ListenMulticastUDP`，因为 fib 没有组播 binding；加入组播组失败时
   静默关闭。
 - **封禁**按 IP（回环上的 peer 按它的监听地址），在客户端整个生命周期内有效。
-- **块直接写入存储**，校验分片时再读回；内存里不攒分片，smart ban 的哈希也来自读回的数据。
+- **块直接写入存储**（经磁盘池），校验分片时再读回；内存里不攒分片，smart ban 的哈希也来自读回的数据。
+- **每个客户端一个磁盘池、一个 FIFO 队列**，写入、分片校验、上传读取和 hash 应答共用：简单，也足够公平，因为
+  上传任务每 16 块就让出一次。备选：每个 torrent 或每类任务一个队列（像 libtorrent 的磁盘线程那样先写后读），
+  或每个任务一个 goroutine，那就什么都限制不住。
+- **`DiskWorkers` 默认 min(GOMAXPROCS, 8)**：哈希吃 CPU，而超过 8 个并发写对磁盘很少有帮助。备选：固定数目，
+  或把哈希和 I/O 分成两组 worker。
+- **字节上限只算收到的块**（`DiskQueueBytes`，64 MiB）：这是 peer 能撑大的内存。上传读取和分片校验只在运行时
+  持有缓冲区，最多 DiskWorkers 个；它们的任务数受每个 peer 一个上传任务、每个在途分片一次校验限制。备选：
+  所有缓冲区都计入，或按 torrent 设上限。
+- **上限是软的**：块从不被拒绝或丢弃，因为它到达时在 fib worker 上，不能等待；达到上限后停止读取，所以会超出
+  已经读到的数据（每条连接一轮读）。降到上限一半时恢复读取，所有被暂停的连接一起恢复。备选：超出时丢弃块，
+  由对端重发。
+- **块写入时发现存储已关闭**（torrent 已停止或移除）则丢弃，不发 `EventError`，该块重新变为缺失。真正的写入
+  错误仍发 `EventError`。
+- **关闭存储时等待正在进行的读写**（每个 torrent 一把锁，任务在 I/O 期间持有），而不等待队列：排队的任务发现
+  存储已不在就什么也不做。因此 `Stop`、`Remove` 和 `Client.Close` 最多等每个磁盘 worker 一次慢 I/O。
+- **不在池上的**：初始校验（每个 torrent 一个 goroutine，同以前）、web seed 的写入与校验（在它的下载
+  goroutine 上）、`Reader` 的读取（调用者的 goroutine），以及 `StorageOpener`——磁力链接的 torrent 在 info 字典
+  到达时于 fib worker 上调用它：opener 不能阻塞（默认的不做 I/O）。收到的 info 字典的 SHA-1 也在那里算，只算一次，
+  最多几 MiB。
+- **想要的空文件在初始校验结束时创建**，而不是下载完成时，这样 `Done` 关闭时它们已经存在；之后才选中的仍在完成
+  时于池上创建。
 - **从不请求填充字节**（anacrolix 拒绝落在填充里的请求）。
 - **纯 v2 torrent 提供文件最后一个完整的 16 KiB 块**，超出文件末尾的部分补零，因为 libtorrent 请求整块。
 - **BEP 52 hash request** 每次最多请求 512 个哈希、`proof_layers` 为 0（与 anacrolix 相同），拼好的 layer 与文件的

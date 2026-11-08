@@ -71,10 +71,14 @@ func (t *Torrent) ResumeData() ([]byte, error) {
 		return nil, errChecking
 	}
 	have := t.have.Clone()
-	st, opener := t.storage, t.opener
+	opener := t.opener
 	ih, ih2 := t.ih, t.ih2
 	t.mu.Unlock()
 
+	// The storage in use is held so that Stop or Close cannot close it
+	// under the Stat calls (see useStorage).
+	st, _, done := t.useStorage()
+	defer done()
 	if st == nil {
 		s, err := opener(info)
 		if err != nil {

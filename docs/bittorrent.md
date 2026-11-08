@@ -153,7 +153,8 @@ A `Conn` tracks choking, interest and the requests outstanding: `Request` keeps 
 `reqq` (and `Config.MaxRequests`, 64) in flight, aware of choking and allowed-fast pieces, and
 without the Fast extension a choke drops them. It sends keepalives every two minutes and closes
 after three of silence. What a handler sends from its callbacks goes out in one write when it
-returns; `Congested` and `OnWritable` pace uploads by what waits for the socket. Over a `net.Conn`,
+returns; `Congested` and `OnWritable` pace uploads by what waits for the socket, and `HoldReads`
+stops reading from the peer while the handler's own work backs up. Over a `net.Conn`,
 one goroutine reads and another writes, so that neither side ever waits on the other's reading.
 
 Package `mse` is MSE/PE: 768-bit Diffie-Hellman, RC4 with the first 1024 bytes dropped, both
@@ -282,6 +283,17 @@ _, err = io.Copy(w, r)
   Like libtorrent's, it trusts the stamps: content changed in place with the same size and
   modification time is not seen, and the pieces taken as had are served to peers without being
   verified again (a peer that gets a bad piece fails its own check and may ban this client).
+- **Disk pool**: storage is never read or written, and no piece is hashed, on a fib worker (or on
+  the goroutine reading a uTP connection). `Config.DiskWorkers` goroutines (GOMAXPROCS, at most
+  `DefaultMaxDiskWorkers` = 8) take the jobs from one queue: a received block is copied into a
+  pooled buffer and its write queued, and the piece is checked on the pool once its last block
+  lands; an upload's reads run there, one job per peer at a time of up to 16 blocks, still paced by
+  `Congested`, `OnWritable` and `UploadRate`; so do the answers to BEP 52 hash requests and the check
+  of a fetched piece layer. The blocks waiting are bounded by `Config.DiskQueueBytes`
+  (`DefaultDiskQueueBytes`, 64 MiB): past it the connections that sent them stop reading
+  (`peer.Conn.HoldReads`, which is `fib.Connection.HoldReads` or a paused reading goroutine) until
+  half has been written. `Stop`, `Remove` and `Close` close a storage only once the reads and writes
+  under way are over; those still queued are dropped.
 - **Picking**: rarest first with random ties, the first 4 pieces at random; file priorities,
   sequential mode and the windows of open `Reader`s (the nearest piece most urgent; readahead 4 MiB
   by default, `SetReadahead`) come first. 16 KiB blocks are pipelined to each peer's `reqq`; in
@@ -504,6 +516,9 @@ alternative.
   v2 bit (anacrolix never does); as initiator the v2 bit is set only when dialing a hybrid by its
   v1 hash.
 - **Allowed-fast set for IPv6**: the address masked to /48, all 16 bytes hashed.
+- **`Conn.HoldReads`** pauses a `net.Conn` transport's reading goroutine before its next read,
+  and is `fib.Connection.HoldReads` on a fib one; holds do not nest. Alternative: blocking inside
+  the handler, which a fib worker must not do.
 - **No write backpressure** on peer connections, so two peers uploading to each other cannot
   deadlock; uploads are paced by `fib.Connection.NotifyOutput` and `MaxQueuedBytes` (1 MiB)
   through `Congested` and `OnWritable`. Over a `net.Conn` the writer goroutine's queue is
@@ -576,8 +591,37 @@ alternative.
 - **Local service discovery is IPv4 only**, on the standard library's `net.ListenMulticastUDP`,
   since fib has no multicast bindings; it turns itself off silently if joining the group fails.
 - **Bans** are by IP (a loopback peer by its listen address) and last for the client's lifetime.
-- **Blocks are written straight to storage** and read back to verify the piece; there are no
-  pieces in memory, and smart-ban hashes come from that read-back.
+- **Blocks are written straight to storage** (through the disk pool) and read back to verify the
+  piece; there are no pieces in memory, and smart-ban hashes come from that read-back.
+- **One disk pool per client, one FIFO queue** for writes, piece checks, upload reads and hash
+  answers: simple and fair enough, as an upload job yields after 16 blocks. Alternatives: a queue
+  per torrent or per kind of job (writes before reads, as libtorrent's disk threads favour), or a
+  goroutine per job, which would bound nothing.
+- **`DiskWorkers` defaults to min(GOMAXPROCS, 8)**: hashing is CPU-bound, and more than 8
+  concurrent writes rarely help a disk. Alternative: a fixed number, or separate hashing and I/O
+  workers.
+- **The byte bound counts received blocks only** (`DiskQueueBytes`, 64 MiB): they are the memory
+  peers can grow. Upload reads and piece checks hold a buffer only while running, so at most
+  DiskWorkers of them; their jobs are bounded by one upload job per peer and one check per piece
+  in flight. Alternatives: counting every buffer, or a bound per torrent.
+- **The bound is soft**: a block is never refused or dropped, since it arrives on a fib worker that
+  must not wait; reads stop once it is reached, so it is exceeded by what reads already delivered
+  (one read round per connection). Reads resume at half the bound, all held connections at once.
+  Alternative: dropping blocks past it, which the peer would have to send again.
+- **A block's write that finds its storage closed** (a stopped or removed torrent) is dropped
+  without an `EventError`; the block becomes missing again. A real write error still emits
+  `EventError`.
+- **Closing a storage waits for the reads and writes under way** (a lock per torrent the jobs hold
+  for their I/O), not for the queue: queued jobs find the storage gone and do nothing. `Stop`,
+  `Remove` and `Client.Close` therefore return after at most one slow I/O per disk worker.
+- **Not on the pool**: the initial check (a goroutine per torrent, as before), a web seed's write
+  and check (on its fetch goroutine), `Reader` reads (the caller's goroutine), and the
+  `StorageOpener`, which a magnet link's torrent calls on a fib worker when the info dictionary
+  arrives: an opener must not block (the default one does no I/O). The SHA-1 of a received info
+  dictionary also runs there; it is hashed once and at most a few MiB.
+- **The wanted empty files are created at the end of the initial check**, rather than at
+  completion, so they exist once `Done` is closed; files selected later are still created at
+  completion, on the pool.
 - **Padding bytes are never requested** (anacrolix refuses requests inside padding).
 - **v2-only torrents serve the whole last 16 KiB block** of a file, zeros past its end, because
   libtorrent requests whole blocks.

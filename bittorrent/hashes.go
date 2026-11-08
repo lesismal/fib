@@ -22,6 +22,9 @@ const (
 	// maxHashesServed bounds the hashes one request may ask of this side.
 	maxHashesServed  = 8192
 	hashRequestRetry = 10 * time.Second
+	// maxHashAnswers bounds a peer's hash requests being answered at
+	// once.
+	maxHashAnswers = 4
 )
 
 // hashKey is a request for part of a file's piece layer.
@@ -39,6 +42,9 @@ type hashReq struct {
 type layerFetch struct {
 	hashes [][32]byte
 	got    []bool // per request of maxHashesPerRequest
+	// checking is set while the assembled layer is checked against the
+	// file's root on the disk pool.
+	checking bool
 }
 
 func log2(n int64) int { return bits.Len64(uint64(n)) - 1 }
@@ -159,18 +165,33 @@ func (t *Torrent) onHashesLocked(pc *peerConn, m *peer.Message) {
 			return
 		}
 	}
+	if lf.checking {
+		return
+	}
 	layer := make([]byte, 0, 32*len(lf.hashes))
 	for _, h := range lf.hashes {
 		layer = append(layer, h[:]...)
 	}
-	root, err := metainfo.LayerRoot(layer, t.info.PieceLength)
-	if err != nil || root != m.PiecesRoot {
-		// Wrong hashes: ask again, from another peer.
-		clear(lf.got)
-		return
-	}
-	delete(t.layerParts, m.PiecesRoot)
-	t.setLayerLocked(m.PiecesRoot, layer)
+	// The layer's root, a hash of every hash in it, is worked out on the
+	// disk pool.
+	lf.checking = true
+	want, pieceLength := m.PiecesRoot, t.info.PieceLength
+	t.c.disk.run(func() {
+		root, err := metainfo.LayerRoot(layer, pieceLength)
+		t.mu.Lock()
+		defer t.mu.Unlock()
+		lf.checking = false
+		if t.layerParts[want] != lf {
+			return
+		}
+		if err != nil || root != want {
+			// Wrong hashes: ask again, from another peer.
+			clear(lf.got)
+			return
+		}
+		delete(t.layerParts, want)
+		t.setLayerLocked(want, layer)
+	})
 }
 
 // setLayerLocked keeps a file's verified piece layer, and checks the
@@ -193,7 +214,7 @@ func (t *Torrent) kickWaitingLocked() {
 		p.waitHashes = false
 		if p.complete() && p.writing == 0 && !p.busy {
 			p.busy = true
-			go t.verifyPiece(i, p)
+			t.c.disk.run(func() { t.verifyPiece(i, p) })
 		}
 	}
 }
@@ -214,26 +235,45 @@ func (t *Torrent) onHashRejectLocked(pc *peerConn, m *peer.Message) {
 // onHashRequestLocked answers a peer's hash request from the piece layers
 // this side has: hashes of the piece layer only, padded past the file's
 // last piece, followed by the uncles that prove them up to proof layers
-// above the base, the subtree the hashes span not counted.
+// above the base, the subtree the hashes span not counted. The proof,
+// which hashes the whole layer, is made on the disk pool, at most
+// maxHashAnswers at a time for a peer; past them the request is rejected.
 func (t *Torrent) onHashRequestLocked(pc *peerConn, m *peer.Message) {
 	reply := *m
 	reply.Type = peer.MsgHashReject
 	reply.Data = nil
-	defer func() { _ = pc.c.Send(&reply) }()
-	if t.info == nil || !t.info.HasV2() {
+	if t.info == nil || !t.info.HasV2() || pc.hashing >= maxHashAnswers {
+		_ = pc.c.Send(&reply)
 		return
 	}
+	// A layer, once kept, is never written to again.
 	layer, ok := t.layers[m.PiecesRoot]
-	if !ok || int(m.BaseLayer) != t.pieceLayerIndex() {
+	base := t.pieceLayerIndex()
+	length, index := int(m.Length), int(m.Index)
+	if !ok || int(m.BaseLayer) != base || length < 1 || length > maxHashesServed || length&(length-1) != 0 ||
+		index%length != 0 || index+length > nextPow2(len(layer)/32) {
+		_ = pc.c.Send(&reply)
 		return
 	}
+	// m is the parser's, reused for the next message: the job has reply.
+	pc.hashing++
+	t.c.disk.run(func() {
+		reply.Type = peer.MsgHashes
+		reply.Data = hashProof(layer, base, index, length, int(reply.ProofLayers))
+		_ = pc.c.Send(&reply)
+		t.mu.Lock()
+		pc.hashing--
+		t.mu.Unlock()
+	})
+}
+
+// hashProof is the answer to a hash request of the piece layer layer,
+// whose index in the file's tree is base: length hashes from index, then
+// the uncles up to proofLayers above the base.
+func hashProof(layer []byte, base, index, length, proofLayers int) []byte {
 	n := len(layer) / 32
 	width := nextPow2(n)
-	length, index := int(m.Length), int(m.Index)
-	if length < 1 || length > maxHashesServed || length&(length-1) != 0 || index%length != 0 || index+length > width {
-		return
-	}
-	pad := metainfo.PadHash(t.pieceLayerIndex())
+	pad := metainfo.PadHash(base)
 	nodes := make([][32]byte, width)
 	for i := range nodes {
 		if i < n {
@@ -242,7 +282,7 @@ func (t *Torrent) onHashRequestLocked(pc *peerConn, m *peer.Message) {
 			nodes[i] = pad
 		}
 	}
-	data := make([]byte, 0, 32*(length+int(m.ProofLayers)))
+	data := make([]byte, 0, 32*(length+proofLayers))
 	for _, h := range nodes[index : index+length] {
 		data = append(data, h[:]...)
 	}
@@ -252,14 +292,13 @@ func (t *Torrent) onHashRequestLocked(pc *peerConn, m *peer.Message) {
 		nodes = parentLayer(nodes)
 	}
 	pos := index / length
-	for level := h; level < int(m.ProofLayers) && len(nodes) > 1; level++ {
+	for level := h; level < proofLayers && len(nodes) > 1; level++ {
 		sib := nodes[pos^1]
 		data = append(data, sib[:]...)
 		nodes = parentLayer(nodes)
 		pos /= 2
 	}
-	reply.Type = peer.MsgHashes
-	reply.Data = data
+	return data
 }
 
 func parentLayer(nodes [][32]byte) [][32]byte {
