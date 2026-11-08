@@ -100,15 +100,18 @@ func (r *Reader) Read(p []byte) (int, error) {
 	for {
 		t.mu.Lock()
 		have := t.pieces[i].have
-		st := t.storage
 		sig := t.pieceSig
 		t.mu.Unlock()
-		if have && st != nil {
-			if err := readData(st, info, off, p[:n]); err != nil {
-				return 0, err
+		if have {
+			if st, _, done := t.useStorage(); st != nil {
+				err := readData(st, info, off, p[:n])
+				done()
+				if err != nil {
+					return 0, err
+				}
+				r.pos += int64(n)
+				return n, nil
 			}
-			r.pos += int64(n)
-			return n, nil
 		}
 		select {
 		case <-sig:

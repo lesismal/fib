@@ -90,7 +90,10 @@ type Config struct {
 	Encryption Encryption
 	// MaxConns bounds the client's peer connections, MaxConnsPerTorrent
 	// a torrent's, MaxHalfOpen the dials in flight, and DialsPerTick the
-	// new dials a torrent starts each second.
+	// new dials a torrent starts each second; their Defaults when zero.
+	// These, the rates, UploadSlots, SeedRatio and SeedTime are the
+	// client's first Limits, which Client.SetLimits changes while it runs
+	// and AddOptions.Limits overrides per torrent.
 	MaxConns, MaxConnsPerTorrent, MaxHalfOpen, DialsPerTick int
 	// UploadRate and DownloadRate bound the payload bytes per second of
 	// all torrents together; zero is unlimited.
@@ -131,8 +134,45 @@ type Config struct {
 	// network; DefaultLSDInterval when zero.
 	LSDInterval time.Duration
 	// Engine configures the client's fib engine; fib.DefaultConfig when
-	// nil.
+	// nil. It is ignored with SharedEngine.
 	Engine *fib.Config
+	// SharedEngine, when set, is a running engine of the caller's that the
+	// client serves on in place of an engine of its own: it adds its TCP
+	// and UDP bindings to it (Engine.AddBinding), dials from it, and on
+	// Close removes those bindings and closes the connections it made,
+	// leaving the engine, its other bindings and their connections
+	// running. NewClient waits for the engine's event loop, so it must not
+	// be called from a callback that loop runs.
+	SharedEngine *fib.Engine
+	// Filter, when set, is asked about each peer's address before the
+	// client deals with it, with the meaning of fib's Binding.Filter: true
+	// serves the peer. A peer it refuses is closed as soon as it connects
+	// over TCP, has its uTP SYN ignored, is neither dialed nor kept as a
+	// candidate when trackers, the DHT, PEX, LSD, magnet links, AddPeers or
+	// PeerSources name it, and, as a DHT node, gets no answers and enters
+	// no routing table (dht.Config.Filter). A connected peer whose
+	// extension handshake names a listening port Filter refuses is closed
+	// too, as a ban by that address would close it. Trackers and web
+	// seeds are URLs, not peers, and are not asked about. It is given
+	// addresses with an IPv4 address mapped into IPv6 unmapped.
+	//
+	// It is asked every time, never once per address, on the event loops
+	// and the client's goroutines, so it must be quick and must not block;
+	// one whose answers change, say one that reads its policy through an
+	// atomic pointer, applies them from the next peer on. The connections
+	// already open are not asked again until Refilter. Banned peers (Ban)
+	// are refused besides, whatever Filter says.
+	Filter func(peer netip.AddrPort) bool
+
+	// DiskWorkers is how many goroutines run the storage's reads and
+	// writes and the pieces' hashing, which never run on a fib worker;
+	// GOMAXPROCS, at most DefaultMaxDiskWorkers, when zero.
+	DiskWorkers int
+	// DiskQueueBytes bounds the received blocks waiting for storage: past
+	// it the client stops reading from the peers that sent them until
+	// half has been written. What reads already delivered may take it
+	// past the bound. DefaultDiskQueueBytes when zero.
+	DiskQueueBytes int64
 }
 
 func (cfg *Config) setDefaults() {
@@ -168,10 +208,17 @@ func (cfg *Config) setDefaults() {
 	if cfg.LSDInterval <= 0 {
 		cfg.LSDInterval = DefaultLSDInterval
 	}
+	if cfg.DiskWorkers <= 0 {
+		cfg.DiskWorkers = diskWorkers()
+	}
+	if cfg.DiskQueueBytes <= 0 {
+		cfg.DiskQueueBytes = DefaultDiskQueueBytes
+	}
 }
 
-// Client is a BitTorrent client: one fib engine, one port for TCP and
-// UDP, and the torrents it downloads and seeds.
+// Client is a BitTorrent client: one fib engine, its own or a shared one
+// (Config.SharedEngine), one port for TCP and UDP, and the torrents it
+// downloads and seeds.
 type Client struct {
 	cfg    Config
 	peerID [20]byte
@@ -183,7 +230,8 @@ type Client struct {
 	wg     sync.WaitGroup
 
 	engine     *fib.Engine
-	engineDone chan error
+	engineDone chan error // nil on a SharedEngine
+	tcpBinding int        // index of the TCP binding, -1 without one
 	server     *peer.Server
 	utp        *utp.Socket
 	udpTracker *tracker.UDPClient
@@ -194,7 +242,11 @@ type Client struct {
 	lsd        *lsd
 	ownAddrs   map[netip.Addr]bool
 
+	// The limits SetLimits changes, and the rate limiters they set.
+	limMu    sync.Mutex
+	limits   atomic.Pointer[Limits]
 	up, down limiter
+	disk     *diskPool
 
 	conns    atomic.Int64
 	halfOpen atomic.Int64
@@ -229,11 +281,12 @@ func NewClient(cfg Config) (*Client, error) {
 		ownAddrs: map[netip.Addr]bool{},
 	}
 	c.evCond.L = &c.evMu
-	c.up.rate = int64(cfg.UploadRate)
-	c.up.tokens = c.up.rate
-	c.down.rate = int64(cfg.DownloadRate)
-	c.down.tokens = c.down.rate
+	lim := cfg.limits()
+	c.limits.Store(&lim)
+	c.up.setRate(int64(lim.UploadRate))
+	c.down.setRate(int64(lim.DownloadRate))
 	c.ctx, c.cancel = context.WithCancel(context.Background())
+	c.disk = newDiskPool(cfg.DiskWorkers, cfg.DiskQueueBytes)
 	c.server = peer.NewServer(peer.Config{
 		PeerID:     c.peerID,
 		DHT:        !cfg.DisableDHT,
@@ -275,21 +328,26 @@ func NewClient(cfg Config) (*Client, error) {
 // UDP for uTP, the DHT and UDP trackers, sorted by first byte. A zero port
 // takes the one the system gives TCP, and tries again if UDP has it taken.
 func (c *Client) listen() error {
-	ecfg := fib.DefaultConfig()
-	if c.cfg.Engine != nil {
-		ecfg = *c.cfg.Engine
-	}
-	if ecfg.Name == "" {
-		ecfg.Name = "bittorrent"
-	}
-	ecfg.LogSettings = false
-	engine, err := fib.New(ecfg)
-	if err != nil {
-		return err
+	engine := c.cfg.SharedEngine
+	if engine == nil {
+		ecfg := fib.DefaultConfig()
+		if c.cfg.Engine != nil {
+			ecfg = *c.cfg.Engine
+		}
+		if ecfg.Name == "" {
+			ecfg.Name = "bittorrent"
+		}
+		ecfg.LogSettings = false
+		e, err := fib.New(ecfg)
+		if err != nil {
+			return err
+		}
+		engine = e
+		c.engineDone = make(chan error, 1)
+		go func() { c.engineDone <- engine.Run() }()
 	}
 	c.engine = engine
-	c.engineDone = make(chan error, 1)
-	go func() { c.engineDone <- engine.Run() }()
+	c.tcpBinding = -1
 	hcfg := fibhttp.DefaultClientConfig()
 	hcfg.Timeout = time.Minute
 	c.httpClient = fibhttp.NewClient(engine, hcfg)
@@ -316,11 +374,12 @@ func (c *Client) listen() error {
 		p := port
 		tcpIndex := -1
 		if !c.cfg.DisableTCP {
-			i, err := engine.AddBinding(fib.Binding{Network: tcpNet, Addr: net.JoinHostPort(host, strconv.Itoa(port)), Handler: c.server})
+			i, err := engine.AddBinding(fib.Binding{Network: tcpNet, Addr: net.JoinHostPort(host, strconv.Itoa(port)), Handler: c.server, Filter: c.cfg.Filter})
 			if err != nil {
 				return err
 			}
 			tcpIndex = i
+			c.tcpBinding = i
 			addrs, err := engine.BindingAddrs(i)
 			if err != nil || len(addrs) == 0 {
 				return fmt.Errorf("bittorrent: no TCP address: %v", err)
@@ -335,10 +394,14 @@ func (c *Client) listen() error {
 		if c.cfg.DisableUTP {
 			ucfg.AcceptBacklog = -1
 		}
+		// Not the UDP binding's Filter: the port is the DHT's and the
+		// UDP trackers' too, and trackers are not peers.
+		ucfg.Accept = c.cfg.Filter
 		s, err := utp.Listen(engine, udpNet, net.JoinHostPort(host, strconv.Itoa(p)), ucfg)
 		if err != nil {
 			if port == 0 && tcpIndex >= 0 && try < 8 {
 				_ = engine.RemoveBinding(tcpIndex)
+				c.tcpBinding = -1
 				continue
 			}
 			return err
@@ -386,14 +449,20 @@ func (c *Client) startDHT() error {
 	cfg := c.cfg.DHT
 	cfg.Send = send
 	cfg.IPv6 = false
+	if f := c.cfg.Filter; f != nil {
+		if own := cfg.Filter; own != nil {
+			cfg.Filter = func(a netip.AddrPort) bool { return f(a) && own(a) }
+		} else {
+			cfg.Filter = f
+		}
+	}
 	n, err := dht.New(cfg)
 	if err != nil {
 		return err
 	}
 	c.dht4 = n
 	if c.cfg.DHTIPv6 {
-		cfg6 := c.cfg.DHT
-		cfg6.Send = send
+		cfg6 := cfg
 		cfg6.IPv6 = true
 		if n6, err := dht.New(cfg6); err == nil {
 			c.dht6 = n6
@@ -449,7 +518,7 @@ func (c *Client) Addr() netip.AddrPort {
 // PeerID is the client's peer ID.
 func (c *Client) PeerID() [20]byte { return c.peerID }
 
-// Engine is the client's fib engine.
+// Engine is the client's fib engine: its own, or Config.SharedEngine.
 func (c *Client) Engine() *fib.Engine { return c.engine }
 
 func (c *Client) isOwnAddr(a netip.AddrPort) bool {
@@ -620,7 +689,9 @@ func (c *Client) Torrents() []*Torrent {
 	return out
 }
 
-// Close closes every torrent, telling their trackers, and the client.
+// Close closes every torrent, telling their trackers, and the client. The
+// storages' reads and writes under way are waited for; those queued are
+// dropped.
 func (c *Client) Close() error {
 	if c.closing.Swap(true) {
 		return nil
@@ -631,16 +702,21 @@ func (c *Client) Close() error {
 		for pc := range t.peers {
 			go pc.Close()
 		}
-		if t.storage != nil {
-			_ = t.storage.Close()
-			t.storage = nil
+		for pc := range t.dials {
+			go pc.Close()
 		}
+		st := t.storage
+		t.storage = nil
 		if t.state != StateRemoved {
 			t.state = StateRemoved
 			close(t.removed)
 		}
 		t.mu.Unlock()
+		if st != nil {
+			_ = t.closeStorage(st, false)
+		}
 	}
+	c.disk.close()
 	c.cancel()
 	// Wait a little for the stopped announces.
 	waited := make(chan struct{})
@@ -655,6 +731,7 @@ func (c *Client) Close() error {
 
 func (c *Client) shutdown() {
 	c.cancel()
+	c.disk.close()
 	if c.lsd != nil {
 		c.lsd.close()
 	}
@@ -672,10 +749,18 @@ func (c *Client) shutdown() {
 	if c.utp != nil {
 		_ = c.utp.Close()
 	}
-	if c.engine != nil {
+	switch {
+	case c.engineDone != nil:
 		c.engine.Stop()
 		<-c.engineDone
 		_ = c.engine.Close()
+	case c.engine != nil && c.tcpBinding >= 0:
+		// On a shared engine, the binding goes with the connections it
+		// accepted that are still open, which a done context closes at
+		// once; those the client dialed it closed itself.
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+		_ = c.engine.ShutdownBinding(ctx, c.tcpBinding)
 	}
 	c.evMu.Lock()
 	c.evClosed = true
@@ -724,6 +809,46 @@ func (c *Client) banned(addr, listen netip.AddrPort) bool {
 // port, from every torrent.
 func (c *Client) Ban(a netip.AddrPort) { c.ban(a, errors.New("banned")) }
 
+// refuses reports whether Config.Filter refuses the peer at a, an address
+// unmapped already.
+func (c *Client) refuses(a netip.AddrPort) bool {
+	return c.cfg.Filter != nil && !c.cfg.Filter(a)
+}
+
+// Refilter asks Config.Filter about the client's open peer connections
+// again, by their remote addresses and the addresses the peers listen at,
+// and closes those it now refuses, the ones still in their
+// handshake too; it forgets the candidate addresses it refuses, so that
+// they are dialed again only once a source names them again. Filter
+// applies a changed policy to the peers that come after it on its own:
+// Refilter is for those already there, after such a change. The closed
+// connections end as any other does, with EventPeerDisconnected. It does
+// nothing without a Filter.
+func (c *Client) Refilter() {
+	if c.cfg.Filter == nil {
+		return
+	}
+	for _, t := range c.Torrents() {
+		t.mu.Lock()
+		for conn, pc := range t.peers {
+			if c.refuses(pc.addr) || (pc.listen.IsValid() && c.refuses(pc.listen)) {
+				go conn.Close()
+			}
+		}
+		for conn, att := range t.dials {
+			if c.refuses(att.cand.addr) {
+				go conn.Close()
+			}
+		}
+		for a, cand := range t.pool {
+			if !cand.connected && !cand.dialing && c.refuses(a) {
+				delete(t.pool, a)
+			}
+		}
+		t.mu.Unlock()
+	}
+}
+
 // tickLoop drives the torrents: rate limits four times a second, and once
 // a second each torrent's upkeep: rates, snubbing, choking, connecting,
 // metadata, hashes and peer exchange.
@@ -739,18 +864,18 @@ func (c *Client) tickLoop() {
 		case <-c.ctx.Done():
 			return
 		case now := <-tk.C:
-			c.up.refill(now.Sub(last))
-			c.down.refill(now.Sub(last))
+			dt := now.Sub(last)
+			c.up.refill(dt)
+			c.down.refill(dt)
 			last = now
 			n++
 			second := n%4 == 0
-			if !second && c.up.rate == 0 && c.down.rate == 0 {
-				continue
-			}
 			for _, t := range c.Torrents() {
+				t.upLim.refill(dt)
+				t.downLim.refill(dt)
 				if second {
 					t.tick(now, 4*step)
-				} else {
+				} else if t.rateLimited() {
 					t.tickLimits()
 				}
 			}
@@ -762,8 +887,9 @@ func (c *Client) tickLoop() {
 func (t *Torrent) tickLimits() {
 	t.mu.Lock()
 	var pump []*peerConn
+	down := t.c.down.limited() || t.downLim.limited()
 	for _, pc := range t.peers {
-		if t.c.down.rate > 0 {
+		if down {
 			t.fillRequestsLocked(pc)
 		}
 		if len(pc.upq) > 0 {
@@ -867,7 +993,7 @@ func (t *Torrent) rechokeLocked(now time.Time) {
 		return a.up.perSec > b.up.perSec
 	})
 	keep := map[*peerConn]bool{}
-	for i := 0; i < len(cands) && i < t.c.cfg.UploadSlots; i++ {
+	for i := 0; i < len(cands) && i < t.uploadSlotsLocked(); i++ {
 		keep[cands[i]] = true
 	}
 	opt := t.optimistic
@@ -907,48 +1033,13 @@ func (t *Torrent) checkSeedLimitsLocked(now time.Time) {
 	if t.info == nil || t.missing > 0 || t.seedStart.IsZero() {
 		return
 	}
-	cfg := &t.c.cfg
-	ratio := cfg.SeedRatio > 0 && float64(t.uploaded.Load()) >= cfg.SeedRatio*float64(t.info.TotalLength())
-	long := cfg.SeedTime > 0 && now.Sub(t.seedStart) >= cfg.SeedTime
+	seedRatio, seedTime := t.seedLimitsLocked()
+	ratio := seedRatio > 0 && float64(t.uploaded.Load()) >= seedRatio*float64(t.info.TotalLength())
+	long := seedTime > 0 && now.Sub(t.seedStart) >= seedTime
 	if ratio || long {
 		t.pauseLocked(StatePaused)
 		t.c.emit(Event{Type: EventSeedLimit, Torrent: t})
 	}
-}
-
-// limiter is a token bucket of bytes per second; a zero rate is no
-// limit. It may go into debt by one block, which the next refills pay.
-type limiter struct {
-	mu     sync.Mutex
-	rate   int64
-	tokens int64
-}
-
-func (l *limiter) allow() bool {
-	if l.rate == 0 {
-		return true
-	}
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	return l.tokens > 0
-}
-
-func (l *limiter) take(n int) {
-	if l.rate == 0 {
-		return
-	}
-	l.mu.Lock()
-	l.tokens -= int64(n)
-	l.mu.Unlock()
-}
-
-func (l *limiter) refill(dt time.Duration) {
-	if l.rate == 0 {
-		return
-	}
-	l.mu.Lock()
-	l.tokens = min(l.tokens+int64(float64(l.rate)*dt.Seconds()), l.rate)
-	l.mu.Unlock()
 }
 
 func resolveAddrPort(s string) (netip.AddrPort, error) {

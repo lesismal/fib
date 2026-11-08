@@ -74,7 +74,7 @@ func (t *Torrent) addPeersLocked(src Source, v2 bool, addrs []netip.AddrPort) {
 		if !a.IsValid() || a.Port() == 0 || a.Addr().IsUnspecified() || a.Addr().IsMulticast() {
 			continue
 		}
-		if t.c.isOwnAddr(a) {
+		if t.c.isOwnAddr(a) || t.c.refuses(a) {
 			continue
 		}
 		if cand, ok := t.pool[a]; ok {
@@ -99,10 +99,11 @@ func (t *Torrent) connectPeersLocked(now time.Time) {
 		return
 	}
 	cl := t.c
-	cfg := &cl.cfg
+	cfg := cl.lim()
 	budget := cfg.DialsPerTick
+	maxConns := t.maxConnsLocked()
 	for _, cand := range t.pool {
-		if budget <= 0 || len(t.peers)+t.halfOpen >= cfg.MaxConnsPerTorrent {
+		if budget <= 0 || len(t.peers)+t.halfOpen >= maxConns {
 			return
 		}
 		if int(cl.conns.Load()+cl.halfOpen.Load()) >= cfg.MaxConns || int(cl.halfOpen.Load()) >= cfg.MaxHalfOpen {
@@ -114,7 +115,7 @@ func (t *Torrent) connectPeersLocked(now time.Time) {
 		if cand.seed && t.info != nil && t.missing == 0 {
 			continue
 		}
-		if cl.banned(cand.addr, cand.addr) {
+		if cl.banned(cand.addr, cand.addr) || cl.refuses(cand.addr) {
 			continue
 		}
 		t.dialLocked(t.newAttempt(cand))
@@ -181,6 +182,13 @@ func (t *Torrent) dial(att *dialAttempt) {
 	defer t.mu.Unlock()
 	if err != nil {
 		t.dialFailedLocked(att, false, err)
+		return
+	}
+	if cl.closing.Load() {
+		// Close has been through t.dials already: on a shared engine
+		// nothing else would close it.
+		t.dialDoneLocked(att)
+		go c.Close()
 		return
 	}
 	if e, ok := t.early[c]; ok {

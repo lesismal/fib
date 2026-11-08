@@ -50,7 +50,8 @@ type peerConn struct {
 	lastBlock time.Time
 	snubbed   bool
 	upq       []peer.Request
-	pumping   bool
+	pumping   bool            // an upload job of its is queued or running
+	hashing   int             // its hash requests being answered on the disk pool
 	fastSet   map[uint32]bool // pieces this side allowed fast
 
 	down, up          rate
@@ -151,7 +152,7 @@ func (t *Torrent) OnHandshake(c *peer.Conn) {
 	if rec != nil {
 		listen = rec.cand.addr
 	}
-	if cl.banned(addr, listen) {
+	if cl.banned(addr, listen) || cl.refuses(addr) {
 		reject()
 		return
 	}
@@ -194,7 +195,7 @@ func (t *Torrent) OnHandshake(c *peer.Conn) {
 		}
 		go replaced.c.Close()
 	}
-	if rec == nil && replaced == nil && (len(t.peers) >= cl.cfg.MaxConnsPerTorrent || int(cl.conns.Load()) >= cl.cfg.MaxConns) {
+	if rec == nil && replaced == nil && (len(t.peers) >= t.maxConnsLocked() || int(cl.conns.Load()) >= cl.lim().MaxConns) {
 		reject()
 		return
 	}
@@ -538,7 +539,7 @@ func (t *Torrent) fillRequestsLocked(pc *peerConn) {
 		limit = 1
 	}
 	now := time.Now()
-	for len(pc.pending) < limit && t.c.down.allow() {
+	for len(pc.pending) < limit && t.downAllow() {
 		r, ok := t.nextRequest(pc, choked)
 		if !ok {
 			return
@@ -547,6 +548,9 @@ func (t *Torrent) fillRequestsLocked(pc *peerConn) {
 			t.releaseRequest(r)
 			return
 		}
+		// The download rates are spent as blocks are asked for, so that
+		// they bound what peers send rather than what this side reads.
+		t.downTake(int(r.Length))
 		if len(pc.pending) == 0 {
 			// The wait for a block starts with the first request.
 			pc.lastBlock = now
@@ -561,7 +565,6 @@ func (t *Torrent) onPiece(pc *peerConn, m *peer.Message) {
 	r := m.Request()
 	n := len(m.Data)
 	t.downloaded.Add(int64(n))
-	t.c.down.take(n)
 	t.mu.Lock()
 	if pc.closed {
 		t.mu.Unlock()
@@ -611,19 +614,37 @@ func (t *Torrent) onPiece(pc *peerConn, m *peer.Message) {
 			}
 		}
 	}
-	st := t.storage
-	info := t.info
+	off := t.info.PieceOffset(i) + int64(r.Begin)
+	t.fillRequestsLocked(pc)
 	t.mu.Unlock()
 
-	err := writeData(st, info, info.PieceOffset(i)+int64(r.Begin), m.Data)
+	// The block aliases the connection's read buffer: the write gets a
+	// copy, and the reads from pc stop while too many wait.
+	buf := bufferpool.Get(n)
+	copy(buf, m.Data)
+	t.c.disk.runBytes(int64(n), pc.c, func() { t.writeBlock(pc, i, b, p, off, buf) })
+}
+
+// writeBlock, on the disk pool, writes block b of piece i, which p holds,
+// and checks the piece if that was its last block to land.
+func (t *Torrent) writeBlock(pc *peerConn, i, b int, p *partial, off int64, buf []byte) {
+	err := errNoStorage
+	st, info, done := t.useStorage()
+	if st != nil {
+		err = writeData(st, info, off, buf)
+	}
+	done()
+	bufferpool.Put(buf)
 
 	t.mu.Lock()
 	p.writing--
 	if err != nil {
-		bs.done = false
+		p.blocks[b].done = false
 		p.done--
 		t.mu.Unlock()
-		t.c.emit(Event{Type: EventError, Torrent: t, Err: err})
+		if st != nil {
+			t.c.emit(Event{Type: EventError, Torrent: t, Err: err})
+		}
 		return
 	}
 	verify := p.complete() && p.writing == 0 && !p.busy && !p.waitHashes && t.partials[i] == p
@@ -680,21 +701,47 @@ func (t *Torrent) onRequest(pc *peerConn, r peer.Request) {
 
 // pump uploads the blocks pc asked for, while its socket keeps up and the
 // upload rate allows; OnWritable and the client's ticks start it again.
+// The reads run on the disk pool, one job of a peer's at a time.
 func (t *Torrent) pump(pc *peerConn) {
-	for {
+	t.mu.Lock()
+	start := !pc.pumping && t.canPumpLocked(pc)
+	pc.pumping = pc.pumping || start
+	t.mu.Unlock()
+	if start {
+		t.c.disk.run(func() { t.pumpBlocks(pc) })
+	}
+}
+
+func (t *Torrent) canPumpLocked(pc *peerConn) bool {
+	return !pc.closed && len(pc.upq) > 0 && t.storage != nil && !pc.c.Congested() && t.upAllow()
+}
+
+// pumpBlocks, on the disk pool, reads and sends up to uploadBatch of the
+// blocks pc asked for, and queues itself again if more may go.
+func (t *Torrent) pumpBlocks(pc *peerConn) {
+	for k := 0; ; k++ {
 		t.mu.Lock()
-		if pc.pumping || pc.closed || len(pc.upq) == 0 || t.storage == nil || pc.c.Congested() || !t.c.up.allow() {
+		if !t.canPumpLocked(pc) {
+			pc.pumping = false
 			t.mu.Unlock()
+			return
+		}
+		if k == uploadBatch {
+			t.mu.Unlock()
+			t.c.disk.run(func() { t.pumpBlocks(pc) })
 			return
 		}
 		r := pc.upq[0]
 		pc.upq = pc.upq[1:]
-		pc.pumping = true
-		st, info := t.storage, t.info
 		t.mu.Unlock()
 
 		buf := bufferpool.Get(int(r.Length))
-		err := readData(st, info, info.PieceOffset(int(r.Index))+int64(r.Begin), buf)
+		err := errNoStorage
+		st, info, done := t.useStorage()
+		if st != nil {
+			err = readData(st, info, info.PieceOffset(int(r.Index))+int64(r.Begin), buf)
+		}
+		done()
 		if err == nil {
 			err = pc.c.SendPiece(r.Index, r.Begin, buf)
 		} else {
@@ -703,13 +750,14 @@ func (t *Torrent) pump(pc *peerConn) {
 		bufferpool.Put(buf)
 		n := int(r.Length)
 		t.mu.Lock()
-		pc.pumping = false
 		if err == nil {
-			t.c.up.take(n)
+			t.upTake(n)
 			t.uploaded.Add(int64(n))
 			pc.up.add(n)
 			t.upRate.add(n)
 			pc.upTotal += int64(n)
+		} else {
+			pc.pumping = false
 		}
 		t.mu.Unlock()
 		if err != nil {
@@ -772,7 +820,7 @@ func (t *Torrent) maybeUnchokeLocked(pc *peerConn) {
 			unchoked++
 		}
 	}
-	if unchoked < t.c.cfg.UploadSlots+1 {
+	if unchoked <= t.uploadSlotsLocked() {
 		t.unchokeLocked(pc, time.Now())
 	}
 }

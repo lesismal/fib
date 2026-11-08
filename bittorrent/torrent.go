@@ -81,6 +81,18 @@ type AddOptions struct {
 	// in Info.FileList, in place of PriorityNormal for all (and of a
 	// magnet link's so=).
 	FilePriorities []int
+	// Limits are the torrent's own limits; the zero value takes the
+	// client's (see TorrentLimits).
+	Limits TorrentLimits
+
+	// Resume is resume data a Torrent.ResumeData of this torrent returned
+	// before: once the info dictionary is known, the pieces it lists in
+	// files whose size and modification time still match are taken as had
+	// without a hash check (see ResumeData). Resume data that is not
+	// valid, of another torrent or of a newer version is reported as an
+	// EventError whose Err is ErrResumeData, and the storage is checked
+	// in full.
+	Resume []byte
 }
 
 // Torrent is a torrent in a Client: its pieces, its peers and its
@@ -97,6 +109,10 @@ type Torrent struct {
 	removed chan struct{}
 
 	uploaded, downloaded atomic.Int64
+
+	// diskMu keeps the storage open while it is used: see useStorage and
+	// closeStorage. Taken before mu, never with mu held.
+	diskMu sync.RWMutex
 
 	mu         sync.Mutex
 	name       string
@@ -151,6 +167,11 @@ type Torrent struct {
 	upRate       rate
 	downRate     rate
 
+	// The torrent's own limits (SetLimits), and the rate limiters they
+	// set, under the client's.
+	lim            TorrentLimits
+	upLim, downLim limiter
+
 	run       context.Context
 	stopRun   context.CancelFunc
 	completed chan struct{} // closed on completion, for the tracker loops
@@ -188,6 +209,7 @@ func newTorrent(c *Client, ih metainfo.InfoHash, ih2 metainfo.InfoHashV2, opts A
 		t.opener = c.cfg.Storage
 	}
 	t.pt = &peer.Torrent{InfoHash: ih, InfoHashV2: ih2, Handler: t}
+	t.setLimitsLocked(opts.Limits.normalized())
 	return t
 }
 
@@ -436,11 +458,31 @@ func (t *Torrent) onCompleteLocked() {
 			go pc.c.Close()
 		}
 	}
-	if st := t.storage; st != nil {
-		for f, file := range t.info.FileList() {
-			if file.Length == 0 && !file.IsPad() && t.filePrio[f] > PriorityNone {
-				_, _ = st.WriteAt(f, nil, 0)
-			}
+	// The check made those wanted then; these were selected since.
+	if empty := t.emptyFilesLocked(); len(empty) > 0 && t.storage != nil {
+		t.c.disk.run(func() { t.createFiles(empty) })
+	}
+}
+
+// emptyFilesLocked lists the empty files that are wanted, which no piece
+// writes.
+func (t *Torrent) emptyFilesLocked() []int {
+	var empty []int
+	for f, file := range t.info.FileList() {
+		if file.Length == 0 && !file.IsPad() && t.filePrio[f] > PriorityNone {
+			empty = append(empty, f)
+		}
+	}
+	return empty
+}
+
+// createFiles creates the empty files, off t.mu.
+func (t *Torrent) createFiles(files []int) {
+	st, _, done := t.useStorage()
+	defer done()
+	if st != nil {
+		for _, f := range files {
+			_, _ = st.WriteAt(f, nil, 0)
 		}
 	}
 }
@@ -497,14 +539,16 @@ func (t *Torrent) Pause() {
 	t.pauseLocked(StatePaused)
 }
 
-// Stop pauses the torrent and closes its storage.
+// Stop pauses the torrent and closes its storage, once the reads and
+// writes under way are over; those still queued are dropped.
 func (t *Torrent) Stop() {
 	t.mu.Lock()
-	defer t.mu.Unlock()
 	t.pauseLocked(StateStopped)
-	if t.storage != nil {
-		_ = t.storage.Close()
-		t.storage = nil
+	st := t.storage
+	t.storage = nil
+	t.mu.Unlock()
+	if st != nil {
+		_ = t.closeStorage(st, false)
 	}
 }
 
@@ -522,7 +566,8 @@ func (t *Torrent) pauseLocked(s State) {
 
 // Remove removes the torrent from its client, closing its connections and
 // storage, and with deleteData deletes what the storage holds when it
-// can (see StorageRemover).
+// can (see StorageRemover). The storage's reads and writes under way are
+// waited for, and those still queued are dropped.
 func (t *Torrent) Remove(deleteData bool) error {
 	t.c.mu.Lock()
 	if t.c.torrents[t.key] == t {
@@ -530,21 +575,19 @@ func (t *Torrent) Remove(deleteData bool) error {
 	}
 	t.c.mu.Unlock()
 	t.mu.Lock()
-	defer t.mu.Unlock()
 	t.c.server.RemoveTorrent(t.pt)
 	if t.state == StateRemoved {
+		t.mu.Unlock()
 		return nil
 	}
 	t.pauseLocked(StateRemoved)
 	close(t.removed)
+	st := t.storage
+	t.storage = nil
+	t.mu.Unlock()
 	var err error
-	if t.storage != nil {
-		if r, ok := t.storage.(StorageRemover); ok && deleteData {
-			err = r.Remove()
-		} else {
-			err = t.storage.Close()
-		}
-		t.storage = nil
+	if st != nil {
+		err = t.closeStorage(st, deleteData)
 	}
 	t.c.emit(Event{Type: EventStateChanged, Torrent: t})
 	return err

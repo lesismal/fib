@@ -6,11 +6,12 @@
 // (BEP 3, BEP 15, BEP 12), the DHT (BEP 5) and local service discovery
 // (BEP 14).
 //
-// A Client is one fib engine and one port: TCP for the peer wire
-// protocol (package peer's Server), and UDP shared by uTP (package
-// utp's Socket), the DHT node (package dht) and the UDP tracker client
-// (package tracker), which tell their datagrams apart by the first byte.
-// A Torrent is a torrent in it:
+// A Client is one fib engine, its own or one it shares with the caller
+// (Config.SharedEngine), and one port: TCP for the peer wire protocol
+// (package peer's Server), and UDP shared by uTP (package utp's Socket),
+// the DHT node (package dht) and the UDP tracker client (package
+// tracker), which tell their datagrams apart by the first byte. A
+// Torrent is a torrent in it:
 //
 //	c, _ := bittorrent.NewClient(bittorrent.Config{DataDir: "downloads"})
 //	defer c.Close()
@@ -24,7 +25,12 @@
 //     (NewFileStorage, with paths made safe for the operating system, and
 //     BEP 47 padding files never written), or memory (NewMemoryStorage).
 //     What storage holds when a torrent is added is checked, so that an
-//     interrupted download resumes.
+//     interrupted download resumes; resume data (Torrent.ResumeData,
+//     AddOptions.Resume) skips the check for files that have not changed.
+//     Storage is read and written, and pieces are hashed, on the client's
+//     disk pool (Config.DiskWorkers), never on a fib worker; the blocks
+//     waiting for it are bounded (Config.DiskQueueBytes), past which the
+//     peers sending them are not read from.
 //   - Its pieces are picked rarest first, ties broken at random, after a
 //     few random ones, by priority (the files', BEP 53's so=, and those of
 //     a Reader, which streams a file as it downloads), or in order. Blocks

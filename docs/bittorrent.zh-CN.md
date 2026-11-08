@@ -136,7 +136,8 @@ engine, err := fib.New(fib.DefaultConfig(),
 `Conn` 跟踪 choke、interest 和未完成的请求：`Request` 让在途请求不超过对端的 `reqq`（以及
 `Config.MaxRequests`，64），并考虑 choke 状态和 allowed fast 分片；没有 Fast 扩展时，choke 会丢弃这些请求。
 它每两分钟发一次 keepalive，静默三分钟后关闭。handler 在回调里发送的内容在回调返回时一次写出；`Congested`
-和 `OnWritable` 按等待写入 socket 的数据量控制上传节奏。在 `net.Conn` 上，读和写各用一个 goroutine，
+和 `OnWritable` 按等待写入 socket 的数据量控制上传节奏；handler 自己的处理积压时，`HoldReads` 暂停从对端读取。
+在 `net.Conn` 上，读和写各用一个 goroutine，
 双方都不会因为对方没读而互相等待。
 
 `mse` 包是 MSE/PE：768 位 Diffie-Hellman，丢弃前 1024 字节的 RC4，两种角色都支持。`Initiator` 与 `Receiver`
@@ -182,6 +183,8 @@ questionable、bad 三态（15 分钟），每个 bucket 有替补缓存，驱�
 BEP 42：外部地址已知时（`Config.PublicIP`，或由响应中 `ip` 键投票得出），ID 由它派生；`Config.EnforceNodeID`
 把 ID 与地址不符的节点挡在路由表外。BEP 43：`Config.ReadOnly` 的节点只查询、不响应。BEP 32：一个 `Node`
 只属于一个地址族，`Config.IPv6` 的节点使用 `nodes6`，双栈客户端跑两个 `Node`。
+`Config.Filter` 与 `fib.Binding.Filter` 含义相同：它拒绝的地址的数据报不读，不进路由表，查找、
+`AddNodes`、应答中的 nodes 与 values 都排除它们。
 
 `New` 创建的 `Node` 经 `Config.Send` 发送，由 `HandleDatagram` 喂入数据，后者认领以 `'d'` 开头的数据报；
 `Listen` 让它跑在自有 binding 上。定时器都是 `time.AfterFunc`：每个在途查询一个，另有一个每隔几秒维护节点。
@@ -221,6 +224,31 @@ _, err = io.Copy(w, r)
 - **存储**是一个 `Storage`（按文件序号的 `ReadAt`、`WriteAt`，以及 `Close`）：`DataDir` 下的文件
   （`NewFileStorage`，路径经 `SanitizePath` 按操作系统处理安全，BEP 47 的填充从不写入），或内存
   （`NewMemoryStorage`）。加入 torrent 时会对存储里已有的数据做哈希校验，中断的下载因此可以续传。
+- **快速续传**可以跳过这次校验：`Torrent.ResumeData()` 返回一小段带版本号的 bencode 数据（info hash、
+  已有分片的位图，以及存储报告的每个文件的大小和修改时间；存储须实现 `StatStorage`，两种内置存储都实现了），
+  `AddOptions.Resume` 在 `AddTorrent`、`AddTorrentFile` 或 `AddMagnet` 时把它交回（磁力链接在拿到 info 字典后才用）。
+  其中列出、且所在文件都未变的分片不经哈希直接记为已有；所在文件大小或修改时间变了的分片照常哈希校验；
+  所在文件缺失的分片，以及数据中没有列出的分片，既不读也不记为已有。数据解不开、属于别的 torrent、
+  版本更新，或存储不是 `StatStorage` 时，以 `Err` 包装 `ErrResumeData` 的 `EventError` 报告，并对存储做完整校验。
+  每有一个分片到手 `ResumeGen()` 就会变化：与上次保存时不同就保存，并在 `Stop` 或 `Client.Close` 之后再存一次。
+  info 字典到手之前、以及 torrent 正在校验存储时，`ResumeData` 返回错误（请保留之前保存的数据）。
+
+  ```go
+  data, _ := t.ResumeData()           // t.Stop() 之后，或 t.ResumeGen() 变化时
+  os.WriteFile(resumePath, data, 0o644)
+  // 重启时：
+  t, _ = c.AddTorrentFile(torrentPath, &bittorrent.AddOptions{Resume: data})
+  ```
+
+  和 libtorrent 一样它信任这些文件戳：大小和修改时间都不变的原地修改发现不了，记为已有的分片发给 peer
+  时也不再校验（收到坏分片的 peer 会在自己的校验中失败，并可能封禁本客户端）。
+- **磁盘池**：存储的读写和分片哈希从不在 fib worker 上（也不在读 uTP 连接的 goroutine 上）进行。
+  `Config.DiskWorkers` 个 goroutine（GOMAXPROCS，最多 `DefaultMaxDiskWorkers` = 8）从同一个队列取任务：收到的块
+  拷进池化缓冲区后排队写入，分片的最后一块落盘后在池上校验整个分片；上传的读也在池上，每个 peer 同时只有一个
+  任务，每个任务最多 16 块，节奏仍受 `Congested`、`OnWritable` 和 `UploadRate` 控制；BEP 52 hash request 的应答和
+  取到的 piece layer 的校验也在池上。等待写入的块受 `Config.DiskQueueBytes`（`DefaultDiskQueueBytes`，64 MiB）
+  限制：超过后，发来这些块的连接停止读取（`peer.Conn.HoldReads`，即 `fib.Connection.HoldReads` 或暂停读
+  goroutine），直到写掉一半。`Stop`、`Remove` 和 `Close` 等正在进行的读写结束后才关闭存储；仍在排队的被丢弃。
 - **选片**：最稀有优先，相同时随机，头 4 个分片随机挑；文件优先级、顺序模式和打开着的 `Reader` 的窗口
   （最近的分片最急；默认预读 4 MiB，可用 `SetReadahead` 调整）优先。16 KiB 的块按每个 peer 的 `reqq` 流水请求；
   endgame 时一个块同时向第二个 peer 请求，较慢的那个被取消。60 秒没发任何东西的 peer 被判为 snub，
@@ -239,6 +267,28 @@ _, err = io.Copy(w, r)
   IPv4）、磁力链接的 `x.pe`、`AddPeers` 和 `Config.PeerSources`；私有 torrent 只用它的 tracker。web seed（BEP 19）
   经 fib/http 客户端用 range 请求提供整个分片。
 - **做种**到 `SeedRatio` 或 `SeedTime` 时暂停 torrent；`Ban` 在所有 torrent 中封禁一个地址。
+- **限制**可在客户端运行时修改，不断开已有 peer：`Client.SetLimits(Limits)` 替换 `UploadRate`、`DownloadRate`、
+  `MaxConns`、`MaxConnsPerTorrent`、`MaxHalfOpen`、`DialsPerTick`、`UploadSlots`、`SeedRatio` 和 `SeedTime`
+  （零值保持它在 `Config` 里的含义：速率和做种上限为不限，数量为默认值），`Client.Limits` 返回当前值。每个 torrent
+  有自己的 `TorrentLimits`（`AddOptions.Limits`、`Torrent.SetLimits`、`Torrent.Limits`）：`UploadRate`、
+  `DownloadRate` 叠加在客户端的速率之下（每个字节两边都要通过），`MaxConns`、`UploadSlots`、`SeedRatio`、
+  `SeedTime` 取代客户端的；零值继承客户端，负值表示该 torrent 不限。新速率在 1/4 秒内生效；调低连接上限立即
+  关闭多出的 peer，最没用的先关（两个方向都没有数据流动的、再是被 snub 的、再是最慢的、再是最新的）；
+  `UploadSlots` 变化立即重新 choke；做种上限每秒检查一次。
+- **地址过滤**：`Config.Filter func(netip.AddrPort) bool` 与 `fib.Binding.Filter` 含义相同（返回 true
+  即服务该 peer，每次都问、从不缓存，IPv4 映射地址先还原为 IPv4）。它是 TCP 绑定的 `Binding.Filter`、
+  uTP `Mux` 的 `Config.Accept`（被拒地址的 SYN 不建连接），也是 DHT 节点的 `dht.Config.Filter`（被拒地址
+  得不到应答、不进路由表、查找不经过它、也不作为 peer 返回）；来自 tracker、DHT、PEX、LSD、磁力链接
+  `x.pe`、`AddPeers` 和 `PeerSources` 的 peer 在成为候选之前被丢弃，每次拨号前和握手时再检查一次。
+  tracker 与 web seed 是 URL，不经过它。已打开的连接直到 `Client.Refilter` 才重新询问：它关闭 Filter
+  现在拒绝的连接（按远端地址或监听地址），包括握手中的，并忘掉被拒的候选；策略变更后调用它。`Ban`
+  与之分开。
+- **共享引擎**：`Config.SharedEngine` 让客户端运行在调用方已在运行的引擎上，而不是自建引擎（此时忽略
+  `Config.Engine`）。客户端把它的 TCP 绑定和 UDP 绑定（`utp.Listen`）加到该引擎上，在其上拨号、运行
+  DHT 和 UDP tracker 客户端，并在其上建 fib/http 客户端（tracker、web seed）；`Close` 移除这两个绑定
+  （TCP 绑定用 `Engine.ShutdownBinding` 加一个已结束的 context，立即关闭它接受的连接），关闭它拨出的
+  连接和 HTTP 客户端，引擎及其他绑定和连接照常运行。`Engine()` 返回正在用的引擎。多个客户端可共享
+  一个引擎，各用各的端口。
 
 ## 互通验证
 
@@ -383,6 +433,8 @@ FIB_DHT_PUBLIC=1 FIB_DHT_INFOHASH=<40 位十六进制> go test -run TestDHTPubli
 - **BEP 52 升级**：作为接收方，对端设置 v2 位时把 hybrid 的 v1 握手升级为 v2（anacrolix 从不这样做）；
   作为发起方，只在用 v1 哈希拨 hybrid torrent 时设置 v2 位。
 - **IPv6 的 allowed fast 集合**：地址按 /48 掩码，对全部 16 字节做哈希。
+- **`Conn.HoldReads`** 在 `net.Conn` 传输上让读 goroutine 在下一次读之前停住，在 fib 传输上就是
+  `fib.Connection.HoldReads`；不嵌套计数。备选：在 handler 里阻塞，而 fib worker 不能阻塞。
 - **peer 连接不开写背压**，两个互相上传的 peer 不会死锁；上传节奏由 `fib.Connection.NotifyOutput` 和
   `MaxQueuedBytes`（1 MiB）经 `Congested` 与 `OnWritable` 控制。在 `net.Conn` 上，写 goroutine 的队列不设上限。
 - **限制与默认值**：消息最大 1 MiB + 64，metadata 最大 16 MiB，通告的 `reqq` 为 250，在途请求最多 64 个，
@@ -441,7 +493,28 @@ FIB_DHT_PUBLIC=1 FIB_DHT_INFOHASH=<40 位十六进制> go test -run TestDHTPubli
 - **本地服务发现只支持 IPv4**，用标准库的 `net.ListenMulticastUDP`，因为 fib 没有组播 binding；加入组播组失败时
   静默关闭。
 - **封禁**按 IP（回环上的 peer 按它的监听地址），在客户端整个生命周期内有效。
-- **块直接写入存储**，校验分片时再读回；内存里不攒分片，smart ban 的哈希也来自读回的数据。
+- **块直接写入存储**（经磁盘池），校验分片时再读回；内存里不攒分片，smart ban 的哈希也来自读回的数据。
+- **每个客户端一个磁盘池、一个 FIFO 队列**，写入、分片校验、上传读取和 hash 应答共用：简单，也足够公平，因为
+  上传任务每 16 块就让出一次。备选：每个 torrent 或每类任务一个队列（像 libtorrent 的磁盘线程那样先写后读），
+  或每个任务一个 goroutine，那就什么都限制不住。
+- **`DiskWorkers` 默认 min(GOMAXPROCS, 8)**：哈希吃 CPU，而超过 8 个并发写对磁盘很少有帮助。备选：固定数目，
+  或把哈希和 I/O 分成两组 worker。
+- **字节上限只算收到的块**（`DiskQueueBytes`，64 MiB）：这是 peer 能撑大的内存。上传读取和分片校验只在运行时
+  持有缓冲区，最多 DiskWorkers 个；它们的任务数受每个 peer 一个上传任务、每个在途分片一次校验限制。备选：
+  所有缓冲区都计入，或按 torrent 设上限。
+- **上限是软的**：块从不被拒绝或丢弃，因为它到达时在 fib worker 上，不能等待；达到上限后停止读取，所以会超出
+  已经读到的数据（每条连接一轮读）。降到上限一半时恢复读取，所有被暂停的连接一起恢复。备选：超出时丢弃块，
+  由对端重发。
+- **块写入时发现存储已关闭**（torrent 已停止或移除）则丢弃，不发 `EventError`，该块重新变为缺失。真正的写入
+  错误仍发 `EventError`。
+- **关闭存储时等待正在进行的读写**（每个 torrent 一把锁，任务在 I/O 期间持有），而不等待队列：排队的任务发现
+  存储已不在就什么也不做。因此 `Stop`、`Remove` 和 `Client.Close` 最多等每个磁盘 worker 一次慢 I/O。
+- **不在池上的**：初始校验（每个 torrent 一个 goroutine，同以前）、web seed 的写入与校验（在它的下载
+  goroutine 上）、`Reader` 的读取（调用者的 goroutine），以及 `StorageOpener`——磁力链接的 torrent 在 info 字典
+  到达时于 fib worker 上调用它：opener 不能阻塞（默认的不做 I/O）。收到的 info 字典的 SHA-1 也在那里算，只算一次，
+  最多几 MiB。
+- **想要的空文件在初始校验结束时创建**，而不是下载完成时，这样 `Done` 关闭时它们已经存在；之后才选中的仍在完成
+  时于池上创建。
 - **从不请求填充字节**（anacrolix 拒绝落在填充里的请求）。
 - **纯 v2 torrent 提供文件最后一个完整的 16 KiB 块**，超出文件末尾的部分补零，因为 libtorrent 请求整块。
 - **BEP 52 hash request** 每次最多请求 512 个哈希、`proof_layers` 为 0（与 anacrolix 相同），拼好的 layer 与文件的
@@ -452,7 +525,63 @@ FIB_DHT_PUBLIC=1 FIB_DHT_INFOHASH=<40 位十六进制> go test -run TestDHTPubli
 - **做种时按上传速度 unchoke**（libtorrent 的 fastest_upload），而非轮转；完整做种时断开做种者和只上传的 peer；
   候选 peer 失败后在 2 秒 << 失败次数后重试，失败 6 次即丢弃（手动加入的除外）。
 - **`Reader` 提升了未选中文件的分片优先级时**，`Done()` 重新打开，直到这些分片到齐。
-- **没有快速续传文件**：每次加入都对存储里的数据做哈希校验。`Preallocate` 用 truncate 把文件设到全长（稀疏文件），
-  而不是 `fallocate`。
+- **快速续传数据是调用方保存的一段字节**（`ResumeData` / `AddOptions.Resume`），而不是客户端写的文件：
+  调用方（fit）本来就持久化自己的 torrent 列表，存在哪、何时存由它决定。备选：在 `Config` 里配续传目录，由客户端写。
+- **快速续传信任大小和修改时间**（存储报告的纳秒值），与 libtorrent 相同；同样文件戳下的原地修改发现不了，
+  续传得来的分片发给 peer 时也不再校验。备选：每个文件存内容哈希（要读整个文件，正是续传要省的），
+  或每个分片第一次上传时校验（每次首传多一次读和哈希，以后可加）。
+- **续传对每个分片的处理**：列出且文件都未变：记为已有，不读；有文件变了（大小或修改时间，含变短）：
+  照常哈希校验；有文件缺失：不读，不记为已有；未列出且文件未变：不读，重新下载。最后一种会丢掉保存时
+  已写完但未校验的分片和部分分片；若要校验它们，每次启动都得读完全部未完成（常是预分配的）数据。
+  备选：像 libtorrent 的 `unfinished` 那样把部分分片的块位图存进数据。
+- **不能用的续传数据以包装 `ErrResumeData` 的 `EventError` 报告**，并退回完整校验：解不开、版本为 0
+  或高于 1、info hash 不符（出现的每个 hash 都须相符）、位图或文件数对不上，或存储不是 `StatStorage`。
+  备选：单独的事件类型；`EventError` 不改变 torrent 状态，可用 `errors.Is` 区分。
+- **"该保存了"的信号是 `ResumeGen()`**，即已有分片数（只增不减），而不是事件：`EventPieceVerified`
+  已经逐片触发，一个廉价计数让调用方可以定时检查、有变化才保存。写未完成分片会改变文件戳但不动它，
+  所以调用方要在 `Stop` / `Client.Close` 之后再存一次。
+- **torrent 校验存储期间 `ResumeData` 返回错误**：此时位图不完整，保存会丢掉还没校验到的分片；
+  已停止的 torrent 只为取文件戳重新打开存储（`fileStorage.Stat` 只调用 `os.Stat`）。备选：校验期间返回加入时的数据。
+- **续传数据不含 v2 piece layer**：续传的 v2 磁力 torrent 有分片，但只为仍需校验的分片获取 layer；
+  需要的调用方自己保存 `MetaInfo()` 的字节。备选：把 layer 放进数据，每分片 32 字节。
+- **`MemoryStorage` 实现了 `StatStorage`**，每次写入（以及 `Corrupt`）用进程内严格递增的时钟，
+  因此续传在同一进程内可用（opener 对同一 info hash 返回同一存储）。
+- **`Preallocate` 用 truncate** 把文件设到全长（稀疏文件），而不是 `fallocate`。
 - **web seed**：每个 seed 同时最多 4 个分片在途，失败 5 次即弃用，只取整个分片。
 - **事件**在一个分发 goroutine 上按顺序投递，从不阻塞客户端；连上与断开事件附带 `PeerInfo` 快照。
+- **运行时限制是独立的 `Limits` 类型**，而不是嵌入 `Config`，这样 `Config{UploadRate: ...}` 这类字面量仍能编译；
+  NewClient 从 `Config` 构造最初的 `Limits`。备选：把这些字段移进嵌入的 `Config.Limits`（只有一处定义，但是
+  破坏性改动）。
+- **零值沿用 `Config` 中的含义**：速率和做种上限为不限，数量为默认值；`Limits` 里负值等同零值，`Limits()`
+  返回填好默认值的数量。备选：零值表示"不变"，那样表达"不限"就需要指针或掩码。
+- **`TorrentLimits` 中零值继承、负值不限**（`MaxConns` 只受客户端 `MaxConns` 约束，`UploadSlots` unchoke 所有
+  感兴趣的 peer，做种上限永不暂停）。每个字节都要通过两个令牌桶，torrent 的速率只能比客户端低，所以负速率等同零值。
+  torrent 的 `MaxConns` 取代 `MaxConnsPerTorrent`，可以更高。备选：单独的 `NoSeedLimit` 标志；每 torrent 值以
+  客户端值为上限。
+- **下载速率在请求块时扣除**，而不是在数据到达时，这样限速是少发请求（peer 不会多发），而不是读进来再丢掉。
+  请求后来被取消（snub、被 choke、peer 断开）时已扣的令牌不退还；令牌桶容量为一秒的速率，每次补充最多透支一个块，
+  所以回环上被限速的传输在几秒内可达速率的约 1.5 倍。web seed 仍在到达时扣除。备选：退还取消的请求，或更小的桶。
+- **调低连接上限时最没用的 peer 先关**：两边都没有"感兴趣且未被 choke"的，再是被 snub 的，再是上下行速率之和
+  最低的，再是最新的；先按每个 torrent，再按客户端的 `MaxConns`。连回已满客户端的拨号和以前一样在握手时被拒。
+  `UploadSlots` 无论调高调低都立即重新 choke；调高做种上限不会重启已因它暂停的 torrent（需 `Start`）。
+- **`Config.Filter`（A78）**：一个以 `netip.AddrPort` 为参数的谓词，与 `fib.Binding.Filter` 同形，而不是
+  IP 段列表类型，便于 fit 用原子指针背后的黑白名单和 eMule `.p2p`/`.dat` 封锁列表实现。UDP 绑定不设
+  `Binding.Filter`，因为该端口也是 UDP tracker 的，而 tracker 不是 peer：uTP 用已有的
+  `utp.Config.Accept`（不加 utp API），DHT 用新增的 `dht.Config.Filter`，它不读被拒节点的数据报，并把
+  它排除在种子节点、查找、应答的 nodes 与 values 以及 `GetPeers`/`Announce` 结果之外。已在路由表中的
+  被拒节点不立即删除，而是不再被应答，像沉默节点一样被淘汰。扩展握手声明的监听端口被拒的 peer 会被
+  关闭，与按该地址封禁一样。备选：fib 提供 IP 前缀集合类型；或用 UDP 绑定的 `Binding.Filter`，但那也
+  会切断被拒地址上的 tracker 和 DHT router。
+- **`Client.Refilter()`（A78）**：关闭 Filter 现在拒绝的已打开和握手中的连接，并丢弃既未连接也未在拨号
+  的被拒候选，等来源再次给出时才回来。被关闭的连接以 `EventPeerDisconnected` 结束，不是
+  `EventPeerBanned`，也不被封禁。备选：一个自带重新过滤的策略设置方法（`SetFilter`）；分开是为了 fit
+  一次策略变更可以重新过滤多个客户端和其他模块。
+- **`Config.SharedEngine *fib.Engine`（A79）**：放在 `Config.Engine` 旁边的字段，而不是
+  `NewClientOn(engine, cfg)` 构造函数，这样单靠一个 Config 就描述了客户端，其他构造路径也不需要第二个
+  构造函数。引擎必须已在运行；NewClient 会等它的事件循环。`Close` 时用 `ShutdownBinding` 加一个已结束
+  的 context 移除 TCP 绑定，core 文档说明这会立即关闭该绑定的连接；没有新增 core API，因为
+  `RemoveBinding` 和 `ShutdownBinding` 已在所有后端存在。拨出的连接由客户端自己关闭（peer 和半开拨号；
+  `Close` 之后才完成的拨号会自行关闭）。`Close` 时 HTTP 客户端尚在进行的请求随其 context（torrent 的
+  context 已取消）结束，而不是靠停止引擎。备选：`NewClientOn` 构造函数；core 的
+  `Engine.RemoveBindingAndConns`。
+

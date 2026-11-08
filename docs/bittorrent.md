@@ -153,7 +153,8 @@ A `Conn` tracks choking, interest and the requests outstanding: `Request` keeps 
 `reqq` (and `Config.MaxRequests`, 64) in flight, aware of choking and allowed-fast pieces, and
 without the Fast extension a choke drops them. It sends keepalives every two minutes and closes
 after three of silence. What a handler sends from its callbacks goes out in one write when it
-returns; `Congested` and `OnWritable` pace uploads by what waits for the socket. Over a `net.Conn`,
+returns; `Congested` and `OnWritable` pace uploads by what waits for the socket, and `HoldReads`
+stops reading from the peer while the handler's own work backs up. Over a `net.Conn`,
 one goroutine reads and another writes, so that neither side ever waits on the other's reading.
 
 Package `mse` is MSE/PE: 768-bit Diffie-Hellman, RC4 with the first 1024 bytes dropped, both
@@ -212,6 +213,9 @@ the `ip` key of responses), and `Config.EnforceNodeID` keeps nodes whose IDs do 
 addresses out of the table. BEP 43: `Config.ReadOnly` queries but answers nothing. BEP 32: a `Node`
 is of one address family; `Config.IPv6` makes one that speaks `nodes6`, and a client on both runs
 two.
+`Config.Filter`, with the meaning of `fib.Binding.Filter`, leaves the addresses it refuses alone:
+their datagrams are dropped unread, and they enter no routing table and are left out of lookups,
+`AddNodes`, and the nodes and values of responses.
 
 `New` makes a `Node` that sends through `Config.Send` and is fed by `HandleDatagram`, which claims
 datagrams that begin with `'d'`; `Listen` runs one on a binding of its own. Timers are
@@ -227,7 +231,7 @@ n, err := node.Announce(ctx, infoHash, 0, true, func(peers []netip.AddrPort) {
 
 ## Client (package bittorrent)
 
-A `Client` is one fib engine and one port: TCP for the peer wire protocol (a `peer.Server`), and
+A `Client` is one fib engine (its own, or a shared one) and one port: TCP for the peer wire protocol (a `peer.Server`), and
 UDP shared by a `utp.Socket`, a `dht.Node` and a `tracker.UDPClient`, as in
 [One port for TCP and UDP](#one-port-for-tcp-and-udp). Its `Config` zero value is a working client:
 it stores in the working directory, listens on `:6881` (`DefaultListenAddr`; a zero port picks one
@@ -256,6 +260,40 @@ _, err = io.Copy(w, r)
   `DataDir` (`NewFileStorage`, paths made safe for the operating system by `SanitizePath`, BEP 47
   padding never written) or memory (`NewMemoryStorage`). What storage holds when a torrent is added
   is hash-checked, so an interrupted download resumes.
+- **Fast resume** skips that check: `Torrent.ResumeData()` returns a small versioned bencoded
+  blob (the info hashes, the bitfield of the pieces had, and each file's size and modification
+  time from the storage, which must be a `StatStorage`; both built-in storages are), and
+  `AddOptions.Resume` takes it back on `AddTorrent`, `AddTorrentFile` or `AddMagnet` (applied once
+  the info dictionary arrives). Pieces it lists whose files all still match are had without
+  hashing; pieces in a file whose size or modification time changed are hash-checked; pieces in a
+  missing file, and pieces the blob does not list, are neither read nor had. A blob that does not
+  decode, is of another torrent or of a newer version, or storage that is not a `StatStorage`,
+  is reported as an `EventError` whose `Err` wraps `ErrResumeData`, and the storage is checked in
+  full. `ResumeGen()` changes whenever a piece is had: save when it differs from the last save,
+  and once more after `Stop` or `Client.Close`. `ResumeData` errs before the info dictionary and
+  while the torrent checks its storage (keep the blob saved before).
+
+  ```go
+  data, _ := t.ResumeData()           // after t.Stop(), or when t.ResumeGen() moved
+  os.WriteFile(resumePath, data, 0o644)
+  // on restart:
+  t, _ = c.AddTorrentFile(torrentPath, &bittorrent.AddOptions{Resume: data})
+  ```
+
+  Like libtorrent's, it trusts the stamps: content changed in place with the same size and
+  modification time is not seen, and the pieces taken as had are served to peers without being
+  verified again (a peer that gets a bad piece fails its own check and may ban this client).
+- **Disk pool**: storage is never read or written, and no piece is hashed, on a fib worker (or on
+  the goroutine reading a uTP connection). `Config.DiskWorkers` goroutines (GOMAXPROCS, at most
+  `DefaultMaxDiskWorkers` = 8) take the jobs from one queue: a received block is copied into a
+  pooled buffer and its write queued, and the piece is checked on the pool once its last block
+  lands; an upload's reads run there, one job per peer at a time of up to 16 blocks, still paced by
+  `Congested`, `OnWritable` and `UploadRate`; so do the answers to BEP 52 hash requests and the check
+  of a fetched piece layer. The blocks waiting are bounded by `Config.DiskQueueBytes`
+  (`DefaultDiskQueueBytes`, 64 MiB): past it the connections that sent them stop reading
+  (`peer.Conn.HoldReads`, which is `fib.Connection.HoldReads` or a paused reading goroutine) until
+  half has been written. `Stop`, `Remove` and `Close` close a storage only once the reads and writes
+  under way are over; those still queued are dropped.
 - **Picking**: rarest first with random ties, the first 4 pieces at random; file priorities,
   sequential mode and the windows of open `Reader`s (the nearest piece most urgent; readahead 4 MiB
   by default, `SetReadahead`) come first. 16 KiB blocks are pipelined to each peer's `reqq`; in
@@ -281,6 +319,35 @@ _, err = io.Copy(w, r)
   `x.pe`, `AddPeers` and `Config.PeerSources`; a private torrent uses its trackers alone. Web seeds
   (BEP 19) serve whole pieces through range requests on the fib/http client.
 - **Seeding** pauses a torrent at `SeedRatio` or `SeedTime`; `Ban` bans an address from every torrent.
+- **Limits** change while the client runs, keeping its peers: `Client.SetLimits(Limits)` replaces
+  `UploadRate`, `DownloadRate`, `MaxConns`, `MaxConnsPerTorrent`, `MaxHalfOpen`, `DialsPerTick`,
+  `UploadSlots`, `SeedRatio` and `SeedTime` (zero keeps its `Config` meaning: unlimited for the rates
+  and seed limits, the default for the counts), and `Client.Limits` returns them. A torrent has its
+  own `TorrentLimits` (`AddOptions.Limits`, `Torrent.SetLimits`, `Torrent.Limits`): `UploadRate`
+  and `DownloadRate` under the client's (a byte passes both), and `MaxConns`, `UploadSlots`,
+  `SeedRatio` and `SeedTime` in place of the client's; zero takes the client's, negative is no limit
+  for that torrent. New rates apply within a quarter second; lowered connection limits close the
+  excess peers at once, least useful first (nothing flowing either way, then snubbed, then slowest,
+  then newest); a changed `UploadSlots` rechokes at once; seed limits are looked at each second.
+- **Address filter**: `Config.Filter func(netip.AddrPort) bool` has the meaning of
+  `fib.Binding.Filter` (true serves the peer, asked every time, never cached; IPv4-mapped addresses
+  unmapped). It is the TCP binding's `Binding.Filter`, the uTP `Mux`'s `Config.Accept` (a SYN from a
+  refused address gets no connection), and the DHT nodes' `dht.Config.Filter` (no answers, no
+  routing table entry, no lookups through, and no peers from a refused address); and peers from
+  trackers, the DHT, PEX, LSD, a magnet's `x.pe`, `AddPeers` and `PeerSources` are dropped before
+  they become candidates, checked again before each dial and at the handshake. Trackers and web
+  seeds are URLs and are not asked about. Open connections are not asked again until
+  `Client.Refilter`, which closes those Filter now refuses (by remote or listen address), their
+  handshakes in flight included, and forgets refused candidates; call it after a policy change.
+  `Ban` stays separate.
+- **Shared engine**: `Config.SharedEngine` serves the client on a running engine of the caller's
+  instead of one of its own (`Config.Engine` is then ignored). The client adds its TCP binding and
+  its UDP binding (`utp.Listen`) to it, dials, runs the DHT and the UDP tracker client, and builds
+  its fib/http client (trackers, web seeds) on it; `Close` removes the two bindings (the TCP one
+  with `Engine.ShutdownBinding` and a done context, which closes the connections it accepted at
+  once), closes the connections it dialed and its HTTP client, and leaves the engine, its other
+  bindings and their connections running. `Engine()` returns the engine in use. Several clients
+  may share one engine, each on its own port.
 
 ## Interop
 
@@ -449,6 +516,9 @@ alternative.
   v2 bit (anacrolix never does); as initiator the v2 bit is set only when dialing a hybrid by its
   v1 hash.
 - **Allowed-fast set for IPv6**: the address masked to /48, all 16 bytes hashed.
+- **`Conn.HoldReads`** pauses a `net.Conn` transport's reading goroutine before its next read,
+  and is `fib.Connection.HoldReads` on a fib one; holds do not nest. Alternative: blocking inside
+  the handler, which a fib worker must not do.
 - **No write backpressure** on peer connections, so two peers uploading to each other cannot
   deadlock; uploads are paced by `fib.Connection.NotifyOutput` and `MaxQueuedBytes` (1 MiB)
   through `Congested` and `OnWritable`. Over a `net.Conn` the writer goroutine's queue is
@@ -521,8 +591,37 @@ alternative.
 - **Local service discovery is IPv4 only**, on the standard library's `net.ListenMulticastUDP`,
   since fib has no multicast bindings; it turns itself off silently if joining the group fails.
 - **Bans** are by IP (a loopback peer by its listen address) and last for the client's lifetime.
-- **Blocks are written straight to storage** and read back to verify the piece; there are no
-  pieces in memory, and smart-ban hashes come from that read-back.
+- **Blocks are written straight to storage** (through the disk pool) and read back to verify the
+  piece; there are no pieces in memory, and smart-ban hashes come from that read-back.
+- **One disk pool per client, one FIFO queue** for writes, piece checks, upload reads and hash
+  answers: simple and fair enough, as an upload job yields after 16 blocks. Alternatives: a queue
+  per torrent or per kind of job (writes before reads, as libtorrent's disk threads favour), or a
+  goroutine per job, which would bound nothing.
+- **`DiskWorkers` defaults to min(GOMAXPROCS, 8)**: hashing is CPU-bound, and more than 8
+  concurrent writes rarely help a disk. Alternative: a fixed number, or separate hashing and I/O
+  workers.
+- **The byte bound counts received blocks only** (`DiskQueueBytes`, 64 MiB): they are the memory
+  peers can grow. Upload reads and piece checks hold a buffer only while running, so at most
+  DiskWorkers of them; their jobs are bounded by one upload job per peer and one check per piece
+  in flight. Alternatives: counting every buffer, or a bound per torrent.
+- **The bound is soft**: a block is never refused or dropped, since it arrives on a fib worker that
+  must not wait; reads stop once it is reached, so it is exceeded by what reads already delivered
+  (one read round per connection). Reads resume at half the bound, all held connections at once.
+  Alternative: dropping blocks past it, which the peer would have to send again.
+- **A block's write that finds its storage closed** (a stopped or removed torrent) is dropped
+  without an `EventError`; the block becomes missing again. A real write error still emits
+  `EventError`.
+- **Closing a storage waits for the reads and writes under way** (a lock per torrent the jobs hold
+  for their I/O), not for the queue: queued jobs find the storage gone and do nothing. `Stop`,
+  `Remove` and `Client.Close` therefore return after at most one slow I/O per disk worker.
+- **Not on the pool**: the initial check (a goroutine per torrent, as before), a web seed's write
+  and check (on its fetch goroutine), `Reader` reads (the caller's goroutine), and the
+  `StorageOpener`, which a magnet link's torrent calls on a fib worker when the info dictionary
+  arrives: an opener must not block (the default one does no I/O). The SHA-1 of a received info
+  dictionary also runs there; it is hashed once and at most a few MiB.
+- **The wanted empty files are created at the end of the initial check**, rather than at
+  completion, so they exist once `Done` is closed; files selected later are still created at
+  completion, on the pool.
 - **Padding bytes are never requested** (anacrolix refuses requests inside padding).
 - **v2-only torrents serve the whole last 16 KiB block** of a file, zeros past its end, because
   libtorrent requests whole blocks.
@@ -536,8 +635,90 @@ alternative.
   full seed drops seeds and upload-only peers; peer candidates are retried after 2 s << failures
   and dropped after 6 failures unless added by hand.
 - **A `Reader` that raises pieces of an unselected file** reopens `Done()` until they arrive.
-- **No fast-resume file**: every add hash-checks what storage holds. `Preallocate` truncates
-  files to length (sparse) rather than `fallocate`.
+- **Fast resume is a blob the caller keeps** (`ResumeData` / `AddOptions.Resume`), not a file the
+  client writes: the caller (fit) already persists its torrent list and chooses where and when.
+  Alternative: a resume directory in `Config`, written by the client.
+- **Fast resume trusts size and modification time** (nanoseconds as the storage reports them),
+  as libtorrent does; content changed in place under the same stamps is not seen, and resumed
+  pieces are served without being verified again. Alternatives: a per-file content hash (costs a
+  read of the file, which is what resume avoids), or verifying each piece the first time it is
+  served (a read and hash per first upload, possible later).
+- **What resume does with each piece**: listed and all files unchanged: had, no read; a file
+  changed (size or mtime, shorter included): hash-checked as without resume; a file missing: not
+  read, not had; not listed and files unchanged: not read, downloaded again. The last loses a
+  piece fully written but not yet verified at save time, and partial pieces; checking them would
+  read the whole unfinished (often preallocated) data at every start. Alternative: keep partial
+  pieces' block bitmaps in the blob, as libtorrent's `unfinished`.
+- **Unusable resume data is reported as `EventError` wrapping `ErrResumeData`** and falls back to
+  a full check: undecodable, version 0 or newer than 1, an info hash that differs (any present
+  hash must match), a bitfield or file count that does not fit, or storage that is not a
+  `StatStorage`. Alternative: a dedicated event type; `EventError` does not change the torrent's
+  state, and `errors.Is` tells it apart.
+- **The "save now" signal is `ResumeGen()`**, the count of pieces had (it only grows), rather than
+  an event: `EventPieceVerified` already fires per piece, and a cheap counter lets a caller save
+  on a timer only when something changed. Writes to unfinished pieces change file stamps without
+  moving it, so callers save once more after `Stop` / `Client.Close`.
+- **`ResumeData` errs while the torrent checks its storage**, since the bitfield is then partial
+  and saving it would lose the pieces not yet reached; a stopped torrent's storage is reopened just
+  for the stamps (`fileStorage.Stat` only calls `os.Stat`). Alternative: return the blob it was
+  added with during the check.
+- **Resume data holds no v2 piece layers**: a v2 magnet resumed has its pieces but fetches layers
+  only for pieces it must still verify; a caller that wants them keeps `MetaInfo()`'s bytes.
+  Alternative: layers in the blob, 32 bytes per piece.
+- **`MemoryStorage` implements `StatStorage`** with a strictly increasing in-process clock per
+  write (and `Corrupt`), so resume works within a process (the opener returns the same storage for
+  an info hash).
+- **`Preallocate` truncates** files to length (sparse) rather than `fallocate`.
 - **Web seeds**: 4 pieces in flight per seed, a seed dropped after 5 failures, whole pieces only.
 - **Events** are delivered in order on one dispatcher goroutine that never blocks the client;
   connect and disconnect carry a `PeerInfo` snapshot.
+- **Run-time limits are a separate `Limits` type**, not an embedded part of `Config`, so that
+  `Config{UploadRate: ...}` literals keep compiling; NewClient builds the first `Limits` from
+  `Config`. Alternative: move the fields into an embedded `Config.Limits` (one source of truth, but
+  a breaking change).
+- **Zero means what it meant in `Config`**: unlimited for rates and seed limits, the default for
+  counts; negative is the same as zero in `Limits`, and `Limits()` returns the counts with defaults
+  filled in. Alternative: zero as "unchanged", which would need pointers or a mask to say "unlimited".
+- **In `TorrentLimits`, zero inherits and negative is no limit** (`MaxConns` then bounded by the
+  client's `MaxConns` only, `UploadSlots` unchokes every interested peer, seed limits never pause).
+  A torrent's rates can only be lower than the client's, since every byte passes both buckets, so a
+  negative rate is the same as zero. A torrent's `MaxConns` replaces `MaxConnsPerTorrent` and may be
+  higher. Alternatives: a separate `NoSeedLimit` flag; per-torrent values capped by the client's.
+- **The download rate is spent when a block is requested**, not when it arrives, so the limit holds
+  back requests (the peer sends no more than was asked) instead of reading and dropping data. Tokens
+  spent on requests later cancelled (snubbing, a choke, a closed peer) are not refunded; the bucket
+  holds one second of rate and may go one block into debt per refill, so a limited transfer runs up
+  to ~1.5× the rate over a couple of seconds on loopback. Web seeds still spend on arrival.
+  Alternative: refund cancelled requests, or a smaller bucket.
+- **Lowered connection limits close peers least useful first**: neither side interested and
+  unchoked, then snubbed, then lowest download+upload rate, then the newest; per torrent first, then
+  across the client for `MaxConns`. Dials back to a full client are refused at the handshake as
+  before. A changed `UploadSlots` rechokes whether raised or lowered; raising a seed limit does not
+  restart a torrent already paused by it (`Start` does).
+- **`Config.Filter` (A78)**: one predicate on `netip.AddrPort`, the shape of `fib.Binding.Filter`,
+  rather than an IP-range list type, so that fit can back it with allow/deny lists and eMule
+  `.p2p`/`.dat` blocklists behind an atomic pointer. The UDP binding gets no `Binding.Filter`,
+  because the port is the UDP trackers' too and trackers are not peers: uTP uses the existing
+  `utp.Config.Accept` (no new utp API), and the DHT a new `dht.Config.Filter`, which drops a refused
+  node's datagrams unread and leaves it out of seeds, lookups, the nodes and values of responses,
+  and `GetPeers`/`Announce` results. A refused node already in a routing table is not removed at
+  once; it stops being answered and falls out as a silent node does. A peer whose extension
+  handshake names a refused listen port is closed, as a ban by it would be. Alternatives: an
+  IP-prefix set type in fib; the UDP binding's `Binding.Filter`, which would also cut off trackers
+  and DHT routers on refused addresses.
+- **`Client.Refilter()` (A78)**: closes the open and handshaking connections Filter now refuses,
+  and drops refused candidates that are neither connected nor being dialed, so that they come back
+  only when a source names them again. The closed connections end with `EventPeerDisconnected`, not
+  `EventPeerBanned`, and are not banned. Alternative: a policy setter (`SetFilter`) that refilters
+  itself; kept apart so that one fit policy change can refilter many clients and other modules.
+- **`Config.SharedEngine *fib.Engine` (A79)**, a field next to `Config.Engine` rather than a
+  `NewClientOn(engine, cfg)` constructor, so that a Config alone describes the client and the
+  other construction paths need no second constructor. The engine must already run; NewClient
+  waits for its loop. On `Close` the TCP binding is removed with `ShutdownBinding` and an already
+  done context, which core documents as closing the binding's connections at once; no core API
+  was added, since `RemoveBinding` and `ShutdownBinding` already exist on every backend. The
+  dialed connections are closed by the client (peers and half-open dials; a dial that completes
+  after `Close` closes itself). Requests of the HTTP client in flight at `Close` end with their
+  contexts (the torrents' are cancelled), not by stopping the engine. Alternatives: a
+  `NewClientOn` constructor; a core `Engine.RemoveBindingAndConns`.
+

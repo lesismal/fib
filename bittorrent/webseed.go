@@ -45,7 +45,7 @@ func (t *Torrent) startWebSeedsLocked(now time.Time) {
 		}
 	}
 	for _, ws := range t.seeds {
-		for ws.inFlight < webSeedConcurrency && ws.fails < webSeedMaxFails && !now.Before(ws.nextTry) && t.c.down.allow() {
+		for ws.inFlight < webSeedConcurrency && ws.fails < webSeedMaxFails && !now.Before(ws.nextTry) && t.downAllow() {
 			i, ok := t.pickPiece(func(i int) bool { return t.wanted(i) })
 			if !ok {
 				return
@@ -96,7 +96,11 @@ func (t *Torrent) fetchWebSeed(ws *webSeed, i int, p *partial) {
 	buf := make([]byte, info.PieceSize(i))
 	err := t.webSeedRead(ctx, ws.url, info, off, buf[:n])
 	if err == nil && st != nil {
-		err = writeData(st, info, off, buf[:n])
+		st, _, done := t.useStorage()
+		if st != nil {
+			err = writeData(st, info, off, buf[:n])
+		}
+		done()
 	}
 	t.mu.Lock()
 	for b := range p.blocks {
@@ -114,7 +118,7 @@ func (t *Torrent) fetchWebSeed(ws *webSeed, i int, p *partial) {
 		}
 		t.downloaded.Add(n)
 		t.downRate.add(int(n))
-		t.c.down.take(int(n))
+		t.downTake(int(n))
 		verify = p.writing == 0
 		p.busy = verify
 	}
