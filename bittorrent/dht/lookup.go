@@ -100,7 +100,7 @@ func (n *Node) newLookup(target ID, q string, mk func() *args) *lookup {
 
 // add adds a node the lookup heard of.
 func (l *lookup) add(ni NodeInfo) {
-	if l.seen[ni.Addr] || ni.ID == l.self || ni.ID.IsZero() || ni.Addr.Addr().Is4() == l.n.cfg.IPv6 {
+	if l.seen[ni.Addr] || ni.ID == l.self || ni.ID.IsZero() || ni.Addr.Addr().Is4() == l.n.cfg.IPv6 || l.n.refuses(ni.Addr) {
 		return
 	}
 	l.seen[ni.Addr] = true
@@ -122,7 +122,7 @@ func (l *lookup) insert(c *cand) {
 func (l *lookup) addSeeds(addrs []netip.AddrPort) {
 	for _, a := range addrs {
 		a = unmap(a)
-		if l.seen[a] || a.Addr().Is4() == l.n.cfg.IPv6 {
+		if l.seen[a] || a.Addr().Is4() == l.n.cfg.IPv6 || l.n.refuses(a) {
 			continue
 		}
 		l.seen[a] = true
@@ -313,6 +313,9 @@ func (n *Node) getPeersLookup(ih metainfo.InfoHash, onPeers func([]netip.AddrPor
 	for _, a := range own {
 		seen[a] = true
 	}
+	if n.cfg.Filter != nil {
+		own = slices.DeleteFunc(own, n.refuses)
+	}
 	if len(own) > 0 && onPeers != nil {
 		onPeers(own)
 	}
@@ -321,7 +324,7 @@ func (n *Node) getPeersLookup(ih metainfo.InfoHash, onPeers func([]netip.AddrPor
 		var fresh []netip.AddrPort
 		for _, v := range m.R.Values {
 			a, ok := parseCompactAddr(v)
-			if a = unmap(a); ok && a.Port() != 0 && !seen[a] {
+			if a = unmap(a); ok && a.Port() != 0 && !seen[a] && !n.refuses(a) {
 				seen[a] = true
 				fresh = append(fresh, a)
 			}

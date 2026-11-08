@@ -6,7 +6,9 @@ import (
 	"errors"
 	"math/rand/v2"
 	"net/netip"
+	"slices"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -540,5 +542,60 @@ func TestSimIPv6(t *testing.T) {
 	}
 	if nodes[0].Stats().QueriesAnswered != before {
 		t.Fatal("IPv6 node answered an IPv4 query")
+	}
+}
+
+// A node's Filter keeps the nodes and peers it refuses out: their queries
+// go unanswered, they enter no routing table, and lookups return none of
+// them; a Filter whose answer changes applies the new one.
+func TestSimFilter(t *testing.T) {
+	s := newSimNet(t, 11)
+	nodes := s.build(t, 60, Config{})
+	refused := simAddr(5)
+	var allow atomic.Bool
+	f := s.add(t, simAddr(900), Config{Filter: func(a netip.AddrPort) bool {
+		return allow.Load() || a != refused
+	}})
+	f.AddNodes(NodeInfo{Addr: refused})
+	f.mu.Lock()
+	seeded := slices.Contains(f.seeds, refused)
+	f.mu.Unlock()
+	if seeded {
+		t.Fatal("AddNodes kept a refused node")
+	}
+	f.AddNodes(NodeInfo{Addr: simAddr(0)})
+	ctx := context.Background()
+	if err := f.Bootstrap(ctx); err != nil {
+		t.Fatal(err)
+	}
+	ih := metainfo.InfoHash(RandomID())
+	for _, i := range []int{5, 6} {
+		if _, err := nodes[i].Announce(ctx, ih, 0, true, nil); err != nil {
+			t.Fatal(err)
+		}
+	}
+	var got []netip.AddrPort
+	if err := f.GetPeers(ctx, ih, func(p []netip.AddrPort) { got = append(got, p...) }); err != nil {
+		t.Fatal(err)
+	}
+	if slices.Contains(got, refused) || !slices.Contains(got, simAddr(6)) {
+		t.Fatalf("get_peers gave %v", got)
+	}
+	for _, ni := range f.Nodes() {
+		if ni.Addr == refused {
+			t.Fatal("refused node in the routing table")
+		}
+	}
+	pctx, cancel := context.WithTimeout(ctx, 2*time.Second)
+	defer cancel()
+	if _, err := nodes[5].Ping(pctx, simAddr(900)); err == nil {
+		t.Fatal("a refused node's ping was answered")
+	}
+	if _, err := nodes[6].Ping(pctx, simAddr(900)); err != nil {
+		t.Fatal(err)
+	}
+	allow.Store(true)
+	if _, err := nodes[5].Ping(pctx, simAddr(900)); err != nil {
+		t.Fatalf("ping after the filter allowed the node: %v", err)
 	}
 }
