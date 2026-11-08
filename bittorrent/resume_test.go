@@ -87,21 +87,15 @@ func (l *errorLog) option(c *Config) {
 	}
 }
 
-// waitResumeError waits for an EventError of ErrResumeData.
-func (l *errorLog) waitResumeError(t *testing.T) {
+// waitResumeErrors waits until n EventErrors of ErrResumeData have been
+// heard: events reach OnEvent on a goroutine of their own, so a count
+// read right after the check may not hold the latest yet.
+func (l *errorLog) waitResumeErrors(t *testing.T, n int) {
 	t.Helper()
-	deadline := time.Now().Add(5 * time.Second)
-	for {
-		l.mu.Lock()
-		for _, err := range l.errs {
-			if errors.Is(err, ErrResumeData) {
-				l.mu.Unlock()
-				return
-			}
-		}
-		l.mu.Unlock()
+	deadline := time.Now().Add(10 * time.Second)
+	for l.resumeErrors() < n {
 		if time.Now().After(deadline) {
-			t.Fatal("unused resume data not reported")
+			t.Fatalf("%d reports of unused resume data, want %d", l.resumeErrors(), n)
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
@@ -329,15 +323,18 @@ func TestResumeRejected(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
+			// Removed however the subtest ends, so that a failure does
+			// not fail the next ones with ErrTorrentExists.
+			defer func() { _ = tor.Remove(false) }()
 			waitDone(t, tor)
-			log.waitResumeError(t)
+			log.waitResumeErrors(t, before+1)
+			time.Sleep(50 * time.Millisecond) // a second report would arrive by now
 			if log.resumeErrors() != before+1 {
 				t.Fatalf("%d reports, want %d", log.resumeErrors(), before+1)
 			}
 			if rc.total() < mi.Info.PieceCount() {
 				t.Fatalf("%d reads: no full check", rc.total())
 			}
-			_ = tor.Remove(false)
 		})
 	}
 }
@@ -411,7 +408,7 @@ func TestResumeMemoryStorage(t *testing.T) {
 			}
 			waitDone(t, tor)
 			if noStat {
-				log.waitResumeError(t)
+				log.waitResumeErrors(t, 1)
 				if rc.total() == 0 {
 					t.Fatal("no check without file stamps")
 				}
