@@ -133,6 +133,16 @@ type Config struct {
 	// Engine configures the client's fib engine; fib.DefaultConfig when
 	// nil.
 	Engine *fib.Config
+
+	// DiskWorkers is how many goroutines run the storage's reads and
+	// writes and the pieces' hashing, which never run on a fib worker;
+	// GOMAXPROCS, at most DefaultMaxDiskWorkers, when zero.
+	DiskWorkers int
+	// DiskQueueBytes bounds the received blocks waiting for storage: past
+	// it the client stops reading from the peers that sent them until
+	// half has been written. What reads already delivered may take it
+	// past the bound. DefaultDiskQueueBytes when zero.
+	DiskQueueBytes int64
 }
 
 func (cfg *Config) setDefaults() {
@@ -168,6 +178,12 @@ func (cfg *Config) setDefaults() {
 	if cfg.LSDInterval <= 0 {
 		cfg.LSDInterval = DefaultLSDInterval
 	}
+	if cfg.DiskWorkers <= 0 {
+		cfg.DiskWorkers = diskWorkers()
+	}
+	if cfg.DiskQueueBytes <= 0 {
+		cfg.DiskQueueBytes = DefaultDiskQueueBytes
+	}
 }
 
 // Client is a BitTorrent client: one fib engine, one port for TCP and
@@ -195,6 +211,7 @@ type Client struct {
 	ownAddrs   map[netip.Addr]bool
 
 	up, down limiter
+	disk     *diskPool
 
 	conns    atomic.Int64
 	halfOpen atomic.Int64
@@ -234,6 +251,7 @@ func NewClient(cfg Config) (*Client, error) {
 	c.down.rate = int64(cfg.DownloadRate)
 	c.down.tokens = c.down.rate
 	c.ctx, c.cancel = context.WithCancel(context.Background())
+	c.disk = newDiskPool(cfg.DiskWorkers, cfg.DiskQueueBytes)
 	c.server = peer.NewServer(peer.Config{
 		PeerID:     c.peerID,
 		DHT:        !cfg.DisableDHT,
@@ -620,7 +638,9 @@ func (c *Client) Torrents() []*Torrent {
 	return out
 }
 
-// Close closes every torrent, telling their trackers, and the client.
+// Close closes every torrent, telling their trackers, and the client. The
+// storages' reads and writes under way are waited for; those queued are
+// dropped.
 func (c *Client) Close() error {
 	if c.closing.Swap(true) {
 		return nil
@@ -631,16 +651,18 @@ func (c *Client) Close() error {
 		for pc := range t.peers {
 			go pc.Close()
 		}
-		if t.storage != nil {
-			_ = t.storage.Close()
-			t.storage = nil
-		}
+		st := t.storage
+		t.storage = nil
 		if t.state != StateRemoved {
 			t.state = StateRemoved
 			close(t.removed)
 		}
 		t.mu.Unlock()
+		if st != nil {
+			_ = t.closeStorage(st, false)
+		}
 	}
+	c.disk.close()
 	c.cancel()
 	// Wait a little for the stopped announces.
 	waited := make(chan struct{})
@@ -655,6 +677,7 @@ func (c *Client) Close() error {
 
 func (c *Client) shutdown() {
 	c.cancel()
+	c.disk.close()
 	if c.lsd != nil {
 		c.lsd.close()
 	}

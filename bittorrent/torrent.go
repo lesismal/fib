@@ -98,6 +98,10 @@ type Torrent struct {
 
 	uploaded, downloaded atomic.Int64
 
+	// diskMu keeps the storage open while it is used: see useStorage and
+	// closeStorage. Taken before mu, never with mu held.
+	diskMu sync.RWMutex
+
 	mu         sync.Mutex
 	name       string
 	info       *metainfo.Info
@@ -436,11 +440,31 @@ func (t *Torrent) onCompleteLocked() {
 			go pc.c.Close()
 		}
 	}
-	if st := t.storage; st != nil {
-		for f, file := range t.info.FileList() {
-			if file.Length == 0 && !file.IsPad() && t.filePrio[f] > PriorityNone {
-				_, _ = st.WriteAt(f, nil, 0)
-			}
+	// The check made those wanted then; these were selected since.
+	if empty := t.emptyFilesLocked(); len(empty) > 0 && t.storage != nil {
+		t.c.disk.run(func() { t.createFiles(empty) })
+	}
+}
+
+// emptyFilesLocked lists the empty files that are wanted, which no piece
+// writes.
+func (t *Torrent) emptyFilesLocked() []int {
+	var empty []int
+	for f, file := range t.info.FileList() {
+		if file.Length == 0 && !file.IsPad() && t.filePrio[f] > PriorityNone {
+			empty = append(empty, f)
+		}
+	}
+	return empty
+}
+
+// createFiles creates the empty files, off t.mu.
+func (t *Torrent) createFiles(files []int) {
+	st, _, done := t.useStorage()
+	defer done()
+	if st != nil {
+		for _, f := range files {
+			_, _ = st.WriteAt(f, nil, 0)
 		}
 	}
 }
@@ -497,14 +521,16 @@ func (t *Torrent) Pause() {
 	t.pauseLocked(StatePaused)
 }
 
-// Stop pauses the torrent and closes its storage.
+// Stop pauses the torrent and closes its storage, once the reads and
+// writes under way are over; those still queued are dropped.
 func (t *Torrent) Stop() {
 	t.mu.Lock()
-	defer t.mu.Unlock()
 	t.pauseLocked(StateStopped)
-	if t.storage != nil {
-		_ = t.storage.Close()
-		t.storage = nil
+	st := t.storage
+	t.storage = nil
+	t.mu.Unlock()
+	if st != nil {
+		_ = t.closeStorage(st, false)
 	}
 }
 
@@ -522,7 +548,8 @@ func (t *Torrent) pauseLocked(s State) {
 
 // Remove removes the torrent from its client, closing its connections and
 // storage, and with deleteData deletes what the storage holds when it
-// can (see StorageRemover).
+// can (see StorageRemover). The storage's reads and writes under way are
+// waited for, and those still queued are dropped.
 func (t *Torrent) Remove(deleteData bool) error {
 	t.c.mu.Lock()
 	if t.c.torrents[t.key] == t {
@@ -530,21 +557,19 @@ func (t *Torrent) Remove(deleteData bool) error {
 	}
 	t.c.mu.Unlock()
 	t.mu.Lock()
-	defer t.mu.Unlock()
 	t.c.server.RemoveTorrent(t.pt)
 	if t.state == StateRemoved {
+		t.mu.Unlock()
 		return nil
 	}
 	t.pauseLocked(StateRemoved)
 	close(t.removed)
+	st := t.storage
+	t.storage = nil
+	t.mu.Unlock()
 	var err error
-	if t.storage != nil {
-		if r, ok := t.storage.(StorageRemover); ok && deleteData {
-			err = r.Remove()
-		} else {
-			err = t.storage.Close()
-		}
-		t.storage = nil
+	if st != nil {
+		err = t.closeStorage(st, deleteData)
 	}
 	t.c.emit(Event{Type: EventStateChanged, Torrent: t})
 	return err

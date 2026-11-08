@@ -96,7 +96,11 @@ func (t *Torrent) fetchWebSeed(ws *webSeed, i int, p *partial) {
 	buf := make([]byte, info.PieceSize(i))
 	err := t.webSeedRead(ctx, ws.url, info, off, buf[:n])
 	if err == nil && st != nil {
-		err = writeData(st, info, off, buf[:n])
+		st, _, done := t.useStorage()
+		if st != nil {
+			err = writeData(st, info, off, buf[:n])
+		}
+		done()
 	}
 	t.mu.Lock()
 	for b := range p.blocks {

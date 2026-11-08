@@ -18,7 +18,8 @@ import (
 // FileList, addressed by their index there. The client never asks it for
 // a padding file (BEP 47), whose bytes are zeros it supplies itself, nor
 // for the gaps between the files of a v2 torrent, which are no file's. Its
-// methods are called from many goroutines at once, for different blocks.
+// methods are called from many goroutines at once, for different blocks,
+// but never on a fib worker: they may block (see Config.DiskWorkers).
 type Storage interface {
 	// ReadAt reads len(p) bytes of file at off. Fewer, with an error, say
 	// the bytes are not there: a file not yet written, or shorter.
@@ -38,7 +39,9 @@ type StorageRemover interface {
 }
 
 // StorageOpener opens the storage of a torrent once its info dictionary is
-// known.
+// known. For a magnet link that is when peers sent it, on a fib worker:
+// an opener should not block, leaving the files to be opened as they are
+// read and written, as NewFileStorage's does.
 type StorageOpener func(info *metainfo.Info) (Storage, error)
 
 // FileStorageOptions tunes the storage NewFileStorage opens.

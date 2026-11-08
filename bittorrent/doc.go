@@ -24,7 +24,11 @@
 //     (NewFileStorage, with paths made safe for the operating system, and
 //     BEP 47 padding files never written), or memory (NewMemoryStorage).
 //     What storage holds when a torrent is added is checked, so that an
-//     interrupted download resumes.
+//     interrupted download resumes. Storage is read and written, and
+//     pieces are hashed, on the client's disk pool (Config.DiskWorkers),
+//     never on a fib worker; the blocks waiting for it are bounded
+//     (Config.DiskQueueBytes), past which the peers sending them are not
+//     read from.
 //   - Its pieces are picked rarest first, ties broken at random, after a
 //     few random ones, by priority (the files', BEP 53's so=, and those of
 //     a Reader, which streams a file as it downloads), or in order. Blocks
