@@ -239,6 +239,14 @@ _, err = io.Copy(w, r)
   IPv4）、磁力链接的 `x.pe`、`AddPeers` 和 `Config.PeerSources`；私有 torrent 只用它的 tracker。web seed（BEP 19）
   经 fib/http 客户端用 range 请求提供整个分片。
 - **做种**到 `SeedRatio` 或 `SeedTime` 时暂停 torrent；`Ban` 在所有 torrent 中封禁一个地址。
+- **限制**可在客户端运行时修改，不断开已有 peer：`Client.SetLimits(Limits)` 替换 `UploadRate`、`DownloadRate`、
+  `MaxConns`、`MaxConnsPerTorrent`、`MaxHalfOpen`、`DialsPerTick`、`UploadSlots`、`SeedRatio` 和 `SeedTime`
+  （零值保持它在 `Config` 里的含义：速率和做种上限为不限，数量为默认值），`Client.Limits` 返回当前值。每个 torrent
+  有自己的 `TorrentLimits`（`AddOptions.Limits`、`Torrent.SetLimits`、`Torrent.Limits`）：`UploadRate`、
+  `DownloadRate` 叠加在客户端的速率之下（每个字节两边都要通过），`MaxConns`、`UploadSlots`、`SeedRatio`、
+  `SeedTime` 取代客户端的；零值继承客户端，负值表示该 torrent 不限。新速率在 1/4 秒内生效；调低连接上限立即
+  关闭多出的 peer，最没用的先关（两个方向都没有数据流动的、再是被 snub 的、再是最慢的、再是最新的）；
+  `UploadSlots` 变化立即重新 choke；做种上限每秒检查一次。
 
 ## 互通验证
 
@@ -456,3 +464,18 @@ FIB_DHT_PUBLIC=1 FIB_DHT_INFOHASH=<40 位十六进制> go test -run TestDHTPubli
   而不是 `fallocate`。
 - **web seed**：每个 seed 同时最多 4 个分片在途，失败 5 次即弃用，只取整个分片。
 - **事件**在一个分发 goroutine 上按顺序投递，从不阻塞客户端；连上与断开事件附带 `PeerInfo` 快照。
+- **运行时限制是独立的 `Limits` 类型**，而不是嵌入 `Config`，这样 `Config{UploadRate: ...}` 这类字面量仍能编译；
+  NewClient 从 `Config` 构造最初的 `Limits`。备选：把这些字段移进嵌入的 `Config.Limits`（只有一处定义，但是
+  破坏性改动）。
+- **零值沿用 `Config` 中的含义**：速率和做种上限为不限，数量为默认值；`Limits` 里负值等同零值，`Limits()`
+  返回填好默认值的数量。备选：零值表示"不变"，那样表达"不限"就需要指针或掩码。
+- **`TorrentLimits` 中零值继承、负值不限**（`MaxConns` 只受客户端 `MaxConns` 约束，`UploadSlots` unchoke 所有
+  感兴趣的 peer，做种上限永不暂停）。每个字节都要通过两个令牌桶，torrent 的速率只能比客户端低，所以负速率等同零值。
+  torrent 的 `MaxConns` 取代 `MaxConnsPerTorrent`，可以更高。备选：单独的 `NoSeedLimit` 标志；每 torrent 值以
+  客户端值为上限。
+- **下载速率在请求块时扣除**，而不是在数据到达时，这样限速是少发请求（peer 不会多发），而不是读进来再丢掉。
+  请求后来被取消（snub、被 choke、peer 断开）时已扣的令牌不退还；令牌桶容量为一秒的速率，每次补充最多透支一个块，
+  所以回环上被限速的传输在几秒内可达速率的约 1.5 倍。web seed 仍在到达时扣除。备选：退还取消的请求，或更小的桶。
+- **调低连接上限时最没用的 peer 先关**：两边都没有"感兴趣且未被 choke"的，再是被 snub 的，再是上下行速率之和
+  最低的，再是最新的；先按每个 torrent，再按客户端的 `MaxConns`。连回已满客户端的拨号和以前一样在握手时被拒。
+  `UploadSlots` 无论调高调低都立即重新 choke；调高做种上限不会重启已因它暂停的 torrent（需 `Start`）。

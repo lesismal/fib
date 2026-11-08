@@ -194,7 +194,7 @@ func (t *Torrent) OnHandshake(c *peer.Conn) {
 		}
 		go replaced.c.Close()
 	}
-	if rec == nil && replaced == nil && (len(t.peers) >= cl.cfg.MaxConnsPerTorrent || int(cl.conns.Load()) >= cl.cfg.MaxConns) {
+	if rec == nil && replaced == nil && (len(t.peers) >= t.maxConnsLocked() || int(cl.conns.Load()) >= cl.lim().MaxConns) {
 		reject()
 		return
 	}
@@ -538,7 +538,7 @@ func (t *Torrent) fillRequestsLocked(pc *peerConn) {
 		limit = 1
 	}
 	now := time.Now()
-	for len(pc.pending) < limit && t.c.down.allow() {
+	for len(pc.pending) < limit && t.downAllow() {
 		r, ok := t.nextRequest(pc, choked)
 		if !ok {
 			return
@@ -547,6 +547,9 @@ func (t *Torrent) fillRequestsLocked(pc *peerConn) {
 			t.releaseRequest(r)
 			return
 		}
+		// The download rates are spent as blocks are asked for, so that
+		// they bound what peers send rather than what this side reads.
+		t.downTake(int(r.Length))
 		if len(pc.pending) == 0 {
 			// The wait for a block starts with the first request.
 			pc.lastBlock = now
@@ -561,7 +564,6 @@ func (t *Torrent) onPiece(pc *peerConn, m *peer.Message) {
 	r := m.Request()
 	n := len(m.Data)
 	t.downloaded.Add(int64(n))
-	t.c.down.take(n)
 	t.mu.Lock()
 	if pc.closed {
 		t.mu.Unlock()
@@ -683,7 +685,7 @@ func (t *Torrent) onRequest(pc *peerConn, r peer.Request) {
 func (t *Torrent) pump(pc *peerConn) {
 	for {
 		t.mu.Lock()
-		if pc.pumping || pc.closed || len(pc.upq) == 0 || t.storage == nil || pc.c.Congested() || !t.c.up.allow() {
+		if pc.pumping || pc.closed || len(pc.upq) == 0 || t.storage == nil || pc.c.Congested() || !t.upAllow() {
 			t.mu.Unlock()
 			return
 		}
@@ -705,7 +707,7 @@ func (t *Torrent) pump(pc *peerConn) {
 		t.mu.Lock()
 		pc.pumping = false
 		if err == nil {
-			t.c.up.take(n)
+			t.upTake(n)
 			t.uploaded.Add(int64(n))
 			pc.up.add(n)
 			t.upRate.add(n)
@@ -772,7 +774,7 @@ func (t *Torrent) maybeUnchokeLocked(pc *peerConn) {
 			unchoked++
 		}
 	}
-	if unchoked < t.c.cfg.UploadSlots+1 {
+	if unchoked <= t.uploadSlotsLocked() {
 		t.unchokeLocked(pc, time.Now())
 	}
 }

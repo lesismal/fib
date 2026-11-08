@@ -281,6 +281,16 @@ _, err = io.Copy(w, r)
   `x.pe`, `AddPeers` and `Config.PeerSources`; a private torrent uses its trackers alone. Web seeds
   (BEP 19) serve whole pieces through range requests on the fib/http client.
 - **Seeding** pauses a torrent at `SeedRatio` or `SeedTime`; `Ban` bans an address from every torrent.
+- **Limits** change while the client runs, keeping its peers: `Client.SetLimits(Limits)` replaces
+  `UploadRate`, `DownloadRate`, `MaxConns`, `MaxConnsPerTorrent`, `MaxHalfOpen`, `DialsPerTick`,
+  `UploadSlots`, `SeedRatio` and `SeedTime` (zero keeps its `Config` meaning: unlimited for the rates
+  and seed limits, the default for the counts), and `Client.Limits` returns them. A torrent has its
+  own `TorrentLimits` (`AddOptions.Limits`, `Torrent.SetLimits`, `Torrent.Limits`): `UploadRate`
+  and `DownloadRate` under the client's (a byte passes both), and `MaxConns`, `UploadSlots`,
+  `SeedRatio` and `SeedTime` in place of the client's; zero takes the client's, negative is no limit
+  for that torrent. New rates apply within a quarter second; lowered connection limits close the
+  excess peers at once, least useful first (nothing flowing either way, then snubbed, then slowest,
+  then newest); a changed `UploadSlots` rechokes at once; seed limits are looked at each second.
 
 ## Interop
 
@@ -541,3 +551,26 @@ alternative.
 - **Web seeds**: 4 pieces in flight per seed, a seed dropped after 5 failures, whole pieces only.
 - **Events** are delivered in order on one dispatcher goroutine that never blocks the client;
   connect and disconnect carry a `PeerInfo` snapshot.
+- **Run-time limits are a separate `Limits` type**, not an embedded part of `Config`, so that
+  `Config{UploadRate: ...}` literals keep compiling; NewClient builds the first `Limits` from
+  `Config`. Alternative: move the fields into an embedded `Config.Limits` (one source of truth, but
+  a breaking change).
+- **Zero means what it meant in `Config`**: unlimited for rates and seed limits, the default for
+  counts; negative is the same as zero in `Limits`, and `Limits()` returns the counts with defaults
+  filled in. Alternative: zero as "unchanged", which would need pointers or a mask to say "unlimited".
+- **In `TorrentLimits`, zero inherits and negative is no limit** (`MaxConns` then bounded by the
+  client's `MaxConns` only, `UploadSlots` unchokes every interested peer, seed limits never pause).
+  A torrent's rates can only be lower than the client's, since every byte passes both buckets, so a
+  negative rate is the same as zero. A torrent's `MaxConns` replaces `MaxConnsPerTorrent` and may be
+  higher. Alternatives: a separate `NoSeedLimit` flag; per-torrent values capped by the client's.
+- **The download rate is spent when a block is requested**, not when it arrives, so the limit holds
+  back requests (the peer sends no more than was asked) instead of reading and dropping data. Tokens
+  spent on requests later cancelled (snubbing, a choke, a closed peer) are not refunded; the bucket
+  holds one second of rate and may go one block into debt per refill, so a limited transfer runs up
+  to ~1.5× the rate over a couple of seconds on loopback. Web seeds still spend on arrival.
+  Alternative: refund cancelled requests, or a smaller bucket.
+- **Lowered connection limits close peers least useful first**: neither side interested and
+  unchoked, then snubbed, then lowest download+upload rate, then the newest; per torrent first, then
+  across the client for `MaxConns`. Dials back to a full client are refused at the handshake as
+  before. A changed `UploadSlots` rechokes whether raised or lowered; raising a seed limit does not
+  restart a torrent already paused by it (`Start` does).

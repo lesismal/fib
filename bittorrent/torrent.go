@@ -81,6 +81,9 @@ type AddOptions struct {
 	// in Info.FileList, in place of PriorityNormal for all (and of a
 	// magnet link's so=).
 	FilePriorities []int
+	// Limits are the torrent's own limits; the zero value takes the
+	// client's (see TorrentLimits).
+	Limits TorrentLimits
 }
 
 // Torrent is a torrent in a Client: its pieces, its peers and its
@@ -151,6 +154,11 @@ type Torrent struct {
 	upRate       rate
 	downRate     rate
 
+	// The torrent's own limits (SetLimits), and the rate limiters they
+	// set, under the client's.
+	lim            TorrentLimits
+	upLim, downLim limiter
+
 	run       context.Context
 	stopRun   context.CancelFunc
 	completed chan struct{} // closed on completion, for the tracker loops
@@ -188,6 +196,7 @@ func newTorrent(c *Client, ih metainfo.InfoHash, ih2 metainfo.InfoHashV2, opts A
 		t.opener = c.cfg.Storage
 	}
 	t.pt = &peer.Torrent{InfoHash: ih, InfoHashV2: ih2, Handler: t}
+	t.setLimitsLocked(opts.Limits.normalized())
 	return t
 }
 

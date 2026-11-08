@@ -99,10 +99,11 @@ func (t *Torrent) connectPeersLocked(now time.Time) {
 		return
 	}
 	cl := t.c
-	cfg := &cl.cfg
+	cfg := cl.lim()
 	budget := cfg.DialsPerTick
+	maxConns := t.maxConnsLocked()
 	for _, cand := range t.pool {
-		if budget <= 0 || len(t.peers)+t.halfOpen >= cfg.MaxConnsPerTorrent {
+		if budget <= 0 || len(t.peers)+t.halfOpen >= maxConns {
 			return
 		}
 		if int(cl.conns.Load()+cl.halfOpen.Load()) >= cfg.MaxConns || int(cl.halfOpen.Load()) >= cfg.MaxHalfOpen {
