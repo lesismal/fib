@@ -589,11 +589,18 @@ func (c *Conn) takeAcks(h header, sack []byte, now int64) {
 	// as samples, their ages grew the RTT, and with it the waits of the
 	// tail loss probe that recovers the next one, until a burst lost on
 	// Windows' loopback took tens of seconds a packet.
+	//
+	// And while the oldest packet in flight is one sent again, the
+	// connection is recovering a loss: what it acknowledges then, the
+	// packets past the hole that a lost acknowledgement or a slow path
+	// left unacknowledged for seconds, times the recovery, not the path.
 	c.noRTTSample = false
-	for i := range acks {
+	if p, ok := c.out.get(oldest); ok && p.transmissions > 1 {
+		c.noRTTSample = true
+	}
+	for i := 1; i < acks && !c.noRTTSample; i++ {
 		if p, ok := c.out.get(oldest + uint16(i)); ok && p.transmissions > 1 {
 			c.noRTTSample = true
-			break
 		}
 	}
 	for i := range acks {
