@@ -1631,6 +1631,8 @@ type udpListener struct {
 	network string
 	handler Handler
 	binding int
+	// filter is the Binding's Filter, asked about each new peer.
+	filter func(netip.AddrPort) bool
 	// draining says ShutdownBinding is draining the socket's binding, which
 	// opens no connection for a peer it does not know. Event-loop ownership.
 	draining bool
@@ -1677,22 +1679,26 @@ func sockaddrToUDPAddr(sa syscall.Sockaddr) *net.UDPAddr {
 // udpPeer returns the connection for the peer whose address a receive left
 // in from, opening one if this is the first datagram from it. It returns nil
 // for a new peer once the engine is stopping or shutting down, as a listener
-// stops taking connections then. Callers run on the event loop.
+// stops taking connections then, and for one the binding's Filter refuses.
+// Callers run on the event loop.
 func (e *Engine) udpPeer(l *udpListener, from *syscall.RawSockaddrAny) *Connection {
 	key, zone, ok := rawSockaddrKey(from)
 	if !ok {
 		return nil
 	}
-	return e.udpPeerAt(l, key, zone)
+	return e.udpPeerAt(l, key, zone, l.filter)
 }
 
-// udpPeerAt is udpPeer for the peer at key, whose IPv6 scope is zone.
-// Callers run on the event loop.
-func (e *Engine) udpPeerAt(l *udpListener, key netip.AddrPort, zone uint32) *Connection {
+// udpPeerAt is udpPeer for the peer at key, whose IPv6 scope is zone, asking
+// filter, unless it is nil, about a new one. Callers run on the event loop.
+func (e *Engine) udpPeerAt(l *udpListener, key netip.AddrPort, zone uint32, filter func(netip.AddrPort) bool) *Connection {
 	if c := l.peers[key]; c != nil {
 		return c
 	}
 	if e.stopping.Load() || e.draining.Load() || l.draining {
+		return nil
+	}
+	if filter != nil && refuses(filter, key) {
 		return nil
 	}
 	sa := keySockaddr(key, zone)

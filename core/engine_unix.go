@@ -115,6 +115,9 @@ type streamListener struct {
 	// socket opened beside it is one too; see Binding.MultipathTCP.
 	mptcp   bool
 	handler Handler
+	// filter is the Binding's Filter, asked about each connection the
+	// socket accepts.
+	filter func(netip.AddrPort) bool
 	// binding is the index of the Binding the socket was opened for.
 	binding int
 }
@@ -322,7 +325,7 @@ func (e *Engine) open(config Config, bindings []Binding) error {
 					return err
 				}
 				e.udpListeners = append(e.udpListeners, &udpListener{udpListenerPlatform: udpListenerPlatform{fd: fd},
-					network: b.Network, handler: b.Handler, binding: i, peers: make(map[netip.AddrPort]*Connection)})
+					network: b.Network, handler: b.Handler, filter: b.Filter, binding: i, peers: make(map[netip.AddrPort]*Connection)})
 				e.udpSpread = e.udpSpread || pollersListen(config, b.Network)
 				continue
 			}
@@ -341,7 +344,7 @@ func (e *Engine) open(config Config, bindings []Binding) error {
 			}
 			e.listeners = append(e.listeners, streamListener{fd: fd, network: b.Network,
 				unix: netaddr.IsUnix(b.Network), spread: spread, shared: shared,
-				mptcp: b.MultipathTCP, handler: b.Handler, binding: i})
+				mptcp: b.MultipathTCP, handler: b.Handler, filter: b.Filter, binding: i})
 			e.pollersListen = e.pollersListen || spread || shared
 			e.noteUnixPath(b.Network, addr, i)
 		}
@@ -391,7 +394,7 @@ func (e *Engine) openUDPBeside(config Config, parent *Engine) error {
 			return err
 		}
 		e.udpListeners = append(e.udpListeners, &udpListener{udpListenerPlatform: udpListenerPlatform{fd: fd},
-			network: like.network, handler: like.handler, binding: like.binding, peers: make(map[netip.AddrPort]*Connection)})
+			network: like.network, handler: like.handler, filter: like.filter, binding: like.binding, peers: make(map[netip.AddrPort]*Connection)})
 	}
 	return nil
 }
@@ -794,6 +797,13 @@ func (e *Engine) acceptConnections(listenFD int) {
 		}
 		if err != nil {
 			return
+		}
+		// A peer the binding's Filter refuses is closed before it costs a
+		// connection or a MaxConns slot. A Unix socket's peer has no
+		// address to ask about.
+		if l.filter != nil && !l.unix && refuses(l.filter, peer) {
+			syscall.Close(fd)
+			continue
 		}
 		if !e.accepted.take() {
 			syscall.Close(fd)

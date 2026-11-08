@@ -37,7 +37,7 @@ func (p placement) close() {
 
 func newUDPListener(fd int, b Binding, i int) *udpListener {
 	return &udpListener{udpListenerPlatform: udpListenerPlatform{fd: fd}, network: b.Network, handler: b.Handler,
-		binding: i, peers: make(map[netip.AddrPort]*Connection)}
+		filter: b.Filter, binding: i, peers: make(map[netip.AddrPort]*Connection)}
 }
 
 // openBinding opens the sockets of b, the i-th binding, and has the loops
@@ -98,7 +98,7 @@ func (e *Engine) openBinding(b Binding, i int) error {
 			return fail(err)
 		}
 		l := streamListener{fd: fd, network: b.Network, unix: netaddr.IsUnix(b.Network), spread: spread,
-			shared: e.noLoop && !spread, mptcp: opts.MultipathTCP, handler: b.Handler, binding: i}
+			shared: e.noLoop && !spread, mptcp: opts.MultipathTCP, handler: b.Handler, filter: b.Filter, binding: i}
 		e.noteUnixPath(b.Network, addr, i)
 		if !e.noLoop {
 			placed = append(placed, placement{loop: e, stream: l})

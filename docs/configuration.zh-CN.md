@@ -105,6 +105,7 @@ if err := engine.Run(); err != nil {
 | `Addrs` | `nil` | 这组地址的完整列表，共享 `Network`；设置后 `Addr` 被忽略。 |
 | `MultipathTCP` | `false` | 内核支持时用 Multipath TCP 监听：Linux 5.6 及以上且开启 `net.mptcp.enabled`，与 `net.ListenConfig.SetMultipathTCP(true)` 相同。内核不支持时回退到普通 TCP，因此 Binding 总能监听成功。只对 TCP 网络生效，UDP 和 Unix Binding 不受影响，其他平台按普通 TCP 监听。 |
 | `Handler` | 必填 | 服务该 Binding 的 handler：HTTP、TLS server、HTTP/3 server、WebSocket、gRPC、裸 TCP 等等。 |
+| `Filter` | `nil` | `func(peer netip.AddrPort) bool`：TCP 连接 accept 之后立刻询问，UDP 新 peer 在首个数据报建立连接之前询问。被拒绝的 TCP 连接立即关闭，UDP 数据报直接丢弃，不创建 `Connection`、不调用 `OnOpen`、不占 `MaxConns` 名额，也不计入 `ConnsRefused`。双栈 socket 上的 IPv4 peer 以去掉映射的 IPv4 地址传入。每次都会询问，不按地址缓存，因此通过 atomic 指针读取策略的 Filter 可以在 Binding 运行中切换策略；已打开的连接、已有连接的 UDP peer 的数据报不会再询问。Unix socket 连接和 `OpenUDPPeer` 不询问。它在事件循环上运行，不能阻塞；`nil` 表示接受所有 peer。 |
 
 其余配置——backlog、缓冲区、水位线、poller、`ReusePort`——都属于 Engine，对所有 Binding 生效。
 `MultipathTCP` 是例外：监听是不是 Multipath TCP，是监听地址本身的属性，所以它归 Binding 自己。

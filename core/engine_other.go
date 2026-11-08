@@ -79,6 +79,9 @@ type Engine struct {
 type boundListener struct {
 	net.Listener
 	handler Handler
+	// filter is the Binding's Filter, asked about each connection the
+	// listener accepts.
+	filter  func(netip.AddrPort) bool
 	binding int
 }
 
@@ -145,7 +148,7 @@ func listenBindings(bindings []Binding, first int) ([]boundListener, []*udpListe
 				return fail(err)
 			}
 			for _, l := range opened {
-				l.handler, l.binding = b.Handler, i
+				l.handler, l.filter, l.binding = b.Handler, b.Filter, i
 			}
 			udpListeners = append(udpListeners, opened...)
 			continue
@@ -158,7 +161,7 @@ func listenBindings(bindings []Binding, first int) ([]boundListener, []*udpListe
 			if err != nil {
 				return fail(err)
 			}
-			listeners = append(listeners, boundListener{Listener: listener, handler: b.Handler, binding: i})
+			listeners = append(listeners, boundListener{Listener: listener, handler: b.Handler, filter: b.Filter, binding: i})
 		}
 	}
 	return listeners, udpListeners, nil
@@ -346,6 +349,15 @@ func (e *Engine) serve(listener boundListener) error {
 				return nil
 			}
 			return err
+		}
+		// A peer the binding's Filter refuses is closed before it costs a
+		// connection or a MaxConns slot. A Unix socket's peer has no
+		// address to ask about.
+		if listener.filter != nil {
+			if addr, ok := conn.RemoteAddr().(*net.TCPAddr); ok && refuses(listener.filter, addr.AddrPort()) {
+				_ = conn.Close()
+				continue
+			}
 		}
 		if !e.accepted.take() {
 			_ = conn.Close()
@@ -1434,6 +1446,8 @@ type udpListener struct {
 	// Binding it was opened for.
 	handler Handler
 	binding int
+	// filter is the Binding's Filter, asked about each new peer.
+	filter func(netip.AddrPort) bool
 	// draining says ShutdownBinding is draining the socket's binding, which
 	// opens no connection for a peer it does not know.
 	draining atomic.Bool
@@ -1476,19 +1490,25 @@ func (e *Engine) serveUDP(l *udpListener) error {
 			// A failed receive loses only its own datagram.
 			continue
 		}
-		if c := e.udpPeer(l, addr); c != nil {
+		if c := e.udpPeer(l, addr, l.filter); c != nil {
 			c.udpActive.Store(time.Now().UnixNano())
 			c.enqueueData(buf[:n])
 		}
 	}
 }
 
-func (e *Engine) udpPeer(l *udpListener, addr netip.AddrPort) *Connection {
+// udpPeer returns the connection for the peer at addr, opening one if it has
+// none, unless the engine is stopping or draining, or filter, which is nil
+// for none, refuses the new peer.
+func (e *Engine) udpPeer(l *udpListener, addr netip.AddrPort, filter func(netip.AddrPort) bool) *Connection {
 	l.mu.Lock()
 	c := l.peers[addr]
 	l.mu.Unlock()
 	if c != nil {
 		return c
+	}
+	if filter != nil && refuses(filter, addr) {
+		return nil
 	}
 	c = &Connection{engine: e, handler: l.handler, conn: &udpPeerConn{l: l, addr: addr}, udp: true,
 		bindingID: int32(l.binding + 1)}

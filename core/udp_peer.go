@@ -55,7 +55,7 @@ func (e *Engine) OpenUDPPeer(binding int, addr netip.AddrPort) (*Connection, err
 					err = errUDPPeerAddr
 					return
 				}
-				if c = o.udpPeerAt(l, key, zone); c == nil {
+				if c = o.udpPeerAt(l, key, zone, nil); c == nil {
 					err = errPeerClosed
 				}
 				return

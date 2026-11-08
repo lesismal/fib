@@ -113,6 +113,9 @@ type winListener struct {
 	// index of the Binding it was opened for.
 	handler Handler
 	binding int
+	// filter is the Binding's Filter, asked about each connection the
+	// listener accepts.
+	filter func(netip.AddrPort) bool
 	// addr is the address the listener is bound to, kept for once Run has
 	// closed it.
 	addr   syscall.Sockaddr
@@ -312,7 +315,7 @@ func (e *Engine) openListener(config Config, b Binding, i int, addr string) (*wi
 		if err != nil {
 			return nil, nil, err
 		}
-		l.network, l.handler, l.binding = b.Network, b.Handler, i
+		l.network, l.handler, l.filter, l.binding = b.Network, b.Handler, b.Filter, i
 		return nil, l, nil
 	}
 	l, err := createListener(config, b.Network, addr)
@@ -324,7 +327,7 @@ func (e *Engine) openListener(config Config, b Binding, i int, addr string) (*wi
 	if err != nil {
 		return nil, nil, err
 	}
-	l.handler, l.binding = b.Handler, i
+	l.handler, l.filter, l.binding = b.Handler, b.Filter, i
 	e.noteUnixPath(b.Network, addr, i)
 	return l, nil, nil
 }
@@ -722,6 +725,11 @@ func (e *Engine) completeAccept(op *acceptOp, err error) {
 	switch {
 	case err != nil:
 		syscall.Closesocket(s)
+	case l.filter != nil && l.family != syscall.AF_UNIX && refuses(l.filter, acceptedPeer(op)):
+		// The binding's Filter refuses the peer: closed before it costs a
+		// connection or a MaxConns slot. A Unix socket's peer has no
+		// address to ask about.
+		syscall.Closesocket(s)
 	case !e.accepted.take():
 		// MaxConns are open: refused as it arrives.
 		syscall.Closesocket(s)
@@ -739,6 +747,20 @@ func (e *Engine) completeAccept(op *acceptOp, err error) {
 			return
 		}
 	}
+}
+
+// acceptedPeer is the address of the peer an AcceptEx accepted, which it
+// wrote into the operation's buffer after the listener's own.
+func acceptedPeer(op *acceptOp) netip.AddrPort {
+	var local, remote *syscall.RawSockaddrAny
+	var localLen, remoteLen int32
+	syscall.GetAcceptExSockaddrs(&op.addrs[0], 0, uint32(acceptAddrLen), uint32(acceptAddrLen),
+		&local, &localLen, &remote, &remoteLen)
+	if remote == nil {
+		return netip.AddrPort{}
+	}
+	peer, _, _ := rawSockaddrKey(remote)
+	return peer
 }
 
 // adopt turns an accepted socket into a connection and arms its first read.

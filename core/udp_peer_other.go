@@ -24,7 +24,7 @@ func (e *Engine) OpenUDPPeer(binding int, addr netip.AddrPort) (*Connection, err
 	if l == nil {
 		return nil, errNoBinding
 	}
-	if c := e.udpPeer(l, addr); c != nil {
+	if c := e.udpPeer(l, addr, nil); c != nil {
 		return c, nil
 	}
 	return nil, errPeerClosed

@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"net"
+	"net/netip"
 	"sync"
 	"sync/atomic"
 )
@@ -70,6 +71,38 @@ type Binding struct {
 	MultipathTCP bool
 	// Handler serves the binding's connections. Every binding names one.
 	Handler Handler
+	// Filter, when set, is asked about each peer before the binding serves
+	// it: a TCP connection right after it is accepted, and a UDP peer before
+	// its first datagram makes it a connection. A peer it refuses, by
+	// returning false, is closed at once (TCP) or has its datagram dropped
+	// (UDP), with no Connection made, no OnOpen and nothing counted against
+	// Config.MaxConns or in Stats.ConnsRefused. The address it is given is the peer's as the socket
+	// reports it, with an IPv4 address mapped into IPv6, which a dual-stack
+	// socket reports for an IPv4 peer, unmapped to IPv4.
+	//
+	// It is asked every time, never once per address: each connection
+	// accepted, and each datagram from a UDP address that has no connection,
+	// so a refused UDP peer is asked again with its next datagram, and a
+	// Filter whose answers change, say one that reads its policy through an
+	// atomic pointer, applies the new answers from the next peer on. The
+	// datagrams of a UDP peer that already has a connection are not asked
+	// about, and neither are the connections already open: closing those a
+	// changed policy refuses is the application's to do. A peer opened with
+	// Engine.OpenUDPPeer, which the application asks for itself, is not
+	// asked about either, nor are Unix socket connections, whose peers have
+	// no address.
+	//
+	// It runs on the event loop that accepts or reads, or on the accepting
+	// goroutine of the portable backend, and must be quick and must not
+	// block. nil serves every peer, at the cost of a nil check.
+	Filter func(peer netip.AddrPort) bool
+}
+
+// refuses reports whether filter, a Binding.Filter, refuses peer. Callers
+// check that filter is not nil first, so a binding without one pays only
+// that check.
+func refuses(filter func(netip.AddrPort) bool, peer netip.AddrPort) bool {
+	return !filter(netip.AddrPortFrom(peer.Addr().Unmap(), peer.Port()))
 }
 
 // errNoBinding is what BindingAddrs reports for an index that names none of
