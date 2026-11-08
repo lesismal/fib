@@ -548,6 +548,14 @@ alternative.
 - **A duplicate SYN is answered again.**
 - **An acknowledgement that is stale but not ahead**: the data is kept, the acknowledgement ignored.
 - **RACK, tail-loss probe and three-duplicate-ack retransmission** added beyond libutp.
+- **Karn for a whole acknowledgement**: one whose cumulative advance covers a packet sent again
+  gives no round-trip sample, from the packets it acknowledges cumulatively or those it newly
+  acknowledges selectively (libutp samples every packet sent once). When a burst is lost, its
+  packets come back one per tail loss probe, and each that fills the hole slides the SACK's 32
+  packets by one, acknowledging a packet that arrived long before; as samples their ages grew the
+  RTT, the probe's wait and the timeout without bound (on Windows CI, from a 1 ms path to an RTO of
+  20 to 70 s, which stalled transfers for minutes; `TestBurstLossKeepsRTT`). Alternative: sample
+  only the newest packet an acknowledgement covers, which a slide still makes old.
 - **Zero-window probes** start at max(RTO, 500 ms) and double up to 15 s (libutp: a fixed 15 s).
 - **Timeouts**: idle 3 min, half-open 10 s, close linger 30 s then RESET; a RESET is sent on idle,
   on linger and on `Mux.Close`.

@@ -125,7 +125,8 @@ type Conn struct {
 	lastDecay         int64
 	rtt, rttVar       int // milliseconds
 	rttSampled        bool
-	rto               int // milliseconds
+	noRTTSample       bool // the acknowledgement being taken times nothing (Karn)
+	rto               int  // milliseconds
 	retransmitTimeout int
 	rtoAt             int64
 	retransmits       int
@@ -581,10 +582,26 @@ func (c *Conn) takeAcks(h header, sack []byte, now int64) {
 	ackedBytes := 0
 	minRTT := int64(1<<63 - 1)
 	oldest := c.seqNr - uint16(c.inflightPkts)
+	// Karn, for the whole acknowledgement: one that a retransmission's
+	// arrival brought about times nothing. When a packet sent again fills
+	// a hole, the packets after it, sent once each, are acknowledged only
+	// now, and those past the 32 a SACK reaches arrived long before: taken
+	// as samples, their ages grew the RTT, and with it the waits of the
+	// tail loss probe that recovers the next one, until a burst lost on
+	// Windows' loopback took tens of seconds a packet.
+	c.noRTTSample = false
+	for i := range acks {
+		if p, ok := c.out.get(oldest + uint16(i)); ok && p.transmissions > 1 {
+			c.noRTTSample = true
+			break
+		}
+	}
 	for i := range acks {
 		if p, ok := c.out.get(oldest + uint16(i)); ok && p.transmissions > 0 {
 			ackedBytes += len(p.payload)
-			minRTT = min(minRTT, rttOf(p, now))
+			if !c.noRTTSample {
+				minRTT = min(minRTT, rttOf(p, now))
+			}
 		}
 	}
 	if sack != nil {
@@ -664,6 +681,7 @@ func (c *Conn) takeAcks(h header, sack []byte, now int64) {
 	if sack != nil {
 		c.selectiveAck(h.ack+2, sack, now)
 	}
+	c.noRTTSample = false
 	if acks > 0 {
 		notify(c.writable)
 		if c.inflightPkts > 0 {
@@ -735,7 +753,7 @@ func (c *Conn) ackPacket(seq uint16, now int64) int {
 		return 2
 	}
 	c.out.del(seq)
-	if p.transmissions == 1 {
+	if p.transmissions == 1 && !c.noRTTSample {
 		// Karn: only a packet sent once times the round trip.
 		ertt := int((now - p.sentAt) / 1000)
 		if !c.rttSampled {
@@ -778,7 +796,9 @@ func (c *Conn) sackBytes(base uint16, mask []byte, minRTT *int64, now int64) int
 		}
 		if mask[bit>>3]&(1<<(bit&7)) != 0 {
 			n += len(p.payload)
-			*minRTT = min(*minRTT, rttOf(p, now))
+			if !c.noRTTSample {
+				*minRTT = min(*minRTT, rttOf(p, now))
+			}
 		}
 	}
 	return n

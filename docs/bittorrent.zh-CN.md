@@ -456,6 +456,10 @@ FIB_DHT_PUBLIC=1 FIB_DHT_INFOHASH=<40 位十六进制> go test -run TestDHTPubli
 - **重复的 SYN 再次应答。**
 - **过时但不超前的 ACK**：保留数据，忽略 ACK。
 - **在 libutp 之外加了 RACK、尾部丢包探测和三个重复 ACK 的快速重传。**
+- **对整个 ACK 应用 Karn 规则**：累计推进覆盖了重发过的包的 ACK 不产生 RTT 样本，无论是它累计确认的包还是它新选择确认的包
+  （libutp 对每个只发过一次的包都取样）。一串包连续丢失后，它们靠尾部丢包探测一个个找回，每找回一个填上空洞，SACK 的 32 个包
+  就后移一位，确认一个早已到达的包；把这些包的“年龄”当样本，RTT、探测等待和超时会无限增长（Windows CI 上从 1 ms 的路径涨到
+  20 到 70 秒的 RTO，传输卡住几分钟；见 `TestBurstLossKeepsRTT`）。备选：只取 ACK 覆盖的最新一个包，但滑动后它同样是旧包。
 - **零窗口探测**从 max(RTO, 500 ms) 开始，翻倍到 15 秒（libutp 固定 15 秒）。
 - **超时**：空闲 3 分钟，半开 10 秒，关闭后 linger 30 秒再 RESET；空闲、linger 到期和 `Mux.Close` 时发 RESET。
 - **双方 FIN 之后**最多停留 3 秒，以便再次确认对端的 FIN。
