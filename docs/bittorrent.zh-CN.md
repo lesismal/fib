@@ -182,6 +182,8 @@ questionable、bad 三态（15 分钟），每个 bucket 有替补缓存，驱�
 BEP 42：外部地址已知时（`Config.PublicIP`，或由响应中 `ip` 键投票得出），ID 由它派生；`Config.EnforceNodeID`
 把 ID 与地址不符的节点挡在路由表外。BEP 43：`Config.ReadOnly` 的节点只查询、不响应。BEP 32：一个 `Node`
 只属于一个地址族，`Config.IPv6` 的节点使用 `nodes6`，双栈客户端跑两个 `Node`。
+`Config.Filter` 与 `fib.Binding.Filter` 含义相同：它拒绝的地址的数据报不读，不进路由表，查找、
+`AddNodes`、应答中的 nodes 与 values 都排除它们。
 
 `New` 创建的 `Node` 经 `Config.Send` 发送，由 `HandleDatagram` 喂入数据，后者认领以 `'d'` 开头的数据报；
 `Listen` 让它跑在自有 binding 上。定时器都是 `time.AfterFunc`：每个在途查询一个，另有一个每隔几秒维护节点。
@@ -239,6 +241,20 @@ _, err = io.Copy(w, r)
   IPv4）、磁力链接的 `x.pe`、`AddPeers` 和 `Config.PeerSources`；私有 torrent 只用它的 tracker。web seed（BEP 19）
   经 fib/http 客户端用 range 请求提供整个分片。
 - **做种**到 `SeedRatio` 或 `SeedTime` 时暂停 torrent；`Ban` 在所有 torrent 中封禁一个地址。
+- **地址过滤**：`Config.Filter func(netip.AddrPort) bool` 与 `fib.Binding.Filter` 含义相同（返回 true
+  即服务该 peer，每次都问、从不缓存，IPv4 映射地址先还原为 IPv4）。它是 TCP 绑定的 `Binding.Filter`、
+  uTP `Mux` 的 `Config.Accept`（被拒地址的 SYN 不建连接），也是 DHT 节点的 `dht.Config.Filter`（被拒地址
+  得不到应答、不进路由表、查找不经过它、也不作为 peer 返回）；来自 tracker、DHT、PEX、LSD、磁力链接
+  `x.pe`、`AddPeers` 和 `PeerSources` 的 peer 在成为候选之前被丢弃，每次拨号前和握手时再检查一次。
+  tracker 与 web seed 是 URL，不经过它。已打开的连接直到 `Client.Refilter` 才重新询问：它关闭 Filter
+  现在拒绝的连接（按远端地址或监听地址），包括握手中的，并忘掉被拒的候选；策略变更后调用它。`Ban`
+  与之分开。
+- **共享引擎**：`Config.SharedEngine` 让客户端运行在调用方已在运行的引擎上，而不是自建引擎（此时忽略
+  `Config.Engine`）。客户端把它的 TCP 绑定和 UDP 绑定（`utp.Listen`）加到该引擎上，在其上拨号、运行
+  DHT 和 UDP tracker 客户端，并在其上建 fib/http 客户端（tracker、web seed）；`Close` 移除这两个绑定
+  （TCP 绑定用 `Engine.ShutdownBinding` 加一个已结束的 context，立即关闭它接受的连接），关闭它拨出的
+  连接和 HTTP 客户端，引擎及其他绑定和连接照常运行。`Engine()` 返回正在用的引擎。多个客户端可共享
+  一个引擎，各用各的端口。
 
 ## 互通验证
 
@@ -456,3 +472,24 @@ FIB_DHT_PUBLIC=1 FIB_DHT_INFOHASH=<40 位十六进制> go test -run TestDHTPubli
   而不是 `fallocate`。
 - **web seed**：每个 seed 同时最多 4 个分片在途，失败 5 次即弃用，只取整个分片。
 - **事件**在一个分发 goroutine 上按顺序投递，从不阻塞客户端；连上与断开事件附带 `PeerInfo` 快照。
+- **`Config.Filter`（A78）**：一个以 `netip.AddrPort` 为参数的谓词，与 `fib.Binding.Filter` 同形，而不是
+  IP 段列表类型，便于 fit 用原子指针背后的黑白名单和 eMule `.p2p`/`.dat` 封锁列表实现。UDP 绑定不设
+  `Binding.Filter`，因为该端口也是 UDP tracker 的，而 tracker 不是 peer：uTP 用已有的
+  `utp.Config.Accept`（不加 utp API），DHT 用新增的 `dht.Config.Filter`，它不读被拒节点的数据报，并把
+  它排除在种子节点、查找、应答的 nodes 与 values 以及 `GetPeers`/`Announce` 结果之外。已在路由表中的
+  被拒节点不立即删除，而是不再被应答，像沉默节点一样被淘汰。扩展握手声明的监听端口被拒的 peer 会被
+  关闭，与按该地址封禁一样。备选：fib 提供 IP 前缀集合类型；或用 UDP 绑定的 `Binding.Filter`，但那也
+  会切断被拒地址上的 tracker 和 DHT router。
+- **`Client.Refilter()`（A78）**：关闭 Filter 现在拒绝的已打开和握手中的连接，并丢弃既未连接也未在拨号
+  的被拒候选，等来源再次给出时才回来。被关闭的连接以 `EventPeerDisconnected` 结束，不是
+  `EventPeerBanned`，也不被封禁。备选：一个自带重新过滤的策略设置方法（`SetFilter`）；分开是为了 fit
+  一次策略变更可以重新过滤多个客户端和其他模块。
+- **`Config.SharedEngine *fib.Engine`（A79）**：放在 `Config.Engine` 旁边的字段，而不是
+  `NewClientOn(engine, cfg)` 构造函数，这样单靠一个 Config 就描述了客户端，其他构造路径也不需要第二个
+  构造函数。引擎必须已在运行；NewClient 会等它的事件循环。`Close` 时用 `ShutdownBinding` 加一个已结束
+  的 context 移除 TCP 绑定，core 文档说明这会立即关闭该绑定的连接；没有新增 core API，因为
+  `RemoveBinding` 和 `ShutdownBinding` 已在所有后端存在。拨出的连接由客户端自己关闭（peer 和半开拨号；
+  `Close` 之后才完成的拨号会自行关闭）。`Close` 时 HTTP 客户端尚在进行的请求随其 context（torrent 的
+  context 已取消）结束，而不是靠停止引擎。备选：`NewClientOn` 构造函数；core 的
+  `Engine.RemoveBindingAndConns`。
+

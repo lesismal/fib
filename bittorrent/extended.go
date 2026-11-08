@@ -55,7 +55,7 @@ func (t *Torrent) onExtHandshakeLocked(pc *peerConn) {
 	}
 	if h.Port > 0 && h.Port < 65536 && !pc.listen.IsValid() {
 		pc.listen = netip.AddrPortFrom(pc.addr.Addr(), uint16(h.Port))
-		if t.c.banned(pc.addr, pc.listen) {
+		if t.c.banned(pc.addr, pc.listen) || t.c.refuses(pc.listen) {
 			go pc.c.Close()
 			return
 		}
