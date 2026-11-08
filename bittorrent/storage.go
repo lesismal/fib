@@ -9,6 +9,7 @@ import (
 	"runtime"
 	"strings"
 	"sync"
+	"time"
 	"unicode/utf8"
 
 	"github.com/lesismal/fib/bittorrent/metainfo"
@@ -35,6 +36,16 @@ type Storage interface {
 // Torrent.Remove.
 type StorageRemover interface {
 	Remove() error
+}
+
+// StatStorage is a Storage that can report the size and modification
+// time of each of its files, which fast resume compares with those in the
+// resume data (see Torrent.ResumeData and AddOptions.Resume). A torrent on
+// storage without it ignores resume data and hash-checks.
+type StatStorage interface {
+	// Stat reports file's size and modification time; an error that is
+	// os.ErrNotExist says the file is not there.
+	Stat(file int) (size int64, mtime time.Time, err error)
 }
 
 // StorageOpener opens the storage of a torrent once its info dictionary is
@@ -292,6 +303,19 @@ func (s *fileStorage) WriteAt(file int, p []byte, off int64) (int, error) {
 
 var errStorageClosed = errors.New("bittorrent: storage closed")
 
+// Stat implements StatStorage, from the file system: it works on a closed
+// storage too, as it opens nothing.
+func (s *fileStorage) Stat(file int) (int64, time.Time, error) {
+	if file < 0 || file >= len(s.paths) || s.paths[file] == "" {
+		return 0, time.Time{}, fmt.Errorf("bittorrent: no file %d in storage", file)
+	}
+	fi, err := os.Stat(s.paths[file])
+	if err != nil {
+		return 0, time.Time{}, err
+	}
+	return fi.Size(), fi.ModTime(), nil
+}
+
 func (s *fileStorage) Close() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -360,7 +384,8 @@ func NewMemoryStorage() StorageOpener {
 		if s, ok := stores[key]; ok {
 			return s, nil
 		}
-		s := &MemoryStorage{files: make([][]byte, len(info.FileList()))}
+		n := len(info.FileList())
+		s := &MemoryStorage{files: make([][]byte, n), mtimes: make([]time.Time, n)}
 		stores[key] = s
 		return s, nil
 	}
@@ -368,8 +393,37 @@ func NewMemoryStorage() StorageOpener {
 
 // MemoryStorage is a Storage in memory.
 type MemoryStorage struct {
-	mu    sync.RWMutex
-	files [][]byte
+	mu     sync.RWMutex
+	files  [][]byte
+	mtimes []time.Time // zero for a file never written
+	last   time.Time
+}
+
+// touchLocked gives file a modification time later than any before, so
+// that two writes in one clock tick still tell apart.
+func (m *MemoryStorage) touchLocked(file int) {
+	now := time.Now()
+	if !now.After(m.last) {
+		now = m.last.Add(time.Nanosecond)
+	}
+	m.last = now
+	if file < len(m.mtimes) {
+		m.mtimes[file] = now
+	}
+}
+
+// Stat implements StatStorage: a file never written is not there, and its
+// modification time is that of its last write.
+func (m *MemoryStorage) Stat(file int) (int64, time.Time, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	if file < 0 || file >= len(m.files) {
+		return 0, time.Time{}, fmt.Errorf("bittorrent: no file %d in storage", file)
+	}
+	if file >= len(m.mtimes) || m.mtimes[file].IsZero() {
+		return 0, time.Time{}, os.ErrNotExist
+	}
+	return int64(len(m.files[file])), m.mtimes[file], nil
 }
 
 // ReadAt implements Storage.
@@ -408,6 +462,7 @@ func (m *MemoryStorage) WriteAt(file int, p []byte, off int64) (int, error) {
 		}
 		m.files[file] = f
 	}
+	m.touchLocked(file)
 	return copy(f[off:], p), nil
 }
 
@@ -421,6 +476,7 @@ func (m *MemoryStorage) Remove() error {
 	for i := range m.files {
 		m.files[i] = nil
 	}
+	clear(m.mtimes)
 	return nil
 }
 
@@ -431,5 +487,6 @@ func (m *MemoryStorage) Corrupt(file int, p []byte, off int64) {
 	defer m.mu.Unlock()
 	if file >= 0 && file < len(m.files) && off < int64(len(m.files[file])) {
 		copy(m.files[file][off:], p)
+		m.touchLocked(file)
 	}
 }

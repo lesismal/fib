@@ -221,6 +221,24 @@ _, err = io.Copy(w, r)
 - **存储**是一个 `Storage`（按文件序号的 `ReadAt`、`WriteAt`，以及 `Close`）：`DataDir` 下的文件
   （`NewFileStorage`，路径经 `SanitizePath` 按操作系统处理安全，BEP 47 的填充从不写入），或内存
   （`NewMemoryStorage`）。加入 torrent 时会对存储里已有的数据做哈希校验，中断的下载因此可以续传。
+- **快速续传**可以跳过这次校验：`Torrent.ResumeData()` 返回一小段带版本号的 bencode 数据（info hash、
+  已有分片的位图，以及存储报告的每个文件的大小和修改时间；存储须实现 `StatStorage`，两种内置存储都实现了），
+  `AddOptions.Resume` 在 `AddTorrent`、`AddTorrentFile` 或 `AddMagnet` 时把它交回（磁力链接在拿到 info 字典后才用）。
+  其中列出、且所在文件都未变的分片不经哈希直接记为已有；所在文件大小或修改时间变了的分片照常哈希校验；
+  所在文件缺失的分片，以及数据中没有列出的分片，既不读也不记为已有。数据解不开、属于别的 torrent、
+  版本更新，或存储不是 `StatStorage` 时，以 `Err` 包装 `ErrResumeData` 的 `EventError` 报告，并对存储做完整校验。
+  每有一个分片到手 `ResumeGen()` 就会变化：与上次保存时不同就保存，并在 `Stop` 或 `Client.Close` 之后再存一次。
+  info 字典到手之前、以及 torrent 正在校验存储时，`ResumeData` 返回错误（请保留之前保存的数据）。
+
+  ```go
+  data, _ := t.ResumeData()           // t.Stop() 之后，或 t.ResumeGen() 变化时
+  os.WriteFile(resumePath, data, 0o644)
+  // 重启时：
+  t, _ = c.AddTorrentFile(torrentPath, &bittorrent.AddOptions{Resume: data})
+  ```
+
+  和 libtorrent 一样它信任这些文件戳：大小和修改时间都不变的原地修改发现不了，记为已有的分片发给 peer
+  时也不再校验（收到坏分片的 peer 会在自己的校验中失败，并可能封禁本客户端）。
 - **选片**：最稀有优先，相同时随机，头 4 个分片随机挑；文件优先级、顺序模式和打开着的 `Reader` 的窗口
   （最近的分片最急；默认预读 4 MiB，可用 `SetReadahead` 调整）优先。16 KiB 的块按每个 peer 的 `reqq` 流水请求；
   endgame 时一个块同时向第二个 peer 请求，较慢的那个被取消。60 秒没发任何东西的 peer 被判为 snub，
@@ -460,8 +478,28 @@ FIB_DHT_PUBLIC=1 FIB_DHT_INFOHASH=<40 位十六进制> go test -run TestDHTPubli
 - **做种时按上传速度 unchoke**（libtorrent 的 fastest_upload），而非轮转；完整做种时断开做种者和只上传的 peer；
   候选 peer 失败后在 2 秒 << 失败次数后重试，失败 6 次即丢弃（手动加入的除外）。
 - **`Reader` 提升了未选中文件的分片优先级时**，`Done()` 重新打开，直到这些分片到齐。
-- **没有快速续传文件**：每次加入都对存储里的数据做哈希校验。`Preallocate` 用 truncate 把文件设到全长（稀疏文件），
-  而不是 `fallocate`。
+- **快速续传数据是调用方保存的一段字节**（`ResumeData` / `AddOptions.Resume`），而不是客户端写的文件：
+  调用方（fit）本来就持久化自己的 torrent 列表，存在哪、何时存由它决定。备选：在 `Config` 里配续传目录，由客户端写。
+- **快速续传信任大小和修改时间**（存储报告的纳秒值），与 libtorrent 相同；同样文件戳下的原地修改发现不了，
+  续传得来的分片发给 peer 时也不再校验。备选：每个文件存内容哈希（要读整个文件，正是续传要省的），
+  或每个分片第一次上传时校验（每次首传多一次读和哈希，以后可加）。
+- **续传对每个分片的处理**：列出且文件都未变：记为已有，不读；有文件变了（大小或修改时间，含变短）：
+  照常哈希校验；有文件缺失：不读，不记为已有；未列出且文件未变：不读，重新下载。最后一种会丢掉保存时
+  已写完但未校验的分片和部分分片；若要校验它们，每次启动都得读完全部未完成（常是预分配的）数据。
+  备选：像 libtorrent 的 `unfinished` 那样把部分分片的块位图存进数据。
+- **不能用的续传数据以包装 `ErrResumeData` 的 `EventError` 报告**，并退回完整校验：解不开、版本为 0
+  或高于 1、info hash 不符（出现的每个 hash 都须相符）、位图或文件数对不上，或存储不是 `StatStorage`。
+  备选：单独的事件类型；`EventError` 不改变 torrent 状态，可用 `errors.Is` 区分。
+- **"该保存了"的信号是 `ResumeGen()`**，即已有分片数（只增不减），而不是事件：`EventPieceVerified`
+  已经逐片触发，一个廉价计数让调用方可以定时检查、有变化才保存。写未完成分片会改变文件戳但不动它，
+  所以调用方要在 `Stop` / `Client.Close` 之后再存一次。
+- **torrent 校验存储期间 `ResumeData` 返回错误**：此时位图不完整，保存会丢掉还没校验到的分片；
+  已停止的 torrent 只为取文件戳重新打开存储（`fileStorage.Stat` 只调用 `os.Stat`）。备选：校验期间返回加入时的数据。
+- **续传数据不含 v2 piece layer**：续传的 v2 磁力 torrent 有分片，但只为仍需校验的分片获取 layer；
+  需要的调用方自己保存 `MetaInfo()` 的字节。备选：把 layer 放进数据，每分片 32 字节。
+- **`MemoryStorage` 实现了 `StatStorage`**，每次写入（以及 `Corrupt`）用进程内严格递增的时钟，
+  因此续传在同一进程内可用（opener 对同一 info hash 返回同一存储）。
+- **`Preallocate` 用 truncate** 把文件设到全长（稀疏文件），而不是 `fallocate`。
 - **web seed**：每个 seed 同时最多 4 个分片在途，失败 5 次即弃用，只取整个分片。
 - **事件**在一个分发 goroutine 上按顺序投递，从不阻塞客户端；连上与断开事件附带 `PeerInfo` 快照。
 - **运行时限制是独立的 `Limits` 类型**，而不是嵌入 `Config`，这样 `Config{UploadRate: ...}` 这类字面量仍能编译；

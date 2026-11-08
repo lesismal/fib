@@ -256,6 +256,29 @@ _, err = io.Copy(w, r)
   `DataDir` (`NewFileStorage`, paths made safe for the operating system by `SanitizePath`, BEP 47
   padding never written) or memory (`NewMemoryStorage`). What storage holds when a torrent is added
   is hash-checked, so an interrupted download resumes.
+- **Fast resume** skips that check: `Torrent.ResumeData()` returns a small versioned bencoded
+  blob (the info hashes, the bitfield of the pieces had, and each file's size and modification
+  time from the storage, which must be a `StatStorage`; both built-in storages are), and
+  `AddOptions.Resume` takes it back on `AddTorrent`, `AddTorrentFile` or `AddMagnet` (applied once
+  the info dictionary arrives). Pieces it lists whose files all still match are had without
+  hashing; pieces in a file whose size or modification time changed are hash-checked; pieces in a
+  missing file, and pieces the blob does not list, are neither read nor had. A blob that does not
+  decode, is of another torrent or of a newer version, or storage that is not a `StatStorage`,
+  is reported as an `EventError` whose `Err` wraps `ErrResumeData`, and the storage is checked in
+  full. `ResumeGen()` changes whenever a piece is had: save when it differs from the last save,
+  and once more after `Stop` or `Client.Close`. `ResumeData` errs before the info dictionary and
+  while the torrent checks its storage (keep the blob saved before).
+
+  ```go
+  data, _ := t.ResumeData()           // after t.Stop(), or when t.ResumeGen() moved
+  os.WriteFile(resumePath, data, 0o644)
+  // on restart:
+  t, _ = c.AddTorrentFile(torrentPath, &bittorrent.AddOptions{Resume: data})
+  ```
+
+  Like libtorrent's, it trusts the stamps: content changed in place with the same size and
+  modification time is not seen, and the pieces taken as had are served to peers without being
+  verified again (a peer that gets a bad piece fails its own check and may ban this client).
 - **Picking**: rarest first with random ties, the first 4 pieces at random; file priorities,
   sequential mode and the windows of open `Reader`s (the nearest piece most urgent; readahead 4 MiB
   by default, `SetReadahead`) come first. 16 KiB blocks are pipelined to each peer's `reqq`; in
@@ -546,8 +569,40 @@ alternative.
   full seed drops seeds and upload-only peers; peer candidates are retried after 2 s << failures
   and dropped after 6 failures unless added by hand.
 - **A `Reader` that raises pieces of an unselected file** reopens `Done()` until they arrive.
-- **No fast-resume file**: every add hash-checks what storage holds. `Preallocate` truncates
-  files to length (sparse) rather than `fallocate`.
+- **Fast resume is a blob the caller keeps** (`ResumeData` / `AddOptions.Resume`), not a file the
+  client writes: the caller (fit) already persists its torrent list and chooses where and when.
+  Alternative: a resume directory in `Config`, written by the client.
+- **Fast resume trusts size and modification time** (nanoseconds as the storage reports them),
+  as libtorrent does; content changed in place under the same stamps is not seen, and resumed
+  pieces are served without being verified again. Alternatives: a per-file content hash (costs a
+  read of the file, which is what resume avoids), or verifying each piece the first time it is
+  served (a read and hash per first upload, possible later).
+- **What resume does with each piece**: listed and all files unchanged: had, no read; a file
+  changed (size or mtime, shorter included): hash-checked as without resume; a file missing: not
+  read, not had; not listed and files unchanged: not read, downloaded again. The last loses a
+  piece fully written but not yet verified at save time, and partial pieces; checking them would
+  read the whole unfinished (often preallocated) data at every start. Alternative: keep partial
+  pieces' block bitmaps in the blob, as libtorrent's `unfinished`.
+- **Unusable resume data is reported as `EventError` wrapping `ErrResumeData`** and falls back to
+  a full check: undecodable, version 0 or newer than 1, an info hash that differs (any present
+  hash must match), a bitfield or file count that does not fit, or storage that is not a
+  `StatStorage`. Alternative: a dedicated event type; `EventError` does not change the torrent's
+  state, and `errors.Is` tells it apart.
+- **The "save now" signal is `ResumeGen()`**, the count of pieces had (it only grows), rather than
+  an event: `EventPieceVerified` already fires per piece, and a cheap counter lets a caller save
+  on a timer only when something changed. Writes to unfinished pieces change file stamps without
+  moving it, so callers save once more after `Stop` / `Client.Close`.
+- **`ResumeData` errs while the torrent checks its storage**, since the bitfield is then partial
+  and saving it would lose the pieces not yet reached; a stopped torrent's storage is reopened just
+  for the stamps (`fileStorage.Stat` only calls `os.Stat`). Alternative: return the blob it was
+  added with during the check.
+- **Resume data holds no v2 piece layers**: a v2 magnet resumed has its pieces but fetches layers
+  only for pieces it must still verify; a caller that wants them keeps `MetaInfo()`'s bytes.
+  Alternative: layers in the blob, 32 bytes per piece.
+- **`MemoryStorage` implements `StatStorage`** with a strictly increasing in-process clock per
+  write (and `Corrupt`), so resume works within a process (the opener returns the same storage for
+  an info hash).
+- **`Preallocate` truncates** files to length (sparse) rather than `fallocate`.
 - **Web seeds**: 4 pieces in flight per seed, a seed dropped after 5 failures, whole pieces only.
 - **Events** are delivered in order on one dispatcher goroutine that never blocks the client;
   connect and disconnect carry a `PeerInfo` snapshot.

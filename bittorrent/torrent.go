@@ -84,6 +84,15 @@ type AddOptions struct {
 	// Limits are the torrent's own limits; the zero value takes the
 	// client's (see TorrentLimits).
 	Limits TorrentLimits
+
+	// Resume is resume data a Torrent.ResumeData of this torrent returned
+	// before: once the info dictionary is known, the pieces it lists in
+	// files whose size and modification time still match are taken as had
+	// without a hash check (see ResumeData). Resume data that is not
+	// valid, of another torrent or of a newer version is reported as an
+	// EventError whose Err is ErrResumeData, and the storage is checked
+	// in full.
+	Resume []byte
 }
 
 // Torrent is a torrent in a Client: its pieces, its peers and its
