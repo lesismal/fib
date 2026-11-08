@@ -45,6 +45,11 @@ type MuxConfig struct {
 	// without a datagram either way before fib closes it;
 	// DefaultMuxIdleTimeout when zero.
 	IdleTimeout time.Duration
+	// Filter, when set, is the binding's fib.Binding.Filter: asked about
+	// each new remote address before its first datagram reaches the Mux;
+	// one it refuses is dropped, with no connection made. Addresses the
+	// Mux opens itself (Engine.OpenUDPPeer) are not asked.
+	Filter func(peer netip.AddrPort) bool
 }
 
 // Mux is a UDP port of a fib engine that many PeerConnections share, as an
@@ -104,7 +109,7 @@ func NewMux(engine *fib.Engine, config MuxConfig) (*Mux, error) {
 	if addr == "" {
 		addr = ":0"
 	}
-	i, err := engine.AddBinding(fib.Binding{Network: network, Addr: addr, Handler: muxHandler{m}})
+	i, err := engine.AddBinding(fib.Binding{Network: network, Addr: addr, Handler: muxHandler{m}, Filter: config.Filter})
 	if err != nil {
 		return nil, err
 	}

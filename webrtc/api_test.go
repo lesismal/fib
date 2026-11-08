@@ -9,6 +9,7 @@ import (
 	"net"
 	"net/netip"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -816,5 +817,47 @@ func TestRemoteRestartOnClosedMux(t *testing.T) {
 	// Offer fails the same way when it restarts ICE itself.
 	if _, err := Offer(context.Background(), b, &OfferOptions{ICERestart: true}); !errors.Is(err, errMuxClosed) {
 		t.Fatalf("Offer restarting on a closed Mux: %v", err)
+	}
+}
+
+// TestMuxFilter has a Mux's Filter refuse a remote address: its datagrams
+// make no connection until the filter lets it in.
+func TestMuxFilter(t *testing.T) {
+	e := startEngine(t)
+	var allow atomic.Bool
+	var asked atomic.Int32
+	m, err := NewMux(e, MuxConfig{Addr: "127.0.0.1:0", Filter: func(peer netip.AddrPort) bool {
+		asked.Add(1)
+		return allow.Load()
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = m.Close() })
+	peer, err := net.DialUDP("udp", nil, net.UDPAddrFromAddrPort(m.Addrs()[0]))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer peer.Close()
+	deadline := time.Now().Add(waitTimeout)
+	for asked.Load() < 3 {
+		if time.Now().After(deadline) {
+			t.Fatal("the filter was not asked")
+		}
+		_, _ = peer.Write([]byte{1})
+		time.Sleep(10 * time.Millisecond)
+	}
+	allow.Store(true)
+	// Once allowed, the address's first datagram makes it a connection,
+	// whose datagrams are not asked about again.
+	_, _ = peer.Write([]byte{1})
+	time.Sleep(200 * time.Millisecond)
+	n := asked.Load()
+	for range 5 {
+		_, _ = peer.Write([]byte{1})
+	}
+	time.Sleep(200 * time.Millisecond)
+	if got := asked.Load(); got != n {
+		t.Fatalf("asked %d more times once allowed: no connection was made", got-n)
 	}
 }
