@@ -5,6 +5,7 @@ import (
 	"errors"
 	"net"
 	"net/netip"
+	"slices"
 	"strconv"
 	"sync"
 	"time"
@@ -96,6 +97,25 @@ type Config struct {
 	OnAnnounce func(infoHash metainfo.InfoHash, peer netip.AddrPort)
 	// Version is the "v" the node sends; DefaultVersion when empty.
 	Version string
+	// Filter, when set, is asked about the address of every node and peer
+	// before the node deals with it, as fib's Binding.Filter is, and those
+	// it refuses, by returning false, are left alone: their datagrams are
+	// dropped unread, so they get no answers and enter no routing table,
+	// lookups and AddNodes skip them, the nodes a response names leave
+	// them out, and the peers of GetPeers and Announce, and of get_peers
+	// responses, omit them. It is given addresses with an IPv4 address
+	// mapped into IPv6 unmapped, and asked every time, never once per
+	// address, so a Filter whose answers change applies the new ones from
+	// then on; nodes it now refuses that are in the routing table go
+	// unanswered and fall out of it as nodes that stop answering do. It
+	// runs on the goroutines that call the node and must be quick.
+	Filter func(addr netip.AddrPort) bool
+}
+
+// refuses reports whether Config.Filter refuses a, an address unmapped
+// already.
+func (n *Node) refuses(a netip.AddrPort) bool {
+	return n.cfg.Filter != nil && !n.cfg.Filter(a)
 }
 
 // Node is a node of the mainline DHT (BEP 5): it keeps a routing table,
@@ -266,7 +286,7 @@ func (n *Node) AddNodes(nodes ...NodeInfo) {
 	defer n.mu.Unlock()
 	for _, ni := range nodes {
 		a := unmap(ni.Addr)
-		if !a.IsValid() || a.Port() == 0 || a.Addr().Is4() == n.cfg.IPv6 || len(n.seeds) >= 1024 {
+		if !a.IsValid() || a.Port() == 0 || a.Addr().Is4() == n.cfg.IPv6 || len(n.seeds) >= 1024 || n.refuses(a) {
 			continue
 		}
 		dup := false
@@ -368,7 +388,7 @@ func (n *Node) HandleDatagram(from netip.AddrPort, b []byte) bool {
 		return false
 	}
 	from = unmap(from)
-	if !from.IsValid() || from.Port() == 0 || from.Addr().Is4() == n.cfg.IPv6 {
+	if !from.IsValid() || from.Port() == 0 || from.Addr().Is4() == n.cfg.IPv6 || n.refuses(from) {
 		return true
 	}
 	m, err := parseMsg(b)
@@ -611,6 +631,9 @@ func (n *Node) handleQuery(from netip.AddrPort, m *msg) {
 		case "get_peers":
 			if ih, ok := target(a.InfoHash); ok {
 				for _, p := range n.peers.get(ih, n.maxValues(), n.cfg.IPv6, now) {
+					if n.refuses(p) {
+						continue
+					}
 					r.Values = append(r.Values, appendCompactAddr(nil, p))
 				}
 				r.Token = n.tokens.make(from.Addr())
@@ -740,6 +763,9 @@ func (n *Node) addNodes(r *ret, target ID, a *args, from netip.AddrPort) {
 		return
 	}
 	closest := n.table.closest(target, K)
+	if n.cfg.Filter != nil {
+		closest = slices.DeleteFunc(closest, func(ni NodeInfo) bool { return n.refuses(ni.Addr) })
+	}
 	if n.cfg.IPv6 {
 		r.Nodes6 = appendCompactNodes(nil, closest, true)
 	} else {

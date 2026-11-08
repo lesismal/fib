@@ -6,11 +6,12 @@
 // (BEP 3, BEP 15, BEP 12), the DHT (BEP 5) and local service discovery
 // (BEP 14).
 //
-// A Client is one fib engine and one port: TCP for the peer wire
-// protocol (package peer's Server), and UDP shared by uTP (package
-// utp's Socket), the DHT node (package dht) and the UDP tracker client
-// (package tracker), which tell their datagrams apart by the first byte.
-// A Torrent is a torrent in it:
+// A Client is one fib engine, its own or one it shares with the caller
+// (Config.SharedEngine), and one port: TCP for the peer wire protocol
+// (package peer's Server), and UDP shared by uTP (package utp's Socket),
+// the DHT node (package dht) and the UDP tracker client (package
+// tracker), which tell their datagrams apart by the first byte. A
+// Torrent is a torrent in it:
 //
 //	c, _ := bittorrent.NewClient(bittorrent.Config{DataDir: "downloads"})
 //	defer c.Close()

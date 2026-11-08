@@ -151,7 +151,7 @@ func (t *Torrent) OnHandshake(c *peer.Conn) {
 	if rec != nil {
 		listen = rec.cand.addr
 	}
-	if cl.banned(addr, listen) {
+	if cl.banned(addr, listen) || cl.refuses(addr) {
 		reject()
 		return
 	}
