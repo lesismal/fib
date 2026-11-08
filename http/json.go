@@ -11,7 +11,9 @@ import (
 
 // JSONEncoder is how Context.JSON encodes a value: it appends v's JSON to dst
 // and returns the extended slice, as strconv's Append functions do. It is
-// encoding/json/v2's by default, which encodes as json.Marshal does. A program
+// encoding/json/v2's by default, which encodes as json.Marshal does, through
+// encoders compiled per type for the common shapes (see json_fast.go) that
+// write the same bytes faster. A program
 // may set it, once, before it serves anything, to another encoder, such as
 // one that appends sonic's encoding:
 //
@@ -76,6 +78,13 @@ var appendWriters = sync.Pool{New: func() any { return new(appendWriter) }}
 // appendJSON appends v's encoding/json/v2 encoding to dst, without a trailing
 // newline. On an error it returns dst as it was.
 func appendJSON(dst []byte, v any, opts ...json.Options) ([]byte, error) {
+	if len(opts) == 0 {
+		// The same bytes v2 writes, from an encoder compiled for v's type
+		// when it is one json_fast.go takes.
+		if out, ok := appendFastJSON(dst, v); ok {
+			return out, nil
+		}
+	}
 	w := appendWriters.Get().(*appendWriter)
 	w.out = dst
 	err := json.MarshalWrite(w, v, opts...)

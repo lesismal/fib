@@ -188,8 +188,9 @@ engine, err := fib.New(config, fib.Binding{Addr: ":8080", Handler: fibhttp.NewHa
 不匹配时返回 405，并带 `Allow` 头。[`http/routerbench`](http/routerbench) 有与 chi、
 `http.ServeMux` 的对比。
 
-`c.JSON(status, v)` 把 `v` 编码成 JSON 回复，由 `encoding/json/v2` 编码，写入的缓冲区在
-HTTP/1 把 body 拷出后复用。启动时给 `fibhttp.JSONEncoder` 赋值一次即可换用其他编码器，例如 sonic。
+`c.JSON(status, v)` 把 `v` 编码成 JSON 回复，写入的缓冲区在 HTTP/1 把 body 拷出后复用。输出的字节与
+`encoding/json/v2` 一致：常见形状（由字符串、整数、布尔及其切片、指针组成的结构体）走按类型编译一次的
+编码器，比 v2 快约 3.8 倍，其余类型交给 v2 本身。启动时给 `fibhttp.JSONEncoder` 赋值一次即可换用其他编码器，例如 sonic。
 
 Context 还有类似 gin、fiber 的一步式方法：`String`、`Data`、`JSON`、`IndentedJSON`、`XML`、
 `IndentedXML`、`HTML`、`HTMLTemplate`、`File`、`FileAttachment`。需要编码的方法在失败时不发送任何内容并返回错误，
