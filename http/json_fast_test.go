@@ -123,10 +123,6 @@ type jfSinglePtr struct {
 	P *int
 }
 
-type jfQuoteName struct {
-	A int `json:"a\"b"`
-}
-
 type jfUnicodeName struct {
 	A int `json:"é"`
 }
@@ -223,7 +219,6 @@ func TestFastJSONMatchesV2(t *testing.T) {
 		{"pointer embed", jfPtrEmbed{&jfInner{"a", 1}}, false},
 		{"only hidden", jfOnlyHidden{1}, false},
 		{"single pointer struct", jfSinglePtr{&n}, false},
-		{"quote name", jfQuoteName{1}, false},
 		{"unicode name", jfUnicodeName{1}, false},
 		{"interface", jfIface{1}, false},
 		{"invalid utf8", "a\xffb", false},
@@ -231,6 +226,21 @@ func TestFastJSONMatchesV2(t *testing.T) {
 	}
 	for _, c := range cases {
 		checkJSON(t, c.name, c.v, c.fast)
+	}
+}
+
+// TestJSONPlainName covers tags a struct literal in a test cannot carry
+// without tripping vet: names with quotes, backslashes or control bytes go to
+// v2, which quotes them.
+func TestJSONPlainName(t *testing.T) {
+	for tag, want := range map[string]bool{
+		"": true, "id": true, "a b": true, "a-b.c": true, "<x>": true,
+		"a,omitempty": false, ",string": false, "a\"b": false, "a\\b": false,
+		"a'b": false, "a`b": false, "a\x01": false, "\u00e9": false,
+	} {
+		if got := jsonPlainName(tag); got != want {
+			t.Errorf("jsonPlainName(%q) = %v, want %v", tag, got, want)
+		}
 	}
 }
 
