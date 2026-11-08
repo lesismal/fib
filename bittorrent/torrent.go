@@ -81,6 +81,15 @@ type AddOptions struct {
 	// in Info.FileList, in place of PriorityNormal for all (and of a
 	// magnet link's so=).
 	FilePriorities []int
+
+	// Resume is resume data a Torrent.ResumeData of this torrent returned
+	// before: once the info dictionary is known, the pieces it lists in
+	// files whose size and modification time still match are taken as had
+	// without a hash check (see ResumeData). Resume data that is not
+	// valid, of another torrent or of a newer version is reported as an
+	// EventError whose Err is ErrResumeData, and the storage is checked
+	// in full.
+	Resume []byte
 }
 
 // Torrent is a torrent in a Client: its pieces, its peers and its

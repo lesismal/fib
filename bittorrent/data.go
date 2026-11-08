@@ -216,11 +216,15 @@ func (t *Torrent) startCheckLocked() {
 func (t *Torrent) check(st Storage, info *metainfo.Info) {
 	n := info.PieceCount()
 	buf := make([]byte, info.PieceLength)
+	plan := t.resumePlan(st, info)
 	for i := range n {
 		select {
 		case <-t.removed:
 			return
 		default:
+		}
+		if t.resumePiece(plan, i) {
+			continue
 		}
 		data := buf[:info.PieceSize(i)]
 		if err := readData(st, info, info.PieceOffset(i), data); err != nil {
