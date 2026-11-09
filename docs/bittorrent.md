@@ -269,7 +269,8 @@ _, err = io.Copy(w, r)
   missing file, and pieces the blob does not list, are neither read nor had. A blob that does not
   decode, is of another torrent or of a newer version, or storage that is not a `StatStorage`,
   is reported as an `EventError` whose `Err` wraps `ErrResumeData`, and the storage is checked in
-  full. `ResumeGen()` changes whenever a piece is had: save when it differs from the last save,
+  full. `ResumeGen()` changes whenever a piece is had (or a piece taken as had by `Seed` passes or
+  fails its check): save when it differs from the last save,
   and once more after `Stop` or `Client.Close`. `ResumeData` errs before the info dictionary and
   while the torrent checks its storage (keep the blob saved before).
 
@@ -283,6 +284,23 @@ _, err = io.Copy(w, r)
   Like libtorrent's, it trusts the stamps: content changed in place with the same size and
   modification time is not seen, and the pieces taken as had are served to peers without being
   verified again (a peer that gets a bad piece fails its own check and may ban this client).
+- **Seed mode** (`AddOptions.Seed`) is for a torrent just made from the files its storage holds
+  (`metainfo.Builder`), which would otherwise be hashed twice: every piece is taken as had, with
+  no check and no storage read when the info dictionary is known (`EventChecked` is still emitted,
+  and the torrent seeds at once). Each piece is checked on the disk pool the first time a block of
+  it is to be served; one that fails (or cannot be read) is no longer had, the request is rejected,
+  an `EventHashFailed` is emitted (with the error in `Err`), the torrent leaves seeding and
+  downloads that piece like any other. `Stats.Trusted` counts the pieces not checked yet;
+  `ResumeData` lists them apart (`trusted`), so a torrent added again with its resume data keeps
+  checking them on first serve. With a magnet link it applies once the info dictionary arrives.
+  `Seed` with `Resume` is refused with `ErrSeedResume`. A `Reader` reads unchecked pieces as they
+  are.
+
+  ```go
+  b := metainfo.Builder{Version: metainfo.Hybrid}
+  mi, _ := b.BuildPath(dir)
+  t, _ := c.AddTorrent(mi, &bittorrent.AddOptions{Seed: true}) // no second hashing pass
+  ```
 - **Disk pool**: storage is never read or written, and no piece is hashed, on a fib worker (or on
   the goroutine reading a uTP connection). `Config.DiskWorkers` goroutines (GOMAXPROCS, at most
   `DefaultMaxDiskWorkers` = 8) take the jobs from one queue: a received block is copied into a
@@ -301,7 +319,11 @@ _, err = io.Copy(w, r)
   nothing for 60 s is snubbed and its requests go to others.
 - **Verification**: SHA-1 for v1, the merkle tree for v2. A v2-only magnet's torrent fetches its
   piece layers with BEP 52 hash requests, and the client answers peers' hash requests from the
-  layers it has (and computes them after a hybrid magnet download). A peer that sent a whole piece
+  layers it has. A hybrid torrent added from a magnet link has no layers in its info dictionary:
+  the client computes them from the data on the disk pool (a job of up to 4 MiB at a time) once
+  the download completes, or a check finds the data complete, and from then on answers v2 peers;
+  `MetaInfo()` then includes them. A hybrid's info dictionary that arrives by magnet also
+  registers the other info hash, so peers of the v2 hash alone reach it. A peer that sent a whole piece
   that failed is banned; when several sent it, their blocks are compared with the good piece once
   it passes and those that sent bad ones are banned.
 - **Choking**: four upload slots (`UploadSlots`) for the peers it downloads most from (that take
@@ -668,7 +690,8 @@ alternative.
   hash must match), a bitfield or file count that does not fit, or storage that is not a
   `StatStorage`. Alternative: a dedicated event type; `EventError` does not change the torrent's
   state, and `errors.Is` tells it apart.
-- **The "save now" signal is `ResumeGen()`**, the count of pieces had (it only grows), rather than
+- **The "save now" signal is `ResumeGen()`**, a count of the changes to the resume bitfields (it
+  only grows: a piece had, or a `Seed` piece checked or failed), rather than
   an event: `EventPieceVerified` already fires per piece, and a cheap counter lets a caller save
   on a timer only when something changed. Writes to unfinished pieces change file stamps without
   moving it, so callers save once more after `Stop` / `Client.Close`.
@@ -679,6 +702,36 @@ alternative.
 - **Resume data holds no v2 piece layers**: a v2 magnet resumed has its pieces but fetches layers
   only for pieces it must still verify; a caller that wants them keeps `MetaInfo()`'s bytes.
   Alternative: layers in the blob, 32 bytes per piece.
+- **Seed mode and resume data cannot be combined** (`ErrSeedResume` from `AddTorrent` and
+  `AddMagnet`): resume data written by a seed-mode torrent already carries its unchecked pieces
+  (the `trusted` bitfield), so a caller adds with `Seed` the first time and with `Resume` after.
+  Alternatives: `Seed` wins and `Resume` is ignored (silently losing the checked pieces), or the
+  two merged (resume's checked pieces had, the rest trusted), more rules for no gain.
+- **Seed mode with a magnet link applies once the info dictionary arrives**, rather than being
+  refused: the dictionary is checked against the info hash, and the storage is trusted as for a
+  .torrent. For a v2-only magnet, a piece cannot be checked before its layer comes by hash
+  requests; until then its blocks are rejected. Alternative: refusing `Seed` without an info
+  dictionary.
+- **Seed-mode unchecked pieces go in a separate `trusted` bitfield in resume data**, and `pieces`
+  lists checked ones only, so the format stays version 1: an older reader ignores the key and
+  downloads those pieces again (safe), rather than taking them as verified. Pieces whose files
+  changed are hash-checked at add, as for resume. Alternatives: listing them in `pieces` (they
+  would be trusted for good), or leaving them out (a restarted seed would download its own data).
+- **A seed-mode piece is checked whole on first serve**, the block then read again from storage
+  (16 KiB more); concurrent first requests of one piece wait for the one check. A piece that fails
+  is reported as `EventHashFailed` (its `Err` the hash or read error), not `EventError`: the
+  torrent goes on, downloading it. Peers that were told the piece is had keep asking and are
+  rejected; the protocol cannot take a have back. `Reader` reads are not checked (they run on the
+  caller's goroutine, and the caller vouched for the data). Alternatives: serving the block from the
+  check's buffer; checking in `Reader` too.
+- **Layers of a hybrid from a magnet link are computed only when its data was hashed in this
+  session** (a download, a check, or `Seed` pieces all checked), not when every piece came from
+  resume data without a read: a resumed seed would otherwise read everything at each start. In
+  that case the first hash request for a missing layer is rejected and starts the computation, and
+  later requests are answered. Each job reads up to 4 MiB then goes to the back of the disk queue;
+  a `Stop` ends it and `Start` begins again. A file whose computed layer does not match its pieces
+  root is left without one. Alternatives: layers in resume data (32 bytes per piece), or computing
+  at every start.
 - **`MemoryStorage` implements `StatStorage`** with a strictly increasing in-process clock per
   write (and `Corrupt`), so resume works within a process (the opener returns the same storage for
   an info hash).

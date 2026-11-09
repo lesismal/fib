@@ -576,6 +576,9 @@ func (c *Client) AddTorrent(mi *metainfo.MetaInfo, opts *AddOptions) (*Torrent, 
 	if opts != nil {
 		o = *opts
 	}
+	if o.Seed && len(o.Resume) > 0 {
+		return nil, ErrSeedResume
+	}
 	var ih metainfo.InfoHash
 	var ih2 metainfo.InfoHashV2
 	if mi.Info.HasV1() {
@@ -629,6 +632,9 @@ func (c *Client) AddMagnet(uri string, opts *AddOptions) (*Torrent, error) {
 	var o AddOptions
 	if opts != nil {
 		o = *opts
+	}
+	if o.Seed && len(o.Resume) > 0 {
+		return nil, ErrSeedResume
 	}
 	t := newTorrent(c, m.InfoHash, m.InfoHashV2, o)
 	t.name = m.Name

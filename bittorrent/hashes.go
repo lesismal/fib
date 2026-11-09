@@ -253,6 +253,11 @@ func (t *Torrent) onHashRequestLocked(pc *peerConn, m *peer.Message) {
 	if !ok || int(m.BaseLayer) != base || length < 1 || length > maxHashesServed || length&(length-1) != 0 ||
 		index%length != 0 || index+length > nextPow2(len(layer)/32) {
 		_ = pc.c.Send(&reply)
+		if !ok {
+			// A file had whole whose layer is not known yet (a hybrid
+			// from a magnet link, resumed): it is made for the next ask.
+			t.computeLayersLocked(true)
+		}
 		return
 	}
 	// m is the parser's, reused for the next message: the job has reply.
@@ -312,55 +317,104 @@ func parentLayer(nodes [][32]byte) [][32]byte {
 	return up
 }
 
-// computeLayers derives the piece layers of the files a hybrid torrent
-// from a magnet link downloaded, from their data, so that this side can
-// answer v2 peers' hash requests as a seed: each piece's subtree root,
-// checked against the file's pieces root.
-func (t *Torrent) computeLayers() {
-	t.mu.Lock()
-	info, st := t.info, t.storage
+// layerBatchBytes bounds what one job of computeLayers reads before it
+// goes to the back of the disk queue, as uploadBatch bounds an upload's.
+const layerBatchBytes = 4 << 20
+
+// layerJob is computeLayers' progress: the files whose layers it makes,
+// the one it is at, and the piece of it.
+type layerJob struct {
+	files []int
+	f, k  int
+	layer []byte
+	buf   []byte
+}
+
+// computeLayersLocked starts computeLayers on the disk pool, unless it
+// runs already, when a v2 torrent lacks the piece layer of a file it has
+// every piece of, checked: a hybrid torrent from a magnet link, whose
+// info dictionary does not hold them, once downloaded or found complete
+// by its check. Pieces all taken from resume data, which were not read,
+// are not read for it either, unless onDemand: a peer asked for hashes
+// of the layer.
+func (t *Torrent) computeLayersLocked(onDemand bool) {
+	if (!onDemand && !t.hashedData) || t.layering || t.storage == nil || t.checking || t.info == nil || !t.info.HasV2() {
+		return
+	}
 	var todo []int
-	if info != nil && info.HasV2() && st != nil {
-		for f, file := range info.FileList() {
-			if file.IsPad() || file.Length <= info.PieceLength {
-				continue
-			}
-			if _, ok := t.layers[file.PiecesRoot]; !ok {
-				todo = append(todo, f)
-			}
+	for f, file := range t.info.FileList() {
+		if file.IsPad() || file.Length <= t.info.PieceLength {
+			continue
+		}
+		if _, ok := t.layers[file.PiecesRoot]; ok {
+			continue
+		}
+		b, e := t.info.FilePieces(f)
+		all := true
+		for i := b; i < e && all; i++ {
+			all = t.pieces[i].have && !t.pieces[i].trusted
+		}
+		if all {
+			todo = append(todo, f)
 		}
 	}
-	t.mu.Unlock()
 	if len(todo) == 0 {
 		return
 	}
+	t.layering = true
+	j := &layerJob{files: todo, buf: make([]byte, t.info.PieceLength)}
+	t.c.disk.run(func() { t.computeLayers(j) })
+}
+
+// computeLayers derives the piece layers of the files of j from their
+// data, so that this side can answer v2 peers' hash requests (BEP 52) as
+// a seed: each piece's subtree root, the layer checked against the file's
+// pieces root. It reads up to layerBatchBytes, then queues itself again;
+// it stops when the storage is closed, to start again with Start.
+func (t *Torrent) computeLayers(j *layerJob) {
+	st, info, done := t.useStorage()
+	if st == nil {
+		done()
+		t.mu.Lock()
+		t.layering = false
+		t.mu.Unlock()
+		return
+	}
 	width := int(info.PieceLength / metainfo.BlockSize)
-	buf := make([]byte, info.PieceLength)
-	for _, f := range todo {
-		file := info.FileList()[f]
+	var got map[[32]byte][]byte
+	read := 0
+	for j.f < len(j.files) && read < layerBatchBytes {
+		file := info.FileList()[j.files[j.f]]
 		n := filePieceCount(file, info.PieceLength)
-		layer := make([]byte, 0, 32*n)
-		ok := true
-		for k := range n {
-			off := file.Offset + int64(k)*info.PieceLength
-			data := buf[:min(info.PieceLength, file.Offset+file.Length-off)]
-			if err := readData(st, info, off, data); err != nil {
-				ok = false
-				break
-			}
-			r := metainfo.MerkleRoot(metainfo.HashBlocks(data), width, [32]byte{})
-			layer = append(layer, r[:]...)
-		}
-		if !ok {
+		off := file.Offset + int64(j.k)*info.PieceLength
+		data := j.buf[:min(info.PieceLength, file.Offset+file.Length-off)]
+		read += len(data)
+		if err := readData(st, info, off, data); err != nil {
+			j.f, j.k, j.layer = j.f+1, 0, nil
 			continue
 		}
-		if root, err := metainfo.LayerRoot(layer, info.PieceLength); err == nil && bytes.Equal(root[:], file.PiecesRoot[:]) {
-			t.mu.Lock()
-			if t.layers == nil {
-				t.layers = metainfo.PieceLayers{}
-			}
-			t.layers[file.PiecesRoot] = layer
-			t.mu.Unlock()
+		r := metainfo.MerkleRoot(metainfo.HashBlocks(data), width, [32]byte{})
+		j.layer = append(j.layer, r[:]...)
+		if j.k++; j.k < n {
+			continue
 		}
+		if root, err := metainfo.LayerRoot(j.layer, info.PieceLength); err == nil && bytes.Equal(root[:], file.PiecesRoot[:]) {
+			if got == nil {
+				got = map[[32]byte][]byte{}
+			}
+			got[file.PiecesRoot] = j.layer
+		}
+		j.f, j.k, j.layer = j.f+1, 0, nil
 	}
+	done()
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	for root, layer := range got {
+		t.setLayerLocked(root, layer)
+	}
+	if j.f < len(j.files) {
+		t.c.disk.run(func() { t.computeLayers(j) })
+		return
+	}
+	t.layering = false
 }

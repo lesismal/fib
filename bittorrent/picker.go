@@ -43,6 +43,9 @@ type pieceState struct {
 	// anacrolix and libtorrent do not serve.
 	dataLen int64
 	have    bool
+	// trusted is a piece had because AddOptions.Seed took the storage as
+	// complete, not yet checked: it is, before it is first served.
+	trusted bool
 	partial *partial
 }
 

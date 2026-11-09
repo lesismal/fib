@@ -97,6 +97,7 @@ func (t *Torrent) verifyPiece(i int, p *partial) {
 	switch {
 	case err == nil:
 		t.smartBanGoodLocked(i, data)
+		t.hashedData = true
 		t.markHaveLocked(i)
 	case errors.Is(err, metainfo.ErrNoPieceLayer):
 		// A v2 torrent from a magnet link: the piece waits for its file's
@@ -126,6 +127,7 @@ func (t *Torrent) markHaveLocked(i int) {
 	ps.have = true
 	t.have.Set(i)
 	t.haveCount++
+	t.resumeGen++
 	if ps.prio > PriorityNone {
 		t.missing--
 	}
@@ -251,6 +253,7 @@ func (t *Torrent) check(info *metainfo.Info) {
 		t.mu.Lock()
 		switch {
 		case err == nil:
+			t.hashedData = true
 			t.markHaveLocked(i)
 		case errors.Is(err, metainfo.ErrNoPieceLayer) && t.partials[i] == nil && !t.pieces[i].have:
 			// The data may be good: check it once the layer is known.

@@ -25,11 +25,16 @@ var errChecking = errors.New("bittorrent: no resume data while the torrent check
 
 // resumeBlob is resume data as it is bencoded.
 type resumeBlob struct {
-	Version  int64        `bencode:"fib resume"`
-	InfoHash []byte       `bencode:"info hash,omitempty"`
-	V2       []byte       `bencode:"info hash v2,omitempty"`
-	Pieces   []byte       `bencode:"pieces"`
-	Files    []resumeFile `bencode:"files"`
+	Version  int64  `bencode:"fib resume"`
+	InfoHash []byte `bencode:"info hash,omitempty"`
+	V2       []byte `bencode:"info hash v2,omitempty"`
+	Pieces   []byte `bencode:"pieces"`
+	// Trusted is the bitfield of the pieces AddOptions.Seed took as had
+	// and that are not checked yet, which Pieces does not list; data
+	// without it, or a reader that knows nothing of it, has them
+	// downloaded again.
+	Trusted []byte       `bencode:"trusted,omitempty"`
+	Files   []resumeFile `bencode:"files"`
 }
 
 // resumeFile is a file's stamp in resume data: its size and modification
@@ -43,10 +48,12 @@ type resumeFile struct {
 // ResumeData returns the torrent's resume data, for AddOptions.Resume when
 // it is added again: a small, versioned bencoded dictionary of its info
 // hashes, the bitfield of the pieces it has (checked, and so written to
-// storage and read back), and the size and modification time of each of
+// storage and read back), that of the pieces AddOptions.Seed took as had
+// and that are not checked yet, and the size and modification time of each of
 // its files as its storage reports them now. Adding the torrent with it
 // takes the pieces it lists as had without hashing them, in the files
-// whose size and modification time have not changed.
+// whose size and modification time have not changed, those not checked
+// yet still to be checked when first served, as AddOptions.Seed does.
 //
 // It is an error before the info dictionary is known, while the storage
 // is checked (keep the resume data saved before), and on storage that is
@@ -71,6 +78,16 @@ func (t *Torrent) ResumeData() ([]byte, error) {
 		return nil, errChecking
 	}
 	have := t.have.Clone()
+	var trusted *peer.Bitfield
+	if t.trusted > 0 {
+		trusted = peer.NewBitfield(len(t.pieces))
+		for i := range t.pieces {
+			if t.pieces[i].trusted {
+				have.Clear(i)
+				trusted.Set(i)
+			}
+		}
+	}
 	opener := t.opener
 	ih, ih2 := t.ih, t.ih2
 	t.mu.Unlock()
@@ -92,6 +109,9 @@ func (t *Torrent) ResumeData() ([]byte, error) {
 		return nil, errors.New("bittorrent: no resume data on storage that cannot report file stamps")
 	}
 	b := resumeBlob{Version: resumeVersion, Pieces: have.Bytes()}
+	if trusted != nil {
+		b.Trusted = trusted.Bytes()
+	}
 	if info.HasV1() {
 		b.InfoHash = ih[:]
 	}
@@ -117,15 +137,16 @@ func (t *Torrent) ResumeData() ([]byte, error) {
 	return bencode.Marshal(&b)
 }
 
-// ResumeGen is a count that changes whenever the bitfield in ResumeData
-// does, which is when a piece passes its check: a caller saves resume data
+// ResumeGen is a count that changes whenever the bitfields in ResumeData
+// do: when a piece passes its check, and when a piece AddOptions.Seed took
+// as had passes or fails it. A caller saves resume data
 // when it differs from the count at the last save. It is not a reason to
 // skip the save after Stop or Client.Close, as writes to pieces not yet
 // had change the file stamps without changing it.
 func (t *Torrent) ResumeGen() uint64 {
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	return uint64(t.haveCount)
+	return t.resumeGen
 }
 
 // What the check does with a piece, as resume data plans it.
@@ -133,6 +154,7 @@ const (
 	resumeCheck int8 = iota // hash it: a file of it changed
 	resumeHave              // had, and its files have not changed
 	resumeSkip              // not had, or a file of it is missing
+	resumeTrust             // had, not checked yet (AddOptions.Seed)
 )
 
 // resumePlan takes the resume data of AddOptions.Resume, once, and plans
@@ -193,6 +215,12 @@ func planResume(st Storage, info *metainfo.Info, data []byte) ([]int8, error) {
 	if err != nil {
 		return nil, errors.New("bitfield does not fit the torrent")
 	}
+	trusted := peer.NewBitfield(n)
+	if len(b.Trusted) > 0 {
+		if trusted, err = peer.ParseBitfield(b.Trusted, n); err != nil {
+			return nil, errors.New("bitfield of trusted pieces does not fit the torrent")
+		}
+	}
 	files := info.FileList()
 	if len(b.Files) != len(files) {
 		return nil, fmt.Errorf("%d files, the torrent has %d", len(b.Files), len(files))
@@ -237,6 +265,8 @@ func planResume(st Storage, info *metainfo.Info, data []byte) ([]int8, error) {
 			plan[i] = resumeCheck
 		case have.Has(i):
 			plan[i] = resumeHave
+		case trusted.Has(i):
+			plan[i] = resumeTrust
 		default:
 			plan[i] = resumeSkip
 		}
@@ -254,6 +284,11 @@ func (t *Torrent) resumePiece(plan []int8, i int) bool {
 	case resumeHave:
 		t.mu.Lock()
 		t.markHaveLocked(i)
+		t.mu.Unlock()
+		return true
+	case resumeTrust:
+		t.mu.Lock()
+		t.markTrustedLocked(i)
 		t.mu.Unlock()
 		return true
 	case resumeSkip:

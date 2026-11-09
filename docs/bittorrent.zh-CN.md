@@ -230,7 +230,7 @@ _, err = io.Copy(w, r)
   其中列出、且所在文件都未变的分片不经哈希直接记为已有；所在文件大小或修改时间变了的分片照常哈希校验；
   所在文件缺失的分片，以及数据中没有列出的分片，既不读也不记为已有。数据解不开、属于别的 torrent、
   版本更新，或存储不是 `StatStorage` 时，以 `Err` 包装 `ErrResumeData` 的 `EventError` 报告，并对存储做完整校验。
-  每有一个分片到手 `ResumeGen()` 就会变化：与上次保存时不同就保存，并在 `Stop` 或 `Client.Close` 之后再存一次。
+  每有一个分片到手（或 `Seed` 记为已有的分片通过或未通过校验）`ResumeGen()` 就会变化：与上次保存时不同就保存，并在 `Stop` 或 `Client.Close` 之后再存一次。
   info 字典到手之前、以及 torrent 正在校验存储时，`ResumeData` 返回错误（请保留之前保存的数据）。
 
   ```go
@@ -242,6 +242,19 @@ _, err = io.Copy(w, r)
 
   和 libtorrent 一样它信任这些文件戳：大小和修改时间都不变的原地修改发现不了，记为已有的分片发给 peer
   时也不再校验（收到坏分片的 peer 会在自己的校验中失败，并可能封禁本客户端）。
+- **做种模式**（`AddOptions.Seed`）用于刚由存储里的文件生成的 torrent（`metainfo.Builder`），否则它要被哈希
+  两遍：所有分片直接记为已有，拿到 info 字典时不校验、不读存储（仍发出 `EventChecked`，torrent 立即做种）。
+  每个分片在第一次要发出它的块时于磁盘池上校验；校验失败（或读不出）的分片不再记为已有，该请求被 reject，
+  发出 `EventHashFailed`（`Err` 带错误），torrent 离开做种状态并像其他缺失分片一样下载它。`Stats.Trusted`
+  是尚未校验的分片数；`ResumeData` 把它们单独列出（`trusted`），用这份续传数据再次加入的 torrent 继续在首次
+  发送时校验它们。对磁力链接，在拿到 info 字典后生效。`Seed` 与 `Resume` 同时设置时返回 `ErrSeedResume`。
+  `Reader` 按原样读取尚未校验的分片。
+
+  ```go
+  b := metainfo.Builder{Version: metainfo.Hybrid}
+  mi, _ := b.BuildPath(dir)
+  t, _ := c.AddTorrent(mi, &bittorrent.AddOptions{Seed: true}) // 不再哈希第二遍
+  ```
 - **磁盘池**：存储的读写和分片哈希从不在 fib worker 上（也不在读 uTP 连接的 goroutine 上）进行。
   `Config.DiskWorkers` 个 goroutine（GOMAXPROCS，最多 `DefaultMaxDiskWorkers` = 8）从同一个队列取任务：收到的块
   拷进池化缓冲区后排队写入，分片的最后一块落盘后在池上校验整个分片；上传的读也在池上，每个 peer 同时只有一个
@@ -254,7 +267,10 @@ _, err = io.Copy(w, r)
   endgame 时一个块同时向第二个 peer 请求，较慢的那个被取消。60 秒没发任何东西的 peer 被判为 snub，
   它的请求转给别人。
 - **校验**：v1 用 SHA-1，v2 用 merkle 树。纯 v2 磁力链接的 torrent 用 BEP 52 的 hash request 取 piece layer，
-  客户端也用手里的 layer 应答 peer 的 hash request（hybrid 磁力链接下载完后自行算出 layer）。整个分片都由一个
+  客户端也用手里的 layer 应答 peer 的 hash request。从磁力链接加入的 hybrid torrent 的 info 字典里没有 layer：
+  下载完成、或校验发现数据完整后，客户端在磁盘池上从数据算出它们（每个任务最多读 4 MiB），此后应答 v2 peer，
+  `MetaInfo()` 也包含它们。经磁力链接拿到的 hybrid info 字典还会登记另一个 info hash，只知道 v2 hash 的 peer
+  也能连上。整个分片都由一个
   peer 发来却校验失败，该 peer 被封禁；由多个 peer 拼成时，等分片校验通过后逐块比对，发了坏块的被封禁。
 - **choke**：四个上传名额（`UploadSlots`）给下载速度最快的 peer（做种时给拿得最多的），另有每 30 秒轮换一次的
   optimistic unchoke，新 peer 的机会是三倍。Fast 扩展：have all 与 have none，10 个 allowed fast 分片，
@@ -543,13 +559,31 @@ FIB_DHT_PUBLIC=1 FIB_DHT_INFOHASH=<40 位十六进制> go test -run TestDHTPubli
 - **不能用的续传数据以包装 `ErrResumeData` 的 `EventError` 报告**，并退回完整校验：解不开、版本为 0
   或高于 1、info hash 不符（出现的每个 hash 都须相符）、位图或文件数对不上，或存储不是 `StatStorage`。
   备选：单独的事件类型；`EventError` 不改变 torrent 状态，可用 `errors.Is` 区分。
-- **"该保存了"的信号是 `ResumeGen()`**，即已有分片数（只增不减），而不是事件：`EventPieceVerified`
+- **"该保存了"的信号是 `ResumeGen()`**，即续传位图的变化次数（只增不减：一个分片到手，或一个 `Seed` 分片
+  校验通过或失败），而不是事件：`EventPieceVerified`
   已经逐片触发，一个廉价计数让调用方可以定时检查、有变化才保存。写未完成分片会改变文件戳但不动它，
   所以调用方要在 `Stop` / `Client.Close` 之后再存一次。
 - **torrent 校验存储期间 `ResumeData` 返回错误**：此时位图不完整，保存会丢掉还没校验到的分片；
   已停止的 torrent 只为取文件戳重新打开存储（`fileStorage.Stat` 只调用 `os.Stat`）。备选：校验期间返回加入时的数据。
 - **续传数据不含 v2 piece layer**：续传的 v2 磁力 torrent 有分片，但只为仍需校验的分片获取 layer；
   需要的调用方自己保存 `MetaInfo()` 的字节。备选：把 layer 放进数据，每分片 32 字节。
+- **做种模式不能与续传数据同用**（`AddTorrent` 与 `AddMagnet` 返回 `ErrSeedResume`）：做种模式 torrent 写出的
+  续传数据已带上未校验的分片（`trusted` 位图），所以调用方第一次用 `Seed` 加入，之后用 `Resume`。备选：`Seed`
+  优先、忽略 `Resume`（悄悄丢掉已校验的分片），或两者合并（续传中已校验的记为已有，其余信任），规则更多而无收益。
+- **磁力链接的做种模式在 info 字典到手后生效**，而不是拒绝：info 字典按 info hash 校验过，存储与 .torrent 一样被信任。
+  对纯 v2 磁力链接，分片要等 hash request 取到 layer 后才能校验，在此之前它的块被 reject。备选：没有 info 字典时拒绝 `Seed`。
+- **做种模式中未校验的分片放在续传数据单独的 `trusted` 位图里**，`pieces` 只列已校验的，格式仍是版本 1：旧的读者
+  忽略该键并重新下载这些分片（安全），而不会当作已校验。所在文件变了的分片在加入时照常哈希校验。备选：放进
+  `pieces`（就永远被信任了），或不列出（重启的做种者会下载自己的数据）。
+- **做种模式的分片在首次发送时整片校验**，之后再从存储读一次那个块（多 16 KiB）；同一分片并发的首次请求等待
+  同一次校验。失败的分片报告为 `EventHashFailed`（`Err` 是哈希或读取错误）而不是 `EventError`：torrent 继续运行
+  并下载它。已被告知有该分片的 peer 会继续请求并被 reject，协议无法撤回 have。`Reader` 的读取不校验（它在
+  调用方的 goroutine 上运行，且数据由调用方担保）。备选：用校验的缓冲区直接发块；`Reader` 也校验。
+- **磁力链接加入的 hybrid 只在本次运行中哈希过数据时才计算 layer**（下载、校验，或 `Seed` 分片全部校验完），
+  所有分片都来自续传数据、一次未读时不算：否则续传的做种者每次启动都要读完全部数据。这种情况下，对缺失
+  layer 的第一个 hash request 被 reject 并触发计算，之后的请求得到应答。每个任务最多读 4 MiB 后排回磁盘队列末尾；
+  `Stop` 终止它，`Start` 重新开始。算出的 layer 与 pieces root 不符的文件不保留 layer。备选：把 layer 放进续传数据
+  （每分片 32 字节），或每次启动都计算。
 - **`MemoryStorage` 实现了 `StatStorage`**，每次写入（以及 `Corrupt`）用进程内严格递增的时钟，
   因此续传在同一进程内可用（opener 对同一 info hash 返回同一存储）。
 - **`Preallocate` 用 truncate** 把文件设到全长（稀疏文件），而不是 `fallocate`。
