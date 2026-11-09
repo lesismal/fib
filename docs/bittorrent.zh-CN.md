@@ -108,7 +108,8 @@ merkle 树（经文件的 piece layer，单分片文件则用它的 pieces root�
 `announce` 或 `scrape` 开头，passkey 放在它前一段），`UDP()` 是 UDP binding 的 `fib.Handler`。UDP 的
 connection ID 是对密钥、当前分钟和客户端地址做的 HMAC-SHA256，有效一到两分钟，因此不为每个客户端保存状态。
 默认的 `Store` 是 `MemoryStore`：64 个分片，限制 torrent 数、每个 torrent 的 peer 数和 peer 总数，peer 超过
-`PeerTTL` 不再 announce 即过期，随机挑选返回的 peer（随机起点加互质步长），给做种者只返回下载者。私有 tracker
+`PeerTTL` 不再 announce 即过期，随机挑选返回的 peer（随机起点加互质步长），给做种者只返回下载者。`MemoryStore.Range` 每次锁一个分片，
+列出各 torrent 及其 `Stats`；`SetConfig` 在服务中修改各项上限和 `PeerTTL`，保留现有 swarm。私有 tracker
 可用 `ServerConfig.AllowInfoHash` 做白名单，用 `Authorize` 检查每个请求的 `Auth`：对端地址、URL（UDP 上是
 BEP 41 的数据）和 passkey（`?passkey=` 或 `/<key>/announce`）。
 
@@ -433,6 +434,16 @@ FIB_DHT_PUBLIC=1 FIB_DHT_INFOHASH=<40 位十六进制> go test -run TestDHTPubli
 - **UDP 重传**：connect 与 announce 共用一个计数，transaction ID 复用；connection ID 过期则重新 connect。
 - **`Tiers.Timeout`** 每个 tracker 30 秒（`DefaultTrackerTimeout`）。
 - **8 字节的空 UDP announce 应答视为 `*Error`**，opentracker 就这样发。
+- **`MemoryStore.Range` 复制一个分片的 torrent 后在不持锁时调用 `fn`**，因此 `fn` 可以使用 store，该分片的
+  announce 也不必等它；每个 torrent 的 `Stats` 取自同一时刻，但期间新增或被遗忘的 torrent 可能漏掉或在消失后仍被
+  看到。它像 `Scrape` 一样让所看到的过期 peer 过期，并略过没有 peer 的 torrent。备选：持分片锁调用 `fn`（省去复制，
+  但慢的 `fn` 会卡住 announce，且不能调用 store）。
+- **调低 `MemoryStore` 的上限不丢弃任何东西**：在回到上限以内之前拒绝新的 torrent 和 peer，超出的部分随 peer
+  停止或过期离开，最多 `PeerTTL`。备选：立即裁剪，这需要挑选丢弃哪些 swarm 和 peer（它们只会再来 announce
+  并被拒绝），还要遍历每个分片。
+- **缩短的 `PeerTTL` 作用于已保存的 peer**（变更后没有 peer 活过 `PeerTTL`），为此遍历所有 peer，每次锁一个
+  分片；延长的 `PeerTTL` 从各 peer 下次 announce 起生效。备选：都从下次 announce 起生效，这会让 peer 按旧
+  TTL 保留。
 
 ### peer 与 mse
 

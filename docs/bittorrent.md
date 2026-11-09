@@ -121,7 +121,9 @@ The clients:
 the minute and the client's address, valid one to two minutes, so it keeps no state per client.
 `MemoryStore`, the default `Store`, keeps 64 shards, bounds torrents, peers per torrent and peers
 in all, expires peers after `PeerTTL`, and hands out random peers (a random start and a coprime
-stride), only leechers to a seeder. For private trackers, `ServerConfig.AllowInfoHash` is an
+stride), only leechers to a seeder. `MemoryStore.Range` lists the torrents with their `Stats`,
+one shard locked at a time, and `SetConfig` changes the bounds and `PeerTTL` while it serves,
+keeping the swarms. For private trackers, `ServerConfig.AllowInfoHash` is an
 allow-list and `Authorize` sees each request's `Auth`: remote address, URL (BEP 41 data over UDP)
 and passkey (`?passkey=` or `/<key>/announce`).
 
@@ -518,6 +520,19 @@ alternative.
   an expired connection ID means connecting again.
 - **`Tiers.Timeout`** 30 s per tracker (`DefaultTrackerTimeout`).
 - **An empty 8-byte UDP announce reply is an `*Error`**, as opentracker sends it.
+- **`MemoryStore.Range` copies a shard's torrents and calls `fn` with no lock held**, so `fn` may
+  use the store and announces of that shard do not wait for it; each torrent's `Stats` are as of
+  one moment, but torrents added or forgotten meanwhile may be missed or seen once gone. It expires
+  the peers it looks at, as `Scrape` does, and leaves out torrents with none. Alternative: call
+  `fn` under the shard's lock (no copy, but a slow `fn` stalls announces and must not call the
+  store).
+- **Lowered `MemoryStore` bounds drop nothing**: new torrents and peers are refused until the store
+  is back under them, and the ones past them leave as peers stop or expire, within `PeerTTL`.
+  Alternative: trim at once, which means picking which swarms and peers to drop (they would only
+  announce again and be refused) and a pass over every shard.
+- **A shorter `PeerTTL` applies to the peers kept** (none outlives `PeerTTL` from the change), in a
+  pass over every peer, one shard locked at a time; a longer one applies from each peer's next
+  announce. Alternative: only from the next announce, which keeps peers up to the old TTL.
 
 ### peer and mse
 
