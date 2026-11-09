@@ -7,3 +7,7 @@
 
 # Test binaries that `go test -c` leaves in a package directory.
 *.test
+
+# Local tool output and Go build cache.
+.VSCodeCounter/
+.gocache/
