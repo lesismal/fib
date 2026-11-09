@@ -216,7 +216,8 @@ func TestSeedDoesNotAnnounceCompleted(t *testing.T) {
 		events:      map[tracker.PeerID][]tracker.Event{},
 		started:     make(chan struct{}),
 	}
-	srv := tracker.NewServer(tracker.ServerConfig{Store: store, Interval: time.Second})
+	// An hour: the seed's announce after its check must not wait for it.
+	srv := tracker.NewServer(tracker.ServerConfig{Store: store, Interval: time.Hour})
 	cfg := fib.DefaultConfig()
 	cfg.LogSettings = false
 	engine, err := fib.New(cfg, fib.Binding{Network: "tcp4", Addr: "127.0.0.1:0", Handler: fibhttp.NewHandler(srv)})
@@ -244,6 +245,18 @@ func TestSeedDoesNotAnnounceCompleted(t *testing.T) {
 		}
 	}
 	seeder, _ := seed(t, sdir, mi, trackers, gated)
+	// Its started announce went out during the check, with bytes left; the
+	// check over, it tells the tracker it is a seed at once.
+	deadline := time.Now().Add(transferTimeout)
+	for {
+		if st, _ := store.Scrape(mi.Info.InfoHashV1()); st.Complete == 1 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("the tracker never counted the seed complete")
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
 	leecher := newTestClient(t, ldir, trackers)
 	lt, err := leecher.AddTorrent(mi, &AddOptions{Peers: []string{addrOf(seeder)}})
 	if err != nil {
@@ -251,7 +264,7 @@ func TestSeedDoesNotAnnounceCompleted(t *testing.T) {
 	}
 	waitDone(t, lt)
 	checkFiles(t, ldir, files)
-	deadline := time.Now().Add(transferTimeout)
+	deadline = time.Now().Add(transferTimeout)
 	for store.count(leecher.peerID, tracker.EventCompleted) == 0 {
 		if time.Now().After(deadline) {
 			t.Fatal("the leecher never announced completed")

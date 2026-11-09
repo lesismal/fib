@@ -209,6 +209,21 @@ type Torrent struct {
 	// checked: the first check of the storage is over. leeched: wanted
 	// pieces were missing since then.
 	checked, leeched bool
+	// checkDone is closed when the first check is over, so that a tracker
+	// loop whose started announce went out during it, with what was left
+	// then, tells the trackers at once what is left now: a seed's data
+	// complete when its check ends announces no completed (see completed),
+	// and would be counted a leecher until the next interval.
+	checkDone chan struct{}
+}
+
+// markCheckedLocked records that the first check of the storage is over.
+// t.mu is held.
+func (t *Torrent) markCheckedLocked() {
+	if !t.checked {
+		t.checked = true
+		close(t.checkDone)
+	}
 }
 
 func newTorrent(c *Client, ih metainfo.InfoHash, ih2 metainfo.InfoHashV2, opts AddOptions) *Torrent {
@@ -233,6 +248,7 @@ func newTorrent(c *Client, ih metainfo.InfoHash, ih2 metainfo.InfoHashV2, opts A
 		rng:         newRNG(),
 		sequential:  opts.Sequential,
 		completed:   make(chan struct{}),
+		checkDone:   make(chan struct{}),
 		state:       StateMetadata,
 	}
 	t.key = ih

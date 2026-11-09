@@ -344,6 +344,12 @@ func (t *Torrent) announceLoop(ctx context.Context, tiers *tracker.Tiers, h meta
 		completed = nil // done before it started: no completed event
 	default:
 	}
+	checkDone := t.checkDone
+	select {
+	case <-checkDone:
+		checkDone = nil // checked before it started: left is known
+	default:
+	}
 	event := tracker.EventStarted
 	started := false
 	backoff := 15 * time.Second
@@ -396,6 +402,12 @@ func (t *Torrent) announceLoop(ctx context.Context, tiers *tracker.Tiers, h meta
 			if started {
 				event = tracker.EventCompleted
 			}
+		case <-checkDone:
+			// The check ended after the started announce: announce
+			// again at once with what is left now (none, for a seed), as
+			// libtorrent does, rather than at the next interval.
+			timer.Stop()
+			checkDone = nil
 		}
 	}
 }

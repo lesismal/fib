@@ -279,7 +279,7 @@ func (t *Torrent) check(info *metainfo.Info) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	t.checking = false
-	t.checked = true
+	t.markCheckedLocked()
 	if t.state == StateChecking {
 		t.state = StateDownloading
 	}
