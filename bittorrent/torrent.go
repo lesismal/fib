@@ -93,6 +93,21 @@ type AddOptions struct {
 	// EventError whose Err is ErrResumeData, and the storage is checked
 	// in full.
 	Resume []byte
+
+	// Seed takes the storage as holding every piece, as for a torrent
+	// just made from the files it stores (libtorrent's seed mode): there
+	// is no check when the info dictionary is known, and no read of
+	// storage until a peer asks for a block. Each piece is checked, on
+	// the disk pool, the first time a block of it is to be served; one
+	// that fails is no longer had, reported as an EventHashFailed, the
+	// block rejected, and the torrent downloads it like any piece it
+	// lacks. Stats.Trusted counts the pieces not checked yet, and
+	// ResumeData keeps them apart from the checked ones. A Reader reads
+	// pieces not checked yet as they are. For a magnet link it applies
+	// once the info dictionary has come. It cannot be set with Resume:
+	// AddTorrent and AddMagnet refuse that, as the resume data of a torrent
+	// added as a seed already says which pieces are still unchecked.
+	Seed bool
 }
 
 // Torrent is a torrent in a Client: its pieces, its peers and its
@@ -114,27 +129,39 @@ type Torrent struct {
 	// closeStorage. Taken before mu, never with mu held.
 	diskMu sync.RWMutex
 
-	mu         sync.Mutex
-	name       string
-	info       *metainfo.Info
-	infoBytes  []byte
-	layers     metainfo.PieceLayers
-	trackers   [][]string
-	webSeeds   []string
-	seeds      []*webSeed
-	nodes      []metainfo.Node
-	selection  []metainfo.IndexRange
-	opener     StorageOpener
-	storage    Storage
-	state      State
-	paused     bool
-	checking   bool
-	err        error
-	pieces     []pieceState
-	partials   map[int]*partial
-	have       *peer.Bitfield
-	haveCount  int
-	missing    int // wanted pieces not had
+	mu        sync.Mutex
+	name      string
+	info      *metainfo.Info
+	infoBytes []byte
+	layers    metainfo.PieceLayers
+	trackers  [][]string
+	webSeeds  []string
+	seeds     []*webSeed
+	nodes     []metainfo.Node
+	selection []metainfo.IndexRange
+	opener    StorageOpener
+	storage   Storage
+	state     State
+	paused    bool
+	checking  bool
+	err       error
+	pieces    []pieceState
+	partials  map[int]*partial
+	have      *peer.Bitfield
+	haveCount int
+	missing   int // wanted pieces not had
+	trusted   int // pieces with pieceState.trusted
+	// trustChecks are the checks of trusted pieces under way, closed
+	// when each is over.
+	trustChecks map[int]chan struct{}
+	// resumeGen counts the changes to what ResumeData lists: see
+	// ResumeGen.
+	resumeGen uint64
+	// layering is set while computeLayers runs; hashedData once a
+	// piece's data was hashed since the torrent was added, not taken from
+	// resume data.
+	layering   bool
+	hashedData bool
 	sequential bool
 	endgame    bool
 	rng        *rand.Rand
@@ -187,25 +214,26 @@ type Torrent struct {
 func newTorrent(c *Client, ih metainfo.InfoHash, ih2 metainfo.InfoHashV2, opts AddOptions) *Torrent {
 	t := &Torrent{
 		c: c, ih: ih, ih2: ih2, opts: opts,
-		gotInfo:    make(chan struct{}),
-		removed:    make(chan struct{}),
-		partials:   map[int]*partial{},
-		urgent:     map[int]int{},
-		readers:    map[*Reader]struct{}{},
-		done:       make(chan struct{}),
-		pieceSig:   make(chan struct{}),
-		peers:      map[*peer.Conn]*peerConn{},
-		pool:       map[netip.AddrPort]*candidate{},
-		dials:      map[*peer.Conn]*dialAttempt{},
-		early:      map[*peer.Conn]earlyClose{},
-		metaReqs:   map[int]time.Time{},
-		hashReqs:   map[hashKey]hashReq{},
-		layerParts: map[[32]byte]*layerFetch{},
-		banRecords: map[blockKey][]blockRecord{},
-		rng:        newRNG(),
-		sequential: opts.Sequential,
-		completed:  make(chan struct{}),
-		state:      StateMetadata,
+		gotInfo:     make(chan struct{}),
+		removed:     make(chan struct{}),
+		partials:    map[int]*partial{},
+		urgent:      map[int]int{},
+		readers:     map[*Reader]struct{}{},
+		done:        make(chan struct{}),
+		pieceSig:    make(chan struct{}),
+		peers:       map[*peer.Conn]*peerConn{},
+		pool:        map[netip.AddrPort]*candidate{},
+		dials:       map[*peer.Conn]*dialAttempt{},
+		early:       map[*peer.Conn]earlyClose{},
+		metaReqs:    map[int]time.Time{},
+		hashReqs:    map[hashKey]hashReq{},
+		layerParts:  map[[32]byte]*layerFetch{},
+		trustChecks: map[int]chan struct{}{},
+		banRecords:  map[blockKey][]blockRecord{},
+		rng:         newRNG(),
+		sequential:  opts.Sequential,
+		completed:   make(chan struct{}),
+		state:       StateMetadata,
 	}
 	t.key = ih
 	if ih.IsZero() {
@@ -354,7 +382,11 @@ func (t *Torrent) setInfoLocked(info *metainfo.Info) error {
 	t.storage = st
 	close(t.gotInfo)
 	t.c.emit(Event{Type: EventMetadata, Torrent: t})
-	t.startCheckLocked()
+	if t.opts.Seed {
+		t.trustAllLocked()
+	} else {
+		t.startCheckLocked()
+	}
 	return nil
 }
 
@@ -474,6 +506,7 @@ func (t *Torrent) onCompleteLocked() {
 	if empty := t.emptyFilesLocked(); len(empty) > 0 && t.storage != nil {
 		t.c.disk.run(func() { t.createFiles(empty) })
 	}
+	t.computeLayersLocked(false)
 }
 
 // emptyFilesLocked lists the empty files that are wanted, which no piece
@@ -541,6 +574,8 @@ func (t *Torrent) Start() {
 		}
 	}
 	t.startRunningLocked()
+	// Layers that a Stop interrupted.
+	t.computeLayersLocked(false)
 }
 
 // Pause closes the torrent's connections and stops its announces,
@@ -748,8 +783,10 @@ type Stats struct {
 	Size, Wanted, Completed int64
 	// Progress is Completed over Wanted.
 	Progress float64
-	// Pieces is the number of pieces, PiecesHave how many are had.
-	Pieces, PiecesHave int
+	// Pieces is the number of pieces, PiecesHave how many are had;
+	// Trusted is how many of those AddOptions.Seed took as had and are
+	// not checked yet.
+	Pieces, PiecesHave, Trusted int
 	// Downloaded and Uploaded are payload bytes since the torrent was
 	// added; the rates are bytes per second, smoothed over seconds.
 	Downloaded, Uploaded       int64
@@ -781,6 +818,7 @@ func (t *Torrent) Stats() Stats {
 		s.Size = t.info.TotalLength()
 		s.Pieces = len(t.pieces)
 		s.PiecesHave = t.haveCount
+		s.Trusted = t.trusted
 		for i := range t.pieces {
 			ps := &t.pieces[i]
 			if ps.prio > PriorityNone {

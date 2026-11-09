@@ -733,8 +733,15 @@ func (t *Torrent) pumpBlocks(pc *peerConn) {
 		}
 		r := pc.upq[0]
 		pc.upq = pc.upq[1:]
+		ps := t.pieces[r.Index]
 		t.mu.Unlock()
 
+		// A piece AddOptions.Seed took as had is checked before its first
+		// block goes out; one that failed is not served.
+		if !ps.have || (ps.trusted && !t.checkTrusted(int(r.Index))) {
+			_ = pc.c.Reject(r)
+			continue
+		}
 		buf := bufferpool.Get(int(r.Length))
 		err := errNoStorage
 		st, info, done := t.useStorage()
