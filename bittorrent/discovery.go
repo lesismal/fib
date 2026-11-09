@@ -89,6 +89,11 @@ func (t *Torrent) addPeersLocked(src Source, v2 bool, addrs []netip.AddrPort) {
 		}
 		t.pool[a] = &candidate{addr: a, sources: src, v2: v2}
 	}
+	// New candidates are dialed now rather than at the next tick, up to a
+	// second later.
+	if len(addrs) > 0 {
+		t.connectPeersLocked(time.Now())
+	}
 }
 
 // connectPeersLocked dials candidates while the limits allow: the

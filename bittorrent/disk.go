@@ -158,6 +158,43 @@ func (d *diskPool) close() {
 	d.wg.Wait()
 }
 
+// allocPieceBuf gives p, a piece just reserved, a buffer for its blocks
+// when the client's piece buffers have room: they share the bound of the
+// writes queued (Config.DiskQueueBytes), so that memory stays bounded
+// however many pieces are under way; a piece without one has each block
+// written as it comes. Called with t.mu held.
+func (c *Client) allocPieceBuf(t *Torrent, p *partial) {
+	n := t.info.PieceLength
+	if c.pieceBufs.Add(n) > c.cfg.DiskQueueBytes {
+		c.pieceBufs.Add(-n)
+		return
+	}
+	var buf []byte
+	if v, ok := t.bufPool.Get().(*[]byte); ok && int64(cap(*v)) == n {
+		buf = (*v)[:t.info.PieceSize(p.index)]
+		// The padding past the piece's data (BEP 47) is not sent: it
+		// is zeros, as the check reads it.
+		clear(buf[t.pieces[p.index].dataLen:])
+	} else {
+		buf = make([]byte, n)[:t.info.PieceSize(p.index)]
+	}
+	p.buf = buf
+}
+
+// freePieceBuf gives back p's piece buffer, to the torrent's pool when no
+// block can still be copied into it. Called with t.mu held.
+func (c *Client) freePieceBuf(t *Torrent, p *partial, pool bool) {
+	if p.buf == nil {
+		return
+	}
+	buf := p.buf[:cap(p.buf)]
+	p.buf = nil
+	c.pieceBufs.Add(-int64(len(buf)))
+	if pool {
+		t.bufPool.Put(&buf)
+	}
+}
+
 // useStorage returns the torrent's storage and info for an operation,
 // nil when it has none, and done, which the operation calls when it is
 // over: until then the storage is not closed. It must not be called with

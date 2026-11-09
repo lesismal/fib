@@ -258,6 +258,8 @@ type Client struct {
 	limits   atomic.Pointer[Limits]
 	up, down limiter
 	disk     *diskPool
+	// pieceBufs is the bytes of the piece buffers held (allocPieceBuf).
+	pieceBufs atomic.Int64
 
 	conns    atomic.Int64
 	halfOpen atomic.Int64
@@ -998,6 +1000,7 @@ func (t *Torrent) tick(now time.Time, dt time.Duration) {
 			}
 			clear(pc.pending)
 			pc.lastBlock = now
+			t.releaseOwnedLocked(pc)
 		}
 		if t.info == nil {
 			t.requestMetadataLocked(pc)
