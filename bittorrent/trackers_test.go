@@ -64,9 +64,13 @@ func TestTrackers(t *testing.T) {
 		t.Fatalf("no tracker %s in %+v", u, list)
 		return TrackerInfo{}
 	}
+	// And the other two done trying: on Windows a dial of a refused port
+	// takes a couple of seconds, so the dead tracker may still be updating.
 	waitFor(t, "the answering tracker's announces and scrapes", func() bool {
-		ok := find(tor.Trackers(), okURL)
-		return !ok.Scraped.IsZero() && ok.V2 != nil && !ok.V2.Scraped.IsZero()
+		list := tor.Trackers()
+		ok, dead, refused := find(list, okURL), find(list, deadURL), find(list, refuseURL)
+		return !ok.Scraped.IsZero() && ok.V2 != nil && !ok.V2.Scraped.IsZero() &&
+			!dead.Updating && dead.Fails > 0 && !refused.Updating && refused.Fails > 0
 	})
 	list := tor.Trackers()
 	if len(list) != 3 {
