@@ -4,6 +4,7 @@ package http
 
 import (
 	"errors"
+	"io"
 	stdhttp "net/http"
 	"strings"
 	"sync"
@@ -585,6 +586,12 @@ func (c *Context) switchHTTP1(head []byte) (*Tunnel, error) {
 	conn.SetAttachment(feed)
 	_ = feed.Write(rest)
 	bufferpool.Put(rest)
+	if parser.inputEnded.Load() {
+		// The client had ended its side while this request was retained;
+		// see ServerHandler.OnInputEnd. The tunnel hears of it after what
+		// arrived before.
+		feed.End(io.EOF)
+	}
 	return feed.Tunnel(), nil
 }
 

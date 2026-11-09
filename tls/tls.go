@@ -466,6 +466,16 @@ func (h *Handler) OnHangup(c *fib.Connection) {
 	}
 }
 
+// OnInputEnd asks the wrapped handler whether the connection stays open to
+// finish sending once the peer has ended its side; see fib.InputEndHandler.
+// A handler that does not say closes it, as before.
+func (h *Handler) OnInputEnd(c *fib.Connection) bool {
+	if inner, ok := h.inner().(fib.InputEndHandler); ok {
+		return inner.OnInputEnd(c)
+	}
+	return false
+}
+
 // OnShutdown passes word that the engine is shutting down on to the wrapped
 // handler, when it takes it, so that the protocol inside the TLS stream can
 // end the connection once it is idle; see fib.ShutdownHandler.

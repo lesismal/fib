@@ -1309,6 +1309,14 @@ func (h *ServerHandler) drive(c *fib.Connection, parser *Parser, data []byte) {
 	// timeout is chosen by what the parser really holds.
 	defer parser.own()
 	h.serveParsed(c, parser, data)
+	if parser.inputEnded.Load() && !parser.busy && !parser.spent && !parser.upgraded {
+		// The client ended its side while a response was owed, and every
+		// request it sent before that has its answer now: nothing more can
+		// come, so the connection ends once the answers have gone. A partial
+		// request left in the buffer will never be finished either.
+		parser.spent = true
+		c.CloseAfterSend()
+	}
 }
 
 // serveParsed is drive's work once the parser's lock is held and its
@@ -1398,6 +1406,12 @@ func (h *ServerHandler) serveParsed(c *fib.Connection, parser *Parser, data []by
 		// written, so that pipelined responses keep their order, and the
 		// connection knows which request to cancel if it closes first.
 		context.begin(true, false)
+		if parser.inputEnded.Load() || parser.hangupHeard.Load() {
+			// Sent before the client ended its side, which cancelled the
+			// requests it had sent without cutting off their responses; see
+			// OnInputEnd. Nothing is registered on this one yet to hear it.
+			context.word.Or(ctxInputEnded)
+		}
 		parser.busy = true
 		parser.liveContext.Store(context)
 		if context.streamed {
@@ -1785,17 +1799,74 @@ func (h *ServerHandler) OnClose(c *fib.Connection, err error) {
 	c.SetAttachment(nil)
 }
 
-// OnHangup cancels the HTTP/1 request whose handler is holding up the round
-// that would read its peer's hangup. A handler that waits in place, on a
-// database or another server, rather than retaining the request, would
-// otherwise hear nothing: by the time the round read the hangup, the handler
-// would have returned and its response been written, leaving nothing to
-// cancel. It hears it through OnCancel, OnBody and Err instead, as one that
-// retained its request hears a close, and the connection closes, since the
-// response is lost and answering what is pipelined behind the request would
-// answer the wrong one. A request whose body is still arriving is left to the
-// round, which reads what the peer sent before it went and then fails the
-// body.
+// OnInputEnd keeps an HTTP/1 connection open after its client has ended its
+// side while a request it sent is still being answered: one whose handler
+// retained it, through Retain or Async, to answer from elsewhere. A FIN says
+// only that the client will send nothing more: it may have closed, or only
+// shut its writing side, as an HTTP/1.0 client, `nc -N` or a client that
+// calls shutdown(SHUT_WR) after its request does, and still be reading. So
+// it is treated as net/http treats it: the request is cancelled, its OnCancel
+// callbacks and its Context hearing io.EOF at once, but its response is not
+// cut off, and what the handler still writes goes; see Context.OnCancel. The
+// requests pipelined behind it before the end are served the same way, and
+// the connection closes once the last of them has its response. A client
+// that had closed outright resets the connection when a response reaches it,
+// which cuts off whatever is still being answered, as a close always has.
+// With nothing owed, or a body still arriving, which the end leaves
+// truncated, the connection closes at the end of input as it otherwise
+// would; see fib.InputEndHandler.
+func (h *ServerHandler) OnInputEnd(c *fib.Connection) bool {
+	parser, ok := c.Attachment().(*Parser)
+	if !ok {
+		return false
+	}
+	parser.mu.Lock()
+	keep := parser.busy && parser.stream == nil && !parser.spent && !parser.upgraded
+	var context *Context
+	var gen uint64
+	if keep {
+		parser.inputEnded.Store(true)
+		if context = parser.liveContext.Load(); context != nil {
+			// Read while the request is still this connection's, as in
+			// OnClose: the parser is busy with it.
+			gen = context.generation()
+		}
+	}
+	parser.mu.Unlock()
+	if context != nil {
+		if rest := context.endInput(gen); rest != nil {
+			// The callbacks may answer, which takes the parser; they run on
+			// the handler pool, as a close's do.
+			cancelElsewhere(c, rest)
+		}
+	}
+	if keep {
+		if feed, ok := c.Attachment().(*TunnelFeed); ok {
+			// The retained request switched the connection to a tunnel
+			// meanwhile, without the parser's lock, and may have looked for
+			// the end before it was recorded: its handler hears of it here.
+			feed.End(io.EOF)
+		}
+	}
+	return keep
+}
+
+// OnHangup tells the HTTP/1 request in progress that its client has ended
+// its side, while the handler serving it may be holding up the round that
+// would read the end: a handler that waits in place, on a database or another
+// server, would otherwise hear nothing until it was done. The request is
+// cancelled with io.EOF, through OnCancel, Err and its Context, as one whose
+// round read the end is (see OnInputEnd), but, as net/http does, its response
+// is not cut off: the end may be a client that only shut its writing side
+// and still reads, and what the handler writes reaches it. The requests
+// pipelined behind it before the end are served the same way, and the
+// connection closes once the last has its response, or as soon as the client,
+// having gone after all, resets it. A handler still running that holds the
+// request in a way of its own, as one whose writes OnHeaderAsync holds does,
+// may be waiting on that hold, which nothing the client sends can settle any
+// more: its request is cut off, and the connection closes, as it does on a
+// reset, where nothing written can reach the client. A request whose body is still arriving is left to the round, which reads what
+// the peer sent before it ended and then fails the body.
 //
 // It runs on the event loop, so the cancellation runs on the handler pool, as
 // OnClose's does; see fib.HangupHandler.
@@ -1811,14 +1882,27 @@ func (h *ServerHandler) OnHangup(c *fib.Connection) {
 	// As in OnClose: the generation is read while the Context is still this
 	// connection's, which the second load confirms.
 	gen := context.generation()
-	if state.liveContext.Load() != context || ctxState(context.word.Load()) != ctxOpen {
+	w := context.word.Load()
+	if state.liveContext.Load() != context || ctxState(w) != ctxOpen {
+		return
+	}
+	if !c.HangupReset() && (w&ctxHolds == 0 || w&(ctxServed|ctxHandedOff) != ctxServed) {
+		// Answered in place with no hold, or from elsewhere, through Retain
+		// or Async: nothing it waits on needs the client. The parser is the
+		// round's, so the end is recorded without its lock, for the requests
+		// begun after this; the round reads what came before the end, and
+		// then the end, which OnInputEnd hears.
+		state.hangupHeard.Store(true)
+		if rest := context.endInput(gen); rest != nil {
+			cancelElsewhere(c, rest)
+		}
 		return
 	}
 	// The connection closes here rather than when the round reads the
 	// hangup, so that what the handler writes from here on is refused, as it
-	// is on a request whose connection closed under it, rather than sent to a
-	// peer that has gone. OnClose still comes after the round, and whichever
-	// of the two cancellations gets there first is the one that counts.
+	// is on a request whose connection closed under it. OnClose still comes
+	// after the round, and whichever of the two cancellations gets there
+	// first is the one that counts.
 	c.CloseWithError(io.EOF)
 	cancelElsewhere(c, func() { context.cancelWith(io.EOF, gen) })
 }

@@ -237,7 +237,7 @@ func (c *Context) resumer(a *asyncHeader, at int) func(error) {
 		}
 		if err == nil {
 			// A request that ended meanwhile is not answered.
-			err = c.Err()
+			err = c.cancelErr()
 		}
 		if a.whole != nil {
 			c.resumeWhole(a, err)

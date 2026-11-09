@@ -130,6 +130,10 @@ type Connection struct {
 	// empties the socket stops at a short read without reaching the end, so
 	// the round that next reads is handed the end with it.
 	hupOwed bool
+	// inputEndKept records that the handler kept the connection open past
+	// the end of the peer's input; see keepAfterInputEnd. Only the round
+	// that owns the connection touches it.
+	inputEndKept bool
 	// roundStalled records that the current round's read stopped with
 	// bytes possibly left in the socket, for a hold or for the write
 	// budget. Only the round that owns the connection touches it.
@@ -152,8 +156,11 @@ type Connection struct {
 	// ShutdownBinding. Guarded by mu.
 	closeDue bool
 	// hangupNoted records that a hangup has been reported while a round was
-	// running, which happens once; see noteEvent. Guarded by mu.
+	// running, which happens once; see noteEvent. hangupReset records that
+	// it was the socket failing, a reset among it, rather than only the end
+	// of the peer's input; see HangupReset. Guarded by mu.
 	hangupNoted    bool
+	hangupReset    bool
 	flushing       bool
 	corked         bool
 	closeAfterSend bool
@@ -1360,6 +1367,9 @@ func (c *Connection) process() {
 		var closeErr error
 		if readNow {
 			closeErr = c.readRound()
+			if closeErr == io.EOF && c.keepAfterInputEnd() {
+				closeErr = nil
+			}
 			alive = closeErr == nil
 			if alive {
 				c.rearmRead()
@@ -1400,6 +1410,9 @@ func (c *Connection) process() {
 					deferred = evIn | events&evRdHup
 				} else {
 					closeErr = c.drainInput()
+					if closeErr == io.EOF && c.keepAfterInputEnd() {
+						closeErr = nil
+					}
 					alive = closeErr == nil
 					if alive {
 						c.rearmRead()
@@ -1425,7 +1438,7 @@ func (c *Connection) process() {
 				c.hupOwed = true
 				c.mu.Unlock()
 				c.stallRead()
-			} else {
+			} else if !c.keepAfterInputEnd() {
 				closeErr = io.EOF
 				alive = false
 			}
@@ -1434,6 +1447,45 @@ func (c *Connection) process() {
 			c.closeWithError(closeErr)
 		}
 	}
+}
+
+// HangupReset reports whether the hangup OnHangup is told of is the socket
+// failing, as a peer that resets the connection fails it, rather than only
+// the end of the peer's input, after which the peer may still read what is
+// sent to it; see HangupHandler. It is false before any OnHangup.
+func (c *Connection) HangupReset() bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.hangupReset
+}
+
+// keepAfterInputEnd asks the handler, once a round has read the end of the
+// peer's input, whether the connection stays open to finish sending; see
+// InputEndHandler. If it does, input ends as CloseRead ends it, which also
+// keeps the loop from offering the end again, and the report is true. It runs
+// in the round, as OnData does.
+func (c *Connection) keepAfterInputEnd() bool {
+	if c.inputEndKept {
+		// A round that reads the end also finds the edge that announced
+		// it among its events: the handler has answered already.
+		return true
+	}
+	if c.flags.has(flagReadShut) || c.flags.has(flagLingering) {
+		return false
+	}
+	h, ok := c.handler.(InputEndHandler)
+	if !ok || !h.OnInputEnd(c) {
+		return false
+	}
+	c.mu.Lock()
+	open := !c.closing && !c.closed
+	if open {
+		c.flags.set(flagReadShut, true)
+		c.hupOwed = false
+		c.inputEndKept = true
+	}
+	c.mu.Unlock()
+	return open
 }
 
 // finishClose ends a closed connection's last round: OnClose runs here,

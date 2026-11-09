@@ -68,9 +68,35 @@ type DatagramsHandler interface {
 // only between its rounds, and the portable backend reports the end of input
 // as a close, so there the hangup is heard when the round ends, as it would
 // be without OnHangup.
+//
+// The peer may only have ended its input, with a FIN, which a peer that has
+// closed and one that has only shut its writing side and still reads both
+// send, or the socket may have failed, as a reset fails it; HangupReset tells
+// OnHangup which.
 type HangupHandler interface {
 	Handler
 	OnHangup(*Connection)
+}
+
+// InputEndHandler is a Handler asked, when its peer has ended its side of
+// the connection, whether the connection stays open to finish sending. The
+// end of input is all a FIN says: a peer that has closed outright and one
+// that has only shut its writing side (shutdown(SHUT_WR), an HTTP/1.0 client
+// or nc -N) look the same until something is written to it. A protocol that
+// still owes the peer an answer, such as HTTP/1 with a response its handler
+// is preparing elsewhere, keeps the connection by returning true: input then
+// ends as CloseRead ends it, nothing more is read, and sends go on until the
+// protocol closes the connection, or until the peer, having gone after all,
+// resets it, which closes it with the socket's error as usual. Returning
+// false closes it with io.EOF, as without OnInputEnd.
+//
+// OnInputEnd runs in the connection's round, after OnData has had everything
+// the peer sent before it ended, at most once per connection. It is not asked
+// about the end of input a CloseRead or a lingering close brings, nor about a
+// socket that failed.
+type InputEndHandler interface {
+	Handler
+	OnInputEnd(*Connection) bool
 }
 
 // ShutdownHandler is a Handler told that its engine is shutting down; see

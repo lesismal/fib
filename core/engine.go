@@ -906,6 +906,7 @@ func (e *Engine) noteEvent(c *Connection, events uint32) *Connection {
 	var handler Handler
 	if hangup {
 		c.hangupNoted = true
+		c.hangupReset = events&(evErr|evHup) != 0
 		// Read under the lock, as SetHandler writes it; see
 		// shutdownConnection.
 		handler = c.handler

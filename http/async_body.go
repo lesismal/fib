@@ -368,7 +368,7 @@ func (c *Context) pump(b *asyncBody) {
 	if !b.owned {
 		if !c.hold() {
 			// The request ended: nothing written now reaches the client.
-			err := c.Err()
+			err := c.cancelErr()
 			if err == nil {
 				err = errBodyUnended
 			}
@@ -550,7 +550,7 @@ func (c *Context) holdBodyWhole(hooks *responseHooks, response Response) error {
 		body = bytes.Clone(body)
 	}
 	if !c.hold() {
-		err := c.Err()
+		err := c.cancelErr()
 		if err == nil {
 			err = errBodyUnended
 		}

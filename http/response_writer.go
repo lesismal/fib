@@ -554,7 +554,7 @@ func (c *Context) FlushError() error {
 		// timeout, a reset, a hangup. Nothing flushed would reach the
 		// client, and every Write and Flush from here reports it, as they
 		// report a send that failed.
-		if err := c.Err(); err != nil {
+		if err := c.cancelErr(); err != nil {
 			return w.fail(err)
 		}
 	}

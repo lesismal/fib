@@ -212,19 +212,48 @@ on the engine's handler pool rather than in the connection's round, so a handler
 cleanup cannot hold the server up. `Context.Err()` reports the same reason to a handler that
 would rather ask than be told.
 
+A client that ends its side of the connection, with a FIN, while its
+response is still owed is a different case, since a FIN does not say the
+client has gone: a client that closes sends one, and so does one that only
+shuts its writing side after its request and still reads, as an HTTP/1.0
+client, `nc -N` or a `shutdown(SHUT_WR)` does. fib takes it as `net/http`
+does: the request is cancelled at once, `OnCancel`, `Err` and
+`Context.Context()` all reporting `io.EOF`, but its response is not cut
+off. What the handler still writes goes out, and reaches a client that is
+still reading; the requests pipelined before the FIN are served the same
+way, each cancelled from its start, and the connection closes once the last
+has its response. A client that had closed outright resets the connection
+when a response reaches it, which cuts off whatever is still being answered
+as any close does, and `OnCancel` is not told a second time. A handler that
+stops at `OnCancel` and releases the request answers with whatever it has
+written, as on any release. A FIN in the middle of a streamed body ends the
+connection as before, since the body can never be finished.
+
 That holds for a handler that waits where it is, on a database or another
-server, as well as for one that retained the request. Such a handler holds up
-the connection's round, which is what would read the hangup, so the engine
-tells the server as soon as its event loop sees the peer go, through
-`fib.HangupHandler`. The request is cancelled while the handler still waits,
-and the connection closes, since nothing pipelined behind the request can be
-answered in its place. A client that half-closes its side after sending a
-request is taken to have gone, as nginx takes it, and as `net/http` takes
-it when it cancels the request's context: it gets no response if its handler
-is still working when the FIN arrives. This is the
+server, as well as for one that retained the request through `Retain` or
+`Async`. A handler waiting in place holds up the connection's round, which is
+what would read the FIN, so the engine tells the server as soon as its event
+loop sees it, through `fib.HangupHandler`, and the request is cancelled while
+the handler still waits. Where the event loop saw the socket fail instead, a
+reset among it (`fib.Connection.HangupReset`), nothing written can reach the
+client: the request is cut off and the connection closes, since nothing
+pipelined behind it can be answered in its place. So is one whose handler is
+waiting on a hold of the request's own, as one whose writes `OnHeaderAsync`
+holds is, which nothing the client sends can settle any more. This is the
 epoll and kqueue backends' doing. On Windows, which arms a read only between
 rounds, a handler that waits in place hears nothing until it returns, by which
 time its response has gone out.
+
+*Decision pending review (2026-11-09).* Until then a FIN was taken for the
+client going, as nginx takes it: a retained request was cut off, and an
+`Async` reply to a client that half-closed after its request was never
+written, which fasthttp and `net/http` both deliver. Taking the FIN as
+`net/http` does keeps both prompt cancellation, for long polls and a proxy
+waiting on its upstream, and delivery to a half-closed client. The cost is
+that a client that closed outright is no longer cut off at the FIN: a handler
+that ignores the cancellation and writes anyway has its first write go to a
+socket the client resets. The engine side is `fib.InputEndHandler`, which
+lets any protocol keep a connection open past the end of its peer's input.
 
 `Request.Context()` is not cancelled, so that a request needs no context of
 its own. Code that hears of a request ending only through a
@@ -764,9 +793,9 @@ are not fib:
   after the handler returned, the release after a body's last callback,
   chunked with trailers, answering early and closing the body, a client that
   walks away mid-upload reaching `OnBody` and
-  `OnCancel` exactly once, a client that hangs up on a handler waiting in
-  place reaching `OnCancel` and `Err` while it waits, with nothing pipelined
-  behind it answered, a read timeout reaching `OnCancel`, an oversized
+  `OnCancel` exactly once, a client that half-closes on a handler waiting in
+  place reaching `OnCancel` and `Err` while it waits and still reading its
+  answer and the one pipelined behind it, a read timeout reaching `OnCancel`, an oversized
   body, holds taken after the response was written, the same handler over
   HTTP/2, and a stress test running all of it at once and checking that
   nothing is left behind.

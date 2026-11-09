@@ -436,7 +436,7 @@ func TestCoverWriterInvalidHeaderClosesConnection(t *testing.T) {
 	}
 }
 
-// cvWrCancelled serves one request that its handler retains, closes the
+// cvWrCancelled serves one request that its handler retains, resets the
 // client's connection under it, and returns the Context once OnCancel has
 // reported the close. The caller still has to Release it.
 func cvWrCancelled(t *testing.T, config Config, request string) *Context {
@@ -456,6 +456,10 @@ func cvWrCancelled(t *testing.T, config Config, request string) *Context {
 	case <-time.After(10 * time.Second):
 		t.Fatal("the handler never ran")
 	}
+	// Reset rather than closed: a FIN on a retained request cancels it but
+	// leaves its response open (see Context.OnCancel), and these tests want
+	// one cut off.
+	_ = conn.Conn.(*net.TCPConn).SetLinger(0)
 	conn.Close()
 	select {
 	case err := <-cancelled:

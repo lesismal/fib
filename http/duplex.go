@@ -135,7 +135,7 @@ func (d *Duplex) Close() error {
 	if d.err == nil {
 		// The request may have ended under the response; ask here, while the
 		// Context is still this request's, so that Err never has to later.
-		d.err = d.c.Err()
+		d.err = d.c.cancelErr()
 	}
 	d.mu.Unlock()
 	return d.teardown()
@@ -189,7 +189,7 @@ func (d *Duplex) Err() error {
 	if d.closed {
 		return ErrDuplexClosed
 	}
-	return d.c.Err()
+	return d.c.cancelErr()
 }
 
 // setErr keeps the first error the duplex saw.
@@ -241,7 +241,7 @@ func (c *Context) ServeDuplex(h DuplexHandler) error {
 		return ErrResponseWritten
 	}
 	if !c.hold() {
-		if err := c.Err(); err != nil {
+		if err := c.cancelErr(); err != nil {
 			return err
 		}
 		return ErrResponseWritten
@@ -292,7 +292,7 @@ func (d *Duplex) finish() {
 	if d.err == nil {
 		// Record the request's error before Release may let the Context serve
 		// another one, so that Err after the handler never asks it.
-		d.err = d.c.Err()
+		d.err = d.c.cancelErr()
 	}
 	d.mu.Unlock()
 	d.teardown()

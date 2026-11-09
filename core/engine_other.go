@@ -535,6 +535,11 @@ func (e *Engine) readConnection(c *Connection) {
 			// stays open until it is closed.
 			return
 		}
+		if (err == io.EOF || err == nil && n == 0) && !c.udp && c.offerInputEnd() {
+			// The handler is asked about the end in its own round, behind
+			// what the peer sent before it; see InputEndHandler.
+			return
+		}
 		if err != nil {
 			if c.isLingering() {
 				// The peer ended its side, or the linger ran out: either way
@@ -777,6 +782,9 @@ type portableEvent struct {
 	data     []byte
 	closeErr error
 	closing  bool
+	// inputEnd is the peer's end of input, for the handler to be asked
+	// about once it has had everything before it; see InputEndHandler.
+	inputEnd bool
 }
 
 type connectionAttachment struct{ value any }
@@ -1155,6 +1163,30 @@ func (c *Connection) isLingering() bool {
 	return lingering
 }
 
+// offerInputEnd queues the peer's end of input for the handler's round, when
+// the handler is one that may keep the connection open past it, and reports
+// whether it did. A lingering close, or a connection already closing, takes
+// the end as before.
+func (c *Connection) offerInputEnd() bool {
+	c.mu.Lock()
+	if _, ok := c.handler.(InputEndHandler); !ok || c.closing || c.lingering || c.readShut {
+		c.mu.Unlock()
+		return false
+	}
+	c.events = append(c.events, portableEvent{inputEnd: true})
+	submit := !c.scheduled
+	c.scheduled = true
+	c.mu.Unlock()
+	if submit && !c.engine.submit(c) {
+		c.closeWithError(errors.New("task pool stopped"))
+	}
+	return true
+}
+
+// HangupReset reports false: this backend calls no OnHangup; see
+// HangupHandler.
+func (c *Connection) HangupReset() bool { return false }
+
 func (c *Connection) enqueueData(data []byte) bool {
 	c.mu.Lock()
 	if c.closing {
@@ -1196,6 +1228,17 @@ func (c *Connection) process() {
 		if event.closing {
 			c.engine.finishConnection(c, event.closeErr)
 			return
+		}
+		if event.inputEnd {
+			if h, ok := c.handler.(InputEndHandler); ok && h.OnInputEnd(c) {
+				c.mu.Lock()
+				c.readShut = true
+				c.mu.Unlock()
+				continue
+			}
+			// The close queues behind this round, which carries it out.
+			c.closeWithError(io.EOF)
+			continue
 		}
 		c.handler.OnData(c, event.data)
 	}

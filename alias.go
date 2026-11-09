@@ -180,6 +180,17 @@ type HandlerFuncs = core.HandlerFuncs
 // be without OnHangup.
 type HangupHandler = core.HangupHandler
 
+// InputEndHandler is a Handler asked, when its peer has ended its side of
+// the connection, whether the connection stays open to finish sending: a FIN
+// may mean the peer has closed outright or only shut its writing side, and a
+// protocol that still owes it an answer keeps the connection by returning
+// true. Input then ends as CloseRead ends it, sends go on until the protocol
+// closes the connection or the peer resets it, and returning false closes it
+// with io.EOF, as without OnInputEnd. It runs in the connection's round,
+// after OnData has had everything sent before the end, at most once per
+// connection.
+type InputEndHandler = core.InputEndHandler
+
 // Layer carries a connection's sends, transforming them on the way to the
 // socket. The tls package installs one that encrypts; any other protocol that
 // frames or encrypts what a connection sends, such as a DTLS implementation

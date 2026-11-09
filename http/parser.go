@@ -419,6 +419,17 @@ type Parser struct {
 	// that a handler switched to another protocol through Context.Upgrade.
 	spent    bool
 	upgraded bool
+	// inputEnded records a client that ended its side of the connection
+	// while a request it sent was still being answered, which the
+	// connection stays open for; see ServerHandler.OnInputEnd. Set under
+	// mu, and read without it by a switch to a tunnel.
+	inputEnded atomic.Bool
+	// hangupHeard records that the event loop saw the client end its side
+	// while a round was running, which may still have what the client sent
+	// before the end to read: the requests begun from then on are
+	// cancelled, but only the round's reading the end, inputEnded, lets the
+	// connection close. See ServerHandler.OnHangup.
+	hangupHeard atomic.Bool
 	// lingers records that the request a spent connection ends on left its
 	// body still arriving, which the close lingers for; see
 	// closeAfterResponse.
@@ -479,6 +490,8 @@ func (p *Parser) Reset() {
 	p.stream, p.busy, p.spent, p.upgraded = nil, false, false, false
 	p.headerComplete, p.requestStart, p.bodyStart = false, time.Time{}, time.Time{}
 	p.live.Store(nil)
+	p.inputEnded.Store(false)
+	p.hangupHeard.Store(false)
 	p.resetServerState()
 }
 

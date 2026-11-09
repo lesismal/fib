@@ -170,13 +170,32 @@ func(c *fibhttp.Context) {
 连接的一轮里，所以 handler 的清理逻辑拖不住服务端。想主动查的话 `Context.Err()` 给出同样的
 原因。
 
-这对原地阻塞的 handler（等数据库、等上游服务）同样成立，不只限于 `Retain` 了请求的
-handler。这样的 handler 占着连接的这一轮，而读到对端断开本该由这一轮来做，所以 engine 的
-事件循环一看到对端断开，就通过 `fib.HangupHandler` 提前告知服务端：请求在 handler 还在
-等待时就被取消，连接随之关闭，因为排在它后面的流水线请求不能顶替它被回复。发完请求就
-半关闭写端的客户端被视为已经离开，与 nginx 的处理一致，`net/http` 也会因此取消请求的
-context：如果 FIN 到达时 handler 还在处理，它就收不到响应。这是 epoll 和 kqueue 后端才有的能力；Windows 只在两轮
-之间才挂读，原地阻塞的 handler 要等到返回才会知道，而那时响应已经发出去了。
+客户端在响应还没给出时用 FIN 结束自己这一侧，是另一种情况，因为 FIN 并不说明客户端已经
+离开：关闭连接的客户端会发 FIN，发完请求只关闭写端、仍在读的客户端（HTTP/1.0 客户端、
+`nc -N`、调用 `shutdown(SHUT_WR)` 的程序）也会发。fib 按 `net/http` 的方式处理：请求立即被
+取消，`OnCancel`、`Err` 和 `Context.Context()` 都报告 `io.EOF`，但响应不会被切断。handler
+之后写的内容照样发出，仍在读的客户端能收到；FIN 之前流水线发来的请求也同样处理，各自从
+一开始就是已取消状态，最后一个请求的响应发完后连接关闭。如果客户端其实已经彻底关闭，
+响应到达时它会 reset 连接，这会像任何关闭一样切断还在处理的请求，`OnCancel` 不会被再通知
+一次。在 `OnCancel` 里放弃并 `Release` 请求的 handler，会以它已经写出的内容作答，与任何
+`Release` 一样。流式 body 收到一半时来的 FIN 仍然结束连接，因为 body 再也收不完了。
+
+这对原地阻塞的 handler（等数据库、等上游服务）同样成立，不只限于通过 `Retain` 或 `Async`
+保留了请求的 handler。原地阻塞的 handler 占着连接的这一轮，而读到 FIN 本该由这一轮来做，
+所以 engine 的事件循环一看到它，就通过 `fib.HangupHandler` 提前告知服务端，请求在 handler
+还在等待时就被取消。如果事件循环看到的是 socket 出错（包括 reset，见
+`fib.Connection.HangupReset`），写什么都到不了客户端：请求被切断，连接随之关闭，因为排在它
+后面的流水线请求不能顶替它被回复。handler 在等请求自己的某个引用（比如写入被
+`OnHeaderAsync` 扣住）时也是如此，因为客户端再发什么都解不开它了。这是 epoll 和 kqueue 后端
+才有的能力；Windows 只在两轮之间才挂读，原地阻塞的 handler 要等到返回才会知道，而那时响应
+已经发出去了。
+
+*待审的决定（2026-11-09）。* 此前 FIN 被视为客户端已经离开，与 nginx 一致：保留中的请求被
+切断，发完请求就半关闭的客户端收不到 `Async` 的回复，而 fasthttp 和 `net/http` 都会送达。
+按 `net/http` 的方式处理 FIN，既保留了及时取消（长轮询、等待上游的代理），也能把响应送到
+半关闭的客户端。代价是：彻底关闭的客户端在 FIN 时不再被切断，无视取消仍去写的 handler，
+第一次写会发到一个随后被客户端 reset 的 socket 上。engine 一侧是 `fib.InputEndHandler`，
+任何协议都可以借它在对端输入结束后继续保持连接。
 
 `Request.Context()` 不会被取消，这样请求不必各自带一个 context。只通过 `context.Context`
 得知请求结束的代码（`database/sql`、`httputil.ReverseProxy`、gRPC 客户端等）改用
@@ -531,8 +550,8 @@ TLS 1.3 或 1.2 的 AES-GCM、ChaCha20-Poly1305，TLS 1.2 或 1.1 的 AES-CBC）
   的请求挡住后面的流水线请求、嵌套持有、`OnBody` 对缓存 body 和流式 body、`OnBody` 只登记
   不回调、`BodyComplete`、handler 返回后才调用 `OnBody`、最后一次 body 回调之后自动释放、
   带 trailer 的 chunked、提前回复并关闭 body、客户端上传到一半跑掉时 `OnBody` 和
-  `OnCancel` 各只收到一次、原地阻塞的 handler 在等待期间就能通过 `OnCancel` 和 `Err`
-  得知客户端已断开且其后流水线的请求不会被回复、读超时触发 `OnCancel`、body 超限、响应写完之后再 Retain、同一
+  `OnCancel` 各只收到一次、原地阻塞的 handler 在客户端半关闭时、等待期间就能通过
+  `OnCancel` 和 `Err` 得知，且客户端仍能读到它的响应和其后流水线请求的响应、读超时触发 `OnCancel`、body 超限、响应写完之后再 Retain、同一
   个 handler 跑在 HTTP/2 上，以及把以上全部并发跑一遍并检查没有残留的压力测试。
 - **读超时**（`http/timeout_test.go`）：header 和 body 收到一半就不来了、流式 body
   收到一半就不来了、比 `ReadTimeout` 慢的 handler 仍然能回复、空闲连接被关闭、每个请求

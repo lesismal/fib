@@ -461,8 +461,10 @@ func TestOnCancelReportsAClosedConnection(t *testing.T) {
 // TestOnCancelReportsAHangupToABlockingHandler covers a handler that waits in
 // place rather than retaining, which holds up the round that would read its
 // peer's hangup: it still hears of it while it waits, through OnCancel and
-// Err, rather than never, and the request pipelined behind it is not answered
-// in its place. The client half-closes, so it can see that nothing came back.
+// Err, rather than never. As in net/http, the end of the client's input
+// cancels the request without cutting off its response: the client only
+// half-closed, and reads what the handler answers anyway, and the answer to
+// the request it pipelined behind, which is cancelled from its start.
 func TestOnCancelReportsAHangupToABlockingHandler(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("Windows arms a connection's read only between its rounds; see fib.HangupHandler")
@@ -535,13 +537,25 @@ func TestOnCancelReportsAHangupToABlockingHandler(t *testing.T) {
 			if err := <-finished; err != io.EOF {
 				t.Fatalf("Err() was %v once the handler was done, want io.EOF", err)
 			}
-			if got, _ := io.ReadAll(conn); len(got) != 0 {
-				t.Fatalf("the client was sent %q after it hung up", got)
+			r := bufio.NewReader(conn)
+			for _, path := range []string{"/wait", "/behind"} {
+				resp, err := stdhttp.ReadResponse(r, nil)
+				if err != nil {
+					t.Fatalf("%s: the answer did not reach the half-closed client: %v", path, err)
+				}
+				body, _ := io.ReadAll(resp.Body)
+				resp.Body.Close()
+				if string(body) != "too late" {
+					t.Fatalf("%s: body %q, want %q", path, body, "too late")
+				}
+				if path == "/behind" {
+					if err := <-finished; err != io.EOF {
+						t.Fatalf("Err() was %v on the request pipelined behind, want io.EOF", err)
+					}
+				}
 			}
-			select {
-			case <-started:
-				t.Fatal("the request pipelined behind the cancelled one was served")
-			case <-time.After(200 * time.Millisecond):
+			if got, _ := io.ReadAll(r); len(got) != 0 {
+				t.Fatalf("the client was sent %q after the last answer", got)
 			}
 		})
 	}

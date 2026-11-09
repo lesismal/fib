@@ -203,10 +203,21 @@ const (
 	// ctxReader marks a handler running on the goroutine that reads its
 	// multiplexed connection, until it returns; see onReader.
 	ctxReader uint64 = 1 << 25
+	// ctxHandedOff marks a request its handler took through Retain or
+	// Async, saying it is answered from elsewhere rather than waited on in
+	// place, so that a half-close is not taken for the client going; see
+	// ServerHandler.OnHangup.
+	ctxHandedOff uint64 = 1 << 26
+	// ctxInputEnded marks a request whose client ended its side of the
+	// connection before the response was written. It is cancelled, as
+	// OnCancel, Err and Context report, but not cut off: the response
+	// stays open and is still written, which a client that only shut its
+	// writing side reads. It is set under mu; see endInput.
+	ctxInputEnded uint64 = 1 << 27
 	// The state takes two bits, and the generation the rest.
-	ctxStateShift        = 26
+	ctxStateShift        = 28
 	ctxStateMask  uint64 = 3 << ctxStateShift
-	ctxGenShift          = 28
+	ctxGenShift          = 30
 
 	// ctxAlive is what keeps the Context the request's.
 	ctxAlive = ctxHolds | ctxServed | ctxConn | ctxCancelling | ctxFinishing
@@ -383,7 +394,11 @@ func (c *Context) reopen() {
 // recycled under it, whenever the cancellation lands.
 //
 // A handler may hold at most 65535 Retains on one request at a time.
-func (c *Context) Retain() { c.hold() }
+func (c *Context) Retain() {
+	if c.hold() {
+		c.word.Or(ctxHandedOff)
+	}
+}
 
 // hold is Retain, reporting whether it took a hold.
 func (c *Context) hold() bool {
@@ -418,6 +433,9 @@ func (c *Context) hold() bool {
 // holds the request as a Retain never released does.
 func (c *Context) Async(fn func()) func() {
 	held := c.hold()
+	if held {
+		c.word.Or(ctxHandedOff)
+	}
 	var ran atomic.Bool
 	return func() {
 		if !ran.CompareAndSwap(false, true) {
@@ -490,7 +508,24 @@ func (c *Context) Status() int {
 // is still going. Writing to a Context whose connection has gone fails with
 // the same reason, so a handler that does not check Err does not corrupt
 // anything; it only finds out later.
+//
+// A client that ends its side of the connection while the response is still
+// owed, which a client that closes it does and one that only shuts its
+// writing side does too, cancels the request with io.EOF without cutting it
+// off: Err reports io.EOF, but what the handler writes still goes, and
+// reaches a client that is still reading.
 func (c *Context) Err() error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.err == nil && c.word.Load()&ctxInputEnded != 0 {
+		return io.EOF
+	}
+	return c.err
+}
+
+// cancelErr is why the response was cut off, or nil while it can still be
+// written: Err, but for a request whose client only ended its side.
+func (c *Context) cancelErr() error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	return c.err
@@ -520,6 +555,15 @@ func (c *Context) Err() error {
 // has to Release what it retained. Nothing more is written then, but the
 // request, its body and the Context stay the handler's until it has, and are
 // recycled or given back only after its last Release.
+//
+// An HTTP/1 client that ends its side of the connection while the handler
+// is answering from elsewhere, having retained the request, cancels it with
+// io.EOF too, but leaves the response open, as net/http leaves its own after
+// cancelling the request's context: a FIN may be a client that has closed or
+// one that only shut its writing side and still reads, and what the handler
+// writes reaches the latter. A handler that gives up on the request and
+// releases it answers with whatever it has written, as on any release. The
+// connection closes once the response has gone.
 // Registering it on a request that has already ended runs it at once, and
 // registering it once the response has been written does nothing.
 func (c *Context) OnCancel(fn func(error)) {
@@ -529,7 +573,8 @@ func (c *Context) OnCancel(fn func(error)) {
 	c.mu.Lock()
 	// cancelWith moves the state on under mu, so what is read here is either
 	// before it, and fn is left for it to run, or after it, with err set.
-	switch ctxState(c.word.Load()) {
+	w := c.word.Load()
+	switch ctxState(w) {
 	case ctxCancelled:
 		err := c.err
 		c.mu.Unlock()
@@ -537,6 +582,11 @@ func (c *Context) OnCancel(fn func(error)) {
 		return
 	case ctxDone:
 		c.mu.Unlock()
+		return
+	}
+	if w&ctxInputEnded != 0 {
+		c.mu.Unlock()
+		fn(io.EOF)
 		return
 	}
 	if h := c.hooks(); h.fn == nil {
@@ -644,6 +694,8 @@ func (c *Context) Context() context.Context {
 	h := c.hooks()
 	if ctxState(w) == ctxCancelled {
 		stop(c.err)
+	} else if w&ctxInputEnded != 0 {
+		stop(io.EOF)
 	} else {
 		h.stop = stop
 	}
@@ -1259,6 +1311,44 @@ func (c *Context) markCancelled(err error, gen uint64) func() {
 			done |= ctxConn
 		}
 		c.drop(done)
+	}
+}
+
+// endInput tells a request in generation gen that its client has ended its
+// side of the connection: it is cancelled with io.EOF, as OnCancel, Err and
+// Context report, but stays open, so that what its handler writes still goes;
+// see OnCancel. It returns what tells the handler, to run off the connection's
+// round, or nil when there is nothing to tell: a request no longer open in
+// gen, or one told already. A cancellation that cuts the request off later,
+// the client resetting the connection, finds the callbacks run already.
+func (c *Context) endInput(gen uint64) func() {
+	c.mu.Lock()
+	for {
+		w := c.word.Load()
+		if ctxState(w) != ctxOpen || w>>ctxGenShift != gen || w&ctxInputEnded != 0 {
+			c.mu.Unlock()
+			return nil
+		}
+		if c.word.CompareAndSwap(w, w|ctxInputEnded) {
+			break
+		}
+	}
+	var onCancel func(error)
+	var more *[]func(error)
+	var stop context.CancelCauseFunc
+	if h := c.cancel.Load(); h != nil {
+		onCancel, more, stop = h.fn, h.more, h.stop
+		h.fn, h.more, h.stop = nil, nil, nil
+	}
+	c.mu.Unlock()
+	if onCancel == nil && more == nil && stop == nil {
+		return nil
+	}
+	return func() {
+		if stop != nil {
+			stop(io.EOF)
+		}
+		runCancel(onCancel, more, io.EOF)
 	}
 }
 

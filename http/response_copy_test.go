@@ -481,6 +481,10 @@ func TestResponseCopyReleasesOnCancel(t *testing.T) {
 	case <-time.After(10 * time.Second):
 		t.Fatal("the handler never ran")
 	}
+	// Reset rather than closed: a FIN cancels the request but leaves its
+	// response open, as net/http does (see Context.OnCancel), and this test
+	// wants one cut off.
+	_ = conn.(*net.TCPConn).SetLinger(0)
 	conn.Close()
 	var got result
 	select {
