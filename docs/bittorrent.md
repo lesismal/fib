@@ -255,7 +255,13 @@ _, err = io.Copy(w, r)
   `State` and `Err`, `Start`, `Pause`, `Stop` and `Remove(deleteData)`, `SetSequential`,
   `SetFilePriority` (`PriorityNone`, `Low`, `Normal`, `High`), `AddPeers`, `Files`, `Stats`, `Peers`
   and `NewReader`. `Config.OnEvent` hears metadata, checked, piece verified, hash failed, completed,
-  peer connected, disconnected and banned, seed limit, state changes and errors, in order.
+  peer connected, disconnected and banned, seed limit, state changes and errors, in order. The
+  queue of events waiting while `OnEvent` runs is bounded (`Config.EventQueue`,
+  `DefaultEventQueue` = 4096): past it piece and peer events are dropped, the oldest first, the
+  others never; an `EventDropped` (with `Dropped`, the count) follows the events taken when some
+  were dropped, and `Client.DroppedEvents()` counts them all. A `Reader`'s `Close` may come from
+  any goroutine: it ends a `Read` waiting for a piece, which returns `net.ErrClosed`, without
+  waiting for it.
 - **Storage** is a `Storage` (`ReadAt` and `WriteAt` by file index, `Close`): files below
   `DataDir` (`NewFileStorage`, paths made safe for the operating system by `SanitizePath`, BEP 47
   padding never written) or memory (`NewMemoryStorage`). What storage holds when a torrent is added
@@ -314,7 +320,8 @@ _, err = io.Copy(w, r)
   and `DialsPerTick` (8), with backoff. Of two connections to one peer, the one the lower peer ID
   began is kept.
 - **Peers** come from trackers (tiered, started, completed and stopped, under both hashes of a
-  hybrid), the DHT (announce every 15 minutes, every minute while there are none; `PORT` both
+  hybrid; completed only for a download that finished in this session, never for data that was
+  complete when its check ended), the DHT (announce every 15 minutes, every minute while there are none; `PORT` both
   ways), PEX (a message a minute per peer), local service discovery (BEP 14, IPv4), a magnet's
   `x.pe`, `AddPeers` and `Config.PeerSources`; a private torrent uses its trackers alone. Web seeds
   (BEP 19) serve whole pieces through range requests on the fib/http client.
@@ -735,4 +742,41 @@ alternative.
   after `Close` closes itself). Requests of the HTTP client in flight at `Close` end with their
   contexts (the torrents' are cancelled), not by stopping the engine. Alternatives: a
   `NewClientOn` constructor; a core `Engine.RemoveBindingAndConns`.
+- **`Config.EventQueue` (A80): drop, not coalesce, and only piece and peer events.** The queue
+  counts the events waiting while `OnEvent` runs (4096 by default; zero or negative takes the
+  default). A full queue drops a new `EventPieceVerified`, `EventHashFailed`,
+  `EventPeerConnected` or `EventPeerDisconnected`; any other event drops the oldest queued one of
+  those to make room, and is queued past the bound when none is left, so metadata, checked,
+  completed, banned, seed limit, state changes and errors always arrive, in order. Those come a
+  few per torrent, so the excess stays small. Why: the dropped kinds come in bursts, and
+  `Torrent.Stats` and `Torrent.Peers` give their sum at any time. Dropping keeps
+  every delivered event a real one with its fields; coalescing (one "pieces verified" event with a
+  range, or the last state per torrent) would need new event shapes. The drop count is both an
+  event and a counter: `EventDropped` (a new type, appended so the others keep their values, with
+  a new `Event.Dropped` field and `Torrent` nil) follows the batch the dispatcher took, telling a
+  handler such as an SSE stream to resynchronise from `Stats`; `Client.DroppedEvents()` is the
+  total since the client started. `EventPeerBanned` is never dropped, being rare and acted on.
+  Alternatives: coalescing piece events per torrent; blocking `emit` (it runs under the torrent's
+  lock, often on a fib worker); keeping an unbounded queue as an option (say `EventQueue`
+  negative), not offered.
+- **`Reader.Close` interrupts a `Read` (A83)** instead of waiting for it on the reader's lock:
+  `Close` closes a channel the waits in `Read` select on (beside the context and the torrent's
+  removal) and drops the reader's window under the torrent's lock without taking the reader's,
+  so it returns at once even while a `Read` is in a storage read. The interrupted `Read` returns
+  `net.ErrClosed`, as a `Read` after `Close` already did (and as `net.Conn` does), rather than
+  `os.ErrClosed` or `io.ErrClosedPipe`. A `Read` that had passed its check and sets its window
+  after `Close` finds the reader closed under the torrent's lock and sets nothing, so a closed
+  reader never keeps pieces urgent. A `Read` already copying data from storage finishes that copy
+  and returns it. Alternative: cancel a per-read context derived from `SetContext`'s, which would
+  turn `ctx.Err()` into the close error.
+- **A seed does not announce `completed` (A86)**: the tracker loops announce `completed` only
+  when the torrent was missing wanted pieces at some point after its first storage check ended,
+  and then had them all: a download this session. Data complete at the end of the check (a seed,
+  or a download finished in an earlier run and checked or resumed now) never announces it,
+  whether the `started` announce went out during the check or after. A seed whose selection later
+  grows and which downloads the new files does announce it, being a download. As before, at most
+  one `completed` per torrent per session, and none when the download finished before the tracker
+  loop started (a torrent paused while completing) or before its `started` announce succeeded.
+  Alternatives: comparing `left` at the `started` announce (wrong when started goes out during the
+  check, as it does), or never announcing `completed` after a pause.
 

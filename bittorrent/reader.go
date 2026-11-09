@@ -16,7 +16,8 @@ const DefaultReadahead = 4 << 20
 // waits for the piece it needs, and the pieces from the position to the
 // readahead go before all others, nearest first, so that a file plays
 // while it streams in. It is an io.ReadSeekCloser; one goroutine at a
-// time may use it.
+// time may use it, except for Close, which any goroutine may call to end
+// a Read waiting for a piece.
 type Reader struct {
 	t     *Torrent
 	start int64
@@ -30,7 +31,10 @@ type Reader struct {
 	ctx       context.Context
 	first     int
 	last      int
-	closed    bool
+
+	closeOnce sync.Once
+	// done is closed by Close; Read waits on it, without r.mu.
+	done chan struct{}
 }
 
 // NewReader returns a Reader of the torrent's data, all its files one
@@ -48,7 +52,7 @@ func (t *Torrent) NewReader() *Reader {
 }
 
 func (t *Torrent) newReader(start, length int64) *Reader {
-	return &Reader{t: t, start: start, length: length, readahead: DefaultReadahead, ctx: context.Background(), first: -1, last: -1}
+	return &Reader{t: t, start: start, length: length, readahead: DefaultReadahead, ctx: context.Background(), first: -1, last: -1, done: make(chan struct{})}
 }
 
 // SetReadahead sets how many bytes past the position are fetched first.
@@ -65,16 +69,21 @@ func (r *Reader) SetContext(ctx context.Context) {
 	r.mu.Unlock()
 }
 
-// Read reads at the position, waiting for the piece there.
+// Read reads at the position, waiting for the piece there. A reader
+// closed, before or during the read, gives net.ErrClosed.
 func (r *Reader) Read(p []byte) (int, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	if r.closed {
+	select {
+	case <-r.done:
 		return 0, net.ErrClosed
+	default:
 	}
 	t := r.t
 	select {
 	case <-t.gotInfo:
+	case <-r.done:
+		return 0, net.ErrClosed
 	case <-r.ctx.Done():
 		return 0, r.ctx.Err()
 	case <-t.removed:
@@ -115,6 +124,8 @@ func (r *Reader) Read(p []byte) (int, error) {
 		}
 		select {
 		case <-sig:
+		case <-r.done:
+			return 0, net.ErrClosed
 		case <-r.ctx.Done():
 			return 0, r.ctx.Err()
 		case <-t.removed:
@@ -157,14 +168,20 @@ func (r *Reader) Seek(offset int64, whence int) (int64, error) {
 	return abs, nil
 }
 
-// Close stops the reader's priority over other pieces.
+// Close stops the reader's priority over other pieces, and ends a Read
+// under way, which returns net.ErrClosed: Close does not wait for it, or
+// for a piece.
 func (r *Reader) Close() error {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	if r.closed {
+	closed := false
+	r.closeOnce.Do(func() {
+		close(r.done)
+		closed = true
+	})
+	if !closed {
 		return nil
 	}
-	r.closed = true
+	// A Read past its own check of done may still call setWindow, which
+	// sees done closed under t.mu, so the window this removes stays gone.
 	t := r.t
 	t.mu.Lock()
 	defer t.mu.Unlock()
@@ -181,6 +198,11 @@ func (t *Torrent) setWindow(r *Reader, from, to int64) {
 	defer t.mu.Unlock()
 	if t.info == nil {
 		return
+	}
+	select {
+	case <-r.done:
+		return
+	default:
 	}
 	first := int(from / t.info.PieceLength)
 	last := int((max(to, from+1) - 1) / t.info.PieceLength)

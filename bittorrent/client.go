@@ -63,6 +63,7 @@ const (
 	DefaultUTPDialTimeout     = 5 * time.Second
 	DefaultDHTRetryInterval   = time.Minute
 	DefaultLSDInterval        = 5 * time.Minute
+	DefaultEventQueue         = 4096
 )
 
 // Config configures a Client. Its zero value is a working client that
@@ -121,6 +122,15 @@ type Config struct {
 	// OnEvent, when set, hears the client's events in order, on a
 	// goroutine of its own: it may call the client, and should be quick.
 	OnEvent func(Event)
+	// EventQueue bounds the events waiting for OnEvent while it runs;
+	// DefaultEventQueue when zero. Past it the oldest piece and peer
+	// events (EventPieceVerified, EventHashFailed, EventPeerConnected,
+	// EventPeerDisconnected) are dropped to make room, and new ones are
+	// dropped when no older one is left to drop; the other events are
+	// never dropped, and take the queue past the bound when they must.
+	// OnEvent hears an EventDropped after the events it missed, and
+	// Client.DroppedEvents counts them all.
+	EventQueue int
 	// MinAnnounceInterval is the least time between a torrent's announces
 	// to its trackers, whatever their interval; one second when zero.
 	MinAnnounceInterval time.Duration
@@ -196,6 +206,7 @@ func (cfg *Config) setDefaults() {
 	def(&cfg.MaxHalfOpen, DefaultMaxHalfOpen)
 	def(&cfg.DialsPerTick, DefaultDialsPerTick)
 	def(&cfg.UploadSlots, DefaultUploadSlots)
+	def(&cfg.EventQueue, DefaultEventQueue)
 	if cfg.MinAnnounceInterval <= 0 {
 		cfg.MinAnnounceInterval = time.Second
 	}
@@ -261,8 +272,13 @@ type Client struct {
 	evMu     sync.Mutex
 	evCond   sync.Cond
 	events   []Event
+	evSpare  []Event // the slice dispatch handed out last, for reuse
 	evClosed bool
 	evDone   chan struct{}
+	// evDrops counts the events dropped since the last EventDropped;
+	// evDropped all of them.
+	evDrops   int
+	evDropped atomic.Int64
 }
 
 // ErrTorrentExists is what adding a torrent the client has already gets.

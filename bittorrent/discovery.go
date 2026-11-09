@@ -310,7 +310,8 @@ func (t *Torrent) left() int64 {
 
 // trackerSource announces to the torrent's trackers, tier by tier (BEP
 // 12): started first, then at the interval each answer gives, completed
-// when the download finishes, stopped when the torrent pauses.
+// when a download finishes (never for a seed's data, complete when its
+// check ends), stopped when the torrent pauses.
 type trackerSource struct{}
 
 func (trackerSource) Find(ctx context.Context, t *Torrent, found func([]netip.AddrPort)) {

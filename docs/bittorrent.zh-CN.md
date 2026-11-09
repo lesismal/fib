@@ -220,7 +220,11 @@ _, err = io.Copy(w, r)
   `Done`、`Removed` 三个 channel，`State` 与 `Err`，`Start`、`Pause`、`Stop`、`Remove(deleteData)`，
   `SetSequential`，`SetFilePriority`（`PriorityNone`、`Low`、`Normal`、`High`），`AddPeers`、`Files`、`Stats`、
   `Peers` 和 `NewReader`。`Config.OnEvent` 按顺序收到 metadata、校验完成、分片校验通过、哈希失败、下载完成、
-  peer 连上、断开、被封禁、达到做种上限、状态变化和错误等事件。
+  peer 连上、断开、被封禁、达到做种上限、状态变化和错误等事件。`OnEvent` 运行期间排队等待的事件有上限
+  （`Config.EventQueue`，`DefaultEventQueue` = 4096）：超过时丢弃分片和 peer 事件，最旧的先丢，其他事件从不
+  丢弃；有事件被丢弃时，取出的那批事件之后会跟一个 `EventDropped`（`Dropped` 为条数），
+  `Client.DroppedEvents()` 统计全部丢弃数。`Reader` 的 `Close` 可在任意 goroutine 调用：它结束正在等待分片的
+  `Read`（返回 `net.ErrClosed`），且不等它返回。
 - **存储**是一个 `Storage`（按文件序号的 `ReadAt`、`WriteAt`，以及 `Close`）：`DataDir` 下的文件
   （`NewFileStorage`，路径经 `SanitizePath` 按操作系统处理安全，BEP 47 的填充从不写入），或内存
   （`NewMemoryStorage`）。加入 torrent 时会对存储里已有的数据做哈希校验，中断的下载因此可以续传。
@@ -262,7 +266,8 @@ _, err = io.Copy(w, r)
 - **连接**先拨 uTP 再拨 TCP；先 MSE、被拒后再明文（默认的 `EncryptionPrefer`），`EncryptionAllow` 反过来，
   `EncryptionRequire` 绝不用明文；受 `MaxConns`（200）、`MaxConnsPerTorrent`（50）、`MaxHalfOpen`（32）和
   `DialsPerTick`（8）限制，失败后退避。与同一 peer 的两条连接，保留 peer ID 较小的一方发起的那条。
-- **peer** 来自 tracker（分 tier，发 started、completed、stopped，hybrid 用两个哈希都 announce）、DHT（每 15 分钟
+- **peer** 来自 tracker（分 tier，发 started、completed、stopped，hybrid 用两个哈希都 announce；completed 只为
+  本次会话中完成的下载发送，校验结束时就已完整的数据从不发送）、DHT（每 15 分钟
   announce 一次，没有 peer 时每分钟一次；双向 `PORT`）、PEX（每个 peer 每分钟一条）、本地服务发现（BEP 14，
   IPv4）、磁力链接的 `x.pe`、`AddPeers` 和 `Config.PeerSources`；私有 torrent 只用它的 tracker。web seed（BEP 19）
   经 fib/http 客户端用 range 请求提供整个分片。
@@ -590,4 +595,29 @@ FIB_DHT_PUBLIC=1 FIB_DHT_INFOHASH=<40 位十六进制> go test -run TestDHTPubli
   `Close` 之后才完成的拨号会自行关闭）。`Close` 时 HTTP 客户端尚在进行的请求随其 context（torrent 的
   context 已取消）结束，而不是靠停止引擎。备选：`NewClientOn` 构造函数；core 的
   `Engine.RemoveBindingAndConns`。
+- **`Config.EventQueue`（A80）：丢弃而非合并，且只丢分片和 peer 事件。** 队列计的是 `OnEvent` 运行期间
+  等待的事件（默认 4096；零或负数取默认值）。队列满时，新来的 `EventPieceVerified`、`EventHashFailed`、
+  `EventPeerConnected` 或 `EventPeerDisconnected` 被丢弃；其他事件则丢掉队列中最旧的一个上述事件腾出位置，
+  没有可丢的就越过上限入队，所以 metadata、校验完成、下载完成、封禁、做种上限、状态变化和错误总会按顺序
+  送达。这些事件每个 torrent 只有几个，超出的量很小。理由：被丢的几类成批出现，而 `Torrent.Stats` 和
+  `Torrent.Peers` 随时给出它们的汇总。丢弃保证送达的每个事件都是真实的、字段完整；合并（一个带范围的
+  "分片已校验"事件，或每个 torrent 只留最后状态）需要新的事件形态。丢弃数既是事件也是计数器：
+  `EventDropped`（新类型，追加在末尾以保持其他类型的值不变，带新字段 `Event.Dropped`，`Torrent` 为 nil）
+  跟在 dispatcher 取出的那批之后，告诉 SSE 流之类的处理者从 `Stats` 重新同步；`Client.DroppedEvents()`
+  是客户端启动以来的总数。`EventPeerBanned` 从不丢弃，因为它少见且需要处理。备选：按 torrent 合并分片
+  事件；让 `emit` 阻塞（它在 torrent 的锁下运行，常在 fib worker 上）；保留无界队列作为选项（比如
+  `EventQueue` 为负），未提供。
+- **`Reader.Close` 中断 `Read`（A83）**，而不是在 reader 的锁上等它：`Close` 关闭一个 channel，`Read` 的
+  等待（与 context、torrent 被移除并列）都 select 它，并在 torrent 的锁下撤掉 reader 的窗口，不取 reader
+  的锁，所以即使 `Read` 正在读存储也立即返回。被中断的 `Read` 返回 `net.ErrClosed`，与 `Close` 之后的
+  `Read` 原本的返回一致（也与 `net.Conn` 一致），而不是 `os.ErrClosed` 或 `io.ErrClosedPipe`。已通过检查、
+  在 `Close` 之后才设置窗口的 `Read` 会在 torrent 的锁下发现 reader 已关闭而什么也不设，所以关闭的 reader
+  不会让分片保持紧急。已在从存储拷贝数据的 `Read` 会拷完并返回数据。备选：从 `SetContext` 的 context
+  派生每次读的 context 并取消，那会把关闭错误变成 `ctx.Err()`。
+- **做种者不 announce `completed`（A86）**：tracker 循环只在 torrent 首次存储校验结束后某一时刻缺过想要的
+  分片、之后又全部拿到时才 announce `completed`，即本次会话的一次下载。校验结束时就完整的数据（做种者，
+  或上次运行已下完、这次校验或续传的）从不 announce，不管 `started` 是在校验期间还是之后发出。做种者后来
+  扩大了选择并下载了新文件的，会 announce，因为那是下载。与以前一样，每个 torrent 每次会话至多一次
+  `completed`；下载在 tracker 循环启动前（完成时暂停的 torrent）或 `started` 成功之前就完成的，不发。备选：
+  比较 `started` 时的 `left`（started 在校验期间发出时会错，而实际正是如此）；暂停后永不 announce `completed`。
 

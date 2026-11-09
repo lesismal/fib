@@ -172,9 +172,16 @@ type Torrent struct {
 	lim            TorrentLimits
 	upLim, downLim limiter
 
-	run       context.Context
-	stopRun   context.CancelFunc
-	completed chan struct{} // closed on completion, for the tracker loops
+	run     context.Context
+	stopRun context.CancelFunc
+
+	// completed is closed when a download finishes, for the tracker
+	// loops' completed announce: only once checked and leeched are true,
+	// never for data complete when it was added and checked.
+	completed chan struct{}
+	// checked: the first check of the storage is over. leeched: wanted
+	// pieces were missing since then.
+	checked, leeched bool
 }
 
 func newTorrent(c *Client, ih metainfo.InfoHash, ih2 metainfo.InfoHashV2, opts AddOptions) *Torrent {
@@ -399,6 +406,9 @@ func (t *Torrent) updateDoneLocked() {
 	if t.info == nil || t.checking {
 		return
 	}
+	if t.checked && t.missing > 0 {
+		t.leeched = true
+	}
 	isDone := false
 	select {
 	case <-t.done:
@@ -417,7 +427,9 @@ func (t *Torrent) updateDoneLocked() {
 		select {
 		case <-t.completed:
 		default:
-			close(t.completed)
+			if t.leeched {
+				close(t.completed)
+			}
 		}
 		t.onCompleteLocked()
 		close(t.done)
