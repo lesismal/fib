@@ -202,6 +202,16 @@ type Torrent struct {
 	run     context.Context
 	stopRun context.CancelFunc
 
+	// tr is the state of the announces to each tracker: see Trackers.
+	tr trackerTable
+
+	// A Recheck under way: the state it came from, whether it opened the
+	// storage of a stopped torrent (to close at its end), and whether
+	// Recheck was called again during it or during the first check.
+	recheckPrev  State
+	recheckClose bool
+	recheckAgain bool
+
 	// completed is closed when a download finishes, for the tracker
 	// loops' completed announce: only once checked and leeched are true,
 	// never for data complete when it was added and checked.
@@ -587,6 +597,10 @@ func (t *Torrent) Start() {
 			if t.missing == 0 {
 				t.state = StateSeeding
 			}
+		}
+		if t.checking {
+			// Paused during a check, which goes on.
+			t.state = StateChecking
 		}
 	}
 	t.startRunningLocked()

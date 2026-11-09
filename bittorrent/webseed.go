@@ -29,6 +29,7 @@ type webSeed struct {
 	inFlight int
 	fails    int
 	nextTry  time.Time
+	err      error // the last failure, nil after a fetch that worked
 }
 
 // startWebSeedsLocked starts web seed downloads where a seed is free and
@@ -124,7 +125,10 @@ func (t *Torrent) fetchWebSeed(ws *webSeed, i int, p *partial) {
 	}
 	if err != nil {
 		ws.fails++
+		ws.err = err
 		ws.nextTry = time.Now().Add(5 * time.Second << min(ws.fails, 6))
+	} else {
+		ws.err = nil
 	}
 	before := t.hashFails
 	t.mu.Unlock()
@@ -136,6 +140,7 @@ func (t *Torrent) fetchWebSeed(ws *webSeed, i int, p *partial) {
 	ws.inFlight--
 	if t.hashFails > before {
 		ws.fails++
+		ws.err = fmt.Errorf("bittorrent: web seed %s: piece %d failed its check", ws.url, i)
 	}
 	// The next piece goes at once rather than at the next tick.
 	t.startWebSeedsLocked(time.Now())

@@ -353,18 +353,24 @@ func (t *Torrent) announceLoop(ctx context.Context, tiers *tracker.Tiers, h meta
 	event := tracker.EventStarted
 	started := false
 	backoff := 15 * time.Second
-	announce := func(ctx context.Context, ev tracker.Event, numWant int) (*tracker.AnnounceResponse, error) {
+	// The announces of a hybrid's second hash are recorded apart (see
+	// Torrent.Trackers).
+	slot := 0
+	if v2 && !t.ih.IsZero() {
+		slot = 1
+	}
+	rec := recordingAnnouncer{t: t, slot: slot, a: cl.trackers}
+	announce := func(ctx context.Context, ev tracker.Event, numWant int) (*tracker.AnnounceResponse, string, error) {
 		req := tracker.AnnounceRequest{
 			InfoHash: h, PeerID: cl.peerID, Port: uint16(cl.port),
 			Uploaded: t.uploaded.Load(), Downloaded: t.downloaded.Load(), Left: t.left(),
 			Event: ev, NumWant: numWant, Key: cl.key,
 		}
-		resp, _, err := tiers.Announce(ctx, cl.trackers, req)
-		return resp, err
+		return tiers.Announce(ctx, rec, req)
 	}
 	for {
 		actx, cancel := context.WithTimeout(ctx, 2*time.Minute)
-		resp, err := announce(actx, event, 0)
+		resp, url, err := announce(actx, event, 0)
 		cancel()
 		var wait time.Duration
 		if err == nil {
@@ -377,6 +383,7 @@ func (t *Torrent) announceLoop(ctx context.Context, tiers *tracker.Tiers, h meta
 			}
 			t.addPeers(SourceTracker, v2, addrs)
 			wait = min(max(resp.Interval, resp.MinInterval, cl.cfg.MinAnnounceInterval), 2*time.Hour)
+			t.scrapeTracker(ctx, url, h, slot)
 		} else {
 			if ctx.Err() != nil {
 				wait = 0
@@ -385,13 +392,17 @@ func (t *Torrent) announceLoop(ctx context.Context, tiers *tracker.Tiers, h meta
 				backoff = min(backoff*2, 30*time.Minute)
 			}
 		}
+		if ctx.Err() == nil {
+			t.setTrackerNext(tiers, slot, time.Now().Add(wait))
+		}
 		timer := time.NewTimer(wait)
 		select {
 		case <-ctx.Done():
 			timer.Stop()
+			t.setTrackerNext(tiers, slot, time.Time{})
 			if started {
 				sctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-				_, _ = announce(sctx, tracker.EventStopped, -1)
+				_, _, _ = announce(sctx, tracker.EventStopped, -1)
 				cancel()
 			}
 			return
