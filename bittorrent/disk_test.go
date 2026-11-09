@@ -227,7 +227,9 @@ func TestCloseWithQueuedWrites(t *testing.T) {
 			testFiles(t, sdir, "content", 2_000_000)
 			mi := buildTorrent(t, sdir, "content", metainfo.V1, 64<<10)
 			seeder, _ := seed(t, sdir, mi)
-			lw := &watch{opener: NewFileStorage(ldir, FileStorageOptions{}), delay: 20 * time.Millisecond}
+			// Slow enough that writes queue up whatever the machine: a
+			// piece is written whole, at once, since A89.
+			lw := &watch{opener: NewFileStorage(ldir, FileStorageOptions{}), delay: 100 * time.Millisecond}
 			leecher := newTestClient(t, ldir, func(c *Config) {
 				c.Storage = lw.open
 				c.DiskWorkers = 1

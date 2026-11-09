@@ -69,7 +69,11 @@ func TestTrackers(t *testing.T) {
 	waitFor(t, "the answering tracker's announces and scrapes", func() bool {
 		list := tor.Trackers()
 		ok, dead, refused := find(list, okURL), find(list, deadURL), find(list, refuseURL)
+		// The seed's counts too: its started announce may have gone out
+		// during its check, as a leecher, and its scrape before the
+		// announce after the check that says it is a seed.
 		return !ok.Scraped.IsZero() && ok.V2 != nil && !ok.V2.Scraped.IsZero() &&
+			ok.Seeders == 1 && ok.V2.Seeders == 1 &&
 			!dead.Updating && dead.Fails > 0 && !refused.Updating && refused.Fails > 0
 	})
 	list := tor.Trackers()
