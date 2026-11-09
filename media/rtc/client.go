@@ -504,37 +504,48 @@ func (c *Client) answered(outs []*outTrack, resp *fibhttp.ClientResponse, err er
 		c.deleteResource()
 		return
 	}
+	if !c.push {
+		// The receiver is in place before the answer is set: from then on
+		// the connection may come up and the first RTP packet raise
+		// OnTrack, which a missing receiver would lose, and with it the
+		// track for good.
+		answer, err := sdp.ParseString(string(body))
+		if err != nil {
+			c.finish(fmt.Errorf("rtc: malformed answer: %w", err))
+			return
+		}
+		r := newReceiver(recvConfig{
+			reorderSize: c.config.ReorderSize, reorderDelay: c.config.ReorderDelay,
+			keyFrameInterval: c.config.KeyFrameInterval, pliInterval: c.config.PLIInterval,
+		}, answer, true)
+		if len(r.Tracks()) == 0 {
+			c.finish(ErrNoMedia)
+			return
+		}
+		r.onTracks, r.onPacket = c.config.OnTracks, c.config.OnPacket
+		r.mu.Lock()
+		r.emitTracks()
+		r.mu.Unlock()
+		c.rcv.Store(r)
+	}
 	if err := pc.SetRemoteDescription(webrtc.SessionDescription{Type: webrtc.SDPTypeAnswer, SDP: string(body)}); err != nil {
 		c.finish(err)
 		return
 	}
-	if c.push {
-		var sending []*outTrack
-		for _, o := range outs {
-			if d := o.rtp.Transceiver().CurrentDirection(); d == webrtc.DirectionSendOnly || d == webrtc.DirectionSendRecv {
-				sending = append(sending, o)
-			}
-		}
-		if len(sending) == 0 {
-			c.finish(ErrNoMedia)
-			return
-		}
-		c.snd.setTracks(sending)
+	if !c.push {
 		return
 	}
-	answer, _ := sdp.ParseString(string(body)) // the PeerConnection has parsed it
-	r := newReceiver(recvConfig{
-		reorderSize: c.config.ReorderSize, reorderDelay: c.config.ReorderDelay,
-		keyFrameInterval: c.config.KeyFrameInterval, pliInterval: c.config.PLIInterval,
-	}, answer, true)
-	r.onTracks, r.onPacket = c.config.OnTracks, c.config.OnPacket
-	r.mu.Lock()
-	r.emitTracks()
-	r.mu.Unlock()
-	c.rcv.Store(r)
-	if len(r.Tracks()) == 0 {
-		c.finish(ErrNoMedia)
+	var sending []*outTrack
+	for _, o := range outs {
+		if d := o.rtp.Transceiver().CurrentDirection(); d == webrtc.DirectionSendOnly || d == webrtc.DirectionSendRecv {
+			sending = append(sending, o)
+		}
 	}
+	if len(sending) == 0 {
+		c.finish(ErrNoMedia)
+		return
+	}
+	c.snd.setTracks(sending)
 }
 
 // connected starts the media once the PeerConnection is.
