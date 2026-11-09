@@ -20,6 +20,9 @@ func (t *Torrent) trustAllLocked() {
 	for i := range t.pieces {
 		t.markTrustedLocked(i)
 	}
+	// The check this takes the place of is over: what downloads from now
+	// on announces completed (see updateDoneLocked).
+	t.checked = true
 	t.updateDoneLocked()
 	t.c.emit(Event{Type: EventChecked, Torrent: t})
 	for _, pc := range t.peers {
