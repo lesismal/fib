@@ -59,6 +59,7 @@
 //     AddPeers; a private torrent (BEP 27) uses its trackers alone. Web
 //     seeds (BEP 19) serve whole pieces over HTTP range requests.
 //
-// Config.OnEvent hears what happens, and Torrent.Stats and Torrent.Peers
-// tell the state.
+// Config.OnEvent hears what happens, and Torrent.Stats, Torrent.Peers,
+// Torrent.Trackers, Torrent.Sources and Torrent.WebSeeds tell the state.
+// Torrent.Recheck checks a running torrent's data again.
 package bittorrent
