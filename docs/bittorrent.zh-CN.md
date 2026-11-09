@@ -223,7 +223,7 @@ _, err = io.Copy(w, r)
   可让它以暂停状态、顺序下载、带文件优先级、额外的 peer 和 tracker 或自己的存储加入。`Torrent` 有 `GotInfo`、
   `Done`、`Removed` 三个 channel，`State` 与 `Err`，`Start`、`Pause`、`Stop`、`Remove(deleteData)`，
   `SetSequential`，`SetFilePriority`（`PriorityNone`、`Low`、`Normal`、`High`），`AddPeers`、`Files`、`Stats`、
-  `Peers` 和 `NewReader`。`Config.OnEvent` 按顺序收到 metadata、校验完成、分片校验通过、哈希失败、下载完成、
+  `Peers`、`Trackers`、`Sources`、`WebSeeds`、`Recheck` 和 `NewReader`。`Config.OnEvent` 按顺序收到 metadata、校验完成、分片校验通过、哈希失败、下载完成、
   peer 连上、断开、被封禁、达到做种上限、状态变化和错误等事件。`OnEvent` 运行期间排队等待的事件有上限
   （`Config.EventQueue`，`DefaultEventQueue` = 4096）：超过时丢弃分片和 peer 事件，最旧的先丢，其他事件从不
   丢弃；有事件被丢弃时，取出的那批事件之后会跟一个 `EventDropped`（`Dropped` 为条数），
@@ -263,6 +263,16 @@ _, err = io.Copy(w, r)
   mi, _ := b.BuildPath(dir)
   t, _ := c.AddTorrent(mi, &bittorrent.AddOptions{Seed: true}) // 不再哈希第二遍
   ```
+- **重新校验**（`Torrent.Recheck()`）在文件被客户端之外改动或恢复后，重新校验运行中 torrent 的数据，保留
+  它的连接、优先级、限制和计数。torrent 处于 `StateChecking`，直到发出 `EventChecked`，然后按分片情况下载或做种，
+  原来暂停或停止的仍回到暂停或停止（停止的 torrent 为校验打开存储、校验后关闭）。所有已有分片都变为未校验，
+  与做种模式相同，校验在磁盘池上按顺序逐个哈希，每个分片一个任务：校验失败或读不出的分片不再记为已有
+  （`EventHashFailed`，计入 `HashFails`），校验结束后重新下载；原本没有、校验通过的分片记为已有并用 `have`
+  通告。peer 仍保留之前被告知的分片，因为协议无法撤回 `have`：对尚未校验到的分片的请求会先校验该分片，对丢失
+  分片的请求被 reject（没有 Fast 扩展时不应答）。校验期间不发请求；已发出的请求收到的块照收。`Stop` 或 `Remove`
+  会中断它（`EventChecked` 的 `Err` 为 `ErrRecheckInterrupted`；未校验到的分片保持未校验，首次发送时校验，续传
+  数据里也如此列出）；校验进行中（包括首次校验）再调用 `Recheck`，会在其结束后再校验一遍；校验期间
+  `ResumeData` 返回错误。info 字典到手前、已移除或处于 `StateError` 的 torrent 调用它返回错误。
 - **磁盘池**：存储的读写和分片哈希从不在 fib worker 上（也不在读 uTP 连接的 goroutine 上）进行。
   `Config.DiskWorkers` 个 goroutine（GOMAXPROCS，最多 `DefaultMaxDiskWorkers` = 8）从同一个队列取任务：收到的块
   拷进池化缓冲区后排队写入，分片的最后一块落盘后在池上校验整个分片；上传的读也在池上，每个 peer 同时只有一个
@@ -291,6 +301,15 @@ _, err = io.Copy(w, r)
   announce 一次，没有 peer 时每分钟一次；双向 `PORT`）、PEX（每个 peer 每分钟一条）、本地服务发现（BEP 14，
   IPv4）、磁力链接的 `x.pe`、`AddPeers` 和 `Config.PeerSources`；私有 torrent 只用它的 tracker。web seed（BEP 19）
   经 fib/http 客户端用 range 请求提供整个分片。
+- **tracker、peer 来源和 web seed 的当前状态**：`Torrent.Trackers()` 按 tier 顺序为 torrent 的 announce-list
+  中每个 URL 返回一个 `TrackerInfo`（`URL`、`Tier`），带其 announce 状态（`TrackerStatus`）：`Updating`、`Last`、
+  `Err`（应答时为 nil；拒绝的原因在 `*tracker.Error` 里）、`Warning`、连续失败次数 `Fails`、`Next`（torrent 不运行
+  时为零）、`Interval` 与 `MinInterval`、上次应答的 `Peers` 数，以及来自上次应答或 scrape 的 `Seeders`、
+  `Leechers`、`Downloaded`（未知时为 -1）。应答了 announce 的 tracker 至多每 30 分钟 scrape 一次（`Scraped`），
+  用于 `Downloaded`。hybrid 用截断 v2 哈希的 announce 状态在 `V2` 里。`Torrent.Sources()` 列出各 peer 来源
+  （tracker、DHT、PEX、LSD、手动、`PeerSources`），是否对该 torrent 启用，以及各自找到、已连接的候选数；
+  `Torrent.WebSeeds()` 给出每个 HTTP web seed 正在取的分片数、失败次数、最后的错误和下次重试时间。它们都以
+  torrent 自己的列表为界。
 - **做种**到 `SeedRatio` 或 `SeedTime` 时暂停 torrent；`Ban` 在所有 torrent 中封禁一个地址。
 - **限制**可在客户端运行时修改，不断开已有 peer：`Client.SetLimits(Limits)` 替换 `UploadRate`、`DownloadRate`、
   `MaxConns`、`MaxConnsPerTorrent`、`MaxHalfOpen`、`DialsPerTick`、`UploadSlots`、`SeedRatio` 和 `SeedTime`
@@ -674,4 +693,46 @@ FIB_DHT_PUBLIC=1 FIB_DHT_INFOHASH=<40 位十六进制> go test -run TestDHTPubli
   扩大了选择并下载了新文件的，会 announce，因为那是下载。与以前一样，每个 torrent 每次会话至多一次
   `completed`；下载在 tracker 循环启动前（完成时暂停的 torrent）或 `started` 成功之前就完成的，不发。备选：
   比较 `started` 时的 `left`（started 在校验期间发出时会错，而实际正是如此）；暂停后永不 announce `completed`。
+- **`Torrent.Trackers()`（A87）：每个 URL 一个 `TrackerInfo`，hybrid 的第二个哈希放在 `V2`。** 列表按 torrent 的
+  announce-list 排列（tier 依次、URL 按列出顺序、重复的 URL 只列一次、空 tier 不计入 `Tier`），而不是
+  `tracker.Tiers` 洗牌和提前之后的尝试顺序，这样每次调用结果稳定。hybrid 以两个哈希 announce，是两个各有计数的
+  swarm：v1（或唯一）哈希的状态内嵌，截断 v2 哈希的是 `V2 *TrackerStatus`，单哈希 torrent 为 nil。备选：把两者
+  合并成一个状态（计数会失去意义）；每个 URL 和哈希一行，如 libtorrent 的 announce endpoint。
+- **状态如何记录（A87）**：announce 循环通过包在客户端 Announcer 外的一个记录用 `tracker.Announcer` 来 announce，
+  `Tiers` 尝试的每个 tracker 都得到自己的结果；tracker 包未改。因 torrent 暂停或被移除而取消的 announce 不记为
+  错误。`Next` 是循环的下次 announce 时间，设在各 tier 的每个 URL 上，文档说明只有排在前面的 tracker 都不应答
+  时才会轮到它（BEP 12）；没有采用同时向所有 tracker announce（qBittorrent 的默认）。`Seeders`、`Leechers` 在
+  任何应答前为 -1，之后为上次应答或 scrape 的值，不给计数的 tracker 为 0（编解码器分不出缺失与零）。`Err` 是
+  `error`（拒绝时为 `*tracker.Error`）而不是字符串，`Warning` 单列，因为 announce 是成功的。状态放在一个有自己
+  互斥锁的表里，不在 `Torrent.mu` 下，只为 torrent 各 tier 中的 URL 建条目。备选：在 `tracker.Tiers` 中加
+  `OnAnnounce` 钩子；错误用字符串。
+- **为 `Downloaded` 做 scrape（A87）**：应答了 announce 的 tracker 紧接着以该哈希被 scrape，每个 tracker 和哈希
+  至多每 30 分钟一次，在 announce 循环的 goroutine 上进行，限时 15 秒；scrape 失败（比如 tracker 没有 scrape
+  URL）不改变任何显示的值。没有关闭开关。备选：不 scrape（`Downloaded` 永远为 -1）；定时 scrape 列表中所有
+  tracker；加一个 `Config` 字段。
+- **`Torrent.Sources()` 与 `Torrent.WebSeeds()`（A87）**：来源按 torrent 的候选统计（每个候选记着所有提到它的
+  来源的位），所以 DHT 和 PEX 都找到的 peer 两边都计；对方连进来的连接不属于任何来源；没有每个来源的上次运行
+  时间。它们是单独的方法，而不是在 `Trackers` 列表里放伪 tracker（qBittorrent 的 "** [DHT] **" 行），那会把 URL
+  和种类混在一起。web seed 只列 HTTP(S) URL，也只有它们会被使用；web seed 记录最后的错误（获取失败，或发来的
+  分片校验失败）。需求中"磁力链接的 info 或 PEX 后来带来的 tracker"在 fib 中没有来源：info 字典不含 tracker，
+  也不支持 tracker 交换扩展，所以列表就是 .torrent 文件或磁力链接的，加上 `AddOptions.Trackers`。
+- **`Torrent.Recheck()`（A88）：已有分片变为未校验，而不是忘掉。** Recheck 复用做种模式的 trusted 分片：每个
+  已有分片记为未校验但仍已有，校验按顺序逐个处理；peer 请求尚未校验到的分片时先校验它（在磁盘池上，只做一次，
+  与重新校验共享），所以 peer 永远不会收到重新校验会判为坏的数据。一开始就忘掉所有分片（libtorrent 的
+  `force_recheck`，它还会断开 peer）会让 peer 请求曾被告知的分片而被 reject，因为 `have` 无法撤回；用 trusted
+  分片，只有真正校验失败的才丢失。校验期间 `Stats.Trusted` 是尚未校验到的分片数。
+- **重新校验的节奏和影响（A88）**：每个分片一个磁盘池任务，一次一个，由 torrent 的一个 goroutine 驱动，所以块
+  写入和上传在池的 FIFO 中与它交错（首次校验仍像以前一样在自己的 goroutine 上）。校验期间不请求分片
+  （`fillRequests`、web seed 和 hash request 本来就在 torrent 校验时停止）；已发出的请求收到的块照收，其分片照常
+  校验。丢失的分片是一个 `EventHashFailed` 并计入 `HashFails`，与做种模式相同，而不是新事件或新计数。每次重新
+  校验以 `EventChecked` 结束，`Stop`、`Remove` 或 `Close` 在其进行中关闭存储时 `Err` 为 `ErrRecheckInterrupted`；
+  未校验到的分片保持未校验，而不是在下次 `Start` 时重新校验。丢了分片又重新下载的做种者会 announce
+  `completed`，因为那是首次校验之后的下载（A86）。备选：并行校验多个分片；单独的"重新校验丢失"计数。
+- **重新校验与 torrent 状态（A88）**：info 字典到手前、已移除的 torrent、处于 `StateError`（存储可能打不开）的
+  torrent 调用 `Recheck` 返回错误，而不是什么也不做。暂停的 torrent 校验后仍暂停；停止的 torrent 为校验打开
+  存储、校验后关闭，仍为停止；校验期间 `Pause` 和 `Start` 照常工作（`Start` 现在在校验——首次或重新——进行时
+  保持 `StateChecking`，而不是声称在下载）。校验进行中调用 `Recheck`，会在其结束后从第一个分片再校验一遍，
+  不论调用了几次（只多一轮）；对首次校验，在它结束之后。重新校验期间 `ResumeData` 与首次校验时一样返回错误，
+  而不是返回一份 trusted 分片的数据，那会跳过调用者要求的校验。备选：校验中忽略 `Recheck`；立即重启正在进行
+  的校验。
 

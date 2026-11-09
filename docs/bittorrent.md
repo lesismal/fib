@@ -260,7 +260,8 @@ _, err = io.Copy(w, r)
   files). `AddOptions` start one paused, in sequential order, with file priorities, extra peers and
   trackers, or on a storage of its own. A `Torrent` has `GotInfo`, `Done` and `Removed` channels,
   `State` and `Err`, `Start`, `Pause`, `Stop` and `Remove(deleteData)`, `SetSequential`,
-  `SetFilePriority` (`PriorityNone`, `Low`, `Normal`, `High`), `AddPeers`, `Files`, `Stats`, `Peers`
+  `SetFilePriority` (`PriorityNone`, `Low`, `Normal`, `High`), `AddPeers`, `Files`, `Stats`, `Peers`,
+  `Trackers`, `Sources`, `WebSeeds`, `Recheck`
   and `NewReader`. `Config.OnEvent` hears metadata, checked, piece verified, hash failed, completed,
   peer connected, disconnected and banned, seed limit, state changes and errors, in order. The
   queue of events waiting while `OnEvent` runs is bounded (`Config.EventQueue`,
@@ -314,6 +315,22 @@ _, err = io.Copy(w, r)
   mi, _ := b.BuildPath(dir)
   t, _ := c.AddTorrent(mi, &bittorrent.AddOptions{Seed: true}) // no second hashing pass
   ```
+- **Recheck** (`Torrent.Recheck()`) checks a running torrent's data again, after its files were
+  changed or restored behind the client's back, keeping its connections, priorities, limits and
+  counters. The torrent is in `StateChecking` until an `EventChecked`, then downloading or seeding
+  as its pieces say, or paused or stopped again if it was (a stopped torrent's storage is opened for
+  the check and closed after it). Every piece had becomes unchecked, as in seed mode, and the check
+  hashes them in order on the disk pool, one job per piece: a piece that fails or cannot be read is
+  no longer had (`EventHashFailed`, counted in `HashFails`) and is downloaded again once the check
+  ends; a piece not had that passes becomes had and is announced with `have`. Peers keep the pieces
+  they were told of, since the protocol cannot take a `have` back: a request for a piece not reached
+  yet checks that piece first, and one for a piece lost is rejected (or, without the Fast
+  extension, not answered). Nothing is requested during the check; blocks already asked for are
+  taken. `Stop` or `Remove` interrupts it (`EventChecked` with `Err` = `ErrRecheckInterrupted`; the
+  pieces not reached stay unchecked, checked when first served and listed so in resume data); a
+  `Recheck` while a check runs (the first one included) checks again once it ends; `ResumeData`
+  errs during it. It errs before the info dictionary, and on a removed torrent or one in
+  `StateError`.
 - **Disk pool**: storage is never read or written, and no piece is hashed, on a fib worker (or on
   the goroutine reading a uTP connection). `Config.DiskWorkers` goroutines (GOMAXPROCS, at most
   `DefaultMaxDiskWorkers` = 8) take the jobs from one queue: a received block is copied into a
@@ -354,6 +371,17 @@ _, err = io.Copy(w, r)
   ways), PEX (a message a minute per peer), local service discovery (BEP 14, IPv4), a magnet's
   `x.pe`, `AddPeers` and `Config.PeerSources`; a private torrent uses its trackers alone. Web seeds
   (BEP 19) serve whole pieces through range requests on the fib/http client.
+- **Trackers, sources and web seeds as they are**: `Torrent.Trackers()` returns a `TrackerInfo` per
+  URL of the torrent's announce-list, in tier order (`URL`, `Tier`), with the state of its announces
+  (`TrackerStatus`): `Updating`, `Last`, `Err` (nil when it answered; a `*tracker.Error` holds a
+  refusal's reason), `Warning`, `Fails` in a row, `Next` (zero while the torrent does not run),
+  `Interval` and `MinInterval`, `Peers` of the last answer, and `Seeders`, `Leechers` and
+  `Downloaded` (-1 until known) from the last answer or scrape. The tracker that answers an announce
+  is scraped once in 30 minutes at most (`Scraped`), for `Downloaded`. A hybrid's announces under its
+  truncated v2 hash are in `V2`. `Torrent.Sources()` lists the peer sources (trackers, DHT, PEX, LSD,
+  manual, `PeerSources`), whether each is used for the torrent, and how many of its candidates each
+  found and are connected; `Torrent.WebSeeds()` gives each HTTP web seed's pieces in flight,
+  failures, last error and next try. All are bounded by the torrent's own lists.
 - **Seeding** pauses a torrent at `SeedRatio` or `SeedTime`; `Ban` bans an address from every torrent.
 - **Limits** change while the client runs, keeping its peers: `Client.SetLimits(Limits)` replaces
   `UploadRate`, `DownloadRate`, `MaxConns`, `MaxConnsPerTorrent`, `MaxHalfOpen`, `DialsPerTick`,
@@ -860,4 +888,67 @@ alternative.
   loop started (a torrent paused while completing) or before its `started` announce succeeded.
   Alternatives: comparing `left` at the `started` announce (wrong when started goes out during the
   check, as it does), or never announcing `completed` after a pause.
+- **`Torrent.Trackers()` (A87): one `TrackerInfo` per URL, a hybrid's second hash in `V2`.** The
+  list follows the torrent's announce-list (tiers in order, URLs in their listed order, a URL listed
+  twice once, empty tiers not counted in `Tier`), not the order `tracker.Tiers` tries them after
+  shuffling and promoting, so that it is stable from call to call. A hybrid is announced under two
+  hashes, which are two swarms with their own counts: the v1 (or only) hash's state is embedded,
+  the truncated v2 hash's is `V2 *TrackerStatus`, nil for a torrent of one hash. Alternatives:
+  merging both into one status (whose counts would mean nothing), or a row per URL and hash, as
+  libtorrent's announce endpoints.
+- **How the state is recorded (A87)**: the announce loops announce through a recording
+  `tracker.Announcer` wrapped around the client's, so every tracker `Tiers` tries gets its own
+  result; the tracker package is unchanged. An announce cancelled because the torrent paused or was
+  removed is not recorded as an error. `Next` is the loop's next announce, set on every URL of the
+  tiers, documented as reaching a tracker only when those tried before it do not answer (BEP 12);
+  announcing to every tracker at once (qBittorrent's default) was not adopted. `Seeders` and
+  `Leechers` are -1 before any answer, then what the last answer or scrape said, 0 from a tracker
+  that gives no counts (the codecs cannot tell missing from zero). `Err` is an `error` (a
+  `*tracker.Error` for a refusal) rather than a string, with `Warning` apart since the announce
+  worked. The state lives in a table with its own mutex, not under `Torrent.mu`, holding an entry
+  per URL of the torrent's tiers only. Alternatives: an `OnAnnounce` hook in `tracker.Tiers`;
+  strings for errors.
+- **Scrapes for `Downloaded` (A87)**: the tracker that answered an announce is scraped right after
+  it, under that hash, at most once in 30 minutes per tracker and hash, on the announce loop's
+  goroutine with a 15 s bound; a failed scrape (a tracker without a scrape URL, say) changes nothing
+  shown. There is no switch to turn it off. Alternatives: no scrapes (`Downloaded` always -1);
+  scraping every tracker of the list on a timer; a `Config` field.
+- **`Torrent.Sources()` and `Torrent.WebSeeds()` (A87)**: sources are counted from the torrent's
+  candidates (each keeps the bits of every source that named it), so a peer found by both the DHT
+  and PEX counts in both; connections peers opened to this side are in no source; there is no
+  per-source last-run time. They are a method of their own rather than pseudo-trackers in the
+  `Trackers` list (qBittorrent's "** [DHT] **" rows), which would mix URLs with kinds. Web seeds of
+  HTTP(S) URLs only, the only ones used; a web seed records its last error (fetch, or a piece that
+  failed its check). The request's "trackers a magnet's info or PEX brought in later" have no
+  source in fib: an info dictionary carries no trackers, and no tracker exchange extension is
+  spoken, so the list is the .torrent file's or magnet link's plus `AddOptions.Trackers`.
+- **`Torrent.Recheck()` (A88): pieces had become unchecked, not forgotten.** Recheck reuses seed
+  mode's trusted pieces: every piece had is taken as not checked, still had, and the check goes
+  through them in order; a peer's request for one not reached yet checks it first (on the disk pool,
+  once, shared with the recheck), so peers are never sent data the recheck would fail. Forgetting
+  every piece at the start (libtorrent's `force_recheck`, which also disconnects the peers) would
+  leave peers asking for pieces they were told of and being rejected, since a `have` cannot be taken
+  back; with trusted pieces only those that really fail are lost. `Stats.Trusted` counts the pieces
+  not reached during the check.
+- **The recheck's pace and its effects (A88)**: one disk pool job per piece, one at a time, driven
+  by a goroutine of the torrent's, so block writes and uploads interleave with it in the pool's FIFO
+  (the first check still runs on its own goroutine, as before). No piece is requested during it
+  (`fillRequests`, web seeds and hash requests already stop while a torrent checks); blocks already
+  asked for are taken and their pieces checked as usual. A piece lost is an `EventHashFailed` and
+  counts in `HashFails`, as in seed mode, rather than a new event or counter. `EventChecked` ends
+  each recheck, with `Err` = `ErrRecheckInterrupted` when `Stop`, `Remove` or `Close` closed the
+  storage under it; the pieces not reached stay unchecked rather than being re-checked on the next
+  `Start`. A seed that loses pieces and downloads them again announces `completed`, being a download
+  after the first check (A86). Alternatives: several pieces in parallel; a separate "lost by
+  recheck" count.
+- **Recheck and the torrent's state (A88)**: `Recheck` returns an error before the info
+  dictionary, on a removed torrent and on one in `StateError` (whose storage may not open), rather
+  than doing nothing. A paused torrent is checked and stays paused; a stopped one has its storage
+  opened for the check and closed after, staying stopped; `Pause` and `Start` during the check work
+  (`Start` now keeps `StateChecking` while a check, first or recheck, runs, instead of claiming
+  downloading). A `Recheck` while a check runs checks again from the first piece once it ends,
+  however many times it was called (one more run); for the first check, after its end. `ResumeData`
+  errs during a recheck as during the first check, rather than returning a blob of trusted pieces
+  that would skip the check the caller asked for. Alternatives: ignoring a `Recheck` while
+  checking; restarting the running check at once.
 
