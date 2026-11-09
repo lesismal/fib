@@ -84,7 +84,10 @@ merkle 树（经文件的 piece layer，单分片文件则用它的 pieces root�
 `LayerRoot`、`VerifyProof` 是 BEP 52 的 hash request 所需的辅助函数。
 
 `Builder` 对一个 `fs.FS`（`Build`）或路径（`BuildPath`）计算哈希，生成 v1、v2 或 hybrid torrent，可带 tracker
-（BEP 12）、web seed（BEP 19）、DHT 节点（BEP 5）和 private 标志（BEP 27）。`ParseMagnet` 与 `Magnet.String`
+（BEP 12）、web seed（BEP 19）、DHT 节点（BEP 5）和 private 标志（BEP 27）。`BuildContext` 与
+`BuildPathContext` 在 context 结束后以 `ctx.Err()` 返回，在文件之间和每算完一兆字节时检查它。构建所用内存不随文件
+大小增长：v2 文件的 16 KiB 叶子哈希在下一个分片开始时折叠成所属分片的根，只保留一个分片的叶子和每个分片 32 字节
+（即输出的 piece layer）；以前把叶子留到文件结束，1 TiB 的文件要 2 GiB。`ParseMagnet` 与 `Magnet.String`
 处理磁力链接（BEP 9）：十六进制或 base32 的 `xt=urn:btih:`、v2 的 `urn:btmh:`、`dn`、`tr`、`ws`、`x.pe`、
 `so`（BEP 53）和 `xl`。
 
@@ -404,6 +407,12 @@ FIB_DHT_PUBLIC=1 FIB_DHT_INFOHASH=<40 位十六进制> go test -run TestDHTPubli
 - **限制**：流式解码 `MaxDepth` 256、`MaxSize` 64 MiB；`Load` 最多读 128 MiB（`MaxFileSize`）。
 - **磁力链接**：拒绝全零哈希；`so` 按区间保存。
 - **Builder 单 goroutine 计算哈希。** 备选：每个 CPU 一个哈希 goroutine。
+- **`BuildContext` 多久检查一次 context**：每个文件之前和每算完一兆字节，因此取消后最多再读约一兆字节，加上读缓冲
+  预读的一兆字节；阻塞在 `fs.FS` 上的读不会被打断，因为 `fs.FS` 不接受 context。备选：每个 16 KiB 块都检查
+  （白白多查）；取消时关闭打开的文件（并非每种 `fs.File` 关闭时都会让读返回）。
+- **Builder 仍在内存里保留 v2 文件的 piece layer**，每个分片 32 字节，因为它是结果的一部分
+  （`MetaInfo.PieceLayers`）；用自动分片大小时每个文件不到 64 KiB。备选：把 layer 流式交给调用者，这会改变
+  `Build` 的返回值。
 
 ### tracker
 

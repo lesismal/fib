@@ -2,6 +2,7 @@ package metainfo
 
 import (
 	"bufio"
+	"context"
 	"crypto/sha1"
 	"crypto/sha256"
 	"errors"
@@ -81,6 +82,11 @@ type sourceFile struct {
 // BuildPath makes a torrent of the file or directory at path in the
 // operating system's file system.
 func (b *Builder) BuildPath(p string) (*MetaInfo, error) {
+	return b.BuildPathContext(context.Background(), p)
+}
+
+// BuildPathContext is BuildPath stopping with ctx.Err() once ctx is done.
+func (b *Builder) BuildPathContext(ctx context.Context, p string) (*MetaInfo, error) {
 	abs, err := filepath.Abs(p)
 	if err != nil {
 		return nil, err
@@ -94,16 +100,30 @@ func (b *Builder) BuildPath(p string) (*MetaInfo, error) {
 		bb.Name = filepath.Base(abs)
 	}
 	if st.IsDir() {
-		return bb.Build(os.DirFS(abs), ".")
+		return bb.BuildContext(ctx, os.DirFS(abs), ".")
 	}
-	return bb.Build(os.DirFS(filepath.Dir(abs)), filepath.Base(abs))
+	return bb.BuildContext(ctx, os.DirFS(filepath.Dir(abs)), filepath.Base(abs))
 }
 
 // Build makes a torrent of root in fsys: a single-file torrent if root is
 // a file, a multi-file one of the regular files below it otherwise, in
 // the order of their paths (as v2 requires), symbolic links to files
 // followed and other entries and empty directories left out.
+//
+// It reads each file once, in 16 KiB blocks, and keeps 32 bytes per piece
+// of a v2 file (the piece layer it outputs) and one piece's leaf hashes,
+// so its memory does not grow with the files' sizes beyond that.
 func (b *Builder) Build(fsys fs.FS, root string) (*MetaInfo, error) {
+	return b.BuildContext(context.Background(), fsys, root)
+}
+
+// BuildContext is Build stopping with ctx.Err() once ctx is done. It looks
+// at ctx between files and every megabyte read, so it returns within a
+// megabyte of hashing; a read of fsys that blocks is not interrupted.
+func (b *Builder) BuildContext(ctx context.Context, fsys fs.FS, root string) (*MetaInfo, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	if b.Version < Hybrid || b.Version > V2 {
 		return nil, fmt.Errorf("metainfo: unknown version %d", b.Version)
 	}
@@ -114,7 +134,7 @@ func (b *Builder) Build(fsys fs.FS, root string) (*MetaInfo, error) {
 	if !validName(name) {
 		return nil, fmt.Errorf("metainfo: invalid torrent name %q; set Builder.Name", name)
 	}
-	files, single, err := listFiles(fsys, root)
+	files, single, err := listFiles(ctx, fsys, root)
 	if err != nil {
 		return nil, err
 	}
@@ -144,15 +164,18 @@ func (b *Builder) Build(fsys fs.FS, root string) (*MetaInfo, error) {
 		info.MetaVersion = 2
 		info.FileTree = &FileTree{}
 	}
+	var v2 *fileHasher
+	if hasV2 {
+		v2 = newFileHasher(pl)
+	}
 	blk := make([]byte, BlockSize)
 	for i, sf := range files {
-		var leaves [][32]byte
-		if err := readFile(fsys, sf, blk, func(block []byte) {
+		if err := readFile(ctx, fsys, sf, blk, func(block []byte) {
 			if v1 != nil {
 				v1.write(block)
 			}
-			if hasV2 {
-				leaves = append(leaves, sha256.Sum256(block))
+			if v2 != nil {
+				v2.add(sha256.Sum256(block))
 			}
 		}); err != nil {
 			return nil, err
@@ -160,7 +183,7 @@ func (b *Builder) Build(fsys fs.FS, root string) (*MetaInfo, error) {
 		var root [32]byte
 		if hasV2 && sf.length > 0 {
 			var layer []byte
-			root, layer = fileRoot(leaves, sf.length, pl)
+			root, layer = v2.finish()
 			if layer != nil {
 				layers[root] = layer
 			}
@@ -225,7 +248,7 @@ func (b *Builder) Build(fsys fs.FS, root string) (*MetaInfo, error) {
 
 // listFiles lists the regular files at or below root, sorted by path
 // component by component, which is the order of a v2 file tree.
-func listFiles(fsys fs.FS, root string) (files []sourceFile, single bool, err error) {
+func listFiles(ctx context.Context, fsys fs.FS, root string) (files []sourceFile, single bool, err error) {
 	st, err := fs.Stat(fsys, root)
 	if err != nil {
 		return nil, false, err
@@ -240,6 +263,9 @@ func listFiles(fsys fs.FS, root string) (files []sourceFile, single bool, err er
 	// first, which is the tree's order.
 	err = fs.WalkDir(fsys, root, func(p string, d fs.DirEntry, err error) error {
 		if err != nil {
+			return err
+		}
+		if err := ctx.Err(); err != nil {
 			return err
 		}
 		if d.IsDir() {
@@ -280,9 +306,17 @@ func listFiles(fsys fs.FS, root string) (files []sourceFile, single bool, err er
 	return files, false, nil
 }
 
+// ctxCheckBlocks is how many blocks readFile hashes between looks at its
+// context: a megabyte.
+const ctxCheckBlocks = (1 << 20) / BlockSize
+
 // readFile feeds the file to fn in BlockSize blocks, the last one
-// shorter, checking that it still has the length it was listed with.
-func readFile(fsys fs.FS, sf sourceFile, blk []byte, fn func([]byte)) error {
+// shorter, checking that it still has the length it was listed with, and
+// returns ctx.Err() once ctx is done.
+func readFile(ctx context.Context, fsys fs.FS, sf sourceFile, blk []byte, fn func([]byte)) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	f, err := fsys.Open(sf.name)
 	if err != nil {
 		return err
@@ -290,7 +324,12 @@ func readFile(fsys fs.FS, sf sourceFile, blk []byte, fn func([]byte)) error {
 	defer f.Close()
 	r := bufio.NewReaderSize(f, 1<<20)
 	var n int64
-	for {
+	for blocks := 1; ; blocks++ {
+		if blocks%ctxCheckBlocks == 0 {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+		}
 		k, err := io.ReadFull(r, blk)
 		if k > 0 {
 			n += int64(k)
@@ -310,24 +349,6 @@ func readFile(fsys fs.FS, sf sourceFile, blk []byte, fn func([]byte)) error {
 		return fmt.Errorf("metainfo: %s shrank while being hashed", sf.name)
 	}
 	return nil
-}
-
-// fileRoot returns a file's pieces root from its leaf hashes, and its
-// piece layer if it is larger than a piece.
-func fileRoot(leaves [][32]byte, length, pieceLength int64) (root [32]byte, layer []byte) {
-	perPiece := int(pieceLength / BlockSize)
-	if length <= pieceLength {
-		return MerkleRoot(leaves, len(leaves), [32]byte{}), nil
-	}
-	nodes := make([][32]byte, 0, (len(leaves)+perPiece-1)/perPiece)
-	for i := 0; i < len(leaves); i += perPiece {
-		nodes = append(nodes, MerkleRoot(leaves[i:min(i+perPiece, len(leaves))], perPiece, [32]byte{}))
-	}
-	layer = make([]byte, 0, len(nodes)*32)
-	for i := range nodes {
-		layer = append(layer, nodes[i][:]...)
-	}
-	return MerkleRoot(nodes, len(nodes), PadHash(log2(int64(perPiece)))), layer
 }
 
 // v1Hasher hashes a stream of data into v1 pieces.

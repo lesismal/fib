@@ -20,7 +20,9 @@
 //
 // A Builder hashes files from an fs.FS or the operating system into a v1,
 // v2 or hybrid torrent with trackers (BEP 12), web seeds (BEP 19), DHT
-// nodes and the private flag (BEP 27).
+// nodes and the private flag (BEP 27), in memory that does not grow with
+// the files' sizes beyond 32 bytes a piece; BuildContext and
+// BuildPathContext stop once a context is done.
 //
 // Magnet links (BEP 9) are parsed and formatted with v1 (btih, in hex or
 // base32) and v2 (btmh) hashes, display name, trackers, web seeds, peers

@@ -176,7 +176,11 @@ func TestPiecesRootIsFullTreeRoot(t *testing.T) {
 		leaves := HashBlocks(data)
 		full := MerkleRoot(leaves, len(leaves), [32]byte{})
 		for _, pl := range []int64{BlockSize, 2 * BlockSize, 4 * BlockSize} {
-			root, layer := fileRoot(leaves, int64(n), pl)
+			h := newFileHasher(pl)
+			for _, l := range leaves {
+				h.add(l)
+			}
+			root, layer := h.finish()
 			if root != full {
 				t.Fatalf("n=%d pl=%d: root from layer differs", n, pl)
 			}
