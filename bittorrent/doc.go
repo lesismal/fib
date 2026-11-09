@@ -28,16 +28,20 @@
 //     interrupted download resumes; resume data (Torrent.ResumeData,
 //     AddOptions.Resume) skips the check for files that have not changed.
 //     Storage is read and written, and pieces are hashed, on the client's
-//     disk pool (Config.DiskWorkers), never on a fib worker; the blocks
-//     waiting for it are bounded (Config.DiskQueueBytes), past which the
-//     peers sending them are not read from.
+//     disk pool (Config.DiskWorkers), never on a fib worker. A piece's
+//     blocks are gathered in a buffer, and the piece checked from it and
+//     written whole; the buffers and the bytes waiting to be written are
+//     bounded (Config.DiskQueueBytes), past which pieces go without a
+//     buffer and the peers sending them are not read from.
 //   - Its pieces are picked rarest first, ties broken at random, after a
 //     few random ones, by priority (the files', BEP 53's so=, and those of
-//     a Reader, which streams a file as it downloads), or in order. Blocks
-//     of 16 KiB are requested as deep as each peer's reqq allows; once
-//     every block is requested, endgame mode asks a second peer for those
-//     outstanding and cancels the slower. A peer that sends nothing for a
-//     minute is snubbed: its requests go to others.
+//     a Reader, which streams a file as it downloads), or in order, from
+//     an index of the pieces by priority and availability. A peer reserves
+//     a piece and is asked for its 16 KiB blocks in order, the pipeline
+//     refilled when half of it is answered; once every block is requested,
+//     endgame mode asks a second peer for those outstanding and cancels
+//     the slower. A peer that sends nothing for a minute is snubbed: its
+//     requests and pieces go to others.
 //   - Each piece is checked, by SHA-1 (v1) or against its file's merkle
 //     tree (v2), whose piece layers a magnet link's torrent asks v2 peers
 //     for (BEP 52 hash requests); this side answers those from the layers

@@ -127,6 +127,7 @@ func (t *Torrent) markHaveLocked(i int) {
 	ps.have = true
 	t.have.Set(i)
 	t.haveCount++
+	t.indexRemoveLocked(i)
 	t.resumeGen++
 	if ps.prio > PriorityNone {
 		t.missing--

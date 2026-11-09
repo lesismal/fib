@@ -46,7 +46,7 @@ func (t *Torrent) startWebSeedsLocked(now time.Time) {
 	}
 	for _, ws := range t.seeds {
 		for ws.inFlight < webSeedConcurrency && ws.fails < webSeedMaxFails && !now.Before(ws.nextTry) && t.downAllow() {
-			i, ok := t.pickPiece(func(i int) bool { return t.wanted(i) })
+			i, ok := t.pickPiece(func(i int) bool { return t.wanted(i) }, 0)
 			if !ok {
 				return
 			}
@@ -107,6 +107,11 @@ func (t *Torrent) fetchWebSeed(ws *webSeed, i int, p *partial) {
 		if p.blocks[b].reqs > 0 {
 			p.blocks[b].reqs--
 		}
+	}
+	if err != nil && !p.complete() {
+		// Its blocks are for the peers to send now.
+		p.next = 0
+		t.markFreeLocked(p)
 	}
 	verify := false
 	if err == nil && t.partials[i] == p && !p.busy {

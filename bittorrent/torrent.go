@@ -171,6 +171,15 @@ type Torrent struct {
 	done       chan struct{}
 	pieceSig   chan struct{}
 
+	// pick is the index of the pieces to download, prioGen counts the
+	// changes of priorities (see nextRequest), free the pieces under way
+	// that no peer reserved, with blocks to request.
+	pick    pickIndex
+	prioGen uint64
+	free    []*partial
+	// bufPool keeps piece buffers (Client.allocPieceBuf) for reuse.
+	bufPool sync.Pool
+
 	peers    map[*peer.Conn]*peerConn
 	pool     map[netip.AddrPort]*candidate
 	dials    map[*peer.Conn]*dialAttempt
@@ -445,6 +454,8 @@ func (t *Torrent) recomputePrioritiesLocked() {
 		}
 	}
 	t.missing = missing
+	t.rebuildIndexLocked()
+	t.prioGen++
 	t.updateDoneLocked()
 }
 
@@ -607,6 +618,7 @@ func (t *Torrent) Pause() {
 func (t *Torrent) Stop() {
 	t.mu.Lock()
 	t.pauseLocked(StateStopped)
+	t.dropBufferedLocked()
 	st := t.storage
 	t.storage = nil
 	t.mu.Unlock()
@@ -645,6 +657,7 @@ func (t *Torrent) Remove(deleteData bool) error {
 	}
 	t.pauseLocked(StateRemoved)
 	close(t.removed)
+	t.dropBufferedLocked()
 	st := t.storage
 	t.storage = nil
 	t.mu.Unlock()
@@ -664,6 +677,9 @@ func (t *Torrent) startRunningLocked() {
 	}
 	t.run, t.stopRun = context.WithCancel(t.c.ctx)
 	t.startDiscoveryLocked(t.run)
+	// The candidates known, such as AddOptions.Peers, are dialed now
+	// rather than at the next tick.
+	t.connectPeersLocked(time.Now())
 }
 
 func (t *Torrent) stopRunningLocked() {
@@ -682,6 +698,7 @@ func (t *Torrent) SetSequential(on bool) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	t.sequential = on
+	t.prioGen++
 }
 
 // AddPeers adds peers to connect to, as "host:port" or netip.AddrPort

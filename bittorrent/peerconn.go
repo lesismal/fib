@@ -1,10 +1,12 @@
 package bittorrent
 
 import (
+	"errors"
 	"net"
 	"net/netip"
 	"time"
 
+	"github.com/lesismal/fib/bittorrent/metainfo"
 	"github.com/lesismal/fib/bittorrent/peer"
 	"github.com/lesismal/fib/bittorrent/peer/mse"
 	"github.com/lesismal/fib/bufferpool"
@@ -46,7 +48,11 @@ type peerConn struct {
 	haves    []uint32
 	seed     bool
 
-	pending   map[peer.Request]time.Time
+	pending map[peer.Request]time.Time
+	// owned are the pieces the peer reserved (partial.owner), and prioGen
+	// the Torrent.prioGen it last picked a piece at.
+	owned     []*partial
+	prioGen   uint64
 	lastBlock time.Time
 	snubbed   bool
 	upq       []peer.Request
@@ -90,7 +96,7 @@ func (pc *peerConn) applyInfoLocked(n int) {
 	pc.rawBits, pc.haves = nil, nil
 	for i := range n {
 		if pc.bits.Has(i) {
-			t.pieces[i].avail++
+			t.addAvailLocked(i, 1)
 		}
 	}
 	pc.seed = pc.bits.All()
@@ -310,10 +316,11 @@ func (t *Torrent) OnClose(c *peer.Conn, err error) {
 		t.releaseRequest(r)
 	}
 	pc.pending = nil
+	t.releaseOwnedLocked(pc)
 	if pc.bits != nil && t.info != nil {
 		for i := range t.pieces {
 			if pc.bits.Has(i) {
-				t.pieces[i].avail--
+				t.addAvailLocked(i, -1)
 			}
 		}
 	}
@@ -378,6 +385,8 @@ func (t *Torrent) OnMessage(c *peer.Conn, m *peer.Message) {
 	}
 	switch m.Type {
 	case peer.MsgChoke:
+		// Its pieces go to the peers that may send them.
+		t.releaseOwnedLocked(pc)
 		if !c.Fast() {
 			// The peer dropped every request; with the Fast extension it
 			// rejects each instead.
@@ -404,7 +413,7 @@ func (t *Torrent) OnMessage(c *peer.Conn, m *peer.Message) {
 			pc.bits.SetAll()
 			for i := range t.pieces {
 				if old == nil || !old.Has(i) {
-					t.pieces[i].avail++
+					t.addAvailLocked(i, 1)
 				}
 			}
 			t.updateInterestLocked(pc)
@@ -458,7 +467,7 @@ func (t *Torrent) onHaveLocked(pc *peerConn, i int) {
 		return
 	}
 	pc.bits.Set(i)
-	t.pieces[i].avail++
+	t.addAvailLocked(i, 1)
 	if pc.bits.All() {
 		pc.seed = true
 		t.closeIfBothSeedsLocked(pc)
@@ -483,7 +492,7 @@ func (t *Torrent) onBitfieldLocked(pc *peerConn, b []byte) {
 	}
 	for i := range t.pieces {
 		if bf.Has(i) && !pc.bits.Has(i) {
-			t.pieces[i].avail++
+			t.addAvailLocked(i, 1)
 		}
 	}
 	pc.bits = bf
@@ -559,8 +568,18 @@ func (t *Torrent) fillRequestsLocked(pc *peerConn) {
 	}
 }
 
-// onPiece takes a block: it goes to storage, and a piece whose blocks
-// are all there is checked.
+// refillLocked tops pc's request pipeline up once at most half of it is
+// outstanding, rather than for each block that arrives: the requests go
+// out together, and the picker runs once for the lot.
+func (t *Torrent) refillLocked(pc *peerConn) {
+	if len(pc.pending) > pc.c.RequestLimit()/2 {
+		return
+	}
+	t.fillRequestsLocked(pc)
+}
+
+// onPiece takes a block: into its piece's buffer, or to storage, and a
+// piece whose blocks are all there is checked.
 func (t *Torrent) onPiece(pc *peerConn, m *peer.Message) {
 	r := m.Request()
 	n := len(m.Data)
@@ -591,7 +610,7 @@ func (t *Torrent) onPiece(pc *peerConn, m *peer.Message) {
 	}
 	if p == nil || t.storage == nil {
 		t.wasted += int64(n)
-		t.fillRequestsLocked(pc)
+		t.refillLocked(pc)
 		t.mu.Unlock()
 		return
 	}
@@ -599,7 +618,6 @@ func (t *Torrent) onPiece(pc *peerConn, m *peer.Message) {
 	bs.done = true
 	bs.from = banAddr(pc)
 	p.done++
-	p.writing++
 	pc.contributedBlocks++
 	if t.endgame {
 		// Whoever else was asked for the block need not send it.
@@ -614,20 +632,114 @@ func (t *Torrent) onPiece(pc *peerConn, m *peer.Message) {
 			}
 		}
 	}
+	buf := p.buf
+	if buf == nil {
+		p.writing++
+	}
 	off := t.info.PieceOffset(i) + int64(r.Begin)
-	t.fillRequestsLocked(pc)
+	t.refillLocked(pc)
 	t.mu.Unlock()
 
+	if buf != nil {
+		// The block's place in the buffer is its own: it is marked done
+		// above, so no other copy of it lands, and the buffer is not
+		// pooled while blocks may still be copied into it.
+		copy(buf[r.Begin:], m.Data)
+		if int(p.copied.Add(1)) == len(p.blocks) {
+			t.pieceBuffered(pc, i, p)
+		}
+		return
+	}
 	// The block aliases the connection's read buffer: the write gets a
 	// copy, and the reads from pc stop while too many wait.
-	buf := bufferpool.Get(n)
-	copy(buf, m.Data)
-	t.c.disk.runBytes(int64(n), pc.c, func() { t.writeBlock(pc, i, b, p, off, buf) })
+	wb := bufferpool.Get(n)
+	copy(wb, m.Data)
+	t.c.disk.runBytes(int64(n), pc.c, func() { t.writeBlock(i, b, p, off, wb) })
+}
+
+// pieceBuffered queues the check of piece i, whose blocks are all in p's
+// buffer, on the disk pool: once it passes, it is written whole.
+func (t *Torrent) pieceBuffered(pc *peerConn, i int, p *partial) {
+	t.mu.Lock()
+	buf := p.buf
+	ok := buf != nil && t.partials[i] == p && !p.busy
+	if ok {
+		p.busy = true
+	}
+	t.mu.Unlock()
+	if ok {
+		t.c.disk.runBytes(int64(len(buf)), pc.c, func() { t.checkBuffered(i, p, buf) })
+	}
+}
+
+// checkBuffered, on the disk pool, checks piece i from buf, p's buffer,
+// and writes it to storage when it passes, in one write per file it
+// covers. Data that fails is never written. A v2 piece whose layer is not
+// known yet is written and waits for it, to be checked from storage.
+func (t *Torrent) checkBuffered(i int, p *partial, buf []byte) {
+	t.mu.Lock()
+	layers := t.pieceLayersFor(i)
+	info := t.info
+	t.mu.Unlock()
+	err := info.VerifyPiece(i, buf, layers)
+	noLayer := errors.Is(err, metainfo.ErrNoPieceLayer)
+	var werr error
+	if err == nil || noLayer {
+		werr = errNoStorage
+		st, info, done := t.useStorage()
+		if st != nil {
+			werr = writeData(st, info, info.PieceOffset(i), buf)
+		}
+		done()
+	}
+
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	current := t.partials[i] == p && !t.pieces[i].have
+	switch {
+	case !current:
+	case werr != nil:
+		if !errors.Is(werr, errNoStorage) {
+			t.c.emit(Event{Type: EventError, Torrent: t, Err: werr})
+		}
+		t.dropPartial(i)
+		for _, pc := range t.peers {
+			t.fillRequestsLocked(pc)
+		}
+	case err == nil:
+		t.smartBanGoodLocked(i, buf)
+		t.hashedData = true
+		t.markHaveLocked(i)
+	case noLayer:
+		// A v2 torrent from a magnet link: the piece, in storage now,
+		// waits for its file's piece layer, which peers are asked for.
+		t.c.freePieceBuf(t, p, true)
+		p.busy = false
+		p.waitHashes = true
+		// The layer may have come while the check ran.
+		t.kickWaitingLocked()
+		t.requestHashesLocked()
+		return
+	default:
+		t.hashFails++
+		t.wasted += int64(len(buf))
+		t.smartBanBadLocked(i, p, buf)
+		t.dropPartial(i)
+		t.c.emit(Event{Type: EventHashFailed, Torrent: t, Piece: i})
+		for _, pc := range t.peers {
+			t.fillRequestsLocked(pc)
+		}
+	}
+	// Every block was copied in before the check: the buffer is the
+	// pool's again.
+	t.c.freePieceBuf(t, p, true)
+	p.busy = false
 }
 
 // writeBlock, on the disk pool, writes block b of piece i, which p holds,
-// and checks the piece if that was its last block to land.
-func (t *Torrent) writeBlock(pc *peerConn, i, b int, p *partial, off int64, buf []byte) {
+// and checks the piece if that was its last block to land: the way of a
+// piece that has no buffer.
+func (t *Torrent) writeBlock(i, b int, p *partial, off int64, buf []byte) {
 	err := errNoStorage
 	st, info, done := t.useStorage()
 	if st != nil {
@@ -641,6 +753,10 @@ func (t *Torrent) writeBlock(pc *peerConn, i, b int, p *partial, off int64, buf 
 	if err != nil {
 		p.blocks[b].done = false
 		p.done--
+		p.reopen(b)
+		if p.owner == nil {
+			t.markFreeLocked(p)
+		}
 		t.mu.Unlock()
 		if st != nil {
 			t.c.emit(Event{Type: EventError, Torrent: t, Err: err})
@@ -651,7 +767,6 @@ func (t *Torrent) writeBlock(pc *peerConn, i, b int, p *partial, off int64, buf 
 	if verify {
 		p.busy = true
 	}
-	t.fillRequestsLocked(pc)
 	t.mu.Unlock()
 	if verify {
 		t.verifyPiece(i, p)

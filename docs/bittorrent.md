@@ -316,20 +316,33 @@ _, err = io.Copy(w, r)
   ```
 - **Disk pool**: storage is never read or written, and no piece is hashed, on a fib worker (or on
   the goroutine reading a uTP connection). `Config.DiskWorkers` goroutines (GOMAXPROCS, at most
-  `DefaultMaxDiskWorkers` = 8) take the jobs from one queue: a received block is copied into a
-  pooled buffer and its write queued, and the piece is checked on the pool once its last block
-  lands; an upload's reads run there, one job per peer at a time of up to 16 blocks, still paced by
-  `Congested`, `OnWritable` and `UploadRate`; so do the answers to BEP 52 hash requests and the check
-  of a fetched piece layer. The blocks waiting are bounded by `Config.DiskQueueBytes`
-  (`DefaultDiskQueueBytes`, 64 MiB): past it the connections that sent them stop reading
+  `DefaultMaxDiskWorkers` = 8) take the jobs from one queue: a received block is copied into its
+  piece's buffer, and once the piece's last block is in, the piece is checked from that buffer on
+  the pool and, when it passes, written in one write per file it covers (data that fails is never
+  written; a v2 piece whose layer is not known yet is written and checked from storage once it
+  is); a piece that found no room for a buffer has each block copied into a pooled buffer and its
+  write queued, and is read back and checked once its last block lands. An upload's reads run
+  there, one job per peer at a time of up to 16 blocks, still paced by `Congested`, `OnWritable`
+  and `UploadRate`; so do the answers to BEP 52 hash requests and the check of a fetched piece
+  layer. The piece buffers held and the bytes waiting to be written are each bounded by
+  `Config.DiskQueueBytes` (`DefaultDiskQueueBytes`, 64 MiB): a piece reserved past the first bound
+  goes without a buffer, and past the second the connections that sent the bytes stop reading
   (`peer.Conn.HoldReads`, which is `fib.Connection.HoldReads` or a paused reading goroutine) until
   half has been written. `Stop`, `Remove` and `Close` close a storage only once the reads and writes
   under way are over; those still queued are dropped.
-- **Picking**: rarest first with random ties, the first 4 pieces at random; file priorities,
-  sequential mode and the windows of open `Reader`s (the nearest piece most urgent; readahead 4 MiB
-  by default, `SetReadahead`) come first. 16 KiB blocks are pipelined to each peer's `reqq`; in
-  endgame a block goes to a second peer and the slower request is cancelled. A peer that sends
-  nothing for 60 s is snubbed and its requests go to others.
+- **Picking and requests**: a peer reserves a piece and is asked for its 16 KiB blocks in order,
+  then for the next piece's, rather than the picker running again for every block; its pipeline
+  (the peer's `reqq`, at most `peer.DefaultMaxRequests` = 64 blocks) is refilled once at most half
+  of it is outstanding, the requests going out together. A new piece is chosen by priority (file
+  priorities, sequential mode and the windows of open `Reader`s, the nearest piece most urgent;
+  readahead 4 MiB by default, `SetReadahead`), then rarest first with random ties, the first 4
+  pieces at random. The picker reads an index of the pieces to download, by priority and then by
+  how many peers have each, kept up to date as have, bitfield and have-all messages arrive and
+  peers close, so a pick does not scan the pieces. A peer that chokes this side, closes, or sends
+  nothing for 60 s (snubbed: its requests go to others) gives up its pieces, whose blocks not
+  received any peer takes; pieces a `Reader` waits for are never reserved, so every peer that has
+  them helps. When priorities change, each peer looks for a better piece at its next request. In
+  endgame a block goes to a second peer and the slower request is cancelled.
 - **Verification**: SHA-1 for v1, the merkle tree for v2. A v2-only magnet's torrent fetches its
   piece layers with BEP 52 hash requests, and the client answers peers' hash requests from the
   layers it has. A hybrid torrent added from a magnet link has no layers in its info dictionary:
@@ -346,8 +359,10 @@ _, err = io.Copy(w, r)
 - **Connections** dial uTP first, then TCP; MSE first and plaintext after a refusal
   (`EncryptionPrefer`, the default), the reverse with `EncryptionAllow`, never plaintext with
   `EncryptionRequire`; bounded by `MaxConns` (200), `MaxConnsPerTorrent` (50), `MaxHalfOpen` (32)
-  and `DialsPerTick` (8), with backoff. Of two connections to one peer, the one the lower peer ID
-  began is kept.
+  and `DialsPerTick` (8), with backoff. Peers are dialed as soon as they are added (`AddOptions.Peers`,
+  `AddPeers`, trackers, the DHT and the rest), and a torrent that starts dials those it knows, rather
+  than at the next one-second tick; `DialsPerTick` bounds each such burst. Of two connections to
+  one peer, the one the lower peer ID began is kept.
 - **Peers** come from trackers (tiered, started, completed and stopped, under both hashes of a
   hybrid; completed only for a download that finished in this session, never for data that was
   complete when its check ended), the DHT (announce every 15 minutes, every minute while there are none; `PORT` both
@@ -383,7 +398,40 @@ _, err = io.Copy(w, r)
   with `Engine.ShutdownBinding` and a done context, which closes the connections it accepted at
   once), closes the connections it dialed and its HTTP client, and leaves the engine, its other
   bindings and their connections running. `Engine()` returns the engine in use. Several clients
-  may share one engine, each on its own port.
+  may share one engine, each on its own port. A client's own engine is `fib.DefaultConfig()`
+  named `bittorrent` (16 KiB read buffer, the adaptive shared task pool, I/O pollers), unless
+  `Config.Engine` says otherwise; downloading, it is as fast as fit's shared engine (64 KiB reads,
+  100 workers a CPU), see [Performance](#performance).
+
+## Performance
+
+Downloading one 1 GiB torrent (v1, 1 MiB pieces, in `/dev/shm`) from 4 local fib seeders over
+TCP, the client measured pinned to 4 CPUs and the seeders on 8 others, on fit's benchmark host
+(16 CPUs, Linux 7.0), with fit's `test/btinterop/btbench` driver: medians of 3 alternating rounds,
+2026-11-09. "Before" is e633fc2; "fit" is fit's `bittorrent.client` role on its shared engine;
+"shared" is fib's client alone on an engine configured as fit's; anacrolix, the same day, is
+for reference.
+
+| Connections | Client | MiB/s before | MiB/s after | CPU s per GiB before | after | Peak RSS MiB before | after |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| plain | fib, own engine | 470 | 2687 | 2.30 | 1.16 | 168 | 48 |
+| plain | fib, shared | | 2871 | | 1.15 | | 47 |
+| plain | fit | 689 | 2705 | 2.28 | 1.12 | 179 | 66 |
+| plain | anacrolix 1.61 | | 1030 | | 2.29 | | 1050 |
+| MSE (RC4) | fib, own engine | 357 | 1308 | 3.87 | 2.70 | 139 | 43 |
+| MSE (RC4) | fib, shared | | 1337 | | 2.60 | | 46 |
+| MSE (RC4) | fit | 549 | 1377 | 3.67 | 2.63 | 172 | 54 |
+| MSE (RC4) | anacrolix 1.61 | | 789 | | 3.82 | | 1051 |
+
+Three things held the download back: every block took the torrent's lock and ran the picker,
+which scanned every piece with a random tie-break (a quarter of the CPU, and the lock waited on
+for three times the download's duration); every 16 KiB block was a write of its own, and every
+piece was read back to be checked; and the first dial waited for the client's one-second tick,
+which was most of the 0.68 ratio between fib alone and fit (fit's client had been running for a
+while, so its tick came sooner). A CPU profile after: the piece writes (`pwrite` into tmpfs, the
+kernel allocating its pages) 49%, SHA-1 30%, socket reads 16%, the torrent's message handling,
+requests and picker 3%. The own engine's defaults and fit's (64 KiB reads, a pool of 100 workers a
+CPU) download at the same rate, before and after, so they are unchanged.
 
 ## Interop
 
@@ -662,8 +710,19 @@ alternative.
 - **Local service discovery is IPv4 only**, on the standard library's `net.ListenMulticastUDP`,
   since fib has no multicast bindings; it turns itself off silently if joining the group fails.
 - **Bans** are by IP (a loopback peer by its listen address) and last for the client's lifetime.
-- **Blocks are written straight to storage** (through the disk pool) and read back to verify the
-  piece; there are no pieces in memory, and smart-ban hashes come from that read-back.
+- **Blocks are gathered in a piece buffer and the piece written whole (A89)**, checked from memory
+  first: one write per file a piece covers instead of one per 16 KiB block, no read-back, and data
+  that fails is never written (smart-ban hashes come from the buffer). The buffers share
+  `DiskQueueBytes` as their own bound (a second 64 MiB by default); a piece reserved past it falls
+  back to the old way, each block written as it comes and the piece read back. A buffer is taken
+  when a piece is reserved, whole (a piece's length), and pooled per torrent; one whose piece is
+  dropped while blocks may still be copied into it is left to the collector. Alternatives: writing
+  contiguous runs of blocks with `pwritev` (still a read-back; the buffer being contiguous, plain
+  `pwrite` suffices and `syscall`/`os` stay the only dependencies), or no bound of their own.
+- **A block is copied into its piece's buffer outside the torrent's lock (A89)**: it is marked
+  done under the lock, so no second copy of it lands, and an atomic count of the blocks copied
+  tells the last copier to queue the check. A write that fails after the check passes drops the
+  piece (emitting `EventError` as before), whose blocks are requested again.
 - **One disk pool per client, one FIFO queue** for writes, piece checks, upload reads and hash
   answers: simple and fair enough, as an upload job yields after 16 blocks. Alternatives: a queue
   per torrent or per kind of job (writes before reads, as libtorrent's disk threads favour), or a
@@ -860,4 +919,38 @@ alternative.
   loop started (a torrent paused while completing) or before its `started` announce succeeded.
   Alternatives: comparing `left` at the `started` announce (wrong when started goes out during the
   check, as it does), or never announcing `completed` after a pause.
+- **A peer reserves the pieces it is asked for (A89)**: the picker runs once per piece, not once
+  per block; the peer's next request is the next block of a piece of its own, then of a piece no
+  peer holds (given up, or failed by a web seed), then a new piece. Other peers do not take the
+  blocks of a piece reserved by another until it is given up (choke, close, snub) or endgame
+  begins, when a peer with nothing else asks for them too, as before. Pieces of urgent priority (a
+  `Reader`'s window) are never reserved, so streaming keeps every peer on the nearest piece. A
+  better piece appearing (a priority change, `SetSequential`) is taken at a peer's next request;
+  one becoming available through a have message is taken at its next piece. Alternatives:
+  libtorrent's piece affinity by peer speed class, or stealing a slow peer's piece before endgame.
+- **The pipeline is refilled once at most half of it is outstanding (A89)**, not after every
+  block: the requests go out in one batch, and the picker and the request code run once per 32
+  blocks. `peer.DefaultMaxRequests` stays 64 (1 MiB a peer): on the benchmark 250 (libtorrent's
+  reqq) or refilling at three quarters changed nothing beyond noise and 250 doubled the peak
+  memory. Alternatives: a pipeline sized by each peer's rate and round trip, as libtorrent does.
+- **Rarest first from an index (A89)**: the pieces to download are filed by priority, then by
+  availability (up to 1024 buckets), moved on have, bitfield and have-all messages, on a peer's
+  close, when a piece is had, and rebuilt when priorities change. Ties are broken by starting at a
+  random place in the bucket rather than uniformly among the pieces a peer can give; the first 4
+  pieces start at a random bucket. Urgent and sequential picks take the lowest index from the
+  class, walking from the first piece missing when the class is large. A pick whose count of
+  pieces filed differs from the count of pieces missing rebuilds the index first, so a change made
+  elsewhere (a recheck, a seed piece failing its check) cannot hide a piece from the picker for
+  long. Pieces under way stay filed and are passed over. Alternatives: a heap per priority, or
+  libtorrent's sorted piece list with availability ranges.
+- **Peers are dialed as they are added (A89, A90)**: `addPeersLocked` and the start of a torrent
+  call the connection loop at once instead of leaving it to the next one-second tick, which was
+  most of a fast download's time and the cause of the 0.68 ratio A90 measured. Each call dials up
+  to `DialsPerTick`, so a burst of tracker, DHT or PEX peers dials more than that per second, still
+  bounded by `MaxHalfOpen` and the connection limits. Alternative: a dial-rate limiter separate from
+  the tick.
+- **The own engine's defaults are unchanged (A90)**: `fib.DefaultConfig()` downloads at the rate
+  of fit's engine configuration (64 KiB read buffer, 100 workers a CPU) and of a 64 KiB read buffer
+  or that pool alone, before and after A89, within noise (64 KiB reads cost about 5% less CPU per GiB, at
+  the same rate). Alternative: a 64 KiB read buffer for the client's own engine.
 

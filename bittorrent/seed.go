@@ -40,6 +40,7 @@ func (t *Torrent) markTrustedLocked(i int) {
 	ps.have, ps.trusted = true, true
 	t.have.Set(i)
 	t.haveCount++
+	t.indexRemoveLocked(i)
 	t.trusted++
 	if ps.prio > PriorityNone {
 		t.missing--
@@ -131,6 +132,7 @@ func (t *Torrent) checkTrusted(i int) bool {
 	if ps.prio > PriorityNone {
 		t.missing++
 	}
+	t.indexAddLocked(i)
 	t.hashFails++
 	t.c.emit(Event{Type: EventHashFailed, Torrent: t, Piece: i, Err: err})
 	t.updateDoneLocked()

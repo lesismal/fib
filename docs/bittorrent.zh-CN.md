@@ -265,15 +265,21 @@ _, err = io.Copy(w, r)
   ```
 - **磁盘池**：存储的读写和分片哈希从不在 fib worker 上（也不在读 uTP 连接的 goroutine 上）进行。
   `Config.DiskWorkers` 个 goroutine（GOMAXPROCS，最多 `DefaultMaxDiskWorkers` = 8）从同一个队列取任务：收到的块
-  拷进池化缓冲区后排队写入，分片的最后一块落盘后在池上校验整个分片；上传的读也在池上，每个 peer 同时只有一个
-  任务，每个任务最多 16 块，节奏仍受 `Congested`、`OnWritable` 和 `UploadRate` 控制；BEP 52 hash request 的应答和
-  取到的 piece layer 的校验也在池上。等待写入的块受 `Config.DiskQueueBytes`（`DefaultDiskQueueBytes`，64 MiB）
-  限制：超过后，发来这些块的连接停止读取（`peer.Conn.HoldReads`，即 `fib.Connection.HoldReads` 或暂停读
-  goroutine），直到写掉一半。`Stop`、`Remove` 和 `Close` 等正在进行的读写结束后才关闭存储；仍在排队的被丢弃。
-- **选片**：最稀有优先，相同时随机，头 4 个分片随机挑；文件优先级、顺序模式和打开着的 `Reader` 的窗口
-  （最近的分片最急；默认预读 4 MiB，可用 `SetReadahead` 调整）优先。16 KiB 的块按每个 peer 的 `reqq` 流水请求；
-  endgame 时一个块同时向第二个 peer 请求，较慢的那个被取消。60 秒没发任何东西的 peer 被判为 snub，
-  它的请求转给别人。
+  拷进它所属分片的缓冲区，分片的最后一块到齐后，在池上直接从缓冲区校验，通过后按它覆盖的文件每个文件一次写入
+  （校验失败的数据从不写入；v2 分片的 layer 尚未得知时先写入，等 layer 到了再从存储校验）；没分到缓冲区的分片，
+  每块拷进池化缓冲区后排队写入，最后一块落盘后读回校验。上传的读也在池上，每个 peer 同时只有一个任务，每个任务
+  最多 16 块，节奏仍受 `Congested`、`OnWritable` 和 `UploadRate` 控制；BEP 52 hash request 的应答和取到的 piece
+  layer 的校验也在池上。持有的分片缓冲区和等待写入的字节各自受 `Config.DiskQueueBytes`（`DefaultDiskQueueBytes`，
+  64 MiB）限制：超过前者，新预留的分片不分缓冲区；超过后者，发来这些字节的连接停止读取（`peer.Conn.HoldReads`，
+  即 `fib.Connection.HoldReads` 或暂停读 goroutine），直到写掉一半。`Stop`、`Remove` 和 `Close` 等正在进行的读写结束后才关闭存储；仍在排队的被丢弃。
+- **选片与请求**：peer 预留一个分片，按顺序向它请求该分片的 16 KiB 块，然后是下一个分片的，而不是每个块都重新
+  选片；它的流水线（peer 的 `reqq`，最多 `peer.DefaultMaxRequests` = 64 块）在未完成的请求降到一半及以下时才补充，
+  补充的请求一起发出。新分片先按优先级选（文件优先级、顺序模式和打开着的 `Reader` 的窗口，最近的分片最急；默认
+  预读 4 MiB，可用 `SetReadahead` 调整），再最稀有优先，相同时随机，头 4 个分片随机挑。选片读的是一个待下载分片的
+  索引，先按优先级、再按有它的 peer 数归类，随 have、bitfield、have all 消息和 peer 关闭更新，所以选片不扫描全部
+  分片。choke 了本方、关闭、或 60 秒没发任何东西（被判为 snub，请求转给别人）的 peer 放弃它预留的分片，其中未收到
+  的块由任何 peer 接手；`Reader` 等待的分片从不被预留，有它的 peer 都会帮忙。优先级变化后，每个 peer 在下一次请求时
+  寻找更好的分片。endgame 时一个块同时向第二个 peer 请求，较慢的那个被取消。
 - **校验**：v1 用 SHA-1，v2 用 merkle 树。纯 v2 磁力链接的 torrent 用 BEP 52 的 hash request 取 piece layer，
   客户端也用手里的 layer 应答 peer 的 hash request。从磁力链接加入的 hybrid torrent 的 info 字典里没有 layer：
   下载完成、或校验发现数据完整后，客户端在磁盘池上从数据算出它们（每个任务最多读 4 MiB），此后应答 v2 peer，
@@ -285,7 +291,9 @@ _, err = io.Copy(w, r)
   被 choke 的 peer 的请求回 reject。上传节奏受 socket（`Congested`、`OnWritable`）和 `UploadRate` 控制。
 - **连接**先拨 uTP 再拨 TCP；先 MSE、被拒后再明文（默认的 `EncryptionPrefer`），`EncryptionAllow` 反过来，
   `EncryptionRequire` 绝不用明文；受 `MaxConns`（200）、`MaxConnsPerTorrent`（50）、`MaxHalfOpen`（32）和
-  `DialsPerTick`（8）限制，失败后退避。与同一 peer 的两条连接，保留 peer ID 较小的一方发起的那条。
+  `DialsPerTick`（8）限制，失败后退避。peer 一加入（`AddOptions.Peers`、`AddPeers`、tracker、DHT 等）就拨号，
+  torrent 启动时也立即拨已知的 peer，而不是等下一次每秒一次的 tick；每次这样的拨号最多 `DialsPerTick` 个。
+  与同一 peer 的两条连接，保留 peer ID 较小的一方发起的那条。
 - **peer** 来自 tracker（分 tier，发 started、completed、stopped，hybrid 用两个哈希都 announce；completed 只为
   本次会话中完成的下载发送，校验结束时就已完整的数据从不发送）、DHT（每 15 分钟
   announce 一次，没有 peer 时每分钟一次；双向 `PORT`）、PEX（每个 peer 每分钟一条）、本地服务发现（BEP 14，
@@ -313,7 +321,34 @@ _, err = io.Copy(w, r)
   DHT 和 UDP tracker 客户端，并在其上建 fib/http 客户端（tracker、web seed）；`Close` 移除这两个绑定
   （TCP 绑定用 `Engine.ShutdownBinding` 加一个已结束的 context，立即关闭它接受的连接），关闭它拨出的
   连接和 HTTP 客户端，引擎及其他绑定和连接照常运行。`Engine()` 返回正在用的引擎。多个客户端可共享
-  一个引擎，各用各的端口。
+  一个引擎，各用各的端口。客户端自建的引擎是名为 `bittorrent` 的 `fib.DefaultConfig()`（16 KiB 读缓冲、
+  自适应共享任务池、I/O poller），除非 `Config.Engine` 另有指定；下载时它与 fit 的共享引擎（64 KiB 读缓冲、
+  每 CPU 100 个 worker）一样快，见[性能](#性能)。
+
+## 性能
+
+在 fit 的基准主机上（16 CPU，Linux 7.0）用 fit 的 `test/btinterop/btbench` 驱动，从 4 个本地 fib 做种方经 TCP
+下载一个 1 GiB 的 torrent（v1，1 MiB 分片，放在 `/dev/shm`），被测客户端固定在 4 个 CPU 上，做种方在另外 8 个上：
+3 轮交替运行的中位数，2026-11-09。"之前"是 e633fc2；"fit"是 fit 的 `bittorrent.client` 角色，运行在它的共享引擎上；
+"共享"是 fib 的客户端单独运行在按 fit 的配置建的引擎上；anacrolix 为同日测得，作参照。
+
+| 连接 | 客户端 | 之前 MiB/s | 之后 MiB/s | 之前 CPU 秒/GiB | 之后 | 之前峰值 RSS MiB | 之后 |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| 明文 | fib，自建引擎 | 470 | 2687 | 2.30 | 1.16 | 168 | 48 |
+| 明文 | fib，共享 | | 2871 | | 1.15 | | 47 |
+| 明文 | fit | 689 | 2705 | 2.28 | 1.12 | 179 | 66 |
+| 明文 | anacrolix 1.61 | | 1030 | | 2.29 | | 1050 |
+| MSE（RC4） | fib，自建引擎 | 357 | 1308 | 3.87 | 2.70 | 139 | 43 |
+| MSE（RC4） | fib，共享 | | 1337 | | 2.60 | | 46 |
+| MSE（RC4） | fit | 549 | 1377 | 3.67 | 2.63 | 172 | 54 |
+| MSE（RC4） | anacrolix 1.61 | | 789 | | 3.82 | | 1051 |
+
+拖慢下载的有三处：每个块都要取 torrent 的锁并运行选片，选片扫描所有分片并随机决胜（占 CPU 的四分之一，
+等锁的总时间是下载时长的三倍）；每个 16 KiB 块各写一次，每个分片还要读回校验；第一次拨号要等客户端每秒
+一次的 tick，这是 fib 单独运行与 fit 之比 0.68 的主要原因（fit 的客户端已运行了一阵，tick 来得早些）。之后的
+CPU profile：分片写入（向 tmpfs `pwrite`，内核分配页）49%，SHA-1 30%，socket 读 16%，torrent 的消息处理、
+请求和选片 3%。自建引擎的默认值与 fit 的（64 KiB 读缓冲、每 CPU 100 个 worker）在改动前后下载速率都相同，
+因此不变。
 
 ## 互通验证
 
@@ -540,7 +575,13 @@ FIB_DHT_PUBLIC=1 FIB_DHT_INFOHASH=<40 位十六进制> go test -run TestDHTPubli
 - **本地服务发现只支持 IPv4**，用标准库的 `net.ListenMulticastUDP`，因为 fib 没有组播 binding；加入组播组失败时
   静默关闭。
 - **封禁**按 IP（回环上的 peer 按它的监听地址），在客户端整个生命周期内有效。
-- **块直接写入存储**（经磁盘池），校验分片时再读回；内存里不攒分片，smart ban 的哈希也来自读回的数据。
+- **块攒进分片缓冲区，分片整个写入（A89）**，写入前先从内存校验：每个分片按它覆盖的文件每个文件写一次，而不是
+  每 16 KiB 块一次，也不再读回，校验失败的数据从不写入（smart ban 的哈希来自缓冲区）。缓冲区以 `DiskQueueBytes`
+  作为自己的上限（默认另一个 64 MiB）；超过后预留的分片退回旧方式，每块到达即写，最后读回校验。缓冲区在分片被
+  预留时整块分配（一个分片的长度），按 torrent 池化；分片被丢弃而可能仍有块在往里拷时，缓冲区交给 GC。备选：用
+  `pwritev` 写连续的块段（仍需读回；缓冲区本身连续，普通 `pwrite` 足够，依赖仍只有 `syscall`/`os`），或不设单独的上限。
+- **块在 torrent 的锁外拷进分片缓冲区（A89）**：块在锁内标记为已完成，所以不会有第二份拷入，已拷入块的原子计数
+  告诉最后一个拷入者排队校验。校验通过后写入失败则丢弃该分片（与以前一样发出 `EventError`），其块重新请求。
 - **每个客户端一个磁盘池、一个 FIFO 队列**，写入、分片校验、上传读取和 hash 应答共用：简单，也足够公平，因为
   上传任务每 16 块就让出一次。备选：每个 torrent 或每类任务一个队列（像 libtorrent 的磁盘线程那样先写后读），
   或每个任务一个 goroutine，那就什么都限制不住。
@@ -674,4 +715,27 @@ FIB_DHT_PUBLIC=1 FIB_DHT_INFOHASH=<40 位十六进制> go test -run TestDHTPubli
   扩大了选择并下载了新文件的，会 announce，因为那是下载。与以前一样，每个 torrent 每次会话至多一次
   `completed`；下载在 tracker 循环启动前（完成时暂停的 torrent）或 `started` 成功之前就完成的，不发。备选：
   比较 `started` 时的 `left`（started 在校验期间发出时会错，而实际正是如此）；暂停后永不 announce `completed`。
+- **peer 预留它被请求的分片（A89）**：选片每个分片运行一次，而不是每个块一次；peer 的下一个请求依次来自它自己
+  的分片的下一块、无人持有的分片（被放弃的，或 web seed 失败的），然后才是新分片。别的 peer 不拿另一个 peer 预留的
+  分片的块，直到它被放弃（choke、关闭、snub）或进入 endgame（与以前一样，无事可做的 peer 也去请求它们）。紧急
+  优先级的分片（`Reader` 的窗口）从不被预留，所以流式播放时所有 peer 都在最近的分片上。出现更好的分片（优先级
+  变化、`SetSequential`）时在 peer 的下一次请求时采用；因 have 消息而变得可得的，在它的下一个分片时采用。备选：
+  libtorrent 按 peer 速度档位的分片亲和，或在 endgame 前抢慢 peer 的分片。
+- **流水线在未完成请求降到一半及以下时才补充（A89）**，而不是每收到一块就补：请求一批发出，选片和请求代码每
+  32 块运行一次。`peer.DefaultMaxRequests` 保持 64（每个 peer 1 MiB）：基准中改为 250（libtorrent 的 reqq）或在
+  四分之三时补充，差别都在噪声内，250 还让峰值内存翻倍。备选：像 libtorrent 那样按每个 peer 的速率和往返时间确定
+  流水线长度。
+- **最稀有优先基于索引（A89）**：待下载分片先按优先级、再按可得数（最多 1024 个桶）归类，在 have、bitfield、
+  have all 消息、peer 关闭、分片已有时移动，优先级变化时重建。决胜是从桶中随机位置开始找，而不是在该 peer 能
+  提供的分片中均匀随机；头 4 个分片从随机的桶开始。紧急和顺序选片从该优先级类中取最小下标，类很大时从第一个
+  缺失的分片开始按下标走。选片时若索引中的分片数与缺失分片数不同，先重建索引，所以别处的改动（重新校验、做种
+  分片校验失败）不会让分片长期对选片不可见。下载中的分片仍留在索引里并被跳过。备选：每个优先级一个堆，或
+  libtorrent 带可得数区间的有序分片表。
+- **peer 一加入就拨号（A89、A90）**：`addPeersLocked` 和 torrent 启动时立即调用连接循环，而不是留给下一次每秒
+  一次的 tick；这个等待曾占快速下载的大部分时间，也是 A90 测得 0.68 之比的原因。每次调用最多拨 `DialsPerTick`
+  个，所以一批 tracker、DHT 或 PEX 的 peer 每秒可拨的多于此数，但仍受 `MaxHalfOpen` 和连接上限约束。备选：
+  独立于 tick 的拨号速率限制。
+- **自建引擎的默认值不变（A90）**：`fib.DefaultConfig()` 的下载速率与 fit 的引擎配置（64 KiB 读缓冲、每 CPU
+  100 个 worker）、以及单独 64 KiB 读缓冲或单独该任务池相同，A89 前后都在噪声内（64 KiB 读缓冲每 GiB 少用约 5%
+  的 CPU，速率相同）。备选：自建引擎用 64 KiB 读缓冲。
 
