@@ -370,26 +370,19 @@ func (c *Client) listen() error {
 			tcpNet, udpNet = "tcp6", "udp6"
 		}
 	}
-	for try := 0; ; try++ {
-		p := port
-		tcpIndex := -1
-		if !c.cfg.DisableTCP {
-			i, err := engine.AddBinding(fib.Binding{Network: tcpNet, Addr: net.JoinHostPort(host, strconv.Itoa(port)), Handler: c.server, Filter: c.cfg.Filter})
-			if err != nil {
-				return err
-			}
-			tcpIndex = i
-			c.tcpBinding = i
-			addrs, err := engine.BindingAddrs(i)
-			if err != nil || len(addrs) == 0 {
-				return fmt.Errorf("bittorrent: no TCP address: %v", err)
-			}
-			p = addrs[0].(*net.TCPAddr).Port
+	addTCP := func(p int) (int, int, error) {
+		i, err := engine.AddBinding(fib.Binding{Network: tcpNet, Addr: net.JoinHostPort(host, strconv.Itoa(p)), Handler: c.server, Filter: c.cfg.Filter})
+		if err != nil {
+			return -1, 0, err
 		}
-		if !needUDP {
-			c.port = p
-			return nil
+		addrs, err := engine.BindingAddrs(i)
+		if err != nil || len(addrs) == 0 {
+			_ = engine.RemoveBinding(i)
+			return -1, 0, fmt.Errorf("bittorrent: no TCP address: %v", err)
 		}
+		return i, addrs[0].(*net.TCPAddr).Port, nil
+	}
+	addUDP := func(p int) (*utp.Socket, int, error) {
 		ucfg := utp.Config{}
 		if c.cfg.DisableUTP {
 			ucfg.AcceptBacklog = -1
@@ -399,19 +392,62 @@ func (c *Client) listen() error {
 		ucfg.Accept = c.cfg.Filter
 		s, err := utp.Listen(engine, udpNet, net.JoinHostPort(host, strconv.Itoa(p)), ucfg)
 		if err != nil {
-			if port == 0 && tcpIndex >= 0 && try < 8 {
-				_ = engine.RemoveBinding(tcpIndex)
-				c.tcpBinding = -1
-				continue
-			}
+			return nil, 0, err
+		}
+		return s, s.Addr().(*net.UDPAddr).Port, nil
+	}
+	useTCP := !c.cfg.DisableTCP
+	switch {
+	case !needUDP:
+		i, p, err := addTCP(port)
+		if err != nil {
 			return err
 		}
-		if p == 0 {
-			p = s.Addr().(*net.UDPAddr).Port
+		c.tcpBinding, c.port = i, p
+		return nil
+	case !useTCP:
+		s, p, err := addUDP(port)
+		if err != nil {
+			return err
 		}
-		c.port = p
-		c.utp = s
-		break
+		c.utp, c.port = s, p
+	default:
+		// One port number for both. A zero port lets one protocol pick a
+		// free port and takes the same number for the other, trying again
+		// when it is taken. TCP picks on even tries and UDP on odd ones:
+		// TCP and UDP ports are handed out apart, and Windows reserves UDP
+		// ports in blocks of a hundred or so, which a run of TCP picks can
+		// fall in for dozens of tries (WSAEACCES).
+		for try := 0; ; try++ {
+			var err error
+			if port != 0 || try%2 == 0 {
+				var i, p int
+				if i, p, err = addTCP(port); err != nil {
+					return err
+				}
+				var s *utp.Socket
+				if s, _, err = addUDP(p); err == nil {
+					c.tcpBinding, c.utp, c.port = i, s, p
+					break
+				}
+				_ = engine.RemoveBinding(i)
+			} else {
+				var s *utp.Socket
+				var p int
+				if s, p, err = addUDP(0); err != nil {
+					return err
+				}
+				var i int
+				if i, _, err = addTCP(p); err == nil {
+					c.tcpBinding, c.utp, c.port = i, s, p
+					break
+				}
+				_ = s.Close()
+			}
+			if port != 0 || try >= 64 {
+				return err
+			}
+		}
 	}
 	c.utp.OnOther(c.onUDP)
 	c.udpTracker = tracker.NewUDPClient(tracker.UDPClientConfig{

@@ -611,8 +611,10 @@ func (c *Conn) takeAcks(h header, sack []byte, now int64) {
 			}
 		}
 	}
+	sacked := 0
 	if sack != nil {
-		ackedBytes += c.sackBytes(h.ack+2, sack, &minRTT, now)
+		sacked = c.sackBytes(h.ack+2, sack, &minRTT, now)
+		ackedBytes += sacked
 	}
 
 	// The one-way delays, each measured against the other end's clock:
@@ -694,6 +696,15 @@ func (c *Conn) takeAcks(h header, sack []byte, now int64) {
 		if c.inflightPkts > 0 {
 			c.armProbe(now)
 		}
+	} else if sacked > 0 && c.inflightPkts > 0 && c.tlpAt == 0 {
+		// Packets past the oldest arrived, and it did not: a probe spent
+		// before, and fewer than three packets selectively acknowledged
+		// past it, left nothing to send it again but the timeout, which
+		// each such acknowledgement puts off (RFC 8985 arms the probe on
+		// any acknowledgement of new data). Only when none is armed, so
+		// that acknowledgements coming faster than two round trips do not
+		// put the probe off too.
+		c.armProbe(now)
 	}
 }
 

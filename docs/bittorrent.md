@@ -547,7 +547,11 @@ alternative.
 - **A fib initiator sends a STATE** once connected.
 - **A duplicate SYN is answered again.**
 - **An acknowledgement that is stale but not ahead**: the data is kept, the acknowledgement ignored.
-- **RACK, tail-loss probe and three-duplicate-ack retransmission** added beyond libutp.
+- **RACK, tail-loss probe and three-duplicate-ack retransmission** added beyond libutp. The probe
+  is armed again by an acknowledgement that selectively acknowledges new packets while none is
+  armed (RFC 8985), so that a lost oldest packet with fewer than three packets arriving past it is
+  sent again within two round trips, rather than when the timeout, which each such
+  acknowledgement puts off, finally fires.
 - **Karn for a whole acknowledgement, and for a recovery**: one whose cumulative advance covers a
   packet sent again gives no round-trip sample, from the packets it acknowledges cumulatively or
   those it newly acknowledges selectively, and neither does any while the oldest packet in flight
