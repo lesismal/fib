@@ -93,6 +93,11 @@ merkle tree (through the file's piece layer, or its pieces root for a file of on
 
 `Builder` hashes an `fs.FS` (`Build`) or a path (`BuildPath`) into a v1, v2 or hybrid torrent, with
 trackers (BEP 12), web seeds (BEP 19), DHT nodes (BEP 5) and the private flag (BEP 27).
+`BuildContext` and `BuildPathContext` stop with `ctx.Err()` once their context is done, looking at
+it between files and every megabyte hashed. A build's memory does not grow with the files: it
+folds a v2 file's 16 KiB leaf hashes into their piece's root as the next piece starts, keeping one
+piece's leaves and 32 bytes per piece (the piece layer it outputs), where keeping every leaf until
+the file ended took 2 GiB for a 1 TiB file.
 `ParseMagnet` and `Magnet.String` handle magnet links (BEP 9): `xt=urn:btih:` in hex or base32,
 `urn:btmh:` for v2, `dn`, `tr`, `ws`, `x.pe`, `so` (BEP 53) and `xl`.
 
@@ -116,7 +121,9 @@ The clients:
 the minute and the client's address, valid one to two minutes, so it keeps no state per client.
 `MemoryStore`, the default `Store`, keeps 64 shards, bounds torrents, peers per torrent and peers
 in all, expires peers after `PeerTTL`, and hands out random peers (a random start and a coprime
-stride), only leechers to a seeder. For private trackers, `ServerConfig.AllowInfoHash` is an
+stride), only leechers to a seeder. `MemoryStore.Range` lists the torrents with their `Stats`,
+one shard locked at a time, and `SetConfig` changes the bounds and `PeerTTL` while it serves,
+keeping the swarms. For private trackers, `ServerConfig.AllowInfoHash` is an
 allow-list and `Authorize` sees each request's `Auth`: remote address, URL (BEP 41 data over UDP)
 and passkey (`?passkey=` or `/<key>/announce`).
 
@@ -487,6 +494,14 @@ alternative.
   (`MaxFileSize`).
 - **Magnets**: an all-zero hash is rejected; `so` is kept as ranges.
 - **Builder hashes on one goroutine.** Alternative: a hashing goroutine per CPU.
+- **How often `BuildContext` looks at its context**: before each file and every megabyte hashed,
+  so a cancelled build stops within about a megabyte read plus the megabyte its read buffer runs
+  ahead; a read of the `fs.FS` that blocks is not interrupted, since `fs.FS` takes no context.
+  Alternatives: every 16 KiB block (a context lookup per block for nothing), or closing the open
+  file on cancellation (not every `fs.File` unblocks a read on close).
+- **Builder still keeps a v2 file's piece layer** in memory, 32 bytes per piece, since it is part
+  of the result (`MetaInfo.PieceLayers`); with the automatic piece length that is under 64 KiB a
+  file. Alternative: stream layers to the caller, which would change what `Build` returns.
 
 ### tracker
 
@@ -512,6 +527,19 @@ alternative.
   an expired connection ID means connecting again.
 - **`Tiers.Timeout`** 30 s per tracker (`DefaultTrackerTimeout`).
 - **An empty 8-byte UDP announce reply is an `*Error`**, as opentracker sends it.
+- **`MemoryStore.Range` copies a shard's torrents and calls `fn` with no lock held**, so `fn` may
+  use the store and announces of that shard do not wait for it; each torrent's `Stats` are as of
+  one moment, but torrents added or forgotten meanwhile may be missed or seen once gone. It expires
+  the peers it looks at, as `Scrape` does, and leaves out torrents with none. Alternative: call
+  `fn` under the shard's lock (no copy, but a slow `fn` stalls announces and must not call the
+  store).
+- **Lowered `MemoryStore` bounds drop nothing**: new torrents and peers are refused until the store
+  is back under them, and the ones past them leave as peers stop or expire, within `PeerTTL`.
+  Alternative: trim at once, which means picking which swarms and peers to drop (they would only
+  announce again and be refused) and a pass over every shard.
+- **A shorter `PeerTTL` applies to the peers kept** (none outlives `PeerTTL` from the change), in a
+  pass over every peer, one shard locked at a time; a longer one applies from each peer's next
+  announce. Alternative: only from the next announce, which keeps peers up to the old TTL.
 
 ### peer and mse
 

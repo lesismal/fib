@@ -81,9 +81,14 @@ type MemoryStoreConfig struct {
 // MemoryStore is a Store in memory. Its torrents are spread over shards,
 // each with a lock of its own, so that announces of different torrents
 // seldom wait for one another. Peers expire PeerTTL after their last
-// announce; a torrent without peers is forgotten.
+// announce; a torrent without peers is forgotten. Range lists its torrents
+// and SetConfig changes its bounds while it serves.
 type MemoryStore struct {
-	cfg      MemoryStoreConfig
+	// cfg is read under a shard's lock, so that SetConfig, storing it
+	// before taking each shard's lock, knows that no announce of the shard
+	// uses the old one afterwards.
+	cfg      atomic.Pointer[MemoryStoreConfig]
+	setMu    sync.Mutex // serializes SetConfig
 	shards   [64]memShard
 	torrents atomic.Int64
 	peers    atomic.Int64
@@ -119,6 +124,17 @@ type memPeer struct {
 
 // NewMemoryStore returns an empty MemoryStore.
 func NewMemoryStore(cfg MemoryStoreConfig) *MemoryStore {
+	m := &MemoryStore{}
+	cfg = cfg.withDefaults()
+	m.cfg.Store(&cfg)
+	for i := range m.shards {
+		m.shards[i].torrents = map[metainfo.InfoHash]*swarm{}
+	}
+	return m
+}
+
+// withDefaults returns cfg with its zero fields set to their defaults.
+func (cfg MemoryStoreConfig) withDefaults() MemoryStoreConfig {
 	if cfg.MaxTorrents <= 0 {
 		cfg.MaxTorrents = DefaultMaxTorrents
 	}
@@ -131,11 +147,82 @@ func NewMemoryStore(cfg MemoryStoreConfig) *MemoryStore {
 	if cfg.PeerTTL <= 0 {
 		cfg.PeerTTL = DefaultPeerTTL
 	}
-	m := &MemoryStore{cfg: cfg}
-	for i := range m.shards {
-		m.shards[i].torrents = map[metainfo.InfoHash]*swarm{}
+	return cfg
+}
+
+// Config returns the store's bounds, its defaults filled in.
+func (m *MemoryStore) Config() MemoryStoreConfig { return *m.cfg.Load() }
+
+// SetConfig changes the store's bounds and peer TTL in place, keeping its
+// swarms; zero fields take their defaults, as in NewMemoryStore. Raised
+// bounds take effect at once. Lowered ones refuse new torrents and peers
+// until the store is back under them, but drop none: the torrents and
+// peers past them leave as peers stop or expire. A shorter PeerTTL is
+// applied to the peers already kept, those that would outlive it expiring
+// PeerTTL from now, which takes a look at every peer, one shard locked at
+// a time.
+func (m *MemoryStore) SetConfig(cfg MemoryStoreConfig) {
+	cfg = cfg.withDefaults()
+	m.setMu.Lock()
+	defer m.setMu.Unlock()
+	old := m.cfg.Swap(&cfg)
+	if cfg.PeerTTL >= old.PeerTTL {
+		return
 	}
-	return m
+	for i := range m.shards {
+		sh := &m.shards[i]
+		sh.mu.Lock()
+		now := time.Now()
+		limit := now.Add(cfg.PeerTTL)
+		if next := now.Add(cfg.PeerTTL / 4); sh.nextSweep.After(next) {
+			sh.nextSweep = next
+		}
+		for _, sw := range sh.torrents {
+			if !sw.minExpiry.IsZero() && sw.minExpiry.After(limit) {
+				sw.minExpiry = limit
+			}
+			for _, p := range sw.byID {
+				if p.expires.After(limit) {
+					p.expires = limit
+				}
+			}
+		}
+		sh.mu.Unlock()
+	}
+}
+
+// Range calls fn with each torrent the store tracks and its swarm's state,
+// in no particular order, until fn returns false. It takes one shard's lock
+// at a time and calls fn with none held, so fn may use the store, and
+// announces go on meanwhile: each torrent's Stats are as of one moment,
+// but a torrent added or forgotten during Range may be left out or seen
+// after it is gone. Like Scrape, it expires the peers it looks at.
+func (m *MemoryStore) Range(fn func(ih metainfo.InfoHash, s Stats) bool) {
+	type entry struct {
+		ih metainfo.InfoHash
+		s  Stats
+	}
+	var buf []entry
+	for i := range m.shards {
+		sh := &m.shards[i]
+		now := time.Now()
+		buf = buf[:0]
+		sh.mu.Lock()
+		for h, sw := range sh.torrents {
+			m.expire(sw, now)
+			if len(sw.byID) == 0 {
+				m.forgetIfEmpty(sh, h, sw)
+				continue
+			}
+			buf = append(buf, entry{h, sw.stats()})
+		}
+		sh.mu.Unlock()
+		for _, e := range buf {
+			if !fn(e.ih, e.s) {
+				return
+			}
+		}
+	}
 }
 
 // Torrents returns how many torrents the store tracks, and Peers how many
@@ -157,13 +244,14 @@ func (m *MemoryStore) Announce(a StoreAnnounce) (StoreResult, error) {
 	sh := m.shard(a.InfoHash)
 	sh.mu.Lock()
 	defer sh.mu.Unlock()
-	m.sweepShard(sh, now)
+	cfg := m.cfg.Load()
+	m.sweepShard(sh, now, cfg.PeerTTL)
 	sw := sh.torrents[a.InfoHash]
 	if sw == nil {
 		if a.Event == EventStopped {
 			return StoreResult{}, nil
 		}
-		if m.torrents.Load() >= int64(m.cfg.MaxTorrents) {
+		if m.torrents.Load() >= int64(cfg.MaxTorrents) {
 			return StoreResult{}, ErrStoreFull
 		}
 		sw = &swarm{byID: map[PeerID]*memPeer{}}
@@ -182,7 +270,7 @@ func (m *MemoryStore) Announce(a StoreAnnounce) (StoreResult, error) {
 		return res, nil
 	}
 	wasSeeder := p != nil && p.seeder
-	expires := now.Add(m.cfg.PeerTTL)
+	expires := now.Add(cfg.PeerTTL)
 	switch {
 	case p != nil:
 		if a.V4.IsValid() {
@@ -195,8 +283,8 @@ func (m *MemoryStore) Announce(a StoreAnnounce) (StoreResult, error) {
 		if p.seeder != a.Seeder {
 			m.move(sw, p, a.Seeder)
 		}
-	case (a.V4.IsValid() || a.V6.IsValid()) && len(sw.byID) < m.cfg.MaxPeersPerTorrent &&
-		m.peers.Load() < int64(m.cfg.MaxPeers):
+	case (a.V4.IsValid() || a.V6.IsValid()) && len(sw.byID) < cfg.MaxPeersPerTorrent &&
+		m.peers.Load() < int64(cfg.MaxPeers):
 		p = &memPeer{id: a.PeerID, v4: a.V4, v6: a.V6, expires: expires, seeder: a.Seeder}
 		sw.byID[a.PeerID] = p
 		m.insert(sw, p)
@@ -304,11 +392,11 @@ func (m *MemoryStore) forgetIfEmpty(sh *memShard, h metainfo.InfoHash, sw *swarm
 // after it last did, so that torrents nobody announces to any more are
 // forgotten in time. Its cost, a look at each torrent of the shard, is
 // spread over the announces of that time.
-func (m *MemoryStore) sweepShard(sh *memShard, now time.Time) {
+func (m *MemoryStore) sweepShard(sh *memShard, now time.Time, ttl time.Duration) {
 	if now.Before(sh.nextSweep) {
 		return
 	}
-	sh.nextSweep = now.Add(m.cfg.PeerTTL / 4)
+	sh.nextSweep = now.Add(ttl / 4)
 	for h, sw := range sh.torrents {
 		m.expire(sw, now)
 		m.forgetIfEmpty(sh, h, sw)

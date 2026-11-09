@@ -84,7 +84,10 @@ merkle 树（经文件的 piece layer，单分片文件则用它的 pieces root�
 `LayerRoot`、`VerifyProof` 是 BEP 52 的 hash request 所需的辅助函数。
 
 `Builder` 对一个 `fs.FS`（`Build`）或路径（`BuildPath`）计算哈希，生成 v1、v2 或 hybrid torrent，可带 tracker
-（BEP 12）、web seed（BEP 19）、DHT 节点（BEP 5）和 private 标志（BEP 27）。`ParseMagnet` 与 `Magnet.String`
+（BEP 12）、web seed（BEP 19）、DHT 节点（BEP 5）和 private 标志（BEP 27）。`BuildContext` 与
+`BuildPathContext` 在 context 结束后以 `ctx.Err()` 返回，在文件之间和每算完一兆字节时检查它。构建所用内存不随文件
+大小增长：v2 文件的 16 KiB 叶子哈希在下一个分片开始时折叠成所属分片的根，只保留一个分片的叶子和每个分片 32 字节
+（即输出的 piece layer）；以前把叶子留到文件结束，1 TiB 的文件要 2 GiB。`ParseMagnet` 与 `Magnet.String`
 处理磁力链接（BEP 9）：十六进制或 base32 的 `xt=urn:btih:`、v2 的 `urn:btmh:`、`dn`、`tr`、`ws`、`x.pe`、
 `so`（BEP 53）和 `xl`。
 
@@ -105,7 +108,8 @@ merkle 树（经文件的 piece layer，单分片文件则用它的 pieces root�
 `announce` 或 `scrape` 开头，passkey 放在它前一段），`UDP()` 是 UDP binding 的 `fib.Handler`。UDP 的
 connection ID 是对密钥、当前分钟和客户端地址做的 HMAC-SHA256，有效一到两分钟，因此不为每个客户端保存状态。
 默认的 `Store` 是 `MemoryStore`：64 个分片，限制 torrent 数、每个 torrent 的 peer 数和 peer 总数，peer 超过
-`PeerTTL` 不再 announce 即过期，随机挑选返回的 peer（随机起点加互质步长），给做种者只返回下载者。私有 tracker
+`PeerTTL` 不再 announce 即过期，随机挑选返回的 peer（随机起点加互质步长），给做种者只返回下载者。`MemoryStore.Range` 每次锁一个分片，
+列出各 torrent 及其 `Stats`；`SetConfig` 在服务中修改各项上限和 `PeerTTL`，保留现有 swarm。私有 tracker
 可用 `ServerConfig.AllowInfoHash` 做白名单，用 `Authorize` 检查每个请求的 `Auth`：对端地址、URL（UDP 上是
 BEP 41 的数据）和 passkey（`?passkey=` 或 `/<key>/announce`）。
 
@@ -409,6 +413,12 @@ FIB_DHT_PUBLIC=1 FIB_DHT_INFOHASH=<40 位十六进制> go test -run TestDHTPubli
 - **限制**：流式解码 `MaxDepth` 256、`MaxSize` 64 MiB；`Load` 最多读 128 MiB（`MaxFileSize`）。
 - **磁力链接**：拒绝全零哈希；`so` 按区间保存。
 - **Builder 单 goroutine 计算哈希。** 备选：每个 CPU 一个哈希 goroutine。
+- **`BuildContext` 多久检查一次 context**：每个文件之前和每算完一兆字节，因此取消后最多再读约一兆字节，加上读缓冲
+  预读的一兆字节；阻塞在 `fs.FS` 上的读不会被打断，因为 `fs.FS` 不接受 context。备选：每个 16 KiB 块都检查
+  （白白多查）；取消时关闭打开的文件（并非每种 `fs.File` 关闭时都会让读返回）。
+- **Builder 仍在内存里保留 v2 文件的 piece layer**，每个分片 32 字节，因为它是结果的一部分
+  （`MetaInfo.PieceLayers`）；用自动分片大小时每个文件不到 64 KiB。备选：把 layer 流式交给调用者，这会改变
+  `Build` 的返回值。
 
 ### tracker
 
@@ -429,6 +439,16 @@ FIB_DHT_PUBLIC=1 FIB_DHT_INFOHASH=<40 位十六进制> go test -run TestDHTPubli
 - **UDP 重传**：connect 与 announce 共用一个计数，transaction ID 复用；connection ID 过期则重新 connect。
 - **`Tiers.Timeout`** 每个 tracker 30 秒（`DefaultTrackerTimeout`）。
 - **8 字节的空 UDP announce 应答视为 `*Error`**，opentracker 就这样发。
+- **`MemoryStore.Range` 复制一个分片的 torrent 后在不持锁时调用 `fn`**，因此 `fn` 可以使用 store，该分片的
+  announce 也不必等它；每个 torrent 的 `Stats` 取自同一时刻，但期间新增或被遗忘的 torrent 可能漏掉或在消失后仍被
+  看到。它像 `Scrape` 一样让所看到的过期 peer 过期，并略过没有 peer 的 torrent。备选：持分片锁调用 `fn`（省去复制，
+  但慢的 `fn` 会卡住 announce，且不能调用 store）。
+- **调低 `MemoryStore` 的上限不丢弃任何东西**：在回到上限以内之前拒绝新的 torrent 和 peer，超出的部分随 peer
+  停止或过期离开，最多 `PeerTTL`。备选：立即裁剪，这需要挑选丢弃哪些 swarm 和 peer（它们只会再来 announce
+  并被拒绝），还要遍历每个分片。
+- **缩短的 `PeerTTL` 作用于已保存的 peer**（变更后没有 peer 活过 `PeerTTL`），为此遍历所有 peer，每次锁一个
+  分片；延长的 `PeerTTL` 从各 peer 下次 announce 起生效。备选：都从下次 announce 起生效，这会让 peer 按旧
+  TTL 保留。
 
 ### peer 与 mse
 

@@ -23,7 +23,8 @@
 // Its UDP connection IDs are HMACs of the client's address and the minute,
 // so it keeps no state per client. MemoryStore, its default Store, bounds
 // the torrents and peers it keeps, expires peers that stop announcing, and
-// hands out random peers. ServerConfig has the hooks of a private tracker:
+// hands out random peers; Range lists its torrents and SetConfig changes
+// its bounds in place. ServerConfig has the hooks of a private tracker:
 // an allow-list of info hashes and a check of each request, with its
 // passkey.
 //
