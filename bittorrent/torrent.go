@@ -283,11 +283,27 @@ func newTorrent(c *Client, ih metainfo.InfoHash, ih2 metainfo.InfoHashV2, opts A
 	return t
 }
 
-// InfoHash is the torrent's v1 info hash, zero for a v2-only torrent.
-func (t *Torrent) InfoHash() metainfo.InfoHash { return t.ih }
+// InfoHash is the torrent's v1 info hash, zero for a v2-only torrent. A
+// magnet link of a hybrid's v2 hash learns it with the info dictionary.
+func (t *Torrent) InfoHash() metainfo.InfoHash {
+	ih, _ := t.hashes()
+	return ih
+}
 
-// InfoHashV2 is the torrent's v2 info hash, zero for a v1-only torrent.
-func (t *Torrent) InfoHashV2() metainfo.InfoHashV2 { return t.ih2 }
+// InfoHashV2 is the torrent's v2 info hash, zero for a v1-only torrent. A
+// magnet link of a hybrid's v1 hash learns it with the info dictionary.
+func (t *Torrent) InfoHashV2() metainfo.InfoHashV2 {
+	_, ih2 := t.hashes()
+	return ih2
+}
+
+// hashes returns the info hashes, which setInfoLocked may complete while
+// others read them.
+func (t *Torrent) hashes() (metainfo.InfoHash, metainfo.InfoHashV2) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.ih, t.ih2
+}
 
 // Name is the torrent's name: the info dictionary's, or the magnet
 // link's display name before it.

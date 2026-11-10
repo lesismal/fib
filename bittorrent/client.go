@@ -729,8 +729,10 @@ func (c *Client) Torrent(ih [20]byte) (*Torrent, bool) {
 	if t, ok := c.torrents[ih]; ok {
 		return t, true
 	}
+	// t.mu under c.mu: nothing takes c.mu while it holds a t.mu.
 	for _, t := range c.torrents {
-		if [20]byte(t.ih) == ih || (!t.ih2.IsZero() && [20]byte(t.ih2.Truncate()) == ih) {
+		v1, v2 := t.hashes()
+		if [20]byte(v1) == ih || (!v2.IsZero() && [20]byte(v2.Truncate()) == ih) {
 			return t, true
 		}
 	}

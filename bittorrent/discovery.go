@@ -297,6 +297,16 @@ func (t *Torrent) announceHashes() []metainfo.InfoHash {
 	return hs
 }
 
+// isV2Announce reports whether h, one of announceHashes, is a hybrid's or
+// a v2 torrent's truncated v2 hash rather than its v1 one. The hashes are
+// read under t.mu: a magnet link of one hash of a hybrid learns the other
+// with the info dictionary, while the announces run.
+func (t *Torrent) isV2Announce(h metainfo.InfoHash) bool {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return !t.ih2.IsZero() && h == t.ih2.Truncate() && h != t.ih
+}
+
 // left is the bytes the torrent misses, -1 before its info dictionary.
 func (t *Torrent) left() int64 {
 	t.mu.Lock()
@@ -330,7 +340,7 @@ func (trackerSource) Find(ctx context.Context, t *Torrent, found func([]netip.Ad
 	hashes := t.announceHashes()
 	done := make(chan struct{}, len(hashes))
 	for _, h := range hashes {
-		v2 := !t.ih2.IsZero() && h == t.ih2.Truncate() && h != t.ih
+		v2 := t.isV2Announce(h)
 		go func() {
 			defer func() { done <- struct{}{} }()
 			t.announceLoop(ctx, tiers, h, v2)
@@ -361,7 +371,7 @@ func (t *Torrent) announceLoop(ctx context.Context, tiers *tracker.Tiers, h meta
 	// The announces of a hybrid's second hash are recorded apart (see
 	// Torrent.Trackers).
 	slot := 0
-	if v2 && !t.ih.IsZero() {
+	if ih, _ := t.hashes(); v2 && !ih.IsZero() {
 		slot = 1
 	}
 	rec := recordingAnnouncer{t: t, slot: slot, a: cl.trackers}
@@ -441,7 +451,7 @@ func (dhtSource) Find(ctx context.Context, t *Torrent, found func([]netip.AddrPo
 	}
 	for {
 		for _, h := range t.announceHashes() {
-			v2 := !t.ih2.IsZero() && h == t.ih2.Truncate() && h != t.ih
+			v2 := t.isV2Announce(h)
 			for _, n := range []*dhtNode{cl.dht4, cl.dht6} {
 				if n == nil {
 					continue

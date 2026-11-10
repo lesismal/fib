@@ -664,14 +664,21 @@ func TestRetainStress(t *testing.T) {
 			finish()
 			_ = c.Respond(stdhttp.StatusOK, "text/plain", []byte("inline"))
 		case "/async":
+			// One Retain, so one Release, the goroutine's. The OnCancel
+			// callback used to release too, and a client that hung up then
+			// gave back the handler's own hold as well: the Context was
+			// recycled under the goroutine's Respond, which the race
+			// detector caught on CI. The callback stays, so a cancellation
+			// still races the goroutine, but the goroutine ends the request
+			// either way.
 			c.Retain()
-			c.OnCancel(func(error) { finish(); c.Release() })
+			c.OnCancel(func(error) {})
 			go func() {
 				time.Sleep(time.Duration(len(c.Request.Host)%5) * time.Millisecond)
 				if c.Err() == nil {
-					finish()
 					_ = c.Respond(stdhttp.StatusOK, "text/plain", []byte("async"))
 				}
+				finish()
 				c.Release()
 			}()
 		default:
