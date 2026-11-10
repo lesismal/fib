@@ -142,7 +142,7 @@ with the Context as its writer:
 ```go
 mux := stdhttp.NewServeMux()
 mux.HandleFunc("GET /hello/{name}", func(w stdhttp.ResponseWriter, r *stdhttp.Request) {
-	fmt.Fprintf(w, "hello %s over %s\n", c.Request.PathValue("name"), c.Request.Proto)
+	fmt.Fprintf(w, "hello %s over %s\n", r.PathValue("name"), r.Proto)
 })
 mux.Handle("/files/", stdhttp.StripPrefix("/files/", stdhttp.FileServer(stdhttp.Dir("."))))
 

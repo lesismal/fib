@@ -738,7 +738,7 @@ type Config struct {
 	// IOPollers and IOPollerCount split an epoll or kqueue engine across
 	// several event loops. This backend has one goroutine per connection
 	// already, so both are ignored here, though DefaultConfig sets IOPollers
-	// as it does on the other backends: on more than four CPUs.
+	// as it does on the other backends.
 	IOPollers     bool
 	IOPollerCount int
 	// EngineLoop gives an epoll or kqueue engine with pollers a loop of its

@@ -25,7 +25,7 @@ import (
 //		r.Get("/{id:[0-9]+}", getUser) // c.Param("id")
 //		r.Get("/{id}/files/*", getFile) // c.Param("*")
 //	})
-//	r.Mount("/debug", pprof.New())
+//	r.Use(pprof.New()) // serves /debug/pprof/, passes the rest on
 //	engine, err := fib.New(config, fib.Binding{Addr: ":8080", Handler: fibhttp.NewHandler(r)})
 //
 // A pattern is a path of static text, parameters and an optional catch-all:
@@ -304,9 +304,8 @@ func (r *Router) NotFound(handler HandlerFunc) {
 // MethodNotAllowed sets the handler for a request whose path a route matches
 // but whose method none serves; nil restores the default, a plain 405. The
 // handler is called with an Allow field naming the methods that are served
-// already in c.Header(), which a response written through the
-// ResponseWriter methods sends; one written with Respond or WriteResponse
-// needs to carry it itself. On a router from With or Group it sets the
+// already in c.Header(), which the response sends whichever call writes it.
+// On a router from With or Group it sets the
 // handler of the router they were made from.
 func (r *Router) MethodNotAllowed(handler HandlerFunc) {
 	r.init()

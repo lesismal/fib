@@ -598,6 +598,16 @@ func (c *Context) RespondCopy(status int, contentType string, body []byte) error
 // from the pool, which this call gives back once the send path has done with
 // it.
 func (c *Context) respond(status int, contentType string, body, copied []byte) error {
+	if c.w != nil && len(c.w.header) > 0 && c.w.status == 0 {
+		// Fields a handler or a middleware set on Header before answering
+		// go with the answer, as they would with net/http's Write. Only a
+		// response that has them pays for the header built here.
+		var header stdhttp.Header
+		if contentType != "" {
+			header = stdhttp.Header{"Content-Type": {contentType}}
+		}
+		return c.writeWhole(Response{StatusCode: status, Header: header, Body: body}, copied)
+	}
 	if contentType == "" {
 		return c.writeWhole(Response{StatusCode: status, Body: body}, copied)
 	}
@@ -640,6 +650,25 @@ func (c *Context) respond(status int, contentType string, body, copied []byte) e
 	return err
 }
 
+// headerWith is the header a whole response sends when the handler has set
+// fields on Context.Header: a copy of them, without the trailer
+// announcements, which a whole response has no use for, and without
+// Content-Length, which is the body's, with the fields of own, the
+// response's own header, replacing theirs.
+func (w *responseWriter) headerWith(own stdhttp.Header) stdhttp.Header {
+	header := make(stdhttp.Header, len(w.header)+len(own))
+	for key, values := range w.header {
+		if key == "Trailer" || key == "Content-Length" || strings.HasPrefix(key, stdhttp.TrailerPrefix) {
+			continue
+		}
+		header[key] = values
+	}
+	for key, values := range own {
+		header[key] = values
+	}
+	return header
+}
+
 // contentTypeHeaders recycles the one-field headers Respond builds. A header
 // in it holds Content-Type and nothing else, which is why it needs no
 // clearing on the way in or out.
@@ -658,6 +687,13 @@ func (c *Context) writeWhole(response Response, copied []byte) error {
 	if c.w != nil && c.w.status != 0 {
 		releaseBody(copied)
 		return ErrResponseWritten
+	}
+	if c.w != nil && len(c.w.header) > 0 {
+		// Fields a handler or a middleware set on Header before answering
+		// go with the answer, as they would with net/http's Write. The
+		// merged header is this call's own, so the hooks may change it.
+		response.Header = c.w.headerWith(response.Header)
+		return c.writeResponse(response, copied)
 	}
 	if hooks := c.hooked(); hooks != nil && hooks.changes && response.Header != nil && !c.wrote {
 		// The OnHeader and OnResponse hooks may change the header, which is

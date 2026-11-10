@@ -96,11 +96,15 @@ func (w *responseWriter) holdsDeclared() bool {
 	return w.declared >= 0 && w.declared <= maxHeldBody
 }
 
-// Header returns the header of the response written through Write, as
-// http.ResponseWriter's does. Changing it after WriteHeader or the first
-// Write has no effect, except for trailers: values for names announced in a
-// "Trailer" header, and keys prefixed with http.TrailerPrefix, are sent
-// after the body.
+// Header returns the header of the response, as http.ResponseWriter's does.
+// A response written through WriteHeader and Write sends it; so does a whole
+// response from Respond, its helpers (String, JSON, …) and WriteResponse,
+// whose own Content-Type and header fields replace the ones set here, and
+// which leave out a Content-Length and trailer announcements set here, since
+// the body they send is whole. Changing it after the response has begun has
+// no effect, except for trailers of a written response: values for names
+// announced in a "Trailer" header, and keys prefixed with
+// http.TrailerPrefix, are sent after the body.
 func (c *Context) Header() stdhttp.Header {
 	w := c.writer()
 	if w.header == nil {
@@ -642,13 +646,14 @@ func (c *Context) SetWriteDeadline(t time.Time) error {
 
 // SetReadDeadline gives the rest of the request's body until t to arrive,
 // for this request alone, as http.ResponseController's does. On HTTP/1 it
-// replaces the deadline Config.ReadTimeout puts on a body that streams: a
-// zero t lifts it, which is how a handler taking a long upload keeps
-// ReadTimeout from cutting it off, and the connection is closed if the body
-// has not all arrived by t. HTTP/2 and HTTP/3 put no read deadline on a
-// stream of their own; one set here fails a body still arriving at t with
-// os.ErrDeadlineExceeded, as net/http's HTTP/2 server does, leaving the
-// stream open for the handler to answer, and a zero t lifts it.
+// replaces the deadline Config.ReadTimeout and Config.ReadBodyTimeout put on
+// a body that streams: a zero t lifts it, which is how a handler taking a
+// long upload keeps them from cutting it off, and the connection is closed if
+// the body has not all arrived by t. On HTTP/2 and HTTP/3 those timeouts
+// bound each stream's body the same way; a deadline set here replaces
+// theirs, fails a body still arriving at t with os.ErrDeadlineExceeded, as
+// net/http's HTTP/2 server does, leaving the stream open for the handler to
+// answer, and a zero t lifts it.
 //
 // A body that had all arrived before the handler ran, as every body does
 // that does not stream (see Config.StreamRequestBody), has nothing left to
