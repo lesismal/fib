@@ -6,6 +6,9 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
+	"io"
+	"os"
+	"sync"
 	"testing"
 	"time"
 )
@@ -123,6 +126,22 @@ func TestClientHTTP2HealthCheckKeepsLiveConnection(t *testing.T) {
 	for _, mode := range []string{"ack", "trickle"} {
 		t.Run(mode, func(t *testing.T) {
 			pings := make(chan int, 1)
+			// What ended the connection on the server's side, and when, for
+			// a failure to tell a reset the network sent both ends from a
+			// close by either: CI's Windows runner once had the client's
+			// read reset 0.75s in, while this side was still trickling.
+			var (
+				serverMu  sync.Mutex
+				serverErr error
+				serverAt  time.Time
+			)
+			noteServer := func(err error) {
+				serverMu.Lock()
+				if serverErr == nil {
+					serverErr, serverAt = err, time.Now()
+				}
+				serverMu.Unlock()
+			}
 			url := cvH2cServe(t, func(p *cvH2cPeer, _ int) {
 				p.settings()
 				id, _, ok := p.request()
@@ -134,7 +153,10 @@ func TestClientHTTP2HealthCheckKeepsLiveConnection(t *testing.T) {
 				deadline := time.Now().Add(2 * time.Second)
 				for time.Now().Before(deadline) {
 					if mode == "trickle" {
-						p.frame(h2FrameData, 0, id, 'x')
+						frame := h2AppendFrameHeader(nil, h2FrameData, 0, id, 1)
+						if _, err := p.conn.Write(append(frame, 'x')); err != nil {
+							noteServer(fmt.Errorf("write: %w", err))
+						}
 						time.Sleep(50 * time.Millisecond)
 						continue
 					}
@@ -144,6 +166,9 @@ func TestClientHTTP2HealthCheckKeepsLiveConnection(t *testing.T) {
 						n++
 						p.frame(h2FramePing, h2FlagAck, 0, f.payload...)
 					}
+					if !ok && p.readErr != nil && !errors.Is(p.readErr, os.ErrDeadlineExceeded) {
+						noteServer(fmt.Errorf("read: %w", p.readErr))
+					}
 				}
 				_ = p.conn.SetReadDeadline(time.Now().Add(20 * time.Second))
 				p.frame(h2FrameData, h2FlagEndStream, id, []byte("done")...)
@@ -151,11 +176,26 @@ func TestClientHTTP2HealthCheckKeepsLiveConnection(t *testing.T) {
 				p.drain()
 			})
 			client := cvH2cClient(t, liveConfig)
+			start := time.Now()
+			fail := func(what string, err error) {
+				t.Helper()
+				serverMu.Lock()
+				server := "the server's side saw no error"
+				if serverErr != nil {
+					server = fmt.Sprintf("the server's side failed %v in: %v", serverAt.Sub(start), serverErr)
+				}
+				serverMu.Unlock()
+				t.Fatalf("%s: %v after %v; %s", what, err, time.Since(start), server)
+			}
 			resp, err := client.Go(mustRequest(t, "POST", url, nil)).Wait()
 			if err != nil {
-				t.Fatal(err)
+				fail("the request", err)
 			}
-			if got := readBody(t, resp); !bytes.HasSuffix([]byte(got), []byte("done")) {
+			body, err := io.ReadAll(resp.Body)
+			if err != nil {
+				fail("the body", err)
+			}
+			if got := string(body); !bytes.HasSuffix([]byte(got), []byte("done")) {
 				t.Fatalf("got %q", got)
 			}
 			n := <-pings

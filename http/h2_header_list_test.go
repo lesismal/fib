@@ -7,6 +7,7 @@ import (
 	stdtls "crypto/tls"
 	"crypto/x509"
 	"errors"
+	"math"
 	stdhttp "net/http"
 	"net/http/httptest"
 	"runtime"
@@ -157,24 +158,34 @@ func TestH2ClientHonoursTheServersHeaderListSize(t *testing.T) {
 func TestH2ClientHeaderBlockBomb(t *testing.T) {
 	config := DefaultClientConfig()
 	config.MaxResponseHeaderBytes = 16 << 10
-	hc := &h2ClientConn{
-		client:  &Client{config: config},
-		dec:     hpack.NewDecoder(hpack.DefaultTableSize),
-		streams: make(map[uint32]*h2ClientStream),
-	}
 	// A literal with incremental indexing, then the bomb: index 2 of the
 	// static table, ":method: GET", a million times.
 	block := []byte{0x40, 3, 'x', '-', 'a', 1, 'b'}
 	block = append(block, bytes.Repeat([]byte{0x82}, 1<<20)...)
-	var before, after runtime.MemStats
-	runtime.GC()
-	runtime.ReadMemStats(&before)
-	if err := hc.handleHeaderBlock(99, block, true); err != nil {
-		t.Fatal(err)
+	// TotalAlloc counts the whole process, so what the package's earlier
+	// tests left running, a server winding down or a client's sidepool
+	// callback, is counted too: the coverage job saw 9 MB in one try. The
+	// decode's own allocation is the same every time and the rest only adds
+	// to it, so the least of a few tries is the decode's.
+	var hc *h2ClientConn
+	least := uint64(math.MaxUint64)
+	for try := 0; try < 5 && least > 1<<20; try++ {
+		hc = &h2ClientConn{
+			client:  &Client{config: config},
+			dec:     hpack.NewDecoder(hpack.DefaultTableSize),
+			streams: make(map[uint32]*h2ClientStream),
+		}
+		var before, after runtime.MemStats
+		runtime.GC()
+		runtime.ReadMemStats(&before)
+		if err := hc.handleHeaderBlock(99, block, true); err != nil {
+			t.Fatal(err)
+		}
+		runtime.ReadMemStats(&after)
+		least = min(least, after.TotalAlloc-before.TotalAlloc)
 	}
-	runtime.ReadMemStats(&after)
-	if got := after.TotalAlloc - before.TotalAlloc; got > 1<<20 {
-		t.Fatalf("decoding the block allocated %d bytes", got)
+	if least > 1<<20 {
+		t.Fatalf("decoding the block allocated %d bytes at least", least)
 	}
 	// The literal went into the table: index 62 is it.
 	var got []hpack.HeaderField
