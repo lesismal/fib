@@ -793,6 +793,8 @@ CI 每次 push 都在 Linux、macOS、Windows 上运行 [`taskpool/benchmark`](t
 
 ## 文档
 
+- [教程](docs/tutorial/README.zh-CN.md)：按用法组织的 22 章教程，逐协议讲解，代码示例参与编译；
+  Engine 配置、handler 同步/异步写法和 hack 技巧各自成章
 - [配置](docs/configuration.zh-CN.md)：全部 `Config`、`Binding` 字段、默认值、机器 sizing 公式和启动
   配置日志
 - [架构](docs/architecture.zh-CN.html)：事件循环、poller 与池、handler 分层、读调度、写背压、负载

@@ -848,6 +848,9 @@ Run it yourself with `cd taskpool/benchmark && ./bench.sh` (or `bench.ps1` on Wi
 
 ## Documentation
 
+- [Tutorial](docs/tutorial/README.md): a usage-first walkthrough in 22 chapters, protocol by
+  protocol, with compiled code examples, plus the engine configuration, the sync/async handler
+  models and the hack techniques as chapters of their own
 - [Configuration](docs/configuration.md): every `Config` and `Binding` field, its default, the
   machine sizing formula and the startup settings log
 - [Architecture](docs/architecture.html): event loops, pollers and pools, handler layers, read
