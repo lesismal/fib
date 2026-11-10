@@ -51,8 +51,8 @@ h := hub.New(hub.Config{
 All packets are in one canonical form, the one ISO BMFF uses (`media/av`): an
 `av.Track.Config` holding the codec's out-of-band configuration (AVC/HEVC decoder
 configuration record, AV1 config, AudioSpecificConfig, OpusHead), and `av.Packet.Data`
-holding one access unit — AVCC for H.264/H.265, a temporal unit of OBUs for AV1, a raw AAC
-access unit, one Opus packet. `DTS` and `PTS` are `time.Duration`, `Keyframe` marks IDR/IRAP
+holding one access unit — AVCC for H.264/H.265, a temporal unit of OBUs without the temporal
+delimiter for AV1, a raw AAC access unit, one Opus packet. `DTS` and `PTS` are `time.Duration`, `Keyframe` marks IDR/IRAP
 access units and every audio packet. Every protocol converts into and out of this form; that
 is why no pair of protocols needs code of its own.
 
@@ -90,12 +90,15 @@ func main() {
 	})
 
 	flv := httpflv.NewHandler(httpflv.Config{Hub: h, CORS: "*", Wait: 10 * time.Second})
-	live := hls.NewHandler(hls.HandlerConfig{Hub: h, AllowOrigin: "*"})
+	live := hls.NewHandler(hls.HandlerConfig{
+		Hub:         h,
+		Formats:     []hls.Format{hls.MPEGTS}, // ?format=ts as well as fMP4
+		AllowOrigin: "*",
+	})
 	ll := hls.NewHandler(hls.HandlerConfig{
 		Hub:         h,
 		Prefix:      "/ll/",
-		Muxer:       hls.Config{PartDuration: 500 * time.Millisecond}, // LL-HLS parts
-		Formats:     []hls.Format{hls.MPEGTS},
+		Muxer:       hls.Config{PartDuration: 500 * time.Millisecond}, // LL-HLS parts, fMP4
 		AllowOrigin: "*",
 	})
 
@@ -140,6 +143,10 @@ and play `live/s` with any of:
 | HLS, MPEG-TS | `http://127.0.0.1:8080/live/s/index.m3u8?format=ts` |
 | LL-HLS | `http://127.0.0.1:8080/ll/live/s/index.m3u8` |
 
+`index.m3u8` is a multivariant playlist naming `media.m3u8`; a format a handler was not given
+in `Formats` is answered 404, so `?format=ts` works on `live` here and not on `ll`. Without
+`PlayWait` in `HandlerConfig`, a playlist request before the publisher arrives is 404 too.
+
 Paths map the same way everywhere: `rtmp://host/app/stream` is `app/stream`, as are
 `/app/stream.flv`, `/app/stream/index.m3u8` and the SRT stream ID `app/stream`. HTTP-FLV
 players are flv.js and mpegts.js; HLS players are hls.js, Safari and ffmpeg. The HTTP
@@ -147,6 +154,10 @@ handlers are ordinary fib/http handlers, so HTTP/2, HTTP/3 and TLS serve them as
 any other handler.
 
 ## RTSP over TCP and UDP
+
+The fragments from here on add protocols to the program above: they use its `engine` and
+`h`, and go before `engine.Run()`, since `AddBinding` works on an engine that is not running
+yet as well as on one that is.
 
 RTSP is a separate binding plus a UDP pair that every session shares. `ListenUDP` binds the
 RTP/RTCP ports on the same engine, so `rtsp://…/live/s` plays over TCP-interleaved RTP by
@@ -164,7 +175,8 @@ if err := rtspServer.ListenUDP(engine); err != nil {
 ```
 
 Publish with `ffmpeg -re -i in.mp4 -c copy -f rtsp -rtsp_transport tcp
-rtsp://127.0.0.1:8554/live/s`. `ServerConfig.Password` with `AuthMethods` turns on Digest
+rtsp://127.0.0.1:8554/live/s` and play with `ffplay rtsp://127.0.0.1:8554/live/s` (add
+`-rtsp_transport udp` for UDP). `ServerConfig.Password` with `AuthMethods` turns on Digest
 (or Basic) authentication, `PlayWait` lets a player outlive its publisher, and for UDP
 players `MaxPlayerLoss` closes a client whose RTCP reports say it loses too much.
 
@@ -178,7 +190,7 @@ both sides encrypts with AES-CTR:
 srtServer, err := srt.NewServer(srt.ServerConfig{
 	Hub:        h,
 	PlayWait:   10 * time.Second,
-	Passphrase: "a passphrase of 10+ bytes", // optional; the caller's must match
+	Passphrase: "correct-horse-battery", // optional, 10 to 79 bytes; callers must send the same
 	MaxConns:   100,
 })
 if err != nil {
@@ -189,9 +201,16 @@ if _, err := engine.AddBinding(fib.Binding{Network: "udp", Addr: "127.0.0.1:9000
 }
 ```
 
-Publish with `ffmpeg -re -i in.mp4 -c copy -f mpegts
-'srt://127.0.0.1:9000?streamid=#!::r=live/s,m=publish'`, play with
-`srt://127.0.0.1:9000?streamid=live/s`. A publisher reserves its path during the handshake,
+With a passphrase on the server, every caller must send it, and one without is rejected in
+the handshake. ffmpeg needs to be built with libsrt (`ffmpeg -protocols | grep srt`):
+
+```sh
+ffmpeg -re -i in.mp4 -c copy -f mpegts \
+  'srt://127.0.0.1:9000?streamid=#!::r=live/s,m=publish&passphrase=correct-horse-battery'
+ffplay 'srt://127.0.0.1:9000?streamid=live/s&passphrase=correct-horse-battery'
+```
+
+A publisher reserves its path during the handshake,
 so a busy path is rejected with `RejectConflict` before any media flows. MPEG-TS is the only
 container SRT carries here; AV1 and G.711 are not in it.
 
@@ -234,7 +253,7 @@ if err != nil {
 	panic(err)
 }
 
-router := fibhttp.NewRouter() // served by the HTTP binding
+router := fibhttp.NewRouter()              // served by the HTTP binding
 router.Handle("/whip/*", rtcServer)        // POST publishes
 router.Handle("/whep/*", rtcServer)        // POST plays
 router.Handle("/rtc/session/*", rtcServer) // PATCH (trickle) and DELETE
@@ -248,10 +267,12 @@ underneath.
 
 ## Pull and push relays
 
-Every client dials through a fib engine and reports through callbacks; none blocks a worker.
-A pull relay plays a remote stream into a hub path, a push relay publishes a hub path to a
-remote server. Reconnecting is the application's: `done`/`OnClose` say the relay ended, and
-starting it again is one call.
+Every client dials through a fib engine, which must be running, and reports through
+callbacks; none blocks a worker. A pull relay plays a remote stream into a hub path, a push
+relay publishes a hub path to a remote server. Reconnecting is the application's: the `done`
+callback says the relay started (nil) or why it could not, `ClientConfig.OnClose` (and
+`PullConfig.OnClose`) that a running one ended, and starting it again is one call. Each call
+returns its relay as well, whose `Close` stops it.
 
 ```go
 // RTMP: pull another server's stream into "live/cam", and push "live/cam" on,
@@ -275,7 +296,8 @@ hub the same clients are plain players and publishers: `rtmp.Play` into any `hub
 ## Pitfalls
 
 - **There is no transcoding.** A track an egress cannot carry is left out of that egress only:
-  WHEP drops AAC (and MP3), SRT and HLS-TS drop AV1 and G.711, RTMP/HTTP-FLV players older
+  WHEP drops AAC and MP3, SRT and HLS-TS drop AV1 and G.711, HLS fMP4 drops G.711, only
+  RTMP/HTTP-FLV carry MP3, and RTMP/HTTP-FLV players older
   than Enhanced RTMP cannot read Opus. Publish the codecs your players need — usually H.264
   with both AAC for HLS/RTMP and Opus for WebRTC. See the codec matrix in
   [the media reference](../media.md#codecs-by-protocol).

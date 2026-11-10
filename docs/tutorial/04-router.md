@@ -54,7 +54,35 @@ func main() {
 }
 ```
 
-`Get`, `Post`, `Put`, `Delete`, `Patch`, `Head`, `Options`, `Connect` and `Trace` cover the standard methods; `Method` and `MethodFunc` take any method token (for example `PROPFIND`), and `Handle` takes a pattern that begins with the method, as `net/http.ServeMux` does: `r.Handle("DELETE /users/{id}", deleteUser)`. A `Handle` pattern without a method matches every method.
+Run it with `go run .` and try the routes:
+
+```sh
+curl http://127.0.0.1:8080/users/42         # user 42           (the regexp route)
+curl http://127.0.0.1:8080/users/bob        # user named bob    (the plain parameter)
+curl http://127.0.0.1:8080/users/a%2Fb      # user named a/b    (%2F stays in the value)
+curl http://127.0.0.1:8080/files/a/b        # file a/b
+curl http://127.0.0.1:8080/files            # 404: "/files/*" needs the slash
+curl -I http://127.0.0.1:8080/users/7       # 200: the GET route serves HEAD
+curl -i -X DELETE http://127.0.0.1:8080/users  # 405 with "Allow: POST"
+```
+
+`Get`, `Post`, `Put`, `Delete`, `Patch`, `Head`, `Options`, `Connect` and `Trace` cover the standard methods; `Method` and `MethodFunc` take any method token (for example `PROPFIND`), and `Handle`/`HandleFunc` take a pattern that may begin with the method, as `net/http.ServeMux` does: `r.HandleFunc("DELETE /users/{id}", deleteUser)`. A `Handle` pattern without a method matches every method.
+
+Besides `Param`, a handler can read every value with `c.Params()`, an iterator of name and value pairs, and the pattern of the route that served it with `c.RoutePattern()` — `"/users/{id}"`, with the patterns of the `Mount`s the request came through in front. That is the label to put on metrics and access logs, since it does not grow with the number of distinct paths. `r.Walk(fn)` visits every registered route with its method and pattern, for printing a route table at startup:
+
+```go
+r.Get("/orders/{id}", func(c *fibhttp.Context) {
+	for name, value := range c.Params() {
+		_ = name  // "id"
+		_ = value // "17" for /orders/17
+	}
+	_ = c.String(200, "served by %s\n", c.RoutePattern()) // served by /orders/{id}
+})
+_ = r.Walk(func(method, pattern string, _ fibhttp.Handler) error {
+	fmt.Println(method, pattern) // GET /orders/{id}, ...
+	return nil
+})
+```
 
 ## Groups and scoping middleware
 
@@ -103,22 +131,40 @@ func main() {
 }
 ```
 
-`/api/status` is served by the mounted router; `/users/42` by the `/users` route. A request to `/api/missing` is answered by the mounted router's 404 (or this router's, if it set none), inside the mounted router's middleware.
+`/api/status` is served by the mounted router; `/users/42` by the `/users` route, and `/users` and `/users/` both by its `"/"`. A request to `/api/missing` is answered by the mounted router's 404 (or this router's, if it set none), inside the mounted router's middleware; `/users/x` gets a 404 because no route under `/users` takes it, and `POST /users/42` a 405 with `Allow: GET, HEAD`.
+
+Middleware for a part of the tree goes in three places, and the next chapter shows a complete program with one:
+
+```go
+r.Route("/admin", func(r *fibhttp.Router) {
+	r.Use(requireToken) // every route under /admin, and its 404s and 405s
+	r.Get("/stats", stats)
+})
+r.Group(func(r *fibhttp.Router) {
+	r.Use(rateLimit) // only the two routes registered in this function
+	r.Post("/login", login)
+	r.Post("/signup", signup)
+})
+r.With(audit).Delete("/users/{id}", deleteUser) // this one route
+```
 
 ## 404, 405 and path values
 
-The default 404 and 405 are plain responses. To customise them, register handlers: `r.NotFound(fn)` for a path no route matches, and `r.MethodNotAllowed(fn)` for a path that matches but not with this method. The `Allow` header is already set in `c.Header()` when the 405 handler runs, so a response written with `Respond` or `WriteResponse` must carry it over itself:
+The default 404 and 405 are plain-text responses (`404 page not found`, `405 method not allowed`). To customise them, register handlers: `r.NotFound(fn)` for a path no route matches, and `r.MethodNotAllowed(fn)` for a path that matches but not with this method. The `Allow` header is already set in `c.Header()` when the 405 handler runs, and it goes out with whatever the handler answers — `String`, `JSON`, `Respond`, `WriteResponse` or the `ResponseWriter` methods:
 
 ```go
 r.NotFound(func(c *fibhttp.Context) {
 	_ = c.JSON(404, map[string]string{"error": "not found"})
 })
 r.MethodNotAllowed(func(c *fibhttp.Context) {
-	_ = c.String(405, "method %s not allowed\n", c.Request.Method) // c.Header() already has Allow
+	// Allow is in c.Header() already and goes out with the answer.
+	_ = c.String(405, "method %s not allowed\n", c.Request.Method)
 })
 ```
 
-A router sets route parameters only for `c.Param`. `r.SetPathValues(true)` makes every request carry them in `c.Request.PathValue` too, so a handler written for `net/http.ServeMux` finds its values; it costs one allocation per request with parameters, where `Param` costs none.
+A `NotFound` or `MethodNotAllowed` set inside a `Route` callback applies under that prefix only; set on a router made by `With` or `Group`, it sets the handler of the router they came from. Passing `nil` restores the default.
+
+A router sets route parameters only for `c.Param`. `r.SetPathValues(true)` makes every request carry them in `c.Request.PathValue` too, so a handler written for `net/http.ServeMux` finds its values; it costs one allocation per request with parameters, where `Param` costs none. It is a setting of the router it is called on and of the routers `Route`, `Group` and `With` made from it; a `*Router` you `Mount` has a setting of its own.
 
 ## Routing a `net/http` mux
 
@@ -171,8 +217,9 @@ The router is a radix tree: static children are indexed by first byte, recursion
 - **`With`/`Group` middleware is not a catch-all.** It wraps only the routes registered through that router, not every request the parent sees; use `Use` on the parent for that.
 - **`Route` is not `Mount`.** A `Route`'s routes are appended to the same tree and routed in one walk; only `Mount` nests a second router and re-routes the rest of the path.
 - **A catch-all cannot be followed by anything.** `*` and `{name...}` must end the pattern, and a `Route`/`Mount` prefix cannot contain one.
-- **`c.Param` values are borrowed.** They are substrings of the path and are invalid after the handler returns; copy them to keep them.
-- **405 handlers must set `Allow` themselves** when they answer with `Respond` or `WriteResponse`; only the `ResponseWriter` path sends the header the router filled in.
+- **`c.Param` values are borrowed.** They are substrings of the path and are invalid after the handler returns (with the default request reuse); copy them, for example with `strings.Clone`, to keep them.
+- **A 405 handler need not set `Allow`.** The router has put it in `c.Header()`, which every way of answering sends; an `Allow` in a `WriteResponse` header replaces it.
+- **`Mount` takes a handler, not a middleware.** `pprof.New()` and the other built-ins are middleware; put them on a router with `Use` (or in a `middleware.Chain`), not in `Mount`.
 - **Don't register routes while serving.** A `Router` is not safe for concurrent registration and dispatch; build it at startup.
 - **Trailing slashes are not redirected.** Register the path you mean; a `Route` prefix matches both `/users` and `/users/` for its own `/`, but a plain route does not silently redirect.
 

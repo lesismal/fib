@@ -17,7 +17,7 @@ type Handler interface {
 }
 ```
 
-`fib.HandlerFuncs` 用你设置的任意几个回调（`Open`、`Data`、`PriorityData`、`Close`）实现它，所以原生协议只需要写用到的部分。下面这个完整的 echo 服务器四个都用了，回调名就是字段名：
+`fib.HandlerFuncs` 用你设置的任意几个回调（`Open`、`Data`、`PriorityData`、`Close`）实现它，所以原生协议只需要写用到的部分；没设置的回调什么都不做。`OnPriorityData` 接收 TCP 紧急（带外）数据，几乎所有协议都不设置它。下面这个完整的 echo 服务器设置了另外三个：
 
 ```go
 package main
@@ -56,11 +56,15 @@ func main() {
 }
 ```
 
+```sh
+printf 'ping\n' | nc 127.0.0.1 9000   # ping; the server prints the open and the close
+```
+
 HTTP handler 实现的则是 `fibhttp.Handler`：`ServeHTTP(*fibhttp.Context)`，用 `fibhttp.HandlerFunc` 从函数适配。Context 里是标准的 `*http.Request`（`c.Request`），它实现 `http.ResponseWriter`，并带有响应辅助方法（`Respond`、`JSON`、`String`、`Data`、`HTML` 等）。绑定的 HTTP handler 栈是 `fibhttp.NewHandler(handler)`，和其他章节一样；原生绑定直接放 `fib.Handler`，如上。
 
 ## 执行模型
 
-handler 的一切写法都源于一个设计决定：同一连接**一次只跑一轮**，每轮交给一个空闲的工作协程。事件循环只读就绪并连接提交给协程池；工作协程一直读到短读为止，跑协议（`OnData`、HTTP 解析器、WebSocket 帧解析器）和你的 handler，并在本轮末尾把输出 cork 后写出。
+handler 的一切写法都源于一个设计决定：同一连接**一次只跑一轮**，每轮交给一个空闲的工作协程。事件循环只读取就绪事件，并把连接交给协程池；工作协程一直读到短读为止，跑协议（`OnData`、HTTP 解析器、WebSocket 帧解析器）和你的 handler，并在本轮末尾把输出 cork 后写出。
 
 对 handler 来说这意味着：
 
@@ -68,7 +72,7 @@ handler 的一切写法都源于一个设计决定：同一连接**一次只跑�
 - 在 handler 里阻塞——sleep、同步 RPC、对另一个 socket 做 `io.ReadAll`——会占住一个工作协程，并拖慢它本可以服务的其他连接；但它**不会**阻塞事件循环。
 - `OnData` 的 `data` 只在本次调用期间有效：`Send` 会复制它，自己保存则不会。
 - 一轮内写出的响应会被 cork，在一次写里发出（`CoalesceWrites`）；从别的协程手工写多条响应则需要显式 `Cork`/`Flush`。
-- HTTP/2 与 HTTP/3 的 handler 不跑在读连接的协程上，而是进引擎的 handler 池（`Engine.HandlerPool()`）`<Name>-streams`，gRPC 调用和 arpc 的异步 handler 也在那里。因此同一连接上的并发流会被并发处理，阻塞的 handler 只拖慢它自己的请求；`Config.StreamPool.MaxConcurrentHandlers` 限制单个连接同时跑多少个请求。
+- HTTP/2 与 HTTP/3 的 handler 不跑在读连接的协程上，而是进引擎的 handler 池（`Engine.HandlerPool()`）`<Name>-streams`，gRPC 调用和 arpc 的异步 handler 也在那里。因此同一连接上的并发流会被并发处理，阻塞的 handler 只拖慢它自己的请求；`fibhttp.Config.StreamPool.MaxConcurrentHandlers`（以及 `http3.Config.StreamPool`）限制单个连接同时跑多少个请求；默认值 0 表示不限制。
 
 从[进阶技巧的速查表](../hacks.zh-CN.md)浓缩出的协程规则：
 
@@ -83,7 +87,7 @@ handler 的一切写法都源于一个设计决定：同一连接**一次只跑�
 
 ## 同步 HTTP handler
 
-默认写法最简单：返回之前就作答。handler 返回时什么都没写、也没有 `Retain`，服务器会补一个空的 `200`——与 `net/http` 完全一致。`Respond`、`JSON`、`String` 等方法要么整体发出响应，要么不发并返回错误，因此 handler 可以回退到别的响应：
+默认写法最简单：返回之前就作答。handler 返回时如果什么都没写、也没有 `Retain`，就得到一个空的 `200`——与 `net/http` 完全一致。`Respond`、`JSON`、`String` 等方法要么整体发出响应，要么不发并返回错误，因此 handler 可以回退到别的响应：
 
 ```go
 package main
@@ -116,6 +120,11 @@ func main() {
 }
 ```
 
+```sh
+curl 'http://127.0.0.1:8080/?name=fib%20dev'   # {"hello":"fib dev"}
+curl http://127.0.0.1:8080/                    # {"hello":"world"}
+```
+
 用 `http.ResponseWriter` 的方法一段一段写响应时，可以在中途 flush；SSE 和长下载就是这样流式发送的，且在 HTTP/1、HTTP/2 和 HTTP/3 上写法相同：
 
 ```go
@@ -124,7 +133,9 @@ c.Flush() // send now instead of when the handler returns
 _, _ = c.WriteString("data: two\n\n")
 ```
 
-`Respond`/`WriteResponse` 与 `ResponseWriter` 方法不能在同一个响应里混用：每个 handler 选定一种写法。
+`Respond`/`WriteResponse` 与 `ResponseWriter` 方法不能在同一个响应里混用：一种写法开始响应之后，另一种写法的调用会返回 `fibhttp.ErrResponseWritten`，什么也不发送。每个 handler 选定一种写法。
+
+`Respond`、`Data` 和 `WriteResponse` 不复制 body，而是持有这个切片直到响应结束，所以 handler 之后不能复用或修改它；body 建在临时缓冲区或池化缓冲区里时用 `RespondCopy`，它在调用时就复制。
 
 ## 异步响应：Retain 与 Release
 
@@ -167,6 +178,10 @@ func main() {
 }
 ```
 
+```sh
+curl 'http://127.0.0.1:8080/?q=abc'   # result for abc, after about 100ms
+```
+
 被 retain 的请求所拥有的一切——`c.Request`、它的 header、URL 和 body，`c.Query` 返回的零拷贝值——在最后一次 `Release` 之前都有效；之后对象复用可能把它们交给另一个请求。需要保存的就复制，或者在释放前用完。`c.Async(fn)` 是简写：它替你 `Retain`，返回一个先执行 `fn` 再（用 defer）`Release` 的函数，交给自己的协程或池执行。
 
 请求可能**在响应之前**就结束：对端关闭、读超时触发、body 出错。`OnCancel` 会在引擎的 handler 池上通知被 retain 的 handler 一次，让它停掉上游工作——但它仍必须归还自己持有的引用，因为取消只是不再写响应，并不会替你释放：
@@ -189,7 +204,7 @@ go func() {
 
 ## 用 OnBody 流式读请求体
 
-默认情况下整个 body 到齐后才调 handler，因此 1 GiB 的上传要占 1 GiB 内存。打开 `Config.StreamRequestBody` 后，header 一到就调 handler，`OnBody` 按顺序、一次一个地把 body 分片交给你，不为每个分片开 goroutine，而且背压是免费的：回调比对端慢时连接就停止读，TCP 窗口会让发送方慢下来，**回调本身就是限速器**。
+默认情况下整个 body 到齐后才调 handler，因此服务器要把它全部放在内存里，超过 `MaxBodyBytes`（`fibhttp.DefaultConfig` 里是 16 MiB）的 body 会被回 `413`。打开 `Config.StreamRequestBody` 后，header 一到就调 handler，`OnBody` 按顺序、一次一个地把 body 分片交给你，不为每个分片开 goroutine，而且背压是免费的：回调比对端慢时连接就停止读，TCP 窗口会让发送方慢下来，**回调本身就是限速器**。
 
 ```go
 package main
@@ -236,10 +251,18 @@ func main() {
 }
 ```
 
+```sh
+head -c 50000000 /dev/urandom > big.bin
+curl --data-binary @big.bin http://127.0.0.1:8080/                          # digest=<sha256> size=50000000
+curl -H 'Transfer-Encoding: chunked' --data-binary @big.bin http://127.0.0.1:8080/
+curl --http2-prior-knowledge --data-binary @big.bin http://127.0.0.1:8080/  # HTTP/2 streams it too
+shasum -a 256 big.bin                                                       # the same digest
+```
+
 `OnBody` 自己会 retain 请求，服务器在回调最后一次调用返回后释放，所以在回调里作答的 handler 不需要 `Retain` 也不需要 `Release`。下面四点以后能省很多时间：
 
 - **`Expect: 100-continue` 是懒的。** handler 第一次要 body 时才发 `100 Continue`，所以先检查 `c.Request.ContentLength` 并在注册 `OnBody` 之前回 `413`，可以在一个字节都没读的情况下拒绝上传。
-- **流式 body 受 `ReadTimeout` 约束。** 它从请求第一个字节开始计时，body 还在到达时就一直生效；大文件上传要把它调大或设为 0，转而依赖 `IdleTimeout`。
+- **流式 body 受读超时约束。** `ReadBodyTimeout`（`fibhttp.DefaultConfig` 里是 5 分钟，从 header 结束开始计时）和 `ReadTimeout`（默认关闭，从请求第一个字节开始计时）在 body 还在到达时都生效，任一到期就关闭连接。慢速的大文件上传要把它们调大，或者用 `c.SetReadDeadline(time.Time{})` 为单个请求解除。
 - **不要在回调里阻塞。** 它跑在连接的 worker 上；慢活交给自己的池，并额外 `Retain`，自己负责 `Release`。
 - **`OnBody` 接管后 `Request.Body` 就不能再读**，而且流式请求永远不会复用它的 `Request`、header 和 URL。
 
@@ -251,9 +274,10 @@ func main() {
 - **`data` 是借来的。** `OnData`、`OnBody` 和 WebSocket 的负载只在调用期间有效；要保留请先复制。
 - **被 retain 的 HTTP/1 请求会挡住它后面流水线化的请求**，直到它被释放，因为响应必须保持顺序。HTTP/2 和 HTTP/3 的流互不等待。
 - **取消不等于释放。** `OnCancel` 只说明请求已经没了；之前取的 hold 仍要归还。
-- **`OnBody` 不是提前作答的办法。** 响应在最后一次回调之后才写出；要在 body 还在到达时就响应，请从回调里 `Retain` 并 `Respond`。
+- **在 `OnBody` 的 `fin` 时作答。** 在 `fin` 之前从回调里发出的响应会立即发出，并放弃 body 的剩余部分：回调的最后一次调用会带上错误（HTTP/1 上是 `io.ErrUnexpectedEOF`，连接在响应之后关闭；HTTP/2 上是一个说明 body 不再被读取的错误）。这是中途拒绝上传的办法，而不是回答完整上传的办法。
 - **没有 retain 就别在别的协程里读 `Context`。** 零拷贝取值方法是最常见的陷阱。
-- **`Respond` 与 `ResponseWriter` 方法互斥。** 混用会让响应失败；每个 handler 只选一种。
+- **`Respond` 与 `ResponseWriter` 方法互斥。** 先开始响应的那种写法生效；另一种写法的调用返回 `ErrResponseWritten`。每个 handler 只选一种。
+- **`Respond` 持有它的 body 切片。** 交给 `Respond` 的缓冲区在响应结束前不要复用；临时缓冲区用 `RespondCopy`。
 
 ## 相关文档
 

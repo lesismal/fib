@@ -155,7 +155,8 @@ _ = pc.AddICECandidate(cand) // held until the remote description is set
 ```
 
 在远端描述设置之前到达的 candidate 会被暂存，上限为
-`Configuration.MaxRemoteCandidates`（64）。客户端侧 `Offer` 同样是完整交换，因此一个 Go
+`Configuration.MaxRemoteCandidates`（64）；超过后 `AddICECandidate` 返回
+`ErrTooManyCandidates`。`Candidate` 为空的 `ICECandidateInit` 表示 candidate 结束。客户端侧 `Offer` 同样是完整交换，因此一个 Go
 客户端对接 HTTP WHIP 端点也很短：
 
 ```go
@@ -200,7 +201,7 @@ if err != nil {
 }
 ```
 
-要么一方都可以重新协商：新增 track 或第一个 data channel 时会触发
+任何一方都可以发起重新协商：新增 track 或第一个 data channel 时会触发
 `OnNegotiationNeeded`；`CreateOffer(&webrtc.OfferOptions{ICERestart: true})` 用新凭据重启
 ICE，而数据和媒体会在旧候选对上继续流动。
 
@@ -246,8 +247,20 @@ sender.OnKeyFrameRequest(func() {
 编码（`Configuration.Codecs`，例如 VP8 和 Opus），其余交给协商取交集。**保留头扩展 id**：
 转发用的 track 通过 `SetHeaderExtensions` 取用远端的 id；没有告知它的扩展会被丢弃。
 **请求关键帧**：新观众从关键帧开始，所以要把它的 `OnKeyFrameRequest` 转到发布端的
-`TrackRemote.RequestKeyFrame`。序列号与时间戳按写入值发出，因此在同一个 track 下切换源会
-让接收端看到跳变，也需要新的关键帧。
+`TrackRemote.RequestKeyFrame`（发送端忽略 PLI 时用 `RequestFIR`）。序列号与时间戳按写入值
+发出，因此在同一个 track 下切换源会让接收端看到跳变，也需要新的关键帧。
+
+丢包修复默认关闭。设置了 `Packets` 的 `Configuration.Retransmit` 会为每个 `TrackLocal` 保留
+最近那么多个包，并用它们应答观众的 NACK；观众协商了 RTX 时以 RTX 重传。这份历史属于 track，
+由它发往的所有观众共享：
+
+```go
+cfg := webrtc.Configuration{
+	Mux:        mux,
+	ICELite:    true,
+	Retransmit: webrtc.RetransmitConfig{Packets: 512}, // about 0.75 MiB per track, once written
+}
+```
 
 ## TURN
 
@@ -275,7 +288,7 @@ if err != nil {
 defer pc.Close()
 ```
 
-服务端侧是 `turnserver` 包，它在同一个 engine 上运行 `turn` 核心。它需要一个具体地址的
+服务端侧是 `webrtc/turn/turnserver` 包，它在同一个 engine 上运行 `webrtc/turn` 核心。它需要一个具体地址的
 `RelayIP`（在一对一 NAT 后面还要 `PublicIP`）、一个 realm，以及一个 `AuthFunc`——固定用户
 用 `turn.StaticAuth`，Web 服务发放的限时凭据用 `turn.EphemeralAuth`：
 
@@ -291,7 +304,7 @@ cfg.Auth = turn.EphemeralAuth(secret, time.Now) // or turn.StaticAuth(cfg.Realm,
 cfg.MaxAllocations, cfg.MaxAllocationsPerUser = 10000, 10
 cfg.AllowedPeers = []netip.Prefix{netip.MustParsePrefix("10.0.1.0/24")} // private peers to relay to
 
-server, err := turnserver.Listen(engine, "127.0.0.1:3478", cfg)
+server, err := turnserver.Listen(engine, "10.0.0.5:3478", cfg) // UDP; ListenTCP, ListenTLS add more
 if err != nil {
 	panic(err)
 }
@@ -300,12 +313,14 @@ go engine.Run()
 
 // For each browser, the web service makes the credentials it puts in RTCIceServer:
 user, pass := turn.EphemeralCredentials(secret, "alice", time.Now().Add(time.Hour))
-log.Printf("RTCIceServer{urls: turn:127.0.0.1:3478, username: %q, credential: %q}", user, pass)
+log.Printf("RTCIceServer{urls: turn:203.0.113.7:3478, username: %q, credential: %q}", user, pass)
 ```
 
 默认情况下服务端拒绝向 loopback、私网和 link-local 地址中继，因此它不会变成进入其所在网络的
-代理；`AllowedPeers` 用来指定例外。`ListenTCP` 和 `ListenTLS` 补上只放行 443 的网络里客户端
-需要的传输方式。即使走 TCP 或 TLS，TURN 仍然用 UDP 向对端中继：只有到服务端这一段是流。
+代理；`AllowedPeers` 用来指定例外。`server.ListenTCP(addr)` 和
+`server.ListenTLS(addr, tlsConfig)` 补上只放行 443 出站的防火墙后面的客户端需要的传输方式。
+即使走 TCP 或 TLS，TURN 仍然用 UDP 向对端中继：只有到服务端这一段是流。`Close` 释放所有
+allocation，但监听用的 binding 留给调用方移除；`Shutdown(ctx)` 会先让 allocation 自然结束。
 
 ## 兼容性与限制
 
@@ -329,6 +344,9 @@ TCP，解析浏览器的 mDNS host candidate，FEC 与发送 NACK，transport-wi
   `DataChannelMessage.Data` 可以保留。
 - **ICE-lite 需要对面是 full agent。** 浏览器都是 full agent；标记 `ICELite` 的
   `PeerConnection` 会拒绝 TURN 服务器和 relay-only 策略，lite 与 lite 之间永远连不上。
+- **ICE 服务器的主机名会立即解析。** `NewPeerConnection` 在创建时就查询每个 `stun:`/`turn:`
+  URL 的主机名，这是会阻塞调用方的 DNS 查询，解析不了的名字会让它返回 `ErrConfiguration`。
+  这类 PeerConnection 应在 fib worker 之外创建，或者直接用 IP 地址给出服务器。
 - **TURN 不能共享 `Mux`。** 给 `PeerConnection` 一个 `Engine`，让它自己开端口，否则
   `NewPeerConnection` 返回 `ErrConfiguration`。
 - **服务端必须保存 `PeerConnection`。** `Answer` 不会把它返回；按会话 id 存好，在 `DELETE`

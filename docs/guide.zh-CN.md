@@ -702,7 +702,8 @@ func(c *fibhttp.Context) {
   没有开始写的响应仍然可以之后在其他 goroutine 中用 `WriteResponse` 异步回复。
 - 同一个响应不能混用两种方式：开始用 `Write`/`WriteHeader` 之后，`WriteResponse` 返回
   `ErrResponseWritten`。
-- HTTP/2 和 HTTP/3 上这些方法同样可用，但响应会先缓存，handler 返回后整体发送。
+- HTTP/2 和 HTTP/3 上这些方法同样可用，响应同样流式发送：body 按客户端的流控窗口以 DATA 帧发出，
+  约 64KB 被压住时 `Write` 等待。
 
 服务端还会：为 HTTP/1.1 缺少 `Host` 或有多个 `Host` 的请求返回 400；
 `Transfer-Encoding` 里 chunked 之上的 gzip、x-gzip、deflate 会被解码（deflate 同时接受
@@ -839,8 +840,10 @@ files.ServeFile(c, strings.TrimPrefix(c.Request.URL.Path, "/static/"))
 ### 读超时
 
 `Config.ReadHeaderTimeout`、`Config.ReadTimeout`、`Config.IdleTimeout` 就是
-`net/http.Server` 的那三个，回退规则也一样（前两者为 0 时用 `ReadTimeout`），
-全为 0 表示不限，默认不限：
+`net/http.Server` 的那三个，回退规则也一样（前两者为 0 时用 `ReadTimeout`），另有
+`Config.ReadBodyTimeout` 约束 body 到达的时间（从 header 结束算起，与 `ReadTimeout` 先到者生效）。
+全为 0 表示不限；`DefaultConfig()` 设了 `ReadHeaderTimeout` 10 秒、`ReadBodyTimeout` 5 分钟、
+`IdleTimeout` 2 分钟，`ReadTimeout` 为 0：
 
 ```go
 config := fibhttp.DefaultConfig()
@@ -851,12 +854,14 @@ handler := fibhttp.NewHandlerWithConfig(config, myHandler)
 ```
 
 - 连接在等第一个/下一个请求时受 `IdleTimeout` 约束；在等 header 收完时受
-  `ReadHeaderTimeout` 约束；在等 body 收完（流式与否都一样）时受 `ReadTimeout` 约束，
-  都从该请求的第一个字节算起。超时的连接被关闭，`OnClose` 收到 `os.ErrDeadlineExceeded`。
-- **请求收全之后 deadline 会被撤掉**：比 `ReadTimeout` 慢的 handler 仍然能把响应写完。
-  `ReadTimeout` 约束的是请求到达的时间，不是处理它的时间。流式 body 在 handler 运行期间
-  仍在到达，所以它确实受 `ReadTimeout` 约束——慢上传占不住连接靠的就是这个。
-- 变成 HTTP/2 的连接（preface 或 h2c 升级）会被解除这些超时，交给 HTTP/2 自己管。
+  `ReadHeaderTimeout` 约束（从该请求的第一个字节算起）；在等 body 收完（流式与否都一样）时受
+  `ReadBodyTimeout` 和 `ReadTimeout` 约束。超时的连接被关闭，`OnClose` 收到 `os.ErrDeadlineExceeded`。
+- **请求收全之后 deadline 会被撤掉**：比这些超时慢的 handler 仍然能把响应写完。
+  它们约束的是请求到达的时间，不是处理它的时间。流式 body 在 handler 运行期间
+  仍在到达，所以它确实受 `ReadBodyTimeout`/`ReadTimeout` 约束——慢上传占不住连接靠的就是这个；
+  handler 可以用 `c.SetReadDeadline` 为自己的流式 body 撤掉或改设 deadline。
+- HTTP/2 和 HTTP/3 上 `ReadTimeout`、`ReadBodyTimeout` 对每个请求的 body 各自计时（从它的
+  HEADERS 算起），超时只结束这个 stream，连接继续服务其它 stream。
 
 ### 流式请求 body（大 body 边收边处理）
 
@@ -1888,7 +1893,7 @@ async 161 万到 194 万，latency-1m 的 p99 从 1.6ms 降到 124µs、同时�
   124µs 更差；4 个 P 的子进程除 json-tls 持平外都不如 2 个 P。`Config.Children` 是子进程数，默认 master 的
   GOMAXPROCS 除以 `ProcsPerChild`（向上取整）。
   子进程的 GOMAXPROCS 小，fib 的默认值随之变化：CPU 数取 `runtime.NumCPU()` 与 GOMAXPROCS 中
-  较小的那个，4 个 P 及以下不开 IOPollers，每个 Engine 只有自己的一个循环。
+  较小的那个，4 个 P 及以下每个 Engine 只有一个 poller。
 - 调用 `Run` 之前的代码 master 和每个子进程都会执行一遍，只有子进程需要的初始化（加载数据、连接池）
   放进 `serve`。子进程之间除了端口什么都不共享，内存里的状态每个子进程一份；整个机器或容器只有
   一份的资源（比如数据库的连接数上限）按 `prefork.Children()` 分给每个子进程。`prefork.Child()`
@@ -1904,18 +1909,18 @@ async 161 万到 194 万，latency-1m 的 p99 从 1.6ms 降到 124µs、同时�
 ## IOPollers
 
 `Config.IOPollers` 把一个 Engine 拆到多个事件循环上（仅 Linux 的 epoll 和 macOS 的 kqueue；
-Windows 上忽略这个配置，保持单个循环）。`DefaultConfig()` 在 CPU 数大于 4 时开启，
-4 个及以下时关闭（CPU 数取 `runtime.NumCPU()`，GOMAXPROCS 更小时取 GOMAXPROCS，例如 prefork
-的子进程、或运行时按容器 CPU 配额调低了它）：这么少的核上一个 poller 只是多一个循环，3 个 CPU 的 HTTP/1 echo 单循环 583k、
-1 个 poller 584k，而 4 核默认也只会建 1 个 poller。显式设为 `true` 则任何核数都有 poller；为 `false`
+Windows 上忽略这个配置，保持单个循环）。`DefaultConfig()` 默认开启，
+不论 CPU 数多少（CPU 数取 `runtime.NumCPU()`，GOMAXPROCS 更小时取 GOMAXPROCS，例如 prefork
+的子进程、或运行时按容器 CPU 配额调低了它）：4 个 CPU 及以下只建 1 个 poller，3 个 CPU 的 HTTP/1 echo
+单循环 583k、1 个 poller 584k，两者相当。为 `false`
 时 listener 和连接都在同一个 event loop 上。开不开都一样，事件循环只等事件、把变为可执行的连接交给
 Engine 的 worker 池（`<Name>-workers`），每条连接的每一轮都在 worker 上执行：
 
 - Engine 自己的循环只负责 accept 和它的 UDP socket；每条 accept 到的连接按 `fd % pollerCount`
   交给其中一个 poller，此后由那个 poller 负责它的事件注册、读写和关闭。poller 数量由
-  `Config.IOPollerCount` 指定，不大于 0（默认）时 32 个 CPU 以内为 `max(1, CPU 数/4)`（CPU 数同上，
-  向下取整，至少 1 个），超过 32 个 CPU 为 CPU 数/2：7 核以内 1 个，8 核 2 个，16 核 4 个，32 核 8 个，
-  64 核 32 个。8、16、32 个 CPU 上 poller 数取 CPU/4、CPU/2 还是每 CPU 一个，HTTP/1 和 WebSocket
+  `Config.IOPollerCount` 指定，不大于 0（默认）时 4 个 CPU 以内 1 个，16 个以内 2 个，更多时为 CPU 数/8
+  （CPU 数同上，向下取整）：8 核和 16 核 2 个，24 核 3 个，32 核 4 个，64 核 8 个。下面是早期默认
+  （CPU/4、CPU/2）时的测量。8、16、32 个 CPU 上 poller 数取 CPU/4、CPU/2 还是每 CPU 一个，HTTP/1 和 WebSocket
   （长连接和每 10 个请求重连两种）差别都在 3% 以内；64 个 CPU 上 CPU/4 个 poller 在连接频繁建立、
   关闭时 accept 跟不上，有四分之一的 CPU 空闲，改为 CPU/2 个后 HttpArena 的 limited-conn 快 15%、
   WebSocket 的对应测试快 6%，长连接不变。profile 下来，poller 每个请求

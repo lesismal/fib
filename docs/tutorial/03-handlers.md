@@ -17,7 +17,7 @@ type Handler interface {
 }
 ```
 
-`fib.HandlerFuncs` implements it from whichever callbacks you set (`Open`, `Data`, `PriorityData`, `Close`), so a raw protocol needs only the parts it uses. This complete echo server uses all four, with the callback names as fields:
+`fib.HandlerFuncs` implements it from whichever callbacks you set (`Open`, `Data`, `PriorityData`, `Close`), so a raw protocol needs only the parts it uses; an unset one does nothing. `OnPriorityData` receives TCP urgent (out-of-band) bytes and almost every protocol leaves it unset. This complete echo server sets the other three:
 
 ```go
 package main
@@ -56,6 +56,10 @@ func main() {
 }
 ```
 
+```sh
+printf 'ping\n' | nc 127.0.0.1 9000   # ping; the server prints the open and the close
+```
+
 An HTTP handler implements `fibhttp.Handler` instead: `ServeHTTP(*fibhttp.Context)`, adapted from a function by `fibhttp.HandlerFunc`. The context holds the standard `*http.Request` in `c.Request`, implements `http.ResponseWriter`, and carries the response helpers (`Respond`, `JSON`, `String`, `Data`, `HTML`, …). A binding's HTTP handler stack is `fibhttp.NewHandler(handler)`, as in every other chapter; a raw binding names the `fib.Handler` directly, as above.
 
 ## The execution model
@@ -68,7 +72,7 @@ For a handler this means:
 - Blocking in a handler — a sleep, a synchronous RPC, `io.ReadAll` on another socket — occupies a worker and delays every other connection that worker could have served. It does **not** block the event loop.
 - `data` in `OnData` is valid only for the duration of the call: `Send` copies it, keeping it does not.
 - Responses written during a round are corked and leave in one write (`CoalesceWrites`); writing several responses by hand from another goroutine needs an explicit `Cork`/`Flush`.
-- HTTP/2 and HTTP/3 handlers do not run on the goroutine that reads the connection: they go to the engine's handler pool (`Engine.HandlerPool()`), `<Name>-streams`, as gRPC calls and arpc's async handlers do. Concurrent streams are therefore handled concurrently and a blocking handler only delays its own request; `Config.StreamPool.MaxConcurrentHandlers` bounds how many of one connection's requests run at once.
+- HTTP/2 and HTTP/3 handlers do not run on the goroutine that reads the connection: they go to the engine's handler pool (`Engine.HandlerPool()`), `<Name>-streams`, as gRPC calls and arpc's async handlers do. Concurrent streams are therefore handled concurrently and a blocking handler only delays its own request; `fibhttp.Config.StreamPool.MaxConcurrentHandlers` (and `http3.Config.StreamPool`) bounds how many of one connection's requests run at once; zero, the default, does not.
 
 The goroutine rules, condensed from the [hack guide's cheat sheet](../hacks.md#19-cheat-sheet-what-may-be-called-from-which-goroutine):
 
@@ -83,7 +87,7 @@ The goroutine rules, condensed from the [hack guide's cheat sheet](../hacks.md#1
 
 ## A synchronous HTTP handler
 
-The default style is the easiest: answer before returning. Nothing is written when the handler returns and nothing retained, so the server answers an empty `200` — exactly as `net/http` does. `Respond`, `JSON`, `String` and the rest either send the whole response or return an error without sending, so a handler can fall back:
+The default style is the easiest: answer before returning. A handler that returns having written nothing and retained nothing gets an empty `200` — exactly as in `net/http`. `Respond`, `JSON`, `String` and the rest either send the whole response or return an error without sending, so a handler can fall back:
 
 ```go
 package main
@@ -116,6 +120,11 @@ func main() {
 }
 ```
 
+```sh
+curl 'http://127.0.0.1:8080/?name=fib%20dev'   # {"hello":"fib dev"}
+curl http://127.0.0.1:8080/                    # {"hello":"world"}
+```
+
 A response written piece by piece through the `http.ResponseWriter` methods can be flushed midway; that is how SSE and long downloads stream, and it works the same over HTTP/1, HTTP/2 and HTTP/3:
 
 ```go
@@ -124,7 +133,9 @@ c.Flush() // send now instead of when the handler returns
 _, _ = c.WriteString("data: two\n\n")
 ```
 
-`Respond`/`WriteResponse` and the `ResponseWriter` methods cannot be mixed in one response: pick one style per handler.
+`Respond`/`WriteResponse` and the `ResponseWriter` methods cannot be mixed in one response: once one style has begun the response, a call of the other returns `fibhttp.ErrResponseWritten` and sends nothing. Pick one style per handler.
+
+`Respond`, `Data` and `WriteResponse` keep the body slice until the response is finished rather than copying it, so a handler must not reuse or change that slice afterwards; `RespondCopy` copies it at the call, for a body built in a scratch or pooled buffer.
 
 ## Asynchronous responses: Retain and Release
 
@@ -167,6 +178,10 @@ func main() {
 }
 ```
 
+```sh
+curl 'http://127.0.0.1:8080/?q=abc'   # result for abc, after about 100ms
+```
+
 Everything the retained request owns — `c.Request`, its header, URL and body, `c.Query`'s zero-copy values — stays valid until the last `Release`; after it, object reuse may hand them to another request. Copy what you must keep, or finish with it before releasing. `c.Async(fn)` is the shorthand: it takes the `Retain` and returns a func that runs `fn` and then releases, deferred, for your own goroutine or pool.
 
 A request can end **before** its response does: the peer closes, a read deadline fires, the body fails. `OnCancel` tells a retained handler once, on the engine's handler pool, so it can stop the upstream work — and it must still release its reference, because cancellation writes nothing but does not give holds back:
@@ -189,7 +204,7 @@ go func() {
 
 ## Streaming request bodies with OnBody
 
-By default the handler is called once the whole body has arrived, so a 1 GiB upload costs 1 GiB of memory. With `Config.StreamRequestBody` the handler runs as soon as the header is in and `OnBody` delivers the body in pieces, in order, one call at a time, with no goroutine per chunk and backpressure for free: if the callback is slower than the peer, the connection stops reading, TCP's window slows the sender down, and the callback itself is the rate limiter.
+By default the handler is called once the whole body has arrived, so the server holds all of it in memory, and a body over `MaxBodyBytes` (16 MiB in `fibhttp.DefaultConfig`) is answered `413`. With `Config.StreamRequestBody` the handler runs as soon as the header is in and `OnBody` delivers the body in pieces, in order, one call at a time, with no goroutine per chunk and backpressure for free: if the callback is slower than the peer, the connection stops reading, TCP's window slows the sender down, and the callback itself is the rate limiter.
 
 ```go
 package main
@@ -236,10 +251,18 @@ func main() {
 }
 ```
 
+```sh
+head -c 50000000 /dev/urandom > big.bin
+curl --data-binary @big.bin http://127.0.0.1:8080/                          # digest=<sha256> size=50000000
+curl -H 'Transfer-Encoding: chunked' --data-binary @big.bin http://127.0.0.1:8080/
+curl --http2-prior-knowledge --data-binary @big.bin http://127.0.0.1:8080/  # HTTP/2 streams it too
+shasum -a 256 big.bin                                                       # the same digest
+```
+
 `OnBody` retains the request itself and the server releases it after the callback's last call, so a handler that answers from the callback needs neither `Retain` nor `Release`. Four things save time later:
 
 - **`Expect: 100-continue` is lazy.** `100 Continue` goes out the first time the handler asks for the body, so checking `c.Request.ContentLength` and answering `413` before registering `OnBody` refuses an upload without reading a byte.
-- **Streamed bodies are bound by `ReadTimeout`.** It counts from the request's first byte and runs while the body is still arriving; raise it or set it to zero for large uploads and rely on `IdleTimeout`.
+- **Streamed bodies are bound by the read timeouts.** `ReadBodyTimeout` (5 minutes in `fibhttp.DefaultConfig`, from the end of the header) and `ReadTimeout` (off by default, from the request's first byte) both run while the body is still arriving, and the connection is closed when one fires. Raise them for slow, large uploads, or lift them for one request with `c.SetReadDeadline(time.Time{})`.
 - **Don't block in the callback.** It runs on the connection's worker; hand slow work to your own pool and take an extra `Retain`, release it yourself.
 - **`Request.Body` is not readable once `OnBody` took the body over**, and a streamed request never reuses its `Request`, header or URL.
 
@@ -251,9 +274,10 @@ func main() {
 - **`data` is borrowed.** `OnData`, `OnBody` and WebSocket payloads are valid only during the call; copy before keeping.
 - **A retained HTTP/1 request holds the pipelined ones behind it** until it is released, because responses must stay in order. HTTP/2 and HTTP/3 streams do not wait for each other.
 - **Cancellation is not a release.** `OnCancel` says the request is gone; the holds it took still have to be given back.
-- **`OnBody` is not a way to answer early.** The response is written after the last callback; to answer while the body is still arriving, use `Retain` and `Respond` from the callback.
+- **Answer from `OnBody` at `fin`.** A response sent from the callback before `fin` goes out at once and gives up the rest of the body: the callback's last call then carries an error (`io.ErrUnexpectedEOF` on HTTP/1, whose connection closes after the response; on HTTP/2 an error saying the body is no longer being read). That is the way to refuse an upload part-way, not to answer a complete one.
 - **Don't read `Context` in another goroutine without retaining it first.** The zero-copy getters are the common trap.
-- **`Respond` and the `ResponseWriter` methods are exclusive.** Mixing them fails the response; choose per handler.
+- **`Respond` and the `ResponseWriter` methods are exclusive.** Whichever begins the response wins; a call of the other style returns `ErrResponseWritten`. Choose per handler.
+- **`Respond` keeps its body slice.** Don't reuse a buffer handed to `Respond` until the response is finished; use `RespondCopy` for scratch buffers.
 
 ## See also
 

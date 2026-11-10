@@ -96,9 +96,10 @@
   连接，只保留它报告的 `tls.ConnectionState`。
 - ACK 不再重复确认对端已经看到被确认过的范围（RFC 9000 第 13.2.4 节），所以对跳过包号的
   对端（quiche 就会这样做），ACK 帧只带少数几个范围，而不是保留的全部范围。
-- `Engine.Shutdown` 会发送 GOAWAY，让在途请求完成，再以 H3_NO_ERROR 关闭连接；但单独
-  调用 `Engine.Stop`/`Close` 时不会给 HTTP/3 连接发送 CONNECTION_CLOSE 或 GOAWAY，
-  连接被直接丢弃，客户端要等空闲超时才会发现。
+- `Engine.Shutdown` 会发送 GOAWAY，让在途请求完成，再以 H3_NO_ERROR 关闭连接。
+  `Engine.Close` 不发 GOAWAY，但会（经 `OnEngineClose`）给每个连接发送 CONNECTION_CLOSE
+  （H3_NO_ERROR），客户端立即得知，在途请求随之结束。`Engine.Stop` 什么也不发，连接保持
+  打开直到 `Close`。
 - 与 `http` package 相同，`http3` 只在 Linux、macOS、Windows 三个原生后端上编译，兼容
   后端（如 FreeBSD）上这个 package 为空。
 

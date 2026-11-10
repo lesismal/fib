@@ -133,9 +133,11 @@ request that arrives whole in one packet, as most do, costs none.
   9000 section 13.2.4), so a peer that skips packet numbers, as quiche does,
   gets ACK frames of a few ranges rather than of every range kept.
 - `Engine.Shutdown` sends GOAWAY, lets the requests in flight finish, and
-  closes each connection with H3_NO_ERROR, but `Engine.Stop`/`Close` on their
-  own send neither CONNECTION_CLOSE nor GOAWAY; connections are dropped and
-  clients find out only when they time out.
+  closes each connection with H3_NO_ERROR. `Engine.Close` sends no GOAWAY, but
+  closes every connection with CONNECTION_CLOSE (H3_NO_ERROR, through
+  `OnEngineClose`), so clients learn at once; the requests in flight end with
+  it. `Engine.Stop` sends nothing and leaves the connections open until
+  `Close`.
 - Like the `http` package, `http3` builds only on the three native backends
   (Linux, macOS, Windows); on the portable backend (e.g. FreeBSD) the package is
   empty.

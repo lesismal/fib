@@ -9,7 +9,8 @@ fib 服务端默认就很快，但"默认"是一组只针对某一类负载的�
 
 ## 协程池模型
 
-连接的每一轮读、handler 调用、回调和写，都是 `taskpool` 上的一个任务。各模式的区别只在 worker 的创建与
+连接的每一轮读——其中的读、它们触发的 `OnData`、cork 住的回复的 flush 以及 `OnClose`——都是引擎
+`taskpool` 上的一个任务；HTTP/2 与 HTTP/3 的请求 handler 跑在另一个池 `Engine.HandlerPool()` 上。各模式的区别只在 worker 的创建与
 回收方式，而不在任务本身：
 
 | 模式 | worker |
@@ -38,8 +39,9 @@ config.MinWorkerCount = 16                    // keep a floor for bursts
 config.SetTaskPoolMode(taskpool.ModeAdaptive) // preferred: also moves the sizing to the mode's
 ```
 
-只有当在本机压测表明默认上限形状不对时才固定容量；仅用 `SetTaskPoolMode` 就足以换策略。引擎运行时，
-`TaskPool` 可以用 `Resize(min, max)` 原地调整下限与上限，而不中断在途连接。
+只有当在本机压测表明默认上限形状不对时才固定容量；仅用 `SetTaskPoolMode` 就足以换策略。通过 `SetTaskPool`
+提供的 `*taskpool.TaskPool`（见下一节）可以在引擎运行时用 `Resize(min, max)` 调整自适应池的下限与上限（其他
+模式返回 false），而不中断在途任务。
 
 下面的完整程序是一个调优过的引擎：协程池下限、缓冲区、背压、poller 与日志，并在收到 SIGINT 时优雅停止。
 
@@ -99,8 +101,8 @@ func main() {
 ## 自定义池与共享池
 
 `Config.TaskPool` 接受任何实现了引擎 `TaskPool` 接口的池（`GoTask(taskpool.Task) bool` 与
-`GoTasks([]taskpool.Task) int`）；`*taskpool.TaskPool` 就是其中一个。这样提供的池，引擎永远不会停止它，
-生命周期由调用方负责。你自己的异步工作一定要用与引擎分开的池：engine worker 会向你的池提交任务，如果是同
+`GoTasks([]taskpool.Task) int`）；`*taskpool.TaskPool` 就是其中一个，用 `Config.SetTaskPool` 设置。这样提供的池，
+引擎永远不会停止它，生命周期由调用方负责，要在所有使用它的引擎关闭后再停止；inline 池（`ModeInline`）会被拒绝。你自己的异步工作一定要用与引擎分开的池：engine worker 会向你的池提交任务，如果是同
 一个池，队列满时所有 worker 都可能卡在提交上。
 
 ```go
@@ -176,8 +178,8 @@ func main() {
 `MaxWriteQueueBytes`，超过就以 `ErrSendQueueFull` 关闭连接）。`MaxPendingBytes` 是整个服务端排队输出的
 总量，默认关闭。
 
-- watermark 要比**一轮读的回复量**大，而不是一条消息：一轮最多读 `ReadBufferSize` 字节，而这一轮 cork 的
-  回复在轮末 flush 前都一起待在队列里。`DefaultConfig` 把它定为 4 个读 buffer，并受 64KiB 与 256KiB 限制。
+- watermark 要比**一次读的回复量**大，而不是一条消息：socket 有数据时一轮会以 `ReadBufferSize` 为单位持续
+  读，回复在轮末（或每读 256KiB）flush 之前都 cork 在一起，每次读完这一轮都会把排队量与 watermark 比较。`DefaultConfig` 把它定为 4 个读 buffer，并受 64KiB 与 256KiB 限制。
 - 当 watermark × 连接数是部署无法承受的内存时，设置 `MaxPendingBytes`；预算耗尽时它会暂停所有连接的读。
 - 向可能停止读数据的对端广播时，设置 `MaxWriteQueueBytes`（或 `Connection.SetWriteQueueLimit`）。它是硬
   上限，不是暂停。
@@ -191,15 +193,16 @@ func main() {
 buffer、回复组装与 TLS 记录都走同一批档位，所以你的 buffer 加入的是同一条循环，而不是多留一份空闲副本。
 
 ```go
-buf := bufferpool.Get(64 << 10)    // len 64KiB; contents are the previous user's, write before reading
-buf = bufferpool.Append(buf, data) // grows from the pool, allocating only what is needed
-defer bufferpool.Put(buf)          // after Put, not even a sub-slice may be used
+buf := bufferpool.Get(64 << 10)[:0] // cap 64KiB; contents are the previous user's, write before reading
+buf = bufferpool.Append(buf, data)  // moves to a larger class only if data does not fit
+defer func() { bufferpool.Put(buf) }() // Put the final buf: Append may have replaced (and Put) the first
 
 joined := bufferpool.Join(nil, a, b) // takes enough at once and joins the parts
 ```
 
 它适合 handler 的临时 buffer，不适合仍被 `SendShared` 或响应体引用的 buffer：`Put` 把它还给某个档位，
-下一次 `Get` 就可能把它交出去。
+下一次 `Get` 就可能把它交出去。`Append`、`Grow` 与 `Join` 换到更大的 buffer 时会把旧的还给池，所以之后只能
+使用它们返回的切片。
 
 完整字段表见 [configuration.zh-CN.md](../configuration.zh-CN.md#缓冲区与背压)。
 
@@ -268,8 +271,9 @@ func serve(ctx context.Context) error {
 
 子进程默认每个 2 个 P，master 启动的数量是机器 GOMAXPROCS 除以 `ProcsPerChild` 再向上取整，使所有子进程
 合计拥有单个进程会有的 P 数；`prefork.Children()` 报告共享这台机器的进程
-数，所以"整机唯一"的资源——比如数据库连接上限——要除以它。在不支持 `SO_REUSEPORT` 的平台上，
-`prefork.Run` 直接在本进程调用 `serve`，程序保持可移植。UDP 连接在对端 NAT rebind 后可能落到另一个子进程，
+数，所以"整机唯一"的资源——比如数据库连接上限——要除以它。prefork 需要 Linux，在那里
+`SO_REUSEPORT` 才会把连接分摊到多个进程；其他平台上 `prefork.Run` 直接在本进程调用 `serve`，程序保持可移植。
+`Config.Children` 可以覆盖子进程数；P 数少于 fib 给 poller 所需数量的子进程，会在引擎自己的循环上服务连接。UDP 连接在对端 NAT rebind 后可能落到另一个子进程，
 而内存状态是每个子进程一份，不共享。
 
 ## 日志
@@ -291,7 +295,7 @@ fiblog.Setup(fiblog.Config{
 程序里不调用时，也可以由环境变量决定：`FIB_LOG_FORMAT=line|text|json` 与
 `FIB_LOG_LEVEL=debug|info|warn|error` 在程序启动时设置 fib 的 logger，
 `FIB_LOG_SETTINGS=0` 静默启动时的配置清单而不改动配置。`Engine.LogSettings()` 可随时打印该清单，
-`Engine.LogStatus` 额外打印一行 `fib: engine started`，`logger` 中间件则通过同一个 logger 记录每个响应。
+`Config.LogStatus` 额外打印一行 `fib: engine started`（监听地址、池、poller、accept 放置方式），`logger` 中间件则通过同一个 logger 记录每个响应。
 
 ## pprof
 
@@ -411,7 +415,9 @@ Runner、WebSocket 的 Autobahn、媒体（ffmpeg）、WebRTC（pion）、KCP（
 
 ## 生产检查清单
 
-1. 从 `fib.DefaultConfig()` 出发再改字段；零值 `fib.Config{}` 没有池、缓冲区和日志配置。
+1. 从 `fib.DefaultConfig()` 出发再改字段：`fib.New` 会拒绝零值 `fib.Config{}`（没有 worker 数），而手工
+   构造的配置会悄悄丢掉 `CoalesceWrites`、`IOPollers`、`ReusePort`、`SocketSyscalls`、`UseWritev` 与
+   `SharedTaskPool`。
 2. 公网监听设置 `MaxConns` 与 `MaxWriteQueueBytes` 上限，让洪泛或停止读数据的对端只消耗有界资源。
 3. 只有在清楚它意味着多少内存时才把 `MaxPendingBytes` 从零调开：它替代的是 watermark × 连接数。
 4. 按你实际发送的最大消息确定读 buffer，并让写 watermark 明显大于一轮的回复量。

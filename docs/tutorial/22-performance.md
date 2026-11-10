@@ -12,8 +12,10 @@ assumes chapter [02-engine.md](02-engine.md); the tricks that change a handler's
 
 ## The worker pool model
 
-Every read round, handler call, callback and write of a connection runs as a task on a
-`taskpool`. The modes differ in how workers are made and retired, not in what a task is:
+Every read round of a connection — its reads, the `OnData` calls they make, the flush of its
+corked replies and its `OnClose` — runs as a task on the engine's `taskpool`; HTTP/2 and HTTP/3
+request handlers run on a second pool, `Engine.HandlerPool()`. The modes differ in how workers are
+made and retired, not in what a task is:
 
 | Mode | Workers |
 | --- | --- |
@@ -44,9 +46,10 @@ config.SetTaskPoolMode(taskpool.ModeAdaptive) // preferred: also moves the sizin
 ```
 
 Pin the sizing only when a load test on your machine says the default ceiling is the wrong shape;
-`SetTaskPoolMode` alone is enough to pick a different policy. When the engine runs, `TaskPool`
-values can be resized in place with `Resize(min, max)`, which moves the floor and the ceiling
-without dropping the connection in flight.
+`SetTaskPoolMode` alone is enough to pick a different policy. A `*taskpool.TaskPool` you supply
+with `SetTaskPool` (next section) can be resized while the engine runs with `Resize(min, max)`,
+which moves the floor and the ceiling of an adaptive pool (it reports false for the other modes)
+without dropping the work in flight.
 
 The complete program below is a tuned engine: pool floor, buffers, backpressure, pollers and
 logging, then a graceful stop on SIGINT.
@@ -107,8 +110,10 @@ func main() {
 ## Custom and shared pools
 
 `Config.TaskPool` takes any pool implementing the engine's `TaskPool` interface
-(`GoTask(taskpool.Task) bool` and `GoTasks([]taskpool.Task) int`); `*taskpool.TaskPool` is one.
-The engine never stops a pool supplied this way, so the caller owns its lifetime. For async work
+(`GoTask(taskpool.Task) bool` and `GoTasks([]taskpool.Task) int`); `*taskpool.TaskPool` is one, and
+`Config.SetTaskPool` is the way to set it. The engine never stops a pool supplied this way, so the
+caller owns its lifetime and stops it after every engine using it has closed; an inline pool
+(`ModeInline`) is refused. For async work
 of your own, always use a pool separate from the engine's: an engine worker submits to your pool,
 and if it were the same pool a full queue could leave every worker stuck submitting.
 
@@ -188,9 +193,10 @@ bytes wait for its socket, so TCP backpressure catches up (a peer that never rea
 queue past `MaxWriteQueueBytes`, which closes it with `ErrSendQueueFull`). `MaxPendingBytes` is the
 server-wide total of queued output; it is off by default.
 
-- The watermark must exceed the replies of **one round of reads**, not one message: a round reads at
-  most `ReadBufferSize` bytes and its replies sit in the queue together until the round's cork
-  flushes. `DefaultConfig` sizes it at four read buffers, bounded by 64KiB and 256KiB.
+- The watermark must exceed the replies of **one read**, not one message: a round keeps reading
+  `ReadBufferSize` at a time while the socket has data, its replies sit under the cork until the
+  round ends (or every 256KiB it reads), and after each read the round compares what is queued with
+  the watermark. `DefaultConfig` sizes it at four read buffers, bounded by 64KiB and 256KiB.
 - Set `MaxPendingBytes` when the watermark times the connection count is more memory than the
   deployment can spare; it pauses every connection while the budget is exhausted.
 - Set `MaxWriteQueueBytes` (or `Connection.SetWriteQueueLimit`) for broadcasts to peers that may
@@ -208,15 +214,17 @@ assembly and TLS records flow through the same classes, so your buffers join the
 instead of holding an extra idle copy.
 
 ```go
-buf := bufferpool.Get(64 << 10)    // len 64KiB; contents are the previous user's, write before reading
-buf = bufferpool.Append(buf, data) // grows from the pool, allocating only what is needed
-defer bufferpool.Put(buf)          // after Put, not even a sub-slice may be used
+buf := bufferpool.Get(64 << 10)[:0] // cap 64KiB; contents are the previous user's, write before reading
+buf = bufferpool.Append(buf, data)  // moves to a larger class only if data does not fit
+defer func() { bufferpool.Put(buf) }() // Put the final buf: Append may have replaced (and Put) the first
 
 joined := bufferpool.Join(nil, a, b) // takes enough at once and joins the parts
 ```
 
 Use it for a handler's scratch buffer, not for a buffer still referenced by a `SendShared` or a
-response body: `Put` returns it to a class where the next `Get` may hand it out again.
+response body: `Put` returns it to a class where the next `Get` may hand it out again. `Append`,
+`Grow` and `Join` give the old buffer back to the pool when they move to a larger one, so only the
+slice they return may be used afterwards.
 
 See [configuration.md](../configuration.md#buffers-and-backpressure) for the full field table.
 
@@ -288,9 +296,10 @@ func serve(ctx context.Context) error {
 Children default to two Ps each and the master starts as many as the machine's GOMAXPROCS
 divided by `ProcsPerChild`, rounded up, so together they have the Ps one process would have had;
 `prefork.Children()` reports how many processes share the machine, so a resource that exists once
-per machine — a database connection limit, say — is divided by it. On platforms without
-`SO_REUSEPORT` support, `prefork.Run` just calls `serve` in this process, so the program stays
-portable. A UDP connection's peer may rebind to another child after a NAT rebind, and in-memory
+per machine — a database connection limit, say — is divided by it. Prefork needs Linux, where
+`SO_REUSEPORT` spreads connections between processes; elsewhere `prefork.Run` just calls `serve` in
+this process, so the program stays portable. `Config.Children` overrides the count, and a child
+with fewer Ps than fib gives pollers to serves on its engine's own loop. A UDP connection's peer may rebind to another child after a NAT rebind, and in-memory
 state is per child, not shared.
 
 ## Logging
@@ -313,8 +322,8 @@ fiblog.Setup(fiblog.Config{
 Without a call in the program, the environment chooses: `FIB_LOG_FORMAT=line|text|json` and
 `FIB_LOG_LEVEL=debug|info|warn|error` set fib's logger when the program starts, and
 `FIB_LOG_SETTINGS=0` silences the startup settings list without changing the config.
-`Engine.LogSettings()` prints that list at any time, `Engine.LogStatus` adds the one-line
-`fib: engine started` banner, and the `logger` middleware logs every response through the same
+`Engine.LogSettings()` prints that list at any time, `Config.LogStatus` adds the one-line
+`fib: engine started` banner (listen addresses, pool, pollers, accept placement), and the `logger` middleware logs every response through the same
 logger.
 
 ## pprof
@@ -444,8 +453,9 @@ build. If a change touches a protocol, the matching job is the one to watch. The
 
 ## Production checklist
 
-1. Start from `fib.DefaultConfig()` and change fields; a zero `fib.Config{}` has no pools, buffers
-   or logging settings.
+1. Start from `fib.DefaultConfig()` and change fields: `fib.New` refuses a zero `fib.Config{}` (no
+   worker count), and a hand-built one silently loses `CoalesceWrites`, `IOPollers`, `ReusePort`,
+   `SocketSyscalls`, `UseWritev` and `SharedTaskPool`.
 2. Set `MaxConns` and a `MaxWriteQueueBytes` cap on public listeners, so a flood or a peer that
    stops reading costs a bounded amount.
 3. Raise `MaxPendingBytes` off zero only with the memory it implies: watermark × connections is

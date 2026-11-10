@@ -15,12 +15,15 @@ servers of [06-http1.md](06-http1.md) and [07-http2.md](07-http2.md).
 - **One handler, two entries.** `websocket.NewHandler(handler)` returns a `fib.Handler` that speaks
   WebSocket on the connection it is bound to. `Upgrade` is the other entry: it turns the request a
   package `http` handler is serving into a WebSocket, so WebSocket and plain HTTP share a port.
-- **Callbacks are serial.** For one connection, the opening handshake and then every message and
-  close callback run one after another — the handshake in `OnOpen` on the event loop, the rest on
-  whichever worker scheduled that round. Two connections' callbacks may run at the same time on
-  different workers, so state shared by connections needs a lock.
+- **Callbacks are serial.** For one connection, `Open`, then every message, frame, ping and pong,
+  then `Close` run one after another, never two at once. They run on the engine's workers; after
+  `Upgrade`, `Open` has already run inside `Upgrade`, on the HTTP handler's goroutine. Two
+  connections' callbacks may run at the same time on different workers, so state shared by
+  connections needs a lock.
 - **Payloads are borrowed.** `OnMessage` and `OnFrame` receive a slice that is valid only for the
-  duration of the callback; copy it before retaining it.
+  duration of the callback; copy it before retaining it. The `*http.Request` given to `Open` is the
+  handshake's, and the HTTP server may reuse it once `Open` returns: copy the fields you need
+  (a cookie, a user ID) rather than the request.
 - **Writes are safe and never block.** `WriteMessage`, `WriteText`, `WriteBinary`,
   `WritePreparedMessage`, `Ping`, `Pong` and `Close` may be called from application goroutines. A
   send queues the frame and returns; a peer that never reads grows its queue, so close such a peer
@@ -75,7 +78,9 @@ func main() {
 `Frame`, `Ping` and `Pong`. A nil `Ping` keeps the default pong reply; a nil `Pong` discards pongs.
 `Connection` writes what the client reads here: `WriteMessage` takes any data opcode, while
 `WriteText` and `WriteBinary` are the two shorthands, and `Close(code, reason)` sends a close frame.
-Test it with any client, for example `websocat ws://127.0.0.1:8080/`, and every line comes back.
+Test it with any client, for example `websocat ws://127.0.0.1:8080/`, and every line comes back;
+the client program [below](#the-client) works too. A plain HTTP request to this port gets
+`400 Bad Request`.
 
 ## Upgrading from an HTTP server
 
@@ -107,6 +112,8 @@ handshake and the whole connection switches to WebSocket. Over HTTP/2 and HTTP/3
 CONNECT whose `:protocol` is `websocket` (RFC 8441, RFC 9220): only that stream switches, the
 connection carries on serving other requests, and package `http` sends the SETTINGS that invite a
 browser to try it. The `Config`'s origin check, subprotocols and compression apply either way.
+A request that is not a valid handshake is answered by `Upgrade` itself — 400 Bad Request, or 403
+Forbidden when the origin check refuses it — and the error says why, so the handler only logs it.
 Return from the HTTP handler as soon as `Upgrade` returns; the connection belongs to the WebSocket
 handler now.
 
@@ -218,18 +225,18 @@ section on receiving by frame ([../hacks.md](../hacks.md)).
 
 ## Compression and handshake options
 
-The handshake is configured with `websocket.Config`, passed to `NewHandlerWithConfig`; its `HTTP`
-field names the package `http` settings used to answer a bad handshake:
+The handshake is configured with `websocket.Config`, passed to `NewHandlerWithConfig`; start from
+`websocket.DefaultConfig()`, whose `HTTP` field holds the package `http` limits and timeouts a
+standalone binding reads the handshake with:
 
 ```go
-config := websocket.Config{
-	MaxMessageBytes:   4 << 20,
-	EnableCompression: true,
-	CheckOrigin: func(r *stdhttp.Request) bool {
-		return r.Header.Get("Origin") == "https://example.com"
-	},
-	Subprotocols: []string{"chat.v2", "chat.v1"},
+config := websocket.DefaultConfig()
+config.MaxMessageBytes = 4 << 20
+config.EnableCompression = true
+config.CheckOrigin = func(r *stdhttp.Request) bool {
+	return r.Header.Get("Origin") == "https://example.com"
 }
+config.Subprotocols = []string{"chat.v2", "chat.v1"}
 handler := websocket.NewHandlerWithConfig(config, websocket.HandlerFuncs{
 	Message: func(c *websocket.Connection, op websocket.Opcode, data []byte) {
 		_ = c.WriteMessage(op, data)
@@ -243,8 +250,10 @@ decompressed. The sender keeps no deflate context — each message borrows a com
 `sync.Pool` — so memory stays bounded with many connections. `CheckOrigin` is the cross-site
 WebSocket hijacking guard: a nil one means `CheckSameOrigin`, which accepts a request without an
 `Origin` header or with an `Origin` naming the request's host, and refuses a browser page from
-another site with 403; accepting every origin is a conscious choice. The server picks a subprotocol
-from `Subprotocols` during the handshake, reported by `Connection.Subprotocol()`.
+another site with 403; accepting every origin is a conscious choice. The server takes the first of the
+client's `Sec-WebSocket-Protocol` offers that is in `Subprotocols` (the client's order decides, not
+the list's), reported by `Connection.Subprotocol()`; when none matches, the handshake still
+succeeds, with no subprotocol, and the handler decides whether to `Close`.
 
 ## The client
 
@@ -308,6 +317,75 @@ compression, sets the `crypto/tls` config used for `wss://`, or replaces the dia
 `Dial` hook such as a SOCKS proxy's. `Go` returns a `DialFuture` instead of taking a callback:
 `future := dialer.Go(url, nil, handler)`, then `conn, resp, err := future.Wait()`.
 
+## wss:// over TLS
+
+A secure WebSocket is the HTTP stack behind TLS ([10-tls.md](10-tls.md)) with `Upgrade` inside it,
+and a dialer whose `DialerConfig.TLSConfig` trusts the server. With `tlstest` certificates both ends
+must be in one process, so this program serves and dials on one engine:
+
+```go
+package main
+
+import (
+	"log"
+	stdhttp "net/http"
+
+	fib "github.com/lesismal/fib"
+	fibhttp "github.com/lesismal/fib/http"
+	fibtls "github.com/lesismal/fib/tls"
+	"github.com/lesismal/fib/tlstest"
+	"github.com/lesismal/fib/websocket"
+)
+
+func main() {
+	serverTLS, clientTLS, err := tlstest.Configs()
+	if err != nil {
+		panic(err)
+	}
+	ws := websocket.NewHandler(websocket.HandlerFuncs{
+		Message: func(c *websocket.Connection, op websocket.Opcode, data []byte) {
+			_ = c.WriteMessage(op, data)
+		},
+	})
+	app := fibhttp.HandlerFunc(func(c *fibhttp.Context) {
+		if c.Request.URL.Path == "/ws" {
+			_, _ = ws.Upgrade(c, nil)
+			return
+		}
+		_ = c.String(stdhttp.StatusOK, "hello over %s\n", c.Request.Proto)
+	})
+	engine, err := fib.New(fib.DefaultConfig(), fib.Binding{
+		Addr:    "127.0.0.1:8443",
+		Handler: fibtls.NewServer(fibhttp.ConfigureTLS(serverTLS), fibhttp.NewHandler(app)),
+	})
+	if err != nil {
+		panic(err)
+	}
+	defer engine.Close()
+	go func() { _ = engine.Run() }()
+
+	config := websocket.DefaultDialerConfig()
+	config.TLSConfig = clientTLS // nil means the system roots, for a real certificate
+	dialer := websocket.NewDialer(engine, config)
+	got := make(chan string, 1)
+	conn, _, err := dialer.Go("wss://127.0.0.1:8443/ws", nil, websocket.HandlerFuncs{
+		Message: func(c *websocket.Connection, op websocket.Opcode, data []byte) {
+			got <- string(data) // a string is a copy; data itself is borrowed
+		},
+	}).Wait()
+	if err != nil {
+		panic(err)
+	}
+	_ = conn.WriteText("hello over wss")
+	log.Printf("echo: %s", <-got)
+	_ = conn.Close(websocket.CloseNormal, "")
+}
+```
+
+The server is the HTTPS server of chapter [07](07-http2.md): a browser that negotiated h2 opens its
+WebSocket as an extended CONNECT on one stream, and fib's dialer, which speaks HTTP/1.1, takes the
+whole connection; the same `Upgrade` call serves both.
+
 ## Pitfalls
 
 - **A WebSocket-only binding cannot answer plain HTTP.** Use `Upgrade` from the HTTP handler when
@@ -324,6 +402,8 @@ compression, sets the `crypto/tls` config used for `wss://`, or replaces the dia
   RFC 6455 reply.
 - **A nil `CheckOrigin` is not "accept everything".** It is `CheckSameOrigin`; a browser page from
   another site is refused with 403.
+- **Do not keep the handshake request.** Copy what `Open` needs from its `*http.Request`; the
+  request object is recycled once the HTTP handler that called `Upgrade` returns.
 
 ## See also
 

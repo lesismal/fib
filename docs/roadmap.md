@@ -26,7 +26,7 @@ Each protocol document (`http1*.md`, `http2*.md`, `http3*.md`, `webrtc*.md`, `me
 | Item | Status | Why | Cost | Reconsider when |
 | --- | --- | --- | --- | --- |
 | Client receives server push | Deliberately not done | Chrome and Firefox removed push, and Go's `net/http` client never supported it; the client declares `ENABLE_PUSH=0`. Preloading uses 103 Early Hints | M | Never |
-| RFC 9218's incremental hint `i`, PRIORITY_UPDATE frames | Deliberately not done | The `priority` header's urgency **is** used for send scheduling; with whole response bodies there is nothing for `i` to reorder. RFC 7540's priority tree was obsoleted by RFC 9113 | M | A genuine streaming or chunk-reordering scheduler |
+| RFC 9218's incremental hint `i`, PRIORITY_UPDATE frames | Deliberately not done | The `priority` header's urgency **is** used for send scheduling; `i` is not. RFC 7540's priority tree was obsoleted by RFC 9113 | M | A genuine streaming or chunk-reordering scheduler |
 | Client-initiated `Upgrade: h2c` | Deliberately not done | RFC 9113 obsoleted that upgrade; cleartext HTTP/2 uses prior knowledge (`UnencryptedHTTP2`). The server still accepts the upgrade for curl's sake | S | Never |
 | `Upgrade: h2c` over TLS | Deliberately not done | TLS may only switch protocol through ALPN | — | Never |
 | 1xx interim responses to HTTP/1.0 requests | Deliberately not done | HTTP/1.0 clients do not know 1xx; `WriteInterim` returns `http.ErrNotSupported` | — | Never |

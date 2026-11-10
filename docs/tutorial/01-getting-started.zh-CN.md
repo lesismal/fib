@@ -136,8 +136,11 @@ func main() {
 ```
 
 ```sh
-curl -k --http2 https://127.0.0.1:8443/
+curl -k --http2 https://127.0.0.1:8443/     # hello over HTTP/2.0
+curl -k --http1.1 https://127.0.0.1:8443/   # hello over HTTP/1.1
 ```
+
+需要 `-k`，是因为 `tlstest` 每次进程启动都会新生成一张自签名证书，任何客户端都不信任它。
 
 `fibhttp.ConfigureTLS` 把 `h2` 和 `http/1.1` 加进 ALPN 列表；`fibtls.NewServer` 在连接上完成 TLS
 握手，再把连接交给 HTTP handler，所以 `app` 仍然不知道自己在回答哪个协议。TLS 见
@@ -164,11 +167,7 @@ func main() {
 			[]byte("hello over "+c.Request.Proto+"\n"))
 	})
 
-	httpTLS, _, err := tlstest.Configs()
-	if err != nil {
-		panic(err)
-	}
-	quicTLS, _, err := tlstest.Configs()
+	serverTLS, _, err := tlstest.Configs()
 	if err != nil {
 		panic(err)
 	}
@@ -176,12 +175,12 @@ func main() {
 	engine, err := fib.New(fib.DefaultConfig(),
 		fib.Binding{
 			Addr:    "127.0.0.1:8443",
-			Handler: fibtls.NewServer(fibhttp.ConfigureTLS(httpTLS), fibhttp.NewHandler(app)),
+			Handler: fibtls.NewServer(fibhttp.ConfigureTLS(serverTLS), fibhttp.NewHandler(app)),
 		},
 		fib.Binding{
 			Network: "udp",
 			Addr:    "127.0.0.1:8443",
-			Handler: http3.NewHandler(http3.ConfigureTLS(quicTLS), app),
+			Handler: http3.NewHandler(http3.ConfigureTLS(serverTLS), app),
 		},
 	)
 	if err != nil {
@@ -198,6 +197,12 @@ func main() {
 ```sh
 curl -k --http3 https://127.0.0.1:8443/    # needs curl built with HTTP/3
 ```
+
+一份 `tlstest` 配置就能同时用于两个 Binding：`fibhttp.ConfigureTLS` 和 `http3.ConfigureTLS` 都返回
+副本，各自带上自己的 ALPN 列表（`h2`/`http/1.1`；以及 `h3`，并要求 TLS 1.3）；而且
+`http3.NewHandler` 自己会调用 `http3.ConfigureTLS`，显式调用只是把这个要求写在明面上。很多 curl
+（包括 macOS 自带的）不支持 HTTP/3；[08-http3.zh-CN.md](08-http3.zh-CN.md) 里的 fib HTTP/3 客户端能从
+同一个服务拿到 `hello over HTTP/3.0`。
 
 TCP Binding 和 UDP Binding 可以共用同一个端口号：它们是不同的传输。浏览器通过 HTTP/1 或 HTTP/2
 响应上的 `Alt-Svc` 头发现 HTTP/3 端点，怎么发这个头见 [08-http3.zh-CN.md](08-http3.zh-CN.md)。
@@ -246,7 +251,7 @@ func main() {
 
 ```sh
 curl http://127.0.0.1:8080/hello/fib
-curl -OJ http://127.0.0.1:8080/files/go.mod
+curl -OJ http://127.0.0.1:8080/files/go.mod   # the file server serves the working directory
 ```
 
 哪些行为照旧、哪些不同，[README](../../README.zh-CN.md) 里有摘要，细节在
@@ -259,8 +264,9 @@ curl -OJ http://127.0.0.1:8080/files/go.mod
 
 - `go run .` 构建并运行。每个 Engine 启动时逐项打印生效配置；`FIB_LOG_SETTINGS=0` 关闭这份列表，
   `engine.LogSettings()` 随时按需打印。
-- `engine.Run()` 阻塞。要在收到信号时退出，就走 `engine.Shutdown` 或 `engine.Close`；
-  [02-engine.zh-CN.md](02-engine.zh-CN.md) 给出写法。
+- `engine.Run()` 阻塞。要在收到信号时退出，就在另一个 goroutine 里调用 `engine.Shutdown(ctx)`
+  （优雅停机）或 `engine.Stop()`（立即停止），让 `Run` 返回，然后再 `engine.Close()`；`Close`
+  本身只能在 `Run` 返回之后调用。[02-engine.zh-CN.md](02-engine.zh-CN.md) 给出写法。
 - 本教程的例子都监听 `127.0.0.1`，不对外暴露。要让所有网卡监听就用 `:8080`。端口 0 让内核挑一个
   空闲端口，`engine.BindingAddrs(i)` 报告实际绑定的是哪个。
 - 教程里每个完整程序都由教程自己的测试编译（`go test ./docs/tutorial`），所以这里展示的 API 就是
@@ -292,6 +298,8 @@ curl -OJ http://127.0.0.1:8080/files/go.mod
 - **`fib.Config{}` 不是 `fib.DefaultConfig()`。** 零值配置不会填好协程池、buffer 和日志配置；始终从
   `DefaultConfig()` 出发再改字段。
 - **一个 Binding 失败，整个 Engine 失败。** `fib.New` 不会保留任何一个地址。
+- **`Close` 在 `Run` 之后。** `Close` 用于 `Run` 已经返回的 Engine；要停掉正在运行的 Engine，
+  调用 `Shutdown` 或 `Stop`，等 `Run` 返回后再关闭它。
 - **让 Engine 活着。** 关掉它就停掉所有 Binding；只做客户端的 Engine 同样要比它的连接活得久。
 
 ## 相关文档

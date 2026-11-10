@@ -43,6 +43,7 @@ func main() {
 		case "/greet":
 			_ = c.String(stdhttp.StatusOK, "hello, %s\n", c.Query("name"))
 		case "/set-cookie":
+			// Fields set on c.Header() before answering go out with the answer.
 			stdhttp.SetCookie(c, &stdhttp.Cookie{Name: "session", Value: "abc", Path: "/"})
 			_ = c.String(stdhttp.StatusOK, "cookie set\n")
 		case "/events":
@@ -82,7 +83,17 @@ func main() {
 }
 ```
 
-`fibhttp.NewHandler(app)` uses the default config; `NewHandlerWithConfig` is how per-server options arrive. The same handler serves HTTP/2 and HTTP/3 on the same port when the binding asks for them (chapters 07 and 08).
+Run it with `go run .` and try it:
+
+```sh
+curl 'http://127.0.0.1:8080/users?name=ann%20b'   # {"id":1,"name":"ann b"}
+curl --data-binary 'hello' http://127.0.0.1:8080/echo  # hello
+curl 'http://127.0.0.1:8080/greet?name=bob'       # hello, bob
+curl -i http://127.0.0.1:8080/set-cookie          # Set-Cookie: session=abc; Path=/
+curl -N http://127.0.0.1:8080/events              # data: event 0, 1, 2, ... once a second
+```
+
+`fibhttp.NewHandler(app)` uses `fibhttp.DefaultConfig()`; `NewHandlerWithConfig` is how per-server options arrive. The same handler also serves HTTP/2 on the same port — over TLS when ALPN picks `h2`, and in cleartext to a client with prior knowledge, unless `Config.DisableHTTP2` is set (chapter 07) — and HTTP/3 on a QUIC binding (chapter 08).
 
 ## Reading the request
 
@@ -106,27 +117,41 @@ func inspect(c *fibhttp.Context) {
 
 ## Answering: the response helpers
 
-`Respond` sends a whole response in one call, `WriteResponse` sends status, header, body and trailer at once, and the small helpers wrap the common content types. There is no `Redirect` helper: set the header and the status as `net/http` does.
+`Respond(status, contentType, body)` sends a whole response in one call, `WriteResponse(fibhttp.Response{...})` sends status, header, body and trailer at once, and the small helpers wrap the common content types. There is no `Redirect` helper: `http.Redirect` works through the `Context`, as any `net/http` helper does.
 
 ```go
+type answer struct {
+	N int `json:"n" xml:"n"`
+}
+
 func render(c *fibhttp.Context) {
 	switch c.Request.URL.Path {
 	case "/json":
-		_ = c.JSON(stdhttp.StatusOK, map[string]int{"n": 42})
+		_ = c.JSON(stdhttp.StatusOK, answer{N: 42}) // {"n":42}
 	case "/xml":
-		_ = c.XML(stdhttp.StatusOK, struct{ N int }{42})
+		_ = c.XML(stdhttp.StatusOK, answer{N: 42}) // <answer><n>42</n></answer>
 	case "/html":
 		_ = c.HTML(stdhttp.StatusOK, "<h1>fib</h1>")
 	case "/redirect":
-		c.Header().Set("Location", "/login")
-		c.WriteHeader(stdhttp.StatusFound)
+		stdhttp.Redirect(c, c.Request, "/login", stdhttp.StatusFound)
+	case "/headers":
+		_ = c.WriteResponse(fibhttp.Response{
+			StatusCode: stdhttp.StatusCreated,
+			Header: stdhttp.Header{
+				"Content-Type": {"text/plain; charset=utf-8"},
+				"Location":     {"/items/7"},
+			},
+			Body: []byte("created\n"),
+		})
 	default:
 		_ = c.String(stdhttp.StatusOK, "n=%d", 42)
 	}
 }
 ```
 
-`Data(status, contentType, body)`, `IndentedJSON`, `IndentedXML`, `HTMLTemplate`, `File` and `FileAttachment` complete the set. A helper that encodes returns the encoder's error and sends nothing, so a handler can still answer another way. `Context` is an `http.ResponseWriter`, `http.Flusher` and `io.ReaderFrom`, so header, status and body written by hand behave as `net/http` describes.
+`Data(status, contentType, body)`, `IndentedJSON`, `IndentedXML`, `HTMLTemplate`, `File` and `FileAttachment` complete the set. A helper that encodes returns the encoder's error and sends nothing, so a handler can still answer another way — check it: `encoding/xml` cannot encode an anonymous struct, for example, and an ignored error there leaves an empty `200`. `Context` is an `http.ResponseWriter`, `http.Flusher` and `io.ReaderFrom`, so header, status and body written by hand behave as `net/http` describes.
+
+`c.Header()` is the response header of both styles. A field set with `c.Header().Set` — or a cookie from `http.SetCookie(c, ...)` — before answering is sent by the `ResponseWriter` methods and equally by `Respond`, `WriteResponse` and the helpers built on them. A whole response's own fields win: the helper's `Content-Type`, and the fields of a `WriteResponse` header, replace the same names set on `c.Header()`, and a `Content-Length` or trailer announcement set there is left out, since the body is whole. Changing `c.Header()` after the response has begun has no effect. The two styles do not mix in one response, though: once one has begun it, the other returns `fibhttp.ErrResponseWritten`.
 
 ## Streaming responses and SSE
 
@@ -148,7 +173,7 @@ A response written entirely before the handler returns is sent whole, with a `Co
 
 ## Trailers
 
-Trailers go after a chunked body. With `WriteResponse` the names are announced automatically; with the `http.ResponseWriter` methods, announce them in a `Trailer` header before the first write, then set the values after the body.
+Trailers go after a chunked body. With `WriteResponse` the names are announced automatically; with the `http.ResponseWriter` methods, announce them in a `Trailer` header before the first write, then set the values after the body. `curl --raw` shows them after the last chunk.
 
 ```go
 func checksummed(c *fibhttp.Context) {
@@ -165,21 +190,19 @@ Trailers can only be sent on a response that has a body; a `HEAD`, a `204` or an
 
 ## Static files and sendfile
 
-`FileCache` serves a directory from memory and follows the disk; a file larger than `MaxFileBytes` is sent from disk through `sendfile`. `File`/`FileAttachment` on `Context` serve one known file, and `http.ServeFile`/`http.ServeContent` work through the `io.ReaderFrom` path.
+`FileCache` serves a directory from memory and follows the disk: a changed file is served as it now is (on Linux by inotify, elsewhere by a stat every `CheckInterval`, 5 seconds by default). A file larger than `MaxFileBytes` (1 MiB by default), or one that does not fit in `MaxBytes` (64 MiB), is sent from disk through `sendfile`. `File`/`FileAttachment` on `Context` serve one known file, and `http.ServeFile`/`http.ServeContent` work through the `io.ReaderFrom` path.
 
 ```go
 package main
 
 import (
-	"strings"
-
 	fib "github.com/lesismal/fib"
 	fibhttp "github.com/lesismal/fib/http"
 )
 
 func main() {
 	files, err := fibhttp.NewFileCache(fibhttp.FileCacheConfig{
-		Root:          ".",
+		Root:          "./public",
 		Precompressed: true, // serve name.br / name.gz when the client accepts them
 	})
 	if err != nil {
@@ -187,12 +210,13 @@ func main() {
 	}
 	defer files.Close()
 
-	app := fibhttp.HandlerFunc(func(c *fibhttp.Context) {
-		files.ServeFile(c, strings.TrimPrefix(c.Request.URL.Path, "/static/"))
+	r := fibhttp.NewRouter()
+	r.Get("/static/*", func(c *fibhttp.Context) {
+		files.ServeFile(c, c.Param("*")) // a name that would leave Root is a 404
 	})
 	engine, err := fib.New(fib.DefaultConfig(), fib.Binding{
 		Addr:    "127.0.0.1:8080",
-		Handler: fibhttp.NewHandler(app),
+		Handler: fibhttp.NewHandler(r),
 	})
 	if err != nil {
 		panic(err)
@@ -203,6 +227,13 @@ func main() {
 		panic(err)
 	}
 }
+```
+
+```sh
+mkdir -p public && echo hello > public/hello.txt && gzip -k public/hello.txt
+go run .
+curl -i http://127.0.0.1:8080/static/hello.txt                          # hello, Last-Modified
+curl -s -H 'Accept-Encoding: gzip' http://127.0.0.1:8080/static/hello.txt | gunzip  # hello.txt.gz, served as is
 ```
 
 `Context.SendFile(f, offset, n, done)` is the asynchronous form for a file the handler already has open: the range is queued with the connection's other sends and `done` runs later, so the worker is not held for the disk or the client. A file read into a `WriteResponse` body is not `sendfile`; the file cache, `Context.SendFile` and `ReadFrom` are the zero-copy paths.
@@ -282,7 +313,7 @@ The handler must not read `Request.Body` or call `OnBody` itself after `ServeDup
 
 ## Deadlines
 
-`Config.ReadTimeout`, `ReadBodyTimeout`, `ReadHeaderTimeout`, `IdleTimeout` and `WriteTimeout` are `net/http.Server`'s, with `DefaultConfig` setting the read and idle ones. A handler overrides them per request with `SetReadDeadline` and `SetWriteDeadline`; a zero time lifts the limit. `SetReadDeadline` bounds a body still arriving, `SetWriteDeadline` a response still being written; a handler that has all its input and answers at once needs neither.
+`Config.ReadTimeout`, `ReadBodyTimeout`, `ReadHeaderTimeout`, `IdleTimeout` and `WriteTimeout` are `net/http.Server`'s. `DefaultConfig` sets `ReadHeaderTimeout` (10 s), `ReadBodyTimeout` (5 min) and `IdleTimeout` (2 min), and leaves `ReadTimeout` and `WriteTimeout` at zero, no limit; a `Config{}` built by hand has none of them. A handler overrides them per request with `SetReadDeadline` and `SetWriteDeadline`; a zero time lifts the limit. `SetReadDeadline` bounds a body still arriving, `SetWriteDeadline` a response still being written; a handler that has all its input and answers at once needs neither.
 
 ```go
 func longLived(c *fibhttp.Context) {
@@ -332,14 +363,16 @@ func main() {
 }
 ```
 
-Two differences matter. `http.Hijacker` is not implemented (`Hijack` returns `http.ErrNotSupported`), so libraries that take over the connection, gorilla/websocket among them, do not work: switch protocols with `Context.Upgrade` (chapter [09](09-websocket.md)) or `Context.Connect` (chapter [13](13-socks-connect.md)). And `c.Request.Context()` is not cancelled when the client goes away; use `c.Context()`, `c.OnCancel` or `c.Err()`, and hand `c.Request.WithContext(c.Context())` to code such as `httputil.ReverseProxy` that expects cancellation.
+Two differences matter. `http.Hijacker` is not implemented (`http.NewResponseController(c).Hijack()` reports `http.ErrNotSupported`), so libraries that take over the connection, gorilla/websocket among them, do not work: switch protocols with `Context.Upgrade` (chapter [09](09-websocket.md)) or `Context.Connect` (chapter [13](13-socks-connect.md)). And `c.Request.Context()` is not cancelled when the client goes away; use `c.Context()`, `c.OnCancel` or `c.Err()`, and hand `c.Request.WithContext(c.Context())` to code such as `httputil.ReverseProxy` that expects cancellation.
 
 ## Pitfalls
 
 - **Blocking holds the connection.** The handler runs on the worker reading it, so a database call or an upstream request inside an HTTP/1 handler idles that connection. Move slow work to another goroutine with `Retain`/`Release` or `c.Async` (chapter 03).
 - **Request objects are recycled.** `ReuseRequests`, `ReuseHeaders`, `ReuseURLs` and `ReuseContexts` are on in `DefaultConfig`; the `Request`, its `Header`, its `URL` and the `Context` are the handler's only until it returns and releases every `Retain`. Clone what must outlive the request (`Request.Clone`, `Header.Clone`), or turn the options off.
 - **`OnBody` calls nothing inside the handler.** It registers and returns; delivery starts after the handler returns and runs on the connection's worker. `Request.Body` is not readable once `OnBody` has taken the body, and `data` is valid only during the call.
-- **Streaming is off by default.** A large upload is buffered whole and refused with 413 past `MaxBodyBytes`; it needs `StreamRequestBody` (or `SaveBody`, which works either way).
+- **Streaming is off by default.** A large upload is buffered whole and refused with 413 past `MaxBodyBytes` (16 MiB in `DefaultConfig`); it needs `StreamRequestBody` (or `SaveBody`, which works either way).
+- **Set `c.Header()` before answering.** Every way of answering sends it, but the response's own `Content-Type` and `WriteResponse` header fields win over the same names, and a change after the answer has begun has no effect.
+- **Check the helpers' errors.** `JSON`, `XML` and `HTMLTemplate` send nothing when encoding fails, and a handler that ignores the error leaves the server's empty `200`.
 - **Reading a streamed body never waits.** `Request.Body.Read` reports `fib.ErrWouldBlock` when nothing has arrived; hand the rest over to `OnBody`.
 - **Writes do not block.** A handler faster than its client queues the difference in memory; `Config.WriteTimeout`, `WriteNoWait`/`OnWritable` and `SendFile` are the levers. `WriteTimeout` also cuts a streaming response, hence the zero deadline for SSE.
 - **`compress` and `br` transfer codings are refused** (501 for a request, a failed response); gzip, x-gzip and deflate are decoded. `Content-Encoding` stays the handler's business.

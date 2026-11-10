@@ -54,11 +54,39 @@ func main() {
 }
 ```
 
-`Get`、`Post`、`Put`、`Delete`、`Patch`、`Head`、`Options`、`Connect`、`Trace` 覆盖标准方法；`Method`/`MethodFunc` 接受任意方法 token（例如 `PROPFIND`），`Handle` 接受以方法开头的 pattern，写法与 `net/http.ServeMux` 相同：`r.Handle("DELETE /users/{id}", deleteUser)`。`Handle` 的 pattern 不带方法时匹配所有方法。
+用 `go run .` 运行，然后试试这些路由：
+
+```sh
+curl http://127.0.0.1:8080/users/42         # user 42           (the regexp route)
+curl http://127.0.0.1:8080/users/bob        # user named bob    (the plain parameter)
+curl http://127.0.0.1:8080/users/a%2Fb      # user named a/b    (%2F stays in the value)
+curl http://127.0.0.1:8080/files/a/b        # file a/b
+curl http://127.0.0.1:8080/files            # 404: "/files/*" needs the slash
+curl -I http://127.0.0.1:8080/users/7       # 200: the GET route serves HEAD
+curl -i -X DELETE http://127.0.0.1:8080/users  # 405 with "Allow: POST"
+```
+
+`Get`、`Post`、`Put`、`Delete`、`Patch`、`Head`、`Options`、`Connect`、`Trace` 覆盖标准方法；`Method`/`MethodFunc` 接受任意方法 token（例如 `PROPFIND`），`Handle`/`HandleFunc` 接受可以以方法开头的 pattern，写法与 `net/http.ServeMux` 相同：`r.HandleFunc("DELETE /users/{id}", deleteUser)`。`Handle` 的 pattern 不带方法时匹配所有方法。
+
+除了 `Param`，handler 还可以用 `c.Params()`（一个按名字和值迭代的迭代器）读取所有参数，用 `c.RoutePattern()` 取得服务该请求的路由 pattern——如 `"/users/{id}"`，前面带上请求经过的各个 `Mount` 的 pattern。它适合作为监控指标和访问日志的标签，因为它不会随不同路径的数量增长。`r.Walk(fn)` 按方法和 pattern 遍历所有已注册的路由，可以在启动时打印路由表：
+
+```go
+r.Get("/orders/{id}", func(c *fibhttp.Context) {
+	for name, value := range c.Params() {
+		_ = name  // "id"
+		_ = value // "17" for /orders/17
+	}
+	_ = c.String(200, "served by %s\n", c.RoutePattern()) // served by /orders/{id}
+})
+_ = r.Walk(func(method, pattern string, _ fibhttp.Handler) error {
+	fmt.Println(method, pattern) // GET /orders/{id}, ...
+	return nil
+})
+```
 
 ## 路由组与中间件作用域
 
-`Use` 包住整个 Router，所以它的中间件能看到每个请求，包括 404 和 405。`Route` 在某个前缀下创建子路由（前缀可以带参数，但不能以通配结尾）：它的路由并入同一棵树，一次查找就能路由到；它的 `Use` 中间件只包住这个前缀；它的 `NotFound`/`MethodNotAllowed` 也只在这个前缀下生效。`Group` 通过一个 Router 注册路由，它的中间件只作用于这些路由；`With` 对单条路由做同样的事。中间件必须在它包住的路由之前添加——注册过路由后再调 `Use` 会 panic——所有路由都必须在本 Router 开始服务之前注册完。
+`Use` 包住整个 Router，所以它的中间件能看到每个请求，包括 404 和 405。`Route` 在某个前缀下创建子路由（前缀可以带参数，但不能含通配）：它的路由并入同一棵树，一次查找就能路由到；它的 `Use` 中间件只包住这个前缀；它的 `NotFound`/`MethodNotAllowed` 也只在这个前缀下生效。`Group` 通过一个 Router 注册路由，它的中间件只作用于这些路由；`With` 对单条路由做同样的事。中间件必须在它包住的路由之前添加——注册过路由后再调 `Use` 会 panic——所有路由都必须在本 Router 开始服务之前注册完。
 
 `Mount` 不一样：它把某个前缀下的一切交给另一个 handler。挂载的 `*Router` 从自己的 `/` 开始路由剩余路径，并带自己的中间件，和 chi 一样；其他 handler 拿到原样的请求，剩余路径放在 `c.Param("*")`。
 
@@ -103,22 +131,40 @@ func main() {
 }
 ```
 
-`/api/status` 由挂载的路由服务，`/users/42` 由 `/users` 下的路由服务。访问 `/api/missing` 时，由挂载路由的 404 处理（它没设置就用本路由的），并且在挂载路由的中间件之内执行。
+`/api/status` 由挂载的路由服务；`/users/42` 由 `/users` 下的路由服务，`/users` 和 `/users/` 都由它的 `"/"` 服务。访问 `/api/missing` 时，由挂载路由的 404 处理（它没设置就用本路由的），并且在挂载路由的中间件之内执行；`/users/x` 得到 404，因为 `/users` 下没有路由接受它，`POST /users/42` 得到 405 并带 `Allow: GET, HEAD`。
+
+只作用于树的一部分的中间件有三个位置可放，下一章有一个带它的完整程序：
+
+```go
+r.Route("/admin", func(r *fibhttp.Router) {
+	r.Use(requireToken) // every route under /admin, and its 404s and 405s
+	r.Get("/stats", stats)
+})
+r.Group(func(r *fibhttp.Router) {
+	r.Use(rateLimit) // only the two routes registered in this function
+	r.Post("/login", login)
+	r.Post("/signup", signup)
+})
+r.With(audit).Delete("/users/{id}", deleteUser) // this one route
+```
 
 ## 404、405 与 PathValue
 
-默认的 404 和 405 是朴素响应。要定制就注册 handler：`r.NotFound(fn)` 处理没有路由匹配的路径，`r.MethodNotAllowed(fn)` 处理路径匹配但方法不支持的情况。405 handler 运行时 `Allow` 头已经设在 `c.Header()` 里了，所以用 `Respond` 或 `WriteResponse` 写的响应要自己带上它：
+默认的 404 和 405 是纯文本响应（`404 page not found`、`405 method not allowed`）。要定制就注册 handler：`r.NotFound(fn)` 处理没有路由匹配的路径，`r.MethodNotAllowed(fn)` 处理路径匹配但方法不支持的情况。405 handler 运行时 `Allow` 头已经设在 `c.Header()` 里了，无论 handler 用哪种方式应答——`String`、`JSON`、`Respond`、`WriteResponse` 还是 `ResponseWriter` 方法——它都会随响应发出：
 
 ```go
 r.NotFound(func(c *fibhttp.Context) {
 	_ = c.JSON(404, map[string]string{"error": "not found"})
 })
 r.MethodNotAllowed(func(c *fibhttp.Context) {
-	_ = c.String(405, "method %s not allowed\n", c.Request.Method) // c.Header() already has Allow
+	// Allow is in c.Header() already and goes out with the answer.
+	_ = c.String(405, "method %s not allowed\n", c.Request.Method)
 })
 ```
 
-Router 默认只给 `c.Param` 提供路由参数。`r.SetPathValues(true)` 让每个请求也把参数放进 `c.Request.PathValue`，为 `net/http.ServeMux` 写的 handler 就能读到；代价是每个带参数的请求多一次分配，而 `Param` 不分配。
+在 `Route` 回调里设置的 `NotFound` 或 `MethodNotAllowed` 只在该前缀下生效；在 `With` 或 `Group` 产生的 Router 上设置，则设置的是它们所来自的那个 Router 的 handler。传 `nil` 恢复默认。
+
+Router 默认只给 `c.Param` 提供路由参数。`r.SetPathValues(true)` 让每个请求也把参数放进 `c.Request.PathValue`，为 `net/http.ServeMux` 写的 handler 就能读到；代价是每个带参数的请求多一次分配，而 `Param` 不分配。它是调用它的那个 Router 以及由它经 `Route`、`Group`、`With` 产生的 Router 的设置；`Mount` 进来的 `*Router` 有自己的设置。
 
 ## 给 `net/http` 的 mux 做路由
 
@@ -171,8 +217,9 @@ Router 是一棵 radix 树：静态子节点按首字节索引，只有存在可
 - **`With`/`Group` 的中间件不是全局的。** 它只包住通过那个 Router 注册的路由，而不是父 Router 看到的所有请求；要全局请对父 Router 用 `Use`。
 - **`Route` 不是 `Mount`。** `Route` 的路由并进同一棵树、一次查找完成；只有 `Mount` 会嵌套第二个 Router 并重新路由剩余路径。
 - **通配后面不能跟别的段。** `*` 和 `{name...}` 必须在 pattern 末尾，`Route`/`Mount` 的前缀里也不能有通配。
-- **`c.Param` 的值是借来的。** 它们是路径的子串，handler 返回后失效；要保留请复制。
-- **405 handler 用 `Respond` 或 `WriteResponse` 时要自己设 `Allow`**；只有 `ResponseWriter` 那条路径会自动发出 Router 填好的头。
+- **`c.Param` 的值是借来的。** 它们是路径的子串，（在默认的请求复用下）handler 返回后失效；要保留请复制，例如用 `strings.Clone`。
+- **405 handler 不必自己设 `Allow`。** Router 已把它放进 `c.Header()`，每种应答方式都会发出；`WriteResponse` header 里的 `Allow` 会替换它。
+- **`Mount` 接受的是 handler，不是中间件。** `pprof.New()` 等自带的都是中间件；请用 `Use`（或 `middleware.Chain`）把它们放到 Router 上，而不是交给 `Mount`。
 - **不要在服务期间注册路由。** Router 的注册与分发不能并发；在启动阶段建好它。
 - **结尾斜杠不会重定向。** 注册你真正要匹配的路径；`Route` 前缀下自己的 `/` 同时匹配 `/users` 和 `/users/`，但普通路由不会悄悄重定向。
 

@@ -11,11 +11,13 @@ engine 的拨号侧。本章这一层是本教程里所有其他协议的底座�
 ## 运行模型
 
 一个 binding 负责监听；每个被接受的连接（UDP 上是每个 peer 地址）就是一个 `*fib.Connection`。连接的
-回调在 engine 池的一个 worker 上按轮（round）一次一轮地执行：`OnData` 拿到本轮读到的数据，`OnOpen`
+回调在 engine 池的一个 worker 上按轮（round）一次一轮地执行：一轮会一直读到 socket 为空，每读一次调用一次
+`OnData`（每次最多 `ReadBufferSize`，默认 16KiB），`OnOpen`
 在任何一轮之前于事件循环的 goroutine 上运行，`OnClose` 在连接的最后一轮、最后一次 `OnData` 之后运行。
-由此有两条决定每个 handler 写法的结论。第一，传给 `OnData` 的数据只在本次调用期间有效——要留下就拷贝。
-第二，handler 不能阻塞：它运行时，它占着的 worker 不能服务其他连接，同一个连接的下—轮也要等它。一轮里
-做的写在轮结束时 cork 起来、一次写入 socket，这就是 fib 的 pipelining。连接上的 `Read` 不会阻塞：
+由此有两条决定每个 handler 写法的结论。第一，在 TCP 与 Unix 连接上，传给 `OnData` 的数据只在本次调用期间
+有效——要留下就拷贝（UDP 数据报是归 handler 所有的副本，见下文）。第二，handler 不能阻塞：它运行时，它占着的
+worker 不能服务其他连接，同一个连接的下一轮也要等它。一轮里做的写会被 cork 住，在轮结束时一次写入 socket
+（`Config.CoalesceWrites`，`DefaultConfig` 默认打开），这就是 fib 的 pipelining。连接上的 `Read` 不会阻塞：
 socket 当前没有更多数据时返回 `fib.ErrWouldBlock`。
 
 ## 一个 TCP echo 服务端和它的客户端
@@ -79,10 +81,11 @@ func main() {
 
 ## Connection API
 
-- `Send(data)` 先尝试直接写，剩下的拷进发送队列后返回，从不等待；`SendParts(header, body)` 不拼接两段而
-  直接发；`SendOwned`/`SendShared` 在所有权明确时省掉拷贝（`SendShared` 用于一份 buffer 发给多个连接）。
+- `Send(data)` 返回前拷贝 `data`：先尝试直接写，剩下的进发送队列，从不等待；`SendParts(header, body)` 不拼接
+  两段而直接发；`SendOwned`/`SendShared` 在所有权明确时省掉拷贝：`SendOwned` 之后调用方不得再碰这个切片，
+  `SendShared` 用于把一份只读 buffer 发给多个连接。
 - `Cork()` 与 `Flush()` 手工控制批量写，适合在连接这一轮之外生成多个回复时使用。在 `OnData` 里写的
-  内容会在回调返回前自动 cork，轮末一次写出。
+  内容会自动 cork，直到这一轮结束才一次写出。
 - `Read` 取 socket 里已有的数据；`SendFile(f, offset, count)` 用 `sendfile(2)`/`TransmitFile` 发一段文件，
   随 peer 消费而读，内存不随文件大小增长。
 - `SetReadDeadline`、`SetWriteDeadline`、`SetDeadline` 到点关闭连接，而不是让某次调用失败；`OnClose`
@@ -93,7 +96,8 @@ func main() {
   EOF，`OnData` 继续运行），`CloseRead` 只关闭读方向。
 - `SetHandler` 把连接交给另一个 handler，`mux` 就是嗅探到首字节后这样切换协议的；`ShuttingDown` 报告
   engine 或 binding 正在排空。
-- `SetAttachment`/`Attachment` 把每连接状态挂在连接上；`SendBatch` 与 `SetUDPIdleTimeout` 只对 UDP 有效。
+- `SetAttachment`/`Attachment` 把每连接状态挂在连接上；`SendBatch` 与 `SetUDPIdleTimeout` 是 UDP 的成员
+  （在流式连接上 `SendBatch` 只是逐个 `Send`）。
 
 `Cork` 是最值得记牢的一个调用，因为最常见的错误就是在 goroutine 里发多个回复，结果变成一次回复一次写：
 
@@ -115,19 +119,26 @@ func replyAll(c *fib.Connection, replies [][]byte) error {
 
 ```go
 // proxyNext moves the next n bytes of src to dst through splice(2).
-// Elsewhere, or between connections it cannot splice, it returns fib.ErrSpliceUnsupported.
+// Elsewhere, or between connections it cannot splice, it returns fib.ErrSpliceUnsupported
+// and calls none of the callbacks.
 func proxyNext(src, dst *fib.Connection, n int64) error {
 	return src.SpliceTo(dst, fib.Splice{
-		Begin: func() int64 { return n },
-		Read:  func(moved int64, err error) { log.Printf("moved %d bytes: %v", moved, err) },
-		Written: func(err error) {
+		Begin: func() int64 { return n }, // a negative count gives the splice up
+		Read: func(moved int64, err error) {
 			if err != nil {
-				dst.Close() // a splice that cannot finish cuts dst's stream
+				src.Close() // a failed splice leaves src's reads held
 			}
+		},
+		Written: func(err error) {
+			// fib has already closed dst if err != nil: its stream was cut mid-way.
+			log.Printf("splice done: %v", err)
 		},
 	})
 }
 ```
+
+splice 正常完成后，`src` 的读取回到 `OnData`，从搬完的最后一个字节之后开始；这些回调在 `src` 的轮里运行，
+所以同样不能阻塞。
 
 ## 读、deadline 与背压
 
@@ -138,7 +149,8 @@ func proxyNext(src, dst *fib.Connection, n int64) error {
 func echoWithIdleTimeout() fib.Handler {
 	return fib.HandlerFuncs{
 		Data: func(c *fib.Connection, b []byte) {
-			// OnData gave what this round read; take what is left in the socket.
+			_ = c.Send(b) // what this read delivered
+			// Then take what is left in the socket now, e.g. the rest of a message.
 			buf := make([]byte, 4096)
 			for {
 				n, err := c.Read(buf)
@@ -165,7 +177,8 @@ func echoWithIdleTimeout() fib.Handler {
 UDP binding 上每个 peer 地址变成一个自己的连接：第一个数据报打开它（`OnOpen`），之后的数据报都到这个
 连接，静默达到 `Config.UDPIdleTimeout`（默认 60 秒）后关闭，`OnClose` 收到 `ErrUDPIdleTimeout`。实现了
 `fib.DatagramsHandler` 的 handler 会把该 peer 已排队的数据报作为一批一次性收到，并用一个 `SendBatch`
-回复整批——这正是 QUIC 与 HTTP/3 用的 ACK 合并：
+回复整批——这正是 QUIC 与 HTTP/3 用的 ACK 合并。和 TCP 的 `OnData` 切片不同，每个数据报都是归 handler 所有
+的副本，可以留着（或在没有任何引用后用 `bufferpool.Put` 还回去）；只有装着这一批的 `[][]byte` 不能留：
 
 ```go
 package main
@@ -214,22 +227,26 @@ func (burstEcho) OnData(c *fib.Connection, b []byte)         { answer(c, [][]byt
 func (burstEcho) OnDatagrams(c *fib.Connection, d [][]byte)  { answer(c, d) }
 
 func answer(c *fib.Connection, dgrams [][]byte) {
-	if err := c.SendBatch(dgrams); err != nil { // one sendmmsg for the whole burst
+	if err := c.SendBatch(dgrams); err != nil { // one sendmmsg (Linux) for the whole burst
 		log.Print(err)
 	}
 }
 ```
 
-有两点把 UDP 和 TCP 区分开：socket 没有空间时数据报会被丢弃，错误返回、连接保持打开（UDP 发送从不入队）；
+有两点把 UDP 和 TCP 区分开：socket 没有空间时数据报会被丢弃，错误返回、连接保持打开（UDP 发送从不入队；
+`SendDatagrams` 报告一批里发出了几个，`NotifyWritable` 在 socket 重新有空间时通知你）；
 `OpenUDPPeer(binding, addr)` 让 binding 先向一个还没发过东西的 peer 发言。它要等 socket 的事件循环，
-所以不能在事件循环跑的某个回调里调用。打开 `ReusePort` 时要按地址而不是连接来记 peer：回复可能落在另一个
-poller 上，从而为同一个 peer 打开第二个连接。
+所以不能在该循环跑的回调里调用（例如 UDP peer 的 `OnOpen`）。`ReusePort` 打开时（默认如此），
+`OpenUDPPeer` 打开的 peer 位于第一个 poller 的 socket 上，回复却可能落到另一个 socket，后者会为同一地址
+再打开一个连接：对这类 peer 的状态要按地址而不是按连接来记。拨出的 UDP 连接不会因空闲超时被关，只有
+监听端的 peer 会。
 
 ## Unix socket
 
 Unix binding 和 TCP 一样，只是 `Network: "unix"`、`Addr` 是 socket 路径。engine 或 binding 关闭时 fib
-会删掉这个路径，而启动时路径不能已存在，所以被异常杀掉的进程会留下一个文件，下一个进程必须先删掉。连接
-行为与 TCP 完全一致；Unix socket 没有地址，`RemoteAddr` 是空地址：
+会删掉这个路径，而启动时路径不能已存在，所以被异常杀掉的进程会留下一个文件，下一个进程必须先删掉（否则 `fib.New` 报
+"address already in use"）。连接行为与 TCP 完全一致；拨号的客户端没有名字，所以 `RemoteAddr` 是名字为空的
+`*net.UnixAddr`，`RemoteAddrPort` 无效：
 
 ```go
 package main
@@ -320,8 +337,8 @@ func dialFromRange(engine *fib.Engine, addr string, handler fib.Handler) error {
 
 ## 坑与限制
 
-- **`OnData` 的切片是借来的。** 它只在本次调用期间有效；要留下就拷贝，或者交给会拷贝的地方（`Send` 会）。
-  `OnDatagrams` 里的数据报同理。
+- **TCP 与 Unix 上 `OnData` 的切片是借来的。** 它只在本次调用期间有效；要留下就拷贝，或者交给会拷贝的地方
+  （`Send` 会）。UDP 数据报归 handler 所有，但 `OnDatagrams` 收到的 `[][]byte` 不是。
 - **`OnOpen` 在事件循环上运行。** 在那里阻塞会卡住该循环上的所有连接；把握手和 I/O 放到 `OnData` 里，
   或者把工作交给池。
 - **绝不要在 handler 里阻塞。** 一个连接一轮一轮地跑，阻塞占掉的是其他连接共享的 worker。长任务放到

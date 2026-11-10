@@ -21,7 +21,7 @@ read. From then on the engine calls the chosen handler directly — no dispatch 
 and asks that handler, not the mux, about `OnHangup` and `OnShutdown`, so the protocol
 handler keeps its normal lifecycle and stops only when the engine shuts down.
 
-A matcher is a `func(input []byte) mux.Result` returning `mux.NoMatch`, `mux.NeedMore` or
+A matcher is a `mux.Matcher`, a `func(input []byte) mux.Result` returning `mux.NoMatch`, `mux.NeedMore` or
 `mux.Match`. It runs on the connection's worker, must not block, and must not keep the
 input slice, which the engine recycles after the round. `NoMatch` rules a route out for
 good; `NeedMore` keeps it waiting for the next read; the mux asks again with everything
@@ -91,10 +91,12 @@ func main() {
 ```
 
 ```sh
-curl -k https://127.0.0.1:8000/                       # TLS route, HTTP/2 by ALPN
-curl --http2-prior-knowledge http://127.0.0.1:8000/   # HTTP route, h2c
-curl --socks5 127.0.0.1:8000 https://example.com/     # SOCKS route
-printf 'PING' | nc 127.0.0.1 8000                     # Prefix route
+curl -k https://127.0.0.1:8000/                       # TLS route: hello over HTTP/2.0 (ALPN)
+curl http://127.0.0.1:8000/                           # HTTP route: hello over HTTP/1.1
+curl --http2-prior-knowledge http://127.0.0.1:8000/   # HTTP route, h2c: hello over HTTP/2.0
+curl --socks5 127.0.0.1:8000 https://example.com/     # SOCKS route, out to the internet
+printf 'PING' | nc -w 1 127.0.0.1 8000                # Prefix route: PONG PING
+printf 'XYZ' | nc -w 1 127.0.0.1 8000                 # no route: closed at once
 ```
 
 The handler stack inside a route is the ordinary one: `fibtls.NewServer` runs the
@@ -135,8 +137,10 @@ plaintext arrives, and can dispatch its inner handler from there.
 | `mux.HTTP()` | `mux.HTTP1()` and `mux.HTTP2()` |
 | `mux.HTTP1()` | a request line beginning with an HTTP or WebDAV method |
 | `mux.HTTP2()` | the HTTP/2 connection preface, h2c with prior knowledge |
-| `mux.SOCKS()` | a SOCKS5 greeting, or a SOCKS4/4a request |
-| `mux.Prefix(...)` | a protocol's magic number or first command |
+| `mux.SOCKS()` | `mux.SOCKS5()` and `mux.SOCKS4()` |
+| `mux.SOCKS5()` | a SOCKS5 greeting: version 5 and a non-zero method count |
+| `mux.SOCKS4()` | a SOCKS4 or SOCKS4a CONNECT or BIND request |
+| `mux.Prefix(...)` | a protocol's magic number or first command; it answers `NeedMore` while the input is still a prefix of one |
 | `mux.Any()` | everything, for a last route or a fallback |
 | `mux.AnyOf(...)` | the union of other matchers |
 
@@ -181,8 +185,9 @@ app := mux.NewWithConfig(mux.Config{
 )
 ```
 
-`mux.Route` also has a `Nudge` hook, which runs each time the mux waits for more bytes
-because that route answered `NeedMore`. It is how a protocol that waits for the *server* to
+`mux.Route` also has a `Nudge` hook, `func(c *fib.Connection, input []byte) (done bool)`,
+which runs each time the mux waits for more bytes because that route answered `NeedMore`,
+until it returns true. It is how a protocol that waits for the *server* to
 speak before it says enough to be matched is served anyway: `multiproto` uses it to send an
 empty HTTP/2 SETTINGS frame to a gRPC client that waits for one before sending its first
 headers. The hook runs on the worker and may send on the connection but must not block.
@@ -259,9 +264,21 @@ func main() {
 }
 ```
 
+```sh
+curl -k https://127.0.0.1:8000/                          # TLS: HTTP/2 by ALPN
+curl http://127.0.0.1:8000/                              # HTTP1
+curl --http2-prior-knowledge http://127.0.0.1:8000/      # HTTP2: h2c that is not gRPC
+curl --socks5 127.0.0.1:8000 http://127.0.0.1:8000/      # SOCKS, back into the same port
+curl -p -x http://127.0.0.1:8000 http://127.0.0.1:8000/  # HTTPProxy: a CONNECT tunnel
+```
+
 A protocol whose handler is nil is not served; its connections go to `Fallback`, or are
 closed. That is how to run a subset, and it is honest about what the port can do: with
 `GRPC` nil and `HTTP2: web`, every h2c connection goes to the HTTP handler.
+
+`fibhttp.NewConnectProxy` is a CONNECT proxy only. `multiproto` hands it the forward-proxy
+requests for an absolute URL too (`curl -x` without `-p`), and it answers them with 405 Method
+Not Allowed unless `ConnectProxyConfig.Next` serves them.
 
 ## How `multiproto` sniffs
 
@@ -314,6 +331,8 @@ peer; `Routes` lets you build your own `mux.Handler` with the same table, and
 - **Too small a `MaxPeek` silently misroutes.** A WebSocket handshake that does not fit
   counts as "not a WebSocket" and falls through to the plain HTTP route; `multiproto`'s
   default of 8192 exists for browsers' heads with cookies.
+- **`HTTPProxy` takes absolute-URL requests too.** A plain `GET http://...` sent to the port
+  goes to the proxy handler, not to `HTTP1`; with `NewConnectProxy` and no `Next` it gets 405.
 - **A route needs both fields.** `mux.New` panics if a `Route` has a nil `Match` or
   `Handler`; there is no implicit "match anything".
 - **`Fallback` is only for no-match, not for a match that then fails.** If the SNI inside

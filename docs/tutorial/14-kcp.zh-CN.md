@@ -105,8 +105,10 @@ func main() {
 
 `kcp.Listen` 给正在运行的 Engine 添加一个 UDP binding，返回 `*kcp.Server`，它就是一个
 `net.Listener`：`Accept` 交出会话，`Close` 关闭会话并移除 binding。`kcp.Dial` 添加自己的客户端
-binding，启动一个随机 ID 的会话并立刻返回——没有握手指令可等，服务端会在收到第一个分段时知道这个
-会话。两者都不能在 Engine 事件循环所执行的某个回调里调用。
+binding，启动一个随机 ID 的会话并立刻返回——没有握手可等，服务端会在收到第一个分段时知道这个
+会话；`kcp.DialConv` 与之相同，只是会话 ID 由调用方给出。两者都不能在 Engine 事件循环所执行的
+某个回调里调用。会话通过 `RTT()` 和 `Stats()` 报告往返时间与计数（发送、重传、FEC 恢复的分段），
+`Server.Sessions()` 列出当前打开的会话。
 
 ## 在 KCP 上跑 net/http
 
@@ -228,6 +230,9 @@ conn, err := kcp.Dial(engine, "127.0.0.1:4002", kcp.Config{
 		log.Printf("message: %s", msg)
 	},
 })
+if err != nil {
+	panic(err)
+}
 if err := conn.Send([]byte("hello")); err != nil {
 	panic(err)
 }
@@ -256,6 +261,8 @@ cfg := kcp.Config{
 	DeadLink: 20,
 	// Segments queued or in flight before Write blocks; twice the send window when zero.
 	WriteQueue: 512,
+	// Pack Write's bytes into whole segments, as kcptun does, instead of a message per Write.
+	StreamMode: true,
 }
 srv, err := kcp.Listen(engine, "127.0.0.1:4000", kcp.ServerConfig{Config: cfg})
 if err != nil {
@@ -275,7 +282,7 @@ if err != nil {
 
 ```go
 key := bytes.Repeat([]byte{0x2a}, 32) // already derived; kcptun derives with PBKDF2-SHA1
-crypt, err := kcp.NewCrypt("aes", key) // "none", "xor", "aes", "aes-128", "aes-192", "3des", "aes-128-gcm"
+crypt, err := kcp.NewCrypt("aes", key) // "null", "none", "xor", "aes", "aes-128", "aes-192", "3des", "aes-128-gcm"
 if err != nil {
 	panic(err)
 }
@@ -290,7 +297,8 @@ if err != nil {
 }
 ```
 
-`NewCrypt` 接受 kcptun 的加密名和一把“已经派生好”的密钥：kcptun 用
+`NewCrypt` 接受 kcptun 的加密名（`"null"` 返回 nil 的 `*Crypt`，即完全不加密；`"none"` 则保留
+kcp-go 的 nonce 与 CRC 头部，只是不加密）和一把“已经派生好”的密钥：kcptun 用
 `pbkdf2.Key(sha1.New, passphrase, []byte("kcp-go"), 4096, 32)` 派生，所以 fib 服务端要服务 kcptun
 客户端，前面必须接同样的派生。标准库没有的分组密码——blowfish、cast5、twofish、tea、xtea、sm4——
 用 `NewBlockCrypt` 包装任意 8 或 16 字节分组、来自任何实现的 `cipher.Block`；其余的是
@@ -299,25 +307,67 @@ if err != nil {
 
 ## Sans-IO 的 KCP
 
-`kcp.New` 是纯协议，给应用自己的传输层用。调用方提供时间、搬运数据包：
+`kcp.New` 是纯协议，给应用自己的传输层用。调用方提供时间、搬运数据包。下面是一个完整程序，把同一会话
+的两端在内存里背靠背接起来：
 
 ```go
-kcpConn := kcp.New(7, func(packet []byte) {
-	_ = udpConn.Write(packet) // packet is valid only for the call
-})
-now := uint32(time.Now().UnixMilli())
-if err := kcpConn.Input(packet, now); err != nil {
-	log.Print(err)
-}
-_ = kcpConn.Send([]byte("hello"))
-if at, due := kcpConn.NextFlush(now); due && int32(at-now) <= 0 {
-	kcpConn.Flush(now)
-}
-if size := kcpConn.PeekSize(); size > 0 {
-	buf := make([]byte, size)
-	if _, err := kcpConn.Recv(buf); err != nil {
-		log.Print(err)
+package main
+
+import (
+	"log"
+	"time"
+
+	"github.com/lesismal/fib/kcp"
+)
+
+func main() {
+	// Two ends of conversation 7, wired back to back: what one outputs is
+	// queued for the other's Input. A real transport would write it to a
+	// socket instead; output's packet is valid only for the call.
+	var toB, toA [][]byte
+	a := kcp.New(7, func(packet []byte) { toB = append(toB, append([]byte(nil), packet...)) })
+	b := kcp.New(7, func(packet []byte) { toA = append(toA, append([]byte(nil), packet...)) })
+	a.NoDelay(1, 10, 2, true) // kcptun's fast3
+	b.NoDelay(1, 10, 2, true)
+
+	start := time.Now()
+	clock := func() uint32 { return uint32(time.Since(start).Milliseconds()) }
+
+	if err := a.Send([]byte("hello sans-IO")); err != nil {
+		panic(err)
 	}
+	// flush runs Flush when NextFlush says something is due.
+	flush := func(k *kcp.KCP, now uint32) {
+		if at, due := k.NextFlush(now); due && int32(at-now) <= 0 {
+			k.Flush(now)
+		}
+	}
+	deliver := func(k *kcp.KCP, packets *[][]byte, now uint32) {
+		for _, p := range *packets {
+			if err := k.Input(p, now); err != nil {
+				log.Print(err)
+			}
+		}
+		*packets = (*packets)[:0]
+	}
+	for i := 0; i < 100; i++ {
+		now := clock()
+		flush(a, now)
+		deliver(b, &toB, now)
+		flush(b, now) // b's acknowledgements
+		deliver(a, &toA, now)
+		if size := b.PeekSize(); size > 0 {
+			buf := make([]byte, size)
+			n, err := b.Recv(buf)
+			if err != nil {
+				panic(err)
+			}
+			log.Printf("b received %q; a still has %d segments in flight", buf[:n], a.WaitSend())
+			return
+		}
+		time.Sleep(time.Millisecond)
+	}
+	log.Print("nothing arrived")
 }
 ```
 
@@ -360,8 +410,9 @@ cd kcp/interop && go test -race ./...
   是发送窗口的两倍），发送速度超过对端的会话应该用 `Send` 配合 `WaitSend`。
 - **一个对端地址一个会话。** 地址变化（NAT 重绑定、移动网络切换）的对端看起来就是新对端：旧会话
   空闲超时退场，新会话只能从序号 0 开始。
-- **会话只在忙碌时才有开销。** 空闲会话没有定时器，但 UDP binding 和会话记录会保留到
-  `IdleTimeout`；用 `MaxSessions` 和合理的空闲超时加以限制。
+- **空闲会话仍然占着位置。** 空闲会话没有定时器，但它的记录会保留到 `IdleTimeout`——拨号会话还
+  占着自己的一个 UDP binding，而 `Server` 的会话共享它的 binding；用 `MaxSessions` 和合理的空闲
+  超时加以限制。
 - **不要在 Engine 的回调里调用 `Listen` 或 `Dial`。** 两者都要等 Engine 的事件循环，而回调正占着
   它。
 

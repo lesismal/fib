@@ -2,13 +2,13 @@
 
 [English](11-grpc.md) | [简体中文](11-grpc.zh-CN.md)
 
-`fib/grpc` 在 fib 自己的 HTTP/2 之上提供并调用 gRPC：`grpc.Server` 就是一个普通的 `fib.Handler`，使用 h2c 协议，或用 `fibtls.NewServer(grpc.ConfigureTLS(config), server)` 包裹后在 TLS 上运行 gRPC；`grpc.NewClient` 则用一个自己的引擎拨号。`protoc-gen-go-grpc` 生成代码只要把 import 指向本包就能使用，但 fib 只依赖标准库，因此本章还会展示如何手写服务描述符并使用内置的 `json` 编解码器——这里的每个完整程序都只依赖 fib 本身即可构建。读者应已了解 [02-engine.md](02-engine.zh-CN.md) 的绑定与 [07-http2.md](07-http2.zh-CN.md) 的 HTTP/2 传输。
+`fib/grpc` 在 fib 自己的 HTTP/2 之上提供并调用 gRPC：`grpc.Server` 就是一个普通的 `fib.Handler`，使用 h2c 协议，或用 `fibtls.NewServer(grpc.ConfigureTLS(config), server)` 包裹后在 TLS 上运行 gRPC；`grpc.NewClient` 则在 `grpc.WithEngine` 指定的引擎上拨号，不指定时用本包自己创建的引擎。`protoc-gen-go-grpc` 生成代码只要把 import 指向本包就能使用，但 fib 只依赖标准库，因此本章还会展示如何手写服务描述符并使用内置的 `json` 编解码器——这里的每个完整程序都只依赖 fib 本身即可构建。读者应已了解 [02-engine.md](02-engine.zh-CN.md) 的绑定与 [07-http2.md](07-http2.zh-CN.md) 的 HTTP/2 传输。
 
 ## 模型
 
 - **`Server` 是 `fib.Handler`。** 直接绑定它，就在每条连接上提供 HTTP/2 先验知识（h2c）服务；需要 TLS 时把它包起来。每个调用都是一个带 gRPC 帧格式的 HTTP/2 stream（`application/grpc`、五字节消息头、携带 `grpc-status` 的 trailer）。
 - **handler 运行在池上，而不是读连接的 worker 上。** 调用的 handler 运行在引擎的 `HandlerPool` 上——也就是 fib 的 HTTP/2 与 HTTP/3 handler 所用的池——或运行在 `grpc.TaskPool(pool)` 指定的池上。一元调用在请求完整到达后被调度，流式调用在 stream 打开时就被调度，因此 handler 阻塞不会拖住连接的读取者。
-- **客户端是一条连接、多条流。** `ClientConn` 在第一个调用需要连接时建立连接，连接丢失后自动重连，并且可以安全地并发使用。每个调用都是一条 stream；一元调用就是一条只有一请求一响应的 stream。
+- **客户端是一条连接、多条流。** `ClientConn` 在第一个调用需要连接时建立连接（或用 `Connect(ctx)` 立即建立），连接丢失后自动重连，并且可以安全地并发使用。每个调用都是一条 stream；一元调用就是一条只有一请求一响应的 stream。连不上时发起的调用会以 `codes.Unavailable` 失败，除非 `grpc.WaitForReady(true)` 让它在 context 允许的时间内等待并重试。
 - **线上格式是 gRPC 的。** 它可以在两个方向上与 `google.golang.org/grpc` 的客户端和服务端互通；下面的 import 替换只是改变由谁的代码实现这个协议。
 
 ## 生成代码与编解码器
@@ -19,7 +19,7 @@
 sed -i 's#google.golang.org/grpc#github.com/lesismal/fib/grpc#' foo_grpc.pb.go
 ```
 
-这一次替换同时覆盖 `google.golang.org/grpc`、`google.golang.org/grpc/codes` 与 `google.golang.org/grpc/status`，因为后两者是第一个的前缀。本包导出了 `SupportPackageIsVersion7` 以及生成代码用到的名字（`ServiceDesc`、`MethodDesc`、`StreamDesc`、`RegisterService`、带类型的 stream 包装器），所以除此之外无需改动即可编译。
+这一次替换同时覆盖 `google.golang.org/grpc`、`google.golang.org/grpc/codes` 与 `google.golang.org/grpc/status`，因为后两者是第一个的前缀。本包导出了 `SupportPackageIsVersion7`、`8`、`9` 以及生成代码用到的名字（`ServiceDesc`、`MethodDesc`、`StreamDesc`、`RegisterService`、带类型的 stream 包装器），所以除此之外无需改动即可编译。
 
 消息由编解码器负责。默认的 `proto` 编解码器处理能自我编码的消息：`MarshalVT`/`UnmarshalVT`（vtprotobuf）或 `Marshal`/`Unmarshal`（gogo/protobuf）。只依赖标准库的模块无法编码 `google.golang.org/protobuf` 的消息，因此使用它们的程序要注册自己的编解码器：
 
@@ -140,11 +140,27 @@ func main() {
 }
 ```
 
-如果实现不满足 `HandlerType`，或者同名服务被注册两次，`RegisterService` 会 panic，因此服务要在服务端开始工作之前注册。客户端用完整路径（`/package.Service/Method`）指明方法，并用 `CallContentSubtype` 选择 `json` 编解码器；生成的客户端会自动完成这两件事。服务端的方法路径必须与服务名、方法名一致。
+如果实现不满足 `HandlerType`，或者同名服务被注册两次，`RegisterService` 会 panic，因此服务要在服务端开始工作之前注册。客户端用完整路径（`/package.Service/Method`）指明方法，并用 `CallContentSubtype` 选择 `json` 编解码器；生成的客户端会替你填好方法路径。服务端的方法路径必须与服务名、方法名一致。服务端按每个调用的 content type 选择编解码器，所以只需客户端选择 `json`；在 `NewClient` 上加 `grpc.WithDefaultCallOptions(grpc.CallContentSubtype("json"))` 会让这个 `ClientConn` 的每个调用都使用它，而 `grpc.ForceServerCodec` 让服务端不管调用指明什么都使用同一个编解码器。不带 `WithEngine` 的 `NewClient` 也能用：本包会在第一次需要时创建自己的引擎。
+
+想让服务端自己拥有引擎时可以省掉 binding：`Serve` 创建引擎、监听并运行，直到 `Stop` 或 `GracefulStop`，然后关闭引擎并返回 nil：
+
+```go
+server := grpc.NewServer()
+server.RegisterService(&desc, greeter{})
+go func() {
+	if err := server.Serve(fib.DefaultConfig(), "127.0.0.1:50051"); err != nil {
+		log.Print(err)
+	}
+}()
+// ...
+server.GracefulStop() // GOAWAY to every client, wait for the calls in progress, then stop
+```
+
+`Stop` 立即关闭所有连接，让进行中的调用失败；`GracefulStop` 对绑定在调用方自己引擎上的 `Server` 同样有效，之后由调用方关闭引擎。`ServeTLS` 就是 TLS 上的 `Serve`。
 
 ## 流式调用
 
-流式方法就是同一个 `ServiceDesc` 中的 `StreamDesc`。`ServerStreams` 与 `ClientStreams` 指明哪个方向是流：都不设、设一个或两个都设，分别对应一元、服务端流、客户端流和双向流。handler 拿到调用的 `ServerStream`：
+流式方法就是同一个 `ServiceDesc` 中的 `StreamDesc`。`ServerStreams` 与 `ClientStreams` 指明哪个方向是流：只设 `ServerStreams` 是服务端流，只设 `ClientStreams` 是客户端流，两个都设是双向流。handler 拿到调用的 `ServerStream`：
 
 ```go
 Streams: []grpc.StreamDesc{{
@@ -264,7 +280,7 @@ default:
 }
 ```
 
-`status.Error`、`status.Errorf` 与 `status.FromContextError` 用来构造错误；`status.Code`、`status.Convert` 与 `status.FromError` 用来检查错误。普通 Go 错误会变成 `codes.Unknown`，handler 中的 panic 会变成 `codes.Internal`。`status.WithDetails` 携带的编码详情通过 `grpc-status-details-bin` 传输，本包把它当字节原样转发，不做解码。
+在发出任何消息之前就失败的调用只用一个 HEADERS 帧应答，即 gRPC 的 “trailers-only” 响应，因此 `SetHeader` 设置的内容会出现在客户端的 `Trailer` 里，`Header` 则为空。`status.Error`、`status.Errorf` 与 `status.FromContextError` 用来构造错误；`status.Code`、`status.Convert` 与 `status.FromError` 用来检查错误。普通 Go 错误会变成 `codes.Unknown`，handler 中的 panic 会变成 `codes.Internal`（并连同调用栈记入日志）。`status.WithDetails` 携带的编码详情通过 `grpc-status-details-bin` 传输，本包把它当字节原样转发，不做解码。
 
 ## 拦截器、压缩与协程池
 
@@ -366,19 +382,35 @@ func main() {
 
 ## TLS
 
-要在 TLS 上运行 gRPC，把 `fibtls.NewServer(grpc.ConfigureTLS(grpcTLS), server)` 用作绑定的 handler，并给客户端 `grpc.WithTLSConfig(clientTLS)`：`grpc.ConfigureTLS` 克隆配置并把 `h2` 放到 `NextProtos` 最前面，`WithTLSConfig` 让客户端在 TLS 上提议 h2，而不是使用 h2c。证书与校验属于 `crypto/tls`，见 [第 10 章](10-tls.zh-CN.md)。
+要在 TLS 上运行 gRPC，把 `fibtls.NewServer(grpc.ConfigureTLS(grpcTLS), server)` 用作绑定的 handler，并给客户端 `grpc.WithTLSConfig(clientTLS)`：`grpc.ConfigureTLS` 克隆配置并把 `h2` 放到 `NextProtos` 最前面，`WithTLSConfig` 让客户端在 TLS 上提议 h2，而不是使用 h2c。在第一个程序里，只有这几行需要改：
+
+```go
+serverTLS, clientTLS, err := tlstest.Configs() // a throwaway certificate, for trying it out
+if err != nil {
+	panic(err)
+}
+serverEngine, err := fib.New(fib.DefaultConfig(), fib.Binding{
+	Addr:    "127.0.0.1:50443",
+	Handler: fibtls.NewServer(grpc.ConfigureTLS(serverTLS), server),
+})
+// ...
+conn, err := grpc.NewClient("127.0.0.1:50443",
+	grpc.WithEngine(clientEngine), grpc.WithTLSConfig(clientTLS))
+```
+
+证书与校验属于 `crypto/tls`，见 [第 10 章](10-tls.zh-CN.md)。
 
 ## 未实现的部分
 
-本包明确记录了它不做什么，迁移时这一点很重要：除单个 `host:port` 目标之外的名字解析与负载均衡（接受 `dns:///` 与 `passthrough:///` 前缀，但不会在解析出的多个地址间轮询）、重试与服务配置、keepalive ping、channelz，以及 health、reflection 与 binary-log 服务；此外 `grpc-status-details-bin` 只作为字节传递，不做解码。调用只支持 HTTP/2：发往 gRPC 绑定的普通 HTTP/1 请求得不到任何响应，`ServeHTTP` 则回以 400。
+本包在文档里写明了它不做什么：除单个 `host:port` 目标之外的名字解析与负载均衡（接受 `dns:///` 与 `passthrough:///` 前缀，但不会在解析出的多个地址间轮询）、重试与服务配置、keepalive ping、channelz，以及 health、reflection 与 binary-log 服务；此外 `grpc-status-details-bin` 只作为字节传递，不做解码。调用只支持 HTTP/2：发往 gRPC 绑定的普通 HTTP/1 请求得不到 HTTP 响应（服务端回一个 HTTP/2 GOAWAY 后关闭连接），`ServeHTTP` 则回以 400。
 
 ## 坑与限制
 
 - **先关闭 `ClientConn`，再关闭引擎。** 关闭引擎会在不通知调用的情况下结束它的连接；`ClientConn.Close` 则会让进行中的调用以 `codes.Canceled` 失败。
-- **消息需要认识它的编解码器。** `google.golang.org/protobuf` 的消息会报 `the proto codec cannot marshal ...`，直到程序以 `proto` 为名注册编解码器；发送普通结构体则要求两侧都使用 `json` 内容子类型。
+- **消息需要认识它的编解码器。** `google.golang.org/protobuf` 的消息会以 `codes.Internal` 和 `the proto codec cannot marshal ...` 失败，直到程序以 `proto` 为名注册编解码器；发送普通结构体则要求客户端的每个调用都使用 `json` 内容子类型（`CallContentSubtype` 或 `WithDefaultCallOptions`）。
 - **方法路径必须精确。** `/package.Service/Method` 必须与 `ServiceName` 和 `MethodName` 完全一致（包括大小写）；不一致时服务端返回 `Unimplemented`。
 - **没有 reflection，grpcurl 默认用不了。** 请让工具读取 `.proto` 文件，或自行添加 reflection 服务；本包不附带。
-- **默认限制是真实存在的。** 每条接收消息 4 MiB、每条连接 100 条并发 stream；要放宽请有意识地使用 `MaxRecvMsgSize` 与 `MaxConcurrentStreams`。
+- **默认限制是真实存在的。** 每条接收消息 4 MiB、每条连接 100 条并发 stream；要放宽请有意识地使用 `MaxRecvMsgSize` 与 `MaxConcurrentStreams`（客户端还有 `MaxCallRecvMsgSize`）。
 
 ## 相关文档
 

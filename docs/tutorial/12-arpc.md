@@ -229,12 +229,46 @@ func main() {
 A notify handler that calls `ctx.Write` gets `ErrContextResponseToNotify`; the peer is not
 waiting for anything.
 
+## Context-bounded calls, unknown methods, pools and singleflight
+
+`CallContext` is `Call` bounded by a `context.Context` instead of a timeout. A request for a
+method no handler is registered for gets the error response `method not found`
+(`ErrMethodNotFound`), unless `HandleNotFound` registers a handler for all of them. A
+`ClientPool` is a fixed set of dialed clients, and `Handler.Singleflight` makes a client's
+concurrent calls of one method with the same request share a single round trip:
+
+```go
+ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+defer cancel()
+if err := client.CallContext(ctx, "/echo", "bounded by ctx", &rsp); err != nil {
+	log.Print(err)
+}
+
+server.Handler.HandleNotFound(func(ctx *arpc.Context) {
+	_ = ctx.Error("no such method: " + ctx.Message.Method())
+})
+
+handler := arpc.NewHandler()
+handler.Singleflight("/profile") // calls share by fmt.Sprint(req) unless a key function is given
+pool, err := arpc.NewClientPool(
+	arpc.TCPDialer(clientEngine, "tcp", "127.0.0.1:8888", 3*time.Second), 4, handler)
+if err != nil {
+	panic(err)
+}
+defer pool.Stop()
+err = pool.Next().Call("/profile", "alice", &rsp, time.Second) // round-robin over the 4 clients
+```
+
+The clients of a pool share its `Handler`, so a singleflight method shares calls per client, not
+across the pool.
+
 ## Streams
 
-A stream is a two-way sequence of messages over one client, bound to a method and opened from
-the client side. The server registers it with `HandleStream`, and the client opens it with
-`NewStream`; each side closes its sending and its receiving half separately, and `Recv` returns
-`io.EOF` once the peer closed its sending half:
+A stream is a two-way sequence of messages over one client, bound to a method. Either side may
+open one with `NewStream`, for a method the peer registered with `HandleStream`, whose handler runs
+when the stream's first message arrives; below the dialed client opens it and the server serves it.
+Each side closes its sending and its receiving half separately, and `Recv` returns `io.EOF` once
+the peer closed its sending half:
 
 ```go
 server.Handler.HandleStream("/upper", func(st *arpc.Stream) {
@@ -262,8 +296,10 @@ if err := st.Recv(&upper); err != nil {
 ```
 
 Stream messages carry the stream command on the wire, so neither side confuses them with calls.
-`Handler.SetStreamQueueSize` bounds how many messages a stream holds for its handler; a
-connection whose stream is full stops reading until the handler takes one.
+`Handler.SetStreamQueueSize` bounds how many messages a stream holds for its handler, 4 by default;
+a connection whose stream is full stops reading until the handler takes one. `RecvContext` bounds
+one wait with a context, and `SendAndClose` sends the last message and closes the sending half in
+one call. Middlewares do not apply to streams: stream methods have no chain.
 
 ## Broadcast and lifecycle callbacks
 
@@ -285,17 +321,18 @@ server.BroadcastWithFilter("/tick", "vip only", func(c *arpc.Client) bool {
 })
 ```
 
-The callbacks run on the task pool: `HandleConnected` runs when a server accepts a connection or
-a dialed client reconnects, so the connection's first messages may already be handled before it
+The callbacks run on the task pool: `HandleConnected` runs when a server accepts a connection, and
+when a dialed client first connects and every time it reconnects, so the connection's first messages may already be handled before it
 returns, and `HandleDisconnected` runs when the client stops. `Server.MaxLoad` bounds how many
 connections a server serves; one beyond it is closed as it is accepted. `Server.Accepted` and
 `Server.CurrLoad` report the counters.
 
 ## Middleware and where handlers run
 
-`Handler.Use` adds a middleware to every method, in the order the chain runs it. The chain is
-assembled per method: a middleware registered before a method runs before its handler, one
-registered after it runs after the handler. A middleware may call `ctx.Next()` to run the rest of
+`Handler.Use` adds a middleware to every method, those registered so far and those registered
+later, in the order the chain runs it. The chain is assembled per method: a middleware registered
+before a method runs before its handler, one registered after it runs after the handler. The chain
+goes on by itself once a middleware returns, so `Next` is only for doing something after the rest. A middleware may call `ctx.Next()` to run the rest of
 the chain and then do something, or `ctx.Abort()` to stop it:
 
 ```go
@@ -341,7 +378,10 @@ func (c xorCoder) Encode(_ *arpc.Client, m *arpc.Message) *arpc.Message { return
 func (c xorCoder) Decode(_ *arpc.Client, m *arpc.Message) *arpc.Message { return c.apply(m) }
 
 server.Handler.UseCoder(xorCoder{0x5a})
-client.Handler.UseCoder(xorCoder{0x5a})
+
+handler := arpc.NewHandler() // the client's Handler, configured before it dials
+handler.UseCoder(xorCoder{0x5a})
+client, err := arpc.Dial(clientEngine, "tcp", "127.0.0.1:8888", 3*time.Second, handler)
 ```
 
 TLS is the `tls` package in front of the same handler, and `TLSDialer` on the client:
@@ -417,9 +457,10 @@ options that no longer exist:
 - **A notify is not a call.** A notify handler has no response to write — `ctx.Write` returns
   `ErrContextResponseToNotify` — and a request handler that writes nothing leaves its caller
   waiting until the call times out.
-- **Limits are enforced by closing the connection.** A method name longer than `MaxMethodLen`
-  (127) or a body longer than `Handler.MaxBodyLen` (`DefaultMaxBodyLen`, 64 MiB − 16) closes the
-  connection; raise the limit with `SetMaxBodyLen`.
+- **Know the limits.** A received body longer than `Handler.MaxBodyLen` (`DefaultMaxBodyLen`,
+  64 MiB − 16) closes the connection; raise it with `SetMaxBodyLen` on both sides. A method name
+  is 1 to `MaxMethodLen` (127) bytes: `Handle` panics on a longer one, sending one fails, and a
+  received message with a bad method length is dropped.
 - **Configure the Handler before clients use it.** `Handler` methods and middlewares are not safe
   to change while a client is serving, and a `Server` shares one Handler among all its
   connections.

@@ -85,13 +85,24 @@ func progress(t *bittorrent.Torrent) {
 }
 ```
 
-- `AddMagnet` 解析链接（v1 的 `btih`、v2 的 `btmh`、`so` 选择文件），然后用 `ut_metadata` 从 peer 取
-  info 字典。没有可用 tracker 的磁力链接需要 `AddOptions.Peers` 或 `Torrent.AddPeers` 找到第一批 peer。
+- `AddMagnet` 解析链接（v1 的 `btih`、v2 的 `btmh`、`tr` tracker、`x.pe` peer、`so` 选择文件），然后用
+  `ut_metadata` 从 peer 取 info 字典。没有可用 tracker 时，第一批 peer 来自 DHT 和本地发现，或者来自
+  `x.pe`、`AddOptions.Peers` 和 `Torrent.AddPeers`。
 - `File.NewReader` 是单个文件上的 `io.ReadSeekCloser`；`Torrent.NewReader` 按分片顺序读整个 torrent 的数据。
   `SetReadahead` 提前取更远的数据，播放器就是靠它一边下载一边无卡顿播放媒体文件；`SetContext` 用一个
   context 结束 reader。
-- torrent 想要的分片全部到手时 `Done` 关闭，之后客户端继续做种。`Stats` 随时给出进度、速率、peer 数和哈希
-  失败数；`Recheck` 在文件被客户端之外改动过后重新哈希校验数据。
+- torrent 想要的分片全部到手并校验后 `Done` 关闭，之后客户端继续做种。提高一个缺分片的文件的优先级会得到新的
+  `Done` channel。`Stats` 随时给出进度、速率、peer 数和哈希失败数；`Recheck` 在文件被客户端之外改动过后重新
+  哈希校验数据。
+- 进度行写到 stderr，文件内容写到 stdout，所以要把 stdout 重定向到文件。`Info().TotalLength()` 也计入
+  兼容 v2 的（hybrid）torrent 在文件之间插入的填充文件；`Files()` 则不包含它们。
+
+想不连互联网试一试：在 `seeds/data` 里放几个文件，先运行下面的做种程序，再运行这个程序——把它的 `ListenAddr`
+改成 `":6882"`（同一台机器上的两个客户端需要两个端口），并在磁力链接里指明做种方：
+
+```sh
+go run ./download 'magnet:?xt=urn:btih:<the v1 info hash the seeder logs>&x.pe=127.0.0.1:6881' > first-file
+```
 
 ## 添加 torrent 与选项
 
@@ -105,18 +116,20 @@ func addWithOptions(c *bittorrent.Client) (*bittorrent.Torrent, error) {
 		return nil, err
 	}
 	return c.AddTorrent(mi, &bittorrent.AddOptions{
-		Paused:         true,                                                   // add it, Start it later
-		Sequential:     true,                                                   // pieces in order, for playback while downloading
+		Paused:         true,                                                    // add it, Start it later
+		Sequential:     true,                                                    // pieces in order, for playback while downloading
 		FilePriorities: []int{bittorrent.PriorityHigh, bittorrent.PriorityNone}, // by Info.FileList index
-		Trackers:       []string{"udp://tracker.example:6969"},                 // one more tier, beside the torrent's
-		Peers:          []string{"192.0.2.10:6881"},                            // beside what discovery finds
+		Trackers:       []string{"udp://tracker.example:6969"},                  // one more tier, beside the torrent's
+		Peers:          []string{"192.0.2.10:6881"},                             // beside what discovery finds
 	})
 }
 ```
 
 运行中的 torrent 用 `Torrent` 的方法调整：`Start`、`Pause`、`Stop`、`Remove(deleteData)`、`SetSequential`、
-`SetFilePriority`、`SetLimits`、`AddPeers`。`PriorityNone` 表示"不要"：只由这类文件组成的分片不会下载，
-选择性下载就是这么做的。
+`SetFilePriority`、`SetLimits`、`AddPeers`。优先级有 `PriorityNone`、`PriorityLow`、`PriorityNormal`（默认）
+和 `PriorityHigh`，`PriorityNone` 表示"不要"：只由这类文件组成的分片不会下载，选择性下载就是这么做的。
+`FilePriorities` 和 `SetFilePriority` 按文件在 `Info.FileList` 中的下标计数，填充文件也算在内；`Files()`
+不含填充文件，所以从 `Files()` 出发时请用 `File.SetPriority` 或 `File.Index`。
 
 ## 进度与事件
 
@@ -141,7 +154,8 @@ func clientWithEvents() (*bittorrent.Client, error) {
 
 `Event` 还带着分片（校验通过、失败）和 peer（连上、断开、被封禁）。`EventQueue` 限制等待 `OnEvent` 的事件数，
 超过时先丢最旧的分片和 peer 事件，随后一个 `EventDropped` 带着条数出现，`DroppedEvents` 统计总数。`State`
-说明 torrent 处于哪一步：`StateMetadata`、`StateChecking`、`StateDownloading`、`StateSeeding`。`Trackers`、
+说明 torrent 处于哪一步：`StateMetadata`、`StateChecking`、`StateDownloading`、`StateSeeding`、
+`StatePaused`、`StateStopped`、`StateRemoved` 和 `StateError`（原因见 `Err`）。`Trackers`、
 `Sources`、`WebSeeds` 和 `Peers` 说明 swarm 的状态：每个 tracker URL 及其最近错误、连续失败次数和下次
 announce 时间；每个 peer 来源及其候选数；每个 web seed 及其失败次数和下次重试。
 
@@ -300,7 +314,9 @@ func limitedClient() (*bittorrent.Client, error) {
 	if err != nil {
 		return nil, err
 	}
-	c.SetLimits(bittorrent.Limits{DownloadRate: 10 << 20}) // 10 MiB/s, changed while it runs
+	l := c.Limits()           // SetLimits replaces them all: start from the current ones
+	l.DownloadRate = 10 << 20 // 10 MiB/s, changed while it runs
+	c.SetLimits(l)
 	return c, nil
 }
 ```
@@ -308,7 +324,7 @@ func limitedClient() (*bittorrent.Client, error) {
 `EncryptionAllow` 先试明文，`EncryptionRequire` 两个方向都拒绝明文。速率、连接数、上传槽和做种上限属于客户端的
 `Limits` 和单个 torrent 的 `TorrentLimits`；`SeedRatio` 或 `SeedTime` 达到时暂停该 torrent。v1、v2 和 hybrid
 torrent 都是一等公民：纯 v2 磁力链接用 BEP 52 的 hash request 取 piece layer，hybrid 在两个 info hash 下
-都会 announce。与 libtorrent、Transmission、anacrolix/torrent、libutp 和 opentracker 的线上兼容性由
+都会 announce。与 libtorrent、anacrolix/torrent（以及 anacrolix/dht）、libutp 和 opentracker 的线上兼容性由
 [`bittorrent/interop`](../bittorrent.zh-CN.md#互通验证) 验证。
 
 ## 坑与限制
@@ -319,8 +335,11 @@ torrent 都是一等公民：纯 v2 磁力链接用 BEP 52 的 hash request 取 
   提供 HTTP，就传 `Config.SharedEngine`。
 - **info hash 就是身份。** 两个客户端看到的 info hash 不同，即使文件一模一样也是在下载不同的 torrent：
   `source`、不同的分片长度、或重新编码过的 info 字典都会改变 hash。请用 `metainfo.Load`/`Parse` 读 torrent。
-- **续传数据和 `Seed` 的信任不等于校验。** 它们记为已有的分片在第一次被读之前不会校验；拿到坏分片的 peer
-  可能封禁本客户端。
+- **续传数据信任的是文件戳。** 续传数据列出的分片，只要所在文件的大小和修改时间没变，就会不经哈希校验直接
+  采用并发送出去；大小和文件戳都不变的内容替换会把坏数据发出去，拿到坏分片的 peer 可能封禁本客户端。原地修改
+  文件后请调用 `Recheck`。`Seed` 的分片则在第一次发送时校验。
+- **`SetLimits` 会设置全部限制。** 字段为零表示取默认值，而不是"不变"：像上面那样修改客户端 `Limits()`
+  返回的值，否则 `Config` 里给的 `MaxConns` 会回到默认值。
 - **不要把文件拷进它正在下载的目录。** `Files()[0].NewReader` 在客户端写存储的同时从存储读；请写到别的
   writer，不要写回 `DataDir`。
 - **磁盘池不是 fib 池。** 磁盘慢或有争用时调 `DiskWorkers`/`DiskQueueBytes`；在 `OnEvent` 里做存储 I/O

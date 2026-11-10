@@ -3,7 +3,7 @@
 [English](01-getting-started.md) | [简体中文](01-getting-started.zh-CN.md)
 
 This chapter is the shortest path from nothing to a running fib server: install it, write the
-four-line program every fib application is built from, and see the same handler answer
+short program every fib application is built from, and see the same handler answer
 HTTP/1.x, HTTP/2, HTTP/3 and a `net/http` mux. It also maps the rest of the tutorial, so a
 reader can jump straight to the protocol they need.
 
@@ -143,10 +143,12 @@ func main() {
 ```
 
 ```sh
-curl -k --http2 https://127.0.0.1:8443/
+curl -k --http2 https://127.0.0.1:8443/     # hello over HTTP/2.0
+curl -k --http1.1 https://127.0.0.1:8443/   # hello over HTTP/1.1
 ```
 
-`fibhttp.ConfigureTLS` adds `h2` and `http/1.1` to the ALPN list; `fibtls.NewServer` runs the
+`-k` is needed because `tlstest` makes a new self-signed certificate every time the process
+starts, so no client trusts it. `fibhttp.ConfigureTLS` adds `h2` and `http/1.1` to the ALPN list; `fibtls.NewServer` runs the
 TLS handshake on the connection and then hands it to the HTTP handler, so `app` still does not
 know which protocol it is answering. TLS is chapter [10-tls.md](10-tls.md); real certificates
 are discussed there. `tlstest` is for tests and examples only.
@@ -172,11 +174,7 @@ func main() {
 			[]byte("hello over "+c.Request.Proto+"\n"))
 	})
 
-	httpTLS, _, err := tlstest.Configs()
-	if err != nil {
-		panic(err)
-	}
-	quicTLS, _, err := tlstest.Configs()
+	serverTLS, _, err := tlstest.Configs()
 	if err != nil {
 		panic(err)
 	}
@@ -184,12 +182,12 @@ func main() {
 	engine, err := fib.New(fib.DefaultConfig(),
 		fib.Binding{
 			Addr:    "127.0.0.1:8443",
-			Handler: fibtls.NewServer(fibhttp.ConfigureTLS(httpTLS), fibhttp.NewHandler(app)),
+			Handler: fibtls.NewServer(fibhttp.ConfigureTLS(serverTLS), fibhttp.NewHandler(app)),
 		},
 		fib.Binding{
 			Network: "udp",
 			Addr:    "127.0.0.1:8443",
-			Handler: http3.NewHandler(http3.ConfigureTLS(quicTLS), app),
+			Handler: http3.NewHandler(http3.ConfigureTLS(serverTLS), app),
 		},
 	)
 	if err != nil {
@@ -206,6 +204,12 @@ func main() {
 ```sh
 curl -k --http3 https://127.0.0.1:8443/    # needs curl built with HTTP/3
 ```
+
+One `tlstest` config serves both bindings: `fibhttp.ConfigureTLS` and `http3.ConfigureTLS` each
+return a copy with their own ALPN list (`h2`/`http/1.1`, and `h3` with TLS 1.3 required), and
+`http3.NewHandler` applies `http3.ConfigureTLS` itself, so the explicit call only makes the
+requirement visible. Many curl builds, macOS's among them, have no HTTP/3; the fib HTTP/3
+client in [08-http3.md](08-http3.md) gets `hello over HTTP/3.0` from the same server.
 
 The TCP and UDP bindings may share a port number: they are different transports. Browsers find
 the HTTP/3 endpoint through the `Alt-Svc` header on an HTTP/1 or HTTP/2 response, which chapter
@@ -256,7 +260,7 @@ func main() {
 
 ```sh
 curl http://127.0.0.1:8080/hello/fib
-curl -OJ http://127.0.0.1:8080/files/go.mod
+curl -OJ http://127.0.0.1:8080/files/go.mod   # the file server serves the working directory
 ```
 
 What carries over and what differs is summarised in [the README](../../README.md); the details
@@ -270,8 +274,10 @@ switches protocols with `Context.Upgrade` instead (chapters
 - `go run .` builds and runs the program. Every engine prints its effective settings at
   startup, one line per parameter; `FIB_LOG_SETTINGS=0` silences that list, and
   `engine.LogSettings()` prints it on demand.
-- `engine.Run()` blocks. A program that should stop on a signal exits through `engine.Shutdown`
-  or `engine.Close`; chapter [02-engine.md](02-engine.md) shows the pattern.
+- `engine.Run()` blocks. A program that should stop on a signal calls `engine.Shutdown(ctx)`
+  (graceful) or `engine.Stop()` (at once) from another goroutine, which makes `Run` return, and
+  then `engine.Close()`; `Close` itself is only for after `Run` has returned. Chapter
+  [02-engine.md](02-engine.md) shows the pattern.
 - The examples in this tutorial listen on `127.0.0.1` so they do not expose anything. Use `:8080`
   for all interfaces. Port 0 asks the kernel for a free port; `engine.BindingAddrs(i)` reports
   which one it picked.
@@ -307,6 +313,8 @@ go beyond the straightforward API.
   buffer and logging sizes; always start from `DefaultConfig()` and change fields.
 - **A bad binding fails the whole engine.** `fib.New` keeps none of the addresses if one of
   them cannot be listened on.
+- **`Close` comes after `Run`.** `Close` is for an engine whose `Run` has returned; to stop a
+  running engine, call `Shutdown` or `Stop` and close it once `Run` returns.
 - **Keep the engine alive.** Closing it stops every binding; a client-only engine still has to
   outlive its connections.
 

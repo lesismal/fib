@@ -163,7 +163,9 @@ _ = pc.AddICECandidate(cand) // held until the remote description is set
 ```
 
 Candidates that arrive before the remote description are held, up to
-`Configuration.MaxRemoteCandidates` (64). On the client side, `Offer` is also the whole
+`Configuration.MaxRemoteCandidates` (64); past it `AddICECandidate` returns
+`ErrTooManyCandidates`. An `ICECandidateInit` with an empty `Candidate` is the end of
+candidates. On the client side, `Offer` is also the whole
 exchange, so a Go client against an HTTP WHIP endpoint is short:
 
 ```go
@@ -256,9 +258,21 @@ list only the codecs every peer has (`Configuration.Codecs`, e.g. VP8 and Opus) 
 negotiation intersect the rest. **Keep the header extension ids**: a forwarding track takes
 the remote's ids with `SetHeaderExtensions`; extensions it was not told of are dropped.
 **Request key frames**: a new viewer starts on a key frame, so route its `OnKeyFrameRequest`
-to the publisher's `TrackRemote.RequestKeyFrame`. Sequence numbers and timestamps go out as
-written, so switching sources under one track makes the receiver see a jump and need a new
-key frame.
+to the publisher's `TrackRemote.RequestKeyFrame` (`RequestFIR` for a sender that ignores
+PLIs). Sequence numbers and timestamps go out as written, so switching sources under one
+track makes the receiver see a jump and need a new key frame.
+
+Loss repair is off by default. `Configuration.Retransmit` with `Packets` set keeps that many
+of each `TrackLocal`'s latest packets and answers the viewers' NACKs from them, as RTX when
+the viewer negotiated it; the history is the track's, shared by every viewer it is sent to:
+
+```go
+cfg := webrtc.Configuration{
+	Mux:        mux,
+	ICELite:    true,
+	Retransmit: webrtc.RetransmitConfig{Packets: 512}, // about 0.75 MiB per track, once written
+}
+```
 
 ## TURN
 
@@ -286,7 +300,8 @@ if err != nil {
 defer pc.Close()
 ```
 
-The server side is package `turnserver`, which runs the `turn` core on the same engine. It
+The server side is package `webrtc/turn/turnserver`, which runs the `webrtc/turn` core on the
+same engine. It
 needs a specific `RelayIP` (and `PublicIP` behind a one-to-one NAT), a realm, and an
 `AuthFunc` — `turn.StaticAuth` for fixed users, or `turn.EphemeralAuth` for the time-limited
 credentials a web service hands out:
@@ -303,7 +318,7 @@ cfg.Auth = turn.EphemeralAuth(secret, time.Now) // or turn.StaticAuth(cfg.Realm,
 cfg.MaxAllocations, cfg.MaxAllocationsPerUser = 10000, 10
 cfg.AllowedPeers = []netip.Prefix{netip.MustParsePrefix("10.0.1.0/24")} // private peers to relay to
 
-server, err := turnserver.Listen(engine, "127.0.0.1:3478", cfg)
+server, err := turnserver.Listen(engine, "10.0.0.5:3478", cfg) // UDP; ListenTCP, ListenTLS add more
 if err != nil {
 	panic(err)
 }
@@ -312,13 +327,15 @@ go engine.Run()
 
 // For each browser, the web service makes the credentials it puts in RTCIceServer:
 user, pass := turn.EphemeralCredentials(secret, "alice", time.Now().Add(time.Hour))
-log.Printf("RTCIceServer{urls: turn:127.0.0.1:3478, username: %q, credential: %q}", user, pass)
+log.Printf("RTCIceServer{urls: turn:203.0.113.7:3478, username: %q, credential: %q}", user, pass)
 ```
 
 By default the server refuses to relay to loopback, private and link-local addresses, so it
 cannot be used as a proxy into the network it runs in; `AllowedPeers` names the exceptions.
-`ListenTCP` and `ListenTLS` add the transports clients behind a firewall-only-443 network
-need. TURN relays UDP to peers even over TCP or TLS: only the leg to the server is a stream.
+`server.ListenTCP(addr)` and `server.ListenTLS(addr, tlsConfig)` add the transports clients
+behind a firewall that only lets 443 out need. TURN relays UDP to peers even over TCP or TLS:
+only the leg to the server is a stream. `Close` frees the allocations but leaves the listening
+bindings to the caller, and `Shutdown(ctx)` lets the allocations end first.
 
 ## Interop and limits
 
@@ -345,6 +362,10 @@ beyond RTCP reports, and TURN on a shared `Mux`. Messages are limited by
 - **ICE-lite needs a full peer.** Browsers are full agents; a `PeerConnection` marked
   `ICELite` refuses TURN servers and the relay-only policy, and a lite-to-lite pair never
   connects.
+- **ICE server names are resolved at once.** `NewPeerConnection` looks up the host of every
+  `stun:`/`turn:` URL as it starts, a DNS lookup that blocks the caller, and a name that does
+  not resolve makes it return `ErrConfiguration`. Create such PeerConnections off the fib
+  workers, or give the servers as IP addresses.
 - **TURN does not share a `Mux`.** Give the `PeerConnection` an `Engine` and let it open its
   own port, or `NewPeerConnection` returns `ErrConfiguration`.
 - **The server must keep the `PeerConnection`.** `Answer` does not return it; store it under

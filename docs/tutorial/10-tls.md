@@ -177,8 +177,10 @@ configured there:
   the engine's event loop;
 - versions and suites: `MinVersion`, `MaxVersion`, and `CipherSuites` for TLS 1.2; TLS 1.3 suites
   have no `crypto/tls` field, so the client's offer order is `Handler.TLS13CipherSuites`;
-- resumption: `ClientSessionCache` and `SessionTicketKey`; a server whose handshakes run as state
-  machines issues its own tickets, under a key of the `Handler`'s.
+- resumption: `SessionTicketKey` on a server — one whose handshakes run as state machines issues
+  its own tickets, under a key of the `Handler`'s — and `ClientSessionCache` on a client, which
+  keeps the connection in `crypto/tls`; a client resumes without a worker through
+  `DialOptions.SessionCache` (`Handler.SessionCache`) instead.
 
 What fib adds on top is the data path — record sealing and opening, writes corked into one record
 per round, and, on Linux, handing the sealing of large `SendFile` responses to the kernel's TLS
@@ -187,35 +189,100 @@ per round, and, on Linux, handing the sealing of large `SendFile` responses to t
 ## An ALPN-aware handler
 
 The wrapped handler is the one that decides what the negotiated protocol means. A custom
-`HandshakeHandler` receives the result once, and can switch the handler of the connection:
+`HandshakeHandler` receives the result once, after the handshake and before any `OnData`, and can
+route the connection's plaintext from then on. This one serves h2 and HTTP/1.1 with two
+differently configured HTTP handlers:
 
 ```go
-type multiplexer struct {
-	h2  fib.Handler
-	h11 fib.Handler
+package main
+
+import (
+	stdtls "crypto/tls"
+	stdhttp "net/http"
+	"sync"
+
+	fib "github.com/lesismal/fib"
+	fibhttp "github.com/lesismal/fib/http"
+	fibtls "github.com/lesismal/fib/tls"
+	"github.com/lesismal/fib/tlstest"
+)
+
+// alpnSwitch is the handler fibtls wraps. Once ALPN has settled it picks a
+// handler for the connection and forwards the plaintext to it.
+type alpnSwitch struct {
+	h2, h11 fib.Handler
+	picked  sync.Map // *fib.Connection -> fib.Handler
 }
 
-func (m multiplexer) OnOpen(c *fib.Connection) {}
+func (m *alpnSwitch) OnOpen(c *fib.Connection) {} // before the handshake: nothing chosen yet
 
-func (m multiplexer) OnData(c *fib.Connection, data []byte) {}
-
-func (m multiplexer) OnPriorityData(c *fib.Connection, data []byte) {}
-
-func (m multiplexer) OnClose(c *fib.Connection, err error) {}
-
-func (m multiplexer) OnHandshake(c *fib.Connection, state stdtls.ConnectionState) {
+func (m *alpnSwitch) OnHandshake(c *fib.Connection, state stdtls.ConnectionState) {
+	h := m.h11
 	if state.NegotiatedProtocol == "h2" {
-		c.SetHandler(m.h2)
-		return
+		h = m.h2
 	}
-	c.SetHandler(m.h11)
+	m.picked.Store(c, h)
+	h.OnOpen(c)
+	if hh, ok := h.(fibtls.HandshakeHandler); ok {
+		hh.OnHandshake(c, state)
+	}
+}
+
+func (m *alpnSwitch) OnData(c *fib.Connection, data []byte) {
+	if h, ok := m.picked.Load(c); ok {
+		h.(fib.Handler).OnData(c, data)
+	}
+}
+
+func (m *alpnSwitch) OnPriorityData(c *fib.Connection, data []byte) {}
+
+func (m *alpnSwitch) OnClose(c *fib.Connection, err error) {
+	if h, ok := m.picked.LoadAndDelete(c); ok {
+		h.(fib.Handler).OnClose(c, err)
+	}
+}
+
+func main() {
+	serverTLS, _, err := tlstest.Configs()
+	if err != nil {
+		panic(err)
+	}
+	app := fibhttp.HandlerFunc(func(c *fibhttp.Context) {
+		_ = c.String(stdhttp.StatusOK, "hello over %s\n", c.Request.Proto)
+	})
+	h2 := fibhttp.DefaultConfig()
+	h2.HTTP2Only = true
+	h11 := fibhttp.DefaultConfig()
+	h11.DisableHTTP2 = true
+	sw := &alpnSwitch{
+		h2:  fibhttp.NewHandlerWithConfig(h2, app),
+		h11: fibhttp.NewHandlerWithConfig(h11, app),
+	}
+	engine, err := fib.New(fib.DefaultConfig(), fib.Binding{
+		Addr:    "127.0.0.1:8443",
+		Handler: fibtls.NewServer(fibhttp.ConfigureTLS(serverTLS), sw),
+	})
+	if err != nil {
+		panic(err)
+	}
+	defer engine.Close()
+	if err := engine.Run(); err != nil {
+		panic(err)
+	}
 }
 ```
 
-`c.SetHandler` installs the chosen handler before any plaintext arrives, because `OnHandshake` runs
-after the handshake's output is encrypted and before `OnData` sees bytes. This is the mechanism
-package `http` uses; most programs should let `http.ConfigureTLS` or `http3.ConfigureTLS` choose the
-ALPN list and keep one handler stack.
+```sh
+curl -k --http2 https://127.0.0.1:8443/    # hello over HTTP/2.0, from h2
+curl -k --http1.1 https://127.0.0.1:8443/  # hello over HTTP/1.1, from h11
+```
+
+The switch remembers its choice per connection and forwards every later callback; the chosen
+handler's `OnOpen` runs at the handshake rather than before it. Do not call `c.SetHandler` for
+this: the connection's handler is the `fibtls.Handler` itself, and replacing it hands ciphertext to
+the new handler. Package `http` already makes this choice on its own — its handler serves HTTP/2
+when ALPN chose `h2` — so most programs only add `http.ConfigureTLS` and keep one handler stack;
+a switch like this is for protocols fib does not pair for you.
 
 ## Client dial options
 
@@ -320,6 +387,10 @@ chapter [16-webrtc.md](16-webrtc.md) for the WebRTC side. For ordinary TCP servi
 - **No plaintext fallback exists.** A binding whose handler is `fibtls.NewServer` accepts TLS only;
   there is no sniffing and no "try TLS then plain". For several protocols on one port use package
   `mux` or `multiproto`, as chapter [15-multiprotocol.md](15-multiprotocol.md) shows.
+- **Some `Config` fields keep a connection in `crypto/tls`.** `GetConfigForClient` on a server and
+  `ClientSessionCache` or renegotiation on a client make the handshake run on a pool worker and
+  leave the records to `crypto/tls`, which is slower; it still works, but measure before relying
+  on them.
 - **The `done` callback is not the end of the handshake.** It fires when the TCP connection is
   established; failures such as a bad certificate arrive later, in `OnClose`.
 - **Client verification must have a name.** A client `Config` with `RootCAs` but no `ServerName` and

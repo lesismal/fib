@@ -19,7 +19,7 @@ HTTPS、h2c、SOCKS 和某种 RPC 协议。`mux` 包做的正是这件事：它�
 `OnShutdown` 也是问这个 handler 而不是 mux，因此协议 handler 保持正常生命周期，只在
 engine 关闭时停止。
 
-匹配器的类型是 `func(input []byte) mux.Result`，返回 `mux.NoMatch`、`mux.NeedMore` 或
+匹配器的类型是 `mux.Matcher`，即 `func(input []byte) mux.Result`，返回 `mux.NoMatch`、`mux.NeedMore` 或
 `mux.Match`。它运行在连接所属的 worker 上，不能阻塞，也不能保留输入切片——engine 在本轮
 结束后会复用它。`NoMatch` 让该路由永久出局；`NeedMore` 让路由等待下一次读取；mux 会把
 已收到的全部字节再次交给它，直到某个路由匹配或已到达 `Config.MaxPeek` 字节。
@@ -86,10 +86,12 @@ func main() {
 ```
 
 ```sh
-curl -k https://127.0.0.1:8000/                       # TLS route, HTTP/2 by ALPN
-curl --http2-prior-knowledge http://127.0.0.1:8000/   # HTTP route, h2c
-curl --socks5 127.0.0.1:8000 https://example.com/     # SOCKS route
-printf 'PING' | nc 127.0.0.1 8000                     # Prefix route
+curl -k https://127.0.0.1:8000/                       # TLS route: hello over HTTP/2.0 (ALPN)
+curl http://127.0.0.1:8000/                           # HTTP route: hello over HTTP/1.1
+curl --http2-prior-knowledge http://127.0.0.1:8000/   # HTTP route, h2c: hello over HTTP/2.0
+curl --socks5 127.0.0.1:8000 https://example.com/     # SOCKS route, out to the internet
+printf 'PING' | nc -w 1 127.0.0.1 8000                # Prefix route: PONG PING
+printf 'XYZ' | nc -w 1 127.0.0.1 8000                 # no route: closed at once
 ```
 
 路由内部的 handler 栈就是平常那一套：`fibtls.NewServer` 完成握手后把连接交给 HTTP
@@ -128,8 +130,10 @@ handler。
 | `mux.HTTP()` | `mux.HTTP1()` 与 `mux.HTTP2()` |
 | `mux.HTTP1()` | 以 HTTP 或 WebDAV 方法开头的请求行 |
 | `mux.HTTP2()` | HTTP/2 连接前言，即带 prior knowledge 的 h2c |
-| `mux.SOCKS()` | SOCKS5 greeting，或 SOCKS4/4a 请求 |
-| `mux.Prefix(...)` | 协议的 magic number 或第一条命令 |
+| `mux.SOCKS()` | `mux.SOCKS5()` 与 `mux.SOCKS4()` |
+| `mux.SOCKS5()` | SOCKS5 greeting：版本号 5，且认证方法数不为 0 |
+| `mux.SOCKS4()` | SOCKS4 或 SOCKS4a 的 CONNECT 或 BIND 请求 |
+| `mux.Prefix(...)` | 协议的 magic number 或第一条命令；输入仍是某个前缀的开头时返回 `NeedMore` |
 | `mux.Any()` | 匹配一切，用于最后一条路由或 fallback |
 | `mux.AnyOf(...)` | 其他匹配器的并集 |
 
@@ -172,8 +176,8 @@ app := mux.NewWithConfig(mux.Config{
 )
 ```
 
-`mux.Route` 还有一个 `Nudge` 钩子：当 mux 因为该路由返回 `NeedMore` 而等待更多字节时，
-每轮都会调用它。这是服务那些必须先等**服务端**开口、之后才肯发够可识别字节的协议的办法：
+`mux.Route` 还有一个 `Nudge` 钩子，类型为 `func(c *fib.Connection, input []byte) (done bool)`：
+当 mux 因为该路由返回 `NeedMore` 而等待更多字节时，每轮都会调用它，直到它返回 true。这是服务那些必须先等**服务端**开口、之后才肯发够可识别字节的协议的办法：
 `multiproto` 用它给 grpc-go 这类要先收到服务端 SETTINGS 才发首请求的 gRPC 客户端发送一个
 空的 HTTP/2 SETTINGS 帧。该钩子运行在 worker 上，可以向连接发送数据，但不能阻塞。
 判断完成之前 `OnPriorityData` 没有协议可以路由，因此 mux 直接丢弃带外数据。
@@ -248,9 +252,21 @@ func main() {
 }
 ```
 
+```sh
+curl -k https://127.0.0.1:8000/                          # TLS: HTTP/2 by ALPN
+curl http://127.0.0.1:8000/                              # HTTP1
+curl --http2-prior-knowledge http://127.0.0.1:8000/      # HTTP2: h2c that is not gRPC
+curl --socks5 127.0.0.1:8000 http://127.0.0.1:8000/      # SOCKS, back into the same port
+curl -p -x http://127.0.0.1:8000 http://127.0.0.1:8000/  # HTTPProxy: a CONNECT tunnel
+```
+
 handler 为 nil 的协议不提供服务，它的连接交给 `Fallback`，没有 fallback 就关闭。只开
 一部分协议就靠这个，而且这样做能如实反映端口的实际能力：`GRPC` 为 nil、`HTTP2: web`
 时，所有 h2c 连接都走 HTTP handler。
+
+`fibhttp.NewConnectProxy` 只是 CONNECT 代理。`multiproto` 也会把目标为绝对 URL 的正向代理
+请求（不带 `-p` 的 `curl -x`）交给它，而它对这类请求回复 405 Method Not Allowed，除非
+`ConnectProxyConfig.Next` 负责处理它们。
 
 ## `multiproto` 的嗅探方式
 
@@ -295,6 +311,8 @@ handler 为 nil 的协议不提供服务，它的连接交给 `Fallback`，没�
   职责，不是 mux 的。
 - **`MaxPeek` 太小会悄悄分错流。** 放不下的 WebSocket 握手会被判为“不是 WebSocket”，
   落到普通 HTTP 路由；`multiproto` 默认 8192 就是为了容纳浏览器带 Cookie 的请求头。
+- **`HTTPProxy` 也会接收绝对 URL 请求。** 发到该端口的普通 `GET http://...` 交给代理
+  handler 而不是 `HTTP1`；使用 `NewConnectProxy` 且没有 `Next` 时会得到 405。
 - **路由两个字段都必需。** `mux.Route` 的 `Match` 或 `Handler` 为 nil 时 `mux.New` 会
   panic，不存在隐式的“匹配一切”。
 - **`Fallback` 只处理“无人匹配”，不处理“匹配后失败”。** TLS 里的 SNI 未知时由 TLS

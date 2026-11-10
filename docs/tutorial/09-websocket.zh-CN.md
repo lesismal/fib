@@ -7,8 +7,8 @@
 ## 模型
 
 - **一个 handler，两个入口。** `websocket.NewHandler(handler)` 返回一个 `fib.Handler`，在它绑定的连接上使用 WebSocket 协议。另一个入口是 `Upgrade`：它把 `http` 包正在处理的某个请求变成 WebSocket，从而让 WebSocket 与普通 HTTP 共用一个端口。
-- **回调是串行的。** 对同一条连接，先是 `OnOpen` 中在事件循环上完成的握手，随后每条消息、每次关闭的回调依次执行，运行在调度该轮事件的某个 worker 上。不同连接的回调可能在不同 worker 上同时运行，因此连接之间共享的状态需要加锁。
-- **payload 是借用的。** `OnMessage` 与 `OnFrame` 收到的切片只在回调执行期间有效；要保留内容，必须先复制。
+- **回调是串行的。** 对同一条连接，`Open`、随后的每条消息、每个帧、ping 与 pong、最后的 `Close` 依次执行，绝不会同时运行两个。它们运行在引擎的 worker 上；经 `Upgrade` 升级时，`Open` 已经在 `Upgrade` 内部、也就是 HTTP handler 的协程上运行过了。不同连接的回调可能在不同 worker 上同时运行，因此连接之间共享的状态需要加锁。
+- **payload 是借用的。** `OnMessage` 与 `OnFrame` 收到的切片只在回调执行期间有效；要保留内容，必须先复制。交给 `Open` 的 `*http.Request` 是握手请求，`Open` 返回后 HTTP 服务可能复用它：复制需要的字段（某个 cookie、用户 ID），不要保留请求本身。
 - **写操作安全且从不阻塞。** `WriteMessage`、`WriteText`、`WriteBinary`、`WritePreparedMessage`、`Ping`、`Pong` 与 `Close` 都可以在应用协程中调用。发送只是把帧放进队列就返回；不读数据的对端会让队列持续增长，这种对端应由你主动关闭。
 - **限制。** `Config.MaxMessageBytes`（`websocket.DefaultConfig()` 中为 16 MiB）限制一条消息重组后的大小；控制帧不计入，非法的 Text payload 会以 1007 关闭连接。收到 ping 会自动回复携带相同 payload 的 pong，但自定义 `HandlerFuncs.Ping` 会取代这个默认回复，因此它必须自己调用 `Connection.Pong`。
 
@@ -53,7 +53,7 @@ func main() {
 }
 ```
 
-`HandlerFuncs` 这个结构体省去了手写六个方法的麻烦：`Open`、`Message`、`Close`、`Frame`、`Ping` 与 `Pong`。`Ping` 为 nil 时保留默认的 pong 回复；`Pong` 为 nil 时丢弃收到的 pong。这里 `Connection` 写出的内容就是客户端读到的：`WriteMessage` 接受任意数据帧 opcode，`WriteText` 与 `WriteBinary` 是两种简写，`Close(code, reason)` 发送关闭帧。可以用任意客户端测试，例如 `websocat ws://127.0.0.1:8080/`，每一行都会原样回显。
+`HandlerFuncs` 这个结构体省去了手写六个方法的麻烦：`Open`、`Message`、`Close`、`Frame`、`Ping` 与 `Pong`。`Ping` 为 nil 时保留默认的 pong 回复；`Pong` 为 nil 时丢弃收到的 pong。这里 `Connection` 写出的内容就是客户端读到的：`WriteMessage` 接受任意数据帧 opcode，`WriteText` 与 `WriteBinary` 是两种简写，`Close(code, reason)` 发送关闭帧。可以用任意客户端测试，例如 `websocat ws://127.0.0.1:8080/`，每一行都会原样回显；[下文](#客户端)的客户端程序也可以。对这个端口发普通 HTTP 请求会得到 `400 Bad Request`。
 
 ## 从 HTTP 服务升级
 
@@ -78,7 +78,7 @@ engine, err := fib.New(fib.DefaultConfig(), fib.Binding{
 })
 ```
 
-`Upgrade` 的行为取决于请求本身的协议。在 HTTP/1.1 上它就是 RFC 6455 的握手，整条连接切换为 WebSocket。在 HTTP/2 与 HTTP/3 上它是 `:protocol` 为 `websocket` 的扩展 CONNECT（RFC 8441、RFC 9220）：只有该 stream 切换，连接上的其他请求照常服务，`http` 包会发送 SETTINGS 引导浏览器尝试。`Config` 中的来源校验、子协议与压缩在两种情况下都生效。`Upgrade` 返回后应立刻从 HTTP handler 返回，连接从此归 WebSocket handler 所有。
+`Upgrade` 的行为取决于请求本身的协议。在 HTTP/1.1 上它就是 RFC 6455 的握手，整条连接切换为 WebSocket。在 HTTP/2 与 HTTP/3 上它是 `:protocol` 为 `websocket` 的扩展 CONNECT（RFC 8441、RFC 9220）：只有该 stream 切换，连接上的其他请求照常服务，`http` 包会发送 SETTINGS 引导浏览器尝试。`Config` 中的来源校验、子协议与压缩在两种情况下都生效。不是合法握手的请求由 `Upgrade` 自己应答——400 Bad Request，来源校验拒绝时为 403 Forbidden——并通过返回的 error 说明原因，handler 只需记录日志。`Upgrade` 返回后应立刻从 HTTP handler 返回，连接从此归 WebSocket handler 所有。
 
 ## 用 PreparedMessage 广播
 
@@ -174,17 +174,16 @@ handler := websocket.NewHandler(websocket.HandlerFuncs{
 
 ## 压缩与握手选项
 
-握手通过 `websocket.Config` 配置，交给 `NewHandlerWithConfig`；其中 `HTTP` 字段指定用于应答错误握手的 `http` 包配置：
+握手通过 `websocket.Config` 配置，交给 `NewHandlerWithConfig`；请从 `websocket.DefaultConfig()` 开始，它的 `HTTP` 字段带有独立绑定读取握手时使用的 `http` 包限制与超时：
 
 ```go
-config := websocket.Config{
-	MaxMessageBytes:   4 << 20,
-	EnableCompression: true,
-	CheckOrigin: func(r *stdhttp.Request) bool {
-		return r.Header.Get("Origin") == "https://example.com"
-	},
-	Subprotocols: []string{"chat.v2", "chat.v1"},
+config := websocket.DefaultConfig()
+config.MaxMessageBytes = 4 << 20
+config.EnableCompression = true
+config.CheckOrigin = func(r *stdhttp.Request) bool {
+	return r.Header.Get("Origin") == "https://example.com"
 }
+config.Subprotocols = []string{"chat.v2", "chat.v1"}
 handler := websocket.NewHandlerWithConfig(config, websocket.HandlerFuncs{
 	Message: func(c *websocket.Connection, op websocket.Opcode, data []byte) {
 		_ = c.WriteMessage(op, data)
@@ -192,7 +191,7 @@ handler := websocket.NewHandlerWithConfig(config, websocket.HandlerFuncs{
 })
 ```
 
-`EnableCompression` 接受客户端的 permessage-deflate 提议（RFC 7692）；此后消息以压缩形式发送，也可能以压缩形式到达，`MaxMessageBytes` 限制的是解压后的消息大小。发送端不保留 deflate 上下文：每条消息从 `sync.Pool` 借一个压缩器，因此连接再多内存也有界。`CheckOrigin` 是跨站 WebSocket 劫持的防线：为 nil 时等价于 `CheckSameOrigin`，即接受没有 `Origin` 头的请求，或 `Origin` 与请求 Host 一致的请求，而对来自其他站点的浏览器页面返回 403。要让所有来源都通过，可以明确地设为 `func(*http.Request) bool { return true }`。服务端在握手时从 `Subprotocols` 中选定一个子协议，结果通过 `Connection.Subprotocol()` 获取。
+`EnableCompression` 接受客户端的 permessage-deflate 提议（RFC 7692）；此后消息以压缩形式发送，也可能以压缩形式到达，`MaxMessageBytes` 限制的是解压后的消息大小。发送端不保留 deflate 上下文：每条消息从 `sync.Pool` 借一个压缩器，因此连接再多内存也有界。`CheckOrigin` 是跨站 WebSocket 劫持的防线：为 nil 时等价于 `CheckSameOrigin`，即接受没有 `Origin` 头的请求，或 `Origin` 与请求 Host 一致的请求，而对来自其他站点的浏览器页面返回 403。要让所有来源都通过，可以明确地设为 `func(*http.Request) bool { return true }`。服务端选取客户端 `Sec-WebSocket-Protocol` 提议中第一个出现在 `Subprotocols` 里的子协议（顺序以客户端为准，而不是这个列表），结果通过 `Connection.Subprotocol()` 获取；没有匹配时握手照样成功，只是没有子协议，是否 `Close` 由 handler 决定。
 
 ## 客户端
 
@@ -249,6 +248,71 @@ func main() {
 握手完成后，客户端连接的服务方式与服务端完全相同：同一套 `Handler` 回调在引擎 worker 上运行，同样的 `Connection` 方法会按 RFC 6455 的要求为客户端发出的帧加掩码。`DialerConfig` 可以限制握手时间（`HandshakeTimeout`；为 0 表示不限时）、限制入站消息（`MaxMessageBytes`）、提供子协议、开启压缩、设置 `wss://` 使用的 `crypto/tls` 配置，或者用 `Dial` 钩子替换拨号过程（例如走 SOCKS 代理）。`Go` 不接收回调，而是返回一个 `DialFuture`：先 `future := dialer.Go(url, nil, handler)`，
 再 `conn, resp, err := future.Wait()`。
 
+## 基于 TLS 的 wss://
+
+安全 WebSocket 就是 TLS（[10-tls.md](10-tls.zh-CN.md)）后面的 HTTP 栈，再在其中调用 `Upgrade`；客户端则用一个 `DialerConfig.TLSConfig` 信任服务端证书的 dialer。使用 `tlstest` 证书时两端必须在同一个进程里，所以这个程序在同一个引擎上既服务又拨号：
+
+```go
+package main
+
+import (
+	"log"
+	stdhttp "net/http"
+
+	fib "github.com/lesismal/fib"
+	fibhttp "github.com/lesismal/fib/http"
+	fibtls "github.com/lesismal/fib/tls"
+	"github.com/lesismal/fib/tlstest"
+	"github.com/lesismal/fib/websocket"
+)
+
+func main() {
+	serverTLS, clientTLS, err := tlstest.Configs()
+	if err != nil {
+		panic(err)
+	}
+	ws := websocket.NewHandler(websocket.HandlerFuncs{
+		Message: func(c *websocket.Connection, op websocket.Opcode, data []byte) {
+			_ = c.WriteMessage(op, data)
+		},
+	})
+	app := fibhttp.HandlerFunc(func(c *fibhttp.Context) {
+		if c.Request.URL.Path == "/ws" {
+			_, _ = ws.Upgrade(c, nil)
+			return
+		}
+		_ = c.String(stdhttp.StatusOK, "hello over %s\n", c.Request.Proto)
+	})
+	engine, err := fib.New(fib.DefaultConfig(), fib.Binding{
+		Addr:    "127.0.0.1:8443",
+		Handler: fibtls.NewServer(fibhttp.ConfigureTLS(serverTLS), fibhttp.NewHandler(app)),
+	})
+	if err != nil {
+		panic(err)
+	}
+	defer engine.Close()
+	go func() { _ = engine.Run() }()
+
+	config := websocket.DefaultDialerConfig()
+	config.TLSConfig = clientTLS // nil means the system roots, for a real certificate
+	dialer := websocket.NewDialer(engine, config)
+	got := make(chan string, 1)
+	conn, _, err := dialer.Go("wss://127.0.0.1:8443/ws", nil, websocket.HandlerFuncs{
+		Message: func(c *websocket.Connection, op websocket.Opcode, data []byte) {
+			got <- string(data) // a string is a copy; data itself is borrowed
+		},
+	}).Wait()
+	if err != nil {
+		panic(err)
+	}
+	_ = conn.WriteText("hello over wss")
+	log.Printf("echo: %s", <-got)
+	_ = conn.Close(websocket.CloseNormal, "")
+}
+```
+
+服务端就是第 [07](07-http2.zh-CN.md) 章的 HTTPS 服务：协商到 h2 的浏览器在一条流上以扩展 CONNECT 打开 WebSocket，而 fib 的 dialer 讲 HTTP/1.1，会占用整条连接；同一个 `Upgrade` 调用两者都能服务。
+
 ## 坑与限制
 
 - **只绑 WebSocket 的端口无法应答普通 HTTP。** 同一个端口要同时服务两者时，请在 HTTP handler 中调用 `Upgrade`，并在调用后立即返回。
@@ -257,6 +321,7 @@ func main() {
 - **发送从不阻塞。** 停止读取的对端会不断堆积帧。慢对端要自己关闭；在引擎上设置 `MaxWriteQueueBytes` 或 `MaxPendingBytes`（见 [02-engine.md](02-engine.zh-CN.md)）是更粗放的做法。
 - **自定义 `Ping` 会关闭默认 pong。** 仍需 RFC 6455 的回复时，自己调用 `c.Pong(payload)`。
 - **`CheckOrigin` 为 nil 不等于“全部放行”。** 它是 `CheckSameOrigin`；来自其他站点的浏览器页面会被 403 拒绝。
+- **不要保留握手请求。** 从 `Open` 的 `*http.Request` 中复制需要的内容；调用 `Upgrade` 的 HTTP handler 返回后，这个请求对象会被复用。
 
 ## 相关文档
 

@@ -54,6 +54,8 @@ func main() {
 curl --http3 -k https://127.0.0.1:8443/   # needs curl built with HTTP/3
 ```
 
+Many curl builds (macOS's among them) lack HTTP/3; the client program [below](#the-client) is the fallback.
+
 ## One handler for h1, h2 and h3
 
 One engine can serve HTTP/1.x and h2 over TCP on a port and HTTP/3 over UDP on the same port number — they are different transports, so the numbers may match. The TLS config is split because each stack has its own ALPN: `fibhttp.ConfigureTLS` for h1/h2, `http3.ConfigureTLS` for h3. The handler `app` is shared.
@@ -105,7 +107,7 @@ func main() {
 }
 ```
 
-An HTTP/1.1 or HTTP/2 client sees `Alt-Svc: h3=":8443"; ma=86400` and may switch its next requests to QUIC; a client that was given the h3 address directly needs no header.
+An HTTP/1.1 or HTTP/2 client sees `Alt-Svc: h3=":8443"; ma=86400` (`curl -ki https://127.0.0.1:8443/` shows it) and may switch its next requests to QUIC; a client that was given the h3 address directly needs no header. A field set on `c.Header()` before answering goes out with `String`, `Respond`, `WriteResponse` and the `ResponseWriter` methods alike.
 
 ## Announcing HTTP/3 with Alt-Svc
 
@@ -138,7 +140,7 @@ The engine-level UDP settings still apply: `Config.UDPIdleTimeout` (60s by defau
 
 ## The client
 
-`http3.NewClient(engine, config)` sends requests over connections an engine dials, one multiplexed connection per host:port, non-blocking, with `Do` for a callback and `Go` returning a `Future`. The engine can be a client-only engine with no bindings.
+`http3.NewClient(engine, config)` sends requests over connections an engine dials, one multiplexed connection per host:port, non-blocking, with `Do` for a callback and `Go` returning a `Future`. The engine can be a client-only engine with no bindings, or, as here, a server's own: `tlstest` certificates are trusted only inside the process that issued them, so the example runs its server on the same engine and prints `HTTP/3.0 200 OK: hello over HTTP/3.0`. Against a real server, set `TLSConfig` to one that trusts its certificate (or leave it nil for the system roots).
 
 ```go
 package main
@@ -149,22 +151,32 @@ import (
 	stdhttp "net/http"
 
 	fib "github.com/lesismal/fib"
+	fibhttp "github.com/lesismal/fib/http"
 	"github.com/lesismal/fib/http3"
 	"github.com/lesismal/fib/tlstest"
 )
 
 func main() {
-	engine, err := fib.New(fib.DefaultConfig()) // a client engine has no bindings
+	// tlstest issues its certificate once per process, so the server the
+	// client trusts runs in this program too, on the same engine.
+	serverTLS, clientTLS, err := tlstest.Configs()
+	if err != nil {
+		panic(err)
+	}
+	app := fibhttp.HandlerFunc(func(c *fibhttp.Context) {
+		_ = c.String(stdhttp.StatusOK, "hello over %s\n", c.Request.Proto)
+	})
+	engine, err := fib.New(fib.DefaultConfig(), fib.Binding{
+		Network: "udp",
+		Addr:    "127.0.0.1:8443",
+		Handler: http3.NewHandler(serverTLS, app),
+	})
 	if err != nil {
 		panic(err)
 	}
 	defer engine.Close()
 	go engine.Run()
 
-	_, clientTLS, err := tlstest.Configs()
-	if err != nil {
-		panic(err)
-	}
 	config := http3.DefaultClientConfig()
 	config.TLSConfig = clientTLS
 	client := http3.NewClient(engine, config)
@@ -183,7 +195,7 @@ func main() {
 	if err != nil {
 		panic(err)
 	}
-	fmt.Printf("%s: %s", resp.Status, body)
+	fmt.Printf("%s %s: %s", resp.Proto, resp.Status, body) // HTTP/3.0 200 OK: hello over HTTP/3.0
 }
 ```
 
@@ -194,9 +206,9 @@ The response body is buffered whole before the callback by default; `ClientConfi
 - **NAT rebinding is followed, active migration is not.** A 1-RTT packet from a new address is routed by its Connection ID, validated with `PATH_CHALLENGE`, and the connection continues there (RFC 9000 §9.3); the server still advertises `disable_active_migration`, so a client that probes a path of its own choosing will not hear the answer.
 - **0-RTT is off by default.** `http3.Config.EarlyData` on the server and `ClientConfig.EarlyData` on the client enable it; a request that arrives as early data carries `Early-Data: 1`, and only GET, HEAD, OPTIONS and TRACE are served, anything else is answered 425 Too Early. Early data is replayable by design, so the safe-method rule is the protection.
 - **No server push.** `Context.Push` returns `stdhttp.ErrNotSupported` over HTTP/3; use 103 Early Hints instead.
-- **No DATAGRAM or WebTransport.** A DATAGRAM frame from the peer is an unknown frame and closes the connection.
+- **No DATAGRAM or WebTransport.** A DATAGRAM frame from the peer is an unknown frame and closes the connection with FRAME_ENCODING_ERROR.
 - **Memory bounds** are `MaxConcurrentStreams × MaxBodyBytes` per connection (100 × 16MB with the defaults) for whole bodies, and a streamed body is bounded by its QUIC stream window (1MB).
-- **Engine shutdown**: `Engine.Shutdown` sends GOAWAY, finishes in-flight requests and closes with `H3_NO_ERROR`; `Engine.Stop`/`Close` alone send neither GOAWAY nor CONNECTION_CLOSE, so clients find out only when they time out.
+- **Engine shutdown**: `Engine.Shutdown` sends GOAWAY, finishes in-flight requests and closes with `H3_NO_ERROR`; `Engine.Close` sends CONNECTION_CLOSE (`H3_NO_ERROR`) at once, ending the requests in flight, and `Engine.Stop` leaves the connections open until `Close`.
 - **Platforms**: like `fib/http`, `fib/http3` builds only on the native Linux, macOS and Windows backends; on the portable backend the package is empty.
 - **Interop**: the conformance suite runs the server and the client against quic-go and quiche in CI; see [HTTP/3](../http3.md#conformance-tests).
 
@@ -206,6 +218,7 @@ The response body is buffered whole before the callback by default; `ClientConfi
 - **Keep `MaxIdleTimeout` below `UDPIdleTimeout`.** With the defaults QUIC's 30s is below the engine's 60s; raising the former past the latter lets the engine reap quiet connections first.
 - **Do not write to `Context.Conn`.** On HTTP/3 it is the engine's UDP connection; responses must go through `Context` or the stream framing dies.
 - **Two bindings, two protocols, two ports or one number.** TCP :8443 and UDP :8443 are distinct bindings; changing the h1/h2 port without changing the Alt-Svc value sends clients to a port nothing listens on.
+- **Set `Alt-Svc` before answering.** `c.Header()` goes out with every kind of answer, but an `Alt-Svc` in a `WriteResponse` header replaces it, and a change after the response has begun has no effect.
 - **Retries are stream-scoped.** A timeout cancels its own stream and leaves the others; a request whose connection breaks after part of its response arrived fails rather than being repeated.
 - **Handler and request lifetime rules are unchanged.** Request/stream objects are recycled on HTTP/3 too (unless `Config.DisableReuse`); do not keep them past the response and the last `Release`, and do not mutate a `Respond` body after the call.
 - **The tutorial's certificate is a test one.** `tlstest.Configs()` is for examples; browsers will not trust it, and real deployments need a certificate for the origin name.

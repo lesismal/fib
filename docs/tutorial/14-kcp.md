@@ -114,7 +114,9 @@ func main() {
 `net.Listener`: `Accept` hands out sessions, and `Close` closes them and removes the binding.
 `kcp.Dial` adds a client binding of its own, starts a conversation of a random ID, and returns at
 once — there is no handshake to wait for, and the server hears of the session with the first
-segment. Neither may be called from a callback that the engine's event loop runs.
+segment; `kcp.DialConv` is the same with a conversation ID of the caller's. Neither may be called
+from a callback that the engine's event loop runs. A session reports `RTT()` and `Stats()`
+(segments sent, retransmitted, FEC-recovered), and `Server.Sessions()` lists the open ones.
 
 ## net/http on KCP
 
@@ -240,6 +242,9 @@ conn, err := kcp.Dial(engine, "127.0.0.1:4002", kcp.Config{
 		log.Printf("message: %s", msg)
 	},
 })
+if err != nil {
+	panic(err)
+}
 if err := conn.Send([]byte("hello")); err != nil {
 	panic(err)
 }
@@ -269,6 +274,8 @@ cfg := kcp.Config{
 	DeadLink: 20,
 	// Segments queued or in flight before Write blocks; twice the send window when zero.
 	WriteQueue: 512,
+	// Pack Write's bytes into whole segments, as kcptun does, instead of a message per Write.
+	StreamMode: true,
 }
 srv, err := kcp.Listen(engine, "127.0.0.1:4000", kcp.ServerConfig{Config: cfg})
 if err != nil {
@@ -290,7 +297,7 @@ the session has none, but their parity is not used:
 
 ```go
 key := bytes.Repeat([]byte{0x2a}, 32) // already derived; kcptun derives with PBKDF2-SHA1
-crypt, err := kcp.NewCrypt("aes", key) // "none", "xor", "aes", "aes-128", "aes-192", "3des", "aes-128-gcm"
+crypt, err := kcp.NewCrypt("aes", key) // "null", "none", "xor", "aes", "aes-128", "aes-192", "3des", "aes-128-gcm"
 if err != nil {
 	panic(err)
 }
@@ -305,7 +312,8 @@ if err != nil {
 }
 ```
 
-`NewCrypt` takes kcptun's cipher names and a key that is already derived: kcptun derives it with
+`NewCrypt` takes kcptun's cipher names (`"null"` gives a nil `*Crypt`: no crypt at all, while
+`"none"` keeps kcp-go's nonce and CRC header unencrypted) and a key that is already derived: kcptun derives it with
 `pbkdf2.Key(sha1.New, passphrase, []byte("kcp-go"), 4096, 32)`, so a fib server serves kcptun
 clients only with that derivation in front. For the ciphers the standard library does not have —
 blowfish, cast5, twofish, tea, xtea, sm4 — `NewBlockCrypt` wraps any `cipher.Block` of 8 or 16
@@ -315,29 +323,71 @@ byte blocks from wherever it is implemented; `NewAESCrypt`, `NewAESGCMCrypt`, `N
 ## Sans-IO KCP
 
 `kcp.New` is the protocol alone, for a transport of the application's own. The caller supplies the
-time and moves the packets:
+time and moves the packets. A complete program, two ends of one conversation wired back to back in
+memory:
 
 ```go
-kcpConn := kcp.New(7, func(packet []byte) {
-	_ = udpConn.Write(packet) // packet is valid only for the call
-})
-now := uint32(time.Now().UnixMilli())
-if err := kcpConn.Input(packet, now); err != nil {
-	log.Print(err)
-}
-_ = kcpConn.Send([]byte("hello"))
-if at, due := kcpConn.NextFlush(now); due && int32(at-now) <= 0 {
-	kcpConn.Flush(now)
-}
-if size := kcpConn.PeekSize(); size > 0 {
-	buf := make([]byte, size)
-	if _, err := kcpConn.Recv(buf); err != nil {
-		log.Print(err)
+package main
+
+import (
+	"log"
+	"time"
+
+	"github.com/lesismal/fib/kcp"
+)
+
+func main() {
+	// Two ends of conversation 7, wired back to back: what one outputs is
+	// queued for the other's Input. A real transport would write it to a
+	// socket instead; output's packet is valid only for the call.
+	var toB, toA [][]byte
+	a := kcp.New(7, func(packet []byte) { toB = append(toB, append([]byte(nil), packet...)) })
+	b := kcp.New(7, func(packet []byte) { toA = append(toA, append([]byte(nil), packet...)) })
+	a.NoDelay(1, 10, 2, true) // kcptun's fast3
+	b.NoDelay(1, 10, 2, true)
+
+	start := time.Now()
+	clock := func() uint32 { return uint32(time.Since(start).Milliseconds()) }
+
+	if err := a.Send([]byte("hello sans-IO")); err != nil {
+		panic(err)
 	}
+	// flush runs Flush when NextFlush says something is due.
+	flush := func(k *kcp.KCP, now uint32) {
+		if at, due := k.NextFlush(now); due && int32(at-now) <= 0 {
+			k.Flush(now)
+		}
+	}
+	deliver := func(k *kcp.KCP, packets *[][]byte, now uint32) {
+		for _, p := range *packets {
+			if err := k.Input(p, now); err != nil {
+				log.Print(err)
+			}
+		}
+		*packets = (*packets)[:0]
+	}
+	for i := 0; i < 100; i++ {
+		now := clock()
+		flush(a, now)
+		deliver(b, &toB, now)
+		flush(b, now) // b's acknowledgements
+		deliver(a, &toA, now)
+		if size := b.PeekSize(); size > 0 {
+			buf := make([]byte, size)
+			n, err := b.Recv(buf)
+			if err != nil {
+				panic(err)
+			}
+			log.Printf("b received %q; a still has %d segments in flight", buf[:n], a.WaitSend())
+			return
+		}
+		time.Sleep(time.Millisecond)
+	}
+	log.Print("nothing arrived")
 }
 ```
 
-`Input` copies what the segments it keeps; `NextFlush` says when `Flush` next has something to
+`Input` copies the data of the segments it keeps; `NextFlush` says when `Flush` next has something to
 do; `Send` keeps the message it is given until it is sent, up to 255 segments, unless stream mode
 is on. A `KCP` is not safe for concurrent use and times are milliseconds on any clock, wrapping
 at 2^32. This is the piece to use under an application-level relay that cannot lend fib a UDP
@@ -385,9 +435,9 @@ full mapping is in [docs/kcp.md](../kcp.md#compatibility-with-kcp-go).
 - **One session per peer address.** A peer whose address changes (NAT rebinding, mobile handover)
   looks like a new peer: the old session idles out, and the new one starts only from sequence
   number 0.
-- **Sessions cost a socket and a timer only when busy.** An idle session has no timer, but the UDP
-  binding and the session entry stay until `IdleTimeout`; bound them with `MaxSessions` and a
-  sensible idle timeout.
+- **Idle sessions still hold their place.** An idle session has no timer, but its entry stays until
+  `IdleTimeout` — with a UDP binding of its own for a dialed session, while a `Server`'s sessions
+  share its binding; bound them with `MaxSessions` and a sensible idle timeout.
 - **Do not call `Listen` or `Dial` from an engine callback.** Both wait for the engine's event
   loop, which that callback would be holding.
 

@@ -27,18 +27,20 @@ The tour, in order: [1](#1-async-responses-retain-and-release) async responses �
 **The trick.** A response is reference counted: serving a request holds one reference, and the
 handler can take another with `Retain` and give it back later with `Release`. Between the two the
 handler returns and its worker goes back to the pool, so a slow backend costs no goroutine.
-`Context.Async(fn)` wraps the pair for a pool of your own.
+`Context.Async(fn)` wraps the pair for a pool of your own: it takes the `Retain` when called and
+returns a func that runs `fn` once and then releases, so don't `Retain` again yourself, and make sure
+the func runs (a func never called is a `Retain` never released).
 
 ```go
-c.Retain()               // the response now waits for a Release
-pool.Go(c.Async(func() { // takes the Retain, runs fn, releases even if fn panics
+pool.Go(c.Async(func() { // Async retains now; the func runs fn, then releases even if fn panics
 	_ = c.Respond(200, "application/json", result)
 }))
 ```
 
 **The trap.** Every `Retain` needs exactly one `Release` on every path, including the error and
-cancellation paths; a missing one pins the connection forever, and there is no timeout. After the
-last `Release` the request object may already belong to another request, so copy what you keep
+cancellation paths; nothing times a `Retain` out, so a missing `Release` holds the connection (and,
+on HTTP/1, every request pipelined behind it) until the peer or a connection timeout ends it. After
+the last `Release` the request object may already belong to another request, so copy what you keep
 first.
 
 Below is the whole pattern in a program, including the copy of a borrowed query value:
@@ -117,7 +119,7 @@ httpConfig := fibhttp.DefaultConfig()
 httpConfig.StreamRequestBody = true
 httpConfig.StreamRequestBodyThreshold = 0 // stream every body
 httpConfig.MaxStreamedBodyBytes = 64 << 30
-httpConfig.ReadTimeout = 0 // a streamed body is still arriving while the handler runs
+httpConfig.ReadBodyTimeout = time.Hour // the 5-minute default would cut a long upload off
 
 app := fibhttp.HandlerFunc(func(c *fibhttp.Context) {
 	if c.Request.ContentLength > limit {
@@ -136,10 +138,11 @@ app := fibhttp.HandlerFunc(func(c *fibhttp.Context) {
 })
 ```
 
-**The trap.** A streamed body is bounded by `ReadTimeout` as well, because it is still arriving
-while the handler runs; raise it for large uploads or bound the body with `ReadBodyTimeout`
-instead. `Request.Body` cannot be read once `OnBody` has taken it over, and the callback must not
-block — it holds the worker.
+**The trap.** A streamed body is still bounded by the read timeouts while it arrives:
+`ReadBodyTimeout` (5 minutes in `DefaultConfig`, from the end of the header) and `ReadTimeout` (off
+by default, from the first byte). Raise them for large uploads, or lift them for one request with
+`c.SetReadDeadline`. `Request.Body` cannot be read once `OnBody` has taken it over, and the
+callback must not block — it holds the worker.
 
 The program below streams a 2MiB upload into a server that only counts bytes:
 
@@ -165,7 +168,7 @@ func main() {
 	httpConfig.StreamRequestBody = true
 	httpConfig.StreamRequestBodyThreshold = 0
 	httpConfig.MaxStreamedBodyBytes = 1 << 30
-	httpConfig.ReadTimeout = 0 // the body streams while the handler runs
+	httpConfig.ReadBodyTimeout = 0 // no limit: the body streams while the handler runs
 
 	var received atomic.Int64
 	app := fibhttp.HandlerFunc(func(c *fibhttp.Context) {
@@ -221,8 +224,9 @@ See [§2](../hacks.md#2-large-bodies-and-onbody-no-buffering-no-goroutine-built-
 **The trick.** On HTTP/2 and HTTP/3 one connection carries many requests, and their handlers run
 on the engine's handler pool (`Engine.HandlerPool()`), not on the worker reading the connection.
 `StreamPool.MaxConcurrentHandlers` caps how many of one connection's requests run at a time: the
-next one runs on the reading worker, so the peer's flow control carries the limit and the server
-queues nothing.
+Nth runs on the connection's own reader, which reads nothing more until it returns, so the peer's
+flow control carries the limit and the server queues nothing. Zero, the default, leaves only
+`MaxConcurrentStreams` as the bound.
 
 ```go
 httpConfig := fibhttp.DefaultConfig()
@@ -256,9 +260,11 @@ Data: func(c *fib.Connection, data []byte) {
 },
 ```
 
-**The trap.** A `Flush` per message throws the benefit away. And the write watermark must exceed one
-round's replies, not one message: a round reads at most `ReadBufferSize` (16KiB by default), so
-keep `WriteBufferHighWatermark` well above that or every pipeline pauses reads for nothing.
+**The trap.** A `Flush` per message throws the benefit away. And the write watermark must exceed
+the replies of one read, not one message: a round keeps reading in `ReadBufferSize` (16KiB by
+default) pieces while the socket has data, checks what its cork holds against
+`WriteBufferHighWatermark` after each, and flushes every 256KiB it reads; keep the watermark (64-256KiB
+by default) well above one read's replies, or every pipeline pauses reads for nothing.
 
 See [§4](../hacks.md#4-pipeline-one-write-per-round) and
 [§8](../hacks.md#8-read-backpressure-holdreads).
@@ -288,9 +294,10 @@ See [§6](../hacks.md#6-object-reuse-using-context-like-fasthttp) and
 ## 6. Read backpressure: HoldReads
 
 **The trick.** On the write side fib pauses reads at the watermark by itself; on the read side the
-application decides. `HoldReads(true)` unregisters read interest, the data stays in the kernel
-buffer and TCP's window slows the peer; `HoldReads(false)` re-registers it, and whatever piled up
-is delivered without another byte from the peer. It is cheap because the connection stops being
+application decides. `HoldReads(true)` stops the connection reading (a round in progress stops
+before its next read), the data stays in the kernel buffer and TCP's window slows the peer;
+`HoldReads(false)` resumes, and whatever piled up is delivered without another byte from the peer.
+It may be called from any goroutine; holds do not nest, the last call wins. It is cheap because the connection stops being
 scheduled instead of holding a worker.
 
 ```go
@@ -461,10 +468,14 @@ func(c *fibhttp.Context) {
 }
 ```
 
-**The trap.** Streamed responses belong to HTTP/1.x: there `Write` and `Flush` go out at once, while
-on h2/h3 the response is buffered and sent whole after the handler returns, so very large responses
-want `FileCache`/`SendFile` instead. `http.Hijacker` is not implemented, and on h2/h3 you must not
-call `Context.Conn.Send`; go through `Respond`/`WriteResponse`.
+**The trap.** A response written through `Write`/`Flush` streams on all three protocols, paced by
+the client: once 64KB of it is unsent, `Write` waits (bounded by `WriteTimeout`), so a handler that
+streams a large body holds its goroutine while the client is slow — stream from a retained
+goroutine of your own, or use `FileCache`/`SendFile` for files. `c.Header()` set before answering
+goes out with `Write` and with `Respond`, `String`, `JSON` and `WriteResponse` alike (a whole
+response's own fields of the same name win); changed after the response has begun, it has no
+effect. `http.Hijacker` is not implemented, and on h2/h3 you must not call
+`Context.Conn.Send`; go through `Respond`/`WriteResponse`.
 
 See [§13](../hacks.md#13-one-handler-for-h1--h2--h3-and-upgrade--tunnel).
 
@@ -511,10 +522,12 @@ func (a acker) OnDatagrams(c *fib.Connection, datagrams [][]byte) {
 }
 ```
 
-**The trap.** The datagrams come from `bufferpool`: give them back with `bufferpool.Put` when done
-and never keep the slice after `OnDatagrams` returns. UDP sends never queue — when the socket has no
-room the datagram is dropped and the send returns an error — and with `ReusePort` a NAT rebind can
-land a datagram on another poller, so key peers by address, not by connection.
+**The trap.** Each datagram is the handler's own copy, a `bufferpool` buffer it may give back with
+`bufferpool.Put` once nothing refers to it; the `[][]byte` holding them must not be kept after
+`OnDatagrams` returns. UDP sends never queue — when the socket has no room the datagram is dropped
+and the send returns an error. With `ReusePort` (the default) a peer `OpenUDPPeer` opened may reply
+to another poller's socket, which opens a second connection for the same address, and a peer whose
+NAT rebinds arrives as a new peer: key peer state by address, not by connection.
 
 See [§15](../hacks.md#15-udp-datagramshandler-and-sendbatch).
 
@@ -526,7 +539,8 @@ work, and don't share a heap when a process of its own is cheaper.
 - **A pool of your own** for async handler work, never the engine's pool: an engine worker submits
   to your pool, and if it were the same pool a full queue could leave every worker stuck
   submitting. `SharedTaskPool` (on by default) shares workers between engines of one `Name`, and
-  the first engine's settings win.
+  the first engine's settings win. `Config.SetTaskPool(p)` is the other direction: it makes the
+  engine run its connections on `p`, which the caller owns and stops after the engine has closed.
 - **prefork** (Linux) runs the same program in several children, each with its own heap and
   collector, sharing the listening port through `SO_REUSEPORT`. Initialization the children need
   goes in `serve`; code before `Run` runs in the master and every child.
@@ -537,10 +551,16 @@ work, and don't share a heap when a process of its own is cheaper.
   (`SetRetainedBytes`), and your buffers can flow through the same pool as fib's.
 
 ```go
-pool := taskpool.NewAdaptive(taskpool.AdaptiveConfig{
+jobs := taskpool.NewAdaptive(taskpool.AdaptiveConfig{
 	Name: "jobs", MinWorkers: 16, MaxWorkers: 4096, QueueSize: 10000,
 })
-config.SetTaskPool(pool) // the engine runs connections on it; the engine never stops it
+defer jobs.Stop()
+
+app := fibhttp.HandlerFunc(func(c *fibhttp.Context) {
+	jobs.Go(c.Async(func() { // async work on a pool of its own, not the engine's
+		_ = c.Respond(200, "text/plain", slowQuery())
+	}))
+})
 
 buf := bufferpool.Get(4096) // len 4096; contents are the previous user's
 defer bufferpool.Put(buf)   // after Put, not even a sub-slice may be used
@@ -583,7 +603,7 @@ See [§19](../hacks.md#19-cheat-sheet-what-may-be-called-from-which-goroutine).
 4. Calling `Respond` after `Release`, or keeping `data` from `OnData`/`OnBody`/`OnFrame`.
 5. A `bufio.Reader` on a `Connection`, or expecting `Read` to block.
 6. A write watermark smaller than one round's replies.
-7. `StreamRequestBody` with the default `ReadTimeout`, so large uploads time out.
+7. `StreamRequestBody` with the default `ReadBodyTimeout` (5 minutes), so large uploads time out.
 8. Async work on the engine's own pool; raising `GOMAXPROCS`; closing your own connection inside
    `OnData` and then waiting for `OnClose`.
 
@@ -596,9 +616,10 @@ See [§20](../hacks.md#20-anti-patterns).
   [03-handlers.md](03-handlers.md) is still the right shape for most code.
 - **The tricks do not compose blindly.** Borrowed memory plus an async branch, or a `Cork` held
   across goroutines, are how the same two APIs that make fib fast corrupt data and deadlock.
-- **The backend differs by platform.** IOPollers need epoll/kqueue, `SendFile` and UDP batches
-  have platform-specific fast paths, and `SendFile`/`splice` are Linux/macOS territory. Verify on
-  the system you deploy to.
+- **The backend differs by platform.** IOPollers need epoll/kqueue (Windows keeps one loop),
+  `SendFile` uses `sendfile(2)` on Linux, macOS, FreeBSD and DragonFly and `TransmitFile` on Windows
+  but reads in chunks on NetBSD/OpenBSD, `SendBatch` is one call only on Linux and macOS, and
+  `SpliceTo` is Linux-only. Verify on the system you deploy to.
 - **Measure, don't guess.** Every "X times faster" in this chapter's guide comes with a benchmark
   and a machine; reproduce it on yours before making it a policy.
 

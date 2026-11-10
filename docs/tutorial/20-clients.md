@@ -40,9 +40,8 @@ Three rules follow from that design and every example below depends on them:
   the client. A request whose engine is gone can only fail by its timeout.
 
 By default a response body is buffered whole before its callback runs, and `ClientResponse`
-embeds the standard `*http.Response`. The streaming style is opt-in per client
-(`StreamResponseBody`) or per request (`Framed`/`Upgrade`), and is shown in
-[Streaming bodies](#streaming-bodies).
+embeds the standard `*http.Response`. Streaming is opt-in per client (`StreamResponseBody`), and is
+shown in [Streaming bodies](#streaming-bodies).
 
 ## Asynchronous dialing
 
@@ -139,9 +138,11 @@ A request body with a `ContentLength` of up to 1MB — what `net/http.NewRequest
 `bytes.Buffer`, `bytes.Reader` or `strings.Reader` — is read whole by `Do` and sent with the
 header. Any other body is read piece by piece by a goroutine of its own and paced by the server
 (64KB unsent at most), so a file upload streams instead of loading into memory. The body is closed
-once sent. Requests a connection failed are retried once when they are idempotent and their body
-can be re-read through `req.GetBody`; a request with `Expect: 100-continue` sends its header first
-and its body once the server answers.
+once sent. A request whose connection fails before any of its response has arrived is sent again,
+once, on another connection when its method is idempotent and its body can be re-read through
+`req.GetBody`; one the server reports unprocessed (HTTP/2 `GOAWAY`, `REFUSED_STREAM`) is resent
+whatever its method. A request with `Expect: 100-continue` sends its header first and its body once
+the server answers 100, or after `ExpectContinueTimeout` (1s in the defaults).
 
 The complete program below runs a server and a client on one engine: the future form for the
 first request, the callback form for the second.
@@ -301,7 +302,9 @@ HTTP/3 is always encrypted and always over QUIC on a UDP socket, so the `http3.C
 1.3 config and an `https://` URL. Where the address of the HTTP/3 endpoint is known, dial that
 origin directly; where it is not — the usual case for a web server that advertises HTTP/3 on its
 TCP responses — wrap the TCP and HTTP/3 clients in `http3.AltSvcClient`, which follows the
-origin's `Alt-Svc` header:
+origin's `Alt-Svc` header. The program below serves the origin on the same engine (HTTPS on TCP and
+HTTP/3 on UDP, both on port 9443) and sends two requests; it prints `HTTP/2.0 hello` and then
+`HTTP/3.0 hello`:
 
 ```go
 package main
@@ -314,16 +317,31 @@ import (
 	fib "github.com/lesismal/fib"
 	fibhttp "github.com/lesismal/fib/http"
 	"github.com/lesismal/fib/http3"
+	fibtls "github.com/lesismal/fib/tls"
 	"github.com/lesismal/fib/tlstest"
 )
 
 func main() {
-	_, clientTLS, err := tlstest.Configs() // a throwaway certificate for localhost
+	serverTLS, clientTLS, err := tlstest.Configs() // a throwaway certificate for localhost
 	if err != nil {
 		panic(err)
 	}
 
-	engine, err := fib.New(fib.DefaultConfig())
+	// The origin: HTTPS on TCP, announcing HTTP/3 on the same port over UDP.
+	app := fibhttp.HandlerFunc(func(c *fibhttp.Context) {
+		if !c.Request.ProtoAtLeast(3, 0) {
+			c.Header().Set("Alt-Svc", http3.AltSvc(9443))
+		}
+		_ = c.String(stdhttp.StatusOK, "hello") // sends Alt-Svc along with it
+	})
+	config := fib.DefaultConfig()
+	config.LogSettings = false
+	engine, err := fib.New(config,
+		fib.Binding{Addr: "127.0.0.1:9443",
+			Handler: fibtls.NewServer(fibhttp.ConfigureTLS(serverTLS), fibhttp.NewHandler(app))},
+		fib.Binding{Network: "udp", Addr: "127.0.0.1:9443",
+			Handler: http3.NewHandler(http3.ConfigureTLS(serverTLS), app)},
+	)
 	if err != nil {
 		panic(err)
 	}
@@ -341,34 +359,39 @@ func main() {
 	// The first request to an origin goes over TCP; once its response has
 	// carried Alt-Svc: h3=..., the next ones take QUIC to that endpoint.
 	client := http3.NewAltSvcClient(tcp, quic)
-	defer client.Close()
+	defer client.Close() // closes both clients, before the engine
 
-	req, err := stdhttp.NewRequest(stdhttp.MethodGet, "https://localhost:8443/", nil)
-	if err != nil {
-		panic(err)
+	for range 2 {
+		req, err := stdhttp.NewRequest(stdhttp.MethodGet, "https://127.0.0.1:9443/", nil)
+		if err != nil {
+			panic(err)
+		}
+		resp, err := client.Go(req).Wait()
+		if err != nil {
+			panic(err)
+		}
+		body, _ := io.ReadAll(resp.Body)
+		_ = resp.Body.Close()
+		fmt.Println(resp.Proto, string(body))
 	}
-	resp, err := client.Go(req).Wait()
-	if err != nil {
-		panic(err)
-	}
-	defer resp.Body.Close()
-	body, _ := io.ReadAll(resp.Body)
-	fmt.Println(resp.Proto, string(body))
 }
 ```
 
-The server side of that handshake is chapter [08-http3.md](08-http3.md): a UDP binding served by
+The server side is chapter [08-http3.md](08-http3.md): a UDP binding served by
 `http3.NewHandler(http3.ConfigureTLS(tlsConfig), app)`, and `http3.AltSvc(port)` in a TCP
-response's header. A QUIC attempt that fails falls back to TCP for a repeatable request, and the
-origin stays on TCP for a while, so a network that blocks UDP costs one timeout rather than one
-per request. `ClientStats` reports resumption and 0-RTT (`EarlyData`).
+response's header. Set that header through `c.Header()` before answering; `String`, `Respond`,
+`WriteResponse` and `Write` all send it. A QUIC attempt that fails falls back to TCP for a repeatable
+request, and the origin stays on TCP for 30 seconds, so a network that blocks UDP costs one timeout
+rather than one per request. `quic.Stats()` reports resumptions (`Resumed`) and 0-RTT (`EarlySent`,
+`EarlyAccepted`, `EarlyRejected`, `TooEarly`) once `quicConfig.EarlyData` is on.
 
 ## WebSocket client
 
 `websocket.Dialer` performs the opening handshake over an engine connection and then serves the
 client connection with the same `HandlerFuncs` as a server connection — the same `OnMessage`,
 `OnFrame`, `WriteMessage` and `Close` from chapter [09-websocket.md](09-websocket.md). The
-handshake returns the connection and the server's `*http.Response`:
+handshake returns the connection and the server's `*http.Response`. The program below dials an echo
+server it runs on the same engine and prints `open, subprotocol: chat` and `got: hello`:
 
 ```go
 package main
@@ -383,19 +406,31 @@ import (
 )
 
 func main() {
-	engine, err := fib.New(fib.DefaultConfig())
+	// A server to talk to, on the same engine: it echoes, and speaks "chat".
+	serverConfig := websocket.DefaultConfig()
+	serverConfig.Subprotocols = []string{"chat"}
+	serverConfig.EnableCompression = true
+	echo := websocket.NewHandlerWithConfig(serverConfig, websocket.HandlerFuncs{
+		Message: func(c *websocket.Connection, op websocket.Opcode, data []byte) {
+			_ = c.WriteMessage(op, data)
+		},
+	})
+	config := fib.DefaultConfig()
+	config.LogSettings = false
+	engine, err := fib.New(config, fib.Binding{Addr: "127.0.0.1:9080", Handler: echo})
 	if err != nil {
 		panic(err)
 	}
 	go func() { _ = engine.Run() }()
 	defer func() { engine.Stop(); _ = engine.Close() }()
 
-	config := websocket.DefaultDialerConfig()
-	config.HandshakeTimeout = 5 * time.Second
-	config.Subprotocols = []string{"chat"}
-	config.EnableCompression = true
-	dialer := websocket.NewDialer(engine, config)
+	dialerConfig := websocket.DefaultDialerConfig()
+	dialerConfig.HandshakeTimeout = 5 * time.Second
+	dialerConfig.Subprotocols = []string{"chat"}
+	dialerConfig.EnableCompression = true
+	dialer := websocket.NewDialer(engine, dialerConfig)
 
+	closed := make(chan struct{})
 	handler := websocket.HandlerFuncs{
 		Open: func(c *websocket.Connection, r *stdhttp.Request) {
 			fmt.Println("open, subprotocol:", c.Subprotocol())
@@ -404,32 +439,34 @@ func main() {
 			fmt.Println("got:", string(data))
 			_ = c.Close(websocket.CloseNormal, "")
 		},
+		Close: func(c *websocket.Connection, code uint16, reason string, err error) {
+			close(closed)
+		},
 	}
 
-	done := make(chan struct{})
-	dialer.Dial("ws://127.0.0.1:8080/ws", nil, handler,
+	dialer.Dial("ws://127.0.0.1:9080/ws", nil, handler,
 		func(conn *websocket.Connection, resp *stdhttp.Response, err error) {
-			defer close(done)
 			if err != nil {
 				if resp != nil {
 					fmt.Println("refused with", resp.StatusCode)
 				}
 				fmt.Println("dial:", err)
+				close(closed)
 				return
 			}
 			_ = conn.WriteText("hello")
 		})
-	<-done
-	time.Sleep(time.Second) // let the server's answer reach the handler
+	<-closed
 }
 ```
 
 The third argument is any `websocket.Handler`, so a client connection can take frames with
 `Frame` or reassembled messages with `Message`, and a `nil` handler accepts the connection and
 ignores its traffic. `Dialer.Go(url, header, handler).Wait()` is the same dial for a caller that
-may block. For a client that must carry a raw byte stream after the handshake, the HTTP client's
-`StartUpgrade` turns the connection into a `*fibhttp.Tunnel` for a `TunnelHandler`; the WebSocket
-handshake itself is that mechanism.
+may block. On failure only `done` runs (with the server's response when it sent one, as the 404 of
+a wrong path); on success the handler's `Open` runs first, then `done`. For a client that must
+carry a raw byte stream after an HTTP/1.1 upgrade of its own, the HTTP client's `StartUpgrade`
+turns the connection into a `*fibhttp.Tunnel` for a `TunnelHandler` once the server answers 101.
 
 ## TLS client options
 
@@ -455,10 +492,11 @@ err = fibtls.DialWithOptions(engine, "tcp", "127.0.0.1:8443", 5*time.Second, tls
 	})
 ```
 
-`ServerName` is filled from the address when the config names none, so one config serves many
-origins. `Blocking: true` runs the handshake through `crypto/tls` on a handshake-pool worker, which
-is the switch to compare the state-machine handshake against; the default parks no goroutine while
-waiting. mTLS, session tickets and cipher choices are chapter [10-tls.md](10-tls.md).
+`done` runs once the TCP connect completes, before the handshake; what it sends waits for the
+handshake and then goes out encrypted, and `myHandler` sees only plaintext. `ServerName` is filled
+from the address when the config names none, so one config serves many origins. `Blocking: true`
+runs the handshake through `crypto/tls` on a handshake-pool worker, which is the switch to compare
+the state-machine handshake against; the default parks no goroutine while waiting. mTLS, session tickets and cipher choices are chapter [10-tls.md](10-tls.md).
 
 ## SOCKS and proxy dialing
 
@@ -549,9 +587,10 @@ The proxy side — authentication, `Allow` rules, CONNECT and UDP ASSOCIATE — 
   neither registers `OnBody` nor reads `Body` leaves the rest to be thrown away (and, past a
   threshold, the connection closed). `data` passed to `OnBody` is valid only during the call; copy
   it to keep it.
-- **`ClientConfig{}` is not `DefaultClientConfig()`.** `NewClient` fills only a few zero fields;
-  a zero `Timeout`, `DialTimeout` or `MaxConnsPerHost` stays zero, which means no timeout and no
-  connection cap.
+- **`ClientConfig{}` is not `DefaultClientConfig()`.** `NewClient` fills only the size limits and
+  `PingTimeout`; a zero `Timeout`, `DialTimeout` or `MaxConnsPerHost` stays zero, which means no
+  timeout and no connection cap, and a zero `MaxIdleConnsPerHost` keeps no idle connection, so every
+  request dials afresh.
 - **One HTTP/1.1 connection carries one request at a time**, and the client does not pipeline. A
   stuck request delays only its own connection; but do set `MaxConnsPerHost` for a burst of slow
   requests, and `MaxPendingPerHost` so a dead host costs a bounded queue rather than a queue that

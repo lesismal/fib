@@ -12,14 +12,16 @@ when the framing and backpressure must be exactly what you decide.
 ## The model
 
 A binding listens; every accepted connection (or, on UDP, every peer address) is a `*fib.Connection`.
-The connection's callbacks run one round at a time on a worker from the engine's pool: `OnData` gets
-a slice of what this round read, `OnOpen` runs on the event-loop goroutine before any round, and
+The connection's callbacks run one round at a time on a worker from the engine's pool: a round reads
+the socket until it is empty and calls `OnData` once per read (up to `ReadBufferSize`, 16KiB by
+default, each), `OnOpen` runs on the event-loop goroutine before any round, and
 `OnClose` runs in the connection's last round, after its last `OnData`. Two consequences shape every
-handler. First, data passed to `OnData` is only valid during the call — copy what you keep. Second,
-a handler must not block: while it runs, its worker is not serving other connections, and the next
-round of the same connection waits. Writes made in a round are corked and reach the socket in one
-write when the round ends, which is fib's pipelining. `Read` on a connection does not block; it
-returns `fib.ErrWouldBlock` when the socket has nothing more right now.
+handler. First, on TCP and Unix connections the data passed to `OnData` is only valid during the
+call — copy what you keep (a UDP datagram is a copy the handler owns; see below). Second, a handler
+must not block: while it runs, its worker is not serving other connections, and the next round of the
+same connection waits. Writes made in a round are corked and reach the socket in one write when the
+round ends (`Config.CoalesceWrites`, on in `DefaultConfig`), which is fib's pipelining. `Read` on a
+connection does not block; it returns `fib.ErrWouldBlock` when the socket has nothing more right now.
 
 ## A TCP echo server and client
 
@@ -85,10 +87,10 @@ not block either.
 
 - `Send(data)` copies `data` before returning, tries the socket first and queues the rest; it never
   waits. `SendParts(header, body)` sends two slices without joining them, and `SendOwned` /
-  `SendShared` avoid the copy when ownership is clear (`SendShared` for one buffer sent to many
-  connections).
+  `SendShared` avoid the copy when ownership is clear: after `SendOwned` the caller must not touch
+  the slice again, and `SendShared` is for one read-only buffer sent to many connections.
 - `Cork()` and `Flush()` control batching by hand, for replies produced outside the connection's
-  round. Inside `OnData` writes are corked automatically until the callback returns.
+  round. Inside `OnData` writes are corked automatically until the round ends.
 - `Read` takes what the socket has, and `SendFile(f, offset, count)` sends a file range by
   `sendfile(2)`/`TransmitFile`, reading it as the peer keeps up.
 - `SetReadDeadline`, `SetWriteDeadline` and `SetDeadline` close the connection when they pass rather
@@ -100,7 +102,7 @@ not block either.
 - `SetHandler` hands the connection to another handler, which is how `mux` switches protocol after
   sniffing the first bytes; `ShuttingDown` reports that the engine or binding is draining.
 - `SetAttachment`/`Attachment` hang per-connection state on the connection; `SendBatch` and
-  `SetUDPIdleTimeout` are the UDP-only members.
+  `SetUDPIdleTimeout` are the UDP members (`SendBatch` on a stream just `Send`s each slice).
 
 Corking is the one call worth learning by heart, because the usual mistake is to send several
 replies from a goroutine and get one write per reply:
@@ -123,19 +125,26 @@ never pass through user space. It is Linux-only, and only for plain TCP or Unix 
 
 ```go
 // proxyNext moves the next n bytes of src to dst through splice(2).
-// Elsewhere, or between connections it cannot splice, it returns fib.ErrSpliceUnsupported.
+// Elsewhere, or between connections it cannot splice, it returns fib.ErrSpliceUnsupported
+// and calls none of the callbacks.
 func proxyNext(src, dst *fib.Connection, n int64) error {
 	return src.SpliceTo(dst, fib.Splice{
-		Begin: func() int64 { return n },
-		Read:  func(moved int64, err error) { log.Printf("moved %d bytes: %v", moved, err) },
-		Written: func(err error) {
+		Begin: func() int64 { return n }, // a negative count gives the splice up
+		Read: func(moved int64, err error) {
 			if err != nil {
-				dst.Close() // a splice that cannot finish cuts dst's stream
+				src.Close() // a failed splice leaves src's reads held
 			}
+		},
+		Written: func(err error) {
+			// fib has already closed dst if err != nil: its stream was cut mid-way.
+			log.Printf("splice done: %v", err)
 		},
 	})
 }
 ```
+
+After a splice that finished, `src`'s reads go back to `OnData` from the byte after the last one
+moved; the callbacks run on `src`'s round, so they must not block either.
 
 ## Reads, deadlines and backpressure
 
@@ -146,7 +155,8 @@ reads it itself, and a rolling idle timeout is a deadline reset on every round:
 func echoWithIdleTimeout() fib.Handler {
 	return fib.HandlerFuncs{
 		Data: func(c *fib.Connection, b []byte) {
-			// OnData gave what this round read; take what is left in the socket.
+			_ = c.Send(b) // what this read delivered
+			// Then take what is left in the socket now, e.g. the rest of a message.
 			buf := make([]byte, 4096)
 			for {
 				n, err := c.Read(buf)
@@ -175,7 +185,9 @@ On a UDP binding each peer address becomes a connection of its own: the first da
 (`OnOpen`), later ones go to the same connection, and it closes after `Config.UDPIdleTimeout` (60
 seconds by default) of silence, with `ErrUDPIdleTimeout` in `OnClose`. A handler implementing
 `fib.DatagramsHandler` receives the datagrams already queued for that peer as one burst and can
-answer the whole burst with one `SendBatch` — the ACK coalescing QUIC and HTTP/3 use:
+answer the whole burst with one `SendBatch` — the ACK coalescing QUIC and HTTP/3 use. Unlike TCP's
+`OnData` slice, each datagram is a copy the handler owns and may keep (or give back with
+`bufferpool.Put` once nothing refers to it); only the `[][]byte` holding a burst must not be kept:
 
 ```go
 package main
@@ -224,24 +236,29 @@ func (burstEcho) OnData(c *fib.Connection, b []byte)         { answer(c, [][]byt
 func (burstEcho) OnDatagrams(c *fib.Connection, d [][]byte)  { answer(c, d) }
 
 func answer(c *fib.Connection, dgrams [][]byte) {
-	if err := c.SendBatch(dgrams); err != nil { // one sendmmsg for the whole burst
+	if err := c.SendBatch(dgrams); err != nil { // one sendmmsg (Linux) for the whole burst
 		log.Print(err)
 	}
 }
 ```
 
 Two details separate UDP from TCP: a datagram is dropped when the socket has no room, with the error
-returned and the connection left open (UDP sends never queue), and `OpenUDPPeer(binding, addr)`
-lets a binding speak first to a peer that has sent nothing. It waits for the socket's event loop, so
-it must not be called from a callback that loop runs. With `ReusePort` on, key peers by address:
-a reply may arrive on another poller and open a second connection for the same peer.
+returned and the connection left open (UDP sends never queue; `SendDatagrams` reports how many of a
+batch went, and `NotifyWritable` says when the socket has room again), and `OpenUDPPeer(binding,
+addr)` lets a binding speak first to a peer that has sent nothing. It waits for the socket's event
+loop, so it must not be called from a callback that loop runs (a UDP peer's `OnOpen`, for one). With
+`ReusePort` on (the default), the peer `OpenUDPPeer` opens lives on the first poller's socket and
+the replies may arrive on another, which opens a second connection for the same address: key what
+you know of such a peer by its address, not its connection. A dialed UDP connection is never idle
+timed out; only a listener's peers are.
 
 ## Unix sockets
 
 A Unix binding is the same as a TCP one with `Network: "unix"` and the socket path as `Addr`. fib
 removes the path when the engine or binding closes, and the path must not exist when it starts, so a
-crashed process leaves a file the next one has to remove. The connections behave exactly like TCP
-ones; there are no addresses, so `RemoteAddr` is the empty address:
+crashed process leaves a file the next one has to remove (`fib.New` fails with "address already in
+use" otherwise). The connections behave exactly like TCP ones; a dialing client has no name, so
+`RemoteAddr` is a `*net.UnixAddr` with an empty name and `RemoteAddrPort` is invalid:
 
 ```go
 package main
@@ -334,8 +351,9 @@ over this same layer, so a raw handler can sit beside them on one engine and eve
 
 ## Pitfalls
 
-- **`OnData`'s slice is borrowed.** It is only valid during the call; keep a copy, or hand it to
-  something that copies (`Send` does). The same holds for UDP datagrams in `OnDatagrams`.
+- **`OnData`'s slice is borrowed** on TCP and Unix. It is only valid during the call; keep a copy,
+  or hand it to something that copies (`Send` does). UDP datagrams are the handler's own, but the
+  `[][]byte` `OnDatagrams` receives is not.
 - **`OnOpen` runs on the event loop.** Blocking there stalls every connection on that loop; do
   handshakes and I/O in `OnData`, or hand work to a pool.
 - **Never block a handler.** One connection runs one round at a time, and blocking occupies a

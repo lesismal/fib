@@ -54,6 +54,8 @@ func main() {
 curl --http3 -k https://127.0.0.1:8443/   # needs curl built with HTTP/3
 ```
 
+很多 curl 构建（包括 macOS 自带的）不支持 HTTP/3；可以改用[下文](#客户端)的客户端程序。
+
 ## 一个 handler 服务 h1、h2 与 h3
 
 同一个引擎可以在某端口上用 TCP 服务 HTTP/1.x 和 h2、用同号 UDP 端口服务 HTTP/3——它们是不同的传输层，端口号可以相同。TLS 配置要分开，因为两种栈各有自己的 ALPN：h1/h2 用 `fibhttp.ConfigureTLS`，h3 用 `http3.ConfigureTLS`。handler `app` 是共享的。
@@ -105,7 +107,7 @@ func main() {
 }
 ```
 
-HTTP/1.1 或 HTTP/2 客户端会收到 `Alt-Svc: h3=":8443"; ma=86400`，可能把后续请求切换到 QUIC；直接拿到 h3 地址的客户端则不需要这个 header。
+HTTP/1.1 或 HTTP/2 客户端会收到 `Alt-Svc: h3=":8443"; ma=86400`（用 `curl -ki https://127.0.0.1:8443/` 可以看到），可能把后续请求切换到 QUIC；直接拿到 h3 地址的客户端则不需要这个 header。作答之前设在 `c.Header()` 上的字段，无论用 `String`、`Respond`、`WriteResponse` 还是 `ResponseWriter` 方法作答，都会一并发出。
 
 ## 用 Alt-Svc 通告 HTTP/3
 
@@ -138,7 +140,7 @@ handler := http3.NewHandlerWithConfig(config, app)
 
 ## 客户端
 
-`http3.NewClient(engine, config)` 通过引擎拨出的连接发送请求，每个 host:port 一条多路复用连接，不阻塞；`Do` 走回调，`Go` 返回 `Future`。引擎可以是没有任何绑定的纯客户端引擎。
+`http3.NewClient(engine, config)` 通过引擎拨出的连接发送请求，每个 host:port 一条多路复用连接，不阻塞；`Do` 走回调，`Go` 返回 `Future`。引擎可以是没有任何绑定的纯客户端引擎，也可以像这里一样是服务端自己的引擎：`tlstest` 的证书只在签发它的进程内受信任，所以示例把服务端跑在同一个引擎上，输出 `HTTP/3.0 200 OK: hello over HTTP/3.0`。连接真实服务时，把 `TLSConfig` 设为信任其证书的配置（或留 nil 使用系统根证书）。
 
 ```go
 package main
@@ -149,22 +151,32 @@ import (
 	stdhttp "net/http"
 
 	fib "github.com/lesismal/fib"
+	fibhttp "github.com/lesismal/fib/http"
 	"github.com/lesismal/fib/http3"
 	"github.com/lesismal/fib/tlstest"
 )
 
 func main() {
-	engine, err := fib.New(fib.DefaultConfig()) // a client engine has no bindings
+	// tlstest issues its certificate once per process, so the server the
+	// client trusts runs in this program too, on the same engine.
+	serverTLS, clientTLS, err := tlstest.Configs()
+	if err != nil {
+		panic(err)
+	}
+	app := fibhttp.HandlerFunc(func(c *fibhttp.Context) {
+		_ = c.String(stdhttp.StatusOK, "hello over %s\n", c.Request.Proto)
+	})
+	engine, err := fib.New(fib.DefaultConfig(), fib.Binding{
+		Network: "udp",
+		Addr:    "127.0.0.1:8443",
+		Handler: http3.NewHandler(serverTLS, app),
+	})
 	if err != nil {
 		panic(err)
 	}
 	defer engine.Close()
 	go engine.Run()
 
-	_, clientTLS, err := tlstest.Configs()
-	if err != nil {
-		panic(err)
-	}
 	config := http3.DefaultClientConfig()
 	config.TLSConfig = clientTLS
 	client := http3.NewClient(engine, config)
@@ -183,7 +195,7 @@ func main() {
 	if err != nil {
 		panic(err)
 	}
-	fmt.Printf("%s: %s", resp.Status, body)
+	fmt.Printf("%s %s: %s", resp.Proto, resp.Status, body) // HTTP/3.0 200 OK: hello over HTTP/3.0
 }
 ```
 
@@ -194,9 +206,9 @@ func main() {
 - **跟随 NAT rebinding，但不做主动迁移。** 来自新地址的 1-RTT 包通过 Connection ID 路由，经 `PATH_CHALLENGE` 验证后连接继续（RFC 9000 §9.3）；服务端仍然通告 `disable_active_migration`，所以客户端自行探测新路径不会得到应答。
 - **0-RTT 默认关闭。** 服务端用 `http3.Config.EarlyData`、客户端用 `ClientConfig.EarlyData` 打开；以 early data 到达的请求带 `Early-Data: 1`，只有 GET、HEAD、OPTIONS、TRACE 会被服务，其他方法一律 425 Too Early。early data 按设计可被重放，安全方法规则就是防护。
 - **没有 server push。** `Context.Push` 在 HTTP/3 上返回 `stdhttp.ErrNotSupported`；请改用 103 Early Hints。
-- **没有 DATAGRAM 和 WebTransport。** 对端发来的 DATAGRAM 帧属于未知帧，会关闭连接。
+- **没有 DATAGRAM 和 WebTransport。** 对端发来的 DATAGRAM 帧属于未知帧，会以 FRAME_ENCODING_ERROR 关闭连接。
 - **内存上限**：整体 body 每连接 `MaxConcurrentStreams × MaxBodyBytes`（默认 100 × 16MB）；流式 body 由其 QUIC 流窗口（1MB）约束。
-- **引擎退出**：`Engine.Shutdown` 发送 GOAWAY、等待在途请求完成并以 `H3_NO_ERROR` 关闭；单用 `Engine.Stop`/`Close` 既不发送 GOAWAY 也不发送 CONNECTION_CLOSE，客户端只能等到超时才发现。
+- **引擎退出**：`Engine.Shutdown` 发送 GOAWAY、等待在途请求完成并以 `H3_NO_ERROR` 关闭；`Engine.Close` 立即发送 CONNECTION_CLOSE（`H3_NO_ERROR`），在途请求随之结束；`Engine.Stop` 则让连接保持打开，直到 `Close`。
 - **平台**：与 `fib/http` 一样，`fib/http3` 只在 Linux、macOS、Windows 原生后端上构建；在可移植后端上这个包是空的。
 - **互操作**：一致性测试在 CI 中同时把服务端和客户端对着 quic-go、quiche 跑；见 [HTTP/3](../http3.zh-CN.md#一致性测试)。
 
@@ -206,6 +218,7 @@ func main() {
 - **`MaxIdleTimeout` 要低于 `UDPIdleTimeout`。** 默认值下 QUIC 的 30 秒低于引擎的 60 秒；把前者调过后者会让引擎先回收安静的连接。
 - **不要直接写 `Context.Conn`。** 在 HTTP/3 上它是引擎的 UDP 连接；响应必须走 `Context`，否则流的分帧会被破坏。
 - **两个绑定、两种协议，可以同号。** TCP :8443 与 UDP :8443 是两个独立绑定；只改 h1/h2 的端口而不改 Alt-Svc 的值，会把客户端送到没人监听的端口。
+- **在作答之前设置 `Alt-Svc`。** `c.Header()` 会随每种应答发出，但 `WriteResponse` header 里的 `Alt-Svc` 会替换它，响应开始之后再改也没有效果。
 - **重试以流为单位。** 超时只取消自己那条流，其他流继续；连接在响应已到达一部分后断开时，请求失败而不是重发。
 - **handler 与请求的生命周期规则不变。** HTTP/3 也会复用请求/流对象（除非 `Config.DisableReuse`）；不要把它们留到响应和最后一次 `Release` 之后，也不要在调用 `Respond` 之后修改 body。
 - **教程里的证书是测试证书。** `tlstest.Configs()` 只用于示例；浏览器不会信任它，真实部署需要与源站名匹配的证书。

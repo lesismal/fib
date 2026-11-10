@@ -34,8 +34,8 @@ defer client.Close() // close clients before the engine
 - **引擎比客户端活得久。** 客户端会池化连接，关闭客户端即停止它；`client.Close()` 必须在
   `engine.Close()` 之前，后者会直接断开连接且不通知客户端，此时在途请求只能等超时。
 
-默认情况下响应体在回调运行前已完整缓冲，`ClientResponse` 内嵌标准 `*http.Response`。流式方式是逐客户端
-（`StreamResponseBody`）或逐请求（`Framed`/`Upgrade`）开启的，见[流式收发](#流式收发)。
+默认情况下响应体在回调运行前已完整缓冲，`ClientResponse` 内嵌标准 `*http.Response`。流式方式按客户端
+（`StreamResponseBody`）开启，见[流式收发](#流式收发)。
 
 ## 异步拨号
 
@@ -127,8 +127,9 @@ call.Cancel(context.Canceled) // callback hears it; a no-op once the request has
 `ContentLength` 不超过 1MB 的请求体（`net/http.NewRequest` 对小的 `bytes.Buffer`、`bytes.Reader`、
 `strings.Reader` 就是这么设置的）会被 `Do` 一次读完并随 header 发出。其他请求体由它自己的协程逐段读取，
 并被服务端限速（最多 64KB 未发出），因此文件上传是流式的，不会整体读入内存；发完后请求体被关闭。连接
-失败时，幂等且能通过 `req.GetBody` 重读请求体的请求会被重试一次；带 `Expect: 100-continue` 的请求先发
-header，收到服务端应答后再发 body。
+在响应的任何部分到达之前失败时，方法幂等且能通过 `req.GetBody` 重读请求体的请求会在另一条连接上重发一次；
+服务端声明未处理的请求（HTTP/2 的 `GOAWAY`、`REFUSED_STREAM`）不论方法都会重发。带 `Expect: 100-continue`
+的请求先发 header，收到服务端的 100 后再发 body，或者等过 `ExpectContinueTimeout`（默认 1 秒）后再发。
 
 下面的完整程序在同一个引擎上运行服务端和客户端：第一个请求用 future 形式，第二个用回调形式。
 
@@ -279,7 +280,9 @@ client := fibhttp.NewClient(engine, config) // https:// then negotiates h2 by de
 
 HTTP/3 一定加密、一定跑在 UDP socket 的 QUIC 上，因此 `http3.Client` 需要 TLS 1.3 配置和 `https://` URL。
 已知 HTTP/3 端点地址时直接拨该源站；未知时（在 TCP 响应上通告 HTTP/3 的 Web 服务器通常如此），用
-`http3.AltSvcClient` 包一层 TCP 客户端与 HTTP/3 客户端，它会跟随源站的 `Alt-Svc` header：
+`http3.AltSvcClient` 包一层 TCP 客户端与 HTTP/3 客户端，它会跟随源站的 `Alt-Svc` header。下面的程序在同一个
+引擎上提供源站（TCP 上的 HTTPS 与 UDP 上的 HTTP/3，都在 9443 端口）并发出两个请求，依次打印
+`HTTP/2.0 hello` 与 `HTTP/3.0 hello`：
 
 ```go
 package main
@@ -292,16 +295,31 @@ import (
 	fib "github.com/lesismal/fib"
 	fibhttp "github.com/lesismal/fib/http"
 	"github.com/lesismal/fib/http3"
+	fibtls "github.com/lesismal/fib/tls"
 	"github.com/lesismal/fib/tlstest"
 )
 
 func main() {
-	_, clientTLS, err := tlstest.Configs() // a throwaway certificate for localhost
+	serverTLS, clientTLS, err := tlstest.Configs() // a throwaway certificate for localhost
 	if err != nil {
 		panic(err)
 	}
 
-	engine, err := fib.New(fib.DefaultConfig())
+	// The origin: HTTPS on TCP, announcing HTTP/3 on the same port over UDP.
+	app := fibhttp.HandlerFunc(func(c *fibhttp.Context) {
+		if !c.Request.ProtoAtLeast(3, 0) {
+			c.Header().Set("Alt-Svc", http3.AltSvc(9443))
+		}
+		_ = c.String(stdhttp.StatusOK, "hello") // sends Alt-Svc along with it
+	})
+	config := fib.DefaultConfig()
+	config.LogSettings = false
+	engine, err := fib.New(config,
+		fib.Binding{Addr: "127.0.0.1:9443",
+			Handler: fibtls.NewServer(fibhttp.ConfigureTLS(serverTLS), fibhttp.NewHandler(app))},
+		fib.Binding{Network: "udp", Addr: "127.0.0.1:9443",
+			Handler: http3.NewHandler(http3.ConfigureTLS(serverTLS), app)},
+	)
 	if err != nil {
 		panic(err)
 	}
@@ -319,32 +337,37 @@ func main() {
 	// The first request to an origin goes over TCP; once its response has
 	// carried Alt-Svc: h3=..., the next ones take QUIC to that endpoint.
 	client := http3.NewAltSvcClient(tcp, quic)
-	defer client.Close()
+	defer client.Close() // closes both clients, before the engine
 
-	req, err := stdhttp.NewRequest(stdhttp.MethodGet, "https://localhost:8443/", nil)
-	if err != nil {
-		panic(err)
+	for range 2 {
+		req, err := stdhttp.NewRequest(stdhttp.MethodGet, "https://127.0.0.1:9443/", nil)
+		if err != nil {
+			panic(err)
+		}
+		resp, err := client.Go(req).Wait()
+		if err != nil {
+			panic(err)
+		}
+		body, _ := io.ReadAll(resp.Body)
+		_ = resp.Body.Close()
+		fmt.Println(resp.Proto, string(body))
 	}
-	resp, err := client.Go(req).Wait()
-	if err != nil {
-		panic(err)
-	}
-	defer resp.Body.Close()
-	body, _ := io.ReadAll(resp.Body)
-	fmt.Println(resp.Proto, string(body))
 }
 ```
 
-这次握手对应的服务端在 [08-http3.md](08-http3.zh-CN.md)：由
+服务端见 [08-http3.md](08-http3.zh-CN.md)：由
 `http3.NewHandler(http3.ConfigureTLS(tlsConfig), app)` 服务的 UDP binding，以及 TCP 响应 header 里的
-`http3.AltSvc(port)`。QUIC 失败时，可重复的请求会回退到 TCP，该源站会在一段时间内留在 TCP 上，因此屏蔽
-UDP 的网络只付一次超时，而不是每个请求都付一次。`ClientStats` 报告会话恢复与 0-RTT（`EarlyData`）。
+`http3.AltSvc(port)`。在作答之前通过 `c.Header()` 设置这个 header 即可；`String`、`Respond`、
+`WriteResponse` 和 `Write` 都会发送它。QUIC 失败时，可重复的请求会回退到 TCP，该源站会在 30 秒内留在 TCP 上，因此屏蔽 UDP 的网络
+只付一次超时，而不是每个请求都付一次。开启 `quicConfig.EarlyData` 后，`quic.Stats()` 报告会话恢复
+（`Resumed`）与 0-RTT（`EarlySent`、`EarlyAccepted`、`EarlyRejected`、`TooEarly`）。
 
 ## WebSocket 客户端
 
 `websocket.Dialer` 在引擎连接上完成打开握手，之后用与服务端连接相同的 `HandlerFuncs` 服务客户端连接——
 即 [09-websocket.md](09-websocket.zh-CN.md) 里的 `OnMessage`、`OnFrame`、`WriteMessage` 与 `Close`。握手回调
-同时拿到连接与服务端的 `*http.Response`：
+同时拿到连接与服务端的 `*http.Response`。下面的程序拨向它在同一个引擎上运行的 echo 服务端，打印
+`open, subprotocol: chat` 与 `got: hello`：
 
 ```go
 package main
@@ -359,19 +382,31 @@ import (
 )
 
 func main() {
-	engine, err := fib.New(fib.DefaultConfig())
+	// A server to talk to, on the same engine: it echoes, and speaks "chat".
+	serverConfig := websocket.DefaultConfig()
+	serverConfig.Subprotocols = []string{"chat"}
+	serverConfig.EnableCompression = true
+	echo := websocket.NewHandlerWithConfig(serverConfig, websocket.HandlerFuncs{
+		Message: func(c *websocket.Connection, op websocket.Opcode, data []byte) {
+			_ = c.WriteMessage(op, data)
+		},
+	})
+	config := fib.DefaultConfig()
+	config.LogSettings = false
+	engine, err := fib.New(config, fib.Binding{Addr: "127.0.0.1:9080", Handler: echo})
 	if err != nil {
 		panic(err)
 	}
 	go func() { _ = engine.Run() }()
 	defer func() { engine.Stop(); _ = engine.Close() }()
 
-	config := websocket.DefaultDialerConfig()
-	config.HandshakeTimeout = 5 * time.Second
-	config.Subprotocols = []string{"chat"}
-	config.EnableCompression = true
-	dialer := websocket.NewDialer(engine, config)
+	dialerConfig := websocket.DefaultDialerConfig()
+	dialerConfig.HandshakeTimeout = 5 * time.Second
+	dialerConfig.Subprotocols = []string{"chat"}
+	dialerConfig.EnableCompression = true
+	dialer := websocket.NewDialer(engine, dialerConfig)
 
+	closed := make(chan struct{})
 	handler := websocket.HandlerFuncs{
 		Open: func(c *websocket.Connection, r *stdhttp.Request) {
 			fmt.Println("open, subprotocol:", c.Subprotocol())
@@ -380,30 +415,32 @@ func main() {
 			fmt.Println("got:", string(data))
 			_ = c.Close(websocket.CloseNormal, "")
 		},
+		Close: func(c *websocket.Connection, code uint16, reason string, err error) {
+			close(closed)
+		},
 	}
 
-	done := make(chan struct{})
-	dialer.Dial("ws://127.0.0.1:8080/ws", nil, handler,
+	dialer.Dial("ws://127.0.0.1:9080/ws", nil, handler,
 		func(conn *websocket.Connection, resp *stdhttp.Response, err error) {
-			defer close(done)
 			if err != nil {
 				if resp != nil {
 					fmt.Println("refused with", resp.StatusCode)
 				}
 				fmt.Println("dial:", err)
+				close(closed)
 				return
 			}
 			_ = conn.WriteText("hello")
 		})
-	<-done
-	time.Sleep(time.Second) // let the server's answer reach the handler
+	<-closed
 }
 ```
 
 第三个参数是任意 `websocket.Handler`，因此客户端连接可以用 `Frame` 按帧接收、或用 `Message` 接收重组后的
 消息；传 `nil` 表示接受连接但忽略其流量。`Dialer.Go(url, header, handler).Wait()` 是给允许阻塞的调用方
-准备的同一拨号方式。若客户端在握手后需要承载原始字节流，HTTP 客户端的 `StartUpgrade` 会把连接变成
-`TunnelHandler` 的 `*fibhttp.Tunnel`；WebSocket 握手本身就是基于这个机制。
+准备的同一拨号方式。失败时只有 `done` 运行（服务端有应答时带上它，例如路径错误时的 404）；成功时先运行
+handler 的 `Open`，再运行 `done`。若客户端要在自己发起的 HTTP/1.1 upgrade 之后承载原始字节流，HTTP 客户端的
+`StartUpgrade` 会在服务端回 101 后把连接变成交给 `TunnelHandler` 的 `*fibhttp.Tunnel`。
 
 ## TLS 客户端选项
 
@@ -429,6 +466,7 @@ err = fibtls.DialWithOptions(engine, "tcp", "127.0.0.1:8443", 5*time.Second, tls
 	})
 ```
 
+`done` 在 TCP 连接建立后、握手之前运行；它发送的内容会等握手完成后加密发出，`myHandler` 只看到明文。
 配置没有指定 `ServerName` 时会从地址填入，因此一份配置可以服务多个源站。`Blocking: true` 让握手在
 握手池的 worker 上通过 `crypto/tls` 运行，用来与状态机式握手做对比；默认实现等待时不占用协程。mTLS、
 会话票据与密码套件选择见 [10-tls.md](10-tls.zh-CN.md)。
@@ -516,8 +554,9 @@ func main() {
   对象。
 - **流式响应体必须被取走。** 开启 `StreamResponseBody` 后，回调既没注册 `OnBody` 也没读 `Body`，剩余
   body 会被丢弃（超过阈值时连接还会关闭）。传给 `OnBody` 的 `data` 只在本次调用内有效，要保留必须拷贝。
-- **`ClientConfig{}` 不是 `DefaultClientConfig()`。** `NewClient` 只补少量零值字段；零 `Timeout`、
-  `DialTimeout`、`MaxConnsPerHost` 依旧是零，意味着没有超时、没有连接上限。
+- **`ClientConfig{}` 不是 `DefaultClientConfig()`。** `NewClient` 只补大小上限与 `PingTimeout`；零
+  `Timeout`、`DialTimeout`、`MaxConnsPerHost` 依旧是零，意味着没有超时、没有连接上限；零
+  `MaxIdleConnsPerHost` 不保留空闲连接，每个请求都重新拨号。
 - **一条 HTTP/1.1 连接同时只承载一个请求**，客户端也不做 pipeline。慢请求只会拖住自己的连接；但一批慢
   请求要设置 `MaxConnsPerHost`，并用 `MaxPendingPerHost` 让一个死掉的 host 只产生有界队列，而不是一直
   增长到超时。

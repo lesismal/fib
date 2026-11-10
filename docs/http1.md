@@ -465,7 +465,10 @@ func(c *fibhttp.Context) {
   `io.ErrUnexpectedEOF` rather than reporting `io.EOF`, so a truncated upload
   is never taken for a complete one. Reading after the handler has returned,
   or after `Close`, returns `ErrBodyAbandoned`.
-- HTTP/2 and HTTP/3 still buffer request bodies whole.
+- HTTP/2 streams request bodies the same way under `StreamRequestBody`, pacing
+  the client by giving the stream's flow-control window back only as the
+  handler consumes the body; package `http3` has the same option
+  (`http3.Config.StreamRequestBody`) for HTTP/3.
 
 A 128MB upload into a handler that counts it peaks at around 470MB of heap
 buffered — the body, the parser buffer it grew in, and what was left behind on

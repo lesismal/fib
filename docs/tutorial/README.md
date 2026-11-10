@@ -35,9 +35,10 @@ BitTorrent — separately or on one engine. No fib knowledge is assumed.
   checkout, so a snippet that no longer compiles fails the repository's tests.
 - Other blocks are **fragments**: the function or the call being discussed, with the imports
   and boilerplate of the surrounding program left out.
-- Examples listen on `127.0.0.1` and use ports like `8080`/`8443`. TLS examples use
-  `fib/tlstest`, which issues a throwaway certificate for `localhost`; production certificates
-  are covered in [10-tls.md](10-tls.md).
+- Examples listen on `127.0.0.1` and use ports like `8080`/`8443`, so stop one before starting
+  the next. TLS examples use `fib/tlstest`, which issues a throwaway self-signed certificate for
+  `localhost` and `127.0.0.1`, a new one each time the process starts, so curl needs `-k`;
+  production certificates are covered in [10-tls.md](10-tls.md).
 - Each chapter ends with **Pitfalls** and **See also**. The reference documents linked there
   hold the complete field tables that the chapter deliberately does not repeat.
 
@@ -95,7 +96,11 @@ go test ./docs/tutorial
 
 - `TestLinks` checks every relative link and heading anchor in these pages.
 - `TestCodeExamples` builds every complete program in a temporary module that depends on this
-  checkout.
+  checkout. A block with a `//go:build` constraint is left out, since it only builds on some
+  systems.
+- `FIB_TUTORIAL_STRICT=1 go test ./docs/tutorial` also asks that every chapter shows at least
+  one complete program (gRPC and WebRTC excepted, whose examples need generated code or a
+  browser).
 
 Both run in CI, so a stale example or a renamed heading is a failed build, not a stale page.
 

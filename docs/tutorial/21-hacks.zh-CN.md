@@ -23,17 +23,18 @@ handler 的读者；否则请先看 [03-handlers.md](03-handlers.zh-CN.md)。
 
 **技巧。** 响应是引用计数的：处理请求占一个引用，handler 可以用 `Retain` 再多占一个，稍后用 `Release`
 还掉。在这两者之间 handler 已经返回、worker 已还给池，所以慢后端不占协程。`Context.Async(fn)` 为它
-包好了这一对，交给自己的池执行。
+包好了这一对，交给自己的池执行：调用它时就已 `Retain`，返回的函数只执行一次 `fn`，然后 `Release`；所以不要
+再自己 `Retain`，并确保这个函数一定会被执行（从未执行的函数就是一个永不释放的 `Retain`）。
 
 ```go
-c.Retain()               // the response now waits for a Release
-pool.Go(c.Async(func() { // takes the Retain, runs fn, releases even if fn panics
+pool.Go(c.Async(func() { // Async retains now; the func runs fn, then releases even if fn panics
 	_ = c.Respond(200, "application/json", result)
 }))
 ```
 
-**坑。** 每个 `Retain` 都必须在每条路径上恰好对应一次 `Release`，包括错误路径和取消路径；漏一次就永久
-钉住连接，而且没有超时。最后一次 `Release` 之后，请求对象可能已经属于另一个请求，要保留的内容必须先拷贝。
+**坑。** 每个 `Retain` 都必须在每条路径上恰好对应一次 `Release`，包括错误路径和取消路径；没有任何东西会让
+`Retain` 超时，漏一次 `Release` 就会一直占住连接（HTTP/1 上还有排在它后面的所有 pipeline 请求），直到对端
+或连接超时结束它。最后一次 `Release` 之后，请求对象可能已经属于另一个请求，要保留的内容必须先拷贝。
 
 下面的完整程序展示了整个模式，包括对借用的 query 值的拷贝：
 
@@ -109,7 +110,7 @@ httpConfig := fibhttp.DefaultConfig()
 httpConfig.StreamRequestBody = true
 httpConfig.StreamRequestBodyThreshold = 0 // stream every body
 httpConfig.MaxStreamedBodyBytes = 64 << 30
-httpConfig.ReadTimeout = 0 // a streamed body is still arriving while the handler runs
+httpConfig.ReadBodyTimeout = time.Hour // the 5-minute default would cut a long upload off
 
 app := fibhttp.HandlerFunc(func(c *fibhttp.Context) {
 	if c.Request.ContentLength > limit {
@@ -128,8 +129,9 @@ app := fibhttp.HandlerFunc(func(c *fibhttp.Context) {
 })
 ```
 
-**坑。** 流式 body 同样受 `ReadTimeout` 约束，因为 handler 运行期间 body 还在到达；大上传要调大它，或改用
-`ReadBodyTimeout` 限定 body。`OnBody` 接管之后 `Request.Body` 不能再读，回调也不能阻塞——它占着 worker。
+**坑。** 流式 body 在到达期间仍受读超时约束：`ReadBodyTimeout`（`DefaultConfig` 中为 5 分钟，从 header 结束
+算起）与 `ReadTimeout`（默认关闭，从第一个字节算起）。大上传要调大它们，或用 `c.SetReadDeadline` 为单个
+请求解除限制。`OnBody` 接管之后 `Request.Body` 不能再读，回调也不能阻塞——它占着 worker。
 
 下面的程序把一个 2MiB 上传流式送进只统计字节数的服务端：
 
@@ -155,7 +157,7 @@ func main() {
 	httpConfig.StreamRequestBody = true
 	httpConfig.StreamRequestBodyThreshold = 0
 	httpConfig.MaxStreamedBodyBytes = 1 << 30
-	httpConfig.ReadTimeout = 0 // the body streams while the handler runs
+	httpConfig.ReadBodyTimeout = 0 // no limit: the body streams while the handler runs
 
 	var received atomic.Int64
 	app := fibhttp.HandlerFunc(func(c *fibhttp.Context) {
@@ -210,7 +212,8 @@ func main() {
 
 **技巧。** HTTP/2 与 HTTP/3 上一条连接承载多个请求，它们的 handler 运行在引擎的 handler 池
 （`Engine.HandlerPool()`）上，而不是读取连接的 worker 上。`StreamPool.MaxConcurrentHandlers` 限定一条
-连接同时运行多少个请求：超出的那个直接在读取 worker 上跑，于是由对端的流控承载这个上限，服务端不排队。
+连接同时运行多少个请求：第 N 个直接在连接自己的读取者上跑，在它返回前这条连接不再读取，于是由对端的流控承载这个上限，服务端不
+排队。默认值 0 不设限，只受 `MaxConcurrentStreams` 约束。
 
 ```go
 httpConfig := fibhttp.DefaultConfig()
@@ -243,9 +246,10 @@ Data: func(c *fib.Connection, data []byte) {
 },
 ```
 
-**坑。** 每条消息一次 `Flush` 就把收益丢掉了。而且写 watermark 要大于一轮的回复量，而不是一条消息的量：
-一轮最多读 `ReadBufferSize`（默认 16KiB），所以 `WriteBufferHighWatermark` 要明显高于它，否则每个
-pipeline 都会无谓地暂停读。
+**坑。** 每条消息一次 `Flush` 就把收益丢掉了。而且写 watermark 要大于一次读对应的回复量，而不是一条消息的量：
+socket 有数据时，一轮会以 `ReadBufferSize`（默认 16KiB）为单位持续读，每次读完都把 cork 住的回复与
+`WriteBufferHighWatermark` 比较，并且每读 256KiB flush 一次；watermark（默认 64-256KiB）要明显高于一次读的
+回复量，否则每个 pipeline 都会无谓地暂停读。
 
 见 [§4](../hacks.zh-CN.md#4-pipeline-优化一轮一写) 与
 [§8](../hacks.zh-CN.md#8-读背压holdreads)。
@@ -271,9 +275,9 @@ _ = c.RespondCopy(200, "application/json", scratchJSON(q, b)) // the copy is mad
 
 ## 6. 读背压：HoldReads
 
-**技巧。** 写侧 fib 自己会在 watermark 处暂停读；读侧由应用决定。`HoldReads(true)` 注销读关注，数据留在
-内核缓冲里，TCP 窗口给对端限速；`HoldReads(false)` 重新注册读关注，已经堆积的数据无需对端再发一个字节就会
-送达。它便宜，因为连接停止被调度，而不是占住一个 worker。
+**技巧。** 写侧 fib 自己会在 watermark 处暂停读；读侧由应用决定。`HoldReads(true)` 让连接停止读取（正在进行的一轮在
+下一次读之前停下），数据留在内核缓冲里，TCP 窗口给对端限速；`HoldReads(false)` 恢复读取，已经堆积的数据无需
+对端再发一个字节就会送达。它可以在任意 goroutine 上调用；hold 不嵌套，以最后一次调用为准。它便宜，因为连接停止被调度，而不是占住一个 worker。
 
 ```go
 Data: func(c *fib.Connection, data []byte) {
@@ -435,8 +439,11 @@ func(c *fibhttp.Context) {
 }
 ```
 
-**坑。** 流式响应属于 HTTP/1.x：在那里 `Write`/`Flush` 立即发出，而 h2/h3 的响应会被缓冲、等 handler 返回后
-整体发送，所以超大响应应改用 `FileCache`/`SendFile`。`http.Hijacker` 没有实现；h2/h3 上不能调用
+**坑。** 通过 `Write`/`Flush` 写的响应在三种协议上都是流式的，并由客户端限速：未发出的数据达到 64KB 时
+`Write` 会等待（受 `WriteTimeout` 约束），所以流式发送大 body 的 handler 会在客户端慢时占住它的 goroutine——
+要从自己 retain 后的 goroutine 里流式写，文件则用 `FileCache`/`SendFile`。作答之前设置的 `c.Header()`
+会随 `Write` 发出，也同样随 `Respond`、`String`、`JSON` 和 `WriteResponse` 发出（完整响应自己的同名字段优先）；
+响应开始之后再改则没有效果。`http.Hijacker` 没有实现；h2/h3 上不能调用
 `Context.Conn.Send`，要走 `Respond`/`WriteResponse`。
 
 见 [§13](../hacks.zh-CN.md#13-一个-handler-同时服务-h1--h2--h3以及-upgrade--tunnel)。
@@ -481,9 +488,11 @@ func (a acker) OnDatagrams(c *fib.Connection, datagrams [][]byte) {
 }
 ```
 
-**坑。** 数据报来自 `bufferpool`：用完用 `bufferpool.Put` 归还，且 `OnDatagrams` 返回后不能保留承载它们的
-切片。UDP 发送从不排队——socket 没空间时数据报被丢弃、发送返回错误。开启 `ReusePort` 时 NAT rebind 可能
-让数据报落到另一个 poller，所以按地址而不是按连接来索引对端。
+**坑。** 每个数据报都是 handler 自己的副本，是一个 `bufferpool` buffer，不再被引用后可以用 `bufferpool.Put`
+归还；承载它们的 `[][]byte` 在 `OnDatagrams` 返回后不能保留。UDP 发送从不排队——socket 没空间时数据报被
+丢弃、发送返回错误。开启 `ReusePort`（默认）时，`OpenUDPPeer` 打开的对端可能把回复发到另一个 poller 的
+socket，后者会为同一地址再开一个连接；NAT rebind 的对端则会作为新对端到达：按地址而不是按连接来索引对端
+状态。
 
 见 [§15](../hacks.zh-CN.md#15-udpdatagramshandler-与-sendbatch)。
 
@@ -494,7 +503,8 @@ func (a acker) OnDatagrams(c *fib.Connection, datagrams [][]byte) {
 
 - **自己的池**用于异步 handler 的工作，绝不用引擎的池：engine worker 向你的池提交任务，如果是同一个池，
   队列满时所有 worker 都可能卡在提交上。`SharedTaskPool`（默认开）让同名 `Name` 的多个引擎共享 worker 和
-  队列，且第一个引擎的配置生效。
+  队列，且第一个引擎的配置生效。`Config.SetTaskPool(p)` 是反方向的：
+  让引擎在 `p` 上跑它的连接，`p` 归调用方所有，由调用方在引擎关闭后停止。
 - **prefork**（Linux）把同一程序跑在多个子进程里，每个有自己的堆和 GC，通过 `SO_REUSEPORT` 共享监听端口。
   子进程需要的初始化放在 `serve` 里；`Run` 之前的代码在 master 和每个子进程都会执行。
 - **IOPollers** 把引擎拆到多个事件循环上；更多 poller 会和 worker 抢 P，通常更慢，所以只在有 profile 时
@@ -504,10 +514,16 @@ func (a acker) OnDatagrams(c *fib.Connection, datagrams [][]byte) {
   （`SetRetainedBytes`），你的 buffer 也能和 fib 的 buffer 走同一个池。
 
 ```go
-pool := taskpool.NewAdaptive(taskpool.AdaptiveConfig{
+jobs := taskpool.NewAdaptive(taskpool.AdaptiveConfig{
 	Name: "jobs", MinWorkers: 16, MaxWorkers: 4096, QueueSize: 10000,
 })
-config.SetTaskPool(pool) // the engine runs connections on it; the engine never stops it
+defer jobs.Stop()
+
+app := fibhttp.HandlerFunc(func(c *fibhttp.Context) {
+	jobs.Go(c.Async(func() { // async work on a pool of its own, not the engine's
+		_ = c.Respond(200, "text/plain", slowQuery())
+	}))
+})
 
 buf := bufferpool.Get(4096) // len 4096; contents are the previous user's
 defer bufferpool.Put(buf)   // after Put, not even a sub-slice may be used
@@ -550,7 +566,7 @@ defer bufferpool.Put(buf)   // after Put, not even a sub-slice may be used
 4. `Release` 之后调用 `Respond`，或保留 `OnData`/`OnBody`/`OnFrame` 的 `data`。
 5. 在 `Connection` 上用 `bufio.Reader`，或期望 `Read` 会阻塞。
 6. 写 watermark 小于一轮的回复量。
-7. 开了 `StreamRequestBody` 却保留默认 `ReadTimeout`，大上传被超时切断。
+7. 开了 `StreamRequestBody` 却保留默认 `ReadBodyTimeout`（5 分钟），大上传被超时切断。
 8. 把异步工作放到引擎自己的池上；调高 `GOMAXPROCS`；在 `OnData` 里关闭自己的连接后等 `OnClose`。
 
 见 [§20](../hacks.zh-CN.md#20-反模式清单)。
@@ -561,8 +577,9 @@ defer bufferpool.Put(buf)   // after Put, not even a sub-slice may be used
   自定义池；大多数代码仍然适合 [03-handlers.md](03-handlers.zh-CN.md) 里的普通 handler 写法。
 - **这些技巧不能盲目组合。** 借用内存加异步分支、跨 goroutine 持有 `Cork`——正是让 fib 变快的同一批 API
   在这样组合时让数据出错、让程序死锁。
-- **后端随平台不同。** IOPollers 需要 epoll/kqueue，`SendFile` 与 UDP 批量各有平台快路径，
-  `SendFile`/`splice` 属于 Linux/macOS。请在实际部署的系统上验证。
+- **后端随平台不同。** IOPollers 需要 epoll/kqueue（Windows 保持单个事件循环）；`SendFile` 在 Linux、macOS、
+  FreeBSD、DragonFly 上用 `sendfile(2)`，Windows 上用 `TransmitFile`，NetBSD/OpenBSD 上分块读取；`SendBatch`
+  只在 Linux 与 macOS 上是一次系统调用；`SpliceTo` 只支持 Linux。请在实际部署的系统上验证。
 - **测量，而不是猜。** 指南里每一个"快 X 倍"都附带了基准和机器；把它变成策略之前先在你的机器上复现。
 
 ## 相关文档

@@ -90,15 +90,29 @@ func progress(t *bittorrent.Torrent) {
 }
 ```
 
-- `AddMagnet` parses the link (v1 `btih`, v2 `btmh`, `so` file selection), then fetches the info
-  dictionary from peers with `ut_metadata`. A magnet without a working tracker needs
-  `AddOptions.Peers` or `Torrent.AddPeers` to find the first peers.
+- `AddMagnet` parses the link (v1 `btih`, v2 `btmh`, `tr` trackers, `x.pe` peers, `so` file
+  selection), then fetches the info dictionary from peers with `ut_metadata`. Without a working
+  tracker the first peers come from the DHT and local discovery, or from `x.pe`,
+  `AddOptions.Peers` and `Torrent.AddPeers`.
 - `File.NewReader` is an `io.ReadSeekCloser` over one file; `Torrent.NewReader` reads the whole
   torrent's data in piece order. `SetReadahead` fetches further ahead, which is how a player streams
   a media file without stalling, and `SetContext` ends a reader with a context.
-- `Done` closes when the torrent has every piece it wants; the client then seeds it. `Stats` reports
+- `Done` closes when the torrent has every piece it wants, checked; the client then seeds it.
+  Raising the priority of a file that misses pieces gives a new `Done` channel. `Stats` reports
   progress, rates, peers and hash failures at any moment, and `Recheck` hashes the data again after
   the files changed behind the client's back.
+- The progress line goes to stderr and the file to stdout, so redirect stdout to a file.
+  `Info().TotalLength()` counts the padding files a v2-compatible (hybrid) torrent has between
+  files; `Files()` leaves them out.
+
+To try it without the internet, put a few files in `seeds/data` and run the seeding program
+below first, then this one with its
+`ListenAddr` changed to `":6882"` (two clients on one host need two ports) and the seeder named
+in the magnet link:
+
+```sh
+go run ./download 'magnet:?xt=urn:btih:<the v1 info hash the seeder logs>&x.pe=127.0.0.1:6881' > first-file
+```
 
 ## Adding torrents and options
 
@@ -113,18 +127,22 @@ func addWithOptions(c *bittorrent.Client) (*bittorrent.Torrent, error) {
 		return nil, err
 	}
 	return c.AddTorrent(mi, &bittorrent.AddOptions{
-		Paused:         true,                                                   // add it, Start it later
-		Sequential:     true,                                                   // pieces in order, for playback while downloading
+		Paused:         true,                                                    // add it, Start it later
+		Sequential:     true,                                                    // pieces in order, for playback while downloading
 		FilePriorities: []int{bittorrent.PriorityHigh, bittorrent.PriorityNone}, // by Info.FileList index
-		Trackers:       []string{"udp://tracker.example:6969"},                 // one more tier, beside the torrent's
-		Peers:          []string{"192.0.2.10:6881"},                            // beside what discovery finds
+		Trackers:       []string{"udp://tracker.example:6969"},                  // one more tier, beside the torrent's
+		Peers:          []string{"192.0.2.10:6881"},                             // beside what discovery finds
 	})
 }
 ```
 
 `Torrent` methods change a running one: `Start`, `Pause`, `Stop`, `Remove(deleteData)`,
-`SetSequential`, `SetFilePriority`, `SetLimits`, `AddPeers`. `PriorityNone` means "not wanted":
-pieces made only of such files are not downloaded, which is how a selective download works.
+`SetSequential`, `SetFilePriority`, `SetLimits`, `AddPeers`. The priorities are
+`PriorityNone`, `PriorityLow`, `PriorityNormal` (the default) and `PriorityHigh`, and
+`PriorityNone` means "not wanted": pieces made only of such files are not downloaded, which is
+how a selective download works. `FilePriorities` and `SetFilePriority` count files by their
+index in `Info.FileList`, padding files included; `Files()` leaves the padding out, so use
+`File.SetPriority`, or `File.Index`, when you start from `Files()`.
 
 ## Progress and events
 
@@ -151,7 +169,8 @@ func clientWithEvents() (*bittorrent.Client, error) {
 `Event` also carries the piece (verified, failed) and the peer (connected, disconnected, banned).
 `EventQueue` bounds the events waiting for `OnEvent`; past it piece and peer events are dropped, the
 oldest first, and an `EventDropped` follows with the count, which `DroppedEvents` totals. `State`
-says where a torrent is: `StateMetadata`, `StateChecking`, `StateDownloading`, `StateSeeding`.
+says where a torrent is: `StateMetadata`, `StateChecking`, `StateDownloading`, `StateSeeding`,
+`StatePaused`, `StateStopped`, `StateRemoved` and `StateError` (`Err` says why).
 `Trackers`, `Sources`, `WebSeeds` and `Peers` say where the swarm is: each tracker URL with its last
 error, consecutive failures and next announce; each peer source with its candidates; each web seed
 with its failures and next try.
@@ -318,7 +337,9 @@ func limitedClient() (*bittorrent.Client, error) {
 	if err != nil {
 		return nil, err
 	}
-	c.SetLimits(bittorrent.Limits{DownloadRate: 10 << 20}) // 10 MiB/s, changed while it runs
+	l := c.Limits()           // SetLimits replaces them all: start from the current ones
+	l.DownloadRate = 10 << 20 // 10 MiB/s, changed while it runs
+	c.SetLimits(l)
 	return c, nil
 }
 ```
@@ -327,8 +348,9 @@ func limitedClient() (*bittorrent.Client, error) {
 directions. Rates, connection counts, upload slots and seed limits are the client's `Limits` and a
 torrent's `TorrentLimits`; a `SeedRatio` or `SeedTime` pauses a torrent when reached. v1, v2 and
 hybrid torrents are all first class: a v2 magnet fetches its piece layers with BEP 52 hash requests,
-and a hybrid is announced under both info hashes. Wire compatibility with libtorrent, Transmission,
-anacrolix/torrent, libutp and opentracker is checked by [`bittorrent/interop`](../bittorrent.md#interop).
+and a hybrid is announced under both info hashes. Wire compatibility with libtorrent,
+anacrolix/torrent (and anacrolix/dht), libutp and opentracker is checked by
+[`bittorrent/interop`](../bittorrent.md#interop).
 
 ## Pitfalls
 
@@ -339,8 +361,13 @@ anacrolix/torrent, libutp and opentracker is checked by [`bittorrent/interop`](.
 - **The info hash is the identity.** Two clients that see different info hashes are downloading
   different torrents even with identical files: a `source`, a different piece length or a re-encoded
   info dictionary changes the hash. Read torrents with `metainfo.Load`/`Parse`.
-- **Storage trust is not verification.** Pieces taken from resume data or `Seed` are served without
-  a check until first read; a peer that gets a bad one may ban this client.
+- **Resume data trusts file stamps.** Pieces listed in resume data, in files whose size and
+  modification time still match, are taken and served without a hash check; content replaced with
+  the same size and stamp goes out bad, and a peer that gets a bad piece may ban this client. Call
+  `Recheck` after editing files in place. `Seed` pieces are checked the first time one is served.
+- **`SetLimits` sets every limit.** A zero field means its default, not "unchanged": change the
+  `Limits()` the client returns, as above, or the `MaxConns` given in `Config` goes back to the
+  default.
 - **Don't copy a file into the directory it downloads into.** `Files()[0].NewReader` reads from
   storage while the client writes it; stream to a different writer, not back into `DataDir`.
 - **The disk pool is not the fib pool.** Raise `DiskWorkers`/`DiskQueueBytes` for a slow disk; doing

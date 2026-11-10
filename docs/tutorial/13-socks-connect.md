@@ -152,7 +152,8 @@ SOCKS4 resolves names at the client, and SOCKS4a sends the proxy a host name to 
 
 UDP ASSOCIATE needs a UDP binding of the same engine. The server tells each client the address of
 the UDP binding of the same family as the one it reached the server at, and a server with no UDP
-binding refuses UDP ASSOCIATE:
+binding refuses UDP ASSOCIATE. `Allow` is asked again for each destination a client sends a
+datagram to, and the datagrams to one it refuses are dropped:
 
 ```go
 server := socks.NewServer(socks.Config{})
@@ -210,15 +211,32 @@ wsConfig.Dial = proxy.Dial // wss:// and ws:// through the proxy
 tlsOptions := fibtls.DialOptions{Dial: proxy.Dial} // any TLS dial through the proxy
 ```
 
-`Dialer.Dial` is also the whole `DialFunc` contract of `socks.Config.Dial`, so `Forward` chains
-one proxy to another: the front proxy reaches its destinations through the back one, and a client
-of the front proxy sees only the front's address:
+A `udp` network asks a SOCKS5 proxy for a UDP ASSOCIATE instead of a CONNECT: each `Send` on the
+connection is one datagram to the destination, through the proxy's relay, and each `OnData` one
+datagram back.
+
+`Dialer.Dial` is also the whole `DialFunc` contract, so proxies chain two ways. On the server,
+`socks.Config.Dial` makes a proxy reach its destinations through another proxy; on the client,
+`Dialer.Forward` makes a dialer reach its proxy through another one:
 
 ```go
-front, err := socks.ParseURL("socks5h://127.0.0.1:1081")
 back, err := socks.ParseURL("socks5h://127.0.0.1:1080")
-front.Forward = back.Dial // front proxies through back
+if err != nil {
+	panic(err)
+}
+// A SOCKS server whose CONNECTs and UDP destinations go out through back:
+front := socks.NewServer(socks.Config{Dial: back.Dial})
+
+// A dialer that reaches the proxy at :1081 through back, then the destination through :1081:
+viaBack, err := socks.ParseURL("socks5h://127.0.0.1:1081")
+if err != nil {
+	panic(err)
+}
+viaBack.Forward = back.Dial
 ```
+
+The destination sees only the last proxy's address. With `Config.Dial` set, `AllowResolved` is not
+called: the chained dialer resolves names itself.
 
 Under the hood the connect to the proxy, the negotiation with it and any DNS lookup all happen on
 the engine's loop and workers, never on the caller's goroutine, so the dialer is safe to call from
@@ -335,53 +353,104 @@ func main() {
 
 `ConnectProxyConfig.Authenticate` reads the `Proxy-Authorization: Basic` header (RFC 9110 §11.7.2)
 and answers a client without it with `407 Proxy Authentication Required` and a `Proxy-Authenticate`
-challenge naming `Realm`. `Allow`, `Dial`, `DialTimeout`, `MaxQueuedBytes`, `IdleTimeout` and
-`Next` are the rest: `Next` serves requests that are not CONNECTs to a host and port, and a nil
-`Next` answers them with `405 Method Not Allowed`. Point `Dial` at a `socks.Dialer`'s `Dial` and
-the CONNECT proxy chains through a SOCKS proxy.
+challenge naming `Realm` (`proxy` when empty). An error from `Allow` answers the CONNECT with
+`403 Forbidden`; a target the proxy cannot reach gets `502 Bad Gateway`, or `504 Gateway Timeout`
+when the dial timed out, and a target that is not a host and port `400 Bad Request`. `Dial`,
+`DialTimeout`, `MaxQueuedBytes`, `IdleTimeout` and `Next` are the rest: `Next` serves requests
+that are not CONNECTs to a host and port, and a nil `Next` answers them with
+`405 Method Not Allowed`. Point `Dial` at a `socks.Dialer`'s `Dial` and the CONNECT proxy chains
+through a SOCKS proxy. The proxy's handler does not wait for the dial: it retains the request,
+returns, and the dial's callback answers it.
 
 ## Context.Connect and tunnel pacing
 
 `ConnectProxy` is built on `Context.Connect`, which any handler may use. It accepts the CONNECT
-request, and from then on a `TunnelHandler` receives what the client sends through the tunnel,
-while `Tunnel.Send` and `CloseAfterSend` carry bytes the other way:
+request with a 200, and from then on a `TunnelHandler` receives what the client sends through the
+tunnel, while `Tunnel.Send` and `CloseAfterSend` carry bytes the other way. A complete program, a
+tunnel that echoes instead of dialing anywhere:
 
 ```go
+package main
+
+import (
+	"log"
+	nethttp "net/http"
+
+	fib "github.com/lesismal/fib"
+	fibhttp "github.com/lesismal/fib/http"
+)
+
+// echoTunnel answers everything the client sends through the tunnel.
 type echoTunnel struct{}
 
 func (echoTunnel) OnTunnelOpen(t *fibhttp.Tunnel) { log.Print("tunnel opened") }
+
 func (echoTunnel) OnTunnelData(t *fibhttp.Tunnel, data []byte) {
-	_ = t.Send(append([]byte("echo: "), data...)) // Send copies, data is valid for the call only
+	_ = t.Send(append([]byte("echo: "), data...)) // data is valid for the call only
 }
+
 func (echoTunnel) OnTunnelClose(t *fibhttp.Tunnel, err error) {
 	log.Printf("tunnel closed: %v", err)
 }
 
-router.Connect("/echo-tunnel", func(c *fibhttp.Context) {
-	tunnel, err := c.Connect(nil, echoTunnel{})
+func main() {
+	// A CONNECT names host:port, not a path, so it is served by a plain
+	// handler rather than a router route.
+	handler := fibhttp.HandlerFunc(func(c *fibhttp.Context) {
+		if c.Request.Method != nethttp.MethodConnect {
+			_ = c.Respond(nethttp.StatusMethodNotAllowed, "text/plain; charset=utf-8", []byte("CONNECT only\n"))
+			return
+		}
+		log.Printf("CONNECT %s", c.Request.Host)
+		if _, err := c.Connect(nil, echoTunnel{}); err != nil {
+			_ = c.Respond(nethttp.StatusBadRequest, "text/plain; charset=utf-8", []byte(err.Error()))
+		}
+	})
+	engine, err := fib.New(fib.DefaultConfig(),
+		fib.Binding{Addr: "127.0.0.1:18084", Handler: fibhttp.NewHandler(handler)})
 	if err != nil {
-		_ = c.Respond(nethttp.StatusBadRequest, "text/plain; charset=utf-8", []byte(err.Error()))
-		return
+		panic(err)
 	}
-	_ = tunnel // the tunnel handler drives the rest
-})
+	defer engine.Close()
+	if err := engine.Run(); err != nil {
+		panic(err)
+	}
+}
 ```
+
+Try it with `nc`; the 200 comes first, then the echo of what was sent after the request:
+
+```sh
+$ (printf 'CONNECT example.com:443 HTTP/1.1\r\nHost: example.com:443\r\n\r\n'; sleep 0.3; printf 'ping'; sleep 0.5) | nc 127.0.0.1 18084
+HTTP/1.1 200 OK
+
+echo: ping
+```
+
+A classic CONNECT's target is in authority form (`example.com:443`), with no path, so router
+patterns such as `router.Connect("/x", ...)` never match it: they serve CONNECTs that carry a path,
+such as HTTP/2's extended CONNECT. Serve tunnels from a plain handler, as here, and let it hand
+every request that is not a CONNECT to a router when one port serves both.
 
 For a relay to a slower peer, pace each side by the other's backlog instead of buffering it. The
 primitives are the tunnel's own flow control: `Unsent` reports what is still waiting to go,
 `HoldReads` stops taking what the peer sends, and `NotifySendable`/`WaitSendable` call back or wait
-until the backlog has drained:
+until the backlog has drained. With `in` the side data comes from and `out` the side it is sent to,
+each time `in`'s data has been passed to `out`:
 
 ```go
-const limit = 256 << 10 // the relay's Config.MaxQueuedBytes equivalent
-tunnel.HoldReads(true)
-if tunnel.Unsent() > limit {
-	tunnel.NotifySendable(limit, func(error) { tunnel.HoldReads(false) }) // may not wait here
-} else {
-	tunnel.HoldReads(false)
+const limit = 256 << 10 // what may wait for out, as Config.MaxQueuedBytes bounds a relay
+in.HoldReads(true) // hold first, so that the callback cannot run before the hold
+if !out.NotifySendable(limit, func(error) { in.HoldReads(false) }) {
+	in.HoldReads(false) // no more than limit waits for out: keep reading
 }
-// In a goroutine of your own, never in OnTunnelData, this is the waiting form:
-go func() { _ = tunnel.WaitSendable(limit) }()
+// The callback runs once out is down to half of limit. In a goroutine of your own,
+// never in OnTunnelData, this is the waiting form:
+go func() {
+	if err := out.WaitSendable(limit); err != nil {
+		log.Print(err) // out has ended
+	}
+}()
 ```
 
 A tunnel over HTTP/1.x switches the whole connection; over HTTP/2 and HTTP/3 only its stream
@@ -391,21 +460,30 @@ allowed already still arrives while reads are held, so the hold is a bound, not 
 ## curl, curl -x and HTTPS_PROXY
 
 Once a proxy is running, the shell tools use it: `curl -x` for the proxy of one command, and
-`HTTPS_PROXY`/`ALL_PROXY` for programs that read the environment:
+`HTTPS_PROXY`/`ALL_PROXY` for programs that read the environment. To try them on the one-port
+program above, keep its engine running (end `main` with `select {}` in place of the hand-written
+client); port 18082 then answers both SOCKS5 and CONNECT:
 
 ```sh
 # SOCKS5 with the proxy resolving the destination name (socks5h vs socks5)
-curl -x socks5h://fib:secret@127.0.0.1:1080 https://example.com/
+curl -x socks5h://fib:secret@127.0.0.1:18082 http://127.0.0.1:18080/hello
 
-# HTTP CONNECT with Basic credentials in the URL; curl sends Proxy-Authorization
+# HTTP CONNECT with Basic credentials in the URL; curl sends Proxy-Authorization.
+# -p makes curl tunnel an http:// URL through CONNECT too.
+curl -p -x http://fib:secret@127.0.0.1:18082 http://127.0.0.1:18080/hello
+
+# Any HTTPS site, through CONNECT, as curl does for https:// URLs on its own
 curl -x http://fib:secret@127.0.0.1:18082 https://example.com/
 
 # The same proxy for programs that read the environment
 HTTPS_PROXY=http://fib:secret@127.0.0.1:18082 curl https://example.com/
 ```
 
-`curl -x` with an `https://` URL uses CONNECT; with an `http://` URL it sends the request to the
-proxy whole, in absolute form, which is `ConnectProxyConfig.Next`'s business, not CONNECT's.
+`curl -x` with an `https://` URL uses CONNECT; with an `http://` URL and no `-p` it sends the
+request to the proxy whole, in absolute form, which is `ConnectProxyConfig.Next`'s business, not
+CONNECT's: here it gets `405 Method Not Allowed`. Without credentials curl gets
+`407 Proxy Authentication Required` from CONNECT, and a failed SOCKS5 login ends the handshake
+(curl exits with code 97).
 
 ## Pitfalls
 

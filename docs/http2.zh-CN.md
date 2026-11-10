@@ -67,11 +67,13 @@ HEADERS 这样到达的 stream 带 `Early-Data: 1`（RFC 8470），只有 GET、
   body 比 handler 设置的 `Content-Length` 短时，stream 会被重置而不是正常结束。
 - [`grpc`](../grpc) 包通过这一机制（`Server.ServeHTTP`）提供 gRPC（含 streaming），它也有
   自己的 HTTP/2 传输层。
-- 内存上限：服务端单连接最坏约为 `MaxConcurrentStreams × MaxBodyBytes`
-  （默认 250 × 16MB），外加每个流式 body 一个 stream 窗口；客户端单个响应受
+- 内存上限：服务端单个 body 超过 `MaxBodyBytes` 返回 413；单连接整体读入的 body 合计不超过
+  `HTTP2.MaxBufferedBodyBytes`（默认 4 × `MaxBodyBytes`，即 64MB），DATA 会超出它的 stream
+  以 `REFUSED_STREAM` 重置；流式 body 占一个 stream 窗口。客户端单个响应受
   `MaxResponseBodyBytes` 限制。整体响应保留 handler 的 body，只把窗口允许的帧排队，
   因此不读的客户端大约只占一个 stream 窗口，而不是 body 本身；见[压测](loadtest.zh-CN.md)。
-- `CONNECT` 请求能被解析并交给 handler，但无法建立隧道（没有双向流式通道）。
+- 不带 `:protocol` 的 `CONNECT` 请求（RFC 9113 第 8.5 节）可用 `Context.Connect` 把它的 stream
+  切换为隧道；`fibhttp.ConnectProxy` 以此在 HTTP/1.x、HTTP/2、HTTP/3 上提供 CONNECT 代理。
 
 ### handler 在协程池上执行
 
@@ -147,7 +149,7 @@ header block 之间能保留多少。
   （`u`，0 到 7，默认 3）决定该 stream 轮到连接窗口时一次可以发多少帧——紧急度 0 为 8 帧，
   1 为 4 帧，2 为 2 帧，默认紧急度 3 及更不紧急的都是每轮 1 帧，也就是每个 stream 原本就
   有的轮询，因此不发 priority、或只写了默认紧急度的客户端行为完全不变。增量提示（`i`）
-  被忽略，因为响应 body 是整体缓存后才发送的；PRIORITY_UPDATE 也没有实现。轮转顺序仍是
+  被忽略，PRIORITY_UPDATE 也没有实现。轮转顺序仍是
   各 stream 开始等待的先后，也不会饿死任何 stream：每个等待的 stream 都能轮到，被连接窗口
   在一轮中途截断的会保留位置和这一轮剩余的帧数，等窗口补充后继续；被自己的窗口挡住的则
   让出这一轮。前面没有其它 stream 等待时仍然立即发送。
@@ -210,7 +212,7 @@ header block 之间能保留多少。
 | 功能 | 原因 |
 | --- | --- |
 | 客户端接收 server push | Chrome、Firefox 已移除 push，Go 的 `net/http` 客户端也从未支持。客户端在 SETTINGS 中声明 `ENABLE_PUSH=0`，服务端 push 能力保留给仍然需要它的客户端。预加载推荐用 103 Early Hints（`Context.WriteInterim`）。 |
-| RFC 9218 的增量提示与 PRIORITY_UPDATE | `priority` 头的紧急度已用于发送调度（见[协议细节](#协议细节)）；响应 body 整体缓存时 `i` 没有可重排的内容，PRIORITY_UPDATE 帧不实现。RFC 7540 的优先级树已被 RFC 9113 废弃，同样不实现。 |
+| RFC 9218 的增量提示与 PRIORITY_UPDATE | `priority` 头的紧急度已用于发送调度（见[协议细节](#协议细节)）；增量提示 `i` 被忽略，PRIORITY_UPDATE 帧不实现。RFC 7540 的优先级树已被 RFC 9113 废弃，同样不实现。 |
 | 客户端发起 `Upgrade: h2c` | RFC 9113 已废弃这种升级方式；需要明文 HTTP/2 的场景使用 prior knowledge（`UnencryptedHTTP2`）。服务端仍然接受升级，以兼容 curl 等客户端。 |
 | TLS 连接上的 `Upgrade: h2c` | RFC 规定 TLS 上只能通过 ALPN 切换协议。 |
 | HTTP/1.0 请求的 1xx 中间响应 | HTTP/1.0 客户端不认识 1xx，`WriteInterim` 返回 `http.ErrNotSupported`。 |

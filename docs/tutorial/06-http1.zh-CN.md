@@ -43,6 +43,7 @@ func main() {
 		case "/greet":
 			_ = c.String(stdhttp.StatusOK, "hello, %s\n", c.Query("name"))
 		case "/set-cookie":
+			// Fields set on c.Header() before answering go out with the answer.
 			stdhttp.SetCookie(c, &stdhttp.Cookie{Name: "session", Value: "abc", Path: "/"})
 			_ = c.String(stdhttp.StatusOK, "cookie set\n")
 		case "/events":
@@ -82,7 +83,17 @@ func main() {
 }
 ```
 
-`fibhttp.NewHandler(app)` 使用默认配置；`NewHandlerWithConfig` 用来传入单个服务的选项。绑定要求 TLS 或 UDP 时，同一个 handler 同样服务 HTTP/2 与 HTTP/3（第 07、08 章）。
+用 `go run .` 运行，然后试试：
+
+```sh
+curl 'http://127.0.0.1:8080/users?name=ann%20b'   # {"id":1,"name":"ann b"}
+curl --data-binary 'hello' http://127.0.0.1:8080/echo  # hello
+curl 'http://127.0.0.1:8080/greet?name=bob'       # hello, bob
+curl -i http://127.0.0.1:8080/set-cookie          # Set-Cookie: session=abc; Path=/
+curl -N http://127.0.0.1:8080/events              # data: event 0, 1, 2, ... once a second
+```
+
+`fibhttp.NewHandler(app)` 使用 `fibhttp.DefaultConfig()`；`NewHandlerWithConfig` 用来传入单个服务的选项。同一个 handler 还在同一端口上服务 HTTP/2——TLS 下 ALPN 选中 `h2` 时，以及明文下以 prior knowledge 连接的客户端，除非设置了 `Config.DisableHTTP2`（第 07 章）——并在 QUIC binding 上服务 HTTP/3（第 08 章）。
 
 ## 读取请求
 
@@ -102,31 +113,45 @@ func inspect(c *fibhttp.Context) {
 }
 ```
 
-没有 body 的请求、以及 body 以流式到达的请求，`Body` 返回 nil；这两种情况下都用 `Request.Body` 读取。这些字节只属于 handler 到响应结束为止，需要越过这个时点就自己拷贝。
+没有 body 的请求、以及 body 以流式到达的请求，`Body` 返回 nil；`Request.Body` 则在任何情况下都是可读的 reader。这些字节只属于 handler 到响应结束为止，需要越过这个时点就自己拷贝。
 
 ## 作答：响应助手
 
-`Respond` 一次给出完整响应，`WriteResponse` 一次给出状态、header、body 和 trailer，若干小助手包装了常见的内容类型。没有 `Redirect` 助手：按 `net/http` 的方式设置 header 和状态码即可。
+`Respond(status, contentType, body)` 一次给出完整响应，`WriteResponse(fibhttp.Response{...})` 一次给出状态、header、body 和 trailer，若干小助手包装了常见的内容类型。没有 `Redirect` 助手：`http.Redirect` 可以通过 `Context` 工作，和其他 `net/http` 辅助函数一样。
 
 ```go
+type answer struct {
+	N int `json:"n" xml:"n"`
+}
+
 func render(c *fibhttp.Context) {
 	switch c.Request.URL.Path {
 	case "/json":
-		_ = c.JSON(stdhttp.StatusOK, map[string]int{"n": 42})
+		_ = c.JSON(stdhttp.StatusOK, answer{N: 42}) // {"n":42}
 	case "/xml":
-		_ = c.XML(stdhttp.StatusOK, struct{ N int }{42})
+		_ = c.XML(stdhttp.StatusOK, answer{N: 42}) // <answer><n>42</n></answer>
 	case "/html":
 		_ = c.HTML(stdhttp.StatusOK, "<h1>fib</h1>")
 	case "/redirect":
-		c.Header().Set("Location", "/login")
-		c.WriteHeader(stdhttp.StatusFound)
+		stdhttp.Redirect(c, c.Request, "/login", stdhttp.StatusFound)
+	case "/headers":
+		_ = c.WriteResponse(fibhttp.Response{
+			StatusCode: stdhttp.StatusCreated,
+			Header: stdhttp.Header{
+				"Content-Type": {"text/plain; charset=utf-8"},
+				"Location":     {"/items/7"},
+			},
+			Body: []byte("created\n"),
+		})
 	default:
 		_ = c.String(stdhttp.StatusOK, "n=%d", 42)
 	}
 }
 ```
 
-`Data(status, contentType, body)`、`IndentedJSON`、`IndentedXML`、`HTMLTemplate`、`File`、`FileAttachment` 补全了这套助手。会做编码的助手在失败时返回编码器的错误且不发送任何内容，handler 仍可换一种方式作答。`Context` 实现了 `http.ResponseWriter`、`http.Flusher` 和 `io.ReaderFrom`，手写 header、状态码和 body 的行为与 `net/http` 描述的一致。
+`Data(status, contentType, body)`、`IndentedJSON`、`IndentedXML`、`HTMLTemplate`、`File`、`FileAttachment` 补全了这套助手。会做编码的助手在失败时返回编码器的错误且不发送任何内容，handler 仍可换一种方式作答——要检查这个错误：例如 `encoding/xml` 无法编码匿名 struct，忽略错误的话只会留下一个空的 `200`。`Context` 实现了 `http.ResponseWriter`、`http.Flusher` 和 `io.ReaderFrom`，手写 header、状态码和 body 的行为与 `net/http` 描述的一致。
+
+`c.Header()` 是两种写法共用的响应头。作答之前用 `c.Header().Set` 设置的字段——或者 `http.SetCookie(c, ...)` 设置的 cookie——既由 `ResponseWriter` 方法发出，也同样由 `Respond`、`WriteResponse` 以及基于它们的助手发出。完整响应自己的字段优先：助手的 `Content-Type` 和 `WriteResponse` header 里的字段会替换 `c.Header()` 上的同名字段；设在那里的 `Content-Length` 和 trailer 声明会被略去，因为响应体是完整的。响应开始之后再改 `c.Header()` 没有效果。不过两种写法不能在同一个响应里混用：一种开始响应之后，另一种会返回 `fibhttp.ErrResponseWritten`。
 
 ## 流式响应与 SSE
 
@@ -148,7 +173,7 @@ func download(c *fibhttp.Context) {
 
 ## Trailer
 
-trailer 跟在 chunked body 之后。用 `WriteResponse` 时会自动声明名字；用 `http.ResponseWriter` 的方法写时，要在第一次写之前用 `Trailer` header 声明，等 body 写完后设置值。
+trailer 跟在 chunked body 之后。用 `WriteResponse` 时会自动声明名字；用 `http.ResponseWriter` 的方法写时，要在第一次写之前用 `Trailer` header 声明，等 body 写完后设置值。`curl --raw` 会在最后一个 chunk 之后显示它们。
 
 ```go
 func checksummed(c *fibhttp.Context) {
@@ -165,21 +190,19 @@ func checksummed(c *fibhttp.Context) {
 
 ## 静态文件与 sendfile
 
-`FileCache` 从内存提供目录，并跟随磁盘变化；超过 `MaxFileBytes` 的文件走磁盘的 `sendfile`。`Context` 上的 `File`/`FileAttachment` 服务单个已知文件，`http.ServeFile`/`http.ServeContent` 则通过 `io.ReaderFrom` 路径工作。
+`FileCache` 从内存提供目录，并跟随磁盘变化：改动过的文件按它现在的内容提供（Linux 上靠 inotify，其他系统每隔 `CheckInterval`——默认 5 秒——stat 一次）。超过 `MaxFileBytes`（默认 1 MiB）的文件，或放不进 `MaxBytes`（64 MiB）的文件，走磁盘的 `sendfile`。`Context` 上的 `File`/`FileAttachment` 服务单个已知文件，`http.ServeFile`/`http.ServeContent` 则通过 `io.ReaderFrom` 路径工作。
 
 ```go
 package main
 
 import (
-	"strings"
-
 	fib "github.com/lesismal/fib"
 	fibhttp "github.com/lesismal/fib/http"
 )
 
 func main() {
 	files, err := fibhttp.NewFileCache(fibhttp.FileCacheConfig{
-		Root:          ".",
+		Root:          "./public",
 		Precompressed: true, // serve name.br / name.gz when the client accepts them
 	})
 	if err != nil {
@@ -187,12 +210,13 @@ func main() {
 	}
 	defer files.Close()
 
-	app := fibhttp.HandlerFunc(func(c *fibhttp.Context) {
-		files.ServeFile(c, strings.TrimPrefix(c.Request.URL.Path, "/static/"))
+	r := fibhttp.NewRouter()
+	r.Get("/static/*", func(c *fibhttp.Context) {
+		files.ServeFile(c, c.Param("*")) // a name that would leave Root is a 404
 	})
 	engine, err := fib.New(fib.DefaultConfig(), fib.Binding{
 		Addr:    "127.0.0.1:8080",
-		Handler: fibhttp.NewHandler(app),
+		Handler: fibhttp.NewHandler(r),
 	})
 	if err != nil {
 		panic(err)
@@ -203,6 +227,13 @@ func main() {
 		panic(err)
 	}
 }
+```
+
+```sh
+mkdir -p public && echo hello > public/hello.txt && gzip -k public/hello.txt
+go run .
+curl -i http://127.0.0.1:8080/static/hello.txt                          # hello, Last-Modified
+curl -s -H 'Accept-Encoding: gzip' http://127.0.0.1:8080/static/hello.txt | gunzip  # hello.txt.gz, served as is
 ```
 
 `Context.SendFile(f, offset, n, done)` 是 handler 已经打开文件时的异步形式：这个区间与连接的其他发送一起排队，`done` 稍后回调，worker 不必为磁盘或客户端等待。把文件读进 `WriteResponse` 的 body 不走 `sendfile`；文件缓存、`Context.SendFile` 和 `ReadFrom` 才是零拷贝路径。
@@ -282,7 +313,7 @@ func echo(c *fibhttp.Context) {
 
 ## 超时与 deadline
 
-`Config.ReadTimeout`、`ReadBodyTimeout`、`ReadHeaderTimeout`、`IdleTimeout`、`WriteTimeout` 与 `net/http.Server` 的语义一致，`DefaultConfig` 会设置读超时和空闲超时。handler 用 `SetReadDeadline`、`SetWriteDeadline` 对单个请求覆盖它们；时间零值表示解除限制。`SetReadDeadline` 约束仍在到达的 body，`SetWriteDeadline` 约束仍在写的响应；输入已经到齐、一次作答的 handler 两者都不需要。
+`Config.ReadTimeout`、`ReadBodyTimeout`、`ReadHeaderTimeout`、`IdleTimeout`、`WriteTimeout` 与 `net/http.Server` 的语义一致。`DefaultConfig` 设置 `ReadHeaderTimeout`（10 秒）、`ReadBodyTimeout`（5 分钟）和 `IdleTimeout`（2 分钟），`ReadTimeout` 和 `WriteTimeout` 保持为零，即不限制；手写的 `Config{}` 一个都没有。handler 用 `SetReadDeadline`、`SetWriteDeadline` 对单个请求覆盖它们；时间零值表示解除限制。`SetReadDeadline` 约束仍在到达的 body，`SetWriteDeadline` 约束仍在写的响应；输入已经到齐、一次作答的 handler 两者都不需要。
 
 ```go
 func longLived(c *fibhttp.Context) {
@@ -332,14 +363,16 @@ func main() {
 }
 ```
 
-有两点差异需要注意。`http.Hijacker` 没有实现（`Hijack` 返回 `http.ErrNotSupported`），所以接管连接的库（包括 gorilla/websocket）不能用：请改用 `Context.Upgrade`（第 [09](09-websocket.zh-CN.md) 章）或 `Context.Connect`（第 [13](13-socks-connect.zh-CN.md) 章）。另外，客户端断开时 `c.Request.Context()` 不会被取消；请用 `c.Context()`、`c.OnCancel` 或 `c.Err()`，并把 `c.Request.WithContext(c.Context())` 交给 `httputil.ReverseProxy` 这类依赖取消的代码。
+有两点差异需要注意。`http.Hijacker` 没有实现（`http.NewResponseController(c).Hijack()` 返回 `http.ErrNotSupported`），所以接管连接的库（包括 gorilla/websocket）不能用：请改用 `Context.Upgrade`（第 [09](09-websocket.zh-CN.md) 章）或 `Context.Connect`（第 [13](13-socks-connect.zh-CN.md) 章）。另外，客户端断开时 `c.Request.Context()` 不会被取消；请用 `c.Context()`、`c.OnCancel` 或 `c.Err()`，并把 `c.Request.WithContext(c.Context())` 交给 `httputil.ReverseProxy` 这类依赖取消的代码。
 
 ## 坑与限制
 
 - **阻塞会占住连接。** handler 跑在读取该连接的 worker 上，所以在 HTTP/1 handler 里做数据库查询或转发上游会让这条连接空转。用 `Retain`/`Release` 或 `c.Async` 把慢活挪到别的 goroutine（第 03 章）。
 - **请求对象会被复用。** `DefaultConfig` 打开了 `ReuseRequests`、`ReuseHeaders`、`ReuseURLs`、`ReuseContexts`；`Request`、它的 `Header`、`URL` 和 `Context` 只在 handler 返回并释放所有 `Retain` 之前属于它。需要越过请求生命周期的内容请拷贝（`Request.Clone`、`Header.Clone`），或者关掉这些选项。
 - **`OnBody` 不会在 handler 内调用回调。** 它只注册然后返回；交付在 handler 返回后开始，在连接的 worker 上运行。`OnBody` 接管 body 后 `Request.Body` 不能再读，`data` 只在本次调用内有效。
-- **流式默认关闭。** 大上传会整体缓冲，超过 `MaxBodyBytes` 直接 413；需要打开 `StreamRequestBody`（或者用 `SaveBody`，两种模式下都能工作）。
+- **流式默认关闭。** 大上传会整体缓冲，超过 `MaxBodyBytes`（`DefaultConfig` 中为 16 MiB）直接 413；需要打开 `StreamRequestBody`（或者用 `SaveBody`，两种模式下都能工作）。
+- **在作答之前设置 `c.Header()`。** 每种作答方式都会发送它，但响应自己的 `Content-Type` 和 `WriteResponse` header 字段优先于同名字段，响应开始之后再改也没有效果。
+- **检查助手的错误。** `JSON`、`XML`、`HTMLTemplate` 编码失败时什么也不发送，忽略错误的 handler 只会留下服务端默认的空 `200`。
 - **读流式 body 不会等待。** 还没有数据时 `Request.Body.Read` 返回 `fib.ErrWouldBlock`；剩下的交给 `OnBody`。
 - **写不会阻塞。** handler 比客户端快时，差额会堆在内存里；`Config.WriteTimeout`、`WriteNoWait`/`OnWritable`、`SendFile` 是调节手段。`WriteTimeout` 也会切断流式响应，所以 SSE 要设零值 deadline。
 - **`compress`、`br` transfer coding 不支持**（请求返回 501，响应失败）；gzip、x-gzip、deflate 会被解码。`Content-Encoding` 仍由 handler 自己负责。

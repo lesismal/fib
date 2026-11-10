@@ -6,7 +6,7 @@ Package `fib/http` speaks HTTP/2 as well as HTTP/1.x, from one handler and one b
 
 ## The model
 
-An HTTP/2 connection has one reader and many streams. The engine's workers frame the connection and decode HPACK/QPACK headers; each complete request is submitted to the engine's handler pool — the shared stream pool named `<Name>-streams`, `fib-streams` by default — where its handler runs. A slow handler therefore holds up only its own stream, and requests a client has open are served concurrently. `Config.MaxConcurrentStreams` (250 by default) bounds the streams per connection, and `Config.StreamPool.MaxConcurrentHandlers` can bound how many of one connection's requests run at once; the last of the N runs on the reader, which then reads nothing further until it returns, so the peer's flow control pays for the limit instead of a queue on the server. Responses are framed as DATA and paced by the peer's flow-control windows. Raw bytes must never go through `Context.Conn`: that would corrupt the framing, so every write goes through `Context`.
+An HTTP/2 connection has one reader and many streams. The engine's workers frame the connection and decode its HPACK headers; each complete request is submitted to the engine's handler pool — the shared stream pool named `<Name>-streams`, `fib-streams` by default — where its handler runs. A slow handler therefore holds up only its own stream, and requests a client has open are served concurrently. `Config.MaxConcurrentStreams` (250 by default) bounds the streams per connection, and `Config.StreamPool.MaxConcurrentHandlers` can bound how many of one connection's requests run at once; the last of the N runs on the reader, which then reads nothing further until it returns, so the peer's flow control pays for the limit instead of a queue on the server. Responses are framed as DATA and paced by the peer's flow-control windows. Raw bytes must never go through `Context.Conn`: that would corrupt the framing, so every write goes through `Context`.
 
 ## h2c: HTTP/2 without TLS
 
@@ -98,7 +98,7 @@ curl -k --http1.1 https://127.0.0.1:8443/  # ALPN: http/1.1, same handler
 
 ## Multiplexing and the handler pool
 
-Because handlers run on the pool, a handler that waits — on a database, an upstream server, a channel — blocks only itself. That makes `Retain`/`Release` much cheaper than on HTTP/1: a retained HTTP/2 request suspends one stream and the connection carries the rest, so one connection can have hundreds of asynchronous requests in flight, and a request that is cancelled (`OnCancel`) or reset affects only its own stream. The per-connection and per-server limits are the two config fields below, and the flow-control windows trade memory for throughput.
+Because handlers run on the pool, a handler that waits — on a database, an upstream server, a channel — blocks only itself. That makes `Retain`/`Release` much cheaper than on HTTP/1: a retained HTTP/2 request suspends one stream and the connection carries the rest, so one connection can have hundreds of asynchronous requests in flight, and a request that is cancelled (`OnCancel`) or reset affects only its own stream. The per-connection limits are the config fields below, and the flow-control windows trade memory for throughput. A `Config` other than the default is passed with `fibhttp.NewHandlerWithConfig(config, app)`.
 
 ```go
 config := fibhttp.DefaultConfig()
@@ -109,9 +109,10 @@ config.HTTP2 = fibhttp.HTTP2Config{
 	ConnWindow:     32 << 20, // shared by the connection's streams
 	AdaptiveWindow: true,     // let the connection grow them to the path's bandwidth-delay product
 }
+handler := fibhttp.NewHandlerWithConfig(config, app)
 ```
 
-The windows matter for streamed bodies: the receive window is given back only as the handler consumes the body, so a fast client is paced by flow control rather than buffered. A bounded server should also remember that a connection can hold up to about `MaxConcurrentStreams × MaxBodyBytes` of whole request bodies (250 × 16MB with the defaults), which is an argument for `StreamRequestBody` on upload endpoints.
+The windows matter for streamed bodies: the receive window is given back only as the handler consumes the body, so a fast client is paced by flow control rather than buffered. Whole request bodies — the default, collected before the handler runs — are bounded twice: each by `MaxBodyBytes` (16MB, answered 413 beyond it), and all of one connection's together by `HTTP2.MaxBufferedBodyBytes`, four times `MaxBodyBytes` (64MB) by default; a stream whose DATA would pass that is reset with `REFUSED_STREAM`, which a client may retry. Upload endpoints are still better served by `StreamRequestBody`.
 
 ## Streaming bodies and responses
 
@@ -171,8 +172,8 @@ func hints(c *fibhttp.Context) {
 - **No client-initiated h2c upgrade**: cleartext HTTP/2 is prior knowledge only for fib's client (`UnencryptedHTTP2`); the server still accepts `Upgrade: h2c` for curl and others. Over TLS, switching protocols is ALPN only.
 - **Priority is ignored**: PRIORITY frames and the RFC 7540 priority tree are validated and dropped (RFC 9113 deprecates them); an RFC 9218 `priority` header's urgency is honoured for response scheduling.
 - **Ping and SETTINGS are bounded**: the server ends a connection with GOAWAY when its client resets streams or sends control frames past a budget (`StreamResetBurst`/`StreamResetRate`, `ControlFrameBurst`/`ControlFrameRate`, `MaxContinuationFrames`), and a client that does not acknowledge SETTINGS within `SettingsTimeout` (10s) is dropped. `Config.PingInterval` adds a keep-alive PING, off by default.
-- **A classic CONNECT gets no tunnel**: it is parsed and handed to a handler, but no bidirectional tunnel is established. Extended CONNECT (RFC 8441) is different — that is how WebSocket runs over HTTP/2 through `Context.Upgrade` (chapter [09](09-websocket.md)).
-- **Memory**: whole request bodies are bounded per connection by `MaxConcurrentStreams × MaxBodyBytes`; use `StreamRequestBody` or `StreamPool.MaxConcurrentHandlers` to keep it down.
+- **CONNECT is a tunnel on one stream**: a classic CONNECT is accepted with `Context.Connect`, and `fibhttp.ConnectProxy` is a ready-made HTTPS proxy over HTTP/1.x, HTTP/2 and HTTP/3 (chapter [13](13-socks-connect.md)). Extended CONNECT (RFC 8441) is how WebSocket runs over HTTP/2, through `Context.Upgrade` (chapter [09](09-websocket.md)). Either way only that stream switches.
+- **Memory**: whole request bodies are bounded per connection by `HTTP2.MaxBufferedBodyBytes` (4 × `MaxBodyBytes`, 64MB, by default), streamed ones by the stream and connection windows; lower those, or use `StreamRequestBody`, to keep it down.
 
 ## Pitfalls
 
@@ -180,7 +181,7 @@ func hints(c *fibhttp.Context) {
 - **The handler pool is shared.** A blocked handler holds a pool worker, not the connection reader, but enough blocked handlers starve every HTTP/2 and HTTP/3 server on engines of that name. Keep slow work off the pool or size it with `StreamPool.MaxConcurrentHandlers`.
 - **`Push` runs inline.** A pushed handler that waits delays the response that called `Push`; push is also disabled by most clients.
 - **A response body is not yours after the write.** `Respond`/`WriteResponse` keep the slice until the stream is finished (HTTP/3 adds the peer's acknowledgement), so do not change it; use `RespondCopy`/`WriteResponseCopy` when the buffer must be reused.
-- **Streamed bodies need `StreamRequestBody`.** Otherwise the body is buffered whole before the handler runs and a big upload costs `MaxBodyBytes` per stream.
+- **Streamed bodies need `StreamRequestBody`.** Otherwise the body is buffered whole before the handler runs, a big upload costs up to `MaxBodyBytes` per stream, and one larger than that is refused with 413.
 - **Stream and request objects are recycled.** The rule from chapter [06](06-http1.md) applies unchanged: don't keep the `Request`, `Header`, `URL` or `Context` past the response and the last `Release`.
 - **h2c is not what browsers speak.** Browsers use h2 over TLS; h2c is for internal services, gRPC cleartext, and conformance tools.
 

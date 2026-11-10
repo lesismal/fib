@@ -91,15 +91,19 @@ Behaviour to be aware of when using it.
   `Content-Length` the handler set resets the stream rather than ending it.
 - Package [`grpc`](../grpc) serves gRPC, streaming included, through this
   (`Server.ServeHTTP`), besides its own HTTP/2 transport.
-- Memory bound: on the server, one connection can hold up to about
-  `MaxConcurrentStreams × MaxBodyBytes` (250 × 16MB by default) of bodies read
-  whole, and a stream window per streamed body; on the client, one response is
+- Memory bound: on the server, a body over `MaxBodyBytes` gets 413, and one
+  connection holds at most `HTTP2.MaxBufferedBodyBytes` (4 × `MaxBodyBytes`,
+  64MB by default) of the bodies it reads whole; a stream whose DATA would go
+  past it is reset with `REFUSED_STREAM`. A streamed body costs a stream
+  window. On the client, one response is
   bounded by `MaxResponseBodyBytes`. A whole response is kept as the
   handler's body, with only the frames the windows admit queued, so a stalled
   reader costs about one stream window rather than the body; see
   [Load testing](loadtest.md).
-- A `CONNECT` request is parsed and handed to the handler, but no tunnel can be
-  established (there is no bidirectional streaming channel).
+- A `CONNECT` request that names no `:protocol` (RFC 9113 section 8.5) is
+  switched to a tunnel on its stream with `Context.Connect`;
+  `fibhttp.ConnectProxy` serves CONNECT this way over HTTP/1.x, HTTP/2 and
+  HTTP/3.
 
 ### Handlers run on a pool
 
@@ -196,8 +200,8 @@ the table what either side's HPACK encoder may keep between header blocks.
   urgency 0, 4 for urgency 1, 2 for urgency 2, and the single frame a turn
   every stream gets for the default urgency 3 and every less urgent one, so a
   client that sends no priority, or the default urgency, sees the round robin
-  unchanged. The incremental hint (`i`) is ignored, since a response body is
-  buffered whole before it is sent, and PRIORITY_UPDATE is not implemented.
+  unchanged. The incremental hint (`i`) is ignored, and PRIORITY_UPDATE is not
+  implemented.
   The turns stay in the order the streams began to wait, and no stream is
   starved: every waiting stream gets its turn, and one the connection's
   window cuts short keeps its place, and the frames left of its turn, until
@@ -296,7 +300,7 @@ The complete list, including the HTTP/1, HTTP/3, engine and test-infrastructure 
 | Feature | Reason |
 | --- | --- |
 | Receiving server push in the client | Chrome and Firefox have removed push, and Go's `net/http` client never supported it. The client sends `ENABLE_PUSH=0`; the server's push support remains for clients that still want it. For preloading, 103 Early Hints (`Context.WriteInterim`) is the recommended replacement. |
-| RFC 9218's incremental hint and PRIORITY_UPDATE | The `priority` header's urgency is used for send scheduling (see [Protocol details](#protocol-details)); `i` has nothing to reorder while a response body is buffered whole, and the update frame is not implemented. The RFC 7540 priority tree is deprecated by RFC 9113 and is not implemented either. |
+| RFC 9218's incremental hint and PRIORITY_UPDATE | The `priority` header's urgency is used for send scheduling (see [Protocol details](#protocol-details)); the incremental hint `i` is ignored, and the update frame is not implemented. The RFC 7540 priority tree is deprecated by RFC 9113 and is not implemented either. |
 | `Upgrade: h2c` initiated by the client | RFC 9113 deprecates this upgrade; cleartext HTTP/2 uses prior knowledge (`UnencryptedHTTP2`). The server still accepts the upgrade for compatibility with curl and others. |
 | `Upgrade: h2c` over TLS | The RFCs allow switching protocols over TLS only through ALPN. |
 | 1xx interim responses to HTTP/1.0 requests | HTTP/1.0 clients do not understand 1xx; `WriteInterim` returns `http.ErrNotSupported`. |

@@ -138,38 +138,99 @@ curl -k --http2 https://127.0.0.1:8443/
 - 客户端认证：`ClientAuth`、`ClientCAs`，以及客户端的 `Certificates`、`GetClientCertificate`；
 - 校验：`RootCAs`、`ServerName`、`InsecureSkipVerify`、`VerifyPeerCertificate`、`VerifyConnection`——回调和校验都运行在握手池的 worker 上，绝不会跑在引擎的事件循环上；
 - 版本与套件：`MinVersion`、`MaxVersion`，TLS 1.2 用 `CipherSuites`；TLS 1.3 套件在 `crypto/tls` 里没有配置字段，客户端的提议顺序由 `Handler.TLS13CipherSuites` 决定；
-- 会话恢复：`ClientSessionCache` 与 `SessionTicketKey`；握手以状态机方式运行的服务端会用自己的 ticket，密钥属于 `Handler`。
+- 会话恢复：服务端用 `SessionTicketKey`——握手以状态机方式运行的服务端会签发自己的 ticket，密钥属于 `Handler`；客户端用 `ClientSessionCache`，但它会让连接留在 `crypto/tls` 里；想在不占 worker 的握手上恢复会话，改用 `DialOptions.SessionCache`（`Handler.SessionCache`）。
 
 fib 增加的是数据路径——记录的加封与解封、一轮写入合并为一条记录，以及在 Linux 上把大文件 `SendFile` 响应的加封交给内核 TLS（`Handler.KernelTLSMinFile`，用 `NoKernelTLS` 关闭）。
 
 ## 感知 ALPN 的 handler
 
-由被包裹的 handler 决定协商出的协议意味着什么。自定义的 `HandshakeHandler` 会收到一次握手结果，可以据此切换连接上的 handler：
+由被包裹的 handler 决定协商出的协议意味着什么。自定义的 `HandshakeHandler` 会在握手之后、任何 `OnData` 之前收到一次握手结果，并据此决定此后把连接的明文交给谁。下面这个例子用两个配置不同的 HTTP handler 分别服务 h2 与 HTTP/1.1：
 
 ```go
-type multiplexer struct {
-	h2  fib.Handler
-	h11 fib.Handler
+package main
+
+import (
+	stdtls "crypto/tls"
+	stdhttp "net/http"
+	"sync"
+
+	fib "github.com/lesismal/fib"
+	fibhttp "github.com/lesismal/fib/http"
+	fibtls "github.com/lesismal/fib/tls"
+	"github.com/lesismal/fib/tlstest"
+)
+
+// alpnSwitch is the handler fibtls wraps. Once ALPN has settled it picks a
+// handler for the connection and forwards the plaintext to it.
+type alpnSwitch struct {
+	h2, h11 fib.Handler
+	picked  sync.Map // *fib.Connection -> fib.Handler
 }
 
-func (m multiplexer) OnOpen(c *fib.Connection) {}
+func (m *alpnSwitch) OnOpen(c *fib.Connection) {} // before the handshake: nothing chosen yet
 
-func (m multiplexer) OnData(c *fib.Connection, data []byte) {}
-
-func (m multiplexer) OnPriorityData(c *fib.Connection, data []byte) {}
-
-func (m multiplexer) OnClose(c *fib.Connection, err error) {}
-
-func (m multiplexer) OnHandshake(c *fib.Connection, state stdtls.ConnectionState) {
+func (m *alpnSwitch) OnHandshake(c *fib.Connection, state stdtls.ConnectionState) {
+	h := m.h11
 	if state.NegotiatedProtocol == "h2" {
-		c.SetHandler(m.h2)
-		return
+		h = m.h2
 	}
-	c.SetHandler(m.h11)
+	m.picked.Store(c, h)
+	h.OnOpen(c)
+	if hh, ok := h.(fibtls.HandshakeHandler); ok {
+		hh.OnHandshake(c, state)
+	}
+}
+
+func (m *alpnSwitch) OnData(c *fib.Connection, data []byte) {
+	if h, ok := m.picked.Load(c); ok {
+		h.(fib.Handler).OnData(c, data)
+	}
+}
+
+func (m *alpnSwitch) OnPriorityData(c *fib.Connection, data []byte) {}
+
+func (m *alpnSwitch) OnClose(c *fib.Connection, err error) {
+	if h, ok := m.picked.LoadAndDelete(c); ok {
+		h.(fib.Handler).OnClose(c, err)
+	}
+}
+
+func main() {
+	serverTLS, _, err := tlstest.Configs()
+	if err != nil {
+		panic(err)
+	}
+	app := fibhttp.HandlerFunc(func(c *fibhttp.Context) {
+		_ = c.String(stdhttp.StatusOK, "hello over %s\n", c.Request.Proto)
+	})
+	h2 := fibhttp.DefaultConfig()
+	h2.HTTP2Only = true
+	h11 := fibhttp.DefaultConfig()
+	h11.DisableHTTP2 = true
+	sw := &alpnSwitch{
+		h2:  fibhttp.NewHandlerWithConfig(h2, app),
+		h11: fibhttp.NewHandlerWithConfig(h11, app),
+	}
+	engine, err := fib.New(fib.DefaultConfig(), fib.Binding{
+		Addr:    "127.0.0.1:8443",
+		Handler: fibtls.NewServer(fibhttp.ConfigureTLS(serverTLS), sw),
+	})
+	if err != nil {
+		panic(err)
+	}
+	defer engine.Close()
+	if err := engine.Run(); err != nil {
+		panic(err)
+	}
 }
 ```
 
-`c.SetHandler` 会在任何明文到达之前装好选定的 handler，因为 `OnHandshake` 在握手输出加密之后、`OnData` 收到字节之前运行。这正是 `http` 包使用的机制；大多数程序应当让 `http.ConfigureTLS` 或 `http3.ConfigureTLS` 决定 ALPN 列表，并保持单一 handler 栈。
+```sh
+curl -k --http2 https://127.0.0.1:8443/    # hello over HTTP/2.0, from h2
+curl -k --http1.1 https://127.0.0.1:8443/  # hello over HTTP/1.1, from h11
+```
+
+这个分发器按连接记住自己的选择，并转发之后的每个回调；被选中 handler 的 `OnOpen` 在握手时才运行，而不是在握手之前。不要为此调用 `c.SetHandler`：连接上的 handler 就是 `fibtls.Handler` 本身，替换它会把密文交给新的 handler。`http` 包自己已经做了这个选择——ALPN 选中 `h2` 时它的 handler 就按 HTTP/2 服务——所以大多数程序只需加上 `http.ConfigureTLS`，保持单一 handler 栈；这样的分发器用于 fib 没有替你配好的协议组合。
 
 ## 客户端拨号选项
 
@@ -248,6 +309,7 @@ DTLS 不是流上的 TLS，因此是另一套 API：`fibtls.NewDTLSServer` 与 `
 - **在第一次握手前改好配置。** `Handler` 在首次使用时克隆配置，之后的修改不会被看到；已在使用的 `Config` 本来也不允许修改，这是 `crypto/tls` 的要求。
 - **缺少 ALPN 列表会静默退化为 HTTP/1.1。** TLS 依然成功，h2 客户端回落到 HTTP/1.1，而 gRPC 客户端会报协议错误。用对应协议的 `ConfigureTLS` 辅助函数加入 `NextProtos`。
 - **不存在明文回退。** handler 为 `fibtls.NewServer` 的绑定只接受 TLS，不会嗅探，也不会“先试 TLS 再退回明文”。一个端口要跑多种协议时请用 `mux` 或 `multiproto` 包，见 [15-multiprotocol.md](15-multiprotocol.zh-CN.md)。
+- **有些 `Config` 字段会让连接留在 `crypto/tls` 里。** 服务端的 `GetConfigForClient`，客户端的 `ClientSessionCache` 或重协商，会让握手在池的 worker 上运行，记录也交给 `crypto/tls` 加解密，速度更慢；功能照常，但依赖它们之前先测一下。
 - **`done` 回调不代表握手结束。** 它在 TCP 连接建立时触发；证书错误之类的失败稍后才会出现在 `OnClose` 里。
 - **客户端校验必须有一个名字。** 有 `RootCAs` 却没有 `ServerName` 又不设 `InsecureSkipVerify` 的客户端配置会失败；`fibtls.Dial` 会自动填好，`NewClient` 不会。
 

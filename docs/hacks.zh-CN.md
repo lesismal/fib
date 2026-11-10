@@ -159,7 +159,7 @@ httpConfig.StreamRequestBody = true
 httpConfig.StreamRequestBodyThreshold = 0      // 0：所有 body 都流式；非 0：不超过它的仍整体缓存
 httpConfig.MaxStreamedBodyBytes = 64 << 30     // 流式 body 的上限
 httpConfig.StreamRequestBodyBuffer = 1 << 20   // 未被读走的 body 攒到这么多就停止读 socket
-httpConfig.ReadTimeout = 0                     // 见下面"慢客户端"
+httpConfig.ReadBodyTimeout = time.Hour         // DefaultConfig 为 5 分钟；见下面"慢上传"
 
 handler := fibhttp.NewHandlerWithConfig(httpConfig, fibhttp.HandlerFunc(
     func(c *fibhttp.Context) {
@@ -241,9 +241,11 @@ c.OnBody(func(data []byte, fin bool, err error) {
 
 **要注意**
 
-- **慢上传**靠 `ReadTimeout` 约束，它从请求第一个字节算起，且 **流式 body 在 handler 运行期间仍在
-  到达，所以也受它约束**。上传大文件时要么把它设得足够大/设 0，要么用 `IdleTimeout`。
-  请求收全之后 deadline 才会撤掉，所以"慢 handler"不受 `ReadTimeout` 限制。
+- **慢上传**靠 `ReadBodyTimeout`（`DefaultConfig` 为 5 分钟，从 header 结束算起）约束，设置了
+  `ReadTimeout` 时也受它约束（`DefaultConfig` 为 0，从请求第一个字节算起），先到者生效；HTTP/2 和
+  HTTP/3 上对每个请求的 body 各自计时。**流式 body 在 handler 运行期间仍在到达，所以也受它们约束**。
+  上传大文件时把 `ReadBodyTimeout` 调大（设 0 即不限），或用 `c.SetReadDeadline(time.Time{})` 为单个
+  请求撤掉。body 收全之后 deadline 才会撤掉，所以"慢 handler"不受它限制。
 - 回调里 **不要长时间阻塞**：连接在你的回调里就不读，其它连接不受影响（回调在 worker 上），
   但它占着一个 worker。需要慢操作就换到自己的池 + `HoldReads`（见 [§8](#8-读背压holdreads)）。
 - 回调里不能再读 `Request.Body`；关闭 `Body` 会让回调以 `ErrBodyAbandoned` 结束并丢弃余下的 body。
@@ -633,8 +635,9 @@ client := fibhttp.NewClient(engine, fibhttp.DefaultClientConfig()) // 复用 ser
   `Upgrade: h2c`）和 HTTP/3**，handler 代码一行都不用改。`Request.Proto` 告诉你是哪个。
   HTTP/3 在同一端口号上用 UDP，TCP 上带 `Alt-Svc` 引导浏览器切换。
 - `Config.HTTP2Only`、`Config.DisableHTTP2` 可以强制其一。
-- `ResponseWriter` 的 `Write`/`Flush` 在 h1 上即刻发出；在 h2/h3 上响应会先缓存、handler 返回后整体发送。
-  超大响应请用 h1 的流式，或 `FileCache` / `SendFile`。
+- `ResponseWriter` 的 `Write`/`Flush` 在 h1、h2、h3 上都是流式的：h2/h3 上 body 按客户端流控窗口
+  以 DATA 帧发出，约 64KB 被压住时 `Write` 就会等待，内存因此有上界（`OnResponse` hook 需要完整
+  响应时仍会保留到 handler 返回）。SSE、长轮询、大文件下载在三者上都能用。
 - **`Context.Upgrade(protocol, header, TunnelHandler)`** 回 101（或 h2/h3 上回 200）并把连接/stream
   切换给 `TunnelHandler`，WebSocket 的 `Upgrade` 就是这么实现的。你自己的协议（自定义二进制、
   CONNECT 代理、隧道）可以直接借用：HTTP 上做握手、鉴权、路由，然后无缝切到原始字节流。
@@ -734,10 +737,11 @@ func main() {
   子进程之间除了端口什么都不共享，内存里的状态每个子进程一份——
   整机只有一份的资源（如 DB 连接上限）按 `prefork.Children()` 分。
 - UDP（HTTP/3）：对端地址变化（NAT 重绑定/迁移）后可能落到另一个子进程，那里没有这条 QUIC 连接。
-- 子进程里 fib 的默认值随之变化：CPU 数取 `min(NumCPU, GOMAXPROCS)`，≤4 个 P 不开 IOPollers。
+- 子进程里 fib 的默认值随之变化：CPU 数取 `min(NumCPU, GOMAXPROCS)`，≤4 个 P 时每个 Engine 只有一个 poller。
 
-**IOPollers**：把 Engine 拆到多个事件循环（Linux epoll / macOS kqueue）。默认 CPU>4 时开启；
-poller 数默认 `max(1, CPU/4)`（32 CPU 以内），更多时 `CPU/2`。poller 只等事件、把变为可执行的连接交给
+**IOPollers**：把 Engine 拆到多个事件循环（Linux epoll / macOS kqueue）。默认开启；
+poller 数默认（`IOPollerCount` 为 0）4 个 CPU 以内 1 个，16 个以内 2 个，更多时 `CPU/8`（24 核 3 个、
+32 核 4 个、64 核 8 个）。poller 只等事件、把变为可执行的连接交给
 worker，**多开 poller 会和 worker 抢 P，通常更慢**。poller 自己的工作（accept）成为瓶颈时才划算：
 连接频繁建立/关闭的场景（limited-conn）里，Linux 上 poller 自己 `SO_REUSEPORT` accept，从每秒 94 万
 请求提到 165 万。
@@ -797,7 +801,7 @@ out := bufferpool.Join(nil, a, b)           // 一次取够，拼几段
 5. **把 `data` 存起来**（`OnData`、`OnBody`、`OnFrame`、`Ping/Pong` payload 全都只在回调内有效）。
 6. **对 `Connection` 用 `bufio.Reader`**，或期待 `Read` 阻塞。
 7. **水位线设得小于一轮读取的回包总量**，pipeline 下触发无谓的暂停读。
-8. **开了 `StreamRequestBody` 却保留默认 `ReadTimeout`**，大上传被超时切断。
+8. **开了 `StreamRequestBody` 却保留默认 `ReadBodyTimeout`（5 分钟）**，大上传被超时切断。
 9. **把异步工作丢进 Engine 的池**，或让同名 Engine 的 `SharedTaskPool` 配置悄悄被第一个 Engine 覆盖。
 10. **把 GOMAXPROCS 调大**以为更快。
 11. **在 `Close` 自己连接之后，在同一个 `OnData` 里等 `OnClose` 的通知**（比如 `OnCancel`）：死锁。

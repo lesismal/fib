@@ -181,7 +181,7 @@ httpConfig.StreamRequestBody = true
 httpConfig.StreamRequestBodyThreshold = 0      // 0: stream every body; otherwise bodies up to it are still buffered whole
 httpConfig.MaxStreamedBodyBytes = 64 << 30     // upper bound for a streamed body
 httpConfig.StreamRequestBodyBuffer = 1 << 20   // stop reading the socket when this much body is waiting unread
-httpConfig.ReadTimeout = 0                     // see "slow clients" below
+httpConfig.ReadBodyTimeout = time.Hour         // DefaultConfig: 5 minutes; see "slow uploads" below
 
 handler := fibhttp.NewHandlerWithConfig(httpConfig, fibhttp.HandlerFunc(
     func(c *fibhttp.Context) {
@@ -270,10 +270,13 @@ c.OnBody(func(data []byte, fin bool, err error) {
 
 **Note**
 
-- **Slow uploads** are bounded by `ReadTimeout`, which counts from the request's first byte, and
-  **a streamed body is still arriving while the handler runs, so it is bound by it too**. For
-  large uploads set it high enough or to 0, and rely on `IdleTimeout`. The deadline is removed
-  only once the request has fully arrived, so a slow *handler* is not limited by `ReadTimeout`.
+- **Slow uploads** are bounded by `ReadBodyTimeout` (5 minutes in `DefaultConfig`, counted from
+  the end of the header) and by `ReadTimeout` when set (0 in `DefaultConfig`, counted from the
+  request's first byte); whichever ends first applies, on HTTP/2 and HTTP/3 to each request's
+  body on its own. **A streamed body is still arriving while the handler runs, so it is bound by
+  them too.** For large uploads raise `ReadBodyTimeout` (0 removes the bound), or lift it for one
+  request with `c.SetReadDeadline(time.Time{})`. The deadline is removed once the body has fully
+  arrived, so a slow *handler* is not limited by it.
 - **Don't block for long in the callback.** While your callback runs the connection does not
   read; other connections are unaffected (the callback is on a worker), but it holds a worker.
   For slow work use your own pool plus `HoldReads` (see [§8](#8-read-backpressure-holdreads)).
@@ -741,9 +744,10 @@ client := fibhttp.NewClient(engine, fibhttp.DefaultClientConfig()) // reuses the
   and HTTP/3**, with no change to the handler code. `Request.Proto` tells you which. HTTP/3 uses
   UDP on the same port number, and responses on TCP carry `Alt-Svc` to steer browsers over.
 - `Config.HTTP2Only` and `Config.DisableHTTP2` force one or the other.
-- `ResponseWriter` `Write`/`Flush` go out immediately on h1; on h2/h3 the response is buffered
-  and sent whole after the handler returns. For very large responses use h1 streaming, or
-  `FileCache` / `SendFile`.
+- `ResponseWriter` `Write`/`Flush` stream on h1, h2 and h3 alike: on h2/h3 the body goes out in
+  DATA frames as the client's flow control lets it, and `Write` waits once about 64KB is held
+  back, so memory stays bounded (a response an `OnResponse` hook needs whole is still held until
+  the handler returns). SSE, long polling and large downloads work on all three.
 - **`Context.Upgrade(protocol, header, TunnelHandler)`** answers 101 (or 200 on h2/h3) and hands
   the connection/stream to the `TunnelHandler`; WebSocket's `Upgrade` is built exactly this way.
   Your own protocols (custom binary, CONNECT proxies, tunnels) can borrow it: do handshake, auth
@@ -865,12 +869,12 @@ func main() {
   divided by `prefork.Children()`.
 - UDP (HTTP/3): after the peer address changes (NAT rebinding / migration) datagrams may land on
   another child, which has no such QUIC connection.
-- fib's defaults shift inside a child: the CPU count is `min(NumCPU, GOMAXPROCS)`, and with 4 Ps
-  or fewer IOPollers is off.
+- fib's defaults shift inside a child: the CPU count is `min(NumCPU, GOMAXPROCS)`, so with 4 Ps
+  or fewer an Engine gets a single poller.
 
 **IOPollers:** splits an Engine across several event loops (Linux epoll / macOS kqueue). It is on
-by default when CPUs > 4; the default poller count is `max(1, CPU/4)` up to 32 CPUs, `CPU/2`
-beyond. A poller only waits for events and hands runnable connections to workers, so **more
+by default; the default poller count (`IOPollerCount` 0) is one up to 4 CPUs, two up to 16, and
+`CPU/8` beyond (3 on 24, 4 on 32, 8 on 64). A poller only waits for events and hands runnable connections to workers, so **more
 pollers compete with workers for Ps and are usually slower**. They pay off only when the pollers'
 own work (accept) is the bottleneck: with frequent connect/close (limited-conn) on Linux, pollers
 accepting for themselves via `SO_REUSEPORT` raised 0.94M to 1.65M requests per second.
@@ -937,7 +941,7 @@ out := bufferpool.Join(nil, a, b)           // takes enough at once and joins th
 6. **Using `bufio.Reader` on a `Connection`**, or expecting `Read` to block.
 7. **A watermark smaller than the replies of one round of reads**, which makes pipelines pause
    reads for no reason.
-8. **Turning on `StreamRequestBody` but keeping the default `ReadTimeout`**, so large uploads are
+8. **Turning on `StreamRequestBody` but keeping the default `ReadBodyTimeout` (5 minutes)**, so large uploads are
    cut off by the timeout.
 9. **Putting async work on the Engine's pool**, or letting `SharedTaskPool` settings of a
    same-name Engine be silently overridden by the first Engine.

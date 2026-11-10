@@ -33,7 +33,7 @@ if err := engine.Run(); err != nil { // blocks until Stop, Shutdown or Close end
 
 字段可以分成几组，其中只有少数会改变服务器的行为。先从默认值开始，只设置部署真正需要的：
 
-- **身份与协程池**——`Name` 用于日志中的引擎标识，也决定两个协程池的名字（连接用的 `<Name>-workers`，HTTP/2 和 HTTP/3 handler 用的 `<Name>-streams`）；同名引擎在 `SharedTaskPool` 打开时（默认打开）共享这两个池。`WorkerCount` 是池的上限，`MinWorkerCount` 是 adaptive 模式回收后保留的下限，`TaskPoolMode` 选择调度器（默认 `taskpool.ModeAdaptive`），`SetTaskPool` 可以换成你自己的池。
+- **身份与协程池**——`Name` 用于日志中的引擎标识，也决定两个协程池的名字（连接用的 `<Name>-workers`，HTTP/2 和 HTTP/3 handler 用的 `<Name>-streams`）；同名引擎在 `SharedTaskPool` 打开时（默认打开）共享 worker 池，handler 池则总是共享。`WorkerCount` 是池的上限，`MinWorkerCount` 是 adaptive 模式回收后保留的下限，`SetTaskPoolMode` 选择调度器（默认 `taskpool.ModeAdaptive`），并把 `WorkerCount` 和 `MaxEvents` 重置为该模式的尺寸，`SetTaskPool` 可以换成你自己的池。
 - **监听器**——`Network` 是绑定自身留空时使用的网络，`Backlog` 是监听队列深度（内核的 `somaxconn`），`MaxConns` 限制全部绑定合计已接受的连接数，`ReusePort` 允许同一用户的其他 socket 共享地址。
 - **缓冲区与背压**——`ReadBufferSize` 限制一次读的字节数（默认 16 KiB，每轮复用池中的一个缓冲区，不是每连接一个）；`WriteBufferHighWatermark` 在某连接待写字节达到该值时暂停它的读；`MaxPendingBytes` 对整个服务器做同样的限制；`MaxWriteQueueBytes` 限制单个连接的发送队列，超出的发送不会入队，而是以 `fib.ErrSendQueueFull` 关闭连接，避免不读数据的对端把队列撑大。
 - **写入与批量**——`UseWritev` 用一次 `writev` 发送多个缓冲区，`CoalesceWrites` 把一轮内的响应 cork 起来，在本轮结束时一起写出。
@@ -52,6 +52,9 @@ import (
 
 func main() {
 	cfg := fib.DefaultConfig()
+	// First: switching the mode resets WorkerCount and MaxEvents to its sizing.
+	cfg.SetTaskPoolMode(taskpool.ModeAdaptive)
+
 	cfg.Name = "gateway"             // names the pools "<Name>-workers" and "<Name>-streams"
 	cfg.WorkerCount = 4 << 10        // ceiling; adaptive mode retires idle workers
 	cfg.MinWorkerCount = 16          // floor the pool retires down to
@@ -61,7 +64,6 @@ func main() {
 	cfg.ReadBufferSize = 64 << 10    // one read takes at most 64 KiB
 	cfg.WriteBufferHighWatermark = 256 << 10
 	cfg.IOPollerCount = 2 // two loops; 0 would size them from the CPUs
-	cfg.SetTaskPoolMode(taskpool.ModeAdaptive)
 
 	handler := fibhttp.NewHandler(fibhttp.HandlerFunc(func(c *fibhttp.Context) {
 		_ = c.String(200, "ok\n")
@@ -76,6 +78,8 @@ func main() {
 	}
 }
 ```
+
+启动配置列表（见[启动日志与日志配置](#启动日志与日志配置)）就是检查结果的办法：这里设置的字段显示 `source=custom`，例如 `parameter=workers value=4096 source=custom`；显示 `default` 的，要么被覆盖了，要么没设上，要么设成了与默认值相同的值（比如这里的 `WriteBufferHighWatermark`）。
 
 有两点要注意。零值是特殊标记的字段（`ReadBufferSize`、`Backlog`、`IOPollerCount`、`UDPIdleTimeout`、`Name`、`Network`）表示“取默认值”；其余字段的零值就是字面含义，所以 `MaxConns`、`MaxPendingBytes`、`MaxWriteQueueBytes` 为 0 表示不启用。只调大 `ReadBufferSize` 并不会改变 `DefaultConfig` 已经按旧值选好的写水位：请改用 `DefaultConfigFor`，或者自己设置 `WriteBufferHighWatermark`。
 
@@ -149,6 +153,17 @@ func main() {
 }
 ```
 
+每个绑定在自己的地址上应答：
+
+```sh
+curl http://127.0.0.1:8080/                           # hello over HTTP/1.1
+curl --http2-prior-knowledge http://127.0.0.1:8080/   # hello over HTTP/2.0
+curl -k https://127.0.0.1:8443/                       # hello over HTTP/2.0
+curl --unix-socket "${TMPDIR:-/tmp}/fib-tutorial.sock" http://localhost/
+```
+
+`:8081` 上的 WebSocket 绑定会回显 WebSocket 客户端发来的消息，客户端见 [09-websocket.zh-CN.md](09-websocket.zh-CN.md)；HTTP/3 绑定需要 HTTP/3 客户端，同第 01 章。socket 路径取自 `os.TempDir()`，在 macOS 上是 `$TMPDIR`，在 Linux 上是 `/tmp`。
+
 `Binding` 还有 `Addrs`（一组共享 `Network` 的地址；此时 `Addr` 被忽略）、`MultipathTCP`（监听器属性，所以别的都归引擎，它仍留在绑定上）和 `Filter`，类型为 `func(netip.AddrPort) bool`，在事件循环上快速询问每个新对端——被拒绝的 TCP 连接直接关闭，被拒绝的 UDP 对端的数据报直接丢弃，不产生 `Connection`，也不占用 `MaxConns` 名额。
 
 ## 运行时增删绑定
@@ -175,7 +190,7 @@ if err := engine.ShutdownBinding(ctx, i); err != nil {
 
 ## 优雅关闭
 
-`Shutdown(ctx)` 立即关闭监听器，此后新来的客户端会被拒绝；然后等待引擎已接受的连接结束，或者等到 `ctx` 到期。如果 context 结束了等待它返回 `ctx.Err()`，否则返回 `nil`，随后停止引擎，使 `Run` 返回；此时仍打开的连接在 `Close` 之前保持打开。引擎主动拨出的连接不等待；UDP 监听器已知的对端要等待：
+`Shutdown(ctx)` 立即关闭监听器，此后新来的客户端会被拒绝；然后等待引擎已接受的连接结束，或者等到 `ctx` 到期。如果 context 结束了等待它返回 `ctx.Err()`，否则返回 `nil`，随后停止引擎，使 `Run` 返回；此时仍打开的连接在 `Close` 之前保持打开。引擎主动拨出的连接不等待；UDP 监听器已知的对端要等待。`Stop` 是立即停止的形式：它关闭监听器并让 `Run` 马上返回，所有连接都留给 `Close`。下面是收到 `SIGINT` 或 `SIGTERM` 时排空连接的服务器：
 
 ```go
 package main
@@ -225,7 +240,7 @@ func main() {
 
 ## 一个进程里的多个引擎
 
-一个进程可以运行多个引擎，而且当它们没有可共享的东西时通常应该这样做：每个协议一个引擎要多一套循环、池和缓冲池，但彼此隔离。同名引擎在 `SharedTaskPool` 打开时（默认打开）跑在同一个工作协程池和 handler 池上：最先启动的引擎按自己的设置建池，其余引擎直接使用。想保留独立协程池，就把 `SharedTaskPool` 设为 false，或者给引擎换一个 `Name`。
+一个进程可以运行多个引擎，而且当它们没有可共享的东西时通常应该这样做：每个协议一个引擎要多一套循环、池和缓冲池，但彼此隔离。同名引擎在 `SharedTaskPool` 打开时（默认打开）跑在同一个工作协程池上：最先启动的引擎按自己的设置建池，其余引擎直接使用。同名引擎还总是共享同一个 handler 池 `<Name>-streams`，与 `SharedTaskPool` 无关；它的上限跟随该名字下最大的工作协程池。把 `SharedTaskPool` 设为 false 可以让引擎拥有自己的工作协程池，再换一个 `Name` 才能把 handler 池也分开。`Name` 保持默认值 `fib` 的引擎两个池都共享。
 
 ## 启动日志与日志配置
 
@@ -255,9 +270,10 @@ fiblog.Setup(fiblog.Config{
 - **`fib.Config{}` 不是 `fib.DefaultConfig()`。** 布尔字段保持 false，协程池、缓冲区和日志的尺寸也不会填好；永远从 `DefaultConfig` 出发。
 - **`New` 会复制配置。** `New` 返回后再改 `cfg` 对运行中的引擎没有任何影响。
 - **一个坏绑定让全部失败。** 任一绑定的任一地址拿不到，`New` 一个都不保留；先确认 Unix socket 路径不存在、端口空闲，再怀疑 handler。
-- **`Run` 是阻塞的，`Close` 要排在它之后。** 必须在 `Run` 返回之后再调用 `Close`；可以在它运行期间调用的是 `Shutdown`。
+- **`Run` 是阻塞的，`Close` 要排在它之后。** 必须在 `Run` 返回之后再调用 `Close`；运行期间要停止它，调用 `Shutdown` 或 `Stop`。
 - **`MaxConns` 只统计已接受的连接。** 主动拨出的连接和 UDP 对端不计入，客户端引擎和 UDP 绑定要自己限制数量。
-- **共享池由第一个引擎决定。** 同名且打开 `SharedTaskPool` 的两个引擎不会各自使用自己的尺寸；请改名或关掉共享。
+- **共享池由第一个引擎决定。** 同名且打开 `SharedTaskPool` 的两个引擎不会各自使用自己的尺寸；请改名或关掉共享。`Name` 保持默认值的引擎全都共享同一个池。
+- **`SetTaskPoolMode` 会重置池的尺寸。** 先调用它，再设置 `WorkerCount` 和 `MaxEvents`；或者用 `SetPoolSizing`，它固定尺寸，调用顺序无所谓。
 - **调大 `ReadBufferSize` 要同时调水位。** `DefaultConfig` 是按 16 KiB 算的写水位；`DefaultConfigFor` 会同时调整两者。
 - **运行时的绑定下标不复用。** 保存 `AddBinding` 返回的下标；`RemoveBinding` 之后它不指向任何绑定。
 - **`RemoveBinding` 不关闭 TCP 连接。** 它只停止监听；要排空连接请用 `ShutdownBinding`。

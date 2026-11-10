@@ -143,7 +143,8 @@ UDP 关联同时保持的目标 socket 数，`MaxQueuedBytes` 限制中继每个
 域名交给代理解析。
 
 UDP ASSOCIATE 需要同一个 Engine 上的 UDP binding。服务端会把与客户端到达时同地址族的 UDP binding
-地址告诉客户端；没有 UDP binding 的 Server 会拒绝 UDP ASSOCIATE：
+地址告诉客户端；没有 UDP binding 的 Server 会拒绝 UDP ASSOCIATE。客户端每向一个新目标发数据报，
+`Allow` 都会再被询问一次，发往被拒目标的数据报会被丢弃：
 
 ```go
 server := socks.NewServer(socks.Config{})
@@ -198,14 +199,30 @@ wsConfig.Dial = proxy.Dial // wss:// and ws:// through the proxy
 tlsOptions := fibtls.DialOptions{Dial: proxy.Dial} // any TLS dial through the proxy
 ```
 
-`Dialer.Dial` 也正好是 `socks.Config.Dial` 要求的整个 `DialFunc` 约定，所以用 `Forward` 可以把
-代理串起来：前端代理通过后端代理到达目标，前端的客户端只看到前端的地址：
+网络为 `udp` 时，向 SOCKS5 代理请求的是 UDP ASSOCIATE 而不是 CONNECT：连接上的每次 `Send` 都是
+经代理中继发往目标的一个数据报，每次 `OnData` 是一个回来的数据报。
+
+`Dialer.Dial` 也正好满足整个 `DialFunc` 约定，所以代理有两种串法。服务端上，`socks.Config.Dial`
+让一个代理经由另一个代理到达目标；客户端上，`Dialer.Forward` 让拨号器经由另一个代理到达它的代理：
 
 ```go
-front, err := socks.ParseURL("socks5h://127.0.0.1:1081")
 back, err := socks.ParseURL("socks5h://127.0.0.1:1080")
-front.Forward = back.Dial // front proxies through back
+if err != nil {
+	panic(err)
+}
+// A SOCKS server whose CONNECTs and UDP destinations go out through back:
+front := socks.NewServer(socks.Config{Dial: back.Dial})
+
+// A dialer that reaches the proxy at :1081 through back, then the destination through :1081:
+viaBack, err := socks.ParseURL("socks5h://127.0.0.1:1081")
+if err != nil {
+	panic(err)
+}
+viaBack.Forward = back.Dial
 ```
+
+目标只看到最后一个代理的地址。设置了 `Config.Dial` 时 `AllowResolved` 不会被调用：串联的拨号器
+自己解析域名。
 
 在底层，连代理、与代理协商以及任何 DNS 查询都发生在 Engine 的循环和 worker 上，而不是调用方
 goroutine 上，所以拨号器在任何地方调用都安全，等待期间 Engine 照常工作：
@@ -320,50 +337,99 @@ func main() {
 
 `ConnectProxyConfig.Authenticate` 读取 `Proxy-Authorization: Basic` 头（RFC 9110 §11.7.2），没有
 凭据的客户端会收到 `407 Proxy Authentication Required` 和带 `Realm` 的 `Proxy-Authenticate`
-质询。其余字段是 `Allow`、`Dial`、`DialTimeout`、`MaxQueuedBytes`、`IdleTimeout` 和 `Next`：
+质询（`Realm` 为空时是 `proxy`）。`Allow` 返回错误时 CONNECT 得到 `403 Forbidden`；代理到不了的
+目标得到 `502 Bad Gateway`，拨号超时则是 `504 Gateway Timeout`，目标不是 host:port 时是
+`400 Bad Request`。其余字段是 `Dial`、`DialTimeout`、`MaxQueuedBytes`、`IdleTimeout` 和 `Next`：
 `Next` 服务那些不是“CONNECT 到 host:port”的请求，nil 的 `Next` 会以 `405 Method Not Allowed`
-回答它们。把 `Dial` 指向某个 `socks.Dialer` 的 `Dial`，CONNECT 代理就会经 SOCKS 代理出网。
+回答它们。把 `Dial` 指向某个 `socks.Dialer` 的 `Dial`，CONNECT 代理就会经 SOCKS 代理出网。代理的
+handler 不等拨号：它 retain 请求后返回，由拨号的回调来应答。
 
 ## Context.Connect 与隧道节流
 
-`ConnectProxy` 建立在 `Context.Connect` 之上，任何 handler 都可以用它。它接受 CONNECT 请求，此后
-`TunnelHandler` 收到客户端经隧道发来的数据，反方向则由 `Tunnel.Send` 和 `CloseAfterSend` 送出：
+`ConnectProxy` 建立在 `Context.Connect` 之上，任何 handler 都可以用它。它以 200 接受 CONNECT 请求，
+此后 `TunnelHandler` 收到客户端经隧道发来的数据，反方向则由 `Tunnel.Send` 和 `CloseAfterSend` 送出。
+下面是一个完整程序，隧道不拨号到任何地方，而是把收到的内容回显：
 
 ```go
+package main
+
+import (
+	"log"
+	nethttp "net/http"
+
+	fib "github.com/lesismal/fib"
+	fibhttp "github.com/lesismal/fib/http"
+)
+
+// echoTunnel answers everything the client sends through the tunnel.
 type echoTunnel struct{}
 
 func (echoTunnel) OnTunnelOpen(t *fibhttp.Tunnel) { log.Print("tunnel opened") }
+
 func (echoTunnel) OnTunnelData(t *fibhttp.Tunnel, data []byte) {
-	_ = t.Send(append([]byte("echo: "), data...)) // Send copies, data is valid for the call only
+	_ = t.Send(append([]byte("echo: "), data...)) // data is valid for the call only
 }
+
 func (echoTunnel) OnTunnelClose(t *fibhttp.Tunnel, err error) {
 	log.Printf("tunnel closed: %v", err)
 }
 
-router.Connect("/echo-tunnel", func(c *fibhttp.Context) {
-	tunnel, err := c.Connect(nil, echoTunnel{})
+func main() {
+	// A CONNECT names host:port, not a path, so it is served by a plain
+	// handler rather than a router route.
+	handler := fibhttp.HandlerFunc(func(c *fibhttp.Context) {
+		if c.Request.Method != nethttp.MethodConnect {
+			_ = c.Respond(nethttp.StatusMethodNotAllowed, "text/plain; charset=utf-8", []byte("CONNECT only\n"))
+			return
+		}
+		log.Printf("CONNECT %s", c.Request.Host)
+		if _, err := c.Connect(nil, echoTunnel{}); err != nil {
+			_ = c.Respond(nethttp.StatusBadRequest, "text/plain; charset=utf-8", []byte(err.Error()))
+		}
+	})
+	engine, err := fib.New(fib.DefaultConfig(),
+		fib.Binding{Addr: "127.0.0.1:18084", Handler: fibhttp.NewHandler(handler)})
 	if err != nil {
-		_ = c.Respond(nethttp.StatusBadRequest, "text/plain; charset=utf-8", []byte(err.Error()))
-		return
+		panic(err)
 	}
-	_ = tunnel // the tunnel handler drives the rest
-})
+	defer engine.Close()
+	if err := engine.Run(); err != nil {
+		panic(err)
+	}
+}
 ```
+
+用 `nc` 试一下：先收到 200，然后是请求之后所发内容的回显：
+
+```sh
+$ (printf 'CONNECT example.com:443 HTTP/1.1\r\nHost: example.com:443\r\n\r\n'; sleep 0.3; printf 'ping'; sleep 0.5) | nc 127.0.0.1 18084
+HTTP/1.1 200 OK
+
+echo: ping
+```
+
+经典 CONNECT 的目标是 authority 形式（`example.com:443`），没有路径，所以 `router.Connect("/x", ...)`
+这样的路由模式永远匹配不到它：这些模式服务的是带路径的 CONNECT，例如 HTTP/2 的扩展 CONNECT。
+隧道要像这里一样由普通 handler 来服务；同一端口还要服务别的请求时，让它把非 CONNECT 请求交给路由。
 
 如果中继的一端更慢，就按对端的积压来节流，而不是先缓冲下来。可用的原语就是隧道自己的流控：
 `Unsent` 报告还有多少字节没送出去，`HoldReads` 暂停接收对端的数据，
-`NotifySendable`/`WaitSendable` 在积压排空后回调或等待：
+`NotifySendable`/`WaitSendable` 在积压排空后回调或等待。设 `in` 是数据来源的一侧、`out` 是数据
+发往的一侧，每次把 `in` 的数据交给 `out` 之后：
 
 ```go
-const limit = 256 << 10 // the relay's Config.MaxQueuedBytes equivalent
-tunnel.HoldReads(true)
-if tunnel.Unsent() > limit {
-	tunnel.NotifySendable(limit, func(error) { tunnel.HoldReads(false) }) // may not wait here
-} else {
-	tunnel.HoldReads(false)
+const limit = 256 << 10 // what may wait for out, as Config.MaxQueuedBytes bounds a relay
+in.HoldReads(true) // hold first, so that the callback cannot run before the hold
+if !out.NotifySendable(limit, func(error) { in.HoldReads(false) }) {
+	in.HoldReads(false) // no more than limit waits for out: keep reading
 }
-// In a goroutine of your own, never in OnTunnelData, this is the waiting form:
-go func() { _ = tunnel.WaitSendable(limit) }()
+// The callback runs once out is down to half of limit. In a goroutine of your own,
+// never in OnTunnelData, this is the waiting form:
+go func() {
+	if err := out.WaitSendable(limit); err != nil {
+		log.Print(err) // out has ended
+	}
+}()
 ```
 
 HTTP/1.x 上的隧道会切换整条连接；HTTP/2 和 HTTP/3 上只切换那条流，共享的连接不动。HTTP/2 和
@@ -372,21 +438,28 @@ HTTP/3 上，暂停读取期间对端窗口已允许的数据仍会到达，所�
 ## curl、curl -x 与 HTTPS_PROXY
 
 代理跑起来后，命令行工具就能用：`curl -x` 给单条命令指定代理，`HTTPS_PROXY`/`ALL_PROXY` 给读
-环境变量的程序用：
+环境变量的程序用。要在上面的单端口程序上试，让它的 Engine 一直运行（把手写的客户端换成
+`select {}` 结束 `main`）；这时 18082 端口同时应答 SOCKS5 和 CONNECT：
 
 ```sh
 # SOCKS5 with the proxy resolving the destination name (socks5h vs socks5)
-curl -x socks5h://fib:secret@127.0.0.1:1080 https://example.com/
+curl -x socks5h://fib:secret@127.0.0.1:18082 http://127.0.0.1:18080/hello
 
-# HTTP CONNECT with Basic credentials in the URL; curl sends Proxy-Authorization
+# HTTP CONNECT with Basic credentials in the URL; curl sends Proxy-Authorization.
+# -p makes curl tunnel an http:// URL through CONNECT too.
+curl -p -x http://fib:secret@127.0.0.1:18082 http://127.0.0.1:18080/hello
+
+# Any HTTPS site, through CONNECT, as curl does for https:// URLs on its own
 curl -x http://fib:secret@127.0.0.1:18082 https://example.com/
 
 # The same proxy for programs that read the environment
 HTTPS_PROXY=http://fib:secret@127.0.0.1:18082 curl https://example.com/
 ```
 
-`curl -x` 访问 `https://` URL 时走 CONNECT；访问 `http://` URL 时会把请求以绝对形式整条发给代理，
-那属于 `ConnectProxyConfig.Next` 的职责，不是 CONNECT。
+`curl -x` 访问 `https://` URL 时走 CONNECT；访问 `http://` URL 且不带 `-p` 时，会把请求以绝对形式
+整条发给代理，那属于 `ConnectProxyConfig.Next` 的职责，不是 CONNECT 的：这里会得到
+`405 Method Not Allowed`。不带凭据时 curl 会从 CONNECT 收到 `407 Proxy Authentication Required`，
+而 SOCKS5 登录失败会终止握手（curl 以退出码 97 结束）。
 
 ## 坑与限制
 

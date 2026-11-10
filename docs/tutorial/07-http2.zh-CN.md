@@ -6,7 +6,7 @@
 
 ## 模型
 
-一条 HTTP/2 连接有一个 reader 和许多 stream。引擎的 worker 负责分帧、解码 HPACK/QPACK header；每个完整请求被提交到引擎的 handler 池——按引擎 `Config.Name` 命名的共享 streams 池，默认叫 `fib-streams`——handler 在那里运行。因此慢 handler 只拖住自己那条流，客户端同时打开的请求是并发处理的。`Config.MaxConcurrentStreams`（默认 250）限制每条连接的流数，`Config.StreamPool.MaxConcurrentHandlers` 可以限制一条连接同时运行多少个请求的 handler；第 N 个请求会直接在 reader 上运行，reader 在它返回前不再读取，所以这个限制由对端流量控制来承担，服务端不排队。响应以 DATA 帧发出，受对端流量控制窗口约束。绝不能直接通过 `Context.Conn` 写字节：那会破坏分帧，所有输出都必须走 `Context`。
+一条 HTTP/2 连接有一个 reader 和许多 stream。引擎的 worker 负责分帧、解码 HPACK header；每个完整请求被提交到引擎的 handler 池——按引擎 `Config.Name` 命名的共享 streams 池，默认叫 `fib-streams`——handler 在那里运行。因此慢 handler 只拖住自己那条流，客户端同时打开的请求是并发处理的。`Config.MaxConcurrentStreams`（默认 250）限制每条连接的流数，`Config.StreamPool.MaxConcurrentHandlers` 可以限制一条连接同时运行多少个请求的 handler；第 N 个请求会直接在 reader 上运行，reader 在它返回前不再读取，所以这个限制由对端流量控制来承担，服务端不排队。响应以 DATA 帧发出，受对端流量控制窗口约束。绝不能直接通过 `Context.Conn` 写字节：那会破坏分帧，所有输出都必须走 `Context`。
 
 ## h2c：不带 TLS 的 HTTP/2
 
@@ -98,7 +98,7 @@ curl -k --http1.1 https://127.0.0.1:8443/  # ALPN: http/1.1, same handler
 
 ## 多路复用与 handler 池
 
-因为 handler 跑在池里，会等待的 handler（数据库、上游服务、channel）只阻塞自己。这让 `Retain`/`Release` 在 HTTP/2 上比 HTTP/1 便宜得多：挂起一个 HTTP/2 请求只暂停一条流，连接继续服务其他流，所以一条连接上可以有几百个异步请求在飞；一个被取消（`OnCancel`）或 reset 的请求只影响自己那条流。每连接的、每服务的限制就是下面两个配置字段，流量控制窗口则是在内存与吞吐之间做取舍。
+因为 handler 跑在池里，会等待的 handler（数据库、上游服务、channel）只阻塞自己。这让 `Retain`/`Release` 在 HTTP/2 上比 HTTP/1 便宜得多：挂起一个 HTTP/2 请求只暂停一条流，连接继续服务其他流，所以一条连接上可以有几百个异步请求在飞；一个被取消（`OnCancel`）或 reset 的请求只影响自己那条流。每连接的限制就是下面这些配置字段，流量控制窗口则是在内存与吞吐之间做取舍。非默认的 `Config` 通过 `fibhttp.NewHandlerWithConfig(config, app)` 传入。
 
 ```go
 config := fibhttp.DefaultConfig()
@@ -109,9 +109,10 @@ config.HTTP2 = fibhttp.HTTP2Config{
 	ConnWindow:     32 << 20, // shared by the connection's streams
 	AdaptiveWindow: true,     // let the connection grow them to the path's bandwidth-delay product
 }
+handler := fibhttp.NewHandlerWithConfig(config, app)
 ```
 
-窗口对流式 body 很关键：接收窗口只在 handler 消费 body 时才归还，所以快速客户端被流量控制拖慢，而不是被缓冲。同时要记住，一条连接可能持有约 `MaxConcurrentStreams × MaxBodyBytes` 的整体请求 body（默认 250 × 16MB），这就是上传接口要打开 `StreamRequestBody` 的理由。
+窗口对流式 body 很关键：接收窗口只在 handler 消费 body 时才归还，所以快速客户端被流量控制拖慢，而不是被缓冲。整体请求 body（默认方式，在 handler 运行前收齐）受两道限制：每个 body 受 `MaxBodyBytes`（16MB，超出回 413）限制，一条连接上所有 body 合计受 `HTTP2.MaxBufferedBodyBytes` 限制，默认是 `MaxBodyBytes` 的四倍（64MB）；某条流的 DATA 会让合计超限时，该流以 `REFUSED_STREAM` 重置，客户端可以重试。上传接口仍然更适合用 `StreamRequestBody`。
 
 ## 流式 body 与流式响应
 
@@ -171,8 +172,8 @@ func hints(c *fibhttp.Context) {
 - **客户端不能发起 h2c 升级**：fib 客户端的明文 HTTP/2 只走 prior knowledge（`UnencryptedHTTP2`）；服务端仍接受 `Upgrade: h2c` 以兼容 curl 等工具。TLS 上切换协议只能靠 ALPN。
 - **优先级被忽略**：PRIORITY 帧和 RFC 7540 的优先级树只做校验后丢弃（RFC 9113 已废弃它们）；RFC 9218 `priority` header 的 urgency 会用于响应调度。
 - **PING 与 SETTINGS 有上限**：客户端重置流或发送控制帧超过预算（`StreamResetBurst`/`StreamResetRate`、`ControlFrameBurst`/`ControlFrameRate`、`MaxContinuationFrames`）时，服务端以 GOAWAY 关闭连接；客户端在 `SettingsTimeout`（默认 10 秒）内不确认 SETTINGS 也会被断开。`Config.PingInterval` 可以加 keep-alive PING，默认关闭。
-- **经典 CONNECT 没有隧道**：请求会被解析并交给 handler，但不会建立双向隧道。扩展 CONNECT（RFC 8441）不同——WebSocket 正是通过 `Context.Upgrade` 走 HTTP/2 的（第 [09](09-websocket.zh-CN.md) 章）。
-- **内存**：整体请求 body 的上限是每连接 `MaxConcurrentStreams × MaxBodyBytes`；用 `StreamRequestBody` 或 `StreamPool.MaxConcurrentHandlers` 把它压下来。
+- **CONNECT 是一条流上的隧道**：经典 CONNECT 用 `Context.Connect` 接受，`fibhttp.ConnectProxy` 是现成的 HTTPS 代理，支持 HTTP/1.x、HTTP/2 和 HTTP/3（第 [13](13-socks-connect.zh-CN.md) 章）。扩展 CONNECT（RFC 8441）是 WebSocket 走 HTTP/2 的方式，通过 `Context.Upgrade`（第 [09](09-websocket.zh-CN.md) 章）。两种情况都只有那一条流切换。
+- **内存**：整体请求 body 每连接受 `HTTP2.MaxBufferedBodyBytes` 限制（默认 4 × `MaxBodyBytes`，即 64MB），流式 body 受流窗口和连接窗口限制；调低它们，或使用 `StreamRequestBody`，把内存压下来。
 
 ## 坑与限制
 
@@ -180,7 +181,7 @@ func hints(c *fibhttp.Context) {
 - **handler 池是共享的。** 阻塞的 handler 占的是池里的 worker，不是连接 reader，但足够多的阻塞 handler 会饿死同名的所有 HTTP/2 与 HTTP/3 服务。把慢活移出池，或用 `StreamPool.MaxConcurrentHandlers` 限流。
 - **`Push` 是同步的。** 会等待的 pushed handler 拖慢调用 `Push` 的响应；而且多数客户端已禁用 push。
 - **响应 body 写出去后不再属于你。** `Respond`/`WriteResponse` 会一直持有切片到流结束（HTTP/3 还要等对端确认），所以不要改动它；缓冲区要复用就用 `RespondCopy`/`WriteResponseCopy`。
-- **流式 body 需要 `StreamRequestBody`。** 否则 body 会整体缓冲，大上传按每条流 `MaxBodyBytes` 计费。
+- **流式 body 需要 `StreamRequestBody`。** 否则 body 会在 handler 运行前整体缓冲，大上传每条流最多占用 `MaxBodyBytes`，超过的直接回 413。
 - **流与请求对象会被复用。** 第 [06](06-http1.zh-CN.md) 章的规则不变：不要把 `Request`、`Header`、`URL`、`Context` 留到响应和最后一次 `Release` 之后。
 - **h2c 不是浏览器使用的协议。** 浏览器走 TLS 上的 h2；h2c 用于内部服务、明文 gRPC 和一致性测试工具。
 

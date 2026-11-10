@@ -220,11 +220,43 @@ func main() {
 
 通知的 handler 如果调 `ctx.Write` 会拿到 `ErrContextResponseToNotify`：对端根本不等待任何应答。
 
+## 受 context 约束的调用、未知方法、客户端池与 singleflight
+
+`CallContext` 就是用 `context.Context` 而不是超时来约束的 `Call`。请求一个没有注册 handler 的
+方法会得到错误应答 `method not found`（`ErrMethodNotFound`），除非用 `HandleNotFound` 为所有这类
+方法注册一个 handler。`ClientPool` 是一组固定数量的拨号客户端；`Handler.Singleflight` 让一个
+客户端对同一方法、同一请求的并发调用共用一次往返：
+
+```go
+ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+defer cancel()
+if err := client.CallContext(ctx, "/echo", "bounded by ctx", &rsp); err != nil {
+	log.Print(err)
+}
+
+server.Handler.HandleNotFound(func(ctx *arpc.Context) {
+	_ = ctx.Error("no such method: " + ctx.Message.Method())
+})
+
+handler := arpc.NewHandler()
+handler.Singleflight("/profile") // calls share by fmt.Sprint(req) unless a key function is given
+pool, err := arpc.NewClientPool(
+	arpc.TCPDialer(clientEngine, "tcp", "127.0.0.1:8888", 3*time.Second), 4, handler)
+if err != nil {
+	panic(err)
+}
+defer pool.Stop()
+err = pool.Next().Call("/profile", "alice", &rsp, time.Second) // round-robin over the 4 clients
+```
+
+池里的客户端共享同一个 `Handler`，所以 singleflight 方法是按客户端合并调用的，而不是跨整个池。
+
 ## 流
 
-流（Stream）是在一条 Client 之上、绑定到某个方法上的双向消息序列，由客户端一侧打开。服务端用
-`HandleStream` 注册，客户端用 `NewStream` 打开；两端各自独立关闭发送半部和接收半部，对端关闭
-发送半部后 `Recv` 返回 `io.EOF`：
+流（Stream）是在一条 Client 之上、绑定到某个方法上的双向消息序列。任一端都可以用 `NewStream`
+为对端用 `HandleStream` 注册过的方法打开一条流，对端的 handler 在流的第一条消息到达时运行；下面
+由拨号客户端打开、服务端来服务。两端各自独立关闭发送半部和接收半部，对端关闭发送半部后 `Recv`
+返回 `io.EOF`：
 
 ```go
 server.Handler.HandleStream("/upper", func(st *arpc.Stream) {
@@ -252,7 +284,9 @@ if err := st.Recv(&upper); err != nil {
 ```
 
 流消息在线格式上带的是流命令，两端都不会把它和普通调用混淆。`Handler.SetStreamQueueSize` 限制
-一条流为它的 handler 缓存多少条消息；流满了的连接会暂停读取，直到 handler 取走一条。
+一条流为它的 handler 缓存多少条消息，默认 4 条；流满了的连接会暂停读取，直到 handler 取走一条。
+`RecvContext` 用 context 约束一次等待，`SendAndClose` 一次调用里发出最后一条消息并关闭发送半部。
+中间件不作用于流：流方法没有调用链。
 
 ## 广播与生命周期回调
 
@@ -274,15 +308,16 @@ server.BroadcastWithFilter("/tick", "vip only", func(c *arpc.Client) bool {
 })
 ```
 
-这些回调跑在协程池上：`HandleConnected` 在服务端接受连接、或拨号客户端重连成功时执行，因此它
+这些回调跑在协程池上：`HandleConnected` 在服务端接受连接时执行，也在拨号客户端第一次连上以及每次重连成功时执行，因此它
 返回之前连接的首批消息可能已经被处理；`HandleDisconnected` 在客户端停止时执行。`Server.MaxLoad` 限制
 服务端同时服务的连接数，超出的连接一被接受就关闭；`Server.Accepted` 和 `Server.CurrLoad` 给出
 计数。
 
 ## 中间件与 Handler 的执行位置
 
-`Handler.Use` 为每个方法添加中间件，按链的执行顺序生效。链是按方法组装的：在方法之前注册的
-中间件在 handler 之前执行，之后注册的在 handler 之后执行。中间件可以调用 `ctx.Next()` 执行链的
+`Handler.Use` 为每个方法添加中间件，包括已经注册的和之后注册的方法，按链的执行顺序生效。链是
+按方法组装的：在方法之前注册的中间件在 handler 之前执行，之后注册的在 handler 之后执行。中间件
+返回后链会自动继续，所以 `Next` 只用于在链的剩余部分之后再做事。中间件可以调用 `ctx.Next()` 执行链的
 剩余部分然后再做自己的事，或者用 `ctx.Abort()` 停止整条链：
 
 ```go
@@ -326,7 +361,10 @@ func (c xorCoder) Encode(_ *arpc.Client, m *arpc.Message) *arpc.Message { return
 func (c xorCoder) Decode(_ *arpc.Client, m *arpc.Message) *arpc.Message { return c.apply(m) }
 
 server.Handler.UseCoder(xorCoder{0x5a})
-client.Handler.UseCoder(xorCoder{0x5a})
+
+handler := arpc.NewHandler() // the client's Handler, configured before it dials
+handler.UseCoder(xorCoder{0x5a})
+client, err := arpc.Dial(clientEngine, "tcp", "127.0.0.1:8888", 3*time.Second, handler)
 ```
 
 TLS 就是在同一个 handler 前套一层 `tls` 包，客户端用 `TLSDialer`：
@@ -396,8 +434,9 @@ client.Keepalive(30 * time.Second) // ping the peer so a dead path is noticed
   用 `false` 注册成同步。
 - **通知不是调用。** 通知的 handler 没有应答可写（`ctx.Write` 返回
   `ErrContextResponseToNotify`），而写不出任何应答的请求 handler 会让调用方一直等到调用超时。
-- **超限会直接关闭连接。** 方法名超过 `MaxMethodLen`（127）或 body 超过 `Handler.MaxBodyLen`
-  （`DefaultMaxBodyLen`，64 MiB − 16）都会关闭连接；用 `SetMaxBodyLen` 放宽。
+- **了解这些上限。** 收到的 body 超过 `Handler.MaxBodyLen`（`DefaultMaxBodyLen`，64 MiB − 16）
+  会关闭连接；在两端都用 `SetMaxBodyLen` 放宽。方法名长 1 到 `MaxMethodLen`（127）字节：`Handle`
+  遇到更长的会 panic，发送会失败，收到方法长度非法的消息则直接丢弃。
 - **在客户端使用之前把 Handler 配置好。** 有客户端在服务时修改 `Handler` 的方法和中间件是不安全
   的，而一个 `Server` 的所有连接共享同一个 Handler。
 - **调用超时不会取消服务端的 handler。** 迟到的应答会交给 `HandleSessionMiss`，活儿已经干完了。

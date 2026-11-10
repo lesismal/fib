@@ -86,12 +86,15 @@ func main() {
 	})
 
 	flv := httpflv.NewHandler(httpflv.Config{Hub: h, CORS: "*", Wait: 10 * time.Second})
-	live := hls.NewHandler(hls.HandlerConfig{Hub: h, AllowOrigin: "*"})
+	live := hls.NewHandler(hls.HandlerConfig{
+		Hub:         h,
+		Formats:     []hls.Format{hls.MPEGTS}, // ?format=ts as well as fMP4
+		AllowOrigin: "*",
+	})
 	ll := hls.NewHandler(hls.HandlerConfig{
 		Hub:         h,
 		Prefix:      "/ll/",
-		Muxer:       hls.Config{PartDuration: 500 * time.Millisecond}, // LL-HLS parts
-		Formats:     []hls.Format{hls.MPEGTS},
+		Muxer:       hls.Config{PartDuration: 500 * time.Millisecond}, // LL-HLS parts, fMP4
 		AllowOrigin: "*",
 	})
 
@@ -136,6 +139,10 @@ ffmpeg -re -i in.mp4 -c copy -f flv rtmp://127.0.0.1/live/s
 | HLS，MPEG-TS | `http://127.0.0.1:8080/live/s/index.m3u8?format=ts` |
 | LL-HLS | `http://127.0.0.1:8080/ll/live/s/index.m3u8` |
 
+`index.m3u8` 是一个指向 `media.m3u8` 的多变体（multivariant）playlist；handler 的
+`Formats` 里没有的格式会得到 404，所以这里 `?format=ts` 在 `live` 上可用，在 `ll` 上不可用。
+`HandlerConfig` 不设 `PlayWait` 时，发布者到来之前的 playlist 请求同样是 404。
+
 路径在各协议中映射方式相同：`rtmp://host/app/stream` 是 `app/stream`，
 `/app/stream.flv`、`/app/stream/index.m3u8` 以及 SRT 的 stream ID `app/stream` 也一样。
 HTTP-FLV 播放器是 flv.js 和 mpegts.js；HLS 播放器是 hls.js、Safari 和 ffmpeg。这些 HTTP
@@ -143,6 +150,9 @@ handler 就是普通的 fib/http handler，因此 HTTP/2、HTTP/3 和 TLS 能像
 服务它们。
 
 ## TCP 与 UDP 上的 RTSP
+
+从这里开始的片段都是给上面的程序添加协议：它们使用其中的 `engine` 和 `h`，放在
+`engine.Run()` 之前——`AddBinding` 对尚未运行的 engine 和已在运行的 engine 都有效。
 
 RTSP 需要一个独立的 binding，再加一对所有会话共用的 UDP 端口。`ListenUDP` 在同一个 engine
 上绑定 RTP/RTCP 端口，因此 `rtsp://…/live/s` 默认用 TCP 交织的 RTP 播放，客户端要求时改用
@@ -160,7 +170,8 @@ if err := rtspServer.ListenUDP(engine); err != nil {
 ```
 
 用 `ffmpeg -re -i in.mp4 -c copy -f rtsp -rtsp_transport tcp
-rtsp://127.0.0.1:8554/live/s` 推流。`ServerConfig.Password` 配合 `AuthMethods` 开启
+rtsp://127.0.0.1:8554/live/s` 推流，用 `ffplay rtsp://127.0.0.1:8554/live/s` 播放（UDP 则加上
+`-rtsp_transport udp`）。`ServerConfig.Password` 配合 `AuthMethods` 开启
 Digest（或 Basic）鉴权；`PlayWait` 让播放器在发布者离开后继续等待；对 UDP 播放器，
 `MaxPlayerLoss` 会关闭 RTCP 报告显示丢包过多的客户端。
 
@@ -173,7 +184,7 @@ SRT 是一个 UDP binding，handler 就是服务端；每个对端地址是一�
 srtServer, err := srt.NewServer(srt.ServerConfig{
 	Hub:        h,
 	PlayWait:   10 * time.Second,
-	Passphrase: "a passphrase of 10+ bytes", // optional; the caller's must match
+	Passphrase: "correct-horse-battery", // optional, 10 to 79 bytes; callers must send the same
 	MaxConns:   100,
 })
 if err != nil {
@@ -184,9 +195,16 @@ if _, err := engine.AddBinding(fib.Binding{Network: "udp", Addr: "127.0.0.1:9000
 }
 ```
 
-用 `ffmpeg -re -i in.mp4 -c copy -f mpegts
-'srt://127.0.0.1:9000?streamid=#!::r=live/s,m=publish'` 推流，用
-`srt://127.0.0.1:9000?streamid=live/s` 播放。发布者在握手期间就预留路径，因此忙碌的路径会
+服务端设置了 passphrase 时，每个 caller 都必须带上同样的值，不带的会在握手阶段被拒绝。
+ffmpeg 需要带 libsrt 编译（`ffmpeg -protocols | grep srt`）：
+
+```sh
+ffmpeg -re -i in.mp4 -c copy -f mpegts \
+  'srt://127.0.0.1:9000?streamid=#!::r=live/s,m=publish&passphrase=correct-horse-battery'
+ffplay 'srt://127.0.0.1:9000?streamid=live/s&passphrase=correct-horse-battery'
+```
+
+发布者在握手期间就预留路径，因此忙碌的路径会
 在传输任何媒体之前以 `RejectConflict` 拒绝。SRT 在这里只承载 MPEG-TS，AV1 与 G.711 不在
 其中。
 
@@ -229,7 +247,7 @@ if err != nil {
 	panic(err)
 }
 
-router := fibhttp.NewRouter() // served by the HTTP binding
+router := fibhttp.NewRouter()              // served by the HTTP binding
 router.Handle("/whip/*", rtcServer)        // POST publishes
 router.Handle("/whep/*", rtcServer)        // POST plays
 router.Handle("/rtc/session/*", rtcServer) // PATCH (trickle) and DELETE
@@ -241,9 +259,11 @@ router.Handle("/rtc/session/*", rtcServer) // PATCH (trickle) and DELETE
 
 ## 拉流与推流转发
 
-每个客户端都通过 fib engine 拨号并用回调上报，没有任何一个会阻塞 worker。拉流转发把远端流
-播放进 hub 的某个路径，推流转发把 hub 的路径发布到远端服务器。重连由应用负责：`done`/
-`OnClose` 告知转发结束，重新启动只是一次调用。
+每个客户端都通过 fib engine（必须已在运行）拨号并用回调上报，没有任何一个会阻塞 worker。
+拉流转发把远端流播放进 hub 的某个路径，推流转发把 hub 的路径发布到远端服务器。重连由应用
+负责：`done` 回调告知转发已经开始（nil）或无法开始的原因，`ClientConfig.OnClose`（以及
+`PullConfig.OnClose`）告知运行中的转发已结束，重新启动只是一次调用。每个调用也会返回对应
+的转发对象，调用它的 `Close` 即可停止。
 
 ```go
 // RTMP: pull another server's stream into "live/cam", and push "live/cam" on,
@@ -265,8 +285,8 @@ httpflv.Pull(httpflv.PullConfig{Engine: engine, OnClose: func(err error) { log.P
 
 ## 坑与限制
 
-- **没有转码。** 出口无法承载的 track 只会在该出口缺失：WHEP 丢弃 AAC（和 MP3），SRT 与
-  HLS-TS 丢弃 AV1 和 G.711，早于 Enhanced RTMP 的 RTMP/HTTP-FLV 播放器读不了 Opus。推流时
+- **没有转码。** 出口无法承载的 track 只会在该出口缺失：WHEP 丢弃 AAC 和 MP3，SRT 与
+  HLS-TS 丢弃 AV1 和 G.711，HLS fMP4 丢弃 G.711，只有 RTMP/HTTP-FLV 承载 MP3，早于 Enhanced RTMP 的 RTMP/HTTP-FLV 播放器读不了 Opus。推流时
   要用播放器需要的编码——通常 H.264 同时配 AAC（给 HLS/RTMP）和 Opus（给 WebRTC）。见
   [流媒体参考文档](../media.zh-CN.md#各协议支持的编码)中的编码矩阵。
 - **每条路径只有一个发布者。** 第二个发布会得到 `hub.ErrStreamBusy`，RTMP 与 SRT 则在握手

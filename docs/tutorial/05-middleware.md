@@ -30,13 +30,25 @@ func requireToken(next fibhttp.Handler) fibhttp.Handler {
 			_ = c.String(stdhttp.StatusUnauthorized, "missing token\n")
 			return // an early return: next does not run
 		}
-		c.Header().Set("X-Served-By", "fib")
+		c.Header().Set("X-Served-By", "fib") // sent with whatever next answers
 		next.ServeHTTP(c)
 	})
 }
 ```
 
-A middleware that must change the response a handler writes does so through the `Context` hooks rather than by wrapping the writer: `OnHeader` runs as the response header is settled and may change it, `OnResponse` hands over the whole response before it is sent, and `OnFinish` runs once it has been handed to the connection. That is how `compress` and `etag` work, which is why they work whichever way the handler answers — `Respond`, `WriteResponse` or the `ResponseWriter` methods. Every built-in `Config` also has a `Next` skipper: when it reports true, the middleware passes the request straight on.
+A middleware that must change the response a handler writes does so through the `Context` hooks rather than by wrapping the writer: `OnHeader(func(status int, header http.Header))` runs as the response header is settled and may change it, `OnResponse(func(*fibhttp.Response))` hands over the whole response before it is sent, and `OnFinish(func(status int, header http.Header, size int64))` runs once it has been handed to the connection. Hooks run in the reverse of the order they were registered, like deferred calls, so the outermost middleware sees the response last. That is how `compress`, `etag`, `cors` and `requestid` work, which is why they work whichever way the handler answers — `Respond`, `WriteResponse`, the helpers or the `ResponseWriter` methods.
+
+A field set with `c.Header().Set` before calling `next`, as above, goes out with whatever the handler answers — `Respond`, `WriteResponse`, a helper such as `String` or `JSON`, or the `ResponseWriter` methods. The handler's own fields win: its `Content-Type`, or a field of the same name in a `WriteResponse` header, replaces the middleware's. Once the handler has answered, changing `c.Header()` has no effect; to add a field that depends on the status the handler chose, or to change one it sent, use `OnHeader`.
+
+Every built-in `Config` also has a `Next` skipper: when it reports true, the middleware passes the request straight on.
+
+```go
+compress.New(compress.Config{
+	Next: func(c *fibhttp.Context) bool { // never hold an event stream to compress it
+		return strings.HasPrefix(c.Request.URL.Path, "/events")
+	},
+})
+```
 
 ## The built-in middleware
 
@@ -95,14 +107,14 @@ What each one does, and the options that matter:
 
 - **`compress`** — gzip or deflate when `Accept-Encoding` allows, the body is at least `MinLength` (1 KiB by default), its media type compresses (`Compressible`), and no `Content-Encoding`, partial response or forbidding `Cache-Control` is in the way. It adds `Vary`, weakens a strong ETag, and holds a whole response until the handler returns; give it a `Next` that skips SSE and long downloads.
 - **`etag`** — generates a 200 GET/HEAD response's ETag from the body and answers a matching `If-None-Match` with 304 and no body; a handler's own ETag is kept. `Weak: true` makes validators weak.
-- **`cors`** — `AllowOrigins` (a `"*"` in a host label matches subdomains), `AllowMethods`, `AllowHeaders`, `ExposeHeaders`, `AllowCredentials`, `AllowPrivateNetwork`, `MaxAge`; it answers preflights itself.
-- **`csrf`** — refuses unsafe methods (anything but GET, HEAD, OPTIONS, TRACE) without the double-submit token cookie, and checks the origin with `net/http`'s `CrossOriginProtection`. Read the token to embed in a form with `csrf.Token(r)`; `Lookup` says where an unsafe request carries it (`header:X-CSRF-Token` by default), and `TrustedOrigins` allows a cross-origin caller.
-- **`limiter`** — at most `Max` requests (60 by default) per `Expiration` window (one minute by default) per key, the client's address unless `KeyGenerator` says otherwise. It answers `429` with `Retry-After` and `X-RateLimit-*`; `SlidingWindow` removes the edge between two windows, and `SkipFailedRequests`/`SkipSuccessfulRequests` leave responses out of the count.
-- **`logger`** — one record per response, once it has been handed to the connection, through package `fib/log`; `Fields` chooses what it carries from the tags in the package documentation (`status`, `latency`, `ip`, `method`, `path` by default), `Level` sets the level, and `Format`/`Output` write a line of a chosen layout straight to a writer instead.
-- **`recover`** — turns a panic while a handler runs into a 500 instead of the loss of the connection; `Handler` answers, `Log` reports and `DisableStackTrace` shortens the report. It recovers only the handler's own panics: work handed to a goroutine of its own must recover itself.
-- **`requestid`** — sets `X-Request-ID` (or `Header`) on the request and the response, reusing the client's value or generating one; `requestid.FromRequest(r)` reads it, `requestid.UUID()` generates one.
-- **`responsetime`** — reports how long the handler took to settle its response in `X-Response-Time` (or `Header`), formatted by `Format`.
-- **`pprof`** — serves the runtime profiles under `/debug/pprof` (`Prefix`), gathering each profile on the engine's handler pool so the worker does not sit through a ten-second CPU profile. See below.
+- **`cors`** — `AllowOrigins` (any origin by default; `"https://*.example.com"` matches its subdomains), `AllowOriginsFunc`, `AllowMethods` (GET, POST, HEAD, PUT, DELETE, PATCH by default), `AllowHeaders` (by default whatever the preflight asks for), `ExposeHeaders`, `AllowCredentials`, `AllowPrivateNetwork`, `MaxAge`; it answers preflights itself with 204. `AllowCredentials` needs explicit origins: with the default any-origin, `New` panics.
+- **`csrf`** — a safe request (GET, HEAD, OPTIONS, TRACE) without the token cookie (`csrf_` by default) gets one; an unsafe request is served only when it sends the same token back and `net/http`'s `CrossOriginProtection` finds it same-origin, and is answered 403 otherwise (`ErrorHandler`). Read the token to embed in a form with `csrf.Token(r)`; `Lookup` says where an unsafe request carries it (`header:X-CSRF-Token` by default, or `form:<field>`, `query:<name>`), and `TrustedOrigins` allows a cross-origin caller.
+- **`limiter`** — at most `Max` requests (60 by default) per `Expiration` window (one minute by default) per key, the client's address unless `KeyGenerator` says otherwise. It answers `429` with `Retry-After` (or calls `LimitReached`), and every response carries `X-RateLimit-Limit`, `-Remaining` and `-Reset` unless `DisableHeaders`; `SlidingWindow` removes the edge between two windows, and `SkipFailedRequests`/`SkipSuccessfulRequests` leave responses out of the count. The counts live in this process's memory, and the default key is the TCP peer: behind a proxy or load balancer, that is the proxy, so give it a `KeyGenerator` that reads the header your proxy sets.
+- **`logger`** — one record per response, once it has been handed to the connection, through package `fib/log` (`http: access status=200 latency=31µs ip=127.0.0.1 method=GET path=/`); `Fields` chooses what it carries from the tags in the package documentation (`status`, `latency`, `ip`, `method`, `path` by default; also `url`, `ua`, `bytesSent`, `reqHeader:Name` and more), `Level` sets the level, and `Format`/`Output` write a line of a chosen layout straight to a writer instead, such as `logger.Config{Format: "${status} ${method} ${path} ${latency}\n", Output: os.Stdout}`.
+- **`recover`** — turns a panic while a handler runs into a 500 instead of the loss of the connection; `Handler` answers, `Log` reports (to `fib/log` at error level by default) and `DisableStackTrace` shortens the report. A panic with `http.ErrAbortHandler` is not logged and, on HTTP/1, closes the connection. It recovers only the handler's own panics: work handed to a goroutine of its own must recover itself.
+- **`requestid`** — sets `X-Request-ID` (or `Header`) on the request and the response, reusing the client's value when it is printable ASCII of at most 128 bytes, or generating one with `Generator` (a random UUID by default); `requestid.FromRequest(r)` reads it when the default header is used (read `r.Header.Get(yourHeader)` otherwise), `requestid.UUID()` generates one. `logger` records it with the `reqHeader:X-Request-ID` field.
+- **`responsetime`** — reports how long the handler took to settle its response in `X-Response-Time` (or `Header`), formatted by `Format` (milliseconds by default, such as `0.017ms`).
+- **`pprof`** — serves the runtime profiles under `/debug/pprof/` (`Prefix`), gathering each profile on the engine's handler pool so the worker does not sit through a CPU profile. See below.
 
 ## Scoping middleware to routes
 
@@ -126,7 +138,7 @@ func requireToken(next fibhttp.Handler) fibhttp.Handler {
 			_ = c.String(stdhttp.StatusUnauthorized, "missing token\n")
 			return // returning here skips next: the early return
 		}
-		c.Header().Set("X-Served-By", "fib")
+		c.Header().Set("X-Served-By", "fib") // sent with whatever next answers
 		next.ServeHTTP(c)
 	})
 }
@@ -157,11 +169,20 @@ func main() {
 }
 ```
 
-`/` is public and `/admin/stats` requires the header. The middleware must be added before the routes it wraps; `Use` panics once a route has been registered.
+`/` is public and `/admin/stats` requires the header:
+
+```sh
+curl http://127.0.0.1:8080/                                   # public
+curl -i http://127.0.0.1:8080/admin/stats                     # 401 missing token
+curl -i -H 'Authorization: Bearer x' http://127.0.0.1:8080/admin/stats  # stats, with X-Served-By: fib
+curl -i http://127.0.0.1:8080/admin/nope                      # 401 too: the prefix's 404s are inside its middleware
+```
+
+The middleware must be added before the routes it wraps; `Use` panics once a route has been registered.
 
 ## pprof wiring
 
-`pprof.New()` is an ordinary middleware: it answers the paths under its prefix itself and passes everything else on, so it slots into a `Chain` in front of the application handler — no separate admin port needed, though you can bind a second router to another address for it. The profiles reveal a lot about the process; expose them only where the people who reach them are trusted.
+`pprof.New()` is an ordinary middleware: it answers the paths under its prefix itself and passes everything else on, so it slots into a `Chain` in front of the application handler, or into a router's `Use` — not into `Mount`, which takes a handler. No separate admin port is needed, though you can serve it on a second binding (a loopback address, say) with a handler of its own. The profiles reveal a lot about the process; expose them only where the people who reach them are trusted.
 
 ```go
 package main
@@ -194,6 +215,14 @@ func main() {
 }
 ```
 
+Then read a profile with the Go tool:
+
+```sh
+curl http://127.0.0.1:8080/debug/pprof/                     # the index
+go tool pprof http://127.0.0.1:8080/debug/pprof/heap
+go tool pprof http://127.0.0.1:8080/debug/pprof/profile?seconds=10
+```
+
 ## Pitfalls
 
 - **Order is semantics.** `recover` outermost, `compress` outside `etag`, an early-returning middleware outside the handlers it protects; reversing two of them changes behavior, not just layout.
@@ -203,7 +232,9 @@ func main() {
 - **Response hooks have limits.** `compress` and `etag` hold a whole response, so a streaming response must skip them with `Next`, or it stops streaming; `OnResponse` also disables sendfile and HTTP/1 `Flush` for that response.
 - **`recover` cannot catch another goroutine's panic.** A handler that answers from a goroutine must recover there itself.
 - **Middleware answering instead of the handler must not also call `next`.** Calling `next` after writing a response corrupts it; return.
-- **Headers set after the response begins are lost.** `c.Header().Set` in a middleware is too late once the handler has answered; use `OnHeader` for a header the handler itself settles.
+- **`c.Header().Set` in a middleware goes before `next`.** The handler's own fields of the same name win, and after it has answered the change has no effect; use `OnHeader` to override what the handler sent or to set a field after it.
+- **`cors` with `AllowCredentials` needs `AllowOrigins`.** Credentials cannot go with the default any-origin; `cors.New` panics at startup.
+- **`limiter` behind a proxy counts the proxy.** Give it a `KeyGenerator` that reads the client address your proxy forwards, and remember each process counts on its own.
 
 ## See also
 

@@ -28,8 +28,9 @@ arpc、SOCKS、KCP、WebRTC、流媒体或 BitTorrent 的 Go 程序员——这�
 - **完整程序**是以 `package main` 开头的代码块。每一个都会被 `go test ./docs/tutorial` 抽取出来，
   放在一个依赖当前 checkout 的临时模块里构建；示例过期就编译失败、仓库测试失败。
 - 其他代码块是**片段**：正在讲的函数或调用，省略了外层程序的 import 和样板代码。
-- 示例监听 `127.0.0.1`，端口用 `8080`/`8443` 之类。TLS 示例用 `fib/tlstest` 给 `localhost` 签发
-  一次性证书；正式证书见 [10-tls.zh-CN.md](10-tls.zh-CN.md)。
+- 示例监听 `127.0.0.1`，端口用 `8080`/`8443` 之类，所以启动下一个之前先停掉上一个。TLS 示例用
+  `fib/tlstest` 给 `localhost` 和 `127.0.0.1` 签发一次性的自签名证书，每次进程启动都换一张，所以
+  curl 要加 `-k`；正式证书见 [10-tls.zh-CN.md](10-tls.zh-CN.md)。
 - 每章以 **坑与限制** 和 **相关文档** 收尾。那里的参考文档才是完整字段表，章节有意不重复。
 
 ## 结构
@@ -82,7 +83,10 @@ go test ./docs/tutorial
 ```
 
 - `TestLinks` 检查这些页面里的每一个相对链接与标题锚点。
-- `TestCodeExamples` 把每个完整程序放进一个依赖当前 checkout 的临时模块里构建。
+- `TestCodeExamples` 把每个完整程序放进一个依赖当前 checkout 的临时模块里构建。带 `//go:build`
+  约束的代码块不参与构建，因为它只能在部分系统上编译。
+- `FIB_TUTORIAL_STRICT=1 go test ./docs/tutorial` 还要求每章至少有一个完整程序（gRPC 和 WebRTC
+  两章除外，它们的示例需要生成代码或浏览器）。
 
 两者都在 CI 里跑，所以过期的示例或改名的标题是构建失败，而不是过期页面。
 
@@ -105,6 +109,6 @@ go test ./docs/tutorial
 
 ## 新增一章
 
-章节是本章录下的编号文件，一篇英文、一篇中文：`NN-slug.md` 和 `NN-slug.zh-CN.md`。两篇开头有
+章节是本目录下的编号文件，一篇英文、一篇中文：`NN-slug.md` 和 `NN-slug.zh-CN.md`。两篇开头有
 同一行语言切换链接，代码块一致，参考链接各用本语言版本。新增章节还要在两个 README 的表格里各加
 一行。提交前运行 `go test ./docs/tutorial`；不能构建的完整程序会让测试失败。

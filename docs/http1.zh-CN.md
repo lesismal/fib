@@ -356,7 +356,9 @@ func(c *fibhttp.Context) {
   body 时连接会关闭，因为客户端还在等这个许可。
 - **连接中途断开**时 `Read` 返回 `io.ErrUnexpectedEOF` 而不是 `io.EOF`，截断的上传不会被
   当成完整的。handler 返回之后或 `Close` 之后再读返回 `ErrBodyAbandoned`。
-- HTTP/2 和 HTTP/3 的请求 body 仍然整体缓存。
+- HTTP/2 在 `StreamRequestBody` 下同样流式交付请求 body，靠 handler 消费 body 之后才归还
+  stream 的流控窗口来给客户端限速；`http3` 包有同样的选项（`http3.Config.StreamRequestBody`）
+  用于 HTTP/3。
 
 handler 收下 128MB 的上传并计数：整体缓存时堆内存峰值约 470MB（body 本身、它增长所在
 的解析缓冲区，以及沿途留下的垃圾），流式时约 4MB（`StreamRequestBodyBuffer` 为默认的

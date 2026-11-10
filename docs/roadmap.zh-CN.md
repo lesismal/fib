@@ -26,7 +26,7 @@
 | 项 | 状态 | 原因 | 成本 | 何时重估 |
 | --- | --- | --- | --- | --- |
 | 客户端接收 server push | 有意不做 | Chrome、Firefox 已移除 push，Go 的 `net/http` 客户端从未支持；客户端在 SETTINGS 里声明 `ENABLE_PUSH=0`。预加载用 103 Early Hints | M | 不重估 |
-| RFC 9218 的 `i` 增量提示、PRIORITY_UPDATE 帧 | 有意不做 | 紧急度 `priority` 头**已**用于发送调度；响应 body 整体发送时 `i` 没有可重排的内容。RFC 7540 的优先级树已被 RFC 9113 废弃 | M | 做真正的流式／分块重排调度时 |
+| RFC 9218 的 `i` 增量提示、PRIORITY_UPDATE 帧 | 有意不做 | 紧急度 `priority` 头**已**用于发送调度；`i` 没有使用。RFC 7540 的优先级树已被 RFC 9113 废弃 | M | 做真正的流式／分块重排调度时 |
 | 客户端发起 `Upgrade: h2c` | 有意不做 | RFC 9113 已废弃这种升级；明文 HTTP/2 用 prior knowledge（`UnencryptedHTTP2`）。服务端仍接受升级以兼容 curl | S | 不重估 |
 | TLS 连接上的 `Upgrade: h2c` | 有意不做 | RFC 规定 TLS 上只能通过 ALPN 切协议 | — | 不重估 |
 | HTTP/1.0 请求的 1xx 中间响应 | 有意不做 | HTTP/1.0 客户端不认识 1xx，`WriteInterim` 返回 `http.ErrNotSupported` | — | 不重估 |

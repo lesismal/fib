@@ -4,7 +4,8 @@
 
 `fib/grpc` serves and calls gRPC over fib's own HTTP/2: a `grpc.Server` is a plain `fib.Handler` that
 speaks h2c, or gRPC over TLS once wrapped in `fibtls.NewServer(grpc.ConfigureTLS(config), server)`,
-and `grpc.NewClient` dials with an engine of its own. Generated `protoc-gen-go-grpc` code works once
+and `grpc.NewClient` dials on the engine `grpc.WithEngine` names, or on one the package makes for
+itself. Generated `protoc-gen-go-grpc` code works once
 its imports name this package, but fib depends only on the standard library, so this chapter also
 shows how to write a service descriptor by hand and use the built-in `json` codec — every complete
 program here builds with fib alone. It assumes the bindings of [02-engine.md](02-engine.md) and the HTTP/2
@@ -20,8 +21,10 @@ transport of [07-http2.md](07-http2.md).
   `grpc.TaskPool(pool)`. A unary call is scheduled once its request has arrived whole; a streaming
   call as soon as it opens, so a handler may block without holding up the connection's reader.
 - **A client is one connection, many streams.** A `ClientConn` connects when its first call needs a
-  connection, reconnects after losing one, and is safe for concurrent use. Calls are streams; unary
-  calls are a stream with one request and one reply.
+  connection (or at once with `Connect(ctx)`), reconnects after losing one, and is safe for
+  concurrent use. Calls are streams; unary calls are a stream with one request and one reply. A
+  call made while no connection can be had fails with `codes.Unavailable`, unless
+  `grpc.WaitForReady(true)` makes it wait and retry for as long as its context lets it.
 - **The wire is gRPC's.** It talks to `google.golang.org/grpc` clients and servers in both
   directions; the import rewrite below only changes whose code implements the protocol.
 
@@ -35,8 +38,9 @@ sed -i 's#google.golang.org/grpc#github.com/lesismal/fib/grpc#' foo_grpc.pb.go
 ```
 
 That substitution covers `google.golang.org/grpc/codes` and `.../status` too, since they are
-prefixes of it. The package exports `SupportPackageIsVersion7` and the names generated code uses, so
-it compiles unchanged otherwise.
+prefixes of it. The package exports `SupportPackageIsVersion7`, `8` and `9` and the names generated
+code uses (`ServiceDesc`, `MethodDesc`, `StreamDesc`, `RegisterService`, the typed stream wrappers),
+so it compiles unchanged otherwise.
 
 Messages are the codec's job. The default `proto` codec encodes messages that encode themselves:
 `MarshalVT`/`UnmarshalVT` (vtprotobuf) or `Marshal`/`Unmarshal` (gogo/protobuf). Messages of
@@ -168,14 +172,38 @@ func main() {
 `RegisterService` panics if the implementation does not satisfy `HandlerType`, or if the service is
 registered twice, so services are registered before the server starts. The client names the method
 with its full path (`/package.Service/Method`) and selects the `json` codec with
-`CallContentSubtype`; generated clients do both for you. The server-side service name and method
-names are what the method path must match.
+`CallContentSubtype`; generated clients name the method for you. The server-side service name and
+method names are what the method path must match. The server picks the codec from each call's
+content type, so only the client chooses `json`; `grpc.WithDefaultCallOptions(grpc.CallContentSubtype("json"))`
+on `NewClient` chooses it for every call of the `ClientConn`, and `grpc.ForceServerCodec` makes a
+server use one codec whatever the call names. `NewClient` without `WithEngine` works too: the
+package then makes an engine of its own the first time one is needed.
+
+A server that should own its engine skips the binding: `Serve` makes the engine, listens and runs
+until `Stop` or `GracefulStop`, then closes the engine and returns nil:
+
+```go
+server := grpc.NewServer()
+server.RegisterService(&desc, greeter{})
+go func() {
+	if err := server.Serve(fib.DefaultConfig(), "127.0.0.1:50051"); err != nil {
+		log.Print(err)
+	}
+}()
+// ...
+server.GracefulStop() // GOAWAY to every client, wait for the calls in progress, then stop
+```
+
+`Stop` closes every connection at once and fails the calls in progress; `GracefulStop` also works
+on a `Server` bound to an engine of the caller's own, which the caller then closes. `ServeTLS` is
+`Serve` over TLS.
 
 ## Streaming calls
 
 A streaming method is a `StreamDesc` in the same `ServiceDesc`. `ServerStreams` and `ClientStreams`
-say which directions stream; zero, one or both may be set, giving server-streaming,
-client-streaming and bidirectional calls. The handler receives the call's `ServerStream`:
+say which directions stream: `ServerStreams` alone is a server-streaming call, `ClientStreams`
+alone a client-streaming one, and both a bidirectional one. The handler receives the call's
+`ServerStream`:
 
 ```go
 Streams: []grpc.StreamDesc{{
@@ -253,8 +281,9 @@ Streams: []grpc.StreamDesc{{
 ```
 
 Every message is flushed as it is sent, under the stream's flow control, so a server stream reaches
-the client message by message. `GenericClientStream` and `GenericServerStream`, the typed wrappers
-generated code uses, are exported for hand-written descriptors too.
+the client message by message rather than all at once when the call ends. `GenericClientStream`
+and `GenericServerStream`, the typed wrappers generated code uses to turn these methods into the
+`Recv`/`Send` methods of the streaming interfaces, are exported for hand-written descriptors too.
 
 ## Metadata, deadlines, cancellation and status
 
@@ -303,9 +332,12 @@ default:
 }
 ```
 
-`status.Error`, `status.Errorf` and `status.FromContextError` build the errors; `status.Code`,
-`status.Convert` and `status.FromError` inspect them. An ordinary Go error becomes
-`codes.Unknown`, a panic in a handler becomes `codes.Internal`. `status.WithDetails` carries encoded
+A call that fails before it has sent a message answers with one HEADERS frame, gRPC's
+"trailers-only" response, so what `SetHeader` set arrives in the client's `Trailer`, and its
+`Header` comes back empty. `status.Error`, `status.Errorf` and `status.FromContextError` build the
+errors; `status.Code`, `status.Convert` and `status.FromError` inspect them. An ordinary Go error
+becomes `codes.Unknown`, a panic in a handler becomes `codes.Internal` (and is logged with its
+stack). `status.WithDetails` carries encoded
 details as `grpc-status-details-bin`, which this package passes along as bytes without decoding.
 
 ## Interceptors, compression and task pools
@@ -424,8 +456,23 @@ bidirectional one, needs `Config.StreamRequestBody` so that it starts as its req
 For gRPC over TLS, use `fibtls.NewServer(grpc.ConfigureTLS(grpcTLS), server)` as the binding's
 handler and give the client `grpc.WithTLSConfig(clientTLS)`: `grpc.ConfigureTLS` clones the config
 and puts `h2` first in `NextProtos`, and `WithTLSConfig` makes the client offer h2 over TLS instead
-of speaking h2c. Certificates and verification are `crypto/tls`'s, as
-[chapter 10](10-tls.md) describes.
+of speaking h2c. In the first program, these are the only lines that change:
+
+```go
+serverTLS, clientTLS, err := tlstest.Configs() // a throwaway certificate, for trying it out
+if err != nil {
+	panic(err)
+}
+serverEngine, err := fib.New(fib.DefaultConfig(), fib.Binding{
+	Addr:    "127.0.0.1:50443",
+	Handler: fibtls.NewServer(grpc.ConfigureTLS(serverTLS), server),
+})
+// ...
+conn, err := grpc.NewClient("127.0.0.1:50443",
+	grpc.WithEngine(clientEngine), grpc.WithTLSConfig(clientTLS))
+```
+
+Certificates and verification are `crypto/tls`'s, as [chapter 10](10-tls.md) describes.
 
 ## Not implemented
 
@@ -433,19 +480,24 @@ The package documents what it does not do: name resolution and load balancing be
 `host:port` target (`dns:///` and `passthrough:///` are accepted, but addresses are not
 round-robined), retries and service config, keepalive pings, channelz, the health, reflection and
 binary-log services, and decoding `grpc-status-details-bin`, which travels as bytes. Calls are
-HTTP/2 only: a plain HTTP/1 request to a gRPC binding gets nothing, and `ServeHTTP` answers 400.
+HTTP/2 only: a plain HTTP/1 request to a gRPC binding gets no HTTP response (the server answers
+with an HTTP/2 GOAWAY and closes the connection), and `ServeHTTP` answers 400.
 
 ## Pitfalls
 
 - **Close the `ClientConn` before the engine.** Closing the engine ends its connections without a
   word to the calls on them; `ClientConn.Close` fails in-flight calls with `codes.Canceled`.
 - **Messages need a codec that knows them.** A `google.golang.org/protobuf` message fails with
-  `the proto codec cannot marshal ...` until the program registers a codec under `proto`; sending
-  plain structs requires the `json` content subtype on both sides.
+  `codes.Internal` and `the proto codec cannot marshal ...` until the program registers a codec
+  under `proto`; sending plain structs takes the `json` content subtype on the client, for every
+  call (`CallContentSubtype` or `WithDefaultCallOptions`).
 - **The method path is exact.** `/package.Service/Method` must match `ServiceName` and `MethodName`,
   case included; a mismatch is an `Unimplemented` from the server.
 - **No reflection means no grpcurl by default.** Point tools at the `.proto` files instead, or add a
   reflection service of your own; this package does not ship one.
+- **The default limits are real.** 4 MiB per received message and 100 concurrent streams per
+  connection; raise them deliberately with `MaxRecvMsgSize` and `MaxConcurrentStreams` (and
+  `MaxCallRecvMsgSize` on the client).
 
 ## See also
 
