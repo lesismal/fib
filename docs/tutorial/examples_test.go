@@ -37,11 +37,7 @@ func programsByFile(t *testing.T, files []string) ([]program, map[string]int) {
 	counts := map[string]int{}
 	seen := map[[32]byte]bool{}
 	for _, file := range files {
-		data, err := os.ReadFile(file)
-		if err != nil {
-			t.Fatal(err)
-		}
-		text := string(data)
+		text := readPage(t, file)
 		for _, m := range goBlock.FindAllStringSubmatchIndex(text, -1) {
 			code := text[m[2]:m[3]]
 			head := code

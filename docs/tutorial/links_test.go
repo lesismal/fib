@@ -37,6 +37,19 @@ func chapters(t *testing.T) []string {
 	return files
 }
 
+// readPage reads a tutorial page with its line endings made \n. A Windows
+// checkout has git's core.autocrlf on, so the pages arrive with \r\n there,
+// and the patterns here and in examples_test.go, a fence's "```go\n" and a
+// heading's end of line, would find nothing or keep a \r.
+func readPage(t *testing.T, path string) string {
+	t.Helper()
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return strings.ReplaceAll(string(data), "\r\n", "\n")
+}
+
 // TestLinks checks every relative link in the tutorial: the file it names
 // exists, and so does the heading or anchor after its #, as GitHub makes
 // them. Targets outside the tutorial (fib's reference pages and README) are
@@ -48,13 +61,10 @@ func TestLinks(t *testing.T) {
 		if a, ok := anchors[path]; ok {
 			return a
 		}
-		data, err := os.ReadFile(path)
-		if err != nil {
-			t.Fatal(err)
-		}
+		data := readPage(t, path)
 		a := map[string]bool{}
 		seen := map[string]int{}
-		for _, m := range heading.FindAllStringSubmatch(fence.ReplaceAllString(string(data), ""), -1) {
+		for _, m := range heading.FindAllStringSubmatch(fence.ReplaceAllString(data, ""), -1) {
 			s := slug(textLink.ReplaceAllString(strings.ReplaceAll(m[1], "`", ""), "$1"))
 			if n, ok := seen[s]; ok {
 				seen[s] = n + 1
@@ -64,7 +74,7 @@ func TestLinks(t *testing.T) {
 			}
 			a[s] = true
 		}
-		for _, m := range anchorTag.FindAllStringSubmatch(string(data), -1) {
+		for _, m := range anchorTag.FindAllStringSubmatch(data, -1) {
 			a[m[1]] = true
 		}
 		anchors[path] = a
@@ -73,12 +83,9 @@ func TestLinks(t *testing.T) {
 
 	checked := 0
 	for _, path := range files {
-		data, err := os.ReadFile(path)
-		if err != nil {
-			t.Fatal(err)
-		}
+		data := readPage(t, path)
 		// Links in code blocks and inline code are examples, not links.
-		text := inlineCode.ReplaceAllString(fence.ReplaceAllString(string(data), ""), "")
+		text := inlineCode.ReplaceAllString(fence.ReplaceAllString(data, ""), "")
 		for _, m := range link.FindAllStringSubmatch(text, -1) {
 			target := m[1]
 			if scheme.MatchString(target) || strings.HasPrefix(target, "mailto:") {
