@@ -613,8 +613,13 @@ func TestIdleTimeout(t *testing.T) {
 }
 
 func TestKeepAlive(t *testing.T) {
+	// The server hears from the client every keep-alive period plus its own
+	// ack delay, about 130ms here. A 300ms idle timeout left too little room
+	// for a loaded macOS runner under -race, which has held a timer back
+	// longer than that, so the timeout is a second, and the wait covers
+	// more than two of them.
 	p := newTestPair(t, 0, func(client, _ *Config) {
-		client.MaxIdleTimeout = 300 * time.Millisecond
+		client.MaxIdleTimeout = time.Second
 		client.KeepAlivePeriod = 100 * time.Millisecond
 	})
 	select {
@@ -622,7 +627,7 @@ func TestKeepAlive(t *testing.T) {
 		t.Fatalf("server closed: %v", err)
 	case err := <-p.clientH.closed:
 		t.Fatalf("client closed: %v", err)
-	case <-time.After(time.Second):
+	case <-time.After(2500 * time.Millisecond):
 	}
 }
 
