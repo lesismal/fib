@@ -5,13 +5,12 @@ package core
 import (
 	"fmt"
 	"net"
-	"os"
-	"path/filepath"
-	"strconv"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/lesismal/fib/internal/reuseportbpf"
 )
 
 // offeredGroups records the groups attachBalancer tries a selector on while
@@ -33,7 +32,8 @@ func offeredGroups(t *testing.T) func() [][]int {
 	}
 }
 
-// A prefork child with a bpffs directory offers its listening sockets to
+// A prefork child handed a socket to its master's broker offers its
+// listening sockets to
 // Config.BalanceReusePort's selector one per address, whether a single
 // poller listens or the engine's own loop does, for the addresses New binds
 // and for those AddBinding adds; outside prefork a single socket is offered
@@ -55,11 +55,9 @@ func TestPreforkChildOffersOneSocketGroups(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			if tc.prefork {
-				t.Setenv(preforkBPFFSEnv, t.TempDir())
-				t.Setenv(preforkChildEnv, "1")
-				t.Setenv(preforkChildrenEnv, "2")
+				brokerChild(t, reuseportbpf.NewBroker(), 1, 2)
 			} else {
-				t.Setenv(preforkBPFFSEnv, "")
+				t.Setenv(reuseportbpf.BrokerEnv, "")
 			}
 			groups := offeredGroups(t)
 			config := tc.config
@@ -96,28 +94,21 @@ func TestPreforkChildOffersOneSocketGroups(t *testing.T) {
 }
 
 // Two engines, each as a prefork child with one poller, share an address
-// and one selector pinned in bpffs, which hands their connections out in
-// turn: the case package prefork's default child, with two Ps and so one
-// poller, is in. It needs bpffs and CAP_BPF, and skips without them.
+// and the one selector a broker makes for it, as a prefork master's would,
+// which hands their connections out in turn: the case package prefork's
+// default child, with two Ps and so one poller, is in. It needs CAP_BPF, and
+// skips without it.
 func TestPreforkChildrenRoundRobinOneSocketEach(t *testing.T) {
 	const conns = 40
-	if fi, err := os.Stat("/sys/fs/bpf"); err != nil || !fi.IsDir() {
-		t.Skip("no bpffs mounted")
-	}
-	dir := filepath.Join("/sys/fs/bpf", fmt.Sprintf("fib-test-prefork-%d", os.Getpid()))
-	if err := os.Mkdir(dir, 0o700); err != nil {
-		t.Skipf("cannot make a bpffs directory (need CAP_BPF): %v", err)
-	}
-	defer os.RemoveAll(dir)
-	t.Setenv(preforkBPFFSEnv, dir)
-	t.Setenv(preforkChildrenEnv, "2")
+	broker := reuseportbpf.NewBroker()
+	defer broker.Close()
 
 	tried := offeredGroups(t)
 	var opened [2]atomic.Int32
 	addr := "127.0.0.1:0"
 	var servers []*Engine
 	for child := 1; child <= 2; child++ {
-		t.Setenv(preforkChildEnv, strconv.Itoa(child))
+		brokerChild(t, broker, child, 2)
 		config := pollerConfig(fmt.Sprintf("pf-rr-%d", child), 1)
 		config.ReusePort = true
 		config.BalanceReusePort = true
@@ -149,7 +140,7 @@ func TestPreforkChildrenRoundRobinOneSocketEach(t *testing.T) {
 		n := len(s.balancers)
 		s.listenMu.Unlock()
 		if n == 0 {
-			t.Skipf("child %d attached no selector (need CAP_BPF): %v", i+1, lastPinErr)
+			t.Skipf("child %d attached no selector (need CAP_BPF)", i+1)
 		}
 	}
 

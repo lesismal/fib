@@ -1,6 +1,6 @@
 //go:build linux && amd64
 
-package core
+package reuseportbpf
 
 // sysBPF is the bpf(2) system call number on this architecture.
 const sysBPF = 321

@@ -445,13 +445,12 @@ func sendFileCopy(c *Connection, f File, offset, count int64, send func([]byte) 
 
 // preforkChildEnv names the variable package prefork starts its children
 // with; see preforkChild. preforkChildrenEnv carries how many children there
-// are, and preforkBPFFSEnv the bpffs directory the children pin a shared
-// reuseport selector under when Config.BalanceReusePort asks; see
+// are. A child's socket to its master's reuseport selector broker is named
+// by reuseportbpf.BrokerEnv when Config.BalanceReusePort asks; see
 // balanceGroups.
 const (
 	preforkChildEnv    = "FIB_PREFORK_CHILD"
 	preforkChildrenEnv = "FIB_PREFORK_CHILDREN"
-	preforkBPFFSEnv    = "FIB_PREFORK_BPFFS"
 )
 
 // preforkChild reports whether this process is one of the children package

@@ -1,26 +1,12 @@
 //go:build linux && (amd64 || arm64)
 
-package core
+package reuseportbpf
 
 import (
-	"fmt"
-	"os"
-	"path/filepath"
 	"runtime"
 	"syscall"
 	"unsafe"
 )
-
-// lastPinErr records why the pinned balancer last fell back, for a test to
-// print; it is unused in normal operation.
-var lastPinErr error
-
-// pinFallback records a stage and its error for lastPinErr, and folds it to
-// the unsupported sentinel as unsupportedIfDenied does.
-func pinFallback(stage string, err error) error {
-	lastPinErr = fmt.Errorf("%s: %w", stage, err)
-	return unsupportedIfDenied(err)
-}
 
 // This file carries fib's whole eBPF dependency: a hand-assembled
 // BPF_PROG_TYPE_SK_REUSEPORT program and the two maps it needs, loaded
@@ -37,8 +23,6 @@ const (
 	bpfMapCreate     = 0
 	bpfMapUpdateElem = 2
 	bpfProgLoad      = 5
-	bpfObjPin        = 6
-	bpfObjGet        = 7
 )
 
 // bpf map and program types used here.
@@ -56,15 +40,6 @@ const (
 
 // bpfAny is BPF_ANY, the update flag that creates or replaces an entry.
 const bpfAny = 0
-
-// A reusePortBalancer holds the maps and program kept alive for one
-// reuseport group. The group holds its own references once the program is
-// attached, so Close only drops fib's handles.
-type reusePortBalancer struct {
-	sockarray int
-	counter   int
-	prog      int
-}
 
 // bpfInsn is one eBPF instruction, as the kernel reads it: an opcode, a
 // register byte holding the destination in its low nibble and the source in
@@ -182,10 +157,10 @@ type bpfProgLoadAttr struct {
 	progName    [16]byte
 }
 
-// progLoadLog, when set, is handed to the verifier to fill with its log, for
+// ProgLoadLog, when set, is handed to the verifier to fill with its log, for
 // a test to print when a load fails. It stays nil on the listen path, so no
 // log buffer is allocated there.
-var progLoadLog []byte
+var ProgLoadLog []byte
 
 func loadProgram(insns []bpfInsn) (int, error) {
 	license := []byte("GPL\x00")
@@ -195,15 +170,15 @@ func loadProgram(insns []bpfInsn) (int, error) {
 		insns:    uint64(uintptr(unsafe.Pointer(&insns[0]))),
 		license:  uint64(uintptr(unsafe.Pointer(&license[0]))),
 	}
-	if progLoadLog != nil {
+	if ProgLoadLog != nil {
 		attr.logLevel = 1
-		attr.logSize = uint32(len(progLoadLog))
-		attr.logBuf = uint64(uintptr(unsafe.Pointer(&progLoadLog[0])))
+		attr.logSize = uint32(len(ProgLoadLog))
+		attr.logBuf = uint64(uintptr(unsafe.Pointer(&ProgLoadLog[0])))
 	}
 	fd, errno := bpf(bpfProgLoad, unsafe.Pointer(&attr), unsafe.Sizeof(attr))
 	runtime.KeepAlive(insns)
 	runtime.KeepAlive(license)
-	runtime.KeepAlive(progLoadLog)
+	runtime.KeepAlive(ProgLoadLog)
 	if errno != 0 {
 		return -1, errno
 	}
@@ -245,208 +220,93 @@ func attach(socketFD, progFD int) error {
 	return syscall.SetsockoptInt(socketFD, syscall.SOL_SOCKET, soAttachReusePortEBPF, progFD)
 }
 
-// newReusePortBalancer round-robins the group of listening sockets fds, which
-// must already share an address through SO_REUSEPORT. It creates the maps,
-// loads the program, registers every socket and attaches the program to the
-// first. It returns errReusePortBalanceUnsupported, with nothing left behind,
-// where bpf(2) is refused, so the caller keeps plain SO_REUSEPORT.
-func newReusePortBalancer(fds []int) (*reusePortBalancer, error) {
-	if len(fds) < 2 {
-		return nil, errReusePortBalanceUnsupported
-	}
-	sockarray, err := createMap(bpfMapTypeReusePortSockHash, 4, 4, len(fds))
-	if err != nil {
-		return nil, unsupportedIfDenied(err)
-	}
-	counter, err := createMap(bpfMapTypeArray, 4, 4, 1)
-	if err != nil {
-		syscall.Close(sockarray)
-		return nil, unsupportedIfDenied(err)
-	}
-	prog, err := loadProgram(selectProgram(counter, sockarray, len(fds)))
-	if err != nil {
-		syscall.Close(sockarray)
-		syscall.Close(counter)
-		return nil, unsupportedIfDenied(err)
-	}
-	b := &reusePortBalancer{sockarray: sockarray, counter: counter, prog: prog}
-	for i, fd := range fds {
-		if err := registerSocket(sockarray, i, fd); err != nil {
-			b.Close()
-			return nil, err
-		}
-	}
-	if err := attach(fds[0], prog); err != nil {
-		b.Close()
-		return nil, err
-	}
-	return b, nil
-}
-
-type bpfObjAttr struct {
-	pathname  uint64
-	bpfFD     uint32
-	fileFlags uint32
-}
-
-// objPin pins the object fd into bpffs at path, so another process can open
-// it by that path with objGet.
-func objPin(fd int, path string) error {
-	p := append([]byte(path), 0)
-	attr := bpfObjAttr{pathname: uint64(uintptr(unsafe.Pointer(&p[0]))), bpfFD: uint32(fd)}
-	_, errno := bpf(bpfObjPin, unsafe.Pointer(&attr), unsafe.Sizeof(attr))
-	runtime.KeepAlive(p)
-	if errno != 0 {
-		return errno
-	}
-	return nil
-}
-
-// objGet opens the object pinned in bpffs at path, or reports the errno; it
-// returns ENOENT when nothing is pinned there yet.
-func objGet(path string) (int, error) {
-	p := append([]byte(path), 0)
-	attr := bpfObjAttr{pathname: uint64(uintptr(unsafe.Pointer(&p[0])))}
-	fd, errno := bpf(bpfObjGet, unsafe.Pointer(&attr), unsafe.Sizeof(attr))
-	runtime.KeepAlive(p)
-	if errno != 0 {
-		return -1, errno
-	}
-	return fd, nil
-}
-
-// openPinnedReusePortBalancer round-robins a reuseport group whose sockets
-// span several processes, as prefork's children do: one selector and its maps
-// are shared through bpffs, pinned at path ("_sock", "_ctr", "_prog" beside
-// it, whose parent directory the caller has made). The group holds size
-// sockets in all; this process registers its fds at baseIndex and on, and
-// attaches the selector to its first. The first process to arrive creates and
-// pins the objects under a lock; the rest open them. It falls back like
-// newReusePortBalancer where bpf(2) is refused.
-func openPinnedReusePortBalancer(path string, size, baseIndex int, fds []int) (*reusePortBalancer, error) {
-	if size < 2 || len(fds) == 0 {
-		return nil, errReusePortBalanceUnsupported
-	}
-	unlock, err := lockPin(path)
-	if err != nil {
-		lastPinErr = fmt.Errorf("lock %s: %w", path, err)
-		return nil, errReusePortBalanceUnsupported
-	}
-	defer unlock()
-
-	b := &reusePortBalancer{sockarray: -1, counter: -1, prog: -1}
-	prog, err := objGet(path + "_prog")
-	if err == nil {
-		b.prog = prog
-		sock, err := objGet(path + "_sock")
-		if err != nil {
-			b.Close()
-			return nil, pinFallback("objGet sock", err)
-		}
-		b.sockarray = sock
-	} else {
-		sock, err := createMap(bpfMapTypeReusePortSockHash, 4, 4, size)
-		if err != nil {
-			return nil, pinFallback("createMap sock", err)
-		}
-		b.sockarray = sock
-		counter, err := createMap(bpfMapTypeArray, 4, 4, 1)
-		if err != nil {
-			b.Close()
-			return nil, pinFallback("createMap counter", err)
-		}
-		b.counter = counter
-		prog, err := loadProgram(selectProgram(counter, sock, size))
-		if err != nil {
-			b.Close()
-			return nil, pinFallback("loadProgram", err)
-		}
-		b.prog = prog
-		for _, pin := range []struct {
-			fd   int
-			path string
-		}{{sock, path + "_sock"}, {counter, path + "_ctr"}, {prog, path + "_prog"}} {
-			if err := objPin(pin.fd, pin.path); err != nil {
-				b.Close()
-				return nil, pinFallback("objPin "+pin.path, err)
-			}
-		}
-	}
-	for j, fd := range fds {
-		if err := registerSocket(b.sockarray, baseIndex+j, fd); err != nil {
-			b.Close()
-			return nil, err
-		}
-	}
-	if err := attach(fds[0], b.prog); err != nil {
-		b.Close()
-		return nil, err
-	}
-	return b, nil
-}
-
-// lockPin serializes the children racing to create the pinned objects for
-// path, so that one creates and pins them and the rest open them. bpffs holds
-// only pinned objects, not lock files, so the lock lives in the temp
-// directory, named for path.
-func lockPin(path string) (func(), error) {
-	name := make([]byte, 0, len(path))
-	for i := 0; i < len(path); i++ {
-		if c := path[i]; c == '/' || c == ':' {
-			name = append(name, '_')
-		} else {
-			name = append(name, c)
-		}
-	}
-	lockPath := filepath.Join(os.TempDir(), "fib-reuseport-"+string(name)+".lock")
-	fd, err := syscall.Open(lockPath, syscall.O_CREAT|syscall.O_RDWR|syscall.O_CLOEXEC, 0o600)
-	if err != nil {
-		return nil, err
-	}
-	if err := syscall.Flock(fd, syscall.LOCK_EX); err != nil {
-		syscall.Close(fd)
-		return nil, err
-	}
-	return func() {
-		_ = syscall.Flock(fd, syscall.LOCK_UN)
-		_ = syscall.Close(fd)
-	}, nil
-}
-
 // unsupportedIfDenied turns the "not permitted" errors, which mean the
 // process lacks CAP_BPF or the kernel is too old, into
-// errReusePortBalanceUnsupported, so the caller falls back rather than
+// ErrUnsupported, so the caller falls back rather than
 // failing to listen. Other errors are real and returned as they are.
-// reusePortDebug keeps unsupportedIfDenied from folding EINVAL into the
-// unsupported sentinel, so a test can see a real bug in the maps or the
-// program rather than a skip. It is false in normal use.
-var reusePortDebug bool
 
 func unsupportedIfDenied(err error) error {
 	switch err {
 	case syscall.EPERM, syscall.EACCES, syscall.ENOSYS:
-		return errReusePortBalanceUnsupported
+		return ErrUnsupported
 	case syscall.EINVAL:
-		if !reusePortDebug {
-			return errReusePortBalanceUnsupported
+		if !Debug {
+			return ErrUnsupported
 		}
 	}
 	return err
 }
 
-func (b *reusePortBalancer) Close() error {
-	if b == nil {
+// NewGroup makes the maps and program of a selector for a group of size
+// sockets, none registered yet. It returns ErrUnsupported, with nothing left
+// behind, where bpf(2) is refused.
+func NewGroup(size int) (*Group, error) {
+	if size < 2 {
+		return nil, ErrUnsupported
+	}
+	g := &Group{Sockarray: -1, Counter: -1, Prog: -1}
+	var err error
+	if g.Sockarray, err = createMap(bpfMapTypeReusePortSockHash, 4, 4, size); err != nil {
+		return nil, unsupportedIfDenied(err)
+	}
+	if g.Counter, err = createMap(bpfMapTypeArray, 4, 4, 1); err != nil {
+		g.Close()
+		return nil, unsupportedIfDenied(err)
+	}
+	if g.Prog, err = loadProgram(selectProgram(g.Counter, g.Sockarray, size)); err != nil {
+		g.Close()
+		return nil, unsupportedIfDenied(err)
+	}
+	return g, nil
+}
+
+// Register puts the listening socket fd in the group's place index, where
+// the program selects it.
+func (g *Group) Register(index, fd int) error { return registerSocket(g.Sockarray, index, fd) }
+
+// Attach makes the group's program the selector of fd's reuseport group,
+// which keeps its own reference to it from then on.
+func (g *Group) Attach(fd int) error { return attach(fd, g.Prog) }
+
+// Close closes the descriptors g holds, once; a nil g does nothing.
+func (g *Group) Close() error {
+	if g == nil {
 		return nil
 	}
-	if b.prog >= 0 {
-		syscall.Close(b.prog)
+	for _, fd := range []*int{&g.Prog, &g.Counter, &g.Sockarray} {
+		if *fd >= 0 {
+			syscall.Close(*fd)
+			*fd = -1
+		}
 	}
-	if b.counter >= 0 {
-		syscall.Close(b.counter)
-	}
-	if b.sockarray >= 0 {
-		syscall.Close(b.sockarray)
-	}
-	b.prog, b.counter, b.sockarray = -1, -1, -1
 	return nil
+}
+
+// Balance round-robins the listening sockets fds of one process, which must
+// already share an address through SO_REUSEPORT: it makes the group's
+// selector, registers every socket in order and attaches the program to the
+// first.
+func Balance(fds []int) (*Group, error) {
+	if len(fds) < 2 {
+		return nil, ErrUnsupported
+	}
+	g, err := NewGroup(len(fds))
+	if err != nil {
+		return nil, err
+	}
+	if err := register(g, 0, fds); err != nil {
+		g.Close()
+		return nil, err
+	}
+	return g, nil
+}
+
+// register puts fds in g from place base on, and attaches g's program.
+func register(g *Group, base int, fds []int) error {
+	for i, fd := range fds {
+		if err := g.Register(base+i, fd); err != nil {
+			return err
+		}
+	}
+	return g.Attach(fds[0])
 }

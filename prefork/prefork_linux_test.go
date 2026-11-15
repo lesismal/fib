@@ -15,6 +15,7 @@ import (
 	"time"
 
 	fib "github.com/lesismal/fib"
+	"github.com/lesismal/fib/internal/reuseportbpf"
 	"github.com/lesismal/fib/prefork"
 )
 
@@ -63,7 +64,14 @@ func runChild() int {
 			return nil
 		}
 		reply := fmt.Sprintf("%d %d %d", prefork.Child(), runtime.GOMAXPROCS(0), prefork.Children())
-		engine, err := fib.New(fib.DefaultConfig(), fib.Binding{Addr: os.Getenv(addrEnv), Handler: fib.HandlerFuncs{Data: func(c *fib.Connection, _ []byte) {
+		config := fib.DefaultConfig()
+		if os.Getenv(modeEnv) == "balance" {
+			// The child also says where it found its socket to the master's
+			// reuseport broker.
+			config.BalanceReusePort = true
+			reply += " " + os.Getenv(reuseportbpf.BrokerEnv)
+		}
+		engine, err := fib.New(config, fib.Binding{Addr: os.Getenv(addrEnv), Handler: fib.HandlerFuncs{Data: func(c *fib.Connection, _ []byte) {
 			_ = c.Send([]byte(reply))
 		}}})
 		if err != nil {
@@ -247,11 +255,93 @@ func TestAChildEndedBySIGTERMStoppedAsAsked(t *testing.T) {
 	}
 }
 
-// BalanceReusePort runs the children as usual where it can hand them a bpffs
-// directory, and where it cannot.
+// BalanceReusePort runs the children as usual where the selectors can be
+// made, and where they cannot.
 func TestBalanceReusePortRuns(t *testing.T) {
 	if err := runUntilReady(t, "sigterm", 1, prefork.Config{Children: 1, ProcsPerChild: 1, BalanceReusePort: true}); err != nil {
 		t.Fatalf("RunContext = %v", err)
+	}
+}
+
+// With BalanceReusePort every child is handed its socket to the master's
+// broker, and where this process may make a selector (CAP_BPF), new
+// connections go to the children in turn: children of two Ps, with one
+// poller each, every one of them a share of the address's group.
+func TestBalanceReusePortSpreadsOverChildren(t *testing.T) {
+	const children, conns = 4, 40
+	addr := freeAddr(t)
+	t.Setenv(addrEnv, addr)
+	t.Setenv(modeEnv, "balance")
+	ctx, cancel := context.WithCancel(context.Background())
+	result := make(chan error, 1)
+	go func() {
+		result <- prefork.RunContext(ctx, prefork.Config{Children: children, ProcsPerChild: 2, BalanceReusePort: true},
+			func(context.Context) error { return errors.New("serve ran in the master") })
+	}()
+	defer func() {
+		cancel()
+		select {
+		case err := <-result:
+			if err != nil {
+				t.Errorf("RunContext = %v", err)
+			}
+		case <-time.After(15 * time.Second):
+			t.Error("the children did not stop")
+		}
+	}()
+
+	ask := func() (string, bool) {
+		conn, err := net.DialTimeout("tcp", addr, time.Second)
+		if err != nil {
+			return "", false
+		}
+		defer conn.Close()
+		_ = conn.SetDeadline(time.Now().Add(2 * time.Second))
+		_, _ = conn.Write([]byte("hi"))
+		buf := make([]byte, 32)
+		n, _ := conn.Read(buf)
+		reply := strings.Fields(string(buf[:n]))
+		if len(reply) != 4 {
+			t.Fatalf("child answered %q, want its index, GOMAXPROCS, children and broker", buf[:n])
+		}
+		if reply[3] != "3" {
+			t.Fatalf("child %s found its broker at %q, want descriptor 3", reply[0], reply[3])
+		}
+		return reply[0], true
+	}
+	// Every child is up once each has answered.
+	seen := map[string]bool{}
+	deadline := time.Now().Add(20 * time.Second)
+	for len(seen) < children && time.Now().Before(deadline) {
+		if child, ok := ask(); ok {
+			seen[child] = true
+		} else {
+			time.Sleep(20 * time.Millisecond)
+		}
+	}
+	if len(seen) < children {
+		t.Fatalf("only children %v answered", seen)
+	}
+
+	if g, err := reuseportbpf.NewGroup(2); err != nil {
+		t.Skipf("selectors cannot be made here (need CAP_BPF): %v; the children got their brokers", err)
+	} else {
+		g.Close()
+	}
+	// Round-robin from wherever the counter stands: any run of conns, a
+	// multiple of the children, gives each the same share.
+	counts := map[string]int{}
+	for i := 0; i < conns; i++ {
+		child, ok := ask()
+		if !ok {
+			t.Fatalf("dial %d failed", i)
+		}
+		counts[child]++
+	}
+	for i := 1; i <= children; i++ {
+		if got := counts[strconv.Itoa(i)]; got != conns/children {
+			t.Fatalf("children took %v, want %d each", counts, conns/children)
+		}
 	}
 }
 

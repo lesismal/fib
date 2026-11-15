@@ -13,6 +13,7 @@ import (
 
 	"github.com/lesismal/fib/internal/listener"
 	"github.com/lesismal/fib/internal/netaddr"
+	"github.com/lesismal/fib/internal/reuseportbpf"
 	"github.com/lesismal/fib/log"
 )
 
@@ -193,10 +194,11 @@ func (e *Engine) balanceGroups(i int, groups [][]int) {
 }
 
 // attachBalancer round-robins one listening group. In a prefork child it
-// shares one selector across the children through bpffs, registering this
-// child's sockets in the whole group by their place in it; otherwise it
-// balances this engine's own pollers, which needs at least two. A group it
-// cannot balance keeps the kernel's hash, logged once.
+// shares one selector across the children, which it has the master make or
+// hand over, registering this child's sockets in the whole group by their
+// place in it; otherwise it balances this engine's own pollers, which needs
+// at least two. A group it cannot balance keeps the kernel's hash, logged
+// once.
 func (e *Engine) attachBalancer(binding int, group []int) {
 	if len(group) == 0 {
 		return
@@ -205,13 +207,12 @@ func (e *Engine) attachBalancer(binding int, group []int) {
 		b   *reusePortBalancer
 		err error
 	)
-	if dir, child, children, ok := preforkBalance(); ok {
+	if conn, child, children, ok := preforkBalance(); ok {
 		if attachBalancerHook != nil {
 			attachBalancerHook(group)
 		}
 		k := len(group)
-		path := dir + "/" + addrKey(group[0])
-		b, err = openPinnedReusePortBalancer(path, children*k, (child-1)*k, group)
+		b, err = reuseportbpf.JoinGroup(conn, addrKey(group[0]), children*k, (child-1)*k, group)
 	} else {
 		if len(group) < 2 {
 			return
@@ -219,7 +220,7 @@ func (e *Engine) attachBalancer(binding int, group []int) {
 		if attachBalancerHook != nil {
 			attachBalancerHook(group)
 		}
-		b, err = newReusePortBalancer(group)
+		b, err = reuseportbpf.Balance(group)
 	}
 	if err != nil {
 		e.logBalanceFallback(err)
@@ -236,7 +237,7 @@ func (e *Engine) attachBalancer(binding int, group []int) {
 var attachBalancerHook func(group []int)
 
 // preforkBalancing reports whether this process is a prefork child handed a
-// bpffs directory to share selectors through: there a group spans the
+// socket to its master's selector broker: there a group spans the
 // children, and a process adds its share to it however few sockets that is,
 // one where its engine listens on its own loop or has a single poller.
 func preforkBalancing() bool {
@@ -244,25 +245,25 @@ func preforkBalancing() bool {
 	return ok
 }
 
-// preforkBalance reports the shared bpffs directory and this child's place
-// among the prefork children, when it is one and a directory was handed down;
-// see Config.BalanceReusePort and package prefork.
-func preforkBalance() (dir string, child, children int, ok bool) {
-	dir = os.Getenv(preforkBPFFSEnv)
-	if dir == "" {
-		return "", 0, 0, false
+// preforkBalance reports this child's end of the socket pair to its master's
+// selector broker and its place among the prefork children, when it is one
+// and was handed a pair; see Config.BalanceReusePort and package prefork.
+func preforkBalance() (conn, child, children int, ok bool) {
+	conn, err := strconv.Atoi(os.Getenv(reuseportbpf.BrokerEnv))
+	if err != nil || conn < 0 {
+		return -1, 0, 0, false
 	}
 	child, _ = strconv.Atoi(os.Getenv(preforkChildEnv))
 	children, _ = strconv.Atoi(os.Getenv(preforkChildrenEnv))
 	if child < 1 || children < 2 {
-		return "", 0, 0, false
+		return -1, 0, 0, false
 	}
-	return dir, child, children, true
+	return conn, child, children, true
 }
 
-// addrKey is a filename-safe key for the address fd is bound to, the same in
-// every child, so they pin one selector per shared address. It avoids dots,
-// which bpffs refuses in a pin name.
+// addrKey is a key for the address fd is bound to, the same in every child,
+// so that the master makes one selector per shared address. It keeps to
+// characters a file name may hold, with no dots.
 func addrKey(fd int) string {
 	sa, err := syscall.Getsockname(fd)
 	if err != nil {

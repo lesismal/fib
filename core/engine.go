@@ -122,7 +122,7 @@ type Engine struct {
 	// balancers are the eBPF reuseport selectors the engine attached to the
 	// listening groups its pollers share, by binding, when
 	// Config.BalanceReusePort asked and the platform allowed it; see
-	// newReusePortBalancer. Held on the root engine, guarded by listenMu.
+	// package reuseportbpf. Held on the root engine, guarded by listenMu.
 	balancers []bindingBalancer
 	// loopMu guards loopOwned, which says the loop's state is no longer
 	// anyone else's to change directly: Run has started the loop, which
