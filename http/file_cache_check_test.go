@@ -66,10 +66,14 @@ func TestFileCacheCheckInterval(t *testing.T) {
 	if fc.check != interval {
 		t.Fatalf("check %v", fc.check)
 	}
+	// The interval runs from when the first lookup loaded the file, so the
+	// clock starts before it: a slow runner can take longer than the margin
+	// below between that load and the replacement, and the cache, past its
+	// interval by then, would rightly stat the file again.
+	start := time.Now()
 	if got := cachedBody(t, fc, "a.txt"); got != "AAAA" {
 		t.Fatalf("got %q", got)
 	}
-	start := time.Now()
 	replaceKeepingStamp(t, dir, "a.txt", "BBBB")
 	if got := cachedBody(t, fc, "a.txt"); got != "AAAA" && time.Since(start) < interval/2 {
 		t.Fatalf("within the interval: got %q", got)
