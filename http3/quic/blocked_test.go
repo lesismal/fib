@@ -2,7 +2,9 @@ package quic
 
 import (
 	"errors"
+	"fmt"
 	"testing"
+	"time"
 )
 
 // A sender held back by flow control says so with a BLOCKED frame for each
@@ -97,11 +99,25 @@ func TestBlockedFramesSent(t *testing.T) {
 		if err := s.Write([]byte{1}, true); err != nil {
 			t.Fatal(err)
 		}
-		waitFor(t, "DATA_BLOCKED", func() bool {
+		blocked := func() bool {
 			server.mu.Lock()
 			defer server.mu.Unlock()
 			return server.dataBlockedAt == 6000
-		})
+		}
+		for deadline := time.Now().Add(5 * time.Second); !blocked(); time.Sleep(time.Millisecond) {
+			if time.Now().After(deadline) {
+				c := p.client
+				c.mu.Lock()
+				cs := fmt.Sprintf("client sent %d of %d, report %+v, queue %d, sending %v, in flight %d",
+					c.sentData, c.peerMaxData, c.dataBlocked, len(c.sendQueue), c.sending, c.cc.bytesInFlight)
+				c.mu.Unlock()
+				server.mu.Lock()
+				ss := fmt.Sprintf("server got %d, gives %d, consumed %d, heard %d",
+					server.recvData, server.recvMaxData, server.recvConsumed, server.dataBlockedAt)
+				server.mu.Unlock()
+				t.Fatalf("no DATA_BLOCKED: %s; %s", cs, ss)
+			}
+		}
 	})
 	t.Run("streams", func(t *testing.T) {
 		p := newTestPair(t, 0, func(_, server *Config) { server.MaxIncomingStreams = 2 })

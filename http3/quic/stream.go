@@ -661,8 +661,14 @@ func (s *Stream) onStreamFrame(off uint64, data []byte, fin bool) error {
 		}
 	}
 	if s.recvDone || s.peerReset || s.stopSent {
-		// Nobody reads it, so it counts as read at once.
-		c.consumed(s, end)
+		// Nobody reads it, so it counts as read at once: data the stream
+		// was reset or stopped with. A copy of data a finished stream
+		// delivered already, a retransmission its sender thought lost, was
+		// counted as it was delivered, and an application holding the
+		// stream's credit back (see HoldCredit) still has it.
+		if s.peerReset || s.stopSent {
+			c.consumed(s, end)
+		}
 		if s.stopSent && s.recvFin >= 0 && !s.recvDone {
 			s.recvDone = true
 			c.maybeFinish(s)

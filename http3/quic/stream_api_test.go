@@ -125,6 +125,48 @@ func TestCloseWhenDoneBounded(t *testing.T) {
 	}
 }
 
+// A stream whose credit the application holds keeps it held when a copy of
+// data it was delivered arrives after its end, as a retransmission the
+// sender thought lost does: the copy is dropped, not taken for data nobody
+// reads and given back to the peer.
+func TestHeldCreditSurvivesLateCopy(t *testing.T) {
+	p := newTestPair(t, 0, func(_, server *Config) { server.ConnReceiveWindow = 6000 })
+	p.serverH.onData = func(s *Stream, _ []byte, _ bool) { s.HoldCredit() }
+	server := p.serverConn(t)
+	s, err := p.client.OpenStream()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Write([]byte{1}, false); err != nil {
+		t.Fatal(err)
+	}
+	var st *Stream
+	waitFor(t, "credit held", func() bool {
+		server.mu.Lock()
+		defer server.mu.Unlock()
+		st = server.streamByID(s.ID())
+		return st != nil && st.holdCredit
+	})
+	if err := s.Write(make([]byte, 2999), true); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, "the stream's end", func() bool {
+		server.mu.Lock()
+		defer server.mu.Unlock()
+		return st.recvDone
+	})
+	server.mu.Lock()
+	defer server.mu.Unlock()
+	consumed, given := server.recvConsumed, server.recvMaxData
+	if err := st.onStreamFrame(0, make([]byte, 3000), true); err != nil {
+		t.Fatal(err)
+	}
+	if server.recvConsumed != consumed || server.recvMaxData != given || server.maxDataPending && given == 6000 {
+		t.Fatalf("a late copy gave credit back: consumed %d -> %d, given %d -> %d",
+			consumed, server.recvConsumed, given, server.recvMaxData)
+	}
+}
+
 // A client opens no more bidirectional streams than the server allows, and
 // unidirectional ones on a count of their own.
 func TestStreamLimits(t *testing.T) {
