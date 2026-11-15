@@ -7,6 +7,7 @@ import (
 	"net"
 	"net/netip"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -18,6 +19,7 @@ import (
 	"github.com/lesismal/fib/internal/netaddr"
 	"github.com/lesismal/fib/internal/sys"
 	"github.com/lesismal/fib/internal/udpbatch"
+	"github.com/lesismal/fib/log"
 	"github.com/lesismal/fib/sidepool"
 )
 
@@ -1079,8 +1081,40 @@ func pollersListen(config Config, network string) bool {
 // listenOptions is what of config the listening sockets on network are
 // opened by; multipathTCP is the binding's Binding.MultipathTCP.
 func listenOptions(config Config, network string, multipathTCP bool) listener.Options {
-	return listener.Options{Network: network, Backlog: config.Backlog, ReusePort: config.ReusePort,
+	o := listener.Options{Network: network, Backlog: config.Backlog, ReusePort: config.ReusePort,
 		MultipathTCP: multipathTCP}
+	if config.ReusePortByCPU && !netaddr.IsUDP(network) && !netaddr.IsUnix(network) {
+		// The group an address's listening sockets form: one per poller
+		// where the pollers listen, one otherwise, in every prefork child.
+		perProcess := 1
+		if pollersListen(config, network) {
+			perProcess = pollerCount(config)
+		}
+		o.CPUSelectGroup = preforkChildren() * perProcess
+		o.SelectorFailed = logCPUSelectFallback
+	}
+	return o
+}
+
+// preforkChildren is how many prefork children share this process's
+// addresses, itself among them, or one outside prefork.
+func preforkChildren() int {
+	if !preforkChild {
+		return 1
+	}
+	n, _ := strconv.Atoi(os.Getenv(preforkChildrenEnv))
+	return max(n, 1)
+}
+
+// cpuSelectFallback logs the first listening socket that could not take
+// Config.ReusePortByCPU's selector; the rest fail the same way.
+var cpuSelectFallback sync.Once
+
+func logCPUSelectFallback(err error) {
+	cpuSelectFallback.Do(func() {
+		log.Warn("fib: ReusePortByCPU could not attach its reuseport selector; keeping the kernel's hash",
+			"error", err)
+	})
 }
 
 // The readiness backends never have a write outstanding in the kernel: a

@@ -41,6 +41,7 @@ type Settings struct {
 	EngineLoop               bool
 	ReusePort                bool
 	BalanceReusePort         bool
+	ReusePortByCPU           bool
 	AcceptPlacement          string
 	UDPIdleTimeout           time.Duration
 	LogStatus                bool
@@ -90,6 +91,7 @@ func (e *Engine) Settings() Settings {
 		EngineLoop:               c.EngineLoop,
 		ReusePort:                c.ReusePort,
 		BalanceReusePort:         c.BalanceReusePort,
+		ReusePortByCPU:           c.ReusePortByCPU,
 		AcceptPlacement:          c.AcceptPlacement.String(),
 		UDPIdleTimeout:           udpIdleTimeout(c.UDPIdleTimeout),
 		LogStatus:                c.LogStatus,
@@ -170,6 +172,7 @@ func (s Settings) Parameters() []Parameter {
 		{"engineLoop", boolValue(s.EngineLoop), source("engineLoop"), "give the engine a loop of its own to accept and read UDP"},
 		{"reusePort", boolValue(s.ReusePort), source("reusePort"), "bind listeners with SO_REUSEPORT so processes may share an address"},
 		{"balanceReusePort", boolValue(s.BalanceReusePort), source("balanceReusePort"), "hand reuseport connections out round-robin with eBPF"},
+		{"reusePortByCPU", boolValue(s.ReusePortByCPU), source("reusePortByCPU"), "hand reuseport TCP connections out by the receiving CPU with classic BPF"},
 		{"accept", s.AcceptPlacement, source("accept"), "which poller serves a connection accepted on a poller's own socket"},
 		{"udpIdleTimeout", s.UDPIdleTimeout.String(), source("udpIdleTimeout"), "close a UDP peer silent this long; zero means the default"},
 		{"logStatus", boolValue(s.LogStatus), source("logStatus"), "log the engine started line when it starts"},
@@ -215,6 +218,7 @@ func customConfig(c Config) map[string]bool {
 	set("engineLoop", c.EngineLoop != base.EngineLoop)
 	set("reusePort", c.ReusePort != base.ReusePort)
 	set("balanceReusePort", c.BalanceReusePort != base.BalanceReusePort)
+	set("reusePortByCPU", c.ReusePortByCPU != base.ReusePortByCPU)
 	set("accept", c.AcceptPlacement != 0 && c.AcceptPlacement != base.AcceptPlacement)
 	set("udpIdleTimeout", c.UDPIdleTimeout != 0)
 	set("logStatus", c.LogStatus != base.LogStatus)

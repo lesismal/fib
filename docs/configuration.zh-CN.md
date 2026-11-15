@@ -53,6 +53,7 @@ if err := engine.Run(); err != nil {
 | `MaxConns` | `0`（关） | 所有 Binding 加在一起，已 accept 且未关闭的连接上限；超过的连接在 handler 看到之前就被关闭，并计入 `Stats.ConnsRefused`。dial 出去的连接和 UDP peer 不计入。 |
 | `ReusePort` | `true` | 监听 socket 设置 `SO_REUSEPORT`，同用户的其他 socket 可以共享地址。Linux 上 `IOPollers` 模式即使不设置，poller 也会各自监听；prefork 子进程总是设置。 |
 | `BalanceReusePort` | `false` | Linux 上 `IOPollers` 且没有 `EngineLoop` 时，挂 eBPF selector，把 reuseport 连接按轮询分给 poller，而不是按内核地址哈希。单进程内需要多个 poller；用 `prefork.Config.BalanceReusePort` 启动的 prefork 子进程里，组由所有子进程共同组成，所以只有一个 poller、或由 engine 自己的 loop 监听也可以。需要 `CAP_BPF`（Linux 5.8 之前是 `CAP_SYS_ADMIN`）；没有权限时保留内核哈希并打日志。 |
+| `ReusePortByCPU` | `false` | Linux 上挂一个经典 BPF selector（`SO_ATTACH_REUSEPORT_CBPF`，不需要任何权限），把新的 TCP 连接交给 reuseport 组里序号等于收包 CPU 编号对组大小取模的 socket；组是所有 prefork 子进程在该地址上的监听 socket。只有当 SYN 均匀落在一段长度为组大小（或其倍数）的连续 CPU 上时才是均匀的，例如压测工具经回环发起的连接；适合清楚客户端所在 CPU 的机器。UDP 仍用内核哈希。4.6 之前的内核保留哈希并打日志；`BalanceReusePort` 的 selector 挂上后会替换它。 |
 | `AcceptPlacement` | `AcceptFDModulo` | poller 在自己独占的 TCP socket 上 accept 的连接交给哪个 poller：`AcceptFDModulo` 按 fd 取模（默认），`AcceptKernelHash` 交给内核地址哈希选中的、也就是该 socket 所属的 poller。只适用于 Linux 上 `IOPollers` 且没有 `EngineLoop` 的情况。 |
 | `UDPIdleTimeout` | `0` → `60s` | UDP peer 这么长时间没有收发就关闭，`OnClose` 收到 `ErrUDPIdleTimeout`。负值表示一直保留；dial 出去的 UDP 连接没有超时。 |
 

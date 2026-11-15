@@ -1510,6 +1510,28 @@ type Config struct {
 	// logs it and keeps the kernel's hash. Only Linux spreads a reuseport
 	// group between sockets at all.
 	BalanceReusePort bool
+	// ReusePortByCPU hands each new TCP connection to the socket of its
+	// address's reuseport group whose place in the group is the number of
+	// the CPU that received the connection's SYN, modulo the group's size:
+	// the engine attaches a classic BPF selector (SO_ATTACH_REUSEPORT_CBPF),
+	// which, unlike BalanceReusePort's eBPF one, needs no capability. The
+	// group is every prefork child's sockets on the address, each child
+	// holding its pollers' where they listen, or one of its own.
+	//
+	// It spreads connections evenly when their SYNs arrive spread evenly over
+	// a run of CPUs as long as the group or a multiple of it: over loopback a
+	// SYN is received on the CPU of the thread that called connect, so a load
+	// generator whose threads run on a range of CPUs is spread exactly where
+	// the kernel's hash spreads its few connections per socket unevenly.
+	// Through a NIC, connections land as its receive queues' CPUs fall, and a
+	// run of CPUs whose numbers fall on only some residues of the group's
+	// size leaves the rest of its sockets without connections; it is for a
+	// machine whose clients' CPUs are known, off by default. UDP keeps the
+	// kernel's hash, which sends all of a peer's datagrams to the socket its
+	// connection lives on. A kernel without reuseport selectors for TCP
+	// (before Linux 4.6) keeps the hash, logged once, and BalanceReusePort's
+	// selector, where it attaches, replaces this one. Linux only.
+	ReusePortByCPU bool
 	// UDPIdleTimeout closes a UDP peer's connection once the peer has neither
 	// sent nor been sent a datagram for this long, since UDP has no close of
 	// its own to end it. OnClose receives ErrUDPIdleTimeout. Zero means

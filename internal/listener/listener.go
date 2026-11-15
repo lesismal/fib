@@ -24,6 +24,15 @@ type Options struct {
 	// Multipath TCP where the kernel offers it, falling back to plain TCP
 	// where it does not. UDP and Unix sockets are unaffected.
 	MultipathTCP bool
+	// CPUSelectGroup, when it is 2 or more, is the size of the reuseport
+	// group a listening TCP socket joins, which the socket gets a classic
+	// BPF selector for that hands each connection to the socket at the
+	// receiving CPU's number modulo it; see Config.ReusePortByCPU. Unix and
+	// UDP sockets, and sockets without SO_REUSEPORT, get none.
+	CPUSelectGroup int
+	// SelectorFailed, if set, hears why a socket did not take its selector,
+	// which leaves its group the kernel's hash.
+	SelectorFailed func(error)
 }
 
 // Create opens a socket bound to addr, and listening on it unless
@@ -141,6 +150,14 @@ func listenSocket(o Options, family int, bound syscall.Sockaddr, listen, reusePo
 	if err != nil {
 		syscall.Close(fd)
 		return -1, err
+	}
+	if listen && reusePort && family != syscall.AF_UNIX && o.CPUSelectGroup >= 2 {
+		// After listen, once the socket is in its reuseport group, whose
+		// selector this sets: every socket of the group setting the same
+		// one leaves it as it was.
+		if err := attachCPUSelector(fd, o.CPUSelectGroup); err != nil && o.SelectorFailed != nil {
+			o.SelectorFailed(err)
+		}
 	}
 	// A UDP socket has the kernel coalesce the runs of datagrams it receives,
 	// which the engine splits again by the size each read reports; see

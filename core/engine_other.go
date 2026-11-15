@@ -755,6 +755,10 @@ type Config struct {
 	// epoll or kqueue engine with pollers. This backend has no pollers, and
 	// ignores it.
 	BalanceReusePort bool
+	// ReusePortByCPU spreads a reuseport group's TCP connections by the CPU
+	// that receives them on an epoll or kqueue engine. This backend listens
+	// through the net package, and ignores it.
+	ReusePortByCPU bool
 	// UDPIdleTimeout closes a silent UDP peer's connection. Zero means
 	// DefaultUDPIdleTimeout and a negative value keeps peers until closed.
 	UDPIdleTimeout time.Duration
