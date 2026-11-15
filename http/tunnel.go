@@ -457,6 +457,13 @@ func (c *Context) Connect(header stdhttp.Header, handler TunnelHandler) (*Tunnel
 // switchTunnel switches the request to a tunnel: for protocol, or for a
 // CONNECT to a host and port when protocol is empty.
 func (c *Context) switchTunnel(protocol string, header stdhttp.Header, handler TunnelHandler) (*Tunnel, error) {
+	return c.switchTunnelOn(protocol, header, handler, false)
+}
+
+// switchTunnelOn is switchTunnel, told by worker that it runs on the
+// goroutine that served the request, after the handler returned: a handover
+// (see later), which holds the connection's parser already.
+func (c *Context) switchTunnelOn(protocol string, header stdhttp.Header, handler TunnelHandler, worker bool) (*Tunnel, error) {
 	if c.begun() {
 		return nil, ErrResponseWritten
 	}
@@ -490,7 +497,8 @@ func (c *Context) switchTunnel(protocol string, header stdhttp.Header, handler T
 	case c.stream != nil:
 		t, err = c.stream.upgrade(c.Request, protocol, header)
 	default:
-		if late && c.parser != nil {
+		lock := late && !worker && c.parser != nil
+		if lock {
 			// Away from the round that served the request, the connection is
 			// the parser's: a round reading it waits for the switch, and then
 			// hands what it read to the tunnel.
@@ -501,7 +509,7 @@ func (c *Context) switchTunnel(protocol string, header stdhttp.Header, handler T
 		} else {
 			t, err = c.upgradeHTTP1(protocol, header)
 		}
-		if late && c.parser != nil {
+		if lock {
 			c.parser.mu.Unlock()
 		}
 	}

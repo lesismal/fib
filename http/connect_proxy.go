@@ -126,17 +126,24 @@ func (p *ConnectProxy) ServeHTTP(c *Context) {
 		return
 	}
 	relay := &connectRelay{limit: p.config.MaxQueuedBytes, idle: p.config.IdleTimeout}
-	// The request is answered once the dial is done, from its callback.
+	// The request is answered once the dial is done, from its callback. That
+	// may come while this handler, or one wrapping it, still runs on the
+	// goroutine serving the request, which on HTTP/1 holds the connection's
+	// parser: the answer waits for the handler's return, and is made on
+	// that goroutine then, or on the handler pool once it has returned.
 	c.Retain()
 	if err := p.config.Dial(c.Conn.Engine(), "tcp", target, p.config.DialTimeout, (*relayTarget)(relay),
-		func(_ *fib.Connection, err error) { p.dialed(c, relay, err) }); err != nil {
-		p.dialed(c, relay, err)
+		func(_ *fib.Connection, err error) {
+			c.later(func(worker bool) { p.dialed(c, relay, err, worker) })
+		}); err != nil {
+		p.dialed(c, relay, err, false)
 	}
 }
 
 // dialed answers the request c, retained while its target was dialed, once
-// the dial is done: the tunnel opens, or err says why it could not.
-func (p *ConnectProxy) dialed(c *Context, relay *connectRelay, err error) {
+// the dial is done: the tunnel opens, or err says why it could not. worker
+// says it runs on the goroutine that served c, after the handler returned.
+func (p *ConnectProxy) dialed(c *Context, relay *connectRelay, err error, worker bool) {
 	defer c.Release()
 	if err != nil {
 		status := stdhttp.StatusBadGateway
@@ -147,7 +154,7 @@ func (p *ConnectProxy) dialed(c *Context, relay *connectRelay, err error) {
 		p.answer(c, status, nil)
 		return
 	}
-	if _, err := c.Connect(nil, (*relayClient)(relay)); err != nil {
+	if _, err := c.switchTunnelOn("", nil, (*relayClient)(relay), worker); err != nil {
 		relay.target.Close()
 		p.answer(c, stdhttp.StatusBadRequest, nil)
 	}

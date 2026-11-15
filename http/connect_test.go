@@ -618,6 +618,48 @@ func TestConnectProxyBackpressure(t *testing.T) {
 	}
 }
 
+// A dial that is done while the handler, or one wrapping it, still runs has
+// its tunnel opened once the handler returns, on the goroutine that served
+// the request, which holds the HTTP/1 parser: not from the dial's callback
+// alongside that goroutine, which raced it for the parser.
+func TestConnectProxyDialDoneWhileHandling(t *testing.T) {
+	target := echoServer(t)
+	fired := make(chan struct{}, 1)
+	proxy := NewConnectProxy(ConnectProxyConfig{
+		Dial: func(engine *fib.Engine, network, addr string, timeout time.Duration, handler fib.Handler,
+			done func(*fib.Connection, error)) error {
+			return engine.DialWithHandler(network, addr, timeout, handler, func(c *fib.Connection, err error) {
+				fired <- struct{}{}
+				done(c, err)
+			})
+		},
+	})
+	addr := serve(t, NewHandler(HandlerFunc(func(c *Context) {
+		proxy.ServeHTTP(c)
+		// Still handling when the callback answers the request, and
+		// returning while it does.
+		select {
+		case <-fired:
+		case <-time.After(5 * time.Second):
+		}
+	})))
+	for i := 0; i < 20; i++ {
+		conn, line := connectThrough(t, addr, target, "")
+		if line != "HTTP/1.1 200 OK" {
+			t.Fatalf("status %q", line)
+		}
+		_ = conn.SetDeadline(time.Now().Add(10 * time.Second))
+		if _, err := conn.Write([]byte("ping")); err != nil {
+			t.Fatal(err)
+		}
+		got := make([]byte, 4)
+		if _, err := io.ReadFull(conn, got); err != nil || string(got) != "ping" {
+			t.Fatalf("echo %q: %v", got, err)
+		}
+		_ = conn.Close()
+	}
+}
+
 // A header HTTP/1 cannot carry is refused before anything is sent, and a
 // tunnel whose writer cannot pace it neither holds nor waits.
 func TestConnectEdges(t *testing.T) {
