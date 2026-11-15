@@ -1499,8 +1499,12 @@ type Config struct {
 	// the group of a listening address its pollers share. The hash spreads a
 	// large, changing set of connections evenly, but a few connections over a
 	// few sockets unevenly, which leaves some pollers idle; the selector keeps
-	// the count even whatever the addresses. It needs IOPollers without
-	// EngineLoop (so each poller listens), more than one poller, and CAP_BPF
+	// the count even whatever the addresses. Within one process it needs
+	// IOPollers without EngineLoop (so each poller listens) and more than one
+	// poller. In a child of package prefork run with its BalanceReusePort,
+	// the group is every child's sockets on the address, so a child whose
+	// single poller, or whose own loop, listens takes part with its one
+	// socket. It needs CAP_BPF
 	// (CAP_SYS_ADMIN before Linux 5.8); without the capability, on an older
 	// kernel, or on an architecture the selector does not cover, the engine
 	// logs it and keeps the kernel's hash. Only Linux spreads a reuseport

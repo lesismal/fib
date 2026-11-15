@@ -102,6 +102,10 @@ func (e *Engine) openBinding(b Binding, i int) error {
 		e.noteUnixPath(b.Network, addr, i)
 		if !e.noLoop {
 			placed = append(placed, placement{loop: e, stream: l})
+			if !l.unix && preforkBalancing() {
+				// This process's one socket in a group the children share.
+				groups = append(groups, []int{fd})
+			}
 			continue
 		}
 		held = append(held, l)
@@ -120,6 +124,8 @@ func (e *Engine) openBinding(b Binding, i int) error {
 		}
 		if spread {
 			groups = append(groups, group)
+		} else if l.shared && !l.unix && preforkBalancing() {
+			groups = append(groups, []int{fd})
 		}
 	}
 	if len(held) > 0 {
@@ -200,12 +206,18 @@ func (e *Engine) attachBalancer(binding int, group []int) {
 		err error
 	)
 	if dir, child, children, ok := preforkBalance(); ok {
+		if attachBalancerHook != nil {
+			attachBalancerHook(group)
+		}
 		k := len(group)
 		path := dir + "/" + addrKey(group[0])
 		b, err = openPinnedReusePortBalancer(path, children*k, (child-1)*k, group)
 	} else {
 		if len(group) < 2 {
 			return
+		}
+		if attachBalancerHook != nil {
+			attachBalancerHook(group)
 		}
 		b, err = newReusePortBalancer(group)
 	}
@@ -216,6 +228,20 @@ func (e *Engine) attachBalancer(binding int, group []int) {
 	e.listenMu.Lock()
 	e.balancers = append(e.balancers, bindingBalancer{binding: binding, b: b})
 	e.listenMu.Unlock()
+}
+
+// attachBalancerHook, when a test sets it, hears every group attachBalancer
+// tries a selector on, whether or not the selector then attaches. It is nil
+// in normal operation.
+var attachBalancerHook func(group []int)
+
+// preforkBalancing reports whether this process is a prefork child handed a
+// bpffs directory to share selectors through: there a group spans the
+// children, and a process adds its share to it however few sockets that is,
+// one where its engine listens on its own loop or has a single poller.
+func preforkBalancing() bool {
+	_, _, _, ok := preforkBalance()
+	return ok
 }
 
 // preforkBalance reports the shared bpffs directory and this child's place
@@ -254,14 +280,35 @@ func addrKey(fd int) string {
 // balanceInitialGroups attaches a selector to the reuseport groups of the
 // listeners New was given, which open creates one per spread address in every
 // poller, in the same order, so the group of an address runs down a column:
-// the j-th per-poller socket of every poller shares it. AddBinding's groups
-// go through balanceGroups instead.
+// the j-th per-poller socket of every poller shares it. In a prefork child a
+// group spans the children, so a single poller's sockets, or those the
+// engine's own loop listens on, or the one its pollers share, are this
+// process's share of their groups, one socket each. AddBinding's groups go
+// through balanceGroups instead.
 func (e *Engine) balanceInitialGroups() {
-	if !e.bindConfig.BalanceReusePort || len(e.pollers) < 2 {
+	if !e.bindConfig.BalanceReusePort {
+		return
+	}
+	prefork := preforkBalancing()
+	if len(e.pollers) < 2 && !prefork {
+		// Within one process a selector needs two sockets to choose between.
 		return
 	}
 	var groups [][]int
 	var bindings []int
+	if prefork {
+		for _, l := range e.listeners {
+			// The engine's own listening sockets: on its loop, or the one its
+			// pollers all wait on. A spread one only holds the address while
+			// the pollers' sockets beside it listen.
+			if !l.unix && !l.spread && (l.shared || !e.noLoop) {
+				groups = append(groups, []int{l.fd})
+				bindings = append(bindings, l.binding)
+			}
+		}
+	}
+	// The pollers' own sockets, a column per address.
+	var cols [][]int
 	for pi, p := range e.pollers {
 		col := 0
 		for _, l := range p.listeners {
@@ -271,14 +318,15 @@ func (e *Engine) balanceInitialGroups() {
 				continue
 			}
 			if pi == 0 {
-				groups = append(groups, []int{l.fd})
+				cols = append(cols, []int{l.fd})
 				bindings = append(bindings, l.binding)
-			} else if col < len(groups) {
-				groups[col] = append(groups[col], l.fd)
+			} else if col < len(cols) {
+				cols[col] = append(cols[col], l.fd)
 			}
 			col++
 		}
 	}
+	groups = append(groups, cols...)
 	for i, g := range groups {
 		e.attachBalancer(bindings[i], g)
 	}

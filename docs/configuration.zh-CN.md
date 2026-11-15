@@ -52,7 +52,7 @@ if err := engine.Run(); err != nil {
 | `Backlog` | *动态* | TCP 和 Unix 监听队列长度：读得到时用内核的 `somaxconn`，否则用 `SOMAXCONN`。accept 队列溢出会静默丢客户端，所以内核值是合理的默认。 |
 | `MaxConns` | `0`（关） | 所有 Binding 加在一起，已 accept 且未关闭的连接上限；超过的连接在 handler 看到之前就被关闭，并计入 `Stats.ConnsRefused`。dial 出去的连接和 UDP peer 不计入。 |
 | `ReusePort` | `true` | 监听 socket 设置 `SO_REUSEPORT`，同用户的其他 socket 可以共享地址。Linux 上 `IOPollers` 模式即使不设置，poller 也会各自监听；prefork 子进程总是设置。 |
-| `BalanceReusePort` | `false` | Linux 上 `IOPollers` 且没有 `EngineLoop` 时，挂 eBPF selector，把 reuseport 连接按轮询分给 poller，而不是按内核地址哈希。需要多个 poller 和 `CAP_BPF`（Linux 5.8 之前是 `CAP_SYS_ADMIN`）；没有权限时保留内核哈希并打日志。 |
+| `BalanceReusePort` | `false` | Linux 上 `IOPollers` 且没有 `EngineLoop` 时，挂 eBPF selector，把 reuseport 连接按轮询分给 poller，而不是按内核地址哈希。单进程内需要多个 poller；用 `prefork.Config.BalanceReusePort` 启动的 prefork 子进程里，组由所有子进程共同组成，所以只有一个 poller、或由 engine 自己的 loop 监听也可以。需要 `CAP_BPF`（Linux 5.8 之前是 `CAP_SYS_ADMIN`）；没有权限时保留内核哈希并打日志。 |
 | `AcceptPlacement` | `AcceptFDModulo` | poller 在自己独占的 TCP socket 上 accept 的连接交给哪个 poller：`AcceptFDModulo` 按 fd 取模（默认），`AcceptKernelHash` 交给内核地址哈希选中的、也就是该 socket 所属的 poller。只适用于 Linux 上 `IOPollers` 且没有 `EngineLoop` 的情况。 |
 | `UDPIdleTimeout` | `0` → `60s` | UDP peer 这么长时间没有收发就关闭，`OnClose` 收到 `ErrUDPIdleTimeout`。负值表示一直保留；dial 出去的 UDP 连接没有超时。 |
 
