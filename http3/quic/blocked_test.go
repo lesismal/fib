@@ -9,17 +9,41 @@ import (
 // limit it reaches: the server, which reads none of what it was sent, hears
 // of the stream's limit, of the connection's, and of its limit on streams.
 func TestBlockedFramesSent(t *testing.T) {
-	hold := func(s *Stream, data []byte, fin bool) { s.HoldCredit() }
-	t.Run("stream", func(t *testing.T) {
-		p := newTestPair(t, 0, func(_, server *Config) { server.StreamReceiveWindow = 4096 })
-		p.serverH.onData = hold
+	// held opens a stream and sends its first byte alone, and returns once
+	// the server holds the stream's credit back, before the rest is sent.
+	// What is delivered before HoldCredit counts as consumed, and data that
+	// reaches the server in one batch is all delivered before the handler
+	// runs, so a busy runner handing it the bulk at once would otherwise
+	// have it give the credit back.
+	held := func(t *testing.T, p *testPair) *Stream {
+		t.Helper()
+		p.serverH.onData = func(s *Stream, data []byte, fin bool) { s.HoldCredit() }
+		server := p.serverConn(t)
 		s, err := p.client.OpenStream()
 		if err != nil {
 			t.Fatal(err)
 		}
-		if err := s.Write(make([]byte, 10000), true); err != nil {
+		if err := s.Write([]byte{1}, false); err != nil {
 			t.Fatal(err)
 		}
+		waitFor(t, "credit held", func() bool {
+			server.mu.Lock()
+			defer server.mu.Unlock()
+			st := server.streamByID(s.ID())
+			return st != nil && st.holdCredit
+		})
+		return s
+	}
+	finish := func(t *testing.T, s *Stream, n int) {
+		t.Helper()
+		if err := s.Write(make([]byte, n-1), true); err != nil {
+			t.Fatal(err)
+		}
+	}
+	t.Run("stream", func(t *testing.T) {
+		p := newTestPair(t, 0, func(_, server *Config) { server.StreamReceiveWindow = 4096 })
+		s := held(t, p)
+		finish(t, s, 10000)
 		server := p.serverConn(t)
 		waitFor(t, "STREAM_DATA_BLOCKED", func() bool {
 			server.mu.Lock()
@@ -30,15 +54,12 @@ func TestBlockedFramesSent(t *testing.T) {
 	})
 	t.Run("connection", func(t *testing.T) {
 		p := newTestPair(t, 0, func(_, server *Config) { server.ConnReceiveWindow = 6000 })
-		p.serverH.onData = hold
+		var ss []*Stream
 		for i := 0; i < 3; i++ {
-			s, err := p.client.OpenStream()
-			if err != nil {
-				t.Fatal(err)
-			}
-			if err := s.Write(make([]byte, 3000), true); err != nil {
-				t.Fatal(err)
-			}
+			ss = append(ss, held(t, p))
+		}
+		for _, s := range ss {
+			finish(t, s, 3000)
 		}
 		server := p.serverConn(t)
 		waitFor(t, "DATA_BLOCKED", func() bool {
@@ -53,14 +74,10 @@ func TestBlockedFramesSent(t *testing.T) {
 		// stream writes: the round that finds the limit for it has the
 		// frame to send and nothing else.
 		p := newTestPair(t, 0, func(_, server *Config) { server.ConnReceiveWindow = 6000 })
-		p.serverH.onData = hold
-		s, err := p.client.OpenStream()
-		if err != nil {
-			t.Fatal(err)
-		}
-		if err := s.Write(make([]byte, 6000), true); err != nil {
-			t.Fatal(err)
-		}
+		s := held(t, p)
+		// The rest reaches the server in one batch, as on a busy runner.
+		p.gather.Store(3)
+		finish(t, s, 6000)
 		server := p.serverConn(t)
 		idle := func(c *Conn) bool {
 			c.mu.Lock()
@@ -73,7 +90,7 @@ func TestBlockedFramesSent(t *testing.T) {
 			p.client.mu.Unlock()
 			return spent && idle(p.client) && idle(server)
 		})
-		s, err = p.client.OpenStream()
+		s, err := p.client.OpenStream()
 		if err != nil {
 			t.Fatal(err)
 		}
