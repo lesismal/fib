@@ -2309,14 +2309,18 @@ func (cc *clientConn) OnData(conn *fib.Connection, data []byte) {
 		// The callback of a streaming response gave up on it already.
 		reusable = false
 	}
+	// The response settles the request before the connection closes: the
+	// close ends a body still being sent, and the failure of that body, a
+	// splice's say, would otherwise race to be the request's outcome.
+	settled := !streamed && r.markDone()
 	if reusable {
 		cc.client.release(cc)
 	} else {
 		cc.discard()
 	}
 	cc.endDeferred()
-	if !streamed {
-		r.finish(resp, nil)
+	if settled {
+		r.deliver(resp, nil)
 	}
 }
 
