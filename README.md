@@ -1,6 +1,6 @@
 # fib — Fast In Balance
 
-[![CI](https://github.com/lesismal/fib/actions/workflows/ci.yml/badge.svg)](https://github.com/lesismal/fib/actions/workflows/ci.yml) [![Coverage](https://img.shields.io/endpoint?url=https%3A%2F%2Fraw.githubusercontent.com%2Flesismal%2Ffib%2Fbadges%2Fcoverage.json)](https://github.com/lesismal/fib/actions/workflows/ci.yml)
+[![CI](https://img.shields.io/endpoint?url=https%3A%2F%2Fraw.githubusercontent.com%2Flesismal%2Ffib%2Fbadges%2Fci.json)](https://github.com/lesismal/fib/actions/workflows/ci.yml) [![Coverage](https://img.shields.io/endpoint?url=https%3A%2F%2Fraw.githubusercontent.com%2Flesismal%2Ffib%2Fbadges%2Fcoverage.json)](https://github.com/lesismal/fib/actions/workflows/ci.yml)
 
 [English](README.md) | [简体中文](README.zh-CN.md)
 
@@ -759,7 +759,7 @@ The default, `ModeAdaptive`, works as follows:
 The other modes are `ModeAdaptiveChan` (the same pool on a channel), `ModeElastic` (a goroutine
 per task, with idle workers lingering) and `ModeInline`.
 
-CI runs [`taskpool/benchmark`](taskpool/benchmark) on every push, against
+CI runs [`taskpool/benchmark`](taskpool/benchmark) in every full run, against
 [nbio](https://github.com/lesismal/nbio), [ants](https://github.com/panjf2000/ants),
 [gopool](https://github.com/bytedance/gopkg) and [fnet](https://github.com/linfeip/fnet) on
 Linux, macOS and Windows. The results below are the medians of

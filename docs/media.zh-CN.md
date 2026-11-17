@@ -779,7 +779,7 @@ libx265、libopus、libsrt）、ffmpeg 7.1（Debian trixie，能读 Enhanced RTM
 [`media/interop`](../media/interop)，它是一个独立的模块，因此 fib 的 `go.mod` 仍然不引入
 任何依赖，根模块的测试也仍然不需要 ffmpeg 就能通过。
 
-CI 在每次 push 和 pull request 时运行 `media/interop`，即 `media-interop` 任务（目前不阻塞
+CI 每次完整运行都会运行 `media/interop`，即 `media-interop` 任务（目前不阻塞
 合并）。它原样运行上面的示例服务端。ffmpeg 7.1 经 RTMP、TCP 与 UDP 的 RTSP、SRT 推
 H.264+AAC、H.265+AAC 和 H.264+Opus，再经下面[矩阵](#接入与出口矩阵)中的八种出口逐一播放回来，
 检查条件与矩阵相同。fib 的 WHEP 客户端也播放每一路，必须收到视频，音频为 Opus 时还必须收到

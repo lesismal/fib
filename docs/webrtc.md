@@ -902,7 +902,7 @@ are those the commit messages record.
 
 The checks against pion's PeerConnection, TURN and DTLS now live in
 [`webrtc/interop`](../webrtc/interop), a module of its own that may depend
-on pion. CI runs them on every push and pull request, in the `webrtc-interop`
+on pion. CI runs them in every full run, in the `webrtc-interop`
 job (non-blocking for now):
 
 - fib offers and pion answers, without trickle; pion offers and fib answers,

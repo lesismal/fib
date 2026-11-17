@@ -782,7 +782,7 @@ ICE-lite PeerConnection 共用一个 Mux，每个都和自己的客户端在 dat
 的版本。
 
 与 pion 的 PeerConnection、TURN 和 DTLS 互通检查现在放在 [`webrtc/interop`](../webrtc/interop)，
-这是一个可以依赖 pion 的独立模块。CI 在每次 push 和 pull request 时运行它们，即
+这是一个可以依赖 pion 的独立模块。CI 每次完整运行都会运行它们，即
 `webrtc-interop` 任务（目前不阻塞合并）：
 
 - fib 发起 offer、pion 应答，不用 trickle；pion 发起 offer、fib 应答，使用 trickle。两种情况下

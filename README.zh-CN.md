@@ -1,6 +1,6 @@
 # fib — Fast In Balance
 
-[![CI](https://github.com/lesismal/fib/actions/workflows/ci.yml/badge.svg)](https://github.com/lesismal/fib/actions/workflows/ci.yml) [![Coverage](https://img.shields.io/endpoint?url=https%3A%2F%2Fraw.githubusercontent.com%2Flesismal%2Ffib%2Fbadges%2Fcoverage.json)](https://github.com/lesismal/fib/actions/workflows/ci.yml)
+[![CI](https://img.shields.io/endpoint?url=https%3A%2F%2Fraw.githubusercontent.com%2Flesismal%2Ffib%2Fbadges%2Fci.json)](https://github.com/lesismal/fib/actions/workflows/ci.yml) [![Coverage](https://img.shields.io/endpoint?url=https%3A%2F%2Fraw.githubusercontent.com%2Flesismal%2Ffib%2Fbadges%2Fcoverage.json)](https://github.com/lesismal/fib/actions/workflows/ci.yml)
 
 [English](README.md) | [简体中文](README.zh-CN.md)
 
@@ -707,7 +707,7 @@ poller 数量（`Config.IOPollers`、`IOPollerCount`）取决于 CPU 数：4 核
 其他模式：`ModeAdaptiveChan`（同样的池，基于 channel）、`ModeElastic`（每任务一个 goroutine，
 空闲 worker 驻留一段时间）、`ModeInline`。
 
-CI 每次 push 都在 Linux、macOS、Windows 上运行 [`taskpool/benchmark`](taskpool/benchmark)，对比
+CI 每次完整运行都在 Linux、macOS、Windows 上运行 [`taskpool/benchmark`](taskpool/benchmark)，对比
 [nbio](https://github.com/lesismal/nbio)、[ants](https://github.com/panjf2000/ants)、
 [gopool](https://github.com/bytedance/gopkg) 和 [fnet](https://github.com/linfeip/fnet)。下面是
 [这次 CI 运行](https://github.com/lesismal/fib/actions/runs/37020403709)（artifact

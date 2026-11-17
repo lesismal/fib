@@ -920,7 +920,7 @@ repository. Their core now lives in [`media/interop`](../media/interop), a
 module of its own, so fib's `go.mod` still takes no dependency and the root
 module's tests still pass without ffmpeg.
 
-CI runs `media/interop` on every push and pull request, in the
+CI runs `media/interop` in every full run, in the
 `media-interop` job (non-blocking for now). It serves the example above as it
 is. ffmpeg 7.1 publishes H.264+AAC, H.265+AAC and H.264+Opus over RTMP, RTSP
 over TCP and UDP, and SRT, and plays each back over the eight egresses of
