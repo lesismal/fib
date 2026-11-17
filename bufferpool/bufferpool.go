@@ -24,7 +24,9 @@
 // shared across every part of a program that takes part: a connection's read
 // buffer, the reply built from it and a TLS record are all the same buffers
 // moving between classes, and a second pool would only mean each of them
-// retaining idle buffers the others could have used.
+// retaining idle buffers the others could have used. For the same reason a
+// program that wants its buffers from somewhere else installs one Allocator
+// for all of them with SetAllocator, and Get and Put go to it instead.
 //
 // # What it costs the collector
 //
@@ -265,9 +267,15 @@ func classSize(i int) int { return MinSize << uint(i) }
 
 // Get returns a buffer of len size, with the capacity Align reports. A size of
 // zero or less returns nil, so that Get(len(x)) on an empty x costs nothing.
+//
+// With an Allocator set, Get returns what the allocator's Get returns for
+// sizes above zero.
 func Get(size int) []byte {
 	if size <= 0 {
 		return nil
+	}
+	if a := allocator.Load(); a != nil {
+		return a.Get(size)
 	}
 	if size > MaxSize {
 		return make([]byte, size)
@@ -308,7 +316,16 @@ func (c *class) take() *byte {
 // it, afterwards. A buffer too small or too large to belong to a class is
 // dropped, so Put may be called on any buffer without the caller having to
 // know where it came from.
+//
+// With an Allocator set, Put hands every buffer with a capacity to the
+// allocator's Put, which decides what to do with one it did not hand out.
 func Put(buf []byte) {
+	if a := allocator.Load(); a != nil {
+		if cap(buf) > 0 {
+			a.Put(buf)
+		}
+		return
+	}
 	capacity := cap(buf)
 	if capacity < MinSize || capacity > MaxSize {
 		return
