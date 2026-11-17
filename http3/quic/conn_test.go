@@ -360,7 +360,23 @@ func newTestPairOpts(t testing.TB, loss float64, configure func(client, server *
 
 func waitFinished(t testing.TB, h *testHandler, id uint64) {
 	t.Helper()
-	timeout := time.After(20 * time.Second)
+	waitFinishedWithin(t, h, id, 20*time.Second)
+}
+
+// lossyStreamWait is how long a stream on a path that loses datagrams is
+// given to finish. A handshake that lost a flight takes its first round-trip
+// sample from an acknowledgement that came a probe timeout late, which RFC
+// 9002 counts as it is: a handshake of a second leaves a smoothed RTT of a
+// second and a variance of half that, and the 13s handshake a Windows runner
+// once had at 20% loss left a probe timeout of tens of seconds, so a stream
+// that then lost a packet more than once went past 20s. Measured on 4000
+// lossy pairs, the slowest transfers were exactly those after such a
+// handshake; the path is at fault, not the connection.
+const lossyStreamWait = 2 * time.Minute
+
+func waitFinishedWithin(t testing.TB, h *testHandler, id uint64, wait time.Duration) {
+	t.Helper()
+	timeout := time.After(wait)
 	for !h.finSet[id] {
 		select {
 		case got := <-h.finished:
@@ -499,8 +515,12 @@ func testTransferWith(t *testing.T, loss float64, size int, configure func(clien
 		}
 		streams = append(streams, s)
 	}
+	wait := 20 * time.Second
+	if loss > 0 {
+		wait = lossyStreamWait
+	}
 	for _, s := range streams {
-		waitFinished(t, p.clientH, s.ID())
+		waitFinishedWithin(t, p.clientH, s.ID(), wait)
 		if got := p.clientH.received(s.ID()); !bytes.Equal(got, payload) {
 			t.Fatalf("stream %d: got %d bytes, want %d", s.ID(), len(got), len(payload))
 		}
