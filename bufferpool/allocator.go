@@ -1,6 +1,9 @@
 package bufferpool
 
-import "sync/atomic"
+import (
+	"sync/atomic"
+	"unsafe"
+)
 
 // Allocator is what Get and Put use instead of the package's own pool once
 // SetAllocator has installed one.
@@ -44,16 +47,21 @@ var allocator atomic.Pointer[installed]
 //
 // Builtin is the package's own pool as an Allocator, so that a program can
 // hold either kind in one place; SetAllocator(Builtin) is SetAllocator(nil).
+//
+// Installing any other allocator releases the arena, since Get no longer takes
+// from it; SetArena makes one again for after SetAllocator(nil).
 func SetAllocator(a Allocator) {
 	if a == nil || a == Builtin {
 		allocator.Store(nil)
 		return
 	}
+	setArena(nil)
 	allocator.Store(&installed{a})
 }
 
-// Builtin is the package's own pool as an Allocator. Its Get and Put go to that
-// pool whatever SetAllocator has installed.
+// Builtin is the package's own pool as an Allocator: the arena, and the
+// sync.Pool with its reserve behind it. Its Get and Put go there whatever
+// SetAllocator has installed.
 var Builtin Allocator = builtin{}
 
 type builtin struct{}
@@ -62,7 +70,45 @@ func (builtin) Get(size int) []byte {
 	if size <= 0 {
 		return nil
 	}
+	if size <= MaxSize {
+		i := classUp(size)
+		if a := arenaP.Load(); a != nil && a.cls[i].count > 0 {
+			if b := a.get(i); b != nil {
+				return b[:size]
+			}
+		}
+	}
 	return getPooled(size)
 }
 
-func (builtin) Put(buf []byte) { putPooled(buf) }
+func (builtin) Put(buf []byte) {
+	capacity := cap(buf)
+	if capacity < MinSize || capacity > MaxSize {
+		return
+	}
+	if a := arenaP.Load(); a != nil {
+		if off := uintptr(unsafe.Pointer(unsafe.SliceData(buf))) - a.base; off < a.size {
+			a.put(off, capacity)
+			return
+		}
+	}
+	putPooled(buf)
+}
+
+// Pooled is the pool without the arena, as an Allocator: each class a
+// sync.Pool, with a reserve behind it that keeps the working set across
+// collections, bounded by SetRetainedBytes. It is for a program that would
+// rather not keep the arena's memory: what it does not hold is given back to
+// the collector, while the arena keeps all of it for the program's life.
+var Pooled Allocator = pooled{}
+
+type pooled struct{}
+
+func (pooled) Get(size int) []byte {
+	if size <= 0 {
+		return nil
+	}
+	return getPooled(size)
+}
+
+func (pooled) Put(buf []byte) { putPooled(buf) }

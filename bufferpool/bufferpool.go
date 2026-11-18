@@ -368,6 +368,7 @@ func init() {
 	budget.Store(int64(bytes))
 	retainFor.Store(int64(DefaultRetainedFor))
 	shards := setReserveShards(defaultReserveShards())
+	setArena(defaultArena())
 	// At Debug, so that every program importing the package does not print
 	// a line at its start; what a program sets itself is logged at Info.
 	log.Debug("fib: bufferpool defaults", "retainedBytes", bytes, "memory", memory,
@@ -547,6 +548,11 @@ func Get(size int) []byte {
 		return make([]byte, size)
 	}
 	i := classUp(size)
+	if a := arenaP.Load(); a != nil && a.cls[i].count > 0 {
+		if b := a.get(i); b != nil {
+			return b[:size]
+		}
+	}
 	c := &classes[i]
 	if p, _ := c.pool.Get().(*byte); p != nil {
 		return unsafe.Slice(p, classSize(i))[:size]
@@ -633,6 +639,12 @@ func Put(buf []byte) {
 	capacity := cap(buf)
 	if capacity < MinSize || capacity > MaxSize {
 		return
+	}
+	if a := arenaP.Load(); a != nil {
+		if off := uintptr(unsafe.Pointer(unsafe.SliceData(buf))) - a.base; off < a.size {
+			a.put(off, capacity)
+			return
+		}
 	}
 	i := classDown(capacity)
 	c := &classes[i]
