@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"hash/crc32"
 	"io"
+	"math"
 	stdhttp "net/http"
 	"net/http/httptest"
 	"runtime"
@@ -176,44 +177,71 @@ func TestClientUploadStreamsLargeBody(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			size := uploadSize()
-			body := newGenBody(size)
-			req := mustRequest(t, stdhttp.MethodPost, tc.url+"/upload", nil)
-			req.Body = body
-			if tc.declared {
-				req.ContentLength = size
-			} else {
-				// The trailer is filled in as the body ends, as net/http
-				// has it.
-				req.Trailer = stdhttp.Header{"X-Crc": nil}
-				body.atEOF = func(crc uint32) { req.Trailer.Set("X-Crc", strconv.FormatUint(uint64(crc), 10)) }
-			}
-			stop := heapPeak()
-			start := time.Now()
-			resp, err := client.Go(req).Wait()
-			peak := stop()
-			if err != nil {
-				t.Fatal(err)
-			}
-			got := readBody(t, resp)
-			body.waitClosed(t) // and the producer is done with crc
-			want := fmt.Sprintf("%d %d %d", tc.proto, size, body.crc)
-			if !tc.declared {
-				want += fmt.Sprintf(" %d", body.crc)
-				if tc.proto == 1 {
-					want += " [chunked]"
-				}
-			}
-			if !strings.HasPrefix(got, want) {
-				t.Fatalf("server saw %q, want %q", got, want)
-			}
-			t.Logf("%dMB in %v, client and server live heap peak +%dKB", size>>20, time.Since(start).Round(time.Millisecond), peak>>10)
+			peak := leastPeak(func() uint64 { return uploadOnce(t, client, tc.url, tc.proto, tc.declared, size) })
 			// The server runs in this process too, so the bound covers both;
 			// buffering the body anywhere would take all of it.
-			if peak > 48<<20 {
+			if peak > uploadHeapBound {
 				t.Fatalf("heap grew by %dMB sending a %dMB body", peak>>20, size>>20)
 			}
 		})
 	}
+}
+
+// uploadOnce sends a size-byte body to url's /upload and checks what the
+// server saw, and returns the live heap's peak while it went.
+func uploadOnce(t *testing.T, client *Client, url string, proto int, declared bool, size int64) uint64 {
+	t.Helper()
+	body := newGenBody(size)
+	req := mustRequest(t, stdhttp.MethodPost, url+"/upload", nil)
+	req.Body = body
+	if declared {
+		req.ContentLength = size
+	} else {
+		// The trailer is filled in as the body ends, as net/http has it.
+		req.Trailer = stdhttp.Header{"X-Crc": nil}
+		body.atEOF = func(crc uint32) { req.Trailer.Set("X-Crc", strconv.FormatUint(uint64(crc), 10)) }
+	}
+	stop := heapPeak()
+	start := time.Now()
+	resp, err := client.Go(req).Wait()
+	peak := stop()
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := readBody(t, resp)
+	body.waitClosed(t) // and the producer is done with crc
+	want := fmt.Sprintf("%d %d %d", proto, size, body.crc)
+	if !declared {
+		want += fmt.Sprintf(" %d", body.crc)
+		if proto == 1 {
+			want += " [chunked]"
+		}
+	}
+	if !strings.HasPrefix(got, want) {
+		t.Fatalf("server saw %q, want %q", got, want)
+	}
+	t.Logf("%dMB in %v, client and server live heap peak +%dKB", size>>20, time.Since(start).Round(time.Millisecond), peak>>10)
+	return peak
+}
+
+// uploadHeapBound is how far the live heap may grow while a body far larger
+// streams through client and server: buffering it anywhere would take all
+// of it.
+const uploadHeapBound = 48 << 20
+
+// leastPeak runs upload, which returns the live heap's peak while it went,
+// until a run stays within uploadHeapBound, at most three times, and
+// returns the least peak. The heap is the whole process's: work an earlier
+// test left behind can hold a large buffer for a moment while a run is
+// measured — a 64 MiB one did, once in a few full runs of the package,
+// against peaks of 0 to 2 MB — and it is not there again for every run,
+// while buffering the body would be.
+func leastPeak(upload func() uint64) uint64 {
+	least := uint64(math.MaxUint64)
+	for i := 0; i < 3 && least > uploadHeapBound; i++ {
+		least = min(least, upload())
+	}
+	return least
 }
 
 // A server that stops reading holds the body back: the client stops reading
@@ -517,31 +545,34 @@ func TestClientUploadToFibServer(t *testing.T) {
 		for _, declared := range []bool{true, false} {
 			t.Run(fmt.Sprintf("%s/declared=%v", tc.name, declared), func(t *testing.T) {
 				size := uploadSize()
-				body := newGenBody(size)
-				req := mustRequest(t, stdhttp.MethodPost, sink, nil)
-				req.Body = body
-				if declared {
-					req.ContentLength = size
-				} else {
-					req.Trailer = stdhttp.Header{"X-Crc": nil}
-					body.atEOF = func(crc uint32) { req.Trailer.Set("X-Crc", strconv.FormatUint(uint64(crc), 10)) }
-				}
-				stop := heapPeak()
-				resp, err := tc.client.Go(req).Wait()
-				peak := stop()
-				if err != nil {
-					t.Fatal(err)
-				}
-				got := readBody(t, resp)
-				body.waitClosed(t)
-				want := fmt.Sprintf("%d %d %d ", tc.proto, size, body.crc)
-				if !declared {
-					want += strconv.FormatUint(uint64(body.crc), 10)
-				}
-				if got != want {
-					t.Fatalf("server saw %q, want %q", got, want)
-				}
-				if peak > 48<<20 {
+				peak := leastPeak(func() uint64 {
+					body := newGenBody(size)
+					req := mustRequest(t, stdhttp.MethodPost, sink, nil)
+					req.Body = body
+					if declared {
+						req.ContentLength = size
+					} else {
+						req.Trailer = stdhttp.Header{"X-Crc": nil}
+						body.atEOF = func(crc uint32) { req.Trailer.Set("X-Crc", strconv.FormatUint(uint64(crc), 10)) }
+					}
+					stop := heapPeak()
+					resp, err := tc.client.Go(req).Wait()
+					peak := stop()
+					if err != nil {
+						t.Fatal(err)
+					}
+					got := readBody(t, resp)
+					body.waitClosed(t)
+					want := fmt.Sprintf("%d %d %d ", tc.proto, size, body.crc)
+					if !declared {
+						want += strconv.FormatUint(uint64(body.crc), 10)
+					}
+					if got != want {
+						t.Fatalf("server saw %q, want %q", got, want)
+					}
+					return peak
+				})
+				if peak > uploadHeapBound {
 					t.Fatalf("heap grew by %dMB sending a %dMB body", peak>>20, size>>20)
 				}
 			})

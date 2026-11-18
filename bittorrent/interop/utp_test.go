@@ -60,7 +60,8 @@ func relay(t *testing.T, target string, lossy bool) string {
 	// pipe forwards what read reads with write, dropping and holding
 	// back as relay says; a datagram is written with the address it came
 	// from.
-	pipe := func(conn *net.UDPConn, read func([]byte) (int, netip.AddrPort, error), write func([]byte, netip.AddrPort)) {
+	trace.reset()
+	pipe := func(dir string, conn *net.UDPConn, read func([]byte) (int, netip.AddrPort, error), write func([]byte, netip.AddrPort)) {
 		buf := make([]byte, 65536)
 		var held []byte
 		var heldFrom netip.AddrPort
@@ -73,6 +74,7 @@ func relay(t *testing.T, target string, lossy bool) string {
 			}
 			m, from, err := read(buf)
 			if ne, ok := err.(net.Error); ok && ne.Timeout() {
+				trace.add(dir, "late", held)
 				write(held, heldFrom)
 				held = nil
 				continue
@@ -83,13 +85,17 @@ func relay(t *testing.T, target string, lossy bool) string {
 			d := buf[:m]
 			switch r := rng.IntN(140); {
 			case lossy && r < 7:
+				trace.add(dir, "drop", d)
 				continue
 			case lossy && r < 27 && held == nil:
+				trace.add(dir, "hold", d)
 				held, heldFrom = append([]byte(nil), d...), from
 				continue
 			}
+			trace.add(dir, "pass", d)
 			write(d, from)
 			if held != nil {
+				trace.add(dir, "late", held)
 				write(held, heldFrom)
 				held = nil
 			}
@@ -106,7 +112,7 @@ func relay(t *testing.T, target string, lossy bool) string {
 			b.Close()
 		}
 	})
-	go pipe(front, front.ReadFromUDPAddrPort, func(d []byte, client netip.AddrPort) {
+	go pipe("to target", front, front.ReadFromUDPAddrPort, func(d []byte, client netip.AddrPort) {
 		mu.Lock()
 		back := backs[client]
 		if back == nil {
@@ -116,7 +122,7 @@ func relay(t *testing.T, target string, lossy bool) string {
 				return
 			}
 			backs[client] = back
-			go pipe(back, func(b []byte) (int, netip.AddrPort, error) {
+			go pipe("from target", back, func(b []byte) (int, netip.AddrPort, error) {
 				n, err := back.Read(b)
 				return n, netip.AddrPort{}, err
 			}, func(d []byte, _ netip.AddrPort) { _, _ = front.WriteToUDPAddrPort(d, client) })
@@ -125,6 +131,60 @@ func relay(t *testing.T, target string, lossy bool) string {
 		_, _ = back.Write(d)
 	})
 	return front.LocalAddr().String()
+}
+
+// trace keeps the uTP headers of the last datagrams the relay saw, and
+// what it did with each, for a stalled test to show where it stopped.
+var trace relayTrace
+
+type relayTrace struct {
+	mu    sync.Mutex
+	lines []string
+	n     int
+}
+
+const traceLines = 200
+
+func (r *relayTrace) reset() {
+	r.mu.Lock()
+	r.lines, r.n = make([]string, traceLines), 0
+	r.mu.Unlock()
+}
+
+func (r *relayTrace) add(dir, what string, d []byte) {
+	line := fmt.Sprintf("%s %-11s %s", what, dir, utpHeader(d))
+	r.mu.Lock()
+	if r.lines != nil {
+		r.lines[r.n%traceLines] = time.Now().Format("15:04:05.000 ") + line
+		r.n++
+	}
+	r.mu.Unlock()
+}
+
+func (r *relayTrace) dump() []string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	var out []string
+	for i := max(r.n-traceLines, 0); i < r.n; i++ {
+		out = append(out, r.lines[i%traceLines])
+	}
+	return out
+}
+
+// utpHeader shows a uTP packet's header (BEP 29): its type, connection ID,
+// window, sequence and acknowledgement numbers, and its length.
+func utpHeader(d []byte) string {
+	if len(d) < 20 {
+		return fmt.Sprintf("%d bytes", len(d))
+	}
+	types := [...]string{"DATA", "FIN", "STATE", "RESET", "SYN"}
+	typ := fmt.Sprint(d[0] >> 4)
+	if int(d[0]>>4) < len(types) {
+		typ = types[d[0]>>4]
+	}
+	return fmt.Sprintf("%-5s id=%d wnd=%d seq=%d ack=%d ext=%d len=%d", typ,
+		uint16(d[2])<<8|uint16(d[3]), uint32(d[12])<<24|uint32(d[13])<<16|uint32(d[14])<<8|uint32(d[15]),
+		uint16(d[16])<<8|uint16(d[17]), uint16(d[18])<<8|uint16(d[19]), d[1], len(d))
 }
 
 func payload(seed uint64, n int) []byte {
@@ -272,6 +332,9 @@ func awaitOrReport(t *testing.T, wg *sync.WaitGroup, limit time.Duration, conns 
 		if fc, ok := c.(*fibutp.Conn); ok {
 			t.Errorf("stalled for %v; fib's end: %+v, RTT %v", limit, fc.Stats(), fc.RTT())
 		}
+	}
+	for _, line := range trace.dump() {
+		t.Log(line)
 	}
 	// Closing them ends the reads and writes, whose goroutines report to
 	// t: they are waited for before the test ends.
