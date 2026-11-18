@@ -61,6 +61,13 @@ func relay(t *testing.T, target string, lossy bool) string {
 	// back as relay says; a datagram is written with the address it came
 	// from.
 	trace.reset()
+	t.Cleanup(func() {
+		if t.Failed() {
+			for _, line := range trace.dump() {
+				t.Log(line)
+			}
+		}
+	})
 	pipe := func(dir string, conn *net.UDPConn, read func([]byte) (int, netip.AddrPort, error), write func([]byte, netip.AddrPort)) {
 		buf := make([]byte, 65536)
 		var held []byte
@@ -134,28 +141,39 @@ func relay(t *testing.T, target string, lossy bool) string {
 }
 
 // trace keeps the uTP headers of the last datagrams the relay saw, and
-// what it did with each, for a stalled test to show where it stopped.
+// what it did with each, for a stalled test to show where it stopped. It
+// copies the header and formats it only when dumped, so that it costs the
+// relay next to nothing: a slower relay hides the stall it is there for.
 var trace relayTrace
 
-type relayTrace struct {
-	mu    sync.Mutex
-	lines []string
-	n     int
+type traceEntry struct {
+	at   time.Time
+	dir  string
+	what string
+	n    int
+	head [20]byte
 }
 
-const traceLines = 200
+type relayTrace struct {
+	mu      sync.Mutex
+	entries []traceEntry
+	n       int
+}
+
+const traceLines = 400
 
 func (r *relayTrace) reset() {
 	r.mu.Lock()
-	r.lines, r.n = make([]string, traceLines), 0
+	r.entries, r.n = make([]traceEntry, traceLines), 0
 	r.mu.Unlock()
 }
 
 func (r *relayTrace) add(dir, what string, d []byte) {
-	line := fmt.Sprintf("%s %-11s %s", what, dir, utpHeader(d))
 	r.mu.Lock()
-	if r.lines != nil {
-		r.lines[r.n%traceLines] = time.Now().Format("15:04:05.000 ") + line
+	if r.entries != nil {
+		e := &r.entries[r.n%traceLines]
+		e.at, e.dir, e.what, e.n = time.Now(), dir, what, len(d)
+		copy(e.head[:], d)
 		r.n++
 	}
 	r.mu.Unlock()
@@ -166,16 +184,17 @@ func (r *relayTrace) dump() []string {
 	defer r.mu.Unlock()
 	var out []string
 	for i := max(r.n-traceLines, 0); i < r.n; i++ {
-		out = append(out, r.lines[i%traceLines])
+		e := r.entries[i%traceLines]
+		out = append(out, fmt.Sprintf("%s %s %-11s %s", e.at.Format("15:04:05.000"), e.what, e.dir, utpHeader(e.head[:min(e.n, 20)], e.n)))
 	}
 	return out
 }
 
 // utpHeader shows a uTP packet's header (BEP 29): its type, connection ID,
 // window, sequence and acknowledgement numbers, and its length.
-func utpHeader(d []byte) string {
+func utpHeader(d []byte, n int) string {
 	if len(d) < 20 {
-		return fmt.Sprintf("%d bytes", len(d))
+		return fmt.Sprintf("%d bytes", n)
 	}
 	types := [...]string{"DATA", "FIN", "STATE", "RESET", "SYN"}
 	typ := fmt.Sprint(d[0] >> 4)
@@ -184,7 +203,7 @@ func utpHeader(d []byte) string {
 	}
 	return fmt.Sprintf("%-5s id=%d wnd=%d seq=%d ack=%d ext=%d len=%d", typ,
 		uint16(d[2])<<8|uint16(d[3]), uint32(d[12])<<24|uint32(d[13])<<16|uint32(d[14])<<8|uint32(d[15]),
-		uint16(d[16])<<8|uint16(d[17]), uint16(d[18])<<8|uint16(d[19]), d[1], len(d))
+		uint16(d[16])<<8|uint16(d[17]), uint16(d[18])<<8|uint16(d[19]), d[1], n)
 }
 
 func payload(seed uint64, n int) []byte {
@@ -332,9 +351,6 @@ func awaitOrReport(t *testing.T, wg *sync.WaitGroup, limit time.Duration, conns 
 		if fc, ok := c.(*fibutp.Conn); ok {
 			t.Errorf("stalled for %v; fib's end: %+v, RTT %v", limit, fc.Stats(), fc.RTT())
 		}
-	}
-	for _, line := range trace.dump() {
-		t.Log(line)
 	}
 	// Closing them ends the reads and writes, whose goroutines report to
 	// t: they are waited for before the test ends.

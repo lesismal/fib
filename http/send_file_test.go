@@ -283,7 +283,9 @@ func TestSendFileOnWritable(t *testing.T) {
 // slowly, waiting for it between pieces as long as it takes something.
 func TestSendFileStall(t *testing.T) {
 	const size = 64 << 20
-	const stall = 300 * time.Millisecond
+	// A second: a runner can stop for longer than 300ms, which cut a client
+	// reading at a tenth of the bound off on Windows.
+	const stall = time.Second
 	path := filepath.Join(t.TempDir(), "file")
 	if err := os.WriteFile(path, make([]byte, size), 0o644); err != nil {
 		t.Fatal(err)
@@ -292,7 +294,19 @@ func TestSendFileStall(t *testing.T) {
 		err error
 		at  time.Time
 	}
-	results := make(chan result, 1)
+	// Room for every request's result, so that done never waits on a
+	// subtest that failed before taking its own: a done held up holds the
+	// send loop, and with it the next subtest's response.
+	results := make(chan result, 16)
+	drain := func() {
+		for {
+			select {
+			case <-results:
+			default:
+				return
+			}
+		}
+	}
 	handler := HandlerFunc(func(c *Context) {
 		f, err := os.Open(path)
 		if err != nil {
@@ -332,6 +346,7 @@ func TestSendFileStall(t *testing.T) {
 	}
 	for _, cl := range clients {
 		t.Run(cl.name+"/stuck", func(t *testing.T) {
+			drain()
 			resp, err := cl.Get(cl.base + "/stuck")
 			if err != nil {
 				t.Fatal(err)
@@ -348,6 +363,7 @@ func TestSendFileStall(t *testing.T) {
 			}
 		})
 		t.Run(cl.name+"/slow", func(t *testing.T) {
+			drain()
 			resp, err := cl.Get(cl.base + "/slow")
 			if err != nil {
 				t.Fatal(err)
