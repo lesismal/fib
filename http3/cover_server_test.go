@@ -261,13 +261,22 @@ func TestCsOneDatagramAtATime(t *testing.T) {
 		// The connection that sends on the address ends with it.
 		_ = c1.Close()
 		w.awaitClosed(t, c1.RemoteAddr().String())
-		// Its close takes it off the routes.
+		// Its close takes it off the routes. The client is still running, and
+		// a packet it sends once c1 is let go opens a successor fib.Connection
+		// for the address before c1's OnClose runs; the connection moves to
+		// it and, rightly, outlives c1 (see bf1dd52). That successor is the
+		// address too, so it is closed in turn.
+		closed := c1
 		for deadline := time.Now().Add(csWait); ; time.Sleep(time.Millisecond) {
 			h.routesMu.RLock()
 			_, routed := h.routes[string(qc.LocalCID())]
 			h.routesMu.RUnlock()
 			if !routed {
 				break
+			}
+			if path, ok := qc.Path().(*peerPath); ok && path.peer.c != closed {
+				closed = path.peer.c
+				_ = closed.Close()
 			}
 			if time.Now().After(deadline) {
 				t.Fatal("the connection outlived its address")
