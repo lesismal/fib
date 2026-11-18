@@ -523,15 +523,18 @@ func TestWriteTimeoutRefusesALateStreamingResponse(t *testing.T) {
 // after it.
 func TestH2FlushReportsAResetStream(t *testing.T) {
 	config := DefaultConfig()
-	config.WriteTimeout = 200 * time.Millisecond
+	// A second from the handler's start to its first Flush: a runner that
+	// stalls longer than that has the first Flush fail too, which the test
+	// reports as such rather than as the calls after it.
+	config.WriteTimeout = time.Second
 	results := make(chan [3]error, 1)
 	addr := serve(t, NewHandlerWithConfig(config, HandlerFunc(func(c *Context) {
 		_, _ = c.WriteString("first")
 		if err := c.FlushError(); err != nil {
-			results <- [3]error{err}
+			results <- [3]error{fmt.Errorf("the first Flush, before WriteTimeout, failed too: %v", err)}
 			return
 		}
-		time.Sleep(500 * time.Millisecond)
+		time.Sleep(1500 * time.Millisecond)
 		flush := c.FlushError()
 		_, write := c.WriteString(strings.Repeat("x", 32<<10))
 		results <- [3]error{flush, write, c.FlushError()}

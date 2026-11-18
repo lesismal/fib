@@ -41,6 +41,24 @@ func (w *h3Wire) awaitExcessiveLoad() {
 	}
 }
 
+// openStream opens a request stream, waiting while the server has yet to
+// grant more: it does so as it takes in the resets before, which on a slow
+// runner can trail the client by a while. It reports false once the
+// connection lets it open none, closed or not granting any for 10s.
+func (w *h3Wire) openStream() (*quic.Stream, bool) {
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		s, err := w.qc.OpenStream()
+		if err == nil {
+			return s, true
+		}
+		if !errors.Is(err, quic.ErrStreamLimit) || time.Now().After(deadline) {
+			return nil, false
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+}
+
 // openAndReset opens n request streams, each with a request header that
 // waits for its body, and abandons each at once, as a client cancelling its
 // requests does. It stops at the first stream the connection no longer
@@ -49,8 +67,8 @@ func (w *h3Wire) openAndReset(n int) {
 	head := headersFrame(qpack.HeaderField{Name: ":method", Value: "POST"}, qpack.HeaderField{Name: ":scheme", Value: "https"},
 		qpack.HeaderField{Name: ":authority", Value: "localhost"}, qpack.HeaderField{Name: ":path", Value: "/"})
 	for i := 0; i < n; i++ {
-		s, err := w.qc.OpenStream()
-		if err != nil {
+		s, ok := w.openStream()
+		if !ok {
 			return
 		}
 		_ = s.Write(head, false)
@@ -88,8 +106,8 @@ func TestH3ServerEndsMalformedRequestFlood(t *testing.T) {
 	head := headersFrame(qpack.HeaderField{Name: ":method", Value: "GET"}, qpack.HeaderField{Name: ":scheme", Value: "https"},
 		qpack.HeaderField{Name: ":authority", Value: "localhost"})
 	for i := 0; i < floodBurst+100; i++ {
-		s, err := w.qc.OpenStream()
-		if err != nil {
+		s, ok := w.openStream()
+		if !ok {
 			break
 		}
 		_ = s.Write(head, true)
