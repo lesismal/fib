@@ -898,8 +898,14 @@ out := bufferpool.Join(nil, a, b)           // takes enough at once and joins th
 - **Get/Put allocate nothing and cost about 7ns**; sizes are classed by powers of two, which are
   exactly Go allocator size classes, so there is no rounding waste.
 - There is a reserve that **survives GC** (`sync.Pool` is emptied each GC cycle, the reserve is
-  not). Its size is learned and capped by `SetRetainedBytes` (32MiB by default);
-  `SetRetainedBytes(0)` releases it at once, for memory pressure.
+  not). Its size is learned and capped by `SetRetainedBytes` — by default an eighth of the
+  memory the process may use (GOMEMLIMIT, the container's limit or the machine's), between 32MiB
+  and 16GiB, and `SetRetainedPercent` sets it as a share of that memory — and kept for
+  `SetRetainedFor` (1 minute by default) after a class last ran short, so buffers held across
+  several collections are waited for rather than written off;
+  `SetRetainedBytes(0)` releases it at once, for memory pressure. Each class's reserve is split
+  into `SetReserveShards` lists (4 per P, 16 to 128, by default), so the takes and returns that
+  follow a collection do not all queue on one lock. Each setting is logged.
 - **One global pool:** fib's read buffers, reply assembly and TLS records are the same buffers
   flowing between classes. Your own buffers can use it too, without holding an extra idle copy.
 - `Put` is safe with buffers of unknown origin: ones under 64B or over 64MiB are simply dropped.

@@ -80,13 +80,11 @@ func TestOversizedBuffersAreServedButNotPooled(t *testing.T) {
 			}
 			classes[i].pool.Put(p)
 		}
-		classes[i].mu.Lock()
-		for _, held := range classes[i].free {
+		for _, held := range classes[i].reserved() {
 			if held == address {
 				t.Fatalf("class %d reserved a buffer larger than MaxSize", i)
 			}
 		}
-		classes[i].mu.Unlock()
 	}
 }
 
@@ -325,7 +323,7 @@ func TestTheWorkingSetSurvivesACollection(t *testing.T) {
 	// Start from a clean pool: the classes are shared, and what the tests
 	// before this one left reserved is budget this one cannot have.
 	SetRetainedBytes(0)
-	SetRetainedBytes(DefaultRetainedBytes)
+	restoreBudget()
 	held := make([][]byte, working)
 	remade := func() uint64 {
 		var before, after runtime.MemStats
@@ -355,7 +353,7 @@ func TestTheWorkingSetSurvivesACollection(t *testing.T) {
 
 // The reserve is bounded, and the bound is what the caller says it is.
 func TestRetentionStaysWithinItsBudget(t *testing.T) {
-	t.Cleanup(func() { SetRetainedBytes(DefaultRetainedBytes) })
+	t.Cleanup(restoreBudget)
 	const size = 64 << 10
 	SetRetainedBytes(8 * size)
 	held := make([][]byte, 512)
@@ -380,10 +378,7 @@ func TestRetentionStaysWithinItsBudget(t *testing.T) {
 		t.Fatalf("retention is %d bytes after being set to zero", got)
 	}
 	for i := range classes {
-		classes[i].mu.Lock()
-		free := len(classes[i].free)
-		classes[i].mu.Unlock()
-		if free != 0 {
+		if free := len(classes[i].reserved()); free != 0 {
 			t.Fatalf("class %d still holds %d buffers", i, free)
 		}
 	}
@@ -392,7 +387,7 @@ func TestRetentionStaysWithinItsBudget(t *testing.T) {
 // With the reserves off the pool is the sync.Pool alone, which still has to
 // hand out buffers of the right shape.
 func TestTheReservesCanBeTurnedOff(t *testing.T) {
-	t.Cleanup(func() { SetRetainedBytes(DefaultRetainedBytes) })
+	t.Cleanup(restoreBudget)
 	SetRetainedBytes(0)
 	collect(t)
 	for range 64 {
@@ -404,5 +399,21 @@ func TestTheReservesCanBeTurnedOff(t *testing.T) {
 	}
 	if got := RetainedBytes(); got != 0 {
 		t.Fatalf("retention grew to %d bytes with the reserves off", got)
+	}
+}
+
+// Get and Put keep their own copies of the pool's body, and Builtin's go
+// through getPooled and putPooled: the two must agree.
+func TestBuiltinMatchesGetAndPut(t *testing.T) {
+	for _, size := range []int{1, 64, 65, 1500, 16 << 10, MaxSize, MaxSize + 1} {
+		a, b := Get(size), Builtin.Get(size)
+		if len(a) != len(b) || cap(a) != cap(b) {
+			t.Fatalf("size %d: Get len %d cap %d, Builtin.Get len %d cap %d", size, len(a), cap(a), len(b), cap(b))
+		}
+		Put(a)
+		Builtin.Put(b)
+	}
+	if Builtin.Get(0) != nil || Get(0) != nil {
+		t.Fatal("a zero size returned a buffer")
 	}
 }

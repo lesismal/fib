@@ -46,21 +46,42 @@
 // package has the collector count them for it — rather than a little on every
 // return. That is what keeps it off the ordinary path: a return between
 // collections reads one counter and goes to the sync.Pool, and the reserve's
-// lock is taken only for the burst that follows a collection, which is as many
-// operations as the reserve holds buffers and saves that many allocations. A
+// locks are taken only for the burst that follows a collection, which is as
+// many operations as the reserve holds buffers and saves that many
+// allocations. The reserve is split into shards with a lock each, so that a
+// burst taken and returned from every core at once is not one queue. A
 // reserve grows only towards what its class has actually had to make, gives
 // back what a burst could not fill, and stops at what SetRetainedBytes allows.
+//
+// It gives back only once its class has gone a while without coming up short.
+// Buffers a program holds for longer than collections are apart — requests
+// queued for seconds while collections come every few hundred milliseconds —
+// are still out when the next collection comes, and a burst that could not be
+// filled then says only that they have not come back yet. So a class keeps
+// its target for SetRetainedFor's window after it last had to make a buffer or
+// ran its reserve dry, and a class that has seen no returns at all for that
+// long gives its reserve back from the collection itself, since it has no
+// returns left to do it.
 //
 // The bytes in a buffer Get returns are whatever the last user left there.
 // Callers write before they read, as they would with any recycled buffer.
 package bufferpool
 
 import (
+	"errors"
+	"fmt"
+	"math"
 	"math/bits"
+	"math/rand/v2"
 	"runtime"
+	"runtime/debug"
 	"sync"
 	"sync/atomic"
+	"time"
 	"unsafe"
+
+	"github.com/lesismal/fib/internal/sys"
+	"github.com/lesismal/fib/log"
 )
 
 const (
@@ -95,11 +116,17 @@ type class struct {
 	// address is all there is to keep.
 	pool sync.Pool
 
-	// mu guards free, the reserve. held mirrors len(free) so that a return
-	// can see the reserve is full without taking the lock.
-	mu   sync.Mutex
-	free []*byte
-	held atomic.Int64
+	// shards is the reserve, split into lists with a lock each, so that the
+	// takes and returns that follow a collection — as many as the reserve
+	// holds buffers — do not all queue on one lock. held is what the lists
+	// hold between them, so that a return can see the reserve is full and a
+	// take that it is empty without taking a lock; the shards have no
+	// capacity of their own, so none is ever full while the class has room.
+	// held is raised before a return is stored and lowered after a take has
+	// removed one, so it may run a buffer or two ahead of the lists but never
+	// behind them.
+	shards atomic.Pointer[reserveShards]
+	held   atomic.Int64
 	// size is this class's capacity, kept here so that a class can price its
 	// own target against the budget.
 	size int64
@@ -115,6 +142,11 @@ type class struct {
 	refill atomic.Int64
 	// epoch is the collection this class last began refilling for.
 	epoch atomic.Uint64
+	// short is when this class last came up short — a Get that had to make a
+	// buffer, or a take that emptied the reserve — in nanoseconds since
+	// start. Both are paths that already cost far more than reading the
+	// clock, and nothing on the ordinary path touches it.
+	short atomic.Int64
 	// pad keeps one class's counters off the cache line of the next one: the
 	// class a server reads into and the class it replies from are neighbours
 	// here, and they are busiest at the same moment.
@@ -122,6 +154,97 @@ type class struct {
 }
 
 var classes [numClasses]class
+
+// reserveShards is one class's reserve: a power of two of lists, so that a
+// shard is picked with a mask.
+type reserveShards struct {
+	mask int
+	list []reserveShard
+}
+
+type reserveShard struct {
+	mu   sync.Mutex
+	free []*byte
+	// n mirrors len(free), so that a take can pass an empty shard without
+	// its lock.
+	n atomic.Int64
+	// retired marks a shard SetReserveShards has replaced and emptied: a
+	// return that picked it before the swap tries again with the new ones.
+	retired bool
+	_       [64]byte
+}
+
+// The default split of a class's reserve is DefaultReserveShardsPerP lists
+// for each P, at least MinDefaultReserveShards and at most
+// MaxDefaultReserveShards. Several per P, since what contends for a reserve
+// is every goroutine returning at once, not only the running ones: a
+// goroutine preempted holding a shard's lock stalls the others that picked
+// it, and more shards make that less likely. Each shard costs about 2.4 KiB
+// across the classes, so the most the default spends is about 300 KiB.
+const (
+	DefaultReserveShardsPerP = 4
+	MinDefaultReserveShards  = 16
+	MaxDefaultReserveShards  = 128
+	// maxReserveShards bounds what SetReserveShards accepts.
+	maxReserveShards = 1024
+)
+
+// defaultReserveShards is the split for the program's GOMAXPROCS.
+func defaultReserveShards() int {
+	return min(max(DefaultReserveShardsPerP*runtime.GOMAXPROCS(0), MinDefaultReserveShards), MaxDefaultReserveShards)
+}
+
+// shardsMu serializes SetReserveShards.
+var shardsMu sync.Mutex
+
+// SetReserveShards splits each class's reserve into n lists, rounded up to a
+// power of two and at most 1024, each with a lock of its own, and returns how
+// many it set. More shards spread the takes and returns that follow a
+// collection over more locks, which pays once a reserve holds many thousands
+// of buffers taken and returned from many goroutines at once; each shard
+// costs about a cache line per class. What the reserves hold is moved to the
+// new lists, so it may be called at any time, though it is meant for a
+// program's start. It logs the new split.
+func SetReserveShards(n int) int {
+	n = setReserveShards(n)
+	log.Info("fib: bufferpool reserve shards", "shards", n)
+	return n
+}
+
+func setReserveShards(n int) int {
+	n = 1 << bits.Len(uint(min(max(n, 1), maxReserveShards)-1))
+	shardsMu.Lock()
+	defer shardsMu.Unlock()
+	for i := range classes {
+		c := &classes[i]
+		next := &reserveShards{mask: n - 1, list: make([]reserveShard, n)}
+		prev := c.shards.Swap(next)
+		if prev == nil {
+			continue
+		}
+		k := 0
+		for j := range prev.list {
+			old := &prev.list[j]
+			old.mu.Lock()
+			free := old.free
+			old.free, old.retired = nil, true
+			old.n.Store(0)
+			old.mu.Unlock()
+			for _, p := range free {
+				sh := &next.list[k&next.mask]
+				k++
+				sh.mu.Lock()
+				sh.free = append(sh.free, p)
+				sh.n.Store(int64(len(sh.free)))
+				sh.mu.Unlock()
+			}
+		}
+	}
+	return n
+}
+
+// ReserveShards reports how many lists each class's reserve is split into.
+func ReserveShards() int { return classes[0].shards.Load().mask + 1 }
 
 // gcEpoch counts collections, so that a class can tell its pool has been
 // emptied. Reading it is one atomic load of a line every core already has,
@@ -139,16 +262,96 @@ type collectionTick struct{ _ [32]byte }
 // the next collection has swept it, and sets up the one after.
 func watchCollections() {
 	runtime.AddCleanup(new(collectionTick), func(struct{}) {
-		gcEpoch.Add(1)
+		epoch := gcEpoch.Add(1)
+		releaseIdle(epoch)
 		watchCollections()
 	}, struct{}{})
 }
 
-// DefaultRetainedBytes is how much the reserves may hold between them until
-// SetRetainedBytes says otherwise. It bounds what the pool keeps while nothing
-// is asking for it, which is the price of not making the working set again
-// after every collection.
-const DefaultRetainedBytes = 32 << 20
+// start is the origin of the clock the classes stamp, so that a stamp is a
+// monotonic reading rather than the wall clock.
+var start = time.Now()
+
+func now() int64 { return int64(time.Since(start)) }
+
+// releaseIdle gives back the reserve of every class that has seen no return
+// for two whole collections and has not come up short within the window.
+// Such a class would otherwise keep its reserve for good: a reserve shrinks
+// at the start of a burst, and a burst starts with a return.
+func releaseIdle(epoch uint64) {
+	t := now()
+	window := retainFor.Load()
+	for i := range classes {
+		c := &classes[i]
+		if c.target.Load() == 0 || epoch-c.epoch.Load() < 2 || t-c.short.Load() < window {
+			continue
+		}
+		c.aim(0)
+		c.shrink()
+	}
+}
+
+// DefaultRetainedFor is how long a class keeps its target after it last came
+// up short, until SetRetainedFor says otherwise.
+const DefaultRetainedFor = time.Minute
+
+var retainFor atomic.Int64
+
+// SetRetainedFor sets how long a class keeps what it is entitled to hold after
+// the last time it had to make a buffer or ran its reserve dry. It should be
+// longer than a buffer is held — a request waiting in a queue, a response
+// waiting on a slow peer — so that buffers still out when a collection comes
+// are waited for rather than written off. Zero gives back at the first
+// collection a burst could not fill. The window only delays giving back:
+// SetRetainedBytes bounds what is held either way.
+func SetRetainedFor(d time.Duration) {
+	if d < 0 {
+		d = 0
+	}
+	retainFor.Store(int64(d))
+}
+
+// The default budget is DefaultRetainedPercent of the memory the process may
+// use — GOMEMLIMIT where it is set and lower, else the container's limit, else
+// the machine's memory — at least DefaultRetainedBytes and at most
+// MaxDefaultRetainedBytes, until SetRetainedBytes or SetRetainedPercent says
+// otherwise. Where the memory cannot be read it is DefaultRetainedBytes.
+//
+// It is a ceiling, not an allocation: a reserve grows only towards what its
+// class has had to make, so a program that cycles less than the budget keeps
+// less than it. What the reserves do keep is live heap, which the collector's
+// goal doubles under GOGC=100, so an eighth of the memory held costs up to a
+// quarter of it at the peak.
+const (
+	DefaultRetainedPercent  = 12.5
+	DefaultRetainedBytes    = 32 << 20
+	MaxDefaultRetainedBytes = 16 << 30
+)
+
+// memoryLimit is what the process may use, GOMEMLIMIT included, or zero when
+// it cannot be read. It is a variable so that a test can stand in for the
+// machine.
+var memoryLimit = func() int64 {
+	limit := sys.MemoryLimit()
+	if soft := debug.SetMemoryLimit(-1); soft > 0 && soft < math.MaxInt64 && (limit <= 0 || soft < limit) {
+		limit = soft
+	}
+	return limit
+}
+
+// defaultRetainedBytes is the budget for the memory the process may use, and
+// that memory, zero when it could not be read.
+func defaultRetainedBytes() (bytes int, memory int64) {
+	memory = memoryLimit()
+	if memory <= 0 {
+		return DefaultRetainedBytes, 0
+	}
+	return clampInt(min(max(int64(float64(memory)*DefaultRetainedPercent/100), DefaultRetainedBytes), MaxDefaultRetainedBytes)), memory
+}
+
+// clampInt converts n to an int, at most math.MaxInt, which a 32-bit platform
+// reaches well below the budgets a large machine is given.
+func clampInt(n int64) int { return int(min(n, math.MaxInt)) }
 
 // budget is the ceiling SetRetainedBytes sets, and committed is what the
 // classes' targets add up to, which is what the reserves may grow to hold.
@@ -161,7 +364,14 @@ func init() {
 	for i := range classes {
 		classes[i].size = int64(classSize(i))
 	}
-	budget.Store(DefaultRetainedBytes)
+	bytes, memory := defaultRetainedBytes()
+	budget.Store(int64(bytes))
+	retainFor.Store(int64(DefaultRetainedFor))
+	shards := setReserveShards(defaultReserveShards())
+	// At Debug, so that every program importing the package does not print
+	// a line at its start; what a program sets itself is logged at Info.
+	log.Debug("fib: bufferpool defaults", "retainedBytes", bytes, "memory", memory,
+		"reserveShards", shards, "retainedFor", DefaultRetainedFor)
 	watchCollections()
 }
 
@@ -173,7 +383,14 @@ func init() {
 //
 // A reserve only grows towards what its class has had to make, so a program
 // that needs less than the budget keeps less than it.
+//
+// It logs the new budget.
 func SetRetainedBytes(bytes int) {
+	bytes = setRetainedBytes(bytes)
+	log.Info("fib: bufferpool retained bytes", "retainedBytes", bytes)
+}
+
+func setRetainedBytes(bytes int) int {
 	if bytes < 0 {
 		bytes = 0
 	}
@@ -181,10 +398,38 @@ func SetRetainedBytes(bytes int) {
 	if committed.Load() > int64(bytes) {
 		trim()
 	}
+	return bytes
+}
+
+// SetRetainedPercent sets the budget to percent of the memory the process may
+// use — GOMEMLIMIT where it is set and lower, else the container's limit, else
+// the machine's memory — and returns the budget in bytes. Zero turns the
+// reserves off, as SetRetainedBytes(0) does. It fails, leaving the budget as
+// it was, for a percent outside 0 to 100 or where the memory cannot be read.
+// It logs the new budget.
+//
+// Mind that what the reserves keep is live heap, which the collector's goal
+// doubles under GOGC=100: a quarter of the memory held can cost half of it at
+// the peak.
+func SetRetainedPercent(percent float64) (int, error) {
+	if !(percent >= 0 && percent <= 100) {
+		return 0, fmt.Errorf("bufferpool: retained percent %v is outside 0 to 100", percent)
+	}
+	memory := memoryLimit()
+	if memory <= 0 {
+		return 0, errors.New("bufferpool: the memory the process may use could not be read")
+	}
+	bytes := setRetainedBytes(clampInt(int64(float64(memory) * percent / 100)))
+	log.Info("fib: bufferpool retained bytes", "retainedBytes", bytes, "percent", percent, "memory", memory)
+	return bytes, nil
 }
 
 // RetainedBytes reports what the reserves are currently entitled to hold.
 func RetainedBytes() int { return int(committed.Load()) }
+
+// RetainedBytesLimit reports the budget: what SetRetainedBytes or
+// SetRetainedPercent last set, or the default for the process's memory.
+func RetainedBytesLimit() int { return clampInt(budget.Load()) }
 
 // reserveMore lets this class keep one more buffer, if the budget has room for
 // one. It is called where a request had to be served by making a buffer, which
@@ -195,6 +440,7 @@ func (c *class) reserveMore() {
 		return
 	}
 	c.target.Add(1)
+	c.short.Store(now())
 }
 
 // aim moves this class's target, giving the difference back to the budget or
@@ -208,25 +454,45 @@ func (c *class) aim(target int64) {
 func trim() {
 	for i := numClasses - 1; i >= 0; i-- {
 		c := &classes[i]
-		for committed.Load() > budget.Load() {
+		// At most as many steps as the target had when trim came to it: misses
+		// raising it again meanwhile would otherwise keep this going as long
+		// as they come.
+		for steps := c.target.Load(); steps > 0 && committed.Load() > budget.Load(); steps-- {
 			target := c.target.Load()
 			if target == 0 {
 				break
 			}
-			c.target.Store(target - 1)
-			committed.Add(-c.size)
+			// A compare-and-swap, since a miss may raise the target at the
+			// same moment: storing over it would lose that rise while the
+			// budget still counts it, and the budget would stay that much
+			// short for good.
+			if c.target.CompareAndSwap(target, target-1) {
+				committed.Add(-c.size)
+			}
 		}
-		if c.held.Load() <= c.target.Load() {
-			continue
+		c.shrink()
+	}
+}
+
+// shrink drops what the reserve holds above the class's target.
+func (c *class) shrink() {
+	set := c.shards.Load()
+	for k := range set.list {
+		excess := c.held.Load() - c.target.Load()
+		if excess <= 0 {
+			return
 		}
-		c.mu.Lock()
-		for int64(len(c.free)) > c.target.Load() {
-			last := len(c.free) - 1
-			c.free[last] = nil
-			c.free = c.free[:last]
+		sh := &set.list[k]
+		sh.mu.Lock()
+		drop := min(excess, int64(len(sh.free)))
+		for j := int64(0); j < drop; j++ {
+			last := len(sh.free) - 1
+			sh.free[last] = nil
+			sh.free = sh.free[:last]
 		}
-		c.held.Store(int64(len(c.free)))
-		c.mu.Unlock()
+		sh.n.Store(int64(len(sh.free)))
+		sh.mu.Unlock()
+		c.held.Add(-drop)
 	}
 }
 
@@ -296,20 +562,58 @@ func Get(size int) []byte {
 	return make([]byte, size, classSize(i))
 }
 
-// take removes a buffer from the reserve, or reports that there was none.
-func (c *class) take() *byte {
-	c.mu.Lock()
-	last := len(c.free) - 1
-	if last < 0 {
-		c.mu.Unlock()
-		return nil
+// getPooled is Get from the package's own pool, for a size above zero, for
+// Builtin. Get keeps its own copy of the body rather than calling this: the
+// call alone measured 1.7ns on a Get+Put pair that costs 11.5.
+func getPooled(size int) []byte {
+	if size > MaxSize {
+		return make([]byte, size)
 	}
-	p := c.free[last]
-	c.free[last] = nil
-	c.free = c.free[:last]
-	c.held.Store(int64(last))
-	c.mu.Unlock()
-	return p
+	i := classUp(size)
+	c := &classes[i]
+	if p, _ := c.pool.Get().(*byte); p != nil {
+		return unsafe.Slice(p, classSize(i))[:size]
+	}
+	// An empty pool is what every collection leaves behind. The reserve is
+	// what the collection could not take.
+	if c.held.Load() > 0 {
+		if p := c.take(); p != nil {
+			return unsafe.Slice(p, classSize(i))[:size]
+		}
+	}
+	c.reserveMore()
+	return make([]byte, size, classSize(i))
+}
+
+// take removes a buffer from the reserve, starting at a random shard and
+// moving past empty ones, or reports that there was none.
+func (c *class) take() *byte {
+	set := c.shards.Load()
+	start := int(rand.Uint32())
+	for k := 0; k <= set.mask; k++ {
+		sh := &set.list[(start+k)&set.mask]
+		if sh.n.Load() == 0 {
+			continue
+		}
+		sh.mu.Lock()
+		last := len(sh.free) - 1
+		if last < 0 {
+			sh.mu.Unlock()
+			continue
+		}
+		p := sh.free[last]
+		sh.free[last] = nil
+		sh.free = sh.free[:last]
+		sh.n.Store(int64(last))
+		sh.mu.Unlock()
+		if c.held.Add(-1) <= 0 {
+			// Running the reserve dry is coming up short as much as a miss
+			// is.
+			c.short.Store(now())
+		}
+		return p
+	}
+	return nil
 }
 
 // Put returns buf to the pool. The caller must not use buf, or any slice of
@@ -346,6 +650,29 @@ func Put(buf []byte) {
 	c.pool.Put(p)
 }
 
+// putPooled is Put to the package's own pool, for Builtin. Put keeps its own
+// copy of the body, as Get does.
+func putPooled(buf []byte) {
+	capacity := cap(buf)
+	if capacity < MinSize || capacity > MaxSize {
+		return
+	}
+	i := classDown(capacity)
+	c := &classes[i]
+	// Trimmed to the class size, so that every buffer in a class is exactly
+	// that size and what Get hands out is always Align of what was asked for,
+	// whatever shape the buffer had before it came here.
+	size := classSize(i)
+	p := unsafe.SliceData(buf[:size:size])
+	if gcEpoch.Load() != c.epoch.Load() {
+		c.beginRefill()
+	}
+	if c.refill.Load() > 0 && c.keep(p) {
+		return
+	}
+	c.pool.Put(p)
+}
+
 // beginRefill starts this class's burst of returns into the reserve, once per
 // collection. The swap settles which caller noticed it first.
 //
@@ -355,12 +682,18 @@ func Put(buf []byte) {
 // did manage to keep, and the difference goes back to the budget for a class
 // that can use it. That is what stops a target raised by one busy stretch from
 // holding memory for the rest of the program's life.
+//
+// Unless the class came up short within the window SetRetainedFor sets. Then
+// the returns the burst was waiting for are more likely still out — held by
+// requests that take longer than collections are apart — than gone, and
+// giving back now would leave the reserve empty for when they are taken
+// again.
 func (c *class) beginRefill() {
 	epoch := gcEpoch.Load()
 	if c.epoch.Swap(epoch) == epoch {
 		return
 	}
-	if c.refill.Load() > 0 {
+	if c.refill.Load() > 0 && now()-c.short.Load() >= retainFor.Load() {
 		c.aim(c.held.Load())
 	}
 	c.refill.Store(c.target.Load())
@@ -371,22 +704,29 @@ func (c *class) beginRefill() {
 // longer keeps that many of in flight stops taking the lock instead of
 // reaching for a target it cannot fill.
 func (c *class) keep(p *byte) bool {
+	// Spent, it is left below zero rather than set back to it: a burst that
+	// began between the two would be wiped, and the reserve left unfilled for
+	// a whole collection. Put stops calling here once it reads zero or less,
+	// so it goes only as far below as there are returns racing it.
 	if c.refill.Add(-1) < 0 {
-		c.refill.Store(0)
 		return false
 	}
-	if c.held.Load() >= c.target.Load() {
+	if c.held.Add(1) > c.target.Load() {
+		c.held.Add(-1)
 		return false
 	}
-	c.mu.Lock()
-	if int64(len(c.free)) >= c.target.Load() {
-		c.mu.Unlock()
-		return false
+	for {
+		set := c.shards.Load()
+		sh := &set.list[int(rand.Uint32())&set.mask]
+		sh.mu.Lock()
+		if !sh.retired {
+			sh.free = append(sh.free, p)
+			sh.n.Store(int64(len(sh.free)))
+			sh.mu.Unlock()
+			return true
+		}
+		sh.mu.Unlock()
 	}
-	c.free = append(c.free, p)
-	c.held.Store(int64(len(c.free)))
-	c.mu.Unlock()
-	return true
 }
 
 // Grow returns a buffer holding buf's bytes with room for capacity of them in

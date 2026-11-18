@@ -189,8 +189,8 @@ func main() {
 
 同一个池也可以服务你自己的 buffer：`bufferpool.Get`/`Put` 零分配，大小按 2 的幂分档（正好是 Go
 分配器的 size class，不会有取整浪费），而且有一个**能活过 GC** 的储备（与 `sync.Pool` 不同），由
-`SetRetainedBytes` 学习并设上限（默认 32MiB；`SetRetainedBytes(0)` 在内存紧张时立即归还）。fib 的读
-buffer、回复组装与 TLS 记录都走同一批档位，所以你的 buffer 加入的是同一条循环，而不是多留一份空闲副本。
+`SetRetainedBytes` 学习并设上限（默认为进程可用内存的 1/8，32MiB 到 16GiB；`SetRetainedBytes(0)` 在内存紧张时立即归还），某一档最后
+一次缺 buffer 之后保留 `SetRetainedFor`（默认 1 分钟）。fib 的读 buffer、回复组装与 TLS 记录都走同一批档位，所以你的 buffer 加入的是同一条循环，而不是多留一份空闲副本。
 
 ```go
 buf := bufferpool.Get(64 << 10)[:0] // cap 64KiB; contents are the previous user's, write before reading

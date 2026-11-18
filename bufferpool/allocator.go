@@ -41,10 +41,28 @@ var allocator atomic.Pointer[installed]
 // Align, MinSize and MaxSize keep describing the package's own pool, which fib
 // uses to size what it asks for, and SetRetainedBytes and RetainedBytes apply
 // to that pool only.
+//
+// Builtin is the package's own pool as an Allocator, so that a program can
+// hold either kind in one place; SetAllocator(Builtin) is SetAllocator(nil).
 func SetAllocator(a Allocator) {
-	if a == nil {
+	if a == nil || a == Builtin {
 		allocator.Store(nil)
 		return
 	}
 	allocator.Store(&installed{a})
 }
+
+// Builtin is the package's own pool as an Allocator. Its Get and Put go to that
+// pool whatever SetAllocator has installed.
+var Builtin Allocator = builtin{}
+
+type builtin struct{}
+
+func (builtin) Get(size int) []byte {
+	if size <= 0 {
+		return nil
+	}
+	return getPooled(size)
+}
+
+func (builtin) Put(buf []byte) { putPooled(buf) }

@@ -15,6 +15,7 @@ The analysis is of `b070cc6` on 2026-11-17. Numbers were measured on Apple Silic
 2. **Only the allocator can tell whether a buffer is its own.** Given just a `[]byte`, fib has no way to know where it came from.
 3. **fib does not pair Get and Put strictly today.** Its contract is that any buffer may be Put and that one never Put is left to the collector, and many paths rely on that. A manually managed allocator needs the contract changed first and every such path fixed.
 4. **jemalloc through cgo makes each Get+Put pair several times slower than the current pool**, and most of the GC cost it would save is already saved by the current design.
+5. **No fd-sharded `GetBy`/`PutBy`.** sync.Pool is already sharded per P and has no global lock, so sharding again by fd gains nothing, and a buffer given back under a different fd than it was taken for becomes 20 to 170 times slower.
 
 ## 1. The allocator hook: nil fallback (implemented)
 
@@ -131,6 +132,106 @@ If the goal is less GC cost, the better options, in order, are:
 1. tune `SetRetainedBytes` and `GOMEMLIMIT` first;
 2. mmap memory outside the Go heap directly from Go and do the size classes there, with no cgo and the current pool still in front;
 3. if jemalloc it must be, put a per-P cache on the Go side in front of it to spread the cost of the cgo calls.
+
+## 5. Sharding by fd: `GetBy`/`PutBy`
+
+The idea is two keyed methods:
+
+```go
+func GetBy(key uintptr, size int) []byte
+func PutBy(key uintptr, buf []byte)
+```
+
+Each connection passes its fd, and a custom allocator carrying several sets of sync.Pools picks one by `fd % N`, to avoid contention on "the one global sync.Pool".
+
+### The premise does not hold
+
+sync.Pool has no global lock; it is already sharded per P, that is per CPU:
+
+- each P has a private slot plus a lock-free shared queue;
+- the fast path of Get and Put pins the goroutine to its P and touches the local slot, with no lock and almost never a CAS;
+- the only global lock is taken the first time a Pool is used on a P.
+
+Per CPU is already the right way to shard. Sharding again by fd means one P serving many fds goes through many Pools in turn, which widens the cache footprint and lowers the hit rate.
+
+Nothing else shared in bufferpool is contended either: counters such as `gcEpoch` are read-mostly, and the reserve's lock is taken only in the refill burst after a collection.
+
+### Measurements
+
+A scratch copy got `GetBy`/`PutBy` (passing straight through to `Get`/`Put` with no allocator installed) and an fd-sharded allocator with one sync.Pool per size class in each shard. The load is 14 cores in parallel, 10,000 fds in random rotation, sizes mixed between 200B and 16KB, each cell the mean of 5 runs:
+
+| Variant | Holding 1 at a time | Holding 64 at once | Holding 64, given back under another fd |
+| --- | --- | --- | --- |
+| fib `Get`/`Put` (current) | 1.40 ns | 1.49 ns | 1.49 ns |
+| fib `GetBy`/`PutBy`, no allocator | 1.41 ns | 1.51 ns | 1.52 ns |
+| Unsharded, one sync.Pool per class | 1.30 ns | 1.45 ns | 1.51 ns |
+| 16 fd shards | 2.68 ns | 3.00 ns | 28.7 ns |
+| 256 fd shards | 1.68 ns | 2.71 ns | 256.9 ns, a fresh allocation every time |
+
+Single-threaded, `GetBy`/`PutBy` with no allocator take 9.56 ns against 9.07 ns for `Get`/`Put`. The API itself costs little; the sharding is the problem.
+
+### Gain against cost
+
+- **Gain: none.** Even when Get and Put use the same fd, sharding is only slower, since the contention it targets does not exist.
+- **Much slower across fds.** In fib a buffer is often given back on a connection other than the one that took it: a read buffer becomes a reply or a TLS record, HTTP/2 and HTTP/3 multiplex, a broadcast sends one buffer to many connections. Given back under another fd, a buffer lands in another shard; the next Get on the first shard misses, sync.Pool searches the other Ps' queues, and failing that allocates. That is the last column above.
+- **More idle buffers.** Every collection empties every sync.Pool, so more shards means more sets to build up again, and idle memory multiplies. This was not quantified.
+- **A large change.** About 270 call sites would have to pass an fd down, `Grow`/`Append`/`Join` would each need a keyed version, and layers such as the http parser, tls and h2 do not have the fd to begin with.
+
+This is the same lesson as the earlier rejected fd-sharded task dispatch (fnet's approach, which measured 1–3% slower in fib): per CPU is already the best cut, and cutting again by fd only adds cross-shard cost.
+
+If the real need is to count or cap memory per connection, that accounting belongs at the Connection, not in a split bufferpool.
+
+## 6. Long-held buffers and storms: the reserve fixes and a sharded reserve
+
+Raised in [lesismal/fib#1](https://github.com/lesismal/fib/issues/1): a WebSocket service whose requests wait 3–8 s in a business queue while collections come every 200–600 ms. Measured with the issue author's cloud-service simulator (16 event loops → 16 workers, waves of 1.6M requests every 12 s, a collection forced every 400 ms, 1 KiB buffers, 1 GiB budget), changed to use only the public API, on a Ryzen 7800X3D (16 threads) with the host otherwise idle, 3 rounds each.
+
+### Four fixes to the package's own pool
+
+1. **A target collapsed when buffers were held across collections.** A burst left unfilled at the next collection dropped the target to what the reserve held, but the buffers it was waiting for were still out. Holding 500 buffers across two collections took the target from 500 to 1. A class now keeps its target for `SetRetainedFor` (default 1 minute) after it last had to make a buffer or ran its reserve dry.
+2. **A class with no more returns never gave its reserve back**, since giving back started on a return. The collection watcher now gives back the reserve of a class that has seen no return for two collections, once the window has passed.
+3. **`keep` could wipe a burst that had just begun** by storing 0 into `refill` after another goroutine set it. The count is now left below zero instead.
+4. **`trim` lowered a target with a load and a store**, losing a concurrent miss's rise while the budget still counted it. It now uses a compare-and-swap, and stops after as many steps as the target had, so misses arriving as fast as it lowers cannot keep it going.
+
+### The reserve split into shards
+
+With the fixes the reserve holds the working set, and every take and return after a collection went through its one lock: on the simulator that cost the wave rate 11%. Each class's reserve is now split into shards, each a list with its own lock. The default is 4 per GOMAXPROCS, at least 16 and at most 128; `SetReserveShards(n)` sets another count, rounded up to a power of two and at most 1024, and returns the count it set. The class still keeps one count and one target, so no shard runs out of room while the class has some, and the ordinary path never reaches the shards: a take goes to the reserve only when a collection has emptied the sync.Pool, and a return only in the burst that follows. `SetReserveShards` moves what the reserve holds into the new shards, so it may be called at any time.
+
+### A budget that follows the memory
+
+The fixed 32 MiB default was far below what a service holding requests across collections needs: HTTP/2 and HTTP/3 streams in flight, or a queue like the one in the issue, keep hundreds of megabytes out. The default budget is now 1/8 of the memory the process may use, at least 32 MiB and at most 16 GiB. That memory is the smaller of the machine's (or the cgroup's) limit and `GOMEMLIMIT` when one is set; when neither can be read the budget stays 32 MiB. The budget is live heap: under `GOGC=100` a full reserve of R can cost up to 2R at the peak, so 1/8 keeps that within a quarter of the memory.
+
+- `SetRetainedPercent(p)` sets the budget to p% of that memory and returns the bytes it set, or an error when p is outside 0–100 or the memory cannot be read.
+- `RetainedBytesLimit()` returns the budget in force.
+- `SetRetainedBytes`, `SetRetainedPercent` and `SetReserveShards` each log what they set at Info through `fib/log`. The defaults chosen at start-up are logged at Debug, so a program that changes nothing prints nothing.
+
+A separate `Sharded` allocator with every size configurable was built first and dropped: the same algorithm behind `SetAllocator` cost 2–2.5 ns more per Get+Put through the interface, and its only other use, separate budgets per instance, had no caller.
+
+Two of the issue author's own versions were checked first. v1 is fix 1 alone. v2 adds 16 shards, but every Put scans them even when no refill is under way: on the idle host the ordinary Get+Put went from 11.5 ns to 26.6 ns, and from 1.39 ns to 3.28 ns on 16 threads. The shards here are behind the class-wide refill count, as the single list was.
+
+A cap on the target was tried and dropped: limiting it to what the class had drawn past its sync.Pool over two collections undercounts whenever a burst spans more collections than that (a 200-buffer wave in a small heap spanned three), and an undercount means making buffers again, which is worse than a target that only overstates the budget's bookkeeping.
+
+### Results
+
+| GOMAXPROCS=16 | Remade per wave (waves 1–5, mean) | Wave rate | Sustained 30 s | Peak heap | Get+Put, 1 thread | Get+Put, 16 threads |
+| --- | --- | --- | --- | --- | --- | --- |
+| Before the fixes | 15.4% | 2.79 M/s | 3.18 M/s, 0.21–0.29% remade | 559–566 MB | 11.6 ns | 1.33 ns |
+| Fixed, 1 shard | 4.5% | 2.39 M/s | 3.07 M/s, 0–0.02% | 454–503 MB | 11.3 ns | 1.32 ns |
+| Fixed, default (16 shards) | 2.8% | 2.74 M/s | 3.16 M/s, 0% | 319–482 MB | 11.3 ns | 1.31 ns |
+| Fixed, 64 shards | 2.7% | 2.78 M/s | 3.17 M/s, 0% | 484–501 MB | 11.4 ns | 1.33 ns |
+
+| GOMAXPROCS=2 | Remade per wave | Wave rate | Sustained 30 s |
+| --- | --- | --- | --- |
+| Before the fixes | 15.8% | 2.75 M/s | 3.09–3.24 M/s, 0.29% |
+| Fixed, 1 shard | 3.8% | 2.48 M/s | 3.05 M/s, 0% |
+| Fixed, default (2 shards) | 3.4% | 2.58 M/s | 3.06 M/s, 0% |
+| Fixed, 64 shards | 3.2% | 2.73 M/s | 3.15 M/s, 0% |
+
+Get+Put times are medians of 10 runs. A wave's first collection after the target has been learned remakes nothing at all; what is left is the first wave or two, while the targets are still being learned.
+
+- The fixes cut what each wave makes again by more than four fifths, and the peak heap falls with it, since a buffer made again is a fresh allocation the collector has to catch up with.
+- One lock costs the wave rate 11–14%; the default shards give nearly all of it back on 16 threads. On 2 threads the default is 2 shards, and 64 do better there (2.73 against 2.58 M/s), since 8 event loops and 2 workers still return at once; a program in that shape can raise it.
+- The ordinary Get+Put costs what it did before the fixes, on one thread and on 16.
+- Retention at the end is higher (480–680 MB against 145 MB of the 1 GiB budget), which is the point: the reserve now keeps the working set the queue holds across collections. `SetRetainedBytes` bounds it as before.
 
 ## Appendix: why not pass a wrapper object
 

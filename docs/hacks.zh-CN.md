@@ -763,7 +763,10 @@ out := bufferpool.Join(nil, a, b)           // 一次取够，拼几段
 
 - **Get/Put 0 分配、约 7ns**；按 2 的幂分档，正好是 Go 分配器的 size class，没有取整浪费。
 - 有一份**扛得过 GC** 的储备（`sync.Pool` 每轮 GC 都清空，储备不会），大小是学出来的，上限
-  `SetRetainedBytes`（默认 32MiB）；`SetRetainedBytes(0)` 立刻释放，应对内存压力。
+  `SetRetainedBytes`（默认为进程可用内存的 1/8——GOMEMLIMIT、容器上限或整机内存——介于 32MiB 和 16GiB
+  之间；`SetRetainedPercent` 按可用内存的百分比设置），某一档最后一次缺 buffer 之后保留 `SetRetainedFor`（默认
+  1 分钟），被持有跨过多次 GC 的 buffer 不会被当成不再需要；`SetRetainedBytes(0)` 立刻释放，应对内存压力。
+  每档储备拆成 `SetReserveShards` 个列表（默认每个 P 4 个，16 到 128），GC 之后的取和还不会都排在一把锁上。每次设置都会打日志。
 - **一个全局池**：fib 的读 buffer、回包拼接、TLS 记录都是同一批 buffer 在各档之间流动。
   你自己的 buffer 也走它，不会额外多一份闲置内存。
 - `Put` 对来路不明的 buffer 是安全的：小于 64B 或大于 64MiB 的直接丢弃。

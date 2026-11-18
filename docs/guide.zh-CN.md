@@ -1747,9 +1747,16 @@ out := bufferpool.Join(nil, first, second)  // 一次取够，把几段拼成一
   等于 reserve 里的 buffer 数，省下的正是同样数量的分配。
 - **reserve 的大小是学出来的，并且有上限。** 某一档每被迫 `make` 一次，它的 target 就加一，
   所以 target 收敛到程序真正同时在用的数量；某一轮补充没用完（说明这一档不再需要那么多）就
-  回落到实际留住的数量，把额度还给别的档。总量由 `SetRetainedBytes` 限定，默认
-  `DefaultRetainedBytes`（32 MiB）；`SetRetainedBytes(0)` 会立刻把已经留住的内存全部释放，
+  回落到实际留住的数量，把额度还给别的档。但只在这一档最近一段时间（`SetRetainedFor`，默认
+  1 分钟）没有缺过 buffer 时才回落：请求持有 buffer 的时间可能比两次 GC 的间隔还长，补充没用完
+  只说明它们还没还回来；一档长时间完全没有归还时，由 GC 那一侧把它的 reserve 释放掉。总量由 `SetRetainedBytes` 限定，默认是进程可用内存
+  （GOMEMLIMIT、容器上限或整机内存，取最小）的 1/8，介于 32 MiB 和 16 GiB 之间，读不到内存时为 32 MiB；
+  `SetRetainedPercent(p)` 按可用内存的百分比设置并返回设置的字节数，`RetainedBytesLimit()` 返回当前上限；`SetRetainedBytes(0)` 会立刻把已经留住的内存全部释放，
   可以用来应对内存压力。`RetainedBytes()` 返回当前的额度。
+- **reserve 分片。** 每档的 reserve 拆成 `SetReserveShards` 个列表（默认每个 P 4 个，16 到 128，
+  向上取 2 的幂；`SetReserveShards` 返回实际设置的数量），各自一把锁；持有量和 target 仍按档只记一份。GC 之后整个工作集都要经过 reserve，
+  分片让这一批取和还分散到多把锁上。`SetReserveShards`、`SetRetainedBytes`、`SetRetainedPercent`
+  每次调用都会以 Info 级别打日志；启动时选定的默认值以 Debug 级别打一次。
 - **一个全局池，不是每处一个。** 连接的读 buffer、由它拼出来的回包、一条 TLS 记录用的都是
   同一批 buffer 在各档之间流动；分成多个池只会让每个池各自留一份闲置 buffer。
 - **`Get` 返回的内容是上一个使用者留下的**，和任何复用 buffer 一样，先写后读。
