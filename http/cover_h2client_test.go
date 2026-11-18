@@ -5,6 +5,7 @@ package http
 import (
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	stdhttp "net/http"
@@ -34,10 +35,37 @@ type cvH2cPeer struct {
 // connection once the client's preface has been read. i counts connections.
 func cvH2cServe(t *testing.T, serve func(p *cvH2cPeer, i int)) string {
 	t.Helper()
+	return cvH2cServeWatching(t, serve, nil)
+}
+
+// cvH2cAccept is a connection the server took: when, and what its preface
+// read got, so that a test can say why its connection never got further.
+type cvH2cAccept struct {
+	at      time.Time
+	preface []byte
+	err     error
+}
+
+func (a cvH2cAccept) String() string {
+	return fmt.Sprintf("taken at %s, preface %q, read error %v", a.at.Format("15:04:05.000"), a.preface, a.err)
+}
+
+// cvH2cServeWatching is cvH2cServe, sending each connection it takes to
+// accepts when that is not nil.
+func cvH2cServeWatching(t *testing.T, serve func(p *cvH2cPeer, i int), accepts chan<- cvH2cAccept) string {
+	t.Helper()
 	return rawServer(t, func(conn net.Conn, i int) {
 		_ = conn.SetDeadline(time.Now().Add(20 * time.Second))
 		preface := make([]byte, len(h2Preface))
-		if _, err := io.ReadFull(conn, preface); err != nil || string(preface) != h2Preface {
+		at := time.Now()
+		n, err := io.ReadFull(conn, preface)
+		if accepts != nil {
+			select {
+			case accepts <- cvH2cAccept{at: at, preface: preface[:n], err: err}:
+			default:
+			}
+		}
+		if err != nil || string(preface) != h2Preface {
 			return
 		}
 		serve(&cvH2cPeer{conn: conn, enc: hpack.NewEncoder(), dec: hpack.NewDecoder(hpack.DefaultTableSize)}, i)

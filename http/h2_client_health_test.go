@@ -47,10 +47,11 @@ func silentPeer(p *cvH2cPeer, pinged chan<- bool) {
 func TestClientHTTP2HealthCheckFindsDeadConnection(t *testing.T) {
 	pinged := make(chan bool, 1)
 	peers := make(chan *cvH2cPeer, 1)
-	url := cvH2cServe(t, func(p *cvH2cPeer, _ int) {
+	accepts := make(chan cvH2cAccept, 4)
+	url := cvH2cServeWatching(t, func(p *cvH2cPeer, _ int) {
 		peers <- p
 		silentPeer(p, pinged)
-	})
+	}, accepts)
 	client := cvH2cClient(t, healthConfig)
 	start := time.Now()
 	_, err := client.Go(mustRequest(t, "POST", url, nil)).Wait()
@@ -58,6 +59,11 @@ func TestClientHTTP2HealthCheckFindsDeadConnection(t *testing.T) {
 		// Say what the server's side saw, which tells a connection the
 		// network ended (a reset both sides hear) from one the client did.
 		server := "the server never took the connection"
+		select {
+		case a := <-accepts:
+			server = "the server took a connection (" + a.String() + ") that sent no HTTP/2 preface"
+		default:
+		}
 		select {
 		case p := <-peers:
 			select {
