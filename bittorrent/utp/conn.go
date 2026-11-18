@@ -285,12 +285,15 @@ func (c *Conn) writePacket(typ uint8, seq, ack uint16, payload []byte, now int64
 	putHeader(b, h)
 	p := b[HeaderSize:]
 	if sack {
-		// Bit i of the mask is packet ackNr+2+i: ackNr+1 is the one
-		// missing, or there would be nothing to acknowledge selectively.
+		// Bit i of the mask is packet ack+2+i, counted from the
+		// acknowledgement this packet carries, not from c.ackNr: a
+		// keepalive carries one short of it, and a mask counted from
+		// c.ackNr would then claim ackNr+1, the packet still missing, has
+		// arrived, which a peer believes and never sends again.
 		p[0], p[1] = 0, sackBytes
 		var mask uint32
 		for i := range sackBytes * 8 {
-			if _, ok := c.in.get(c.ackNr + 2 + uint16(i)); ok {
+			if _, ok := c.in.get(ack + 2 + uint16(i)); ok {
 				mask |= 1 << i
 			}
 		}
