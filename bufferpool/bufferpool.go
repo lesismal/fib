@@ -541,6 +541,16 @@ func Get(size int) []byte {
 		return nil
 	}
 	if a := allocator.Load(); a != nil {
+		if ar := a.arena; ar != nil && size <= MaxSize {
+			// Arena.Get, written out here to save a call.
+			i := classUp(size)
+			if ar.cls[i].count > 0 {
+				if b := ar.get(i); b != nil {
+					return b[:size]
+				}
+			}
+			return getPooled(size)
+		}
 		return a.Get(size)
 	}
 	if size > MaxSize {
@@ -625,7 +635,18 @@ func (c *class) take() *byte {
 // allocator's Put, which decides what to do with one it did not hand out.
 func Put(buf []byte) {
 	if a := allocator.Load(); a != nil {
-		if cap(buf) > 0 {
+		if ar := a.arena; ar != nil {
+			// Arena.Put, written out here to save a call.
+			capacity := cap(buf)
+			if capacity < MinSize || capacity > MaxSize {
+				return
+			}
+			if off := uintptr(unsafe.Pointer(unsafe.SliceData(buf))) - ar.base; off < ar.size {
+				ar.put(off, capacity)
+				return
+			}
+			putPooled(buf)
+		} else if cap(buf) > 0 {
 			a.Put(buf)
 		}
 		return

@@ -20,8 +20,14 @@ type Allocator interface {
 }
 
 // installed holds the Allocator, since an atomic pointer cannot hold an
-// interface itself.
-type installed struct{ Allocator }
+// interface itself. arena is the same allocator when it is an *Arena, so that
+// Get and Put call it directly: through the interface the call cannot be
+// inlined, and on the hot path that measured 13% of a Get+Put pair on 16
+// threads.
+type installed struct {
+	Allocator
+	arena *Arena
+}
 
 // allocator is the Allocator SetAllocator installed, or nil for the package's
 // own pool. Get and Put load it first; while it is nil that is one load of a
@@ -54,7 +60,8 @@ func SetAllocator(a Allocator) {
 		allocator.Store(nil)
 		return
 	}
-	allocator.Store(&installed{a})
+	arena, _ := a.(*Arena)
+	allocator.Store(&installed{a, arena})
 }
 
 // Builtin is the package's own pool as an Allocator. Its Get and Put go to that

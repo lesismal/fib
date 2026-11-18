@@ -272,7 +272,8 @@ The peak heap with the default arena reads 4213 MB: the whole arena counts as li
 - **The collector's work is what drops.** Process CPU falls to a fifth on 16 threads and a third on 2: each forced collection marks one object instead of some 500k buffers, and the buffers are not made again (510k fresh allocations against 5.5k).
 - **Throughput rises a little:** the wave rate by 4–5%, the sustained rate by 2–3%, and no wave makes a buffer again.
 - **An arena smaller than the working set still gets nearly all of it.** With 256k slots the rest goes to the pool, and the peak RSS is the lowest of all, since the pool's reserve no longer keeps a copy of what the arena holds.
-- **The ordinary Get+Put** (1500 B, median of 10) through the interface: 11.8 ns against 11.5 on one thread, 1.48 ns against 1.31 on 16, 5.88 against 5.82 on 2.
+- **The ordinary Get+Put is faster than the pool's** (1500 B, median of 10): 9.9 ns against 11.2 on one thread, 1.25 ns against 1.33 on 16, 5.0 against 5.9 on 2. `Get` and `Put` call an installed `*Arena` directly rather than through the interface: through it the same pair measured 11.8, 1.48 and 5.88 ns.
+- **`go test -tags fib_arena ./...`** runs every test with a 64 MiB arena installed; CI runs it, and the main packages again with the race detector.
 
 ## Appendix: why not pass a wrapper object
 

@@ -375,6 +375,26 @@ jobs:
       - name: Static file tests
         run: go test -race -count=1 -timeout 10m -v -run 'TestStaticFiles|TestFileCache' ./http/ ./http3/
 
+  # Every test with bufferpool.Arena installed as the allocator (the
+  # fib_arena build tag does that at init), once without the race detector,
+  # where the arena takes its per-P path, and once with it, where it takes
+  # the locked one the detector can follow.
+  arena:
+    name: Test with the arena allocator
+    if: ${{ !(github.event_name == 'pull_request' || inputs.scope == 'quick' || startsWith(github.ref_name, 'ci-quick-')) }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v6
+        with:
+          go-version: stable
+          cache-dependency-path: go.mod
+      - name: Test
+        run: go test -tags fib_arena -count=1 -timeout 15m ./...
+      - name: Test with the race detector
+        run: go test -race -tags fib_arena -count=1 -timeout 15m ./bufferpool ./core ./tls ./websocket ./http ./http3/...
+
   # HTTP/2 conformance: the fib server against net/http's client, h2spec and
   # curl, and the fib client against net/http's server and a raw frame server.
   # h2spec is installed as a tool, like staticcheck, so the module itself
