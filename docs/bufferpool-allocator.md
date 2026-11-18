@@ -16,6 +16,7 @@ The analysis is of `b070cc6` on 2026-11-17. Numbers were measured on Apple Silic
 3. **fib does not pair Get and Put strictly today.** Its contract is that any buffer may be Put and that one never Put is left to the collector, and many paths rely on that. A manually managed allocator needs the contract changed first and every such path fixed.
 4. **jemalloc through cgo makes each Get+Put pair several times slower than the current pool**, and most of the GC cost it would save is already saved by the current design.
 5. **No fd-sharded `GetBy`/`PutBy`.** sync.Pool is already sharded per P and has no global lock, so sharding again by fd gains nothing, and a buffer given back under a different fd than it was taken for becomes 20 to 170 times slower.
+6. **An arena allocator for programs that hold many buffers across collections** (section 7): one allocation cut into slots, opt-in through `SetAllocator(NewArena(...))`; the package's own pool stays the default.
 
 ## 1. The allocator hook: nil fallback (implemented)
 
@@ -232,6 +233,46 @@ Get+Put times are medians of 10 runs. A wave's first collection after the target
 - One lock costs the wave rate 11–14%; the default shards give nearly all of it back on 16 threads. On 2 threads the default is 2 shards, and 64 do better there (2.73 against 2.58 M/s), since 8 event loops and 2 workers still return at once; a program in that shape can raise it.
 - The ordinary Get+Put costs what it did before the fixes, on one thread and on 16.
 - Retention at the end is higher (480–680 MB against 145 MB of the 1 GiB budget), which is the point: the reserve now keeps the working set the queue holds across collections. `SetRetainedBytes` bounds it as before.
+
+## 7. An arena allocator
+
+The pool and its reserve keep the working set across collections, but every buffer is still an object of its own: a collection marks each one, and the simulator in section 6 forces one every 400 ms. `Arena` takes the other route. It is one allocation with no pointers in it, cut into fixed slots per class and kept for the program's life; free slots are kept as their index (a `uint32`), each P has a stack of 64 per class taken with the P pinned and no lock, and past that slots move in batches of 32 to and from 8 shared stacks with a lock each. A class with no free slot, or no slots at all, is served by the package's own pool, and `Put` sends there every buffer that is not a slot. It is an `Allocator`, installed with `SetAllocator`; the package's own pool stays the default.
+
+```go
+arena, err := bufferpool.NewArena(nil)                                     // an eighth of the memory, split by ArenaWeightsServer
+arena, err := bufferpool.NewArenaBytes(2<<30, bufferpool.ArenaWeightsStreaming()) // a total, split by weight
+arena, err := bufferpool.NewArena(map[int]int{1024: 300000})                 // slots per class
+bufferpool.SetAllocator(arena)
+```
+
+- **Size.** By default an eighth of the memory the process may use, 32 MiB to 16 GiB, as the pool's budget. `NewArenaBytes(total, weights)` splits a total between classes by `ArenaWeights` (size → weight); `ArenaCounts` shows the split.
+- **Presets.** `ArenaWeightsServer` (the default) follows the buffers a fib server takes: the 16 KiB read buffers the largest share, then 32 KiB (TLS records, response copies) and 64 KiB (streamed bodies, sendfile, QUIC send buffers), 2 KiB for QUIC datagrams. `ArenaWeightsMessages` favours 64 B to 4 KiB, `ArenaWeightsStreaming` 16 to 64 KiB, `ArenaWeightsEven` gives each class from 64 B to 64 KiB the same bytes. They are starting points drawn from fib's own sizes, not measurements of a program.
+- **What it costs.** The arena counts towards the live heap from the start (GOGC's goal, GOMEMLIMIT); the system backs a page only once a slot on it is used. A slot never `Put` is lost to the arena, since the collector never takes it back — fib leaves some buffers to the collector (section 3) — and so is one returned as a slice that does not start at it (`buf[k:]`); `Lost` counts the second kind, `Free` shows both. Under the race detector the per-P stacks are skipped, since it cannot see that pinning a P makes them its own.
+
+### Results
+
+The simulator of section 6 on the same host, otherwise idle, 3 rounds each, with the arena installed through `SetAllocator`. "Default" is the arena `NewArena(nil)` made when this was measured: 1/16 of the host's 64 GiB, split evenly, 369k slots of 1 KiB; the default is now 1/8 split by `ArenaWeightsServer`. The other two give the 1 KiB class 256k and 512k slots; the simulator holds about 300k at its peak.
+
+| GOMAXPROCS=16 | Remade per wave | Wave rate | Sustained 30 s | Process CPU | Fresh allocations | Peak RSS |
+| --- | --- | --- | --- | --- | --- | --- |
+| Pool (the default) | 2.6% | 2.78 M/s | 3.17–3.18 M/s | 47.6–49.3 s | 510–523k | 502–522 MB |
+| Arena, default | 0% | 2.88 M/s | 3.23–3.26 M/s | 9.1–9.5 s | 5.5k | 446–449 MB |
+| Arena, 256k slots | 0% | 2.92 M/s | 3.25 M/s | 9.6–10.1 s | 39–52k | 304–310 MB |
+| Arena, 512k slots | 0% | 2.93 M/s | 3.25–3.26 M/s | 9.2–9.5 s | 5.6k | 521–558 MB |
+
+| GOMAXPROCS=2 | Remade per wave | Wave rate | Sustained 30 s | Process CPU | Peak RSS |
+| --- | --- | --- | --- | --- | --- |
+| Pool | 3.1% | 2.72 M/s | 3.13–3.14 M/s | 15.2–15.9 s | 565–572 MB |
+| Arena, default | 0% | 2.84 M/s | 3.19–3.20 M/s | 5.3–5.6 s | 447 MB |
+| Arena, 256k slots | 0.2% | 2.83 M/s | 3.18–3.19 M/s | 5.7–5.8 s | 302–303 MB |
+| Arena, 512k slots | 0% | 2.84 M/s | 3.17–3.18 M/s | 5.4–5.5 s | 509–557 MB |
+
+The peak heap with the default arena reads 4213 MB: the whole arena counts as live heap, though the system backed only the 449 MB used.
+
+- **The collector's work is what drops.** Process CPU falls to a fifth on 16 threads and a third on 2: each forced collection marks one object instead of some 500k buffers, and the buffers are not made again (510k fresh allocations against 5.5k).
+- **Throughput rises a little:** the wave rate by 4–5%, the sustained rate by 2–3%, and no wave makes a buffer again.
+- **An arena smaller than the working set still gets nearly all of it.** With 256k slots the rest goes to the pool, and the peak RSS is the lowest of all, since the pool's reserve no longer keeps a copy of what the arena holds.
+- **The ordinary Get+Put** (1500 B, median of 10) through the interface: 11.8 ns against 11.5 on one thread, 1.48 ns against 1.31 on 16, 5.88 against 5.82 on 2.
 
 ## Appendix: why not pass a wrapper object
 

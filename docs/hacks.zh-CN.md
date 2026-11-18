@@ -767,6 +767,12 @@ out := bufferpool.Join(nil, a, b)           // 一次取够，拼几段
   之间；`SetRetainedPercent` 按可用内存的百分比设置），某一档最后一次缺 buffer 之后保留 `SetRetainedFor`（默认
   1 分钟），被持有跨过多次 GC 的 buffer 不会被当成不再需要；`SetRetainedBytes(0)` 立刻释放，应对内存压力。
   每档储备拆成 `SetReserveShards` 个列表（默认每个 P 4 个，16 到 128），GC 之后的取和还不会都排在一把锁上。每次设置都会打日志。
+- **可选的 arena**：`arena, _ := bufferpool.NewArena(nil)` 后 `bufferpool.SetAllocator(arena)`，
+  buffer 来自一整块预先分配、按档切成固定槽位的内存（默认可用内存的 1/8，32MiB 到 16GiB，与默认池的预算一样；`NewArenaBytes(total, weights)`
+  按权重把总大小分给各档，预设有 `ArenaWeightsServer`（默认）、`ArenaWeightsMessages`、`ArenaWeightsStreaming`、
+  `ArenaWeightsEven`；`NewArena(map[size]count)` 逐档指定），程序整个生命周期都留着。GC 只需标记一个对象而不是每个 buffer 一个，GC 之后也不用重新分配，
+  适合跨多次 GC 持有大量 buffer 的程序。从不 `Put` 的槽位就丢了，槽位用完时由包内默认池接着供应。
+  不是默认值，见 [bufferpool-allocator.zh-CN.md](bufferpool-allocator.zh-CN.md) 第 7 节。
 - **一个全局池**：fib 的读 buffer、回包拼接、TLS 记录都是同一批 buffer 在各档之间流动。
   你自己的 buffer 也走它，不会额外多一份闲置内存。
 - `Put` 对来路不明的 buffer 是安全的：小于 64B 或大于 64MiB 的直接丢弃。

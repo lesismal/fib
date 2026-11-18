@@ -906,6 +906,16 @@ out := bufferpool.Join(nil, a, b)           // takes enough at once and joins th
   `SetRetainedBytes(0)` releases it at once, for memory pressure. Each class's reserve is split
   into `SetReserveShards` lists (4 per P, 16 to 128, by default), so the takes and returns that
   follow a collection do not all queue on one lock. Each setting is logged.
+- **An arena, if you want one:** `bufferpool.SetAllocator(arena)` with `arena, _ :=
+  bufferpool.NewArena(nil)` serves buffers from one allocation cut into fixed slots (an eighth of
+  the memory by default, 32MiB to 16GiB like the pool's budget; `NewArenaBytes(total, weights)`
+  splits a total between the classes by weight, with presets `ArenaWeightsServer` (the default),
+  `ArenaWeightsMessages`, `ArenaWeightsStreaming` and `ArenaWeightsEven`; `NewArena(map[size]count)`
+  sets each class), kept for the program's life. The collector
+  has one object to mark instead of one per buffer, and nothing is made again after a
+  collection: for programs that hold many buffers across collections. A slot never `Put` is lost
+  to it, and the package's own pool serves what it runs out of. Not the default; see
+  [bufferpool-allocator.md](bufferpool-allocator.md) section 7.
 - **One global pool:** fib's read buffers, reply assembly and TLS records are the same buffers
   flowing between classes. Your own buffers can use it too, without holding an extra idle copy.
 - `Put` is safe with buffers of unknown origin: ones under 64B or over 64MiB are simply dropped.

@@ -44,6 +44,11 @@ var allocator atomic.Pointer[installed]
 //
 // Builtin is the package's own pool as an Allocator, so that a program can
 // hold either kind in one place; SetAllocator(Builtin) is SetAllocator(nil).
+//
+// NewArena makes the other Allocator the package provides: one allocation cut
+// into slots, for a program that holds many buffers across collections. It
+// falls back to the package's own pool, so the retention settings apply to
+// what it cannot serve.
 func SetAllocator(a Allocator) {
 	if a == nil || a == Builtin {
 		allocator.Store(nil)

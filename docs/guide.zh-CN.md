@@ -1757,6 +1757,16 @@ out := bufferpool.Join(nil, first, second)  // 一次取够，把几段拼成一
   向上取 2 的幂；`SetReserveShards` 返回实际设置的数量），各自一把锁；持有量和 target 仍按档只记一份。GC 之后整个工作集都要经过 reserve，
   分片让这一批取和还分散到多把锁上。`SetReserveShards`、`SetRetainedBytes`、`SetRetainedPercent`
   每次调用都会以 Info 级别打日志；启动时选定的默认值以 Debug 级别打一次。
+- **可选的 arena allocator。** `bufferpool.NewArena(counts)` 返回一个 `*Arena`，用 `SetAllocator` 装上后，
+  buffer 来自一整块预先分配、按档切成固定槽位的内存；空闲槽位只记下标，每个 P 一个无锁小栈，后面是带锁的共享栈。
+  `NewArenaBytes(total, weights)` 按 `ArenaWeights`（档大小 → 权重）把总字节数分给各档（`ArenaCounts(total, weights)` 返回分法）。
+  预设权重：`ArenaWeightsServer()`（默认，按 fib 服务端自己的 buffer：16KiB 读 buffer 最多，其次 32KiB/64KiB）、
+  `ArenaWeightsMessages()`（大量小消息：WebSocket、RPC、排队请求）、`ArenaWeightsStreaming()`（HTTP/2、HTTP/3、TLS、文件、媒体）、
+  `ArenaWeightsEven()`（64B 到 64KiB 每档字节数相同）；预设只是起点，不是对某个程序的实测。不给参数（`nil` 或 0）时，
+  总大小为 `DefaultArenaBytes()`：和默认池的预算一样是可用内存的 1/8，32 MiB 到 16 GiB，按 `ArenaWeightsServer()` 分。
+  arena 是一个不含指针的对象，GC 不扫描、不回收，跨多少次 GC 被持有的槽位都还在。代价是这块内存一直计入活跃堆，
+  从不 `Put` 的槽位（以及 `Put` 一个不从槽位开头开始的切片）会永久丢失；槽位用完时 `Get` 走包内默认池，
+  `Put` 也把不是槽位的 buffer 交给默认池。默认仍是原来的池，见 bufferpool-allocator.zh-CN.md 第 7 节。
 - **一个全局池，不是每处一个。** 连接的读 buffer、由它拼出来的回包、一条 TLS 记录用的都是
   同一批 buffer 在各档之间流动；分成多个池只会让每个池各自留一份闲置 buffer。
 - **`Get` 返回的内容是上一个使用者留下的**，和任何复用 buffer 一样，先写后读。

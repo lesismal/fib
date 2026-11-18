@@ -210,7 +210,9 @@ The same pool serves your own buffers: `bufferpool.Get`/`Put` allocate nothing, 
 by powers of two (Go's allocator size classes, so no rounding waste), and a reserve that survives
 GC — unlike a `sync.Pool`'s — is learned, kept for `SetRetainedFor` after a class last ran short
 (1 minute by default), and capped by `SetRetainedBytes` (an eighth of the memory the process may use by default, 32MiB to 16GiB;
-`SetRetainedBytes(0)` gives it back at once, for memory pressure). fib's read buffers, reply
+`SetRetainedBytes(0)` gives it back at once, for memory pressure). A program that holds many
+buffers across collections can install `bufferpool.NewArena(nil)` with `SetAllocator` instead:
+one allocation cut into slots, which the collector never has to mark buffer by buffer. fib's read buffers, reply
 assembly and TLS records flow through the same classes, so your buffers join the same circulation
 instead of holding an extra idle copy.
 
