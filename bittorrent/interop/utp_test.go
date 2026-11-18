@@ -228,7 +228,7 @@ func (s session) run(t *testing.T) {
 	wg.Add(2)
 	go func() { defer wg.Done(); checkErr(t, "dialer", both(d, fromD, fromA)) }()
 	go func() { defer wg.Done(); checkErr(t, "acceptor", both(a, fromA, fromD)) }()
-	wg.Wait()
+	awaitOrReport(t, &wg, 5*time.Minute, d, a)
 	t.Logf("%d bytes each way in %v", s.size, time.Since(start))
 	for _, c := range []net.Conn{d, a} {
 		if fc, ok := c.(*fibutp.Conn); ok {
@@ -254,6 +254,36 @@ func (s session) run(t *testing.T) {
 		checkErr(t, fmt.Sprintf("reader to EOF (dialer writes: %v)", writerIsDialer), toEOF(r, data))
 		r.Close()
 	}
+}
+
+// awaitOrReport waits for wg, and fails the test with what fib's end of
+// each connection reports once it has waited for limit: a transfer that
+// stopped would otherwise hold the test until go test's own timeout, and
+// say nothing of where it stopped.
+func awaitOrReport(t *testing.T, wg *sync.WaitGroup, limit time.Duration, conns ...net.Conn) {
+	done := make(chan struct{})
+	go func() { wg.Wait(); close(done) }()
+	select {
+	case <-done:
+		return
+	case <-time.After(limit):
+	}
+	for _, c := range conns {
+		if fc, ok := c.(*fibutp.Conn); ok {
+			t.Errorf("stalled for %v; fib's end: %+v, RTT %v", limit, fc.Stats(), fc.RTT())
+		}
+	}
+	// Closing them ends the reads and writes, whose goroutines report to
+	// t: they are waited for before the test ends.
+	for _, c := range conns {
+		c.Close()
+	}
+	select {
+	case <-done:
+	case <-time.After(time.Minute):
+		t.Error("the transfer's goroutines did not end once its connections were closed")
+	}
+	t.FailNow()
 }
 
 func checkErr(t *testing.T, who string, err error) {
@@ -314,7 +344,17 @@ func TestUTPLibutpDialsFib(t *testing.T) {
 			session{
 				size: size(lossy),
 				dial: func(ctx context.Context) (net.Conn, error) {
-					return ls.DialContext(ctx, "udp4", target)
+					// libutp gives a dial up once its SYN has gone
+					// unanswered twice (utp_check_timeouts: CS_SYN_SENT
+					// and retransmit_count >= 2), which the lossy relay
+					// brings about now and then; dial again, as its
+					// callers would.
+					for {
+						c, err := ls.DialContext(ctx, "udp4", target)
+						if err == nil || err.Error() != "UTP_ETIMEDOUT" || ctx.Err() != nil {
+							return c, err
+						}
+					}
 				},
 				accept: fs.Accept,
 			}.run(t)
