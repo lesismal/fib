@@ -267,7 +267,7 @@ func TestClientUploadCancel(t *testing.T) {
 			}
 		}
 	}()
-	body := &readWatch{r: pr, readErr: make(chan error, 1)}
+	body := newReadWatch(pr)
 	ctx, cancel := context.WithCancel(context.Background())
 	req, err := stdhttp.NewRequestWithContext(ctx, stdhttp.MethodPost, url, body)
 	if err != nil {
@@ -288,13 +288,21 @@ func TestClientUploadCancel(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("cancel did not end the request")
 	}
+	// The body is closed, which ends a Read waiting on it. Whether a Read
+	// is waiting when it is depends on where the cancel finds the client's
+	// sender — on Windows it can still be waiting for its last write — so
+	// only a Read that did end is checked for why.
+	select {
+	case <-body.closed:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the client left the body open, and a Read waiting on it")
+	}
 	select {
 	case err := <-body.readErr:
 		if !errors.Is(err, io.ErrClosedPipe) {
 			t.Fatalf("the waiting Read ended with %v, want io.ErrClosedPipe", err)
 		}
-	case <-time.After(5 * time.Second):
-		t.Fatal("the client's Read was left waiting on a body nobody wants")
+	case <-time.After(100 * time.Millisecond):
 	}
 	select {
 	case err := <-gotErr:
@@ -357,6 +365,12 @@ func (r errReader) Read([]byte) (int, error) { return 0, r.err }
 type readWatch struct {
 	r       io.ReadCloser
 	readErr chan error
+	closed  chan struct{}
+	once    sync.Once
+}
+
+func newReadWatch(r io.ReadCloser) *readWatch {
+	return &readWatch{r: r, readErr: make(chan error, 1), closed: make(chan struct{})}
 }
 
 func (w *readWatch) Read(p []byte) (int, error) {
@@ -370,4 +384,7 @@ func (w *readWatch) Read(p []byte) (int, error) {
 	return n, err
 }
 
-func (w *readWatch) Close() error { return w.r.Close() }
+func (w *readWatch) Close() error {
+	w.once.Do(func() { close(w.closed) })
+	return w.r.Close()
+}
