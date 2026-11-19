@@ -1,6 +1,9 @@
 package bufferpool
 
-import "sync/atomic"
+import (
+	"sync"
+	"sync/atomic"
+)
 
 // Allocator is what Get and Put use instead of the package's own pool once
 // SetAllocator has installed one.
@@ -35,6 +38,10 @@ type installed struct {
 // the package's own pool costs what it did before there was a choice.
 var allocator atomic.Pointer[installed]
 
+// setMu keeps SetAllocator calls one at a time, so that each retires the
+// arena it actually replaces.
+var setMu sync.Mutex
+
 // SetAllocator makes Get and Put use a, or the package's own pool again when a
 // is nil. Get, Grow, Append and Join then take their buffers from a, and Put
 // returns them to it.
@@ -42,7 +49,10 @@ var allocator atomic.Pointer[installed]
 // It is meant to be called once, before anything has taken a buffer: a buffer
 // taken before the change is returned to whichever allocator is in place when
 // it is Put, so changing it while buffers are out hands one allocator's buffers
-// to the other.
+// to the other. Slots of an Arena are the exception: an Arena it replaces is
+// retired, Put sends its slots back to it, and once they are all back its
+// memory is released (see Arena). A retired arena serves nothing again, even
+// if installed again.
 //
 // Align, MinSize and MaxSize keep describing the package's own pool, which fib
 // uses to size what it asks for, and SetRetainedBytes and RetainedBytes apply
@@ -56,12 +66,21 @@ var allocator atomic.Pointer[installed]
 // falls back to the package's own pool, so the retention settings apply to
 // what it cannot serve.
 func SetAllocator(a Allocator) {
-	if a == nil || a == Builtin {
-		allocator.Store(nil)
-		return
+	var next *installed
+	if a != nil && a != Builtin {
+		arena, _ := a.(*Arena)
+		next = &installed{a, arena}
 	}
-	arena, _ := a.(*Arena)
-	allocator.Store(&installed{a, arena})
+	setMu.Lock()
+	defer setMu.Unlock()
+	// The arena is retired before it is replaced, not after: from the swap
+	// on, its slots are Put through whatever is installed, which must find
+	// it on the retired list rather than keep them. Until the swap it serves
+	// nothing, so Get goes to the pool.
+	if prev := allocator.Load(); prev != nil && prev.arena != nil && (next == nil || next.arena != prev.arena) {
+		prev.arena.retire()
+	}
+	allocator.Store(next)
 }
 
 // Builtin is the package's own pool as an Allocator. Its Get and Put go to that

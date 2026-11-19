@@ -7,7 +7,11 @@ import (
 	"unsafe"
 )
 
-var procVirtualAlloc = syscall.NewLazyDLL("kernel32.dll").NewProc("VirtualAlloc")
+var (
+	modKernel32      = syscall.NewLazyDLL("kernel32.dll")
+	procVirtualAlloc = modKernel32.NewProc("VirtualAlloc")
+	procVirtualFree  = modKernel32.NewProc("VirtualFree")
+)
 
 // arenaMemory reserves and commits n bytes outside the Go heap with
 // VirtualAlloc, so the arena counts towards neither GOGC's goal nor
@@ -24,4 +28,12 @@ func arenaMemory(n int) ([]byte, bool) {
 		}
 	}
 	return make([]byte, n), false
+}
+
+// arenaRelease frees what arenaMemory reserved.
+func arenaRelease(b []byte) {
+	const memRelease = 0x8000
+	if procVirtualFree.Find() == nil {
+		procVirtualFree.Call(uintptr(unsafe.Pointer(unsafe.SliceData(b))), 0, memRelease)
+	}
 }

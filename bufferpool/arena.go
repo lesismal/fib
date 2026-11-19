@@ -40,16 +40,19 @@ import (
 //
 // What it costs:
 //
-//   - The memory is the arena's for good. By default, on Linux, the BSDs,
-//     macOS and Windows it is mapped outside the Go heap, so it counts towards
-//     neither GOGC's goal nor GOMEMLIMIT: a program that sets GOMEMLIMIT
-//     leaves room for the arena itself, and the mapping is never released.
-//     With ArenaOnHeap, elsewhere, under the race detector (which does not
-//     instrument memory outside the heap), or when the mapping fails, it is
-//     made on the heap: it counts as live heap from the start, raising the
-//     collector's goal by its size, and is freed once nothing refers to it.
-//     Either way the operating system backs a page only once a slot on it has
-//     been used.
+//   - With ArenaMapped, the default, on Linux, the BSDs, macOS and Windows
+//     the memory is mapped outside the Go heap, so it counts towards neither
+//     GOGC's goal nor GOMEMLIMIT: a program that sets GOMEMLIMIT leaves room
+//     for the arena itself. With ArenaHeap, elsewhere, under the race detector
+//     (which does not instrument memory outside the heap), or when the mapping
+//     fails, it is made on the heap: it counts as live heap from the start,
+//     raising the collector's goal by its size. Either way the operating
+//     system backs a page only once a slot on it has been used.
+//   - An arena SetAllocator replaces is retired: it serves nothing more, Put
+//     still takes its slots back whatever is installed, and once every slot
+//     it handed out has come back its memory is released — unmapped, or left
+//     to the collector when it was made on the heap. A slot that is never Put
+//     keeps it from being released. Released says when it has been.
 //   - A slot that is never Put is lost to the arena, since the collector never
 //     takes it back: fib leaves some buffers to the collector rather than
 //     returning them (docs/bufferpool-allocator.md lists where), and each one
@@ -70,11 +73,45 @@ type Arena struct {
 	lost  atomic.Int64
 	// mapped is set when mem was mapped outside the Go heap.
 	mapped bool
+
+	// state is arenaActive until SetAllocator replaces the arena; see retire.
+	state atomic.Int32
+	// outstanding is how many slots are out, counted once the arena has
+	// quiesced, and counted down as they come back.
+	outstanding atomic.Int64
+	// retireMu orders a retired arena's lost slots with quiesce's count.
+	retireMu sync.Mutex
 }
+
+// An arena's states. Active serves and takes back slots. Retiring serves
+// nothing and waits for Get and Put that began before it to finish. Quiesced
+// has counted the slots still out and counts them down as they come back.
+// Released has given its memory back.
+const (
+	arenaActive int32 = iota
+	arenaRetiring
+	arenaQuiesced
+	arenaReleased
+)
+
+// ArenaMemory is where NewArena and NewArenaBytes make an arena's memory.
+type ArenaMemory uint8
+
+const (
+	// ArenaMapped maps the memory outside the Go heap where the platform
+	// allows it (Linux, the BSDs and macOS with mmap, Windows with
+	// VirtualAlloc), and makes it on the heap elsewhere, under the race
+	// detector, or when the mapping fails. It is the zero value.
+	ArenaMapped ArenaMemory = iota
+	// ArenaHeap makes the memory one []byte on the Go heap.
+	ArenaHeap
+)
 
 type arenaClass struct {
 	start, end uintptr
 	count      int
+	// freshMu orders takeFresh with quiesce's count.
+	freshMu sync.Mutex
 	// fresh is how many slots, from index 0 up, have been handed out at least
 	// once; the ones past it have never been out and are in no depot. It runs
 	// past count once they all have.
@@ -133,7 +170,7 @@ func procPin() int
 //go:linkname procUnpin runtime.procUnpin
 func procUnpin()
 
-// DefaultArenaBytes is the size of the arena NewArena(nil) makes: an eighth
+// DefaultArenaBytes is the size of the arena NewArena(nil, ArenaMapped) makes: an eighth
 // of the memory the process may use (see SetRetainedPercent), at least 32 MiB
 // and at most MaxDefaultArenaBytes, 1 GiB.
 func DefaultArenaBytes() int {
@@ -226,48 +263,25 @@ func ArenaCounts(total int, weights ArenaWeights) map[int]int {
 	return counts
 }
 
-// ArenaOption changes how NewArena and NewArenaBytes make an arena.
-type ArenaOption func(*arenaOptions)
-
-type arenaOptions struct {
-	onHeap bool
-}
-
-// ArenaOnHeap makes the arena's memory on the Go heap, as one []byte, rather
-// than mapping it outside the heap, which is the default where the platform
-// allows it (see OutsideHeap). On the heap the arena counts as live heap from
-// the start, so towards GOGC's goal and GOMEMLIMIT, and the collector frees
-// it once nothing refers to it any more: once another allocator is installed
-// and no slot of it is still held. A mapped arena is kept for the program's
-// life.
-func ArenaOnHeap() ArenaOption {
-	return func(o *arenaOptions) { o.onHeap = true }
-}
-
 // NewArenaBytes makes an Arena of about total bytes, split between classes
-// by weights as ArenaCounts splits it; nil weights are ArenaWeightsServer. A
-// total of zero or less is DefaultArenaBytes.
-func NewArenaBytes(total int, weights ArenaWeights, opts ...ArenaOption) (*Arena, error) {
+// by weights as ArenaCounts splits it, with its memory where memory says;
+// nil weights are ArenaWeightsServer. A total of zero or less is
+// DefaultArenaBytes.
+func NewArenaBytes(total int, weights ArenaWeights, memory ArenaMemory) (*Arena, error) {
 	if total <= 0 {
 		total = DefaultArenaBytes()
 	}
-	return NewArena(ArenaCounts(total, weights), opts...)
+	return NewArena(ArenaCounts(total, weights), memory)
 }
 
 // NewArena makes an Arena with counts[size] slots of each size, rounded up to
 // its class; sizes of two or more requests that round to one class add up.
 // Sizes above MaxSize and counts of zero or less are left out. A nil or empty
 // map makes the default arena: DefaultArenaBytes, split by
-// ArenaWeightsServer. It returns an error when
-// the arena would not fit in an int, or a class would have more than 2^32-1
-// slots.
-func NewArena(counts map[int]int, opts ...ArenaOption) (*Arena, error) {
-	var o arenaOptions
-	for _, opt := range opts {
-		if opt != nil {
-			opt(&o)
-		}
-	}
+// ArenaWeightsServer. Its memory is where memory says. It returns an error
+// when the arena would not fit in an int, or a class would have more than
+// 2^32-1 slots.
+func NewArena(counts map[int]int, memory ArenaMemory) (*Arena, error) {
 	if len(counts) == 0 {
 		counts = ArenaCounts(DefaultArenaBytes(), nil)
 	}
@@ -291,7 +305,7 @@ func NewArena(counts map[int]int, opts ...ArenaOption) (*Arena, error) {
 	}
 	a := &Arena{local: make([]arenaLocal, max(runtime.GOMAXPROCS(0), runtime.NumCPU()))}
 	if total > 0 {
-		if o.onHeap {
+		if memory == ArenaHeap {
 			a.mem = make([]byte, total)
 		} else {
 			a.mem, a.mapped = arenaMemory(int(total))
@@ -355,9 +369,14 @@ func (a *Arena) Free(size int) int {
 }
 
 // OutsideHeap says whether the arena's memory was mapped outside the Go heap
-// (see the Arena type) rather than made on it, as ArenaOnHeap asks for and as
+// (see the Arena type) rather than made on it, as ArenaHeap asks for and as
 // it is where mapping is not available.
 func (a *Arena) OutsideHeap() bool { return a.mapped }
+
+// Released says whether the arena has given its memory back, which it does
+// once SetAllocator has replaced it and every slot it handed out has come
+// back.
+func (a *Arena) Released() bool { return a.state.Load() == arenaReleased }
 
 // Lost is how many slots Put could not take back because the slice it was
 // given does not start at a slot.
@@ -406,12 +425,19 @@ func (a *Arena) slot(i int, idx uint32) []byte {
 func (a *Arena) get(i int) []byte {
 	if raceEnabled {
 		var one [1]uint32
-		if a.cls[i].pop(one[:]) == 0 {
+		if a.pop(i, one[:]) == 0 {
 			return nil
 		}
 		return a.slot(i, one[0])
 	}
 	pid := procPin()
+	// Read pinned: retire waits out every pinned section that began before
+	// the state changed, so one that sees it active finishes before the
+	// slots out are counted.
+	if a.state.Load() != arenaActive {
+		procUnpin()
+		return nil
+	}
 	if pid < len(a.local) {
 		m := &a.local[pid].m[i]
 		if m.n > 0 {
@@ -430,7 +456,7 @@ func (a *Arena) get(i int) []byte {
 // since a pinned goroutine must not block.
 func (a *Arena) getSlow(i int) []byte {
 	var batch [magBatch]uint32
-	n := a.cls[i].pop(batch[:])
+	n := a.pop(i, batch[:])
 	if n == 0 {
 		return nil
 	}
@@ -438,7 +464,10 @@ func (a *Arena) getSlow(i int) []byte {
 	idx := batch[n]
 	if n > 0 {
 		pid := procPin()
-		if pid < len(a.local) {
+		// The batch left the depots before the arena may have been retired;
+		// once it has, the per-P stacks are counted and the rest goes back
+		// through push.
+		if pid < len(a.local) && a.state.Load() == arenaActive {
 			m := &a.local[pid].m[i]
 			k := min(n, magSize-m.n)
 			copy(m.s[m.n:], batch[n-k:n])
@@ -447,7 +476,7 @@ func (a *Arena) getSlow(i int) []byte {
 		}
 		procUnpin()
 		if n > 0 {
-			a.cls[i].push(batch[:n])
+			a.push(i, batch[:n])
 		}
 	}
 	return a.slot(i, idx)
@@ -462,20 +491,26 @@ func (a *Arena) put(off uintptr, capacity int) {
 		i++
 	}
 	if i == numClasses || a.cls[i].count == 0 || off < a.cls[i].start {
-		a.lost.Add(1)
+		a.putLost()
 		return
 	}
 	rel := off - a.cls[i].start
 	if rel&uintptr(classSize(i)-1) != 0 {
-		a.lost.Add(1)
+		a.putLost()
 		return
 	}
 	idx := uint32(rel >> (uint(i) + minShift))
 	if raceEnabled {
-		a.cls[i].push([]uint32{idx})
+		a.push(i, []uint32{idx})
 		return
 	}
 	pid := procPin()
+	if a.state.Load() != arenaActive {
+		// Retired: past the per-P stacks, which quiesce counts once.
+		procUnpin()
+		a.push(i, []uint32{idx})
+		return
+	}
 	if pid < len(a.local) {
 		m := &a.local[pid].m[i]
 		if m.n < magSize {
@@ -489,14 +524,36 @@ func (a *Arena) put(off uintptr, capacity int) {
 		copy(batch[:], m.s[m.n:m.n+magBatch])
 		batch[magBatch] = idx
 		procUnpin()
-		a.cls[i].push(batch[:])
+		a.push(i, batch[:])
 		return
 	}
 	procUnpin()
-	a.cls[i].push([]uint32{idx})
+	a.push(i, []uint32{idx})
 }
 
-func (c *arenaClass) pop(out []uint32) int {
+// putLost counts a slot Put could not take back. Once the arena has quiesced
+// it still came back, so it counts down what is out.
+func (a *Arena) putLost() {
+	if a.state.Load() == arenaActive {
+		a.lost.Add(1)
+		return
+	}
+	a.retireMu.Lock()
+	quiesced := a.state.Load() >= arenaQuiesced
+	if !quiesced {
+		a.lost.Add(1)
+	}
+	a.retireMu.Unlock()
+	if quiesced {
+		a.returned(1)
+	}
+}
+
+// pop takes up to len(out) free slots of class i: from the depots, or ones
+// never out. A retired arena gives none: its depot locks order that with
+// quiesce's count.
+func (a *Arena) pop(i int, out []uint32) int {
+	c := &a.cls[i]
 	// Unsigned, so that the shard stays in range where int is 32 bits.
 	start := rand.Uint32()
 	for k := range uint32(depotShards) {
@@ -505,6 +562,10 @@ func (c *arenaClass) pop(out []uint32) int {
 			continue
 		}
 		d.mu.Lock()
+		if a.state.Load() != arenaActive {
+			d.mu.Unlock()
+			return 0
+		}
 		n := min(len(out), len(d.free))
 		copy(out, d.free[len(d.free)-n:])
 		d.free = d.free[:len(d.free)-n]
@@ -514,33 +575,185 @@ func (c *arenaClass) pop(out []uint32) int {
 			return n
 		}
 	}
-	return c.takeFresh(out)
+	return a.takeFresh(i, out)
 }
 
 // takeFresh hands out slots that have never been out, up to len(out), once
 // the depots have none. Taking from the depots first keeps a program on the
 // slots it has touched, so the system backs pages only as the working set
 // grows.
-func (c *arenaClass) takeFresh(out []uint32) int {
+func (a *Arena) takeFresh(i int, out []uint32) int {
+	c := &a.cls[i]
 	if c.fresh.Load() >= uint64(c.count) {
 		return 0
 	}
-	k := uint64(len(out))
-	first := c.fresh.Add(k) - k
+	c.freshMu.Lock()
+	defer c.freshMu.Unlock()
+	if a.state.Load() != arenaActive {
+		return 0
+	}
+	first := c.fresh.Load()
 	if first >= uint64(c.count) {
 		return 0
 	}
-	n := int(min(k, uint64(c.count)-first))
+	n := int(min(uint64(len(out)), uint64(c.count)-first))
 	for j := range n {
 		out[j] = uint32(first) + uint32(j)
 	}
+	c.fresh.Store(first + uint64(n))
 	return n
 }
 
-func (c *arenaClass) push(in []uint32) {
-	d := &c.depot[rand.Uint32()%depotShards]
+// push gives slots of class i back to a depot. Once the arena has quiesced
+// they count down what is out instead: the depot lock orders that with
+// quiesce, which holds every one while it counts.
+func (a *Arena) push(i int, in []uint32) {
+	d := &a.cls[i].depot[rand.Uint32()%depotShards]
 	d.mu.Lock()
+	if a.state.Load() >= arenaQuiesced {
+		d.mu.Unlock()
+		a.returned(len(in))
+		return
+	}
 	d.free = append(d.free, in...)
 	d.n.Store(int64(len(d.free)))
 	d.mu.Unlock()
+}
+
+// retire stops the arena serving and, once Get and Put that began before
+// have finished, counts the slots still out; see quiesce.
+func (a *Arena) retire() {
+	if !a.state.CompareAndSwap(arenaActive, arenaRetiring) {
+		return
+	}
+	addRetired(a)
+	go a.quiesce()
+}
+
+// quiesce waits until no Get or Put that saw the arena active can still be
+// using its per-P stacks, then counts the slots out: handed out, less those
+// free in the depots and per-P stacks, less those Put back but lost.
+//
+// A pinned section cannot be preempted, and a collection stops the world,
+// which waits for every running one to end: after runtime.GC returns, each
+// pinned section is either finished or began after the state changed and so
+// left the arena alone. The depot and fresh locks, all held while counting,
+// order the unpinned paths: pop and takeFresh give nothing once retired, and
+// push counts down instead of filling a depot once quiesced.
+func (a *Arena) quiesce() {
+	runtime.GC()
+	a.retireMu.Lock()
+	for i := range a.cls {
+		a.cls[i].freshMu.Lock()
+		for s := range a.cls[i].depot {
+			a.cls[i].depot[s].mu.Lock()
+		}
+	}
+	out := -a.lost.Load()
+	for i := range a.cls {
+		c := &a.cls[i]
+		out += int64(min(c.fresh.Load(), uint64(c.count)))
+		for s := range c.depot {
+			out -= int64(len(c.depot[s].free))
+			c.depot[s].free = nil
+			c.depot[s].n.Store(0)
+		}
+		for p := range a.local {
+			out -= int64(a.local[p].m[i].n)
+			a.local[p].m[i].n = 0
+		}
+	}
+	a.outstanding.Store(out)
+	a.state.Store(arenaQuiesced)
+	for i := range a.cls {
+		for s := range a.cls[i].depot {
+			a.cls[i].depot[s].mu.Unlock()
+		}
+		a.cls[i].freshMu.Unlock()
+	}
+	a.retireMu.Unlock()
+	if out <= 0 {
+		a.release()
+	}
+}
+
+// returned counts down n slots that came back to a quiesced arena, and
+// releases it when the last one has.
+func (a *Arena) returned(n int) {
+	if a.outstanding.Add(-int64(n)) == 0 {
+		a.release()
+	}
+}
+
+// release gives the memory back: unmaps it, or drops it from the retired
+// list so that the collector can free it once nothing else refers to it.
+func (a *Arena) release() {
+	if !a.state.CompareAndSwap(arenaQuiesced, arenaReleased) {
+		return
+	}
+	removeRetired(a)
+	if a.mapped {
+		arenaRelease(a.mem)
+	}
+	log.Info("fib: bufferpool arena released", "bytes", a.size, "outsideHeap", a.mapped)
+}
+
+// retired lists the arenas SetAllocator replaced that still have slots out,
+// so that Put sends those slots back to them whatever is installed. It is
+// nil while there are none, which keeps Put's check to one load.
+var (
+	retired   atomic.Pointer[[]*Arena]
+	retiredMu sync.Mutex
+)
+
+func addRetired(a *Arena) {
+	retiredMu.Lock()
+	defer retiredMu.Unlock()
+	var list []*Arena
+	if p := retired.Load(); p != nil {
+		list = append(list, *p...)
+	}
+	list = append(list, a)
+	retired.Store(&list)
+}
+
+func removeRetired(a *Arena) {
+	retiredMu.Lock()
+	defer retiredMu.Unlock()
+	p := retired.Load()
+	if p == nil {
+		return
+	}
+	var list []*Arena
+	for _, r := range *p {
+		if r != a {
+			list = append(list, r)
+		}
+	}
+	if len(list) == 0 {
+		retired.Store(nil)
+		return
+	}
+	retired.Store(&list)
+}
+
+// putRetired gives buf back to the retired arena it came from, if any, and
+// says whether it did.
+func putRetired(buf []byte) bool {
+	p := retired.Load()
+	if p == nil {
+		return false
+	}
+	capacity := cap(buf)
+	if capacity < MinSize || capacity > MaxSize {
+		return false
+	}
+	addr := uintptr(unsafe.Pointer(unsafe.SliceData(buf)))
+	for _, a := range *p {
+		if off := addr - a.base; off < a.size {
+			a.put(off, capacity)
+			return true
+		}
+	}
+	return false
 }

@@ -236,18 +236,21 @@ Get+Put 是 10 次的中位数。目标学到之后，一波请求经过的 GC �
 
 ## 7. arena allocator
 
-池和它的储备能跨 GC 保住工作集，但每个 buffer 仍是一个独立对象：每次 GC 都要逐个标记，第 6 节的模拟器每 400 毫秒就强制一次。`Arena` 换了一条路：一整块不含指针的内存，按档切成固定槽位，程序整个生命周期都留着；空闲槽位只记下标（`uint32`），每个 P 每档一个 64 个槽位的栈，固定 P 后无锁存取，超出后以 32 个一批和 8 个带锁的共享栈交换。某档没有空闲槽位或根本没有槽位时由包内默认池供应，`Put` 也把不是槽位的 buffer 交给默认池。它是一个 `Allocator`，用 `SetAllocator` 装上；默认仍是包内原来的池。
+池和它的储备能跨 GC 保住工作集，但每个 buffer 仍是一个独立对象：每次 GC 都要逐个标记，第 6 节的模拟器每 400 毫秒就强制一次。`Arena` 换了一条路：一整块不含指针的内存，按档切成固定槽位，一直留到被别的分配器替换；空闲槽位只记下标（`uint32`），从没发出过的槽位不记：每档记一个已发出槽位数，共享栈空了才从这个计数往后取，所以记下的下标随程序用过的槽位增长，而不随 arena 大小增长（按 `ArenaWeightsMessages` 分的 6.3 GiB arena 有 1800 万个槽位，预先建好全部下标要 72 MB、40–55 毫秒）；每个 P 每档一个 64 个槽位的栈，固定 P 后无锁存取，超出后以 32 个一批和 8 个带锁的共享栈交换。某档没有空闲槽位或根本没有槽位时由包内默认池供应，`Put` 也把不是槽位的 buffer 交给默认池。它是一个 `Allocator`，用 `SetAllocator` 装上；默认仍是包内原来的池。
 
 ```go
-arena, err := bufferpool.NewArena(nil)                                     // 可用内存的 1/8，按 ArenaWeightsServer 分
-arena, err := bufferpool.NewArenaBytes(2<<30, bufferpool.ArenaWeightsStreaming()) // 总大小，按权重分
-arena, err := bufferpool.NewArena(map[int]int{1024: 300000})                 // 逐档指定槽位数
+arena, err := bufferpool.NewArena(nil, bufferpool.ArenaMapped)                         // 可用内存的 1/8，最多 1 GiB，按 ArenaWeightsServer 分
+arena, err := bufferpool.NewArenaBytes(2<<30, bufferpool.ArenaWeightsStreaming(), bufferpool.ArenaMapped) // 总大小，按权重分
+arena, err := bufferpool.NewArena(map[int]int{1024: 300000}, bufferpool.ArenaMapped)     // 逐档指定槽位数
+arena, err := bufferpool.NewArenaBytes(0, nil, bufferpool.ArenaHeap)                    // 放在 Go 堆上，不做映射
 bufferpool.SetAllocator(arena)
 ```
 
-- **大小。** 默认是进程可用内存的 1/8，32 MiB 到 16 GiB，与默认池的预算一样。`NewArenaBytes(total, weights)` 按 `ArenaWeights`（档大小 → 权重）把总大小分给各档；`ArenaCounts` 返回分法。
+- **大小。** 默认是进程可用内存的 1/8，32 MiB 到 1 GiB（`MaxDefaultArenaBytes`）。上限是为了不让大内存机器按内存而不是按程序实际持有量建 arena：61 GiB 的机器上 1/8 是 6.3 GiB、1800 万个槽位，而一个 WebSocket 服务在途的 buffer 只有几百 MB。上限只约束默认值：`NewArenaBytes`、`NewArena` 按给定大小建，可以超过 1 GiB。`NewArenaBytes(total, weights, memory)` 按 `ArenaWeights`（档大小 → 权重）把总大小分给各档；`ArenaCounts` 返回分法。
 - **预设权重。** `ArenaWeightsServer`（默认）按 fib 服务端自己的 buffer：16 KiB 读 buffer 占比最大，其次是 32 KiB（TLS 记录、响应复制）和 64 KiB（流式 body、sendfile、QUIC 发送 buffer），2 KiB 给 QUIC 数据报。`ArenaWeightsMessages` 偏向 64 B 到 4 KiB，`ArenaWeightsStreaming` 偏向 16 到 64 KiB，`ArenaWeightsEven` 让 64 B 到 64 KiB 每档字节数相同。这些都是按 fib 自己的尺寸定的起点，不是对某个程序的实测。
-- **代价。** arena 从一开始就计入活跃堆（GOGC 的目标、GOMEMLIMIT）；系统只在页上的槽位用过之后才分配物理内存。从不 `Put` 的槽位会永久丢失，因为 GC 不会回收它——fib 有些 buffer 本来就交给 GC（第 3 节）；`Put` 一个不从槽位开头开始的切片（`buf[k:]`）也一样。`Lost` 统计后一种，`Free` 能看出两种。race 检测下不走每个 P 的栈，因为检测器看不出固定 P 就保证了独占。
+- **内存放在哪。** 由构造函数最后一个参数决定。`ArenaMapped` 时，Linux、BSD、macOS 上是匿名 `mmap`（Linux 加 `MAP_NORESERVE`），Windows 上是 `VirtualAlloc`：在 Go 堆外，既不计入 GOGC 的目标也不计入 `GOMEMLIMIT`（`OutsideHeap` 可查），设了 `GOMEMLIMIT` 的程序要自己给 arena 留出余量。`ArenaHeap` 则在 Go 堆上建一个 `[]byte`。`ArenaMapped` 在其他平台、映射失败时，以及 race 检测下（检测器不插桩堆外内存），也在堆上建，从一开始就计入活跃堆，把 GC 目标抬高 arena 的大小。两种方式下，系统都只在页上的槽位用过之后才分配物理内存。
+- **切换与释放。** `SetAllocator` 会把被替换的 arena 退役，比如把 mmap 的 arena 换成堆上的 arena 或包内默认池。退役的 arena 不再发出槽位，即使再装上也一样；不管当前装的是什么，`Put` 都把它的槽位送回给它，别的分配器不会留下这些槽位。它发出的槽位全部回来后就释放内存：映射的 arena 解除映射（`munmap`、`VirtualFree`），堆上的交给 GC，`Released` 可查。从不 `Put` 的槽位会让 arena 一直不释放，所以仍在使用的 buffer 不会指向已经还给系统的内存。为了数清在外的槽位，它先要等切换前开始的 `Get`、`Put` 离开每个 P 的栈：这些操作在固定 P 下运行，GC 的 stop-the-world 会等它们结束，所以退役的 arena 在后台跑一次 `runtime.GC()`。退役检查给热路径加的开销：已安装 arena 单线程 Get+Put 多 0.45 ns（7.73 到 8.19 ns），16 线程下测不出。
+- **代价。** 从不 `Put` 的槽位会永久丢失，因为 GC 不会回收它——fib 有些 buffer 本来就交给 GC（第 3 节）；`Put` 一个不从槽位开头开始的切片（`buf[k:]`）也一样。`Lost` 统计后一种，`Free` 能看出两种。race 检测下不走每个 P 的栈，因为检测器看不出固定 P 就保证了独占。
 
 ### 结果
 
@@ -267,7 +270,7 @@ bufferpool.SetAllocator(arena)
 | arena，25.6 万槽位 | 0.2% | 2.83 M/s | 3.18–3.19 M/s | 5.7–5.8 s | 302–303 MB |
 | arena，51.2 万槽位 | 0% | 2.84 M/s | 3.17–3.18 M/s | 5.4–5.5 s | 509–557 MB |
 
-默认 arena 的堆峰值显示为 4213 MB：整块 arena 都算活跃堆，但系统实际只分配了用到的 449 MB。
+默认 arena 的堆峰值显示为 4213 MB：当时 arena 建在堆上，整块都算活跃堆，但系统实际只分配了用到的 449 MB。
 
 - **省下的是 GC 的工作量。** 进程 CPU 在 16 线程下降到 1/5，2 线程下降到 1/3：每次强制 GC 只标记一个对象，而不是约 50 万个 buffer；buffer 也不再重新分配（新分配 5.5 千次，池是 51 万次）。
 - **吞吐略有提升：** 波浪吞吐高 4–5%，持续吞吐高 2–3%，没有一波需要重新分配。

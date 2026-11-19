@@ -10,7 +10,7 @@ import (
 
 func newArena(t testing.TB, counts map[int]int) *Arena {
 	t.Helper()
-	a, err := NewArena(counts)
+	a, err := NewArena(counts, ArenaMapped)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -112,7 +112,7 @@ func TestArenaAsTheAllocator(t *testing.T) {
 }
 
 func TestNewArenaRejectsTooMuch(t *testing.T) {
-	if _, err := NewArena(map[int]int{1: math.MaxInt32, 32: math.MaxInt32, 64: math.MaxInt32}); err == nil {
+	if _, err := NewArena(map[int]int{1: math.MaxInt32, 32: math.MaxInt32, 64: math.MaxInt32}, ArenaMapped); err == nil {
 		t.Fatal("a class with more slots than a uint32 can number")
 	}
 	if a := newArena(t, map[int]int{MaxSize + 1: 4, 1024: -1}); a.Bytes() != 0 {
@@ -208,7 +208,7 @@ func TestArenaWeights(t *testing.T) {
 
 func newArenaBytes(t testing.TB, total int, w ArenaWeights) *Arena {
 	t.Helper()
-	a, err := NewArenaBytes(total, w)
+	a, err := NewArenaBytes(total, w, ArenaMapped)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -360,7 +360,7 @@ func TestArenaOutsideHeap(t *testing.T) {
 	a.Put(b)
 	runtime.KeepAlive(a)
 
-	h, err := NewArena(map[int]int{1024: size / 1024}, ArenaOnHeap())
+	h, err := NewArena(map[int]int{1024: size / 1024}, ArenaHeap)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -368,7 +368,7 @@ func TestArenaOutsideHeap(t *testing.T) {
 	var onHeap runtime.MemStats
 	runtime.ReadMemStats(&onHeap)
 	if h.OutsideHeap() {
-		t.Fatal("ArenaOnHeap mapped the arena")
+		t.Fatal("ArenaHeap mapped the arena")
 	}
 	if grew := int64(onHeap.HeapAlloc) - int64(after.HeapAlloc); grew < size-size/16 {
 		t.Fatalf("the heap grew %d bytes for a %d byte arena made on it", grew, size)
@@ -380,7 +380,7 @@ func TestArenaOutsideHeap(t *testing.T) {
 }
 
 func TestArenaBytesOnHeap(t *testing.T) {
-	a, err := NewArenaBytes(4<<20, ArenaWeightsMessages(), ArenaOnHeap())
+	a, err := NewArenaBytes(4<<20, ArenaWeightsMessages(), ArenaHeap)
 	if err != nil {
 		t.Fatal(err)
 	}

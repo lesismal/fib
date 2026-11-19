@@ -15,3 +15,8 @@ func arenaMemory(n int) ([]byte, bool) {
 	}
 	return b, true
 }
+
+// arenaRelease unmaps what arenaMemory mapped.
+func arenaRelease(b []byte) {
+	_ = syscall.Munmap(b)
+}

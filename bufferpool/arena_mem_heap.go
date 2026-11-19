@@ -8,3 +8,6 @@ package bufferpool
 func arenaMemory(n int) ([]byte, bool) {
 	return make([]byte, n), false
 }
+
+// arenaRelease has nothing to do: the collector frees the heap.
+func arenaRelease([]byte) {}
