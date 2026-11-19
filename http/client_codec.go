@@ -289,7 +289,9 @@ func fastFramedRequest(req *stdhttp.Request, body []byte, http10 bool, fields []
 		dst = appendCollectedFields(dst, collected)
 	}
 	dst = append(dst, "\r\n"...)
-	return append(dst, body...), true
+	dst = append(dst, body...)
+	putIfMoved(buf, dst)
+	return dst, true
 }
 
 // fastStreamedHead is the start of marshalStreamedHead's head, without its

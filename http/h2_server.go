@@ -18,6 +18,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+	"unsafe"
 
 	fib "github.com/lesismal/fib"
 	"github.com/lesismal/fib/bufferpool"
@@ -498,6 +499,18 @@ func (sc *h2ServerConn) sendPooledLocked(out []byte) {
 	}
 	bufferpool.Put(out)
 	sc.armDrainLocked()
+}
+
+// putIfMoved gives first, a buffer from the pool, back when out, built on it
+// by appending, no longer uses it: an append past the size worked out for
+// it moved out to an array of its own. out is what goes on, and is given
+// back where it is sent; first would otherwise be left to the collector,
+// which an allocator that cannot take a buffer back, such as Arena, does
+// not get back at all.
+func putIfMoved(first, out []byte) {
+	if cap(first) > 0 && (cap(out) == 0 || unsafe.SliceData(first[:1]) != unsafe.SliceData(out[:1])) {
+		bufferpool.Put(first)
+	}
 }
 
 // sendPooledPartsLocked sends first, a buffer from the pool, and second
@@ -2156,9 +2169,10 @@ func (sc *h2ServerConn) answerLocked(r *h2Answer) error {
 		// A layer such as TLS seals what it is given in one copy anyway, and
 		// is left the single buffer it had.
 		size := len(block) + h2FrameHeaderLen*(1+len(block)/sc.peerMaxFrame) + h2FrameHeaderLen
-		out := bufferpool.Get(size)[:0]
-		out = h2AppendHeaderBlock(out, st.id, block, false, sc.peerMaxFrame)
+		first := bufferpool.Get(size)[:0]
+		out := h2AppendHeaderBlock(first, st.id, block, false, sc.peerMaxFrame)
 		out = h2AppendFrameHeader(out, h2FrameData, h2FlagEndStream, st.id, len(body))
+		putIfMoved(first, out)
 		sc.keepHeaderBlockLocked(block)
 		sc.sendWindow -= sendable
 		st.sendWindow -= sendable
@@ -2181,8 +2195,8 @@ func (sc *h2ServerConn) answerLocked(r *h2Answer) error {
 			size += int(sendable)
 		}
 	}
-	out := bufferpool.Get(size)[:0]
-	out = h2AppendHeaderBlock(out, st.id, block, len(body) == 0 && st.trailer == nil, sc.peerMaxFrame)
+	first := bufferpool.Get(size)[:0]
+	out := h2AppendHeaderBlock(first, st.id, block, len(body) == 0 && st.trailer == nil, sc.peerMaxFrame)
 	sc.keepHeaderBlockLocked(block)
 	if len(body) == 0 {
 		out = sc.endStreamLocked(out, st)
@@ -2209,6 +2223,7 @@ func (sc *h2ServerConn) answerLocked(r *h2Answer) error {
 		sc.goAway = true
 		out = h2AppendGoAway(out, sc.lastStreamID.Load(), H2NoError, "")
 	}
+	putIfMoved(first, out)
 	sc.sendPooledLocked(out)
 	sc.finishStreamLocked(st)
 	sc.closeFinishedLocked()

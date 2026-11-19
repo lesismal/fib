@@ -213,6 +213,19 @@ func (c *ClientResponse) deliverWhole() {
 	c.taken = int64(len(data))
 	c.mu.Unlock()
 	fn(data, true, nil)
+	// data was fn's for the call only: a pooled body nothing else was handed
+	// goes back now.
+	c.mu.Lock()
+	w := c.whole
+	put := w != nil && w.pooled
+	if put {
+		w.pooled = false
+	}
+	c.mu.Unlock()
+	if put {
+		bufferpool.Put(w.data)
+		w.data, w.off = nil, 0
+	}
 }
 
 // BodyBytes returns the body of a response that arrived whole, what of it
@@ -228,6 +241,11 @@ func (c *ClientResponse) BodyBytes() ([]byte, bool) {
 	}
 	switch body := c.Response.Body; {
 	case c.whole != nil:
+		// The bytes are the caller's for as long as it keeps them: Close
+		// leaves them to the collector rather than give them back.
+		c.mu.Lock()
+		c.whole.pooled = false
+		c.mu.Unlock()
 		return c.whole.data[c.whole.off:], true
 	case body == nil || body == stdhttp.NoBody:
 		return nil, true
@@ -311,9 +329,10 @@ func (c *ClientResponse) Close() {
 type bufferedBody struct {
 	data []byte
 	off  int
-	// pooled says data is a buffer from package bufferpool, which TakeBody
-	// can hand over for the caller to give back. Left to the collector
-	// otherwise, as Body and BodyBytes leave it.
+	// pooled says data is a buffer from package bufferpool that nothing
+	// outside has been handed: TakeBody hands it over for the caller to give
+	// back, Close gives it back, and BodyBytes, which hands it out for as
+	// long as the caller keeps it, clears it, leaving it to the collector.
 	pooled bool
 }
 
@@ -326,7 +345,15 @@ func (b *bufferedBody) Read(p []byte) (int, error) {
 	return n, nil
 }
 
-func (b *bufferedBody) Close() error { return nil }
+// Close gives a pooled body back to the pool, which Read has only ever
+// copied from; Read finds the body ended after it, as it would have.
+func (b *bufferedBody) Close() error {
+	if b.pooled {
+		bufferpool.Put(b.data)
+		b.data, b.off, b.pooled = nil, 0, false
+	}
+	return nil
+}
 
 // StreamHooks ties a ResponseStream to the request it answers, which is the
 // transport's own.

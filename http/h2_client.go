@@ -1164,6 +1164,12 @@ func (hc *h2ClientConn) handleHeaderBlock(id uint32, block []byte, endStream boo
 	// stream is reset once the response is complete (see complete).
 	st.gate.Shut()
 	st.r.headerArrived()
+	// The request went out as HTTP/2 frames, not in the HTTP/1 framing built
+	// for it before the connection was known; that goes back with the
+	// answer, as it does when HTTP/1 carries it.
+	if st.r.answered.CompareAndSwap(false, true) {
+		st.r.releaseData()
+	}
 	config := &hc.client.config
 	streams := config.StreamResponseBody && !st.r.whole && !endStream && bodyAllowed(st.r.req, resp.StatusCode) &&
 		!(resp.ContentLength >= 0 && resp.ContentLength <= max(config.StreamResponseBodyThreshold, 0))

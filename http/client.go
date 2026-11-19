@@ -509,6 +509,9 @@ func (c *Client) doFramed(req *stdhttp.Request, callback func(*ClientResponse, e
 		// not read into a copy: HTTP/1 copies it into data below, and HTTP/2,
 		// which would send it by reference later, copies it then (borrowed).
 		body, borrowed = b.data[b.off:], true
+		// A response's pooled body passed on as this request's is borrowed
+		// from here on: its Close must not give it back under the send.
+		b.pooled = false
 	} else if req.Body != nil && req.Body != stdhttp.NoBody {
 		body, err = readWhole(req.Body, req.ContentLength)
 		_ = req.Body.Close()
