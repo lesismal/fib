@@ -40,14 +40,16 @@ import (
 //
 // What it costs:
 //
-//   - The memory is the arena's for good. On Linux, the BSDs, macOS and
-//     Windows it is mapped outside the Go heap, so it counts towards neither
-//     GOGC's goal nor GOMEMLIMIT: a program that sets GOMEMLIMIT leaves room
-//     for the arena itself. Elsewhere, under the race detector (which does not
+//   - The memory is the arena's for good. By default, on Linux, the BSDs,
+//     macOS and Windows it is mapped outside the Go heap, so it counts towards
+//     neither GOGC's goal nor GOMEMLIMIT: a program that sets GOMEMLIMIT
+//     leaves room for the arena itself, and the mapping is never released.
+//     With ArenaOnHeap, elsewhere, under the race detector (which does not
 //     instrument memory outside the heap), or when the mapping fails, it is
-//     made on the heap and counts as live heap from the start. Either way the
-//     operating system backs a page only once a slot on it has been used, and
-//     does not get it back after.
+//     made on the heap: it counts as live heap from the start, raising the
+//     collector's goal by its size, and is freed once nothing refers to it.
+//     Either way the operating system backs a page only once a slot on it has
+//     been used.
 //   - A slot that is never Put is lost to the arena, since the collector never
 //     takes it back: fib leaves some buffers to the collector rather than
 //     returning them (docs/bufferpool-allocator.md lists where), and each one
@@ -224,14 +226,32 @@ func ArenaCounts(total int, weights ArenaWeights) map[int]int {
 	return counts
 }
 
+// ArenaOption changes how NewArena and NewArenaBytes make an arena.
+type ArenaOption func(*arenaOptions)
+
+type arenaOptions struct {
+	onHeap bool
+}
+
+// ArenaOnHeap makes the arena's memory on the Go heap, as one []byte, rather
+// than mapping it outside the heap, which is the default where the platform
+// allows it (see OutsideHeap). On the heap the arena counts as live heap from
+// the start, so towards GOGC's goal and GOMEMLIMIT, and the collector frees
+// it once nothing refers to it any more: once another allocator is installed
+// and no slot of it is still held. A mapped arena is kept for the program's
+// life.
+func ArenaOnHeap() ArenaOption {
+	return func(o *arenaOptions) { o.onHeap = true }
+}
+
 // NewArenaBytes makes an Arena of about total bytes, split between classes
 // by weights as ArenaCounts splits it; nil weights are ArenaWeightsServer. A
 // total of zero or less is DefaultArenaBytes.
-func NewArenaBytes(total int, weights ArenaWeights) (*Arena, error) {
+func NewArenaBytes(total int, weights ArenaWeights, opts ...ArenaOption) (*Arena, error) {
 	if total <= 0 {
 		total = DefaultArenaBytes()
 	}
-	return NewArena(ArenaCounts(total, weights))
+	return NewArena(ArenaCounts(total, weights), opts...)
 }
 
 // NewArena makes an Arena with counts[size] slots of each size, rounded up to
@@ -241,7 +261,13 @@ func NewArenaBytes(total int, weights ArenaWeights) (*Arena, error) {
 // ArenaWeightsServer. It returns an error when
 // the arena would not fit in an int, or a class would have more than 2^32-1
 // slots.
-func NewArena(counts map[int]int) (*Arena, error) {
+func NewArena(counts map[int]int, opts ...ArenaOption) (*Arena, error) {
+	var o arenaOptions
+	for _, opt := range opts {
+		if opt != nil {
+			opt(&o)
+		}
+	}
 	if len(counts) == 0 {
 		counts = ArenaCounts(DefaultArenaBytes(), nil)
 	}
@@ -265,7 +291,11 @@ func NewArena(counts map[int]int) (*Arena, error) {
 	}
 	a := &Arena{local: make([]arenaLocal, max(runtime.GOMAXPROCS(0), runtime.NumCPU()))}
 	if total > 0 {
-		a.mem, a.mapped = arenaMemory(int(total))
+		if o.onHeap {
+			a.mem = make([]byte, total)
+		} else {
+			a.mem, a.mapped = arenaMemory(int(total))
+		}
 		a.base = uintptr(unsafe.Pointer(unsafe.SliceData(a.mem)))
 		a.size = uintptr(total)
 	}
@@ -325,7 +355,8 @@ func (a *Arena) Free(size int) int {
 }
 
 // OutsideHeap says whether the arena's memory was mapped outside the Go heap
-// (see the Arena type) rather than made on it.
+// (see the Arena type) rather than made on it, as ArenaOnHeap asks for and as
+// it is where mapping is not available.
 func (a *Arena) OutsideHeap() bool { return a.mapped }
 
 // Lost is how many slots Put could not take back because the slice it was
