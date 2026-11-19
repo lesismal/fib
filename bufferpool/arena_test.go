@@ -280,3 +280,45 @@ func BenchmarkArenaInstalledGetPutParallel(b *testing.B) {
 		}
 	})
 }
+
+// A new arena keeps no index for a slot that has never been out: those come
+// from the class's count of slots handed out, each once, and only the slots
+// that come back are kept in the depots.
+func TestArenaHandsOutUnusedSlotsOnce(t *testing.T) {
+	const n = 1000
+	a := newArena(t, map[int]int{1024: n})
+	c := &a.cls[classUp(1024)]
+	for s := range c.depot {
+		if cap(c.depot[s].free) != 0 {
+			t.Fatalf("depot %d holds room for %d indexes before any slot was out", s, cap(c.depot[s].free))
+		}
+	}
+	if a.Free(1024) != n {
+		t.Fatalf("free %d in a new arena", a.Free(1024))
+	}
+	seen := map[uintptr]bool{}
+	var out [][]byte
+	for range n {
+		b := a.Get(1024)
+		p := uintptr(unsafe.Pointer(unsafe.SliceData(b)))
+		if !a.holds(b) || seen[p] {
+			t.Fatalf("slot %#x from the arena %v, handed out before %v", p-a.base, a.holds(b), seen[p])
+		}
+		seen[p] = true
+		out = append(out, b)
+	}
+	if b := a.Get(1024); a.holds(b) || a.Free(1024) != 0 {
+		t.Fatalf("past the last slot: from the arena %v, free %d", a.holds(b), a.Free(1024))
+	}
+	for _, b := range out[:n/2] {
+		a.Put(b)
+	}
+	if a.Free(1024) != n/2 {
+		t.Fatalf("free %d after half came back", a.Free(1024))
+	}
+	for range n / 2 {
+		if b := a.Get(1024); !a.holds(b) {
+			t.Fatal("a returned slot was not served again")
+		}
+	}
+}
