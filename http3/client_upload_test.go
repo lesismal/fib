@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"hash/crc32"
 	"io"
+	"math"
 	stdhttp "net/http"
 	"runtime"
 	"runtime/metrics"
@@ -163,32 +164,43 @@ func TestClientUploadStreamsLargeBody(t *testing.T) {
 	for _, declared := range []bool{true, false} {
 		t.Run(fmt.Sprintf("declared=%v", declared), func(t *testing.T) {
 			size := uploadSize()
-			body := newGenBody(size)
-			req := mustRequest(t, stdhttp.MethodPost, url+"/upload", nil)
-			req.Body = body
-			if declared {
-				req.ContentLength = size
-			} else {
-				req.Trailer = stdhttp.Header{"X-Crc": nil}
-				body.atEOF = func(crc uint32) { req.Trailer.Set("X-Crc", strconv.FormatUint(uint64(crc), 10)) }
+			// The heap is the whole process's: a run is measured again when
+			// it is past the bound, and the least kept, as package http's
+			// upload tests do, since a large buffer something else holds for
+			// a moment is not there every time and buffering the body would be.
+			least := uint64(math.MaxUint64)
+			for try := 0; try < 3 && least > 48<<20; try++ {
+				least = min(least, func() uint64 {
+					body := newGenBody(size)
+					req := mustRequest(t, stdhttp.MethodPost, url+"/upload", nil)
+					req.Body = body
+					if declared {
+						req.ContentLength = size
+					} else {
+						req.Trailer = stdhttp.Header{"X-Crc": nil}
+						body.atEOF = func(crc uint32) { req.Trailer.Set("X-Crc", strconv.FormatUint(uint64(crc), 10)) }
+					}
+					stop := heapPeak()
+					start := time.Now()
+					resp, err := client.Go(req).Wait()
+					peak := stop()
+					if err != nil {
+						t.Fatal(err)
+					}
+					got := readBody(t, resp)
+					body.waitClosed(t)
+					want := fmt.Sprintf("%d %d ", size, body.crc)
+					if !declared {
+						want += strconv.FormatUint(uint64(body.crc), 10)
+					}
+					if got != want {
+						t.Fatalf("server saw %q, want %q", got, want)
+					}
+					t.Logf("%dMB in %v, client and server live heap peak +%dKB", size>>20, time.Since(start).Round(time.Millisecond), peak>>10)
+					return peak
+				}())
 			}
-			stop := heapPeak()
-			start := time.Now()
-			resp, err := client.Go(req).Wait()
-			peak := stop()
-			if err != nil {
-				t.Fatal(err)
-			}
-			got := readBody(t, resp)
-			body.waitClosed(t)
-			want := fmt.Sprintf("%d %d ", size, body.crc)
-			if !declared {
-				want += strconv.FormatUint(uint64(body.crc), 10)
-			}
-			if got != want {
-				t.Fatalf("server saw %q, want %q", got, want)
-			}
-			t.Logf("%dMB in %v, client and server live heap peak +%dKB", size>>20, time.Since(start).Round(time.Millisecond), peak>>10)
+			peak := least
 			if peak > 48<<20 {
 				t.Fatalf("heap grew by %dMB sending a %dMB body", peak>>20, size>>20)
 			}

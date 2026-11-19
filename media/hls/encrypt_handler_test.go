@@ -5,6 +5,7 @@ package hls
 import (
 	"bytes"
 	"errors"
+	stdhttp "net/http"
 	"strconv"
 	"strings"
 	"testing"
@@ -89,10 +90,19 @@ func TestHandlerEncryption(t *testing.T) {
 		if format != "" {
 			q = "?format=" + format
 		}
-		resp, body := get(t, "GET", base+"live/s/media.m3u8"+q)
-		if resp.StatusCode != 200 {
-			t.Fatal(resp.StatusCode)
-		}
+		// The muxer cuts the segments the writer's media makes as it goes,
+		// and on a slow runner the playlist may have named only the first
+		// key when it is fetched: it is fetched again until it names two.
+		var resp *stdhttp.Response
+		var body string
+		until(t, "a playlist naming two keys", func() bool {
+			resp, body = get(t, "GET", base+"live/s/media.m3u8"+q)
+			if resp.StatusCode != 200 {
+				t.Fatal(resp.StatusCode)
+			}
+			keys, _ := playlistKeys(t, []byte(body))
+			return len(keys) >= 2
+		})
 		m := h.FormatMuxer("live/s", format)
 		if h.SessionMuxer("live/s", m.Session()) != m || h.SessionMuxer("live/x", m.Session()) != nil || h.SessionMuxer("live/s", "x") != nil {
 			t.Fatal("SessionMuxer")
