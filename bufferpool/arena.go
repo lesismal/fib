@@ -17,7 +17,8 @@ import (
 // Install it with SetAllocator: NewArena sets the slots of each class,
 // NewArenaBytes a total it splits between the classes by ArenaWeights (one of
 // the presets, or a program's own), and either one with nothing given makes
-// an eighth of the memory the process may use, split by ArenaWeightsServer.
+// an eighth of the memory the process may use, at most 1 GiB, split by
+// ArenaWeightsServer.
 //
 // It is for a program that holds many buffers across collections — requests
 // queued for seconds while collections come every few hundred milliseconds,
@@ -39,10 +40,14 @@ import (
 //
 // What it costs:
 //
-//   - The memory is the arena's for good. It counts towards the live heap, so
-//     towards GOGC's goal and GOMEMLIMIT, from the start; the operating system
-//     backs a page only once a slot on it has been used, but does not get it
-//     back after.
+//   - The memory is the arena's for good. On Linux, the BSDs, macOS and
+//     Windows it is mapped outside the Go heap, so it counts towards neither
+//     GOGC's goal nor GOMEMLIMIT: a program that sets GOMEMLIMIT leaves room
+//     for the arena itself. Elsewhere, under the race detector (which does not
+//     instrument memory outside the heap), or when the mapping fails, it is
+//     made on the heap and counts as live heap from the start. Either way the
+//     operating system backs a page only once a slot on it has been used, and
+//     does not get it back after.
 //   - A slot that is never Put is lost to the arena, since the collector never
 //     takes it back: fib leaves some buffers to the collector rather than
 //     returning them (docs/bufferpool-allocator.md lists where), and each one
@@ -61,6 +66,8 @@ type Arena struct {
 	// shared stacks.
 	local []arenaLocal
 	lost  atomic.Int64
+	// mapped is set when mem was mapped outside the Go heap.
+	mapped bool
 }
 
 type arenaClass struct {
@@ -100,14 +107,19 @@ const (
 	depotShards = 8
 
 	// DefaultArenaDivisor makes the default arena an eighth of the memory the
-	// process may use, read as the default retention budget reads it, and
-	// bounded the same way. The package's own pool still serves what the
-	// arena cannot, with that budget of its own.
+	// process may use, read as the default retention budget reads it. The
+	// package's own pool still serves what the arena cannot, with that budget
+	// of its own.
 	DefaultArenaDivisor = 8
 	// MinDefaultArenaBytes and MaxDefaultArenaBytes bound the default arena;
 	// MinDefaultArenaBytes is also what it is when the memory cannot be read.
+	// MaxDefaultArenaBytes keeps a large machine from getting an arena sized
+	// to its memory rather than to what a program holds: 1 GiB is 65k 16 KiB
+	// read buffers, or a million 1 KiB messages, out at once, and the pool
+	// serves whatever is past it. It bounds the default only: NewArenaBytes
+	// and NewArena make an arena of any size they are given.
 	MinDefaultArenaBytes = DefaultRetainedBytes
-	MaxDefaultArenaBytes = MaxDefaultRetainedBytes
+	MaxDefaultArenaBytes = 1 << 30
 
 	// maxArenaSlots keeps a slot's index within a uint32.
 	maxArenaSlots = math.MaxUint32
@@ -121,7 +133,7 @@ func procUnpin()
 
 // DefaultArenaBytes is the size of the arena NewArena(nil) makes: an eighth
 // of the memory the process may use (see SetRetainedPercent), at least 32 MiB
-// and at most 16 GiB, as the default retention budget is.
+// and at most MaxDefaultArenaBytes, 1 GiB.
 func DefaultArenaBytes() int {
 	total := int64(MinDefaultArenaBytes)
 	if memory := memoryLimit(); memory > 0 {
@@ -253,7 +265,7 @@ func NewArena(counts map[int]int) (*Arena, error) {
 	}
 	a := &Arena{local: make([]arenaLocal, max(runtime.GOMAXPROCS(0), runtime.NumCPU()))}
 	if total > 0 {
-		a.mem = make([]byte, total)
+		a.mem, a.mapped = arenaMemory(int(total))
 		a.base = uintptr(unsafe.Pointer(unsafe.SliceData(a.mem)))
 		a.size = uintptr(total)
 	}
@@ -264,7 +276,7 @@ func NewArena(counts map[int]int) (*Arena, error) {
 		off += uintptr(n) * uintptr(classSize(i))
 		c.end = off
 	}
-	log.Info("fib: bufferpool arena", "bytes", total, "classes", a.describe())
+	log.Info("fib: bufferpool arena", "bytes", total, "outsideHeap", a.mapped, "classes", a.describe())
 	return a, nil
 }
 
@@ -311,6 +323,10 @@ func (a *Arena) Free(size int) int {
 	}
 	return n
 }
+
+// OutsideHeap says whether the arena's memory was mapped outside the Go heap
+// (see the Arena type) rather than made on it.
+func (a *Arena) OutsideHeap() bool { return a.mapped }
 
 // Lost is how many slots Put could not take back because the slice it was
 // given does not start at a slot.
@@ -450,8 +466,9 @@ func (a *Arena) put(off uintptr, capacity int) {
 }
 
 func (c *arenaClass) pop(out []uint32) int {
-	start := int(rand.Uint32())
-	for k := range depotShards {
+	// Unsigned, so that the shard stays in range where int is 32 bits.
+	start := rand.Uint32()
+	for k := range uint32(depotShards) {
 		d := &c.depot[(start+k)%depotShards]
 		if d.n.Load() == 0 {
 			continue
