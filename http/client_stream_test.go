@@ -68,9 +68,11 @@ func (s *streamRun) run(t *testing.T, client *Client, req *stdhttp.Request) {
 			}
 		})
 	})
+	// Thirty seconds: eight 4 MB downloads at once over TLS took more than
+	// ten on a slow Windows runner, and a run that hangs fails all the same.
 	select {
 	case <-s.done:
-	case <-time.After(10 * time.Second):
+	case <-time.After(30 * time.Second):
 		t.Fatal("timed out waiting for the response")
 	}
 }
