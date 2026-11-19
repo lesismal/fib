@@ -2,6 +2,7 @@ package bufferpool
 
 import (
 	"math"
+	"runtime"
 	"sync"
 	"testing"
 	"unsafe"
@@ -128,10 +129,15 @@ func TestDefaultArenaFollowsTheMemory(t *testing.T) {
 	}{
 		{0, MinDefaultArenaBytes},
 		{128 << 20, MinDefaultArenaBytes},
+		{4 << 30, 512 << 20},
 		{8 << 30, 1 << 30},
+		{64 << 30, MaxDefaultArenaBytes},
 		{512 << 30, MaxDefaultArenaBytes},
 	} {
 		withMemory(t, c.memory)
+		if MaxDefaultArenaBytes != 1<<30 {
+			t.Fatalf("MaxDefaultArenaBytes %d", MaxDefaultArenaBytes)
+		}
 		// A 32-bit int gives the arena at most half its range.
 		want := min(c.want, math.MaxInt/2)
 		if got := DefaultArenaBytes(); int64(got) != want {
@@ -321,4 +327,36 @@ func TestArenaHandsOutUnusedSlotsOnce(t *testing.T) {
 			t.Fatal("a returned slot was not served again")
 		}
 	}
+}
+
+// Where the platform maps it, an arena is outside the Go heap: making one
+// leaves HeapAlloc, and with it GOGC's goal, where it was.
+func TestArenaOutsideHeap(t *testing.T) {
+	switch runtime.GOOS {
+	case "linux", "darwin", "freebsd", "netbsd", "openbsd", "dragonfly", "windows":
+	default:
+		t.Skipf("%s makes the arena on the heap", runtime.GOOS)
+	}
+	if raceEnabled {
+		t.Skip("the race detector makes the arena on the heap")
+	}
+	const size = 256 << 20
+	var before, after runtime.MemStats
+	runtime.GC()
+	runtime.ReadMemStats(&before)
+	a := newArena(t, map[int]int{1024: size / 1024})
+	runtime.GC()
+	runtime.ReadMemStats(&after)
+	if !a.OutsideHeap() {
+		t.Fatal("the arena was made on the heap")
+	}
+	if grew := int64(after.HeapAlloc) - int64(before.HeapAlloc); grew > size/16 {
+		t.Fatalf("the heap grew %d bytes for a %d byte arena", grew, size)
+	}
+	b := a.Get(1024)
+	for k := range b {
+		b[k] = byte(k)
+	}
+	a.Put(b)
+	runtime.KeepAlive(a)
 }

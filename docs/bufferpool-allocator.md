@@ -239,15 +239,16 @@ Get+Put times are medians of 10 runs. A wave's first collection after the target
 The pool and its reserve keep the working set across collections, but every buffer is still an object of its own: a collection marks each one, and the simulator in section 6 forces one every 400 ms. `Arena` takes the other route. It is one allocation with no pointers in it, cut into fixed slots per class and kept for the program's life; free slots are kept as their index (a `uint32`), but a slot that has never been out is kept nowhere: each class counts the slots handed out so far and takes the next ones from that count once its shared stacks are empty, so the indexes held grow with the slots a program has used, not with the arena (a 6.3 GiB arena split by `ArenaWeightsMessages` has 18 million slots, whose indexes made up front took 72 MB and 40–55 ms); each P has a stack of 64 per class taken with the P pinned and no lock, and past that slots move in batches of 32 to and from 8 shared stacks with a lock each. A class with no free slot, or no slots at all, is served by the package's own pool, and `Put` sends there every buffer that is not a slot. It is an `Allocator`, installed with `SetAllocator`; the package's own pool stays the default.
 
 ```go
-arena, err := bufferpool.NewArena(nil)                                     // an eighth of the memory, split by ArenaWeightsServer
+arena, err := bufferpool.NewArena(nil)                                     // an eighth of the memory, at most 1 GiB, split by ArenaWeightsServer
 arena, err := bufferpool.NewArenaBytes(2<<30, bufferpool.ArenaWeightsStreaming()) // a total, split by weight
 arena, err := bufferpool.NewArena(map[int]int{1024: 300000})                 // slots per class
 bufferpool.SetAllocator(arena)
 ```
 
-- **Size.** By default an eighth of the memory the process may use, 32 MiB to 16 GiB, as the pool's budget. `NewArenaBytes(total, weights)` splits a total between classes by `ArenaWeights` (size → weight); `ArenaCounts` shows the split.
+- **Size.** By default an eighth of the memory the process may use, 32 MiB to 1 GiB (`MaxDefaultArenaBytes`). The cap keeps a large machine from getting an arena sized to its memory rather than to what the program holds: on a 61 GiB host the eighth was 6.3 GiB, 18 million slots, for a WebSocket server whose buffers in flight came to a few hundred MB. It bounds the default only: `NewArenaBytes(total, weights)` and `NewArena(counts)` make an arena of any size, past 1 GiB too. `NewArenaBytes(total, weights)` splits a total between classes by `ArenaWeights` (size → weight); `ArenaCounts` shows the split.
 - **Presets.** `ArenaWeightsServer` (the default) follows the buffers a fib server takes: the 16 KiB read buffers the largest share, then 32 KiB (TLS records, response copies) and 64 KiB (streamed bodies, sendfile, QUIC send buffers), 2 KiB for QUIC datagrams. `ArenaWeightsMessages` favours 64 B to 4 KiB, `ArenaWeightsStreaming` 16 to 64 KiB, `ArenaWeightsEven` gives each class from 64 B to 64 KiB the same bytes. They are starting points drawn from fib's own sizes, not measurements of a program.
-- **What it costs.** The arena counts towards the live heap from the start (GOGC's goal, GOMEMLIMIT); the system backs a page only once a slot on it is used. A slot never `Put` is lost to the arena, since the collector never takes it back — fib leaves some buffers to the collector (section 3) — and so is one returned as a slice that does not start at it (`buf[k:]`); `Lost` counts the second kind, `Free` shows both. Under the race detector the per-P stacks are skipped, since it cannot see that pinning a P makes them its own.
+- **Where the memory is.** On Linux, the BSDs and macOS the arena is an anonymous `mmap` (with `MAP_NORESERVE` on Linux), on Windows a `VirtualAlloc`: outside the Go heap, so it counts towards neither GOGC's goal nor `GOMEMLIMIT` (`OutsideHeap` says so), and a program that sets `GOMEMLIMIT` leaves room for the arena itself. On other platforms, when the mapping fails, and under the race detector (which does not instrument memory outside the heap) it is made on the heap and counts as live heap from the start, which raises the collector's goal by the arena's size. Either way the system backs a page only once a slot on it is used.
+- **What it costs.** A slot never `Put` is lost to the arena, since the collector never takes it back — fib leaves some buffers to the collector (section 3) — and so is one returned as a slice that does not start at it (`buf[k:]`); `Lost` counts the second kind, `Free` shows both. Under the race detector the per-P stacks are skipped, since it cannot see that pinning a P makes them its own.
 
 ### Results
 
@@ -267,7 +268,7 @@ The simulator of section 6 on the same host, otherwise idle, 3 rounds each, with
 | Arena, 256k slots | 0.2% | 2.83 M/s | 3.18–3.19 M/s | 5.7–5.8 s | 302–303 MB |
 | Arena, 512k slots | 0% | 2.84 M/s | 3.17–3.18 M/s | 5.4–5.5 s | 509–557 MB |
 
-The peak heap with the default arena reads 4213 MB: the whole arena counts as live heap, though the system backed only the 449 MB used.
+The peak heap with the default arena reads 4213 MB: the arena was made on the heap then, so all of it counted as live heap, though the system backed only the 449 MB used.
 
 - **The collector's work is what drops.** Process CPU falls to a fifth on 16 threads and a third on 2: each forced collection marks one object instead of some 500k buffers, and the buffers are not made again (510k fresh allocations against 5.5k).
 - **Throughput rises a little:** the wave rate by 4–5%, the sustained rate by 2–3%, and no wave makes a buffer again.
