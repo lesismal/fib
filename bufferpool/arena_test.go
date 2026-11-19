@@ -359,4 +359,32 @@ func TestArenaOutsideHeap(t *testing.T) {
 	}
 	a.Put(b)
 	runtime.KeepAlive(a)
+
+	h, err := NewArena(map[int]int{1024: size / 1024}, ArenaOnHeap())
+	if err != nil {
+		t.Fatal(err)
+	}
+	runtime.GC()
+	var onHeap runtime.MemStats
+	runtime.ReadMemStats(&onHeap)
+	if h.OutsideHeap() {
+		t.Fatal("ArenaOnHeap mapped the arena")
+	}
+	if grew := int64(onHeap.HeapAlloc) - int64(after.HeapAlloc); grew < size-size/16 {
+		t.Fatalf("the heap grew %d bytes for a %d byte arena made on it", grew, size)
+	}
+	if b := h.Get(1024); !h.holds(b) {
+		t.Fatal("a heap arena did not serve its slot")
+	}
+	runtime.KeepAlive(h)
+}
+
+func TestArenaBytesOnHeap(t *testing.T) {
+	a, err := NewArenaBytes(4<<20, ArenaWeightsMessages(), ArenaOnHeap())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if a.OutsideHeap() || a.Bytes() == 0 {
+		t.Fatalf("outside the heap %v, %d bytes", a.OutsideHeap(), a.Bytes())
+	}
 }
