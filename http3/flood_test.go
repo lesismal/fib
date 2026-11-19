@@ -82,7 +82,11 @@ func (w *h3Wire) openAndReset(n int) {
 // connection closed with H3_EXCESSIVE_LOAD (CVE-2023-44487's HTTP/3 form).
 func TestH3ServerEndsRapidReset(t *testing.T) {
 	w := dialH3Wire(t, nil, floodServer(t))
-	w.openAndReset(floodBurst + 100)
+	// The bucket gets resets back at a hundred a second: a runner that
+	// takes over a second to send floodBurst+100 has them refilled as they
+	// go. Resetting goes on until the connection is closed, which stops
+	// openAndReset, or ten bursts have gone.
+	w.openAndReset(10 * floodBurst)
 	w.awaitExcessiveLoad()
 }
 
@@ -105,7 +109,8 @@ func TestH3ServerEndsMalformedRequestFlood(t *testing.T) {
 	// No :path, which a request must have.
 	head := headersFrame(qpack.HeaderField{Name: ":method", Value: "GET"}, qpack.HeaderField{Name: ":scheme", Value: "https"},
 		qpack.HeaderField{Name: ":authority", Value: "localhost"})
-	for i := 0; i < floodBurst+100; i++ {
+	// Ten bursts at most, for the reason TestH3ServerEndsRapidReset gives.
+	for i := 0; i < 10*floodBurst; i++ {
 		s, ok := w.openStream()
 		if !ok {
 			break
