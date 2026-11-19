@@ -452,8 +452,11 @@ func TestSpliceBodyConcurrent(t *testing.T) {
 	if t.Failed() {
 		t.Log(f.state())
 	}
-	if f.fallbacks.Load() != 0 || f.offered.Load() != clients*rounds {
-		t.Fatalf("%d offered, %d declined", f.offered.Load(), f.fallbacks.Load())
+	// A body that arrived whole before the handler ran is not offered, as
+	// on a slow runner one of 96 was; every other one is, and none is
+	// declined or refused.
+	if n := f.offered.Load(); n+f.arrived.Load() != clients*rounds || n == 0 || f.refused.Load() != 0 || f.fallbacks.Load() != 0 {
+		t.Fatalf("%d offered, %d arrived whole, %d refused, %d declined", n, f.arrived.Load(), f.refused.Load(), f.fallbacks.Load())
 	}
 }
 
