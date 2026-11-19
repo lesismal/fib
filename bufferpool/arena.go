@@ -27,7 +27,9 @@ import (
 // comes back, nothing is made again, and a collection has one object to mark
 // where the package's own pool has one per buffer. Free slots are kept as
 // their index within the class, not as pointers, so keeping them costs the
-// collector nothing either.
+// collector nothing either; a slot that has never been out is not kept at all
+// but taken from a count of the slots handed out so far, so the indexes held
+// grow with the slots a program has used rather than with the arena.
 //
 // Each P has a small stack of free slots per class, taken and returned with
 // the P pinned and no lock, as a sync.Pool's private slot is; past that, slots
@@ -64,7 +66,12 @@ type Arena struct {
 type arenaClass struct {
 	start, end uintptr
 	count      int
-	depot      [depotShards]depotShard
+	// fresh is how many slots, from index 0 up, have been handed out at least
+	// once; the ones past it have never been out and are in no depot. It runs
+	// past count once they all have.
+	fresh atomic.Uint64
+	_     [64]byte
+	depot [depotShards]depotShard
 }
 
 type depotShard struct {
@@ -256,19 +263,6 @@ func NewArena(counts map[int]int) (*Arena, error) {
 		c.start, c.count = off, int(n)
 		off += uintptr(n) * uintptr(classSize(i))
 		c.end = off
-		if n == 0 {
-			continue
-		}
-		for s := range c.depot {
-			c.depot[s].free = make([]uint32, 0, c.count/depotShards+1)
-		}
-		for k := range c.count {
-			d := &c.depot[k%depotShards]
-			d.free = append(d.free, uint32(k))
-		}
-		for s := range c.depot {
-			c.depot[s].n.Store(int64(len(c.depot[s].free)))
-		}
 	}
 	log.Info("fib: bufferpool arena", "bytes", total, "classes", a.describe())
 	return a, nil
@@ -306,7 +300,7 @@ func (a *Arena) Free(size int) int {
 		return 0
 	}
 	c := &a.cls[classUp(size)]
-	n := 0
+	n := c.count - int(min(c.fresh.Load(), uint64(c.count)))
 	for s := range c.depot {
 		n += int(c.depot[s].n.Load())
 	}
@@ -472,7 +466,27 @@ func (c *arenaClass) pop(out []uint32) int {
 			return n
 		}
 	}
-	return 0
+	return c.takeFresh(out)
+}
+
+// takeFresh hands out slots that have never been out, up to len(out), once
+// the depots have none. Taking from the depots first keeps a program on the
+// slots it has touched, so the system backs pages only as the working set
+// grows.
+func (c *arenaClass) takeFresh(out []uint32) int {
+	if c.fresh.Load() >= uint64(c.count) {
+		return 0
+	}
+	k := uint64(len(out))
+	first := c.fresh.Add(k) - k
+	if first >= uint64(c.count) {
+		return 0
+	}
+	n := int(min(k, uint64(c.count)-first))
+	for j := range n {
+		out[j] = uint32(first) + uint32(j)
+	}
+	return n
 }
 
 func (c *arenaClass) push(in []uint32) {
