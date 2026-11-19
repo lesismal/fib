@@ -247,7 +247,10 @@ func TestCcSendOnClosedStream(t *testing.T) {
 		upload,
 	} {
 		r, outcome := ccvRequest(t, req)
-		s, err := cc.qc.OpenStream()
+		cc.mu.Lock()
+		qc := cc.qc
+		cc.mu.Unlock()
+		s, err := qc.OpenStream()
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -297,7 +300,13 @@ func TestCcConnectionEndsWithoutError(t *testing.T) {
 	client := newClient(t, nil)
 	held := client.Go(mustRequest(t, stdhttp.MethodGet, base+"/hold", nil))
 	server.awaitArrival(t, "/hold")
-	ccvConn(t, client).qc.Abort(nil)
+	// The dial's callback stores qc under the connection's lock, on the
+	// engine's goroutine: it is read under it here too.
+	cc := ccvConn(t, client)
+	cc.mu.Lock()
+	qc := cc.qc
+	cc.mu.Unlock()
+	qc.Abort(nil)
 	if _, err := ccvWait(t, held); !errors.Is(err, net.ErrClosed) {
 		t.Fatalf("in flight: %v, want net.ErrClosed", err)
 	}

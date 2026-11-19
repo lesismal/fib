@@ -989,17 +989,29 @@ func TestExpectedWriteCarriesTheAck(t *testing.T) {
 		// longer than flushHold finds the acknowledgement gone ahead of it,
 		// as it should: only an answer written while the connection was
 		// still waiting for it that leaves without it fails.
+		//
+		// A runner can also pause the connection's own goroutine between
+		// the answer's write and its flush, past flushHold, as a macOS one
+		// did once ("the server sent [536 31]"): so an answer that went
+		// without the acknowledgement fails the test only when every one of
+		// three that were waited for did.
+		var last []int
+		waitedFor := 0
 		for range 3 {
 			sent, waited := expectedAnswer(t, false)
 			if !waited {
 				continue
 			}
-			if small(sent) > 0 {
-				t.Fatalf("the server sent %v", sent)
+			waitedFor++
+			if small(sent) == 0 {
+				return
 			}
-			return
+			last = sent
 		}
-		t.Fatal("three answers in a row were written after the connection stopped waiting for them")
+		if waitedFor == 0 {
+			t.Fatal("three answers in a row were written after the connection stopped waiting for them")
+		}
+		t.Fatalf("every answer waited for went without the acknowledgement; the last sent %v", last)
 	})
 	t.Run("late", func(t *testing.T) {
 		// The answer is written once the acknowledgement has gone without
