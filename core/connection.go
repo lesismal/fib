@@ -224,6 +224,9 @@ const (
 	// flagNoWriteBackpressure records SetWriteBackpressure(false): the
 	// connection's own backlog does not pause its reads.
 	flagNoWriteBackpressure
+	// flagWriteBackpressure records SetWriteBackpressure(true), which a
+	// dialed connection, off by default, needs to turn it on.
+	flagWriteBackpressure
 	// flagCloseReason marks a reason CloseWithError recorded when it asked
 	// for the close, which the close reports over whatever the event loop
 	// meets before carrying it out: a layer that answers a failed handshake
@@ -876,7 +879,7 @@ func (c *Connection) pauseDecision(readPaused bool) (pause, byBudget bool) {
 	if e.maxPendingBytes > 0 && e.pendingTotal.Load() >= e.maxPendingBytes {
 		return true, true
 	}
-	if e.writeHighWatermark <= 0 || c.flags.has(flagNoWriteBackpressure) {
+	if e.writeHighWatermark <= 0 || c.writeBackpressureOff() {
 		return false, false
 	}
 	pendingBytes := c.pendingBytes.Load()
@@ -1377,7 +1380,7 @@ func (c *Connection) process() {
 				alive = closeErr == nil
 			}
 			if alive && events&evIn != 0 {
-				if c.hasQueuedOutput() && (c.engine.writeHighWatermark <= 0 && !c.flags.has(flagNoWriteBackpressure) ||
+				if c.hasQueuedOutput() && (c.engine.writeHighWatermark <= 0 && !c.writeBackpressureOff() ||
 					c.readShouldStop()) {
 					// The output queued already fills the connection's budget, or
 					// the handler holds reads, or there is no watermark and the
@@ -1849,23 +1852,43 @@ func (c *Connection) HoldReads(hold bool) {
 func (c *Connection) ReadsHeld() bool { return c.flags.has(flagReadHeld) }
 
 // SetWriteBackpressure says whether the connection's own backlog paces its
-// reads, which it does by default: while more than
-// Config.WriteBufferHighWatermark of what it was sent waits for its socket,
-// it stops reading, so that a peer that sends faster than it reads the
-// replies is held back by TCP rather than by memory here.
+// reads: while more than Config.WriteBufferHighWatermark of what it was sent
+// waits for its socket, it stops reading, so that a peer that sends faster
+// than it reads the replies is held back by TCP rather than by memory here.
+// It is on by default for a connection a listener accepted, and off for one
+// the engine dialed.
+//
+// A dialed connection is a client's, whose backlog is its own requests, not
+// answers the peer's data called for: pacing its reads by it only stops it
+// reading the answers. Against a server that paces itself the same way, a
+// client that sends a burst larger than the watermark stops reading, the
+// server's answers back up behind it, the server stops reading too, and
+// neither drains again; fib's WebSocket, arpc and HTTP/2 clients each did
+// against fib's servers.
 //
 // A relay, which passes what one connection reads on to another, turns it
-// off on both and paces each by the other's backlog instead, with HoldReads.
-// Left on, a connection whose writes to its peer back up would stop reading
-// that peer's answers, and a peer that answers as it reads, waiting to send
-// before it reads more, would then wait for it forever. Holds and the
-// server-wide MaxPendingBytes still pause it. It may be called from any
-// goroutine, and takes effect from the next read.
+// off on both and paces each by the other's backlog instead, with HoldReads,
+// for the same reason. Holds and the server-wide MaxPendingBytes still pause
+// a connection with it off. It may be called from any goroutine, and takes
+// effect from the next read.
 func (c *Connection) SetWriteBackpressure(on bool) {
-	if c.flags.set(flagNoWriteBackpressure, !on) == !on {
+	was := !c.writeBackpressureOff()
+	if on {
+		c.flags.replace(flagNoWriteBackpressure, flagWriteBackpressure)
+	} else {
+		c.flags.replace(flagWriteBackpressure, flagNoWriteBackpressure)
+	}
+	if was == on {
 		return
 	}
 	c.engine.request(command{kind: commandRefresh, connection: c})
+}
+
+// writeBackpressureOff reports whether the connection's backlog leaves its
+// reads alone: SetWriteBackpressure(false), or a dialed connection that was
+// not told otherwise.
+func (c *Connection) writeBackpressureOff() bool {
+	return c.flags.has(flagNoWriteBackpressure) || c.dialed && !c.flags.has(flagWriteBackpressure)
 }
 
 // SetWriteQueueLimit caps the bytes this connection may have queued for its

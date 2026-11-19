@@ -18,6 +18,7 @@ import (
 	"os"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -155,6 +156,50 @@ func TestClientEchoesThroughServer(t *testing.T) {
 		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("OnClose never ran")
+	}
+}
+
+// A client that sends a burst of large messages before reading any echo gets
+// them all back: its own backlog does not stop it reading the server's
+// echoes. With the engine's default write backpressure on the client's
+// connection both ends stopped reading once their backlogs passed the high
+// watermark, the client's behind its messages and the server's behind its
+// echoes, about four runs in ten.
+func TestClientBurstOfLargeMessagesIsEchoed(t *testing.T) {
+	url := startWebSocketServer(t, DefaultConfig(), echoServerHandler())
+	dialer := NewDialer(startClientEngine(t), DefaultDialerConfig())
+	const rounds, n, size = 3, 200, 64 << 10
+	var got atomic.Int64
+	var done [rounds]chan struct{}
+	for i := range done {
+		done[i] = make(chan struct{})
+	}
+	conn, _, err := dialer.Go(url, nil, HandlerFuncs{
+		Message: func(_ *Connection, _ Opcode, data []byte) {
+			if len(data) != size {
+				t.Errorf("a %d-byte echo came back as %d bytes", size, len(data))
+			}
+			if k := got.Add(1); k%n == 0 && k <= rounds*n {
+				close(done[k/n-1])
+			}
+		},
+	}).Wait()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close(CloseNormal, "")
+	payload := bytes.Repeat([]byte{7}, size)
+	for round := range rounds {
+		for range n {
+			if err := conn.WriteBinary(payload); err != nil {
+				t.Fatal(err)
+			}
+		}
+		select {
+		case <-done[round]:
+		case <-time.After(15 * time.Second):
+			t.Fatalf("round %d: %d of %d echoes came back", round, got.Load()-int64(round*n), n)
+		}
 	}
 }
 

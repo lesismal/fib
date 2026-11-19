@@ -1510,6 +1510,63 @@ func TestSetWriteBackpressure(t *testing.T) {
 	}
 }
 
+// TestDialedConnectionLeavesWriteBackpressureOff checks that a connection the
+// engine dialed goes on reading its peer while its own backlog to that peer
+// is past the watermark, its peer reading none of it, and that
+// SetWriteBackpressure(true) has it stop as an accepted connection does. A
+// client's backlog is its own requests: paced by it, a fib client and a fib
+// server each stopped reading once both backlogs had grown, and neither
+// drained again.
+func TestDialedConnectionLeavesWriteBackpressureOff(t *testing.T) {
+	const sent = 1 << 20
+	for _, on := range []bool{false, true} {
+		ln, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			t.Fatal(err)
+		}
+		// The peer sends sent bytes and reads nothing back.
+		go func() {
+			conn, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			defer conn.Close()
+			_ = conn.SetDeadline(time.Now().Add(20 * time.Second))
+			_, _ = conn.Write(make([]byte, sent))
+			time.Sleep(5 * time.Second)
+		}()
+		engine, err := New(DefaultConfig())
+		if err != nil {
+			t.Fatal(err)
+		}
+		runEngine(t, engine)
+		var received atomic.Int64
+		handler := HandlerFuncs{
+			Open: func(c *Connection) {
+				if on {
+					c.SetWriteBackpressure(true)
+				}
+			},
+			Data: func(c *Connection, data []byte) {
+				received.Add(int64(len(data)))
+				// Answer every byte with sixteen, which the peer never reads.
+				_ = c.Send(make([]byte, 16*len(data)))
+			},
+		}
+		if err := engine.DialWithHandler("tcp", ln.Addr().String(), 5*time.Second, handler, nil); err != nil {
+			t.Fatal(err)
+		}
+		deadline := time.Now().Add(3 * time.Second)
+		for received.Load() < sent && time.Now().Before(deadline) {
+			time.Sleep(10 * time.Millisecond)
+		}
+		if got := received.Load() == sent; got == on {
+			t.Errorf("SetWriteBackpressure(true) %v: the dialed connection read %d of %d bytes", on, received.Load(), sent)
+		}
+		_ = ln.Close()
+	}
+}
+
 // waitConnState waits until check reports true, run with c's lock held. A
 // test uses it to ask the connection where it has got to rather than sleeping
 // a guessed time for it; the deadline bounds how long a failure takes to show,
