@@ -646,13 +646,17 @@ func Put(buf []byte) {
 				return
 			}
 			putPooled(buf)
-		} else if cap(buf) > 0 {
+		} else if cap(buf) > 0 && !putRetired(buf) {
 			a.Put(buf)
 		}
 		return
 	}
 	capacity := cap(buf)
 	if capacity < MinSize || capacity > MaxSize {
+		return
+	}
+	// A slot of an arena SetAllocator replaced goes back to it.
+	if retired.Load() != nil && putRetired(buf) {
 		return
 	}
 	i := classDown(capacity)
@@ -676,6 +680,9 @@ func Put(buf []byte) {
 func putPooled(buf []byte) {
 	capacity := cap(buf)
 	if capacity < MinSize || capacity > MaxSize {
+		return
+	}
+	if retired.Load() != nil && putRetired(buf) {
 		return
 	}
 	i := classDown(capacity)

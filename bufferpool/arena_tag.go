@@ -7,7 +7,7 @@ package bufferpool
 // fib_arena ./... The arena is small, so that classes run out of slots and
 // fall back to the pool on the way.
 func init() {
-	a, err := NewArenaBytes(64<<20, nil)
+	a, err := NewArenaBytes(64<<20, nil, ArenaMapped)
 	if err != nil {
 		panic(err)
 	}
