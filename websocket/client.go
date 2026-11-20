@@ -87,8 +87,9 @@ func DefaultDialerConfig() DialerConfig {
 // own: each client connection carries its own handler. The engine has to be
 // running. ws:// and wss:// are supported.
 type Dialer struct {
-	engine *fib.Engine
-	config DialerConfig
+	engine   *fib.Engine
+	config   DialerConfig
+	settings []connSettings
 }
 
 // NewDialer returns a dialer for engine. Zero limits in config are replaced by
@@ -104,9 +105,10 @@ func NewDialer(engine *fib.Engine, config DialerConfig) *Dialer {
 	if config.PendingWriteLimit <= 0 {
 		config.PendingWriteLimit = DefaultPendingWriteLimit
 	}
-	// The dialer's own copy, which its connections point into.
+	// The dialer's own copy, which the caller cannot change under it.
 	config.Subprotocols = slices.Clone(config.Subprotocols)
-	return &Dialer{engine: engine, config: config}
+	return &Dialer{engine: engine, config: config,
+		settings: newConnSettings(config.Subprotocols, config.PendingWriteLimit)}
 }
 
 // Dial connects to rawURL, performs the opening handshake and reports the
@@ -384,9 +386,8 @@ func (cc *clientConn) OnData(conn *fib.Connection, data []byte) {
 	// read; they are the connection's first.
 	remainder := cc.response[headerEnd:]
 	cc.response = nil
-	cc.ws = Connection{conn: conn, subprotocol: internSubprotocol(cc.dialer.config.Subprotocols, subprotocol),
-		client: true, compress: compress, windowBits: uint8(deflate.windowBits),
-		pendingLimit: cc.dialer.config.PendingWriteLimit}
+	cc.ws = Connection{conn: conn, settings: settingsFor(cc.dialer.settings, subprotocol),
+		client: true, compress: compress, windowBits: uint8(deflate.windowBits)}
 	cc.parser = Parser{maxMessageBytes: cc.dialer.config.MaxMessageBytes, fromServer: true, deflate: compress,
 		contextTakeover: compress && deflate.peerContextTakeover, perFrame: cc.frames != nil}
 	cc.upgraded.Store(true)

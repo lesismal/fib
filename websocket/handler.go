@@ -186,21 +186,60 @@ type Connection struct {
 	// client of this package's own, or the http.Tunnel of a request that
 	// ServerHandler.Upgrade switched, on HTTP/1.1, HTTP/2 or HTTP/3.
 	conn transport
-	// subprotocol is the one the handshake chose, nil for none. It points
-	// into the handler's or the dialer's own list rather than holding a
-	// string, which keeps a server's connectionState within its size class.
-	subprotocol *string
-	closeState  atomic.Pointer[connectionCloseState]
-	closeSent   atomic.Bool
+	// settings is what the connection has in common with the others of its
+	// ServerHandler or Dialer that chose the same subprotocol: that
+	// subprotocol and the PendingWriteLimit. One pointer to them, rather
+	// than a copy of each, keeps a server's connectionState within its size
+	// class. Nil, as in a Connection a test makes, means no subprotocol and
+	// DefaultPendingWriteLimit.
+	settings   *connSettings
+	closeState atomic.Pointer[connectionCloseState]
+	closeSent  atomic.Bool
 	// client marks the dialing side, whose frames must be masked.
 	client bool
 	// compress says permessage-deflate is in use, and windowBits bounds how
 	// far back what this side sends may refer.
 	compress   bool
 	windowBits uint8
-	// pendingLimit is Config.PendingWriteLimit, or DialerConfig's; zero
-	// means DefaultPendingWriteLimit.
+	// attachment is what SetAttachment set, boxed: a pointer takes half the
+	// room an any would, which a server's connectionState has no more of,
+	// and is read and set atomically, from any goroutine.
+	attachment atomic.Pointer[any]
+}
+
+// connSettings is what the connections of a ServerHandler or a Dialer that
+// chose the same subprotocol have in common.
+type connSettings struct {
+	subprotocol  string
 	pendingLimit int64
+}
+
+// newConnSettings returns the settings of the connections of a handler or a
+// dialer offering subprotocols: the first for those that chose none, then
+// one for each of subprotocols in turn.
+func newConnSettings(subprotocols []string, pendingLimit int64) []connSettings {
+	settings := make([]connSettings, len(subprotocols)+1)
+	for i := range settings {
+		settings[i].pendingLimit = pendingLimit
+		if i > 0 {
+			settings[i].subprotocol = subprotocols[i-1]
+		}
+	}
+	return settings
+}
+
+// settingsFor returns the element of settings for the subprotocol s, which
+// the handshake chose from those settings were made with, or the first, for
+// none, when s is empty.
+func settingsFor(settings []connSettings, s string) *connSettings {
+	if s != "" {
+		for i := 1; i < len(settings); i++ {
+			if settings[i].subprotocol == s {
+				return &settings[i]
+			}
+		}
+	}
+	return &settings[0]
 }
 
 // transport is what a Connection sends its frames through, which a
@@ -231,25 +270,10 @@ type connectionCloseState struct {
 
 // Subprotocol is the subprotocol the opening handshake chose, or "".
 func (c *Connection) Subprotocol() string {
-	if c.subprotocol == nil {
+	if c.settings == nil {
 		return ""
 	}
-	return *c.subprotocol
-}
-
-// internSubprotocol returns the element of list that is s, for a connection
-// to point at, or nil when s is empty. s is always one of list's, which the
-// handshake chose it from.
-func internSubprotocol(list []string, s string) *string {
-	if s == "" {
-		return nil
-	}
-	for i := range list {
-		if list[i] == s {
-			return &list[i]
-		}
-	}
-	return &s
+	return c.settings.subprotocol
 }
 
 func (c *Connection) WriteMessage(opcode Opcode, payload []byte) error {
@@ -443,6 +467,7 @@ func stateOf(c *fib.Connection) *connectionState {
 
 type ServerHandler struct {
 	config           Config
+	settings         []connSettings
 	handler          Handler
 	frames           FrameHandler
 	needsRequest     bool
@@ -461,7 +486,7 @@ func NewHandlerWithConfig(config Config, handler Handler) *ServerHandler {
 	if config.PendingWriteLimit <= 0 {
 		config.PendingWriteLimit = DefaultPendingWriteLimit
 	}
-	// The handler's own copy, which its connections point into.
+	// The handler's own copy, which the caller cannot change under it.
 	config.Subprotocols = slices.Clone(config.Subprotocols)
 	if config.HTTP.MaxHeaderBytes <= 0 {
 		config.HTTP.MaxHeaderBytes = defaults.HTTP.MaxHeaderBytes
@@ -483,8 +508,8 @@ func NewHandlerWithConfig(config Config, handler Handler) *ServerHandler {
 			needsRequest = true
 		}
 	}
-	h := &ServerHandler{config: config, handler: handler, frames: frameHandler(handler),
-		needsRequest: needsRequest}
+	h := &ServerHandler{config: config, settings: newConnSettings(config.Subprotocols, config.PendingWriteLimit),
+		handler: handler, frames: frameHandler(handler), needsRequest: needsRequest}
 	h.handshakeParsers.New = func() any {
 		return &handshakeParser{maxHeaderBytes: config.HTTP.MaxHeaderBytes}
 	}
@@ -567,8 +592,8 @@ func (h *ServerHandler) upgrade(c *fib.Connection, state *connectionState, reque
 		return
 	}
 	compress := result.extensions != ""
-	state.websocket = Connection{conn: c, subprotocol: internSubprotocol(h.config.Subprotocols, result.subprotocol),
-		compress: compress, windowBits: uint8(result.deflate.windowBits), pendingLimit: h.config.PendingWriteLimit}
+	state.websocket = Connection{conn: c, settings: settingsFor(h.settings, result.subprotocol),
+		compress: compress, windowBits: uint8(result.deflate.windowBits)}
 	state.wsParser.maxMessageBytes = h.config.MaxMessageBytes
 	state.wsParser.deflate = compress
 	state.wsParser.contextTakeover = compress && result.deflate.peerContextTakeover

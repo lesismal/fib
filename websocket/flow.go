@@ -34,6 +34,70 @@ func (c *Connection) RemoteAddr() net.Addr {
 	return nil
 }
 
+// LocalAddr returns the address of this end of the connection, as
+// RemoteAddr returns the peer's: the local end of the TCP connection, or of
+// the QUIC connection one upgraded over HTTP/3 runs on. It may be nil once
+// the connection has closed.
+func (c *Connection) LocalAddr() net.Addr {
+	switch t := c.conn.(type) {
+	case *fib.Connection:
+		return t.LocalAddr()
+	case *epollhttp.Tunnel:
+		if conn := t.Conn(); conn != nil {
+			return conn.LocalAddr()
+		}
+	}
+	return nil
+}
+
+// NetConn returns the connection the WebSocket's frames go through when it
+// has one of its own: one a ServerHandler serves directly, or one a Dialer
+// dialed. Its own settings are then the WebSocket's to change, such as
+// SetWriteQueueLimit, SetKeepAlive, SetNoDelay or a deadline; what it sends
+// must still go through the WebSocket's methods, or the peer sees bytes
+// that are not frames. On a connection upgraded through Upgrade it returns
+// nil: see Tunnel.
+func (c *Connection) NetConn() *fib.Connection {
+	conn, _ := c.conn.(*fib.Connection)
+	return conn
+}
+
+// Tunnel returns the tunnel of a connection upgraded through
+// ServerHandler.Upgrade, and nil for any other. Its Conn is the connection
+// it runs on: over HTTP/1.1 the whole of it switched to the WebSocket, as
+// NetConn's connection is, while over HTTP/2 and HTTP/3 it carries other
+// requests too, and its settings are the server's to keep.
+func (c *Connection) Tunnel() *epollhttp.Tunnel {
+	t, _ := c.conn.(*epollhttp.Tunnel)
+	return t
+}
+
+// SetAttachment keeps value with the connection, for the Handler's callbacks
+// and whatever else holds the connection to read back with Attachment: the
+// state of the session it carries, which would otherwise have to be found in
+// a map on every message. There is one slot, which nil clears; several
+// values go in a struct of the caller's. It may be set and read from any
+// goroutine, and stays set once the connection has closed, for OnClose to
+// read. A ServerHandler's own connections are first seen in OnOpen, which
+// can set it there; one upgraded through UpgradeWithAttachment has it set
+// before OnOpen. Setting it allocates the 16 bytes that hold value, unless
+// value is nil.
+func (c *Connection) SetAttachment(value any) {
+	if value == nil {
+		c.attachment.Store(nil)
+		return
+	}
+	c.attachment.Store(&value)
+}
+
+// Attachment returns what SetAttachment last set, or nil.
+func (c *Connection) Attachment() any {
+	if p := c.attachment.Load(); p != nil {
+		return *p
+	}
+	return nil
+}
+
 // Abort ends the connection at once, without the close handshake: no close
 // frame is sent, what is still queued for the peer is dropped, and nothing
 // more that arrives is handed to the Handler. OnClose follows, with the
@@ -67,8 +131,8 @@ func (c *Connection) Abort(err error) {
 
 // pendingWriteLimit is the connection's PendingWriteLimit.
 func (c *Connection) pendingWriteLimit() int64 {
-	if c.pendingLimit > 0 {
-		return c.pendingLimit
+	if c.settings != nil && c.settings.pendingLimit > 0 {
+		return c.settings.pendingLimit
 	}
 	return DefaultPendingWriteLimit
 }

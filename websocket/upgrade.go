@@ -42,6 +42,20 @@ var errOriginRejected = errors.New("websocket: origin rejected")
 // request, which it must not keep: the server may reuse it once the handler
 // that called Upgrade has returned.
 func (h *ServerHandler) Upgrade(c *epollhttp.Context, header stdhttp.Header) (*Connection, error) {
+	return h.upgradeRequest(c, header, nil)
+}
+
+// UpgradeWithAttachment is Upgrade for a connection that is to carry
+// attachment, which Connection.Attachment returns from OnOpen on, as if
+// SetAttachment had been called before it: the state of the session the
+// handler that upgrades the request has already built, which the
+// ServerHandler's Handler then finds on the connection rather than in a map
+// keyed by the request or the connection. A nil attachment is Upgrade.
+func (h *ServerHandler) UpgradeWithAttachment(c *epollhttp.Context, header stdhttp.Header, attachment any) (*Connection, error) {
+	return h.upgradeRequest(c, header, attachment)
+}
+
+func (h *ServerHandler) upgradeRequest(c *epollhttp.Context, header stdhttp.Header, attachment any) (*Connection, error) {
 	request := c.Request
 	var result handshakeResult
 	var err error
@@ -72,8 +86,11 @@ func (h *ServerHandler) Upgrade(c *epollhttp.Context, header stdhttp.Header) (*C
 	}
 	compress := result.extensions != ""
 	u := &upgradedConn{handler: h, request: request}
-	u.ws = Connection{subprotocol: internSubprotocol(h.config.Subprotocols, result.subprotocol), compress: compress,
-		windowBits: uint8(result.deflate.windowBits), pendingLimit: h.config.PendingWriteLimit}
+	u.ws = Connection{settings: settingsFor(h.settings, result.subprotocol), compress: compress,
+		windowBits: uint8(result.deflate.windowBits)}
+	if attachment != nil {
+		u.ws.attachment.Store(&attachment)
+	}
 	u.parser = Parser{maxMessageBytes: h.config.MaxMessageBytes, deflate: compress,
 		contextTakeover: compress && result.deflate.peerContextTakeover, perFrame: h.frames != nil}
 	if _, err := c.Upgrade("websocket", response, u); err != nil {
