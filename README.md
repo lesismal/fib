@@ -226,6 +226,9 @@ app := fibhttp.HandlerFunc(func(c *fibhttp.Context) {
 
 To serve only WebSocket, bind the WebSocket handler directly:
 `fib.New(config, fib.Binding{Addr: ":8080", Handler: websocket.NewHandlerWithConfig(cfg, handlers)})`.
+With no HTTP server in front, `Config.HandshakeTimeout` (10s by default, below zero for none)
+closes a connection that has not completed its opening handshake in time, and `Config.Path`,
+when set, answers a handshake for any other path with 404.
 
 To send one message to many connections, prepare it once:
 
@@ -257,8 +260,14 @@ if err == nil && above {
 }
 c.HoldReads(true)      // stop reading the peer; HoldReads(false) resumes
 c.Abort(errTooSlow)    // close at once, dropping what is queued; OnClose gets errTooSlow
-addr := c.RemoteAddr() // on a server's connection and a dialed one alike
+addr := c.RemoteAddr() // on a server's connection and a dialed one alike; LocalAddr is this end's
+c.SetAttachment(sess)  // one value of the caller's, which c.Attachment() returns in every later callback
+conn := c.NetConn()    // the fib.Connection of a served or dialed connection; nil when upgraded, see c.Tunnel()
 ```
+
+`ws.UpgradeWithAttachment(ctx, nil, sess)` attaches the value as part of an upgrade, so `OnOpen`
+already finds it. `NetConn` is there to change the connection's own settings, such as
+`SetWriteQueueLimit` or `SetKeepAlive`; frames still go through the WebSocket's methods.
 
 `PendingWriteLimit` is set in `websocket.Config` and `websocket.DialerConfig` (64 KiB by
 default). A relay between a WebSocket and another connection also calls

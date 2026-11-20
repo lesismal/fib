@@ -1685,7 +1685,48 @@ code（没有则为 1006），err 是 `Abort` 的参数（为 nil 时是连接�
 
 `RemoteAddr()` 在 server 端和拨号端都返回对端地址：直连、经 HTTP/1.1 或 HTTP/2 升级时是 TCP 对端，
 经 HTTP/3 升级时是 QUIC 连接建立时的地址；经 `DialerConfig.Dial`（如 SOCKS）拨号时是代理的地址。
-每次调用都从 socket 读取，连接关闭后可能为 nil，之后还要用就在 `OnOpen` 里保存。
+每次调用都从 socket 读取，连接关闭后可能为 nil，之后还要用就在 `OnOpen` 里保存。`LocalAddr()`
+同样返回本端地址。
+
+连接底下是什么、连接上挂着调用方的什么状态，都可以从 `Connection` 上直接拿到，不需要按地址或
+连接指针建 map：
+
+```go
+func onOpen(c *websocket.Connection, r *http.Request) {
+    c.SetAttachment(newSession(r)) // 之后每个回调里 c.Attachment().(*session)
+    if conn := c.NetConn(); conn != nil {
+        conn.SetWriteQueueLimit(4 << 20)
+        _ = conn.SetKeepAlivePeriod(30 * time.Second)
+    }
+}
+```
+
+- `SetAttachment(v)` / `Attachment()`：一个槽位，和 `fib.Connection` 的同名方法一样；`nil` 清空，
+  多个值放进调用方自己的 struct。任何 goroutine 都可以设置和读取（原子操作），连接关闭后仍保留，
+  `OnClose` 里也能读。设置一个非 nil 值分配 16 字节（装箱）。server 端每个连接的状态因此仍是
+  160 字节：子协议和 `PendingWriteLimit` 改为同一 handler（或 dialer）下、选了同一子协议的连接
+  共用一份设置，腾出的 8 字节放这个指针。
+- `ServerHandler.UpgradeWithAttachment(c, header, v)`：经 HTTP server 升级时在升级的同时挂上 `v`，
+  `OnOpen` 及之后的回调里就已经能取到，不需要先用以 `*http.Request` 为键的 map 交接。
+- `NetConn()`：直接接入 `ServerHandler` 或由 `Dialer` 拨号的连接，返回它自己的 `*fib.Connection`，
+  其设置（`SetWriteQueueLimit`、`SetKeepAlive`、`SetNoDelay`、deadline 等）由调用方调整；发送仍要
+  走 WebSocket 的方法，直接写字节对端看到的就不是帧了。经 `Upgrade` 升级的连接返回 nil。
+- `Tunnel()`：经 `Upgrade` 升级的连接返回它的 `*http.Tunnel`，其他返回 nil。`Tunnel().Conn()` 是它
+  所在的连接：HTTP/1.1 下整条连接都切换给了 WebSocket，和 `NetConn` 一样归它；HTTP/2、HTTP/3 下
+  还承载别的请求，其设置归 server 管。
+
+### 直接 bind 时的握手超时与路径
+
+`ServerHandler` 直接 bind 到监听地址、前面没有 HTTP server 时，握手的限制由它自己的 `Config` 给出：
+
+- `HandshakeTimeout`：从 accept 开始，连接要在这段时间内完成打开握手，否则被关闭，挡住只连不发、
+  或一个字节一个字节发请求头的对端。0 表示 `DefaultHandshakeTimeout`（10s，与 HTTP server 的
+  `DefaultReadHeaderTimeout` 相同），小于 0 表示不限。每个连接在握手期间一个定时器（挂在池化的握手
+  解析器上），握手完成即停止并释放，打开后的连接不再为它占内存，读路径也没有额外开销。经
+  `Upgrade` 升级的请求由 HTTP server 的 `ReadHeaderTimeout` 约束，不看这个字段。
+- `Path`：非空时，握手只能请求这一个路径（按解码后的路径、不含 query 比较），请求其他路径的回
+  404 Not Found，经 `Upgrade` 来的请求也一样。空表示接受任何路径。需要更复杂的路由时，放在 HTTP
+  server 后面用 `Upgrade`。
 
 ### 在 HTTP server 中升级为 WebSocket
 
@@ -1710,7 +1751,7 @@ handler := http.HandlerFunc(func(c *http.Context) {
   RFC 9220），server 会在 SETTINGS 里声明 `SETTINGS_ENABLE_CONNECT_PROTOCOL`。只有这个
   stream 切换过去，回 200 并保持打开，帧放在 DATA 里双向传输，受 stream 流控约束；同一
   连接上的其他请求照常处理。关闭时各自发 END_STREAM（HTTP/3 为 FIN）。
-- `CheckOrigin`、`Subprotocols`、`EnableCompression` 同样生效；`header` 会随接受握手的
+- `CheckOrigin`、`Subprotocols`、`EnableCompression`、`Path` 同样生效；`header` 会随接受握手的
   响应发出。`Upgrade` 返回前 `OnOpen` 已经调用，传给它的 request 不能保留。
 - 底层是 `http.Context.Upgrade` 返回的 `http.Tunnel`，其他协议也可以借它实现。
 

@@ -215,6 +215,8 @@ app := fibhttp.HandlerFunc(func(c *fibhttp.Context) {
 
 只提供 WebSocket 时，可以直接 bind WebSocket handler：
 `fib.New(config, fib.Binding{Addr: ":8080", Handler: websocket.NewHandlerWithConfig(cfg, handlers)})`。
+前面没有 HTTP server 时，`Config.HandshakeTimeout`（默认 10s，小于 0 表示不限）关闭没有及时完成
+握手的连接；设置了 `Config.Path` 时，请求其他路径的握手回 404。
 
 同一条消息发给多个连接时，先准备一次：
 
@@ -243,8 +245,14 @@ if err == nil && above {
 }
 c.HoldReads(true)      // 停止读对端；HoldReads(false) 恢复
 c.Abort(errTooSlow)    // 立即关闭，丢弃排队的数据；OnClose 收到 errTooSlow
-addr := c.RemoteAddr() // server 端和拨号端都可用
+addr := c.RemoteAddr() // server 端和拨号端都可用；LocalAddr 是本端地址
+c.SetAttachment(sess)  // 调用方自己的一个值，之后每个回调里用 c.Attachment() 取回
+conn := c.NetConn()    // 直连或拨号连接底下的 fib.Connection；升级来的连接返回 nil，见 c.Tunnel()
 ```
+
+`ws.UpgradeWithAttachment(ctx, nil, sess)` 在升级的同时挂上这个值，`OnOpen` 里就已经能取到。
+`NetConn` 用来调整连接自己的设置，如 `SetWriteQueueLimit`、`SetKeepAlive`；帧仍然要经
+WebSocket 的方法发送。
 
 `PendingWriteLimit` 在 `websocket.Config` 和 `websocket.DialerConfig` 里设置（默认 64 KiB）。
 在 WebSocket 和另一条连接之间转发时，两边都调用 `SetWriteBackpressure(false)`，原因见

@@ -36,11 +36,12 @@ var (
 // whose :protocol is "websocket" (RFC 8441, RFC 9220), which those servers
 // invite browsers to send, and only its stream switches, while the connection
 // goes on serving other requests. Either way the Config's CheckOrigin,
-// Subprotocols and EnableCompression apply, and header is sent with the
+// Subprotocols, EnableCompression and Path apply, and header is sent with the
 // response that accepts the handshake, which Upgrade writes.
 //
 // A request that is not a valid handshake is answered with 400 Bad Request,
-// or 403 Forbidden when CheckOrigin rejects it, and Upgrade reports why.
+// 403 Forbidden when CheckOrigin rejects it, or 404 Not Found for a path
+// other than Config.Path, and Upgrade reports why.
 // Handler.OnOpen has been called by the time Upgrade returns, with the
 // request, which it must not keep: the server may reuse it once the handler
 // that called Upgrade has returned.
