@@ -355,7 +355,12 @@ func sendPartsCopied(t transport, first, second []byte) error {
 // sendMaskedFrame is sendFrame for a client, which has to mask every frame
 // with a key the server cannot predict. Masking rewrites the payload, which is
 // the caller's buffer and not this connection's to scramble, so the frame is
-// built whole in a buffer of its own and the header never leaves this frame.
+// built whole in a buffer from the pool and the header never leaves this
+// frame. A connection with no layer takes the buffer over and gives it back
+// once it has been written, as it does a layer's sealed output, so a client's
+// steady sending allocates nothing (TestClientWriteMessageAllocs); a layer
+// such as TLS seals the frame as it takes it, and any other transport copies
+// what it keeps, so the buffer is free again once the send returns.
 func (c *Connection) sendMaskedFrame(opcode Opcode, payload []byte, compressed bool) error {
 	var header [maxFrameHeader]byte
 	headerLen, err := frameHeader(header[:], opcode, len(payload))
@@ -365,7 +370,7 @@ func (c *Connection) sendMaskedFrame(opcode Opcode, payload []byte, compressed b
 	if compressed {
 		header[0] |= 0x40
 	}
-	frame := make([]byte, headerLen+4+len(payload))
+	frame := bufferpool.Get(headerLen + 4 + len(payload))
 	copy(frame, header[:headerLen])
 	frame[1] |= 0x80
 	mask := frame[headerLen : headerLen+4]
@@ -375,7 +380,12 @@ func (c *Connection) sendMaskedFrame(opcode Opcode, payload []byte, compressed b
 	_, _ = rand.Read(mask)
 	copy(frame[headerLen+4:], payload)
 	applyMask(frame[headerLen+4:], mask)
-	return c.conn.SendOwned(frame)
+	if conn, ok := c.conn.(*fib.Connection); ok && conn.Layer() == nil {
+		return conn.SendRawPooled(frame)
+	}
+	err = c.conn.SendParts(frame, nil)
+	bufferpool.Put(frame)
+	return err
 }
 
 func (c *Connection) sendClose(payload []byte) error {

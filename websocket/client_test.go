@@ -28,7 +28,7 @@ import (
 )
 
 // startClientEngine runs an engine with no listener, for clients only.
-func startClientEngine(t *testing.T) *fib.Engine {
+func startClientEngine(t testing.TB) *fib.Engine {
 	t.Helper()
 	engine, err := fib.New(fib.DefaultConfig())
 	if err != nil {

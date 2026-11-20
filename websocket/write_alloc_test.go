@@ -3,6 +3,7 @@
 package websocket
 
 import (
+	"fmt"
 	"io"
 	stdhttp "net/http"
 	"testing"
@@ -56,5 +57,62 @@ func TestServerWriteMessageAllocs(t *testing.T) {
 	})
 	if allocs != 0 {
 		t.Fatalf("WriteMessage allocated %v times a message", allocs)
+	}
+}
+
+// dialDiscardingServer dials a server that reads and drops every message,
+// and returns the client's connection.
+func dialDiscardingServer(tb testing.TB) *Connection {
+	tb.Helper()
+	url := startWebSocketServer(tb, DefaultConfig(), HandlerFuncs{})
+	engine := startClientEngine(tb)
+	type result struct {
+		c   *Connection
+		err error
+	}
+	done := make(chan result, 1)
+	NewDialer(engine, DefaultDialerConfig()).Dial(url, nil, nil, func(c *Connection, _ *stdhttp.Response, err error) {
+		done <- result{c, err}
+	})
+	r := <-done
+	if r.err != nil {
+		tb.Fatal(r.err)
+	}
+	tb.Cleanup(func() { _ = r.c.Close(CloseNormal, "") })
+	return r.c
+}
+
+// A client's frame is masked into a buffer from the pool, which the
+// connection gives back once it has been written, so a client's
+// WriteMessage allocates nothing either.
+func TestClientWriteMessageAllocs(t *testing.T) {
+	c := dialDiscardingServer(t)
+	payload := make([]byte, 16)
+	if err := c.WriteMessage(Binary, payload); err != nil {
+		t.Fatal(err)
+	}
+	allocs := testing.AllocsPerRun(100, func() {
+		if err := c.WriteMessage(Binary, payload); err != nil {
+			t.Fatal(err)
+		}
+	})
+	if allocs != 0 {
+		t.Fatalf("a client's WriteMessage allocated %v times a message", allocs)
+	}
+}
+
+func BenchmarkClientWriteMessage(b *testing.B) {
+	for _, size := range []int{16, 1 << 10} {
+		b.Run(fmt.Sprint(size), func(b *testing.B) {
+			c := dialDiscardingServer(b)
+			payload := make([]byte, size)
+			b.SetBytes(int64(size))
+			b.ReportAllocs()
+			for b.Loop() {
+				if err := c.WriteMessage(Binary, payload); err != nil {
+					b.Fatal(err)
+				}
+			}
+		})
 	}
 }
