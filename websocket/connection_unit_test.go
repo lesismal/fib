@@ -148,7 +148,7 @@ func TestConnectionCloseSentOnce(t *testing.T) {
 	if want := []byte{0x88, 5, 0x03, 0xe8, 'b', 'y', 'e'}; !bytes.Equal(transport.frames[0], want) {
 		t.Fatalf("close frame %x, want %x", transport.frames[0], want)
 	}
-	if code, reason := c.closeStatus(); code != CloseNormal || reason != "bye" {
+	if code, reason, _ := c.closeStatus(nil); code != CloseNormal || reason != "bye" {
 		t.Fatalf("close status %d %q", code, reason)
 	}
 	if err := c.WriteText("late"); !errors.Is(err, errCloseSent) {
@@ -203,7 +203,7 @@ func TestServeFramesEchoesEmptyClose(t *testing.T) {
 	if len(transport.frames) != 1 || !bytes.Equal(transport.frames[0], []byte{0x88, 0}) {
 		t.Fatalf("frames %x", transport.frames)
 	}
-	if code, reason := ws.closeStatus(); code != CloseNormal || reason != "" {
+	if code, reason, _ := ws.closeStatus(nil); code != CloseNormal || reason != "" {
 		t.Fatalf("close status %d %q", code, reason)
 	}
 }

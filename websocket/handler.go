@@ -10,6 +10,7 @@ import (
 	"encoding/binary"
 	"errors"
 	stdhttp "net/http"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -43,11 +44,23 @@ type Config struct {
 	// 7692). Messages are then sent compressed, and a client may send its own
 	// compressed. MaxMessageBytes bounds a message once decompressed.
 	EnableCompression bool
+	// PendingWriteLimit is how many bytes sent on a connection may wait to
+	// go to the peer before WriteMessageNoWait reports above, and twice what
+	// OnWritable waits for them to fall to; see Connection.OnWritable. Zero
+	// means DefaultPendingWriteLimit. It paces only a writer that asks: what
+	// WriteMessage sends is queued however much already waits.
+	PendingWriteLimit int64
 	HTTP              epollhttp.Config
 }
 
+// DefaultPendingWriteLimit is the PendingWriteLimit of a Config or a
+// DialerConfig that sets none, as much as an HTTP response's WriteNoWait lets
+// wait.
+const DefaultPendingWriteLimit = 64 << 10
+
 func DefaultConfig() Config {
-	return Config{MaxMessageBytes: 16 << 20, HTTP: epollhttp.DefaultConfig()}
+	return Config{MaxMessageBytes: 16 << 20, PendingWriteLimit: DefaultPendingWriteLimit,
+		HTTP: epollhttp.DefaultConfig()}
 }
 
 type Handler interface {
@@ -172,8 +185,11 @@ type Connection struct {
 	// conn is what the frames go through: the fib.Connection of a server or
 	// client of this package's own, or the http.Tunnel of a request that
 	// ServerHandler.Upgrade switched, on HTTP/1.1, HTTP/2 or HTTP/3.
-	conn        transport
-	subprotocol string
+	conn transport
+	// subprotocol is the one the handshake chose, nil for none. It points
+	// into the handler's or the dialer's own list rather than holding a
+	// string, which keeps a server's connectionState within its size class.
+	subprotocol *string
 	closeState  atomic.Pointer[connectionCloseState]
 	closeSent   atomic.Bool
 	// client marks the dialing side, whose frames must be masked.
@@ -182,6 +198,9 @@ type Connection struct {
 	// far back what this side sends may refer.
 	compress   bool
 	windowBits uint8
+	// pendingLimit is Config.PendingWriteLimit, or DialerConfig's; zero
+	// means DefaultPendingWriteLimit.
+	pendingLimit int64
 }
 
 // transport is what a Connection sends its frames through, which a
@@ -201,12 +220,37 @@ var (
 	errCloseSent  = errors.New("websocket: close already sent")
 )
 
+// connectionCloseState is how a connection's end began: the close frame this
+// end sent, or Abort, whose err OnClose then reports.
 type connectionCloseState struct {
-	code   uint16
-	reason string
+	code    uint16
+	reason  string
+	aborted bool
+	err     error
 }
 
-func (c *Connection) Subprotocol() string { return c.subprotocol }
+// Subprotocol is the subprotocol the opening handshake chose, or "".
+func (c *Connection) Subprotocol() string {
+	if c.subprotocol == nil {
+		return ""
+	}
+	return *c.subprotocol
+}
+
+// internSubprotocol returns the element of list that is s, for a connection
+// to point at, or nil when s is empty. s is always one of list's, which the
+// handshake chose it from.
+func internSubprotocol(list []string, s string) *string {
+	if s == "" {
+		return nil
+	}
+	for i := range list {
+		if list[i] == s {
+			return &list[i]
+		}
+	}
+	return &s
+}
 
 func (c *Connection) WriteMessage(opcode Opcode, payload []byte) error {
 	if opcode != Text && opcode != Binary {
@@ -341,7 +385,10 @@ func (c *Connection) sendClose(payload []byte) error {
 	// Every caller hands over at most 125 bytes: Close checks the reason's
 	// length, and the parser bounds a received close frame.
 	code, reason := closePayload(payload)
-	c.closeState.Store(&connectionCloseState{code: code, reason: reason})
+	if !c.closeState.CompareAndSwap(nil, &connectionCloseState{code: code, reason: reason}) {
+		// Abort got there first: nothing is sent once it has.
+		return nil
+	}
 	if err := c.sendFrame(Close, payload, false); err != nil {
 		return err
 	}
@@ -401,6 +448,11 @@ func NewHandlerWithConfig(config Config, handler Handler) *ServerHandler {
 	if config.MaxMessageBytes <= 0 {
 		config.MaxMessageBytes = defaults.MaxMessageBytes
 	}
+	if config.PendingWriteLimit <= 0 {
+		config.PendingWriteLimit = DefaultPendingWriteLimit
+	}
+	// The handler's own copy, which its connections point into.
+	config.Subprotocols = slices.Clone(config.Subprotocols)
 	if config.HTTP.MaxHeaderBytes <= 0 {
 		config.HTTP.MaxHeaderBytes = defaults.HTTP.MaxHeaderBytes
 	}
@@ -505,8 +557,8 @@ func (h *ServerHandler) upgrade(c *fib.Connection, state *connectionState, reque
 		return
 	}
 	compress := result.extensions != ""
-	state.websocket = Connection{conn: c, subprotocol: result.subprotocol, compress: compress,
-		windowBits: uint8(result.deflate.windowBits)}
+	state.websocket = Connection{conn: c, subprotocol: internSubprotocol(h.config.Subprotocols, result.subprotocol),
+		compress: compress, windowBits: uint8(result.deflate.windowBits), pendingLimit: h.config.PendingWriteLimit}
 	state.wsParser.maxMessageBytes = h.config.MaxMessageBytes
 	state.wsParser.deflate = compress
 	state.wsParser.contextTakeover = compress && result.deflate.peerContextTakeover
@@ -861,19 +913,24 @@ func (h *ServerHandler) OnClose(c *fib.Connection, err error) {
 	}
 	h.releaseHandshakeParser(state)
 	if state.upgraded() {
-		code, reason := state.websocket.closeStatus()
+		code, reason, err := state.websocket.closeStatus(err)
 		h.handler.OnClose(&state.websocket, code, reason, err)
 	}
 }
 
-// closeStatus is the code and reason OnClose reports: those of the close frame
-// this end sent, which echoes the peer's when the peer closed first, or 1006
-// when the connection ended without a close handshake.
-func (c *Connection) closeStatus() (uint16, string) {
-	if closeState := c.closeState.Load(); closeState != nil {
-		return closeState.code, closeState.reason
+// closeStatus is what OnClose reports of a connection that ended with err:
+// the code and reason of the close frame this end sent, which echoes the
+// peer's when the peer closed first, or 1006 when the connection ended
+// without a close handshake; and err, or what Abort was given instead.
+func (c *Connection) closeStatus(err error) (uint16, string, error) {
+	closeState := c.closeState.Load()
+	if closeState == nil {
+		return 1006, "", err
 	}
-	return 1006, ""
+	if closeState.aborted && closeState.err != nil {
+		err = closeState.err
+	}
+	return closeState.code, closeState.reason, err
 }
 
 func (h *ServerHandler) releaseHandshakeParser(state *connectionState) {

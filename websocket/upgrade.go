@@ -72,7 +72,8 @@ func (h *ServerHandler) Upgrade(c *epollhttp.Context, header stdhttp.Header) (*C
 	}
 	compress := result.extensions != ""
 	u := &upgradedConn{handler: h, request: request}
-	u.ws = Connection{subprotocol: result.subprotocol, compress: compress, windowBits: uint8(result.deflate.windowBits)}
+	u.ws = Connection{subprotocol: internSubprotocol(h.config.Subprotocols, result.subprotocol), compress: compress,
+		windowBits: uint8(result.deflate.windowBits), pendingLimit: h.config.PendingWriteLimit}
 	u.parser = Parser{maxMessageBytes: h.config.MaxMessageBytes, deflate: compress,
 		contextTakeover: compress && result.deflate.peerContextTakeover, perFrame: h.frames != nil}
 	if _, err := c.Upgrade("websocket", response, u); err != nil {
@@ -200,6 +201,6 @@ func (u *upgradedConn) OnTunnelShutdown(*epollhttp.Tunnel) {
 }
 
 func (u *upgradedConn) OnTunnelClose(_ *epollhttp.Tunnel, err error) {
-	code, reason := u.ws.closeStatus()
+	code, reason, err := u.ws.closeStatus(err)
 	u.handler.handler.OnClose(&u.ws, code, reason, err)
 }

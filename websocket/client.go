@@ -54,6 +54,9 @@ type DialerConfig struct {
 	// EnableCompression offers the server permessage-deflate (RFC 7692). If
 	// the server accepts, messages are sent compressed and may arrive so.
 	EnableCompression bool
+	// PendingWriteLimit is Config.PendingWriteLimit for the dialer's
+	// connections. Zero means DefaultPendingWriteLimit.
+	PendingWriteLimit int64
 	// BlockingTLSHandshake runs the TLS handshakes of wss:// connections
 	// through crypto/tls on a worker of the handshake pool, each waiting there
 	// for its peer. By default they run as state machines that take no
@@ -71,7 +74,8 @@ type DialerConfig struct {
 }
 
 func DefaultDialerConfig() DialerConfig {
-	return DialerConfig{HandshakeTimeout: 10 * time.Second, MaxMessageBytes: 16 << 20, MaxHandshakeBytes: 1 << 20}
+	return DialerConfig{HandshakeTimeout: 10 * time.Second, MaxMessageBytes: 16 << 20, MaxHandshakeBytes: 1 << 20,
+		PendingWriteLimit: DefaultPendingWriteLimit}
 }
 
 // Dialer opens client WebSocket connections over an engine without blocking
@@ -97,6 +101,11 @@ func NewDialer(engine *fib.Engine, config DialerConfig) *Dialer {
 	if config.MaxHandshakeBytes <= 0 {
 		config.MaxHandshakeBytes = defaults.MaxHandshakeBytes
 	}
+	if config.PendingWriteLimit <= 0 {
+		config.PendingWriteLimit = DefaultPendingWriteLimit
+	}
+	// The dialer's own copy, which its connections point into.
+	config.Subprotocols = slices.Clone(config.Subprotocols)
 	return &Dialer{engine: engine, config: config}
 }
 
@@ -375,8 +384,9 @@ func (cc *clientConn) OnData(conn *fib.Connection, data []byte) {
 	// read; they are the connection's first.
 	remainder := cc.response[headerEnd:]
 	cc.response = nil
-	cc.ws = Connection{conn: conn, subprotocol: subprotocol, client: true, compress: compress,
-		windowBits: uint8(deflate.windowBits)}
+	cc.ws = Connection{conn: conn, subprotocol: internSubprotocol(cc.dialer.config.Subprotocols, subprotocol),
+		client: true, compress: compress, windowBits: uint8(deflate.windowBits),
+		pendingLimit: cc.dialer.config.PendingWriteLimit}
 	cc.parser = Parser{maxMessageBytes: cc.dialer.config.MaxMessageBytes, fromServer: true, deflate: compress,
 		contextTakeover: compress && deflate.peerContextTakeover, perFrame: cc.frames != nil}
 	cc.upgraded.Store(true)
@@ -421,7 +431,7 @@ func (cc *clientConn) checkResponse(resp *stdhttp.Response) (subprotocol string,
 
 func (cc *clientConn) OnClose(_ *fib.Connection, err error) {
 	if cc.upgraded.Load() {
-		code, reason := cc.ws.closeStatus()
+		code, reason, err := cc.ws.closeStatus(err)
 		cc.handler.OnClose(&cc.ws, code, reason, err)
 		return
 	}
