@@ -23,6 +23,10 @@ import (
 // The connection is told (fib.Connection.SetKernelTLS), so that it writes as
 // suits the kernel's records.
 //
+// With Handler.KernelTLSFromHandshake the switch comes earlier, at the first
+// send of application data after the handshake that finds nothing sealed here
+// still queued, for a network card that seals the records the kernel hands it.
+//
 // A smaller file is sealed here until then. The switch is for good, and the
 // kernel seals a reply from memory at more cost than this package does:
 // Linux's TLS takes a few records' worth of plaintext through more work for
@@ -141,13 +145,44 @@ func (t *layer) kernelSealsLocked(f fib.File, count int64) bool {
 		t.ktls = ktlsOff
 		return false
 	}
-	if !largeFile(f, count, t.kernelTLSMinFile()) {
+	if !t.kernelFromHandshake() && !largeFile(f, count, t.kernelTLSMinFile()) {
 		return false
 	}
+	return t.startKernelLocked()
+}
+
+// kernelFromHandshake reports whether the Handler hands the sealing to the
+// kernel from the first send after the handshake (KernelTLSFromHandshake).
+func (t *layer) kernelFromHandshake() bool {
+	return t.owner != nil && t.owner.KernelTLSFromHandshake && !t.owner.NoKernelTLS
+}
+
+// kernelBeforeSendLocked hands the sealing to the kernel ahead of a send of
+// application data, where the Handler asks for that from the handshake on
+// and it has not been tried to the end yet: the handshake over, with nothing
+// sealed here still queued, which a send behind the handshake's last flight
+// or a busy stream may not find, and the next send then tries again. Only
+// application data tries, so that a KeyUpdate or an alert is sealed under the
+// keys it was made for. The caller holds wmu.
+func (t *layer) kernelBeforeSendLocked() {
+	if !t.ready || t.earlyAhead || !t.kernelFromHandshake() {
+		return
+	}
+	if !kernelTLSFits(t.tx) {
+		t.ktls = ktlsOff
+		return
+	}
+	t.startKernelLocked()
+}
+
+// startKernelLocked hands the sealing to the kernel if nothing sealed here is
+// still queued, and reports whether the kernel seals from now on. A kernel
+// that refuses leaves the sealing here for good. The caller holds wmu.
+func (t *layer) startKernelLocked() bool {
 	ran, err := t.c.ControlIdle(func(fd uintptr) error { return startKernelTLS(fd, t.tx) })
 	if !ran {
-		// Something sealed here is still on its way; the next file tries
-		// again.
+		// Something sealed here is still on its way; the next file, or
+		// send, tries again.
 		return false
 	}
 	if err != nil {

@@ -699,3 +699,71 @@ func testSendFileOverTLSChaCha20(t *testing.T) {
 		})
 	}
 }
+
+// KernelTLSFromHandshake hands the sealing to the kernel at a send after the
+// handshake, with no file sent, over every suite the kernel's TLS has, and
+// leaves it here over the others, with the option off and with NoKernelTLS
+// set. Replies corked in the handler, sends from outside it and the
+// close_notify reach the client whole whoever seals them, including the
+// replies that cross the switch.
+func TestKernelTLSFromHandshake(t *testing.T) {
+	sizes := []int{1, 100, maxPlaintext + 1, 200_000}
+	for _, s := range fileSuites {
+		for _, tc := range []struct {
+			name     string
+			from, no bool
+		}{
+			{"from-handshake", true, false},
+			{"off", false, false},
+			{"no-kernel", true, true},
+		} {
+			t.Run(s.name+"/"+tc.name, func(t *testing.T) {
+				echoBack := func(c *fib.Connection, b []byte) {
+					if err := c.Send(b); err != nil {
+						t.Error(err)
+					}
+				}
+				layers, config, addr := fileServerWith(t, s.version, s.suite, echoBack, func(h *Handler) {
+					h.KernelTLSFromHandshake, h.NoKernelTLS = tc.from, tc.no
+				})
+				conn := dialFileServer(t, addr, config)
+				l := <-layers
+				kernel := tc.from && !tc.no
+				// The first reply may find the handshake's last records still
+				// queued, which leaves the switch to a later one.
+				for i := 0; i < 20; i++ {
+					echo(t, conn, sizes...)
+					l.wmu.Lock()
+					state := l.ktls
+					l.wmu.Unlock()
+					if state != ktlsUntried || !kernel {
+						break
+					}
+				}
+				wantKernel(t, l, kernel)
+				l.wmu.Lock()
+				state, fits := l.ktls, kernelTLSFits(l.tx)
+				l.wmu.Unlock()
+				if !kernel && fits && state != ktlsUntried {
+					t.Fatalf("kernel TLS state %d, want untried: no file has been sent", state)
+				}
+				payload := bytes.Repeat([]byte{'o'}, 3*maxPlaintext+1)
+				if err := l.c.Send(payload); err != nil {
+					t.Fatal(err)
+				}
+				got := make([]byte, len(payload))
+				if _, err := io.ReadFull(conn, got); err != nil || !bytes.Equal(got, payload) {
+					t.Fatalf("a send from outside the handler: %v", err)
+				}
+				if err := l.c.Send([]byte("bye")); err != nil {
+					t.Fatal(err)
+				}
+				l.c.CloseAfterSend()
+				rest, err := io.ReadAll(conn)
+				if err != nil || string(rest) != "bye" {
+					t.Fatalf("read %q, %v at the end", rest, err)
+				}
+			})
+		}
+	}
+}

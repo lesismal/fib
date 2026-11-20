@@ -140,7 +140,7 @@ curl -k --http2 https://127.0.0.1:8443/
 - 版本与套件：`MinVersion`、`MaxVersion`，TLS 1.2 用 `CipherSuites`；TLS 1.3 套件在 `crypto/tls` 里没有配置字段，客户端的提议顺序由 `Handler.TLS13CipherSuites` 决定；
 - 会话恢复：服务端用 `SessionTicketKey`——握手以状态机方式运行的服务端会签发自己的 ticket，密钥属于 `Handler`；客户端用 `ClientSessionCache`，但它会让连接留在 `crypto/tls` 里；想在不占 worker 的握手上恢复会话，改用 `DialOptions.SessionCache`（`Handler.SessionCache`）。
 
-fib 增加的是数据路径——记录的加封与解封、一轮写入合并为一条记录，以及在 Linux 上把大文件 `SendFile` 响应的加封交给内核 TLS（`Handler.KernelTLSMinFile`，用 `NoKernelTLS` 关闭）。
+fib 增加的是数据路径——记录的加封与解封、一轮写入合并为一条记录，以及在 Linux 上把大文件 `SendFile` 响应的加封交给内核 TLS（`Handler.KernelTLSMinFile`，用 `NoKernelTLS` 关闭；`KernelTLSFromHandshake` 改为握手之后就交给内核，用于自己能加密 TLS 记录的网卡）。
 
 ## 感知 ALPN 的 handler
 

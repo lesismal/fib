@@ -458,7 +458,11 @@ TLS 1.3 或 1.2 的 AES-GCM、ChaCha20-Poly1305，TLS 1.2 或 1.1 的 AES-CBC）
   的记录发出（`Connection.SendRawRecord`）。对端要求的 KeyUpdate 在下一次队列为空时经由
   内核发出，内核随后换用下一代密钥；不能换密钥的内核（6.14 之前的 Linux）则改为关闭连接。
   读取仍在用户态。内核没有 `tls` 模块、或进程无权加载时只记录一次，之后不再尝试。
-  `tls.Handler.NoKernelTLS` 关闭这一切换。
+  `tls.Handler.NoKernelTLS` 关闭这一切换。`tls.Handler.KernelTLSFromHandshake`（默认关闭）
+  让切换提前到握手之后第一次遇到队列为空的发送，不论是否是文件，用于自己能加密 TLS 记录的
+  网卡（NVIDIA/Mellanox ConnectX-6 Dx 及以后，打开 `tls-hw-tx-offload`）：内核把记录交给网卡
+  加密，`/proc/net/tls_stat` 的 `TlsTxDevice` 会计数。没有这种网卡时，内核加密小回包比用户态
+  更贵，所以默认要等到大文件才切换。
 - **其他情况**（macOS、BSD、Windows、ChaCha20-Poly1305 与 AES-CBC 套件，或关闭了、缺少
   内核 TLS）连接把文件
   排进队列，由 flush 随 socket 排空每次读取 64KB，封装成四条满的记录（`fib.FileSealer`）

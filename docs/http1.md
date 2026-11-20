@@ -615,6 +615,13 @@ ChaCha20-Poly1305 over TLS 1.3 or 1.2, AES-CBC over TLS 1.2 or 1.1):
   ends the connection instead. Reading stays in user space. A kernel without
   the `tls` module, or one the process may not load, is noted once and
   never asked again. `tls.Handler.NoKernelTLS` turns the switch off.
+  `tls.Handler.KernelTLSFromHandshake` (off by default) makes the switch at
+  the first send after the handshake that finds nothing queued, file or not,
+  for a network card that seals TLS records itself (NVIDIA/Mellanox
+  ConnectX-6 Dx and later with `tls-hw-tx-offload` on): the kernel hands the
+  records to the card, and `TlsTxDevice` in `/proc/net/tls_stat` counts them.
+  Without such a card the kernel seals small replies at more cost than user
+  space does, which is why the default waits for a large file.
 - **Otherwise** (macOS, the BSDs, Windows, ChaCha20-Poly1305 and AES-CBC
   suites, or kernel TLS off or missing) the connection queues the file and its
   flush reads it 64KB at a time as the socket drains, seals each chunk into

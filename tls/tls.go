@@ -174,6 +174,19 @@ type Handler struct {
 	// than sealing them here: a large file pays that back, and a smaller one
 	// is sealed here as it is read.
 	KernelTLSMinFile int64
+	// KernelTLSFromHandshake hands the sealing of what a connection sends to
+	// the kernel's TLS from its first send after the handshake, where
+	// NoKernelTLS allows it and the suite is one of AES-GCM's on Linux, rather
+	// than from its first large file. It is for a network card that seals TLS
+	// records itself, such as NVIDIA (Mellanox) ConnectX-6 Dx and later with
+	// tls-hw-tx-offload on (see ethtool -k, and TlsTxDevice in
+	// /proc/net/tls_stat): the kernel then hands the records to the card, and
+	// neither it nor this package seals them. Without such a card the kernel
+	// seals them itself, which costs more than this package does for replies
+	// from memory, so it is off by default. The switch is made at a send that
+	// finds nothing sealed here still queued, as a file's is; until one does,
+	// this package seals. Receiving stays with this package either way.
+	KernelTLSFromHandshake bool
 	// SessionCache, on a client, is where tickets go and sessions come from,
 	// for client handshakes that run without a worker: a connection then
 	// resumes the session of one before it. With EarlyData also set, what is
@@ -645,7 +658,8 @@ type layer struct {
 	// into one record when the cork comes off; see holdLocked. It is wmu's.
 	held []byte
 	// ktls is where the connection stands with the kernel's TLS, which the
-	// first file it sends may hand its sealing to (see kernelSealsLocked),
+	// first file it sends may hand its sealing to (see kernelSealsLocked), or
+	// its first send (kernelBeforeSendLocked),
 	// and rekeyOwed a KeyUpdate the peer asked for that the kernel has not
 	// sent yet. Both are wmu's.
 	ktls      uint8
@@ -654,7 +668,8 @@ type layer struct {
 
 // The states of layer.ktls.
 const (
-	// ktlsUntried: this package seals, and the next file may change that.
+	// ktlsUntried: this package seals, and the next file, or with
+	// KernelTLSFromHandshake the next send, may change that.
 	ktlsUntried uint8 = iota
 	// ktlsOn: the kernel seals every record sent from here on.
 	ktlsOn

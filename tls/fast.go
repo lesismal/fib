@@ -676,6 +676,9 @@ func (t *layer) dropHeld() {
 // sealSendWith is sealSendLocked under the keys given, or hands the record
 // to the kernel to seal where it has taken the sealing over.
 func (t *layer) sealSendWith(keys *recordKeys, typ byte, first, second []byte) error {
+	if t.ktls == ktlsUntried && typ == recordTypeApplicationData && keys == t.tx {
+		t.kernelBeforeSendLocked()
+	}
 	if t.ktls == ktlsOn {
 		return t.kernelSendLocked(typ, first, second)
 	}
