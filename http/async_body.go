@@ -181,10 +181,15 @@ func runStages(stages []BodyFilter, p []byte, end bool, trailer stdhttp.Header, 
 		}
 		out, err := f.Filter(p)
 		if err == nil && end {
+			// out may be a buffer of the filter's own, which Close reuses:
+			// it is copied first, and the tail after it.
+			out = append([]byte(nil), out...)
 			var tail []byte
-			if tail, err = f.Close(); err == nil && len(tail) > 0 {
-				out = append(append([]byte(nil), out...), tail...)
+			tail, err = f.Close()
+			if err == nil {
+				out = append(out, tail...)
 			}
+			releaseFilter(f)
 		}
 		if err != nil {
 			if end {

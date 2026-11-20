@@ -78,6 +78,24 @@ type BodyAborter interface {
 	Abort(err error)
 }
 
+// BodyReleaser is implemented by a BodyFilter whose Close returns a buffer
+// of its own, as a compressor taken from a pool does: Release is called once,
+// after what Close returned has been sent or copied, and whether Close erred
+// or not, so that the filter gives the buffer back then rather than copy what
+// it returns. It is called on the goroutine that called Close, and no method
+// of the filter is called after it.
+type BodyReleaser interface {
+	Release()
+}
+
+// releaseFilter releases f, which has been closed, when it is a
+// BodyReleaser.
+func releaseFilter(f BodyFilter) {
+	if r, ok := f.(BodyReleaser); ok {
+		r.Release()
+	}
+}
+
 // errBodyUnended is why a filter is aborted when its response ended without
 // the body ending and without an error of its own.
 var errBodyUnended = errors.New("http: the response ended before its body did")
@@ -331,7 +349,12 @@ func (h *responseHooks) filter(p []byte) ([]byte, error) {
 // those after it, and returns what is left to send, in a slice of its own.
 // flush says to flush them instead, where they can, rather than close them.
 func (h *responseHooks) endFilters(flush bool) ([]byte, error) {
-	var out []byte
+	return h.appendEnd(nil, flush)
+}
+
+// appendEnd is endFilters, appending what is left to send to out. A closed
+// filter is released (see BodyReleaser) once its tail is in out.
+func (h *responseHooks) appendEnd(out []byte, flush bool) ([]byte, error) {
 	for i, f := range h.filters {
 		var tail []byte
 		var err error
@@ -346,6 +369,7 @@ func (h *responseHooks) endFilters(flush bool) ([]byte, error) {
 		if err != nil {
 			if !flush {
 				// The ones after it will not be closed now.
+				releaseFilter(f)
 				abortFilters(h.filters[i+1:], err)
 				h.filters = nil
 			}
@@ -357,6 +381,7 @@ func (h *responseHooks) endFilters(flush bool) ([]byte, error) {
 			}
 			if tail, err = next.Filter(tail); err != nil {
 				if !flush {
+					releaseFilter(f)
 					abortFilters(h.filters[i+1:], err)
 					h.filters = nil
 				}
@@ -364,6 +389,9 @@ func (h *responseHooks) endFilters(flush bool) ([]byte, error) {
 			}
 		}
 		out = append(out, tail...)
+		if !flush {
+			releaseFilter(f)
+		}
 	}
 	if !flush {
 		h.filters = nil
@@ -386,12 +414,12 @@ func (h *responseHooks) filterWhole(response *Response, head bool) error {
 	if err != nil {
 		return err
 	}
-	out := append([]byte(nil), body...)
-	tail, err := h.endFilters(false)
+	// The body is the last filter's own until the filters are closed.
+	out, err := h.appendEnd(append([]byte(nil), body...), false)
 	if err != nil {
 		return err
 	}
-	response.Body = append(out, tail...)
+	response.Body = out
 	delete(response.Header, "Content-Length")
 	return nil
 }
