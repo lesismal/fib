@@ -11,7 +11,10 @@ import (
 	epollhttp "github.com/lesismal/fib/http"
 )
 
-var errOriginRejected = errors.New("websocket: origin rejected")
+var (
+	errOriginRejected = errors.New("websocket: origin rejected")
+	errPathNotFound   = errors.New("websocket: path not found")
+)
 
 // Upgrade switches a request that a server of package http or package http3
 // is serving to WebSocket, and returns the connection, which the
@@ -108,6 +111,9 @@ func (h *ServerHandler) validateExtendedConnect(request *stdhttp.Request) (hands
 		request.Header.Get("Sec-Websocket-Version") != "13" {
 		return handshakeResult{}, ErrProtocol
 	}
+	if !h.pathAllowed(request) {
+		return handshakeResult{}, errPathNotFound
+	}
 	if !h.checkOrigin(request) {
 		return handshakeResult{}, errOriginRejected
 	}
@@ -174,11 +180,9 @@ func sameOrigin(origin, host []byte) bool {
 
 // refuse answers a request that is not a handshake the server accepts.
 func (h *ServerHandler) refuse(c *epollhttp.Context, err error) {
-	status := stdhttp.StatusBadRequest
+	status := rejectStatus(err)
 	header := stdhttp.Header{"Content-Type": {"text/plain; charset=utf-8"}}
-	if errors.Is(err, errOriginRejected) {
-		status = stdhttp.StatusForbidden
-	} else {
+	if status == stdhttp.StatusBadRequest {
 		// What a client offering another version needs to hear (RFC 6455
 		// section 4.4).
 		header["Sec-WebSocket-Version"] = []string{"13"}

@@ -7,6 +7,7 @@ import (
 	"net/textproto"
 	"net/url"
 	"strings"
+	"time"
 )
 
 var (
@@ -18,7 +19,13 @@ type handshakeParser struct {
 	buffer         []byte
 	headerScan     int
 	maxHeaderBytes int
+	// timer closes the connection whose handshake this is once
+	// Config.HandshakeTimeout has passed, and is nil without one.
+	timer *time.Timer
 }
+
+// idle reports whether p holds nothing of a handshake yet, as a nil p does.
+func (p *handshakeParser) idle() bool { return p == nil || len(p.buffer) == 0 }
 
 func (p *handshakeParser) Feed(data []byte) (*stdhttp.Request, bool, error) {
 	// The common case is a complete handshake in one socket read. Parse it

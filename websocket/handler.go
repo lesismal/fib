@@ -10,10 +10,12 @@ import (
 	"encoding/binary"
 	"errors"
 	stdhttp "net/http"
+	"net/url"
 	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
+	"time"
 	"unicode/utf8"
 
 	fib "github.com/lesismal/fib"
@@ -50,8 +52,28 @@ type Config struct {
 	// means DefaultPendingWriteLimit. It paces only a writer that asks: what
 	// WriteMessage sends is queued however much already waits.
 	PendingWriteLimit int64
-	HTTP              epollhttp.Config
+	// HandshakeTimeout bounds how long a connection the ServerHandler serves
+	// itself may take, from its accept, to complete its opening handshake:
+	// one that has not by then is closed, so that a peer that connects and
+	// sends nothing, or a request head a byte at a time, holds no
+	// connection for long. Zero means DefaultHandshakeTimeout; below zero,
+	// no limit. It is one timer for each connection while its handshake
+	// lasts, and costs nothing once the WebSocket is open. A request
+	// upgraded through Upgrade is bounded by its server's
+	// http.Config.ReadHeaderTimeout instead.
+	HandshakeTimeout time.Duration
+	// Path, when not empty, is the one path a handshake may ask for: one for
+	// any other, percent-decoded and without its query, is answered 404 Not
+	// Found, whether it came to the ServerHandler itself or through Upgrade.
+	// It is for a ServerHandler bound to a connection directly, with no HTTP
+	// server to route its requests. Empty accepts every path.
+	Path string
+	HTTP epollhttp.Config
 }
+
+// DefaultHandshakeTimeout is the HandshakeTimeout of a Config that sets none,
+// what an HTTP server's DefaultReadHeaderTimeout gives a request's header.
+const DefaultHandshakeTimeout = epollhttp.DefaultReadHeaderTimeout
 
 // DefaultPendingWriteLimit is the PendingWriteLimit of a Config or a
 // DialerConfig that sets none, as much as an HTTP response's WriteNoWait lets
@@ -60,7 +82,7 @@ const DefaultPendingWriteLimit = 64 << 10
 
 func DefaultConfig() Config {
 	return Config{MaxMessageBytes: 16 << 20, PendingWriteLimit: DefaultPendingWriteLimit,
-		HTTP: epollhttp.DefaultConfig()}
+		HandshakeTimeout: DefaultHandshakeTimeout, HTTP: epollhttp.DefaultConfig()}
 }
 
 type Handler interface {
@@ -486,6 +508,9 @@ func NewHandlerWithConfig(config Config, handler Handler) *ServerHandler {
 	if config.PendingWriteLimit <= 0 {
 		config.PendingWriteLimit = DefaultPendingWriteLimit
 	}
+	if config.HandshakeTimeout == 0 {
+		config.HandshakeTimeout = DefaultHandshakeTimeout
+	}
 	// The handler's own copy, which the caller cannot change under it.
 	config.Subprotocols = slices.Clone(config.Subprotocols)
 	if config.HTTP.MaxHeaderBytes <= 0 {
@@ -517,7 +542,16 @@ func NewHandlerWithConfig(config Config, handler Handler) *ServerHandler {
 }
 
 func (h *ServerHandler) OnOpen(c *fib.Connection) {
-	c.SetAttachment(&connectionState{})
+	state := &connectionState{}
+	if d := h.config.HandshakeTimeout; d > 0 {
+		// The timer has to be stopped once the handshake completes, and the
+		// state has no room for it beside the parser it takes only for a
+		// handshake that arrives in pieces: the parser, from the pool,
+		// carries it.
+		state.handshake = h.handshakeParsers.Get().(*handshakeParser)
+		state.handshake.timer = time.AfterFunc(d, func() { c.CloseWithError(errHandshakeTimeout) })
+	}
+	c.SetAttachment(state)
 }
 
 func (h *ServerHandler) OnData(c *fib.Connection, data []byte) {
@@ -530,7 +564,7 @@ func (h *ServerHandler) OnData(c *fib.Connection, data []byte) {
 		h.handleFrames(state, data)
 		return
 	}
-	if !h.needsRequest && state.handshake == nil {
+	if !h.needsRequest && state.handshake.idle() {
 		key, result, remainder, complete, err := h.validateMinimalHandshake(data)
 		if err != nil {
 			h.reject(c, nil, rejectStatus(err))
@@ -587,6 +621,13 @@ func (h *ServerHandler) negotiateExtensions(result *handshakeResult, offers []st
 }
 
 func (h *ServerHandler) upgrade(c *fib.Connection, state *connectionState, request *stdhttp.Request, key []byte, result handshakeResult, remainder []byte) {
+	if p := state.handshake; p != nil && p.timer != nil {
+		if !p.timer.Stop() {
+			// HandshakeTimeout ran out first, and is closing the connection.
+			return
+		}
+		p.timer = nil
+	}
 	if err := sendHandshakeResponse(c, key, result); err != nil {
 		c.Close()
 		return
@@ -684,6 +725,9 @@ func closeParserError(ws *Connection, err error) {
 }
 
 func (h *ServerHandler) validateHandshake(request *stdhttp.Request) (handshakeResult, error) {
+	if !h.pathAllowed(request) {
+		return handshakeResult{}, errPathNotFound
+	}
 	var result handshakeResult
 	var err error
 	result.subprotocol, err = h.validateHandshakeRequest(request)
@@ -758,6 +802,9 @@ func (h *ServerHandler) validateMinimalHandshake(data []byte) ([]byte, handshake
 	requestURI := data[len("GET ") : lineEnd-len(" HTTP/1.1")]
 	if !validMinimalRequestURI(requestURI) {
 		return nil, handshakeResult{}, nil, false, errMalformedHandshake
+	}
+	if h.config.Path != "" && !h.targetAllowed(requestURI) {
+		return nil, handshakeResult{}, nil, false, errPathNotFound
 	}
 
 	var key, host, origin []byte
@@ -890,12 +937,36 @@ func isHex(c byte) bool {
 }
 
 // rejectStatus is the status a handshake refused for err is answered with:
-// 403 Forbidden for an origin CheckOrigin refuses, 400 Bad Request otherwise.
+// 403 Forbidden for an origin CheckOrigin refuses, 404 Not Found for a path
+// other than Config.Path, 400 Bad Request otherwise.
 func rejectStatus(err error) int {
-	if errors.Is(err, errOriginRejected) {
+	switch {
+	case errors.Is(err, errOriginRejected):
 		return stdhttp.StatusForbidden
+	case errors.Is(err, errPathNotFound):
+		return stdhttp.StatusNotFound
 	}
 	return stdhttp.StatusBadRequest
+}
+
+// pathAllowed reports whether request asks for Config.Path, or any path when
+// it is empty.
+func (h *ServerHandler) pathAllowed(request *stdhttp.Request) bool {
+	return h.config.Path == "" || request.URL != nil && request.URL.Path == h.config.Path
+}
+
+// targetAllowed is pathAllowed for the request-target of a handshake read
+// without making a request of it, which validMinimalRequestURI has checked:
+// its path is compared as it is, and percent-decoded only if it has to be.
+func (h *ServerHandler) targetAllowed(target []byte) bool {
+	if query := bytes.IndexByte(target, '?'); query >= 0 {
+		target = target[:query]
+	}
+	if bytes.IndexByte(target, '%') < 0 {
+		return string(target) == h.config.Path
+	}
+	path, err := url.PathUnescape(string(target))
+	return err == nil && path == h.config.Path
 }
 
 func (h *ServerHandler) reject(c *fib.Connection, request *stdhttp.Request, status int) {
@@ -971,6 +1042,10 @@ func (c *Connection) closeStatus(err error) (uint16, string, error) {
 func (h *ServerHandler) releaseHandshakeParser(state *connectionState) {
 	if state.handshake == nil {
 		return
+	}
+	if timer := state.handshake.timer; timer != nil {
+		timer.Stop()
+		state.handshake.timer = nil
 	}
 	state.handshake.Reset()
 	h.handshakeParsers.Put(state.handshake)
