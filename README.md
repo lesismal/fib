@@ -244,6 +244,26 @@ enough; split them across a few goroutines only for very many connections or wit
 encrypts per connection. A peer that never reads keeps queueing what is sent to it, so close
 such peers yourself.
 
+A writer that must not outrun its peer paces itself without waiting on it, and a peer that has
+stopped reading can be dropped without the close handshake:
+
+```go
+above, err := c.WriteMessageNoWait(websocket.Binary, data) // above: more than PendingWriteLimit waits
+if err == nil && above {
+	pause() // stop producing, or src.HoldReads(true) for a relay
+	if !c.OnWritable(resume) { // resume(err) runs once half of it has gone, or the connection ends
+		resume(nil)
+	}
+}
+c.HoldReads(true)      // stop reading the peer; HoldReads(false) resumes
+c.Abort(errTooSlow)    // close at once, dropping what is queued; OnClose gets errTooSlow
+addr := c.RemoteAddr() // on a server's connection and a dialed one alike
+```
+
+`PendingWriteLimit` is set in `websocket.Config` and `websocket.DialerConfig` (64 KiB by
+default). A relay between a WebSocket and another connection also calls
+`SetWriteBackpressure(false)` on both, as `fib.Connection.SetWriteBackpressure` explains.
+
 ### arpc
 
 ```go

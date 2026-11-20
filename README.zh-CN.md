@@ -231,6 +231,25 @@ for _, c := range conns {
 才值得分到几个 goroutine 并行。对端一直不读时，发给它的数据会一直排队，这类连接需要应用自己
 关闭。详见 [guide](docs/guide.zh-CN.md#向多个连接广播fan-out)。
 
+写方不能跑得比对端快时，可以不等待对端而自我限速；对端已经不读时，可以跳过关闭握手直接断开：
+
+```go
+above, err := c.WriteMessageNoWait(websocket.Binary, data) // above：排队等待的字节超过 PendingWriteLimit
+if err == nil && above {
+	pause() // 暂停生产；转发场景是 src.HoldReads(true)
+	if !c.OnWritable(resume) { // 降到一半时 resume(nil)，连接结束时 resume(err)
+		resume(nil)
+	}
+}
+c.HoldReads(true)      // 停止读对端；HoldReads(false) 恢复
+c.Abort(errTooSlow)    // 立即关闭，丢弃排队的数据；OnClose 收到 errTooSlow
+addr := c.RemoteAddr() // server 端和拨号端都可用
+```
+
+`PendingWriteLimit` 在 `websocket.Config` 和 `websocket.DialerConfig` 里设置（默认 64 KiB）。
+在 WebSocket 和另一条连接之间转发时，两边都调用 `SetWriteBackpressure(false)`，原因见
+`fib.Connection.SetWriteBackpressure`。详见 [guide](docs/guide.zh-CN.md#背压强制关闭与对端地址)。
+
 ### arpc
 
 ```go

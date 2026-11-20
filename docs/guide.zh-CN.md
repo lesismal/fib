@@ -1641,6 +1641,52 @@ for _, c := range conns {
 （含 cork 在一轮里的输出，以及 TLS 层加密后的字节）加上这次要排队的字节会超过上限时，这次 `Send` 不入队，返回
 `fib.ErrSendQueueFull` 并关闭连接，队列永远不超过上限。内核当场整个写走的发送不排队，也就不计入，再大也放行。对端只是慢、但还在读的场景，也可以继续用应用层心跳提前断开。
 
+### 背压、强制关闭与对端地址
+
+`WriteMessage` 从不阻塞，也从不告诉调用方排了多少。写方需要按对端的速度限速（转发、按信用窗口
+发送的流）时，用不等待的写法和回调，不需要 goroutine 等着：
+
+```go
+above, err := c.WriteMessageNoWait(websocket.Binary, data)
+if err == nil && above {
+    pause() // 暂停生产，或者转发时 src.HoldReads(true)
+    if !c.OnWritable(resume) {
+        resume(nil) // 已经降下来了
+    }
+}
+```
+
+- `WriteMessageNoWait` 与 `WriteMessage` 一样发送，之后报告排队等待发往对端的字节是否超过连接的
+  `PendingWriteLimit`（`Config.PendingWriteLimit`、`DialerConfig.PendingWriteLimit`，0 表示
+  `DefaultPendingWriteLimit`，64 KiB，和 HTTP 响应的 `WriteNoWait` 相同）。超过也照常入队，不拒绝；
+  只有引擎的 `MaxWriteQueueBytes`（若设置）是硬上限。`WritePreparedMessageNoWait` 是
+  `WritePreparedMessage` 的对应版本，server 端共享的那一份帧在每个连接上都按全长计。
+- 计的是线上的字节：成帧后、开了 permessage-deflate 时压缩后的大小，Pong、Close 等控制帧也计入。
+  handler 在自己连接的回调里发送的数据，在这一轮读结束前处于 cork 中，同样计入；此时注册的
+  `OnWritable` 在这一轮把它交给 socket 后触发。
+- `OnWritable(fn)`：排队的字节降到 limit 的一半时，在另一个 goroutine 上调用一次 `fn(nil)`；
+  连接先结束（包括 `Abort`）则以非 nil 错误调用；返回 true。已经不超过 limit 时返回 false，`fn`
+  不会被调用，调用方直接继续。每次调用各自注册一个 `fn`。经 HTTP/2、HTTP/3 升级的连接，等的是
+  stream 的流控；server 不支持通知时返回 false。
+- `HoldReads(true/false)`：停止 / 恢复读对端（HTTP/1.1 和直连是 socket 不再读，HTTP/2、HTTP/3
+  是 stream 不再给对端窗口），让对端被 TCP 或 stream 的流控挡住，而不是在内存里堆积。停的是读，
+  不是交付：已经读到的那一次数据里的帧仍会交给 handler（最多一次读的量）；分片消息读到一半时，
+  已读的部分留在解析器里，恢复后接着读。停读期间什么都不读，Ping 和 Close 也一样，所以对端的
+  Ping 得不到回复：停读时间要短于对端等 Pong 的超时。
+- `SetWriteBackpressure(on)`：server 接入的连接默认在自己的发送队列过高时停读，拨号的连接默认
+  不停。在 WebSocket 和另一条连接（如 TCP）之间双向转发时，两边都关掉它，各自用对方的
+  `HoldReads` 和 `OnWritable`/`NotifyOutput` 限速，否则一个先发后读的对端会和它互相等死，见
+  `fib.Connection.SetWriteBackpressure`。
+
+对端已死、或慢到 Close 帧要排在它没读的所有数据后面时，用 `Abort(err)` 直接断开：不发 Close 帧，
+丢弃排队的数据，之后到达的帧不再交给 handler；`OnClose` 随后被调用，code 是之前 `Close` 发出的
+code（没有则为 1006），err 是 `Abort` 的参数（为 nil 时是连接结束时的错误）。只有第一次 `Abort`
+生效。经 HTTP/2、HTTP/3 升级的连接，`Abort` 重置的是 stream，底下的连接继续服务其他请求。
+
+`RemoteAddr()` 在 server 端和拨号端都返回对端地址：直连、经 HTTP/1.1 或 HTTP/2 升级时是 TCP 对端，
+经 HTTP/3 升级时是 QUIC 连接建立时的地址；经 `DialerConfig.Dial`（如 SOCKS）拨号时是代理的地址。
+每次调用都从 socket 读取，连接关闭后可能为 nil，之后还要用就在 `OnOpen` 里保存。
+
 ### 在 HTTP server 中升级为 WebSocket
 
 同一个 `http` 或 `http3` server 既要答普通请求又要提供 WebSocket 时，在 handler 里调用
