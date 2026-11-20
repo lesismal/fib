@@ -105,7 +105,26 @@ handler := middleware.Chain(app,
 
 各自的作用与关键选项：
 
-- **`compress`**——在 `Accept-Encoding` 允许、body 至少 `MinLength`（默认 1 KiB）、媒体类型可压缩（`Compressible`）、且没有 `Content-Encoding`、不是部分响应、`Cache-Control` 也不禁止改写时，用 gzip 或 deflate 压缩。它会加 `Vary`、把强 ETag 变弱，并把整个响应缓存到 handler 返回；对 SSE 和长下载请给它一个返回 true 的 `Next` 跳过。
+- **`compress`**——在 `Accept-Encoding` 允许、body 至少 `MinLength`（默认 1 KiB）、媒体类型可压缩（`Compressible`）、且没有 `Content-Encoding`、不是部分响应、`Cache-Control` 也不禁止改写时，用 gzip 或 deflate 压缩。它会加 `Vary`、把强 ETag 变弱，并把整个响应缓存到 handler 返回；对 SSE 和长下载请给它一个返回 true 的 `Next` 跳过。 `Level` 是 `compress/flate` 的等级，默认 `LevelBestSpeed`（1 档）：6 档（`LevelDefault`）压 JSON 只让 body 再小约一成，CPU 却要多花约一倍。编码器默认用标准库的，fib 因此不依赖任何第三方模块；`Gzip` 和 `Deflate` 可以换成其他库的构造函数，例如 `github.com/klauspost/compress`，它的 gzip 压出的大小相同，快约五分之一：
+
+  ```go
+  import (
+  	"io"
+
+  	"github.com/klauspost/compress/flate"
+  	"github.com/klauspost/compress/gzip"
+  	"github.com/lesismal/fib/middleware/compress"
+  )
+
+  compress.New(compress.Config{
+  	Gzip: func(w io.Writer, level int) (compress.Encoder, error) {
+  		return gzip.NewWriterLevel(w, level)
+  	},
+  	Deflate: func(w io.Writer, level int) (compress.Encoder, error) {
+  		return flate.NewWriter(w, level)
+  	},
+  })
+  ```
 - **`etag`**——为 200 的 GET/HEAD 响应按 body 生成 ETag，`If-None-Match` 命中时回 304 且不带 body；handler 自己设的 ETag 会保留。`Weak: true` 让校验符变成弱 ETag。
 - **`cors`**——`AllowOrigins`（默认允许任意来源；`"https://*.example.com"` 匹配其子域名）、`AllowOriginsFunc`、`AllowMethods`（默认 GET、POST、HEAD、PUT、DELETE、PATCH）、`AllowHeaders`（默认为预检请求所要求的那些）、`ExposeHeaders`、`AllowCredentials`、`AllowPrivateNetwork`、`MaxAge`；预检请求由它自己以 204 回答。`AllowCredentials` 需要明确列出来源：配合默认的任意来源时 `New` 会 panic。
 - **`csrf`**——没有 token cookie（默认名 `csrf_`）的安全请求（GET、HEAD、OPTIONS、TRACE）会拿到一个；不安全请求只有把同一个 token 带回来、且 `net/http` 的 `CrossOriginProtection` 判定为同源时才会被处理，否则回 403（`ErrorHandler`）。用 `csrf.Token(r)` 取 token 放进表单；`Lookup` 指定不安全请求从哪里带 token（默认 `header:X-CSRF-Token`，也可以是 `form:<field>`、`query:<name>`），`TrustedOrigins` 放行跨源调用方。

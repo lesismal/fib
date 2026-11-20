@@ -105,7 +105,26 @@ handler := middleware.Chain(app,
 
 What each one does, and the options that matter:
 
-- **`compress`** — gzip or deflate when `Accept-Encoding` allows, the body is at least `MinLength` (1 KiB by default), its media type compresses (`Compressible`), and no `Content-Encoding`, partial response or forbidding `Cache-Control` is in the way. It adds `Vary`, weakens a strong ETag, and holds a whole response until the handler returns; give it a `Next` that skips SSE and long downloads.
+- **`compress`** — gzip or deflate when `Accept-Encoding` allows, the body is at least `MinLength` (1 KiB by default), its media type compresses (`Compressible`), and no `Content-Encoding`, partial response or forbidding `Cache-Control` is in the way. It adds `Vary`, weakens a strong ETag, and holds a whole response until the handler returns; give it a `Next` that skips SSE and long downloads. `Level` is a `compress/flate` level, `LevelBestSpeed` (1) by default: level 6 (`LevelDefault`) takes about twice the CPU for JSON bodies about a tenth smaller. The encoders are the standard library's, so that fib needs no other module; `Gzip` and `Deflate` take the constructors of another library, such as `github.com/klauspost/compress`, whose gzip makes bodies of the same size about a fifth faster:
+
+  ```go
+  import (
+  	"io"
+
+  	"github.com/klauspost/compress/flate"
+  	"github.com/klauspost/compress/gzip"
+  	"github.com/lesismal/fib/middleware/compress"
+  )
+
+  compress.New(compress.Config{
+  	Gzip: func(w io.Writer, level int) (compress.Encoder, error) {
+  		return gzip.NewWriterLevel(w, level)
+  	},
+  	Deflate: func(w io.Writer, level int) (compress.Encoder, error) {
+  		return flate.NewWriter(w, level)
+  	},
+  })
+  ```
 - **`etag`** — generates a 200 GET/HEAD response's ETag from the body and answers a matching `If-None-Match` with 304 and no body; a handler's own ETag is kept. `Weak: true` makes validators weak.
 - **`cors`** — `AllowOrigins` (any origin by default; `"https://*.example.com"` matches its subdomains), `AllowOriginsFunc`, `AllowMethods` (GET, POST, HEAD, PUT, DELETE, PATCH by default), `AllowHeaders` (by default whatever the preflight asks for), `ExposeHeaders`, `AllowCredentials`, `AllowPrivateNetwork`, `MaxAge`; it answers preflights itself with 204. `AllowCredentials` needs explicit origins: with the default any-origin, `New` panics.
 - **`csrf`** — a safe request (GET, HEAD, OPTIONS, TRACE) without the token cookie (`csrf_` by default) gets one; an unsafe request is served only when it sends the same token back and `net/http`'s `CrossOriginProtection` finds it same-origin, and is answered 403 otherwise (`ErrorHandler`). Read the token to embed in a form with `csrf.Token(r)`; `Lookup` says where an unsafe request carries it (`header:X-CSRF-Token` by default, or `form:<field>`, `query:<name>`), and `TrustedOrigins` allows a cross-origin caller.

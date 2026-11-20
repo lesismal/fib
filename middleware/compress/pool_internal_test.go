@@ -13,7 +13,7 @@ import (
 // handler's requests may never meet a recycled one; this does, on one
 // goroutine.
 func TestWriterPoolsReuse(t *testing.T) {
-	pools := &writerPools{level: flate.DefaultCompression}
+	pools := &writerPools{level: flate.DefaultCompression, newGzip: stdGzip, newDeflate: stdDeflate}
 	body := []byte(strings.Repeat("recycled compressor ", 100))
 	for _, encoding := range []string{encodingGzip, encodingDeflate} {
 		first, ok := pools.compress(encoding, body)

@@ -32,24 +32,62 @@ import (
 	"github.com/lesismal/fib/middleware"
 )
 
-// Level is how hard the compressor works.
+// Level is how hard the compressor works: a compress/flate level, from
+// LevelBestSpeed (1) to LevelBestCompression (9), or LevelDefault (-1), the
+// compressor's own default. It is handed to the Encoders as it is, so those
+// of a library with levels of its own take them too.
 type Level int
 
 const (
-	LevelDefault Level = iota
-	LevelBestSpeed
-	LevelBestCompression
+	// LevelBestSpeed compresses fastest: the default. On JSON of 4 to 8 KB
+	// it takes about half the CPU of LevelDefault, for bodies about a tenth
+	// larger.
+	LevelBestSpeed Level = flate.BestSpeed
+	// LevelDefault is the compressor's own default, level 6 of
+	// compress/flate.
+	LevelDefault Level = flate.DefaultCompression
+	// LevelBestCompression compresses smallest, and slowest.
+	LevelBestCompression Level = flate.BestCompression
 )
 
 // DefaultMinLength is the shortest body compressed by default. Below about
 // a kilobyte what compression saves is less than it costs.
 const DefaultMinLength = 1024
 
+// Encoder compresses what is written to it into the writer it was made with
+// or last Reset onto; Close writes the end of the stream. The gzip and flate
+// Writers of the standard library are Encoders, and so are those of
+// github.com/klauspost/compress, which make bodies of the same size about a
+// fifth faster.
+type Encoder interface {
+	io.WriteCloser
+	Reset(w io.Writer)
+}
+
+// NewEncoder makes an Encoder that writes to w, compressing at level.
+type NewEncoder func(w io.Writer, level int) (Encoder, error)
+
 type Config struct {
 	// Next passes the requests it reports true for straight on.
 	Next middleware.Skipper
-	// Level is how hard the compressor works; LevelDefault by default.
+	// Level is how hard the compressor works; LevelBestSpeed by default.
 	Level Level
+	// Gzip and Deflate make the Encoders of the two encodings: those of the
+	// standard library's compress/gzip and compress/flate by default, so
+	// that fib needs no other module. To compress with another library, as
+	// github.com/klauspost/compress, hand its constructors here:
+	//
+	//	Gzip: func(w io.Writer, level int) (compress.Encoder, error) {
+	//		return gzip.NewWriterLevel(w, level)
+	//	},
+	//	Deflate: func(w io.Writer, level int) (compress.Encoder, error) {
+	//		return flate.NewWriter(w, level)
+	//	},
+	//
+	// Each is called with Level once by New, which panics on the error of
+	// a level it refuses, and again whenever the middleware needs another
+	// Encoder; Encoders are reused, Reset onto each body's output.
+	Gzip, Deflate NewEncoder
 	// MinLength is the shortest body compressed; DefaultMinLength by
 	// default.
 	MinLength int
@@ -76,14 +114,23 @@ func New(config ...Config) middleware.Middleware {
 	if cfg.Compressible == nil {
 		cfg.Compressible = Compressible
 	}
-	level := flate.DefaultCompression
-	switch cfg.Level {
-	case LevelBestSpeed:
-		level = flate.BestSpeed
-	case LevelBestCompression:
-		level = flate.BestCompression
+	if cfg.Level == 0 {
+		cfg.Level = LevelBestSpeed
 	}
-	pools := &writerPools{level: level}
+	if cfg.Gzip == nil {
+		cfg.Gzip = stdGzip
+	}
+	if cfg.Deflate == nil {
+		cfg.Deflate = stdDeflate
+	}
+	pools := &writerPools{level: int(cfg.Level), newGzip: cfg.Gzip, newDeflate: cfg.Deflate}
+	for _, encoding := range []string{encodingGzip, encodingDeflate} {
+		w, err := pools.newEncoder(encoding, io.Discard)
+		if err != nil {
+			panic("compress: " + encoding + " level " + strconv.Itoa(int(cfg.Level)) + ": " + err.Error())
+		}
+		pools.put(encoding, w)
+	}
 	return func(next fibhttp.Handler) fibhttp.Handler {
 		return fibhttp.HandlerFunc(func(c *fibhttp.Context) {
 			if cfg.Next != nil && cfg.Next(c) {
@@ -212,33 +259,50 @@ func negotiate(fields []string) string {
 	return ""
 }
 
-// writerPools recycles the compressors, which cost far more to make than to
+// stdGzip and stdDeflate make the standard library's Encoders.
+func stdGzip(w io.Writer, level int) (Encoder, error)    { return gzip.NewWriterLevel(w, level) }
+func stdDeflate(w io.Writer, level int) (Encoder, error) { return flate.NewWriter(w, level) }
+
+// writerPools recycles the Encoders, which cost far more to make than to
 // reset.
 type writerPools struct {
-	level         int
-	gzip, deflate sync.Pool
+	level               int
+	newGzip, newDeflate NewEncoder
+	gzip, deflate       sync.Pool
 }
 
-type compressor interface {
-	io.WriteCloser
-	Reset(io.Writer)
+// newEncoder makes an Encoder of encoding that writes to w.
+func (p *writerPools) newEncoder(encoding string, w io.Writer) (Encoder, error) {
+	if encoding == encodingGzip {
+		return p.newGzip(w, p.level)
+	}
+	return p.newDeflate(w, p.level)
+}
+
+func (p *writerPools) pool(encoding string) *sync.Pool {
+	if encoding == encodingDeflate {
+		return &p.deflate
+	}
+	return &p.gzip
+}
+
+// put keeps w, an Encoder of encoding, for the next body, writing to
+// io.Discard until then so that it holds no output of the last.
+func (p *writerPools) put(encoding string, w Encoder) {
+	w.Reset(io.Discard)
+	p.pool(encoding).Put(w)
 }
 
 // compress returns body compressed with encoding, and whether that made it
 // shorter.
 func (p *writerPools) compress(encoding string, body []byte) ([]byte, bool) {
-	pool := &p.gzip
-	if encoding == encodingDeflate {
-		pool = &p.deflate
-	}
 	var out bytes.Buffer
 	out.Grow(len(body)/2 + 64)
-	w, _ := pool.Get().(compressor)
+	w, _ := p.pool(encoding).Get().(Encoder)
 	if w == nil {
-		if encoding == encodingGzip {
-			w, _ = gzip.NewWriterLevel(&out, p.level)
-		} else {
-			w, _ = flate.NewWriter(&out, p.level)
+		var err error
+		if w, err = p.newEncoder(encoding, &out); err != nil {
+			return nil, false
 		}
 	} else {
 		w.Reset(&out)
@@ -247,8 +311,7 @@ func (p *writerPools) compress(encoding string, body []byte) ([]byte, bool) {
 	if err == nil {
 		err = w.Close()
 	}
-	w.Reset(io.Discard)
-	pool.Put(w)
+	p.put(encoding, w)
 	if err != nil || out.Len() >= len(body) {
 		return nil, false
 	}
