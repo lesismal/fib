@@ -4,8 +4,11 @@ package core
 
 import (
 	"encoding/binary"
+	"errors"
 	"os"
+	"sync/atomic"
 	"syscall"
+	"time"
 	"unsafe"
 
 	"github.com/lesismal/fib/internal/sys"
@@ -30,6 +33,9 @@ var _ [0]struct{} = [evIn ^ syscall.EPOLLIN | evPri ^ syscall.EPOLLPRI | evOut ^
 // wake it.
 type backend struct {
 	epollFD, wakeFD int
+	// loop is the waiter of the loop running on this backend while it parks
+	// in the runtime's poller, for nudgeLoops.
+	loop atomic.Pointer[epollWaiter]
 }
 
 func (e *Engine) openBackend() error {
@@ -91,6 +97,10 @@ func (e *Engine) runLoop() error {
 	var waiter *epollWaiter
 	if !e.blockingWait {
 		waiter = newEpollWaiter(e.epollFD)
+	}
+	if waiter != nil {
+		e.loop.Store(waiter)
+		defer e.loop.Store(nil)
 	}
 	defer waiter.close()
 	for !e.stopping.Load() {
@@ -224,6 +234,13 @@ type epollWaiter struct {
 	events []syscall.EpollEvent
 	n      int
 	err    error
+	// nudge is file for nudgeLoops, which runs on other goroutines and so
+	// does not read file; it is nil once the relay is given up. parked is
+	// when the loop parked, from monoNow, or 0 while it runs, and checked
+	// when a worker last looked at its events for it.
+	nudge   atomic.Pointer[os.File]
+	parked  atomic.Int64
+	checked atomic.Int64
 }
 
 func newEpollWaiter(epfd int) *epollWaiter {
@@ -249,6 +266,7 @@ func newEpollWaiter(epfd int) *epollWaiter {
 		return nil
 	}
 	w := &epollWaiter{file: file, conn: conn, relay: relay, epfd: epfd}
+	w.nudge.Store(file)
 	w.poll = func(uintptr) bool {
 		w.n, w.err = pollEvents(w.epfd, w.events)
 		return w.n != 0 || (w.err != nil && w.err != syscall.EINTR)
@@ -281,8 +299,15 @@ func (w *epollWaiter) wait(epfd int, events []syscall.EpollEvent) (int, error) {
 		}
 		if w.arm(syscall.EPOLLIN) == nil {
 			w.events = events
+			w.parked.Store(monoNow())
 			readErr := w.conn.Read(w.poll)
+			w.parked.Store(0)
 			w.events = nil
+			if errors.Is(readErr, os.ErrDeadlineExceeded) &&
+				w.file.SetReadDeadline(time.Time{}) == nil && w.arm(0) == nil {
+				// Woken by nudgeLoops, which saw events waiting.
+				return pollEvents(epfd, events)
+			}
 			if w.arm(0) == nil && readErr == nil {
 				return w.n, w.err
 			}
@@ -314,9 +339,77 @@ func pollEvents(epfd int, events []syscall.EpollEvent) (int, error) {
 
 func (w *epollWaiter) close() {
 	if w != nil && w.file != nil {
+		w.nudge.Store(nil)
 		w.file.Close()
 	}
 }
+
+// nudgeAfter is how long a loop stays parked with events waiting before a
+// worker wakes it. The runtime looks at its poller when a P runs out of
+// work, or else every 10ms, from its monitor; on a process whose workers
+// keep every P busy, a parked loop's events waited that long. The static
+// files of a proxy at 320k requests a second on 8 CPUs had their 99th
+// percentile at 5 to 8ms at 128 and 256 connections, where a build a fifth
+// slower, which left Ps idle, had 2.2 to 2.5ms.
+const nudgeAfter = 100 * time.Microsecond
+
+// nudgeLoops wakes the loops of e's engine that have been parked past
+// nudgeAfter with events waiting, as the runtime would if a P ran out of
+// work. A worker calls it as it finishes a connection's round: a worker that
+// runs is a P that has not. It looks at a loop's events at most once each
+// nudgeAfter, and only while the loop is parked: on a lightly loaded process
+// the runtime wakes a loop long before.
+func (e *Engine) nudgeLoops() {
+	root := e.root()
+	root.nudgeLoop()
+	for _, p := range root.pollers {
+		p.nudgeLoop()
+	}
+}
+
+func (e *Engine) nudgeLoop() {
+	w := e.loop.Load()
+	if w == nil {
+		return
+	}
+	parked := w.parked.Load()
+	if parked == 0 {
+		return
+	}
+	now := monoNow()
+	checked := w.checked.Load()
+	if now-parked < int64(nudgeAfter) || now-checked < int64(nudgeAfter) || !w.checked.CompareAndSwap(checked, now) {
+		return
+	}
+	if !epollReadable(w.epfd) {
+		return
+	}
+	if f := w.nudge.Load(); f != nil {
+		// A deadline passed wakes the goroutine parked in Read, and readies
+		// it on this P.
+		_ = f.SetReadDeadline(time.Unix(1, 0))
+	}
+}
+
+// epollReadable reports whether the epoll instance epfd has events ready,
+// without taking them: a poll of it, with no wait.
+func epollReadable(epfd int) bool {
+	pfd := struct {
+		fd             int32
+		events, revent int16
+	}{fd: int32(epfd), events: 0x1} // POLLIN
+	var ts syscall.Timespec
+	r, _, errno := syscall.RawSyscall6(syscall.SYS_PPOLL, uintptr(unsafe.Pointer(&pfd)), 1,
+		uintptr(unsafe.Pointer(&ts)), 0, 0, 0)
+	return errno == 0 && r > 0 && pfd.revent&0x1 != 0
+}
+
+// monoEpoch is what monoNow counts from.
+var monoEpoch = time.Now()
+
+// monoNow is the time since monoEpoch on the monotonic clock, in
+// nanoseconds, never 0.
+func monoNow() int64 { return int64(time.Since(monoEpoch)) + 1 }
 
 func (e *Engine) wake() {
 	var b [8]byte

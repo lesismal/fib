@@ -31,11 +31,15 @@ func TestEpollRelayLosesNoWakeup(t *testing.T) {
 	// One pipe is a single connection's ping-pong, which leaves the loop
 	// parking between every two events; more keep it busier.
 	for _, pipes := range []int{1, 8} {
-		t.Run(strconv.Itoa(pipes), func(t *testing.T) { testEpollRelay(t, pipes) })
+		t.Run(strconv.Itoa(pipes), func(t *testing.T) { testEpollRelay(t, pipes, false) })
+		// With nudgeLoops' wake-ups landing in every window too: a deadline
+		// that passes as the loop parks, while it is parked, as it wakes for
+		// an event, and before a later park.
+		t.Run(strconv.Itoa(pipes)+"/nudged", func(t *testing.T) { testEpollRelay(t, pipes, true) })
 	}
 }
 
-func testEpollRelay(t *testing.T, pipes int) {
+func testEpollRelay(t *testing.T, pipes int, nudged bool) {
 	rounds := 24000 / pipes
 	if testing.Short() {
 		rounds /= 10
@@ -134,6 +138,39 @@ func testEpollRelay(t *testing.T, pipes int) {
 		}(i)
 	}
 
+	var nudges atomic.Int64
+	if nudged {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			rnd := uint64(99)
+			for {
+				select {
+				case <-stop:
+					return
+				default:
+				}
+				rnd = rnd*6364136223846793005 + 1442695040888963407
+				switch r := rnd >> 33; r % 4 {
+				case 0:
+					time.Sleep(20 * time.Microsecond)
+				case 1:
+					runtime.Gosched()
+				default:
+					spin := int64(0)
+					for n := int64(0); n < int64(r>>4)%20000; n++ {
+						spin += n
+					}
+					relaySpin.Store(spin)
+				}
+				if f := w.nudge.Load(); f != nil {
+					_ = f.SetReadDeadline(time.Unix(1, 0))
+					nudges.Add(1)
+				}
+			}
+		}()
+	}
+
 	const lostAfter = 500 * time.Millisecond
 	wg.Add(1)
 	go func() {
@@ -219,6 +256,101 @@ func testEpollRelay(t *testing.T, pipes int) {
 		t.Fatalf("%d wakeups lost in the relay and %d in the loop's instance, over %d events",
 			lostInRelay, lostInInstance, pipes*rounds)
 	}
+	if nudged && (w.file == nil || nudges.Load() == 0) {
+		t.Fatalf("the relay was given up, or never nudged (%d nudges)", nudges.Load())
+	}
+}
+
+// TestNudgeLoop checks when nudgeLoop wakes a parked loop: not while it
+// runs, nor before it has been parked nudgeAfter, nor with no events
+// waiting, nor twice within nudgeAfter; and that wait, woken so, returns
+// the events and keeps the relay.
+func TestNudgeLoop(t *testing.T) {
+	epfd, err := syscall.EpollCreate1(syscall.EPOLL_CLOEXEC)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer syscall.Close(epfd)
+	var p [2]int
+	if err := syscall.Pipe2(p[:], syscall.O_NONBLOCK|syscall.O_CLOEXEC); err != nil {
+		t.Fatal(err)
+	}
+	defer syscall.Close(p[0])
+	defer syscall.Close(p[1])
+	ev := syscall.EpollEvent{Events: syscall.EPOLLIN, Fd: 7}
+	if err := syscall.EpollCtl(epfd, syscall.EPOLL_CTL_ADD, p[0], &ev); err != nil {
+		t.Fatal(err)
+	}
+	w := newEpollWaiter(epfd)
+	if w == nil {
+		t.Skip("the relay cannot be set up here")
+	}
+	defer w.close()
+	e := &Engine{}
+	e.loop.Store(w)
+
+	if epollReadable(epfd) {
+		t.Fatal("an empty instance reads as readable")
+	}
+	// Running: nothing to do.
+	e.nudgeLoop()
+	if w.checked.Load() != 0 {
+		t.Fatal("a running loop was looked at")
+	}
+	// Parked just now: too soon.
+	w.parked.Store(monoNow())
+	e.nudgeLoop()
+	if w.checked.Load() != 0 {
+		t.Fatal("a loop parked just now was looked at")
+	}
+	// Parked long enough, nothing waiting: looked at, not woken.
+	w.parked.Store(monoNow() - int64(2*nudgeAfter))
+	e.nudgeLoop()
+	first := w.checked.Load()
+	if first == 0 {
+		t.Fatal("a loop parked past nudgeAfter was not looked at")
+	}
+	// Within nudgeAfter of that look: not again.
+	e.nudgeLoop()
+	if w.checked.Load() != first {
+		t.Fatal("looked at twice within nudgeAfter")
+	}
+	if _, err := syscall.Write(p[1], []byte{1}); err != nil {
+		t.Fatal(err)
+	}
+	if !epollReadable(epfd) {
+		t.Fatal("an instance with an event waiting reads as not readable")
+	}
+	// The next look, with the event waiting, sets the deadline: the next
+	// wait, which would park, returns at once through it with the event.
+	w.checked.Store(monoNow() - int64(2*nudgeAfter))
+	e.nudgeLoop()
+	events := make([]syscall.EpollEvent, 4)
+	n, err := w.wait(epfd, events)
+	if err != nil || n != 1 || events[0].Fd != 7 {
+		t.Fatalf("wait after a nudge: %d %v %+v", n, err, events[:n])
+	}
+	var b [1]byte
+	_, _ = syscall.Read(p[0], b[:])
+	// A nudge with nothing waiting returns nothing, and the relay stays.
+	_ = w.nudge.Load().SetReadDeadline(time.Unix(1, 0))
+	if n, err := w.wait(epfd, events); n != 0 || err != nil || w.file == nil {
+		t.Fatalf("a spurious nudge: %d %v, relay kept %v", n, err, w.file != nil)
+	}
+	// And the loop parks as before: an event wakes it.
+	go func() {
+		time.Sleep(20 * time.Millisecond)
+		_, _ = syscall.Write(p[1], []byte{1})
+	}()
+	if n, err := w.wait(epfd, events); n != 1 || err != nil {
+		t.Fatalf("wait after a spurious nudge: %d %v", n, err)
+	}
+	// A loop with no waiter, or a waiter given up, is left alone.
+	(&Engine{}).nudgeLoop()
+	w.close()
+	w.parked.Store(1)
+	w.checked.Store(0)
+	e.nudgeLoop()
 }
 
 // stopRelayWriters tells a relay test's writers to stop and waits for them to

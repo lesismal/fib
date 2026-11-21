@@ -278,3 +278,7 @@ const pausesInPlace = true
 func (e *Engine) setReadPaused(*Connection, bool) error { return nil }
 
 func (e *Engine) isListener(fd int) bool { return e.listenerAt(fd) != nil }
+
+// nudgeLoops does nothing here: a loop waits in kevent, which wakes it as
+// soon as an event arrives; see the epoll poller's.
+func (e *Engine) nudgeLoops() {}

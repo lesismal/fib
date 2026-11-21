@@ -1330,21 +1330,24 @@ type Config struct {
 	// epoll_wait, rather than parked in the runtime's network poller (see
 	// epollWaiter), whenever it finds none ready. Parked, a loop gives its P
 	// up at once, but the runtime looks for its events only when a P runs
-	// out of work, or every 10ms, so on a busy server the loop learns of
-	// them late, and the requests it serves wait with them. Blocked, the
-	// kernel wakes the loop as soon as an event arrives, and the runtime
-	// takes back the P it holds once the call has lasted one of its
-	// monitor's ticks while other goroutines wait for one.
+	// out of work, or every 10ms, so on a busy server the loop learned of
+	// them late, and the requests it serves waited with them; a worker that
+	// finishes a connection's round now wakes a loop parked past 100us with
+	// events waiting (see nudgeLoops), which bounds that wait on a server
+	// whose workers keep every P busy. Blocked, the kernel wakes the loop as
+	// soon as an event arrives, and the runtime takes back the P it holds
+	// once the call has lasted one of its monitor's ticks while other
+	// goroutines wait for one.
 	//
-	// fit proxying a JSON API to nginx on 6 CPUs (500 connections, 200,000
-	// requests a second, HTTP/1.1) answered with its 99th percentile at
-	// 2.96-3.85ms blocked against 4.70-5.32ms parked, and the 99.9th at
-	// 4.43-5.69ms against 6.09-7.13ms; at 30,000 a second it spent 5% less
-	// CPU a request over HTTP/1.1 and 12% less over h2, without the relay
-	// armed and disarmed around every wait. Parking keeps an edge at
+	// Measured before nudgeLoops: fit proxying a JSON API to nginx on 6 CPUs
+	// (500 connections, 200,000 requests a second, HTTP/1.1) answered with its
+	// 99th percentile at 2.96-3.85ms blocked against 4.70-5.32ms parked, and
+	// the 99.9th at 4.43-5.69ms against 6.09-7.13ms; at 30,000 a second it
+	// spent 5% less CPU a request over HTTP/1.1 and 12% less over h2, without
+	// the relay armed and disarmed around every wait. Parking keeps an edge at
 	// saturation, where a blocked loop's P waits for the monitor: the same
-	// proxy unpaced served h2 0.9% slower blocked, HTTP/1.1 the same; and
-	// with one P, or a loop woken once for every connection it accepts; see
+	// proxy unpaced served h2 0.9% slower blocked, HTTP/1.1 the same; and with
+	// one P, or a loop woken once for every connection it accepts; see
 	// epollWaiter. Only Linux honours it.
 	BlockingWait bool
 	// TaskPoolMode picks the scheduler the workers run under. Prefer

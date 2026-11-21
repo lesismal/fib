@@ -1693,3 +1693,7 @@ func (e *Engine) acceptPlacements() (string, bool) {
 	}
 	return "engine-loop", false
 }
+
+// nudgeLoops does nothing here: completions wake the goroutines waiting on
+// them; see the epoll poller's.
+func (e *Engine) nudgeLoops() {}

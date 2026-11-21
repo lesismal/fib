@@ -1273,6 +1273,7 @@ func (c *Connection) sendParts(first, second []byte, shared bool) error {
 func (c *Connection) RunTask() {
 	defer c.engine.taskWG.Done()
 	c.process()
+	c.engine.nudgeLoops()
 }
 
 func (c *Connection) process() {
