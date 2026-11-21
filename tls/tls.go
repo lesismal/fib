@@ -181,9 +181,12 @@ type Handler struct {
 	// records itself, such as NVIDIA (Mellanox) ConnectX-6 Dx and later with
 	// tls-hw-tx-offload on (see ethtool -k, and TlsTxDevice in
 	// /proc/net/tls_stat): the kernel then hands the records to the card, and
-	// neither it nor this package seals them. Without such a card the kernel
-	// seals them itself, which costs more than this package does for replies
-	// from memory, so it is off by default. The switch is made at a send that
+	// neither it nor this package seals them. The card takes TLS 1.2
+	// connections only, Linux's offload having none for TLS 1.3: the kernel
+	// seals a TLS 1.3 connection's records itself (TlsTxSw), so a server
+	// meant for the card caps Config.MaxVersion at tls.VersionTLS12. Without
+	// such a card the kernel seals them itself, which costs more than this
+	// package does for replies from memory, so it is off by default. The switch is made at a send that
 	// finds nothing sealed here still queued, as a file's is; until one does,
 	// this package seals. Receiving stays with this package either way.
 	KernelTLSFromHandshake bool

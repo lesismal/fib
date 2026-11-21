@@ -620,6 +620,10 @@ ChaCha20-Poly1305 over TLS 1.3 or 1.2, AES-CBC over TLS 1.2 or 1.1):
   for a network card that seals TLS records itself (NVIDIA/Mellanox
   ConnectX-6 Dx and later with `tls-hw-tx-offload` on): the kernel hands the
   records to the card, and `TlsTxDevice` in `/proc/net/tls_stat` counts them.
+  The card takes TLS 1.2 connections only, Linux's device offload having none
+  for TLS 1.3: the kernel seals a TLS 1.3 connection's records itself
+  (`TlsTxSw`), so a server meant for the card sets `Config.MaxVersion` to
+  `tls.VersionTLS12`.
   Without such a card the kernel seals small replies at more cost than user
   space does, which is why the default waits for a large file.
 - **Otherwise** (macOS, the BSDs, Windows, ChaCha20-Poly1305 and AES-CBC

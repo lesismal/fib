@@ -461,7 +461,9 @@ TLS 1.3 或 1.2 的 AES-GCM、ChaCha20-Poly1305，TLS 1.2 或 1.1 的 AES-CBC）
   `tls.Handler.NoKernelTLS` 关闭这一切换。`tls.Handler.KernelTLSFromHandshake`（默认关闭）
   让切换提前到握手之后第一次遇到队列为空的发送，不论是否是文件，用于自己能加密 TLS 记录的
   网卡（NVIDIA/Mellanox ConnectX-6 Dx 及以后，打开 `tls-hw-tx-offload`）：内核把记录交给网卡
-  加密，`/proc/net/tls_stat` 的 `TlsTxDevice` 会计数。没有这种网卡时，内核加密小回包比用户态
+  加密，`/proc/net/tls_stat` 的 `TlsTxDevice` 会计数。网卡只接 TLS 1.2 的连接：Linux 的网卡
+  卸载不支持 TLS 1.3，TLS 1.3 连接由内核自己加密（计入 `TlsTxSw`），所以要用网卡的服务把
+  `Config.MaxVersion` 设为 `tls.VersionTLS12`。没有这种网卡时，内核加密小回包比用户态
   更贵，所以默认要等到大文件才切换。
 - **其他情况**（macOS、BSD、Windows、ChaCha20-Poly1305 与 AES-CBC 套件，或关闭了、缺少
   内核 TLS）连接把文件

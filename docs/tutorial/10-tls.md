@@ -185,7 +185,8 @@ configured there:
 What fib adds on top is the data path — record sealing and opening, writes corked into one record
 per round, and, on Linux, handing the sealing of large `SendFile` responses to the kernel's TLS
 (`Handler.KernelTLSMinFile`, off with `NoKernelTLS`; `KernelTLSFromHandshake` hands it over
-after the handshake instead, for a network card that seals TLS records itself).
+after the handshake instead, for a network card that seals TLS records itself, which Linux
+hands TLS 1.2 connections only: cap `Config.MaxVersion` at `tls.VersionTLS12` for it).
 
 ## An ALPN-aware handler
 
