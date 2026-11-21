@@ -8,6 +8,7 @@ import (
 	"io"
 	"net"
 	stdhttp "net/http"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -196,7 +197,10 @@ func TestAbortServerSide(t *testing.T) {
 		}
 		got += len(payload)
 	}
-	if got >= sent {
+	// On Windows a send is posted to the kernel at once (overlapped I/O), so
+	// there is no queue of the connection's own for Abort to drop: the
+	// kernel still delivers what it was given.
+	if got >= sent && runtime.GOOS != "windows" {
 		t.Fatalf("the peer read all %d bytes: nothing queued was dropped", got)
 	}
 }
