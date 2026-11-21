@@ -42,6 +42,9 @@ type sendItem struct {
 	data   []byte
 	offset int
 	pooled bool
+	// owned says data is a buffer of package bufferpool that SendPartsOwned
+	// handed over, which goes back to the pool once sent or dropped.
+	owned  bool
 	record uint8
 	file   *fileSegment
 }
@@ -617,7 +620,7 @@ func (c *Connection) resetQueueLocked() {
 func (c *Connection) releaseItemLocked(item *sendItem) {
 	if item.pooled {
 		c.engine.releaseSendBuffer(item.data)
-	} else if item.record != 0 && item.record != spliceRecord {
+	} else if item.owned || item.record != 0 && item.record != spliceRecord {
 		bufferpool.Put(item.data)
 	}
 	if item.file != nil {
@@ -789,6 +792,21 @@ func (c *Connection) queueSharedPartsLocked(first, second []byte) {
 	}
 	if len(second) > 0 {
 		c.queueOwnedLocked(second)
+	}
+}
+
+// queueOwnedPartsLocked queues what a parts send that hands second over did
+// not hand the socket: first copied into the queue's pooled buffer, and
+// second, from offset on, as an item that keeps the whole buffer, so that
+// it goes back to the pool as it was taken from it. Callers hold c.mu.
+func (c *Connection) queueOwnedPartsLocked(first, second []byte, offset int) {
+	if len(first) > 0 {
+		c.queueLocked(first, nil)
+	}
+	if offset < len(second) {
+		c.pushLocked(sendItem{data: second, offset: offset, owned: true})
+	} else {
+		bufferpool.Put(second)
 	}
 }
 
@@ -1161,7 +1179,20 @@ func (c *Connection) send(data []byte, mode sendMode) error {
 // SendParts writes a two-part message without first joining the parts. If the
 // socket is backpressured, only the unsent suffix is copied before returning.
 func (c *Connection) SendParts(first, second []byte) error {
-	return c.sendParts(first, second, false)
+	return c.sendParts(first, second, partsCopied)
+}
+
+// SendPartsOwned writes a two-part message like SendPartsShared, but takes
+// second over: a buffer of package bufferpool, which the connection gives
+// back to the pool once it is sent, or dropped with the queue of a
+// connection that closes, or at once when the socket takes it all or the
+// send fails. The caller must not touch second after the call, whatever it
+// returns. A message the kernel may still be sending from as the connection
+// closes is left to the collector, as the queue's own buffers are. It is how
+// a response whose body was read or copied into a pooled buffer goes out
+// without a copy and without leaving the buffer to the collector.
+func (c *Connection) SendPartsOwned(first, second []byte) error {
+	return c.sendParts(first, second, partsOwned)
 }
 
 // SendPartsShared writes a two-part message like SendParts, but keeps second,
@@ -1175,21 +1206,43 @@ func (c *Connection) SendParts(first, second []byte) error {
 // this returns. Where a layer such as TLS transforms the parts, both are
 // copied, as SendParts copies them.
 func (c *Connection) SendPartsShared(first, second []byte) error {
-	return c.sendParts(first, second, true)
+	return c.sendParts(first, second, partsShared)
 }
 
-// sendParts is SendParts and SendPartsShared: shared says second is kept as
-// the caller gave it rather than copied.
-func (c *Connection) sendParts(first, second []byte, shared bool) error {
+// How sendParts keeps the second part of a message the socket does not take.
+const (
+	// partsCopied copies it into the queue's buffer.
+	partsCopied = iota
+	// partsShared queues it as the caller gave it, never written to nor
+	// given to a pool.
+	partsShared
+	// partsOwned queues it as the caller gave it, a pooled buffer the
+	// connection gives back once it is sent.
+	partsOwned
+)
+
+// sendParts is SendParts, SendPartsShared and SendPartsOwned: mode says how
+// second is kept when the socket does not take it all.
+func (c *Connection) sendParts(first, second []byte, mode int) error {
+	owned := mode == partsOwned
 	if l := c.layer; l != nil {
 		// Layer.Send is an interface call, so whatever it is handed escapes to
 		// the heap. Only second would be harmless, being the caller's buffer
 		// already; first is usually a frame header on the caller's stack,
-		// which a copy keeps there for every connection without a layer.
-		return l.Send(append([]byte(nil), first...), second)
+		// which a copy keeps there for every connection without a layer. A
+		// layer transforms what it is given, copying it.
+		err := l.Send(append([]byte(nil), first...), second)
+		if owned {
+			bufferpool.Put(second)
+		}
+		return err
 	}
 	if c.udp != nil {
-		return c.sendDatagramParts(first, second)
+		err := c.sendDatagramParts(first, second)
+		if owned {
+			bufferpool.Put(second)
+		}
+		return err
 	}
 	total := len(first) + len(second)
 	if total == 0 {
@@ -1198,16 +1251,27 @@ func (c *Connection) sendParts(first, second []byte, shared bool) error {
 	c.mu.Lock()
 	if c.closing || c.closed || c.closeAfterSend || c.writeShut {
 		c.mu.Unlock()
+		if owned {
+			bufferpool.Put(second)
+		}
 		return syscall.EPIPE
 	}
 	if c.corked {
 		if c.sendQueueOverLocked(int64(total)) {
 			c.mu.Unlock()
+			if owned {
+				bufferpool.Put(second)
+			}
 			return c.closeOverSendQueue()
 		}
-		if shared {
+		switch mode {
+		case partsShared:
 			c.queueCorkedSharedLocked(first, second)
-		} else {
+		case partsOwned:
+			c.queueOwnedPartsLocked(first, second, 0)
+			c.corkedBytes += int64(total)
+			c.corkedPending.Add(int64(total))
+		default:
 			c.queueCorkedLocked(first, second)
 		}
 		c.mu.Unlock()
@@ -1223,6 +1287,9 @@ func (c *Connection) sendParts(first, second []byte, shared bool) error {
 			}
 			if err != nil && !sys.IsWouldBlock(err) {
 				c.mu.Unlock()
+				if owned {
+					bufferpool.Put(second)
+				}
 				c.closeWithError(err)
 				return err
 			}
@@ -1233,14 +1300,26 @@ func (c *Connection) sendParts(first, second []byte, shared bool) error {
 		}
 		if sent == total {
 			c.mu.Unlock()
+			if owned {
+				bufferpool.Put(second)
+			}
 			return nil
 		}
 	}
 	if c.sendQueueOverLocked(int64(total - sent)) {
 		c.mu.Unlock()
+		if owned {
+			bufferpool.Put(second)
+		}
 		return c.closeOverSendQueue()
 	}
-	if shared {
+	if mode == partsOwned {
+		if sent < len(first) {
+			c.queueOwnedPartsLocked(first[sent:], second, 0)
+		} else {
+			c.queueOwnedPartsLocked(nil, second, sent-len(first))
+		}
+	} else if mode == partsShared {
 		if sent < len(first) {
 			c.queueSharedPartsLocked(first[sent:], second)
 		} else {

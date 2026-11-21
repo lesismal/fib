@@ -1101,6 +1101,14 @@ func (c *Connection) SendPartsShared(first, second []byte) error {
 	return c.SendParts(first, second)
 }
 
+// SendPartsOwned sends like SendParts and gives second, a buffer of package
+// bufferpool, back to the pool once the send has returned, which on this
+// backend is once it has reached the socket.
+func (c *Connection) SendPartsOwned(first, second []byte) error {
+	defer bufferpool.Put(second)
+	return c.SendParts(first, second)
+}
+
 // sendClosed reports whether the connection has stopped accepting sends.
 func (c *Connection) sendClosed() bool {
 	c.mu.Lock()

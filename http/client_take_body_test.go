@@ -6,6 +6,7 @@ import (
 	"io"
 	stdhttp "net/http"
 	"net/http/httptest"
+	"strconv"
 	"sync"
 	"testing"
 	"time"
@@ -173,16 +174,24 @@ func TestWriteResponseOwned(t *testing.T) {
 	}
 }
 
-// TestWriteResponseOwnedGivesTheBodyBack checks that a small body sent with
-// WriteResponseOwned goes back to the pool once sent, over HTTP/1 and over
-// HTTP/2, whose framing copies it: a buffer the handler sent turns up again
+// TestWriteResponseOwnedGivesTheBodyBack checks that a body sent with
+// WriteResponseOwned goes back to the pool once sent, small and larger than a
+// small reply, which HTTP/1 sends by reference and gives back once the
+// connection has sent it, over HTTP/1 and over HTTP/2, whose framing copies
+// it: a buffer the handler sent turns up again
 // from the pool, at a handler's Get or at the test's own once the requests
 // are done. The test keeps every buffer it sent alive, so that one turning up
 // cannot be a new allocation at its address. A buffer given back may be
 // held by something else on the server when the requests end, so the test's
 // own Get looks for a while rather than once.
 func TestWriteResponseOwnedGivesTheBodyBack(t *testing.T) {
-	const size, requests = 1000, 50
+	for _, size := range []int{1000, 32 << 10} {
+		t.Run(strconv.Itoa(size), func(t *testing.T) { testWriteResponseOwnedGivesTheBodyBack(t, size) })
+	}
+}
+
+func testWriteResponseOwnedGivesTheBodyBack(t *testing.T, size int) {
+	const requests = 50
 	var mu sync.Mutex
 	sent := map[*byte]bool{}
 	reused := 0

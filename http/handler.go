@@ -727,15 +727,16 @@ func (c *Context) WriteResponseCopy(response Response) error {
 // WriteResponseOwned sends the whole response at once, as WriteResponse does,
 // for a Body that is a buffer from package bufferpool, which the response
 // takes over: it gives it back to the pool once the send path is done with
-// it, or leaves it to the collector where giving it back would cost more than
-// it saves: HTTP/1 sends a body larger than a small reply's by reference
-// rather than copying it into its queue, and HTTP/2 keeps by reference what
-// its windows hold back. The caller must not touch the buffer
-// after the call, whatever it returns. It is how a proxy sends on a
-// response's body from ClientResponse.TakeBody without a copy.
+// it, which on HTTP/1, for a body larger than a small reply's, is once the
+// connection has sent it, since it goes out by reference rather than copied
+// into the queue; or leaves it to the collector where giving it back would
+// cost more than it saves, as for the part of a body HTTP/2's windows hold
+// back. The caller must not touch the buffer after the call, whatever it
+// returns. It is how a proxy sends on a response's body from
+// ClientResponse.TakeBody without a copy.
 func (c *Context) WriteResponseOwned(response Response) error {
 	owned := response.Body
-	if len(owned) == 0 || !c.senderTakesCopiedBody() || c.external == nil && c.stream == nil && len(owned) > maxCopiedResponseBody {
+	if len(owned) == 0 || !c.senderTakesCopiedBody() {
 		owned = nil
 	}
 	if c.begun() {
@@ -1965,12 +1966,19 @@ func (h *ServerHandler) idleForShutdown(parser *Parser) bool {
 // *Copy call goes through SendParts whatever its size, so that the copy, a
 // buffer from the pool, is the send's to be done with when it returns.
 func (c *Context) sendResponse(response Response, contentType string, closeConnection bool, copied []byte) error {
-	// A body copied for a *Copy call, from the pool, is this call's to give
-	// back: the send below copies it, as it copies the head, so nothing reads
-	// it once this returns.
-	defer releaseBody(copied)
 	framing, body, trailer := responseFraming(c.Request, response, closeConnection)
 	framing.contentType = contentType
+	// A body that is a buffer of this call's from the pool, copied for a
+	// *Copy call or handed over by WriteResponseOwned, and larger than a
+	// small reply, goes to the connection with SendPartsOwned, which sends it
+	// as it is and gives it back to the pool once sent. Any other such
+	// buffer, a small body the send copies into the round's buffer, or one a
+	// hook replaced, is this call's to give back once the send has copied
+	// what it needs.
+	handOver := copied != nil && len(body) > maxCopiedResponseBody && sameBody(body, copied) && !framing.chunked
+	if !handOver {
+		defer releaseBody(copied)
+	}
 	if framing.chunked {
 		data, err := marshalChunked(c.Request, framing, body, trailer)
 		if err != nil {
@@ -1981,17 +1989,18 @@ func (c *Context) sendResponse(response Response, contentType string, closeConne
 	pooled := bufferpool.Get(headCapacity(response.Header) + len(response.HeaderBlock) + len(contentType))
 	head, err := appendResponseHead(pooled[:0], c.Request, framing)
 	if err == nil {
-		// A body from a *Copy call is a buffer of this call's, from the pool,
-		// which SendParts copies into the round's buffer or the queue as it
-		// copies the head; SendPartsShared would keep it, and the pool could
-		// not have it back when this returns.
-		if len(body) > maxCopiedResponseBody && copied == nil &&
-			!(c.whole != nil && within(body, c.whole.data)) {
+		switch {
+		case handOver:
+			err = c.Conn.SendPartsOwned(head, body)
+		case len(body) > maxCopiedResponseBody && copied == nil &&
+			!(c.whole != nil && within(body, c.whole.data)):
 			err = c.Conn.SendPartsShared(head, body)
-		} else {
+		default:
 			err = c.Conn.SendParts(head, body)
 		}
 		pooled = head
+	} else if handOver {
+		releaseBody(copied)
 	}
 	bufferpool.Put(pooled)
 	return err
