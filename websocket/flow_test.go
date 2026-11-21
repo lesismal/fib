@@ -264,7 +264,8 @@ func TestAbortClientSide(t *testing.T) {
 	if r[1] != 0 {
 		t.Fatal("a close frame was sent after Abort")
 	}
-	if r[0] >= sent {
+	// As in TestAbortServerSide: on Windows the kernel holds the sends.
+	if r[0] >= sent && runtime.GOOS != "windows" {
 		t.Fatalf("the peer read all %d bytes: nothing queued was dropped", r[0])
 	}
 }
