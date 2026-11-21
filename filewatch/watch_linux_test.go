@@ -5,6 +5,7 @@ package filewatch
 import (
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 )
@@ -55,10 +56,16 @@ func (r *recorder) drain() {
 	}
 }
 
+// watched reports whether rel is watched, and fails the test when the set
+// Watch looks at without the lock says otherwise.
 func (r *recorder) watched(rel string) bool {
+	r.t.Helper()
 	r.w.mu.Lock()
 	defer r.w.mu.Unlock()
 	_, ok := r.w.dirs[rel]
+	if _, mirrored := r.w.watched.Load(rel); mirrored != ok {
+		r.t.Fatalf("%q: watched %v, but the set without the lock says %v", rel, ok, mirrored)
+	}
 	return ok
 }
 
@@ -250,5 +257,63 @@ func TestWatchClose(t *testing.T) {
 func TestNewMissingRoot(t *testing.T) {
 	if _, err := New(filepath.Join(t.TempDir(), "nope", "x"), func(Event) {}); err == nil {
 		t.Fatal("a root that does not exist was watched")
+	}
+}
+
+// TestWatchConcurrent checks Watch from many goroutines at once, of
+// directories watched and not, while one of them is moved away and back,
+// for the race detector, and that the set Watch looks at without the lock
+// ends as the directories watched.
+func TestWatchConcurrent(t *testing.T) {
+	root := t.TempDir()
+	for _, d := range []string{"a/b", "c/d", "m/n"} {
+		mkdir(t, filepath.Join(root, filepath.FromSlash(d)))
+	}
+	r := newRecorder(t, root)
+	stop := make(chan struct{})
+	var wg sync.WaitGroup
+	for i := range 8 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			dirs := []string{"a/b", "c/d", "m/n", "./a/b", "c//d", "missing/x"}
+			for k := 0; ; k++ {
+				select {
+				case <-stop:
+					return
+				default:
+				}
+				r.w.Watch(dirs[(i+k)%len(dirs)])
+			}
+		}()
+	}
+	for range 20 {
+		if err := os.Rename(filepath.Join(root, "m"), filepath.Join(root, "m2")); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Rename(filepath.Join(root, "m2"), filepath.Join(root, "m")); err != nil {
+			t.Fatal(err)
+		}
+	}
+	close(stop)
+	wg.Wait()
+	r.drain()
+	r.w.mu.Lock()
+	n := 0
+	r.w.watched.Range(func(k, _ any) bool {
+		if _, ok := r.w.dirs[k.(string)]; !ok {
+			t.Errorf("%q is in the set without the lock but not watched", k)
+		}
+		n++
+		return true
+	})
+	if n != len(r.w.dirs) {
+		t.Errorf("%d in the set without the lock, %d watched", n, len(r.w.dirs))
+	}
+	r.w.mu.Unlock()
+	for _, d := range []string{"a/b", "c/d"} {
+		if !r.watched(d) {
+			t.Errorf("%s not watched", d)
+		}
 	}
 }

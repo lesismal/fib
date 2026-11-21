@@ -54,6 +54,11 @@ type Watcher struct {
 	// path relative to it, with their watch descriptors.
 	dirs  map[string]int32
 	nodes map[int32]*node
+	// watched holds dirs' paths, changed with dirs under mu, for Watch to
+	// find a directory watched already without taking mu: a cache asks for
+	// the directory of every path it looks up, and most are watched. It is
+	// cleared when the Watcher closes.
+	watched sync.Map
 }
 
 // node is what one watch descriptor stands for: directories under the root,
@@ -98,6 +103,12 @@ func (w *Watcher) Watch(dir string) bool {
 	if w == nil {
 		return false
 	}
+	// A directory watched already, as dir is written, with no lock taken
+	// and nothing allocated. One that goes as this answers is reported as
+	// it goes, as it is when the lock below is taken just before.
+	if _, ok := w.watched.Load(dir); ok {
+		return true
+	}
 	dir = path.Clean("/" + dir)[1:]
 	w.mu.Lock()
 	defer w.mu.Unlock()
@@ -115,6 +126,7 @@ func (w *Watcher) Watch(dir string) bool {
 				return rel != "" && (errors.Is(err, syscall.ENOENT) || errors.Is(err, syscall.ENOTDIR))
 			}
 			w.dirs[rel] = wd
+			w.watched.Store(rel, struct{}{})
 			w.nodes[wd].rels = append(w.nodes[wd].rels, rel)
 		}
 		if rest == "" {
@@ -139,6 +151,7 @@ func (w *Watcher) Close() error {
 		return nil
 	}
 	w.closed = true
+	w.watched.Clear()
 	err := w.file.Close()
 	w.mu.Unlock()
 	<-w.done
@@ -218,6 +231,7 @@ func (w *Watcher) dropLocked(rel string) {
 			continue
 		}
 		delete(w.dirs, dir)
+		w.watched.Delete(dir)
 		n := w.nodes[wd]
 		if n == nil {
 			continue
