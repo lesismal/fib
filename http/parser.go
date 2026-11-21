@@ -408,6 +408,14 @@ type Parser struct {
 	// held while a request is served, so that the connection's worker and the
 	// goroutine serving a streamed request never parse at once.
 	mu sync.Mutex
+	// switchMu is held, and switching set, while a Context switches the
+	// connection to a tunnel during its handler's time without mu: the
+	// handler's round holds mu then, and the switch may be made on the
+	// handler's goroutine or on another. The handler's return waits for such
+	// a switch, so the round does not go on with the parser under it; see
+	// Context.switchTunnelOn and Context.handled.
+	switchMu  sync.Mutex
+	switching atomic.Bool
 	// stream is the streamed body being fed from buffer, and busy records
 	// that the handler of a streamed request has not returned: nothing that
 	// follows it on the connection is parsed until it has, so pipelined

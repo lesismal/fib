@@ -899,6 +899,8 @@ func (c *Context) later(handover func(worker bool)) {
 // while it ran, on the handler's goroutine, which holds the connection's
 // parser. It runs before the handler's hold
 // is given back, so the response the body callbacks answer is still open.
+// A switch to a tunnel that another goroutine began while the handler ran
+// is waited for first, since the round goes on with the parser it changes.
 func (c *Context) handled() {
 	var w uint64
 	for {
@@ -906,6 +908,9 @@ func (c *Context) handled() {
 		if c.word.CompareAndSwap(w, w|ctxHandled) {
 			break
 		}
+	}
+	if p := c.parser; p != nil {
+		p.waitSwitch()
 	}
 	if w&ctxHandover == 0 {
 		return

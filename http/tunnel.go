@@ -497,20 +497,40 @@ func (c *Context) switchTunnelOn(protocol string, header stdhttp.Header, handler
 	case c.stream != nil:
 		t, err = c.stream.upgrade(c.Request, protocol, header)
 	default:
-		lock := late && !worker && c.parser != nil
-		if lock {
-			// Away from the round that served the request, the connection is
-			// the parser's: a round reading it waits for the switch, and then
-			// hands what it read to the tunnel.
-			c.parser.mu.Lock()
+		parser := c.parser
+		lock, claimed := false, false
+		if parser != nil && !worker {
+			// While the handler runs, its round holds the parser, and the
+			// switch is made without taking it, on the handler's goroutine or
+			// on another for a request it retained: the claim makes the
+			// handler's return wait for it. A switch that finds the handler
+			// returned, now or when it began, is away from the round that
+			// served the request, and the connection is the parser's: a
+			// round reading it waits for the switch, and then hands what it
+			// read to the tunnel.
+			claimed = !late && parser.claimSwitch(c)
+			lock = !claimed
 		}
-		if protocol == "" {
+		if lock {
+			parser.mu.Lock()
+		}
+		switch {
+		case lock && !late && !c.Retained():
+			// The handler returned, without retaining the request, while
+			// this switch began: the response it left is written, and the
+			// connection has gone on without it.
+			err = ErrNotUpgradable
+		case protocol == "":
 			t, err = c.connectHTTP1(header)
-		} else {
+		default:
 			t, err = c.upgradeHTTP1(protocol, header)
 		}
 		if lock {
-			c.parser.mu.Unlock()
+			parser.mu.Unlock()
+		}
+		if claimed {
+			parser.switching.Store(false)
+			parser.switchMu.Unlock()
 		}
 	}
 	if err != nil {
@@ -527,6 +547,31 @@ func (c *Context) switchTunnelOn(protocol string, header stdhttp.Header, handler
 	}
 	t.open(handler)
 	return t, nil
+}
+
+// claimSwitch claims a switch made while c's handler is still running,
+// reporting false, and claiming nothing, when the handler has returned. A
+// claimed switch holds switchMu until it is done, and the handler's return,
+// which sets ctxHandled before it looks at switching, waits for it there:
+// whichever of the two comes second sees the other.
+func (p *Parser) claimSwitch(c *Context) bool {
+	p.switchMu.Lock()
+	p.switching.Store(true)
+	if c.handling() {
+		return true
+	}
+	p.switching.Store(false)
+	p.switchMu.Unlock()
+	return false
+}
+
+// waitSwitch waits for a switch claimed while the handler ran; see
+// claimSwitch.
+func (p *Parser) waitSwitch() {
+	if p.switching.Load() {
+		p.switchMu.Lock()
+		p.switchMu.Unlock()
+	}
 }
 
 // upgradeHTTP1 switches an HTTP/1.1 connection to protocol. The handler runs

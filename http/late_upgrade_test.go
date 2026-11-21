@@ -259,3 +259,83 @@ func TestClientStartUpgradeHTTP2(t *testing.T) {
 		t.Fatal("no answer")
 	}
 }
+
+// TestUpgradeFromGoroutineAsHandlerReturns switches a retained request from
+// another goroutine that begins the switch while the handler is still
+// running. The handler's round and the switch both work on the connection's
+// parser, so they must not overlap and must be ordered for -race, which
+// reported them unordered before they were. In "switch first" the switch is
+// made while the handler runs, and the handler returns after it, before the
+// goroutine releases the request; in "return first" the OnHeader hook, which
+// runs between the switch's start and its reaching the connection, holds it
+// until the handler has returned, so the switch has to wait for the round's
+// end, as one begun after the handler returned does.
+func TestUpgradeFromGoroutineAsHandlerReturns(t *testing.T) {
+	for _, returnFirst := range []bool{false, true} {
+		name := "switch first"
+		if returnFirst {
+			name = "return first"
+		}
+		t.Run(name, func(t *testing.T) {
+			testUpgradeFromGoroutine(t, returnFirst)
+		})
+	}
+}
+
+func testUpgradeFromGoroutine(t *testing.T, returnFirst bool) {
+	echo := &echoTunnel{closed: make(chan error, 3)}
+	results := make(chan error, 3)
+	release := make(chan struct{})
+	defer close(release)
+	addr := serve(t, NewHandler(HandlerFunc(func(c *Context) {
+		c.Retain()
+		hooked := make(chan struct{})
+		c.OnHeader(func(int, stdhttp.Header) {
+			close(hooked)
+			if returnFirst {
+				time.Sleep(50 * time.Millisecond)
+			}
+		})
+		go func() {
+			_, err := c.Upgrade("echo", nil, echo)
+			results <- err
+			// Released only once the test is over, so that nothing the
+			// release does orders the switch before the round's end.
+			<-release
+			c.Release()
+		}()
+		<-hooked
+		if !returnFirst {
+			time.Sleep(50 * time.Millisecond)
+		}
+	})))
+	for range 3 {
+		conn, err := net.DialTimeout("tcp", addr, 5*time.Second)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer conn.Close()
+		_ = conn.SetDeadline(time.Now().Add(10 * time.Second))
+		reader := bufio.NewReader(conn)
+		if _, err := io.WriteString(conn, "GET / HTTP/1.1\r\nHost: x\r\nConnection: Upgrade\r\nUpgrade: echo\r\n\r\nearly"); err != nil {
+			t.Fatal(err)
+		}
+		resp, err := stdhttp.ReadResponse(reader, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if resp.StatusCode != stdhttp.StatusSwitchingProtocols {
+			t.Fatalf("status %d", resp.StatusCode)
+		}
+		if err := <-results; err != nil {
+			t.Fatal(err)
+		}
+		if _, err := io.WriteString(conn, "after"); err != nil {
+			t.Fatal(err)
+		}
+		got := make([]byte, len("earlyafter"))
+		if _, err := io.ReadFull(reader, got); err != nil || string(got) != "earlyafter" {
+			t.Fatalf("read %q %v", got, err)
+		}
+	}
+}
