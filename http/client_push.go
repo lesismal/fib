@@ -114,7 +114,7 @@ func (s *h1Sink) End() error {
 	}
 	s.done()
 	if err == nil {
-		s.r.requestSent()
+		s.r.requestSent(s.cc)
 	}
 	return err
 }
@@ -194,7 +194,7 @@ func (s *h2Sink) End() error {
 		out = hc.appendTrailerLocked(nil, st)
 	} else {
 		out = h2AppendFrameHeader(nil, h2FrameData, h2FlagEndStream, st.id, 0)
-		st.endLocalLocked()
+		st.endLocalLocked(hc.cc)
 	}
 	hc.sendLocked(out)
 	return nil
@@ -236,7 +236,7 @@ func (cc *clientConn) spliceWritten(r *clientRequest, err error) {
 		r.abort(err)
 		return
 	}
-	r.requestSent()
+	r.requestSent(cc)
 }
 
 // attachPush starts sending r's pushed body through sink, or fails r when it

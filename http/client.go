@@ -1559,14 +1559,20 @@ func (r *clientRequest) markDone() bool {
 }
 
 // requestSent starts the wait for the response's header, now that the whole
-// request has been handed to the connection. A request sent again, after a
-// reused connection turned out to be closed, starts it again.
-func (r *clientRequest) requestSent() {
+// request has been handed to sender. A request sent again, after a reused
+// connection turned out to be closed, starts it again.
+//
+// The send that hands it over may still be on its way back when the server's
+// hang-up has already been dealt with: OnClose has taken the request from
+// sender and queued it to be sent again, and requeued has stopped the wait.
+// The wait then starts only once the request is on another connection, not
+// now, when it may yet wait for that connection longer than the header may.
+func (r *clientRequest) requestSent(sender *clientConn) {
 	if r.headerWait <= 0 {
 		return
 	}
 	r.mu.Lock()
-	if r.headerDone || r.done.Load() {
+	if r.headerDone || r.done.Load() || r.conn != sender {
 		r.mu.Unlock()
 		return
 	}
@@ -2005,7 +2011,7 @@ func (cc *clientConn) send(r *clientRequest) {
 		// The body waits for the server's 100, or for the wait to run out.
 		gate.Start(cc.client.config.ExpectContinueTimeout)
 	case r.upload == nil:
-		r.requestSent()
+		r.requestSent(cc)
 	default:
 		cc.startUpload(r)
 	}
@@ -2058,7 +2064,7 @@ func (cc *clientConn) sendHeld(r *clientRequest) {
 		r.releaseData()
 	}
 	if sent {
-		r.requestSent()
+		r.requestSent(cc)
 	}
 }
 
@@ -2100,7 +2106,7 @@ func (cc *clientConn) sendBody(r *clientRequest) {
 		}
 	}
 	if err == nil {
-		r.requestSent()
+		r.requestSent(cc)
 	}
 	cc.mu.Lock()
 	if cc.uploading == r {

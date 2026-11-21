@@ -86,9 +86,9 @@ func TestResponseHeaderTimeout(t *testing.T) {
 // the header starts again once it has been sent on that one.
 func TestResponseHeaderTimeoutSkipsRetryWait(t *testing.T) {
 	// The header wait also covers the first try, from its send until the
-	// client sees the hang-up, which a loaded runner under the race detector
-	// has stretched past 150ms and then past 500ms; the retry's dial still
-	// takes twice it.
+	// client sees the hang-up; the retry's dial takes twice it. Its rare
+	// failures, once taken for a slow runner, were a late send's report
+	// starting the wait for the retry (see TestResponseHeaderTimeoutLateSend).
 	const wait = 2 * time.Second
 	url := rawServer(t, func(conn net.Conn, _ int) {
 		reader := bufio.NewReader(conn)
@@ -126,5 +126,68 @@ func TestResponseHeaderTimeoutSkipsRetryWait(t *testing.T) {
 	}
 	if n := dials.Load(); n != 2 {
 		t.Fatalf("%d dials, want 2: one reused and dropped, one for the retry", n)
+	}
+}
+
+// TestResponseHeaderTimeoutLateSend checks the race behind
+// TestResponseHeaderTimeoutSkipsRetryWait's rare failures: the send that put
+// a request on a kept connection returns only after the server's hang-up has
+// been dealt with, OnClose having taken the request off the connection and
+// queued it to be sent again. That send's late report must not start the
+// wait for the header, which would then run out while the request waits for
+// its new connection, but leave it to the send on that one.
+func TestResponseHeaderTimeoutLateSend(t *testing.T) {
+	const wait = 150 * time.Millisecond
+	url := rawServer(t, func(conn net.Conn, _ int) {
+		reader := bufio.NewReader(conn)
+		for {
+			if _, err := stdhttp.ReadRequest(reader); err != nil {
+				return
+			}
+			_, _ = io.WriteString(conn, "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
+		}
+	})
+	dial := make(chan struct{})
+	config := DefaultClientConfig()
+	config.ResponseHeaderTimeout = wait
+	config.Dial = func(engine *fib.Engine, network, addr string, timeout time.Duration,
+		handler fib.Handler, done func(*fib.Connection, error)) error {
+		// The new connection takes longer than the header may.
+		go func() {
+			<-dial
+			if err := engine.DialWithHandler(network, addr, timeout, handler, done); err != nil {
+				done(nil, err)
+			}
+		}()
+		return nil
+	}
+	client := newTestClient(t, config)
+	type result struct {
+		body string
+		err  error
+	}
+	results := make(chan result, 1)
+	r := client.do(mustRequest(t, "GET", url, nil), func(resp *ClientResponse, err error) {
+		if err != nil {
+			results <- result{err: err}
+			return
+		}
+		body, err := io.ReadAll(resp.Body)
+		results <- result{string(body), err}
+	}, false, nil)
+	// What OnClose did on the connection the server hung up on: r is off it
+	// and back in the queue, where it waits for the dial. Then that
+	// connection's send returns.
+	old := &clientConn{}
+	if !r.attach(old) {
+		t.Fatal("request settled before it was sent")
+	}
+	r.detach()
+	r.requestSent(old)
+	time.Sleep(3 * wait)
+	close(dial)
+	got := <-results
+	if got.err != nil || got.body != "ok" {
+		t.Fatalf("body %q, err %v: the late send started the header wait", got.body, got.err)
 	}
 }

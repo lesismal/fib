@@ -379,7 +379,7 @@ func (hc *h2ClientConn) startBodyLocked(out []byte, st *h2ClientStream) []byte {
 	case len(st.trailer) > 0:
 		out = hc.appendTrailerLocked(out, st)
 	default:
-		st.endLocalLocked()
+		st.endLocalLocked(hc.cc)
 	}
 	return out
 }
@@ -414,9 +414,9 @@ func (hc *h2ClientConn) sendHeld(st *h2ClientStream) {
 
 // endLocalLocked records that st's request has all been handed to the
 // connection, which starts the wait for its response's header.
-func (st *h2ClientStream) endLocalLocked() {
+func (st *h2ClientStream) endLocalLocked(cc *clientConn) {
 	st.localDone = true
-	st.r.requestSent()
+	st.r.requestSent(cc)
 }
 
 // liveLocked reports whether st is still open on the connection.
@@ -474,7 +474,7 @@ func (hc *h2ClientConn) sendBody(st *h2ClientStream) {
 				out = hc.appendTrailerLocked(nil, st)
 			} else {
 				out = h2AppendFrameHeader(nil, h2FrameData, h2FlagEndStream, st.id, 0)
-				st.endLocalLocked()
+				st.endLocalLocked(hc.cc)
 			}
 			hc.sendLocked(out)
 		}
@@ -1371,7 +1371,7 @@ func (hc *h2ClientConn) flushStreamLocked(out []byte, st *h2ClientStream) []byte
 		if last {
 			if len(st.trailer) == 0 {
 				flags = h2FlagEndStream
-				st.endLocalLocked()
+				st.endLocalLocked(hc.cc)
 			}
 		}
 		out = h2AppendFrameHeader(out, h2FrameData, flags, st.id, len(chunk))
@@ -1392,6 +1392,6 @@ func (hc *h2ClientConn) appendTrailerLocked(out []byte, st *h2ClientStream) []by
 		block = hc.enc.AppendField(block, st.trailer[i], st.trailer[i+1], false)
 	}
 	st.trailer = nil
-	st.endLocalLocked()
+	st.endLocalLocked(hc.cc)
 	return h2AppendHeaderBlock(out, st.id, block, true, hc.peerMaxFrame)
 }
