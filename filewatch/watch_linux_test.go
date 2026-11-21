@@ -272,14 +272,25 @@ func TestWatchConcurrent(t *testing.T) {
 	r := newRecorder(t, root)
 	stop := make(chan struct{})
 	var wg sync.WaitGroup
+	// cycled counts the goroutines that have watched each of their paths
+	// once: the moves start after all have, so that every path is asked for
+	// however late a goroutine starts.
+	var cycled sync.WaitGroup
 	for i := range 8 {
 		wg.Add(1)
+		cycled.Add(1)
 		go func() {
 			defer wg.Done()
 			dirs := []string{"a/b", "c/d", "m/n", "./a/b", "c//d", "missing/x"}
 			for k := 0; ; k++ {
+				if k == len(dirs) {
+					cycled.Done()
+				}
 				select {
 				case <-stop:
+					if k < len(dirs) {
+						cycled.Done()
+					}
 					return
 				default:
 				}
@@ -287,6 +298,7 @@ func TestWatchConcurrent(t *testing.T) {
 			}
 		}()
 	}
+	cycled.Wait()
 	for range 20 {
 		if err := os.Rename(filepath.Join(root, "m"), filepath.Join(root, "m2")); err != nil {
 			t.Fatal(err)
