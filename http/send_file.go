@@ -11,6 +11,7 @@ import (
 	"strconv"
 	"time"
 
+	fib "github.com/lesismal/fib"
 	"github.com/lesismal/fib/bufferpool"
 	"github.com/lesismal/fib/sidepool"
 )
@@ -46,12 +47,17 @@ const sendFileQueuePiece = 256 << 10
 // Content-Range, calls WriteHeader first. SendFile keeps the response open
 // until done has run, as a Retain does, and lets it go after: the handler
 // writes nothing more until then, and may return at once. f must stay open
-// until done runs; the range must lie within it, since a file that turns
-// out shorter ends the response short, which closes an HTTP/1 connection or
-// resets a stream. A response to HEAD sends none of the file.
+// until done runs, and done may close it: f is an *os.File, or any
+// fib.File. A fib.FileHandover may hand its descriptor over instead, for the
+// range, or the last piece of it SendFileStall queues, sent by sendfile on
+// Unix, and then the connection closes it once sent, and f's own close must
+// not. The range
+// must lie within the file, since a file that turns out shorter ends the
+// response short, which closes an HTTP/1 connection or resets a stream. A
+// response to HEAD sends none of the file.
 //
 // SendFile waits for the client without a bound; SendFileStall bounds it.
-func (c *Context) SendFile(f *os.File, offset, n int64, done func(error)) {
+func (c *Context) SendFile(f fib.File, offset, n int64, done func(error)) {
 	c.SendFileStall(f, offset, n, 0, done)
 }
 
@@ -66,7 +72,7 @@ func (c *Context) SendFile(f *os.File, offset, n int64, done func(error)) {
 // deadline the connection has. A stream that takes no write deadline, one
 // served outside this package that does not implement StreamDeadliner, is
 // waited for without one. A stall of 0 or less is SendFile's.
-func (c *Context) SendFileStall(f *os.File, offset, n int64, stall time.Duration, done func(error)) {
+func (c *Context) SendFileStall(f fib.File, offset, n int64, stall time.Duration, done func(error)) {
 	if done == nil {
 		done = func(error) {}
 	}
@@ -115,7 +121,7 @@ func (c *Context) SendFileStall(f *os.File, offset, n int64, stall time.Duration
 
 // sendFileHTTP1 is SendFile on an HTTP/1 connection that queues the file,
 // to be read as the socket takes it.
-func (c *Context) sendFileHTTP1(f *os.File, offset, n int64) error {
+func (c *Context) sendFileHTTP1(f fib.File, offset, n int64) error {
 	w := c.w
 	if !w.committed {
 		if err := c.commit(false); err != nil {
@@ -141,11 +147,16 @@ func (c *Context) sendFileHTTP1(f *os.File, offset, n int64) error {
 	return nil
 }
 
+// keptFile hides a FileHandover's HandOverFD from the connection, for the
+// pieces SendFileStall queues before a file's last, which are sent from
+// duplicates of its descriptor.
+type keptFile struct{ fib.File }
+
 // fileSend is a SendFile reading its file a piece at a time, or queuing it
 // for sendfile a piece at a time when it has a stall bound.
 type fileSend struct {
 	c      *Context
-	f      *os.File
+	f      fib.File
 	offset int64
 	left   int64
 	stall  time.Duration
@@ -158,7 +169,13 @@ type fileSend struct {
 func (s *fileSend) queue() {
 	for {
 		k := min(s.left, sendFileQueuePiece)
-		if err := s.c.sendFileHTTP1(s.f, s.offset, k); err != nil {
+		f := s.f
+		if k < s.left {
+			// The pieces after this one are sent from the same descriptor,
+			// which this one must not take away; the last may.
+			f = keptFile{f}
+		}
+		if err := s.c.sendFileHTTP1(f, s.offset, k); err != nil {
 			sidepool.Go(func() { s.finish(err) })
 			return
 		}

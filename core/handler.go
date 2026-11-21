@@ -382,6 +382,20 @@ type File interface {
 	SyscallConn() (syscall.RawConn, error)
 }
 
+// FileHandover is a File that can hand its descriptor over to SendFile. On
+// Unix, SendFile asks for it once: a File that answers ok gives up the
+// descriptor, which the connection sends from and closes once the range is
+// sent or the connection drops it, and the caller must neither read from it
+// nor close it after that; a File that does not implement it, or answers
+// false, keeps its descriptor, which SendFile duplicates as it always has.
+// Handing it over saves the duplicate's two system calls a send: a server
+// that opens a file for each response has no use for its own descriptor
+// once the file is queued. Elsewhere SendFile never asks.
+type FileHandover interface {
+	File
+	HandOverFD() (fd int, ok bool)
+}
+
 // ErrSendFileDatagram is what SendFile returns on a UDP connection, whose
 // sends are datagrams rather than a stream a file could be copied into.
 var ErrSendFileDatagram = errors.New("fib: SendFile needs a stream connection")

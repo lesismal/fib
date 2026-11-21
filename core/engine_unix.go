@@ -1358,6 +1358,11 @@ func (s *fileSegment) readAt(p []byte, off int64) (int, error) {
 func newSealBuffer(n int) []byte { return bufferpool.Get(n) }
 
 func newFileSegment(f File, offset, count int64) (*fileSegment, error) {
+	if h, ok := f.(FileHandover); ok {
+		if fd, ok := h.HandOverFD(); ok {
+			return &fileSegment{fd: fd, offset: offset, remaining: count}, nil
+		}
+	}
 	rc, err := f.SyscallConn()
 	if err != nil {
 		return nil, err

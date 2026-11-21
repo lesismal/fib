@@ -126,6 +126,10 @@ type EngineCloseHandler = core.EngineCloseHandler
 // and passes its descriptor on through SyscallConn.
 type File = core.File
 
+// FileHandover is a File that can hand its descriptor over to SendFile,
+// which then sends from it and closes it itself, without duplicating it.
+type FileHandover = core.FileHandover
+
 // FileLayer is a Layer that carries a file SendFile sends as the socket takes
 // it, rather than having the whole range read and handed to Send before
 // SendFile returns: the tls package seals a file's records as the socket
