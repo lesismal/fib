@@ -27,6 +27,9 @@ func TestClientTakeBody(t *testing.T) {
 		case "/large":
 			_, _ = w.Write(pattern(1 << 20))
 		case "/medium":
+			// With its length, so that it arrives whole rather than
+			// chunked.
+			w.Header().Set("Content-Length", strconv.Itoa(8<<10))
 			_, _ = w.Write(pattern(8 << 10))
 		default:
 			_, _ = w.Write([]byte("body of " + r.URL.Path))
@@ -65,6 +68,22 @@ func TestClientTakeBody(t *testing.T) {
 			})
 			return <-got
 		}
+		// bytesFirst takes BodyBytes before TakeBody.
+		bytesFirst := func(path string) (kept []byte, taken result) {
+			done := make(chan struct{})
+			client.Do(mustRequest(t, "GET", url+path, nil), func(cr *ClientResponse, err error) {
+				defer close(done)
+				if err != nil {
+					t.Error(err)
+					return
+				}
+				kept, _ = cr.BodyBytes()
+				taken.body, taken.pooled, taken.ok = cr.TakeBody()
+				cr.Close()
+			})
+			<-done
+			return kept, taken
+		}
 		small := get("/a")
 		if !small.ok || string(small.body) != "body of /a" {
 			t.Errorf("%s: took %q, %v", proto, small.body, small.ok)
@@ -78,9 +97,27 @@ func TestClientTakeBody(t *testing.T) {
 		if small.pooled {
 			bufferpool.Put(small.body)
 		}
+		// A body above a small reply's is pooled too over HTTP/1, up to
+		// maxPooledResponseBody.
 		medium := get("/medium")
-		if !medium.ok || !bytes.Equal(medium.body, pattern(8<<10)) || medium.pooled {
+		if !medium.ok || !bytes.Equal(medium.body, pattern(8<<10)) || medium.pooled != (proto == "HTTP/1.1") {
 			t.Errorf("%s: took %d bytes, pooled %v, ok %v", proto, len(medium.body), medium.pooled, medium.ok)
+		}
+		if medium.pooled {
+			bufferpool.Put(medium.body)
+		}
+		// BodyBytes of such a body hands out a copy of its own size, which
+		// the caller may keep, and leaves the pooled buffer to TakeBody or
+		// Close.
+		kept, taken := bytesFirst("/medium")
+		if !bytes.Equal(kept, pattern(8<<10)) || !bytes.Equal(taken.body, pattern(8<<10)) {
+			t.Errorf("%s: BodyBytes %d bytes, then TakeBody %d", proto, len(kept), len(taken.body))
+		}
+		if proto == "HTTP/1.1" {
+			if cap(kept) != len(kept) || !taken.pooled || unsafe.SliceData(kept) == unsafe.SliceData(taken.body) {
+				t.Errorf("%s: BodyBytes cap %d of %d, then TakeBody pooled %v", proto, cap(kept), len(kept), taken.pooled)
+			}
+			bufferpool.Put(taken.body)
 		}
 		if large := get("/large"); !large.done || large.ok {
 			t.Errorf("%s: a streamed body handed over %d bytes", proto, len(large.body))

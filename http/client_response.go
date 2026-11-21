@@ -3,6 +3,7 @@
 package http
 
 import (
+	"bytes"
 	"errors"
 	"io"
 	stdhttp "net/http"
@@ -241,12 +242,19 @@ func (c *ClientResponse) BodyBytes() ([]byte, bool) {
 	}
 	switch body := c.Response.Body; {
 	case c.whole != nil:
+		c.mu.Lock()
+		defer c.mu.Unlock()
+		data := c.whole.data[c.whole.off:]
+		if c.whole.pooled && len(data) > maxCopiedResponseBody {
+			// A pooled buffer can be nearly twice the body: the caller,
+			// who may keep the bytes, gets a copy of their own size, and
+			// Close gives the buffer back.
+			return bytes.Clone(data), true
+		}
 		// The bytes are the caller's for as long as it keeps them: Close
 		// leaves them to the collector rather than give them back.
-		c.mu.Lock()
 		c.whole.pooled = false
-		c.mu.Unlock()
-		return c.whole.data[c.whole.off:], true
+		return data, true
 	case body == nil || body == stdhttp.NoBody:
 		return nil, true
 	}

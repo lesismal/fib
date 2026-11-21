@@ -540,18 +540,27 @@ func (p *responseParser) completeChunked(end int, req *stdhttp.Request) (*stdhtt
 	return p.complete(end, body), nil
 }
 
+// maxPooledResponseBody is the largest whole response body the client
+// copies into a buffer from the pool. Up to it, a caller that reads the body
+// and closes it, or a proxy that sends it on with WriteResponseOwned, gives
+// the buffer back, and a response costs no garbage; BodyBytes, which hands
+// the bytes out for as long as the caller keeps them, hands out a copy of
+// their own size instead, since a pool's class can be nearly twice that.
+// fit's proxy sending on bodies of 8 and 32 KiB from nginx, which the client
+// copied into buffers of their own above 4 KiB, collected 130 to 150 times a
+// second.
+const maxPooledResponseBody = 1 << 20
+
 // complete hands out the response in progress with its body and removes it
 // from the buffer. The body is copied: the parser's buffer is reused for the
-// next response on the connection. A small body's copy is a buffer from the
-// pool, which a caller that passes the body on can give back (TakeBody,
-// Context.WriteResponseOwned); a larger one is of its own size, since a
-// pool's class can be nearly twice that, and a caller may keep the body.
+// next response on the connection. Its copy is a buffer from the pool up to
+// maxPooledResponseBody, and above it of its own size.
 func (p *responseParser) complete(end int, body []byte) *stdhttp.Response {
 	resp := p.head
 	switch {
 	case len(body) == 0:
 		resp.Body = stdhttp.NoBody
-	case len(body) <= maxCopiedResponseBody:
+	case len(body) <= maxPooledResponseBody:
 		data := bufferpool.Get(len(body))
 		copy(data, body)
 		resp.Body = &bufferedBody{data: data, pooled: true}
