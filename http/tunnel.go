@@ -570,6 +570,7 @@ func (p *Parser) claimSwitch(c *Context) bool {
 func (p *Parser) waitSwitch() {
 	if p.switching.Load() {
 		p.switchMu.Lock()
+		//lint:ignore SA2001 taking the lock is the wait
 		p.switchMu.Unlock()
 	}
 }
