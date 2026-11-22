@@ -118,9 +118,18 @@ func (h *testHandler) OnStreamData(s *Stream, data []byte, fin bool) {
 		h.finished <- s.ID()
 	}
 }
-func (h *testHandler) OnStreamReset(s *Stream, code uint64) { h.reset <- s.ID() }
-func (h *testHandler) OnStopSending(*Stream, uint64)        {}
-func (h *testHandler) OnStreamsAvailable(*Conn)             {}
+func (h *testHandler) OnStreamReset(s *Stream, code uint64) {
+	// Past the buffer, which no test reads that far into, a reset is
+	// dropped rather than blocking the connection's goroutine: a test that
+	// failed before reading its resets would otherwise hang the pair's
+	// close until the package times out.
+	select {
+	case h.reset <- s.ID():
+	default:
+	}
+}
+func (h *testHandler) OnStopSending(*Stream, uint64) {}
+func (h *testHandler) OnStreamsAvailable(*Conn)      {}
 func (h *testHandler) OnClose(_ *Conn, err error) {
 	// A connection closes once, but a handler that a test gave a second
 	// one keeps the first close for the test to read: the second never

@@ -53,6 +53,12 @@ func floodPair(t *testing.T) *testPair {
 	return newTestPair(t, 0, func(_, server *Config) {
 		server.ExcessiveLoadCode = floodCode
 		server.MaxIncomingStreams = 4 * DefaultStreamResetBurst
+		// The default bursts, refilled at a token a second rather than
+		// the default 100: the tests send a hundred past the burst, which a
+		// runner that took a second to send and take them would have
+		// refilled (run 45049620517, Windows).
+		server.ControlFrameRate = 1
+		server.StreamResetRate = 1
 	})
 }
 
