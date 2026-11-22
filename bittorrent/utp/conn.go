@@ -597,12 +597,17 @@ func (c *Conn) takeAcks(h header, sack []byte, now int64) {
 	// connection is recovering a loss: what it acknowledges then, the
 	// packets past the hole that a lost acknowledgement or a slow path
 	// left unacknowledged for seconds, times the recovery, not the path.
+	// So does one a timeout declared lost that still waits to go again,
+	// sent once: after a timeout the window lets only the oldest go, and
+	// the rest, which arrived long before while their acknowledgements
+	// were lost, are acknowledged once the oldest is (run 45049748444,
+	// Windows: a 244ms RTT on a 2ms path).
 	c.noRTTSample = false
-	if p, ok := c.out.get(oldest); ok && p.transmissions > 1 {
+	if p, ok := c.out.get(oldest); ok && (p.transmissions > 1 || p.needResend) {
 		c.noRTTSample = true
 	}
 	for i := 1; i < acks && !c.noRTTSample; i++ {
-		if p, ok := c.out.get(oldest + uint16(i)); ok && p.transmissions > 1 {
+		if p, ok := c.out.get(oldest + uint16(i)); ok && (p.transmissions > 1 || p.needResend) {
 			c.noRTTSample = true
 		}
 	}
@@ -774,8 +779,9 @@ func (c *Conn) ackPacket(seq uint16, now int64) int {
 		return 2
 	}
 	c.out.del(seq)
-	if p.transmissions == 1 && !c.noRTTSample {
-		// Karn: only a packet sent once times the round trip.
+	if p.transmissions == 1 && !p.needResend && !c.noRTTSample {
+		// Karn: only a packet sent once times the round trip, and not
+		// one a timeout declared lost, which times the recovery.
 		ertt := int((now - p.sentAt) / 1000)
 		if !c.rttSampled {
 			c.rtt, c.rttVar, c.rttSampled = ertt, ertt/2, true
@@ -817,7 +823,7 @@ func (c *Conn) sackBytes(base uint16, mask []byte, minRTT *int64, now int64) int
 		}
 		if mask[bit>>3]&(1<<(bit&7)) != 0 {
 			n += len(p.payload)
-			if !c.noRTTSample {
+			if !c.noRTTSample && p.transmissions == 1 && !p.needResend {
 				*minRTT = min(*minRTT, rttOf(p, now))
 			}
 		}

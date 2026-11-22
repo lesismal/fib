@@ -163,3 +163,26 @@ func TestLostSACKsKeepRTT(t *testing.T) {
 		t.Fatalf("rtt %dms, rto %dms after lost SACKs", maxRTT, maxRTO)
 	}
 }
+
+// TestAckAwaitingResendTimesNothing: a packet a timeout declared lost, sent
+// once and still waiting to go again, times nothing when its
+// acknowledgement comes: it arrived long before, while its acknowledgement
+// was lost, and its age times the recovery, not the path. A packet sent
+// once and not lost still does.
+func TestAckAwaitingResendTimesNothing(t *testing.T) {
+	c := &Conn{cfg: &Config{MinRTO: DefaultMinRTO}}
+	c.rtt, c.rttVar, c.rttSampled = 20, 10, true
+	now := int64(10_000_000) // microseconds
+	c.out.put(7, &outPacket{seq: 7, transmissions: 1, needResend: true, sentAt: now - 2_000_000}, 7)
+	c.out.put(8, &outPacket{seq: 8, transmissions: 1, sentAt: now - 30_000}, 7)
+	if got := c.ackPacket(7, now); got != 0 {
+		t.Fatalf("ackPacket = %d", got)
+	}
+	if c.rtt != 20 {
+		t.Fatalf("rtt %dms after a packet that waited to go again", c.rtt)
+	}
+	c.ackPacket(8, now)
+	if c.rtt == 20 {
+		t.Fatal("a packet sent once timed nothing")
+	}
+}
