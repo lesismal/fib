@@ -156,7 +156,18 @@ func (s *simNet) build(t testing.TB, size int, cfg Config) []*Node {
 			wg.Add(1)
 			go func() {
 				defer wg.Done()
-				if err := nodes[j].Bootstrap(ctx); err != nil {
+				// A seed's answers can run past the query timeout while the
+				// network is busy with the refreshes earlier batches left
+				// running, as on a slow runner under -race (run 45051554489,
+				// macOS): no seed answered, and the node bootstraps again,
+				// as a node does.
+				var err error
+				for range 3 {
+					if err = nodes[j].Bootstrap(ctx); !errors.Is(err, ErrNoNodes) {
+						break
+					}
+				}
+				if err != nil {
 					t.Errorf("bootstrap %d: %v", j, err)
 				}
 			}()
