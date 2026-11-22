@@ -87,8 +87,16 @@ func TestCloseLetsGoOfAnIdleHTTP2Connection(t *testing.T) {
 	// module with atomic counters and shares the runner, and a collector
 	// pass that needs a few cycles can miss a five-second window without the
 	// connection being reachable.
+	//
+	// The processor count is shrunk again every round too: Close hands the
+	// OnClose of the connections it cuts to the handler pool, so a timer can
+	// be stopped after the shrink above and wait as a zombie on a processor
+	// that then idles (the arena job of run 45053791527 ran out the twenty
+	// seconds so).
 	deadline := time.Now().Add(20 * time.Second)
 	for !collected.Load() && time.Now().Before(deadline) {
+		procs := runtime.GOMAXPROCS(1)
+		runtime.GOMAXPROCS(procs)
 		runtime.GC()
 		time.Sleep(20 * time.Millisecond)
 	}
