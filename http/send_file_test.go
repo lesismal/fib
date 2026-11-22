@@ -128,6 +128,67 @@ func TestSendFile(t *testing.T) {
 	}
 }
 
+// TestSendFileHeaderAfter checks that what a handler does to its header
+// once SendFile has returned goes out nowhere, over every protocol, for a
+// file queued for sendfile, one too small for it, and HEAD: SendFile sends
+// the handler's header without a copy only where it is sent before
+// SendFile returns.
+func TestSendFileHeaderAfter(t *testing.T) {
+	data := make([]byte, 64<<10)
+	path := filepath.Join(t.TempDir(), "file")
+	if err := os.WriteFile(path, data, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	handler := HandlerFunc(func(c *Context) {
+		f, err := os.Open(path)
+		if err != nil {
+			t.Error(err)
+			return
+		}
+		n := int64(len(data))
+		if c.Request.URL.Path == "/small" {
+			n = 1000
+		}
+		c.Header().Set("X-A", "before")
+		stall := time.Duration(0)
+		if c.Request.URL.Query().Has("stall") {
+			stall = time.Second
+		}
+		c.SendFileStall(f, 0, n, stall, func(error) { f.Close() })
+		c.Header().Set("X-A", "after")
+		c.Header().Set("X-B", "after")
+		c.Header().Del("Content-Length")
+	})
+	base := "http://" + serve(t, NewHandler(handler))
+	for _, cl := range hookClients(t) {
+		for _, target := range []string{"/", "/?stall", "/small", "/small?stall"} {
+			for _, method := range []string{"GET", "HEAD"} {
+				req, _ := stdhttp.NewRequest(method, base+target, nil)
+				resp, err := cl.Do(req)
+				if err != nil {
+					t.Fatalf("%s %s %s: %v", cl.proto, method, target, err)
+				}
+				body, _ := io.ReadAll(resp.Body)
+				resp.Body.Close()
+				want := len(data)
+				if strings.HasPrefix(target, "/small") {
+					want = 1000
+				}
+				if method == "HEAD" {
+					if len(body) != 0 {
+						t.Errorf("%s HEAD %s: %d bytes", cl.proto, target, len(body))
+					}
+				} else if len(body) != want {
+					t.Errorf("%s GET %s: %d bytes, want %d", cl.proto, target, len(body), want)
+				}
+				if a, b := resp.Header.Get("X-A"), resp.Header.Get("X-B"); a != "before" || b != "" || resp.ContentLength != int64(want) {
+					t.Errorf("%s %s %s: X-A %q, X-B %q, Content-Length %d", cl.proto, method, target, a, b, resp.ContentLength)
+				}
+			}
+		}
+	}
+}
+
 // TestSendFileClientGone checks that a file SendFile reads a piece at a
 // time, here over h2c, to a client that goes away part way, tells done so.
 func TestSendFileClientGone(t *testing.T) {

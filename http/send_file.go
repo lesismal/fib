@@ -85,14 +85,25 @@ func (c *Context) SendFileStall(f fib.File, offset, n int64, stall time.Duration
 		return
 	}
 	w := c.writer()
+	shared := false
 	if w.status == 0 {
 		if _, set := w.header["Content-Length"]; !set && w.written == 0 && !c.holdsWhole() {
 			c.Header().Set("Content-Length", strconv.FormatInt(n, 10))
 		}
-		c.WriteHeader(stdhttp.StatusOK)
+		shared = c.writeHeaderShared(stdhttp.StatusOK)
 	}
 	c.Retain()
 	s := &fileSend{c: c, f: f, offset: offset, left: n, stall: stall, done: done}
+	queued := n > 0 && c.Request.Method != stdhttp.MethodHead && statusHasBody(w.status) &&
+		c.isHTTP1() && !c.holdsWhole() && c.Conn.QueuesFiles() && w.err == nil && n >= minSendFileSize &&
+		(w.declared < 0 || w.written+n <= w.declared)
+	if shared && !queued {
+		// Only the first piece's queuing, on the handler's goroutine, builds
+		// and sends the header before SendFile returns: anywhere else the
+		// handler, which may change the header from then on, would race
+		// with what sends it.
+		w.sent = w.sent.Clone()
+	}
 	if n == 0 || c.Request.Method == stdhttp.MethodHead || !statusHasBody(w.status) {
 		var err error
 		switch {
@@ -106,8 +117,7 @@ func (c *Context) SendFileStall(f fib.File, offset, n int64, stall time.Duration
 		sidepool.Go(func() { s.finish(err) })
 		return
 	}
-	if c.isHTTP1() && !c.holdsWhole() && c.Conn.QueuesFiles() && w.err == nil && n >= minSendFileSize &&
-		(w.declared < 0 || w.written+n <= w.declared) {
+	if queued {
 		if stall <= 0 {
 			err := c.sendFileHTTP1(f, offset, n)
 			sidepool.Go(func() { s.finish(err) })

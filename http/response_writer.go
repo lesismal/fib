@@ -201,6 +201,28 @@ func (c *Context) WriteHeader(status int) {
 	c.settleHeader()
 }
 
+// writeHeaderShared is WriteHeader of a final status for SendFile, which
+// may send the handler's header as it is, without the copy WriteHeader
+// makes of it: it does when the response has no hooks, which may change
+// or hold the header, and reports whether it did. SendFile then copies it
+// after all unless the header is built and sent before SendFile returns,
+// after which a change the handler makes to it changes nothing.
+func (c *Context) writeHeaderShared(status int) bool {
+	w := c.writer()
+	if w.hooks != nil {
+		c.WriteHeader(status)
+		return false
+	}
+	w.status = status
+	w.sent = w.header
+	if w.sent == nil {
+		w.sent = make(stdhttp.Header)
+		w.header = w.sent
+	}
+	c.settleHeader()
+	return true
+}
+
 // settleHeader is the header of a response written through the
 // ResponseWriter methods settled, once its hooks have run: the length it
 // declares, and what filtering its body changes.
