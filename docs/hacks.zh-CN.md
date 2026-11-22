@@ -733,6 +733,10 @@ func main() {
   花在这上面而不是请求上。64 核 HttpArena：pipelined 1820 万 → 2540 万，latency-1m 的 p99 从
   1.6ms → 124µs 同时少用四分之一核。
 - 默认每个子进程 `GOMAXPROCS=2`（`ProcsPerChild`），子进程数 = master 的 GOMAXPROCS / 2。
+- NUMA：`Placement: prefork.PlaceNode` 把每个子进程限制在一个节点的 CPU 上，子进程按各节点 CPU
+  数分配；`prefork.PlaceCPU` 再给每个子进程一段独占的本节点 CPU，SMT 兄弟线程在一起。页在第一次访问它的
+  CPU 所在节点分配，所以不设内存策略内存也在本节点；`BindMemory: true` 改成严格绑定（`MPOL_BIND`，Docker
+  默认 seccomp 下需要 `CAP_SYS_NICE`）。子进程用 `prefork.Node()` 得知所在节点。网卡队列和中断亲和仍需自己配。
 - **只有子进程需要的初始化放进 `serve`**；`Run` 之前的代码 master 和每个子进程都会跑一遍。
   子进程之间除了端口什么都不共享，内存里的状态每个子进程一份——
   整机只有一份的资源（如 DB 连接上限）按 `prefork.Children()` 分。

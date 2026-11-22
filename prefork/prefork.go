@@ -23,6 +23,10 @@
 // pools, belongs in serve. The children share nothing but their listening
 // addresses, so state a program keeps in memory is kept once per child.
 //
+// On a machine of several NUMA nodes, Config.Placement keeps each child on
+// one node's CPUs, or on a share of them of its own, so that its threads, its
+// heap and the caches they use stay on one node; see PlaceNode and PlaceCPU.
+//
 // Prefork needs Linux, where SO_REUSEPORT spreads connections between
 // processes; elsewhere Run calls serve in this process, as a lone child would.
 package prefork
@@ -100,6 +104,23 @@ type Config struct {
 	// (CAP_SYS_ADMIN before Linux 5.8); without them the children keep the
 	// kernel's hash.
 	BalanceReusePort bool
+	// Placement says which CPUs each child may run on: PlaceAny, the zero
+	// value, any the master may; PlaceNode those of one NUMA node; PlaceCPU
+	// a share of one node's CPUs of the child's own. The master reads the
+	// nodes from /sys/devices/system/node, and a child learns its node from
+	// Node. A placed child still runs with ProcsPerChild Ps, however many
+	// CPUs it may use. Run fails when the master cannot read the nodes or
+	// move a child onto its CPUs.
+	Placement Placement
+	// BindMemory, with PlaceNode or PlaceCPU, has each child allocate its
+	// memory only from its node, with set_mempolicy's MPOL_BIND, rather than
+	// from whichever node its CPU is on when it first touches a page: the
+	// same node while the node has memory free, but a child whose node runs
+	// out is then reclaimed from, swapped or killed by the OOM killer rather
+	// than handed another node's memory. Docker's default seccomp profile
+	// allows set_mempolicy only to a container with CAP_SYS_NICE; without
+	// it, or where a cpuset's mems leave the node out, Run fails.
+	BindMemory bool
 }
 
 // IsChild reports whether this process is a child Run started.
@@ -189,6 +210,16 @@ func master(ctx context.Context, config Config) error {
 	if err != nil {
 		return fmt.Errorf("prefork: %w", err)
 	}
+	var slots []slot
+	switch config.Placement {
+	case PlaceAny:
+	case PlaceNode, PlaceCPU:
+		if slots, err = planPlacement(config.Placement, n); err != nil {
+			return fmt.Errorf("prefork: %v: %w", config.Placement, err)
+		}
+	default:
+		return fmt.Errorf("prefork: unknown %v", config.Placement)
+	}
 
 	// The broker makes each shared address's reuseport selector, the first
 	// time a child asks for it, and hands it to every child that asks, so
@@ -205,7 +236,11 @@ func master(ctx context.Context, config Config) error {
 	exited := make(chan *child, n)
 	var failure error
 	for i := 1; i <= n; i++ {
-		c, err := start(path, i, n, procs, broker)
+		var place *slot
+		if slots != nil {
+			place = &slots[i-1]
+		}
+		c, err := start(path, i, n, procs, broker, place, config.BindMemory)
 		if err != nil {
 			failure = err
 			break
@@ -262,12 +297,23 @@ func master(ctx context.Context, config Config) error {
 // procs Ps. broker, when set, is handed the child's requests for reuseport
 // selectors over a socket pair whose other end the child gets at balanceFD;
 // see Config.BalanceReusePort. A pair that cannot be made leaves the child
-// the kernel's hash.
-func start(path string, index, n, procs int, broker *reuseportbpf.Broker) (*child, error) {
+// the kernel's hash. place, when set, is where the child runs: the master's
+// thread is moved there while it starts the child, which inherits it, with
+// its memory bound to the node too when bindMemory says; see
+// Config.Placement.
+func start(path string, index, n, procs int, broker *reuseportbpf.Broker, place *slot, bindMemory bool) (*child, error) {
 	cmd := exec.Command(path, os.Args[1:]...)
 	cmd.Stdin, cmd.Stdout, cmd.Stderr = os.Stdin, os.Stdout, os.Stderr
 	cmd.Env = append(os.Environ(), childEnv+"="+strconv.Itoa(index), childrenEnv+"="+strconv.Itoa(n),
 		"GOMAXPROCS="+strconv.Itoa(procs))
+	if place != nil {
+		restore, err := placeThread(*place, bindMemory)
+		if err != nil {
+			return nil, fmt.Errorf("prefork: place child %d: %w", index, err)
+		}
+		defer restore()
+		cmd.Env = append(cmd.Env, nodeEnv+"="+strconv.Itoa(place.node))
+	}
 	if pair, err := broker.Pair(); err == nil {
 		// The child has its own copy once it has started.
 		defer pair.Close()

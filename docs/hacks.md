@@ -867,6 +867,12 @@ func main() {
   master and in every child. Children share nothing but the port, so in-memory state exists once
   per child, and a resource that exists once per machine (a database connection limit, say) is
   divided by `prefork.Children()`.
+- NUMA: `Placement: prefork.PlaceNode` keeps each child on one node's CPUs, children spread over
+  the nodes by their CPU counts; `prefork.PlaceCPU` also gives each child a share of its node's
+  CPUs of its own, SMT siblings together. Pages land on the node of the CPU that first touches
+  them, so a child's memory is local without a policy; `BindMemory: true` makes that strict
+  (`MPOL_BIND`, needs `CAP_SYS_NICE` under Docker's seccomp profile). `prefork.Node()` tells a
+  child its node. NIC queue and IRQ affinity are still yours to set.
 - UDP (HTTP/3): after the peer address changes (NAT rebinding / migration) datagrams may land on
   another child, which has no such QUIC connection.
 - fib's defaults shift inside a child: the CPU count is `min(NumCPU, GOMAXPROCS)`, so with 4 Ps

@@ -2005,6 +2005,19 @@ async 161 万到 194 万，latency-1m 的 p99 从 1.6ms 降到 124µs、同时�
 - 任何一个子进程在要求停止之前退出（崩溃或 `serve` 返回），master 让其余子进程停止，`Run` 返回
   说明是哪个子进程的错误；要求停止后 `Config.ShutdownTimeout`（默认 10 秒）内没退出的子进程被
   kill。master 意外退出时子进程收到 SIGTERM（Linux 的 `Pdeathsig`）。
+- `Config.Placement` 决定子进程跑在哪些 CPU 上，用于多 NUMA 节点（多路服务器，或 EPYC/Threadripper 设成
+  NPS2/NPS4）的机器。默认 `PlaceAny` 不限制；`PlaceNode` 把每个子进程限制在一个 NUMA 节点的 CPU 上，子进程按
+  各节点可用 CPU 数成比例分到各节点（编号连续，低编号节点在前）；`PlaceCPU` 在此基础上把节点的 CPU 再分给该
+  节点上的各个子进程，每个子进程独占一段，同一物理核的 SMT 兄弟线程分在一起，子进程多于 CPU 时才会共用。
+  master 从 `/sys/devices/system/node` 读拓扑，只用 master 自己的亲和掩码（taskset、cgroup cpuset）里的 CPU，
+  没有 CPU 的节点（纯内存、CXL）跳过，内核不支持 NUMA 时把全部可用 CPU 当成节点 0。子进程里 `prefork.Node()`
+  返回所在节点（不是被放置的子进程返回 -1）。子进程的 GOMAXPROCS 仍是 `ProcsPerChild`，不随可用 CPU 数变。
+  不需要内存策略内存也在本节点：Linux 在第一次访问一页的 CPU 所在节点分配它，子进程的线程都在本节点的 CPU
+  上。`Config.BindMemory` 用 `set_mempolicy(MPOL_BIND)` 把子进程的内存严格限制在本节点：节点内存足够时结果
+  一样，节点用完时回收、换出或触发 OOM，而不是借别的节点的内存。Docker 默认的 seccomp 配置只在容器有
+  `CAP_SYS_NICE` 时允许 `set_mempolicy`；没有权限、cpuset 的 mems 不含该节点、或读不到拓扑、设不了亲和时
+  `Run` 返回错误。实现上 master 在启动每个子进程前把自己（锁定的）线程移到子进程的 CPU 和节点上，子进程
+  经 fork、execve 继承，启动后 master 的线程恢复原样。网卡队列所在节点的亲和（RSS、IRQ affinity）仍要自己配。
 - 只支持 Linux：macOS 的 `SO_REUSEPORT` 不在进程间分摊连接，Windows 没有 fork。其他平台上
   `Run` 直接在当前进程里调用 `serve`，相当于只有一个子进程。
 - UDP（HTTP/3）的 socket 同样共享：同一对端的数据报按四元组哈希总落在同一个子进程上。对端地址

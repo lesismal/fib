@@ -302,7 +302,10 @@ divided by `ProcsPerChild`, rounded up, so together they have the Ps one process
 per machine — a database connection limit, say — is divided by it. Prefork needs Linux, where
 `SO_REUSEPORT` spreads connections between processes; elsewhere `prefork.Run` just calls `serve` in
 this process, so the program stays portable. `Config.Children` overrides the count, and a child
-with fewer Ps than fib gives pollers to serves on its engine's own loop. A UDP connection's peer may rebind to another child after a NAT rebind, and in-memory
+with fewer Ps than fib gives pollers to serves on its engine's own loop. On a machine of several
+NUMA nodes, `Config.Placement` keeps each child on one node's CPUs (`prefork.PlaceNode`) or on a
+share of them of its own (`prefork.PlaceCPU`), and `BindMemory` binds its memory to the node too;
+`prefork.Node()` tells a child which node it is on. A UDP connection's peer may rebind to another child after a NAT rebind, and in-memory
 state is per child, not shared.
 
 ## Logging

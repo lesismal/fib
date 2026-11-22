@@ -274,7 +274,7 @@ func serve(ctx context.Context) error {
 合计拥有单个进程会有的 P 数；`prefork.Children()` 报告共享这台机器的进程
 数，所以"整机唯一"的资源——比如数据库连接上限——要除以它。prefork 需要 Linux，在那里
 `SO_REUSEPORT` 才会把连接分摊到多个进程；其他平台上 `prefork.Run` 直接在本进程调用 `serve`，程序保持可移植。
-`Config.Children` 可以覆盖子进程数；P 数少于 fib 给 poller 所需数量的子进程，会在引擎自己的循环上服务连接。UDP 连接在对端 NAT rebind 后可能落到另一个子进程，
+`Config.Children` 可以覆盖子进程数；P 数少于 fib 给 poller 所需数量的子进程，会在引擎自己的循环上服务连接。多 NUMA 节点的机器上，`Config.Placement` 把每个子进程限制在一个节点的 CPU 上（`prefork.PlaceNode`），或给它一段独占的本节点 CPU（`prefork.PlaceCPU`），`BindMemory` 再把内存也绑到该节点；子进程用 `prefork.Node()` 得知所在节点。UDP 连接在对端 NAT rebind 后可能落到另一个子进程，
 而内存状态是每个子进程一份，不共享。
 
 ## 日志
