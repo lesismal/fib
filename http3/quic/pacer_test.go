@@ -324,7 +324,12 @@ func TestBlockedSendAwaitsRoom(t *testing.T) {
 		blocked, sendAt, awaiting := c.blocked != nil, c.sendAt, c.awaitingRoom
 		built := c.spaces[spaceApp].nextPN
 		c.mu.Unlock()
-		if !blocked || awaiting != tc.awaits || sendAt.IsZero() == !tc.awaits {
+		// A round left to the timer goes again blockedRetry, a millisecond,
+		// after the refusal, which a slow runner may let pass before the
+		// look here: only a round still kept must have the timer set. The
+		// loop below checks the timer sends it all.
+		if tc.awaits && (!blocked || !awaiting || !sendAt.IsZero()) ||
+			!tc.awaits && (awaiting || blocked && sendAt.IsZero()) {
 			t.Fatalf("%s: refused round kept %v, awaiting room %v, sendAt %v", tc.name, blocked, awaiting, sendAt)
 		}
 		if !tc.awaits {
