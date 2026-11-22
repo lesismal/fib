@@ -816,12 +816,25 @@ func (c *Context) OnBody(fn BodyFunc) {
 		return
 	}
 	c.body, c.bodyHeld = fn, true
+	// The handover below takes a hold of its own, given back once it has
+	// run: a cancel delivers its error to fn at once and gives back the
+	// body's hold, after which the Context, and the server's buffer the body
+	// is in, could be recycled under a handover still queued on the handler
+	// pool. Under mu the request is still open: a cancel takes mu to end it.
+	own := c.retain()
+	// The body is taken over under mu too, which a cancel reads it under.
+	body := c.Request.Body
+	stream, _ := body.(*BodyStream)
+	if stream == nil && body != nil {
+		c.Request.Body = emptyBody()
+	}
 	c.mu.Unlock()
-	if stream := c.RequestBody(); stream != nil {
+	if stream != nil {
 		// The body is still arriving; the stream hands it on from here,
 		// starting with whatever it has already taken off the connection.
-		if stream.setSink(c.deliverBody, c.handling()) {
-			c.later(stream.drain)
+		if !stream.setSink(c.deliverBody, c.handling()) ||
+			!c.later(func(worker bool) { stream.drain(worker); c.releaseHandover(own, worker) }) {
+			c.releaseHandover(own, false)
 		}
 		return
 	}
@@ -830,16 +843,32 @@ func (c *Context) OnBody(fn BodyFunc) {
 	// server's buffer is handed over from there rather than copied out; the
 	// hold taken above keeps the buffer until then.
 	var data []byte
-	if whole, ok := c.Request.Body.(*wholeBody); ok && !whole.released {
+	if whole, ok := body.(*wholeBody); ok && !whole.released {
 		data = whole.data[whole.read:]
 		whole.read = len(whole.data)
-	} else if c.Request.Body != nil {
-		data, _ = io.ReadAll(c.Request.Body)
+	} else if body != nil {
+		data, _ = io.ReadAll(body)
 	}
-	if c.Request.Body != nil {
-		c.Request.Body = emptyBody()
+	if !c.later(func(worker bool) { c.deliverBody(data, true, nil, worker); c.releaseHandover(own, worker) }) {
+		c.releaseHandover(own, false)
 	}
-	c.later(func(worker bool) { c.deliverBody(data, true, nil, worker) })
+}
+
+// releaseHandover gives back the hold OnBody took for its handover, if it
+// took one. On the connection's worker it counts as a body delivery, as a
+// release from inside a body callback does, since that goroutine holds the
+// parser; see giveBack.
+func (c *Context) releaseHandover(own, worker bool) {
+	if !own {
+		return
+	}
+	if worker {
+		c.setDelivering(true)
+	}
+	c.Release()
+	if worker {
+		c.setDelivering(false)
+	}
 }
 
 // failureLocked is what a body callback registered after the request failed
@@ -870,8 +899,9 @@ func (c *Context) handling() bool {
 // goroutine, after it returns, when it is still running, and on the engine's
 // handler pool when it is not, so that OnBody never calls a body callback
 // itself and no goroutine is started for one. handover is told whether it
-// runs on the connection's worker.
-func (c *Context) later(handover func(worker bool)) {
+// runs on the connection's worker. later reports false, and handover never
+// runs, when one is owed already.
+func (c *Context) later(handover func(worker bool)) bool {
 	c.mu.Lock()
 	for {
 		w := c.word.Load()
@@ -880,19 +910,21 @@ func (c *Context) later(handover func(worker bool)) {
 		}
 		if w&ctxHandover != 0 {
 			// Only one handover is ever owed: a second OnBody replaces the
-			// callback, which the first handover delivers to.
+			// callback, which the first handover delivers to. handover will
+			// not run, which the caller is told.
 			c.mu.Unlock()
-			return
+			return false
 		}
 		c.handover = handover
 		if c.word.CompareAndSwap(w, w|ctxHandover) {
 			c.mu.Unlock()
-			return
+			return true
 		}
 		c.handover = nil
 	}
 	c.mu.Unlock()
 	runOnStreams(c.Conn, func() { handover(false) })
+	return true
 }
 
 // handled marks the handler's return, and hands over the body it asked for
@@ -1239,13 +1271,15 @@ func (c *Context) markCancelled(err error, gen uint64) func() {
 		onCancel, more, stop = h.fn, h.more, h.stop
 		h.fn, h.more, h.stop = nil, nil, nil
 	}
+	// Read under mu, which OnBody takes the body over under.
+	stream := c.RequestBody()
 	c.mu.Unlock()
 	c.forget()
 	return func() {
 		if stop != nil {
 			stop(err)
 		}
-		if stream := c.RequestBody(); stream == nil {
+		if stream == nil {
 			c.deliverBody(nil, true, err, false)
 		} else if !stream.failSink(err) {
 			// OnBody has not handed the body its callback, though it may

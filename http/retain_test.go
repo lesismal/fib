@@ -948,3 +948,79 @@ func TestAsync(t *testing.T) {
 		t.Errorf("Err = %v after a no-op Async", err)
 	}
 }
+
+// TestOnBodyHandoverOutlivesACancel: OnBody, called once the handler has
+// returned, queues the body's delivery on the handler pool. A client that
+// goes away meanwhile has its cancel deliver the error to the callback and
+// give back the body's hold; the queued delivery must still find its own
+// Context, not one recycled and serving another request, and the callback
+// is ended exactly once. Run under -race, it caught the delivery reading a
+// recycled Context (fit's TestRetryingClientLosesNothing, CI run
+// 45047324674).
+func TestOnBodyHandoverOutlivesACancel(t *testing.T) {
+	var ends, extra atomic.Int64
+	addr := serveStreamingServer(t, DefaultConfig(), func(c *Context) {
+		c.Retain()
+		go func() {
+			ended := false
+			c.OnBody(func(data []byte, fin bool, err error) {
+				if !fin && err == nil {
+					return
+				}
+				if ended {
+					extra.Add(1)
+					return
+				}
+				ended = true
+				ends.Add(1)
+				if err == nil {
+					_ = c.Respond(stdhttp.StatusOK, "text/plain", []byte("ok"))
+				}
+			})
+			c.Release()
+		}()
+	})
+	const conns, rounds = 32, 20
+	body := strings.Repeat("b", 2048)
+	req := fmt.Sprintf("POST /up HTTP/1.1\r\nHost: test\r\nContent-Length: %d\r\n\r\n%s", len(body), body)
+	var started atomic.Int64
+	var wg sync.WaitGroup
+	for i := 0; i < conns; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			for r := 0; r < rounds; r++ {
+				conn, err := net.DialTimeout("tcp", addr, 5*time.Second)
+				if err != nil {
+					t.Error(err)
+					return
+				}
+				if _, err := io.WriteString(conn, req); err != nil {
+					t.Error(err)
+					conn.Close()
+					return
+				}
+				started.Add(1)
+				if (i+r)%2 == 0 {
+					// Gone before the answer: the cancel races the handover.
+					conn.Close()
+					continue
+				}
+				_ = conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+				_, _ = io.ReadAll(io.LimitReader(conn, 1))
+				conn.Close()
+			}
+		}(i)
+	}
+	wg.Wait()
+	deadline := time.Now().Add(5 * time.Second)
+	for ends.Load() < started.Load() && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if got, want := ends.Load(), started.Load(); got != want {
+		t.Fatalf("%d of %d callbacks ended", got, want)
+	}
+	if n := extra.Load(); n != 0 {
+		t.Fatalf("callbacks ended %d times more than once", n)
+	}
+}
