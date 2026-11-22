@@ -732,6 +732,11 @@ func (t *layer) handshake(handler fib.Handler, timeout time.Duration) {
 	if err != nil {
 		t.failWith(err)
 		t.settle(handler)
+		// crypto/tls has sent its alert. This worker can run while the read
+		// round that fed the handshake still has the connection corked, and
+		// the alert then waits in the cork, which the close would drop: it
+		// is flushed first, as fail flushes its own.
+		_ = t.c.Flush()
 		t.c.CloseWithError(err)
 		return
 	}
@@ -846,6 +851,9 @@ func (t *layer) drainLocked(handler fib.Handler) {
 		// io.EOF is close_notify: the peer has finished cleanly.
 		if err != io.EOF {
 			t.failWith(err)
+			// The alert crypto/tls sent for a record it refused is under
+			// the round's cork, which the close would drop.
+			_ = t.c.Flush()
 		}
 		t.c.CloseWithError(err)
 		return
