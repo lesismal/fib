@@ -4,6 +4,7 @@
 
 - 表里的"成本"是量级估计：S（一两天内）／M（几天）／L（一两周以上，需要新的测试手段）
 - 标"有意不做"的，是权衡后的结论，不是遗漏；需求变了就按第 8 节重新评估
+- 哪些热路径功能已做基准测试和优化、哪些是留给压测任务的待办，见 [dev-plan.zh-CN.md](dev-plan.zh-CN.md)
 - 各项的权威细节仍在原协议文档里，本页只做索引与理由，行尾给出出处
 
 ## 1. QUIC 与 HTTP/3
@@ -118,4 +119,5 @@
 | BitTorrent 的决定、BEP 覆盖与互通 | `docs/bittorrent.zh-CN.md`，"待审的决定"、"BEP 覆盖" | `docs/bittorrent.md`，"Decisions pending review"、"BEP coverage" |
 | 引擎、TLS、WebSocket 的取舍 | `docs/guide.zh-CN.md` 对应小节 | 同左（guide 只有中文） |
 | 压测方法与结论 | `docs/loadtest.zh-CN.md` | `docs/loadtest.md` |
+| 各热路径功能的基准测试与优化状态 | `docs/dev-plan.zh-CN.md` | `docs/dev-plan.md` |
 | Interop 逐 case 结果 | `http3/interoprunner/README.md` | 同左 |

@@ -3,7 +3,7 @@
 English | [简体中文](rules.zh-CN.md)
 
 Rules every change to fib follows, beside how the code is organised and verified
-([roadmap](roadmap.md), [load tests](loadtest.md)).
+([roadmap](roadmap.md), [dev plan](dev-plan.md), [load tests](loadtest.md)).
 
 ## 1. Cleaning up
 
@@ -28,3 +28,7 @@ Rules every change to fib follows, beside how the code is organised and verified
    task that loads the host wastes it and skews or delays those runs. Where another rule asks for a
    measurement, the feature task leaves it to such a benchmark task and says in its report what
    should be measured. A feature task runs a benchmark only when the user asks for one in that task.
+   A feature task whose feature needs a benchmark (a hot path: engine reads and writes, parsers,
+   framing, crypto, flow control, pools) adds or keeps its row in [the dev plan](dev-plan.md),
+   marked not benchmarked and not optimized, and names there what should be measured; the
+   benchmark task that measures or optimizes it updates the row.

@@ -4,6 +4,7 @@ Each protocol document (`http1*.md`, `http2*.md`, `http3*.md`, `webrtc*.md`, `me
 
 - The cost column is an order of magnitude: S (a day or two), M (a few days), L (a week or more, or it needs test infrastructure that does not exist yet).
 - "Deliberately not done" is a conclusion, not an oversight. When the requirement changes, re-evaluate it as described in section 8.
+- Which hot-path features are benchmarked and optimized, and which are open todo items for benchmark tasks, is in [dev-plan.md](dev-plan.md).
 - The authoritative detail stays in the protocol documents; this page indexes it and records the reason, citing the source at the end of each row.
 
 ## 1. QUIC and HTTP/3
@@ -118,4 +119,5 @@ Each protocol document (`http1*.md`, `http2*.md`, `http3*.md`, `webrtc*.md`, `me
 | BitTorrent decisions, BEP coverage and interop | `docs/bittorrent.zh-CN.md`, "待审的决定", "BEP 覆盖" | `docs/bittorrent.md`, "Decisions pending review", "BEP coverage" |
 | Engine, TLS and WebSocket trade-offs | `docs/guide.zh-CN.md`, the relevant sections | The same (the guide is Chinese only) |
 | Load-test method and conclusions | `docs/loadtest.zh-CN.md` | `docs/loadtest.md` |
+| Benchmark and optimization status of each hot-path feature | `docs/dev-plan.zh-CN.md` | `docs/dev-plan.md` |
 | Per-case interop results | `http3/interoprunner/README.md` | The same |

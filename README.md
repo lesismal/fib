@@ -899,6 +899,8 @@ Run it yourself with `cd taskpool/benchmark && ./bench.sh` (or `bench.ps1` on Wi
 - [BitTorrent](docs/bittorrent.md): the packages, one port for TCP and UDP, each protocol, the client,
   the BEPs covered, and the interop with libtorrent, anacrolix/torrent, anacrolix/dht, libutp and opentracker
 - [Roadmap](docs/roadmap.md): what is planned but not done, and what is deliberately not done, with the reason, the rough cost and when to reconsider each
+- [Dev plan](docs/dev-plan.md): for every hot-path feature, whether it has been benchmarked and
+  optimized, and what is left to measure
 - [Load testing](docs/loadtest.md): the `benchmark/loadtest` campaign, its results and the
   memory cost of whole responses to slow readers
 

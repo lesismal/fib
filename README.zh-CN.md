@@ -839,6 +839,7 @@ CI 每次完整运行都在 Linux、macOS、Windows 上运行 [`taskpool/benchma
 - [BitTorrent](docs/bittorrent.zh-CN.md)：各个包、TCP 与 UDP 共用一个端口、各协议、客户端、BEP 覆盖情况，以及与
   libtorrent、anacrolix/torrent、anacrolix/dht、libutp 和 opentracker 的互通验证
 - [路线图](docs/roadmap.zh-CN.md)：计划中但未做、以及有意不做的项，各带原因、成本量级和重新评估的条件
+- [开发计划](docs/dev-plan.zh-CN.md)：每个热路径功能是否已做基准测试和优化，以及还要测什么
 - [压测](docs/loadtest.zh-CN.md)：`benchmark/loadtest` 压测、结果，以及整体响应发给慢客户端时的内存代价
 
 ## 构建与测试
