@@ -32,3 +32,23 @@ Rules every change to fib follows, beside how the code is organised and verified
    framing, crypto, flow control, pools) adds or keeps its row in [the dev plan](dev-plan.md),
    marked not benchmarked and not optimized, and names there what should be measured; the
    benchmark task that measures or optimizes it updates the row.
+
+## 3. No run hangs unnoticed
+
+3. **A hung test costs minutes, not hours.** A bug that deadlocks a test must fail the run
+   quickly and visibly, never leave it waiting:
+   - **Each test binary has a time limit.** Every `go test` run passes an explicit `-timeout` sized
+     to what it runs (the whole suite: `-timeout 20m`, as CI uses; a single slow test: a few times
+     its usual time), and never `-timeout 0`. When it expires, Go fails the binary with
+     `panic: test timed out`, the tests still running and every goroutine's stack, so the hung test
+     and where it waits show.
+   - **A timeout is a failure like any other**: it is reported, and the test is rerun alone a few
+     times (`-run <Test> -count=5 -timeout ...`) to tell a rare hang from a deadlock the change
+     brought in.
+   - **Whoever waits on a long run watches its progress, not only its end.** The watcher checks
+     that the log keeps growing (`go test -v` or `-json` output) and speaks up when it has not grown
+     for 15 minutes; then the running processes are looked at (`ps`, and `kill -QUIT <pid>` for a
+     goroutine dump of a test binary). Waiting for the end marker alone is not enough.
+   - **Tests have their own deadlines.** A test that waits on a connection, a channel or a
+     condition sets a read/write deadline, a `select` with a timeout or a context with a deadline,
+     so a bug makes it fail rather than hang.
