@@ -379,4 +379,3 @@ anacrolix/torrent (and anacrolix/dht), libutp and opentracker is checked by
 - [Raw TCP, UDP and Unix sockets](19-raw-io.md) — the fib layer the client is built on
 - [Engine and configuration](02-engine.md) — the pools, buffers and bindings the client inherits
 - [The hack guide](../hacks.md) — UDP `DatagramsHandler`, `SendBatch` and the goroutine cheat sheet
-- [The README](../../README.md#bittorrent) — the client and its packages at a glance

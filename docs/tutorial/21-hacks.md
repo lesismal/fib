@@ -632,5 +632,4 @@ See [§20](../hacks.md#20-anti-patterns).
 - [Raw TCP, UDP and Unix sockets](19-raw-io.md) — the `Connection` API used throughout this chapter
 - [Performance and operations](22-performance.md) — pool modes, sizes, prefork and pprof for real
 - [flows.html](../flows.html) — the diagrams of a round, a cork and a handler pool
-- [Architecture](../../README.md#architecture) — the three rules in the README, and the benchmark
-  tables
+- [Architecture](../architecture.html) — event loops, pollers and pools, read scheduling and write backpressure

@@ -590,4 +590,4 @@ defer bufferpool.Put(buf)   // after Put, not even a sub-slice may be used
 - [原生 TCP、UDP 与 Unix socket](19-raw-io.zh-CN.md) —— 本章反复使用的 `Connection` API
 - [性能与运维](22-performance.zh-CN.md) —— 真实的池模式、容量、prefork 与 pprof
 - [flows.html](../flows.html) —— 一轮、cork 与 handler 池的图示
-- [架构](../../README.zh-CN.md#架构) —— README 里的三条规则与基准测试表
+- [架构](../architecture.zh-CN.html) —— 事件循环、poller 与池、读调度和写背压

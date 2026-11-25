@@ -608,4 +608,4 @@ The proxy side — authentication, `Allow` rules, CONNECT and UDP ASSOCIATE — 
 - [WebSocket](09-websocket.md) — the connection API the client's handler shares with the server
 - [SOCKS and HTTP CONNECT](13-socks-connect.md) — proxy servers, auth and dial chaining
 - [Hacks](21-hacks.md) — one engine as server and client, and the callback lifetime rules
-- [The README](../../README.md) — the async clients at a glance and the benchmark tables
+- [The README](../../README.md#engine) — the async clients among the engine features

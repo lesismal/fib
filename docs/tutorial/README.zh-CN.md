@@ -92,7 +92,7 @@ go test ./docs/tutorial
 
 ## 相关文档
 
-- [README](../../README.zh-CN.md) — fib 是什么、特性、架构与基准。
+- [README](../../README.zh-CN.md) — 特性、与标准库的比较和文档索引。
 - [配置](../configuration.zh-CN.md) — 全部 `Config`、`Binding` 字段、默认值、机器 sizing 公式和
   启动配置日志。
 - [架构](../architecture.zh-CN.html) 与 [协议流程](../flows.zh-CN.html) — 事件循环、worker 池，

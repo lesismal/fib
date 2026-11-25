@@ -254,7 +254,7 @@ curl http://127.0.0.1:8080/hello/fib
 curl -OJ http://127.0.0.1:8080/files/go.mod   # the file server serves the working directory
 ```
 
-哪些行为照旧、哪些不同，[README](../../README.zh-CN.md) 里有摘要，细节在
+哪些行为照旧、哪些不同，[README](../../README.zh-CN.md#与-go-标准库的比较) 里有摘要，细节在
 [06-http1.zh-CN.md](06-http1.zh-CN.md)。简单说：流式响应、flush、文件、trailer 和
 `http.ResponseController` 的 deadline 都能用；`Hijack` 不行，因为 fib 用 `Context.Upgrade` 切换
 协议（见 [09-websocket.zh-CN.md](09-websocket.zh-CN.md) 和
@@ -307,6 +307,6 @@ curl -OJ http://127.0.0.1:8080/files/go.mod   # the file server serves the worki
 - [引擎与配置](02-engine.zh-CN.md) — `Config`、`Binding`、运行时增删 Binding、优雅停机
 - [Handler：同步与异步](03-handlers.zh-CN.md) — 执行模型与异步 API
 - [配置](../configuration.zh-CN.md) — 全部 `Config`、`Binding` 字段及默认值
-- [README](../../README.zh-CN.md) — 特性、架构与基准一览
+- [README](../../README.zh-CN.md) — 特性、与标准库的比较和文档索引
 - [Hack 指南](../hacks.zh-CN.md) — 第 [21-hacks.zh-CN.md](21-hacks.zh-CN.md) 章浓缩的内容
 - [fib-examples](https://github.com/lesismal/fib-examples) — 每种协议的可运行示例

@@ -572,4 +572,4 @@ func main() {
 - [WebSocket](09-websocket.zh-CN.md) —— 客户端 Handler 与服务端共用的连接 API
 - [SOCKS 与 HTTP CONNECT](13-socks-connect.zh-CN.md) —— 代理服务端、认证与拨号串联
 - [进阶技巧](21-hacks.zh-CN.md) —— 单引擎同时做服务端与客户端，以及回调生命周期规则
-- [README](../../README.zh-CN.md) —— 异步客户端概览与基准测试表
+- [README](../../README.zh-CN.md#引擎) —— 引擎特性里的异步客户端

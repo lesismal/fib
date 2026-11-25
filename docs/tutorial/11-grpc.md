@@ -505,5 +505,5 @@ with an HTTP/2 GOAWAY and closes the connection), and `ServeHTTP` answers 400.
 - [TLS](10-tls.md) — certificates, ALPN and the client options `WithTLSConfig` uses
 - [arpc](12-arpc.md) — fib's own RPC protocol, simpler when you control both ends
 - [Multiprotocol ports](15-multiprotocol.md) — gRPC beside HTTP, SOCKS and raw TCP on one port
-- [The README](../../README.md) — the gRPC feature summary and wire-compatibility notes
+- [The README](../../README.md#protocols) — the gRPC row of the protocol table
 - [docs/http2.md](../http2.md) — the reference for the HTTP/2 implementation gRPC rides on

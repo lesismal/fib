@@ -351,4 +351,3 @@ torrent 都是一等公民：纯 v2 磁力链接用 BEP 52 的 hash request 取 
 - [原生 TCP、UDP 与 Unix socket](19-raw-io.zh-CN.md) — 客户端所依赖的 fib 层
 - [引擎与配置](02-engine.zh-CN.md) — 客户端继承的池、缓冲区和 binding
 - [进阶技巧](../hacks.zh-CN.md) — UDP 的 `DatagramsHandler`、`SendBatch` 与 goroutine 速查
-- [README](../../README.zh-CN.md#bittorrent) — 客户端与各包概览

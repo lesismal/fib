@@ -375,6 +375,6 @@ over this same layer, so a raw handler can sit beside them on one engine and eve
 - [The hack guide](../hacks.md) — §8 `HoldReads`, §9 cork and sendfile, §10 `Read` and deadlines, §15 UDP
 - [Handlers: sync and async](03-handlers.md) — the execution model in full
 - [Engine and configuration](02-engine.md) — `UDPIdleTimeout`, buffers, `ReusePort`, `SplitEventLoops`
-- [The README](../../README.md#raw-tcp) — raw TCP in four lines, and where each protocol runs
+- [Protocol flows](../flows.html) — which loop and which pool runs what, protocol by protocol
 - [BitTorrent](18-bittorrent.md) — a full protocol stack built on this layer
 - [Clients](20-clients.md) — dialing with the engine, callbacks and futures

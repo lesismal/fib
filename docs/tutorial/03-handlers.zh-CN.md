@@ -286,4 +286,4 @@ shasum -a 256 big.bin                                                       # th
 - [路由](04-router.zh-CN.md)——给本章的 HTTP handler 做路由
 - [HTTP/1.x](06-http1.zh-CN.md) 与 [HTTP/2](07-http2.zh-CN.md)——这些 handler 背后的协议细节
 - [原生 TCP、UDP 与 Unix socket](19-raw-io.zh-CN.md)——完整的 `Connection` API
-- [README](../../README.zh-CN.md)——标准库 `http.Handler` 的兼容性说明
+- [README](../../README.zh-CN.md#与-go-标准库的比较)——fib 与标准库的比较，含 `http.Handler` 的兼容性

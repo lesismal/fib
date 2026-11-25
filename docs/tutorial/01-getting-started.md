@@ -263,7 +263,7 @@ curl http://127.0.0.1:8080/hello/fib
 curl -OJ http://127.0.0.1:8080/files/go.mod   # the file server serves the working directory
 ```
 
-What carries over and what differs is summarised in [the README](../../README.md); the details
+What carries over and what differs is summarised in [the README](../../README.md#compared-with-the-go-standard-library); the details
 are in chapter [06-http1.md](06-http1.md). The short version: streaming, flushing, files,
 trailers and `http.ResponseController`'s deadlines work; `Hijack` does not, because fib
 switches protocols with `Context.Upgrade` instead (chapters
@@ -323,7 +323,7 @@ go beyond the straightforward API.
 - [Engine and configuration](02-engine.md) — `Config`, `Binding`, runtime bindings, shutdown
 - [Handlers: sync and async](03-handlers.md) — the execution model and the async API
 - [Configuration](../configuration.md) — every `Config` and `Binding` field with defaults
-- [The README](../../README.md) — features, architecture and benchmarks at a glance
+- [The README](../../README.md) — the features, a comparison with the standard library, and the documentation index
 - [The hack guide](../hacks.md) — the techniques chapter [21-hacks.md](21-hacks.md) condenses
 - [fib-examples](https://github.com/lesismal/fib-examples) — runnable programs for every
   protocol

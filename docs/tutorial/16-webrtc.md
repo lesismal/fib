@@ -387,6 +387,6 @@ beyond RTCP reports, and TURN on a shared `Mux`. Messages are limited by
 - [TLS](10-tls.md) — DTLS 1.2, certificates and the `tls` package the media stack uses
 - [Streaming media](17-media.md) — WHIP and WHEP endpoints on a media hub
 - [Engine and configuration](02-engine.md) — UDP bindings, `AddBinding` and `OpenUDPPeer`
-- [The README](../../README.md) — the feature table and the runnable examples
+- [The README](../../README.md#protocols) — the protocol table
 - [fib-examples](https://github.com/lesismal/fib-examples) — browser pages, SFU, datachannel and
   TURN programs

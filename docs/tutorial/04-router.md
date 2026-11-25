@@ -230,4 +230,4 @@ The router is a radix tree: static children are indexed by first byte, recursion
 - [HTTP/1.x](06-http1.md) — the request and response helpers the handlers use
 - [Hacks](../hacks.md) — zero-copy `Param` and the object-reuse rule
 - [Router benchmark README](../../http/routerbench/README.md) — fib's router against chi and `http.ServeMux`
-- [The README](../../README.md) — the router example and the `net/http` compatibility notes
+- [The README](../../README.md#compared-with-the-go-standard-library) — how fib compares with `net/http`

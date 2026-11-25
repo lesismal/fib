@@ -472,7 +472,6 @@ options that no longer exist:
 ## See also
 
 - The [`arpc` package](../../arpc) and its package doc, the full API reference.
-- The root README's [arpc section](../../README.md#arpc).
 - [Chapter 11: gRPC](11-grpc.md) for the other RPC protocol, and [chapter 13: SOCKS and HTTP
   CONNECT](13-socks-connect.md) for proxying and tunneling.
 - [Chapter 15: Multiprotocol ports](15-multiprotocol.md) for arpc on a shared port, and

@@ -348,4 +348,4 @@ peer; `Routes` lets you build your own `mux.Handler` with the same table, and
 - [WebSocket](09-websocket.md) — the handshake `multiproto` reads a whole head for
 - [gRPC](11-grpc.md) — the h2c handler that needs `NudgeHTTP2` to be recognised
 - [Engine and configuration](02-engine.md) — bindings, addresses and shutdown
-- [The README](../../README.md) — the `mux` and `multiproto` snippets in context
+- [fib-examples](https://github.com/lesismal/fib-examples) — the `multiprotocol` and `multiproto` servers, ready to run

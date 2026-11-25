@@ -262,4 +262,4 @@ go tool pprof http://127.0.0.1:8080/debug/pprof/profile?seconds=10
 - [配置](../configuration.zh-CN.md#日志)——`fib/log` 如何设置、`logger` 中间件如何写记录
 - [性能与运维](22-performance.zh-CN.md)——生产环境里的 `pprof`、日志配置、压测
 - [进阶技巧](../hacks.zh-CN.md)——中间件必须遵守的对象复用规则
-- [README](../../README.zh-CN.md)——中间件清单与快速开始
+- [README](../../README.zh-CN.md#引擎)——引擎特性里的中间件清单

@@ -330,4 +330,4 @@ func main() {
 - [TLS](10-tls.zh-CN.md) —— `wss://`、证书以及 HTTP 服务前面的 ALPN 栈
 - [客户端](20-clients.zh-CN.md) —— 与 HTTP 客户端并列的 WebSocket 客户端
 - [进阶技巧](../hacks.zh-CN.md) —— 逐帧接收、PreparedMessage 与其他技巧
-- [README](../../README.zh-CN.md) —— WebSocket 特性概览与 Autobahn CI
+- [README](../../README.zh-CN.md#协议) —— 协议表里的 WebSocket 一行

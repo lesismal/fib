@@ -21,8 +21,8 @@ fib 服务端默认就很快，但"默认"是一组只针对某一类负载的�
 | `ModeInline` | 没有 worker：在提交方的协程上带 recover 地执行每个任务 |
 
 `ModeAdaptive` 还按 P 分片（提交进入提交协程所在 P 的分片，该分片有积压时再看一个随机分片），每个分片是
-无锁 MPMC 环形队列，并把热的空闲 worker 放在 LIFO 栈上——这正是 README 的
-[Taskpool 一节](../../README.zh-CN.md#taskpool)里它在争用型和事件循环型负载上领先的原因。`ModeInline` 只是
+无锁 MPMC 环形队列，并把热的空闲 worker 放在 LIFO 栈上——这正是
+[taskpool 基准测试](../../taskpool/benchmark/README.zh-CN.md)里它在争用型和事件循环型负载上领先的原因。`ModeInline` 只是
 库特性：引擎拒绝它，否则连接的一轮就会跑在事件循环上。
 
 ## 池的容量
@@ -412,7 +412,6 @@ go test -race -count=1 -timeout 10m -v ./...
 Runner、WebSocket 的 Autobahn、媒体（ffmpeg）、WebRTC（pion）、KCP（kcp-go）与 BitTorrent
 （anacrolix、libutp、libtorrent）的互操作对端、fuzzer、覆盖率下限、`gofmt`/`go vet`/`staticcheck`、
 `go mod tidy`、漏洞扫描与交叉编译。改动涉及某个协议时，要看的就是对应的任务。
-[README 的构建与测试一节](../../README.zh-CN.md#构建与测试)是它的简版。
 
 ## 生产检查清单
 
@@ -450,6 +449,6 @@ Runner、WebSocket 的 Autobahn、媒体（ffmpeg）、WebRTC（pion）、KCP（
 - [配置](../configuration.zh-CN.md) —— 每个 `Config` 字段的默认值与容量计算规则
 - [压测](../loadtest.zh-CN.md) —— 压测框架、活动与实测结果
 - [引擎与配置](02-engine.zh-CN.md) —— `Config`、`Binding` 与关闭语义
-- [README 的 Taskpool 一节](../../README.zh-CN.md#taskpool) —— 池模式与基准测试表
-- [README 的基准测试一节](../../README.zh-CN.md#基准测试) —— 协议基准与运行方式
+- [taskpool 基准测试](../../taskpool/benchmark/README.zh-CN.md) —— 参与比较的池、场景与运行方式
+- [README 的比较一节](../../README.zh-CN.md#fib-的优势) —— 对比标准库的协议基准，附运行方式的链接
 - [进阶技巧](21-hacks.zh-CN.md) —— 本章为其定容的写侧与读侧控制

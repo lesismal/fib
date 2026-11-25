@@ -285,4 +285,4 @@ fiblog.Setup(fiblog.Config{
 - [Handlers: sync and async](03-handlers.md) — what the handlers these bindings name actually do
 - [Architecture](../architecture.html) — loops, workers and one round of a connection
 - [Performance and operations](22-performance.md) — pool sizing, `prefork`, `bufferpool`, load testing
-- [The README](../../README.md) — features and the quick start this chapter expands
+- [The README](../../README.md) — the feature overview

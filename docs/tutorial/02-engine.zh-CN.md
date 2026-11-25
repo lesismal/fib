@@ -285,4 +285,4 @@ fiblog.Setup(fiblog.Config{
 - [Handler：同步与异步](03-handlers.zh-CN.md)——这些绑定指定的 handler 到底做什么
 - [架构](../architecture.zh-CN.html)——事件循环、工作协程和连接的一轮
 - [性能与运维](22-performance.zh-CN.md)——协程池尺寸、`prefork`、`bufferpool`、压测
-- [README](../../README.zh-CN.md)——特性总览和本章展开的快速开始
+- [README](../../README.zh-CN.md)——特性总览

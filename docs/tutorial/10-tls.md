@@ -405,4 +405,4 @@ chapter [16-webrtc.md](16-webrtc.md) for the WebRTC side. For ordinary TCP servi
 - [WebSocket](09-websocket.md) — `wss://` from the WebSocket client and server
 - [WebRTC](16-webrtc.md) — DTLS 1.2 and DTLS-SRTP, the reason the DTLS API exists
 - [Clients](20-clients.md) — the HTTP/2 and HTTP/3 clients that use these dial options
-- [The README](../../README.md) — the TLS feature summary
+- [The README](../../README.md#protocols) — the TLS row of the protocol table

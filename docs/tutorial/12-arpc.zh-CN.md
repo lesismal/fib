@@ -446,7 +446,6 @@ client.Keepalive(30 * time.Second) // ping the peer so a dead path is noticed
 ## 相关文档
 
 - [`arpc` 包](../../arpc) 与它的包文档，完整 API 参考。
-- 根 README 的 [arpc 一节](../../README.zh-CN.md#arpc)。
 - [第 11 章：gRPC](11-grpc.zh-CN.md) 讲另一种 RPC 协议，[第 13 章：SOCKS 与 HTTP
   CONNECT](13-socks-connect.zh-CN.md) 讲代理与隧道。
 - [第 15 章：单端口多协议](15-multiprotocol.zh-CN.md) 讲在共享端口上跑 arpc，

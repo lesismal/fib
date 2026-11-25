@@ -327,4 +327,4 @@ handler 为 nil 的协议不提供服务，它的连接交给 `Fallback`，没�
 - [WebSocket](09-websocket.zh-CN.md) —— `multiproto` 要读完整请求头的握手
 - [gRPC](11-grpc.zh-CN.md) —— 需要 `NudgeHTTP2` 才能被识别的 h2c handler
 - [引擎与配置](02-engine.zh-CN.md) —— Binding、地址与关闭
-- [README](../../README.zh-CN.md) —— `mux` 与 `multiproto` 片段所在的上下文
+- [fib-examples](https://github.com/lesismal/fib-examples) —— 可以直接运行的 `multiprotocol` 与 `multiproto` 服务端

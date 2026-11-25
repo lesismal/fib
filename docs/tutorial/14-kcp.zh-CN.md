@@ -420,7 +420,6 @@ cd kcp/interop && go test -race ./...
 
 - [docs/kcp.zh-CN.md](../kcp.zh-CN.md)，包含分层与兼容性表格的参考页。
 - [`kcp` 包](../../kcp) 与互操作模块 [`kcp/interop`](../../kcp/interop)。
-- 根 README 的 [KCP 一节](../../README.zh-CN.md#kcp)。
 - [第 19 章：原生 TCP、UDP 与 Unix socket](19-raw-io.zh-CN.md) 讲 KCP 所依赖的 UDP 层。
 - [第 22 章：性能与运维](22-performance.zh-CN.md) 讲服务端调优与 profiling。
 - 兼容的上游：[xtaci/kcp-go](https://github.com/xtaci/kcp-go) 与

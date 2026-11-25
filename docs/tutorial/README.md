@@ -106,7 +106,7 @@ Both run in CI, so a stale example or a renamed heading is a failed build, not a
 
 ## Related documentation
 
-- [The README](../../README.md) — what fib is, the features, the architecture and the benchmarks.
+- [The README](../../README.md) — the features, a comparison with the standard library, and the documentation index.
 - [Configuration](../configuration.md) — every `Config` and `Binding` field, the defaults, the
   machine sizing formula and the startup settings log.
 - [Architecture](../architecture.html) and [protocol flows](../flows.html) — the event loops,

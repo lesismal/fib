@@ -418,5 +418,5 @@ conn, err := grpc.NewClient("127.0.0.1:50443",
 - [TLS](10-tls.zh-CN.md) —— `WithTLSConfig` 用到的证书、ALPN 与客户端选项
 - [arpc](12-arpc.zh-CN.md) —— fib 自己的 RPC 协议，两端都由你控制时更简单
 - [单端口多协议](15-multiprotocol.zh-CN.md) —— 在同一个端口上同时跑 gRPC、HTTP、SOCKS 与原生 TCP
-- [README](../../README.zh-CN.md) —— gRPC 特性概览与线上格式兼容性说明
+- [README](../../README.zh-CN.md#协议) —— 协议表里的 gRPC 一行
 - [docs/http2.md](../http2.zh-CN.md) —— gRPC 所依赖的 HTTP/2 实现参考

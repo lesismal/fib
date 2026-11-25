@@ -357,6 +357,6 @@ func dialFromRange(engine *fib.Engine, addr string, handler fib.Handler) error {
 - [进阶技巧](../hacks.zh-CN.md) — 第 8 节 `HoldReads`、第 9 节 cork 与 sendfile、第 10 节 `Read` 与 deadline、第 15 节 UDP
 - [Handler：同步与异步](03-handlers.zh-CN.md) — 完整的执行模型
 - [引擎与配置](02-engine.zh-CN.md) — `UDPIdleTimeout`、缓冲区、`ReusePort`、`SplitEventLoops`
-- [README](../../README.zh-CN.md#裸-tcp) — 四行代码的原生 TCP，以及每种协议在哪里运行
+- [协议流程](../flows.zh-CN.html) — 每种协议由哪个循环、哪个池执行
 - [BitTorrent](18-bittorrent.zh-CN.md) — 建在这一层之上的完整协议栈
 - [客户端](20-clients.zh-CN.md) — 用 engine 拨号、回调与 future

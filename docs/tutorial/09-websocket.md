@@ -412,4 +412,4 @@ whole connection; the same `Upgrade` call serves both.
 - [TLS](10-tls.md) — `wss://`, certificates and the ALPN stack in front of an HTTP server
 - [Clients](20-clients.md) — the WebSocket client beside the HTTP clients
 - [The hack guide](../hacks.md) — receiving by frame, prepared messages and other tricks
-- [The README](../../README.md) — the WebSocket feature summary and the Autobahn CI run
+- [The README](../../README.md#protocols) — the WebSocket row of the protocol table

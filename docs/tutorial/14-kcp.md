@@ -445,7 +445,6 @@ full mapping is in [docs/kcp.md](../kcp.md#compatibility-with-kcp-go).
 
 - [docs/kcp.md](../kcp.md), the reference page with the layer and compatibility tables.
 - The [`kcp` package](../../kcp) and the interop module [`kcp/interop`](../../kcp/interop).
-- The root README's [KCP section](../../README.md#kcp).
 - [Chapter 19: Raw TCP, UDP and Unix sockets](19-raw-io.md) for the UDP layer KCP runs on.
 - [Chapter 22: Performance and operations](22-performance.md) for tuning and profiling a server.
 - [xtaci/kcp-go](https://github.com/xtaci/kcp-go) and

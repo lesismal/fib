@@ -262,4 +262,4 @@ go tool pprof http://127.0.0.1:8080/debug/pprof/profile?seconds=10
 - [Configuration](../configuration.md#logging) — how `fib/log` is set up and how the `logger` middleware writes its records
 - [Performance and operations](22-performance.md) — `pprof` in production, logging setup, load testing
 - [Hacks](../hacks.md) — the object-reuse rules a middleware must respect
-- [The README](../../README.md) — the middleware list and the quick start
+- [The README](../../README.md#engine) — the middleware list among the engine features

@@ -515,7 +515,6 @@ CONNECT's: here it gets `405 Method Not Allowed`. Without credentials curl gets
 
 - The [`socks` package](../../socks), the [`http` package](../../http) for `ConnectProxy`, and
   their package docs.
-- The root README's [SOCKS section](../../README.md#socks), with the one-port `mux` snippet.
 - [Chapter 06: HTTP/1.x](06-http1.md) for CONNECT from the server's side, and [chapter 07:
   HTTP/2](07-http2.md) for CONNECT over a stream.
 - [Chapter 15: Multiprotocol ports](15-multiprotocol.md) for `mux` and `multiproto` in depth.

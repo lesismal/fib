@@ -230,4 +230,4 @@ Router 是一棵 radix 树：静态子节点按首字节索引，只有存在可
 - [HTTP/1.x](06-http1.zh-CN.md)——handler 用到的请求与响应辅助方法
 - [进阶技巧](../hacks.zh-CN.md)——零拷贝 `Param` 与对象复用规则
 - [路由 benchmark 的 README](../../http/routerbench/README.md)——fib 的 Router 对比 chi 与 `http.ServeMux`
-- [README](../../README.zh-CN.md)——路由示例与 `net/http` 兼容性说明
+- [README](../../README.zh-CN.md#与-go-标准库的比较)——fib 与 `net/http` 的比较

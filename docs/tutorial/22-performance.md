@@ -26,8 +26,8 @@ made and retired, not in what a task is:
 
 `ModeAdaptive` is also sharded by P (a submission goes to the shard of the submitting goroutine's
 P, plus one random shard if that one has a backlog), queues in a lock-free MPMC ring per shard, and
-keeps warm idle workers on a LIFO stack, which is why the README's
-[Taskpool section](../../README.md#taskpool) shows it ahead on contended, event-loop-shaped
+keeps warm idle workers on a LIFO stack, which is why the
+[taskpool benchmark](../../taskpool/benchmark/README.md) shows it ahead on contended, event-loop-shaped
 workloads. `ModeInline` is a library feature only: an engine refuses it, because a connection's
 round would then run on the event loop.
 
@@ -454,8 +454,7 @@ On top of that it runs the conformance jobs: HTTP/1.x against `net/http` and cur
 HTTP/2, the QUIC Interop Runner for HTTP/3, Autobahn for WebSocket, interop peers for media
 (ffmpeg), WebRTC (pion), KCP (kcp-go) and BitTorrent (anacrolix, libutp, libtorrent), the fuzzers,
 a coverage floor, `gofmt`/`go vet`/`staticcheck`, `go mod tidy`, a vulnerability scan and a cross
-build. If a change touches a protocol, the matching job is the one to watch. The
-[README's Build and test section](../../README.md#build-and-test) is the short form.
+build. If a change touches a protocol, the matching job is the one to watch.
 
 ## Production checklist
 
@@ -500,7 +499,7 @@ build. If a change touches a protocol, the matching job is the one to watch. The
 - [Configuration](../configuration.md) — every `Config` field with its default and sizing rule
 - [Load testing](../loadtest.md) — the harness, the campaign and the measured results
 - [Engine and configuration](02-engine.md) — `Config`, `Binding`, shutdown semantics
-- [The README's Taskpool section](../../README.md#taskpool) — the pool modes and the benchmark tables
-- [The README's Benchmarks section](../../README.md#benchmarks) — protocol benchmarks and how they
+- [taskpool benchmark](../../taskpool/benchmark/README.md) — the pools compared, the scenarios and how to run them
+- [The README's comparison](../../README.md#where-fib-is-stronger) — protocol benchmarks against the standard library, with links to how they
   were run
 - [Hacks](21-hacks.md) — the write-side and read-side controls this chapter sizes

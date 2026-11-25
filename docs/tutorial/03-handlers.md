@@ -286,4 +286,4 @@ shasum -a 256 big.bin                                                       # th
 - [Router](04-router.md) — routing the HTTP handlers this chapter writes
 - [HTTP/1.x](06-http1.md) and [HTTP/2](07-http2.md) — the protocol details behind these handlers
 - [Raw TCP, UDP and Unix sockets](19-raw-io.md) — the full `Connection` API
-- [The README](../../README.md) — the standard-library `http.Handler` compatibility notes
+- [The README](../../README.md#compared-with-the-go-standard-library) — how fib compares with the standard library, `http.Handler` compatibility included

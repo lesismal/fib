@@ -485,7 +485,6 @@ HTTPS_PROXY=http://fib:secret@127.0.0.1:18082 curl https://example.com/
 ## 相关文档
 
 - [`socks` 包](../../socks)、[`http` 包](../../http)（`ConnectProxy` 所在）以及它们的包文档。
-- 根 README 的 [SOCKS 一节](../../README.zh-CN.md#socks)，里面有单端口 `mux` 的代码片段。
 - [第 06 章：HTTP/1.x](06-http1.zh-CN.md) 讲服务端一侧的 CONNECT，[第 07 章：
   HTTP/2](07-http2.zh-CN.md) 讲流上的 CONNECT。
 - [第 15 章：单端口多协议](15-multiprotocol.zh-CN.md) 深入讲 `mux` 与 `multiproto`。

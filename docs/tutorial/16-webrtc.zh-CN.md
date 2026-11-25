@@ -365,6 +365,6 @@ TCP，解析浏览器的 mDNS host candidate，FEC 与发送 NACK，transport-wi
 - [TLS](10-tls.zh-CN.md) —— DTLS 1.2、证书以及媒体栈使用的 `tls` 包
 - [流媒体](17-media.zh-CN.md) —— 媒体 hub 上的 WHIP 与 WHEP 端点
 - [引擎与配置](02-engine.zh-CN.md) —— UDP binding、`AddBinding` 与 `OpenUDPPeer`
-- [README](../../README.zh-CN.md) —— 特性表与可运行示例
+- [README](../../README.zh-CN.md#协议) —— 协议表
 - [fib-examples](https://github.com/lesismal/fib-examples) —— 浏览器页面、SFU、datachannel
   与 TURN 程序

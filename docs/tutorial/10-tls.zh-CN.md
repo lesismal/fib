@@ -320,4 +320,4 @@ DTLS 不是流上的 TLS，因此是另一套 API：`fibtls.NewDTLSServer` 与 `
 - [WebSocket](09-websocket.zh-CN.md) —— WebSocket 客户端与服务器上的 `wss://`
 - [WebRTC](16-webrtc.zh-CN.md) —— DTLS 1.2 与 DTLS-SRTP，DTLS API 存在的原因
 - [客户端](20-clients.zh-CN.md) —— 使用这些拨号选项的 HTTP/2 与 HTTP/3 客户端
-- [README](../../README.zh-CN.md) —— TLS 特性概览
+- [README](../../README.zh-CN.md#协议) —— 协议表里的 TLS 一行

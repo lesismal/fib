@@ -24,13 +24,8 @@ fib is also level with or close to the C, C++ and Rust servers in the same bench
 uSockets, workflow, axum, h2, quiche and rustls.
 
 - [Features](#features)
-- [Quick start](#quick-start)
-- [Configuration](#configuration)
-- [Architecture](#architecture)
-- [Where the speed and the memory come from](#where-the-speed-and-the-memory-come-from)
-- [Benchmarks](#benchmarks)
-- [Taskpool](#taskpool)
-- [Packages](#packages), [Documentation](#documentation)
+- [Compared with the Go standard library](#compared-with-the-go-standard-library)
+- [Documentation](#documentation)
 
 ## Features
 
@@ -86,794 +81,143 @@ uSockets, workflow, axum, h2, quiche and rustls.
 - **Platforms**: Linux, macOS, the BSDs and Windows, on amd64, arm64, 386, arm, riscv64 and
   loong64. Needs Go 1.27.3 or later.
 
-## Quick start
-
-```sh
-go get github.com/lesismal/fib
-```
-
-### HTTP/1.x and HTTP/2
-
-```go
-package main
-
-import (
-	stdhttp "net/http"
-
-	fib "github.com/lesismal/fib"
-	fibhttp "github.com/lesismal/fib/http"
-	"github.com/lesismal/fib/middleware"
-	"github.com/lesismal/fib/middleware/logger"
-	"github.com/lesismal/fib/middleware/recover"
-)
-
-func main() {
-	app := fibhttp.HandlerFunc(func(c *fibhttp.Context) {
-		_ = c.Respond(stdhttp.StatusOK, "text/plain; charset=utf-8", []byte("hello\n"))
-	})
-
-	engine, err := fib.New(fib.DefaultConfig(), fib.Binding{
-		Addr:    "127.0.0.1:8080",
-		Handler: fibhttp.NewHandler(middleware.Chain(app, recover.New(), logger.New())),
-	})
-	if err != nil {
-		panic(err)
-	}
-	defer engine.Close()
-	if err := engine.Run(); err != nil {
-		panic(err)
-	}
-}
-```
-
-This one handler serves HTTP/1.x and h2c on the same port.
-
-- **TLS**: serve the binding with `fibtls.NewServer(fibhttp.ConfigureTLS(tlsConfig), fibhttp.NewHandler(app))`
-  instead. HTTP/2 is then negotiated over ALPN.
-- **HTTP/3**: add a UDP binding (`fib.Binding{Network: "udp", ...}`) served by `http3.NewHandler(tlsConfig, app)`,
-  with the same `app`.
-
-### Standard library `http.Handler`
-
-`*fibhttp.Context` implements `http.ResponseWriter`, `http.Flusher`, `io.ReaderFrom` and
-`io.StringWriter`, and the request is a standard `*http.Request`. A `net/http` handler is called
-with the Context as its writer:
-
-```go
-mux := stdhttp.NewServeMux()
-mux.HandleFunc("GET /hello/{name}", func(w stdhttp.ResponseWriter, r *stdhttp.Request) {
-	fmt.Fprintf(w, "hello %s over %s\n", r.PathValue("name"), r.Proto)
-})
-mux.Handle("/files/", stdhttp.StripPrefix("/files/", stdhttp.FileServer(stdhttp.Dir("."))))
-
-std := fibhttp.HandlerFunc(func(c *fibhttp.Context) {
-	mux.ServeHTTP(c, c.Request) // c is the http.ResponseWriter
-})
-engine, err := fib.New(config, fib.Binding{Addr: ":8080", Handler: fibhttp.NewHandler(std)})
-```
-
-Any `http.Handler` can be served this way, including chi, gorilla/mux and gin's `*gin.Engine`,
-over HTTP/1.x, HTTP/2 and HTTP/3. Here is what carries over and what behaves differently:
-
-- **Streaming**: on HTTP/1.x, `Write` and `Flush` stream the response as it is written.
-- **Files**: `http.ServeFile`, `http.ServeContent` and `http.FileServer` work. On HTTP/1.x they send
-  files with sendfile(2), via `ReadFrom`.
-- **`http.ResponseController`**: `Flush`, `SetWriteDeadline` and `SetReadDeadline` work; `Hijack`
-  does not (see below), and `EnableFullDuplex` reports `http.ErrNotSupported`. A zero
-  `SetWriteDeadline` lifts `WriteTimeout` for one response, as SSE streams and long downloads do, on
-  HTTP/1.x, HTTP/2 and HTTP/3. `SetReadDeadline` bounds or lifts the time left for a streamed body
-  to arrive. On HTTP/1.x it stands in for `ReadTimeout` and closes the connection when it passes;
-  on HTTP/2 and HTTP/3 it fails that stream's body with `os.ErrDeadlineExceeded`, as net/http does,
-  and the handler can still answer.
-- **Hijacking**: `http.Hijacker` is not implemented, so libraries that hijack the connection, such
-  as gorilla/websocket, do not work. Switch protocols with `Context.Upgrade` or
-  `websocket.ServerHandler.Upgrade` instead.
-- **Cancellation**: `c.Request.Context()` is not cancelled when the client goes away. Use `c.OnCancel`,
-  `c.Err()`, or `c.Context()`, a `context.Context` cancelled when the request is (`context.Cause` gives
-  the reason) or ends, made only for a handler that asks for it. Code that takes the request's context,
-  such as `httputil.ReverseProxy`, can be handed `c.Request.WithContext(c.Context())`.
-
-### Router
-
-`fibhttp.Router` has chi's API, takes fib's handlers, and is itself a `Handler`:
-
-```go
-r := fibhttp.NewRouter()
-r.Use(recover.New(), logger.New()) // sees every request, 404s included
-r.Get("/", index)
-r.Route("/users", func(r *fibhttp.Router) {
-	r.Use(auth) // only under /users
-	r.Get("/{id:[0-9]+}", func(c *fibhttp.Context) {
-		_ = c.Respond(stdhttp.StatusOK, "text/plain", []byte("user "+c.Param("id")))
-	})
-	r.Get("/{id}/files/*", file) // c.Param("*") is the rest of the path
-})
-r.Mount("/api/{version}", apiRouter)
-engine, err := fib.New(config, fib.Binding{Addr: ":8080", Handler: fibhttp.NewHandler(r)})
-```
-
-Routes match in this order: static text first, then a parameter with a regexp, then a plain
-parameter, then a catch-all. A GET route also answers HEAD. A path that exists only for other
-methods gets a 405 with an `Allow` header. [`http/routerbench`](http/routerbench) compares the
-router with chi and `http.ServeMux`.
-
-`c.JSON(status, v)` answers with `v` encoded as JSON, into a buffer reused once HTTP/1 has
-copied the body out. The bytes are `encoding/json/v2`'s; for the common shapes (structs of
-strings, integers, booleans, slices and pointers of them) an encoder compiled once per type
-writes them about 3.8x faster than v2 does, and anything else goes to v2 itself. Set `fibhttp.JSONEncoder` once at startup to use
-another encoder, such as sonic's.
-
-Context also has one-call helpers like gin's and fiber's: `String`, `Data`, `JSON`, `IndentedJSON`,
-`XML`, `IndentedXML`, `HTML`, `HTMLTemplate`, `File` and `FileAttachment`. The ones that encode
-send nothing and return the error when they cannot, so the handler can answer otherwise.
-
-### WebSocket
-
-```go
-ws := websocket.NewHandler(websocket.HandlerFuncs{
-	Message: func(c *websocket.Connection, op websocket.Opcode, data []byte) {
-		_ = c.WriteMessage(op, data)
-	},
-})
-app := fibhttp.HandlerFunc(func(c *fibhttp.Context) {
-	if c.Request.URL.Path == "/ws" {
-		_, _ = ws.Upgrade(c, nil) // HTTP/1.1, HTTP/2 or HTTP/3, whichever the request came on
-		return
-	}
-	_ = c.Respond(stdhttp.StatusOK, "text/plain", []byte("hello\n"))
-})
-```
-
-To serve only WebSocket, bind the WebSocket handler directly:
-`fib.New(config, fib.Binding{Addr: ":8080", Handler: websocket.NewHandlerWithConfig(cfg, handlers)})`.
-With no HTTP server in front, `Config.HandshakeTimeout` (10s by default, below zero for none)
-closes a connection that has not completed its opening handshake in time, and `Config.Path`,
-when set, answers a handshake for any other path with 404.
-
-To send one message to many connections, prepare it once:
-
-```go
-m, _ := websocket.NewPreparedMessage(websocket.Text, payload)
-for _, c := range conns {
-	_ = c.WritePreparedMessage(m)
-}
-```
-
-It is checked and framed once, and compressed at most once for each permessage-deflate
-window in use, where `WriteMessage` compresses for every connection. On a server all
-connections send the same frame, so peers too slow to take it at once queue that one frame
-rather than a copy each. Sends never block, so one goroutine looping over the connections is
-enough; split them across a few goroutines only for very many connections or with TLS, which
-encrypts per connection. A peer that never reads keeps queueing what is sent to it, so close
-such peers yourself.
-
-A writer that must not outrun its peer paces itself without waiting on it, and a peer that has
-stopped reading can be dropped without the close handshake:
-
-```go
-above, err := c.WriteMessageNoWait(websocket.Binary, data) // above: more than PendingWriteLimit waits
-if err == nil && above {
-	pause() // stop producing, or src.HoldReads(true) for a relay
-	if !c.OnWritable(resume) { // resume(err) runs once half of it has gone, or the connection ends
-		resume(nil)
-	}
-}
-c.HoldReads(true)      // stop reading the peer; HoldReads(false) resumes
-c.Abort(errTooSlow)    // close at once, dropping what is queued; OnClose gets errTooSlow
-addr := c.RemoteAddr() // on a server's connection and a dialed one alike; LocalAddr is this end's
-c.SetAttachment(sess)  // one value of the caller's, which c.Attachment() returns in every later callback
-conn := c.NetConn()    // the fib.Connection of a served or dialed connection; nil when upgraded, see c.Tunnel()
-```
-
-`ws.UpgradeWithAttachment(ctx, nil, sess)` attaches the value as part of an upgrade, so `OnOpen`
-already finds it. `NetConn` is there to change the connection's own settings, such as
-`SetWriteQueueLimit` or `SetKeepAlive`; frames still go through the WebSocket's methods.
-
-`PendingWriteLimit` is set in `websocket.Config` and `websocket.DialerConfig` (64 KiB by
-default). A relay between a WebSocket and another connection also calls
-`SetWriteBackpressure(false)` on both, as `fib.Connection.SetWriteBackpressure` explains.
-
-### arpc
-
-```go
-server := arpc.NewServer()
-server.Handler.Handle("/echo", func(ctx *arpc.Context) { ctx.Write(ctx.Body()) })
-engine, err := fib.New(config, fib.Binding{Addr: ":9000", Handler: server}) // or fibtls.NewServer(tlsConfig, server)
-
-client, err := arpc.Dial(clientEngine, "tcp", addr, 3*time.Second, nil)
-var rsp string
-err = client.Call("/echo", "hello", &rsp, time.Second)
-```
-
-Handlers run on the engine's handler pool, the one HTTP/2 and HTTP/3 use, unless
-`Handler.SetAsyncResponse(false)` or `Handle(method, h, false)` runs them where the connection is
-read, or `Handler.SetTaskPool` names another pool.
-
-### gRPC
-
-```go
-server := grpc.NewServer()                    // grpc.TaskPool(pool) to run calls on your own pool
-pb.RegisterGreeterServer(server, &greeter{})  // protoc-gen-go-grpc code, imports pointed at fib/grpc
-engine, err := fib.New(config, fib.Binding{Addr: ":50051", Handler: server}) // h2c; fibtls.NewServer(grpc.ConfigureTLS(c), server) for TLS
-
-conn, err := grpc.NewClient("127.0.0.1:50051", grpc.WithEngine(clientEngine))
-reply, err := pb.NewGreeterClient(conn).SayHello(ctx, &pb.HelloRequest{Name: "fib"})
-```
-
-Every call runs on the engine's handler pool, the one HTTP/2 and HTTP/3 use, or on the pool the
-`grpc.TaskPool` option names. Generated `_grpc.pb.go` files work once their `google.golang.org/grpc`
-imports name `github.com/lesismal/fib/grpc`. fib depends on nothing outside the standard library,
-so messages of google.golang.org/protobuf need a codec registered with `grpc.RegisterCodec`; the
-package doc shows the five lines.
-
-To serve gRPC on the same port as HTTP, route the service's paths to the server. `Server` has a
-`ServeHTTP` for calls that come in through fib's HTTP/2, h2c or h2 over TLS:
-
-```go
-r := fibhttp.NewRouter()
-r.Handle("/helloworld.Greeter/*", server)
-r.Get("/", index)
-engine, err := fib.New(config, fib.Binding{Addr: ":8080", Handler: fibhttp.NewHandler(r)})
-```
-
-Each message a call sends goes out as it is sent, paced by the stream's flow control, so server
-streams reach the client message by message. A call whose client streams, a bidirectional one
-above all, needs `Config.StreamRequestBody`, so that the call starts as its request starts
-arriving rather than once it has arrived whole.
-
-### SOCKS
-
-```go
-server := socks.NewServer(socks.Config{Authenticate: check}) // nil Authenticate: no login
-engine, err := fib.New(config,
-	fib.Binding{Addr: ":1080", Handler: server},
-	fib.Binding{Network: "udp", Addr: ":1080", Handler: server}, // UDP ASSOCIATE
-) // or mux.Route{Match: mux.SOCKS(), Handler: server} on a shared port
-
-proxy, err := socks.ParseURL("socks5h://user:pass@127.0.0.1:1080")
-clientConfig := fibhttp.DefaultClientConfig()
-clientConfig.Dial = proxy.Dial // also websocket.DialerConfig.Dial and fibtls.DialOptions.Dial
-err = proxy.Dial(clientEngine, "tcp", "example.com:443", 5*time.Second, handler, done)
-```
-
-The server relays a CONNECT from callback to callback with no goroutine in between, holding the
-faster side's reads while the slower side's queue is over `Config.MaxQueuedBytes`. `Config.Allow`
-sees every request, `Config.Dial` chains the proxy to another, and a dial through the `Dialer`
-never blocks: the connect, the negotiation and any DNS lookup run on the engine and its client pool.
-
-An HTTP handler accepts a CONNECT with `Context.Connect`, over HTTP/1.x, HTTP/2 (RFC 9113 section
-8.5) and HTTP/3 (RFC 9114 section 4.4), and gets a `Tunnel`, as `Upgrade` gives one for a protocol.
-`Tunnel.HoldReads`, `Unsent` and `WaitSendable` pace it with the stream's own flow control, and
-`NotifySendable` calls back once what it holds back has drained, for a relay that may not wait.
-`fibhttp.ConnectProxy` is a whole HTTPS proxy built on them, with Basic proxy authentication; behind
-`mux`, one port serves it and SOCKS:
-
-```go
-proxy := fibhttp.NewConnectProxy(fibhttp.ConnectProxyConfig{Authenticate: check})
-engine, err := fib.New(config, fib.Binding{Addr: ":8000", Handler: mux.New(
-	mux.Route{Match: mux.SOCKS(), Handler: socks.NewServer(socks.Config{Authenticate: check})},
-	mux.Route{Match: mux.HTTP(), Handler: fibhttp.NewHandler(proxy)}, // curl -x http://host:port
-)})
-```
-
-### KCP
-
-```go
-srv, err := kcp.Listen(engine, ":4000", kcp.ServerConfig{Config: kcp.Config{
-	NoDelay: 1, Interval: 10 * time.Millisecond, Resend: 2, NoCongestion: true, // kcptun's fast3
-	DataShards: 10, ParityShards: 3, // kcp-go's FEC
-}})
-go http.Serve(srv, handler) // a Server is a net.Listener; or ServerConfig.OnSession
-
-conn, err := kcp.Dial(engine, "example.com:4000", kcp.Config{OnMessage: func(s *kcp.Session, msg []byte) {
-	_ = s.Send(msg) // whole messages, on a fib worker
-}})
-```
-
-A session reads each burst of datagrams fib takes from the socket in one go and answers it with one
-batch, and keeps a timer only while something is in flight. `kcp.KCP` is the protocol alone, without
-I/O, for a transport of the application's own.
-
-### BitTorrent
-
-```go
-trackers := tracker.NewServer(tracker.ServerConfig{})
-peers := peer.NewServer(peer.Config{Encryption: mse.Prefer})
-peers.AddTorrent(&peer.Torrent{InfoHash: mi.Info.InfoHashV1(), Handler: handler}) // a peer.Handler
-engine, err := fib.New(fib.DefaultConfig(),
-	fib.Binding{Addr: ":6881", Handler: peers},                          // peers over TCP
-	fib.Binding{Addr: ":6969", Handler: fibhttp.NewHandler(trackers)},   // HTTP tracker
-	fib.Binding{Network: "udp", Addr: ":6969", Handler: trackers.UDP()}) // UDP tracker
-go engine.Run()
-
-// One UDP port for uTP, the DHT and the UDP tracker client, sorted by first byte.
-sock, err := utp.Listen(engine, "udp", ":6881", utp.Config{})
-go peers.Serve(sock) // peers over uTP
-node, err := dht.New(dht.Config{Send: func(to netip.AddrPort, b []byte) { _ = sock.WriteTo(b, to) }})
-udp := tracker.NewUDPClient(tracker.UDPClientConfig{
-	Send: func(to netip.AddrPort, b []byte) error { return sock.WriteTo(b, to) },
-})
-sock.OnOther(func(from netip.AddrPort, b []byte) {
-	if !node.HandleDatagram(from, b) {
-		udp.HandleDatagram(from, b)
-	}
-})
-err = node.Bootstrap(ctx)
-err = node.GetPeers(ctx, mi.Info.InfoHashV1(), func(addrs []netip.AddrPort) { /* dial them */ })
-
-// The client, with an engine and a port of its own.
-c, err := bittorrent.NewClient(bittorrent.Config{DataDir: "downloads", ListenAddr: ":6882"})
-defer c.Close()
-t, err := c.AddMagnet("magnet:?xt=urn:btih:...", nil)
-<-t.GotInfo()                 // the info dictionary, fetched from peers
-r := t.Files()[0].NewReader() // an io.ReadSeekCloser that streams the file as it downloads
-defer r.Close()
-_, err = io.Copy(w, r)
-<-t.Done()
-```
-
-The client, package `bittorrent`, downloads and seeds v1, v2 and hybrid torrents over TCP and uTP
-with MSE, finding peers through trackers, the DHT, PEX and local service discovery. The pieces it is
-built from are packages under `bittorrent/`, each usable alone: `bencode`, `metainfo`, `tracker`,
-`peer` (with `peer/mse`), `utp` and `dht`; `utp.Mux` and `dht.Node` own no socket.
-
-### Raw TCP
-
-```go
-engine, err := fib.New(fib.DefaultConfig(), fib.Binding{Addr: "127.0.0.1:9000", Handler: fib.HandlerFuncs{
-	Data: func(c *fib.Connection, data []byte) { // data is only valid during the call
-		if c.Send(data) != nil {
-			c.Close()
-		}
-	},
-}})
-```
-
-### Several protocols on one engine
-
-Each `Binding` is one address, or a group of them, on a network of its own, served by a handler
-of its own, which every binding names; `fib.New` with no bindings makes a client engine that only
-dials.
-
-```go
-engine, err := fib.New(fib.DefaultConfig(),
-	fib.Binding{Addr: ":80", Handler: fibhttp.NewHandler(web)}, // plain HTTP
-	fib.Binding{Addrs: []string{":443", ":8443"}, Handler: fibtls.NewServer(fibhttp.ConfigureTLS(tlsConfig), fibhttp.NewHandler(web))},
-	fib.Binding{Network: "udp", Addr: ":443", Handler: http3.NewHandler(tlsConfig, web)},
-	fib.Binding{Addr: ":8081", Handler: websocket.NewHandler(wsHandler)},
-	fib.Binding{Addr: ":9000", Handler: grpcServer},
-	fib.Binding{Network: "unix", Addr: "/run/app.sock", Handler: admin},
-)
-addrs, err := engine.BindingAddrs(2) // where binding 2 listens, ports chosen for ":0" included
-```
-
-Every binding shares the engine's event loops, descriptor table, task pool and buffer pool, and
-its settings: backlog, buffers, watermarks, `SplitEventLoops` and `ReusePort` apply to all of them.
-Binding fails as a whole: if one address cannot be taken, none is kept.
-
-Bindings can also come and go while the engine runs. `AddBinding` listens on a binding more and
-returns its index; `RemoveBinding` closes its listeners and leaves the connections they took open
-(a UDP binding's peers close with its socket); `ShutdownBinding` drains it the way `Shutdown`
-drains the whole engine, telling its connections to finish, with `Connection.ShuttingDown` true
-for them alone, and closing what is left once its context is done:
-
-```go
-i, err := engine.AddBinding(fib.Binding{Addr: ":8082", Handler: fibhttp.NewHandler(canary)})
-// ...
-ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-defer cancel()
-err = engine.ShutdownBinding(ctx, i) // the other bindings keep serving
-```
-
-Several protocols can also share one port. `mux` looks at the first bytes a client sends, picks
-the route that recognises them, and hands the connection over with `Connection.SetHandler`, after
-which the engine calls the chosen handler directly:
-
-```go
-engine, err := fib.New(config, fib.Binding{Addr: ":8000", Handler: mux.NewWithConfig(mux.Config{Fallback: rawEcho},
-	mux.Route{Match: mux.TLS(), Handler: fibtls.NewServer(fibhttp.ConfigureTLS(tlsConfig), fibhttp.NewHandler(web))},
-	mux.Route{Match: mux.HTTP(), Handler: fibhttp.NewHandler(web)}, // HTTP/1.x and h2c
-	mux.Route{Match: mux.Prefix("PING"), Handler: pinger},
-)})
-```
-
-Only protocols whose client speaks first can be sniffed; one where the server greets first, such as
-SMTP or MySQL, needs a binding of its own.
-
-`multiproto` builds such a handler from the protocols you name: each one whose handler is set is
-served, and it reads only as far as those need to be told apart — the whole request head to set a
-WebSocket handshake apart from other HTTP/1.x, the first HTTP/2 headers to set gRPC apart from other
-h2c (sending the server's SETTINGS to clients that wait for them, as grpc-go's do):
-
-```go
-engine, err := fib.New(config, fib.Binding{Addr: ":8000", Handler: multiproto.New(multiproto.Config{
-	TLS:       fibtls.NewServer(fibhttp.ConfigureTLS(tlsConfig), web),
-	HTTP1:     web, // fibhttp.NewHandler(...)
-	HTTP2:     web,
-	WebSocket: websocket.NewHandler(wsHandler),
-	GRPC:      grpcServer,
-	SOCKS:     socks.NewServer(socks.Config{}),
-	HTTPProxy: fibhttp.NewHandler(fibhttp.NewConnectProxy(fibhttp.ConnectProxyConfig{})), // CONNECT, absolute URLs
-	ARPC:      arpcServer,
-})})
-```
-
-### Examples
-
-The runnable examples live in their own repository, [fib-examples](https://github.com/lesismal/fib-examples), one module that depends on fib like any application would. Clone it and run them from its root:
-
-```sh
-git clone https://github.com/lesismal/fib-examples && cd fib-examples
-go run ./multiprotocol/server # HTTP, HTTPS, HTTP/3, WebSocket and raw TCP from one engine, and a port that sniffs
-go run ./multiproto/server   # HTTPS, HTTP/1.1, h2c, WebSocket, gRPC, SOCKS, HTTP CONNECT, arpc and a TCP echo on one port
-go run ./tcp/nontls/server
-go run ./tcp/dialfrom          # Engine.DialWith: a dial from a chosen local address and port range
-go run ./udp/openpeer         # Engine.OpenUDPPeer: a UDP binding that speaks first
-go run ./tls/dtls/server      # a DTLS 1.2 echo with DTLS-SRTP keys; its client speaks first through OpenUDPPeer
-go run ./http/nontls/server
-go run ./http/router
-go run ./http/upload/server   # big bodies: SaveBody, resumable SaveBodyResumable, OnBody echo; see its mkfile and client
-go run ./http2/upload/server  # the same upload endpoints over HTTP/2 (TLS)
-go run ./http3/upload/server  # ... and over HTTP/3 (QUIC)
-go run ./websocket/nontls/server
-go run ./http3/tls/server
-go run ./arpc/server
-go run ./grpc/server
-go run ./webrtc               # a page whose data channel and camera come back from the server; webrtc/sfu forwards one publisher to many viewers
-go run ./socks/server        # SOCKS5/4/4a and an HTTP CONNECT proxy on one port; socks/client fetches through it
-go run ./gateway/upstream     # a reverse proxy / gateway for HTTP/1.1, HTTP/2, HTTP/3 and WebSocket:
-go run ./gateway/server       # upstream, gateway and client, all callback-based (see its server's doc comment)
-go run ./gateway/client
-```
-
-Each server directory but `multiprotocol` has a matching `client` next to it; `multiproto`'s server also lists a curl or client command for each of its protocols.
-
-## Configuration
-
-`fib.DefaultConfig()` returns an engine sized for the machine: the pool follows the CPUs, the
-backlog the kernel, and the write watermark the read buffer and the machine's memory and descriptor
-limits. Pass it to `fib.New` with one or more `fib.Binding`s, and set only what you need:
-
-```go
-cfg := fib.DefaultConfig()
-cfg.MaxPendingBytes = 1 << 30 // optional server-wide output budget
-cfg.LogSettings = false       // silence the startup settings list
-
-engine, err := fib.New(cfg, fib.Binding{Addr: ":8080", Handler: handler})
-```
-
-The effective settings are logged at startup by default, one line per parameter, with its
-`default`/`custom` source and a description; `Engine.LogSettings()` prints the same list on demand.
-All of fib logs through package `fib/log`, as lines, logfmt text or JSON:
-`fiblog.Setup(fiblog.Config{Format: fiblog.FormatJSON})`, or `FIB_LOG_FORMAT=json` in the
-environment; until then it writes to `slog.Default()`. The full reference — every `Config` and
-`Binding` field, its default, the machine sizing formula, the startup log and logging — is in
-[Configuration](docs/configuration.md).
-
-## Architecture
-
-fib separates waiting for I/O from doing the work:
-
-- **Event loops** only wait for readiness, accept connections, register and close fds, and read
-  the shared UDP sockets.
-- **Workers** do everything else: read, parse, run your callbacks and handlers, and write.
-
-```mermaid
-flowchart TB
-    K[("socket")] -->|"① readiness, edge-triggered"| L["event loop / poller<br/>epoll_wait · kqueue · IOCP"]
-    L -->|"② one task per ready connection,<br/>one GoTasks batch per wait"| Q["taskpool<br/>P-local shard queues"]
-    Q -->|"③ any idle worker,<br/>one at a time per connection"| W["worker<br/>read with a borrowed buffer until a short read"]
-    W --> H["OnData · TLS · HTTP/1 · HTTP/2 · WebSocket parser<br/>→ handler"]
-    H --> O["corked output<br/>one writev / sendfile per round"]
-    O -->|"④ write; the rest waits for EPOLLOUT"| K
-    W -. "close / register:<br/>command queue + eventfd" .-> L
-```
-
-### Three rules
-
-1. **Only a loop touches the poller.** Only a loop calls `epoll_ctl`, `accept` and `close`.
-   Workers ask for these through a command queue and wake the loop with an eventfd.
-2. **Order belongs to the connection.** Each connection folds its readiness into pending events
-   and has a `scheduled` flag, so at most one worker runs it at a time, in FIFO order. For example,
-   `OnClose` always comes after the `OnData` before it.
-3. **No affinity.** Each round of a connection goes to whichever worker is idle, so one busy
-   connection never holds up the others on its loop.
-
-### One round of a connection
-
-1. The loop's `epoll_wait` returns a batch of ready connections. The loop submits them to the pool
-   in one `GoTasks` call, then yields.
-2. A worker flushes any queued output, then reads into a buffer borrowed from the pool until a read
-   comes back short.
-3. It runs the protocol on the data it read (`OnData`, the HTTP parser or the WebSocket frame
-   parser) and the handler.
-4. Responses produced during the round are corked, and go out in one `writev` (or `sendfile`) at
-   the end of the round. Whatever cannot be written stays queued, `EPOLLOUT` picks it up later, and
-   past the watermark reads pause until the queue drains.
-
-The pollers (`Config.SplitEventLoops`, on by default; how many is `EventLoopCount`) follow the CPU count:
-one on four CPUs or fewer, two on up to sixteen, and one per eight CPUs above that. Each poller listens
-and accepts for itself, and connections are spread over them by fd. A poller parks in Go's own netpoller rather than blocking in
-`epoll_wait`, so it never holds a P while goroutines wait to run.
-
-### Where each protocol runs
-
-| Protocol | Loop | Engine workers | Other pools |
-| --- | --- | --- | --- |
-| TCP | readiness, accept | read, `OnData`, write | — |
-| TLS | — | decrypt, encrypt, inner handler | `fib-tls-handshake` (handshakes that crypto/tls runs; others take no worker) |
-| HTTP/1.x | — | parse, handler, response: one round, one write | — |
-| HTTP/2 | — | framing, HPACK decoding | `<Name>-streams` runs handlers, HPACK encoding and writes |
-| HTTP/3 | reads UDP in batches, sorts datagrams by peer | QUIC packets, TLS 1.3, QPACK | `<Name>-streams` (handlers) |
-| WebSocket | — | handshake, frames, `OnMessage`, deflate | over HTTP/2 or HTTP/3: `Upgrade` and `OnOpen` on streams |
-| WebRTC | reads UDP, sorts datagrams by peer | the Mux routes by sender; ICE, DTLS, SRTP and SCTP under a mutex per PeerConnection, then its callbacks | — (one timer per PeerConnection) |
-| Streaming media | reads UDP for SRT, RTSP and WHIP/WHEP | ingest parsing, then the hub's fan-out: every subscriber muxes and queues its writes on the publisher's worker | — (one timer per SRT session) |
-| KCP | reads UDP, sorts datagrams by peer | decryption, FEC, KCP and `OnMessage` under a mutex per session, then one batch of datagrams out | — (one timer per session while data is in flight) |
-| BitTorrent | reads UDP for uTP, the DHT and UDP trackers, sorts datagrams by peer | peer wire parsing and `peer.Handler` callbacks, one write per callback; uTP under the `Mux`'s mutex, then one batch of datagrams out; DHT and UDP tracker messages | — (one timer per uTP connection, peer connection and DHT query in flight; a peer over a `net.Conn`, such as uTP's, has a reader and a writer goroutine; the client adds a tick goroutine for every torrent's upkeep, an event dispatcher, and goroutines for dials in flight, peer sources and hash checks) |
-| arpc | — | framing, responses, handlers registered sync | `<Name>-streams` (async handlers, the default) |
-| gRPC | — | HTTP/2 framing, HPACK, flow control | `<Name>-streams` (every call) |
-
-Waits only go one way, from engine workers to the other pools, so the pools cannot deadlock each
-other. [docs/architecture.html](docs/architecture.html) and [docs/flows.html](docs/flows.html)
-have the full picture, with one diagram per protocol.
-
-## Where the speed and the memory come from
-
-### Throughput
-
-- **Batching at every step.** One `epoll_wait` returns up to 1024 events, and they reach the pool
-  in one `GoTasks` call. A worker reads until a short read, then writes once per round. Pipelined
-  HTTP/1 responses and WebSocket frames written in one round leave in a single `writev`. This is
-  why fib does so well in the pipelined benchmarks.
-- **Cheaper system calls on Linux.** Sockets are read and written with `recvfrom`, `sendto` and
-  `sendmsg` through raw system calls (`Config.SocketSyscalls`, on by default). The fd is already
-  non-blocking and its readiness already known, so the runtime's syscall bookkeeping is pure
-  overhead.
-- **A scheduler-aware worker pool.** The default taskpool queues each task on a shard owned by the
-  current P, in a lock-free ring. Idle workers park on a LIFO stack, so the warmest one wakes
-  first, and at most one wake-up is sent per hop rather than one per task. See
-  [Taskpool](#taskpool).
-- **TLS without crypto/tls on the hot path.** After crypto/tls finishes the handshake, fib takes
-  over the AES-GCM and ChaCha20-Poly1305 (TLS 1.3/1.2) and AES-CBC (TLS 1.2/1.1) record layers,
-  and decrypts records in place in the round's read buffer. Renegotiation and TLS 1.2 resumption
-  stay on crypto/tls.
-- **Protocol stacks written for this model.** HTTP/2, HPACK, QUIC, QPACK and WebSocket are
-  implemented in fib. They are fed straight from the round's read buffer rather than through a
-  blocking `net.Conn`, and the WebSocket parser consumes pipelined frames in place. The Router
-  allocates nothing per request.
-
-### Memory
-
-- **No goroutine per connection.** net/http keeps at least one goroutine per connection, each with
-  its own stack, plus a `bufio.Reader` and `bufio.Writer`. In fib, an idle connection is a struct
-  and an entry in an fd-indexed table.
-- **Buffers are borrowed for one round only.** Read and write buffers come from `bufferpool` at the
-  start of a round and go back at the end, so an idle connection holds no I/O buffer at all. The
-  pool's size classes match the Go allocator's, so nothing is lost to rounding. A reserve survives
-  GC, so a collection does not empty the pool.
-- **Bounded backlog.** The per-connection watermark, and the server-wide `MaxPendingBytes` budget
-  when one is set, cap how much output can queue up. When either is reached, fib stops reading
-  from the connections that are behind. In the HTTP/1 and WebSocket pipeline benchmarks this keeps fib at
-  32–36 MB while most other servers grow to hundreds of MB.
-- **TLS state is dropped after the handshake.** On the fast path, the `tls.Conn` and its input and
-  handshake buffers are released, keeping only the keys and sequence numbers.
-- **Object reuse, on by default.** `Config.ReuseRequests`, `ReuseHeaders`, `ReuseURLs` and
-  `ReuseContexts` recycle request objects, and HTTP/2 its streams, under the same lifetime rule as
-  fasthttp and Fiber; each can be turned off. HTTP/3 recycles its request streams the same way
-  unless `http3.Config.DisableReuse` is set. `Context.Body` and `Context.Query` read the body and the query without
-  copying them.
-
-## Benchmarks
-
-The numbers come from the Docker benchmark workflows of the `lesismal/go-*-benchmark` repositories,
-on GitHub-hosted `ubuntu-24.04` runners. Each runner has 4 vCPUs: 2 for the server and 2 for the
-client. Every run uses 10,000 connections and a 1 KiB payload, and fib is at
-[`4ffe768`](https://github.com/lesismal/fib/commit/4ffe768).
-
-- **TPS** is requests (or messages) per second.
-- **MEM** is the server's average RSS.
-- Each is a single run, and shared runners are noisy, so read differences of a few percent as
-  ties. Follow the links for the complete tables, including CPU efficiency (EER) and latency
-  percentiles. Each repository's README describes its clients and how to reproduce the runs.
-
-### HTTP/1.1: [go-http1-benchmark](https://github.com/lesismal/go-http1-benchmark) · [Actions run](https://github.com/lesismal/go-http1-benchmark/actions/runs/36839290265)
-
-Client: Rust (tokio). Echo has one request in flight per connection. Pipeline sends 10 requests
-per write, 200 per second per connection.
-
-| Server | Echo TPS | Echo MEM | Pipeline TPS | Pipeline MEM |
-| --- | ---: | ---: | ---: | ---: |
-| **fib** | 194,671 | **32 MB** | **1,140,457** | **36 MB** |
-| axum (Rust) | **236,244** | 227 MB | 301,804 | 490 MB |
-| workflow (C++) | 150,407 | 14 MB | — ¹ | — |
-| fasthttp | 139,830 | 197 MB | 692,671 | 197 MB |
-| hertz | 125,451 | 399 MB | 325,226 | 524 MB |
-| nbio | 92,356 | 64 MB | 185,196 | 87 MB |
-| net/http | 84,739 | 314 MB | 164,811 | 323 MB |
-| gin | 81,437 | 317 MB | 161,646 | 326 MB |
-
-- **Echo**: fib is 2.30× net/http and 1.39× fasthttp, with a tenth of net/http's memory.
-- **Pipeline**: fib is 6.9× net/http, 1.65× fasthttp and 3.8× axum.
-- **Connections**: fib also accepts connections the fastest, at 61.8k/s, against 54.4k for axum and
-  40.5k for net/http.
-
-¹ This run produced no workflow pipeline result.
-
-### HTTP/2 (h2c): [go-http2-benchmark](https://github.com/lesismal/go-http2-benchmark) · [Actions run](https://github.com/lesismal/go-http2-benchmark/actions/runs/36839294047)
-
-Client: Go `x/net/http2`. Multiplex opens 10 streams at once per connection.
-
-| Server | Echo TPS | Echo MEM | Multiplex TPS | Multiplex MEM |
-| --- | ---: | ---: | ---: | ---: |
-| **fib** | 129,676 | **119 MB** | **333,692** | **432 MB** |
-| h2 (Rust) | **143,107** | 246 MB | 129,729 | 870 MB |
-| hertz | 35,637 | 988 MB | 49,976 | 1.02 GB |
-| net/http | 35,415 | 633 MB | 25,051 | 809 MB |
-| gin | 35,835 | 634 MB | 26,955 | 807 MB |
-
-- **Echo**: fib is 3.7× net/http, and at 90% of Rust's h2 it uses half h2's memory.
-- **Multiplex**: fib is 13× net/http and 2.6× h2.
-
-### HTTP/3: [go-http3-benchmark](https://github.com/lesismal/go-http3-benchmark) · [Actions run](https://github.com/lesismal/go-http3-benchmark/actions/runs/36839296383)
-
-Client: Rust (quiche).
-
-| Server | Echo TPS | Echo MEM | Multiplex TPS | Multiplex MEM | Handshakes/s |
-| --- | ---: | ---: | ---: | ---: | ---: |
-| quiche (Rust) | **72,919** | **387 MB** | **101,233** | **881 MB** | **3,128** |
-| **fib** | 67,396 | 504 MB | 94,443 | 1.05 GB | 2,707 |
-| quic-go | 19,545 | 1.20 GB | 17,505 | 1.80 GB | 1,819 |
-| gin (quic-go) | 19,427 | 1.20 GB | 14,979 | 1.79 GB | 1,799 |
-
-- **Echo**: fib is 3.4× quic-go, on 58% less memory.
-- **Multiplex**: fib is 5.4× quic-go, on 42% less memory.
-- **Against quiche**: fib reaches 92–93% of Cloudflare's quiche, but still uses more memory.
-
-### TLS: [go-tls-benchmark](https://github.com/lesismal/go-tls-benchmark) · [Actions run](https://github.com/lesismal/go-tls-benchmark/actions/runs/36839299713)
-
-Client: C (uSockets + BoringSSL). All servers echo plaintext.
-
-| Server | TLS 1.3 Echo | MEM | TLS 1.3 Pipeline | MEM | TLS 1.2 Pipeline | TLS 1.1 Pipeline |
-| --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| **fib** | 103,427 | 180 MB | 690,000 | 180 MB | 692,960 | 356,423 |
-| crypto/tls + net | 92,494 | 285 MB | 241,106 | 518 MB | 245,672 | 155,931 |
-| uSockets (C, BoringSSL) | 103,972 | **51 MB** | **735,000** | **51 MB** | **750,000** | **400,342** |
-| rustls (Rust) | **107,406** | 110 MB | 195,835 | 201 MB | 198,465 | — |
-
-- **Against crypto/tls over `net`**: fib echoes 12% more on 37% less memory, and pipelines
-  2.3–2.9× as much on about a third of the memory.
-- **Against C and Rust**: fib's echo is within 4% of uSockets and rustls. Its pipeline reaches
-  89–94% of uSockets and 3.5× rustls.
-- **Handshakes**: fib runs crypto/tls's handshake, so handshakes per second match crypto/tls
-  (3,445 against 3,413 for TLS 1.3).
-
-### WebSocket: [go-websocket-benchmark](https://github.com/lesismal/go-websocket-benchmark) · [Actions run](https://github.com/lesismal/go-websocket-benchmark/actions/runs/36999378687)
-
-Client: C++ (uWebSockets).
-
-| Server | Echo TPS | Echo MEM | Pipeline TPS | Pipeline MEM |
-| --- | ---: | ---: | ---: | ---: |
-| **fib** | **138,592** | 32 MB | 984,917 | 32 MB |
-| uws_events | 129,363 | 41 MB | 1,072,766 | 43 MB |
-| fnet | 126,401 | **28 MB** | 1,151,710 | **30 MB** |
-| uws_std | 107,694 | 204 MB | **1,218,616** | 216 MB |
-| gws | 124,645 | 136 MB | 205,047 | 147 MB |
-| gorilla | 122,296 | 229 MB | 205,224 | 235 MB |
-| nbio | 121,398 | 62 MB | 191,091 | 100 MB |
-| tokio-tungstenite (Rust) | 83,841 | 105 MB | 748,297 | 286 MB |
-| gobwas | 70,477 | 257 MB | 98,621 | 267 MB |
-
-- **Echo**: fib has the highest echo throughput, and the most connections per second (32.9k), of
-  the 17 servers.
-- **Pipeline**: fib is 4.8× gorilla on a seventh of its memory. uws_std, fnet and uws_events are
-  9–24% ahead of fib here.
-
-The Go event-loop servers that accept a task pool run on the one the benchmark selects
-(`fib_adaptive` unless set otherwise; the run's Summary lists it). See that repository's README.
-
-## Taskpool
-
-[`taskpool`](taskpool) is the worker pool under the engine, and it can also be used on its own.
-The default, `ModeAdaptive`, works as follows:
-
-- **Sharded by P**: a submission goes to the shard owned by the submitting goroutine's P. If that
-  shard has a backlog, fib also looks at one random shard and takes the lighter of the two.
-- **Lock-free queue**: each shard queues tasks in a bounded MPMC ring (Vyukov's). Submitting and
-  taking a task need no lock.
-- **Warm workers first**: idle workers park on a LIFO stack. Each hop wakes at most one worker, and
-  no more than two are waking at a time.
-- **Elastic**: the pool grows only when every worker is busy and none is on the way. Each
-  `ShrinkInterval` (1s) it retires half of the workers that stayed idle the whole time.
-
-The other modes are `ModeAdaptiveChan` (the same pool on a channel), `ModeElastic` (a goroutine
-per task, with idle workers lingering) and `ModeInline`.
-
-CI runs [`taskpool/benchmark`](taskpool/benchmark) in every full run, against
-[nbio](https://github.com/lesismal/nbio), [ants](https://github.com/panjf2000/ants),
-[gopool](https://github.com/bytedance/gopkg) and [fnet](https://github.com/linfeip/fnet) on
-Linux, macOS and Windows. The results below are the medians of
-[this CI run](https://github.com/lesismal/fib/actions/runs/37020403709) (artifacts
-`taskpool-benchmark-*`), in ns per task / CPU-ns per task; lower is better.
-
-**Linux** (ubuntu-latest, 4 vCPU, AMD EPYC 9V74)
-
-| Scenario | nbio | ants | gopool | fnet | **fib-adaptive** |
-| --- | ---: | ---: | ---: | ---: | ---: |
-| Handoff | 378 / 458 | **310 / 362** | 364 / 429 | 361 / 420 | 346 / 409 |
-| ParallelTiny | 176 / 506 | 258 / 1,020 | 335 / 1,290 | 83.2 / 328 | **32.9 / 131** |
-| LoopCPUShort | 188 / 480 | 253 / 641 | 317 / 856 | 82.5 / 326 | **75.3 / 293** |
-| LoopCPULong | 608 / 2,422 | 676 / 2,620 | 610 / 2,424 | 600 / 2,385 | **581 / 2,307** |
-| LoopBlocking | **298** / 931 | 498 / 1,083 | 451 / 818 | 433 / **682** | 460 / 692 |
-| LoopMixed | 302 / 1,100 | 369 / 1,056 | 370 / 1,321 | 203 / 802 | **185 / 671** |
-| Bursts | 245 / 1,269 | 349 / 1,405 | 396 / 1,880 | **161** / 1,011 | 173 / **817** |
-
-**macOS** (macos-latest, 3 vCPU, Apple M1), ns per task
-
-| Scenario | nbio | ants | gopool | fnet | **fib-adaptive** |
-| --- | ---: | ---: | ---: | ---: | ---: |
-| Handoff | 684 | **495** | 592 | 643 | 578 |
-| ParallelTiny | 226 | 513 | 454 | 154 | **42.1** |
-| LoopCPUShort | 266 | 440 | 403 | 163 | **101** |
-| LoopCPULong | 1,209 | 1,908 | 1,185 | **1,072** | 1,244 |
-| LoopBlocking | **356** | 560 | 380 | 447 | 483 |
-| LoopMixed | 536 | 885 | 830 | 496 | **472** |
-| Bursts | 1,050 | 921 | 870 | 555 | **474** |
-
-**Windows** (windows-latest, 4 vCPU, Xeon Platinum 8573C), ns per task
-
-| Scenario | nbio | ants | gopool | fnet | **fib-adaptive** |
-| --- | ---: | ---: | ---: | ---: | ---: |
-| Handoff | 1,041 | **994** | 1,138 | 1,213 | 1,119 |
-| ParallelTiny | 304 | 623 | 772 | 163 | **72.5** |
-| LoopCPUShort | 506 | 595 | 783 | 178 | **175** |
-| LoopCPULong | 814 | 939 | 1,110 | 803 | **733** |
-| LoopBlocking | 520 | 742 | 953 | **490** | **490** |
-| LoopMixed | 516 | 729 | 914 | 333 | **256** |
-| Bursts | 502 | 647 | 847 | 273 | **234** |
-
-**Scenarios:**
-
-- `Handoff`: one task at a time.
-- `ParallelTiny`: every P submits empty tasks at once.
-- `Loop*`: GOMAXPROCS/4 submitters act as event loops, feeding CPU-bound, sleeping or mixed tasks.
-- `Bursts`: 256 tasks, then an idle gap.
-
-**Results:**
-
-- **Where fib-adaptive leads**: the contended and event-loop-shaped cases, `ParallelTiny`,
-  `LoopCPUShort` and `LoopMixed`, on all three systems. On `ParallelTiny` it is 4–12× ahead of
-  nbio, ants and gopool, and 2.2–3.7× ahead of fnet, its closest rival. It wins 4 of 7 scenarios on
-  Linux and macOS, and 6 of 7 on Windows (one a tie). On Linux it also uses the least CPU per
-  task in 5 of 7.
-- **Where it trails**: ants wins `Handoff` (single-task latency). nbio fans out to blocking tasks
-  faster on Linux and macOS (`LoopBlocking`). fnet is slightly ahead on Linux `Bursts` and macOS
-  `LoopCPULong`.
-
-Run it yourself with `cd taskpool/benchmark && ./bench.sh` (or `bench.ps1` on Windows). See its
-[README](taskpool/benchmark/README.md) for the options.
-
-## Packages
-
-| Package | Description |
-| --- | --- |
-| [`fib`](.) | The public API: `Engine`, `Connection`, `Config`, handlers and the rest, re-exported from `core` |
-| [`core`](core) | Engine, event loops, TCP / UDP / Unix connections, `SendFile`, async dial |
-| [`taskpool`](taskpool) | Worker pools: adaptive (default), adaptive-chan, elastic, inline |
-| [`bufferpool`](bufferpool) | Size-classed buffer pool aligned to the Go allocator |
-| [`tls`](tls) | TLS as a layer on a connection, transparent to the protocol above it |
-| [`http`](http) | HTTP/1.x and HTTP/2 server and client, Router |
-| [`http3`](http3) | HTTP/3, QUIC and QPACK server and client |
-| [`websocket`](websocket) | RFC 6455 server and client, permessage-deflate, upgrades over HTTP/1.1, HTTP/2 and HTTP/3 |
-| [`arpc`](arpc) | [lesismal/arpc](https://github.com/lesismal/arpc) server and client, wire compatible |
-| [`grpc`](grpc) | gRPC server and client over an HTTP/2 transport of its own, compatible with grpc-go and its generated code |
-| [`webrtc`](webrtc) | WebRTC PeerConnection and a UDP Mux shared by many; `stun`, `ice`, `turn` (and `turnserver`), `sdp`, `sctp`, `srtp` and `rtp` underneath, DTLS 1.2 in `tls` |
-| [`media`](media) | Live streaming: `rtmp`, `rtsp`, `srt`, `httpflv`, `hls` and `rtc` (WHIP/WHEP) on the `hub`; `av`, `flv`, `amf`, `mpegts`, `fmp4`, `mp4`, `rtpcodec` and `codec/{h264,h265,aac,opus}` underneath |
-| [`kcp`](kcp) | KCP server, client and sans-I/O protocol, compatible with kcp-go's crypts and FEC |
-| [`bittorrent`](bittorrent) | BitTorrent client; `bencode`, `metainfo`, `tracker`, `peer` and `peer/mse`, `utp` and `dht` underneath |
-| [`middleware`](middleware) | Middleware chain and the common middleware |
-| [`socks`](socks) | SOCKS5, SOCKS4 and SOCKS4a proxy server and non-blocking dialer; `http.ConnectProxy` is the HTTP proxy |
-| [`mux`](mux) | Several protocols on one port, told apart by the first bytes a client sends |
-| [`prefork`](prefork) | One program served from several processes sharing its ports (Linux) |
+## Compared with the Go standard library
+
+"The standard library" here means `net` + `net/http` (HTTP/2 built in) + `crypto/tls`. It has no
+HTTP/3, WebSocket or gRPC; those usually come from quic-go, gorilla/websocket and grpc-go.
+
+### What is the same
+
+- **The HTTP programming model**: a handler gets the standard `*http.Request`, and
+  `*fibhttp.Context` implements `http.ResponseWriter`, `http.Flusher` and `io.ReaderFrom`. So
+  `http.ServeMux`, `http.FileServer`, `ServeContent`, and frameworks built on `http.Handler` such
+  as chi and gin run on fib mostly unchanged, over HTTP/1, HTTP/2 and HTTP/3.
+- **TLS handshakes by `crypto/tls`**: a `tls.Config` works as it is, and handshakes per second are
+  about the same (3,445 against 3,413 for TLS 1.3).
+- **Runtime and dependencies**: both are pure Go with no cgo, on the same runtime and GC. fib
+  depends on nothing outside the standard library either, and its event loops park in Go's own
+  netpoller.
+- **Shared interfaces and features**: `fib.Connection` implements `net.Conn`; both have h1/h2/h2c,
+  ALPN, graceful shutdown with a context (`Shutdown(ctx)`), and `ResponseController.Flush` and
+  `SetWriteDeadline`.
+
+### What is different
+
+| | Standard library | fib |
+|---|---|---|
+| Concurrency | One goroutine per connection (and one more per HTTP/2 stream), blocking I/O | A few event loops (epoll/kqueue/IOCP) and a shared worker pool; a connection holds no goroutine, and runs on one worker at a time, in order |
+| Blocking in a handler | Fine: it costs one goroutine | It holds a scarce worker. Reply asynchronously with `Retain/Release`, take the body with `OnBody`, or hand the work to a pool of your own |
+| `Read` / `Write` | `Read` waits for data; `Write` blocks on a slow reader, which is backpressure for free | `Read` returns `ErrWouldBlock` when there is nothing; `Write` never blocks: data queues and the watermark pauses reads |
+| Deadlines | The call fails; the connection stays | The connection is closed |
+| Request body | Streamed by default, read from the network as `r.Body` is read | Read whole before the handler runs (up to `MaxBodyBytes`); `StreamRequestBody` streams it |
+| Object lifetimes | Fresh objects per request, safe to keep after the handler returns | Request, Header, URL and Context are reused by default, with fasthttp's rules: touching them after the handler is done reads another request's data, with no error |
+| Client disconnect | `r.Context()` is cancelled | `r.Context()` is not; use `c.Context()`, `c.OnCancel` or `c.Err()` |
+| Hijack | Supported | Not supported, so libraries that hijack, such as gorilla/websocket, do not work; `EnableFullDuplex` returns `ErrNotSupported` |
+| TLS records | `crypto/tls` throughout | fib encrypts and decrypts records itself after the handshake (AES-GCM, ChaCha20, CBC), and can offload them to the NIC with kTLS |
+| Protocols | h1/h2; the rest from third-party modules | Its own h2, HPACK, QUIC/HTTP/3, WebSocket, gRPC transport, KCP, WebRTC, streaming media and more; one engine serves many protocols, and can tell them apart on one port by the first bytes |
+| Writing | Each `Write` goes through `bufio` | A round's output is corked and leaves in one `writev`; files go out with `sendfile`, and relays between connections can `splice` |
+| Clients | `http.Client` blocks | Non-blocking dial and async h1/h2/h3/WS clients reporting through callbacks or futures (calling `Wait()` in a handler is an anti-pattern) |
+| Platforms | The same everywhere | Native backends on Linux, macOS, the BSDs and Windows, `net` elsewhere; prefork, `recvmmsg`, inotify and raw syscalls are Linux only |
+| Tuning | Next to none | Worker pool, watermarks, `SplitEventLoops`, `EventLoopCount`, `MaxPendingBytes` and more, with defaults sized from the machine |
+
+### Where fib is stronger
+
+1. **Throughput**: on GitHub Actions (2 vCPUs for the server, 10,000 connections, 1 KiB
+   payloads), against net/http (against `crypto/tls` + `net` for the TLS row):
+
+   | Case | Throughput |
+   |---|---|
+   | HTTP/1 echo | 2.3× |
+   | HTTP/1 pipelined | 6.9× |
+   | HTTP/2 echo | 3.7× |
+   | HTTP/2 multiplexed | 13× |
+   | TLS 1.3 pipelined | 2.9× |
+
+   HTTP/3 is 3.4–5.4× quic-go, and in the same runs fib is close to the C, C++ and Rust servers.
+   The numbers and how to reproduce them are in
+   [go-http1-benchmark](https://github.com/lesismal/go-http1-benchmark),
+   [go-http2-benchmark](https://github.com/lesismal/go-http2-benchmark),
+   [go-http3-benchmark](https://github.com/lesismal/go-http3-benchmark),
+   [go-tls-benchmark](https://github.com/lesismal/go-tls-benchmark) and
+   [go-websocket-benchmark](https://github.com/lesismal/go-websocket-benchmark).
+2. **Memory, more so with more connections**: an idle connection holds no goroutine stack and no
+   I/O buffer; buffers are borrowed for one round. In the HTTP/1 echo fib used 32 MB, net/http
+   314 MB.
+3. **Bounded backlog**: watermarks on both reads and writes kept fib at 32–36 MB in the pipelined
+   tests, where most other servers grew to hundreds of MB.
+4. **Many protocols and no third-party dependencies**: one engine serves HTTP, HTTPS, HTTP/3,
+   WebSocket, gRPC, SOCKS, arpc and raw TCP on shared loops, pools and buffers.
+5. **A cheap migration**: most existing `http.Handler`s plug in as they are, which takes part of the
+   gain at once; hot paths can move to the `Context` API later.
+6. **More control**: `HoldReads`, `Cork`, `SendFile`, `FileCache`, and prefork for a heap per
+   process, for gateways, proxies, push and long-lived connections.
+
+### Where fib is weaker, and the risks
+
+1. **More to keep in mind**: a handler must not block casually; breaking the object-reuse lifetime
+   rules mixes up requests' data silently instead of panicking; the `data` a callback gets is valid
+   only inside it. Developers have to keep to these themselves; the
+   [hack guide's anti-patterns](docs/hacks.md#20-anti-patterns) lists them.
+2. **Not 100% compatible**: no Hijack; `r.Context()` is not cancelled on disconnect; the body is
+   read whole by default; `Read` does not block, so `bufio.Reader` cannot wrap it; a deadline
+   closes the connection. Standard-library code that relies on these needs changes.
+3. **Defaults to watch**:
+   - HTTP/1 writes do not block, so a whole response to a slow client sits in memory.
+     `MaxWriteQueueBytes` and `MaxPendingBytes` are unlimited by default: stream large responses,
+     or set the limits (see the slow-client section of [load testing](docs/loadtest.md)).
+   - Object reuse is on by default.
+4. **More code of its own**: the TLS record layer, QUIC, HTTP/2 and the rest are fib's own, which
+   is more to audit and more edge cases than the standard library, which has the Go team and the
+   whole community behind it.
+5. **Maturity**: few maintainers, a small community, an API still changing (the constructors are
+   already down to `fib.New`), Go 1.27.3 or later, and no Go 1 compatibility promise.
+6. **Harder to debug**: a standard-library goroutine dump shows the line each connection waits on;
+   fib is state machines and callbacks, so finding a stall or a leak takes more tools and
+   experience.
+7. **Less gain for heavier handlers**: the benchmarks use light handlers such as echo. Where the
+   handler is heavy (databases, remote calls) the network is not the bottleneck and fib's lead
+   shrinks; used wrongly (blocking on a worker), it can do worse than the standard library.
+
+### Where the standard library is stronger
+
+1. **Simple and intuitive**: synchronous, blocking code; block whenever you like, goroutines are
+   cheap, and there are few traps for newcomers.
+2. **Safe semantics**: no object reuse, contexts cancelled on disconnect, backpressure built into
+   `Write`, streamed bodies.
+3. **Stable and trusted**: the Go 1 compatibility promise, maintained by the Go team, prompt
+   security fixes, and proven in the largest production deployments.
+4. **The whole ecosystem**: every middleware, framework and hijacking library (gorilla/websocket
+   and the like), and `httputil.ReverseProxy`, works as it is.
+5. **Easy to debug**: pprof and goroutine dumps map straight onto connections.
+
+### Where the standard library is weaker
+
+1. **A goroutine and `bufio` buffers per connection, so memory grows with connections**: about
+   300 MB at 10,000 connections, and far more at hundreds of thousands or millions of long-lived
+   ones.
+2. **Lower throughput**: no batching of writes across requests, so pipelining and HTTP/2
+   multiplexing suffer most (7–13× behind); every HTTP/2 stream starts a goroutine.
+3. **No global bound on backlog**: with slow clients or deep pipelines, memory grows with the
+   goroutines and buffers.
+4. **No HTTP/3, WebSocket or gRPC**: they come from third-party modules, each with its own model and
+   memory profile (quic-go's throughput and memory are well behind fib's).
+5. **Little low-level control**: no read-side flow control, no cork, no several protocols on one
+   port.
+
+### Which to choose
+
+- **Ordinary business services** (handlers mostly query databases and call services, connections
+  are few, the team changes often): the standard library is enough: stable, simple, the whole
+  ecosystem.
+- **Services where the network layer is the bottleneck** (gateways, proxies, long-lived push, chat,
+  real-time media, many connections or deep pipelines, tight memory, or many protocols in one
+  process): fib pays off, provided the team keeps to these rules:
+  - handlers do not block; heavy work goes behind `Retain` or to a pool of its own;
+  - reused objects never leave the handler;
+  - large responses are streamed, or the write queue is bounded.
+- **A middle way**: plug the existing `http.Handler` into fib unchanged and take the connection and
+  memory gains; if a handler keeps the Request after it returns, turn off `ReuseRequests` or
+  `Clone` the request first. Then move hot paths to the native `Context` API one by one.
 
 ## Documentation
 
@@ -903,17 +247,3 @@ Run it yourself with `cd taskpool/benchmark && ./bench.sh` (or `bench.ps1` on Wi
   optimized, and what is left to measure
 - [Load testing](docs/loadtest.md): the `benchmark/loadtest` campaign, its results and the
   memory cost of whole responses to slow readers
-
-## Build and test
-
-```sh
-go build ./...
-go test ./...
-```
-
-CI also runs HTTP/1.x conformance tests against net/http and curl, h2spec, HTTP/3 interop with
-quic-go, the Autobahn WebSocket suite and the fuzzers.
-
-## License
-
-MIT, see [LICENSE](LICENSE).
