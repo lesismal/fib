@@ -507,8 +507,8 @@ socket，后者会为同一地址再开一个连接；NAT rebind 的对端则会
   让引擎在 `p` 上跑它的连接，`p` 归调用方所有，由调用方在引擎关闭后停止。
 - **prefork**（Linux）把同一程序跑在多个子进程里，每个有自己的堆和 GC，通过 `SO_REUSEPORT` 共享监听端口。
   子进程需要的初始化放在 `serve` 里；`Run` 之前的代码在 master 和每个子进程都会执行。
-- **IOPollers** 把引擎拆到多个事件循环上；更多 poller 会和 worker 抢 P，通常更慢，所以只在有 profile 时
-  才动 `IOPollerCount` 和 `EngineLoop`。
+- **SplitEventLoops** 把引擎拆到多个事件循环上；更多 poller 会和 worker 抢 P，通常更慢，所以只在有 profile 时
+  才动 `EventLoopCount` 和 `EngineLoop`。
 - **GOMAXPROCS** 保持默认。调高只会更慢、更费内存。
 - **bufferpool** 是 fib 自己的 buffer 池；`Get`/`Put` 零分配，有一个能活过 GC 的储备
   （`SetRetainedBytes`），你的 buffer 也能和 fib 的 buffer 走同一个池。
@@ -534,7 +534,7 @@ defer bufferpool.Put(buf)   // after Put, not even a sub-slice may be used
 `prefork.Children()`。
 
 见 [§16](../hacks.zh-CN.md#16-协程池自己的池独立的池不要死锁)、
-[§17](../hacks.zh-CN.md#17-进程级技巧preforkiopollersgomaxprocs) 与
+[§17](../hacks.zh-CN.md#17-进程级技巧preforkspliteventloopsgomaxprocs) 与
 [§18](../hacks.zh-CN.md#18-bufferpool自己的-buffer-也走同一个池)。
 
 ## 15. 速查表
@@ -577,7 +577,7 @@ defer bufferpool.Put(buf)   // after Put, not even a sub-slice may be used
   自定义池；大多数代码仍然适合 [03-handlers.md](03-handlers.zh-CN.md) 里的普通 handler 写法。
 - **这些技巧不能盲目组合。** 借用内存加异步分支、跨 goroutine 持有 `Cork`——正是让 fib 变快的同一批 API
   在这样组合时让数据出错、让程序死锁。
-- **后端随平台不同。** IOPollers 需要 epoll/kqueue（Windows 保持单个事件循环）；`SendFile` 在 Linux、macOS、
+- **后端随平台不同。** SplitEventLoops 需要 epoll/kqueue（Windows 保持单个事件循环）；`SendFile` 在 Linux、macOS、
   FreeBSD、DragonFly 上用 `sendfile(2)`，Windows 上用 `TransmitFile`，NetBSD/OpenBSD 上分块读取；`SendBatch`
   只在 Linux 与 macOS 上是一次系统调用；`SpliceTo` 只支持 Linux。请在实际部署的系统上验证。
 - **测量，而不是猜。** 指南里每一个"快 X 倍"都附带了基准和机器；把它变成策略之前先在你的机器上复现。

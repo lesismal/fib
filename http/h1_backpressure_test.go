@@ -32,7 +32,7 @@ func serveEngineStoppable(t *testing.T, config Config, handler HandlerFunc) (eng
 	t.Helper()
 	setReuse(&config, false)
 	engineConfig := fib.DefaultConfig()
-	engineConfig.IOPollers = false
+	engineConfig.SplitEventLoops = false
 	server, err := fib.New(engineConfig, fib.Binding{Addr: "127.0.0.1:0", Handler: NewHandlerWithConfig(config, handler)})
 	if err != nil {
 		t.Fatal(err)

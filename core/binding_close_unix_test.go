@@ -19,7 +19,7 @@ import (
 func TestShutdownBindingDuringClose(t *testing.T) {
 	config := DefaultConfig()
 	config.Name = "shutdown-binding-close"
-	config.IOPollers, config.IOPollerCount = true, 1
+	config.SplitEventLoops, config.EventLoopCount = true, 1
 	server, err := New(config, Binding{Addr: "127.0.0.1:0", Handler: HandlerFuncs{}})
 	if err != nil {
 		t.Fatal(err)

@@ -52,7 +52,7 @@ Behavior users need to be aware of.
   datagrams drop to 1200 bytes until the new path is validated, after which
   path MTU discovery searches it afresh. Requests
   after the move report the new address in `Request.RemoteAddr`.
-- Under `Config.IOPollers` with `ReusePort` on Linux, the new address may
+- Under `Config.SplitEventLoops` with `ReusePort` on Linux, the new address may
   fall to another poller's socket; the connection follows it there, since a
   QUIC connection takes datagrams from any goroutine.
 - Once the handshake is confirmed, each side issues Connection IDs beyond the

@@ -544,8 +544,8 @@ work, and don't share a heap when a process of its own is cheaper.
 - **prefork** (Linux) runs the same program in several children, each with its own heap and
   collector, sharing the listening port through `SO_REUSEPORT`. Initialization the children need
   goes in `serve`; code before `Run` runs in the master and every child.
-- **IOPollers** split the engine across event loops; more pollers compete with workers for Ps and
-  are usually slower, so touch `IOPollerCount` and `EngineLoop` only with a profile.
+- **SplitEventLoops** splits the engine across event loops; more pollers compete with workers for Ps and
+  are usually slower, so touch `EventLoopCount` and `EngineLoop` only with a profile.
 - **GOMAXPROCS** stays at its default. Raising it is slower and uses more memory.
 - **bufferpool** is fib's own buffer pool; `Get`/`Put` allocate nothing, a reserve survives GC
   (`SetRetainedBytes`), and your buffers can flow through the same pool as fib's.
@@ -571,7 +571,7 @@ loop), and a prefork child shares nothing but the port with its siblings, so in-
 once per child and a resource that exists once per machine is divided by `prefork.Children()`.
 
 See [§16](../hacks.md#16-pools-your-own-separate-ones-and-avoiding-deadlock),
-[§17](../hacks.md#17-process-level-tricks-prefork-iopollers-gomaxprocs) and
+[§17](../hacks.md#17-process-level-tricks-prefork-spliteventloops-gomaxprocs) and
 [§18](../hacks.md#18-bufferpool-your-buffers-can-use-the-same-pool).
 
 ## 15. The cheat sheet
@@ -616,7 +616,7 @@ See [§20](../hacks.md#20-anti-patterns).
   [03-handlers.md](03-handlers.md) is still the right shape for most code.
 - **The tricks do not compose blindly.** Borrowed memory plus an async branch, or a `Cork` held
   across goroutines, are how the same two APIs that make fib fast corrupt data and deadlock.
-- **The backend differs by platform.** IOPollers need epoll/kqueue (Windows keeps one loop),
+- **The backend differs by platform.** SplitEventLoops needs epoll/kqueue (Windows keeps one loop),
   `SendFile` uses `sendfile(2)` on Linux, macOS, FreeBSD and DragonFly and `TransmitFile` on Windows
   but reads in chunks on NetBSD/OpenBSD, `SendBatch` is one call only on Linux and macOS, and
   `SpliceTo` is Linux-only. Verify on the system you deploy to.

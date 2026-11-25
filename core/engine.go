@@ -78,7 +78,7 @@ const (
 	commandDialTimeout
 	commandUDPSweep
 	// commandAccept hands a poller a connection the engine's own loop
-	// accepted; see Config.IOPollers.
+	// accepted; see Config.SplitEventLoops.
 	commandAccept
 	// commandDetach releases the descriptor of a connection whose last
 	// round has run its OnClose; see closeConnection.
@@ -102,7 +102,7 @@ type commandBatch struct{ items []command }
 // pool. The loop itself is platform code: epoll on Linux, kqueue on macOS and
 // the BSDs, and an I/O completion port on Windows, each embedded here as enginePlatform.
 //
-// With Config.IOPollers, the engine also owns the pollers its connections are
+// With Config.SplitEventLoops, the engine also owns the pollers its connections are
 // served on. Each poller is an Engine of its own with no listeners, whose
 // loop, command queue and descriptor table serve only the connections handed
 // to it, while the settings, the handler, the task pool and the server-wide
@@ -114,7 +114,7 @@ type Engine struct {
 	// engine the application created.
 	parent *Engine
 	// pollers are the loops the engine hands its connections to; see
-	// Config.IOPollers. Empty when the engine serves them itself.
+	// Config.SplitEventLoops. Empty when the engine serves them itself.
 	pollers []*Engine
 	// noLoop says the engine has no event loop of its own, and its pollers
 	// listen, dial and serve everything; see Config.EngineLoop.
@@ -371,7 +371,7 @@ func newEngine(config Config, bindings []Binding) (*Engine, error) {
 	return e, nil
 }
 
-// openPollers creates the loops Config.IOPollers asks for. A poller is
+// openPollers creates the loops Config.SplitEventLoops asks for. A poller is
 // created as an engine without listeners and shares everything else with
 // this one.
 func (e *Engine) openPollers(config Config) error {
@@ -1366,7 +1366,7 @@ type Config struct {
 	// TaskPool, when set, runs the engine's connections instead of a pool the
 	// engine builds from the fields above. See SetTaskPool.
 	TaskPool TaskPool
-	// IOPollers splits the engine across IOPollerCount event loops, its
+	// SplitEventLoops splits the engine across EventLoopCount event loops, its
 	// pollers, each of which waits on the connections it is given for the
 	// rest of their lives. Which loops listen is EngineLoop's to say: by
 	// default the pollers accept connections themselves and the engine has
@@ -1393,8 +1393,8 @@ type Config struct {
 	//
 	// Only the epoll and kqueue backends have pollers; on Windows the engine
 	// keeps its single loop, as if this were unset.
-	IOPollers bool
-	// IOPollerCount is how many loops IOPollers creates. Zero or less means
+	SplitEventLoops bool
+	// EventLoopCount is how many loops SplitEventLoops creates. Zero or less means
 	// one on up to four CPUs, two on up to sixteen, and the CPUs divided by
 	// eight, rounded down, on more: 1 on 4, 2 on 8 and 16, 2 on 17 to 23, 3
 	// on 24, 4 on 32, 8 on 64. The CPUs are runtime.NumCPU, or GOMAXPROCS
@@ -1411,8 +1411,8 @@ type Config struct {
 	// More loops pay off where the loops' own work, accepting and registering
 	// connections and waking for them, is what runs short, as it may with
 	// ReusePort and many connections arriving at once.
-	IOPollerCount int
-	// EngineLoop gives an engine with IOPollers a loop of its own beside
+	EventLoopCount int
+	// EngineLoop gives an engine with SplitEventLoops a loop of its own beside
 	// its pollers, which every listener of the engine waits on: it accepts
 	// each TCP and Unix connection and hands it to the poller its descriptor
 	// picks, and reads the datagrams of every UDP address itself. One loop
@@ -1433,12 +1433,12 @@ type Config struct {
 	// ReusePort on Linux, and otherwise by the first poller alone. Dials go
 	// to the pollers either way.
 	//
-	// Without IOPollers the engine always has its loop, which listens and
+	// Without SplitEventLoops the engine always has its loop, which listens and
 	// serves alike.
 	EngineLoop bool
 	// AcceptPlacement picks the poller that serves a connection a poller
 	// accepts on a TCP socket of its own, which it has only where all of
-	// these hold: the engine has IOPollers and no EngineLoop, so the pollers
+	// these hold: the engine has SplitEventLoops and no EngineLoop, so the pollers
 	// listen; the address is TCP on Linux, where each poller binds a socket
 	// of its own beside the others with SO_REUSEPORT. AcceptFDModulo, the
 	// default, hands it to the poller its descriptor picks, as a connection
@@ -1459,7 +1459,7 @@ type Config struct {
 	// user, may listen on the same address and share its connections, or
 	// its datagrams. DefaultConfig sets it.
 	//
-	// Under IOPollers on Linux, without EngineLoop, the pollers accept TCP
+	// Under SplitEventLoops on Linux, without EngineLoop, the pollers accept TCP
 	// connections themselves whether or not it is set: each poller listens
 	// on a socket of its own, bound to the engine's address with
 	// SO_REUSEPORT, and accepts the
@@ -1503,7 +1503,7 @@ type Config struct {
 	// large, changing set of connections evenly, but a few connections over a
 	// few sockets unevenly, which leaves some pollers idle; the selector keeps
 	// the count even whatever the addresses. Within one process it needs
-	// IOPollers without EngineLoop (so each poller listens) and more than one
+	// SplitEventLoops without EngineLoop (so each poller listens) and more than one
 	// poller. In a child of package prefork run with its BalanceReusePort,
 	// the group is every child's sockets on the address, so a child whose
 	// single poller, or whose own loop, listens takes part with its one
@@ -1552,7 +1552,7 @@ func DefaultConfigFor(readBuffer int) Config {
 		MaxEvents: sizing.MaxEvents, ReadBufferSize: readBuffer,
 		WriteBufferHighWatermark: backpressure.WriteWatermark, MaxPendingBytes: defaultMaxPendingBytes,
 		UseWritev: true, CoalesceWrites: true, SocketSyscalls: true, TaskPoolMode: taskpool.ModeAdaptive, SharedTaskPool: true,
-		IOPollers: true, ReusePort: true, LogSettings: true}
+		SplitEventLoops: true, ReusePort: true, LogSettings: true}
 }
 
 // UDP rides on the same connections, handlers and workers as TCP. What is

@@ -30,7 +30,7 @@ if err := engine.Run(); err != nil {
 - A zero `fib.Config{}` is *not* `DefaultConfig`: booleans stay false and the pool and logging
   settings are not filled in. Build from `DefaultConfig` and change what you need.
 - A field whose zero is a sentinel means "choose the default": `WriteBufferHighWatermark` (negative
-  disables it), `ReadBufferSize`, `MaxEvents`, `PollBatchSize`, `Backlog`, `IOPollerCount`,
+  disables it), `ReadBufferSize`, `MaxEvents`, `PollBatchSize`, `Backlog`, `EventLoopCount`,
   `UDPIdleTimeout` (negative keeps UDP peers forever), `Network` and `Name`. For the others, zero
   has its literal meaning: `MaxPendingBytes`, `MaxWriteQueueBytes` and `MaxConns` are off, and the
   rest of the booleans are as set.
@@ -55,9 +55,9 @@ marked *dynamic* and explained in [How the machine sizes the defaults](#how-the-
 | `Network` | `"tcp"` | Network for a `Binding` whose own `Network` is empty: `tcp`, `tcp4`, `tcp6`, `unix`, `udp`, `udp4` or `udp6`. |
 | `Backlog` | *dynamic* | Listen queue depth for TCP and Unix listeners: the kernel's `somaxconn` where it can be read, otherwise `SOMAXCONN`. An overflowing accept queue silently drops clients, so the kernel's value is the useful default. |
 | `MaxConns` | `0` (off) | Most connections the engine's bindings may have accepted and not yet closed, all bindings together. One past it is closed before a handler sees it and counted in `Stats.ConnsRefused`. Dialed connections and UDP peers are not counted. |
-| `ReusePort` | `true` | Bind listeners with `SO_REUSEPORT`, so another socket of the same user may share the address. Under `IOPollers` on Linux, pollers accept on sockets of their own whether or not this is set. A prefork child always sets it. |
-| `BalanceReusePort` | `false` | On Linux with `IOPollers` and without `EngineLoop`, attach an eBPF selector that hands reuseport connections to the pollers round-robin instead of by the kernel's address hash. Needs more than one poller within one process; in a prefork child started with `prefork.Config.BalanceReusePort` the group spans the children, so one poller, or the engine's own loop, is enough. Needs `CAP_BPF` (`CAP_SYS_ADMIN` before Linux 5.8); without it, the kernel's hash is kept with a log line. |
-| `AcceptPlacement` | `AcceptFDModulo` | Which poller serves a connection a poller accepted on a TCP socket of its own: `AcceptFDModulo` by descriptor (the default, and what every other connection does), or `AcceptKernelHash` by the kernel's address hash, which is the socket's own poller. Applies only on Linux with `IOPollers` without `EngineLoop`. |
+| `ReusePort` | `true` | Bind listeners with `SO_REUSEPORT`, so another socket of the same user may share the address. Under `SplitEventLoops` on Linux, pollers accept on sockets of their own whether or not this is set. A prefork child always sets it. |
+| `BalanceReusePort` | `false` | On Linux with `SplitEventLoops` and without `EngineLoop`, attach an eBPF selector that hands reuseport connections to the pollers round-robin instead of by the kernel's address hash. Needs more than one poller within one process; in a prefork child started with `prefork.Config.BalanceReusePort` the group spans the children, so one poller, or the engine's own loop, is enough. Needs `CAP_BPF` (`CAP_SYS_ADMIN` before Linux 5.8); without it, the kernel's hash is kept with a log line. |
+| `AcceptPlacement` | `AcceptFDModulo` | Which poller serves a connection a poller accepted on a TCP socket of its own: `AcceptFDModulo` by descriptor (the default, and what every other connection does), or `AcceptKernelHash` by the kernel's address hash, which is the socket's own poller. Applies only on Linux with `SplitEventLoops` without `EngineLoop`. |
 | `UDPIdleTimeout` | `0` → `60s` | Close a UDP peer's connection after it has neither sent nor received a datagram this long. `OnClose` receives `ErrUDPIdleTimeout`. Negative keeps peers until they are closed. Dialed UDP connections never time out. |
 
 ### Buffers and backpressure
@@ -93,9 +93,9 @@ marked *dynamic* and explained in [How the machine sizes the defaults](#how-the-
 
 | Field | Default | Description |
 | --- | --- | --- |
-| `IOPollers` | `true` | Split the engine across event loops that wait for readiness, instead of one loop. Only epoll and kqueue have pollers; Windows keeps one loop. Without it the engine always has its own loop. |
-| `IOPollerCount` | `0` → *dynamic* | Loops to create: 1 on up to 4 CPUs, 2 on up to 16, and CPUs/8 above that (2 on 17–23, 3 on 24, 4 on 32, 8 on 64). The CPUs are `min(NumCPU, GOMAXPROCS)`, so a cgroup's quota counts. |
-| `EngineLoop` | `false` | Give an engine with `IOPollers` a loop of its own to accept every TCP and Unix connection and read the UDP sockets. By default the pollers listen as well as serve, which lets them accept in parallel. |
+| `SplitEventLoops` | `true` | Split the engine across event loops that wait for readiness, instead of one loop. Only epoll and kqueue have pollers; Windows keeps one loop. Without it the engine always has its own loop. |
+| `EventLoopCount` | `0` → *dynamic* | Loops to create: 1 on up to 4 CPUs, 2 on up to 16, and CPUs/8 above that (2 on 17–23, 3 on 24, 4 on 32, 8 on 64). The CPUs are `min(NumCPU, GOMAXPROCS)`, so a cgroup's quota counts. |
+| `EngineLoop` | `false` | Give an engine with `SplitEventLoops` a loop of its own to accept every TCP and Unix connection and read the UDP sockets. By default the pollers listen as well as serve, which lets them accept in parallel. |
 
 ## `Binding` reference
 

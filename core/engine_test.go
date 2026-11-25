@@ -87,8 +87,8 @@ func TestConcurrentBackpressuredEcho(t *testing.T) {
 func TestStopRefusesNewConnections(t *testing.T) {
 	for _, pollers := range []int{0, 2} {
 		config := DefaultConfig()
-		config.IOPollers = pollers > 0
-		config.IOPollerCount = pollers
+		config.SplitEventLoops = pollers > 0
+		config.EventLoopCount = pollers
 		engine, err := New(config, Binding{Addr: "127.0.0.1:0", Handler: HandlerFuncs{Data: func(c *Connection, b []byte) { _, _ = c.Write(b) }}})
 		if err != nil {
 			t.Fatal(err)
@@ -1598,7 +1598,7 @@ func TestRemoteAddrPort(t *testing.T) {
 			t.Run(fmt.Sprintf("%s/pollers=%v", tc.name, pollers), func(t *testing.T) {
 				got := make(chan [2]string, 1)
 				config := DefaultConfig()
-				config.IOPollers, config.IOPollerCount = pollers, 2
+				config.SplitEventLoops, config.EventLoopCount = pollers, 2
 				server, err := New(config, Binding{Addr: tc.listen, Handler: HandlerFuncs{Data: func(c *Connection, _ []byte) {
 					remote := ""
 					if addr := c.RemoteAddr(); addr != nil {

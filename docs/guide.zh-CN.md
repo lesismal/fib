@@ -3,12 +3,12 @@
 这是 [`c/`](../c) 目录下 C11 实现的 Go 移植版，保留相同的核心架构：
 
 - 单个 edge-triggered event loop（Linux 上是 epoll，macOS 上是 kqueue，Windows 上是 IOCP）
-  独占所有事件注册和 fd 关闭操作。Linux 和 macOS 上 CPU 多于 4 个时默认开启 `IOPollers`，连接
-  分到多个 event loop 上（见下）；4 个及以下默认关闭，只有一个 event loop。
+  独占所有事件注册和 fd 关闭操作。Linux 和 macOS 上默认开启 `SplitEventLoops`，连接分到
+  `EventLoopCount` 个 event loop 上（见下）；4 个 CPU 及以下默认只有 1 个。
 - connection 是本地 `taskpool.TaskPool` 的任务单位。TaskPool 使用常驻、有界
   worker，避免短事件触发大量 goroutine 创建和栈扩容；connection 不与某个
   worker 固定绑定。事件循环只等事件、把变为可执行的连接交给 worker，从不自己执行
-  连接的一轮（读、`OnData`、`OnClose`），开不开 `IOPollers` 都一样。唯一的例外是多个 peer
+  连接的一轮（读、`OnData`、`OnClose`），开不开 `SplitEventLoops` 都一样。唯一的例外是多个 peer
   共用的 UDP socket：由事件循环读取、按对端地址分给各连接的队列，`OnData` 仍在 worker 上
   执行。实测把这个读取也交给 worker 更慢：3 个 CPU、50 个端口、1000 个连接的 HTTP/3，
   multiplex 27.0 万请求/s 对 loop 读取的 28.9 万，开 ReusePort 时 echo 34.9 万对 37.2 万，
@@ -768,7 +768,7 @@ func(c *fibhttp.Context) {
   （`BodyComplete()` 为 true 时就是整个 body）在 handler 返回之后、在运行 handler 的
   goroutine 上交给回调。框架从不为回调单独启动 goroutine：之后到达的数据由事件循环读到时
   触发交付（连接在 worker 上读时就在那个 worker 上；在事件循环上读时——HTTP/2/3，以及开启
-  IOPollers 时的 HTTP/1——交给 Engine 的 handler 协程池，见 `Engine.HandlerPool`）；handler
+  SplitEventLoops 时的 HTTP/1——交给 Engine 的 handler 协程池，见 `Engine.HandlerPool`）；handler
   返回后才调用 `OnBody` 时已经到达的部分，同样交给 handler 协程池。
 - **自动 Retain / Release**：`OnBody` 自动占一个引用，最后一次回调（`fin` 或 `err`）返回
   之后框架自动释放，回调里写的响应随即回写，handler 不用自己 `Retain`/`Release`。要在别处
@@ -916,7 +916,7 @@ handler := fibhttp.NewHandlerWithConfig(config, fibhttp.HandlerFunc(
 ```
 
 - **读取不阻塞，也不额外开 goroutine**：handler 和别的 handler 一样跑在 worker 上（不开
-  IOPollers 时是读这条连接的 worker，开启时是 handler 协程池的 worker），去等对端要么是
+  SplitEventLoops 时是读这条连接的 worker，开启时是 handler 协程池的 worker），去等对端要么是
   在等自己，要么是白占一个 worker。`Read` 的返回值就是状态机：`n > 0` 是已经到的字节，
   `io.EOF` 是整个 body 读完了，`ErrWouldBlock`（就是 `fib.ErrWouldBlock`）是现在一个
   字节都没有、后续还会来，`ErrBodyAbandoned` 是 body 已被 `Close`/`OnBody` 接管或
@@ -1393,7 +1393,7 @@ server, err := fib.New(fib.DefaultConfig(),
   HTTP/3 的 push 需要客户端先发 MAX_PUSH_ID，浏览器都不这样做。
 - `Response.Close` 在 HTTP/3 上优雅关闭：发送 GOAWAY，不再接受新请求，已在处理的请求
   的响应全部送达后再关闭连接。
-- handler 协程池：与 HTTP/2 一样，请求收齐后交给 Engine 的 handler 协程池（开启 IOPollers
+- handler 协程池：与 HTTP/2 一样，请求收齐后交给 Engine 的 handler 协程池（开启 SplitEventLoops
   时是 Engine 的 `<Name>-workers`，否则是与 HTTP/2 server 共用的 `<Name>-streams`），
   同一连接上的请求并发处理；用 `Config.StreamPool` 配置，
   `StreamPool.MaxConcurrentHandlers` 限制单个连接的并发处理数，其中最后一个在读取该
@@ -1942,7 +1942,7 @@ fib 不调整 GOMAXPROCS，保持 Go 运行时的默认值（等于可用的核�
 
 曾经的实测是把 GOMAXPROCS 设成核数的 2 倍更快（echo 330k/s 到 415k/s），那是早期架构下的
 结果：工作协程在系统调用里占着 P，事件循环也在 `epoll_wait` 里占着 P。现在的事件循环只等事件、
-开启 IOPollers 时停在运行时的网络轮询器里等待，这个收益已经不存在，调高反而更慢。1 万连接的
+开启 SplitEventLoops 时停在运行时的网络轮询器里等待，这个收益已经不存在，调高反而更慢。1 万连接的
 HTTP/2（1 个 poller），相对 GOMAXPROCS 等于核数：
 
 | 服务端核数 | 核数 + 2 | 2 倍核数 |
@@ -1952,7 +1952,7 @@ HTTP/2（1 个 poller），相对 GOMAXPROCS 等于核数：
 | 6 核 | multiplex −13% | multiplex −11% |
 
 echo 和 p99 在等于核数时最好或持平，内存随 GOMAXPROCS 升高而增加（2 倍核数时多 25–40%）；
-不开 IOPollers 时，为阻塞在 `epoll_wait` 里的那一个循环多给一个 P 也慢 5–6%。WebSocket 在这些
+不开 SplitEventLoops 时，为阻塞在 `epoll_wait` 里的那一个循环多给一个 P 也慢 5–6%。WebSocket 在这些
 配置之间的差别在噪声范围内。
 
 需要注意 `runtime.NumCPU()` 取的是本进程的 CPU 亲和性掩码，被 taskset 或 cpuset 限制时它已经
@@ -2023,9 +2023,9 @@ async 161 万到 194 万，latency-1m 的 p99 从 1.6ms 降到 124µs、同时�
 - UDP（HTTP/3）的 socket 同样共享：同一对端的数据报按四元组哈希总落在同一个子进程上。对端地址
   变化（NAT 重绑定、连接迁移）后可能落到另一个子进程，那个子进程里没有这条 QUIC 连接。
 
-## IOPollers
+## SplitEventLoops
 
-`Config.IOPollers` 把一个 Engine 拆到多个事件循环上（仅 Linux 的 epoll 和 macOS 的 kqueue；
+`Config.SplitEventLoops` 把一个 Engine 拆到多个事件循环上（仅 Linux 的 epoll 和 macOS 的 kqueue；
 Windows 上忽略这个配置，保持单个循环）。`DefaultConfig()` 默认开启，
 不论 CPU 数多少（CPU 数取 `runtime.NumCPU()`，GOMAXPROCS 更小时取 GOMAXPROCS，例如 prefork
 的子进程、或运行时按容器 CPU 配额调低了它）：4 个 CPU 及以下只建 1 个 poller，3 个 CPU 的 HTTP/1 echo
@@ -2033,9 +2033,10 @@ Windows 上忽略这个配置，保持单个循环）。`DefaultConfig()` 默认
 时 listener 和连接都在同一个 event loop 上。开不开都一样，事件循环只等事件、把变为可执行的连接交给
 Engine 的 worker 池（`<Name>-workers`），每条连接的每一轮都在 worker 上执行：
 
-- Engine 自己的循环只负责 accept 和它的 UDP socket；每条 accept 到的连接按 `fd % pollerCount`
-  交给其中一个 poller，此后由那个 poller 负责它的事件注册、读写和关闭。poller 数量由
-  `Config.IOPollerCount` 指定，不大于 0（默认）时 4 个 CPU 以内 1 个，16 个以内 2 个，更多时为 CPU 数/8
+- 默认没有 Engine 自己的循环，由 poller 自己监听、accept 和读 UDP（见下面几条）；设置
+  `Config.EngineLoop` 时，Engine 自己的循环负责 accept 和 UDP socket。accept 到的连接按 `fd % pollerCount`
+  交给其中一个 poller（`AcceptPlacement` 的默认），此后由那个 poller 负责它的事件注册、读写和关闭。poller 数量由
+  `Config.EventLoopCount` 指定，不大于 0（默认）时 4 个 CPU 以内 1 个，16 个以内 2 个，更多时为 CPU 数/8
   （CPU 数同上，向下取整）：8 核和 16 核 2 个，24 核 3 个，32 核 4 个，64 核 8 个。下面是早期默认
   （CPU/4、CPU/2）时的测量。8、16、32 个 CPU 上 poller 数取 CPU/4、CPU/2 还是每 CPU 一个，HTTP/1 和 WebSocket
   （长连接和每 10 个请求重连两种）差别都在 3% 以内；64 个 CPU 上 CPU/4 个 poller 在连接频繁建立、
@@ -2044,7 +2045,7 @@ Engine 的 worker 池（`<Name>-workers`），每条连接的每一轮都在 wor
   只花约 0.2µs，worker 花约 4.5µs（1 万连接的 WebSocket、HTTP/2 echo）。
   poller 只负责等事件、交给 worker，一个就能应付很多连接，多出来的 poller 会和 worker 抢同样
   的 P：每一轮结束后 poller 都要让出 P 给刚唤醒的 worker，再排在它们后面等 P，于是每轮收集到的
-  连接更少、请求被读到得更晚。实测 3 个 CPU、1 万连接的 HTTP/1 echo：不开 IOPollers 583k
+  连接更少、请求被读到得更晚。实测 3 个 CPU、1 万连接的 HTTP/1 echo：不开 SplitEventLoops 583k
   请求/s，1 个 poller 584k，3 个 poller 569k，p99 从 25ms 升到 37ms；4 个 CPU 的 HTTP/2 echo，
   1 个 poller 411k、4 个 399k，p99 从 55ms 升到 64ms。poller 自己的工作（accept、
   注册连接、被唤醒）成为瓶颈时，多开 poller 才划算。
@@ -2056,11 +2057,11 @@ Engine 的 worker 池（`<Name>-workers`），每条连接的每一轮都在 wor
   accept 后是 165 万。代价是均衡：连接留在哈希选中的 poller 上，不管它多忙。不设置 `ReusePort`
   时，Engine 先用一个不带 `SO_REUSEPORT` 的 socket 试 bind 这个地址，地址已被占用就照常返回
   `EADDRINUSE`，之后也只有自己设置了 `SO_REUSEPORT` 的 socket 能加入；设置 `ReusePort` 则是明确
-  允许同一用户的其他进程监听同一地址并分走连接（例如平滑重启）。Unix socket 和其他平台仍由
-  Engine 自己的循环 accept；macOS 的 `SO_REUSEPORT` 不在多个 socket 之间分摊 TCP 连接。
+  允许同一用户的其他进程监听同一地址并分走连接（例如平滑重启）。Unix socket 和其他平台（macOS
+  的 `SO_REUSEPORT` 不在多个 socket 之间分摊 TCP 连接）上，所有 poller 等同一个监听 socket，accept
+  到的连接按 fd 取模分配；设置 `EngineLoop` 时改由 Engine 自己的循环 accept。
 - `Dial` / `DialWithHandler` / `DialWith` 发起的连接（TCP、UDP、Unix socket）也同样按 fd 取模分到 poller 上。
-- UDP server 默认只有一个 socket，各个 peer 共用它，所以留在 Engine 自己的循环上。Linux 上设置
-  `ReusePort` 时，UDP 地址也改由 poller 读：每个 poller 在这个地址上用 `SO_REUSEPORT` bind 一个
+- Linux 上开启 `ReusePort`（默认）时，UDP 地址由各 poller 读：每个 poller 在这个地址上用 `SO_REUSEPORT` bind 一个
   自己的 socket（第一个 poller 直接接管 Engine bind 的那个，Engine 自己不留 socket，因为已 bind
   的 UDP socket 就在 reuseport 组里，会分到一份数据报），只注册在自己的循环上。内核按四元组哈希
   把每个数据报交给其中一个 socket，只唤醒读它的那个 poller，没有惊群；同一对端的数据报总落在同一个
@@ -2068,6 +2069,8 @@ Engine 的 worker 池（`<Name>-workers`），每条连接的每一轮都在 wor
   限制：组里的 socket 一变（例如同一用户的其他进程 bind 同一地址）哈希就变，部分对端会换到别的
   socket；对端地址变了（NAT 重绑定）会被当成新的对端。HTTP/3 按 Connection ID 把新地址的包
   找回原来的 QUIC 连接，不管新地址落在哪个 poller 上，连接都会跟过去。
+  不设 `ReusePort` 或在其他平台上，UDP 地址只有一个 socket，各 peer 共用，由第一个 poller 读；
+  设置 `EngineLoop` 时由 Engine 自己的循环读。
 - http 子 package：HTTP/1 连接的每一轮（读、解析、handler、写）都在同一个 worker 上完成，写合并
   成一次；HTTP/2（preface、ALPN `h2`、h2c upgrade）和 HTTP/3 在 worker 上读和解析，请求的
   handler 交给 `<Name>-streams`（`Engine.HandlerPool()`），不与 Engine 的协程池共用。
@@ -2078,13 +2081,13 @@ Engine 的 worker 池（`<Name>-workers`），每条连接的每一轮都在 wor
   `Connection.Engine()` 返回的仍是用户创建的那个 Engine。
 
 ```go
-config := fib.DefaultConfig() // CPU 多于 4 个时默认已开启 IOPollers
-config.IOPollers = true       // 4 核及以下也要 poller 时显式打开
-config.IOPollerCount = 0      // 32 个 CPU 以内 max(1, CPU 数/4)，更多时 CPU 数/2
-config.ReusePort = true       // 允许其他进程共享地址；UDP 也改由各 poller 读
+config := fib.DefaultConfig() // 默认已开启 SplitEventLoops 和 ReusePort
+config.EventLoopCount = 0     // 4 个 CPU 以内 1 个，16 个以内 2 个，更多时 CPU 数/8
+config.EngineLoop = false     // 默认：poller 自己监听和 accept
+config.ReusePort = true       // 允许其他进程共享地址；Linux 上 UDP 由各 poller 读
 
 single := fib.DefaultConfig()
-single.IOPollers = false // 单个 event loop，同样把每一轮交给 worker 池
+single.SplitEventLoops = false // 单个 event loop，同样把每一轮交给 worker 池
 ```
 
 ## OnClose 的顺序

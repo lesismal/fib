@@ -167,7 +167,7 @@ func TestMultipathTCPClaimedPort(t *testing.T) {
 	requireMultipathTCP(t)
 	config := DefaultConfig()
 	config.Name = "mptcp-claim"
-	config.IOPollers, config.IOPollerCount = true, 3
+	config.SplitEventLoops, config.EventLoopCount = true, 3
 	// ReusePort off is what forces the claim below: with it on the sockets
 	// bind the port themselves.
 	config.ReusePort = false

@@ -137,7 +137,7 @@ body{margin:0}
 
 <section id="parts">
   <h2>组成</h2>
-  <p class="lede">一个 Engine 拥有监听器、事件循环、命令队列和 worker 池。开启 <code>IOPollers</code>（CPU 多于 4 个时默认开启）时，它还拥有若干 poller：每个 poller 是一个没有监听器的 Engine，有自己的循环、命令队列和 fd 表，配置、handler、worker 池和全局预算与父 Engine 共用。</p>
+  <p class="lede">一个 Engine 拥有监听器、事件循环、命令队列和 worker 池。开启 <code>SplitEventLoops</code>（<code>DefaultConfig</code> 默认开启）时，它还拥有若干 poller：每个 poller 是一个没有监听器的 Engine，有自己的循环、命令队列和 fd 表，配置、handler、worker 池和全局预算与父 Engine 共用。图中的根循环是 <code>EngineLoop</code> 加上的；默认没有根循环，由 poller 自己监听、accept 和读 UDP socket。</p>
   <div class="diagram"><pre class="mermaid">
 flowchart LR
   subgraph ENG["Engine（fib.New）"]
@@ -180,8 +180,8 @@ flowchart LR
   <div class="tbl"><table>
     <thead><tr><th>部件</th><th>数量与规模</th><th>职责</th></tr></thead>
     <tbody>
-      <tr><td>根循环</td><td>每个 Engine 1 个，即 <code>Run</code> 所在 goroutine</td><td>accept；读共享的 UDP socket 并按对端分拣；执行自己的命令队列</td></tr>
-      <tr><td>poller</td><td>NumCPU÷4 向下取整，至少 1；<code>IOPollerCount</code> 可改；Windows 忽略</td><td>接手的连接的事件等待、读暂停与恢复、fd 注册与关闭、OnOpen</td></tr>
+      <tr><td>根循环</td><td>设置 <code>EngineLoop</code> 或关闭 <code>SplitEventLoops</code> 时 1 个；默认没有</td><td>accept；读共享的 UDP socket 并按对端分拣；执行自己的命令队列</td></tr>
+      <tr><td>poller</td><td>4 CPU 及以下 1 个，16 个以内 2 个，更多时 CPU÷8（CPU 数取 min(NumCPU, GOMAXPROCS)）；<code>EventLoopCount</code> 可改；Windows 忽略</td><td>接手的连接的事件等待、读暂停与恢复、fd 注册与关闭、OnOpen；没有根循环时还负责监听、accept 和读 UDP</td></tr>
       <tr><td>‹Name›-workers</td><td>Adaptive；上限 max(GOMAXPROCS×1000, NumCPU×20)；默认同名 Engine 共用</td><td>每条连接的每一轮：读、OnData 链、写合并、OnClose</td></tr>
       <tr><td>‹Name›-streams</td><td>Adaptive；上限为同名最宽引擎池的 2 倍，下限 0</td><td>HTTP/2、HTTP/3 的请求 handler；HTTP/1 的异步交接</td></tr>
       <tr><td>fib-tls-handshake</td><td>Adaptive；上限 65536，进程内 1 个</td><td>阻塞的 TLS 握手</td></tr>
@@ -262,7 +262,7 @@ flowchart LR
   <ul class="notes">
     <li><b>事件合并</b>：就绪对连接来说是电平信息，重复通知按位或在一起，热连接不会攒出无界的事件队列。只有 EPOLLOUT 且没有排队输出的通知直接丢弃，避免每条新连接被多调度一次。</li>
     <li><b>让出 P</b>：提交后循环先 <code>Gosched</code>，刚唤醒的 worker 立刻用上这个 P。4 个 P、1 万连接的 HTTP/2 echo 上这一步提升 10% 到 25%。</li>
-    <li><b>循环不占 P</b>：开启 IOPollers 时，循环停在 Go 运行时的网络轮询器里等待，而不是阻塞在 <code>epoll_wait</code> 系统调用里。</li>
+    <li><b>循环不占 P</b>：开启 SplitEventLoops 时，循环停在 Go 运行时的网络轮询器里等待，而不是阻塞在 <code>epoll_wait</code> 系统调用里。</li>
     <li><b>读缓冲按轮借用</b>：16KB 读缓冲每轮从 bufferpool 取、轮末归还，空闲连接不占读缓冲。短读说明 socket 已空，不再多读一次去拿 EAGAIN。</li>
     <li><b>UDP 例外</b>：共享的 UDP socket 由循环自己读（批量收包），按对端地址把数据报放进各 peer 连接的队列，worker 的一轮只负责把队列交给 handler。</li>
   </ul>
@@ -368,8 +368,8 @@ flowchart LR
     <thead><tr><th>层次</th><th>做法</th><th>代价与取舍</th></tr></thead>
     <tbody>
       <tr><td>worker</td><td>连接每一轮由空闲 worker 领取，没有亲和性；Adaptive 池按 P 分片入队，批量提交</td><td>阻塞的 handler 只拖住自己的连接，池会增长来吸收</td></tr>
-      <tr><td>poller</td><td>accept 到的连接按 <code>fd % pollerCount</code> 分配；poller 只等事件，每请求约 0.2µs，worker 约 4.5µs</td><td>poller 多了会和 worker 抢 P：每 4 个 CPU 一个是默认值</td></tr>
-      <tr><td>accept</td><td>默认由根循环 accept 再分发；Linux 上 <code>ReusePort</code> 让每个 poller 自己 listen、自己 accept</td><td>ReusePort 解除单循环的 accept 上限，但连接留在内核哈希选中的 poller 上，不管它多忙</td></tr>
+      <tr><td>poller</td><td>accept 到的连接按 <code>fd % pollerCount</code> 分配；poller 只等事件，每请求约 0.2µs，worker 约 4.5µs</td><td>poller 多了会和 worker 抢 P：默认 4 CPU 及以下 1 个、16 个以内 2 个、更多时每 8 个 CPU 一个</td></tr>
+      <tr><td>accept</td><td>默认每个 poller 自己 listen、自己 accept：Linux 上各用一个 <code>SO_REUSEPORT</code> socket，其他平台共用一个 socket；设置 <code>EngineLoop</code> 时改由根循环 accept 再分发</td><td>poller 自己 accept 解除单循环的 accept 上限；<code>AcceptPlacement</code> 决定连接按 <code>fd % pollerCount</code> 分配（默认），还是留在内核哈希选中的 poller 上，不管它多忙</td></tr>
       <tr><td>多路复用</td><td>HTTP/2、HTTP/3 的 handler 进流池，一条连接上的请求并发执行</td><td><code>MaxConcurrentHandlers</code> 可限制单连接并发，超限的在读者上执行</td></tr>
     </tbody>
   </table></div>
@@ -393,9 +393,9 @@ flowchart LR
   <div class="tbl"><table>
     <thead><tr><th>平台</th><th>后端</th><th>要点</th></tr></thead>
     <tbody>
-      <tr><td>Linux</td><td>epoll，边沿触发，eventfd 唤醒</td><td>IOPollers、ReusePort 分摊 accept 和 UDP；读写是原始系统调用，<code>SocketSyscalls</code> 时走 recvfrom / sendto / sendmsg；UDP 用 recvmmsg / sendmmsg</td></tr>
-      <tr><td>macOS</td><td>kqueue</td><td>支持 IOPollers；<code>SO_REUSEPORT</code> 不在多个 socket 间分摊 TCP 连接，accept 仍在根循环</td></tr>
-      <tr><td>Windows</td><td>I/O 完成端口</td><td>零字节重叠 WSARecv 充当读边沿，重叠 WSASend 的完成充当写边沿；保持单个循环，忽略 IOPollers</td></tr>
+      <tr><td>Linux</td><td>epoll，边沿触发，eventfd 唤醒</td><td>SplitEventLoops、ReusePort 分摊 accept 和 UDP；读写是原始系统调用，<code>SocketSyscalls</code> 时走 recvfrom / sendto / sendmsg；UDP 用 recvmmsg / sendmmsg</td></tr>
+      <tr><td>macOS</td><td>kqueue</td><td>支持 SplitEventLoops；<code>SO_REUSEPORT</code> 不在多个 socket 间分摊 TCP 连接，所以各 poller 共用一个监听 socket</td></tr>
+      <tr><td>Windows</td><td>I/O 完成端口</td><td>零字节重叠 WSARecv 充当读边沿，重叠 WSASend 的完成充当写边沿；保持单个循环，忽略 SplitEventLoops</td></tr>
       <tr><td>其他</td><td><code>*_other.go</code></td><td>基于标准库的回退实现，每条连接一个 goroutine，API 相同</td></tr>
     </tbody>
   </table></div>

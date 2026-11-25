@@ -35,7 +35,7 @@ type AcceptPlacement = core.AcceptPlacement
 // ReusePort, is the engine's and applies to every binding alike. MultipathTCP
 // is the exception: whether a listener is a Multipath TCP one is a property of
 // the address it listens on, so it stays the binding's, as Network and Handler
-// do. With IOPollers, each binding's connections are spread over the same
+// do. With SplitEventLoops, each binding's connections are spread over the same
 // pollers as every other binding's.
 //
 // Bindings can also be added and removed while the engine runs; see
@@ -99,7 +99,7 @@ type DialOptions = core.DialOptions
 // pool. The loop itself is platform code: epoll on Linux, kqueue on macOS and
 // the BSDs, and an I/O completion port on Windows, each embedded here as enginePlatform.
 //
-// With Config.IOPollers, the engine also owns the pollers its connections are
+// With Config.SplitEventLoops, the engine also owns the pollers its connections are
 // served on. Each poller is an Engine of its own with no listeners, whose
 // loop, command queue and descriptor table serve only the connections handed
 // to it, while the settings, the handler, the task pool and the server-wide

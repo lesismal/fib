@@ -182,8 +182,8 @@ func TestConnectionsThePoolRefusesAreClosed(t *testing.T) {
 func TestUnixListenerHandsConnectionsToPollers(t *testing.T) {
 	config := DefaultConfig()
 	config.Network = "unix"
-	config.IOPollers = true
-	config.IOPollerCount = 2
+	config.SplitEventLoops = true
+	config.EventLoopCount = 2
 	path := unixSocketPath(t)
 	server, err := New(config, Binding{Addr: path, Handler: echoHandler()})
 	if err != nil {

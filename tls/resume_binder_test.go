@@ -69,7 +69,7 @@ func TestNativeServerClientChecksDoNotBlock(t *testing.T) {
 			return nil
 		}}
 	engineConfig := fib.DefaultConfig()
-	engineConfig.IOPollers, engineConfig.WorkerCount, engineConfig.SharedTaskPool = false, 1, false
+	engineConfig.SplitEventLoops, engineConfig.WorkerCount, engineConfig.SharedTaskPool = false, 1, false
 	ours := newStateServer()
 	_, addr := startEchoServer(t, engineConfig, NewServer(serverConfig, ours))
 	// Before the engine stops, so that a test that fails leaves no check

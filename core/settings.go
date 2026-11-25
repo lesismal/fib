@@ -35,9 +35,9 @@ type Settings struct {
 	TaskPoolMode             taskpool.Mode
 	MinWorkerCount           int
 	SharedTaskPool           bool
-	IOPollers                bool
-	IOPollerCount            int
-	Pollers                  int
+	SplitEventLoops          bool
+	EventLoopCount           int
+	EventLoops               int
 	EngineLoop               bool
 	ReusePort                bool
 	BalanceReusePort         bool
@@ -84,9 +84,9 @@ func (e *Engine) Settings() Settings {
 		TaskPoolMode:             c.TaskPoolMode,
 		MinWorkerCount:           c.MinWorkerCount,
 		SharedTaskPool:           c.SharedTaskPool,
-		IOPollers:                c.IOPollers,
-		IOPollerCount:            c.IOPollerCount,
-		Pollers:                  len(e.pollers),
+		SplitEventLoops:          c.SplitEventLoops,
+		EventLoopCount:           c.EventLoopCount,
+		EventLoops:               len(e.pollers),
 		EngineLoop:               c.EngineLoop,
 		ReusePort:                c.ReusePort,
 		BalanceReusePort:         c.BalanceReusePort,
@@ -109,8 +109,8 @@ func (s Settings) String() string {
 		s.ReadBufferSize, s.ReadBufferStartSize, s.WriteBufferHighWatermark, s.WriteBufferHighWatermark/4, s.MaxPendingBytes, s.MaxWriteQueueBytes, s.MaxConns)
 	fmt.Fprintf(&b, "taskPool=%s taskPoolMode=%s minWorkers=%d sharedTaskPool=%t ",
 		s.TaskPool, s.TaskPoolMode, s.MinWorkerCount, s.SharedTaskPool)
-	fmt.Fprintf(&b, "ioPollers=%t ioPollerCount=%d pollers=%d engineLoop=%t reusePort=%t balanceReusePort=%t ",
-		s.IOPollers, s.IOPollerCount, s.Pollers, s.EngineLoop, s.ReusePort, s.BalanceReusePort)
+	fmt.Fprintf(&b, "splitEventLoops=%t eventLoopCount=%d eventLoops=%d engineLoop=%t reusePort=%t balanceReusePort=%t ",
+		s.SplitEventLoops, s.EventLoopCount, s.EventLoops, s.EngineLoop, s.ReusePort, s.BalanceReusePort)
 	fmt.Fprintf(&b, "accept=%s coalesceWrites=%t useWritev=%t socketSyscalls=%t blockingWait=%t udpIdleTimeout=%s logStatus=%t logSettings=%t",
 		s.AcceptPlacement, s.CoalesceWrites, s.UseWritev, s.SocketSyscalls, s.BlockingWait, s.UDPIdleTimeout, s.LogStatus, s.LogSettings)
 	return b.String()
@@ -164,9 +164,9 @@ func (s Settings) Parameters() []Parameter {
 		{"taskPoolMode", s.TaskPoolMode.String(), source("taskPoolMode"), "how the pool grows and shrinks: elastic, adaptive or inline"},
 		{"minWorkers", intValue(int64(s.MinWorkerCount)), source("minWorkers"), "resident workers an adaptive pool retires down to; zero retires all"},
 		{"sharedTaskPool", boolValue(s.SharedTaskPool), source("sharedTaskPool"), "engines of one name share one task pool"},
-		{"ioPollers", boolValue(s.IOPollers), source("ioPollers"), "split the engine across event loops that wait for readiness"},
-		{"ioPollerCount", intValue(int64(s.IOPollerCount)), source("ioPollerCount"), "loops to create; zero follows the CPUs"},
-		{"pollers", intValue(int64(s.Pollers)), "default", "loops actually created"},
+		{"splitEventLoops", boolValue(s.SplitEventLoops), source("splitEventLoops"), "split the engine across event loops that wait for readiness"},
+		{"eventLoopCount", intValue(int64(s.EventLoopCount)), source("eventLoopCount"), "loops to create; zero follows the CPUs"},
+		{"eventLoops", intValue(int64(s.EventLoops)), "default", "loops actually created"},
 		{"engineLoop", boolValue(s.EngineLoop), source("engineLoop"), "give the engine a loop of its own to accept and read UDP"},
 		{"reusePort", boolValue(s.ReusePort), source("reusePort"), "bind listeners with SO_REUSEPORT so processes may share an address"},
 		{"balanceReusePort", boolValue(s.BalanceReusePort), source("balanceReusePort"), "hand reuseport connections out round-robin with eBPF"},
@@ -210,8 +210,8 @@ func customConfig(c Config) map[string]bool {
 	set("taskPoolMode", c.TaskPoolMode != 0 && c.TaskPoolMode != base.TaskPoolMode)
 	set("minWorkers", c.MinWorkerCount != 0)
 	set("sharedTaskPool", c.SharedTaskPool != base.SharedTaskPool)
-	set("ioPollers", c.IOPollers != base.IOPollers)
-	set("ioPollerCount", c.IOPollerCount != 0)
+	set("splitEventLoops", c.SplitEventLoops != base.SplitEventLoops)
+	set("eventLoopCount", c.EventLoopCount != 0)
 	set("engineLoop", c.EngineLoop != base.EngineLoop)
 	set("reusePort", c.ReusePort != base.ReusePort)
 	set("balanceReusePort", c.BalanceReusePort != base.BalanceReusePort)

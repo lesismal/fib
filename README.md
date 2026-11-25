@@ -448,7 +448,7 @@ addrs, err := engine.BindingAddrs(2) // where binding 2 listens, ports chosen fo
 ```
 
 Every binding shares the engine's event loops, descriptor table, task pool and buffer pool, and
-its settings: backlog, buffers, watermarks, `IOPollers` and `ReusePort` apply to all of them.
+its settings: backlog, buffers, watermarks, `SplitEventLoops` and `ReusePort` apply to all of them.
 Binding fails as a whole: if one address cannot be taken, none is kept.
 
 Bindings can also come and go while the engine runs. `AddBinding` listens on a binding more and
@@ -591,9 +591,9 @@ flowchart TB
    the end of the round. Whatever cannot be written stays queued, `EPOLLOUT` picks it up later, and
    past the watermark reads pause until the queue drains.
 
-The number of pollers (`Config.IOPollers`, `IOPollerCount`) depends on the CPU count. With four
-CPUs or fewer, one loop does everything. Above that, there is one poller per four CPUs and never fewer than
-two, and connections are spread over them by fd. A poller parks in Go's own netpoller rather than blocking in
+The pollers (`Config.SplitEventLoops`, on by default; how many is `EventLoopCount`) follow the CPU count:
+one on four CPUs or fewer, two on up to sixteen, and one per eight CPUs above that. Each poller listens
+and accepts for itself, and connections are spread over them by fd. A poller parks in Go's own netpoller rather than blocking in
 `epoll_wait`, so it never holds a P while goroutines wait to run.
 
 ### Where each protocol runs

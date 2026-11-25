@@ -86,7 +86,7 @@ type Config struct {
 	// ProcsPerChild is the GOMAXPROCS each child runs with. Zero or less
 	// means DefaultProcsPerChild. A child with fewer Ps than fib's defaults
 	// give pollers to serves its connections on its engine's own loop; see
-	// fib.Config.IOPollers.
+	// fib.Config.SplitEventLoops.
 	ProcsPerChild int
 	// ShutdownTimeout bounds how long the master waits for the children to
 	// exit once it has sent them SIGTERM, after which it kills them. Zero or

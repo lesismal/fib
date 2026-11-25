@@ -37,7 +37,7 @@
 14. [FileCache 与 sendfile：静态文件不碰磁盘、不过用户态](#14-filecache-与-sendfile静态文件不碰磁盘不过用户态)
 15. [UDP：`DatagramsHandler` 与 `SendBatch`](#15-udpdatagramshandler-与-sendbatch)
 16. [协程池：自己的池、独立的池、不要死锁](#16-协程池自己的池独立的池不要死锁)
-17. [进程级技巧：Prefork、IOPollers、GOMAXPROCS](#17-进程级技巧preforkiopollersgomaxprocs)
+17. [进程级技巧：Prefork、SplitEventLoops、GOMAXPROCS](#17-进程级技巧preforkspliteventloopsgomaxprocs)
 18. [bufferpool：自己的 buffer 也走同一个池](#18-bufferpool自己的-buffer-也走同一个池)
 19. [速查：哪些东西能在哪个 goroutine 上调](#19-速查哪些东西能在哪个-goroutine-上调)
 20. [反模式清单](#20-反模式清单)
@@ -187,7 +187,7 @@ handler := fibhttp.NewHandlerWithConfig(httpConfig, fibhttp.HandlerFunc(
 
 1. **不缓存整个 body。** 128MB 上传，整体缓存时堆峰值约 470MB，流式时约 4MB。
 2. **不开 goroutine。** `OnBody` 只登记回调，从不在内部调用它；已经到达的部分在 handler 返回之后、
-   在跑 handler 的 goroutine 上交付，之后的数据由读到它的 worker 交付（开了 IOPollers 或在
+   在跑 handler 的 goroutine 上交付，之后的数据由读到它的 worker 交付（开了 SplitEventLoops 或在
    HTTP/2、HTTP/3 上则交给 Engine 的 handler 池）。回调一次一个、保持顺序。
    这和 C 里 `on_body(chunk)` 的回调模型一模一样。
 3. **背压是免费的。** 回调慢，body 就积压在 `StreamRequestBodyBuffer` 里；攒满就
@@ -719,7 +719,7 @@ config.SetTaskPool(pool)          // Engine 用你的池；关闭 Engine 不会�
 
 ---
 
-## 17. 进程级技巧：Prefork、IOPollers、GOMAXPROCS
+## 17. 进程级技巧：Prefork、SplitEventLoops、GOMAXPROCS
 
 **Prefork**（Linux）：多进程 + `SO_REUSEPORT`，每个子进程有自己的堆和 GC。
 
@@ -743,8 +743,8 @@ func main() {
 - UDP（HTTP/3）：对端地址变化（NAT 重绑定/迁移）后可能落到另一个子进程，那里没有这条 QUIC 连接。
 - 子进程里 fib 的默认值随之变化：CPU 数取 `min(NumCPU, GOMAXPROCS)`，≤4 个 P 时每个 Engine 只有一个 poller。
 
-**IOPollers**：把 Engine 拆到多个事件循环（Linux epoll / macOS kqueue）。默认开启；
-poller 数默认（`IOPollerCount` 为 0）4 个 CPU 以内 1 个，16 个以内 2 个，更多时 `CPU/8`（24 核 3 个、
+**SplitEventLoops**：把 Engine 拆到多个事件循环（Linux epoll / macOS kqueue）。默认开启；
+poller 数默认（`EventLoopCount` 为 0）4 个 CPU 以内 1 个，16 个以内 2 个，更多时 `CPU/8`（24 核 3 个、
 32 核 4 个、64 核 8 个）。poller 只等事件、把变为可执行的连接交给
 worker，**多开 poller 会和 worker 抢 P，通常更慢**。poller 自己的工作（accept）成为瓶颈时才划算：
 连接频繁建立/关闭的场景（limited-conn）里，Linux 上 poller 自己 `SO_REUSEPORT` accept，从每秒 94 万

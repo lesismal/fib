@@ -82,8 +82,8 @@ func main() {
 	config.MaxWriteQueueBytes = 4 << 20       // one peer that stops reading
 	config.MaxConns = 100000
 
-	config.IOPollers = true
-	config.IOPollerCount = 0 // let the machine size the pollers
+	config.SplitEventLoops = true
+	config.EventLoopCount = 0 // let the machine size the pollers
 	config.LogSettings = false
 
 	app := fibhttp.HandlerFunc(func(c *fibhttp.Context) {
@@ -233,20 +233,20 @@ See [configuration.md](../configuration.md#buffers-and-backpressure) for the ful
 
 ## Pollers, GOMAXPROCS and prefork
 
-`IOPollers` splits an engine across event loops (Linux epoll, macOS/BSD kqueue). A poller only
+`SplitEventLoops` splits an engine across event loops (Linux epoll, macOS/BSD kqueue). A poller only
 waits for events and hands runnable connections to workers, so pollers cost Ps and are usually
 slower unless accept is the bottleneck; the default count follows the machine (one on up to 4
 CPUs, two on up to 16, CPUs/8 beyond that). `EngineLoop` gives the engine an accept loop of its own
 instead of letting pollers listen. On Windows there is one loop whatever the setting.
 
 ```go
-config.IOPollers = true
-config.IOPollerCount = 0  // 0: machine-sized; > 0: exactly this many loops
+config.SplitEventLoops = true
+config.EventLoopCount = 0    // 0: machine-sized; > 0: exactly this many loops
 config.EngineLoop = false // let the pollers accept, which accepts in parallel
 ```
 
 `GOMAXPROCS` stays at its default, the cores. Raising it is slower and costs 25–40% more memory in
-the measurements in the [hack guide](../hacks.md#17-process-level-tricks-prefork-iopollers-gomaxprocs);
+the measurements in the [hack guide](../hacks.md#17-process-level-tricks-prefork-spliteventloops-gomaxprocs);
 `runtime.NumCPU` already respects a CPU affinity mask or a cgroup quota.
 
 `prefork` (Linux) is the process-level answer to the same problem: on many cores one heap's GC and
@@ -460,7 +460,7 @@ build. If a change touches a protocol, the matching job is the one to watch. The
 ## Production checklist
 
 1. Start from `fib.DefaultConfig()` and change fields: `fib.New` refuses a zero `fib.Config{}` (no
-   worker count), and a hand-built one silently loses `CoalesceWrites`, `IOPollers`, `ReusePort`,
+   worker count), and a hand-built one silently loses `CoalesceWrites`, `SplitEventLoops`, `ReusePort`,
    `SocketSyscalls`, `UseWritev` and `SharedTaskPool`.
 2. Set `MaxConns` and a `MaxWriteQueueBytes` cap on public listeners, so a flood or a peer that
    stops reading costs a bounded amount.

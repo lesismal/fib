@@ -18,8 +18,8 @@ func TestMaxConns(t *testing.T) {
 		t.Run(fmt.Sprintf("pollers=%d", pollers), func(t *testing.T) {
 			config := DefaultConfig()
 			config.MaxConns = 2
-			config.IOPollers = pollers > 0
-			config.IOPollerCount = pollers
+			config.SplitEventLoops = pollers > 0
+			config.EventLoopCount = pollers
 			opened := make(chan struct{}, 8)
 			server, err := New(config, Binding{Addr: "127.0.0.1:0", Handler: HandlerFuncs{
 				Open: func(*Connection) { opened <- struct{}{} },

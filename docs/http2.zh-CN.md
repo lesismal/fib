@@ -80,7 +80,7 @@ HEADERS 这样到达的 stream 带 `Early-Data: 1`（RFC 8470），只有 GET、
 - 一个连接的帧按顺序处理，请求完整后按 `Config.StreamPool` 的描述交给 engine 的 handler
   协程池（`fib.Engine.HandlerPool`），因此同一连接上客户端并发发起的多个请求是并发处理的，
   阻塞的 handler 只拖累它自己。
-- 不管开不开 `IOPollers`，连接都由 engine 的 worker 读和分帧，每个 engine 名字（`Config.Name`）有一个
+- 不管开不开 `SplitEventLoops`，连接都由 engine 的 worker 读和分帧，每个 engine 名字（`Config.Name`）有一个
   单独的 handler 协程池，名为 `<Name>-streams`
   （默认 `fib-streams`），由连接来自该名字 engine 的所有 HTTP/2 与 HTTP/3 server 共用，且
   永远不与 engine 的协程池共用（共用会在队列满时让 engine 的 worker 全部卡在提交上而死锁）。

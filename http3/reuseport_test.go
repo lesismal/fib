@@ -23,8 +23,8 @@ func TestRequestsOverReusePortPollers(t *testing.T) {
 	const clients, requests = 8, 5
 	fc := fib.DefaultConfig()
 	fc.Name = "http3-reuseport"
-	fc.IOPollers = true
-	fc.IOPollerCount = 4
+	fc.SplitEventLoops = true
+	fc.EventLoopCount = 4
 	fc.ReusePort = true
 	url := startServerOn(t, fc, Config{}, echo)
 	var wg sync.WaitGroup
@@ -131,8 +131,8 @@ func (p *rebindingProxy) rebind(t *testing.T) *net.UDPAddr {
 func TestConnectionFollowsRebindingClient(t *testing.T) {
 	fc := fib.DefaultConfig()
 	fc.Name = "http3-rebinding"
-	fc.IOPollers = true
-	fc.IOPollerCount = 4
+	fc.SplitEventLoops = true
+	fc.EventLoopCount = 4
 	fc.ReusePort = true
 	url := startServerOn(t, fc, Config{}, func(c *fibhttp.Context) {
 		_ = c.Respond(stdhttp.StatusOK, "text/plain", []byte(c.Request.RemoteAddr))

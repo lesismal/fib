@@ -137,7 +137,7 @@ body{margin:0}
 
 <section id="parts">
   <h2>The parts</h2>
-  <p class="lede">An Engine owns the listeners, the event loop, its command queue and the worker pool. With <code>IOPollers</code>, the default on more than four CPUs, it also owns pollers: each is an Engine without listeners, with a loop, command queue and descriptor table of its own, sharing its parent's settings, handler, worker pool and server-wide budget.</p>
+  <p class="lede">An Engine owns the listeners, the event loop, its command queue and the worker pool. With <code>SplitEventLoops</code>, which <code>DefaultConfig</code> sets, it also owns pollers: each is an Engine without listeners, with a loop, command queue and descriptor table of its own, sharing its parent's settings, handler, worker pool and server-wide budget. The diagram shows the root loop that <code>EngineLoop</code> adds. By default there is none: the pollers listen, accept and read the UDP sockets themselves.</p>
   <div class="diagram"><pre class="mermaid">
 flowchart LR
   subgraph ENG["Engine (fib.New)"]
@@ -180,8 +180,8 @@ flowchart LR
   <div class="tbl"><table>
     <thead><tr><th>Part</th><th>How many, how large</th><th>What it does</th></tr></thead>
     <tbody>
-      <tr><td>Root loop</td><td>One per Engine, the goroutine in <code>Run</code></td><td>Accepts; reads the shared UDP socket and sorts datagrams by peer; runs its own command queue</td></tr>
-      <tr><td>Poller</td><td>NumCPU÷4 rounded down, at least 1; <code>IOPollerCount</code> overrides; ignored on Windows</td><td>For the connections handed to it: waiting for events, pausing and resuming reads, registering and closing descriptors, OnOpen</td></tr>
+      <tr><td>Root loop</td><td>One with <code>EngineLoop</code>, or without <code>SplitEventLoops</code>; none by default</td><td>Accepts; reads the shared UDP socket and sorts datagrams by peer; runs its own command queue</td></tr>
+      <tr><td>Poller</td><td>1 on up to 4 CPUs, 2 on up to 16, CPUs÷8 above (CPUs are min(NumCPU, GOMAXPROCS)); <code>EventLoopCount</code> overrides; ignored on Windows</td><td>For the connections handed to it: waiting for events, pausing and resuming reads, registering and closing descriptors, OnOpen. Without a root loop, also listening, accepting and reading UDP</td></tr>
       <tr><td>‹Name›-workers</td><td>Adaptive; ceiling max(GOMAXPROCS×1000, NumCPU×20); shared by engines of one Name by default</td><td>Every round of every connection: reads, the OnData chain, coalesced writes, OnClose</td></tr>
       <tr><td>‹Name›-streams</td><td>Adaptive; ceiling twice the widest engine pool of that Name, floor 0</td><td>HTTP/2 and HTTP/3 request handlers; HTTP/1's asynchronous handovers</td></tr>
       <tr><td>fib-tls-handshake</td><td>Adaptive; ceiling 65536, one per process</td><td>Blocking TLS handshakes</td></tr>
@@ -262,7 +262,7 @@ flowchart LR
   <ul class="notes">
     <li><b>Coalescing.</b> Readiness is level information to a connection, so repeated notifications are or-ed together and a hot connection cannot grow an unbounded event queue. A notification that is only EPOLLOUT with nothing queued is dropped, which keeps every new connection from being scheduled a second time.</li>
     <li><b>Giving up the P.</b> After submitting, the loop calls <code>Gosched</code> so that the workers it just woke run on its P straight away. With 4 Ps serving HTTP/2 echoes over 10k connections that was worth 10% to 25%.</li>
-    <li><b>A loop holds no P while it waits.</b> With IOPollers a loop parks in the Go runtime's network poller instead of blocking in the <code>epoll_wait</code> system call.</li>
+    <li><b>A loop holds no P while it waits.</b> With SplitEventLoops a loop parks in the Go runtime's network poller instead of blocking in the <code>epoll_wait</code> system call.</li>
     <li><b>Read buffers are borrowed per round.</b> The 16KB read buffer comes from bufferpool for the round and goes back at its end, so an idle connection holds none. A short read says the socket is empty, and no further read is made only to get EAGAIN.</li>
     <li><b>UDP is the exception.</b> The loop reads a shared UDP socket itself, in batches, and queues each datagram on its peer's connection; the worker's round only hands the queue to the handler.</li>
   </ul>
@@ -367,8 +367,8 @@ flowchart LR
     <thead><tr><th>Level</th><th>What it does</th><th>Cost and trade-off</th></tr></thead>
     <tbody>
       <tr><td>Workers</td><td>Each round of a connection goes to an idle worker, with no affinity; the adaptive pool queues by P and takes batches</td><td>A handler that blocks holds up its own connection only, and the pool grows to absorb it</td></tr>
-      <tr><td>Pollers</td><td>Accepted connections go to <code>fd % pollerCount</code>; a poller only waits, about 0.2µs a request against 4.5µs on the workers</td><td>More pollers compete with the workers for Ps; one per 4 CPUs is the default</td></tr>
-      <tr><td>Accept</td><td>The root loop accepts and hands on by default; on Linux <code>ReusePort</code> has every poller listen and accept for itself</td><td>ReusePort lifts the one loop's accept ceiling, but a connection stays on the poller the kernel's hash chose, however busy</td></tr>
+      <tr><td>Pollers</td><td>Accepted connections go to <code>fd % pollerCount</code>; a poller only waits, about 0.2µs a request against 4.5µs on the workers</td><td>More pollers compete with the workers for Ps; the default is 1 up to 4 CPUs, 2 up to 16, one per 8 CPUs above</td></tr>
+      <tr><td>Accept</td><td>By default every poller listens and accepts: on Linux on a <code>SO_REUSEPORT</code> socket of its own, elsewhere on one socket the pollers share. <code>EngineLoop</code> has one root loop accept and hand on instead</td><td>Pollers accepting lift the one loop's accept ceiling. <code>AcceptPlacement</code> picks whether a connection goes to <code>fd % pollerCount</code> (the default) or stays on the poller the kernel's hash chose, however busy</td></tr>
       <tr><td>Multiplexing</td><td>HTTP/2 and HTTP/3 handlers run on the stream pool, so one connection's requests are served concurrently</td><td><code>MaxConcurrentHandlers</code> bounds one connection; the request over the limit runs on the reader</td></tr>
     </tbody>
   </table></div>
@@ -392,9 +392,9 @@ flowchart LR
   <div class="tbl"><table>
     <thead><tr><th>Platform</th><th>Backend</th><th>Notes</th></tr></thead>
     <tbody>
-      <tr><td>Linux</td><td>epoll, edge-triggered, eventfd wake-ups</td><td>IOPollers; ReusePort spreads accepts and UDP; reads and writes are raw system calls, recvfrom / sendto / sendmsg under <code>SocketSyscalls</code>; UDP uses recvmmsg / sendmmsg</td></tr>
-      <tr><td>macOS</td><td>kqueue</td><td>IOPollers supported; <code>SO_REUSEPORT</code> does not spread TCP connections between sockets, so the root loop still accepts</td></tr>
-      <tr><td>Windows</td><td>I/O completion port</td><td>A zero-byte overlapped WSARecv plays the read edge and an overlapped WSASend's completion the write edge; one loop, IOPollers ignored</td></tr>
+      <tr><td>Linux</td><td>epoll, edge-triggered, eventfd wake-ups</td><td>SplitEventLoops; ReusePort spreads accepts and UDP; reads and writes are raw system calls, recvfrom / sendto / sendmsg under <code>SocketSyscalls</code>; UDP uses recvmmsg / sendmmsg</td></tr>
+      <tr><td>macOS</td><td>kqueue</td><td>SplitEventLoops supported; <code>SO_REUSEPORT</code> does not spread TCP connections between sockets, so the pollers share one listening socket</td></tr>
+      <tr><td>Windows</td><td>I/O completion port</td><td>A zero-byte overlapped WSARecv plays the read edge and an overlapped WSASend's completion the write edge; one loop, SplitEventLoops ignored</td></tr>
       <tr><td>Others</td><td><code>*_other.go</code></td><td>A fallback on the standard library, a goroutine per connection, with the same API</td></tr>
     </tbody>
   </table></div>

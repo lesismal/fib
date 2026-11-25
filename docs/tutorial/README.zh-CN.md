@@ -60,7 +60,7 @@ arpc、SOCKS、KCP、WebRTC、流媒体或 BitTorrent 的 Go 程序员——这�
 | 19 | [原生 TCP、UDP 与 Unix socket](19-raw-io.zh-CN.md) | `fib.Connection`、`fib.Handler` | 原生连接 API、corked 写与 `SendFile`/`SpliceTo`、`HoldReads`、UDP 数据报与 peer、Unix socket、异步 dial。 |
 | 20 | [客户端](20-clients.zh-CN.md) | HTTP、WebSocket、Dial | 异步 dial；HTTP/1.x、HTTP/2、HTTP/3 客户端；Alt-Svc 发现；WebSocket 客户端；TLS 与 SOCKS dial；一个 Engine 同时做服务端和客户端。 |
 | 21 | [进阶技巧](21-hacks.zh-CN.md) | — | 把 [Hack 指南](../hacks.zh-CN.md) 改写成教程：异步响应、零拷贝读、写侧、`HoldReads`、`OnFrame`、对象复用、协程池、进程级技巧，以及反模式。 |
-| 22 | [性能与运维](22-performance.zh-CN.md) | taskpool、bufferpool、prefork、log | worker 池的模式与容量、buffer 尺寸、`IOPollers`、`prefork`、日志、pprof、压测，以及上线检查清单。 |
+| 22 | [性能与运维](22-performance.zh-CN.md) | taskpool、bufferpool、prefork、log | worker 池的模式与容量、buffer 尺寸、`SplitEventLoops`、`prefork`、日志、pprof、压测，以及上线检查清单。 |
 
 ## 怎么读一章
 

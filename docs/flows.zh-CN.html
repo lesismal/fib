@@ -119,7 +119,7 @@ body{margin:0}
 <main>
 <header>
   <h1>fib 事件循环与协程池流程图</h1>
-  <p>按协议逐一画出：哪个事件循环等事件，哪个协程池跑哪段代码，数据和控制在它们之间怎么流动。依据当前 <code>main</code>（8a388d4）的源码，平台按 Linux epoll / macOS kqueue 描述，配置按 CPU 多于 4 个时的 <code>fib.DefaultConfig()</code>：<code>IOPollers=true</code>（4 个及以下默认关闭，由 Engine 自己的循环服务连接）、<code>TaskPoolMode=ModeAdaptive</code>、<code>SharedTaskPool=true</code>、<code>SocketSyscalls=true</code>。</p>
+  <p>按协议逐一画出：哪个事件循环等事件，哪个协程池跑哪段代码，数据和控制在它们之间怎么流动。依据当前 <code>main</code>（8a388d4）的源码，平台按 Linux epoll / macOS kqueue 描述，配置按 <code>fib.DefaultConfig()</code>：<code>SplitEventLoops=true</code>（4 个 CPU 及以下 1 个 poller，16 个以内 2 个，更多时每 8 个 CPU 一个）、<code>EngineLoop=false</code>、<code>TaskPoolMode=ModeAdaptive</code>、<code>SharedTaskPool=true</code>、<code>SocketSyscalls=true</code>。</p>
   <p>图中颜色固定对应执行者：</p>
   <div class="legend">
     <span class="chip c-loop"><i></i>事件循环（根 / poller）</span>
@@ -137,7 +137,7 @@ body{margin:0}
   <div class="tbl"><table>
     <thead><tr><th>执行者</th><th>来源</th><th>模式 / 规模</th><th>跑什么</th></tr></thead>
     <tbody>
-      <tr><td><span class="chip c-loop"><i></i>事件循环</span></td><td><code>Engine.runLoop</code></td><td>根循环 1 个；poller 数为 NumCPU÷4 向下取整（至少 1）：7 核以内 1 个，8 核 2 个，16 核 4 个；<code>IOPollerCount</code> 可改</td><td>epoll_wait/kevent、accept、UDP 收包分拣、命令队列（close / refresh / detach / accept）、<b>OnOpen</b></td></tr>
+      <tr><td><span class="chip c-loop"><i></i>事件循环</span></td><td><code>Engine.runLoop</code></td><td>poller：4 CPU 及以下 1 个，16 个以内 2 个，更多时 CPU÷8；<code>EventLoopCount</code> 可改。只有设置 <code>EngineLoop</code> 或关闭 <code>SplitEventLoops</code> 时才有根循环</td><td>epoll_wait/kevent、accept、UDP 收包分拣、命令队列（close / refresh / detach / accept）、<b>OnOpen</b></td></tr>
       <tr><td><span class="chip c-work"><i></i>‹Name›-workers</span></td><td><code>acquireTaskPool</code>（config.go）</td><td>Adaptive（按 P 分片入队）；上限 max(GOMAXPROCS×1000, NumCPU×20)，常驻下限 <code>MinWorkerCount</code>，同 Name 的 Engine 共用</td><td><code>Connection.RunTask → process()</code>：读 socket、OnData 链（TLS 解密 → 协议解析 → HTTP/1 handler / WS 回调）、写合并、OnClose</td></tr>
       <tr><td><span class="chip c-hs"><i></i>fib-tls-handshake</span></td><td><code>sidepool</code></td><td>Adaptive；上限 65536，队列 10000，下限 0，进程内全局共享</td><td><code>crypto/tls.HandshakeContext</code> 这个阻塞调用，以及与握手同到的首批明文的交付</td></tr>
       <tr><td><span class="chip c-str"><i></i>‹Name›-streams</span></td><td><code>streampool</code>，<code>Engine.HandlerPool()</code></td><td>Adaptive；上限 = 同 Name 最宽引擎池 ×2，下限 0</td><td>HTTP/2、HTTP/3 的请求 handler（含扩展 CONNECT 的升级和 WebSocket OnOpen）；HTTP/1 的 OnBody 交接、连接关闭时的取消通知</td></tr>
@@ -159,13 +159,13 @@ flowchart LR
     CFD[("conn fd")]
     UFD[("UDP fd")]
   end
-  subgraph ROOT["根 Engine 事件循环 · Run 所在 goroutine"]
+  subgraph ROOT["根 Engine 事件循环 · 仅 EngineLoop 时"]
     R1["epoll_wait"] --> R2{"token 类型"}
     R2 -- listener --> R3["acceptConnections&lt;br/&gt;TCP_NODELAY"]
     R2 -- udp --> R4["readUDPListener&lt;br/&gt;recvmmsg，每轮至多 256 个&lt;br/&gt;按对端地址分到 peer Connection"]
     R2 -- wake --> R5["drainCommands"]
   end
-  subgraph POL["poller i 事件循环 · 每 4 CPU 一个"]
+  subgraph POL["poller i 事件循环 · 共 EventLoopCount 个"]
     P1["commandAccept → admit&lt;br/&gt;EPOLL_CTL_ADD + OnOpen"]
     P2["epoll_wait → noteEvent&lt;br/&gt;事件并入 pendingEvents&lt;br/&gt;scheduled 为假才入 ready"]
     P3["runReady：GoTasks 批量提交&lt;br/&gt;然后 runtime.Gosched"]
@@ -192,8 +192,9 @@ flowchart LR
   class TM tmr
   </pre></div>
   <ul class="notes">
-    <li><b>不开 IOPollers</b>：没有 poller，根循环自己 accept、注册、等所有连接的事件，其余相同。</li>
-    <li><b>ReusePort（仅 Linux）</b>：每个 poller 在同一地址上 listen 自己的 socket，自己 accept；根 socket 只 bind 不 listen。UDP 同理，每个 poller 读自己的 UDP socket。</li>
+    <li><b>默认没有根循环</b>（<code>EngineLoop</code> 关闭）：每个 poller 像上图的根循环那样自己 listen、自己 accept，accept 到的连接按 <code>fd % pollerCount</code> 分配。Linux 上每个 poller 在 Engine 的地址上有一个自己的 <code>SO_REUSEPORT</code> socket，根 socket 只 bind 不 listen；其他平台各 poller 共用一个监听 socket。</li>
+    <li><b>UDP</b>：Linux 上开启 <code>ReusePort</code>（默认）时每个 poller 读自己的 UDP socket；否则只有一个 socket，由第一个 poller 读，设置 <code>EngineLoop</code> 时由根循环读。</li>
+    <li><b>不开 SplitEventLoops</b>：没有 poller，根循环自己 accept、注册、等所有连接的事件，其余相同。</li>
     <li><b>OnOpen 在事件循环上执行</b>（<code>admit</code> / <code>udpPeer</code>），所以 OnOpen 里不能阻塞；TLS 正是在这里把握手交给握手池。</li>
     <li>worker 在轮外发送（<code>Send</code> 在非 corked 状态）会直接写 socket；写不完才排队、靠常驻的 EPOLLOUT 边沿续写。</li>
     <li>Linux 上连接的读写是不经调度器的原始系统调用（socket 非阻塞，不会等待）；<code>SocketSyscalls</code> 默认开启时用 <code>recvfrom</code> / <code>sendto</code> / <code>sendmsg</code>，绕开 VFS 层的权限钩子。</li>
@@ -598,10 +599,10 @@ flowchart TD
 <section id="h3">
   <h2>HTTP/3（QUIC，TLS 1.3 内置）</h2>
   <p class="lede">HTTP/3 没有明文形态，TLS 1.3 是 QUIC 的一部分。UDP 数据报由事件循环自己读并按对端地址分拣，QUIC 的解包、握手和帧处理在 worker 上执行，请求 handler 批量交给流池；QUIC 自己的定时器在运行时定时器 goroutine 上发包。</p>
-  <div class="runs"><span class="chip c-loop"><i></i>根循环读 UDP</span><span class="chip c-work"><i></i>workers</span><span class="chip c-str"><i></i>流池</span><span class="chip c-tmr"><i></i>QUIC 定时器 / UDP sweep</span></div>
+  <div class="runs"><span class="chip c-loop"><i></i>poller 读 UDP</span><span class="chip c-work"><i></i>workers</span><span class="chip c-str"><i></i>流池</span><span class="chip c-tmr"><i></i>QUIC 定时器 / UDP sweep</span></div>
   <div class="diagram"><pre class="mermaid">
 flowchart TD
-  subgraph LOOP["根事件循环，ReusePort 时为各 poller"]
+  subgraph LOOP["Linux 上 ReusePort 时为各 poller；否则第一个 poller，EngineLoop 时为根循环"]
     L1["UDP fd 可读 → readUDPListener&lt;br/&gt;recvmmsg，每轮至多 256 个"]
     L2["udpPeer：按四元组找 peer Connection&lt;br/&gt;新对端则建连接 + OnOpen"]
     L3["deliverDatagram：复制进 peer 队列&lt;br/&gt;noteEvent → GoTasks"]
@@ -765,7 +766,7 @@ flowchart TD
   <div class="runs"><span class="chip c-loop"><i></i>循环读 UDP</span><span class="chip c-work"><i></i>workers</span><span class="chip c-str"><i></i>流池</span><span class="chip c-tmr"><i></i>QUIC 定时器</span></div>
   <div class="diagram"><pre class="mermaid">
 flowchart TD
-  L1["根循环：recvmmsg → 分拣到 peer → GoTasks"]
+  L1["poller：recvmmsg → 分拣到 peer → GoTasks"]
   subgraph WK["‹Name›-workers"]
     W1["HandlePathDatagrams → dispatch&lt;br/&gt;OnStreamData → requestStream"]
     W2["HEADERS 带 :protocol&lt;br/&gt;→ serveTunnel：NewTunnelFeed&lt;br/&gt;streams.Queue，OnCallsDone 时 Submit"]

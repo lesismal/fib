@@ -67,9 +67,9 @@ func exchange(t *testing.T, addr net.Addr, message string) string {
 // themselves.
 func bindingConfigs() map[string]Config {
 	single := DefaultConfig()
-	single.IOPollers = false
+	single.SplitEventLoops = false
 	pollers := DefaultConfig()
-	pollers.IOPollers, pollers.IOPollerCount = true, 3
+	pollers.SplitEventLoops, pollers.EventLoopCount = true, 3
 	reusePort := pollers
 	reusePort.ReusePort = true
 	return map[string]Config{"single-loop": single, "pollers": pollers, "pollers-reuseport": reusePort}

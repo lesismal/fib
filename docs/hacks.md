@@ -41,7 +41,7 @@ Keep three premises in mind. Every trick below follows from them:
 14. [FileCache and sendfile: static files without touching the disk or user space](#14-filecache-and-sendfile-static-files-without-touching-the-disk-or-user-space)
 15. [UDP: `DatagramsHandler` and `SendBatch`](#15-udp-datagramshandler-and-sendbatch)
 16. [Pools: your own, separate ones, and avoiding deadlock](#16-pools-your-own-separate-ones-and-avoiding-deadlock)
-17. [Process-level tricks: Prefork, IOPollers, GOMAXPROCS](#17-process-level-tricks-prefork-iopollers-gomaxprocs)
+17. [Process-level tricks: Prefork, SplitEventLoops, GOMAXPROCS](#17-process-level-tricks-prefork-spliteventloops-gomaxprocs)
 18. [bufferpool: your buffers can use the same pool](#18-bufferpool-your-buffers-can-use-the-same-pool)
 19. [Cheat sheet: what may be called from which goroutine](#19-cheat-sheet-what-may-be-called-from-which-goroutine)
 20. [Anti-patterns](#20-anti-patterns)
@@ -212,7 +212,7 @@ generator) is in [`fib-examples/http/upload`](https://github.com/lesismal/fib-ex
 2. **No goroutine.** `OnBody` only registers the callback and never calls it itself. What has
    already arrived is delivered after the handler returns, on the goroutine that ran it; the
    rest is delivered by the worker that reads it (or by the Engine's handler pool with
-   IOPollers on, and on HTTP/2 and HTTP/3). Calls come one at a time, in order. This is exactly
+   SplitEventLoops on, and on HTTP/2 and HTTP/3). Calls come one at a time, in order. This is exactly
    the `on_body(chunk)` callback model of C.
 3. **Backpressure is free.** If the callback is slow the body piles up in
    `StreamRequestBodyBuffer`; when that is full the connection calls `HoldReads(true)` and stops
@@ -847,7 +847,7 @@ config.SetTaskPool(pool)          // the Engine uses your pool; closing the Engi
 
 ---
 
-## 17. Process-level tricks: Prefork, IOPollers, GOMAXPROCS
+## 17. Process-level tricks: Prefork, SplitEventLoops, GOMAXPROCS
 
 **Prefork** (Linux): several processes with `SO_REUSEPORT`, each with its own heap and GC.
 
@@ -878,8 +878,8 @@ func main() {
 - fib's defaults shift inside a child: the CPU count is `min(NumCPU, GOMAXPROCS)`, so with 4 Ps
   or fewer an Engine gets a single poller.
 
-**IOPollers:** splits an Engine across several event loops (Linux epoll / macOS kqueue). It is on
-by default; the default poller count (`IOPollerCount` 0) is one up to 4 CPUs, two up to 16, and
+**SplitEventLoops:** splits an Engine across several event loops (Linux epoll / macOS kqueue). It is on
+by default; the default poller count (`EventLoopCount` 0) is one up to 4 CPUs, two up to 16, and
 `CPU/8` beyond (3 on 24, 4 on 32, 8 on 64). A poller only waits for events and hands runnable connections to workers, so **more
 pollers compete with workers for Ps and are usually slower**. They pay off only when the pollers'
 own work (accept) is the bottleneck: with frequent connect/close (limited-conn) on Linux, pollers

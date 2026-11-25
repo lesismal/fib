@@ -180,11 +180,11 @@ func TestSetPoolSizingKeepsFieldsLeftUnset(t *testing.T) {
 // DefaultConfig serves on pollers, with no loop of the engine's own, binds
 // its listeners with SO_REUSEPORT, and places accepted connections by
 // descriptor, as the zero Config does.
-func TestDefaultIOPollers(t *testing.T) {
+func TestDefaultSplitEventLoops(t *testing.T) {
 	config := DefaultConfig()
-	if !config.IOPollers || config.EngineLoop || !config.ReusePort || config.AcceptPlacement != AcceptFDModulo {
-		t.Errorf("IOPollers %v, EngineLoop %v, ReusePort %v, AcceptPlacement %v, want true, false, true, fd-modulo",
-			config.IOPollers, config.EngineLoop, config.ReusePort, config.AcceptPlacement)
+	if !config.SplitEventLoops || config.EngineLoop || !config.ReusePort || config.AcceptPlacement != AcceptFDModulo {
+		t.Errorf("SplitEventLoops %v, EngineLoop %v, ReusePort %v, AcceptPlacement %v, want true, false, true, fd-modulo",
+			config.SplitEventLoops, config.EngineLoop, config.ReusePort, config.AcceptPlacement)
 	}
 	if (Config{}).AcceptPlacement != AcceptFDModulo {
 		t.Error("the zero Config does not place accepted connections by descriptor")
@@ -204,8 +204,8 @@ func TestDefaultsFollowGOMAXPROCS(t *testing.T) {
 	}
 	runtime.GOMAXPROCS(8)
 	config := DefaultConfig()
-	if got := pollerCount(config); !config.IOPollers || got != 2 {
-		t.Errorf("GOMAXPROCS 8: IOPollers %v with %d pollers, want on with 2", config.IOPollers, got)
+	if got := pollerCount(config); !config.SplitEventLoops || got != 2 {
+		t.Errorf("GOMAXPROCS 8: SplitEventLoops %v with %d pollers, want on with 2", config.SplitEventLoops, got)
 	}
 }
 
@@ -503,7 +503,7 @@ func TestPollersOnChosenPortsShareNone(t *testing.T) {
 		go func() {
 			defer wg.Done()
 			config := DefaultConfig()
-			config.IOPollers, config.IOPollerCount = true, 8
+			config.SplitEventLoops, config.EventLoopCount = true, 8
 			reply := []byte(strconv.Itoa(i))
 			engine, err := New(config, Binding{Addr: "127.0.0.1:0", Handler: HandlerFuncs{Data: func(c *Connection, _ []byte) { _ = c.Send(reply) }}})
 			if err != nil {
@@ -555,7 +555,7 @@ func TestPollersOnChosenPortsShareNone(t *testing.T) {
 // let into a listener of a poller still waiting its turn to close.
 func TestCloseStopsListeningFirst(t *testing.T) {
 	config := DefaultConfig()
-	config.IOPollers, config.IOPollerCount = true, 32
+	config.SplitEventLoops, config.EventLoopCount = true, 32
 	engine, err := New(config, Binding{Addr: "127.0.0.1:0", Handler: HandlerFuncs{}})
 	if err != nil {
 		t.Fatal(err)

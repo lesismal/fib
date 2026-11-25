@@ -40,7 +40,7 @@
   旧路径上再来更新的包也会把连接拉回去。
   除非只是端口变了，拥塞控制和 RTT 从头开始；新路径验证完成前数据报降到 1200 字节，验证后重新做路径 MTU 探测。迁移之后
   的请求，`Request.RemoteAddr` 是新地址。
-- Linux 上开启 `Config.IOPollers` 和 `ReusePort` 时，新地址可能落到另一个 poller 的
+- Linux 上开启 `Config.SplitEventLoops` 和 `ReusePort` 时，新地址可能落到另一个 poller 的
   socket 上；QUIC 连接可以从任意 goroutine 接收数据报，所以连接会跟过去。
 - 握手确认后，两端用 NEW_CONNECTION_ID 签发握手之外的 Connection ID，数量取对端
   `active_connection_id_limit` 与 `TransportConfig.ActiveConnectionIDs`（默认 4）中的较小者；

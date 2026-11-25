@@ -31,7 +31,7 @@ import (
 // ReusePort, is the engine's and applies to every binding alike. MultipathTCP
 // is the exception: whether a listener is a Multipath TCP one is a property of
 // the address it listens on, so it stays the binding's, as Network and Handler
-// do. With IOPollers, each binding's connections are spread over the same
+// do. With SplitEventLoops, each binding's connections are spread over the same
 // pollers as every other binding's.
 //
 // Bindings can also be added and removed while the engine runs; see
@@ -166,7 +166,7 @@ type bindingState struct {
 //
 // The binding's sockets are opened as New would open them, with the
 // engine's Backlog and ReusePort, and are placed on the engine's loops as
-// its other bindings' are: see Config.IOPollers, Config.EngineLoop and
+// its other bindings' are: see Config.SplitEventLoops, Config.EngineLoop and
 // Config.ReusePort. Either every address listens or, with the error that
 // stopped one, none does.
 func (e *Engine) AddBinding(b Binding) (int, error) {

@@ -510,7 +510,7 @@ func (e *Engine) logRun() {
 	accept, applies := e.acceptPlacements()
 	if e.acceptPlacement != AcceptFDModulo && !applies {
 		// Said whatever LogStatus says: the setting asked for does nothing.
-		log.Warn("fib: Config.AcceptPlacement applies to no listener: it needs IOPollers without EngineLoop and a TCP address on Linux, where each poller listens on a socket of its own with SO_REUSEPORT",
+		log.Warn("fib: Config.AcceptPlacement applies to no listener: it needs SplitEventLoops without EngineLoop and a TCP address on Linux, where each poller listens on a socket of its own with SO_REUSEPORT",
 			"engine", e.name, "acceptPlacement", e.acceptPlacement.String())
 	}
 	if e.logStatus {
@@ -529,7 +529,7 @@ func (e *Engine) logRun() {
 			pool = named.Name()
 		}
 		log.Info("fib: engine started", "engine", e.name, "listen", listening, "taskPool", pool,
-			"pollers", len(e.pollers), "accept", accept)
+			"eventLoops", len(e.pollers), "accept", accept)
 	}
 	if e.logSettings && !logSettingsSilenced() {
 		e.LogSettings()

@@ -412,7 +412,7 @@ func TestNativeServerGetCertificate(t *testing.T) {
 	// One loop and one worker: a GetCertificate that blocked them would stall
 	// every other handshake.
 	engineConfig := fib.DefaultConfig()
-	engineConfig.IOPollers, engineConfig.WorkerCount, engineConfig.SharedTaskPool = false, 1, false
+	engineConfig.SplitEventLoops, engineConfig.WorkerCount, engineConfig.SharedTaskPool = false, 1, false
 	ours := newStateServer()
 	_, addr := startEchoServer(t, engineConfig, NewServer(serverConfig, ours))
 
@@ -605,7 +605,7 @@ func TestNativeClientChecksDoNotBlock(t *testing.T) {
 	// One loop and one worker: a check that blocked them would stall every
 	// other handshake.
 	engineConfig := fib.DefaultConfig()
-	engineConfig.IOPollers, engineConfig.WorkerCount, engineConfig.SharedTaskPool = false, 1, false
+	engineConfig.SplitEventLoops, engineConfig.WorkerCount, engineConfig.SharedTaskPool = false, 1, false
 	client, _ := startEchoServer(t, engineConfig, nil)
 
 	dial := func(t *testing.T, config *stdtls.Config, msg string) *collector {

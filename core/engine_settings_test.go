@@ -59,7 +59,7 @@ func TestEngineSettings(t *testing.T) {
 		"maxWriteQueueBytes=0",
 		"maxConns=0",
 		"taskPoolMode=adaptive",
-		"ioPollers=true",
+		"splitEventLoops=true",
 		"coalesceWrites=true",
 		"useWritev=true",
 		"socketSyscalls=true",
@@ -136,7 +136,7 @@ func TestSettingsParameterSources(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, name := range []string{"name", "readBuffer", "writeWatermark", "maxPendingBytes", "useWritev", "ioPollers"} {
+	for _, name := range []string{"name", "readBuffer", "writeWatermark", "maxPendingBytes", "useWritev", "splitEventLoops"} {
 		if got := source(engine.Settings(), name); got != "default" {
 			t.Errorf("DefaultConfig %s source = %q, want default", name, got)
 		}
@@ -151,7 +151,7 @@ func TestSettingsParameterSources(t *testing.T) {
 	config.MaxConns = 100_000
 	config.MaxWriteQueueBytes = 32 << 20
 	config.UseWritev = false
-	config.IOPollers = false
+	config.SplitEventLoops = false
 	config.LogStatus = true
 	engine, err = New(config, Binding{Addr: "127.0.0.1:0", Handler: HandlerFuncs{}})
 	if err != nil {
@@ -159,7 +159,7 @@ func TestSettingsParameterSources(t *testing.T) {
 	}
 	defer engine.Close()
 	settings := engine.Settings()
-	for _, name := range []string{"name", "readBuffer", "maxPendingBytes", "maxConns", "maxWriteQueueBytes", "useWritev", "ioPollers", "logStatus"} {
+	for _, name := range []string{"name", "readBuffer", "maxPendingBytes", "maxConns", "maxWriteQueueBytes", "useWritev", "splitEventLoops", "logStatus"} {
 		if got := source(settings, name); got != "custom" {
 			t.Errorf("%s source = %q, want custom", name, got)
 		}

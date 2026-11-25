@@ -227,11 +227,11 @@ func engineLoop(config Config) bool {
 // pollerCount reports how many loops config has an engine hand its
 // connections to, or zero when it keeps them on its own loop.
 func pollerCount(config Config) int {
-	if !config.IOPollers || !pollersSupported {
+	if !config.SplitEventLoops || !pollersSupported {
 		return 0
 	}
-	if config.IOPollerCount > 0 {
-		return config.IOPollerCount
+	if config.EventLoopCount > 0 {
+		return config.EventLoopCount
 	}
 	return defaultPollerCount(defaultCPUs())
 }
@@ -263,8 +263,8 @@ const (
 	twoPollerCPUs = 16
 )
 
-// defaultPollerCount is how many pollers IOPollers creates on cpus CPUs when
-// IOPollerCount leaves it to the engine: one on onePollerCPUs or fewer, two
+// defaultPollerCount is how many pollers SplitEventLoops creates on cpus CPUs when
+// EventLoopCount leaves it to the engine: one on onePollerCPUs or fewer, two
 // on up to twoPollerCPUs, and cpus divided by cpusPerPoller, rounded down,
 // on more.
 func defaultPollerCount(cpus int) int {

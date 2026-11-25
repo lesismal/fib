@@ -21,7 +21,7 @@ import (
 	"github.com/lesismal/fib/taskpool"
 )
 
-// pollersSupported says Config.IOPollers applies, which it does not to a
+// pollersSupported says Config.SplitEventLoops applies, which it does not to a
 // backend that already serves each connection on a goroutine of its own.
 const pollersSupported = false
 
@@ -735,12 +735,12 @@ type Config struct {
 	// TaskPool, when set, runs the engine's connections instead of a pool the
 	// engine builds from the fields above. See SetTaskPool.
 	TaskPool TaskPool
-	// IOPollers and IOPollerCount split an epoll or kqueue engine across
+	// SplitEventLoops and EventLoopCount split an epoll or kqueue engine across
 	// several event loops. This backend has one goroutine per connection
-	// already, so both are ignored here, though DefaultConfig sets IOPollers
+	// already, so both are ignored here, though DefaultConfig sets SplitEventLoops
 	// as it does on the other backends.
-	IOPollers     bool
-	IOPollerCount int
+	SplitEventLoops bool
+	EventLoopCount  int
 	// EngineLoop gives an epoll or kqueue engine with pollers a loop of its
 	// own for its listeners. This backend has no loops, and ignores it.
 	EngineLoop bool
@@ -770,7 +770,7 @@ type Config struct {
 
 func DefaultConfig() Config {
 	sizing := DefaultPoolSizing(taskpool.ModeAdaptive)
-	return Config{Name: DefaultName, Network: "tcp", Backlog: 128, WorkerCount: sizing.WorkerCount, MaxEvents: sizing.MaxEvents, ReadBufferSize: defaultReadBufferSize, WriteBufferHighWatermark: 4 * 1024, UseWritev: true, CoalesceWrites: true, SocketSyscalls: true, TaskPoolMode: taskpool.ModeAdaptive, SharedTaskPool: true, IOPollers: true, ReusePort: true, LogSettings: true}
+	return Config{Name: DefaultName, Network: "tcp", Backlog: 128, WorkerCount: sizing.WorkerCount, MaxEvents: sizing.MaxEvents, ReadBufferSize: defaultReadBufferSize, WriteBufferHighWatermark: 4 * 1024, UseWritev: true, CoalesceWrites: true, SocketSyscalls: true, TaskPoolMode: taskpool.ModeAdaptive, SharedTaskPool: true, SplitEventLoops: true, ReusePort: true, LogSettings: true}
 }
 
 type portableEvent struct {

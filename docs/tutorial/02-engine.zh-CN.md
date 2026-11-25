@@ -37,7 +37,7 @@ if err := engine.Run(); err != nil { // blocks until Stop, Shutdown or Close end
 - **监听器**——`Network` 是绑定自身留空时使用的网络，`Backlog` 是监听队列深度（内核的 `somaxconn`），`MaxConns` 限制全部绑定合计已接受的连接数，`ReusePort` 允许同一用户的其他 socket 共享地址。
 - **缓冲区与背压**——`ReadBufferSize` 限制一次读的字节数（默认 16 KiB，每轮复用池中的一个缓冲区，不是每连接一个）；`WriteBufferHighWatermark` 在某连接待写字节达到该值时暂停它的读；`MaxPendingBytes` 对整个服务器做同样的限制；`MaxWriteQueueBytes` 限制单个连接的发送队列，超出的发送不会入队，而是以 `fib.ErrSendQueueFull` 关闭连接，避免不读数据的对端把队列撑大。
 - **写入与批量**——`UseWritev` 用一次 `writev` 发送多个缓冲区，`CoalesceWrites` 把一轮内的响应 cork 起来，在本轮结束时一起写出。
-- **事件循环**——`IOPollers` 把引擎分散到多个事件循环，`IOPollerCount` 指定数量（0 表示按 CPU 数决定），`EngineLoop` 给引擎一个自己的循环来 accept 和读 UDP，`AcceptPlacement` 决定由哪个 poller 服务它 accept 到的连接。
+- **事件循环**——`SplitEventLoops` 把引擎分散到多个事件循环，`EventLoopCount` 指定数量（0 表示按 CPU 数决定），`EngineLoop` 给引擎一个自己的循环来 accept 和读 UDP，`AcceptPlacement` 决定由哪个 poller 服务它 accept 到的连接。
 
 一个调好的网关配置会把它们组合起来：
 
@@ -63,7 +63,7 @@ func main() {
 	cfg.MaxWriteQueueBytes = 8 << 20 // per-connection queue cap
 	cfg.ReadBufferSize = 64 << 10    // one read takes at most 64 KiB
 	cfg.WriteBufferHighWatermark = 256 << 10
-	cfg.IOPollerCount = 2 // two loops; 0 would size them from the CPUs
+	cfg.EventLoopCount = 2 // two loops; 0 would size them from the CPUs
 
 	handler := fibhttp.NewHandler(fibhttp.HandlerFunc(func(c *fibhttp.Context) {
 		_ = c.String(200, "ok\n")
@@ -81,7 +81,7 @@ func main() {
 
 启动配置列表（见[启动日志与日志配置](#启动日志与日志配置)）就是检查结果的办法：这里设置的字段显示 `source=custom`，例如 `parameter=workers value=4096 source=custom`；显示 `default` 的，要么被覆盖了，要么没设上，要么设成了与默认值相同的值（比如这里的 `WriteBufferHighWatermark`）。
 
-有两点要注意。零值是特殊标记的字段（`ReadBufferSize`、`Backlog`、`IOPollerCount`、`UDPIdleTimeout`、`Name`、`Network`）表示“取默认值”；其余字段的零值就是字面含义，所以 `MaxConns`、`MaxPendingBytes`、`MaxWriteQueueBytes` 为 0 表示不启用。只调大 `ReadBufferSize` 并不会改变 `DefaultConfig` 已经按旧值选好的写水位：请改用 `DefaultConfigFor`，或者自己设置 `WriteBufferHighWatermark`。
+有两点要注意。零值是特殊标记的字段（`ReadBufferSize`、`Backlog`、`EventLoopCount`、`UDPIdleTimeout`、`Name`、`Network`）表示“取默认值”；其余字段的零值就是字面含义，所以 `MaxConns`、`MaxPendingBytes`、`MaxWriteQueueBytes` 为 0 表示不启用。只调大 `ReadBufferSize` 并不会改变 `DefaultConfig` 已经按旧值选好的写水位：请改用 `DefaultConfigFor`，或者自己设置 `WriteBufferHighWatermark`。
 
 ## 一个引擎服务多种协议
 

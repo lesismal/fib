@@ -73,8 +73,8 @@ func main() {
 	config.MaxWriteQueueBytes = 4 << 20       // one peer that stops reading
 	config.MaxConns = 100000
 
-	config.IOPollers = true
-	config.IOPollerCount = 0 // let the machine size the pollers
+	config.SplitEventLoops = true
+	config.EventLoopCount = 0 // let the machine size the pollers
 	config.LogSettings = false
 
 	app := fibhttp.HandlerFunc(func(c *fibhttp.Context) {
@@ -209,19 +209,19 @@ joined := bufferpool.Join(nil, a, b) // takes enough at once and joins the parts
 
 ## Poller、GOMAXPROCS 与 prefork
 
-`IOPollers` 把引擎拆到多个事件循环上（Linux epoll、macOS/BSD kqueue）。poller 只等待事件并把可运行的
+`SplitEventLoops` 把引擎拆到多个事件循环上（Linux epoll、macOS/BSD kqueue）。poller 只等待事件并把可运行的
 连接交给 worker，因此 poller 消耗 P，除非 accept 是瓶颈，否则通常更慢；默认数量随机器而定（4 CPU 及以下
 1 个，16 CPU 及以下 2 个，更多则 CPU/8）。`EngineLoop` 让引擎拥有自己的 accept 循环，而不是让 poller 监听。
 Windows 上无论怎么设置都只有一个循环。
 
 ```go
-config.IOPollers = true
-config.IOPollerCount = 0  // 0: machine-sized; > 0: exactly this many loops
+config.SplitEventLoops = true
+config.EventLoopCount = 0    // 0: machine-sized; > 0: exactly this many loops
 config.EngineLoop = false // let the pollers accept, which accepts in parallel
 ```
 
 `GOMAXPROCS` 保持默认值，即核数。调高会更慢，并在
-[奇技淫巧指南](../hacks.zh-CN.md#17-进程级技巧preforkiopollersgomaxprocs)的测量中多用 25–40% 内存；
+[奇技淫巧指南](../hacks.zh-CN.md#17-进程级技巧preforkspliteventloopsgomaxprocs)的测量中多用 25–40% 内存；
 `runtime.NumCPU` 已经会尊重 CPU 亲和掩码或 cgroup 配额。
 
 `prefork`（Linux）是同一问题在进程层面的答案：核数很多时，单个堆的 GC 和锁争用会成为主导，于是 master
@@ -417,7 +417,7 @@ Runner、WebSocket 的 Autobahn、媒体（ffmpeg）、WebRTC（pion）、KCP（
 ## 生产检查清单
 
 1. 从 `fib.DefaultConfig()` 出发再改字段：`fib.New` 会拒绝零值 `fib.Config{}`（没有 worker 数），而手工
-   构造的配置会悄悄丢掉 `CoalesceWrites`、`IOPollers`、`ReusePort`、`SocketSyscalls`、`UseWritev` 与
+   构造的配置会悄悄丢掉 `CoalesceWrites`、`SplitEventLoops`、`ReusePort`、`SocketSyscalls`、`UseWritev` 与
    `SharedTaskPool`。
 2. 公网监听设置 `MaxConns` 与 `MaxWriteQueueBytes` 上限，让洪泛或停止读数据的对端只消耗有界资源。
 3. 只有在清楚它意味着多少内存时才把 `MaxPendingBytes` 从零调开：它替代的是 watermark × 连接数。

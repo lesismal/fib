@@ -119,7 +119,7 @@ body{margin:0}
 <main>
 <header>
   <h1>fib event loops and goroutine pools, protocol by protocol</h1>
-  <p>For each protocol: which event loop waits for events, which pool runs which code, and how data and control move between them. Drawn from the source at <code>main</code> (8a388d4), for Linux epoll and macOS kqueue, under <code>fib.DefaultConfig()</code> on more than four CPUs: <code>IOPollers=true</code> (on four or fewer it is off and the engine's loop serves the connections itself), <code>TaskPoolMode=ModeAdaptive</code>, <code>SharedTaskPool=true</code>, <code>SocketSyscalls=true</code>.</p>
+  <p>For each protocol: which event loop waits for events, which pool runs which code, and how data and control move between them. Drawn from the source at <code>main</code> (8a388d4), for Linux epoll and macOS kqueue, under <code>fib.DefaultConfig()</code>: <code>SplitEventLoops=true</code> (1 poller on up to four CPUs, 2 on up to sixteen, one per eight CPUs above), <code>EngineLoop=false</code>, <code>TaskPoolMode=ModeAdaptive</code>, <code>SharedTaskPool=true</code>, <code>SocketSyscalls=true</code>.</p>
   <p>A colour always means the same executor:</p>
   <div class="legend">
     <span class="chip c-loop"><i></i>event loop (root / poller)</span>
@@ -137,7 +137,7 @@ body{margin:0}
   <div class="tbl"><table>
     <thead><tr><th>Executor</th><th>Where it comes from</th><th>Mode / size</th><th>What it runs</th></tr></thead>
     <tbody>
-      <tr><td><span class="chip c-loop"><i></i>event loop</span></td><td><code>Engine.runLoop</code></td><td>One root loop; NumCPU÷4 pollers, rounded down, at least one: 1 up to 7 CPUs, 2 on 8, 4 on 16; <code>IOPollerCount</code> overrides</td><td>epoll_wait/kevent, accept, reading and sorting UDP datagrams, the command queue (close / refresh / detach / accept), <b>OnOpen</b></td></tr>
+      <tr><td><span class="chip c-loop"><i></i>event loop</span></td><td><code>Engine.runLoop</code></td><td>Pollers: 1 on up to 4 CPUs, 2 on up to 16, CPUs÷8 above; <code>EventLoopCount</code> overrides. A root loop only with <code>EngineLoop</code> or without <code>SplitEventLoops</code></td><td>epoll_wait/kevent, accept, reading and sorting UDP datagrams, the command queue (close / refresh / detach / accept), <b>OnOpen</b></td></tr>
       <tr><td><span class="chip c-work"><i></i>‹Name›-workers</span></td><td><code>acquireTaskPool</code> (config.go)</td><td>Adaptive, queues sharded by P; ceiling max(GOMAXPROCS×1000, NumCPU×20), floor <code>MinWorkerCount</code>; shared by engines of one Name</td><td><code>Connection.RunTask → process()</code>: socket reads, the OnData chain (TLS decryption → protocol parsing → HTTP/1 handler / WebSocket callbacks), coalesced writes, OnClose</td></tr>
       <tr><td><span class="chip c-hs"><i></i>fib-tls-handshake</span></td><td><code>sidepool</code></td><td>Adaptive; ceiling 65536, queue 10000, floor 0; one for the process</td><td>The blocking <code>crypto/tls.HandshakeContext</code> call, and delivery of the plaintext that arrived with the handshake</td></tr>
       <tr><td><span class="chip c-str"><i></i>‹Name›-streams</span></td><td><code>streampool</code>, <code>Engine.HandlerPool()</code></td><td>Adaptive; ceiling twice the widest engine pool of that Name, floor 0</td><td>HTTP/2 and HTTP/3 request handlers (extended CONNECT upgrades and WebSocket OnOpen among them); HTTP/1 OnBody handovers and cancellation when a connection closes</td></tr>
@@ -159,13 +159,13 @@ flowchart LR
     CFD[("conn fd")]
     UFD[("UDP fd")]
   end
-  subgraph ROOT["root engine loop · the goroutine in Run"]
+  subgraph ROOT["root engine loop · only with EngineLoop"]
     R1["epoll_wait"] --> R2{"token kind"}
     R2 -- listener --> R3["acceptConnections&lt;br/&gt;TCP_NODELAY"]
     R2 -- udp --> R4["readUDPListener&lt;br/&gt;recvmmsg, 256 a round at most&lt;br/&gt;sorted by peer address onto peer Connections"]
     R2 -- wake --> R5["drainCommands"]
   end
-  subgraph POL["poller i loop · one per 4 CPUs"]
+  subgraph POL["poller i loop · EventLoopCount of them"]
     P1["commandAccept → admit&lt;br/&gt;EPOLL_CTL_ADD + OnOpen"]
     P2["epoll_wait → noteEvent&lt;br/&gt;fold events into pendingEvents&lt;br/&gt;ready only if not scheduled"]
     P3["runReady: GoTasks in one batch&lt;br/&gt;then runtime.Gosched"]
@@ -195,8 +195,9 @@ flowchart LR
   class TM tmr
   </pre></div>
   <ul class="notes">
-    <li><b>Without IOPollers</b> there are no pollers: the root loop accepts, registers and waits for every connection itself. The rest is the same.</li>
-    <li><b>ReusePort (Linux only)</b>: each poller listens on a socket of its own at the engine's address and accepts for itself; the root socket is bound but does not listen. UDP likewise: each poller reads its own UDP socket.</li>
+    <li><b>By default there is no root loop</b> (<code>EngineLoop</code> is off): each poller listens and accepts for itself, as the root loop does above, and hands what it accepts on by <code>fd % pollerCount</code>. On Linux each poller has a <code>SO_REUSEPORT</code> socket of its own at the engine's address and the root socket is bound but does not listen; elsewhere the pollers share one listening socket.</li>
+    <li><b>UDP</b>: with <code>ReusePort</code> on Linux, the default, each poller reads a UDP socket of its own; otherwise the first poller reads the one socket, or the root loop with <code>EngineLoop</code>.</li>
+    <li><b>Without SplitEventLoops</b> there are no pollers: the root loop accepts, registers and waits for every connection itself. The rest is the same.</li>
     <li><b>OnOpen runs on the event loop</b> (<code>admit</code> / <code>udpPeer</code>), so it must not block. That is where TLS hands the handshake to its pool.</li>
     <li>A send made outside a round (<code>Send</code> while not corked) writes to the socket at once. Only what the socket does not take is queued, and the standing EPOLLOUT edge carries it on.</li>
     <li>On Linux connections read and write with raw system calls that bypass the scheduler, since a non-blocking socket never waits. With <code>SocketSyscalls</code>, the default, they are <code>recvfrom</code> / <code>sendto</code> / <code>sendmsg</code>, which skip the VFS permission hooks.</li>
@@ -622,10 +623,10 @@ flowchart TD
 <section id="h3">
   <h2>HTTP/3 (QUIC, with TLS 1.3 built in)</h2>
   <p class="lede">HTTP/3 has no cleartext form: TLS 1.3 is part of QUIC. The event loop reads the UDP datagrams itself and sorts them by peer address; QUIC's packets, handshake and frames are handled on workers; request handlers go to the stream pool in batches; and QUIC's own timers send from the runtime's timer goroutines.</p>
-  <div class="runs"><span class="chip c-loop"><i></i>root loop reads UDP</span><span class="chip c-work"><i></i>workers</span><span class="chip c-str"><i></i>stream pool</span><span class="chip c-tmr"><i></i>QUIC timers / UDP sweep</span></div>
+  <div class="runs"><span class="chip c-loop"><i></i>pollers read UDP</span><span class="chip c-work"><i></i>workers</span><span class="chip c-str"><i></i>stream pool</span><span class="chip c-tmr"><i></i>QUIC timers / UDP sweep</span></div>
   <div class="diagram"><pre class="mermaid">
 flowchart TD
-  subgraph LOOP["root loop, or each poller under ReusePort"]
+  subgraph LOOP["each poller with ReusePort on Linux; else the first poller, or the root loop with EngineLoop"]
     L1["UDP fd readable → readUDPListener&lt;br/&gt;recvmmsg, 256 a round at most"]
     L2["udpPeer: peer Connection by address&lt;br/&gt;a new peer gets a connection + OnOpen"]
     L3["deliverDatagram: copy onto the peer's queue&lt;br/&gt;noteEvent → GoTasks"]
@@ -670,7 +671,7 @@ flowchart TD
   class T1,T2 tmr
   </pre></div>
   <ul class="notes">
-    <li><b>Who reads UDP.</b> By default there is one UDP socket that every peer shares, so it stays on the root loop and the pollers take no part. With <code>ReusePort</code> on Linux each poller binds a socket of its own, and the kernel's four-tuple hash always hands a peer to the same poller.</li>
+    <li><b>Who reads UDP.</b> With <code>ReusePort</code> on Linux, the default, each poller binds a socket of its own, and the kernel's four-tuple hash always hands a peer to the same poller. Otherwise there is one UDP socket that every peer shares, read by the first poller, or by the root loop with <code>EngineLoop</code>.</li>
     <li><b>The handshake uses no handshake pool.</b> QUIC runs <code>crypto/tls</code>'s QUICConn, which is event-driven and never blocks, so the TLS 1.3 handshake advances within the worker's round.</li>
     <li><b>Batching.</b> The requests a burst of datagrams brings are submitted together, land on one shard and are taken by the same few workers, so their responses fit into the same UDP packets, along with the burst's acknowledgement.</li>
     <li>A stream worker writing a response and a timer goroutine both send through the UDP listener's descriptor directly, holding <code>quic.Conn.mu</code>, without going back to the event loop.</li>
@@ -791,7 +792,7 @@ flowchart TD
   <div class="runs"><span class="chip c-loop"><i></i>loop reads UDP</span><span class="chip c-work"><i></i>workers</span><span class="chip c-str"><i></i>stream pool</span><span class="chip c-tmr"><i></i>QUIC timers</span></div>
   <div class="diagram"><pre class="mermaid">
 flowchart TD
-  L1["root loop: recvmmsg → sort onto peers → GoTasks"]
+  L1["poller: recvmmsg → sort onto peers → GoTasks"]
   subgraph WK["‹Name›-workers"]
     W1["HandlePathDatagrams → dispatch&lt;br/&gt;OnStreamData → requestStream"]
     W2["HEADERS with :protocol&lt;br/&gt;→ serveTunnel: NewTunnelFeed&lt;br/&gt;streams.Queue, Submit at OnCallsDone"]

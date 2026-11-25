@@ -426,7 +426,7 @@ addrs, err := engine.BindingAddrs(2) // binding 2 实际监听的地址，包括
 ```
 
 所有 binding 共享引擎的事件循环、描述符表、task pool 和 buffer pool，也共享它的配置：backlog、
-buffer、水位线、`IOPollers` 和 `ReusePort` 对每个 binding 都生效。绑定是整体的：任一地址失败，
+buffer、水位线、`SplitEventLoops` 和 `ReusePort` 对每个 binding 都生效。绑定是整体的：任一地址失败，
 已打开的地址都会释放。
 
 引擎运行期间也可以增减 binding。`AddBinding` 新增一个 binding 并返回它的序号；`RemoveBinding`
@@ -556,8 +556,8 @@ flowchart TB
 4. 本轮产生的响应先 cork，在本轮结束时用一次 `writev`（或 `sendfile`）发出。写不完的部分留在
    队列里，由 `EPOLLOUT` 继续；超过水位线时暂停读取，直到队列排空。
 
-poller 数量（`Config.IOPollers`、`IOPollerCount`）取决于 CPU 数：4 核及以下由一个事件循环包办；
-4 核以上每 4 个 CPU 一个 poller，连接按 fd 分配。poller 停在 Go 自己的 netpoller 里，而不是阻塞在
+poller（`Config.SplitEventLoops`，默认开启；数量由 `EventLoopCount` 决定）跟随 CPU 数：4 核及以下 1 个，
+16 核以内 2 个，更多时每 8 个 CPU 一个；每个 poller 自己监听、自己 accept，连接按 fd 分配。poller 停在 Go 自己的 netpoller 里，而不是阻塞在
 `epoll_wait` 上，所以不会在有 goroutine 等待运行时占着 P。
 
 ### 各协议在哪里执行

@@ -21,7 +21,7 @@ import (
 func dialClient(t *testing.T, pollers bool) *Engine {
 	t.Helper()
 	config := DefaultConfig()
-	config.IOPollers = pollers
+	config.SplitEventLoops = pollers
 	client, _ := startEchoServer(t, config, HandlerFuncs{})
 	return client
 }

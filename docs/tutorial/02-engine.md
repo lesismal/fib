@@ -37,7 +37,7 @@ The fields fall into a few groups; only a handful change how a server behaves. S
 - **Listeners** — `Network` is the network of a binding that leaves its own empty, `Backlog` the listen queue depth (the kernel's `somaxconn`), `MaxConns` a cap on accepted connections across all bindings, and `ReusePort` lets another socket of the same user share the address.
 - **Buffers and backpressure** — `ReadBufferSize` bounds one read (16 KiB by default, one pooled buffer per round, not per connection); `WriteBufferHighWatermark` pauses reads on a connection with that much output waiting; `MaxPendingBytes` bounds the same for the whole server; `MaxWriteQueueBytes` caps one connection's queue and closes the connection with `fib.ErrSendQueueFull` rather than letting a peer that never reads grow it.
 - **Writes and batching** — `UseWritev` sends several buffers in one `writev`, `CoalesceWrites` corks a round's replies and writes them when the round ends.
-- **Pollers** — `IOPollers` splits the engine across event loops, `IOPollerCount` says how many (zero sizes them from the CPUs), `EngineLoop` gives the engine a loop of its own to accept and read UDP on, and `AcceptPlacement` picks which poller serves a connection a poller accepted.
+- **Pollers** — `SplitEventLoops` splits the engine across event loops, `EventLoopCount` says how many (zero sizes them from the CPUs), `EngineLoop` gives the engine a loop of its own to accept and read UDP on, and `AcceptPlacement` picks which poller serves a connection a poller accepted.
 
 A tuned gateway config combines them:
 
@@ -63,7 +63,7 @@ func main() {
 	cfg.MaxWriteQueueBytes = 8 << 20 // per-connection queue cap
 	cfg.ReadBufferSize = 64 << 10    // one read takes at most 64 KiB
 	cfg.WriteBufferHighWatermark = 256 << 10
-	cfg.IOPollerCount = 2 // two loops; 0 would size them from the CPUs
+	cfg.EventLoopCount = 2 // two loops; 0 would size them from the CPUs
 
 	handler := fibhttp.NewHandler(fibhttp.HandlerFunc(func(c *fibhttp.Context) {
 		_ = c.String(200, "ok\n")
@@ -81,7 +81,7 @@ func main() {
 
 The startup list (see [Startup log and logging](#startup-log-and-logging)) is the way to check the result: a field set here reads `source=custom`, for example `parameter=workers value=4096 source=custom`; one that says `default` was overwritten, never set, or set to the value the default already had (as `WriteBufferHighWatermark` is here).
 
-Two cautions. A field whose zero is a sentinel (`ReadBufferSize`, `Backlog`, `IOPollerCount`, `UDPIdleTimeout`, `Name`, `Network`) means "pick the default"; for the others zero has its literal meaning, so `MaxConns`, `MaxPendingBytes` and `MaxWriteQueueBytes` at zero are off. And raising `ReadBufferSize` alone does not resize the watermark that `DefaultConfig` already chose from the old one: use `DefaultConfigFor` or set `WriteBufferHighWatermark` yourself.
+Two cautions. A field whose zero is a sentinel (`ReadBufferSize`, `Backlog`, `EventLoopCount`, `UDPIdleTimeout`, `Name`, `Network`) means "pick the default"; for the others zero has its literal meaning, so `MaxConns`, `MaxPendingBytes` and `MaxWriteQueueBytes` at zero are off. And raising `ReadBufferSize` alone does not resize the watermark that `DefaultConfig` already chose from the old one: use `DefaultConfigFor` or set `WriteBufferHighWatermark` yourself.
 
 ## Several protocols on one engine
 

@@ -28,8 +28,8 @@ func (h *shutdownHandler) OnShutdown(c *Connection) {
 func startShutdownEngine(t *testing.T, pollers int, handler Handler) (*Engine, string, chan error) {
 	t.Helper()
 	config := DefaultConfig()
-	config.IOPollers = pollers > 0
-	config.IOPollerCount = pollers
+	config.SplitEventLoops = pollers > 0
+	config.EventLoopCount = pollers
 	engine, err := New(config, Binding{Addr: "127.0.0.1:0", Handler: handler})
 	if err != nil {
 		t.Fatal(err)

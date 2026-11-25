@@ -70,7 +70,7 @@ client side, the low-level tricks and operations.
 | 19 | [Raw TCP, UDP and Unix sockets](19-raw-io.md) | `fib.Connection`, `fib.Handler` | The raw connection API, corked writes and `SendFile`/`SpliceTo`, `HoldReads`, UDP datagrams and peers, Unix sockets, and async dialing. |
 | 20 | [Clients](20-clients.md) | HTTP, WebSocket, dial | Async dial, the HTTP/1.x, HTTP/2 and HTTP/3 clients, Alt-Svc discovery, the WebSocket client, TLS and SOCKS dialing, and one engine as both server and client. |
 | 21 | [Hacks](21-hacks.md) | — | The techniques from the [hack guide](../hacks.md) in tutorial form: async responses, zero-copy reads, the write side, `HoldReads`, `OnFrame`, object reuse, pools, process-level tricks, and the anti-patterns. |
-| 22 | [Performance and operations](22-performance.md) | taskpool, bufferpool, prefork, log | Worker pool modes and sizing, buffer sizing, `IOPollers`, `prefork`, logging, pprof, load testing, and a production checklist. |
+| 22 | [Performance and operations](22-performance.md) | taskpool, bufferpool, prefork, log | Worker pool modes and sizing, buffer sizing, `SplitEventLoops`, `prefork`, logging, pprof, load testing, and a production checklist. |
 
 ## How to read a chapter
 

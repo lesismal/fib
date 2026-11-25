@@ -22,9 +22,9 @@ import (
 // are one loop too.
 func dynamicConfigs() map[string]Config {
 	single := DefaultConfig()
-	single.IOPollers = false
+	single.SplitEventLoops = false
 	pollers := DefaultConfig()
-	pollers.IOPollers, pollers.IOPollerCount = true, 3
+	pollers.SplitEventLoops, pollers.EventLoopCount = true, 3
 	noReuse := pollers
 	noReuse.ReusePort = false
 	engineLoop := pollers

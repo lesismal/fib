@@ -21,7 +21,7 @@ import (
 	"github.com/lesismal/fib/sidepool"
 )
 
-// pollersSupported says Config.IOPollers applies: the readiness backends
+// pollersSupported says Config.SplitEventLoops applies: the readiness backends
 // can run one loop per poller.
 const pollersSupported = true
 
@@ -1067,7 +1067,7 @@ func (e *Engine) acceptPlacements() (string, bool) {
 
 // pollersListen reports whether config has each poller listen on a socket
 // of its own for an address on network, accepting its TCP connections or
-// reading its UDP datagrams itself. Under IOPollers without EngineLoop it
+// reading its UDP datagrams itself. Under SplitEventLoops without EngineLoop it
 // does for TCP whatever ReusePort says, where SO_REUSEPORT spreads
 // connections; see Config.ReusePort. UDP needs ReusePort, since a peer's datagrams move
 // between sockets as sockets join.

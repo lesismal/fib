@@ -7,7 +7,7 @@ package sys
 const SoReusePort = 0xf
 
 // ReusePortSpreads says sockets sharing an address through SO_REUSEPORT
-// share its connections between them, which lets IOPollers have each poller
+// share its connections between them, which lets SplitEventLoops have each poller
 // accept for itself; see Config.ReusePort.
 const ReusePortSpreads = true
 

@@ -24,8 +24,8 @@ import (
 func pollerConfig(name string, pollers int) Config {
 	config := DefaultConfig()
 	config.Name = name
-	config.IOPollers = true
-	config.IOPollerCount = pollers
+	config.SplitEventLoops = true
+	config.EventLoopCount = pollers
 	return config
 }
 
@@ -534,9 +534,9 @@ func TestPollersRunRoundsOnWorkers(t *testing.T) {
 // of CPUs, and hands their rounds to the engine's pool of workers.
 func TestDefaultConfigHasPollersAndWorkerPool(t *testing.T) {
 	config := DefaultConfig()
-	if !config.IOPollers || config.TaskPoolMode == taskpool.ModeInline {
-		t.Fatalf("DefaultConfig on %d CPUs has IOPollers=%v, TaskPoolMode=%v",
-			defaultCPUs(), config.IOPollers, config.TaskPoolMode)
+	if !config.SplitEventLoops || config.TaskPoolMode == taskpool.ModeInline {
+		t.Fatalf("DefaultConfig on %d CPUs has SplitEventLoops=%v, TaskPoolMode=%v",
+			defaultCPUs(), config.SplitEventLoops, config.TaskPoolMode)
 	}
 	config.Name = "default-config"
 	server, err := New(config, Binding{Addr: "127.0.0.1:0", Handler: HandlerFuncs{}})
@@ -974,7 +974,7 @@ func TestReadDeferredBehindAnotherGoroutinesFlush(t *testing.T) {
 	// The handler waits for the loop to note the next read, which a loop
 	// running the round inline never would.
 	config := DefaultConfig()
-	config.IOPollers = false
+	config.SplitEventLoops = false
 	_, addr := startEchoServer(t, config, handler)
 	conn, err := net.DialTimeout("tcp", addr, 5*time.Second)
 	if err != nil {
@@ -1031,7 +1031,7 @@ func waitFor(done func() bool) bool {
 func TestTCPConnectionsSetNoDelay(t *testing.T) {
 	for _, pollers := range []bool{false, true} {
 		config := DefaultConfig()
-		config.IOPollers = pollers
+		config.SplitEventLoops = pollers
 		accepted := make(chan int, 1)
 		_, addr := startEchoServer(t, config, HandlerFuncs{Open: func(c *Connection) {
 			v, _ := syscall.GetsockoptInt(c.FD(), syscall.IPPROTO_TCP, syscall.TCP_NODELAY)
@@ -1051,10 +1051,10 @@ func TestTCPConnectionsSetNoDelay(t *testing.T) {
 			t.Fatal(err)
 		}
 		if v := <-dialed; v == 0 {
-			t.Errorf("IOPollers=%v: dialed connection has TCP_NODELAY off", pollers)
+			t.Errorf("SplitEventLoops=%v: dialed connection has TCP_NODELAY off", pollers)
 		}
 		if v := <-accepted; v == 0 {
-			t.Errorf("IOPollers=%v: accepted connection has TCP_NODELAY off", pollers)
+			t.Errorf("SplitEventLoops=%v: accepted connection has TCP_NODELAY off", pollers)
 		}
 	}
 }
@@ -1630,7 +1630,7 @@ func TestOnHangupReachesARunningRound(t *testing.T) {
 		t.Run(fmt.Sprintf("pollers=%v", pollers), func(t *testing.T) {
 			serve := func(h Handler) string {
 				config := DefaultConfig()
-				config.IOPollers = pollers
+				config.SplitEventLoops = pollers
 				server, err := New(config, Binding{Addr: "127.0.0.1:0", Handler: h})
 				if err != nil {
 					t.Fatal(err)

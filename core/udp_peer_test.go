@@ -35,7 +35,7 @@ func (h *peerRecorder) OnClose(*Connection, error)         {}
 // oneSocketConfig binds each address once, on a single loop.
 func oneSocketConfig() Config {
 	config := DefaultConfig()
-	config.IOPollers = false
+	config.SplitEventLoops = false
 	config.ReusePort = false
 	return config
 }
