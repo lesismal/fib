@@ -60,7 +60,6 @@ var submitSites = []submitSite{
 	{"http/stream_pool_native.go", "StreamPool.submit", "pool.GoTask", []string{onEngine}, onHandlers, true},
 	{"http/stream_pool_native.go", "runOnStreamsFromReader", "handlerPool(conn).Go", []string{onEngine}, onHandlers, true},
 	{"http/stream_pool_native.go", "handOn", "pool.Go", []string{onGoroutine}, onHandlers, true},
-	{"http/h2_server.go", "h2ServerConn.flushBehindHandoffs", "sc.flushPool.GoTask", []string{onEngine}, onHandlers, true},
 	{"http/h2_server.go", "h2ServerConn.scheduleFlush", "sidepool.Flush().GoTask",
 		[]string{onEngine, onHandlers, onClient, onNotify, onGoroutine}, onFlush, true},
 	{"grpc/transport.go", "transport.run", "pool.GoTask", []string{onEngine}, onHandlers, true},

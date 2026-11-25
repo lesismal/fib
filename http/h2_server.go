@@ -25,7 +25,6 @@ import (
 	"github.com/lesismal/fib/hpack"
 	"github.com/lesismal/fib/internal/outputwait"
 	"github.com/lesismal/fib/sidepool"
-	"github.com/lesismal/fib/taskpool"
 )
 
 // HTTP/2 on the server side. ServerHandler recognizes a connection that
@@ -232,13 +231,9 @@ type h2ServerConn struct {
 	frameHeads []byte
 
 	// flushPending says flusher is on its way to write what the connection
-	// has queued, and flushPool is the pool the requests run on, which a
-	// read sends it to behind the requests it handed there; see sendLocked.
-	// handed counts those requests, and only the reader touches it.
+	// has queued; see sendLocked.
 	flushPending atomic.Bool
 	flusher      h2Flusher
-	flushPool    *taskpool.TaskPool
-	handed       int
 
 	// outputFull says framing stopped short of what the windows allow
 	// because the connection had h2MaxQueuedOutput waiting for its socket,
@@ -387,7 +382,6 @@ func newH2ServerConn(h *ServerHandler, c *fib.Connection, remoteAddr string) *h2
 		pushEnabled:  true,
 		nextPushID:   2,
 		peerMaxPush:  math.MaxUint32,
-		flushPool:    handlerPool(c),
 		reuseStreams: h.config.ReuseRequests && h.config.ReuseURLs && h.config.ReuseContexts,
 		reuseHeaders: h.config.ReuseHeaders,
 		maxContFrames: h2MaxContinuations(h.config.MaxContinuationFrames,
@@ -474,14 +468,13 @@ func (sc *h2ServerConn) idleExpired() {
 
 // sendLocked sends out unless the connection has ended.
 //
-// What the connection sends is queued, corked, and written by flusher. A
-// read that hands the pool the requests run on more than one request sends
-// flusher there behind them (see flushBehindHandoffs), so the handlers that
-// answer them find it on its way and only queue what they send: the
-// responses of a burst of requests leave in one write rather than one each.
-// Frames queued with no flusher on its way send it to the flush pool (see
-// scheduleFlush), so none waits for another, a slow handler's included. On
-// 64 CPUs, the responses of h2load's 100 streams a connection each written
+// What the connection sends is queued, corked, and written by flusher, which
+// the first frames queued since it last ran send to the flush pool (see
+// scheduleFlush). The handlers that answer meanwhile find it on its way and
+// only queue what they send, so the responses of a burst of requests leave
+// in fewer writes than one each; a response that comes in after the flusher
+// ran sends it again, so none waits for another, a slow handler's included.
+// On 64 CPUs, the responses of h2load's 100 streams a connection each written
 // as they came spent 60% of the server's time in write.
 func (sc *h2ServerConn) sendLocked(out []byte) {
 	if len(out) > 0 && !sc.closed {
@@ -555,23 +548,6 @@ func (sc *h2ServerConn) scheduleFlush() {
 	}
 }
 
-// flushBehindHandoffs sends flusher to the pool the requests run on, behind
-// the requests this read handed it, when it handed more than one: the
-// handlers that answer them then find it on its way, and their responses
-// leave in one write. The reader submits it, an engine worker, which is no
-// worker of that pool. One request alone gains nothing from it, and its
-// handler's response sends flusher to the flush pool instead.
-func (sc *h2ServerConn) flushBehindHandoffs() {
-	handed := sc.handed
-	sc.handed = 0
-	if handed < 2 || sc.flushPool == nil || !sc.flushPending.CompareAndSwap(false, true) {
-		return
-	}
-	if !sc.flushPool.GoTask(&sc.flusher) {
-		sc.flusher.RunTask()
-	}
-}
-
 // feed takes bytes from the connection, preface included, and handles every
 // complete frame among them.
 func (sc *h2ServerConn) feed(data []byte) {
@@ -621,7 +597,6 @@ func (sc *h2ServerConn) feed(data []byte) {
 	} else if offset > 0 {
 		sc.in = append(sc.in[:0], sc.in[offset:]...)
 	}
-	sc.flushBehindHandoffs()
 }
 
 // handleError resets a stream for a stream error and ends the connection for
@@ -1513,7 +1488,6 @@ func (sc *h2ServerConn) finishRequest(st *h2ServerStream) error {
 	st.refs.Add(1)
 	sc.armWriteTimeout(st)
 	sc.handler.streams.Serve(&sc.gate, sc.conn, sc.handler.handler, &st.block)
-	sc.handed++
 	return nil
 }
 
@@ -1567,7 +1541,6 @@ func (sc *h2ServerConn) streamRequest(st *h2ServerStream, buffered, arrived []by
 	bufferpool.Put(buffered)
 	sc.armWriteTimeout(st)
 	sc.handler.streams.Serve(&sc.gate, sc.conn, sc.handler.handler, &st.block)
-	sc.handed++
 }
 
 // handleStreamedData hands a DATA frame to the handler of a body that
