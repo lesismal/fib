@@ -23,6 +23,14 @@ func Notify() *taskpool.TaskPool { return notify.get("fib-notify", notifyWorkers
 // lock that fn takes. A callback that finds the pool's queue full waits in a
 // list of Post's own instead, which every callback the pool runs empties
 // before it lets its worker go, so no goroutine is started for it.
+//
+// A callback Post runs may call Post again, which submits to the notify pool
+// from one of its own workers. That is the one place fib lets a pool's task
+// submit to its own pool, and it is safe because Post never waits: a pool
+// stops for good only when every worker waits for room in its own queue
+// (see taskpool.TaskPool.Go), and none of Post's ever does. Every other
+// submission fib makes from a pool's task goes to another pool, or through
+// an event loop with fib.Engine.Hand; see TestPoolSubmissions.
 func Post(fn func()) { post(Notify(), &overflow, fn) }
 
 var overflow backlog

@@ -556,7 +556,7 @@ func (c *Client) doFramed(req *stdhttp.Request, callback func(*ClientResponse, e
 	}
 	r := &clientRequest{req: req, data: data, body: body, borrowed: borrowed, upload: upload, declared: declared,
 		chunked: chunked, callback: callback, whole: whole, tunnel: tunnel, headerWait: c.config.ResponseHeaderTimeout,
-		wantBlock: framing.ResponseHeaderBlock, flush: framing.Flush}
+		wantBlock: framing.ResponseHeaderBlock, flush: framing.Flush, engine: c.engine}
 	r.headLen = len(data)
 	if c.config.ExpectContinueTimeout > 0 && reqbody.ExpectsContinue(req, len(body) > 0 || upload != nil) {
 		r.expect = true
@@ -1447,6 +1447,9 @@ type clientRequest struct {
 	expect   bool
 	headLen  int
 	callback func(*ClientResponse, error)
+	// engine is the client's, whose loop hands a late body delivery on; see
+	// ClientResponse.later.
+	engine *fib.Engine
 	// whole asks for the response to arrive whole even when the client would
 	// stream it, as Go's does. tunnel is StartUpgrade's handler, for a 101 to
 	// switch the connection to; a 101 has no body, so it always arrives whole.
@@ -1529,7 +1532,7 @@ func (r *clientRequest) deliver(resp *stdhttp.Response, err error) {
 		r.callback(nil, err)
 		return
 	}
-	deliverArrived(&ClientResponse{Response: resp, req: r, block: r.block}, r.callback)
+	deliverArrived(&ClientResponse{Response: resp, req: r, block: r.block, engine: r.engine}, r.callback)
 }
 
 // markDone settles the request, once, and stops what would abandon it.
@@ -2380,6 +2383,7 @@ func newClientStream(cc *clientConn, r *clientRequest, head *stdhttp.Response, c
 		Done:     r.markDone,
 		Abort:    r.abort,
 		Credit:   credit,
+		Engine:   r.engine,
 	}
 	if credit == nil {
 		hooks.Hold = cc.conn.HoldReads

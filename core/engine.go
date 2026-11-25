@@ -83,9 +83,10 @@ const (
 	// commandDetach releases the descriptor of a connection whose last
 	// round has run its OnClose; see closeConnection.
 	commandDetach
-	// commandRun runs a function on the loop, for the rare changes to
-	// what the loop owns that come from elsewhere: a Shutdown round, or a
-	// binding opened or closed; see runOrQueue.
+	// commandRun runs a function on the loop: a change to what the loop
+	// owns that comes from elsewhere, such as a Shutdown round or a binding
+	// opened or closed (see runOrQueue), or a function Hand has the loop
+	// submit to a pool.
 	commandRun
 )
 
@@ -176,7 +177,10 @@ type Engine struct {
 	// Guarded by commandMu.
 	commandsClosed bool
 	commandPool    sync.Pool
-	wakePending    atomic.Bool
+	// hand holds what Hand asked the loop to submit and a full pool turned
+	// away for now.
+	hand        handQueue
+	wakePending atomic.Bool
 	// budgetPaused holds connections whose reads the server-wide budget stopped,
 	// waiting to be resumed once it recovers. Event-loop ownership.
 	budgetPaused []*Connection

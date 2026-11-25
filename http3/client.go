@@ -380,7 +380,7 @@ func (c *Client) do(req *stdhttp.Request, callback func(*fibhttp.ClientResponse,
 		length = int64(len(body))
 	}
 	r := &clientRequest{req: req, body: body, upload: upload, declared: length, callback: callback, whole: whole, alt: alt,
-		expect: c.config.ExpectContinueTimeout > 0 && reqbody.ExpectsContinue(req, len(body) > 0 || upload != nil)}
+		expect: c.config.ExpectContinueTimeout > 0 && reqbody.ExpectsContinue(req, len(body) > 0 || upload != nil), engine: c.engine}
 	fields, trailer, err := requestFields(req, length)
 	if err != nil {
 		if upload != nil {
@@ -538,8 +538,10 @@ func (c *Client) forget(cc *clientConn) {
 
 // clientRequest is one request from Do until its callback.
 type clientRequest struct {
-	req  *stdhttp.Request
-	body []byte
+	req *stdhttp.Request
+	// engine is the client's, whose loop hands a late body delivery on.
+	engine *fib.Engine
+	body   []byte
 	// upload is the body of a request whose body streams, sent after the
 	// header, and declared its length, or -1 when it has none.
 	upload   *reqbody.Source
@@ -611,7 +613,7 @@ func (r *clientRequest) finish(resp *stdhttp.Response, err error) bool {
 	case err != nil:
 		r.callback(nil, err)
 	default:
-		fibhttp.DeliverResponse(resp, r.abort, r.callback)
+		fibhttp.DeliverResponseOn(r.engine, resp, r.abort, r.callback)
 	}
 	return true
 }
@@ -1676,6 +1678,7 @@ func (st *clientStream) onFrame(typ uint64, payload []byte) error {
 			Done:     r.markDone,
 			Abort:    r.abort,
 			Credit:   st.credit,
+			Engine:   r.engine,
 		})
 		st.stream.Start()
 	}

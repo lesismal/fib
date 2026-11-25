@@ -14,7 +14,7 @@
   接覆盖；"否"表示没有任何测量。
 - **已优化**："是"表示已有基于测量的优化合入；"部分"表示做过一些，但已知有部分未看过；"否"表示没有。
 - 依据写日期、提交或文档；细节见提交日志中的 `perf(...)` 条目。
-- 状态截至 2026-11-24。
+- 状态截至 2026-11-25。
 
 ## 状态
 
@@ -28,7 +28,7 @@
 | TLS 握手 | `tls` | 是（`BenchmarkServerHandshake`、`BenchmarkClientHandshake`，01a143d） | 部分 | 基准已有；没有据此做的优化记录 |
 | HTTP/1 服务端：解析器、响应分帧 | `http` | 是（`BenchmarkParser*`、`BenchmarkServerKeepAlive*`、`BenchmarkParseRequestHead`、压测） | 是（8bb8a82、de62b0b、e17bf98、534f420、2e2fef1） | — |
 | HTTP/1 客户端 | `http` | 是（`BenchmarkMarshalRequest`、`BenchmarkParseResponseHead`、`BenchmarkClientNewConnection`） | 是（0a9339f、e51b8f5、a9493a8、415e755） | — |
-| HTTP/2 服务端：帧、流控、流 | `http` | 是（`BenchmarkH2Server*`，10e984f，[http2](http2.zh-CN.md) 基准一节） | 是（73c0c3b、d03e91e、6d145b4、e02d9a9、089a5b0） | — |
+| HTTP/2 服务端：帧、流控、流 | `http` | 部分（响应 flush 改动未测；`BenchmarkH2Server*`，10e984f，[http2](http2.zh-CN.md) 基准一节） | 是（73c0c3b、d03e91e、6d145b4、e02d9a9、089a5b0） | 响应 flush 改动后要重测（一次读分发的请求之后在 handler 池排一个 flusher，其余 flush 走 `fib-flush`）：h2load 每连接多 stream，对比改动前一个提交的请求数/秒和每个响应的 write 次数 |
 | HTTP/2 客户端 | `http` | 部分（没有多流并发的客户端 HTTP/2 基准） | 部分（cb9bbbe） | 一个连接上大量请求并发的客户端基准 |
 | HPACK | `hpack` | 是（编解码基准，0e7016b） | 是（0c47caf、346f48e、871bdb7、d7e117c） | — |
 | 路由、Context.JSON | `http`、`http/routerbench` | 是（`BenchmarkRouter*`、`BenchmarkGitHub`、`BenchmarkJSONResponse`） | 是（240182e、b39373d） | — |

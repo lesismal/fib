@@ -454,7 +454,11 @@ func (s *Server) openStream(t *transport, id uint32, fields []hpack.HeaderField,
 	t.streams[id] = st
 	t.mu.Unlock()
 	if fail != nil {
-		ss.finish(fail)
+		// The reader finishes it, an engine worker, which may hand a call
+		// that waited on to the pool.
+		if next := ss.finish(fail); next != nil {
+			t.run(next)
+		}
 		return nil
 	}
 	if ss.unary != nil && !endStream {
@@ -572,8 +576,11 @@ func (ss *serverStream) rejectHTTP(t *transport, id uint32, grpcType, endStream 
 
 // RunTask serves the call on the pool.
 func (ss *serverStream) RunTask() {
-	err := ss.server.invoke(ss, ss.method, ss.svc, ss.unary, ss.stream)
-	ss.finish(status.Convert(errOrContext(err, ss.ctx)))
+	// A call that waited for this one's turn runs next, on this task.
+	for ss != nil {
+		err := ss.server.invoke(ss, ss.method, ss.svc, ss.unary, ss.stream)
+		ss = ss.finish(status.Convert(errOrContext(err, ss.ctx)))
+	}
 }
 
 // invoke runs the handler of the call on ss to method, which lookup found to
@@ -737,21 +744,25 @@ func toRPCErr(err error) error {
 
 // finish ends the call with st: its status and trailers go out, as the
 // whole response if no header has, and the stream is forgotten.
-func (ss *serverStream) finish(st *status.Status) {
+//
+// When the handler of the call has returned, finish also returns the call
+// that was waiting for its turn, if any, counted as running already. The
+// caller runs it: the task that ran the handler runs the next one itself,
+// since a task of the handler pool must not submit to that pool (see
+// taskpool.TaskPool.Go).
+func (ss *serverStream) finish(st *status.Status) (next *serverStream) {
 	defer ss.cancel()
 	t := ss.s.t
 	t.mu.Lock()
 	if ss.running {
-		// The handler has returned; a call waiting for it to runs now.
+		// The handler has returned; a call waiting for it to runs next.
 		ss.running = false
-		if next := t.handlerDoneLocked(); next != nil {
-			defer t.run(next)
-		}
+		next = t.handlerDoneLocked()
 	}
 	if ss.done || t.closed || t.streams[ss.s.id] != ss.s {
 		ss.done = true
 		t.mu.Unlock()
-		return
+		return next
 	}
 	block := t.enc.Begin(t.scratch[:0])
 	if !ss.headerSent {
@@ -786,6 +797,7 @@ func (ss *serverStream) finish(st *status.Status) {
 	t.removeLocked(ss.s)
 	t.mu.Unlock()
 	t.flush()
+	return next
 }
 
 // SetHeader sets header metadata of the call of ctx, a server handler's.

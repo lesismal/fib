@@ -694,12 +694,14 @@ func (h *ServerHandler) OnShutdown(c *fib.Connection) {
 }
 
 // elsewhere runs fn, which works on qc, on the engine's handler pool, or on
-// a goroutine of its own once the pool has stopped taking work. If fn
+// a goroutine of its own once the engine has closed. The loop that serves c
+// submits fn (see fib.Connection.Hand), since the caller may be running on
+// that pool, which a task must not submit to. If fn
 // panics, qc is closed with H3_INTERNAL_ERROR; the panic then goes on to the
 // pool, whose panic handler sees it, and on a goroutine of its own, where
 // nothing would recover it, is logged instead of taking the process down.
 func elsewhere(c *fib.Connection, qc *quic.Conn, fn func()) {
-	if pool := c.Engine().HandlerPool(); pool != nil && pool.Go(func() {
+	if pool := c.Engine().HandlerPool(); pool != nil && c.Hand(pool, func() {
 		defer closePanicked(qc, true)
 		fn()
 	}) {

@@ -106,7 +106,9 @@ func serve(c *fibhttp.Context, handler stdhttp.Handler) {
 		}
 		_ = c.WriteResponse(fibhttp.Response{StatusCode: w.status, Header: w.header, Body: w.body})
 	}
-	if pool := c.Conn.Engine().HandlerPool(); pool == nil || !pool.Go(gather) {
+	// The handler may be running on the handler pool itself, which a task
+	// must not submit to, so the connection's loop submits gather.
+	if pool := c.Conn.Engine().HandlerPool(); pool == nil || !c.Conn.Hand(pool, gather) {
 		// The engine is closing; the profile is gathered here.
 		gather()
 	}

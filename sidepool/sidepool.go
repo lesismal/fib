@@ -39,6 +39,9 @@ const (
 	// reads wait on the disk at once, which more workers would not make
 	// faster.
 	fileWorkers = 256
+	// flushWorkers is the flush pool's ceiling. What it runs writes what a
+	// connection has queued, one non-blocking write, and returns.
+	flushWorkers = 4096
 	// queueSize bounds what waits for a worker in either pool, once it is at
 	// its ceiling. A submission to the client pool that finds the queue full
 	// waits for room; package tls submits to the handshake pool with TryGo,
@@ -46,7 +49,7 @@ const (
 	queueSize = 10000
 )
 
-var client, handshake, file lazyPool
+var client, handshake, file, flush lazyPool
 
 // Client returns the pool the clients built on an engine run their
 // asynchronous work on: DNS lookups for a dial, and the callbacks that hand a
@@ -60,7 +63,17 @@ func Handshake() *taskpool.TaskPool { return handshake.get("fib-tls-handshake", 
 // waiting are read from the disk on; see http.Context.SendFile.
 func File() *taskpool.TaskPool { return file.get("fib-file", fileWorkers) }
 
-// Go runs fn on the client pool.
+// Flush returns the pool that writes out what a connection has queued, for
+// a protocol that corks what it sends and has it written later, such as
+// HTTP/2 serving its responses. What it runs only writes to a socket, and
+// submits nothing to any pool, so any goroutine may wait to submit to it,
+// a worker of any other pool included.
+func Flush() *taskpool.TaskPool { return flush.get("fib-flush", flushWorkers) }
+
+// Go runs fn on the client pool. It waits for room when the pool is full, so
+// it must not be called from a task of the client pool itself, nor from
+// anything the client pool may wait on; such a caller uses
+// fib.Engine.Hand or fib.Connection.Hand instead.
 func Go(fn func()) { Client().Go(fn) }
 
 type lazyPool struct {

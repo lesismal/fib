@@ -111,13 +111,19 @@ func (e *Engine) DialWith(opts DialOptions, done func(*Connection, error)) error
 	}
 	if !isLiteralAddr(opts.Addr) {
 		resolveOn := opts.resolveNetwork(network)
-		sidepool.Go(func() {
+		// The lookup runs on the client pool. The caller may be a callback
+		// running on that pool, which must not submit to it, so the loop
+		// submits the lookup; see Hand.
+		resolve := func() {
 			d.family, d.sa, d.raddr, d.err = netaddr.ResolveDial(resolveOn, opts.Addr)
 			if d.err == nil && d.raddr != nil {
 				d.err = opts.familyMismatch(d.raddr.IP)
 			}
 			e.requestDial(d)
-		})
+		}
+		if !e.Hand(sidepool.Client(), resolve) {
+			return d.opError(errLoopClosed)
+		}
 		return nil
 	}
 	var err error

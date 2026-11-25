@@ -120,6 +120,7 @@ type TaskPool struct {
 	executor *executor
 	backend  backend
 	mode     Mode
+	stopped  atomic.Bool
 }
 
 // New creates a ModeAdaptive pool that grows to maxConcurrent workers under
@@ -198,6 +199,15 @@ func (tp *TaskPool) SetPanicHandler(handler func(any, []byte)) {
 	tp.executor.setPanicHandler(handler)
 }
 
+// Go runs f on one of the pool's workers. It reports false, and f does not
+// run, once the pool has stopped.
+//
+// When every worker the pool may run is busy and its queue is full, Go waits
+// for room. A task of the pool must therefore never submit to its own pool
+// with Go, GoTask or GoTasks: were every worker waiting so, none would be left
+// to take a task off the queue, and the pool would stop for good. Submitting
+// to another pool may wait, as long as no chain of such waits leads back to
+// the pool it started from. A caller that may not wait at all uses TryGo.
 func (tp *TaskPool) Go(f func()) bool {
 	if f == nil {
 		return true
@@ -205,6 +215,7 @@ func (tp *TaskPool) Go(f func()) bool {
 	return tp.GoTask(taskFunc(f))
 }
 
+// GoTask is Go for a Task, and waits for room as Go does.
 func (tp *TaskPool) GoTask(task Task) bool {
 	if task == nil {
 		return true
@@ -228,7 +239,7 @@ func (tp *TaskPool) TryGo(f func()) bool {
 
 // GoTasks submits tasks in order and returns how many were accepted. Tasks
 // must be non-nil. A short count means the pool stopped; the suffix
-// tasks[n:] was not accepted.
+// tasks[n:] was not accepted. It waits for room as Go does.
 func (tp *TaskPool) GoTasks(tasks []Task) int {
 	if len(tasks) == 0 {
 		return 0
@@ -236,9 +247,20 @@ func (tp *TaskPool) GoTasks(tasks []Task) int {
 	return tp.backend.submitBatch(tasks)
 }
 
+// Call runs f here, on the calling goroutine, under the panic recovery the
+// pool gives its tasks.
 func (tp *TaskPool) Call(f func()) { tp.executor.call(taskFunc(f)) }
 
-func (tp *TaskPool) Stop() { tp.backend.stop() }
+// Stop stops the pool: it takes no more tasks, and its workers leave once
+// the tasks already queued have run.
+func (tp *TaskPool) Stop() {
+	tp.stopped.Store(true)
+	tp.backend.stop()
+}
+
+// Stopped reports whether Stop has been called, which tells a TryGo that
+// failed because the pool stopped from one that found its queue full.
+func (tp *TaskPool) Stopped() bool { return tp.stopped.Load() }
 
 // Workers reports how many workers the pool is running: the forked workers
 // under ModeElastic, the current population under ModeAdaptive and ModeAdaptiveChan, and none under ModeInline.

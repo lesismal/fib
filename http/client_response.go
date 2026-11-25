@@ -10,6 +10,7 @@ import (
 	"runtime/debug"
 	"sync"
 
+	fib "github.com/lesismal/fib"
 	"github.com/lesismal/fib/bufferpool"
 	"github.com/lesismal/fib/log"
 	"github.com/lesismal/fib/sidepool"
@@ -64,6 +65,9 @@ type ClientResponse struct {
 	tunnel *Tunnel
 	// block is the header's lines, when they came in place of Header.
 	block string
+	// engine is the client's engine, whose loop hands the body on when
+	// delivery is resumed from elsewhere; see later.
+	engine *fib.Engine
 }
 
 // HeaderBlock is the response's header as the lines it arrived in, each ended
@@ -101,7 +105,26 @@ func NewBufferedBody(data []byte) io.ReadCloser {
 // exchange. It is for the clients of other transports, such as package http3,
 // to deliver their responses the way this package's Client does.
 func DeliverResponse(resp *stdhttp.Response, abort func(error), callback func(*ClientResponse, error)) {
-	deliverArrived(&ClientResponse{Response: resp, abort: abort}, callback)
+	DeliverResponseOn(nil, resp, abort, callback)
+}
+
+// DeliverResponseOn is DeliverResponse for a client on engine, whose loop
+// hands the body to OnBody's function when it is asked for, or resumed,
+// from elsewhere than the callback. With a nil engine, goroutines of their
+// own do it.
+func DeliverResponseOn(engine *fib.Engine, resp *stdhttp.Response, abort func(error), callback func(*ClientResponse, error)) {
+	deliverArrived(&ClientResponse{Response: resp, abort: abort, engine: engine}, callback)
+}
+
+// later runs fn on the client pool, submitted by the loop of the client's
+// engine rather than here: the caller may be a callback running on the
+// client pool itself, which must not submit to it (see taskpool.TaskPool.Go).
+// With no engine, or once it has closed, fn runs on a goroutine of its own,
+// which is no worker of any pool.
+func (c *ClientResponse) later(fn func()) {
+	if c.engine == nil || !c.engine.Hand(sidepool.Client(), fn) {
+		go fn()
+	}
 }
 
 // deliverArrived runs callback with cr, a response whose body has arrived
@@ -161,7 +184,7 @@ func (c *ClientResponse) OnBody(fn BodyFunc) {
 	late := !c.inCallback
 	c.mu.Unlock()
 	if late {
-		sidepool.Go(c.deliverWhole)
+		c.later(c.deliverWhole)
 	}
 }
 
@@ -189,7 +212,7 @@ func (c *ClientResponse) HoldBody(hold bool) {
 	c.paused = hold
 	c.mu.Unlock()
 	if resume {
-		sidepool.Go(c.deliverWhole)
+		c.later(c.deliverWhole)
 	}
 }
 
@@ -380,6 +403,10 @@ type StreamHooks struct {
 	Done func() bool
 	// Abort fails the request with err and abandons the exchange.
 	Abort func(err error)
+	// Engine is the client's engine, whose loop hands the body on when
+	// delivery is resumed from elsewhere than the stream's own goroutine.
+	// Left nil, goroutines of their own do it.
+	Engine *fib.Engine
 	// Hold stops or resumes the transport's reading, for a transport that
 	// can stop reading just this response, by holding the connection's.
 	// Transports that pace the sender by flow control instead leave it nil
@@ -525,7 +552,7 @@ func NewResponseStream(head *stdhttp.Response, req *stdhttp.Request, options Str
 	if s.highWater <= 0 {
 		s.highWater = DefaultStreamResponseBodyBuffer
 	}
-	s.cr = &ClientResponse{Response: head, s: s, abort: hooks.Abort}
+	s.cr = &ClientResponse{Response: head, s: s, abort: hooks.Abort, engine: hooks.Engine}
 	head.Body = &streamBody{s: s}
 	return s
 }
@@ -683,7 +710,7 @@ func (s *ResponseStream) setFn(fn BodyFunc) {
 	s.mu.Lock()
 	if s.discarding {
 		s.mu.Unlock()
-		sidepool.Go(func() { fn(nil, true, ErrResponseAbandoned) })
+		s.cr.later(func() { fn(nil, true, ErrResponseAbandoned) })
 		return
 	}
 	s.fn, s.touched = fn, true
@@ -693,7 +720,7 @@ func (s *ResponseStream) setFn(fn BodyFunc) {
 	case late && s.detached:
 		s.kick()
 	case late:
-		sidepool.Go(s.drain)
+		s.cr.later(s.drain)
 	}
 }
 
@@ -708,7 +735,7 @@ func (s *ResponseStream) hold(hold bool) {
 	case s.detached:
 		s.kick()
 	default:
-		sidepool.Go(s.drain)
+		s.cr.later(s.drain)
 	}
 }
 

@@ -78,10 +78,10 @@ func (c *Context) SendFileStall(f fib.File, offset, n int64, stall time.Duration
 	}
 	switch {
 	case f == nil || offset < 0 || n < 0:
-		sidepool.Go(func() { done(errors.New("http: invalid SendFile range")) })
+		c.handClient(func() { done(errors.New("http: invalid SendFile range")) })
 		return
 	case c.wrote:
-		sidepool.Go(func() { done(ErrResponseWritten) })
+		c.handClient(func() { done(ErrResponseWritten) })
 		return
 	}
 	w := c.writer()
@@ -114,19 +114,30 @@ func (c *Context) SendFileStall(f fib.File, offset, n int64, stall time.Duration
 			// Counted, as Write counts what it is given for HEAD.
 			w.written += n
 		}
-		sidepool.Go(func() { s.finish(err) })
+		s.c.handClient(func() { s.finish(err) })
 		return
 	}
 	if queued {
 		if stall <= 0 {
 			err := c.sendFileHTTP1(f, offset, n)
-			sidepool.Go(func() { s.finish(err) })
+			s.c.handClient(func() { s.finish(err) })
 			return
 		}
 		s.queue()
 		return
 	}
 	sidepool.File().Go(s.pump)
+}
+
+// handClient runs fn, a SendFile's done or what leads to it, on the client
+// pool, submitted by the loop that serves the connection rather than here
+// (see fib.Connection.Hand): the caller may be a callback running on that
+// pool, which must not submit to it. With no connection, or once the engine
+// has closed, fn runs on a goroutine of its own.
+func (c *Context) handClient(fn func()) {
+	if c.Conn == nil || !c.Conn.Hand(sidepool.Client(), fn) {
+		go fn()
+	}
 }
 
 // sendFileHTTP1 is SendFile on an HTTP/1 connection that queues the file,
@@ -186,18 +197,18 @@ func (s *fileSend) queue() {
 			f = keptFile{f}
 		}
 		if err := s.c.sendFileHTTP1(f, s.offset, k); err != nil {
-			sidepool.Go(func() { s.finish(err) })
+			s.c.handClient(func() { s.finish(err) })
 			return
 		}
 		s.offset += k
 		s.left -= k
 		if s.left == 0 {
-			sidepool.Go(func() { s.finish(nil) })
+			s.c.handClient(func() { s.finish(nil) })
 			return
 		}
 		waiting, err := s.wait(s.requeue)
 		if err != nil {
-			sidepool.Go(func() { s.finish(err) })
+			s.c.handClient(func() { s.finish(err) })
 			return
 		}
 		if waiting {

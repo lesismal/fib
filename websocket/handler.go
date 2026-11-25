@@ -1004,9 +1004,11 @@ func (h *ServerHandler) OnShutdown(c *fib.Connection) {
 var _ fib.ShutdownHandler = (*ServerHandler)(nil)
 
 // elsewhere runs fn on the engine's handler pool, or on a goroutine of its
-// own once the pool has stopped taking work.
+// own once the engine has closed. The loop that serves c submits fn (see
+// fib.Connection.Hand), since the caller may be running on that pool, which
+// a task must not submit to.
 func elsewhere(c *fib.Connection, fn func()) {
-	if pool := c.Engine().HandlerPool(); pool == nil || !pool.Go(fn) {
+	if pool := c.Engine().HandlerPool(); pool == nil || !c.Hand(pool, fn) {
 		go fn()
 	}
 }

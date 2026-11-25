@@ -829,6 +829,19 @@ config.SetTaskPool(pool)          // the Engine uses your pool; closing the Engi
   event loop hangs too. fib does the same internally: `<Name>-streams` (HTTP/2 and HTTP/3
   handlers), `fib-client` and `fib-tls-handshake` are all separate pools, and
   **waiting goes one way only, engine worker → other pools**.
+- **A task never submits to its own pool with `Go`, `GoTask` or `GoTasks`.** They wait for room
+  when the pool is at its ceiling with a full queue; if every worker waits so, none is left to make
+  room and the pool stops for good. Submitting to another pool may wait, as long as no chain of
+  such waits leads back to where it started. Code that may be running on the pool it wants to
+  submit to — a handler handing work to `HandlerPool()`, a client callback handing a callback to
+  `fib-client` — uses `Connection.Hand(pool, fn)` or `Engine.Hand(pool, fn)`: the event loop
+  submits `fn` with `TryGo` and, when the queue is full, offers it again shortly, so neither the
+  caller nor the loop ever waits. fib's own code follows this rule, and `TestPoolSubmissions`
+  (`pool_submit_test.go`) lists every submission in fib with where it may run and fails on a new
+  one until it is listed, on one that may wait on its own pool, and on a cycle of waits. The one
+  exception is `sidepool.Post`: a callback on `fib-notify` may post another, which submits to
+  `fib-notify` from its own worker, but `Post` never waits (`TryGo`, and a list of its own that the
+  pool's callbacks empty when the queue is full), so it cannot stop the pool.
 - Blocking handlers (which wait on your application's own I/O) belong in `<Name>-streams` (its
   ceiling is twice the Engine pool's) or your own pool, not the Engine's.
 - `SharedTaskPool` (on by default): Engines **with the same name** in a process share workers and

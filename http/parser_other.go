@@ -19,5 +19,8 @@ func (b *requestBlock) recycleServerState() {}
 // callback it would hand on, and there is no server here.
 func runOnStreams(_ *fib.Connection, fn func()) { fn() }
 
+// runOnStreamsFromReader runs fn here, as runOnStreams does.
+func runOnStreamsFromReader(_ *fib.Connection, fn func()) { fn() }
+
 // cancelLive has no request to cancel here; see the server's.
 func (p *Parser) cancelLive(*BodyStream, error) bool { return false }

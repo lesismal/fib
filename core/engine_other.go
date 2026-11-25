@@ -942,8 +942,15 @@ func (c *Connection) closeWithError(err error) {
 	c.scheduled = true
 	c.mu.Unlock()
 	_ = c.conn.Close()
-	if submit && !c.engine.submit(c) {
-		c.engine.finishConnection(c, err)
+	if submit {
+		// Any goroutine may close a connection, a worker of the engine's
+		// pool among them, which must not submit to its own pool (see
+		// taskpool.TaskPool.Go); a goroutine of its own submits the round.
+		go func() {
+			if !c.engine.submit(c) {
+				c.engine.finishConnection(c, err)
+			}
+		}()
 	}
 }
 

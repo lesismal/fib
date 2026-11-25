@@ -705,6 +705,15 @@ config.SetTaskPool(pool)          // Engine 用你的池；关闭 Engine 不会�
   若是同一个池，队列满时所有 worker 都卡在提交上，事件循环也卡住。fib 内部也是这么做的：
   `<Name>-streams`（HTTP/2、HTTP/3 的 handler）、`fib-client`、`fib-tls-handshake` 全是独立的池，
   **等待只有 engine worker → 其它池一个方向**。
+- **池里的任务不要用 `Go`、`GoTask`、`GoTasks` 向自己所在的池投递。** 池到上限且队列满时这几个调用会
+  等待空位；所有 worker 都这样等时，就没有 worker 去腾出空位，整个池永远卡住。投递到别的池可以等待，
+  只要这些等待连起来不会绕回起点。可能就跑在目标池上的代码——handler 把工作交给 `HandlerPool()`、
+  客户端回调把回调交给 `fib-client`——改用 `Connection.Hand(pool, fn)` 或 `Engine.Hand(pool, fn)`：
+  由事件循环用 `TryGo` 投递 `fn`，队列满时稍后再试，调用方和事件循环都不会等待。fib 自己的代码遵守
+  这条规则，`TestPoolSubmissions`（`pool_submit_test.go`）列出了 fib 里每个投递点及其可能运行的位置：
+  出现未登记的新投递点、可能等待自己所在池的投递点，或者等待成环，测试都会失败。唯一的例外是
+  `sidepool.Post`：`fib-notify` 上的回调可以再 `Post`，即由 `fib-notify` 自己的 worker 向它投递；但
+  `Post` 从不等待（用 `TryGo`，队列满时放进自己的列表，由池里的回调执行完后清空），所以不会让池卡住。
 - 阻塞型 handler（要等应用自己的 I/O）放在 `<Name>-streams`（上限是 Engine 池的 2 倍）或你自己的池里，
   而不是 Engine 的池里。
 - `SharedTaskPool`（默认开）：同进程内**同名**的 Engine 共享 worker 和队列，避免多监听端口重复创建

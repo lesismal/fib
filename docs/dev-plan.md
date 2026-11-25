@@ -20,7 +20,7 @@ measures, optimizes where it pays, and updates the row.
 - **Optimized**: "yes" when measurement-driven optimizations have landed; "partial" when some have
   but a known part has not been looked at; "no" when none have.
 - Evidence is a date, a commit or a doc; the commit log's `perf(...)` entries hold the detail.
-- Status as of 2026-11-24.
+- Status as of 2026-11-25.
 
 ## Status
 
@@ -34,7 +34,7 @@ measures, optimizes where it pays, and updates the row.
 | TLS handshakes | `tls` | yes (`BenchmarkServerHandshake`, `BenchmarkClientHandshake`, 01a143d) | partial | The benchmarks exist; no optimization pass driven by them is recorded |
 | HTTP/1 server: parser, response framing | `http` | yes (`BenchmarkParser*`, `BenchmarkServerKeepAlive*`, `BenchmarkParseRequestHead`, load campaign) | yes (8bb8a82, de62b0b, e17bf98, 534f420, 2e2fef1) | — |
 | HTTP/1 client | `http` | yes (`BenchmarkMarshalRequest`, `BenchmarkParseResponseHead`, `BenchmarkClientNewConnection`) | yes (0a9339f, e51b8f5, a9493a8, 415e755) | — |
-| HTTP/2 server: frames, flow control, streams | `http` | yes (`BenchmarkH2Server*`, 10e984f, [http2](http2.md) "Benchmarks") | yes (73c0c3b, d03e91e, 6d145b4, e02d9a9, 089a5b0) | — |
+| HTTP/2 server: frames, flow control, streams | `http` | partial (the response flush change is unmeasured; `BenchmarkH2Server*`, 10e984f, [http2](http2.md) "Benchmarks") | yes (73c0c3b, d03e91e, 6d145b4, e02d9a9, 089a5b0) | Redo after the response flush change (flusher behind a read's handed requests on the handler pool, later flushes on `fib-flush`): h2load with many streams a connection, requests/s and writes per response, against the commit before it |
 | HTTP/2 client | `http` | partial (no client-side HTTP/2 benchmark with many streams) | partial (cb9bbbe) | A client benchmark of one connection with many requests in flight |
 | HPACK | `hpack` | yes (encode and decode benchmarks, 0e7016b) | yes (0c47caf, 346f48e, 871bdb7, d7e117c) | — |
 | Router, Context.JSON | `http`, `http/routerbench` | yes (`BenchmarkRouter*`, `BenchmarkGitHub`, `BenchmarkJSONResponse`) | yes (240182e, b39373d) | — |

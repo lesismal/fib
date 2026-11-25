@@ -131,6 +131,7 @@ func (sc *h2ServerConn) serveTunnel(st *h2ServerStream) {
 	}
 	st.block.bind(sc.conn, nil).stream = st
 	sc.handler.streams.Serve(&sc.gate, sc.conn, sc.handler.handler, &st.block)
+	sc.handed++
 }
 
 // handleTunnelData hands a DATA frame to a tunnel. The window it took is

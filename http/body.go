@@ -672,7 +672,11 @@ func (s *BodyStream) deliverLocked(worker bool) {
 	s.sinkBusy = true
 	s.mu.Unlock()
 	if s.offload {
-		runOnStreams(s.owner, func() { s.drain(false) })
+		if worker {
+			runOnStreamsFromReader(s.owner, func() { s.drain(false) })
+		} else {
+			runOnStreams(s.owner, func() { s.drain(false) })
+		}
 		return
 	}
 	s.drain(worker)

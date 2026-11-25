@@ -240,13 +240,27 @@ func (t *streamTask) run() {
 }
 
 // runOnStreams runs fn on the pool conn's request handlers run on (see
-// handlerPool), or here once that pool has stopped taking work. It carries
-// the body callbacks that no read of the connection will: a body already
-// here when OnBody is called away from its handler, a body read by a
-// multiplexed connection's reader, and a body whose request has ended under
-// it — a connection closing, or a stream reset. Those never
-// get a goroutine of their own.
+// handlerPool), or here once the engine has closed. It carries the body
+// callbacks that no read of the connection will: a body already here when
+// OnBody is called away from its handler, and a body whose request has
+// ended under it — a connection closing, or a stream reset. Those never get
+// a goroutine of their own.
+//
+// The caller may be a handler, or a body callback, running on that very
+// pool, and a task must never submit to its own pool (see
+// taskpool.TaskPool.Go), so the loop that serves conn submits fn instead;
+// see handOn. The connection's reader, which runs on no such pool, uses
+// runOnStreamsFromReader.
 func runOnStreams(conn *fib.Connection, fn func()) {
+	if !handOn(conn, handlerPool(conn), fn) {
+		fn()
+	}
+}
+
+// runOnStreamsFromReader is runOnStreams for the connection's reader, an
+// engine worker, which submits fn to the pool itself and may wait for room
+// there: no task of that pool ever waits on an engine worker.
+func runOnStreamsFromReader(conn *fib.Connection, fn func()) {
 	if !handlerPool(conn).Go(fn) {
 		fn()
 	}
@@ -254,9 +268,26 @@ func runOnStreams(conn *fib.Connection, fn func()) {
 
 // cancelElsewhere runs fn, a cancellation found under a lock its callback
 // may take, on the pool conn's request handlers run on, or on a goroutine of
-// its own once that pool has stopped taking work: never here.
+// its own once the engine has closed: never here. As with runOnStreams, the
+// loop that serves conn submits it.
 func cancelElsewhere(conn *fib.Connection, fn func()) {
-	if !handlerPool(conn).Go(fn) {
+	if !handOn(conn, handlerPool(conn), fn) {
 		go fn()
 	}
+}
+
+// handOn runs fn on pool, submitted by the loop that serves conn rather than
+// by the caller (see fib.Connection.Hand), and reports false once the engine
+// has closed. With no connection there is no loop to ask, and a goroutine of
+// its own submits fn, which is no worker of any pool either.
+func handOn(conn *fib.Connection, pool *taskpool.TaskPool, fn func()) bool {
+	if conn == nil {
+		go func() {
+			if !pool.Go(fn) {
+				fn()
+			}
+		}()
+		return true
+	}
+	return conn.Hand(pool, fn)
 }

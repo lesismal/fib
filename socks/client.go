@@ -172,7 +172,9 @@ func (d *Dialer) start(engine *fib.Engine, cmd Command, network, addr string, ti
 	ip, err := netip.ParseAddr(host)
 	isIP := err == nil
 	if !isIP && (d.Version == Version4 || d.Version == Version5 && d.ResolveLocally) {
-		sidepool.Go(func() {
+		// The caller may be a callback running on the client pool, which must
+		// not submit to it, so the engine's loop submits the lookup.
+		resolve := func() {
 			if err := h.resolve(); err != nil {
 				h.finish(err)
 				return
@@ -180,7 +182,10 @@ func (d *Dialer) start(engine *fib.Engine, cmd Command, network, addr string, ti
 			if err := h.connect(); err != nil {
 				h.finish(err)
 			}
-		})
+		}
+		if !engine.Hand(sidepool.Client(), resolve) {
+			return h.opError(net.ErrClosed)
+		}
 		return nil
 	}
 	if d.Version != Version5 && isIP && !ip.Unmap().Is4() {

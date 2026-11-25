@@ -872,12 +872,17 @@ func (c *Client) runTask(task taskpool.Task) {
 }
 
 // goFunc runs a callback on the task pool, or on a goroutine of its own if
-// there is none or it turns the callback away: a callback is not run where it
-// is called, which may be an event loop.
+// there is none, no connection yet, or the engine has closed: a callback is
+// not run where it is called, which may be an event loop. The caller may also
+// be a task of that pool, a handler or another callback, which must not
+// submit to it, so the loop that serves the connection submits the callback
+// (see fib.Connection.Hand).
 func (c *Client) goFunc(f func()) {
 	task := funcTask(f)
-	if pool := c.taskPool(); pool != nil && pool.GoTask(task) {
-		return
+	if pool := c.taskPool(); pool != nil {
+		if conn := c.Conn(); conn != nil && conn.Hand(pool, task.RunTask) {
+			return
+		}
 	}
 	go task.RunTask()
 }
