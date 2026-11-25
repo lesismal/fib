@@ -385,11 +385,35 @@ func TestConcurrentAcceptBurst(t *testing.T) {
 		}
 	}()
 
-	var wg sync.WaitGroup
+	// At most inFlight connections are dialled and not yet echoed at a time.
+	// A connection the engine has echoed has been accepted, so no more than
+	// inFlight ever wait in the listen queue. The kernel caps that queue at
+	// somaxconn whatever backlog the engine asks for, and macOS's default is
+	// 128 and resets what overflows it rather than dropping the SYN for the
+	// client to retry, as Linux does: with all 256 dialled at once, a plain
+	// net.Listen echo server lost up to 108 of them to "connection reset by
+	// peer", at connect or at the first read, and the connections reset
+	// under fib never reached its accept. Every connection stays open until
+	// all have echoed, so the engine still tracks the whole burst at once.
+	const inFlight = 64
+	slots := make(chan struct{}, inFlight)
+	allEchoed := make(chan struct{})
+	var echoed, wg sync.WaitGroup
 	for i := 0; i < burst; i++ {
 		wg.Add(1)
+		echoed.Add(1)
 		go func(value byte) {
 			defer wg.Done()
+			slots <- struct{}{}
+			released := false
+			release := func() {
+				if !released {
+					released = true
+					<-slots
+					echoed.Done()
+				}
+			}
+			defer release()
 			conn, err := net.DialTimeout("tcp4", addr.String(), 20*time.Second)
 			if err != nil {
 				t.Error(err)
@@ -402,16 +426,21 @@ func TestConcurrentAcceptBurst(t *testing.T) {
 				t.Error(err)
 				return
 			}
-			echoed := make([]byte, len(payload))
-			if _, err = io.ReadFull(conn, echoed); err != nil {
+			reply := make([]byte, len(payload))
+			if _, err = io.ReadFull(conn, reply); err != nil {
 				t.Error(err)
 				return
 			}
-			if !bytes.Equal(echoed, payload) {
+			if !bytes.Equal(reply, payload) {
 				t.Error("echo mismatch")
+				return
 			}
+			release()
+			<-allEchoed
 		}(byte(i))
 	}
+	echoed.Wait()
+	close(allEchoed)
 	wg.Wait()
 }
 
