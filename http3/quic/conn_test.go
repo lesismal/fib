@@ -1187,7 +1187,12 @@ func uploadAckDelay(t *testing.T) time.Duration {
 // A timer that fires with nothing of its own due, as one set for the probe
 // timeout of packets the request has just acknowledged does when its
 // goroutine runs late, leaves what waits for an expected write waiting: the
-// acknowledgement of the request still leaves with the answer.
+// acknowledgement of the request still leaves with the answer. That holds
+// for one that fires while the handler is still being called, before the
+// answer is expected, too: it does not start the clock on the wait, which
+// would let the acknowledgement go alone flushHold later, should the handler
+// take that long, as it once did on a busy macOS runner ("the server sent
+// [32 530]").
 func TestMootTimerKeepsTheHold(t *testing.T) {
 	// As in TestExpectedWriteCarriesTheAck, only an answer written while
 	// the connection was still waiting for it counts.
@@ -1202,7 +1207,14 @@ func TestMootTimerKeepsTheHold(t *testing.T) {
 // mootTimerHold runs TestMootTimerKeepsTheHold once and reports whether the
 // answer was written while the connection was still waiting for it.
 func mootTimerHold(t *testing.T) bool {
-	p := newTestPair(t, 0, nil)
+	// The acknowledgement of the request waits for the handler at most as
+	// long as the server lets an acknowledgement wait, its max_ack_delay,
+	// counted from the request's first packet, and then leaves on its own,
+	// as it should: at the default 25ms, a busy runner that keeps the
+	// handler from the request that long would have it leave before the
+	// answer is even expected. Given a second, only a timer that sends what
+	// is not due, or starts the wait's clock early, sends it alone.
+	p := newTestPair(t, 0, func(_, server *Config) { server.MaxAckDelay = time.Second })
 	waitQuiet(t, p)
 	server := p.serverConn(t)
 	// Something of the server's in flight, which the client acknowledges
@@ -1217,6 +1229,9 @@ func mootTimerHold(t *testing.T) bool {
 	waitFinished(t, p.clientH, push.ID())
 	sends := watchSends(p.serverEnd)
 	var before int
+	// ackLeft is how long the request's acknowledgement could still wait
+	// once the answer was expected; 0 if it had gone already.
+	var ackLeft time.Duration
 	moot := make(chan string, 1)
 	waitedc := make(chan bool, 1)
 	p.serverH.onData = func(s *Stream, data []byte, fin bool) {
@@ -1228,13 +1243,23 @@ func mootTimerHold(t *testing.T) bool {
 		// before it was all there: what counts is what follows.
 		before = len(sends())
 		c := s.Conn()
-		c.ExpectWrite()
 		c.mu.Lock()
 		if !c.ackElicitingInFlight() && !c.lossDeadline.IsZero() {
 			moot <- fmt.Sprintf("the probe timeout is still set %v from now for packets acknowledged", c.lossDeadline.Sub(c.now()))
 		}
 		c.mu.Unlock()
-		// The timer fires now, for whatever it was set for.
+		// The timer fires now, for whatever it was set for, while the
+		// handler is still being called, and the handler takes longer than
+		// flushHold to expect the answer.
+		c.onTimer()
+		time.Sleep(3 * flushHold)
+		c.ExpectWrite()
+		c.mu.Lock()
+		if a := &c.spaces[spaceApp]; a.ackPending {
+			ackLeft = a.ackDeadline.Sub(c.now())
+		}
+		c.mu.Unlock()
+		// It fires again with the answer expected.
 		c.onTimer()
 		go func() {
 			_ = s.Write(bytes.Repeat([]byte("a"), 500), true)
@@ -1263,7 +1288,7 @@ func mootTimerHold(t *testing.T) bool {
 	// A probe of the push, should one go, carries the push again: only an
 	// acknowledgement on its own is this small.
 	if sent := sends(); small(sent[before:]) > 0 {
-		t.Fatalf("the server sent %v", sent[before:])
+		t.Fatalf("the server sent %v; once the answer was expected, the request's acknowledgement could wait %v more", sent[before:], ackLeft)
 	}
 	return true
 }
