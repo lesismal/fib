@@ -179,8 +179,8 @@ type Engine struct {
 	commandsClosed bool
 	commandPool    sync.Pool
 	// hand holds what Hand asked the loop to submit and a full pool turned
-	// away for now.
-	hand        handQueue
+	// away for now; nil until something is first handed through the loop.
+	hand        atomic.Pointer[handQueue]
 	wakePending atomic.Bool
 	// budgetPaused holds connections whose reads the server-wide budget stopped,
 	// waiting to be resumed once it recovers. Event-loop ownership.
@@ -505,7 +505,10 @@ func (e *Engine) Stats() Stats {
 		ConnsRefused:           e.accepted.refused.Load(),
 	}
 	for _, loop := range append([]*Engine{e}, e.pollers...) {
-		h := &loop.hand
+		h := loop.hand.Load()
+		if h == nil {
+			continue
+		}
 		s.HandQueued += h.queued.Load()
 		s.HandMaxQueued = max(s.HandMaxQueued, h.maxQueued.Load())
 		s.HandRejected += h.rejected.Load()

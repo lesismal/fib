@@ -168,8 +168,8 @@ func (e *Engine) handBusy(tp *taskpool.TaskPool) bool {
 	if queued, size := tp.Queued(); size > 0 && queued >= size {
 		return true
 	}
-	h := &e.hand
-	if h.queued.Load() == 0 {
+	h := e.hand.Load()
+	if h == nil || h.queued.Load() == 0 {
 		return false
 	}
 	h.mu.Lock()
@@ -180,7 +180,7 @@ func (e *Engine) handBusy(tp *taskpool.TaskPool) bool {
 // rejectHand counts a TryHand turned away for tp, and logs it unless the
 // loop logged one less than handLogEvery ago.
 func (e *Engine) rejectHand(tp *taskpool.TaskPool) {
-	h := &e.hand
+	h := e.hands()
 	n := h.rejected.Add(1)
 	now := time.Now().UnixNano()
 	if last := h.rejectLogged.Load(); now-last < int64(handLogEvery) || !h.rejectLogged.CompareAndSwap(last, now) {
@@ -196,7 +196,7 @@ func (e *Engine) rejectHand(tp *taskpool.TaskPool) {
 // waiting for the same pool, or its queue full, waits its turn; one for a
 // pool nothing waits for is offered at once.
 func (e *Engine) handOn(pool TaskPool, fn func()) {
-	h := &e.hand
+	h := e.hands()
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	tp, ok := pool.(*taskpool.TaskPool)
@@ -217,6 +217,17 @@ func (e *Engine) handOn(pool TaskPool, fn func()) {
 	e.armHandLocked()
 }
 
+// hands returns the loop's handQueue, made the first time anything is
+// handed through the loop. Most loops never need one, and keeping it out of
+// Engine keeps the struct, which every poller is, in a smaller size class.
+func (e *Engine) hands() *handQueue {
+	if h := e.hand.Load(); h != nil {
+		return h
+	}
+	e.hand.CompareAndSwap(nil, new(handQueue))
+	return e.hand.Load()
+}
+
 // find returns the index of tp's list in h.pools, or -1. A loop hands to a
 // few pools at most, so a scan is all it takes.
 func (h *handQueue) find(tp *taskpool.TaskPool) int {
@@ -231,7 +242,7 @@ func (h *handQueue) find(tp *taskpool.TaskPool) int {
 // noteHandLocked publishes how many functions wait for Stats, and warns as
 // the number rises past each of handWarnAt.
 func (e *Engine) noteHandLocked() {
-	h := &e.hand
+	h := e.hands()
 	n := h.waiting
 	h.queued.Store(int64(n))
 	if int64(n) > h.maxQueued.Load() {
@@ -292,7 +303,7 @@ func (t handTask) RunTask() { t() }
 // armHandLocked has the loop offer what waits again after handRetry, or,
 // once the loop has closed, hands it to goroutines of their own.
 func (e *Engine) armHandLocked() {
-	h := &e.hand
+	h := e.hands()
 	if h.armed {
 		return
 	}
@@ -308,7 +319,7 @@ func (e *Engine) armHandLocked() {
 // in order, stopping at the first that pool turns away, and keeps that one
 // and those behind it.
 func (e *Engine) retryHand() {
-	h := &e.hand
+	h := e.hands()
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	h.armed = false
@@ -342,7 +353,7 @@ func (e *Engine) retryHand() {
 // abandonHand runs what still waits on goroutines of its own, once the loop
 // that was to hand it on has closed.
 func (e *Engine) abandonHand() {
-	h := &e.hand
+	h := e.hands()
 	h.mu.Lock()
 	pools := h.pools
 	h.pools = nil
