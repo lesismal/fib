@@ -153,8 +153,12 @@ func TestFloodGlitchesCounted(t *testing.T) {
 			if tc.setup != nil {
 				tc.setup(c)
 			}
+			// Twice the burst: the bucket gets DefaultControlFrameRate tokens
+			// back a second, and a runner slow enough to spend a tenth of a
+			// second on the loop would refill more than a few frames past
+			// the burst can spend (macOS, PING padded, 0.14s).
 			var err error
-			for i := 0; i < DefaultControlFrameBurst+10 && err == nil; i++ {
+			for i := 0; i < 2*DefaultControlFrameBurst && err == nil; i++ {
 				_, err = c.handleFrames(spaceApp, tc.payload(i), time.Now())
 			}
 			var te *TransportError

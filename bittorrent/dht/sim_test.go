@@ -331,16 +331,20 @@ func TestSimLoss(t *testing.T) {
 		if n, err := a.Announce(ctx, ih, 1000+round, false, nil); err != nil || n == 0 {
 			t.Fatalf("announce under loss: %d, %v", n, err)
 		}
+		// A lookup under 20% loss may miss the nodes that hold the peer, as
+		// a real client's may; it looks again, up to three times.
 		found := false
-		if err := b.GetPeers(ctx, ih, func(p []netip.AddrPort) {
-			for _, x := range p {
-				found = found || x.Port() == uint16(1000+round)
+		for try := 0; try < 3 && !found; try++ {
+			if err := b.GetPeers(ctx, ih, func(p []netip.AddrPort) {
+				for _, x := range p {
+					found = found || x.Port() == uint16(1000+round)
+				}
+			}); err != nil {
+				t.Fatal(err)
 			}
-		}); err != nil {
-			t.Fatal(err)
 		}
 		if !found {
-			t.Fatalf("round %d: peer not found under 20%% loss", round)
+			t.Fatalf("round %d: peer not found under 20%% loss in three lookups", round)
 		}
 	}
 }
