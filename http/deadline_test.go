@@ -11,6 +11,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -529,12 +530,23 @@ func TestH2FlushReportsAResetStream(t *testing.T) {
 	config.WriteTimeout = time.Second
 	results := make(chan [3]error, 1)
 	addr := serve(t, NewHandlerWithConfig(config, HandlerFunc(func(c *Context) {
+		// The reset cancels the Context. Waiting for that, rather than
+		// sleeping past WriteTimeout, keeps a runner whose timer fires late
+		// from having the Flush come before the reset.
+		reset := make(chan struct{})
+		var once sync.Once
+		c.OnCancel(func(error) { once.Do(func() { close(reset) }) })
 		_, _ = c.WriteString("first")
 		if err := c.FlushError(); err != nil {
 			results <- [3]error{fmt.Errorf("the first Flush, before WriteTimeout, failed too: %v", err)}
 			return
 		}
-		time.Sleep(1500 * time.Millisecond)
+		select {
+		case <-reset:
+		case <-time.After(10 * time.Second):
+			results <- [3]error{errors.New("WriteTimeout never reset the stream")}
+			return
+		}
 		flush := c.FlushError()
 		_, write := c.WriteString(strings.Repeat("x", 32<<10))
 		results <- [3]error{flush, write, c.FlushError()}
