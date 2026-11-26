@@ -868,6 +868,12 @@ config.SetTaskPool(pool)          // the Engine uses your pool; closing the Engi
   functions waiting in `Hand` on the loops (`HandQueued`, `HandMaxQueued`), the `TryHand` calls
   turned away (`HandRejected`) and the warnings logged as the waiting rose past 1,024, 16,384 and
   131,072 on a loop (`HandWarnings`).
+- **Pool sizes follow the machine.** Every pool's worker ceiling is what its work calls for (per
+  CPU for the engine and handler pools, a fixed number for the side pools), held under what the
+  pool's share of the process's memory pays for, so a small container or many prefork children do
+  not let a handshake flood or blocked handlers outgrow the memory. `Config.WorkerCount`,
+  `StreamWorkerCount` and `SidePools` override it; `New` logs the sizes at debug level. See
+  [configuration: pool sizing](configuration.md#pool-sizing).
 - Blocking handlers (which wait on your application's own I/O) belong in `<Name>-streams` (its
   ceiling is twice the Engine pool's) or your own pool, not the Engine's.
 - `SharedTaskPool` (on by default): Engines **with the same name** in a process share workers and

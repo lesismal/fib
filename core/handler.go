@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net"
 	"os"
 	"strings"
@@ -532,32 +533,48 @@ func (e *Engine) logRun() {
 			"eventLoops", len(e.pollers), "accept", accept)
 	}
 	if e.logSettings && !logSettingsSilenced() {
-		e.LogSettings()
+		e.logSettingsAt(slog.LevelDebug)
 	}
 }
 
-// LogSettings logs every effective setting, with its value, whether fib's
-// default or the caller's produced it, and what it does: in fib/log's
-// FormatLine as one record with the settings as a table below it, and
-// otherwise as a record for the list and one per parameter. The engine calls
-// it at startup when Config.LogSettings is set, which DefaultConfig does;
-// call it directly to print the list on demand, whether or not the config
-// asks for it.
-func (e *Engine) LogSettings() {
+// LogSettings logs every effective setting at info level, with its value,
+// whether fib's default or the caller's produced it, and what it does: in
+// fib/log's FormatLine as one record with the settings as a table below it,
+// and otherwise as a record for the list and one per parameter. The record
+// for the list names, as "changed", the settings the caller set to other
+// than fib's default. The engine logs the same list at debug level when it
+// starts, when Config.LogSettings is set, which DefaultConfig does; call
+// LogSettings to print it on demand, whatever the config and the log level
+// say.
+func (e *Engine) LogSettings() { e.logSettingsAt(slog.LevelInfo) }
+
+// logSettingsAt is LogSettings at level.
+func (e *Engine) logSettingsAt(level slog.Level) {
+	if !log.Enabled(level) {
+		return
+	}
+	logAt := log.Info
+	if level < slog.LevelInfo {
+		logAt = log.Debug
+	}
 	settings := e.Settings()
 	parameters := settings.Parameters()
+	changed := strings.Join(settings.Changed(), ",")
+	if changed == "" {
+		changed = "none"
+	}
 	if log.IsLine(log.Logger().Handler()) {
 		rows := make([][]string, len(parameters))
 		for i, p := range parameters {
 			rows[i] = []string{p.Name, p.Value, p.Source, p.About}
 		}
-		log.Info("fib: engine config", "engine", e.name, "parameters", len(parameters),
+		logAt("fib: engine config", "engine", e.name, "parameters", len(parameters), "changed", changed,
 			"settings", log.Table([]string{"parameter", "value", "source", "about"}, rows))
 		return
 	}
-	log.Info("fib: engine config", "engine", e.name, "parameters", len(parameters))
+	logAt("fib: engine config", "engine", e.name, "parameters", len(parameters), "changed", changed)
 	for _, p := range parameters {
-		log.Info("fib: config", "parameter", p.Name,
+		logAt("fib: config", "parameter", p.Name,
 			"value", p.Value, "source", p.Source, "about", p.About)
 	}
 }

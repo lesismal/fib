@@ -42,7 +42,7 @@ if err := engine.Run(); err != nil {
 | --- | --- | --- |
 | `Name` | `"fib"` | Engine 名。worker 池叫 `<Name>-workers`，HTTP/2、HTTP/3 handler 池叫 `<Name>-streams`。同名 Engine 共享这两个池，见 `SharedTaskPool`。 |
 | `LogStatus` | `false` | 启动时打印一行 `fib: engine started`：名字、监听地址、任务池、poller 数和 accept 放置方式。 |
-| `LogSettings` | `true` | 启动时逐项打印全部生效配置：值、`default`/`custom` 来源和说明。设为 false 关闭；`Engine.LogSettings()` 仍可随时打印。 |
+| `LogSettings` | `true` | 启动时以 debug 级别逐项打印全部生效配置：值、`default`/`custom` 来源和说明，并列出调用方改过的项。设为 false 关闭；`Engine.LogSettings()` 仍可随时以 info 级别打印。 |
 
 ### 监听与连接
 
@@ -78,10 +78,12 @@ if err := engine.Run(); err != nil {
 
 | 字段 | 默认值 | 说明 |
 | --- | --- | --- |
-| `WorkerCount` | *动态* | worker 数上限：`max(GOMAXPROCS×1000, NumCPU×20)`。池随负载伸缩，上限在负载到达前不产生成本。 |
+| `WorkerCount` | *动态* | worker 数上限：`max(GOMAXPROCS×1000, NumCPU×20)`，再以 engine 池分到的内存为上限（见[协程池大小](#协程池大小)）。池随负载伸缩，上限在负载到达前不产生成本。 |
 | `MaxEvents` | *动态* | 池里等待 worker 的任务上限：`clamp(WorkerCount×10, 10,000, 100,000)`。 |
 | `TaskPoolMode` | `ModeAdaptive` | 池的伸缩方式：`elastic` 每次提交 fork 一个 worker；`adaptive` 保留 parked worker、按需增长；`adaptive-chan` 通过 channel 做同样的事；`inline` 在提交者 goroutine 上直接跑。优先用 `SetTaskPoolMode`，它会同时调整 sizing。 |
 | `MinWorkerCount` | `0` | adaptive 池缩容后保留的常驻 worker 数。0 表示空闲时全部退休，有任务再启动；其他模式忽略。 |
+| `StreamWorkerCount` | `0` → *动态* | `<Name>-streams`（HTTP/2、HTTP/3 handler 池）的 worker 上限：`WorkerCount` 的 2 倍，再以该池分到的内存为上限，但不低于 `WorkerCount`。同名 Engine 共享这个池，上限取它们要求的最大值。 |
+| `SidePools` | 零值 → *动态* | 进程级 sidepool `fib-client`、`fib-tls-handshake`、`fib-file`、`fib-flush`、`fib-notify` 的 worker 上限和队列（`sidepool.Sizing`）；字段为 0 表示用 fib 的默认值 `sidepool.DefaultSizing()`。这些池是整个进程共用的，第一次使用时才创建，所以 Engine 的设置只作用于还没创建的池；见[协程池大小](#协程池大小)。 |
 | `SharedTaskPool` | `true` | 同名 Engine 共享一个 worker 池和一个 handler 池。第一个启动的 Engine 按自己的设置创建；之后的同名 Engine 直接使用。要隔离就设 false 或换名字。 |
 | `TaskPool` | `nil` | 外部任务池，替代内置池运行连接的轮次，见 `SetTaskPool`。设置后 pool mode、worker 数、共享池和 sizing 都不再作用于它；Engine 不会停止外部池。 |
 
@@ -148,21 +150,55 @@ W    = 向下取整到 16 KiB
 
 `DefaultConfigFor(64 << 10)` 直接给出这个读缓冲和水位线，通常就是代理网关想要的 sizing。
 
-## 启动日志与生效配置
+## 协程池大小
 
-`LogSettings` 开启时，Engine 启动会打印一个 header 和每个参数一行：
+配置里留 0 的协程池，worker 上限都按机器自动确定：先按池的工作性质给出需要的数量（大多按 CPU
+数），再以该池分到的进程内存能负担的数量为上限，每个 worker 的内存成本是估计值。CPU 数取
+`min(NumCPU, GOMAXPROCS)`，所以 cgroup 的 CPU 配额和 prefork 子进程的份额都会计入；内存取物理
+内存与 cgroup 限制中较小的那个，其中一半作为各个池可以规划的预算，再由 fib 的 prefork 子进程均分。
+每个池每核至少保留一个下限。读不到内存的机器只按 CPU 定上限。队列不按内存定：队列内存按实际用到
+的深度增长。
+
+| 池 | 工作需要的数量 | 内存份额 | 每个 worker 成本 | 每核下限 | 队列 |
+| --- | --- | --- | --- | --- | --- |
+| `<Name>-workers`（`WorkerCount`） | GOMAXPROCS×1000 | 30% | 64 KiB | 64 | `MaxEvents` |
+| `<Name>-streams`（`StreamWorkerCount`） | 2×`WorkerCount`，不低于 `WorkerCount` | 30% | 64 KiB | 64 | 同 `MaxEvents` 规则 |
+| `fib-tls-handshake` | 65536 | 15% | 64 KiB | 64 | 10000 |
+| `fib-client` | 4096 | 10% | 32 KiB | 32 | 10000 |
+| `fib-file` | 256 | 5% | 256 KiB | 4 | 10000 |
+| `fib-flush` | 4096 | 5% | 16 KiB | 16 | 10000 |
+| `fib-notify` | 4096 | 5% | 16 KiB | 16 | 131072 |
+
+例如 8 核、512 MiB 的容器，engine worker 上限是 1228 而不是 8000，握手池也是 1228 而不是 65536；
+64 核、128 GiB 的机器跑 32 个 prefork 子进程时，每个子进程的握手池上限是 4915。每个 worker 的成本
+在压测实测之前都是估计值。设置 `WorkerCount`、`StreamWorkerCount` 或 `SidePools` 的某个字段，就会
+覆盖对应池的自动大小。
+
+`New` 会以 debug 级别打印确定的大小和依据：
 
 ```text
-INFO fib: engine config engine=gateway parameters=30
-INFO fib: config parameter=readBuffer value="65536 (64 KiB)" source=custom about="the most bytes one read of a connection's socket takes"
-INFO fib: config parameter=writeWatermark value="262144 (256 KiB)" source=default about="bytes a connection may have waiting before its reads pause; zero is sized from readBuffer and the machine"
-INFO fib: config parameter=maxPendingBytes value="33255979008 (30.97 GiB)" source=custom about="bytes all connections together may have waiting; zero means no budget"
+DEBUG fib: engine pool sizing engine=fib cpus=14 memory="68719476736 (64 GiB)" processes=1 poolBudget="34359738368 (32 GiB)" workers=14000 maxEvents=100000 streamWorkers=28000 fib-client=4096/10000 fib-tls-handshake=65536/10000 fib-file=256/10000 fib-flush=4096/10000 fib-notify=4096/131072 custom=""
+```
+
+`custom` 列出配置里设置过的大小；出现 `keptBuilt` 时，表示这些 sidepool 已被别的 Engine 或更早的
+使用按其他大小创建，保持原样。
+
+## 启动日志与生效配置
+
+`LogSettings` 开启时，Engine 启动会以 debug 级别打印一个 header 和每个参数一行；header 里的
+`changed` 列出调用方改成非默认值的配置：
+
+```text
+DEBUG fib: engine config engine=gateway parameters=37 changed=readBuffer,maxPendingBytes
+DEBUG fib: config parameter=readBuffer value="65536 (64 KiB)" source=custom about="the most bytes one read of a connection's socket takes"
+DEBUG fib: config parameter=writeWatermark value="262144 (256 KiB)" source=default about="bytes a connection may have waiting before its reads pause; zero is sized from readBuffer and the machine"
+DEBUG fib: config parameter=maxPendingBytes value="33255979008 (30.97 GiB)" source=custom about="bytes all connections together may have waiting; zero means no budget"
 ```
 
 使用 fib/log 的 `line` 格式时（见[日志](#日志)），整个列表是一条记录，参数以对齐的表格写在它下面：
 
 ```text
-2026-10-27 10:00:00.000 INFO  fib: engine config engine=gateway parameters=30
+2026-10-27 10:00:00.000 DEBUG fib: engine config engine=gateway parameters=37 changed=readBuffer,maxPendingBytes
 	settings:
 		parameter           value             source   about
 		readBuffer          65536 (64 KiB)    custom   the most bytes one read of a connection's socket takes
@@ -171,7 +207,7 @@ INFO fib: config parameter=maxPendingBytes value="33255979008 (30.97 GiB)" sourc
 ```
 
 `source=default` 表示值来自 fib 默认或机器 sizing；`source=custom` 表示调用方改成了不同的值。
-`Engine.LogSettings()` 可以随时打印同样的列表，不受 `LogSettings` 开关影响；
+`Engine.LogSettings()` 可以随时以 info 级别打印同样的列表，不受 `LogSettings` 开关影响；
 `Engine.Settings()` 以结构体返回，`Settings.Parameters()` 返回日志使用的同一组行。
 
 环境变量 `FIB_LOG_SETTINGS=0`（也可以是 `false`、`off`、`no`，不区分大小写）会在不改配置的

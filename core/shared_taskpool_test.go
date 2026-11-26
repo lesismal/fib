@@ -76,12 +76,15 @@ func TestStreamPoolStaysWiderThanEnginePools(t *testing.T) {
 		if pool == TaskPool(streams) {
 			t.Fatalf("shared=%v: the engine was given the stream pool", shared)
 		}
-		if got, want := streampool.Ceiling(engine), 2*workers; got != want {
-			t.Fatalf("shared=%v: stream pool ceiling = %d, want %d", shared, got, want)
+		// Twice the engine's pool, held under the stream pool's share of the
+		// memory, but never narrower than the engine's pool.
+		want := streamWorkers(0, workers)
+		if got := streampool.Ceiling(engine); got != want || got < workers {
+			t.Fatalf("shared=%v: stream pool ceiling = %d, want %d, at least %d", shared, got, want, workers)
 		}
 		release()
 		release()
-		if got := streampool.Ceiling(engine); got >= 2*workers {
+		if got := streampool.Ceiling(engine); got >= want {
 			t.Fatalf("shared=%v: stream pool ceiling = %d after the engine released its pool", shared, got)
 		}
 	}

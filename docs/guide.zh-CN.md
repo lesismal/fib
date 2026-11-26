@@ -104,9 +104,10 @@
   按自己的配置创建协程池，之后的同名 Engine 直接使用它，其余配置不生效。需要隔离时
   可以给 Engine 起不同的名字，或把 `SharedTaskPool` 设为 `false`（仍用同名的
   `<Name>-streams`）。
-- 参数日志默认开启（经 `fib/log` 输出，格式见[配置](configuration.zh-CN.md#日志)）：Engine 启动后逐项打印
+- 参数日志默认开启，级别为 debug（经 `fib/log` 输出，格式见[配置](configuration.zh-CN.md#日志)）：Engine 启动后逐项打印
   实际生效的 `readBuffer`、`writeWatermark`、`maxPendingBytes`、`maxWriteQueueBytes` 等
-  全部基础配置，每项带 `default`/`custom` 来源标记和一句说明。`config.LogSettings = false`
+  全部基础配置，每项带 `default`/`custom` 来源标记和一句说明，header 的 `changed` 列出改过的项；
+  `New` 时还会打印一行各协程池按 CPU 和内存确定的大小（见[协程池大小](configuration.zh-CN.md#协程池大小)）。`config.LogSettings = false`
   关闭它，或调用 `Engine.LogSettings()` 手动打印。`config.LogStatus = true` 另外打印一行
   名字、监听地址、协程池和 poller 数；`taskpool.SetLogStatus(true)` 之后创建的协程池在启动后
   打印协程池名字，以及实际运行的分片数、worker 数和队列容量等。任务 panic 且没有设置

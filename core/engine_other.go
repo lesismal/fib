@@ -18,6 +18,7 @@ import (
 
 	"github.com/lesismal/fib/bufferpool"
 	"github.com/lesismal/fib/internal/netaddr"
+	"github.com/lesismal/fib/sidepool"
 	"github.com/lesismal/fib/taskpool"
 )
 
@@ -122,6 +123,7 @@ func newEngine(config Config, bindings []Binding) (*Engine, error) {
 	e.readBufferStart = config.ReadBufferStartSize
 	e.bindConfig = config
 	e.bindingCount = len(bindings)
+	e.logSizing(sidepool.Configure(config.SidePools))
 	e.startUDPSweeper()
 	return e, nil
 }
@@ -737,6 +739,19 @@ type Config struct {
 	// lets an idle pool retire every worker and start them again when work
 	// arrives. The other modes ignore it.
 	MinWorkerCount int
+	// StreamWorkerCount is the ceiling of the pool HTTP/2 and HTTP/3 run
+	// their handlers on, "<Name>-streams". Zero means twice WorkerCount, held
+	// under what that pool's share of the process's memory pays for; see
+	// DefaultStreamPoolSizing. Engines of one Name share the pool, whose
+	// ceiling is the largest any of them asks for.
+	StreamWorkerCount int
+	// SidePools sizes the process's side pools: fib-client, fib-tls-handshake,
+	// fib-file, fib-flush and fib-notify. A zero field is fib's default for
+	// it, sized from the CPUs and the memory (sidepool.DefaultSizing). The
+	// pools are the process's and are built the first time they are used, so
+	// an engine's sizes apply to the pools not built yet when it is made; see
+	// sidepool.Configure.
+	SidePools sidepool.Sizing
 	// SharedTaskPool has the engines of one Name run on one task pool. The
 	// first of them builds it from its own settings, and those that follow
 	// run on it as it is, whatever theirs say.

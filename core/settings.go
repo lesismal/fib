@@ -2,9 +2,14 @@ package core
 
 import (
 	"fmt"
+	"log/slog"
 	"strings"
 	"time"
 
+	"github.com/lesismal/fib/internal/poolsize"
+	"github.com/lesismal/fib/log"
+	"github.com/lesismal/fib/sidepool"
+	"github.com/lesismal/fib/streampool"
 	"github.com/lesismal/fib/taskpool"
 )
 
@@ -34,6 +39,8 @@ type Settings struct {
 	TaskPool                 string
 	TaskPoolMode             taskpool.Mode
 	MinWorkerCount           int
+	StreamWorkerCount        int
+	SidePools                sidepool.Sizing
 	SharedTaskPool           bool
 	SplitEventLoops          bool
 	EventLoopCount           int
@@ -83,6 +90,8 @@ func (e *Engine) Settings() Settings {
 		TaskPool:                 pool,
 		TaskPoolMode:             c.TaskPoolMode,
 		MinWorkerCount:           c.MinWorkerCount,
+		StreamWorkerCount:        e.streamCeiling(),
+		SidePools:                sidepool.Current(),
 		SharedTaskPool:           c.SharedTaskPool,
 		SplitEventLoops:          c.SplitEventLoops,
 		EventLoopCount:           c.EventLoopCount,
@@ -107,8 +116,11 @@ func (s Settings) String() string {
 		s.Name, s.Network, s.Backlog, s.WorkerCount, s.MaxEvents, s.PollBatchSize)
 	fmt.Fprintf(&b, "readBuffer=%d readBufferStart=%d writeWatermark=%d writeLowWatermark=%d maxPendingBytes=%d maxWriteQueueBytes=%d maxConns=%d ",
 		s.ReadBufferSize, s.ReadBufferStartSize, s.WriteBufferHighWatermark, s.WriteBufferHighWatermark/4, s.MaxPendingBytes, s.MaxWriteQueueBytes, s.MaxConns)
-	fmt.Fprintf(&b, "taskPool=%s taskPoolMode=%s minWorkers=%d sharedTaskPool=%t ",
-		s.TaskPool, s.TaskPoolMode, s.MinWorkerCount, s.SharedTaskPool)
+	fmt.Fprintf(&b, "taskPool=%s taskPoolMode=%s minWorkers=%d streamWorkers=%d sharedTaskPool=%t ",
+		s.TaskPool, s.TaskPoolMode, s.MinWorkerCount, s.StreamWorkerCount, s.SharedTaskPool)
+	for _, p := range s.SidePools.Pools() {
+		fmt.Fprintf(&b, "%s=%d/%d ", p.Name, p.Workers, p.Queue)
+	}
 	fmt.Fprintf(&b, "splitEventLoops=%t eventLoopCount=%d eventLoops=%d engineLoop=%t reusePort=%t balanceReusePort=%t ",
 		s.SplitEventLoops, s.EventLoopCount, s.EventLoops, s.EngineLoop, s.ReusePort, s.BalanceReusePort)
 	fmt.Fprintf(&b, "accept=%s coalesceWrites=%t useWritev=%t socketSyscalls=%t blockingWait=%t udpIdleTimeout=%s logStatus=%t logSettings=%t",
@@ -142,11 +154,11 @@ func (s Settings) Parameters() []Parameter {
 	if s.WriteBufferHighWatermark > 0 {
 		low = byteSize(int64(s.WriteBufferHighWatermark) / 4)
 	}
-	return []Parameter{
+	params := []Parameter{
 		{"name", s.Name, source("name"), "engine name; names its worker and stream pools"},
 		{"network", s.Network, source("network"), "network a binding that names none uses: tcp, udp or unix"},
 		{"backlog", intValue(int64(s.Backlog)), source("backlog"), "listen queue depth; zero means the kernel's somaxconn"},
-		{"workers", intValue(int64(s.WorkerCount)), source("workers"), "task pool worker ceiling; follows GOMAXPROCS and the cores"},
+		{"workers", intValue(int64(s.WorkerCount)), source("workers"), "task pool worker ceiling; follows GOMAXPROCS, held under the pool's share of the memory"},
 		{"maxEvents", intValue(int64(s.MaxEvents)), source("maxEvents"), "tasks the pool may hold waiting for a worker"},
 		{"pollBatch", intValue(int64(s.PollBatchSize)), source("pollBatch"), "most events one wait of an event loop collects"},
 		{"readBuffer", byteSize(int64(s.ReadBufferSize)), source("readBuffer"), "the most bytes one read of a connection's socket takes"},
@@ -163,6 +175,7 @@ func (s Settings) Parameters() []Parameter {
 		{"taskPool", s.TaskPool, source("taskPool"), "the pool connections run on; built from the settings unless supplied"},
 		{"taskPoolMode", s.TaskPoolMode.String(), source("taskPoolMode"), "how the pool grows and shrinks: elastic, adaptive or inline"},
 		{"minWorkers", intValue(int64(s.MinWorkerCount)), source("minWorkers"), "resident workers an adaptive pool retires down to; zero retires all"},
+		{"streamWorkers", intValue(int64(s.StreamWorkerCount)), source("streamWorkers"), "ceiling of the HTTP/2 and HTTP/3 handlers' pool; twice workers, held under its share of the memory"},
 		{"sharedTaskPool", boolValue(s.SharedTaskPool), source("sharedTaskPool"), "engines of one name share one task pool"},
 		{"splitEventLoops", boolValue(s.SplitEventLoops), source("splitEventLoops"), "split the engine across event loops that wait for readiness"},
 		{"eventLoopCount", intValue(int64(s.EventLoopCount)), source("eventLoopCount"), "loops to create; zero follows the CPUs"},
@@ -175,6 +188,73 @@ func (s Settings) Parameters() []Parameter {
 		{"logStatus", boolValue(s.LogStatus), source("logStatus"), "log the engine started line when it starts"},
 		{"logSettings", boolValue(s.LogSettings), source("logSettings"), "log this setting list when the engine starts"},
 	}
+	for _, p := range s.SidePools.Pools() {
+		key := sidePoolKey(p.Name)
+		params = append(params, Parameter{key, fmt.Sprintf("%d workers, queue %d", p.Workers, p.Queue), source(key), sidePoolAbout[p.Name]})
+	}
+	return params
+}
+
+// sidePoolKey is the parameter name of a side pool's size.
+func sidePoolKey(pool string) string { return "sidePools." + pool }
+
+// sidePoolAbout says what each side pool runs, for the settings list.
+var sidePoolAbout = map[string]string{
+	"fib-client":        "process-wide: DNS lookups and client callbacks; follows the memory",
+	"fib-tls-handshake": "process-wide: blocking TLS handshakes; follows the memory",
+	"fib-file":          "process-wide: disk reads of files sent without waiting",
+	"fib-flush":         "process-wide: writes of what HTTP/2 connections queued",
+	"fib-notify":        "process-wide: notifications sidepool.Post runs",
+}
+
+// Changed lists the parameters the caller set to other than fib's default,
+// by name.
+func (s Settings) Changed() []string {
+	var names []string
+	for _, p := range s.Parameters() {
+		if p.Source == "custom" {
+			names = append(names, p.Name)
+		}
+	}
+	return names
+}
+
+// streamCeiling is the ceiling of the engine's stream pool: the largest the
+// engines of its name ask for, or what this one asks for before any has.
+func (e *Engine) streamCeiling() int {
+	if c := streampool.Ceiling(e.name); c > 0 {
+		return c
+	}
+	return streamWorkers(e.bindConfig.StreamWorkerCount, e.bindConfig.WorkerCount)
+}
+
+// logSizing logs, at debug level, what the engine's pools are sized to as
+// it is made, and what they were sized from: the machine, and which sizes
+// the caller set. kept names the side pools already built with sizes other
+// than the config's, which keep theirs.
+func (e *Engine) logSizing(kept []string) {
+	if !log.Enabled(slog.LevelDebug) {
+		return
+	}
+	s := e.Settings()
+	m := poolsize.Detect()
+	args := []any{"engine", e.name, "cpus", m.CPUs, "memory", byteSize(m.Memory),
+		"processes", m.Processes, "poolBudget", byteSize(m.Budget()),
+		"workers", s.WorkerCount, "maxEvents", s.MaxEvents, "streamWorkers", s.StreamWorkerCount}
+	for _, p := range s.SidePools.Pools() {
+		args = append(args, p.Name, fmt.Sprintf("%d/%d", p.Workers, p.Queue))
+	}
+	var custom []string
+	for _, name := range s.Changed() {
+		if name == "workers" || name == "maxEvents" || name == "streamWorkers" || strings.HasPrefix(name, "sidePools.") {
+			custom = append(custom, name)
+		}
+	}
+	args = append(args, "custom", strings.Join(custom, ","))
+	if len(kept) > 0 {
+		args = append(args, "keptBuilt", strings.Join(kept, ","))
+	}
+	log.Debug("fib: engine pool sizing", args...)
 }
 
 // customConfig records the settings c set rather than left for fib's
@@ -209,6 +289,11 @@ func customConfig(c Config) map[string]bool {
 	set("taskPool", c.TaskPool != nil)
 	set("taskPoolMode", c.TaskPoolMode != 0 && c.TaskPoolMode != base.TaskPoolMode)
 	set("minWorkers", c.MinWorkerCount != 0)
+	set("streamWorkers", c.StreamWorkerCount != 0 && c.StreamWorkerCount != streamWorkers(0, c.WorkerCount))
+	def := sidepool.DefaultSizing().Pools()
+	for i, p := range c.SidePools.Pools() {
+		set(sidePoolKey(p.Name), p.Workers != 0 && p.Workers != def[i].Workers || p.Queue != 0 && p.Queue != def[i].Queue)
+	}
 	set("sharedTaskPool", c.SharedTaskPool != base.SharedTaskPool)
 	set("splitEventLoops", c.SplitEventLoops != base.SplitEventLoops)
 	set("eventLoopCount", c.EventLoopCount != 0)

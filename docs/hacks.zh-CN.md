@@ -734,6 +734,10 @@ config.SetTaskPool(pool)          // Engine 用你的池；关闭 Engine 不会�
   （warn，100% 时为 error），每个池每一档最多每 10 秒一条。`Engine.Stats()` 报告各 loop 上在 `Hand`
   里等待的函数数（`HandQueued`、`HandMaxQueued`）、被拒的 `TryHand` 次数（`HandRejected`），以及某个
   loop 的等待数升过 1024、16384、131072 时的告警次数（`HandWarnings`）。
+- **池的大小跟随机器。** 每个池的 worker 上限先按工作需要给出（engine 池和 handler 池按 CPU，
+  sidepool 用固定数），再以该池分到的进程内存为上限，这样小容器或大量 prefork 子进程时，握手洪峰或
+  阻塞的 handler 不会把内存撑爆。`Config.WorkerCount`、`StreamWorkerCount`、`SidePools` 可以覆盖；
+  `New` 以 debug 级别打印确定的大小。见[配置：协程池大小](configuration.zh-CN.md#协程池大小)。
 - 阻塞型 handler（要等应用自己的 I/O）放在 `<Name>-streams`（上限是 Engine 池的 2 倍）或你自己的池里，
   而不是 Engine 的池里。
 - `SharedTaskPool`（默认开）：同进程内**同名**的 Engine 共享 worker 和队列，避免多监听端口重复创建

@@ -46,7 +46,7 @@ marked *dynamic* and explained in [How the machine sizes the defaults](#how-the-
 | --- | --- | --- |
 | `Name` | `"fib"` | Engine name. It names the worker pool `<Name>-workers` and the HTTP/2 and HTTP/3 handler pool `<Name>-streams`. Engines of the same name share both pools; see `SharedTaskPool`. |
 | `LogStatus` | `false` | Log one `fib: engine started` line when the engine starts: name, listen addresses, task pool, pollers and accept placement. |
-| `LogSettings` | `true` | Log every effective setting when the engine starts, one line per parameter, with its value, `default` or `custom` source, and a description. Set it to false to silence the list; `Engine.LogSettings()` prints it on demand either way. |
+| `LogSettings` | `true` | Log every effective setting at debug level when the engine starts, one line per parameter, with its value, `default` or `custom` source, and a description, and name the ones the caller changed. Set it to false to silence the list; `Engine.LogSettings()` prints it at info level on demand either way. |
 
 ### Listeners and connections
 
@@ -82,10 +82,12 @@ marked *dynamic* and explained in [How the machine sizes the defaults](#how-the-
 
 | Field | Default | Description |
 | --- | --- | --- |
-| `WorkerCount` | *dynamic* | Ceiling on the pool's workers: `max(GOMAXPROCS×1000, NumCPU×20)`. The pool grows and shrinks with load, so the ceiling costs nothing until work reaches it. |
+| `WorkerCount` | *dynamic* | Ceiling on the pool's workers: `max(GOMAXPROCS×1000, NumCPU×20)`, held under what the engine pool's share of the memory pays for (see [Pool sizing](#pool-sizing)). The pool grows and shrinks with load, so the ceiling costs nothing until work reaches it. |
 | `MaxEvents` | *dynamic* | Tasks the pool may hold waiting for a worker: `clamp(WorkerCount×10, 10,000, 100,000)`. |
 | `TaskPoolMode` | `ModeAdaptive` | How the pool grows and shrinks: `elastic` forks a worker per submission, `adaptive` keeps parked workers and grows on demand, `adaptive-chan` does the same through a channel, and `inline` runs each task on its submitter. Prefer `SetTaskPoolMode`, which also moves the sizing. |
 | `MinWorkerCount` | `0` | Resident floor an adaptive pool retires down to. Zero retires every idle worker and starts one again when work arrives; the other modes ignore it. |
+| `StreamWorkerCount` | `0` → *dynamic* | Ceiling of `<Name>-streams`, the pool HTTP/2 and HTTP/3 run their handlers on: twice `WorkerCount`, held under that pool's share of the memory but never below `WorkerCount`. Engines of one name share the pool, whose ceiling is the largest any of them asks for. |
+| `SidePools` | zero → *dynamic* | Worker ceiling and queue of the process's side pools `fib-client`, `fib-tls-handshake`, `fib-file`, `fib-flush` and `fib-notify` (`sidepool.Sizing`); a zero field is fib's default, `sidepool.DefaultSizing()`. The pools are process-wide and built on first use, so an engine's sizes apply to those not built yet; see [Pool sizing](#pool-sizing). |
 | `SharedTaskPool` | `true` | Engines of one `Name` share one worker pool and one handler pool. The first engine to start builds them from its settings; later engines of that name use them as they are. Set it false, or give the engine another name, to isolate. |
 | `TaskPool` | `nil` | An external pool that runs the engine's connections instead of the built-in one; see `SetTaskPool`. When set, the pool mode, worker count, shared-pool setting and sizing no longer apply to it. The engine never stops a pool supplied this way. |
 
@@ -158,22 +160,58 @@ buffer, as a proxy or a bulk transfer wants, it is:
 `DefaultConfigFor(64 << 10)` gives that read buffer and watermark directly. It is the sizing a
 gateway that proxies bodies usually wants.
 
-## Startup log and effective settings
+## Pool sizing
 
-With `LogSettings` on, the engine prints a header and one line per setting when it starts:
+Every pool fib builds sizes its worker ceiling from the machine when the config leaves it at zero:
+what the pool's work calls for, mostly a number per CPU, held under what the pool's share of the
+process's memory pays for at an estimated cost per worker. The CPUs are `min(NumCPU, GOMAXPROCS)`,
+so a cgroup's quota and a prefork child's share count; the memory is the machine's or its cgroup's
+limit, whichever is lower, and half of it is the budget the pools may plan for, divided among
+fib's prefork children. Each pool keeps at least a floor per CPU. A machine whose memory cannot be
+read keeps the CPU-based ceilings. Queues are not sized from memory: a queue takes memory only as
+deep as it has been.
+
+| Pool | What its work calls for | Memory share | Cost a worker | Floor a CPU | Queue |
+| --- | --- | --- | --- | --- | --- |
+| `<Name>-workers` (`WorkerCount`) | GOMAXPROCS×1000 | 30% | 64 KiB | 64 | `MaxEvents` |
+| `<Name>-streams` (`StreamWorkerCount`) | 2×`WorkerCount`, at least `WorkerCount` | 30% | 64 KiB | 64 | as `MaxEvents` |
+| `fib-tls-handshake` | 65,536 | 15% | 64 KiB | 64 | 10,000 |
+| `fib-client` | 4,096 | 10% | 32 KiB | 32 | 10,000 |
+| `fib-file` | 256 | 5% | 256 KiB | 4 | 10,000 |
+| `fib-flush` | 4,096 | 5% | 16 KiB | 16 | 10,000 |
+| `fib-notify` | 4,096 | 5% | 16 KiB | 16 | 131,072 |
+
+So a container of 8 CPUs and 512 MiB gets 1,228 engine workers instead of 8,000, and 1,228
+handshakes instead of 65,536; a machine of 64 CPUs and 128 GiB run as 32 prefork children gives
+each child 4,915 handshakes. The costs are estimates until a benchmark measures them. Setting
+`WorkerCount`, `StreamWorkerCount` or a `SidePools` field overrides the sizing for that pool.
+
+`New` logs at debug level what it sized, and from what:
 
 ```text
-INFO fib: engine config engine=gateway parameters=30
-INFO fib: config parameter=readBuffer value="65536 (64 KiB)" source=custom about="the most bytes one read of a connection's socket takes"
-INFO fib: config parameter=writeWatermark value="262144 (256 KiB)" source=default about="bytes a connection may have waiting before its reads pause; zero is sized from readBuffer and the machine"
-INFO fib: config parameter=maxPendingBytes value="33255979008 (30.97 GiB)" source=custom about="bytes all connections together may have waiting; zero means no budget"
+DEBUG fib: engine pool sizing engine=fib cpus=14 memory="68719476736 (64 GiB)" processes=1 poolBudget="34359738368 (32 GiB)" workers=14000 maxEvents=100000 streamWorkers=28000 fib-client=4096/10000 fib-tls-handshake=65536/10000 fib-file=256/10000 fib-flush=4096/10000 fib-notify=4096/131072 custom=""
+```
+
+`custom` names the sizes the config set; `keptBuilt`, when present, names side pools another
+engine or an earlier use had built already with other sizes, which keep theirs.
+
+## Startup log and effective settings
+
+With `LogSettings` on, the engine prints at debug level a header and one line per setting when it
+starts; the header's `changed` names the settings the caller set to other than fib's default:
+
+```text
+DEBUG fib: engine config engine=gateway parameters=37 changed=readBuffer,maxPendingBytes
+DEBUG fib: config parameter=readBuffer value="65536 (64 KiB)" source=custom about="the most bytes one read of a connection's socket takes"
+DEBUG fib: config parameter=writeWatermark value="262144 (256 KiB)" source=default about="bytes a connection may have waiting before its reads pause; zero is sized from readBuffer and the machine"
+DEBUG fib: config parameter=maxPendingBytes value="33255979008 (30.97 GiB)" source=custom about="bytes all connections together may have waiting; zero means no budget"
 ```
 
 In fib/log's `line` format (see [Logging](#logging)) the list is one record instead, with the
 settings as an aligned table below it:
 
 ```text
-2026-10-27 10:00:00.000 INFO  fib: engine config engine=gateway parameters=30
+2026-10-27 10:00:00.000 DEBUG fib: engine config engine=gateway parameters=37 changed=readBuffer,maxPendingBytes
 	settings:
 		parameter           value             source   about
 		readBuffer          65536 (64 KiB)    custom   the most bytes one read of a connection's socket takes
@@ -182,8 +220,8 @@ settings as an aligned table below it:
 ```
 
 `source=default` means the value came from fib's default or its machine sizing; `source=custom`
-means the caller set a different value. `Engine.LogSettings()` prints the same list at any time,
-whether or not `LogSettings` is set. `Engine.Settings()` returns the values programmatically, and
+means the caller set a different value. `Engine.LogSettings()` prints the same list at info level
+at any time, whether or not `LogSettings` is set. `Engine.Settings()` returns the values programmatically, and
 `Settings.Parameters()` returns the same rows the log uses.
 
 Setting the environment variable `FIB_LOG_SETTINGS=0` (also `false`, `off` or `no`, in any case)

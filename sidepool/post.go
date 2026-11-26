@@ -27,7 +27,7 @@ var notify lazyPool
 
 // Notify returns the pool Post runs its callbacks on. Nothing but Post
 // submits to it.
-func Notify() *taskpool.TaskPool { return notify.get("fib-notify", notifyWorkers, notifyQueue) }
+func Notify() *taskpool.TaskPool { return pools[4].get() }
 
 // Post runs fn on the notify pool without waiting and without failing, for a
 // caller that may not wait, such as an event loop or a goroutine holding a

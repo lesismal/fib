@@ -7,6 +7,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/lesismal/fib/internal/poolsize"
 	"github.com/lesismal/fib/internal/udpbatch"
 	"github.com/lesismal/fib/streampool"
 	"github.com/lesismal/fib/taskpool"
@@ -105,9 +106,14 @@ const (
 // DefaultPoolSizing reports the sizing mode is tuned for, which is what
 // DefaultConfig and SetTaskPoolMode install. Every mode now takes the same
 // one; the parameter stays so that a mode tuned otherwise can be told apart.
+//
+// The worker count is what the CPUs call for, held under what the engine
+// pool's share of the process's memory pays for at an estimated cost a
+// worker, on a machine whose memory can be read; see internal/poolsize. The
+// queue follows the worker count.
 func DefaultPoolSizing(mode taskpool.Mode) PoolSizing {
 	workerCount := max(runtime.GOMAXPROCS(0)*elasticWorkersPerCPU, runtime.NumCPU()*elasticMinWorkersPerCPU)
-	return poolSizing(workerCount)
+	return poolSizing(poolsize.Engine.Ceiling(poolsize.Detect(), workerCount))
 }
 
 // DefaultStreamPoolSizing reports the sizing of the pool HTTP/2 and HTTP/3
@@ -116,7 +122,18 @@ func DefaultPoolSizing(mode taskpool.Mode) PoolSizing {
 // ceiling is twice the widest of their pools instead, whatever their mode;
 // see streamPoolFactor.
 func DefaultStreamPoolSizing(mode taskpool.Mode) PoolSizing {
-	return poolSizing(DefaultPoolSizing(mode).WorkerCount * streamPoolFactor)
+	return poolSizing(streamWorkers(0, DefaultPoolSizing(mode).WorkerCount))
+}
+
+// streamWorkers is the stream pool ceiling an engine asks for: set, when the
+// caller set Config.StreamWorkerCount, or else streamPoolFactor times its
+// pool's workers, held under what the stream pool's share of the process's
+// memory pays for but never narrower than the engine's pool, which feeds it.
+func streamWorkers(set, engineWorkers int) int {
+	if set > 0 {
+		return set
+	}
+	return max(engineWorkers, poolsize.Streams.Ceiling(poolsize.Detect(), engineWorkers*streamPoolFactor))
 }
 
 // poolSizing pairs a worker count with the queue that goes with it.
@@ -387,7 +404,7 @@ func acquireTaskPool(config Config) (TaskPool, func()) {
 	if !config.SharedTaskPool {
 		// The pool HTTP/2 and HTTP/3 run their handlers on has to stay wider
 		// than every engine pool that feeds it; see streamPoolFactor.
-		releaseStreams := streampool.Require(engine, config.WorkerCount*streamPoolFactor)
+		releaseStreams := streampool.Require(engine, streamWorkers(config.StreamWorkerCount, config.WorkerCount))
 		pool := newTaskPool(config)
 		return pool, func() {
 			pool.Stop()
@@ -403,7 +420,7 @@ func acquireTaskPool(config Config) (TaskPool, func()) {
 	}
 	entry.refs++
 	sharedTaskPools.Unlock()
-	releaseStreams := streampool.Require(engine, entry.workers*streamPoolFactor)
+	releaseStreams := streampool.Require(engine, streamWorkers(config.StreamWorkerCount, entry.workers))
 	var once sync.Once
 	return entry.pool, func() {
 		once.Do(func() {

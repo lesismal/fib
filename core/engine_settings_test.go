@@ -9,6 +9,7 @@ import (
 	"testing"
 
 	"github.com/lesismal/fib/log"
+	"github.com/lesismal/fib/sidepool"
 )
 
 // Settings reports what the engine runs with, after the defaults have filled
@@ -77,15 +78,15 @@ func TestEngineSettings(t *testing.T) {
 	}
 }
 
-// The startup log prints the settings line, with the sized values, when
-// LogStatus asks for it.
+// The startup log prints the settings list at debug level, with the sized
+// values, when LogSettings asks for it.
 func TestLogRunPrintsSettings(t *testing.T) {
 	// The CI environment silences the list by default; this test is about
 	// the list, so it asks for it.
 	t.Setenv(logSettingsEnv, "1")
 	var buf bytes.Buffer
 	old := slog.Default()
-	slog.SetDefault(slog.New(slog.NewTextHandler(&buf, nil)))
+	slog.SetDefault(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug})))
 	defer slog.SetDefault(old)
 
 	config := DefaultConfig()
@@ -98,11 +99,14 @@ func TestLogRunPrintsSettings(t *testing.T) {
 	engine.logRun()
 
 	out := buf.String()
-	if !strings.Contains(out, "fib: engine config") {
-		t.Fatalf("logRun did not print the settings header: %q", out)
+	if !strings.Contains(out, "level=DEBUG msg=\"fib: engine config\"") {
+		t.Fatalf("logRun did not print the settings header at debug level: %q", out)
 	}
 	for _, want := range []string{
+		"changed=logStatus",
 		"engine=" + DefaultName,
+		"parameter=streamWorkers",
+		"parameter=sidePools.fib-tls-handshake",
 		"parameter=name",
 		"parameter=readBuffer",
 		"parameter=writeWatermark",
@@ -258,5 +262,66 @@ func TestLogSettingsLineTable(t *testing.T) {
 			!strings.HasPrefix(row[source:], p.Source+" ") || row[about:] != p.About {
 			t.Errorf("row %q for %+v", row, p)
 		}
+	}
+}
+
+// At the default info level neither the sizing made at New nor the startup
+// list is logged.
+func TestSizingLogsAreDebug(t *testing.T) {
+	t.Setenv(logSettingsEnv, "1")
+	var buf bytes.Buffer
+	old := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&buf, nil)))
+	defer slog.SetDefault(old)
+	engine, err := New(DefaultConfig(), Binding{Addr: "127.0.0.1:0", Handler: HandlerFuncs{}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer engine.Close()
+	engine.logRun()
+	if out := buf.String(); strings.Contains(out, "engine pool sizing") || strings.Contains(out, "engine config") {
+		t.Fatalf("logged at info level: %q", out)
+	}
+}
+
+// New logs the pool sizes at debug level, marking those the caller set, and
+// the startup list names them as changed.
+func TestSizingLogMarksCustomPools(t *testing.T) {
+	t.Setenv(logSettingsEnv, "1")
+	var buf bytes.Buffer
+	old := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug})))
+	defer slog.SetDefault(old)
+	config := DefaultConfig()
+	config.Name = "sizing-log-test"
+	config.WorkerCount = 123
+	config.StreamWorkerCount = 456
+	engine, err := New(config, Binding{Addr: "127.0.0.1:0", Handler: HandlerFuncs{}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer engine.Close()
+	engine.logRun()
+	out := buf.String()
+	for _, want := range []string{
+		"msg=\"fib: engine pool sizing\"", "workers=123", "streamWorkers=456", "custom=workers,streamWorkers",
+		"cpus=", "poolBudget=", "fib-tls-handshake=",
+		"changed=name,workers,streamWorkers",
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("log %q is missing %q", out, want)
+		}
+	}
+}
+
+// A side pool size the config sets other than fib's default is custom.
+func TestCustomConfigSidePools(t *testing.T) {
+	config := DefaultConfig()
+	def := sidepool.DefaultSizing()
+	config.SidePools.File = sidepool.PoolSize{Workers: def.File.Workers + 1}
+	config.SidePools.Flush = sidepool.PoolSize{Workers: def.Flush.Workers}
+	custom := customConfig(config)
+	if !custom["sidePools.fib-file"] || custom["sidePools.fib-flush"] || custom["sidePools.fib-client"] {
+		t.Fatalf("custom %v, want sidePools.fib-file alone among the side pools", custom)
 	}
 }
