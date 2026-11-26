@@ -5,7 +5,7 @@
 // a file a response sends without waiting. None of it may run
 // on the goroutine that has it to do, which is an event loop or a worker
 // holding a lock more often than not, and none of it gets a goroutine of its
-// own.
+// own, short of a notification Post finds no room for (see Post).
 //
 // Each pool is its own, apart from every engine's, so that neither ever
 // waits on the other's queue: a worker of an engine may hand a handshake to
@@ -42,8 +42,8 @@ const (
 	// flushWorkers is the flush pool's ceiling. What it runs writes what a
 	// connection has queued, one non-blocking write, and returns.
 	flushWorkers = 4096
-	// queueSize bounds what waits for a worker in either pool, once it is at
-	// its ceiling. A submission to the client pool that finds the queue full
+	// queueSize bounds what waits for a worker in each pool but the notify
+	// pool (see notifyQueue), once it is at its ceiling. A submission to the client pool that finds the queue full
 	// waits for room; package tls submits to the handshake pool with TryGo,
 	// and closes the connection instead, since it submits from an event loop.
 	queueSize = 10000
@@ -54,21 +54,23 @@ var client, handshake, file, flush lazyPool
 // Client returns the pool the clients built on an engine run their
 // asynchronous work on: DNS lookups for a dial, and the callbacks that hand a
 // dial, a request or a WebSocket handshake its outcome.
-func Client() *taskpool.TaskPool { return client.get("fib-client", clientWorkers) }
+func Client() *taskpool.TaskPool { return client.get("fib-client", clientWorkers, queueSize) }
 
 // Handshake returns the pool TLS handshakes run on.
-func Handshake() *taskpool.TaskPool { return handshake.get("fib-tls-handshake", handshakeWorkers) }
+func Handshake() *taskpool.TaskPool {
+	return handshake.get("fib-tls-handshake", handshakeWorkers, queueSize)
+}
 
 // File returns the pool the pieces of a file a response sends without
 // waiting are read from the disk on; see http.Context.SendFile.
-func File() *taskpool.TaskPool { return file.get("fib-file", fileWorkers) }
+func File() *taskpool.TaskPool { return file.get("fib-file", fileWorkers, queueSize) }
 
 // Flush returns the pool that writes out what a connection has queued, for
 // a protocol that corks what it sends and has it written later, such as
 // HTTP/2 serving its responses. What it runs only writes to a socket, and
 // submits nothing to any pool, so any goroutine may wait to submit to it,
 // a worker of any other pool included.
-func Flush() *taskpool.TaskPool { return flush.get("fib-flush", flushWorkers) }
+func Flush() *taskpool.TaskPool { return flush.get("fib-flush", flushWorkers, queueSize) }
 
 // Go runs fn on the client pool. It waits for room when the pool is full, so
 // it must not be called from a task of the client pool itself, nor from
@@ -81,10 +83,10 @@ type lazyPool struct {
 	pool *taskpool.TaskPool
 }
 
-func (l *lazyPool) get(name string, workers int) *taskpool.TaskPool {
+func (l *lazyPool) get(name string, workers, queue int) *taskpool.TaskPool {
 	l.once.Do(func() {
 		l.pool = taskpool.NewAdaptive(taskpool.AdaptiveConfig{
-			Name: name, MaxWorkers: workers, QueueSize: queueSize,
+			Name: name, MaxWorkers: workers, QueueSize: queue,
 		})
 	})
 	return l.pool

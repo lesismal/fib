@@ -111,18 +111,32 @@ func (e *Engine) DialWith(opts DialOptions, done func(*Connection, error)) error
 	}
 	if !isLiteralAddr(opts.Addr) {
 		resolveOn := opts.resolveNetwork(network)
+		var deadline time.Time
+		if opts.Timeout > 0 {
+			deadline = time.Now().Add(opts.Timeout)
+		}
 		// The lookup runs on the client pool. The caller may be a callback
 		// running on that pool, which must not submit to it, so the loop
-		// submits the lookup; see Hand.
+		// submits the lookup; see Hand. A pool too busy to take it fails the
+		// dial with ErrPoolBusy, and a lookup that waited out the dial's
+		// timeout, or the engine's closing, for a worker is not made.
 		resolve := func() {
+			switch {
+			case e.stopping.Load():
+				d.fail(net.ErrClosed)
+				return
+			case !deadline.IsZero() && !time.Now().Before(deadline):
+				d.fail(os.ErrDeadlineExceeded)
+				return
+			}
 			d.family, d.sa, d.raddr, d.err = netaddr.ResolveDial(resolveOn, opts.Addr)
 			if d.err == nil && d.raddr != nil {
 				d.err = opts.familyMismatch(d.raddr.IP)
 			}
 			e.requestDial(d)
 		}
-		if !e.Hand(sidepool.Client(), resolve) {
-			return d.opError(errLoopClosed)
+		if err := e.TryHand(sidepool.Client(), resolve); err != nil {
+			return d.opError(err)
 		}
 		return nil
 	}

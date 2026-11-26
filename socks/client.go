@@ -7,6 +7,7 @@ import (
 	"net"
 	"net/netip"
 	"net/url"
+	"os"
 	"strconv"
 	"sync"
 	"sync/atomic"
@@ -173,8 +174,14 @@ func (d *Dialer) start(engine *fib.Engine, cmd Command, network, addr string, ti
 	isIP := err == nil
 	if !isIP && (d.Version == Version4 || d.Version == Version5 && d.ResolveLocally) {
 		// The caller may be a callback running on the client pool, which must
-		// not submit to it, so the engine's loop submits the lookup.
+		// not submit to it, so the engine's loop submits the lookup. A pool
+		// too busy to take it fails the dial with fib.ErrPoolBusy, and a
+		// lookup that waited out the dial's timeout for a worker is not made.
 		resolve := func() {
+			if !h.deadline.IsZero() && !time.Now().Before(h.deadline) {
+				h.finish(os.ErrDeadlineExceeded)
+				return
+			}
 			if err := h.resolve(); err != nil {
 				h.finish(err)
 				return
@@ -183,8 +190,8 @@ func (d *Dialer) start(engine *fib.Engine, cmd Command, network, addr string, ti
 				h.finish(err)
 			}
 		}
-		if !engine.Hand(sidepool.Client(), resolve) {
-			return h.opError(net.ErrClosed)
+		if err := engine.TryHand(sidepool.Client(), resolve); err != nil {
+			return h.opError(err)
 		}
 		return nil
 	}

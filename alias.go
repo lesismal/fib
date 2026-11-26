@@ -305,6 +305,10 @@ var ErrNoLocalPort = core.ErrNoLocalPort
 // not UDP.
 var ErrNotUDP = core.ErrNotUDP
 
+// ErrPoolBusy is what TryHand reports when the pool it was to hand work to
+// is full. A caller fails what it was asked to do with it.
+var ErrPoolBusy = core.ErrPoolBusy
+
 // ErrSendFileDatagram is what SendFile returns on a UDP connection, whose
 // sends are datagrams rather than a stream a file could be copied into.
 var ErrSendFileDatagram = core.ErrSendFileDatagram

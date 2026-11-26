@@ -33,7 +33,9 @@ type Engine struct {
 	acceptPlacement AcceptPlacement
 	// accepted counts the connections the bindings accepted, against
 	// Config.MaxConns.
-	accepted        acceptedConns
+	accepted acceptedConns
+	// handRejected counts the TryHand calls turned away.
+	handRejected    atomic.Uint64
 	name            string
 	logStatus       bool
 	logSettings     bool
@@ -190,10 +192,17 @@ type Stats struct {
 	PendingBytes           int64
 	OpenConns              int64
 	ConnsRefused           uint64
+	HandQueued             int64
+	HandMaxQueued          int64
+	HandRejected           uint64
+	HandWarnings           uint64
 }
 
 func (e *Engine) Stats() Stats {
-	return Stats{OpenConns: e.accepted.open.Load(), ConnsRefused: e.accepted.refused.Load()}
+	return Stats{
+		OpenConns: e.accepted.open.Load(), ConnsRefused: e.accepted.refused.Load(),
+		HandRejected: e.handRejected.Load(),
+	}
 }
 
 // acceptedConns counts the connections an engine's bindings accepted and

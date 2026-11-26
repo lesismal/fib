@@ -458,6 +458,15 @@ type Stats struct {
 	// were closed as they were accepted because MaxConns were open.
 	OpenConns    int64
 	ConnsRefused uint64
+	// HandQueued is how many functions Hand was given that wait on the
+	// loops for a full pool to take them, and HandMaxQueued the most that
+	// have waited on one loop. HandRejected counts the TryHand calls turned
+	// away because their pool was full, and HandWarnings the times a loop's
+	// waiting functions rose past a level it warns at; see Engine.Hand.
+	HandQueued    int64
+	HandMaxQueued int64
+	HandRejected  uint64
+	HandWarnings  uint64
 }
 
 // acceptedConns counts the connections an engine's bindings accepted and
@@ -492,6 +501,13 @@ func (e *Engine) Stats() Stats {
 		PendingBytes:           e.pendingTotal.Load(),
 		OpenConns:              e.accepted.open.Load(),
 		ConnsRefused:           e.accepted.refused.Load(),
+	}
+	for _, loop := range append([]*Engine{e}, e.pollers...) {
+		h := &loop.hand
+		s.HandQueued += h.queued.Load()
+		s.HandMaxQueued = max(s.HandMaxQueued, h.maxQueued.Load())
+		s.HandRejected += h.rejected.Load()
+		s.HandWarnings += h.warnings.Load()
 	}
 	for _, p := range e.pollers {
 		s.ReadsPausedByWatermark += p.readsPausedByWatermark.Load()

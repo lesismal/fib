@@ -337,6 +337,8 @@ func (p *chanAdaptivePool) resize(minWorkers, maxWorkers int) {
 
 func (p *chanAdaptivePool) workerCount() int { return int(p.workers.Load()) }
 
+func (p *chanAdaptivePool) queueLen() (queued, size int) { return len(p.tasks), cap(p.tasks) }
+
 func (p *chanAdaptivePool) attrs() []any {
 	return []any{
 		"workers", p.workerCount(), "minWorkers", int(p.minWorkers.Load()),

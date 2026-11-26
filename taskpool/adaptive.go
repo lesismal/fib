@@ -164,6 +164,14 @@ func (b *adaptiveBackend) workerCount() int {
 	return total
 }
 
+func (b *adaptiveBackend) queueLen() (queued, size int) {
+	for _, p := range b.shards {
+		queued += p.ring.len()
+		size += int(p.ring.limit)
+	}
+	return queued, size
+}
+
 func (b *adaptiveBackend) attrs() []any {
 	minWorkers, queueSize := 0, 0
 	for _, p := range b.shards {

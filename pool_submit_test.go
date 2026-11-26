@@ -92,8 +92,8 @@ var submitSites = []submitSite{
 	{"tls/tls.go", "Handler.startBlocking", "sidepool.Handshake().TryGo", []string{onLoop, onEngine}, onHandshake, false},
 	{"tls/tls.go", "layer.async", "sidepool.Handshake().TryGo", []string{onLoop, onEngine}, onHandshake, false},
 
-	// sidepool.Post, which never waits: a callback it cannot queue waits in
-	// a list the notify pool's callbacks empty.
+	// sidepool.Post, which never waits: a callback it cannot queue runs on
+	// a goroutine of its own.
 	{"sidepool/post.go", "post", "pool.TryGo", []string{onLoop, onEngine, onHandlers, onClient, onNotify, onFlush, onGoroutine}, onNotify, false},
 	{"core/connection.go", "Connection.fireNoticesLocked", "sidepool.Post", []string{onLoop, onEngine, onHandlers, onClient, onNotify, onFlush, onGoroutine}, onNotify, false},
 	{"core/engine_unix.go", "udpWaiters.ready", "sidepool.Post", []string{onLoop, onEngine}, onNotify, false},

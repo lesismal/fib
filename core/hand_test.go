@@ -186,3 +186,98 @@ func TestHandAfterClose(t *testing.T) {
 		t.Fatal("Hand reported true after the engine closed")
 	}
 }
+
+// fullPool returns a pool with one worker, held until release is closed, and
+// its one slot taken, so that it turns away whatever is offered to it.
+func fullPool(t *testing.T, name string) (pool *taskpool.TaskPool, release func()) {
+	t.Helper()
+	pool = taskpool.NewAdaptive(taskpool.AdaptiveConfig{Name: name, MaxWorkers: 1, QueueSize: 1})
+	held := make(chan struct{})
+	running := make(chan struct{})
+	if !pool.Go(func() { close(running); <-held }) {
+		t.Fatal("the pool turned the first task away")
+	}
+	waitHand(t, running, "the first task to start")
+	if !pool.Go(func() {}) {
+		t.Fatal("the pool turned the queued task away")
+	}
+	var once atomic.Bool
+	release = func() {
+		if once.CompareAndSwap(false, true) {
+			close(held)
+		}
+	}
+	t.Cleanup(func() { release(); pool.Stop() })
+	return pool, release
+}
+
+// A full pool holds up what is handed to it, and nothing handed to another
+// pool on the same loop: that runs at once.
+func TestHandFullPoolHoldsUpOnlyItsOwn(t *testing.T) {
+	engine := newHandEngine(t)
+	full, release := fullPool(t, "hand-held")
+	free := taskpool.NewAdaptive(taskpool.AdaptiveConfig{Name: "hand-free", MaxWorkers: 4, QueueSize: 16})
+	defer free.Stop()
+
+	heldRan := make(chan struct{})
+	if !engine.Hand(full, func() { close(heldRan) }) {
+		t.Fatal("Hand reported the engine closed")
+	}
+	deadline := time.Now().Add(handDeadline)
+	for engine.Stats().HandQueued != 1 {
+		if time.Now().After(deadline) {
+			t.Fatalf("HandQueued %d, want 1 waiting for the full pool", engine.Stats().HandQueued)
+		}
+		time.Sleep(time.Millisecond)
+	}
+	freeRan := make(chan struct{})
+	if !engine.Hand(free, func() { close(freeRan) }) {
+		t.Fatal("Hand reported the engine closed")
+	}
+	// Well within one retry of the held pool, which would not take it anyway.
+	waitHand(t, freeRan, "a hand to a pool with room, with another pool full")
+	select {
+	case <-heldRan:
+		t.Fatal("the hand to the full pool ran before it had room")
+	default:
+	}
+	release()
+	waitHand(t, heldRan, "the hand to the full pool once it had room")
+	for engine.Stats().HandQueued != 0 {
+		if time.Now().After(deadline) {
+			t.Fatalf("HandQueued %d once drained, want 0", engine.Stats().HandQueued)
+		}
+		time.Sleep(time.Millisecond)
+	}
+	if s := engine.Stats(); s.HandMaxQueued < 1 {
+		t.Fatalf("HandMaxQueued %d, want at least 1", s.HandMaxQueued)
+	}
+}
+
+// TryHand turns work away, with ErrPoolBusy, while the pool's queue is full
+// or functions it turned away wait on the loop, counts it, and hands it on
+// once the pool has room.
+func TestTryHandTurnsAwayWhileFull(t *testing.T) {
+	engine := newHandEngine(t)
+	pool, release := fullPool(t, "tryhand-full")
+	if err := engine.TryHand(pool, func() { t.Error("TryHand ran work it turned away") }); err != ErrPoolBusy {
+		t.Fatalf("TryHand with the queue full: %v, want ErrPoolBusy", err)
+	}
+	if got := engine.Stats().HandRejected; got != 1 {
+		t.Fatalf("HandRejected %d, want 1", got)
+	}
+	release()
+	ran := make(chan struct{})
+	deadline := time.Now().Add(handDeadline)
+	for {
+		err := engine.TryHand(pool, func() { close(ran) })
+		if err == nil {
+			break
+		}
+		if err != ErrPoolBusy || time.Now().After(deadline) {
+			t.Fatalf("TryHand once the pool drains: %v", err)
+		}
+		time.Sleep(time.Millisecond)
+	}
+	waitHand(t, ran, "the work TryHand took")
+}

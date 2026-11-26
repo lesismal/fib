@@ -1,7 +1,6 @@
 package sidepool
 
 import (
-	"runtime"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -11,93 +10,85 @@ import (
 )
 
 // Callbacks posted while the pool's one worker is busy and its queue full
-// wait in the backlog, start no goroutine, and all run once the worker is
-// free, each once.
+// are neither dropped nor waited for: each runs once, on a goroutine of its
+// own, and is counted.
 func TestPostOverflow(t *testing.T) {
 	pool := taskpool.NewAdaptive(taskpool.AdaptiveConfig{Name: "post-test", MaxWorkers: 1, QueueSize: 1})
 	defer pool.Stop()
-	var b backlog
 	release := make(chan struct{})
+	var releaseOnce sync.Once
+	free := func() { releaseOnce.Do(func() { close(release) }) }
+	defer free()
 	started := make(chan struct{})
-	post(pool, &b, func() { close(started); <-release })
+	post(pool, func() { close(started); <-release })
 	<-started
+	before := PostSpilled()
 	var mu sync.Mutex
-	var order []int
-	before := runtime.NumGoroutine()
+	seen := map[int]int{}
+	var ran atomic.Int32
 	const posts = 50
+	var wg sync.WaitGroup
+	wg.Add(posts)
 	for i := range posts {
-		post(pool, &b, func() {
+		post(pool, func() {
+			defer wg.Done()
+			ran.Add(1)
 			mu.Lock()
-			order = append(order, i)
+			seen[i]++
 			mu.Unlock()
 		})
 	}
-	if grew := runtime.NumGoroutine() - before; grew > 2 {
-		t.Fatalf("posting to a full pool started %d goroutines", grew)
+	// The queue holds one; the rest ran on goroutines of their own, while
+	// the worker is still held.
+	spilled := int32(PostSpilled() - before)
+	if spilled < posts-2 {
+		t.Fatalf("%d of %d callbacks spilled with the queue full", spilled, posts)
 	}
-	b.mu.Lock()
-	waiting := len(b.fns)
-	b.mu.Unlock()
-	if waiting == 0 {
-		t.Fatal("nothing waited in the backlog with the queue full")
-	}
-	close(release)
 	deadline := time.Now().Add(10 * time.Second)
-	for {
-		mu.Lock()
-		n := len(order)
-		mu.Unlock()
-		if n == posts {
-			break
-		}
+	for ran.Load() < spilled {
 		if time.Now().After(deadline) {
-			t.Fatalf("%d of %d callbacks ran", n, posts)
+			t.Fatalf("%d of %d spilled callbacks ran while the worker was held", ran.Load(), spilled)
 		}
 		time.Sleep(time.Millisecond)
 	}
-	seen := make(map[int]bool, posts)
-	for _, i := range order {
-		if seen[i] {
-			t.Fatalf("callback %d ran twice: %v", i, order)
+	free()
+	done := make(chan struct{})
+	go func() { wg.Wait(); close(done) }()
+	select {
+	case <-done:
+	case <-time.After(10 * time.Second):
+		t.Fatalf("%d of %d callbacks ran", ran.Load(), posts)
+	}
+	for i := range posts {
+		if seen[i] != 1 {
+			t.Fatalf("callback %d ran %d times", i, seen[i])
 		}
-		seen[i] = true
 	}
 }
 
-// A callback that panics, whether the pool queued it or it waited in the
-// backlog, is reported to the pool's panic handler, and the callbacks behind
-// it in the backlog still run.
-func TestPostPanicKeepsDraining(t *testing.T) {
+// A callback that panics, whether the pool queued it or it ran on a
+// goroutine of its own, is reported to the pool's panic handler.
+func TestPostPanic(t *testing.T) {
 	pool := taskpool.NewAdaptive(taskpool.AdaptiveConfig{Name: "post-panic-test", MaxWorkers: 1, QueueSize: 1})
 	defer pool.Stop()
 	var panics atomic.Int32
 	pool.SetPanicHandler(func(any, []byte) { panics.Add(1) })
-	var b backlog
 	release := make(chan struct{})
+	var releaseOnce sync.Once
+	free := func() { releaseOnce.Do(func() { close(release) }) }
+	defer free()
 	started := make(chan struct{})
-	post(pool, &b, func() { close(started); <-release; panic("first") })
+	post(pool, func() { close(started); <-release; panic("first") })
 	<-started
-	var ran atomic.Int32
 	const posts = 20
-	for i := range posts {
-		post(pool, &b, func() {
-			ran.Add(1)
-			if i%2 == 0 {
-				panic("again")
-			}
-		})
+	for range posts {
+		post(pool, func() { panic("again") })
 	}
-	b.mu.Lock()
-	waiting := len(b.fns)
-	b.mu.Unlock()
-	if waiting == 0 {
-		t.Fatal("nothing waited in the backlog with the queue full")
-	}
-	close(release)
+	free()
 	deadline := time.Now().Add(10 * time.Second)
-	for ran.Load() != posts || panics.Load() != 1+posts/2 {
+	for panics.Load() != 1+posts {
 		if time.Now().After(deadline) {
-			t.Fatalf("%d of %d callbacks ran, %d panics reported", ran.Load(), posts, panics.Load())
+			t.Fatalf("%d of %d panics reported", panics.Load(), 1+posts)
 		}
 		time.Sleep(time.Millisecond)
 	}

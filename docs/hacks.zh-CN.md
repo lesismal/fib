@@ -713,10 +713,27 @@ config.SetTaskPool(pool)          // Engine 用你的池；关闭 Engine 不会�
   这条规则，`TestPoolSubmissions`（`pool_submit_test.go`）列出了 fib 里每个投递点及其可能运行的位置：
   出现未登记的新投递点、可能等待自己所在池的投递点，或者等待成环，测试都会失败。任务只能用从不等待的
   调用向自己所在的池投递：`TryGo`（队列满时返回 false），以及基于它的 `sidepool.Post`。fib 有两处这样
-  做。`fib-notify` 上的回调可以再 `Post`，即由 `fib-notify` 自己的 worker 向它投递；队列满时 `Post`
-  把回调放进自己的列表，由池里的回调执行完后清空。HTTP/2 handler 排入响应后，用 `TryGo` 把该连接的
+  做。`fib-notify` 上的回调可以再 `Post`，即由 `fib-notify` 自己的 worker 向它投递。HTTP/2 handler
+  排入响应后，用 `TryGo` 把该连接的
   flush 投给 `<Name>-streams`，于是通常由它所在的 worker 在它返回后，把这期间排入的响应一次写出；队列
   满时 flush 改投只做写操作的 `fib-flush`。
+- **谁可以等待，池满时拒绝什么。** 事件循环、定时器，以及持有池中任务可能要拿的锁的 goroutine，
+  向任何池投递都不能等待，只能用 `TryGo`、`Hand` 或 `sidepool.Post`。其他调用方可以等待别的池腾出
+  空位，只要这些等待连起来不会绕回起点（由 `TestPoolSubmissions` 检查）。不等待地交出去的任务分两类，
+  池满时处理方式不同：
+  - **通知**——唤醒等待者、请求或连接的结束、把结果交给回调——永远不拒绝，因为没有别的途径告诉
+    等待者。`Hand(pool, fn)` 把满池拒收的函数留在 loop 上，每个池一个列表，所以一个池满了只拖住
+    投给它的任务。`sidepool.Post` 投到 `fib-notify`，它的队列能放 131072 个回调；超过之后回调在
+    单独的 goroutine 上执行，由 `sidepool.PostSpilled` 计数并打日志。通知的数量随 engine 已接纳的
+    工作量而定。
+  - **新工作**——拨号前的域名解析、性能剖析采集——走 `TryHand(pool, fn)`：池的队列满了，或者还有它
+    拒收的任务在等，就返回 `fib.ErrPoolBusy`，由调用方以此失败（拨号返回这个错误，`middleware/pprof`
+    回 503 并带 `Retry-After`）。等 worker 期间请求已结束或拨号已超时的采集或解析，不会再执行。
+- **看出池跟不上。** 每个池的队列每 100ms 采样一次：`TaskPool.QueueStats()` 报告当前排队数、见过的
+  最深值、被拒的 `TryGo` 次数，以及队列升过容量的 50%、75%、90%、100% 各几次；每升过一档也会打日志
+  （warn，100% 时为 error），每个池每一档最多每 10 秒一条。`Engine.Stats()` 报告各 loop 上在 `Hand`
+  里等待的函数数（`HandQueued`、`HandMaxQueued`）、被拒的 `TryHand` 次数（`HandRejected`），以及某个
+  loop 的等待数升过 1024、16384、131072 时的告警次数（`HandWarnings`）。
 - 阻塞型 handler（要等应用自己的 I/O）放在 `<Name>-streams`（上限是 Engine 池的 2 倍）或你自己的池里，
   而不是 Engine 的池里。
 - `SharedTaskPool`（默认开）：同进程内**同名**的 Engine 共享 worker 和队列，避免多监听端口重复创建

@@ -15,10 +15,12 @@ package pprof
 
 import (
 	"context"
+	"errors"
 	stdhttp "net/http"
 	"net/http/pprof"
 	"strings"
 
+	fib "github.com/lesismal/fib"
 	fibhttp "github.com/lesismal/fib/http"
 	"github.com/lesismal/fib/middleware"
 )
@@ -99,6 +101,10 @@ func serve(c *fibhttp.Context, handler stdhttp.Handler) {
 	gather := func() {
 		defer c.Release()
 		defer cancel()
+		if ctx.Err() != nil {
+			// The request ended while the capture waited for a worker.
+			return
+		}
 		w := &recorder{header: make(stdhttp.Header)}
 		handler.ServeHTTP(w, r.WithContext(ctx))
 		if w.status == 0 {
@@ -107,8 +113,25 @@ func serve(c *fibhttp.Context, handler stdhttp.Handler) {
 		_ = c.WriteResponse(fibhttp.Response{StatusCode: w.status, Header: w.header, Body: w.body})
 	}
 	// The handler may be running on the handler pool itself, which a task
-	// must not submit to, so the connection's loop submits gather.
-	if pool := c.Conn.Engine().HandlerPool(); pool == nil || !c.Conn.Hand(pool, gather) {
+	// must not submit to, so the connection's loop submits gather. A pool
+	// too busy to take it answers 503: a profile is no work to queue behind
+	// the requests a busy server has yet to run.
+	pool := c.Conn.Engine().HandlerPool()
+	if pool == nil {
+		gather()
+		return
+	}
+	switch err := c.Conn.TryHand(pool, gather); {
+	case err == nil:
+	case errors.Is(err, fib.ErrPoolBusy):
+		cancel()
+		_ = c.WriteResponse(fibhttp.Response{
+			StatusCode: stdhttp.StatusServiceUnavailable,
+			Header:     stdhttp.Header{"Retry-After": {"1"}, "Content-Type": {"text/plain; charset=utf-8"}},
+			Body:       []byte("pprof: server busy\n"),
+		})
+		c.Release()
+	default:
 		// The engine is closing; the profile is gathered here.
 		gather()
 	}

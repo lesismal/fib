@@ -121,6 +121,8 @@ type TaskPool struct {
 	backend  backend
 	mode     Mode
 	stopped  atomic.Bool
+	// watch is what the pool keeps of its queue's depth; see QueueStats.
+	watch queueWatch
 }
 
 // New creates a ModeAdaptive pool that grows to maxConcurrent workers under
@@ -179,6 +181,7 @@ var poolIDs atomic.Uint64
 func start(name string, mode Mode, build func(*executor) backend) *TaskPool {
 	executor := &executor{name: name, id: poolIDs.Add(1)}
 	pool := &TaskPool{executor: executor, backend: build(executor), mode: mode}
+	watchPool(pool)
 	if logStatus.Load() {
 		label := []any{"pool", name, "id", executor.id, "mode", mode.String()}
 		log.Info("taskpool: started", append(label, pool.backend.attrs()...)...)
@@ -232,7 +235,13 @@ func (tp *TaskPool) TryGo(f func()) bool {
 		return true
 	}
 	if t, ok := tp.backend.(trySubmitter); ok {
-		return t.trySubmit(taskFunc(f))
+		if t.trySubmit(taskFunc(f)) {
+			return true
+		}
+		if !tp.stopped.Load() {
+			tp.rejectedFull()
+		}
+		return false
 	}
 	return tp.backend.submit(taskFunc(f))
 }

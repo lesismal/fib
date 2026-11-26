@@ -264,6 +264,8 @@ func (p *elasticPool) stop() {
 
 func (p *elasticPool) workerCount() int { return int(p.concurrent.Load()) }
 
+func (p *elasticPool) queueLen() (queued, size int) { return len(p.tasks), cap(p.tasks) }
+
 func (p *elasticPool) attrs() []any {
 	return []any{
 		"workers", p.workerCount(), "maxWorkers", p.maxWorkers,

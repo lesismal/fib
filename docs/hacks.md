@@ -841,11 +841,33 @@ config.SetTaskPool(pool)          // the Engine uses your pool; closing the Engi
   one until it is listed, on one that may wait on its own pool, and on a cycle of waits. A task may
   submit to its own pool only with a call that never waits: `TryGo`, which returns false when the
   queue is full, and `sidepool.Post` built on it. fib does so in two places. A callback on
-  `fib-notify` may post another, which submits to `fib-notify` from its own worker; when the queue
-  is full `Post` puts the callback in a list of its own that the pool's callbacks empty. An HTTP/2
+  `fib-notify` may post another, which submits to `fib-notify` from its own worker. An HTTP/2
   handler that queues a response offers the connection's flush to `<Name>-streams` with `TryGo`,
   so the worker it runs on usually writes the responses queued meanwhile in one go once it
   returns; when the queue is full, the flush goes to `fib-flush` instead, which runs only writes.
+- **Who may wait, and what a full pool turns away.** An event loop, a timer and a goroutine holding
+  a lock that the pool's tasks may take never wait to submit, to any pool: they use `TryGo`,
+  `Hand` or `sidepool.Post`. Anyone else may wait for room in another pool, as long as no chain of
+  waits leads back to where it started (`TestPoolSubmissions` checks). What is handed on without
+  waiting is of two kinds, handled differently once a pool is full:
+  - **Notifications** — a waiter's wake-up, the end of a request or connection, a result handed
+    to a callback — are never turned away, since nothing else would tell their waiter.
+    `Hand(pool, fn)` keeps what a full pool turned away on the loop, one list per pool, so a full
+    pool holds up only what is for it. `sidepool.Post` queues on `fib-notify`, whose queue holds
+    131,072 callbacks; past that a callback runs on a goroutine of its own, counted by
+    `sidepool.PostSpilled` and logged. Their number follows the work an engine has taken on.
+  - **New work** — a lookup before a dial, a profile capture — goes through
+    `TryHand(pool, fn)`, which returns `fib.ErrPoolBusy` instead while the pool's queue is full or
+    work it turned away still waits; the caller fails with it (a dial returns the error,
+    `middleware/pprof` answers 503 with `Retry-After`). A capture or lookup that waited for a
+    worker until its request ended or its dial timed out is not made.
+- **Seeing a pool fall behind.** Every pool's queue is sampled every 100 ms:
+  `TaskPool.QueueStats()` reports what waits now, the deepest seen, the `TryGo` calls turned away,
+  and how often the queue rose past 50, 75, 90 and 100% of its size, each of which is also logged
+  (warn, error at 100%) at most once every 10 s per pool and level. `Engine.Stats()` reports the
+  functions waiting in `Hand` on the loops (`HandQueued`, `HandMaxQueued`), the `TryHand` calls
+  turned away (`HandRejected`) and the warnings logged as the waiting rose past 1,024, 16,384 and
+  131,072 on a loop (`HandWarnings`).
 - Blocking handlers (which wait on your application's own I/O) belong in `<Name>-streams` (its
   ceiling is twice the Engine pool's) or your own pool, not the Engine's.
 - `SharedTaskPool` (on by default): Engines **with the same name** in a process share workers and
