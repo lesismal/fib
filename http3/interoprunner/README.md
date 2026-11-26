@@ -50,10 +50,10 @@ docker build -f http3/interoprunner/Dockerfile -t fib-interop:local .
 ```
 
 The runner needs `docker compose`, `tshark` (4.5.0 or newer, as its README
-says; older versions cannot follow a migrated connection) and these Python
-modules: `pycryptodome`, `random-slugs`, `termcolor`, `prettytable`,
-`pyshark`. `pyshark` does not run on Python 3.14; use 3.12, as the runner's
-own CI does.
+says; older versions cannot follow a migrated connection; the runner reads
+its captures with it) and the Python modules in the runner's
+`requirements.txt`, which `run-runner.sh` checks for. Use Python 3.12, as
+the runner's own CI does.
 
 The runner's compose file names the containers' interfaces
 (`interface_name`), which needs Docker Engine 28.1 and Compose 2.36 or newer.

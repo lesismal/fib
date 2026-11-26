@@ -39,7 +39,25 @@ fi
 if [ ! -f "$runner/run.py" ]; then
     git clone --depth 1 https://github.com/quic-interop/quic-interop-runner "$runner"
 fi
-if ! python3 -c 'import pyshark, Crypto, termcolor, prettytable, random_slugs' 2>/dev/null; then
+# The runner's requirements change upstream (it dropped pyshark for tshark on
+# 2026-11-25), so check the distributions its requirements.txt names rather
+# than a list kept here.
+if ! python3 - "$runner/requirements.txt" <<'PY'
+import importlib.metadata, re, sys
+missing = []
+for line in open(sys.argv[1]):
+    name = re.split(r"[\s;<>=!~\[#]", line.strip(), maxsplit=1)[0]
+    if not name:
+        continue
+    try:
+        importlib.metadata.version(name)
+    except importlib.metadata.PackageNotFoundError:
+        missing.append(name)
+if missing:
+    print("missing:", " ".join(missing), file=sys.stderr)
+    sys.exit(1)
+PY
+then
     echo "the runner's Python dependencies are missing: pip3 install -r $runner/requirements.txt" >&2
     exit 1
 fi

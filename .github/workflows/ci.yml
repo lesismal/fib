@@ -662,10 +662,9 @@ jobs:
       - uses: actions/setup-go@v6
         with:
           go-version: stable
-      # pyshark, which the runner reads its traces with, asks asyncio for
-      # the current event loop with none set; Python 3.14 (ubuntu-latest's
-      # python3) raises there, so every testcase failed in the runner's own
-      # check. 3.12 only warns.
+      # The runner's own CI uses Python 3.12. It read its traces with
+      # pyshark until 2026-11-25, which failed every testcase on Python 3.14
+      # (ubuntu-latest's python3); it reads them with tshark now.
       - uses: actions/setup-python@v6
         with:
           python-version: '3.12'
