@@ -322,14 +322,25 @@ func TestCvCliIdleTimerReused(t *testing.T) {
 // earlier fires, and is set again for what is left. The connection closes
 // IdleConnTimeout after it last went idle, not after it first did.
 func TestCvCliIdleTimerSetAgain(t *testing.T) {
-	closed := make(chan time.Time, 1)
-	u := rawServer(t, func(conn net.Conn, _ int) {
+	// closed has each connection's close, by the number rawServer gives it,
+	// and lastConn the connection that served the last request: a runner
+	// that oversleeps a gap past the timeout has the connection rightly
+	// close, and the next request go out on another (on Windows, the first
+	// connection's close was taken for the last one's, 602ms early).
+	type closing struct {
+		conn int
+		at   time.Time
+	}
+	closed := make(chan closing, 8)
+	var lastConn atomic.Int64
+	u := rawServer(t, func(conn net.Conn, n int) {
 		r := bufio.NewReader(conn)
 		for {
 			if _, err := stdhttp.ReadRequest(r); err != nil {
-				closed <- time.Now()
+				closed <- closing{n, time.Now()}
 				return
 			}
+			lastConn.Store(int64(n))
 			if _, err := io.WriteString(conn, cvCliOK); err != nil {
 				return
 			}
@@ -353,7 +364,15 @@ func TestCvCliIdleTimerSetAgain(t *testing.T) {
 		last = time.Now()
 		time.Sleep(timeout / 2)
 	}
-	at := cvCliWait(t, closed, "the idle connection to close")
+	want := int(lastConn.Load())
+	var at time.Time
+	for {
+		c := cvCliWait(t, closed, "the idle connection to close")
+		if c.conn == want {
+			at = c.at
+			break
+		}
+	}
 	// last is taken after the body was read, so the client's own mark came a
 	// little before it, and a runner's timer granularity is coarse: Windows
 	// closed it 13.5ms early. A timer kept from an earlier idle spell would
