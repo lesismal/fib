@@ -1214,7 +1214,22 @@ func mootTimerHold(t *testing.T) bool {
 	// handler from the request that long would have it leave before the
 	// answer is even expected. Given a second, only a timer that sends what
 	// is not due, or starts the wait's clock early, sends it alone.
-	p := newTestPair(t, 0, func(_, server *Config) { server.MaxAckDelay = time.Second })
+	//
+	// The client holds its acknowledgement of the push as long, so that it
+	// goes with the request, and the push's probe timeout, which counts the
+	// client's max_ack_delay in, does not come in the meantime. At 25ms it
+	// can: on a Windows runner, whose clock moves on every 15.6ms, the
+	// client's timer for that acknowledgement fires a tick late, the push is
+	// probed first, and a probe the request did not acknowledge comes due
+	// again while the handler takes its time, as it most likely did there
+	// ("the server sent [34 535]", the acknowledgement gone before the
+	// answer was expected). A probe timeout is loss recovery, which rightly
+	// does not wait for the handler, and the acknowledgement goes with what
+	// it sends.
+	p := newTestPair(t, 0, func(client, server *Config) {
+		client.MaxAckDelay = time.Second
+		server.MaxAckDelay = time.Second
+	})
 	waitQuiet(t, p)
 	server := p.serverConn(t)
 	// Something of the server's in flight, which the client acknowledges
@@ -1232,6 +1247,9 @@ func mootTimerHold(t *testing.T) bool {
 	// ackLeft is how long the request's acknowledgement could still wait
 	// once the answer was expected; 0 if it had gone already.
 	var ackLeft time.Duration
+	// inFlight says the server still had something ack-eliciting in flight
+	// once the request was there, which a probe timeout may send for.
+	var inFlight bool
 	moot := make(chan string, 1)
 	waitedc := make(chan bool, 1)
 	p.serverH.onData = func(s *Stream, data []byte, fin bool) {
@@ -1244,7 +1262,8 @@ func mootTimerHold(t *testing.T) bool {
 		before = len(sends())
 		c := s.Conn()
 		c.mu.Lock()
-		if !c.ackElicitingInFlight() && !c.lossDeadline.IsZero() {
+		inFlight = c.ackElicitingInFlight()
+		if !inFlight && !c.lossDeadline.IsZero() {
 			moot <- fmt.Sprintf("the probe timeout is still set %v from now for packets acknowledged", c.lossDeadline.Sub(c.now()))
 		}
 		c.mu.Unlock()
@@ -1285,10 +1304,9 @@ func mootTimerHold(t *testing.T) bool {
 	if !<-waitedc {
 		return false
 	}
-	// A probe of the push, should one go, carries the push again: only an
-	// acknowledgement on its own is this small.
+	// Only an acknowledgement on its own, or with a PING, is this small.
 	if sent := sends(); small(sent[before:]) > 0 {
-		t.Fatalf("the server sent %v; once the answer was expected, the request's acknowledgement could wait %v more", sent[before:], ackLeft)
+		t.Fatalf("the server sent %v; once the answer was expected, the request's acknowledgement could wait %v more; something of the server's in flight at the request: %v", sent[before:], ackLeft, inFlight)
 	}
 	return true
 }
