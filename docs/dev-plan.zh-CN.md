@@ -23,7 +23,7 @@
 | 引擎事件循环：读、写、poller、背压 | `fib`（根包）、`core` | 是（2026-10-26，`benchmark/loadtest`，[压测](loadtest.zh-CN.md)） | 是（d57d895、1d6841b、a1ba88b、c16c260、9dcfc6b） | 包内没有 Go 微基准；通过 HTTP、WebSocket 基准和压测间接测量 |
 | UDP 批量收发与 GSO | `fib`（根包）、`core` | 部分（只通过 HTTP/3 和 QUIC 基准） | 是（8643164、e4cb6ab；eb2b9d2 已回退） | 单独的数据报收发基准、GRO 密集的接收 |
 | 缓冲池与 Arena 分配器 | `bufferpool` | 是（2026-11-19，[bufferpool-allocator](bufferpool-allocator.zh-CN.md)） | 是（5c574b0、3df429f、d91b7a4、419f7bd） | — |
-| 任务池 | `taskpool` | 部分（`taskpool/benchmark`，对比 nbio、ants、gopool，662e533；2026-11-26 加的队列采样和 Hand 按池分列表未测） | 是（13b3d41、8380486、a6d78cd、8895a6a） | 池很多时采样的开销（每 100ms 汇总每个 adaptive 池各分片的队列）；一个池满、另一个池在承载负载时的 `Engine.Hand`，对比共用一个列表；队列满时 `TryGo` 被拒的路径；各池每个 worker 实际占的内存，internal/poolsize 目前是估计值（engine、handler、握手 64 KiB，client 32 KiB，flush、notify 16 KiB，file 256 KiB） |
+| 任务池 | `taskpool` | 部分（`taskpool/benchmark`，对比 nbio、ants、gopool，662e533；队列采样（2026-11-27 起改为提交时发现队列深才上膛）和 2026-11-26 加的 Hand 按池分列表未测） | 是（13b3d41、8380486、a6d78cd、8895a6a） | 每次提交时 `taskRing.put` 和 chan 池发送后做的深度检查（一次比较；`taskpool/benchmark` 和 HttpArena pipelined，对比改动之前的提交），以及很多池同时上膛时 watcher 的开销（每 100ms 汇总每个已上膛 adaptive 池各分片的队列）；一个池满、另一个池在承载负载时的 `Engine.Hand`，对比共用一个列表；队列满时 `TryGo` 被拒的路径；各池每个 worker 实际占的内存，internal/poolsize 目前是估计值（engine、handler、握手 64 KiB，client 32 KiB，flush、notify 16 KiB，file 256 KiB） |
 | TLS 记录：加密、内核 TLS、SendFile | `tls` | 是（`BenchmarkSendFileTLS`，322315d） | 是（9beb221、42867d8、5a02929、881ff97、08faed6） | — |
 | TLS 握手 | `tls` | 是（`BenchmarkServerHandshake`、`BenchmarkClientHandshake`，01a143d） | 部分 | 基准已有；没有据此做的优化记录 |
 | HTTP/1 服务端：解析器、响应分帧 | `http` | 是（`BenchmarkParser*`、`BenchmarkServerKeepAlive*`、`BenchmarkParseRequestHead`、压测） | 是（8bb8a82、de62b0b、e17bf98、534f420、2e2fef1） | — |

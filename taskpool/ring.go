@@ -76,6 +76,10 @@ type ringSegment struct {
 	base uint64
 	// next is the segment that took over from this one, once it is closed.
 	next atomic.Pointer[ringSegment]
+	// deep is the queue's depth past which a push reports pushedDeep: the
+	// first of WarnLevels of its limit. It sits on the line push reads for
+	// cells and room, so the check costs a push no other line.
+	deep uint64
 	_    cacheLinePad
 	head atomic.Uint64
 	_    cacheLinePad
@@ -114,8 +118,31 @@ func newRingSegment(n int, limit, base uint64) *ringSegment {
 	for size < n {
 		size <<= 1
 	}
-	return &ringSegment{cells: make([]ringCell, size), mask: uint64(size - 1), room: min(uint64(size), limit), base: base}
+	return &ringSegment{
+		cells: make([]ringCell, size), mask: uint64(size - 1), room: min(uint64(size), limit), base: base,
+		deep: deepDepth(limit),
+	}
 }
+
+// deepDepth is the depth, in tasks, at which a queue of limit reaches the
+// first of WarnLevels, and at least one.
+func deepDepth(limit uint64) uint64 {
+	return max(1, (limit*uint64(WarnLevels[0])+99)/100)
+}
+
+// pushResult is what push did with a task.
+type pushResult uint8
+
+const (
+	// pushFull: the queue was full, and the task was not queued.
+	pushFull pushResult = iota
+	// pushed: the task was queued.
+	pushed
+	// pushedDeep: the task was queued, and the queue it joined holds at
+	// least the first of WarnLevels of its limit; the pool's watch is armed
+	// with it. See queueWatch.
+	pushedDeep
+)
 
 // seqOf reads the full seq of the cell for pos.
 func (s *ringSegment) seqOf(cell *ringCell, pos uint64) uint64 {
@@ -127,18 +154,27 @@ func (s *ringSegment) setSeq(cell *ringCell, pos, seq uint64) {
 	cell.seq.Store(seq - pos&s.mask)
 }
 
-// push publishes task and reports whether there was room for it. A producer
+// push is put for a caller that needs only to know whether task was queued.
+func (r *taskRing) push(task Task) bool { return r.put(task) != pushFull }
+
+// put publishes task and reports whether there was room for it, and whether
+// the queue it joined is deep; see pushedDeep. A producer
 // claims a position before it publishes the task there, so for a moment the
 // tail is past a task that is not in its cell yet; see pop.
 //
 // A segment that is full, or closed, sends the producer to advance, which
 // finds it the segment to claim in next; the common case, one segment with
 // room, takes no call.
-func (r *taskRing) push(task Task) bool {
+//
+// The depth it reports comes from the head and tail it reads to claim a
+// position anyway, so knowing it costs a push one compare: the tasks in
+// older segments, which a push has to count only while one drains, are
+// added in then.
+func (r *taskRing) put(task Task) pushResult {
 	s := r.tail.Load()
-	room := s.room
+	room, older := s.room, uint64(0)
 	if r.head.Load() != s {
-		room = r.room(s)
+		room, older = r.room(s)
 	}
 	for {
 		tail := s.tail.Load()
@@ -150,8 +186,8 @@ func (r *taskRing) push(task Task) bool {
 		// A closed segment's tail carries closedBit, which puts it past any
 		// room.
 		if tail-head >= room {
-			if s, room = r.advance(s); s == nil {
-				return false
+			if s, room, older = r.advance(s); s == nil {
+				return pushFull
 			}
 			continue
 		}
@@ -161,8 +197,8 @@ func (r *taskRing) push(task Task) bool {
 			if seq < tail {
 				// The consumer that took the task a lap ago has not handed
 				// the cell back yet.
-				if s, room = r.advance(s); s == nil {
-					return false
+				if s, room, older = r.advance(s); s == nil {
+					return pushFull
 				}
 			}
 			// Otherwise another producer claimed this position first.
@@ -173,29 +209,32 @@ func (r *taskRing) push(task Task) bool {
 		}
 		cell.task = task
 		s.setSeq(cell, tail, tail+1)
-		return true
+		if tail+1-head+older >= s.deep {
+			return pushedDeep
+		}
+		return pushed
 	}
 }
 
 // room is how many positions s, the newest segment, may have claimed: its
 // own, less what the older segments still hold, since those count against
-// the queue's limit until they are taken.
-func (r *taskRing) room(s *ringSegment) uint64 {
+// the queue's limit until they are taken; and older, what they hold.
+func (r *taskRing) room(s *ringSegment) (room, older uint64) {
 	h := r.head.Load()
 	head := h.base + h.head.Load()
 	if head >= s.base {
-		return s.room
+		return s.room, 0
 	}
-	if older := s.base - head; older < r.limit {
-		return min(s.room, r.limit-older)
+	if older = s.base - head; older < r.limit {
+		return min(s.room, r.limit-older), older
 	}
-	return 0
+	return 0, older
 }
 
 // advance finds the segment a producer that found s full or closed claims in
-// next, and its room, growing the queue if s was full and the limit allows;
-// or nil if the queue is full.
-func (r *taskRing) advance(s *ringSegment) (*ringSegment, uint64) {
+// next, with its room and what the older segments hold (see room), growing
+// the queue if s was full and the limit allows; or nil if the queue is full.
+func (r *taskRing) advance(s *ringSegment) (*ringSegment, uint64, uint64) {
 	if s.tail.Load()&closedBit != 0 {
 		if r.tail.Load() == s {
 			// The producer growing the queue closed s and has yet to
@@ -205,10 +244,11 @@ func (r *taskRing) advance(s *ringSegment) (*ringSegment, uint64) {
 			r.growMu.Unlock()
 		}
 	} else if !r.grow(s) {
-		return nil, 0
+		return nil, 0, 0
 	}
 	s = r.tail.Load()
-	return s, r.room(s)
+	room, older := r.room(s)
+	return s, room, older
 }
 
 // grow links a segment twice the size of s, the queue's newest, once s is
@@ -295,6 +335,20 @@ func (r *taskRing) moveOn(s, next *ringSegment) *ringSegment {
 	}
 	r.head.CompareAndSwap(s, next)
 	return r.head.Load()
+}
+
+// grownPast is about the deepest the queue has been, as far as its growth
+// tells: a segment after the first was linked when the one before it, of at
+// least half its cells, filled. It is 0 for a queue that has not grown. A
+// producer also moves on from a segment whose cell a worker has claimed and
+// not yet handed back, so the depth it found may have been short of the
+// segment by the few tasks the workers were taking.
+func (r *taskRing) grownPast() int {
+	t := r.tail.Load()
+	if t.base == 0 {
+		return 0
+	}
+	return len(t.cells) / 2
 }
 
 // len is how many positions are claimed and not yet taken, including any

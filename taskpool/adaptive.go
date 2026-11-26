@@ -172,6 +172,14 @@ func (b *adaptiveBackend) queueLen() (queued, size int) {
 	return queued, size
 }
 
+func (b *adaptiveBackend) queueShape() (fullest, grown int) {
+	for _, p := range b.shards {
+		fullest = max(fullest, p.ring.len()*100/int(p.ring.limit))
+		grown = max(grown, p.ring.grownPast())
+	}
+	return fullest, grown
+}
+
 func (b *adaptiveBackend) attrs() []any {
 	minWorkers, queueSize := 0, 0
 	for _, p := range b.shards {
@@ -659,12 +667,26 @@ func (p *adaptivePool) waitForRoomLocked() {
 // reports false if the pool stopped first.
 func (p *adaptivePool) pushLocked(task Task) bool {
 	for !p.stopped.Load() {
-		if p.ring.push(task) {
+		if r := p.ring.put(task); r != pushFull {
+			if r == pushedDeep {
+				p.deep()
+			}
 			return true
 		}
 		p.waitForRoomLocked()
 	}
 	return false
+}
+
+// deep arms the pool's watch for a push that found the shard's queue deep;
+// see queueWatch. It is kept out of line, off the submit path's common case,
+// and reads the queue's depth again only for the push that arms the watch.
+//
+//go:noinline
+func (p *adaptivePool) deep() {
+	if w := p.executor.watch; !w.armed.Load() {
+		w.arm(p.ring.len())
+	}
 }
 
 // submit queues task without the lock, which it takes only to wait for room
@@ -676,8 +698,13 @@ func (p *adaptivePool) submit(task Task) bool {
 	if p.stopped.Load() {
 		return false
 	}
-	if !p.ring.push(task) && !p.pushSlow(task) {
-		return false
+	switch p.ring.put(task) {
+	case pushFull:
+		if !p.pushSlow(task) {
+			return false
+		}
+	case pushedDeep:
+		p.deep()
 	}
 	p.kick()
 	return true
@@ -688,8 +715,14 @@ func (p *adaptivePool) submit(task Task) bool {
 func (p *adaptivePool) trySubmit(task Task) bool {
 	p.submitting.Add(1)
 	defer p.submitting.Add(-1)
-	if p.stopped.Load() || !p.ring.push(task) {
+	if p.stopped.Load() {
 		return false
+	}
+	switch p.ring.put(task) {
+	case pushFull:
+		return false
+	case pushedDeep:
+		p.deep()
 	}
 	p.kick()
 	return true
@@ -711,11 +744,20 @@ func (p *adaptivePool) submitBatch(tasks []Task) int {
 	p.submitting.Add(1)
 	defer p.submitting.Add(-1)
 	submitted := 0
+	deep := false
 	for _, task := range tasks {
-		if p.stopped.Load() || !p.ring.push(task) && !p.pushSlow(task) {
+		if p.stopped.Load() {
 			break
 		}
+		r := p.ring.put(task)
+		if r == pushFull && !p.pushSlow(task) {
+			break
+		}
+		deep = deep || r == pushedDeep
 		submitted++
+	}
+	if deep {
+		p.deep()
 	}
 	if submitted > 0 {
 		p.kick()

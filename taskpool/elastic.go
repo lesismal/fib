@@ -231,6 +231,7 @@ func (p *elasticPool) submit(task Task) bool {
 		return true
 	}
 	p.tasks <- task
+	checkDeep(p.executor, p.tasks)
 	return true
 }
 
@@ -265,6 +266,8 @@ func (p *elasticPool) stop() {
 func (p *elasticPool) workerCount() int { return int(p.concurrent.Load()) }
 
 func (p *elasticPool) queueLen() (queued, size int) { return len(p.tasks), cap(p.tasks) }
+
+func (p *elasticPool) queueShape() (fullest, grown int) { return chanShape(p.tasks) }
 
 func (p *elasticPool) attrs() []any {
 	return []any{

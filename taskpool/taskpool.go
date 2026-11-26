@@ -91,6 +91,9 @@ type executor struct {
 	id      uint64
 	mu      sync.RWMutex
 	handler func(any, []byte)
+	// watch is the pool's, which a submission that finds the queue deep
+	// arms; see queueWatch.
+	watch *queueWatch
 }
 
 func (e *executor) setPanicHandler(handler func(any, []byte)) {
@@ -122,7 +125,7 @@ type TaskPool struct {
 	mode     Mode
 	stopped  atomic.Bool
 	// watch is what the pool keeps of its queue's depth; see QueueStats.
-	watch queueWatch
+	watch *queueWatch
 }
 
 // New creates a ModeAdaptive pool that grows to maxConcurrent workers under
@@ -180,8 +183,9 @@ var poolIDs atomic.Uint64
 // workers and queue its parameters resolved to.
 func start(name string, mode Mode, build func(*executor) backend) *TaskPool {
 	executor := &executor{name: name, id: poolIDs.Add(1)}
-	pool := &TaskPool{executor: executor, backend: build(executor), mode: mode}
-	watchPool(pool)
+	executor.watch = newQueueWatch(executor)
+	pool := &TaskPool{executor: executor, backend: build(executor), mode: mode, watch: executor.watch}
+	pool.watch.setBackend(pool.backend)
 	if logStatus.Load() {
 		label := []any{"pool", name, "id", executor.id, "mode", mode.String()}
 		log.Info("taskpool: started", append(label, pool.backend.attrs()...)...)
@@ -264,6 +268,7 @@ func (tp *TaskPool) Call(f func()) { tp.executor.call(taskFunc(f)) }
 // the tasks already queued have run.
 func (tp *TaskPool) Stop() {
 	tp.stopped.Store(true)
+	tp.watch.stopped.Store(true)
 	tp.backend.stop()
 }
 

@@ -223,3 +223,40 @@ func BenchmarkNewTaskRing(b *testing.B) {
 		_ = newTaskRing(100000)
 	}
 }
+
+// TestTaskRingReportsDeep checks that put reports pushedDeep exactly when the
+// queue it leaves holds the first of WarnLevels of its limit, counting the
+// tasks in the older segments while the queue grows, and that grownPast
+// tells about the depth that made it grow.
+func TestTaskRingReportsDeep(t *testing.T) {
+	const limit = 16
+	r := newTaskRingFrom(limit, 2)
+	deep := int(deepDepth(limit))
+	if got := r.grownPast(); got != 0 {
+		t.Fatalf("grownPast %d before any push, want 0", got)
+	}
+	for i := 0; i < limit; i++ {
+		got := r.put(indexTask(i))
+		want := pushed
+		if i+1 >= deep {
+			want = pushedDeep
+		}
+		if got != want {
+			t.Fatalf("put of task %d left %d queued: %d, want %d", i, i+1, got, want)
+		}
+	}
+	if got := r.grownPast(); got < 1 || got > limit {
+		t.Fatalf("grownPast %d once the queue filled to %d, want up to that", got, limit)
+	}
+	if r.put(indexTask(limit)) != pushFull {
+		t.Fatal("a full queue took a task")
+	}
+	for i := 0; i < limit-deep+2; i++ {
+		if _, ok := r.pop(); !ok {
+			t.Fatal("pop found the queue empty")
+		}
+	}
+	if got := r.put(indexTask(0)); got != pushed {
+		t.Fatalf("put leaving %d of %d queued: %d, want pushed", deep-1, limit, got)
+	}
+}

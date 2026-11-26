@@ -178,6 +178,7 @@ func (p *chanAdaptivePool) trySubmit(task Task) bool {
 		}
 	}
 	p.grow()
+	checkDeep(p.executor, p.tasks)
 	return true
 }
 
@@ -203,6 +204,7 @@ func (p *chanAdaptivePool) push(task Task) {
 		p.tasks <- task
 	}
 	p.grow()
+	checkDeep(p.executor, p.tasks)
 }
 
 // noteIdleDrop lowers lowIdle to idle if idle is below it.
@@ -338,6 +340,8 @@ func (p *chanAdaptivePool) resize(minWorkers, maxWorkers int) {
 func (p *chanAdaptivePool) workerCount() int { return int(p.workers.Load()) }
 
 func (p *chanAdaptivePool) queueLen() (queued, size int) { return len(p.tasks), cap(p.tasks) }
+
+func (p *chanAdaptivePool) queueShape() (fullest, grown int) { return chanShape(p.tasks) }
 
 func (p *chanAdaptivePool) attrs() []any {
 	return []any{
