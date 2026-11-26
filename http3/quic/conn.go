@@ -2530,6 +2530,7 @@ func (c *Conn) onTimer() {
 	}
 	c.timerAt = time.Time{}
 	now := c.now()
+	keepHold := false
 	switch {
 	case !c.handshakeComplete && !now.Before(c.created.Add(c.config.HandshakeTimeout)):
 		c.terminateLocked(ErrHandshakeTimeout)
@@ -2582,15 +2583,22 @@ func (c *Conn) onTimer() {
 			// moved, a probe timeout the acknowledgement just handled made
 			// moot, say: what there is to send keeps waiting for the
 			// handler, or it would leave the acknowledgement of a request
-			// without the answer being written to it.
+			// without the answer being written to it. Nor does it start
+			// the clock on that wait: a flush while it is held would, and an
+			// acknowledgement held for a handler still being called would
+			// leave flushHold after the timer rather than with the answer,
+			// should the handler take that long to expect it.
 			c.armTimerLocked(now)
+			keepHold = c.heldLocked()
 		}
 	}
 	givenUp := c.takeGivenUpLocked()
 	locked = false
 	c.mu.Unlock()
 	closePaths(givenUp)
-	c.dispatch()
+	if !keepHold {
+		c.dispatch()
+	}
 }
 
 // endClosing ends the closing period: the CONNECTION_CLOSE is no longer sent
