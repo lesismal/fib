@@ -838,10 +838,14 @@ config.SetTaskPool(pool)          // the Engine uses your pool; closing the Engi
   submits `fn` with `TryGo` and, when the queue is full, offers it again shortly, so neither the
   caller nor the loop ever waits. fib's own code follows this rule, and `TestPoolSubmissions`
   (`pool_submit_test.go`) lists every submission in fib with where it may run and fails on a new
-  one until it is listed, on one that may wait on its own pool, and on a cycle of waits. The one
-  exception is `sidepool.Post`: a callback on `fib-notify` may post another, which submits to
-  `fib-notify` from its own worker, but `Post` never waits (`TryGo`, and a list of its own that the
-  pool's callbacks empty when the queue is full), so it cannot stop the pool.
+  one until it is listed, on one that may wait on its own pool, and on a cycle of waits. A task may
+  submit to its own pool only with a call that never waits: `TryGo`, which returns false when the
+  queue is full, and `sidepool.Post` built on it. fib does so in two places. A callback on
+  `fib-notify` may post another, which submits to `fib-notify` from its own worker; when the queue
+  is full `Post` puts the callback in a list of its own that the pool's callbacks empty. An HTTP/2
+  handler that queues a response offers the connection's flush to `<Name>-streams` with `TryGo`,
+  so the worker it runs on usually writes the responses queued meanwhile in one go once it
+  returns; when the queue is full, the flush goes to `fib-flush` instead, which runs only writes.
 - Blocking handlers (which wait on your application's own I/O) belong in `<Name>-streams` (its
   ceiling is twice the Engine pool's) or your own pool, not the Engine's.
 - `SharedTaskPool` (on by default): Engines **with the same name** in a process share workers and

@@ -25,6 +25,7 @@ import (
 	"github.com/lesismal/fib/hpack"
 	"github.com/lesismal/fib/internal/outputwait"
 	"github.com/lesismal/fib/sidepool"
+	"github.com/lesismal/fib/taskpool"
 )
 
 // HTTP/2 on the server side. ServerHandler recognizes a connection that
@@ -232,8 +233,13 @@ type h2ServerConn struct {
 
 	// flushPending says flusher is on its way to write what the connection
 	// has queued; see sendLocked.
+	// flushPool is the pool the requests run on, which flusher is offered
+	// to first, and flushFn flusher's RunTask as a func, made once; see
+	// scheduleFlush.
 	flushPending atomic.Bool
 	flusher      h2Flusher
+	flushPool    *taskpool.TaskPool
+	flushFn      func()
 
 	// outputFull says framing stopped short of what the windows allow
 	// because the connection had h2MaxQueuedOutput waiting for its socket,
@@ -393,6 +399,8 @@ func newH2ServerConn(h *ServerHandler, c *fib.Connection, remoteAddr string) *h2
 	}
 	sc.peerMaxHeaderList.Store(math.MaxInt64)
 	sc.flusher.sc = sc
+	sc.flushPool = handlerPool(c)
+	sc.flushFn = sc.flusher.RunTask
 	sc.gate.ownFlush = true
 	return sc
 }
@@ -469,7 +477,7 @@ func (sc *h2ServerConn) idleExpired() {
 // sendLocked sends out unless the connection has ended.
 //
 // What the connection sends is queued, corked, and written by flusher, which
-// the first frames queued since it last ran send to the flush pool (see
+// the first frames queued since it last ran send on its way (see
 // scheduleFlush). The handlers that answer meanwhile find it on its way and
 // only queue what they send, so the responses of a burst of requests leave
 // in fewer writes than one each; a response that comes in after the flusher
@@ -530,17 +538,25 @@ func (sc *h2ServerConn) sendPooledPartsLocked(first, second []byte, shared bool)
 	sc.armDrainLocked()
 }
 
-// scheduleFlush sends flusher to the flush pool unless it is on its way
-// already, and runs it here if the pool takes no more work. A flusher that
-// has not begun yet writes what was queued before this call; one that has
-// begun leaves flushPending false for this call to set again.
+// scheduleFlush sends flusher on its way unless it is on its way already. A
+// flusher that has not begun yet writes what was queued before this call;
+// one that has begun leaves flushPending false for this call to set again.
 //
-// It never sends flusher to the pool the requests run on: the caller is as
-// often a handler running on that pool, and a task must not submit to its
-// own pool (see taskpool.TaskPool.Go). The flush pool runs nothing but
-// writes, so any caller may wait for room in it.
+// It offers flusher to the pool the requests run on first, with TryGo: the
+// caller is most often a handler on that pool, whose worker then usually
+// runs flusher itself once the handler returns, after the other handlers
+// that ran meanwhile have queued their frames, so that they leave in one
+// write; while that handler keeps working, a worker the offer woke flushes
+// instead. TryGo never waits, so a handler may offer to its own pool (a task
+// must never wait to submit to its own pool; see taskpool.TaskPool.Go). When
+// that pool has no room, flusher goes to the flush pool, which runs nothing
+// but writes, so any caller may wait for room in it, and runs here if that
+// pool takes no more work.
 func (sc *h2ServerConn) scheduleFlush() {
 	if !sc.flushPending.CompareAndSwap(false, true) {
+		return
+	}
+	if sc.flushPool != nil && sc.flushPool.TryGo(sc.flushFn) {
 		return
 	}
 	if !sidepool.Flush().GoTask(&sc.flusher) {

@@ -60,6 +60,10 @@ var submitSites = []submitSite{
 	{"http/stream_pool_native.go", "StreamPool.submit", "pool.GoTask", []string{onEngine}, onHandlers, true},
 	{"http/stream_pool_native.go", "runOnStreamsFromReader", "handlerPool(conn).Go", []string{onEngine}, onHandlers, true},
 	{"http/stream_pool_native.go", "handOn", "pool.Go", []string{onGoroutine}, onHandlers, true},
+	// An HTTP/2 flush tries the handler pool first, which never waits, and
+	// else goes to the flush pool, which may.
+	{"http/h2_server.go", "h2ServerConn.scheduleFlush", "sc.flushPool.TryGo",
+		[]string{onEngine, onHandlers, onClient, onNotify, onGoroutine}, onHandlers, false},
 	{"http/h2_server.go", "h2ServerConn.scheduleFlush", "sidepool.Flush().GoTask",
 		[]string{onEngine, onHandlers, onClient, onNotify, onGoroutine}, onFlush, true},
 	{"grpc/transport.go", "transport.run", "pool.GoTask", []string{onEngine}, onHandlers, true},
@@ -189,8 +193,8 @@ func exprString(fset *token.FileSet, expr ast.Expr) string {
 
 // TestPoolSubmissions checks that submitSites lists every submission in fib
 // and nothing that is gone, that no submission is made from the pool it
-// submits to but sidepool.Post's, which never wait, and that the waits it
-// lists lead from no pool back to itself.
+// submits to but with TryGo or sidepool.Post, which never wait, and that the
+// waits it lists lead from no pool back to itself.
 func TestPoolSubmissions(t *testing.T) {
 	found := scanSubmissions(t)
 	listed := map[string]bool{}
@@ -204,13 +208,13 @@ func TestPoolSubmissions(t *testing.T) {
 			t.Errorf("%s is listed in submitSites but not found: drop it, or fix where it is", key)
 		}
 		if slices.Contains(s.from, s.to) {
-			// A task may submit to its own pool only through sidepool.Post,
-			// whose submissions never wait.
+			// A task may submit to its own pool only with TryGo or
+			// sidepool.Post, which never wait.
 			switch {
 			case s.wait:
 				t.Errorf("%s may wait to submit to %s from %s itself", key, s.to, s.to)
-			case s.to != onNotify || !strings.HasSuffix(s.call, "TryGo") && s.call != "sidepool.Post":
-				t.Errorf("%s submits to %s from %s itself: only sidepool.Post may, since it never waits", key, s.to, s.to)
+			case !strings.HasSuffix(s.call, "TryGo") && s.call != "sidepool.Post":
+				t.Errorf("%s submits to %s from %s itself: only TryGo and sidepool.Post may, since they never wait", key, s.to, s.to)
 			}
 		}
 	}

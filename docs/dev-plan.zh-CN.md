@@ -14,7 +14,7 @@
   接覆盖；"否"表示没有任何测量。
 - **已优化**："是"表示已有基于测量的优化合入；"部分"表示做过一些，但已知有部分未看过；"否"表示没有。
 - 依据写日期、提交或文档；细节见提交日志中的 `perf(...)` 条目。
-- 状态截至 2026-11-25。
+- 状态截至 2026-11-26。
 
 ## 状态
 
@@ -28,7 +28,7 @@
 | TLS 握手 | `tls` | 是（`BenchmarkServerHandshake`、`BenchmarkClientHandshake`，01a143d） | 部分 | 基准已有；没有据此做的优化记录 |
 | HTTP/1 服务端：解析器、响应分帧 | `http` | 是（`BenchmarkParser*`、`BenchmarkServerKeepAlive*`、`BenchmarkParseRequestHead`、压测） | 是（8bb8a82、de62b0b、e17bf98、534f420、2e2fef1） | — |
 | HTTP/1 客户端 | `http` | 是（`BenchmarkMarshalRequest`、`BenchmarkParseResponseHead`、`BenchmarkClientNewConnection`） | 是（0a9339f、e51b8f5、a9493a8、415e755） | — |
-| HTTP/2 服务端：帧、流控、流 | `http` | 是（`BenchmarkH2Server*`，10e984f，[http2](http2.zh-CN.md) 基准一节；2026-11-26 在 benchmark 主机上用 h2load 对 flush 改投 `fib-flush` 做了 A/B） | 是（73c0c3b、d03e91e、6d145b4、e02d9a9、089a5b0） | — flusher 改投 `fib-flush`、不再投 handler 池，对比 7404d01（h2load，64 个连接，每连接 1、10、100 个 stream，服务端 8 个 CPU 跑满，5 轮交替）：请求数/秒和每请求 CPU 在 ±1% 内，每响应 write 次数不变（1.00、0.101、0.0108）。只有一个请求在途时就地 flush 的做法在 1 个 stream 时省 1.1% CPU，但 10 和 100 个 stream 时慢 0.7-1.5%，未采用 |
+| HTTP/2 服务端：帧、流控、流 | `http` | 是（`BenchmarkH2Server*`，10e984f，[http2](http2.zh-CN.md) 基准一节；2026-11-26 在 benchmark 主机上用 h2load 对 flush 在哪里执行做了 A/B） | 是（73c0c3b、d03e91e、6d145b4、e02d9a9、089a5b0） | — flusher 先用 `TryGo` 投给 handler 池，满了再投 `fib-flush`，对比用 `Go` 投 handler 池的 7404d01（h2load，64 个连接，服务端 8 个 CPU，5 轮交替，取中位数）：1、10、100 个 stream 时请求数/秒在 ±1% 内，每响应 write 次数相同（1.00、0.101、0.0109），每秒 1000 和 4000 个请求时 p99 和每请求 CPU 在 1% 内。每次 flush 都投 `fib-flush` 的做法吞吐持平，但在这两档负载下 p99 高 10-21%、p999 高约 30%、每请求 CPU 高 2-5%。在每个 handler 返回时 flush 的做法会把响应扣到 handler 返回才发出，10 个 stream 时每响应 0.59 次 write，10 和 100 个 stream 时慢 54%。两者都未采用 |
 | HTTP/2 客户端 | `http` | 部分（没有多流并发的客户端 HTTP/2 基准） | 部分（cb9bbbe） | 一个连接上大量请求并发的客户端基准 |
 | HPACK | `hpack` | 是（编解码基准，0e7016b） | 是（0c47caf、346f48e、871bdb7、d7e117c） | — |
 | 路由、Context.JSON | `http`、`http/routerbench` | 是（`BenchmarkRouter*`、`BenchmarkGitHub`、`BenchmarkJSONResponse`） | 是（240182e、b39373d） | — |

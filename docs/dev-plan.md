@@ -20,7 +20,7 @@ measures, optimizes where it pays, and updates the row.
 - **Optimized**: "yes" when measurement-driven optimizations have landed; "partial" when some have
   but a known part has not been looked at; "no" when none have.
 - Evidence is a date, a commit or a doc; the commit log's `perf(...)` entries hold the detail.
-- Status as of 2026-11-25.
+- Status as of 2026-11-26.
 
 ## Status
 
@@ -34,7 +34,7 @@ measures, optimizes where it pays, and updates the row.
 | TLS handshakes | `tls` | yes (`BenchmarkServerHandshake`, `BenchmarkClientHandshake`, 01a143d) | partial | The benchmarks exist; no optimization pass driven by them is recorded |
 | HTTP/1 server: parser, response framing | `http` | yes (`BenchmarkParser*`, `BenchmarkServerKeepAlive*`, `BenchmarkParseRequestHead`, load campaign) | yes (8bb8a82, de62b0b, e17bf98, 534f420, 2e2fef1) | — |
 | HTTP/1 client | `http` | yes (`BenchmarkMarshalRequest`, `BenchmarkParseResponseHead`, `BenchmarkClientNewConnection`) | yes (0a9339f, e51b8f5, a9493a8, 415e755) | — |
-| HTTP/2 server: frames, flow control, streams | `http` | yes (`BenchmarkH2Server*`, 10e984f, [http2](http2.md) "Benchmarks"; 2026-11-26 h2load A/B of the flush to `fib-flush` on the benchmark host) | yes (73c0c3b, d03e91e, 6d145b4, e02d9a9, 089a5b0) | — The flusher on `fib-flush` instead of the handler pool, against 7404d01 (h2load, 64 connections at 1, 10 and 100 streams each, server on 8 CPUs, CPU-bound, 5 rotated rounds): requests/s and CPU per request within ±1%, writes per response unchanged (1.00, 0.101, 0.0108). A flush run in place when one request is in flight saved 1.1% CPU at 1 stream but lost 0.7-1.5% at 10 and 100, and was not kept |
+| HTTP/2 server: frames, flow control, streams | `http` | yes (`BenchmarkH2Server*`, 10e984f, [http2](http2.md) "Benchmarks"; 2026-11-26 h2load A/B of where the flush runs on the benchmark host) | yes (73c0c3b, d03e91e, 6d145b4, e02d9a9, 089a5b0) | — The flusher offered to the handler pool with `TryGo` first and sent to `fib-flush` when that is full, against 7404d01, which offered it with `Go` (h2load, 64 connections, server on 8 CPUs, 5 rotated rounds, medians): requests/s within ±1% at 1, 10 and 100 streams, writes per response the same (1.00, 0.101, 0.0109), p99 and CPU per request at 1,000 and 4,000 requests/s within 1%. Sending every flush to `fib-flush` matched the throughput but raised p99 10-21%, p999 about 30% and CPU per request 2-5% at those rates. Flushing when each handler returns held a response back until its handler returned, and with 0.59 writes per response at 10 streams lost 54% at 10 and 100. Neither is kept |
 | HTTP/2 client | `http` | partial (no client-side HTTP/2 benchmark with many streams) | partial (cb9bbbe) | A client benchmark of one connection with many requests in flight |
 | HPACK | `hpack` | yes (encode and decode benchmarks, 0e7016b) | yes (0c47caf, 346f48e, 871bdb7, d7e117c) | — |
 | Router, Context.JSON | `http`, `http/routerbench` | yes (`BenchmarkRouter*`, `BenchmarkGitHub`, `BenchmarkJSONResponse`) | yes (240182e, b39373d) | — |

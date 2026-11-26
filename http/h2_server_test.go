@@ -730,3 +730,28 @@ func fibStacks() string {
 	}
 	return text
 }
+
+// TestH2ResponseLeavesBeforeHandlerReturns has handlers answer and then go
+// on working: each response must reach the client while its handler still
+// runs, rather than when it returns, the second one's too, which finds the
+// first one's flush arranged already.
+func TestH2ResponseLeavesBeforeHandlerReturns(t *testing.T) {
+	release := make(chan struct{})
+	addr := serve(t, NewHandler(HandlerFunc(func(c *Context) {
+		_ = c.Respond(200, "", []byte(c.Request.URL.Path))
+		select {
+		case <-release:
+		case <-time.After(30 * time.Second):
+		}
+	})))
+	t.Cleanup(func() { close(release) })
+	tc := dialH2(t, addr)
+	_ = tc.c.SetDeadline(time.Now().Add(5 * time.Second))
+	for i, path := range []string{"/first", "/second"} {
+		id := uint32(1 + 2*i)
+		tc.headers(id, true, get(path)...)
+		if _, body := tc.response(id); string(body) != path {
+			t.Fatalf("stream %d: body %q, want %q", id, body, path)
+		}
+	}
+}
