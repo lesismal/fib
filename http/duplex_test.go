@@ -528,9 +528,19 @@ func TestDuplexAfterClose(t *testing.T) {
 	if err != nil {
 		t.Fatalf("the request: %v", err)
 	}
+	// Read the response to its end before closing it: closing a body the
+	// server has not ended resets the stream, and a reset that reaches the
+	// server between the headers Close sends and the end Finish queues
+	// would make Close report it.
+	_, _ = io.Copy(io.Discard, resp.Body)
 	resp.Body.Close()
-	if err := <-results; err != nil {
-		t.Fatal(err)
+	select {
+	case err := <-results:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("the duplex handler never finished")
 	}
 }
 
