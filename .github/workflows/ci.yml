@@ -916,7 +916,7 @@ jobs:
           path: "bittorrent/**/testdata/fuzz/**"
           if-no-files-found: ignore
 
-  # The taskpool comparison against nbio, ants and gopool. It is a module of
+  # The taskpool comparison against nbio, ants, gopool, fnet and agilePool. It is a module of
   # its own under taskpool/benchmark, so the pools it compares with never
   # become fib's dependencies. Shared runners are too noisy for the numbers
   # to gate anything: the job fails only if a benchmark does, and keeps the

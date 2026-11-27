@@ -16,6 +16,7 @@ dependencies of fib itself.
 | `ants` | `github.com/panjf2000/ants/v2` v2.12.1 | `NewPool(ceiling)`, defaults: `Submit` blocks while every worker is busy |
 | `gopool` | `github.com/bytedance/gopkg/util/gopool` v0.1.4 | `NewPool(name, ceiling, NewConfig())`, unbounded task list |
 | `fnet` | `github.com/linfeip/fnet/pool` (b3e61d2) | `New(Config{MaxWorkers: ceiling})`, defaults otherwise: per-core shards, unbounded queues, 5s idle timeout |
+| `agilepool` | `github.com/Yiming1997/agilePool/v2` v2.1.3 | `WithWorkerNumCapacity(ceiling)`, `WithTaskQueueSize(100000)`, defaults otherwise: LinkedList idle container, BLOCK mode, its scaler; it buffers up to 100,000 more tasks behind the handoff queue, and a worker exits as soon as the queues are empty |
 | `fib-adaptive` | `taskpool.ModeAdaptive` | floor 0, queue 100000 |
 | `fib-adaptive-chan` | `taskpool.ModeAdaptiveChan` | floor 0, queue 100000 |
 | `fib-elastic` | `taskpool.ModeElastic` | queue 100000 |

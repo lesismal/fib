@@ -11,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	agilepool "github.com/Yiming1997/agilePool/v2"
 	"github.com/bytedance/gopkg/util/gopool"
 	fnetpool "github.com/linfeip/fnet/pool"
 	"github.com/panjf2000/ants/v2"
@@ -68,6 +69,19 @@ func (p fnetPool) Go(f func()) {
 
 func (p fnetPool) Stop() { p.Close() }
 
+// agilePoolT runs on agilePool's defaults (LinkedList idle container, BLOCK
+// mode, its scaler) apart from the ceiling and the handoff queue. Behind the
+// handoff queue agilePool buffers up to 100,000 more tasks before Submit
+// blocks, which no option changes. Its Submit takes its own Task, so a func is
+// wrapped in a TaskFunc, one allocation per task.
+type agilePoolT struct{ *agilepool.Pool }
+
+func (p agilePoolT) Go(f func()) {
+	p.Submit(agilepool.TaskFunc(func() error { f(); return nil }))
+}
+
+func (p agilePoolT) Stop() { p.Close() }
+
 var pools = []struct {
 	name string
 	new  func() pool
@@ -84,6 +98,12 @@ var pools = []struct {
 		return gopoolPool{gopool.NewPool("benchmark", int32(maxWorkers()), gopool.NewConfig())}
 	}},
 	{"fnet", func() pool { return fnetPool{fnetpool.New(fnetpool.Config{MaxWorkers: maxWorkers()})} }},
+	{"agilepool", func() pool {
+		return agilePoolT{agilepool.NewPool(agilepool.NewConfig(
+			agilepool.WithWorkerNumCapacity(int64(maxWorkers())),
+			agilepool.WithTaskQueueSize(queueSize),
+		))}
+	}},
 	{"fib-adaptive", func() pool {
 		return fibPool{fibpool.NewWithMode("benchmark", fibpool.ModeAdaptive, maxWorkers(), queueSize)}
 	}},

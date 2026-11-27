@@ -14,6 +14,7 @@
 | `ants` | `github.com/panjf2000/ants/v2` v2.12.1 | `NewPool(上限)`，默认配置：worker 全忙时 `Submit` 阻塞 |
 | `gopool` | `github.com/bytedance/gopkg/util/gopool` v0.1.4 | `NewPool(name, 上限, NewConfig())`，任务链表不限长 |
 | `fnet` | `github.com/linfeip/fnet/pool` (b3e61d2) | `New(Config{MaxWorkers: 上限})`，其余默认：按核分片、队列不限长、空闲 5s 退出 |
+| `agilepool` | `github.com/Yiming1997/agilePool/v2` v2.1.3 | `WithWorkerNumCapacity(上限)`、`WithTaskQueueSize(100000)`，其余默认：LinkedList 空闲容器、BLOCK 模式、自带 scaler；handoff 队列之外还会再缓冲最多 100,000 个任务，队列一空 worker 就退出 |
 | `fib-adaptive` | `taskpool.ModeAdaptive` | 下限 0，队列 100000 |
 | `fib-adaptive-chan` | `taskpool.ModeAdaptiveChan` | 下限 0，队列 100000 |
 | `fib-elastic` | `taskpool.ModeElastic` | 队列 100000 |

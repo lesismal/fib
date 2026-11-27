@@ -3,6 +3,7 @@ module github.com/lesismal/fib/taskpool/benchmark
 go 1.27.3
 
 require (
+	github.com/Yiming1997/agilePool/v2 v2.1.3
 	github.com/bytedance/gopkg v0.1.4
 	github.com/lesismal/fib v0.0.0
 	github.com/lesismal/nbio v1.7.0
