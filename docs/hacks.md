@@ -861,16 +861,17 @@ config.SetTaskPool(pool)          // the Engine uses your pool; closing the Engi
     work it turned away still waits; the caller fails with it (a dial returns the error,
     `middleware/pprof` answers 503 with `Retry-After`). A capture or lookup that waited for a
     worker until its request ended or its dial timed out is not made.
-- **Seeing a pool fall behind.** By default nothing samples a pool's queue: a process samples them
-  itself, from its own status or metrics endpoint, with `taskpool.Sample()`, which looks once at
-  every pool built and not yet stopped (fib's engine, handler and side pools too) and returns each
-  one's name, id, mode, workers and `QueueStats`; `TaskPool.Sample()` does the same for one pool.
-  `taskpool.SetAutoSample(true)` has the pools watched without asking, and takes effect at once.
-  Then a submission that leaves a pool's queue, or one shard of it, half full arms the pool's
-  watch (one compare on the depth the submission knows already; nothing shared is written), and so
-  does a `TryGo` turned away. A watcher goroutine samples the armed pools every 100 ms and disarms
-  one once it has stayed below 40% for 1 s, or below 50% with no level warned for 10 s; it runs
-  only while a pool is armed. Off, a deep submission reads the switch and nothing else.
+- **Seeing a pool fall behind.** Nothing looks at a shallow queue. A submission that leaves a
+  pool's queue, or one shard of it, half full arms the pool's watch (one compare on the depth the
+  submission knows already; nothing shared is written), and so does a `TryGo` turned away. A
+  watcher goroutine samples the armed pools every 500 ms (`taskpool.SetSampleInterval` changes it,
+  at once) and disarms one once it has stayed below 40% for 2 s, or below 50% with no level warned
+  for 10 s; it runs only while a pool is armed.
+  `taskpool.SetAutoSample(false)` switches this off at once, leaving a deep submission to read the
+  switch and nothing else. Either way a process can sample the pools itself, from its own status or
+  metrics endpoint, with `taskpool.Sample()`, which looks once at every pool built and not yet
+  stopped (fib's engine, handler and side pools too) and returns each one's name, id, mode, workers
+  and `QueueStats`; `TaskPool.Sample()` does the same for one pool.
   `TaskPool.QueueStats()` reports what waits now, the deepest seen, the `TryGo` calls turned away,
   and how often a sample found the queue risen past 50, 75, 90 and 100% of its size, each of which
   is also logged (warn, error at 100%) at most once every 10 s per pool and level. `Engine.Stats()` reports the

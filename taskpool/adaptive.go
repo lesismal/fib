@@ -688,7 +688,7 @@ func (p *adaptivePool) pushLocked(task Task) bool {
 }
 
 // deep arms the pool's watch for a push that found the shard's queue deep,
-// when SetAutoSample has switched automatic sampling on; see queueWatch. It
+// while automatic sampling is on (see SetAutoSample); see queueWatch. It
 // is kept out of line, off the submit path's common case, and reads the
 // queue's depth again only for the push that arms the watch.
 //

@@ -729,13 +729,14 @@ config.SetTaskPool(pool)          // Engine 用你的池；关闭 Engine 不会�
   - **新工作**——拨号前的域名解析、性能剖析采集——走 `TryHand(pool, fn)`：池的队列满了，或者还有它
     拒收的任务在等，就返回 `fib.ErrPoolBusy`，由调用方以此失败（拨号返回这个错误，`middleware/pprof`
     回 503 并带 `Retry-After`）。等 worker 期间请求已结束或拨号已超时的采集或解析，不会再执行。
-- **看出池跟不上。** 默认不采样任何池的队列：由进程在自己的状态或监控接口里调用 `taskpool.Sample()`
-  自行采样，它对每个已建且未停的池（包括 fib 自己建的 engine、handler 和 side 池）各看一次，返回每个池的
-  名字、id、模式、worker 数和 `QueueStats`；`TaskPool.Sample()` 只采一个池。`taskpool.SetAutoSample(true)`
-  打开自动采样，立即生效：某次提交让池的队列（或其中一个分片）达到半满时，就给这个池的 watch 上膛（只是对
-  提交本来就知道的深度做一次比较，不写任何共享数据），被拒的 `TryGo` 也会上膛。一个 watcher goroutine 每
-  100ms 采样已上膛的池；池在 40% 以下保持 1 秒，或在 50% 以下且没有处于任何告警档位保持 10 秒，就解除；
-  没有上膛的池时 watcher 不运行。关闭时，深的提交只读一下这个开关。`TaskPool.QueueStats()`
+- **看出池跟不上。** 队列浅时没有任何东西去看它。某次提交让池的队列（或其中一个分片）达到半满时，
+  就给这个池的 watch 上膛（只是对提交本来就知道的深度做一次比较，不写任何共享数据），被拒的 `TryGo`
+  也会上膛。一个 watcher goroutine 每 500ms 采样已上膛的池（可用 `taskpool.SetSampleInterval` 修改，立即生效）；池在 40% 以下保持 2 秒，或在 50% 以下且
+  没有处于任何告警档位保持 10 秒，就解除；没有上膛的池时 watcher 不运行。`taskpool.SetAutoSample(false)`
+  立即关闭自动采样，此后深的提交只读一下这个开关。无论开关与否，进程都可以在自己的状态或监控接口里调用
+  `taskpool.Sample()` 自行采样，它对每个已建且未停的池（包括 fib 自己建的 engine、handler 和 side 池）
+  各看一次，返回每个池的名字、id、模式、worker 数和 `QueueStats`；`TaskPool.Sample()` 只采一个池。
+  `TaskPool.QueueStats()`
   报告当前排队数、见过的最深值、被拒的 `TryGo` 次数，以及采样发现队列升过容量的 50%、75%、90%、100% 各几次；每升过一档也会打日志
   （warn，100% 时为 error），每个池每一档最多每 10 秒一条。`Engine.Stats()` 报告各 loop 上在 `Hand`
   里等待的函数数（`HandQueued`、`HandMaxQueued`）、被拒的 `TryHand` 次数（`HandRejected`），以及某个

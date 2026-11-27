@@ -14,47 +14,50 @@ import (
 // makes Go wait. A queue that fills shows in QueueStats, and in a warning
 // logged as it rises past each of WarnLevels, at a sample of the queue.
 //
-// Queues are sampled two ways, and neither by default:
+// Queues are sampled two ways:
 //
-//   - By hand: Sample looks once at every pool, and TaskPool.Sample at one,
-//     so a process that serves its own status or metrics endpoint samples
-//     its pools when it answers, as often as it is asked.
-//   - Automatically, once SetAutoSample switches it on. Nothing looks at a
-//     queue while it is shallow then either. A submission that leaves a
+//   - Automatically, unless SetAutoSample switches it off. Nothing looks at
+//     a queue while it is shallow. A submission that leaves a
 //     queue (or one shard of it) at the first of WarnLevels or deeper arms
 //     the pool's watch, and so does a TryGo turned away by a full queue; the
 //     queue's depth is known to the submission already, from the head and
 //     tail it read to queue its task, so the check costs it one compare and
 //     writes nothing a shallow queue's submissions share. An armed pool is
-//     sampled every watchInterval by a watcher goroutine, which disarms the
+//     sampled every SampleInterval by a watcher goroutine, which disarms the
 //     pool once it has calmed: below the first level less warnHysteresis for
 //     releaseCalm, or below the first level, with no level warned at, for
 //     releaseQuiet. The watcher runs only while some pool is armed, and
 //     leaves once none is, so a process whose queues stay shallow runs no
-//     timer for them.
+//     timer for them, and one whose queues are deep wakes for them once
+//     every SampleInterval, half a second unless SetSampleInterval says
+//     otherwise.
+//   - By hand: Sample looks once at every pool, and TaskPool.Sample at one,
+//     so a process that serves its own status or metrics endpoint samples
+//     its pools when it answers, as often as it is asked, whether or not
+//     the watcher samples them too.
 //
 // Either way a sample counts a warning at each level the queue rose past
-// since the one before, and logs it. Off, a submission that finds the queue
-// deep reads the switch and nothing else.
+// since the one before, and logs it. Switched off, a submission that finds
+// the queue deep reads the switch and nothing else, and no warning is logged
+// but at a sample taken by hand.
 //
 // MaxQueued is the deepest queue the samples found, the depth that armed the
 // watch, the whole queue once TryGo has been turned away, and, for a queue
 // that grows its storage as it fills, about the depth that made it grow; a
 // burst that came and went between two samples may not show in it.
 
-// autoSample is SetAutoSample's switch.
-var autoSample atomic.Bool
+// autoSample is SetAutoSample's switch, on unless switched off.
+var autoSample = func() (on atomic.Bool) { on.Store(true); return }()
 
 // SetAutoSample switches whether every pool's queue is watched once it is
 // deep, and its warnings logged without anyone asking; see the top of this
-// file. It is off by default, and takes effect at once: switched on, a pool
-// is armed at its next deep submission; switched off, the watcher disarms
-// the armed pools at its next look, and leaves. Sample and TaskPool.Sample
-// look at the queues either way.
+// file. It is on by default, and takes effect at once: switched off, the
+// watcher disarms the armed pools at its next look, and leaves; switched
+// back on, a pool is armed at its next deep submission. Sample and
+// TaskPool.Sample look at the queues either way.
 func SetAutoSample(on bool) { autoSample.Store(on) }
 
-// AutoSample reports whether SetAutoSample has switched automatic sampling
-// on.
+// AutoSample reports whether automatic sampling is on; see SetAutoSample.
 func AutoSample() bool { return autoSample.Load() }
 
 // WarnLevels are the shares of a pool's queue, in percent, that the watcher
@@ -68,16 +71,50 @@ var WarnLevels = [...]int{50, 75, 90, 100}
 // level it has warned at before it may warn there again.
 const warnHysteresis = 10
 
-// watchInterval is how often the watcher samples the armed pools' queues,
-// and warnEvery the least time between two warnings a pool logs at one
+// DefaultSampleInterval is how often the watcher samples the armed pools'
+// queues unless SetSampleInterval says otherwise: often enough that a queue
+// left deep is warned of within half a second, seldom enough that watching
+// it costs a deep queue's process two wake-ups a second.
+const DefaultSampleInterval = 500 * time.Millisecond
+
+// sampleInterval is SetSampleInterval's, in nanoseconds.
+var sampleInterval = func() (d atomic.Int64) { d.Store(int64(DefaultSampleInterval)); return }()
+
+// SetSampleInterval sets how often the watcher samples the armed pools'
+// queues, at once: a watcher running starts the new interval from now. Zero
+// or less sets DefaultSampleInterval again. A longer interval costs a deep
+// queue's process fewer wake-ups and warns later; a pool is found calm, and
+// disarmed, no sooner than two samples apart, even when that is longer than
+// the 2 s of calm it otherwise takes. Samples taken by hand, with Sample,
+// follow no interval.
+func SetSampleInterval(d time.Duration) {
+	if d <= 0 {
+		d = DefaultSampleInterval
+	}
+	sampleInterval.Store(int64(d))
+	select {
+	case intervalSet <- struct{}{}:
+	default:
+	}
+}
+
+// intervalSet tells a running watcher SetSampleInterval was called. One
+// sent with no watcher running is taken by the next, which finds the
+// interval it started with.
+var intervalSet = make(chan struct{}, 1)
+
+// SampleInterval reports how often the watcher samples the armed pools'
+// queues; see SetSampleInterval.
+func SampleInterval() time.Duration { return time.Duration(sampleInterval.Load()) }
+
+// warnEvery is the least time between two warnings a pool logs at one
 // level; the ones held back meanwhile are counted, and the next says how
 // many. releaseCalm and releaseQuiet are how long a pool stays calm before
 // the watcher disarms it; see the top of this file.
 var (
-	watchInterval = 100 * time.Millisecond
-	warnEvery     = 10 * time.Second
-	releaseCalm   = time.Second
-	releaseQuiet  = 10 * time.Second
+	warnEvery    = 10 * time.Second
+	releaseCalm  = 2 * time.Second
+	releaseQuiet = 10 * time.Second
 )
 
 // QueueStats describes a pool's queue; see TaskPool.QueueStats.
@@ -136,7 +173,7 @@ func Sample() []PoolStats {
 // to the depth it finds, and counts and logs a warning at each of
 // WarnLevels the queue has risen past since the last sample, by hand or by
 // the watcher. It does not arm the watch, and works whether or not
-// SetAutoSample has switched automatic sampling on.
+// automatic sampling is on, as it is unless SetAutoSample switched it off.
 func (tp *TaskPool) Sample() QueueStats {
 	tp.watch.observe(time.Now())
 	return tp.QueueStats()
@@ -277,8 +314,8 @@ func (tp *TaskPool) queueLen() (queued, size int) {
 }
 
 // rejectedFull records a TryGo turned away by a full queue: the queue was as
-// deep as it goes, and, under SetAutoSample, the watch is armed for the
-// watcher to warn of it.
+// deep as it goes, and, while automatic sampling is on, the watch is armed
+// for the watcher to warn of it.
 func (tp *TaskPool) rejectedFull() {
 	w := tp.watch
 	w.rejected.Add(1)
@@ -288,9 +325,9 @@ func (tp *TaskPool) rejectedFull() {
 	}
 }
 
-// checkDeep arms e's watch, under SetAutoSample, if queue, a pool's channel,
-// will be at the first of WarnLevels or deeper once the task about to be
-// sent is in it. It reads the channel's header before the send, which takes
+// checkDeep arms e's watch, while automatic sampling is on, if queue, a
+// pool's channel, will be at the first of WarnLevels or deeper once the task
+// about to be sent is in it. It reads the channel's header before the send, which takes
 // that line anyway; read after, it could find the line taken by the worker
 // receiving. With automatic sampling off it reads the switch alone.
 func checkDeep(e *executor, queue chan Task) {
@@ -314,8 +351,8 @@ func chanState(queue chan Task) (queued, size, fullest int) {
 }
 
 // arm has the watcher sample the pool's queue, which a submission found
-// depth deep, from now until it calms, when SetAutoSample has switched
-// automatic sampling on. Arming one already armed reads armed and writes
+// depth deep, from now until it calms, while automatic sampling is on
+// (see SetAutoSample). Arming one already armed reads armed and writes
 // nothing.
 func (w *queueWatch) arm(depth int) {
 	if !autoSample.Load() || w.armed.Load() || w.queue == nil || !w.armed.CompareAndSwap(false, true) {
@@ -449,13 +486,25 @@ var watcher struct {
 	running bool
 }
 
-// watchLoop samples every armed pool every watchInterval, disarms the ones
-// that have calmed, and returns once none is left armed.
+// watchLoop samples every armed pool every SampleInterval, disarms the ones
+// that have calmed, and returns once none is left armed. An interval
+// SetSampleInterval changes starts as it is set.
 func watchLoop() {
-	ticker := time.NewTicker(watchInterval)
+	interval := SampleInterval()
+	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 	var pools, calmed []*queueWatch
-	for now := range ticker.C {
+	for {
+		var now time.Time
+		select {
+		case now = <-ticker.C:
+		case <-intervalSet:
+			if d := SampleInterval(); d != interval {
+				interval = d
+				ticker.Reset(d)
+			}
+			continue
+		}
 		watcher.mu.Lock()
 		pools = append(pools[:0], watcher.pools...)
 		watcher.mu.Unlock()
