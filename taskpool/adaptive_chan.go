@@ -167,6 +167,7 @@ func (p *chanAdaptivePool) trySubmit(task Task) bool {
 	if p.stopped.Load() {
 		return false
 	}
+	checkDeep(p.executor, p.tasks)
 	select {
 	case p.tasks <- task:
 	default:
@@ -178,7 +179,6 @@ func (p *chanAdaptivePool) trySubmit(task Task) bool {
 		}
 	}
 	p.grow()
-	checkDeep(p.executor, p.tasks)
 	return true
 }
 
@@ -197,6 +197,7 @@ func (p *chanAdaptivePool) submitBatch(tasks []Task) int {
 // push queues task, making sure a worker is on its way to it, and blocks
 // while the queue is full.
 func (p *chanAdaptivePool) push(task Task) {
+	checkDeep(p.executor, p.tasks)
 	select {
 	case p.tasks <- task:
 	default:
@@ -204,7 +205,6 @@ func (p *chanAdaptivePool) push(task Task) {
 		p.tasks <- task
 	}
 	p.grow()
-	checkDeep(p.executor, p.tasks)
 }
 
 // noteIdleDrop lowers lowIdle to idle if idle is below it.
@@ -341,7 +341,9 @@ func (p *chanAdaptivePool) workerCount() int { return int(p.workers.Load()) }
 
 func (p *chanAdaptivePool) queueLen() (queued, size int) { return len(p.tasks), cap(p.tasks) }
 
-func (p *chanAdaptivePool) queueShape() (fullest, grown int) { return chanShape(p.tasks) }
+func (p *chanAdaptivePool) queueState() (queued, size, fullest int) { return chanState(p.tasks) }
+
+func (p *chanAdaptivePool) grownPast() int { return 0 }
 
 func (p *chanAdaptivePool) attrs() []any {
 	return []any{

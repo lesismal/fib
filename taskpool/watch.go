@@ -80,10 +80,12 @@ type QueueStats struct {
 // and how many it holds.
 type queueReporter interface {
 	queueLen() (queued, size int)
-	// queueShape reports how full the backend's fullest shard is, in
-	// percent of that shard's size, and about the deepest the queue has been
-	// as far as its growth tells (see taskRing.grownPast), or 0.
-	queueShape() (fullest, grown int)
+	// queueState is queueLen with how full the backend's fullest shard is,
+	// in percent of that shard's size, read in the same pass.
+	queueState() (queued, size, fullest int)
+	// grownPast is about the deepest the queue has been as far as its
+	// growth tells (see taskRing.grownPast), or 0.
+	grownPast() int
 }
 
 // queueWatch is what a pool keeps of its queue's history. The pool, its
@@ -149,8 +151,7 @@ func (tp *TaskPool) QueueStats() QueueStats {
 		s.Warnings[i] = w.warnings[i].Load()
 	}
 	if w.queue != nil {
-		_, grown := w.queue.queueShape()
-		s.MaxQueued = max(s.MaxQueued, grown)
+		s.MaxQueued = max(s.MaxQueued, w.queue.grownPast())
 	}
 	s.MaxQueued = max(s.MaxQueued, q)
 	return s
@@ -177,23 +178,25 @@ func (tp *TaskPool) rejectedFull() {
 	}
 }
 
-// checkDeep arms e's watch if queue, a pool's channel, is at the first of
-// WarnLevels or deeper. len and cap read the channel's header, which the
-// send just before wrote.
+// checkDeep arms e's watch if queue, a pool's channel, will be at the first
+// of WarnLevels or deeper once the task about to be sent is in it. It reads
+// the channel's header before the send, which takes that line anyway;
+// read after, it could find the line taken by the worker receiving.
 func checkDeep(e *executor, queue chan Task) {
 	if size := cap(queue); size > 0 {
-		if q := len(queue); q*100 >= WarnLevels[0]*size {
+		if q := len(queue) + 1; q*100 >= WarnLevels[0]*size {
 			e.watch.arm(q)
 		}
 	}
 }
 
-// chanShape is queueShape for a backend whose queue is the one channel.
-func chanShape(queue chan Task) (fullest, grown int) {
-	if size := cap(queue); size > 0 {
-		return len(queue) * 100 / size, 0
+// chanState is queueState for a backend whose queue is the one channel.
+func chanState(queue chan Task) (queued, size, fullest int) {
+	if size = cap(queue); size > 0 {
+		queued = len(queue)
+		return queued, size, queued * 100 / size
 	}
-	return 0, 0
+	return 0, 0, 0
 }
 
 // arm has the watcher sample the pool's queue, which a submission found
@@ -229,11 +232,10 @@ func (w *queueWatch) sample(now time.Time) (calmed bool) {
 	if w.stopped.Load() || w.queue == nil {
 		return true
 	}
-	q, size := w.queue.queueLen()
+	q, size, fullest := w.queue.queueState()
 	if size <= 0 {
 		return true
 	}
-	fullest, _ := w.queue.queueShape()
 	raiseMax(&w.maxQueued, int64(q))
 	if r := w.rejected.Load(); r != w.rejectsSeen {
 		// A TryGo found the queue full since the last sample, which the

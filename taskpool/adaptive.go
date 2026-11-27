@@ -172,12 +172,21 @@ func (b *adaptiveBackend) queueLen() (queued, size int) {
 	return queued, size
 }
 
-func (b *adaptiveBackend) queueShape() (fullest, grown int) {
+func (b *adaptiveBackend) queueState() (queued, size, fullest int) {
 	for _, p := range b.shards {
-		fullest = max(fullest, p.ring.len()*100/int(p.ring.limit))
+		q, limit := p.ring.len(), int(p.ring.limit)
+		queued += q
+		size += limit
+		fullest = max(fullest, q*100/limit)
+	}
+	return queued, size, fullest
+}
+
+func (b *adaptiveBackend) grownPast() (grown int) {
+	for _, p := range b.shards {
 		grown = max(grown, p.ring.grownPast())
 	}
-	return fullest, grown
+	return grown
 }
 
 func (b *adaptiveBackend) attrs() []any {

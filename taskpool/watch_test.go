@@ -150,8 +150,9 @@ func TestWatchChanBackends(t *testing.T) {
 // fakeQueue is a queueReporter whose depth a test sets.
 type fakeQueue struct{ queued, size, fullest int }
 
-func (f *fakeQueue) queueLen() (int, int)   { return f.queued, f.size }
-func (f *fakeQueue) queueShape() (int, int) { return f.fullest, 0 }
+func (f *fakeQueue) queueLen() (int, int)        { return f.queued, f.size }
+func (f *fakeQueue) queueState() (int, int, int) { return f.queued, f.size, f.fullest }
+func (f *fakeQueue) grownPast() int              { return 0 }
 
 // TestWatchCalms checks when the watcher finds a pool calm: below the first
 // level less the hysteresis for releaseCalm, or below the first level with no

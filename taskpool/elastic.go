@@ -230,8 +230,8 @@ func (p *elasticPool) submit(task Task) bool {
 	if p.fork(task) {
 		return true
 	}
-	p.tasks <- task
 	checkDeep(p.executor, p.tasks)
+	p.tasks <- task
 	return true
 }
 
@@ -267,7 +267,9 @@ func (p *elasticPool) workerCount() int { return int(p.concurrent.Load()) }
 
 func (p *elasticPool) queueLen() (queued, size int) { return len(p.tasks), cap(p.tasks) }
 
-func (p *elasticPool) queueShape() (fullest, grown int) { return chanShape(p.tasks) }
+func (p *elasticPool) queueState() (queued, size, fullest int) { return chanState(p.tasks) }
+
+func (p *elasticPool) grownPast() int { return 0 }
 
 func (p *elasticPool) attrs() []any {
 	return []any{
