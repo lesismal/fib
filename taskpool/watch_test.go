@@ -1,9 +1,18 @@
 package taskpool
 
 import (
+	"runtime"
 	"testing"
 	"time"
 )
+
+// autoSampling switches automatic sampling on for the test, and back off
+// after it.
+func autoSampling(t *testing.T) {
+	t.Helper()
+	SetAutoSample(true)
+	t.Cleanup(func() { SetAutoSample(false) })
+}
 
 // holdWorker runs a task on tp that holds its one worker until the returned
 // func is called.
@@ -33,6 +42,7 @@ func watcherRunning() bool {
 // and a warning at every level as the queue rises past it, and that a level
 // warns again only once the queue has fallen well below it.
 func TestQueueStatsWarnings(t *testing.T) {
+	autoSampling(t)
 	tp := NewAdaptive(AdaptiveConfig{Name: "watch-test", MaxWorkers: 1, QueueSize: 20})
 	defer tp.Stop()
 	release := holdWorker(t, tp)
@@ -56,21 +66,19 @@ func TestQueueStatsWarnings(t *testing.T) {
 	}
 	// The watcher's own samples may have come first; take what they left.
 	before := tp.QueueStats().Warnings
-	tp.watch.sample(time.Now())
-	after := tp.QueueStats().Warnings
+	after := tp.Sample().Warnings
 	for i := range WarnLevels {
 		if after[i] < 1 {
 			t.Fatalf("no warning at %d%% with the queue full: %v", WarnLevels[i], after)
 		}
 	}
 	// A second look at the same full queue warns of nothing new.
-	tp.watch.sample(time.Now())
-	if again := tp.QueueStats().Warnings; again != after {
+	if again := tp.Sample().Warnings; again != after {
 		t.Fatalf("a full queue looked at twice warned again: %v, then %v (before %v)", after, again, before)
 	}
 	release()
 	waitFor(t, "the queue drains", func() bool { q, _ := tp.Queued(); return q == 0 })
-	tp.watch.sample(time.Now())
+	tp.Sample()
 	tp.watch.mu.Lock()
 	level := tp.watch.level
 	tp.watch.mu.Unlock()
@@ -87,6 +95,7 @@ func TestQueueStatsWarnings(t *testing.T) {
 // that the watcher disarms it once the queue has calmed and leaves once no
 // pool is armed, and that a deep queue arms it again after.
 func TestWatchArmsOnlyWhenDeep(t *testing.T) {
+	autoSampling(t)
 	tp := NewAdaptive(AdaptiveConfig{Name: "watch-arm", MaxWorkers: 1, QueueSize: 20})
 	defer tp.Stop()
 	for round := 0; round < 2; round++ {
@@ -123,6 +132,7 @@ func TestWatchArmsOnlyWhenDeep(t *testing.T) {
 // TestWatchChanBackends checks that the channel-backed pools arm the watch
 // when their queue is deep.
 func TestWatchChanBackends(t *testing.T) {
+	autoSampling(t)
 	for _, mode := range []Mode{ModeElastic, ModeAdaptiveChan} {
 		t.Run(mode.String(), func(t *testing.T) {
 			tp := NewWithMode("watch-chan", mode, 1, 4)
@@ -147,6 +157,105 @@ func TestWatchChanBackends(t *testing.T) {
 	}
 }
 
+// TestAutoSampleOff checks that, with automatic sampling off as it is by
+// default, neither a deep queue nor a TryGo turned away arms the watch or
+// starts the watcher, and that a sample taken by hand counts the warnings
+// and the deepest queue the watcher would have.
+func TestAutoSampleOff(t *testing.T) {
+	if AutoSample() {
+		t.Fatal("automatic sampling is on by default")
+	}
+	tp := NewAdaptive(AdaptiveConfig{Name: "watch-off", MaxWorkers: 1, QueueSize: 20})
+	defer tp.Stop()
+	release := holdWorker(t, tp)
+	_, size := tp.Queued()
+	queued := 0
+	for tp.TryGo(func() {}) {
+		queued++
+		if queued > 4*size {
+			t.Fatal("the queue never filled")
+		}
+	}
+	if tp.watch.armed.Load() {
+		t.Fatal("a full queue armed the watch with automatic sampling off")
+	}
+	s := tp.QueueStats()
+	if s.Rejected != 1 || s.MaxQueued != size || s.Warnings != [len(WarnLevels)]uint64{} {
+		t.Fatalf("stats %+v before any sample, want 1 rejected, the queue full and no warnings", s)
+	}
+	s = tp.Sample()
+	for i := range WarnLevels {
+		if s.Warnings[i] != 1 {
+			t.Fatalf("warnings %v after a sample of a full queue, want one at every level", s.Warnings)
+		}
+	}
+	if again := tp.Sample().Warnings; again != s.Warnings {
+		t.Fatalf("a full queue sampled twice warned again: %v, then %v", s.Warnings, again)
+	}
+	if tp.watch.armed.Load() {
+		t.Fatal("a sample by hand armed the watch")
+	}
+	release()
+	waitFor(t, "the queue drains", func() bool { q, _ := tp.Queued(); return q == 0 })
+}
+
+// TestAutoSampleSwitchedOff checks that switching automatic sampling off
+// disarms the pools armed and lets the watcher leave.
+func TestAutoSampleSwitchedOff(t *testing.T) {
+	autoSampling(t)
+	tp := NewAdaptive(AdaptiveConfig{Name: "watch-switch", MaxWorkers: 1, QueueSize: 20})
+	defer tp.Stop()
+	release := holdWorker(t, tp)
+	defer release()
+	for i := 0; i < int(deepDepth(20)); i++ {
+		if !tp.TryGo(func() {}) {
+			t.Fatalf("task %d turned away", i)
+		}
+	}
+	if !tp.watch.armed.Load() || !watcherRunning() {
+		t.Fatal("a deep queue did not arm the watch")
+	}
+	SetAutoSample(false)
+	waitFor(t, "the watch is disarmed", func() bool { return !tp.watch.armed.Load() })
+	waitFor(t, "the watcher leaves", func() bool { return !watcherRunning() })
+}
+
+// TestSampleAll checks that Sample reports every pool built and not yet
+// stopped, with what tells it from the others, and drops a pool once it has
+// stopped or been collected.
+func TestSampleAll(t *testing.T) {
+	find := func(id uint64) (PoolStats, bool) {
+		for _, s := range Sample() {
+			if s.ID == id {
+				return s, true
+			}
+		}
+		return PoolStats{}, false
+	}
+	tp := NewWithMode("sample-all", ModeAdaptiveChan, 2, 8)
+	release := holdWorker(t, tp)
+	tp.Go(func() {})
+	s, ok := find(tp.executor.id)
+	if !ok {
+		t.Fatal("Sample left out a running pool")
+	}
+	if s.Name != "sample-all" || s.Mode != ModeAdaptiveChan || s.Workers < 1 || s.QueueSize != 8 || s.MaxQueued < 1 {
+		t.Fatalf("Sample reported %+v", s)
+	}
+	release()
+	tp.Stop()
+	if _, ok := find(tp.executor.id); ok {
+		t.Fatal("Sample reported a stopped pool")
+	}
+
+	id := NewInline("sample-dropped").executor.id
+	waitFor(t, "a pool let go of is dropped", func() bool {
+		runtime.GC()
+		_, ok := find(id)
+		return !ok
+	})
+}
+
 // fakeQueue is a queueReporter whose depth a test sets.
 type fakeQueue struct{ queued, size, fullest int }
 
@@ -158,6 +267,7 @@ func (f *fakeQueue) grownPast() int              { return 0 }
 // level less the hysteresis for releaseCalm, or below the first level with no
 // level held for releaseQuiet; never while a shard is deep or a level is held.
 func TestWatchCalms(t *testing.T) {
+	autoSampling(t)
 	for _, c := range []struct {
 		name            string
 		queued, fullest int

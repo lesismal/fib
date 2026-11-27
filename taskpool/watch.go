@@ -4,6 +4,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+	"weak"
 
 	"github.com/lesismal/fib/log"
 )
@@ -11,26 +12,50 @@ import (
 // A pool's queue is where its tasks wait for a worker, and what it holds
 // says how far the pool is behind: a queue that fills turns TryGo away and
 // makes Go wait. A queue that fills shows in QueueStats, and in a warning
-// logged as it rises past each of WarnLevels.
+// logged as it rises past each of WarnLevels, at a sample of the queue.
 //
-// Nothing looks at a queue while it is shallow. A submission that leaves a
-// queue (or one shard of it) at the first of WarnLevels or deeper arms the
-// pool's watch, and so does a TryGo turned away by a full queue; the queue's
-// depth is known to the submission already, from the head and tail it read to
-// queue its task, so the check costs it one compare and writes nothing a
-// shallow queue's submissions share. An armed pool is sampled every
-// watchInterval by a watcher goroutine, which warns as the queue rises past
-// each level, and disarms the pool once it has calmed: below the first level
-// less warnHysteresis for releaseCalm, or below the first level, with no
-// level warned at, for releaseQuiet. The watcher runs only while some pool is
-// armed, and leaves once none is, so a process whose queues stay shallow runs
-// no timer for them.
+// Queues are sampled two ways, and neither by default:
+//
+//   - By hand: Sample looks once at every pool, and TaskPool.Sample at one,
+//     so a process that serves its own status or metrics endpoint samples
+//     its pools when it answers, as often as it is asked.
+//   - Automatically, once SetAutoSample switches it on. Nothing looks at a
+//     queue while it is shallow then either. A submission that leaves a
+//     queue (or one shard of it) at the first of WarnLevels or deeper arms
+//     the pool's watch, and so does a TryGo turned away by a full queue; the
+//     queue's depth is known to the submission already, from the head and
+//     tail it read to queue its task, so the check costs it one compare and
+//     writes nothing a shallow queue's submissions share. An armed pool is
+//     sampled every watchInterval by a watcher goroutine, which disarms the
+//     pool once it has calmed: below the first level less warnHysteresis for
+//     releaseCalm, or below the first level, with no level warned at, for
+//     releaseQuiet. The watcher runs only while some pool is armed, and
+//     leaves once none is, so a process whose queues stay shallow runs no
+//     timer for them.
+//
+// Either way a sample counts a warning at each level the queue rose past
+// since the one before, and logs it. Off, a submission that finds the queue
+// deep reads the switch and nothing else.
 //
 // MaxQueued is the deepest queue the samples found, the depth that armed the
 // watch, the whole queue once TryGo has been turned away, and, for a queue
 // that grows its storage as it fills, about the depth that made it grow; a
-// burst that came and went between two samples of an armed pool may not show
-// in it.
+// burst that came and went between two samples may not show in it.
+
+// autoSample is SetAutoSample's switch.
+var autoSample atomic.Bool
+
+// SetAutoSample switches whether every pool's queue is watched once it is
+// deep, and its warnings logged without anyone asking; see the top of this
+// file. It is off by default, and takes effect at once: switched on, a pool
+// is armed at its next deep submission; switched off, the watcher disarms
+// the armed pools at its next look, and leaves. Sample and TaskPool.Sample
+// look at the queues either way.
+func SetAutoSample(on bool) { autoSample.Store(on) }
+
+// AutoSample reports whether SetAutoSample has switched automatic sampling
+// on.
+func AutoSample() bool { return autoSample.Load() }
 
 // WarnLevels are the shares of a pool's queue, in percent, that the watcher
 // warns about as the queue rises past each. A level warns again only once
@@ -61,9 +86,9 @@ type QueueStats struct {
 	// the queue holds. Both are 0 for a ModeInline pool, which has none.
 	Queued    int
 	QueueSize int
-	// MaxQueued is the deepest the queue has been seen: by the watcher, which
-	// samples it once it is deep, by the submission that found it deep, or by
-	// a TryGo turned away, which found it full. A queue that grows its
+	// MaxQueued is the deepest the queue has been seen: by a sample, by the
+	// submission that found it deep and armed the watch, or by a TryGo turned
+	// away, which found it full. A queue that grows its
 	// storage, as ModeAdaptive's does, also reports about the depth that made
 	// it grow, so a queue never deep enough to be watched shows roughly how
 	// deep it got.
@@ -74,6 +99,89 @@ type QueueStats struct {
 	// Warnings counts, for each of WarnLevels, the times the queue rose
 	// past that level.
 	Warnings [len(WarnLevels)]uint64
+}
+
+// PoolStats is one pool's QueueStats, with what tells the pool from the
+// others; see Sample.
+type PoolStats struct {
+	// Name is the name the pool was created with, and ID the number that
+	// tells it from another of the same name in what the pools log.
+	Name string
+	ID   uint64
+	Mode Mode
+	// Workers is how many workers the pool runs; see TaskPool.Workers.
+	Workers int
+	QueueStats
+}
+
+// Sample looks once at the queue of every pool created and not yet stopped,
+// as TaskPool.Sample does, and reports each, in the order they were created.
+// It is for a process to call from its own status or metrics endpoint: each
+// call is a sample, so the warnings it counts and logs follow how often the
+// endpoint is asked. It reaches the pools fib builds for its engines and
+// handlers too, which the process holds no TaskPool for.
+func Sample() []PoolStats {
+	pools := livePools()
+	stats := make([]PoolStats, 0, len(pools))
+	for _, tp := range pools {
+		stats = append(stats, PoolStats{
+			Name: tp.executor.name, ID: tp.executor.id, Mode: tp.mode,
+			Workers: tp.Workers(), QueueStats: tp.Sample(),
+		})
+	}
+	return stats
+}
+
+// Sample looks at the pool's queue once and reports it: it raises MaxQueued
+// to the depth it finds, and counts and logs a warning at each of
+// WarnLevels the queue has risen past since the last sample, by hand or by
+// the watcher. It does not arm the watch, and works whether or not
+// SetAutoSample has switched automatic sampling on.
+func (tp *TaskPool) Sample() QueueStats {
+	tp.watch.observe(time.Now())
+	return tp.QueueStats()
+}
+
+// registry holds every pool built, for Sample, without keeping a pool the
+// program has let go of alive: a pool collected or stopped is dropped at the
+// next look. live is how many were left at the last look, so that a program
+// that builds pools and never samples them drops the dead ones as it goes.
+var registry struct {
+	mu    sync.Mutex
+	pools []weak.Pointer[TaskPool]
+	live  int
+}
+
+// register adds tp to the registry.
+func register(tp *TaskPool) {
+	registry.mu.Lock()
+	defer registry.mu.Unlock()
+	if len(registry.pools) >= 2*max(registry.live, 64) {
+		livePoolsLocked()
+	}
+	registry.pools = append(registry.pools, weak.Make(tp))
+}
+
+// livePools returns the pools built and not yet collected or stopped, in the
+// order they were built, and drops the rest from the registry.
+func livePools() []*TaskPool {
+	registry.mu.Lock()
+	defer registry.mu.Unlock()
+	return livePoolsLocked()
+}
+
+func livePoolsLocked() []*TaskPool {
+	var live []*TaskPool
+	kept := registry.pools[:0]
+	for _, p := range registry.pools {
+		if tp := p.Value(); tp != nil && !tp.Stopped() {
+			kept = append(kept, p)
+			live = append(live, tp)
+		}
+	}
+	clear(registry.pools[len(kept):])
+	registry.pools, registry.live = kept, len(kept)
+	return live
 }
 
 // queueReporter is a backend that can say how many tasks wait in its queue
@@ -90,6 +198,7 @@ type queueReporter interface {
 
 // queueWatch is what a pool keeps of its queue's history. The pool, its
 // backend (through the executor) and, while it is armed, the watcher hold it.
+// The samples, the watcher's and those taken by hand, share it under mu.
 type queueWatch struct {
 	// armed is set by the submission that arms the watch, and cleared by the
 	// watcher as it disarms it; only the first arms it, so a deep queue's
@@ -106,8 +215,8 @@ type queueWatch struct {
 	queue   queueReporter
 	workers func() int
 
-	// Only the watcher touches the rest. rejectsSeen is rejected as the
-	// last sample saw it; level is the index of the highest of WarnLevels
+	// Only a sample touches the rest, under mu. rejectsSeen is rejected as
+	// the last sample saw it; level is the index of the highest of WarnLevels
 	// warned at and not yet left, or -1; lastWarn and held, per level, when
 	// it last logged and how many warnings it has held back since; calmSince
 	// and quietSince when the queue was last found to have calmed, by
@@ -168,7 +277,8 @@ func (tp *TaskPool) queueLen() (queued, size int) {
 }
 
 // rejectedFull records a TryGo turned away by a full queue: the queue was as
-// deep as it goes, and the watch is armed for the watcher to warn of it.
+// deep as it goes, and, under SetAutoSample, the watch is armed for the
+// watcher to warn of it.
 func (tp *TaskPool) rejectedFull() {
 	w := tp.watch
 	w.rejected.Add(1)
@@ -178,11 +288,15 @@ func (tp *TaskPool) rejectedFull() {
 	}
 }
 
-// checkDeep arms e's watch if queue, a pool's channel, will be at the first
-// of WarnLevels or deeper once the task about to be sent is in it. It reads
-// the channel's header before the send, which takes that line anyway;
-// read after, it could find the line taken by the worker receiving.
+// checkDeep arms e's watch, under SetAutoSample, if queue, a pool's channel,
+// will be at the first of WarnLevels or deeper once the task about to be
+// sent is in it. It reads the channel's header before the send, which takes
+// that line anyway; read after, it could find the line taken by the worker
+// receiving. With automatic sampling off it reads the switch alone.
 func checkDeep(e *executor, queue chan Task) {
+	if !autoSample.Load() {
+		return
+	}
 	if size := cap(queue); size > 0 {
 		if q := len(queue) + 1; q*100 >= WarnLevels[0]*size {
 			e.watch.arm(q)
@@ -200,10 +314,11 @@ func chanState(queue chan Task) (queued, size, fullest int) {
 }
 
 // arm has the watcher sample the pool's queue, which a submission found
-// depth deep, from now until it calms. Arming one already armed reads armed
-// and writes nothing.
+// depth deep, from now until it calms, when SetAutoSample has switched
+// automatic sampling on. Arming one already armed reads armed and writes
+// nothing.
 func (w *queueWatch) arm(depth int) {
-	if w.armed.Load() || w.queue == nil || !w.armed.CompareAndSwap(false, true) {
+	if !autoSample.Load() || w.armed.Load() || w.queue == nil || !w.armed.CompareAndSwap(false, true) {
 		return
 	}
 	raiseMax(&w.maxQueued, int64(depth))
@@ -227,23 +342,50 @@ func raiseMax(m *atomic.Int64, v int64) {
 }
 
 // sample looks at the pool's queue once, for the watcher, and reports whether
-// the pool has calmed, or stopped, and should be disarmed.
+// the pool has calmed, or stopped, and should be disarmed; every pool has,
+// once automatic sampling is switched off.
 func (w *queueWatch) sample(now time.Time) (calmed bool) {
-	if w.stopped.Load() || w.queue == nil {
+	if !autoSample.Load() {
 		return true
+	}
+	share, ok := w.observe(now)
+	if !ok {
+		return true
+	}
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	calmed = calmFor(&w.calmSince, share < WarnLevels[0]-warnHysteresis, now, releaseCalm)
+	if calmFor(&w.quietSince, share < WarnLevels[0] && w.level < 0, now, releaseQuiet) {
+		calmed = true
+	}
+	if calmed {
+		w.calmSince, w.quietSince = time.Time{}, time.Time{}
+	}
+	return calmed
+}
+
+// observe is one sample of the pool's queue, the watcher's or one taken by
+// hand: it raises MaxQueued to the depth it finds, and counts and logs a
+// warning at each level the queue has risen past since the sample before.
+// It reports how full the queue is, in percent, by the fuller of the whole
+// and its fullest shard, since a shard that deep arms the watch again; ok is
+// false for a pool stopped or with no queue.
+func (w *queueWatch) observe(now time.Time) (share int, ok bool) {
+	if w.stopped.Load() || w.queue == nil {
+		return 0, false
 	}
 	q, size, fullest := w.queue.queueState()
 	if size <= 0 {
-		return true
+		return 0, false
 	}
 	raiseMax(&w.maxQueued, int64(q))
+	w.mu.Lock()
+	defer w.mu.Unlock()
 	if r := w.rejected.Load(); r != w.rejectsSeen {
 		// A TryGo found the queue full since the last sample, which the
 		// sample itself may have missed.
 		w.rejectsSeen, q, fullest = r, size, 100
 	}
-	w.mu.Lock()
-	defer w.mu.Unlock()
 	reached := levelOf(q, size, 0)
 	// A level is left once the queue falls warnHysteresis below it.
 	if kept := levelOf(q, size, warnHysteresis); kept < w.level {
@@ -269,17 +411,7 @@ func (w *queueWatch) sample(now time.Time) (calmed bool) {
 			log.Warn("taskpool: queue filling", args...)
 		}
 	}
-	// The pool calms by the fuller of its queue and its fullest shard, since
-	// a shard that deep arms it again.
-	share := max(q*100/size, fullest)
-	calmed = calmFor(&w.calmSince, share < WarnLevels[0]-warnHysteresis, now, releaseCalm)
-	if calmFor(&w.quietSince, share < WarnLevels[0] && w.level < 0, now, releaseQuiet) {
-		calmed = true
-	}
-	if calmed {
-		w.calmSince, w.quietSince = time.Time{}, time.Time{}
-	}
-	return calmed
+	return max(q*100/size, fullest), true
 }
 
 // calmFor keeps in since when calm began, and reports whether it has lasted

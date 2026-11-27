@@ -186,6 +186,7 @@ func start(name string, mode Mode, build func(*executor) backend) *TaskPool {
 	executor.watch = newQueueWatch(executor)
 	pool := &TaskPool{executor: executor, backend: build(executor), mode: mode, watch: executor.watch}
 	pool.watch.setBackend(pool.backend)
+	register(pool)
 	if logStatus.Load() {
 		label := []any{"pool", name, "id", executor.id, "mode", mode.String()}
 		log.Info("taskpool: started", append(label, pool.backend.attrs()...)...)

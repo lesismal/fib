@@ -687,13 +687,14 @@ func (p *adaptivePool) pushLocked(task Task) bool {
 	return false
 }
 
-// deep arms the pool's watch for a push that found the shard's queue deep;
-// see queueWatch. It is kept out of line, off the submit path's common case,
-// and reads the queue's depth again only for the push that arms the watch.
+// deep arms the pool's watch for a push that found the shard's queue deep,
+// when SetAutoSample has switched automatic sampling on; see queueWatch. It
+// is kept out of line, off the submit path's common case, and reads the
+// queue's depth again only for the push that arms the watch.
 //
 //go:noinline
 func (p *adaptivePool) deep() {
-	if w := p.executor.watch; !w.armed.Load() {
+	if w := p.executor.watch; autoSample.Load() && !w.armed.Load() {
 		w.arm(p.ring.len())
 	}
 }
