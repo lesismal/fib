@@ -5,6 +5,7 @@
 package benchmark
 
 import (
+	"log/slog"
 	"runtime"
 	"sync"
 	"sync/atomic"
@@ -16,9 +17,18 @@ import (
 	fnetpool "github.com/linfeip/fnet/pool"
 	"github.com/panjf2000/ants/v2"
 
+	fiblog "github.com/lesismal/fib/log"
 	fibpool "github.com/lesismal/fib/taskpool"
 	nbiopool "github.com/lesismal/nbio/taskpool"
 )
+
+func init() {
+	// fib's pools log a warning when a queue fills, which the loop scenarios
+	// do on purpose. On stderr, which bench.sh and CI merge into the output,
+	// it lands between a benchmark's name and its figures and splits the
+	// result line, which summarize then cannot read.
+	fiblog.SetLogger(slog.New(slog.DiscardHandler))
+}
 
 // pool is what every scenario submits to.
 type pool interface {
