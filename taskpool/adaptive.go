@@ -1,6 +1,7 @@
 package taskpool
 
 import (
+	"math"
 	"math/rand/v2"
 	"runtime"
 	"sync"
@@ -434,10 +435,14 @@ type adaptivePool struct {
 	// are on the budget; see addWorker.
 	workers   atomic.Int32
 	idleCount atomic.Int32
-	// roomWanted is set by a submitter that waits for room, and cleared by
-	// the one worker that wakes the waiters.
-	roomWanted atomic.Bool
-	_          cacheLinePad
+	// roomWaiting counts the submitters waiting for room that no place has
+	// been granted to yet, and roomGranted the places granted whose
+	// submitter has not tried the queue again yet; roomGranting is held by
+	// the one worker granting places. See grantRoom.
+	roomWaiting  atomic.Int32
+	roomGranted  atomic.Int32
+	roomGranting atomic.Bool
+	_            cacheLinePad
 	// What every submission reads and writes has a line of its own, so that
 	// submitting does not move the line the wake-ups use.
 	//
@@ -452,8 +457,11 @@ type adaptivePool struct {
 	draining atomic.Bool
 	_        cacheLinePad
 
-	mu      sync.Mutex
-	notFull *sync.Cond
+	mu sync.Mutex
+	// room carries a place granted to a submitter waiting for room, one
+	// token each. Its tokens take no memory, and no more are ever in it than
+	// submitters wait, so a send never blocks.
+	room chan struct{}
 	// idle holds the parked workers, the one parked last on top. idleCount
 	// mirrors its length for the checks made without the lock.
 	idle       []*adaptiveWorker
@@ -466,7 +474,7 @@ type adaptivePool struct {
 func newAdaptivePool(b *adaptiveBackend, executor *executor, queueSize int, index int32) *adaptivePool {
 	p := &adaptivePool{backend: b, budget: &b.budget, executor: executor, workerWG: &b.workerWG, index: index}
 	p.ring.init(queueSize, ringStartCells)
-	p.notFull = sync.NewCond(&p.mu)
+	p.room = make(chan struct{}, math.MaxInt32)
 	return p
 }
 
@@ -647,44 +655,94 @@ func (p *adaptivePool) kick() {
 }
 
 // lowWater is how far the queue drains before the submitters waiting for
-// room are woken. Waking one each time a cell frees would take the lock once
-// per task, with the waiters queued behind it and filling the queue again one
-// cell at a time; waking them all once half the queue is free lets them queue
-// a run of tasks each.
+// room are granted places. Granting one each time a cell frees would cost a
+// worker a channel send per task while the queue stays full; granting them a
+// run once half the queue is free lets them queue a run of tasks.
 func (p *adaptivePool) lowWater() int { return int(p.ring.limit / 2) }
 
-// waitForRoomLocked parks a submitter until the queue has drained to its low
-// water mark, making sure first that a worker is on its way to drain it. A
-// worker that takes a task signals only if it sees the submitter counted, so
-// the count goes up before the queue is looked at again; a waiter that finds
-// the queue full is then woken by whichever worker takes it down to the mark.
-func (p *adaptivePool) waitForRoomLocked() {
-	var w wakeups
-	p.kickLocked(&w)
-	if w.woken > 0 || w.spawn > 0 || w.adopt {
-		p.mu.Unlock()
-		w.run(p)
-		p.mu.Lock()
+// waitForRoom parks a submitter that found the queue full until it is
+// granted a place, making sure first that a worker is on its way to drain the
+// queue, and reports whether it took a token that it must give back once it
+// has tried the queue again (see pushSlow), and whether the pool is still
+// running.
+//
+// It takes no lock, so that the submitters waiting for room never stand
+// between a worker and the lock, nor wake all together to take it in turn,
+// as they did waiting on a condition variable under it: with many of them,
+// workers left the queue empty waiting for the lock to wake them. A waiter
+// counts itself in roomWaiting and then looks at the queue again, and a
+// worker takes a task and then looks at the count, so the sequentially
+// consistent atomics let one of them see the other.
+func (p *adaptivePool) waitForRoom() (granted, running bool) {
+	p.kick()
+	p.roomWaiting.Add(1)
+	if p.stopped.Load() || p.ring.len() < int(p.ring.limit) {
+		// Room, or stop, came first: take the count back, or, if every
+		// waiter counted has been granted a place since, the token on its
+		// way for one of them.
+		granted = p.cancelRoomWait()
+		return granted, !p.stopped.Load()
 	}
-	p.roomWanted.Store(true)
-	if !p.stopped.Load() && p.ring.len() >= int(p.ring.limit) {
-		p.notFull.Wait()
+	<-p.room
+	return true, !p.stopped.Load()
+}
+
+// cancelRoomWait takes a waiter's count back from roomWaiting, or, when
+// every waiter counted there has been granted a place, takes the token sent
+// for one of them, which is on its way, and reports that it did.
+func (p *adaptivePool) cancelRoomWait() bool {
+	for {
+		n := p.roomWaiting.Load()
+		if n <= 0 {
+			<-p.room
+			return true
+		}
+		if p.roomWaiting.CompareAndSwap(n, n-1) {
+			return false
+		}
 	}
 }
 
-// pushLocked queues task, waiting for room while the queue is full, and
-// reports false if the pool stopped first.
-func (p *adaptivePool) pushLocked(task Task) bool {
-	for !p.stopped.Load() {
-		if r := p.ring.put(task); r != pushFull {
-			if r == pushedDeep {
-				p.deep()
-			}
-			return true
+// takeRoomWaiting takes up to n waiters off roomWaiting and returns how many
+// it took.
+func (p *adaptivePool) takeRoomWaiting(n int32) int32 {
+	for {
+		waiting := p.roomWaiting.Load()
+		take := min(waiting, n)
+		if take <= 0 {
+			return 0
 		}
-		p.waitForRoomLocked()
+		if p.roomWaiting.CompareAndSwap(waiting, waiting-take) {
+			return take
+		}
 	}
-	return false
+}
+
+// grant sends n waiting submitters a token each.
+func (p *adaptivePool) grant(n int32) {
+	p.roomGranted.Add(n)
+	for ; n > 0; n-- {
+		p.room <- struct{}{}
+	}
+}
+
+// grantRoom grants the submitters waiting for room as many places as the
+// queue has free cells that no place granted before covers. One worker
+// grants at a time; the others leave it to that one, which looks again once
+// it lets go, so that room freed meanwhile is not left ungranted while the
+// queue drains.
+func (p *adaptivePool) grantRoom() {
+	for p.roomGranting.CompareAndSwap(false, true) {
+		free := int32(int(p.ring.limit)-p.ring.len()) - p.roomGranted.Load()
+		if free > 0 {
+			p.grant(p.takeRoomWaiting(free))
+		}
+		p.roomGranting.Store(false)
+		if p.roomWaiting.Load() == 0 || p.ring.len() > p.lowWater() ||
+			int32(int(p.ring.limit)-p.ring.len()) <= p.roomGranted.Load() {
+			return
+		}
+	}
 }
 
 // deep arms the pool's watch for a push that found the shard's queue deep,
@@ -738,13 +796,31 @@ func (p *adaptivePool) trySubmit(task Task) bool {
 	return true
 }
 
-// pushSlow queues task once the queue was found full, waiting for room under
-// the lock, and reports false if the pool stopped first.
+// pushSlow queues task once the queue was found full, waiting for room
+// while it stays full, and reports false if the pool stopped first. A
+// submitter granted a place gives it back once it has tried the queue, so
+// that the place counts as free again whether it took it or found it taken
+// by a submission that did not wait.
 func (p *adaptivePool) pushSlow(task Task) bool {
-	p.mu.Lock()
-	ok := p.pushLocked(task)
-	p.mu.Unlock()
-	return ok
+	for {
+		if p.stopped.Load() {
+			return false
+		}
+		r := p.ring.put(task)
+		if r != pushFull {
+			if r == pushedDeep {
+				p.deep()
+			}
+			return true
+		}
+		granted, running := p.waitForRoom()
+		if granted {
+			p.roomGranted.Add(-1)
+		}
+		if !running {
+			return false
+		}
+	}
 }
 
 // submitBatch queues tasks and then sends workers to the queue for them,
@@ -820,10 +896,8 @@ func (p *adaptivePool) work(self *adaptiveWorker) {
 				break
 			}
 			p.kick()
-			if p.roomWanted.Load() && p.ring.len() <= p.lowWater() && p.roomWanted.Swap(false) {
-				p.mu.Lock()
-				p.notFull.Broadcast()
-				p.mu.Unlock()
+			if p.roomWaiting.Load() > 0 && p.ring.len() <= p.lowWater() {
+				p.grantRoom()
 			}
 			p.executor.call(task)
 		}
@@ -938,12 +1012,16 @@ func (p *adaptivePool) workerCount() int { return int(p.workers.Load()) }
 func (p *adaptivePool) stop() {
 	p.mu.Lock()
 	p.stopped.Store(true)
-	p.notFull.Broadcast()
 	p.mu.Unlock()
+	// Every submitter waiting for room is granted a place, and finds the pool
+	// stopped. One that counts itself in after this sees stopped, since it
+	// looks after it counts itself in and stop looks at the count after it
+	// sets stopped.
+	p.grant(p.takeRoomWaiting(math.MaxInt32))
 	// A submission counts itself in before it looks at stopped, and stop
 	// sets stopped before it looks at the count, so a submission either sees
 	// stopped or is waited for here, and its task is queued before the
-	// workers are told to drain. One waiting for room was woken above.
+	// workers are told to drain.
 	for p.submitting.Load() > 0 {
 		runtime.Gosched()
 	}

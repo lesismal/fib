@@ -505,3 +505,93 @@ func TestAdaptivePickPrefersAnIdleShard(t *testing.T) {
 		}
 	}
 }
+
+// Many submitters waiting for room on a small queue all get their tasks in,
+// each run once, and the pool keeps its workers busy while they wait: a
+// submitter waiting for room once stood between the workers and the shard's
+// lock, which left the queue empty while they waited for it.
+func TestAdaptiveManySubmittersWaitingForRoom(t *testing.T) {
+	const submitters, perSubmitter = 2000, 20
+	tp := NewAdaptive(AdaptiveConfig{MaxWorkers: 8, QueueSize: 16})
+	defer tp.Stop()
+	var counts [submitters * perSubmitter]atomic.Int32
+	var submitted, ran sync.WaitGroup
+	ran.Add(len(counts))
+	for s := 0; s < submitters; s++ {
+		submitted.Add(1)
+		go func() {
+			defer submitted.Done()
+			for i := 0; i < perSubmitter; i++ {
+				index := s*perSubmitter + i
+				if !tp.Go(func() { counts[index].Add(1); ran.Done() }) {
+					t.Errorf("task %d rejected before Stop", index)
+					ran.Done()
+				}
+			}
+		}()
+	}
+	done := make(chan struct{})
+	go func() { submitted.Wait(); ran.Wait(); close(done) }()
+	select {
+	case <-done:
+	case <-time.After(30 * time.Second):
+		t.Fatal("submitters waiting for room did not all get their tasks in")
+	}
+	for i := range counts {
+		if got := counts[i].Load(); got != 1 {
+			t.Fatalf("task %d ran %d times", i, got)
+		}
+	}
+}
+
+// Stop turns away the submitters waiting for room at once, without waiting
+// for the tasks that hold the workers, and runs every task it accepted.
+func TestAdaptiveStopReleasesSubmittersWaitingForRoom(t *testing.T) {
+	b := newBlocker()
+	defer b.open()
+	tp := NewAdaptive(AdaptiveConfig{MaxWorkers: 2, QueueSize: 2})
+	var accepted, rejected atomic.Int64
+	var submitted sync.WaitGroup
+	for s := 0; s < 64; s++ {
+		submitted.Add(1)
+		task := b.task()
+		go func() {
+			defer submitted.Done()
+			if tp.Go(task) {
+				accepted.Add(1)
+			} else {
+				rejected.Add(1)
+				b.done.Done()
+			}
+		}()
+	}
+	waitFor(t, "the workers to hold their tasks", func() bool { return b.running.Load() == 2 })
+	waitFor(t, "the queue to fill", func() bool { queued, size := tp.Queued(); return queued >= size })
+	stopped := make(chan struct{})
+	go func() { tp.Stop(); close(stopped) }()
+	released := make(chan struct{})
+	go func() { submitted.Wait(); close(released) }()
+	select {
+	case <-released:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Stop left submitters waiting for room")
+	}
+	select {
+	case <-stopped:
+		t.Fatal("Stop returned while accepted tasks were still held")
+	default:
+	}
+	if rejected.Load() == 0 {
+		t.Fatal("no submitter waiting for room was turned away")
+	}
+	b.open()
+	select {
+	case <-stopped:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Stop did not return once the tasks were released")
+	}
+	b.done.Wait()
+	if got := b.peak.Load(); got > 2 {
+		t.Fatalf("%d tasks ran at once in a pool of 2 workers", got)
+	}
+}
